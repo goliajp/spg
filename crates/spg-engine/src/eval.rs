@@ -3160,40 +3160,18 @@ impl crate::Engine {
                 ),
             });
         }
-        // Bind the arguments by rewriting their references into literals. A name
-        // that is also a COLUMN of the body's own FROM is that column, not the
-        // argument — PG resolves it the same way, so the substitution skips it.
-        let cat = self.active_catalog();
-        let mut bound = stmt.clone();
-        let mut binds: alloc::collections::BTreeMap<alloc::string::String, spg_sql::ast::Expr> =
-            alloc::collections::BTreeMap::new();
-        for (i, name) in arg_names.iter().enumerate() {
-            if name.is_empty() {
-                continue;
-            }
-            let shadowed = body_from_tables(stmt).iter().any(|t| {
-                cat.get(t).is_some_and(|tb| {
-                    tb.schema()
-                        .columns
-                        .iter()
-                        .any(|c| c.name.eq_ignore_ascii_case(name))
-                })
-            });
-            if shadowed {
-                continue;
-            }
-            let v = args.values.get(i).cloned().unwrap_or(Value::Null);
-            let lit = crate::substitute::value_to_literal_expr(v.into_owned()).map_err(|e| {
-                EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "function {:?}: argument {name} cannot be bound into a body with a FROM: {e}",
-                        def.name
-                    ),
-                }
+        // Bind the arguments — the same helper the set-returning path uses, so
+        // both resolve an argument identically (a COLUMN of the body's own FROM
+        // shadows a same-named argument, as in PG).
+        let owned: alloc::vec::Vec<Value<'static>> = args
+            .values
+            .iter()
+            .map(|v| v.clone().into_owned())
+            .collect();
+        let bound = bind_user_fn_args(self.active_catalog(), stmt, arg_names, &owned)
+            .map_err(|e| EvalError::TypeMismatch {
+                detail: alloc::format!("function {:?}: {e}", def.name),
             })?;
-            binds.insert(name.to_ascii_lowercase(), lit);
-        }
-        substitute_arg_refs_in_select(&mut bound, &binds);
 
         let out = self
             .exec_select_cancel(&bound, crate::CancelToken::none())
@@ -3218,6 +3196,46 @@ impl crate::Engine {
         )
         .or_else(|_| Ok(Value::Null))
     }
+}
+
+/// v7.39 (read01 round 65) — bind a call's arguments into a function body's
+/// SELECT, as literals. Shared by the scalar path (round 63) and the
+/// set-returning one, so both resolve an argument the same way — including the
+/// rule that a COLUMN of the body's own FROM shadows a same-named argument.
+pub(crate) fn bind_user_fn_args(
+    cat: &spg_storage::Catalog,
+    stmt: &spg_sql::ast::SelectStatement,
+    arg_names: &[alloc::string::String],
+    args: &[Value<'static>],
+) -> Result<spg_sql::ast::SelectStatement, EvalError> {
+    let mut bound = stmt.clone();
+    let mut binds: alloc::collections::BTreeMap<alloc::string::String, spg_sql::ast::Expr> =
+        alloc::collections::BTreeMap::new();
+    for (i, name) in arg_names.iter().enumerate() {
+        if name.is_empty() {
+            continue;
+        }
+        let shadowed = body_from_tables(stmt).iter().any(|t| {
+            cat.get(t).is_some_and(|tb| {
+                tb.schema()
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(name))
+            })
+        });
+        if shadowed {
+            continue;
+        }
+        let v = args.get(i).cloned().unwrap_or(Value::Null);
+        let lit = crate::substitute::value_to_literal_expr(v).map_err(|e| {
+            EvalError::TypeMismatch {
+                detail: alloc::format!("argument {name} cannot be bound into the body: {e}"),
+            }
+        })?;
+        binds.insert(name.to_ascii_lowercase(), lit);
+    }
+    substitute_arg_refs_in_select(&mut bound, &binds);
+    Ok(bound)
 }
 
 /// The base tables a function body's FROM names — used to decide whether an

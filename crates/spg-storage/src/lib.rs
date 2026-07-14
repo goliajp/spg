@@ -3564,6 +3564,32 @@ pub fn function_arg_types(args_repr: &str) -> Vec<String> {
         .collect()
 }
 
+/// v7.39 (read01 round 65) — the declared argument NAMES of a function (`""` for
+/// a bare type with no name).
+#[must_use]
+pub fn function_arg_names(args_repr: &str) -> Vec<String> {
+    let inner = args_repr.trim().trim_start_matches('(').trim_end_matches(')');
+    if inner.trim().is_empty() {
+        return Vec::new();
+    }
+    inner
+        .split(',')
+        .map(|part| {
+            let mut words: Vec<&str> = part.split_whitespace().collect();
+            if !words.is_empty()
+                && (words[0].eq_ignore_ascii_case("OUT") || words[0].eq_ignore_ascii_case("INOUT"))
+            {
+                words.remove(0);
+            }
+            if words.len() >= 2 {
+                words[0].to_string()
+            } else {
+                String::new()
+            }
+        })
+        .collect()
+}
+
 /// Fold PG's type aliases so a signature key is stable across spellings.
 /// Unknown names pass through lower-cased — consistency is what the key needs.
 #[must_use]

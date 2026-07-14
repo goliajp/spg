@@ -2888,10 +2888,114 @@ impl Engine {
                 };
                 Ok((rows, cols))
             }
-            other => Err(EngineError::Unsupported(alloc::format!(
-                "table function {other}() is not supported in FROM"
-            ))),
+            // v7.39 (read01 round 65) — a set-returning USER function in FROM
+            // (`FROM rows_of(2)`). Its body runs through the real executor, like
+            // every other function body since round 63.
+            other => {
+                if !self.active_catalog().functions_named(other).is_empty() {
+                    return self.exec_setof_user_function(other, args, primary.alias.as_deref());
+                }
+                Err(EngineError::Unsupported(alloc::format!(
+                    "table function {other}() is not supported in FROM"
+                )))
+            }
         }
+    }
+
+    /// v7.39 (read01 round 65) — run a `RETURNS SETOF <type>` / `RETURNS
+    /// TABLE(…)` function in FROM position. The body is a SELECT; the arguments
+    /// are bound into it as literals and it goes through the read path, so the
+    /// rows it yields are exactly the rows a hand-written query would see.
+    ///
+    /// The column NAMES come from the declared shape: `RETURNS TABLE(id int, v
+    /// text)` names them, and a `SETOF <scalar>` yields a single column named
+    /// after the function — PG's rule, and what a bare `SELECT * FROM f()`
+    /// shows.
+    fn exec_setof_user_function(
+        &self,
+        name: &str,
+        args: &[spg_sql::ast::Expr],
+        // v7.39 (read01 round 65) — `FROM evens() AS x` names the single column
+        // `x`: for a scalar SETOF, the table alias IS the column name (PG).
+        alias: Option<&str>,
+    ) -> Result<(alloc::vec::Vec<Row<'static>>, alloc::vec::Vec<ColumnSchema>), EngineError> {
+        let cat = self.active_catalog();
+        let overloads = cat.functions_named(name);
+        let def = overloads
+            .iter()
+            .find(|f| spg_storage::function_arg_types(&f.args_repr).len() == args.len())
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "function {name} does not exist with {} argument(s)",
+                    args.len()
+                ))
+            })?;
+        let declared = def.returns.trim().to_string();
+        let upper = declared.to_ascii_uppercase();
+        if !upper.starts_with("SETOF") && !upper.starts_with("TABLE(") {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "function {name}() does not return a set — it cannot be used in FROM"
+            )));
+        }
+        if !def.language.eq_ignore_ascii_case("sql") {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "function {name}(): a set-returning body must be LANGUAGE sql so far"
+            )));
+        }
+        // Evaluate the call's arguments (they are literals / expressions of the
+        // enclosing query, not of the function's body).
+        let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+        let arg_ctx = self.ev_ctx(&empty_schema, None);
+        let dummy = Row::new(alloc::vec::Vec::new());
+        let mut arg_values: alloc::vec::Vec<Value<'static>> = alloc::vec::Vec::new();
+        for a in args {
+            arg_values.push(eval::eval_expr(a, &dummy, &arg_ctx).map_err(EngineError::Eval)?);
+        }
+        let body = def.body.trim().trim_end_matches(';');
+        let stmt = spg_sql::parser::parse_statement(body).map_err(|e| {
+            EngineError::Unsupported(alloc::format!("function {name} body does not parse: {e}"))
+        })?;
+        let spg_sql::ast::Statement::Select(body_select) = stmt else {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "function {name}(): a set-returning body must be a SELECT"
+            )));
+        };
+        let arg_names = spg_storage::function_arg_names(&def.args_repr);
+        let bound = crate::eval::bind_user_fn_args(
+            self.active_catalog(),
+            &body_select,
+            &arg_names,
+            &arg_values,
+        )
+        .map_err(EngineError::Eval)?;
+        let out = self.exec_select_cancel(&bound, crate::CancelToken::none())?;
+        let QueryResult::Rows { columns, rows } = out else {
+            return Ok((alloc::vec::Vec::new(), alloc::vec::Vec::new()));
+        };
+        // Name the columns from the DECLARED shape.
+        let cols = if upper.starts_with("TABLE(") {
+            let raw = &declared["TABLE(".len()..declared.len() - 1];
+            raw.split(',')
+                .zip(columns.iter())
+                .map(|(decl, got)| {
+                    let cname = decl
+                        .trim()
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or(got.name.as_str());
+                    ColumnSchema::new(cname.to_string(), got.ty, true)
+                })
+                .collect()
+        } else {
+            // SETOF <scalar>: one column, named after the alias when there is
+            // one, else after the function.
+            let cname = alias.unwrap_or(name);
+            columns
+                .first()
+                .map(|c| alloc::vec![ColumnSchema::new(cname.to_string(), c.ty, true)])
+                .unwrap_or_default()
+        };
+        Ok((rows, cols))
     }
 
     fn exec_select_jsonb_each_text(
