@@ -312,15 +312,44 @@ impl Engine {
                         };
                     }
                 }
-                for n in names {
-                    if self.active_catalog().functions().get(n).is_none() {
-                        return Err(EngineError::Unsupported(alloc::format!(
-                            "function {n} does not exist"
-                        )));
-                    }
+                // v7.39 (read01 round 62) — a GRANT names ONE overload. With a
+                // signature, resolve it exactly; without one, the name must be
+                // unambiguous (PG's rule).
+                let mut keys: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+                for (n, sig) in names {
+                    let key = match sig {
+                        Some(types) => {
+                            let repr = alloc::format!("({})", types.join(", "));
+                            let k = spg_storage::function_signature_key(n, &repr);
+                            if self.active_catalog().function_by_key(&k).is_none() {
+                                return Err(EngineError::Unsupported(alloc::format!(
+                                    "function {n}({}) does not exist",
+                                    types.join(", ")
+                                )));
+                            }
+                            k
+                        }
+                        None => {
+                            let all = self.active_catalog().functions_named(n);
+                            match all.len() {
+                                0 => {
+                                    return Err(EngineError::Unsupported(alloc::format!(
+                                        "function {n} does not exist"
+                                    )));
+                                }
+                                1 => spg_storage::function_signature_key(n, &all[0].args_repr),
+                                _ => {
+                                    return Err(EngineError::Unsupported(alloc::format!(
+                                        "function name \"{n}\" is not unique"
+                                    )));
+                                }
+                            }
+                        }
+                    };
+                    keys.push(key);
                 }
-                for n in names {
-                    self.acl_apply_function(n, mask, &g.grantees, grant, g.grant_option)?;
+                for k in &keys {
+                    self.acl_apply_function(k, mask, &g.grantees, grant, g.grant_option)?;
                 }
             }
             _ => {
@@ -1521,6 +1550,7 @@ impl Engine {
     /// GRANT / REVOKE on a function.
     pub(crate) fn acl_apply_function(
         &mut self,
+        // v7.39 (read01 round 62) — the SIGNATURE key: two overloads, two ACLs.
         name: &str,
         mask: u16,
         grantees: &[String],

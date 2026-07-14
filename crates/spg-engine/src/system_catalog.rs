@@ -2758,12 +2758,15 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
     // missing entirely, so `SELECT proacl FROM pg_proc WHERE proname = 'f1'` —
     // the canonical way to read a function's privileges — came back empty.
     let mut user_oid: i64 = 400_000;
-    for (name, def) in cat.functions() {
+    // v7.39 (read01 round 62) — the map is keyed by SIGNATURE now, so `proname`
+    // comes off the definition, not the key: two overloads are two rows sharing
+    // one name, exactly as in PG.
+    for def in cat.functions().values() {
         user_oid += 1;
         let nargs = crate::acl::function_arg_count(&def.args_repr);
         rows.push(Row::new(alloc::vec![
             Value::BigInt(user_oid),
-            Value::text(name.clone()),
+            Value::text(def.name.clone()),
             Value::BigInt(2200), // pronamespace — public
             Value::BigInt(10),   // proowner
             // prolang: 14 = sql, 13 = plpgsql (PG's oids).

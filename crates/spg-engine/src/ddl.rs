@@ -3261,9 +3261,27 @@ impl Engine {
     pub(crate) fn exec_drop_function(
         &mut self,
         name: &str,
+        args: Option<&[alloc::string::String]>,
         if_exists: bool,
     ) -> Result<QueryResult, EngineError> {
-        let removed = self.active_catalog_mut().drop_function(name);
+        // v7.39 (read01 round 62) — with overloads, the signature says WHICH one.
+        let removed = match args {
+            Some(types) => {
+                let repr = alloc::format!("({})", types.join(", "));
+                let key = spg_storage::function_signature_key(name, &repr);
+                self.active_catalog_mut().drop_function_by_key(&key)
+            }
+            None => {
+                // PG refuses a bare `DROP FUNCTION f` when `f` is overloaded —
+                // it cannot know which one is meant.
+                if self.active_catalog().functions_named(name).len() > 1 {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "function name \"{name}\" is not unique DETAIL: Specify the argument list to select the function unambiguously."
+                    )));
+                }
+                self.active_catalog_mut().drop_function(name)
+            }
+        };
         if !removed && !if_exists {
             return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
                 alloc::format!("function {name:?} does not exist"),

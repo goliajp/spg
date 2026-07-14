@@ -1581,7 +1581,10 @@ impl Engine {
                     && t.for_each.eq_ignore_ascii_case("row")
                     && t.events.iter().any(|e| e.eq_ignore_ascii_case(event))
             })
-            .filter_map(|t| cat.functions().get(&t.function).cloned())
+            // v7.39 (read01 round 62) — functions are keyed by SIGNATURE now. A
+            // trigger names its function by NAME, and a trigger function takes
+            // no arguments, so there is at most one.
+            .filter_map(|t| cat.functions_named(&t.function).first().map(|f| (*f).clone()))
             .collect()
     }
 
@@ -1606,10 +1609,9 @@ impl Engine {
                     && t.events.iter().any(|e| e.eq_ignore_ascii_case("UPDATE"))
             })
             .filter_map(|t| {
-                cat.functions()
-                    .get(&t.function)
-                    .cloned()
-                    .map(|fd| (fd, t.update_columns.clone()))
+                cat.functions_named(&t.function)
+                    .first()
+                    .map(|fd| ((*fd).clone(), t.update_columns.clone()))
             })
             .collect()
     }

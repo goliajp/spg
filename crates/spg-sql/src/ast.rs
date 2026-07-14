@@ -321,6 +321,10 @@ pub enum Statement {
     /// DROP TRIGGER but global (no table scope).
     DropFunction {
         name: String,
+        /// v7.39 (read01 round 62) — the argument TYPES, when the statement gave
+        /// them: `DROP FUNCTION f(int)` drops that overload only. `None` = no
+        /// argument list, which PG accepts only when the name is unambiguous.
+        args: Option<Vec<String>>,
         if_exists: bool,
     },
     /// v7.17.0 — `CREATE [TEMPORARY] SEQUENCE [IF NOT EXISTS] name
@@ -3531,7 +3535,7 @@ pub enum GrantObject {
     Databases(Vec<String>),
     /// v7.39 (read01 round 61) — `ON FUNCTION f(int)`. The names are bare
     /// (SPG keys functions by name); the argument list parses and is dropped.
-    Functions(Vec<String>),
+    Functions(Vec<(String, Option<Vec<String>>)>),
     /// v7.39 (read01 round 61) — `ON ALL TABLES IN SCHEMA public`: expands to
     /// every table at GRANT time, exactly like PG.
     AllTablesInSchema,
@@ -3584,7 +3588,13 @@ impl GrantStatement {
                 alloc::format!("DATABASE {}", names.join(", "))
             }
             GrantObject::Functions(n) => {
-                let names: Vec<_> = n.iter().map(|x| quote_ident(x)).collect();
+                let names: Vec<_> = n
+                    .iter()
+                    .map(|(name, args)| match args {
+                        Some(a) => alloc::format!("{}({})", quote_ident(name), a.join(", ")),
+                        None => quote_ident(name),
+                    })
+                    .collect();
                 alloc::format!("FUNCTION {}", names.join(", "))
             }
             GrantObject::AllTablesInSchema => "ALL TABLES IN SCHEMA public".into(),
@@ -4005,12 +4015,20 @@ impl fmt::Display for Statement {
                 }
                 write!(f, "{} ON {}", quote_ident(name), quote_ident(table))
             }
-            Self::DropFunction { name, if_exists } => {
+            Self::DropFunction {
+                name,
+                args,
+                if_exists,
+            } => {
                 f.write_str("DROP FUNCTION ")?;
                 if *if_exists {
                     f.write_str("IF EXISTS ")?;
                 }
-                write!(f, "{}", quote_ident(name))
+                write!(f, "{}", quote_ident(name))?;
+                if let Some(a) = args {
+                    write!(f, "({})", a.join(", "))?;
+                }
+                Ok(())
             }
             Self::CreateSequence(s) => s.fmt(f),
             Self::AlterSequence(s) => s.fmt(f),
