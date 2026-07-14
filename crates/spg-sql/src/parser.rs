@@ -8944,6 +8944,7 @@ impl Parser {
                             lateral_subquery: Some(Box::new(head)),
                             jsonb_each_text_arg: None,
                             table_fn_call: None,
+        rows_from: None,
                         },
                         joins: Vec::new(),
                     }),
@@ -9081,6 +9082,7 @@ impl Parser {
                     inner_name.to_ascii_lowercase(),
                     inner_args.clone(),
                 ))),
+                rows_from: None,
             };
             items = alloc::vec![SelectItem::Wildcard];
             from = Some(FromClause {
@@ -9088,15 +9090,11 @@ impl Parser {
                 joins: Vec::new(),
             });
         }
-        if items.iter().any(|it| {
-            matches!(it, SelectItem::Expr { expr: Expr::FunctionCall { name, .. }, .. }
-                if name == "__record_expand")
-        }) {
-            return Err(self.err(
-                "(<fn>).* is only supported as the sole select item — call the function in FROM"
-                    .into(),
-            ));
-        }
+        // v7.39 (read01 round 74) — `(f(args)).*` beside other items, or over a
+        // FROM, keeps its marker: the ENGINE lowers it, because naming the
+        // record's fields takes the catalog. It becomes a LATERAL of the same
+        // function plus one item per declared column — the machinery rounds 65
+        // and 69 already built.
         // v7.39 (read01 round 67) — the lift moves ONE SRF into FROM. With two
         // (`SELECT generate_series(1,3), generate_series(10,11)`) PG runs them in
         // LOCKSTEP, padding the shorter with NULLs — a shape the lift cannot
@@ -9205,6 +9203,7 @@ impl Parser {
                             lateral_subquery: None,
                             jsonb_each_text_arg: None,
                             table_fn_call: None,
+        rows_from: None,
                         },
                         colname,
                     ));
@@ -13077,6 +13076,7 @@ impl Parser {
                         lateral_subquery: None,
                         jsonb_each_text_arg: Some((each_fn, Box::new(arg))),
                         table_fn_call: None,
+        rows_from: None,
                     },
                     joins: Vec::new(),
                 }),
@@ -13101,6 +13101,7 @@ impl Parser {
                 lateral_subquery: Some(Box::new(inner_select)),
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
+        rows_from: None,
             });
         }
         // v7.37.43-T4.5 — bare `CROSS JOIN jsonb_each_text(t.col)`
@@ -13153,6 +13154,7 @@ impl Parser {
                 lateral_subquery: Some(Box::new(head)),
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
+        rows_from: None,
             });
         }
         // v7.37.17 (17.6 siblings) — plain derived table:
@@ -13209,6 +13211,7 @@ impl Parser {
                 lateral_subquery: Some(Box::new(inner)),
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
+        rows_from: None,
             });
         }
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("lateral"))
@@ -13248,6 +13251,7 @@ impl Parser {
                 lateral_subquery: Some(Box::new(inner)),
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
+        rows_from: None,
             });
         }
         // v7.37.43-T4.5 — `jsonb_each_text(<expr>)` set-returning
@@ -13287,6 +13291,7 @@ impl Parser {
                 lateral_subquery: None,
                 jsonb_each_text_arg: Some((each_fn, Box::new(arg))),
                 table_fn_call: None,
+        rows_from: None,
             });
         }
         // `jsonb_to_recordset(J) AS t(a int, b text)` / `jsonb_to_record`
@@ -13368,6 +13373,7 @@ impl Parser {
                 lateral_subquery: Some(Box::new(inner)),
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
+        rows_from: None,
             });
         }
         // v7.37.17 (17.6 siblings) — `jsonb_array_elements[_text](<expr>)`
@@ -13461,6 +13467,7 @@ impl Parser {
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
+        rows_from: None,
             };
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
@@ -13484,6 +13491,9 @@ impl Parser {
             self.advance(); // FROM
             self.advance(); // (
             let mut entries: Vec<Expr> = Vec::new();
+            // v7.39 (read01 round 74) — the generic channel, filled in parallel.
+            // Used only when some entry has no array form.
+            let mut generic: Vec<(String, Vec<Expr>)> = Vec::new();
             loop {
                 let fn_name = self.expect_ident_like()?.to_ascii_lowercase();
                 if !matches!(self.peek(), Token::LParen) {
@@ -13538,13 +13548,28 @@ impl Parser {
                         name: "regexp_split_to_array".to_string(),
                         args: fn_args,
                     },
-                    other => {
-                        return Err(self.err(alloc::format!(
-                            "ROWS FROM supports unnest and the array-returning SRF \
-                             family; {other:?} is not supported here yet"
-                        )));
+                    // v7.39 (read01 round 74) — an SRF with no array form
+                    // (`generate_series`, a user `RETURNS SETOF` function) has no
+                    // scalar expression to zip, so the WHOLE list switches to the
+                    // rows_from channel, which runs each function and zips the
+                    // rows themselves. The all-array case keeps the old lowering:
+                    // it is well-trodden and this must not disturb it.
+                    _ => {
+                        generic.push((fn_name, fn_args));
+                        if matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
                     }
                 };
+                generic.push((
+                    // The array-able entries carry their lowered expr along, so a
+                    // MIXED list still works: the engine sees the scalar array
+                    // form and unnests it.
+                    "__array".to_string(),
+                    alloc::vec![entry.clone()],
+                ));
                 entries.push(entry);
                 if matches!(self.peek(), Token::Comma) {
                     self.advance();
@@ -13562,6 +13587,31 @@ impl Parser {
             let with_ordinality = self.absorb_with_ordinality();
             let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns();
             let name = alias_ident.clone().unwrap_or_else(|| "rows".to_string());
+            // v7.39 (read01 round 74) — some entry had no array form, so the whole
+            // list rides the generic channel.
+            if generic.iter().any(|(n, _)| n != "__array") {
+                let correlated = generic
+                    .iter()
+                    .any(|(_, a)| a.iter().any(Self::expr_has_any_column));
+                let tref = TableRef {
+                    name,
+                    alias: alias_ident,
+                    as_of_segment: None,
+                    unnest_expr: None,
+                    unnest_column_aliases,
+                    with_ordinality,
+                    generate_series_args: None,
+                    lateral_subquery: None,
+                    jsonb_each_text_arg: None,
+                    table_fn_call: None,
+                    rows_from: Some(generic),
+                };
+                return Ok(if correlated {
+                    Self::wrap_correlated_srf(tref)
+                } else {
+                    tref
+                });
+            }
             let correlated = entries.iter().any(Self::expr_has_any_column);
             let expr = if entries.len() == 1 {
                 entries.pop().expect("len checked")
@@ -13582,6 +13632,7 @@ impl Parser {
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
+        rows_from: None,
             };
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
@@ -13636,6 +13687,7 @@ impl Parser {
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
+        rows_from: None,
             };
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
@@ -13730,6 +13782,7 @@ impl Parser {
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
+        rows_from: None,
             };
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
@@ -13887,6 +13940,7 @@ impl Parser {
             lateral_subquery: None,
             jsonb_each_text_arg: None,
             table_fn_call: None,
+        rows_from: None,
         })
     }
 
@@ -13994,6 +14048,7 @@ impl Parser {
             lateral_subquery: Some(Box::new(inner)),
             jsonb_each_text_arg: None,
             table_fn_call: None,
+        rows_from: None,
         }
     }
 
@@ -14123,6 +14178,7 @@ impl Parser {
                     lateral_subquery: None,
                     jsonb_each_text_arg: None,
                     table_fn_call: None,
+        rows_from: None,
                 },
                 joins: Vec::new(),
             }),
@@ -14264,6 +14320,7 @@ impl Parser {
                     lateral_subquery: None,
                     jsonb_each_text_arg: None,
                     table_fn_call: None,
+        rows_from: None,
                 },
                 joins: Vec::new(),
             })
@@ -14297,6 +14354,7 @@ impl Parser {
             lateral_subquery: Some(Box::new(inner)),
             jsonb_each_text_arg: None,
             table_fn_call: None,
+        rows_from: None,
         })
     }
 
@@ -14362,6 +14420,7 @@ impl Parser {
             lateral_subquery: None,
             jsonb_each_text_arg: None,
             table_fn_call: Some(Box::new((fn_name, args))),
+            rows_from: None,
         })
     }
 

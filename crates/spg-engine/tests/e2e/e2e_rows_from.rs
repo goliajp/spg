@@ -60,16 +60,18 @@ fn mixes_srf_families_with_ordinality() {
 }
 
 #[test]
-fn single_entry_and_unsupported_error() {
+fn single_entry_and_srfs_without_an_array_form() {
     let mut e = Engine::new();
     // Single entry rides the plain unnest channel.
     let got = rows(&mut e, "SELECT * FROM ROWS FROM (unnest(ARRAY[7])) AS t(v)");
     assert_eq!(got.len(), 1);
     assert_eq!(as_i64(&got[0][0]), 7);
-    // generate_series has no scalar array form — honest error.
-    let err = e
-        .execute("SELECT * FROM ROWS FROM (generate_series(1, 3)) AS t(v)")
-        .unwrap_err();
-    let msg = format!("{err:?}");
-    assert!(msg.contains("generate_series"), "unexpected error: {msg}");
+    // v7.39 (read01 round 74) — generate_series has no scalar array form, so it
+    // used to be an honest error here. It now rides the generic rows_from
+    // channel, which RUNS each function and zips the rows themselves — so it
+    // works, and so does a user set-returning function (see
+    // e2e_rows_from_round74).
+    let got = rows(&mut e, "SELECT * FROM ROWS FROM (generate_series(1, 3)) AS t(v)");
+    assert_eq!(got.len(), 3);
+    assert_eq!(as_i64(&got[2][0]), 3);
 }
