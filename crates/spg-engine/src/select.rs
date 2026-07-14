@@ -204,9 +204,24 @@ impl Engine {
                     .iter()
                     .map(|p| eval::eval_expr(p, row, &ctx))
                     .collect::<Result<_, _>>()?;
+                // v7.39 (read01 round 54) — a window's ORDER BY over an enum
+                // column must sort by MEMBER order (enumsortorder), not the
+                // label's text. Enum values are Text at runtime, so the raw
+                // value key sorted alphabetically — `row_number() OVER (ORDER
+                // BY mood)` numbered the rows happy,ok,sad. Substitute the
+                // member ordinal, the same key the top-level ORDER BY uses.
+                // (Closes the enum-order knife's recorded window residual.)
                 let okey: Vec<(Value, bool, Option<bool>)> = order_by
                     .iter()
-                    .map(|(e, desc, nf)| eval::eval_expr(e, row, &ctx).map(|v| (v, *desc, *nf)))
+                    .map(|(e, desc, nf)| {
+                        eval::eval_expr(e, row, &ctx).map(|v| {
+                            let v = match crate::orderby::enum_order_ordinal(e, &v, &ctx) {
+                                Some(ord) => Value::Float(ord),
+                                None => v,
+                            };
+                            (v, *desc, *nf)
+                        })
+                    })
                     .collect::<Result<_, _>>()?;
                 indexed.push((pkey, okey, i));
             }
@@ -288,7 +303,12 @@ impl Engine {
         // composite `alias.col` schema lookup; single-table case
         // keeps the bare alias so `bare_col` resolution still
         // works for the projection's per-row column references.
-        let ext_ctx = EvalContext::new(&ext_cols, alias_opt);
+        // v7.39 (read01 round 54) — build through `ev_ctx`, the canonical
+        // constructor: it threads the catalog (plus render style / tz / GUCs)
+        // that a bare `EvalContext::new` drops. Without the catalog the OUTER
+        // `ORDER BY <enum col>` of a windowed query sorted by TEXT — the
+        // window values were right, the row order silently was not.
+        let ext_ctx = self.ev_ctx(&ext_cols, alias_opt);
         let projection = build_projection(&rewritten_items, &ext_cols, alias)?;
         let mut tagged: Vec<(Vec<OrderKey>, Row)> = Vec::with_capacity(n_rows);
         for (i, row) in ext_rows.iter().enumerate() {
@@ -307,7 +327,16 @@ impl Engine {
                     let mut e = o.expr.clone();
                     rewrite_window_to_columns(&mut e, &window_nodes);
                     let key = eval::eval_expr(&e, row, &ext_ctx)?;
-                    keys.push(value_to_order_key(&key)?);
+                    // v7.39 (read01 round 54) — this path builds its order keys
+                    // itself instead of going through `build_order_keys`, so it
+                    // skipped the enum-ordinal substitution: the OUTER
+                    // `ORDER BY <enum col>` of a windowed query sorted by the
+                    // label's TEXT, not by member order. The window values were
+                    // right and only the row order was wrong — silently.
+                    match crate::orderby::enum_order_ordinal(&e, &key, &ext_ctx) {
+                        Some(ord) => keys.push(value_to_order_key(&Value::Float(ord))?),
+                        None => keys.push(value_to_order_key(&key)?),
+                    }
                 }
                 keys
             };
@@ -330,7 +359,11 @@ impl Engine {
         apply_offset_and_limit(&mut out_rows, stmt.offset_literal(), stmt.limit_literal());
         let final_cols: Vec<ColumnSchema> = projection
             .into_iter()
-            .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+            .map(|p| {
+                let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
+                c.user_enum_type = p.user_enum_type;
+                c
+            })
             .collect();
         Ok(QueryResult::Rows {
             columns: final_cols,
@@ -1468,7 +1501,7 @@ impl Engine {
         schema_cols: &[ColumnSchema],
         alias: &str,
     ) -> Result<Row<'static>, EngineError> {
-        let ctx = EvalContext::new(schema_cols, Some(alias));
+        let ctx = self.ev_ctx(schema_cols, Some(alias));
         let cancel = CancelToken::none();
         let mut out_vals = Vec::new();
         for item in items {
@@ -1511,7 +1544,14 @@ impl Engine {
                         && let Some(sc) = schema_cols.iter().find(|c| c.name == col.name)
                     {
                         let name = alias.clone().unwrap_or_else(|| sc.name.clone());
-                        out.push(ColumnSchema::new(name, sc.ty, sc.nullable));
+                        let mut c = ColumnSchema::new(name, sc.ty, sc.nullable);
+                        // v7.39 (read01 round 54) — carry the enum identity:
+                        // it lives outside the DataType lattice, so a derived
+                        // table built from this schema otherwise forgets it and
+                        // the OUTER `ORDER BY <enum col>` silently sorts by the
+                        // label's TEXT instead of member order.
+                        c.user_enum_type = sc.user_enum_type.clone();
+                        out.push(c);
                         continue;
                     }
                     let name = alias.clone().unwrap_or_else(|| "?column?".to_string());
@@ -1889,7 +1929,13 @@ impl Engine {
         // ORDER BY at the top of a UNION applies to the combined result.
         // Eval against the projected schema (NOT the source table).
         if !stmt.order_by.is_empty() {
-            let synth_ctx = EvalContext::new(&columns, None);
+            // v7.39 (read01 round 54) — the combined-result ctx must carry the
+            // catalog, and the projected columns must keep their enum identity
+            // (`user_enum_type`), or `ORDER BY <enum col>` over a UNION sorts
+            // by TEXT instead of member order — silently wrong rows, not an
+            // error. (Same shape as the enum-order knife's GROUP BY fix.)
+            let synth_ctx =
+                EvalContext::new(&columns, None).with_catalog(self.active_catalog());
             // v7.37.17 (17.6 siblings) — positional keys (ORDER BY 1)
             // survive to here when the head projects a Wildcard (the
             // group-tail wrapper shape): map them onto the Nth
@@ -2084,7 +2130,10 @@ impl Engine {
         } else {
             rows
         };
-        let scan_ctx = EvalContext::new(&schema_cols, Some(&alias));
+        // v7.39 (read01 round 54) — `ev_ctx` threads the catalog; a bare
+        // `EvalContext::new` drops it and every catalog-dependent cast
+        // (regclass / enum / composite / domain) silently degrades.
+        let scan_ctx = self.ev_ctx(&schema_cols, Some(&alias));
         // Apply WHERE.
         let filtered: alloc::vec::Vec<Row<'static>> = if let Some(w) = &stmt.where_ {
             let mut out = alloc::vec::Vec::with_capacity(rows.len());
@@ -2188,7 +2237,15 @@ impl Engine {
         // unnest result sets are small by design).
         let columns: alloc::vec::Vec<ColumnSchema> = projection
             .iter()
-            .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))
+            // v7.39 (read01 round 54) — keep the column's enum identity through
+            // the projection (it lives outside the DataType lattice), or a
+            // derived table / UNION / windowed result forgets it and any outer
+            // `ORDER BY <enum col>` silently sorts by the label's TEXT.
+            .map(|p| {
+                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
+                c.user_enum_type = p.user_enum_type.clone();
+                c
+            })
             .collect();
         // Re-evaluate ORDER BY against the source schema (pre-projection
         // so col refs by name still resolve through `scan_ctx`).
@@ -2295,7 +2352,10 @@ impl Engine {
         } else {
             rows
         };
-        let scan_ctx = EvalContext::new(&schema_cols, Some(&alias));
+        // v7.39 (read01 round 54) — `ev_ctx` threads the catalog; a bare
+        // `EvalContext::new` drops it and every catalog-dependent cast
+        // (regclass / enum / composite / domain) silently degrades.
+        let scan_ctx = self.ev_ctx(&schema_cols, Some(&alias));
         // WHERE.
         let filtered: alloc::vec::Vec<Row<'static>> = if let Some(w) = &stmt.where_ {
             let mut out = alloc::vec::Vec::with_capacity(rows.len());
@@ -2367,7 +2427,15 @@ impl Engine {
         }
         let columns: alloc::vec::Vec<ColumnSchema> = projection
             .iter()
-            .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))
+            // v7.39 (read01 round 54) — keep the column's enum identity through
+            // the projection (it lives outside the DataType lattice), or a
+            // derived table / UNION / windowed result forgets it and any outer
+            // `ORDER BY <enum col>` silently sorts by the label's TEXT.
+            .map(|p| {
+                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
+                c.user_enum_type = p.user_enum_type.clone();
+                c
+            })
             .collect();
         // ORDER BY against the source schema.
         if !stmt.order_by.is_empty() {
@@ -2852,7 +2920,10 @@ impl Engine {
         let key_col = ColumnSchema::new("key".to_string(), spg_storage::DataType::Text, false);
         let value_col = ColumnSchema::new("value".to_string(), value_dtype, as_text);
         let schema_cols = alloc::vec![key_col, value_col];
-        let scan_ctx = EvalContext::new(&schema_cols, Some(&alias));
+        // v7.39 (read01 round 54) — `ev_ctx` threads the catalog; a bare
+        // `EvalContext::new` drops it and every catalog-dependent cast
+        // (regclass / enum / composite / domain) silently degrades.
+        let scan_ctx = self.ev_ctx(&schema_cols, Some(&alias));
         // WHERE.
         let filtered: alloc::vec::Vec<Row<'static>> = if let Some(w) = &stmt.where_ {
             let mut out = alloc::vec::Vec::with_capacity(rows.len());
@@ -2906,7 +2977,15 @@ impl Engine {
         }
         let columns: alloc::vec::Vec<ColumnSchema> = projection
             .iter()
-            .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))
+            // v7.39 (read01 round 54) — keep the column's enum identity through
+            // the projection (it lives outside the DataType lattice), or a
+            // derived table / UNION / windowed result forgets it and any outer
+            // `ORDER BY <enum col>` silently sorts by the label's TEXT.
+            .map(|p| {
+                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
+                c.user_enum_type = p.user_enum_type.clone();
+                c
+            })
             .collect();
         // ORDER BY.
         if !stmt.order_by.is_empty() {
@@ -3083,7 +3162,15 @@ impl Engine {
         }
         let columns: alloc::vec::Vec<ColumnSchema> = projection
             .iter()
-            .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))
+            // v7.39 (read01 round 54) — keep the column's enum identity through
+            // the projection (it lives outside the DataType lattice), or a
+            // derived table / UNION / windowed result forgets it and any outer
+            // `ORDER BY <enum col>` silently sorts by the label's TEXT.
+            .map(|p| {
+                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
+                c.user_enum_type = p.user_enum_type.clone();
+                c
+            })
             .collect();
         // ORDER BY over the source rows (same shape as the other
         // synthetic-table executors).
@@ -3096,7 +3183,20 @@ impl Engine {
                         .order_by
                         .iter()
                         .map(|ob| {
-                            eval::eval_expr(&ob.expr, r, &scan_ctx).map_err(EngineError::Eval)
+                            // v7.39 (read01 round 54) — this path builds its
+                            // sort keys itself instead of going through
+                            // `build_order_keys`, so it skipped the enum-ordinal
+                            // substitution: an OUTER `ORDER BY <enum col>` over
+                            // a DERIVED TABLE sorted by the label TEXT, not by
+                            // member order. Silently wrong rows, not an error.
+                            let v = eval::eval_expr(&ob.expr, r, &scan_ctx)
+                                .map_err(EngineError::Eval)?;
+                            Ok(match crate::orderby::enum_order_ordinal(
+                                &ob.expr, &v, &scan_ctx,
+                            ) {
+                                Some(ord) => Value::Float(ord),
+                                None => v,
+                            })
                         })
                         .collect();
                     Ok((i, keys?))
@@ -3150,7 +3250,11 @@ impl Engine {
             if !matches!(cond, Value::Bool(true)) {
                 let columns: Vec<ColumnSchema> = projection
                     .into_iter()
-                    .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+                    .map(|p| {
+                let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
+                c.user_enum_type = p.user_enum_type;
+                c
+            })
                     .collect();
                 return Ok(QueryResult::Rows {
                     columns,
@@ -3179,7 +3283,11 @@ impl Engine {
             }
             let columns: Vec<ColumnSchema> = projection
                 .into_iter()
-                .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+                .map(|p| {
+                let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
+                c.user_enum_type = p.user_enum_type;
+                c
+            })
                 .collect();
             return Ok(QueryResult::Rows {
                 columns,
@@ -3192,7 +3300,11 @@ impl Engine {
         }
         let columns: Vec<ColumnSchema> = projection
             .into_iter()
-            .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+            .map(|p| {
+                let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
+                c.user_enum_type = p.user_enum_type;
+                c
+            })
             .collect();
         Ok(QueryResult::Rows {
             columns,
@@ -4128,7 +4240,11 @@ impl Engine {
 
         let columns: Vec<ColumnSchema> = projection
             .into_iter()
-            .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+            .map(|p| {
+                let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
+                c.user_enum_type = p.user_enum_type;
+                c
+            })
             .collect();
 
         Ok(QueryResult::Rows {
@@ -4303,7 +4419,15 @@ impl Engine {
         // Emit columns once.
         let columns: Vec<ColumnSchema> = projection
             .iter()
-            .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))
+            // v7.39 (read01 round 54) — keep the column's enum identity through
+            // the projection (it lives outside the DataType lattice), or a
+            // derived table / UNION / windowed result forgets it and any outer
+            // `ORDER BY <enum col>` silently sorts by the label's TEXT.
+            .map(|p| {
+                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
+                c.user_enum_type = p.user_enum_type.clone();
+                c
+            })
             .collect();
         emit(crate::StreamItem::Header(&columns))?;
         let sources_ref = &deferred.sources;
@@ -4600,7 +4724,11 @@ impl Engine {
         );
         let columns: Vec<ColumnSchema> = projection
             .into_iter()
-            .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+            .map(|p| {
+                let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
+                c.user_enum_type = p.user_enum_type;
+                c
+            })
             .collect();
         Ok(QueryResult::Rows {
             columns,
@@ -4653,7 +4781,7 @@ impl Engine {
             .alias
             .as_deref()
             .unwrap_or(from.primary.name.as_str());
-        let ctx = EvalContext::new(schema_cols, Some(alias));
+        let ctx = self.ev_ctx(schema_cols, Some(alias));
         let seg = self
             .active_catalog()
             .cold_segment(segment_id)
@@ -4719,6 +4847,12 @@ pub(crate) struct ProjectedItem {
     pub(crate) output_name: String,
     pub(crate) ty: DataType,
     pub(crate) nullable: bool,
+    /// v7.39 (read01 round 54) — a projected enum column keeps its enum
+    /// identity. Enum-ness lives outside the DataType lattice (the value is a
+    /// Text), so a projection that dropped this made the RESULT schema forget
+    /// it — and a UNION's combined `ORDER BY <enum col>`, which sorts against
+    /// that schema, silently fell back to TEXT order instead of member order.
+    pub(crate) user_enum_type: Option<String>,
 }
 
 /// Dedupe a row set, preserving first-seen order. `Row`'s `PartialEq` is
@@ -5492,6 +5626,7 @@ pub(crate) fn build_projection(
                         output_name: col.name.clone(),
                         ty: col.ty,
                         nullable: col.nullable,
+                        user_enum_type: col.user_enum_type.clone(),
                     });
                 }
             }
@@ -5510,6 +5645,9 @@ pub(crate) fn build_projection(
                         output_name,
                         ty: sch.ty,
                         nullable: sch.nullable,
+                        // v7.39 (read01 round 54) — a bare enum column keeps
+                        // its enum identity through the projection.
+                        user_enum_type: sch.user_enum_type.clone(),
                     });
                 } else if let Some(shape) = describe::describe_expr(expr, schema_cols) {
                     let output_name = alias.clone().unwrap_or_else(|| expr.to_string());
@@ -5518,6 +5656,7 @@ pub(crate) fn build_projection(
                         output_name,
                         ty: shape.ty,
                         nullable: shape.nullable,
+                        user_enum_type: None,
                     });
                 } else {
                     let output_name = alias.clone().unwrap_or_else(|| expr.to_string());
@@ -5526,6 +5665,7 @@ pub(crate) fn build_projection(
                         output_name,
                         ty: DataType::Text,
                         nullable: true,
+                        user_enum_type: None,
                     });
                 }
             }

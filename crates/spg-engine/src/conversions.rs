@@ -2966,6 +2966,32 @@ fn decode_array_elems(
     Ok(out)
 }
 
+/// v7.39 (read01 round 54) — coerce a value whose `data_type()` is None (the
+/// eval-only variants: RegClass carries an oid + name, Composite a field
+/// tuple). They used to panic in `coerce_value`.
+fn coerce_untyped_value(
+    v: Value<'static>,
+    expected: DataType,
+    col_name: &str,
+    position: usize,
+) -> Result<Value<'static>, EngineError> {
+    match (&v, expected) {
+        // A regclass IS an oid — it coerces to any integer width, and to text
+        // through its relation name.
+        (Value::RegClass(oid, _), DataType::BigInt) => Ok(Value::BigInt(*oid)),
+        (Value::RegClass(oid, _), DataType::Int) => Ok(Value::Int(
+            i32::try_from(*oid).unwrap_or(i32::MAX),
+        )),
+        (Value::RegClass(_, name), DataType::Text) => {
+            Ok(Value::text(alloc::string::String::from(name.as_ref())))
+        }
+        _ => Err(EngineError::Unsupported(alloc::format!(
+            "cannot coerce {:?} to {expected:?} for column {col_name:?} (position {position})",
+            v
+        ))),
+    }
+}
+
 pub(crate) fn coerce_value(
     v: Value<'static>,
     expected: DataType,
@@ -2975,7 +3001,17 @@ pub(crate) fn coerce_value(
     if v.is_null() {
         return Ok(Value::Null);
     }
-    let actual = v.data_type().expect("non-null");
+    // v7.39 (read01 round 54) — `data_type()` is None for the eval-only
+    // variants that carry no DataType (RegClass, Composite): they are NOT
+    // NULL, so the old `.expect("non-null")` PANICKED on them. A regclass
+    // reaching a coercion (e.g. `EXISTS (SELECT 1 WHERE oid_col = 't'::regclass)`,
+    // which coerces the subquery's row) crashed the query with an
+    // "internal error" instead of comparing by oid. Fall through to the
+    // coercion table, which handles the shapes it knows and errors cleanly
+    // on the rest.
+    let Some(actual) = v.data_type() else {
+        return coerce_untyped_value(v, expected, col_name, position);
+    };
     if actual == expected {
         return Ok(v);
     }

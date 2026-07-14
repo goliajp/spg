@@ -952,7 +952,7 @@ pub(crate) fn cmp_multi_key(a: &[OrderKey], b: &[OrderKey], descs: &[bool]) -> c
 /// value is one of the type's labels, return its 0-based ordinal in the
 /// enum's declaration order — the key PG sorts by (enumsortorder). Else
 /// `None`, so the caller falls back to the normal value key.
-fn enum_order_ordinal(expr: &Expr, v: &Value, ctx: &EvalContext) -> Option<f64> {
+pub(crate) fn enum_order_ordinal(expr: &Expr, v: &Value, ctx: &EvalContext) -> Option<f64> {
     let Expr::Column(c) = expr else { return None };
     let Value::Text(label) = v else { return None };
     let pos = eval::find_column_pos(c, ctx)?;
