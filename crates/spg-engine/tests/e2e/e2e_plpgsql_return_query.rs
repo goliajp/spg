@@ -34,9 +34,18 @@ fn return_query_execute_runs_dynamic_sql_in_do() {
     let mut e = Engine::new();
     ddl(&mut e, "CREATE TABLE t (id INT)");
     ddl(&mut e, "INSERT INTO t VALUES (7)");
-    ddl(
-        &mut e,
-        "DO $$ BEGIN RETURN QUERY EXECUTE 'SELECT id FROM t'; END $$;",
+    // v7.39 (read01 round 68) — the dynamic twin of RETURN QUERY joins it: its
+    // rows go to the SET a set-returning function is building, instead of being
+    // run and discarded. A DO block has no set, so PG rejects it there — and now
+    // so does SPG. (This test used to assert the discard path.)
+    let msg = format!(
+        "{}",
+        e.execute("DO $$ BEGIN RETURN QUERY EXECUTE 'SELECT id FROM t'; END $$;")
+            .unwrap_err()
+    );
+    assert!(
+        msg.contains("cannot use RETURN QUERY in a non-SETOF function"),
+        "{msg}"
     );
 }
 

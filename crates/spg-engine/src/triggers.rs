@@ -830,6 +830,57 @@ fn execute_stmts(
                     }
                 }
             }
+            // v7.39 (read01 round 68) — `RETURN QUERY EXECUTE <sql>`: evaluate
+            // the expression to a SQL string, run it through the same query
+            // runner the static form uses, and append the rows to the set. It
+            // used to run and DISCARD them.
+            PlPgSqlStmt::ReturnQueryExecute { sql } => {
+                let sink = ctx.set_sink.ok_or_else(|| TriggerError::UnsupportedConstruct {
+                    function: ctx.function.into(),
+                    detail: alloc::string::String::from(
+                        "cannot use RETURN QUERY in a non-SETOF function",
+                    ),
+                })?;
+                let resolver = ctx.for_query_resolver.ok_or_else(|| {
+                    TriggerError::UnsupportedConstruct {
+                        function: ctx.function.into(),
+                        detail: alloc::string::String::from(
+                            "RETURN QUERY EXECUTE needs a query runner (this context has none)",
+                        ),
+                    }
+                })?;
+                let sql_val = eval_with_new_old_and_locals(
+                    sql,
+                    current_new.as_ref(),
+                    old_row,
+                    locals,
+                    ctx.columns,
+                    ctx.table_name,
+                    ctx.params,
+                    ctx.default_text_search_config,
+                )
+                .map_err(|cause| TriggerError::EvalFailed {
+                    function: ctx.function.into(),
+                    cause,
+                })?;
+                let Value::Text(text) = &sql_val else {
+                    return Err(TriggerError::UnsupportedConstruct {
+                        function: ctx.function.into(),
+                        detail: alloc::format!(
+                            "RETURN QUERY EXECUTE needs a text SQL string, got {:?}",
+                            sql_val.data_type()
+                        ),
+                    });
+                };
+                let stmt = spg_sql::parser::parse_statement(text.as_ref()).map_err(|e| {
+                    TriggerError::UnparseableBody {
+                        function: ctx.function.into(),
+                        detail: alloc::format!("RETURN QUERY EXECUTE: {e}"),
+                    }
+                })?;
+                let (_cols, rows) = resolver(&stmt)?;
+                sink.borrow_mut().extend(rows);
+            }
             PlPgSqlStmt::ExecuteDynamic { sql } => {
                 // v7.37.20 (20.13) — EXECUTE <string_expr>. Evaluate
                 // the expression at runtime to obtain a SQL string,
