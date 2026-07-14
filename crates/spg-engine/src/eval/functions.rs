@@ -16795,6 +16795,23 @@ fn call_user_function<'v>(
         .collect();
     let row = spg_storage::Row::new(owned);
 
+    // v7.39 (read01 round 63) — a body with its own FROM is a QUERY, not an
+    // expression: it runs through the real executor, with the arguments
+    // substituted in as literals. Reading the catalog's rows from here would
+    // bypass the visibility filter and hand back dead rows under MVCC.
+    if let Some(stmt) = user_fn_body_query(def)? {
+        let Some(engine) = ctx.engine else {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "function {:?}: a body with its own FROM needs the engine \
+                     (this context has none)",
+                    def.name
+                ),
+            });
+        };
+        return engine.run_user_fn_query(def, &stmt, &names, &row, ctx.fn_depth + 1);
+    }
+
     let body_expr = user_fn_body_expr(def)?;
 
     let mut child = EvalContext::new(&columns, None);
@@ -16807,6 +16824,7 @@ fn call_user_function<'v>(
     child.tz_localize_fn = ctx.tz_localize_fn;
     child.tz_abbrev_fn = ctx.tz_abbrev_fn;
     child.fn_depth = ctx.fn_depth + 1;
+    child.engine = ctx.engine;
 
     let out = crate::eval::eval_expr(&body_expr, &row, &child)?;
     // PG coerces the body's value to the DECLARED return type: a function
@@ -16820,6 +16838,24 @@ fn call_user_function<'v>(
         spg_sql::ast::CastTarget::Named(declared.to_string()),
     )
     .or_else(|_| Ok(Value::Null))
+}
+
+/// v7.39 (read01 round 63) — the body as a QUERY, when it has its own FROM.
+/// `None` for the single-expression shape, which stays on the pure-eval path.
+fn user_fn_body_query(
+    def: &spg_storage::FunctionDef,
+) -> Result<Option<spg_sql::ast::SelectStatement>, EvalError> {
+    if !def.language.eq_ignore_ascii_case("sql") {
+        return Ok(None);
+    }
+    let body = def.body.trim().trim_end_matches(';');
+    let Ok(spg_sql::ast::Statement::Select(s)) = spg_sql::parser::parse_statement(body) else {
+        return Ok(None);
+    };
+    if s.from.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(s))
 }
 
 /// The single expression a user function's body evaluates to.
@@ -16837,11 +16873,6 @@ fn user_fn_body_expr(def: &spg_storage::FunctionDef) -> Result<Expr, EvalError> 
         let spg_sql::ast::Statement::Select(s) = stmt else {
             return Err(unsupported("a LANGUAGE sql body must be a SELECT"));
         };
-        if s.from.is_some() {
-            return Err(unsupported(
-                "a LANGUAGE sql body with its own FROM is not supported yet —                  the body must be a single expression",
-            ));
-        }
         if s.items.len() != 1 {
             return Err(unsupported("a LANGUAGE sql body must select exactly one value"));
         }

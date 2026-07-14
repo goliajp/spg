@@ -650,6 +650,11 @@ pub(crate) fn run(
     // v7.39 (enum order knife) — catalog for enum member-order metadata
     // (spec collection is AST-only). None keeps every ordering textual.
     catalog: Option<&spg_storage::Catalog>,
+    // v7.39 (read01 round 63) — and the engine, so a user function whose body
+    // has its own FROM can run inside an aggregate's argument
+    // (`string_agg(lookup(id), ',')`). The catalog alone is not enough: the body
+    // is a QUERY and has to go through the real executor.
+    engine: Option<&crate::Engine>,
 ) -> Result<AggResult, EvalError> {
     // v7.38 P0 元机制 A — fires at the top of the aggregate
     // executor with the number of input rows. Tests use this to
@@ -730,11 +735,20 @@ pub(crate) fn run(
         correlated_eval,
         runner,
         catalog,
+        engine,
     )?;
 
     // (2) Build the synthetic per-group schema and finalise each group's row.
     let synth_schema =
-        build_synth_schema(rows, &group_exprs, &agg_specs, schema_cols, table_alias, catalog)?;
+        build_synth_schema(
+            rows,
+            &group_exprs,
+            &agg_specs,
+            schema_cols,
+            table_alias,
+            catalog,
+            engine,
+        )?;
     let synth_rows = finalize_synth_rows(
         &order,
         &agg_specs,
@@ -743,6 +757,7 @@ pub(crate) fn run(
         schema_cols,
         table_alias,
         catalog,
+        engine,
     )?;
 
     // v7.37.x (mailrs Track A 100k attack) — defer the bound
@@ -1241,9 +1256,14 @@ fn fused_acc_cell(a: &mut FusedAcc, v: &Value<'_>) -> Result<(), EvalError> {
 fn with_catalog<'a>(
     ctx: EvalContext<'a>,
     catalog: Option<&'a spg_storage::Catalog>,
+    engine: Option<&'a crate::Engine>,
 ) -> EvalContext<'a> {
-    match catalog {
+    let ctx = match catalog {
         Some(c) => ctx.with_catalog(c),
+        None => ctx,
+    };
+    match engine {
+        Some(e) => ctx.with_engine(e),
         None => ctx,
     }
 }
@@ -1262,8 +1282,9 @@ fn accumulate_groups(
     // argument (`string_agg(f1(id), ',')`, a user function) answered "unknown
     // function". Same family as rounds 49/53/54/55/56.
     catalog: Option<&spg_storage::Catalog>,
+    engine: Option<&crate::Engine>,
 ) -> Result<Vec<(Vec<Value<'static>>, Vec<AggState>)>, EvalError> {
-    let ctx = with_catalog(EvalContext::new(schema_cols, table_alias), catalog);
+    let ctx = with_catalog(EvalContext::new(schema_cols, table_alias), catalog, engine);
     // Map group key (vec of values, encoded as canonical string) -> group state.
     // v7.32 (architecture v2, P2b) — insertion-ordered group state in
     // a Vec; the hash map only maps key → index. Removes the parallel
@@ -2917,8 +2938,9 @@ fn build_synth_schema(
     schema_cols: &[ColumnSchema],
     table_alias: Option<&str>,
     catalog: Option<&spg_storage::Catalog>,
+    engine: Option<&crate::Engine>,
 ) -> Result<Vec<ColumnSchema>, EvalError> {
-    let ctx = with_catalog(EvalContext::new(schema_cols, table_alias), catalog);
+    let ctx = with_catalog(EvalContext::new(schema_cols, table_alias), catalog, engine);
     // Build synthetic schema: __grp_0..K then __agg_0..N.
     let group_types: Vec<DataType> = if rows.is_empty() {
         // Use Text as a safe stand-in — empty result means schema isn't
@@ -3002,8 +3024,9 @@ fn finalize_synth_rows(
     schema_cols: &[ColumnSchema],
     table_alias: Option<&str>,
     catalog: Option<&spg_storage::Catalog>,
+    engine: Option<&crate::Engine>,
 ) -> Result<Vec<Row<'static>>, EvalError> {
-    let ctx = with_catalog(EvalContext::new(schema_cols, table_alias), catalog);
+    let ctx = with_catalog(EvalContext::new(schema_cols, table_alias), catalog, engine);
     // v7.32 (round-29) — ordered-set direct arguments (the percentile
     // fraction) are constant per PG, so evaluate each once up front.
     let direct_arg_vals: Vec<Option<Value>> = agg_specs

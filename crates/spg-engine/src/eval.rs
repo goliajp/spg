@@ -163,6 +163,13 @@ pub struct EvalContext<'a> {
     /// calls itself would otherwise blow the stack, which an embed host cannot
     /// catch).
     pub fn_depth: u16,
+    /// v7.39 (read01 round 63) — the ENGINE, for a user-function body that has
+    /// its own FROM (`SELECT v FROM t WHERE id = k`). Such a body has to run
+    /// through the real executor: reading `catalog`'s rows straight from eval
+    /// would bypass the row-header visibility filter, so under in-place MVCC a
+    /// function would happily read DEAD rows. `None` in a context with no
+    /// engine behind it — a body with a FROM then errors, saying so.
+    pub engine: Option<&'a crate::Engine>,
     /// v7.38 (read01 U15) — per-scan deterministic sampler state for
     /// `TABLESAMPLE … REPEATABLE(seed)`. A fresh cell is created before a
     /// scan whose predicate may draw `__tsm_fract(seed)`; the cell holds
@@ -261,6 +268,7 @@ impl<'a> EvalContext<'a> {
             session_gucs: None,
             users: None,
             fn_depth: 0,
+            engine: None,
             sample_rng: None,
             recursion_base: core::cell::Cell::new(0),
             render_style: crate::eval::format::RenderStyle {
@@ -382,6 +390,12 @@ impl<'a> EvalContext<'a> {
     /// Attach the session's GUC map so `current_setting` can resolve
     /// custom (namespaced) settings written with `SET` / `set_config`.
     #[must_use]
+    /// v7.39 (read01 round 63) — thread the engine (see `engine`).
+    pub const fn with_engine(mut self, engine: &'a crate::Engine) -> Self {
+        self.engine = Some(engine);
+        self
+    }
+
     /// v7.39 (read01 round 58) — thread the role store (see `users`).
     pub const fn with_users(mut self, users: &'a crate::users::UserStore) -> Self {
         self.users = Some(users);
@@ -3117,5 +3131,183 @@ mod tests {
             format_interval(0, 1, 0),
             format_interval(0, 0, 86_400_000_000),
         );
+    }
+}
+
+impl crate::Engine {
+    /// v7.39 (read01 round 63) — run a user function whose body has its own
+    /// FROM. The arguments are substituted into the body as literals and the
+    /// SELECT goes through the REAL executor, so it sees exactly the rows a
+    /// hand-written query would: the row-header visibility filter applies, and
+    /// under in-place MVCC a dead row stays dead.
+    ///
+    /// PG returns the FIRST row of a scalar SQL function's body (and NULL when
+    /// it returns none).
+    pub(crate) fn run_user_fn_query(
+        &self,
+        def: &spg_storage::FunctionDef,
+        stmt: &spg_sql::ast::SelectStatement,
+        arg_names: &[alloc::string::String],
+        args: &spg_storage::Row<'static>,
+        fn_depth: u16,
+    ) -> Result<Value<'static>, EvalError> {
+        const MAX_QUERY_FN_DEPTH: u16 = 8;
+        if fn_depth >= MAX_QUERY_FN_DEPTH {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "function {:?}: a body with its own FROM may nest at most {MAX_QUERY_FN_DEPTH} deep",
+                    def.name
+                ),
+            });
+        }
+        // Bind the arguments by rewriting their references into literals. A name
+        // that is also a COLUMN of the body's own FROM is that column, not the
+        // argument — PG resolves it the same way, so the substitution skips it.
+        let cat = self.active_catalog();
+        let mut bound = stmt.clone();
+        let mut binds: alloc::collections::BTreeMap<alloc::string::String, spg_sql::ast::Expr> =
+            alloc::collections::BTreeMap::new();
+        for (i, name) in arg_names.iter().enumerate() {
+            if name.is_empty() {
+                continue;
+            }
+            let shadowed = body_from_tables(stmt).iter().any(|t| {
+                cat.get(t).is_some_and(|tb| {
+                    tb.schema()
+                        .columns
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(name))
+                })
+            });
+            if shadowed {
+                continue;
+            }
+            let v = args.values.get(i).cloned().unwrap_or(Value::Null);
+            let lit = crate::substitute::value_to_literal_expr(v.into_owned()).map_err(|e| {
+                EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "function {:?}: argument {name} cannot be bound into a body with a FROM: {e}",
+                        def.name
+                    ),
+                }
+            })?;
+            binds.insert(name.to_ascii_lowercase(), lit);
+        }
+        substitute_arg_refs_in_select(&mut bound, &binds);
+
+        let out = self
+            .exec_select_cancel(&bound, crate::CancelToken::none())
+            .map_err(|e| EvalError::TypeMismatch {
+                detail: alloc::format!("function {:?}: {e}", def.name),
+            })?;
+        let crate::QueryResult::Rows { rows, .. } = out else {
+            return Ok(Value::Null);
+        };
+        let Some(first) = rows.first() else {
+            // No row: PG's scalar SQL function returns NULL.
+            return Ok(Value::Null);
+        };
+        let v = first.values.first().cloned().unwrap_or(Value::Null);
+        let declared = def.returns.trim();
+        if declared.eq_ignore_ascii_case("VOID") {
+            return Ok(Value::Null);
+        }
+        crate::eval::cast::cast_value(
+            v.into_owned(),
+            spg_sql::ast::CastTarget::Named(alloc::string::String::from(declared)),
+        )
+        .or_else(|_| Ok(Value::Null))
+    }
+}
+
+/// The base tables a function body's FROM names — used to decide whether an
+/// argument name is shadowed by a column of the same name.
+fn body_from_tables(stmt: &spg_sql::ast::SelectStatement) -> alloc::vec::Vec<alloc::string::String> {
+    let mut out = alloc::vec::Vec::new();
+    if let Some(from) = &stmt.from {
+        out.push(from.primary.name.clone());
+        for j in &from.joins {
+            out.push(j.table.name.clone());
+        }
+    }
+    out
+}
+
+/// Replace every bare reference to an argument name with its literal value.
+fn substitute_arg_refs_in_select(
+    stmt: &mut spg_sql::ast::SelectStatement,
+    binds: &alloc::collections::BTreeMap<alloc::string::String, spg_sql::ast::Expr>,
+) {
+    use spg_sql::ast::{Expr, SelectItem};
+    fn walk(e: &mut Expr, binds: &alloc::collections::BTreeMap<alloc::string::String, Expr>) {
+        match e {
+            Expr::Column(c) => {
+                if c.qualifier.is_none()
+                    && let Some(lit) = binds.get(&c.name.to_ascii_lowercase())
+                {
+                    *e = lit.clone();
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                walk(lhs, binds);
+                walk(rhs, binds);
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => walk(expr, binds),
+            Expr::FunctionCall { args, .. } => args.iter_mut().for_each(|a| walk(a, binds)),
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                if let Some(o) = operand {
+                    walk(o, binds);
+                }
+                for (c, v) in branches.iter_mut() {
+                    walk(c, binds);
+                    walk(v, binds);
+                }
+                if let Some(x) = else_branch {
+                    walk(x, binds);
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                walk(expr, binds);
+                list.iter_mut().for_each(|it| walk(it, binds));
+            }
+            Expr::AnyAll { expr, array, .. } => {
+                walk(expr, binds);
+                walk(array, binds);
+            }
+            Expr::Array(items) => items.iter_mut().for_each(|it| walk(it, binds)),
+            Expr::ArraySubscript { target, index } => {
+                walk(target, binds);
+                walk(index, binds);
+            }
+            _ => {}
+        }
+    }
+    for item in &mut stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            walk(expr, binds);
+        }
+    }
+    if let Some(w) = &mut stmt.where_ {
+        walk(w, binds);
+    }
+    if let Some(h) = &mut stmt.having {
+        walk(h, binds);
+    }
+    if let Some(gs) = &mut stmt.group_by {
+        gs.iter_mut().for_each(|g| walk(g, binds));
+    }
+    for o in &mut stmt.order_by {
+        walk(&mut o.expr, binds);
+    }
+    if let Some(from) = &mut stmt.from {
+        for j in &mut from.joins {
+            if let Some(on) = &mut j.on {
+                walk(on, binds);
+            }
+        }
     }
 }

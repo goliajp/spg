@@ -2191,6 +2191,7 @@ impl Engine {
                 Some(&agg_correlated),
                 self.parallel_runner.0.as_deref(),
                 Some(self.active_catalog()),
+                Some(self),
             )?;
             return self.finish_agg_result(agg, stmt, cancel);
         }
@@ -2417,6 +2418,7 @@ impl Engine {
                 Some(&agg_correlated),
                 self.parallel_runner.0.as_deref(),
                 Some(self.active_catalog()),
+                Some(self),
             )?;
             return self.finish_agg_result(agg, stmt, cancel);
         }
@@ -2974,6 +2976,7 @@ impl Engine {
                 Some(&agg_correlated),
                 self.parallel_runner.0.as_deref(),
                 Some(self.active_catalog()),
+                Some(self),
             )?;
             return self.finish_agg_result(agg, stmt, cancel);
         }
@@ -3153,6 +3156,7 @@ impl Engine {
                 Some(&agg_correlated),
                 self.parallel_runner.0.as_deref(),
                 Some(self.active_catalog()),
+                Some(self),
             )?;
             return self.finish_agg_result(agg, stmt, cancel);
         }
@@ -3910,6 +3914,7 @@ impl Engine {
             Some(&agg_correlated),
             self.parallel_runner.0.as_deref(),
             Some(self.active_catalog()),
+            Some(self),
         )?;
         self.finish_agg_result(agg, stmt, cancel)
     }
@@ -4571,6 +4576,7 @@ impl Engine {
                 Some(&agg_correlated),
                 self.parallel_runner.0.as_deref(),
                 Some(self.active_catalog()),
+                Some(self),
             )?;
             return self.finish_agg_result(agg, stmt, cancel);
         }
