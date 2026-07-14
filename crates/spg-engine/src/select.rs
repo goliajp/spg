@@ -2937,11 +2937,7 @@ impl Engine {
                 "function {name}() does not return a set — it cannot be used in FROM"
             )));
         }
-        if !def.language.eq_ignore_ascii_case("sql") {
-            return Err(EngineError::Unsupported(alloc::format!(
-                "function {name}(): a set-returning body must be LANGUAGE sql so far"
-            )));
-        }
+
         // Evaluate the call's arguments (they are literals / expressions of the
         // enclosing query, not of the function's body).
         let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
@@ -2950,6 +2946,24 @@ impl Engine {
         let mut arg_values: alloc::vec::Vec<Value<'static>> = alloc::vec::Vec::new();
         for a in args {
             arg_values.push(eval::eval_expr(a, &dummy, &arg_ctx).map_err(EngineError::Eval)?);
+        }
+        let arg_names_pl = spg_storage::function_arg_names(&def.args_repr);
+        // v7.39 (read01 round 66) — a plpgsql SETOF body builds its rows with
+        // RETURN NEXT / RETURN QUERY; the interpreter collects them.
+        if def.language.eq_ignore_ascii_case("plpgsql") {
+            let empty_schema2: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+            let arg_ctx2 = self.ev_ctx(&empty_schema2, None);
+            let dummy2 = Row::new(alloc::vec::Vec::new());
+            let mut vals: alloc::vec::Vec<Value<'static>> = alloc::vec::Vec::new();
+            for a in args {
+                vals.push(eval::eval_expr(a, &dummy2, &arg_ctx2).map_err(EngineError::Eval)?);
+            }
+            let out_rows = self
+                .call_plpgsql_setof_fn(def, &arg_names_pl, &vals)
+                .map_err(EngineError::Eval)?;
+            let cols = setof_column_shape(&declared, name, alias, out_rows.first());
+            let rows = out_rows.into_iter().map(Row::new).collect();
+            return Ok((rows, cols));
         }
         let body = def.body.trim().trim_end_matches(';');
         let stmt = spg_sql::parser::parse_statement(body).map_err(|e| {
@@ -2972,29 +2986,9 @@ impl Engine {
         let QueryResult::Rows { columns, rows } = out else {
             return Ok((alloc::vec::Vec::new(), alloc::vec::Vec::new()));
         };
-        // Name the columns from the DECLARED shape.
-        let cols = if upper.starts_with("TABLE(") {
-            let raw = &declared["TABLE(".len()..declared.len() - 1];
-            raw.split(',')
-                .zip(columns.iter())
-                .map(|(decl, got)| {
-                    let cname = decl
-                        .trim()
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or(got.name.as_str());
-                    ColumnSchema::new(cname.to_string(), got.ty, true)
-                })
-                .collect()
-        } else {
-            // SETOF <scalar>: one column, named after the alias when there is
-            // one, else after the function.
-            let cname = alias.unwrap_or(name);
-            columns
-                .first()
-                .map(|c| alloc::vec![ColumnSchema::new(cname.to_string(), c.ty, true)])
-                .unwrap_or_default()
-        };
+        // Name the columns from the DECLARED shape — the same rule the plpgsql
+        // path above uses, so a body's language cannot change the row shape.
+        let cols = setof_column_shape_from(&declared, name, alias, &columns);
         Ok((rows, cols))
     }
 
@@ -7411,4 +7405,62 @@ fn parse_select_or_corrupt(sql: &str) -> Result<SelectStatement, EngineError> {
         )));
     };
     Ok(body)
+}
+
+/// v7.39 (read01 round 65/66) — the column shape a set-returning function
+/// exposes. `RETURNS TABLE(id int, v text)` names them; a `SETOF <scalar>`
+/// yields ONE column named after the call's alias when there is one (`FROM
+/// odds() AS x` → `x`), else after the function. Get this wrong and the alias
+/// resolves to the whole ROW: `SELECT x::text FROM odds() AS x` renders `(1)`.
+fn setof_column_shape_from(
+    declared: &str,
+    name: &str,
+    alias: Option<&str>,
+    got: &[ColumnSchema],
+) -> alloc::vec::Vec<ColumnSchema> {
+    let upper = declared.to_ascii_uppercase();
+    if upper.starts_with("TABLE(") {
+        let raw = &declared["TABLE(".len()..declared.len() - 1];
+        return raw
+            .split(',')
+            .zip(got.iter())
+            .map(|(decl, g)| {
+                let cname = decl
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(g.name.as_str());
+                ColumnSchema::new(cname.to_string(), g.ty, true)
+            })
+            .collect();
+    }
+    let cname = alias.unwrap_or(name);
+    got.first()
+        .map(|c| alloc::vec![ColumnSchema::new(cname.to_string(), c.ty, true)])
+        .unwrap_or_default()
+}
+
+/// The plpgsql twin: the interpreter hands back raw value rows, so the types
+/// come off the first row.
+fn setof_column_shape(
+    declared: &str,
+    name: &str,
+    alias: Option<&str>,
+    first_row: Option<&alloc::vec::Vec<Value<'static>>>,
+) -> alloc::vec::Vec<ColumnSchema> {
+    let got: alloc::vec::Vec<ColumnSchema> = first_row
+        .map(|r| {
+            r.iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    ColumnSchema::new(
+                        alloc::format!("col{i}"),
+                        v.data_type().unwrap_or(DataType::Text),
+                        true,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    setof_column_shape_from(declared, name, alias, &got)
 }

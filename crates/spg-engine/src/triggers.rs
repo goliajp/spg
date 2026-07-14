@@ -229,6 +229,8 @@ pub fn fire_row_trigger(
         is_after,
         select_into_resolver: None,
         for_query_resolver: None,
+        // A trigger function is not set-returning.
+        set_sink: None,
     };
     let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();
     let outcome = match execute_stmts(
@@ -289,6 +291,10 @@ struct BodyCtx<'a> {
     /// by `FOR <var> IN <SELECT> LOOP`. Provided by the DO block
     /// executor; runs the SELECT once and returns every row.
     for_query_resolver: Option<&'a ForQueryResolver<'a>>,
+    /// v7.39 (read01 round 66) — where `RETURN NEXT` / `RETURN QUERY` append
+    /// their rows. `None` outside a SETOF function, which makes either statement
+    /// an error there — as in PG.
+    set_sink: Option<&'a core::cell::RefCell<Vec<Vec<Value<'static>>>>>,
 }
 
 /// v7.16.2 — callback shape the DO-block executor registers
@@ -384,6 +390,65 @@ fn execute_stmts(
             }
             PlPgSqlStmt::Return(target) => {
                 return Ok(BodyOutcome::Return(target.clone()));
+            }
+            // v7.39 (read01 round 66) — `RETURN NEXT <expr>`: append one row and
+            // KEEP GOING. It is not a return.
+            PlPgSqlStmt::ReturnNext(e) => {
+                let sink = ctx.set_sink.ok_or_else(|| TriggerError::UnsupportedConstruct {
+                    function: ctx.function.into(),
+                    // PG's wording.
+                    detail: alloc::string::String::from(
+                        "cannot use RETURN NEXT in a non-SETOF function",
+                    ),
+                })?;
+                let v = eval_with_new_old_and_locals(
+                    e,
+                    current_new.as_ref(),
+                    old_row,
+                    locals,
+                    ctx.columns,
+                    ctx.table_name,
+                    ctx.params,
+                    ctx.default_text_search_config,
+                )
+                .map_err(|cause| TriggerError::EvalFailed {
+                    function: ctx.function.into(),
+                    cause,
+                })?;
+                sink.borrow_mut().push(alloc::vec![v]);
+            }
+            // `RETURN QUERY <select>`: append every row it yields, and keep
+            // going. This used to desugar to a side-effect SELECT whose rows
+            // were DISCARDED — the whole answer, thrown away.
+            PlPgSqlStmt::ReturnQuery(query) => {
+                let sink = ctx.set_sink.ok_or_else(|| TriggerError::UnsupportedConstruct {
+                    function: ctx.function.into(),
+                    detail: alloc::string::String::from(
+                        "cannot use RETURN QUERY in a non-SETOF function",
+                    ),
+                })?;
+                let resolver = ctx.for_query_resolver.ok_or_else(|| {
+                    TriggerError::UnsupportedConstruct {
+                        function: ctx.function.into(),
+                        detail: alloc::string::String::from(
+                            "RETURN QUERY needs a query runner (this context has none)",
+                        ),
+                    }
+                })?;
+                let mut stmt = spg_sql::ast::Statement::Select((**query).clone());
+                substitute_trigger_context_in_statement(
+                    &mut stmt,
+                    current_new.as_ref(),
+                    old_row,
+                    locals,
+                    ctx.columns,
+                )
+                .map_err(|cause| TriggerError::EvalFailed {
+                    function: ctx.function.into(),
+                    cause,
+                })?;
+                let (_cols, rows) = resolver(&stmt)?;
+                sink.borrow_mut().extend(rows);
             }
             PlPgSqlStmt::If {
                 branches,
@@ -986,6 +1051,9 @@ pub fn execute_do_block_top_level<'a>(
     select_into_resolver: Option<&'a SelectIntoResolver<'a>>,
     for_query_resolver: Option<&'a ForQueryResolver<'a>>,
 ) -> Result<Vec<spg_sql::ast::Statement>, TriggerError> {
+    // A DO block returns nothing, so RETURN NEXT / RETURN QUERY have nowhere to
+    // go — PG rejects them there too.
+    let set_sink: Option<&core::cell::RefCell<Vec<Vec<Value<'static>>>>> = None;
     let mut locals: BTreeMap<String, Value<'static>> = BTreeMap::new();
     let empty_cols: &[ColumnSchema] = &[];
     init_locals_from_declarations(
@@ -1008,6 +1076,7 @@ pub fn execute_do_block_top_level<'a>(
         is_after: false,
         select_into_resolver,
         for_query_resolver,
+        set_sink,
     };
     let mut current_new: Option<Row> = None;
     let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();
@@ -1098,6 +1167,9 @@ pub fn call_plpgsql_scalar<'a>(
     default_text_search_config: Option<&'a str>,
     select_into_resolver: Option<&'a SelectIntoResolver<'a>>,
     for_query_resolver: Option<&'a ForQueryResolver<'a>>,
+    // v7.39 (read01 round 66) — where `RETURN NEXT` / `RETURN QUERY` append.
+    // `Some` when the function is SETOF; the caller reads the rows out of it.
+    set_sink: Option<&'a core::cell::RefCell<Vec<Vec<Value<'static>>>>>,
 ) -> Result<Option<Value<'static>>, TriggerError> {
     let mut locals: BTreeMap<String, Value<'static>> = args;
     let empty_cols: &[ColumnSchema] = &[];
@@ -1123,6 +1195,7 @@ pub fn call_plpgsql_scalar<'a>(
         is_after: false,
         select_into_resolver,
         for_query_resolver,
+        set_sink,
     };
     let mut current_new: Option<Row> = None;
     let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();

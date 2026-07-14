@@ -1220,6 +1220,14 @@ pub enum PlPgSqlStmt {
     /// `NEW` / `OLD` / `NULL`; v7.12.4 also accepts a bare
     /// expression for forward compatibility with scalar UDFs.
     Return(ReturnTarget),
+    /// v7.39 (read01 round 66) — `RETURN NEXT <expr>;`: append one row to the
+    /// set a SETOF function is building, and KEEP GOING. Not a return.
+    ReturnNext(Expr),
+    /// v7.39 (read01 round 66) — `RETURN QUERY <select>;`: append every row the
+    /// query yields, and keep going. It used to desugar to a side-effect
+    /// statement whose result was DISCARDED — in a SETOF function that is the
+    /// whole answer thrown away.
+    ReturnQuery(Box<SelectStatement>),
     /// v7.12.6 — `IF cond THEN body [ELSIF cond THEN body]*
     /// [ELSE body] END IF;`. Branches are tried in order; first
     /// truthy condition wins; the optional ELSE runs when no
@@ -4448,6 +4456,8 @@ impl fmt::Display for PlPgSqlStmt {
         match self {
             Self::Assign { target, value } => write!(f, "{target} := {value}"),
             Self::SelectInto { var, body } => write!(f, "{body} INTO {var}"),
+            Self::ReturnNext(e) => write!(f, "RETURN NEXT {e}"),
+            Self::ReturnQuery(s) => write!(f, "RETURN QUERY {s}"),
             Self::Return(t) => match t {
                 ReturnTarget::New => f.write_str("RETURN NEW"),
                 ReturnTarget::Old => f.write_str("RETURN OLD"),

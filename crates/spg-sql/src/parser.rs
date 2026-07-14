@@ -5278,6 +5278,14 @@ impl Parser {
         // effects and discards the result. RETURN NEXT <expr>
         // (single-row accumulator) queues with v7.40 SETOF function
         // infrastructure.
+        // v7.39 (read01 round 66) — `RETURN NEXT <expr>`: append a row to the set
+        // and keep going.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("next"))
+        {
+            self.advance();
+            let e = self.parse_expr(0)?;
+            return Ok(PlPgSqlStmt::ReturnNext(e));
+        }
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("query"))
         {
             self.advance();
@@ -5302,7 +5310,10 @@ impl Parser {
                     self.peek()
                 )));
             };
-            return Ok(PlPgSqlStmt::EmbeddedSql(Box::new(Statement::Select(s))));
+            // v7.39 (read01 round 66) — a REAL statement now. It used to desugar
+            // to an embedded side-effect SELECT whose rows were DISCARDED, which
+            // in a SETOF function is the entire answer thrown away.
+            return Ok(PlPgSqlStmt::ReturnQuery(Box::new(s)));
         }
         // Fall through: parse a full expression.
         let e = self.parse_expr(0)?;
