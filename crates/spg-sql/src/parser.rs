@@ -6584,14 +6584,16 @@ impl Parser {
                     if matches!(&kind, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("primary"))
                     {
                         self.advance(); // CONSTRAINT
-                        let _name = self.expect_ident_like()?;
+                        // v7.39 (read01 round 48) — keep the name; the engine
+                        // stores it now instead of dropping it on the floor.
+                        let con_name = self.expect_ident_like()?;
                         self.advance(); // PRIMARY
                         self.expect_keyword_ident("key")?;
                         let cols = self.parse_paren_ident_list("PRIMARY KEY")?;
                         return Ok(alloc::vec![
                             crate::ast::AlterTableTarget::AddTableConstraint(
                                 crate::ast::TableConstraint::PrimaryKey {
-                                    name: None,
+                                    name: Some(con_name),
                                     columns: cols,
                                 }
                             )
@@ -6600,13 +6602,17 @@ impl Parser {
                     if matches!(&kind, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("unique"))
                     {
                         self.advance(); // CONSTRAINT
-                        let _name = self.expect_ident_like()?;
+                        // v7.39 (read01 round 48) — keep the name.
+                        let con_name = self.expect_ident_like()?;
                         // v7.22 (mailrs round-13 gap 6) — delegate so
                         // the optional `NULLS [NOT] DISTINCT` modifier
                         // parses here too (pg_dump emits the ALTER
                         // form; semantics enforced by the engine
                         // since v7.13).
-                        let uc = self.parse_table_level_unique()?;
+                        let mut uc = self.parse_table_level_unique()?;
+                        if let crate::ast::TableConstraint::Unique { name, .. } = &mut uc {
+                            *name = Some(con_name);
+                        }
                         return Ok(alloc::vec![
                             crate::ast::AlterTableTarget::AddTableConstraint(uc)
                         ]);
@@ -6614,7 +6620,8 @@ impl Parser {
                     if matches!(&kind, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("check"))
                     {
                         self.advance(); // CONSTRAINT
-                        let _name = self.expect_ident_like()?;
+                        // v7.39 (read01 round 48) — keep the name.
+                        let con_name = self.expect_ident_like()?;
                         self.advance(); // CHECK
                         if !matches!(self.peek(), Token::LParen) {
                             return Err(self.err(alloc::format!(
@@ -6628,7 +6635,10 @@ impl Parser {
                         }
                         return Ok(alloc::vec![
                             crate::ast::AlterTableTarget::AddTableConstraint(
-                                crate::ast::TableConstraint::Check { name: None, expr }
+                                crate::ast::TableConstraint::Check {
+                                    name: Some(con_name),
+                                    expr
+                                }
                             )
                         ]);
                     }
@@ -6950,6 +6960,20 @@ impl Parser {
                     return Ok(alloc::vec![crate::ast::AlterTableTarget::RenameTable {
                         new,
                     }]);
+                }
+                // v7.39 (read01 round 48) — `RENAME CONSTRAINT old TO new`.
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("constraint")) {
+                    self.advance();
+                    let old = self.expect_ident_like()?;
+                    if matches!(self.peek(), Token::To) {
+                        self.advance();
+                    } else {
+                        self.expect_keyword_ident("to")?;
+                    }
+                    let new = self.expect_ident_like()?;
+                    return Ok(alloc::vec![
+                        crate::ast::AlterTableTarget::RenameConstraint { old, new }
+                    ]);
                 }
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("column")) {
                     self.advance();
@@ -8821,12 +8845,23 @@ impl Parser {
                 // and discarded — same handling as every other SPG
                 // constraint name.
                 self.advance(); // CONSTRAINT
-                let _name = self.expect_ident_like()?;
-                table_constraints.push(match kind {
+                // v7.39 (read01 round 48) — the name is kept now: the schema
+                // stores it, so DROP / RENAME CONSTRAINT can find it.
+                let con_name = self.expect_ident_like()?;
+                let mut tc = match kind {
                     NamedTableConstraintKind::Check => self.parse_table_level_check()?,
                     NamedTableConstraintKind::Unique => self.parse_table_level_unique()?,
                     NamedTableConstraintKind::PrimaryKey => self.parse_table_level_primary_key()?,
-                });
+                };
+                match &mut tc {
+                    crate::ast::TableConstraint::Check { name, .. }
+                    | crate::ast::TableConstraint::Unique { name, .. }
+                    | crate::ast::TableConstraint::PrimaryKey { name, .. } => {
+                        *name = Some(con_name);
+                    }
+                    _ => {}
+                }
+                table_constraints.push(tc);
             } else if self.peek_constraint_or_fk_start() {
                 foreign_keys.push(self.parse_table_level_fk()?);
             } else {

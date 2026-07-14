@@ -13786,7 +13786,7 @@ fn apply_function_dispatch(
                     if check_names.get(ci).map(String::as_str) != Some(bare) {
                         continue;
                     }
-                    let inner = pred.trim();
+                    let inner = pred.expr.trim();
                     let body = if inner.starts_with('(') && inner.ends_with(')') {
                         inner.to_string()
                     } else {

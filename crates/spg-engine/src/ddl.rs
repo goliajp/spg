@@ -82,6 +82,7 @@ impl Engine {
             }
             T::RenameTable { new } => self.alter_rename_table(tbl, new),
             T::RenameColumn { old, new } => self.alter_rename_column(tbl, old, new),
+            T::RenameConstraint { old, new } => self.alter_rename_constraint(tbl, &old, new),
             T::AttachPartition { child, bounds } => self.alter_attach_partition(tbl, child, bounds),
             T::DetachPartition {
                 child,
@@ -755,6 +756,26 @@ impl Engine {
         let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
         })?;
+        // v7.39 (read01 round 48) — 0) the stored name wins. A constraint
+        // created with `ADD CONSTRAINT <name> …` (or the inline `CONSTRAINT
+        // <name>` form) now carries that name, so DROP finds it directly.
+        // Catalogs written before FILE_VERSION 60 have no stored names and
+        // fall through to the synthesised-name lookups below, which stay
+        // exactly as they were.
+        {
+            let ucs = &mut table.schema_mut().uniqueness_constraints;
+            let before = ucs.len();
+            ucs.retain(|u| u.name.as_deref() != Some(name.as_str()));
+            if ucs.len() != before {
+                return Ok(());
+            }
+            let checks = &mut table.schema_mut().checks;
+            let before = checks.len();
+            checks.retain(|c| c.name.as_deref() != Some(name.as_str()));
+            if checks.len() != before {
+                return Ok(());
+            }
+        }
         // 1) Try foreign keys.
         let fks = &mut table.schema_mut().foreign_keys;
         let fk_before = fks.len();
@@ -762,34 +783,32 @@ impl Engine {
         if fks.len() != fk_before {
             return Ok(());
         }
-        // 2) Try PK / UNIQUE constraints. SPG names PK as
-        //    `<table>_pkey` and UNIQUE as `<table>_uniqN` (the
-        //    same naming pg_constraint uses), so the lookup is
-        //    by reconstructing the candidate names.
-        let pkey_name = alloc::format!("{tbl}_pkey");
-        let ucs = &mut table.schema_mut().uniqueness_constraints;
-        let uc_before = ucs.len();
-        if name == pkey_name {
-            ucs.retain(|uc| !uc.is_primary_key);
-        } else if let Some(idx) = name
-            .strip_prefix(&alloc::format!("{tbl}_uniq"))
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            if idx < ucs.len() {
-                ucs.remove(idx);
-            }
-        }
-        if ucs.len() != uc_before {
+        // 2) Try PK / UNIQUE constraints by their SYNTHESISED name.
+        //    v7.39 (read01 round 48) — resolve through the very
+        //    synthesisers pg_constraint / pg_get_constraintdef report from
+        //    (`pg_unique_conname` / `pg_check_connames`), so a name the
+        //    catalog shows is always a name DROP accepts. The old ad-hoc
+        //    `<table>_uniqN` / `<table>_checkN` prefixes never matched what
+        //    the views printed (`<table>_<col>_key` / `<table>_<col>_check`).
+        // (Single-column UNIQUE indices that don't have a UC entry need to go
+        // through `DROP INDEX <name>` instead — indices are a slice, not a Vec.)
+        let uc_hit = table
+            .schema()
+            .uniqueness_constraints
+            .iter()
+            .position(|uc| {
+                uc.name.is_none()
+                    && crate::system_catalog::pg_unique_conname(table, uc, tbl) == name
+            });
+        if let Some(idx) = uc_hit {
+            table.schema_mut().uniqueness_constraints.remove(idx);
             return Ok(());
         }
-        // 3) CHECK constraints. SPG synthesises names as
-        //    `<table>_check<i>` in pg_constraint.
-        // (Single-column UNIQUE indices that don't have a UC
-        // entry need to go through `DROP INDEX <name>` instead —
-        // the indices storage is a slice not a Vec.)
-        if let Some(rest) = name.strip_prefix(&alloc::format!("{tbl}_check"))
-            && let Ok(idx) = rest.parse::<usize>()
-        {
+        // 3) CHECK constraints by their synthesised name.
+        let check_names =
+            crate::system_catalog::pg_check_connames(table, tbl, &table.schema().checks);
+        let check_hit = check_names.iter().position(|n| *n == name);
+        if let Some(idx) = check_hit {
             let checks = &mut table.schema_mut().checks;
             if idx < checks.len() {
                 checks.remove(idx);
@@ -999,6 +1018,22 @@ impl Engine {
             EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
         })?;
         let is_pk = matches!(tc, spg_sql::ast::TableConstraint::PrimaryKey { .. });
+        // v7.39 (read01 round 48) — a constraint name must be unique on the
+        // table. PG rejects a re-used name with 42710; SPG used to drop the
+        // name on the floor entirely, so the collision was invisible.
+        let con_name: Option<String> = match &tc {
+            spg_sql::ast::TableConstraint::PrimaryKey { name, .. }
+            | spg_sql::ast::TableConstraint::Unique { name, .. }
+            | spg_sql::ast::TableConstraint::Check { name, .. } => name.clone(),
+            _ => None,
+        };
+        if let Some(n) = &con_name
+            && constraint_name_taken(table, n)
+        {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "constraint {n:?} for relation {tbl:?} already exists"
+            )));
+        }
         // v7.39 (read01 round 45) — a table may have at most one PRIMARY
         // KEY. PG rejects a second one (even on the same column) with
         // 42P16; SPG used to install it silently. SPG's own dumps emit PK
@@ -1058,6 +1093,7 @@ impl Engine {
                             is_primary_key: is_pk,
                             columns: positions.clone(),
                             nulls_not_distinct: nnd,
+                            name: con_name.clone(),
                         },
                     );
                     // PK implies NOT NULL on referenced cols.
@@ -1083,7 +1119,10 @@ impl Engine {
                 }
             }
             spg_sql::ast::TableConstraint::Check { expr, .. } => {
-                table.schema_mut().checks.push(alloc::format!("{expr}"));
+                table.schema_mut().checks.push(spg_storage::CheckConstraint {
+                    name: con_name.clone(),
+                    expr: alloc::format!("{expr}"),
+                });
             }
             spg_sql::ast::TableConstraint::Index { name, columns } => {
                 // v7.15.0 — ALTER TABLE ADD KEY (cols).
@@ -1316,6 +1355,52 @@ impl Engine {
         Ok(())
     }
 
+    /// v7.39 (read01 round 48) — `ALTER TABLE t RENAME CONSTRAINT old TO new`.
+    /// Only constraints that carry a stored name can be renamed: an unnamed
+    /// one has no name to change, and its synthesised `pg_constraint` name
+    /// is derived, not stored. PG's wording here says "for table" (while
+    /// DROP CONSTRAINT says "of relation") — matched verbatim.
+    fn alter_rename_constraint(
+        &mut self,
+        tbl: &str,
+        old: &str,
+        new: String,
+    ) -> Result<(), EngineError> {
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        if !constraint_name_taken(table, old) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "constraint {old:?} for table {tbl:?} does not exist"
+            )));
+        }
+        if constraint_name_taken(table, &new) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "constraint {new:?} for relation {tbl:?} already exists"
+            )));
+        }
+        let sch = table.schema_mut();
+        for f in &mut sch.foreign_keys {
+            if f.name.as_deref() == Some(old) {
+                f.name = Some(new);
+                return Ok(());
+            }
+        }
+        for u in &mut sch.uniqueness_constraints {
+            if u.name.as_deref() == Some(old) {
+                u.name = Some(new);
+                return Ok(());
+            }
+        }
+        for c in &mut sch.checks {
+            if c.name.as_deref() == Some(old) {
+                c.name = Some(new);
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     fn alter_rename_table(&mut self, tbl: &str, new: String) -> Result<(), EngineError> {
         // v7.16.2 — table-level rename (mailrs round-10
         // A.5 — used by migrate-042's `ALTER TABLE
@@ -1411,7 +1496,11 @@ impl Engine {
         let checks = table.schema().checks.clone();
         let mut new_checks = Vec::with_capacity(checks.len());
         for chk in checks {
-            new_checks.push(rewrite_column_in_source(&chk, &old, &new)?);
+            // v7.39 (read01 round 48) — rewrite the predicate, keep the name.
+            new_checks.push(spg_storage::CheckConstraint {
+                name: chk.name,
+                expr: rewrite_column_in_source(&chk.expr, &old, &new)?,
+            });
         }
         table.schema_mut().checks = new_checks;
         // Rewrite per-index partial_predicate sources.
@@ -2543,21 +2632,26 @@ impl Engine {
         // UniquenessConstraints (column name → position) so the
         // INSERT enforcement helper sees positions directly.
         let mut uc_storage: Vec<spg_storage::UniquenessConstraint> = Vec::new();
-        let mut check_exprs: Vec<String> = Vec::new();
+        // v7.39 (read01 round 48) — the AST has carried `name` all along;
+        // the schema now keeps it instead of dropping it on the floor.
+        let mut check_exprs: Vec<spg_storage::CheckConstraint> = Vec::new();
         for tc in table_constraints {
-            let (is_pk, names, nnd) = match tc {
-                spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } => {
-                    (true, columns.clone(), false)
+            let (is_pk, names, nnd, con_name) = match tc {
+                spg_sql::ast::TableConstraint::PrimaryKey { name, columns } => {
+                    (true, columns.clone(), false, name.clone())
                 }
                 spg_sql::ast::TableConstraint::Unique {
+                    name,
                     columns,
                     nulls_not_distinct,
-                    ..
-                } => (false, columns.clone(), *nulls_not_distinct),
-                spg_sql::ast::TableConstraint::Check { expr, .. } => {
+                } => (false, columns.clone(), *nulls_not_distinct, name.clone()),
+                spg_sql::ast::TableConstraint::Check { name, expr } => {
                     // v7.13.0 — collect CHECK predicate sources;
                     // they get attached to the schema below.
-                    check_exprs.push(alloc::format!("{expr}"));
+                    check_exprs.push(spg_storage::CheckConstraint {
+                        name: name.clone(),
+                        expr: alloc::format!("{expr}"),
+                    });
                     continue;
                 }
                 // v7.15.0 — plain `KEY (cols)` from MySQL inline
@@ -2588,6 +2682,7 @@ impl Engine {
                 is_primary_key: is_pk,
                 columns: positions,
                 nulls_not_distinct: nnd,
+                name: con_name,
             });
         }
         // v7.24 (round-16 collateral) — inline `PRIMARY KEY` column
@@ -2611,6 +2706,8 @@ impl Engine {
                     is_primary_key: true,
                     columns: positions,
                     nulls_not_distinct: false,
+                    // Inline `col INT PRIMARY KEY` carries no name.
+                    name: None,
                 });
             }
         }
@@ -4113,4 +4210,21 @@ fn render_function_args(args: &[spg_sql::ast::FunctionArg]) -> alloc::string::St
     }
     out.push(')');
     out
+}
+
+/// v7.39 (read01 round 48) — is `name` already taken by a constraint on this
+/// table? Checks the stored names of foreign keys, uniqueness constraints and
+/// CHECKs. Constraints written before FILE_VERSION 60 have no stored name, so
+/// they can't collide here — they are still reachable by their synthesised
+/// name through `resolve_constraint`.
+fn constraint_name_taken(table: &spg_storage::Table, name: &str) -> bool {
+    let sch = table.schema();
+    sch.foreign_keys
+        .iter()
+        .any(|f| f.name.as_deref() == Some(name))
+        || sch
+            .uniqueness_constraints
+            .iter()
+            .any(|u| u.name.as_deref() == Some(name))
+        || sch.checks.iter().any(|c| c.name.as_deref() == Some(name))
 }

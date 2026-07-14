@@ -777,6 +777,9 @@ pub enum AlterTableTarget {
     /// column referenced by a function body update the function
     /// body separately.
     RenameColumn { old: String, new: String },
+    /// v7.39 (read01 round 48) — `ALTER TABLE t RENAME CONSTRAINT old TO new`.
+    /// Reachable now that the schema stores user-supplied constraint names.
+    RenameConstraint { old: String, new: String },
     /// v7.22 (round-13 T2) — mark a column auto-incrementing.
     /// pg_dump splits SERIAL/IDENTITY columns into a plain integer
     /// column plus either `ALTER COLUMN c SET DEFAULT nextval(…)`
@@ -4605,6 +4608,14 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
             write!(
                 f,
                 "RENAME COLUMN {} TO {}",
+                quote_ident(old),
+                quote_ident(new)
+            )
+        }
+        AlterTableTarget::RenameConstraint { old, new } => {
+            write!(
+                f,
+                "RENAME CONSTRAINT {} TO {}",
                 quote_ident(old),
                 quote_ident(new)
             )

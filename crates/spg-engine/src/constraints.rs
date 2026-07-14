@@ -1289,9 +1289,10 @@ pub(crate) fn enforce_check_constraints(
     let ctx = eval::EvalContext::new(&schema.columns, None);
     let mut parsed: alloc::vec::Vec<(usize, Expr)> = alloc::vec::Vec::new();
     for (i, src) in schema.checks.iter().enumerate() {
-        let expr = spg_sql::parser::parse_expression(src).map_err(|e| {
+        let expr = spg_sql::parser::parse_expression(&src.expr).map_err(|e| {
+            let pred = &src.expr;
             EngineError::Unsupported(alloc::format!(
-                "CHECK constraint #{i} on {table_name:?} ({src:?}) failed to re-parse: {e:?}"
+                "CHECK constraint #{i} on {table_name:?} ({pred:?}) failed to re-parse: {e:?}"
             ))
         })?;
         parsed.push((i, expr));

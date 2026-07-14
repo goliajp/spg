@@ -920,9 +920,16 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
     // the spliced image is byte-for-byte a genuine pre-v53 catalog.
     const EMPTY_DEFAULT_TEXT_APPENDIX: usize = 2;
     let trailing_v53plus = EMPTY_DEFAULT_TEXT_APPENDIX + EMPTY_POLICY_APPENDIX;
-    let mut v52 = Vec::with_capacity(v53.len() - appendix.len() - trailing_v53plus);
+    // v7.39 (read01 round 48) — the constraint-name appendix (v60) is written
+    // AFTER the MVCC appendix, so it is spliced out from the far side. For `t`
+    // (no CHECKs, no uniqueness constraints) it is two zero counts:
+    // [u16 check_count=0][u16 uc_count=0].
+    const EMPTY_CONSTRAINT_NAME_APPENDIX: usize = 4;
+    let mut v52 = Vec::with_capacity(
+        v53.len() - appendix.len() - trailing_v53plus - EMPTY_CONSTRAINT_NAME_APPENDIX,
+    );
     v52.extend_from_slice(&v53[..start - trailing_v53plus]);
-    v52.extend_from_slice(&v53[start + appendix.len()..]);
+    v52.extend_from_slice(&v53[start + appendix.len() + EMPTY_CONSTRAINT_NAME_APPENDIX..]);
     // Set the version byte to 52 — the format before the MVCC appendix (v53)
     // and before the CRC trailer (v54): byte-for-byte what the pre-slice
     // released code would have written for this catalog.

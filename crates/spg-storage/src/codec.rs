@@ -167,6 +167,9 @@ pub(crate) fn deserialize_table(
                 is_primary_key: is_pk,
                 columns: cols,
                 nulls_not_distinct,
+                // v7.39 (read01 round 48) — filled in by the v60
+                // constraint-name appendix at the tail; < v60 stays None.
+                name: None,
             });
         }
         t.schema_mut().uniqueness_constraints = ucs;
@@ -186,7 +189,13 @@ pub(crate) fn deserialize_table(
         let check_count = cur.read_u16()? as usize;
         let mut checks = Vec::with_capacity(check_count);
         for _ in 0..check_count {
-            checks.push(cur.read_str()?);
+            // v7.39 (read01 round 48) — the name rides the v60 appendix at
+            // the tail; < v60 catalogs leave it None (pg_constraint then
+            // synthesises PG's <table>_<col>_check form, as before).
+            checks.push(crate::CheckConstraint {
+                name: None,
+                expr: cur.read_str()?,
+            });
         }
         t.schema_mut().checks = checks;
     }
@@ -376,6 +385,42 @@ pub(crate) fn deserialize_table(
     // state left by `deserialize_rows` is the exact pre-v53 contract.
     if version >= 53 {
         read_mvcc_header_appendix(cur, t)?;
+    }
+    // v7.39 (read01 round 48) — constraint-name appendix (FILE_VERSION 60+),
+    // index-aligned to the CHECK / uniqueness appendices decoded above. A
+    // count mismatch means the appendix desynced from the schema — refuse
+    // rather than mis-pair a name with the wrong constraint.
+    if version >= 60 {
+        let check_count = cur.read_u16()? as usize;
+        if check_count != t.schema().checks.len() {
+            return Err(StorageError::Corrupt(format!(
+                "constraint-name appendix: {check_count} CHECK names != {} CHECK constraints                  for table {table_name:?}",
+                t.schema().checks.len()
+            )));
+        }
+        for i in 0..check_count {
+            let name = if cur.read_u8()? != 0 {
+                Some(cur.read_str()?)
+            } else {
+                None
+            };
+            t.schema_mut().checks[i].name = name;
+        }
+        let uc_count = cur.read_u16()? as usize;
+        if uc_count != t.schema().uniqueness_constraints.len() {
+            return Err(StorageError::Corrupt(format!(
+                "constraint-name appendix: {uc_count} unique names != {} uniqueness constraints                  for table {table_name:?}",
+                t.schema().uniqueness_constraints.len()
+            )));
+        }
+        for i in 0..uc_count {
+            let name = if cur.read_u8()? != 0 {
+                Some(cur.read_str()?)
+            } else {
+                None
+            };
+            t.schema_mut().uniqueness_constraints[i].name = name;
+        }
     }
     let _ = table_name;
     Ok(())
