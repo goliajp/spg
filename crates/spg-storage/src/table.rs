@@ -1158,6 +1158,7 @@ impl Table {
             partial_predicate: None,
             expression: None,
             is_unique: false,
+            nulls_not_distinct: false,
             extra_column_positions: Vec::new(),
         });
         Ok(())
@@ -2540,6 +2541,7 @@ impl Table {
                 partial_predicate: None,
                 expression: None,
                 is_unique: false,
+                nulls_not_distinct: false,
                 extra_column_positions: Vec::new(),
             });
             return Ok(());

@@ -4110,12 +4110,34 @@ pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
                 ""
             };
             // Matches PG's pg_get_indexdef spelling (with `USING btree`).
-            let indexdef = alloc::format!(
-                "CREATE {unique_kw}INDEX {} ON public.{} USING btree ({})",
-                idx.name,
-                tname,
-                cols
-            );
+            // v7.39 (read01 round 52) — the key list is the EXPRESSION when
+            // the index has one, and a partial index carries its predicate.
+            // Both were already stored on `Index`; this view just dropped
+            // them, so `CREATE INDEX i ON t (lower(b)) WHERE a > 1` came back
+            // as `... USING btree (b)`.
+            let key = idx.expression.clone().unwrap_or(cols);
+            let indexdef = match &idx.partial_predicate {
+                // The stored Display form of a binary predicate is already
+                // parenthesised ("(a > 1)"); only wrap one that isn't.
+                Some(pred) => {
+                    let p = pred.trim();
+                    let wrapped = if p.starts_with('(') && p.ends_with(')') {
+                        alloc::string::String::from(p)
+                    } else {
+                        alloc::format!("({p})")
+                    };
+                    alloc::format!(
+                        "CREATE {unique_kw}INDEX {} ON public.{} USING btree ({key}) WHERE {wrapped}",
+                        idx.name,
+                        tname
+                    )
+                }
+                None => alloc::format!(
+                    "CREATE {unique_kw}INDEX {} ON public.{} USING btree ({key})",
+                    idx.name,
+                    tname
+                ),
+            };
             rows.push(Row::new(alloc::vec![
                 Value::text("public"),
                 Value::text(tname.clone()),

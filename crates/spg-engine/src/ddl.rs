@@ -1937,6 +1937,8 @@ impl Engine {
         if stmt.is_unique {
             if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name) {
                 idx.is_unique = true;
+                // v7.39 (read01 round 52) — NULLS NOT DISTINCT (PG 15+).
+                idx.nulls_not_distinct = stmt.nulls_not_distinct;
             }
             // At index-creation time, check the existing rows for
             // pre-existing duplicates that would have violated the
@@ -1959,7 +1961,17 @@ impl Engine {
                 .iter()
                 .find(|i| i.name == stmt.name)
                 .expect("just-added index");
-            check_existing_unique_violation(idx_ref, &snapshot_schema, &snapshot_rows)?;
+            // v7.39 (read01 round 52) — the index was already installed above,
+            // so a validation failure must ROLL IT BACK. PG's CREATE UNIQUE
+            // INDEX is atomic; SPG used to leave the half-built index in the
+            // catalog (pg_indexes listed an index that "failed" to create).
+            if let Err(e) =
+                check_existing_unique_violation(idx_ref, &snapshot_schema, &snapshot_rows)
+            {
+                let name = stmt.name.clone();
+                self.active_catalog_mut().drop_named_index(&name);
+                return Err(e);
+            }
         }
         // v6.3.1 — adding an index can change the optimal plan for
         // any cached query that references this table.

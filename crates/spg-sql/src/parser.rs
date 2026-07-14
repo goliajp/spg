@@ -10482,6 +10482,22 @@ impl Parser {
                 }
             }
         }
+        // v7.39 (read01 round 52) — optional `NULLS [NOT] DISTINCT` (PG 15+),
+        // which sits between the key list and the WHERE clause.
+        let mut nulls_not_distinct = false;
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("nulls")) {
+            let n1 = self.tokens.get(self.pos + 1);
+            let n2 = self.tokens.get(self.pos + 2);
+            if matches!(n1, Some(Token::Not)) && matches!(n2, Some(Token::Distinct)) {
+                self.advance(); // NULLS
+                self.advance(); // NOT
+                self.advance(); // DISTINCT
+                nulls_not_distinct = true;
+            } else if matches!(n1, Some(Token::Distinct)) {
+                self.advance(); // NULLS
+                self.advance(); // DISTINCT
+            }
+        }
         // v6.8.1 — optional `WHERE <expr>` partial-index predicate.
         let partial_predicate = if matches!(self.peek(), Token::Where) {
             self.advance();
@@ -10503,6 +10519,7 @@ impl Parser {
             name,
             table,
             column,
+            nulls_not_distinct,
             method,
             if_not_exists,
             included_columns,

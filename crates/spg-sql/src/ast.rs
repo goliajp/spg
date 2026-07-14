@@ -1413,6 +1413,10 @@ pub struct CreateIndexStatement {
     pub name: String,
     pub table: String,
     pub column: String,
+    /// v7.39 (read01 round 52) — `CREATE UNIQUE INDEX … NULLS NOT DISTINCT`
+    /// (PG 15+). Default (`false`) is the SQL-standard NULLS DISTINCT, where
+    /// any NULL in the key exempts the row from the uniqueness check.
+    pub nulls_not_distinct: bool,
     /// Optional `USING <method>` clause. v2.0 recognises `hnsw` (NSW
     /// graph for vector kNN); unspecified is the default B-tree index.
     pub method: IndexMethod,
