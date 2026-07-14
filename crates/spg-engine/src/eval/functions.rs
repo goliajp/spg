@@ -3924,9 +3924,36 @@ fn apply_function_dispatch(
                     });
                 }
             };
+            // v7.39 (read01 arrayfuncs.c) — the 2-dimensional fill
+            // (array_fill(v, ARRAY[r, c])) for the integer element types.
+            if dims.len() == 2 {
+                let r = dims[0].unwrap_or(0);
+                let c = dims[1].unwrap_or(0);
+                if r < 0 || c < 0 {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "array_fill(): dimension must be non-negative".into(),
+                    });
+                }
+                let (r, c) = (r as usize, c as usize);
+                return match &args[0] {
+                    Value::Int(x) => Ok(Value::IntArray2D(alloc::vec![alloc::vec![Some(*x); c]; r])),
+                    Value::SmallInt(x) => Ok(Value::IntArray2D(
+                        alloc::vec![alloc::vec![Some(i32::from(*x)); c]; r],
+                    )),
+                    Value::BigInt(x) => Ok(Value::BigIntArray2D(
+                        alloc::vec![alloc::vec![Some(*x); c]; r],
+                    )),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "array_fill(): unsupported 2-D element type {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                };
+            }
             if dims.len() != 1 {
                 return Err(EvalError::TypeMismatch {
-                    detail: "array_fill(): only 1-dimensional fill is supported".into(),
+                    detail: "array_fill(): only 1- and 2-dimensional fill are supported".into(),
                 });
             }
             let n = dims[0].unwrap_or(0);
