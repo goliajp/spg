@@ -20,18 +20,40 @@ use crate::eval::EvalContext;
 /// The `__spg_` prefix keeps it out of the user-visible GUC namespace.
 pub(crate) const CURRENT_ROLE_KEY: &str = "__spg_current_role";
 
+/// v7.39 (read01 round 51) — reserved `session_params` key holding the LOGIN
+/// identity: the `user` the client sent in the startup packet. `session_user`
+/// reports it, and `current_user` falls back to it when no `SET ROLE` is in
+/// effect. Absent (embedded engine, or a wire that never set it) = LOGIN_ROLE.
+pub(crate) const SESSION_USER_KEY: &str = "__spg_session_user";
+
 /// v7.39 (RLS) — the login identity (superuser). SPG's embedded engine and
 /// its default server session both authenticate as this.
 pub(crate) const LOGIN_ROLE: &str = "admin";
 
 impl Engine {
+    /// v7.39 (read01 round 51) — the login identity: the startup packet's
+    /// `user`, else the Admin default. Drives `session_user`.
+    #[must_use]
+    pub(crate) fn session_user(&self) -> &str {
+        self.session_params
+            .get(SESSION_USER_KEY)
+            .map_or(LOGIN_ROLE, String::as_str)
+    }
+
+    /// v7.39 (read01 round 51) — record the connection's login identity.
+    /// The server calls this once per connection from the startup packet.
+    pub fn set_session_user(&mut self, user: &str) {
+        self.session_params
+            .insert(String::from(SESSION_USER_KEY), String::from(user));
+    }
+
     /// v7.39 (RLS) — the effective session role: the `SET ROLE` override, or
-    /// the Admin login identity. Drives `current_user` and RLS role matching.
+    /// the login identity. Drives `current_user` and RLS role matching.
     #[must_use]
     pub(crate) fn current_role(&self) -> &str {
         self.session_params
             .get(CURRENT_ROLE_KEY)
-            .map_or(LOGIN_ROLE, String::as_str)
+            .map_or_else(|| self.session_user(), String::as_str)
     }
 
     /// v7.39 (RLS) — whether the session bypasses RLS. PG: superusers always
@@ -40,7 +62,17 @@ impl Engine {
     /// role is policy-subject.
     #[must_use]
     pub(crate) fn is_superuser(&self) -> bool {
-        self.current_role().eq_ignore_ascii_case(LOGIN_ROLE)
+        // v7.39 (read01 round 51) — keyed on whether an explicit `SET ROLE` to
+        // a non-admin role is in effect, NOT on the login NAME. The wire now
+        // reports the startup packet's `user` as current_user / session_user;
+        // if superuser-ness followed that name, every connection as e.g.
+        // "unmei" would silently become RLS-subject. Reported identity and
+        // privilege semantics stay decoupled (recorded residual: real
+        // per-role enforcement is the RLS epic's own step).
+        match self.session_params.get(CURRENT_ROLE_KEY) {
+            Some(r) => r.eq_ignore_ascii_case(LOGIN_ROLE),
+            None => true,
+        }
     }
 
     /// v7.12.1 — record a `SET <name> = <value>` parameter. Names

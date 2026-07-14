@@ -57,6 +57,10 @@ fn size_and_encoding_funcs_return_defaults() {
 #[test]
 fn permission_probes_return_true() {
     let mut e = Engine::new();
+    // v7.39 (read01 round 51) — has_table_privilege validates its relation now
+    // (PG errors on a missing one), so the probe needs a real table. The other
+    // members of the family still answer unconditionally.
+    e.execute("CREATE TABLE foo(col INT)").unwrap();
     for f in &[
         "has_table_privilege('foo', 'select')",
         "has_column_privilege('foo', 'col', 'select')",
@@ -68,6 +72,11 @@ fn permission_probes_return_true() {
             other => panic!("SELECT {f} expected true, got {other:?}"),
         }
     }
+    // A missing relation is an error, not `true` (PG 42P01).
+    assert!(
+        e.execute("SELECT has_table_privilege('nope_tbl', 'select')")
+            .is_err()
+    );
 }
 
 #[test]
