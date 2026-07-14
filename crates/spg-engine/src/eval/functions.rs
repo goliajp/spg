@@ -14381,16 +14381,30 @@ fn apply_function_dispatch(
             let Value::Text(fname) = fn_arg else {
                 return Ok(Value::Bool(true));
             };
-            // PG names a function as `f1(int)`; SPG keys them by name.
-            let bare = fname
-                .as_ref()
-                .split_once('(')
-                .map_or(fname.as_ref(), |(n, _)| n)
-                .trim();
+            // PG names a function as `f1(int)` — the signature picks the
+            // overload. Without one, the name has to be unambiguous.
+            let text = fname.as_ref().trim();
+            let (bare, sig) = match text.split_once('(') {
+                Some((n, rest)) => (n.trim(), Some(rest.trim_end_matches(')'))),
+                None => (text, None),
+            };
             let Some(cat) = ctx.catalog else {
                 return Ok(Value::Bool(true));
             };
-            let Some(def) = cat.functions().get(bare) else {
+            let def = match sig {
+                Some(types) => {
+                    let key = spg_storage::function_signature_key(
+                        bare,
+                        &alloc::format!("({types})"),
+                    );
+                    cat.function_by_key(&key)
+                }
+                None => {
+                    let all = cat.functions_named(bare);
+                    if all.len() == 1 { Some(all[0]) } else { None }
+                }
+            };
+            let Some(def) = def else {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!("function {} does not exist", fname.as_ref()),
                 });
@@ -16595,7 +16609,7 @@ fn apply_function_dispatch(
             // recurses through this very path, and a per-row call
             // (`SELECT f1(a) FROM t`) works with no engine round-trip.
             if let Some(cat) = ctx.catalog
-                && let Some(def) = cat.functions().get(other)
+                && let Some(def) = resolve_overload(cat, other, args)?
             {
                 // v7.39 (read01 round 61) — EXECUTE. PG grants it to PUBLIC by
                 // default, so this only ever bites after a REVOKE … FROM PUBLIC.
@@ -16629,6 +16643,60 @@ fn apply_function_dispatch(
             })
         }
     }
+}
+
+/// v7.39 (read01 round 62) — pick the OVERLOAD a call means. PG keys a function
+/// by name + argument types; SPG used to key by name alone, so a second
+/// `CREATE FUNCTION f(text)` was an "already exists" error, and — worse — a call
+/// to `f('hi')` silently ran `f(int)` and answered `int:hi`.
+///
+/// The rule: among the overloads of that name with the right arity, an exact
+/// argument-type match wins. If there is exactly one candidate of that arity it
+/// is taken (PG would coerce the arguments to fit, and this is where SPG's
+/// implicit coercion happens too). Otherwise the call names no function that
+/// exists, and says so.
+fn resolve_overload<'c>(
+    cat: &'c spg_storage::Catalog,
+    name: &str,
+    args: &[Value<'_>],
+) -> Result<Option<&'c spg_storage::FunctionDef>, EvalError> {
+    let all = cat.functions_named(name);
+    if all.is_empty() {
+        return Ok(None);
+    }
+    let by_arity: Vec<&spg_storage::FunctionDef> = all
+        .iter()
+        .copied()
+        .filter(|f| spg_storage::function_arg_types(&f.args_repr).len() == args.len())
+        .collect();
+    if by_arity.len() == 1 {
+        return Ok(Some(by_arity[0]));
+    }
+    if !by_arity.is_empty() {
+        // An exact type match decides between same-arity overloads.
+        for f in &by_arity {
+            let declared = spg_storage::function_arg_types(&f.args_repr);
+            let exact = declared.iter().zip(args).all(|(d, v)| {
+                crate::conversions::type_name_to_data_type(d)
+                    .is_some_and(|dt| v.data_type() == Some(dt))
+            });
+            if exact {
+                return Ok(Some(f));
+            }
+        }
+    }
+    // No overload of that name accepts these arguments — PG's wording.
+    let sig: Vec<&str> = args
+        .iter()
+        .map(|v| {
+            v.data_type()
+                .and_then(crate::eval::pg_typeof_name_for_datatype)
+                .unwrap_or("unknown")
+        })
+        .collect();
+    Err(EvalError::TypeMismatch {
+        detail: format!("function {}({}) does not exist", name, sig.join(", ")),
+    })
 }
 
 /// The maximum depth of nested user-function calls. A function that calls

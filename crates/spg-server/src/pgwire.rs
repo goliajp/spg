@@ -3669,6 +3669,14 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // (PG 2BP01 dependent_objects_still_exist).
         } else if msg.contains("cannot be dropped because some objects depend on it") {
             "2BP01"
+        // v7.39 (read01 round 62) — an overloaded name with no signature to
+        // disambiguate it (PG 42725 ambiguous_function).
+        } else if msg.contains("is not unique") {
+            "42725"
+        // …and a call / GRANT / DROP naming a function that has no such
+        // signature (PG 42883 undefined_function).
+        } else if msg.contains("function") && msg.contains("does not exist") {
+            "42883"
         } else {
             "42000"
         };

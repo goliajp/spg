@@ -1364,9 +1364,11 @@ impl Engine {
                 table,
                 if_exists,
             } => self.exec_drop_trigger(&name, &table, if_exists),
-            Statement::DropFunction { name, if_exists } => {
-                self.exec_drop_function(&name, if_exists)
-            }
+            Statement::DropFunction {
+                name,
+                args,
+                if_exists,
+            } => self.exec_drop_function(&name, args.as_deref(), if_exists),
             Statement::CreateSequence(s) => self.exec_create_sequence(s),
             Statement::AlterSequence(s) => self.exec_alter_sequence(s),
             Statement::DropSequence { names, if_exists } => {

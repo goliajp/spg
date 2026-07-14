@@ -3525,6 +3525,68 @@ pub struct FunctionDef {
     pub acl: Vec<AclItem>,
 }
 
+/// v7.39 (read01 round 62) — the canonical key for one function overload:
+/// `name(type, type)`, lower-cased, with PG's type aliases folded together so
+/// `f(integer)` and `f(int)` are the SAME function (which they are).
+#[must_use]
+pub fn function_signature_key(name: &str, args_repr: &str) -> String {
+    let types = function_arg_types(args_repr);
+    format!("{}({})", name.to_ascii_lowercase(), types.join(","))
+}
+
+/// The declared argument TYPES of a function, out of its `args_repr`
+/// (`"(x INT, y DOUBLE PRECISION)"` → `["int", "float"]`). An entry may be a
+/// bare type with no name (`"(INT)"`).
+#[must_use]
+pub fn function_arg_types(args_repr: &str) -> Vec<String> {
+    let inner = args_repr.trim().trim_start_matches('(').trim_end_matches(')');
+    if inner.trim().is_empty() {
+        return Vec::new();
+    }
+    inner
+        .split(',')
+        .map(|part| {
+            let mut words: Vec<&str> = part.split_whitespace().collect();
+            // `OUT x INT` / `INOUT x INT` — the mode is not part of the type.
+            if !words.is_empty()
+                && (words[0].eq_ignore_ascii_case("OUT") || words[0].eq_ignore_ascii_case("INOUT"))
+            {
+                words.remove(0);
+            }
+            // Two or more words = `name TYPE …`; one word = a bare TYPE.
+            let ty = if words.len() >= 2 {
+                words[1..].join(" ")
+            } else {
+                words.first().map_or(String::new(), |w| (*w).to_string())
+            };
+            normalize_type_name(&ty)
+        })
+        .collect()
+}
+
+/// Fold PG's type aliases so a signature key is stable across spellings.
+/// Unknown names pass through lower-cased — consistency is what the key needs.
+#[must_use]
+pub fn normalize_type_name(ty: &str) -> String {
+    let t = ty.trim().to_ascii_lowercase();
+    // Peel a precision/length modifier: `numeric(10,2)`, `varchar(64)`.
+    let base = t.split_once('(').map_or(t.as_str(), |(h, _)| h).trim();
+    match base {
+        "int" | "int4" | "integer" => "int",
+        "bigint" | "int8" => "bigint",
+        "smallint" | "int2" => "smallint",
+        "text" | "varchar" | "character varying" | "char" | "character" | "bpchar" => "text",
+        "bool" | "boolean" => "bool",
+        "float" | "float8" | "double precision" => "float",
+        "real" | "float4" => "real",
+        "numeric" | "decimal" => "numeric",
+        "timestamptz" | "timestamp with time zone" => "timestamptz",
+        "timestamp" | "timestamp without time zone" => "timestamp",
+        other => other,
+    }
+    .to_string()
+}
+
 /// v7.12.4 — catalogued trigger. References its function by
 /// name; the function must exist at TRIGGER creation time
 /// (forward references are deferred to v7.12.5+).
@@ -3884,21 +3946,61 @@ impl Catalog {
         def: FunctionDef,
         or_replace: bool,
     ) -> Result<(), StorageError> {
-        if !or_replace && self.functions.contains_key(&def.name) {
+        // v7.39 (read01 round 62) — functions are keyed by SIGNATURE, not by
+        // name: `f(int)` and `f(text)` are two functions, as in PG. Keying by
+        // name alone made a second overload an "already exists" error — so a
+        // pg_dump carrying an overload set could not restore — and, worse, a
+        // call to one overload silently ran the other.
+        let key = function_signature_key(&def.name, &def.args_repr);
+        if !or_replace && self.functions.contains_key(&key) {
             return Err(StorageError::Corrupt(format!(
                 "function {:?} already exists (drop or use CREATE OR REPLACE)",
                 def.name
             )));
         }
-        self.functions.insert(def.name.clone(), def);
+        self.functions.insert(key, def);
         Ok(())
+    }
+
+    /// v7.39 (read01 round 62) — every overload of `name`.
+    #[must_use]
+    pub fn functions_named(&self, name: &str) -> Vec<&FunctionDef> {
+        self.functions
+            .values()
+            .filter(|f| f.name.eq_ignore_ascii_case(name))
+            .collect()
+    }
+
+    /// v7.39 (read01 round 62) — one overload, by its signature key.
+    #[must_use]
+    pub fn function_by_key(&self, key: &str) -> Option<&FunctionDef> {
+        self.functions.get(key)
+    }
+
+    /// v7.39 (read01 round 62) — drop ONE overload. `true` if it was there.
+    pub fn drop_function_by_key(&mut self, key: &str) -> bool {
+        self.functions.remove(key).is_some()
     }
 
     /// v7.12.4 — remove a user-defined function by name. Returns
     /// `true` if a function was removed, `false` if none matched.
     /// Caller decides whether to surface `if_exists` semantics.
+    /// v7.39 (read01 round 62) — with no signature, PG drops the function only
+    /// when the name is unambiguous. SPG mirrors that: this removes EVERY
+    /// overload of `name`, and the caller (ddl.rs) refuses the ambiguous case
+    /// before getting here.
     pub fn drop_function(&mut self, name: &str) -> bool {
-        self.functions.remove(name).is_some()
+        let keys: Vec<String> = self
+            .functions
+            .iter()
+            .filter(|(_, f)| f.name.eq_ignore_ascii_case(name))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let hit = !keys.is_empty();
+        for k in keys {
+            self.functions.remove(&k);
+        }
+        hit
     }
 
     /// v7.17.0 — read-only handle to catalogued sequences.
@@ -4472,7 +4574,10 @@ impl Catalog {
                 name: def.table.clone(),
             });
         }
-        if !self.functions.contains_key(&def.function) {
+        // v7.39 (read01 round 62) — functions are keyed by SIGNATURE now. A
+        // trigger names its function by NAME (a trigger function takes no
+        // arguments), so the existence check goes through the name index.
+        if self.functions_named(&def.function).is_empty() {
             return Err(StorageError::Corrupt(format!(
                 "trigger {:?} references unknown function {:?}",
                 def.name, def.function
@@ -6564,7 +6669,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 67;
+const FILE_VERSION: u8 = 68;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7536,7 +7641,9 @@ impl Catalog {
             .collect();
         write_u32(&mut out, u32::try_from(fns.len()).expect("≤ 4G functions"));
         for f in fns {
-            write_str(&mut out, &f.name);
+            // v7.39 (read01 round 62) — keyed by SIGNATURE now: two overloads
+            // have two ACLs.
+            write_str(&mut out, &function_signature_key(&f.name, &f.args_repr));
             match &f.owner {
                 Some(o) => {
                     out.push(1);
@@ -7599,8 +7706,9 @@ impl Catalog {
                 let returns = cur.read_str()?;
                 let language = cur.read_str()?;
                 let body = cur.read_str_long()?;
+                let key = function_signature_key(&name, &args_repr);
                 cat.functions.insert(
-                    name.clone(),
+                    key,
                     FunctionDef {
                         name,
                         args_repr,
@@ -7867,7 +7975,8 @@ impl Catalog {
             }
             cat.schema_acl = read_acl(&mut cur)?;
             cat.database_acl = read_acl(&mut cur)?;
-            // v7.39 (read01 round 61) — FUNCTION owner + ACL (v67+).
+            // v7.39 (read01 round 61) — FUNCTION owner + ACL (v67+; keyed by
+            // signature from v68, when overloads became possible).
             if version >= 67 {
                 let fn_count = cur.read_u32()? as usize;
                 for _ in 0..fn_count {

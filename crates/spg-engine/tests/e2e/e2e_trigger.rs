@@ -50,7 +50,9 @@ fn create_function_and_trigger_persist_in_catalog() {
     // Snapshot + restore round-trips functions + triggers.
     let bytes = e.snapshot();
     let cat = spg_storage::Catalog::deserialize(&bytes).unwrap();
-    assert!(cat.functions().contains_key("noop"));
+    // v7.39 (read01 round 62) — the map is keyed by SIGNATURE now
+    // (`noop()`), so a function is looked up by name through the index.
+    assert_eq!(cat.functions_named("noop").len(), 1);
     assert!(cat.triggers().iter().any(|t| t.name == "tg"));
 }
 

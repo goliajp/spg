@@ -1014,6 +1014,48 @@ fn truncated_mvcc_appendix_errors_cleanly() {
 /// deserialize with headers AND rowids identical, and next_rowid correct
 /// (strictly above every loaded id).
 #[test]
+fn v68_overloads_are_separate_functions_with_separate_acls() {
+    // read01 round 62 — keyed by SIGNATURE. Keying by name alone made a second
+    // overload an "already exists" error, and made a call to one silently run
+    // the other.
+    use crate::{AclItem, FunctionDef, priv_bits};
+
+    let mk = |args: &str, body: &str, grantee: &str| FunctionDef {
+        name: "f".into(),
+        args_repr: args.into(),
+        returns: "TEXT".into(),
+        language: "sql".into(),
+        body: body.into(),
+        owner: Some("alice".into()),
+        acl: alloc::vec![AclItem {
+            grantee: grantee.into(),
+            privs: priv_bits::EXECUTE,
+            grantable: 0,
+            grantor: "alice".into(),
+        }],
+    };
+    let mut c = Catalog::new();
+    c.create_function(mk("(x INT)", "SELECT 'int'", "bob"), false)
+        .unwrap();
+    c.create_function(mk("(x TEXT)", "SELECT 'text'", "eve"), false)
+        .unwrap();
+    assert_eq!(c.functions_named("f").len(), 2, "two overloads coexist");
+
+    let restored = Catalog::deserialize(&c.serialize()).expect("v68 image loads");
+    assert_eq!(restored.functions_named("f").len(), 2);
+    // A type ALIAS names the same overload: `integer` is `int`.
+    let by_alias = restored
+        .function_by_key(&crate::function_signature_key("f", "(x integer)"))
+        .expect("integer folds to int");
+    assert_eq!(by_alias.body, "SELECT 'int'");
+    assert_eq!(by_alias.acl[0].grantee, "bob", "each overload keeps its OWN acl");
+    let text_one = restored
+        .function_by_key(&crate::function_signature_key("f", "(TEXT)"))
+        .expect("bare type, no arg name");
+    assert_eq!(text_one.acl[0].grantee, "eve");
+}
+
+#[test]
 fn v67_roundtrip_preserves_function_owner_and_acl() {
     // read01 round 61 — like the sequence block, the function block sits
     // mid-image, so a function's owner and ACL ride the catalog-wide tail.
@@ -1040,7 +1082,9 @@ fn v67_roundtrip_preserves_function_owner_and_acl() {
     .unwrap();
 
     let restored = Catalog::deserialize(&c.serialize()).expect("v67 image loads");
-    let f = restored.functions().get("f1").unwrap();
+    let f = restored
+        .function_by_key(&crate::function_signature_key("f1", "(x INT)"))
+        .unwrap();
     assert_eq!(f.owner.as_deref(), Some("alice"));
     assert_eq!(f.acl.len(), 1);
     assert_eq!(f.acl[0].grantee, "fred");

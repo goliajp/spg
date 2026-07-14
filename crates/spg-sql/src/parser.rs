@@ -909,7 +909,7 @@ impl Parser {
                 // dropped (an overload set shares one ACL — recorded residual).
                 if matches!(lc.as_str(), "function" | "procedure" | "routine") {
                     self.advance();
-                    let mut names: Vec<String> = Vec::new();
+                    let mut names: Vec<(String, Option<Vec<String>>)> = Vec::new();
                     loop {
                         let mut parts: Vec<String> = Vec::new();
                         loop {
@@ -920,24 +920,15 @@ impl Parser {
                                 break;
                             }
                         }
-                        names.push(parts.pop().expect("at least one part"));
-                        // The signature: `(int, text)` — parsed, dropped.
-                        if matches!(self.peek(), Token::LParen) {
-                            let mut depth = 0usize;
-                            loop {
-                                match self.advance() {
-                                    Token::LParen => depth += 1,
-                                    Token::RParen => {
-                                        depth -= 1;
-                                        if depth == 0 {
-                                            break;
-                                        }
-                                    }
-                                    Token::Eof => break,
-                                    _ => {}
-                                }
-                            }
-                        }
+                        let fname = parts.pop().expect("at least one part");
+                        // v7.39 (read01 round 62) — the signature picks the
+                        // overload, so it is captured.
+                        let sig = if matches!(self.peek(), Token::LParen) {
+                            Some(self.parse_function_signature_types()?)
+                        } else {
+                            None
+                        };
+                        names.push((fname, sig));
                         if matches!(self.peek(), Token::Comma) {
                             self.advance();
                         } else {
@@ -1024,6 +1015,53 @@ impl Parser {
                 grant_option,
             },
         ))
+    }
+
+    /// v7.39 (read01 round 62) — the argument TYPES in a function signature:
+    /// `(int, text)` or `(x int, y text)` (PG accepts either). Returns the type
+    /// words; the caller normalises them into a signature key.
+    fn parse_function_signature_types(&mut self) -> Result<Vec<String>, ParseError> {
+        self.advance(); // (
+        let mut types: Vec<String> = Vec::new();
+        if matches!(self.peek(), Token::RParen) {
+            self.advance();
+            return Ok(types);
+        }
+        loop {
+            // Collect the words of one argument up to a comma / close paren.
+            let mut words: Vec<String> = Vec::new();
+            loop {
+                match self.peek() {
+                    Token::Comma | Token::RParen | Token::Eof => break,
+                    _ => {}
+                }
+                let tok = self.advance();
+                match tok {
+                    Token::Ident(w) | Token::QuotedIdent(w) => words.push(w),
+                    other => {
+                        if let Some(w) = unreserved_keyword_text(&other) {
+                            words.push(w);
+                        }
+                    }
+                }
+            }
+            // `name TYPE` or a bare `TYPE`.
+            let ty = if words.len() >= 2 {
+                words[1..].join(" ")
+            } else {
+                words.first().cloned().unwrap_or_default()
+            };
+            types.push(ty);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if matches!(self.peek(), Token::RParen) {
+            self.advance();
+        }
+        Ok(types)
     }
 
     /// v7.39 (read01 round 59) — `( col, col, … )` after a privilege word.
@@ -1892,26 +1930,20 @@ impl Parser {
                         self.advance();
                         let if_exists = self.consume_if_exists();
                         let name = self.expect_ident_like()?;
-                        // Optional `()` — consume + discard.
-                        if matches!(self.peek(), Token::LParen) {
-                            self.advance();
-                            // Skip until matching RParen, accepting any tokens (typed args we don't model yet).
-                            let mut depth = 1usize;
-                            while depth > 0 {
-                                match self.peek() {
-                                    Token::LParen => depth += 1,
-                                    Token::RParen => depth -= 1,
-                                    Token::Eof => {
-                                        return Err(self.err(alloc::format!(
-                                            "unterminated arg list in DROP FUNCTION {name:?}"
-                                        )));
-                                    }
-                                    _ => {}
-                                }
-                                self.advance();
-                            }
-                        }
-                        Ok(Statement::DropFunction { name, if_exists })
+                        // v7.39 (read01 round 62) — the argument list identifies
+                        // WHICH overload to drop, so it is captured, not
+                        // discarded. `DROP FUNCTION f` (no list) is legal when
+                        // the name is unambiguous; the engine enforces that.
+                        let args = if matches!(self.peek(), Token::LParen) {
+                            Some(self.parse_function_signature_types()?)
+                        } else {
+                            None
+                        };
+                        Ok(Statement::DropFunction {
+                            name,
+                            args,
+                            if_exists,
+                        })
                     }
                     // v7.14.0 — DROP TABLE [IF EXISTS] name [, name…]
                     // [CASCADE|RESTRICT]. pg_dump and mysqldump both
