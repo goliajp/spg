@@ -2207,27 +2207,18 @@ impl Engine {
         // projections from the same input row. Multi-SRF + LCM
         // padding stays a documented carve-out; mailrs uses
         // single-SRF for redirect_uris.
-        let srf_position = projection.iter().position(|p| is_top_level_unnest(&p.expr));
-        if let Some(srf_idx) = srf_position {
+        // v7.39 (read01 round 67) — EVERY set-returning item expands, in lockstep
+        // (see `expand_srf_row`); a user `RETURNS SETOF` function counts too.
+        let srf_idxs = self.srf_target_idxs(&projection);
+        if !srf_idxs.is_empty() {
             for row in &filtered {
-                let elements = top_level_srf_output(&projection[srf_idx].expr, row, &scan_ctx)?;
-                // Empty array → zero rows for this input row (PG
-                // semantics: `SELECT unnest('{}'::int[])` returns
-                // 0 rows, not a single NULL row).
-                for elem in elements {
-                    let mut vals = alloc::vec::Vec::with_capacity(projection.len());
-                    for (i, p) in projection.iter().enumerate() {
-                        if i == srf_idx {
-                            vals.push(elem.clone());
-                        } else {
-                            vals.push(
-                                eval::eval_expr(&p.expr, row, &scan_ctx)
-                                    .map_err(EngineError::Eval)?,
-                            );
-                        }
-                    }
-                    projected_rows.push(Row::new(vals));
-                }
+                projected_rows.extend(expand_srf_row(
+                    self,
+                    &projection,
+                    &srf_idxs,
+                    row,
+                    &scan_ctx,
+                )?);
             }
         } else {
             // v7.24 (round-16 B) — select-list subqueries resolve
@@ -2919,15 +2910,39 @@ impl Engine {
         // `x`: for a scalar SETOF, the table alias IS the column name (PG).
         alias: Option<&str>,
     ) -> Result<(alloc::vec::Vec<Row<'static>>, alloc::vec::Vec<ColumnSchema>), EngineError> {
+        // The call's arguments belong to the ENCLOSING query, so they are
+        // evaluated here and the body sees values.
+        let empty: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+        let arg_ctx = self.ev_ctx(&empty, None);
+        let dummy = Row::new(alloc::vec::Vec::new());
+        let mut vals: alloc::vec::Vec<Value<'static>> = alloc::vec::Vec::new();
+        for a in args {
+            vals.push(eval::eval_expr(a, &dummy, &arg_ctx).map_err(EngineError::Eval)?);
+        }
+        self.setof_rows_of(name, &vals, alias)
+    }
+
+    /// v7.39 (read01 round 67) — the set-returning core, on already-evaluated
+    /// arguments. Shared by the FROM position and the target-list expansion, so
+    /// a function cannot behave differently depending on where it is called.
+    pub(crate) fn setof_rows_of(
+        &self,
+        name: &str,
+        arg_values: &[Value<'static>],
+        alias: Option<&str>,
+    ) -> Result<(alloc::vec::Vec<Row<'static>>, alloc::vec::Vec<ColumnSchema>), EngineError> {
+
         let cat = self.active_catalog();
         let overloads = cat.functions_named(name);
         let def = overloads
             .iter()
-            .find(|f| spg_storage::function_arg_types(&f.args_repr).len() == args.len())
+            .find(|f| {
+                spg_storage::function_arg_types(&f.args_repr).len() == arg_values.len()
+            })
             .ok_or_else(|| {
                 EngineError::Unsupported(alloc::format!(
                     "function {name} does not exist with {} argument(s)",
-                    args.len()
+                    arg_values.len()
                 ))
             })?;
         let declared = def.returns.trim().to_string();
@@ -2938,28 +2953,12 @@ impl Engine {
             )));
         }
 
-        // Evaluate the call's arguments (they are literals / expressions of the
-        // enclosing query, not of the function's body).
-        let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
-        let arg_ctx = self.ev_ctx(&empty_schema, None);
-        let dummy = Row::new(alloc::vec::Vec::new());
-        let mut arg_values: alloc::vec::Vec<Value<'static>> = alloc::vec::Vec::new();
-        for a in args {
-            arg_values.push(eval::eval_expr(a, &dummy, &arg_ctx).map_err(EngineError::Eval)?);
-        }
         let arg_names_pl = spg_storage::function_arg_names(&def.args_repr);
         // v7.39 (read01 round 66) — a plpgsql SETOF body builds its rows with
         // RETURN NEXT / RETURN QUERY; the interpreter collects them.
         if def.language.eq_ignore_ascii_case("plpgsql") {
-            let empty_schema2: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
-            let arg_ctx2 = self.ev_ctx(&empty_schema2, None);
-            let dummy2 = Row::new(alloc::vec::Vec::new());
-            let mut vals: alloc::vec::Vec<Value<'static>> = alloc::vec::Vec::new();
-            for a in args {
-                vals.push(eval::eval_expr(a, &dummy2, &arg_ctx2).map_err(EngineError::Eval)?);
-            }
             let out_rows = self
-                .call_plpgsql_setof_fn(def, &arg_names_pl, &vals)
+                .call_plpgsql_setof_fn(def, &arg_names_pl, arg_values)
                 .map_err(EngineError::Eval)?;
             let cols = setof_column_shape(&declared, name, alias, out_rows.first());
             let rows = out_rows.into_iter().map(Row::new).collect();
@@ -2979,7 +2978,7 @@ impl Engine {
             self.active_catalog(),
             &body_select,
             &arg_names,
-            &arg_values,
+            arg_values,
         )
         .map_err(EngineError::Eval)?;
         let out = self.exec_select_cancel(&bound, crate::CancelToken::none())?;
@@ -3383,20 +3382,10 @@ impl Engine {
         // desugar to unnest) expands here: one output row per SRF row, sibling
         // scalar columns repeated. unnest / array_elements / path_query reach a
         // real FROM via the parser rewrite and never land here.
-        if let Some(srf_idx) = projection.iter().position(|p| is_top_level_unnest(&p.expr)) {
-            let srf_rows = top_level_srf_output(&projection[srf_idx].expr, &dummy_row, &ctx)?;
-            let mut out_rows: Vec<Row<'static>> = Vec::with_capacity(srf_rows.len());
-            for srf_val in srf_rows {
-                let mut values = Vec::with_capacity(projection.len());
-                for (i, p) in projection.iter().enumerate() {
-                    if i == srf_idx {
-                        values.push(srf_val.clone());
-                    } else {
-                        values.push(eval::eval_expr(&p.expr, &dummy_row, &ctx)?);
-                    }
-                }
-                out_rows.push(Row::new(values));
-            }
+        // v7.39 (read01 round 67) — every SRF in the list, in lockstep.
+        let srf_idxs = self.srf_target_idxs(&projection);
+        if !srf_idxs.is_empty() {
+            let out_rows = expand_srf_row(self, &projection, &srf_idxs, &dummy_row, &ctx)?;
             let columns: Vec<ColumnSchema> = projection
                 .into_iter()
                 .map(|p| {
@@ -4047,7 +4036,9 @@ impl Engine {
         // element (broadcasting non-SRF projections from the
         // same input row). Empty / NULL arrays emit zero rows
         // for that input — PG semantics.
-        let srf_position = projection.iter().position(|p| is_top_level_unnest(&p.expr));
+        // v7.39 (read01 round 67) — every SRF in the target list, in lockstep.
+        let srf_idxs = self.srf_target_idxs(&projection);
+        let srf_position = srf_idxs.first().copied();
 
         // Materialise the filter pass into `(order_key, projected_row)`
         // tuples. The order key is `None` when there's no ORDER BY clause.
@@ -4163,23 +4154,13 @@ impl Engine {
             } else {
                 build_order_keys(&stmt.order_by, row, &ctx)?
             };
-            if let Some(srf_idx) = srf_position {
+            if srf_position.is_some() {
                 let order_keys = if stmt.distinct && !stmt.order_by.is_empty() {
                     build_order_keys(&stmt.order_by, row, &ctx)?
                 } else {
                     order_keys
                 };
-                let elements = top_level_srf_output(&projection[srf_idx].expr, row, &ctx)?;
-                for elem in elements {
-                    let mut values: Vec<Value<'static>> = Vec::with_capacity(projection.len());
-                    for (i, p) in projection.iter().enumerate() {
-                        if i == srf_idx {
-                            values.push(elem.clone());
-                        } else {
-                            values.push(eval::eval_expr(&p.expr, row, &ctx)?);
-                        }
-                    }
-                    let out = Row::new(values);
+                for out in expand_srf_row(self, &projection, &srf_idxs, row, &ctx)? {
                     if stmt.distinct {
                         let bucket = seen_distinct
                             .entry(norm_hash_row(&out, &distinct_hb))
@@ -6475,6 +6456,10 @@ fn is_top_level_unnest(expr: &spg_sql::ast::Expr) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SrfKind {
     Unnest,
+    /// v7.39 (read01 round 67) — `generate_series(a, b[, step])` in the target
+    /// list. It used to be handled ONLY by the parser's lift into FROM, so a
+    /// second one in the same list came back as "unknown function".
+    GenerateSeries,
     GenerateSubscripts,
     /// `_text` variants unwrap scalars to their lexeme; the plain forms render
     /// every value as compact JSON text.
@@ -6504,6 +6489,9 @@ fn top_level_srf_kind(expr: &spg_sql::ast::Expr) -> Option<SrfKind> {
     // expansion machinery.
     if n == 1 && name.eq_ignore_ascii_case("unnest") {
         return Some(SrfKind::Unnest);
+    }
+    if (2..=3).contains(&n) && name.eq_ignore_ascii_case("generate_series") {
+        return Some(SrfKind::GenerateSeries);
     }
     if n == 2 && name.eq_ignore_ascii_case("generate_subscripts") {
         return Some(SrfKind::GenerateSubscripts);
@@ -6561,6 +6549,39 @@ fn top_level_srf_output(
         SrfKind::Unnest => {
             let arr = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
             array_value_to_elements(&arr)
+        }
+        SrfKind::GenerateSeries => {
+            let start = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
+            let stop = eval::eval_expr(&args[1], row, ctx).map_err(EngineError::Eval)?;
+            let step = match args.get(2) {
+                Some(e) => eval::eval_expr(e, row, ctx).map_err(EngineError::Eval)?,
+                None => Value::BigInt(1),
+            };
+            let as_i64 = |v: &Value| -> Option<i64> {
+                match v {
+                    Value::SmallInt(n) => Some(i64::from(*n)),
+                    Value::Int(n) => Some(i64::from(*n)),
+                    Value::BigInt(n) => Some(*n),
+                    _ => None,
+                }
+            };
+            let (Some(a), Some(b), Some(st)) = (as_i64(&start), as_i64(&stop), as_i64(&step))
+            else {
+                // A NULL bound yields the empty set (PG).
+                return Ok(Vec::new());
+            };
+            if st == 0 {
+                return Err(EngineError::Unsupported(
+                    "step size cannot equal zero".into(),
+                ));
+            }
+            let mut out = Vec::new();
+            let mut i = a;
+            while (st > 0 && i <= b) || (st < 0 && i >= b) {
+                out.push(Value::BigInt(i));
+                i += st;
+            }
+            Ok(out)
         }
         SrfKind::GenerateSubscripts => {
             let arr = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
@@ -7463,4 +7484,108 @@ fn setof_column_shape(
         })
         .unwrap_or_default();
     setof_column_shape_from(declared, name, alias, &got)
+}
+
+/// v7.39 (read01 round 67) — expand every set-returning call in a target list
+/// for ONE input row, PG's ProjectSet semantics.
+///
+/// Several SRFs in one list run in **LOCKSTEP**, not as a cross product: the
+/// output has as many rows as the LONGEST of them, and a shorter one is padded
+/// with NULLs. (`SELECT generate_series(1,3), generate_series(10,11)` →
+/// `1/10, 2/11, 3/NULL`.) A single SRF is the degenerate case of that, and an
+/// SRF that yields no rows at all contributes none — `SELECT unnest('{}'::int[])`
+/// is zero rows, not one NULL row.
+///
+/// Non-SRF items repeat, evaluated once per output row from the same input row.
+fn expand_srf_row(
+    engine: &Engine,
+    projection: &[ProjectedItem],
+    srf_idxs: &[usize],
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Vec<Row<'static>>, EngineError> {
+    let mut lists: Vec<Vec<Value<'static>>> = Vec::with_capacity(srf_idxs.len());
+    for &i in srf_idxs {
+        lists.push(engine.srf_values(&projection[i].expr, row, ctx)?);
+    }
+    let n = lists.iter().map(Vec::len).max().unwrap_or(0);
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let mut vals = Vec::with_capacity(projection.len());
+        for (i, p) in projection.iter().enumerate() {
+            match srf_idxs.iter().position(|&s| s == i) {
+                // Past the end of THIS srf's rows → NULL (PG pads).
+                Some(slot) => vals.push(lists[slot].get(k).cloned().unwrap_or(Value::Null)),
+                None => {
+                    vals.push(eval::eval_expr(&p.expr, row, ctx).map_err(EngineError::Eval)?);
+                }
+            }
+        }
+        out.push(Row::new(vals));
+    }
+    Ok(out)
+}
+
+impl Engine {
+    /// The rows one target-list SRF yields for an input row. `None` from
+    /// `srf_target_idxs` means the expression is not set-returning at all.
+    fn srf_values(
+        &self,
+        expr: &spg_sql::ast::Expr,
+        row: &Row<'static>,
+        ctx: &EvalContext<'_>,
+    ) -> Result<Vec<Value<'static>>, EngineError> {
+        if top_level_srf_kind(expr).is_some() {
+            return top_level_srf_output(expr, row, ctx);
+        }
+        // A user set-returning function. Its body runs through the real
+        // executor, like every function body since round 63.
+        let spg_sql::ast::Expr::FunctionCall { name, args } = expr else {
+            return Err(EngineError::Unsupported(
+                "expected a SELECT-list SRF call".into(),
+            ));
+        };
+        let mut vals: alloc::vec::Vec<Value<'static>> = alloc::vec::Vec::new();
+        for a in args {
+            vals.push(eval::eval_expr(a, row, ctx).map_err(EngineError::Eval)?);
+        }
+        let (rows, _cols) = self.setof_rows_of(name, &vals, None)?;
+        // In a target list a SETOF function contributes ONE value per row; a
+        // multi-column RETURNS TABLE would be a record there, which SPG does not
+        // build yet — say so rather than silently taking the first column.
+        for r in &rows {
+            if r.values.len() != 1 {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "function {name}() returns several columns — call it in FROM, \
+                     not in the SELECT list"
+                )));
+            }
+        }
+        Ok(rows.into_iter().filter_map(|r| r.values.into_iter().next()).collect())
+    }
+
+    /// Which projection items are set-returning: the builtin kinds, plus any
+    /// user function declared `RETURNS SETOF` / `RETURNS TABLE`.
+    fn srf_target_idxs(&self, projection: &[ProjectedItem]) -> alloc::vec::Vec<usize> {
+        projection
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                if is_top_level_unnest(&p.expr) {
+                    return true;
+                }
+                let spg_sql::ast::Expr::FunctionCall { name, .. } = &p.expr else {
+                    return false;
+                };
+                self.active_catalog()
+                    .functions_named(name)
+                    .iter()
+                    .any(|f| {
+                        let r = f.returns.trim().to_ascii_uppercase();
+                        r.starts_with("SETOF") || r.starts_with("TABLE(")
+                    })
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
 }
