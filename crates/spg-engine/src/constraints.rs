@@ -848,12 +848,18 @@ pub(crate) fn check_existing_unique_violation(
                 collated_key_cell(&v, p, schema)
             })
             .collect();
-        if key.iter().any(|v| matches!(v, spg_storage::Value::Null)) {
+        // v7.39 (read01 round 52) — NULLS NOT DISTINCT keeps NULL keys in the
+        // check, so CREATE UNIQUE INDEX … NULLS NOT DISTINCT over two all-NULL
+        // rows is rejected (PG: "could not create unique index").
+        if !idx.nulls_not_distinct
+            && key.iter().any(|v| matches!(v, spg_storage::Value::Null))
+        {
             continue;
         }
         if seen.iter().any(|other| *other == key) {
+            // v7.39 (read01 round 52) — PG wording (23505 at the wire).
             return Err(EngineError::Unsupported(alloc::format!(
-                "CREATE UNIQUE INDEX {:?}: existing rows already violate the constraint",
+                "could not create unique index {:?}",
                 idx.name
             )));
         }
@@ -975,7 +981,11 @@ pub(crate) fn enforce_unique_index_inserts(
                 continue;
             }
             let key = key_of(&prow.values)?;
-            if key.iter().any(|v| matches!(v, spg_storage::Value::Null)) {
+            // v7.39 (read01 round 52) — NULLS NOT DISTINCT keeps NULL keys in
+            // the uniqueness check (PG 15+); the default exempts them.
+            if !idx.nulls_not_distinct
+                && key.iter().any(|v| matches!(v, spg_storage::Value::Null))
+            {
                 continue;
             }
             seen.insert(aggregate::encode_key(&key));
@@ -985,7 +995,9 @@ pub(crate) fn enforce_unique_index_inserts(
                 continue;
             }
             let key = key_of(row_values)?;
-            if key.iter().any(|v| matches!(v, spg_storage::Value::Null)) {
+            if !idx.nulls_not_distinct
+                && key.iter().any(|v| matches!(v, spg_storage::Value::Null))
+            {
                 continue;
             }
             if !seen.insert(aggregate::encode_key(&key)) {

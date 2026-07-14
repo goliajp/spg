@@ -735,6 +735,14 @@ fn deserialize_indices(
                         last.extra_column_positions = extras;
                     }
                 }
+                // v7.39 (read01 round 52) — nulls_not_distinct (FILE_VERSION
+                // 62+). v61-and-below leave the flag false (NULLS DISTINCT).
+                if version >= 62 {
+                    let nnd = cur.read_u8()? != 0;
+                    if let Some(last) = t.indices.last_mut() {
+                        last.nulls_not_distinct = nnd;
+                    }
+                }
             }
         }
     }

@@ -173,11 +173,16 @@ fn create_unique_index_rejects_pre_existing_dup() {
     ok(&mut eng, "CREATE TABLE t (a INT NOT NULL)");
     ok(&mut eng, "INSERT INTO t VALUES (1)");
     ok(&mut eng, "INSERT INTO t VALUES (1)");
+    // v7.39 (read01 round 52) — PG's wording (23505 at the wire). The helper
+    // matches against the Debug form, which backslash-escapes the quotes
+    // around the index name, so assert on the unquoted core.
     err_contains(
         &mut eng,
         "CREATE UNIQUE INDEX uq_a ON t (a)",
-        "existing rows already violate",
+        "could not create unique index",
     );
+    // …and the failed index must not be left behind (PG's CREATE is atomic).
+    ok(&mut eng, "CREATE INDEX uq_a ON t (a)");
 }
 
 #[test]

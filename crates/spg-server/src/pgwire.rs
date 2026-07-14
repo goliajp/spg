@@ -3612,6 +3612,8 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             "0A000"
         } else if msg.contains("duplicate key value violates unique constraint")
             || (msg.contains("violation") && (msg.contains("UNIQUE") || msg.contains("PRIMARY KEY")))
+            // v7.39 (read01 round 52) — CREATE UNIQUE INDEX over duplicate rows.
+            || msg.contains("could not create unique index")
         {
             "23505"
         } else if msg.contains("violates foreign key constraint")

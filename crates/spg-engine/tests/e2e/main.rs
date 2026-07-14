@@ -166,6 +166,7 @@ mod e2e_ddl_errors_round45;
 mod e2e_ddl_errors_round47;
 mod e2e_alter_subcommands_round49;
 mod e2e_comment_on_round50;
+mod e2e_index_round52;
 mod e2e_session_identity_round51;
 mod e2e_named_constraints_round48;
 mod e2e_fts_default_config_round44;

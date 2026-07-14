@@ -1998,6 +1998,12 @@ pub struct Index {
     /// index (the legacy shape). Persisted alongside
     /// `partial_predicate` on the v12 catalog snapshot.
     pub expression: Option<String>,
+    /// v7.39 (read01 round 52) — `CREATE UNIQUE INDEX … NULLS NOT DISTINCT`
+    /// (PG 15+): a NULL in the key no longer exempts the row, so two
+    /// all-NULL keys collide. Default `false` = SQL-standard NULLS DISTINCT.
+    /// Persisted in the index appendix (FILE_VERSION 62+); older catalogs
+    /// deserialise with `false`.
+    pub nulls_not_distinct: bool,
     /// v7.9.29 — `CREATE UNIQUE INDEX …`. When true the engine
     /// rejects INSERTs whose key already appears in this index
     /// (combined with `partial_predicate` when present — only
@@ -2346,6 +2352,7 @@ impl Index {
             partial_predicate: None,
             expression: None,
             is_unique: false,
+            nulls_not_distinct: false,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2359,6 +2366,7 @@ impl Index {
             partial_predicate: None,
             expression: None,
             is_unique: false,
+            nulls_not_distinct: false,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2375,6 +2383,7 @@ impl Index {
             partial_predicate: None,
             expression: None,
             is_unique: false,
+            nulls_not_distinct: false,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2392,6 +2401,7 @@ impl Index {
             partial_predicate: None,
             expression: None,
             is_unique: false,
+            nulls_not_distinct: false,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2409,6 +2419,7 @@ impl Index {
             partial_predicate: None,
             expression: None,
             is_unique: false,
+            nulls_not_distinct: false,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2427,6 +2438,7 @@ impl Index {
             partial_predicate: None,
             expression: None,
             is_unique: false,
+            nulls_not_distinct: false,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2446,6 +2458,7 @@ impl Index {
             partial_predicate: None,
             expression: None,
             is_unique: false,
+            nulls_not_distinct: false,
             extra_column_positions: Vec::new(),
         }
     }
@@ -6416,7 +6429,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 61;
+const FILE_VERSION: u8 = 62;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -6683,6 +6696,11 @@ impl Catalog {
                 for cp in &idx.extra_column_positions {
                     write_u16(&mut out, u16::try_from(*cp).expect("≤ 65k columns/table"));
                 }
+                // v7.39 (read01 round 52) — nulls_not_distinct (FILE_VERSION
+                // 62+). Appended at the end of the per-index block so the v16
+                // layout above is untouched; v61-and-below readers stop before
+                // this byte and default the flag to false (NULLS DISTINCT).
+                out.push(u8::from(idx.nulls_not_distinct));
             }
             // v6.7.2 — per-table hot_tier_bytes Option<u64>.
             // Layout: [u8 has_value][u64 LE value (if has_value)].
