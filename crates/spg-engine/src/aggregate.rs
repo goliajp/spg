@@ -729,11 +729,12 @@ pub(crate) fn run(
         table_alias,
         correlated_eval,
         runner,
+        catalog,
     )?;
 
     // (2) Build the synthetic per-group schema and finalise each group's row.
     let synth_schema =
-        build_synth_schema(rows, &group_exprs, &agg_specs, schema_cols, table_alias)?;
+        build_synth_schema(rows, &group_exprs, &agg_specs, schema_cols, table_alias, catalog)?;
     let synth_rows = finalize_synth_rows(
         &order,
         &agg_specs,
@@ -741,6 +742,7 @@ pub(crate) fn run(
         rows,
         schema_cols,
         table_alias,
+        catalog,
     )?;
 
     // v7.37.x (mailrs Track A 100k attack) — defer the bound
@@ -1233,6 +1235,19 @@ fn fused_acc_cell(a: &mut FusedAcc, v: &Value<'_>) -> Result<(), EvalError> {
     Ok(())
 }
 
+/// v7.39 (read01 round 61) — thread the catalog into a stage's context when the
+/// caller has one. `EvalContext::with_catalog` takes a reference, so this keeps
+/// the Option handling in one place rather than at four call sites.
+fn with_catalog<'a>(
+    ctx: EvalContext<'a>,
+    catalog: Option<&'a spg_storage::Catalog>,
+) -> EvalContext<'a> {
+    match catalog {
+        Some(c) => ctx.with_catalog(c),
+        None => ctx,
+    }
+}
+
 fn accumulate_groups(
     rows: &[RowRef<'_>],
     group_exprs: &[Expr],
@@ -1241,8 +1256,14 @@ fn accumulate_groups(
     table_alias: Option<&str>,
     correlated_eval: Option<CorrelatedEval<'_>>,
     runner: Option<&dyn crate::ParallelRunner>,
+    // v7.39 (read01 round 61) — the catalog. `run` has carried it since the
+    // enum-order knife, but the four stages below each built a BARE context and
+    // dropped it — so a catalog-dependent expression inside an aggregate's
+    // argument (`string_agg(f1(id), ',')`, a user function) answered "unknown
+    // function". Same family as rounds 49/53/54/55/56.
+    catalog: Option<&spg_storage::Catalog>,
 ) -> Result<Vec<(Vec<Value<'static>>, Vec<AggState>)>, EvalError> {
-    let ctx = EvalContext::new(schema_cols, table_alias);
+    let ctx = with_catalog(EvalContext::new(schema_cols, table_alias), catalog);
     // Map group key (vec of values, encoded as canonical string) -> group state.
     // v7.32 (architecture v2, P2b) — insertion-ordered group state in
     // a Vec; the hash map only maps key → index. Removes the parallel
@@ -2895,8 +2916,9 @@ fn build_synth_schema(
     agg_specs: &[AggSpec],
     schema_cols: &[ColumnSchema],
     table_alias: Option<&str>,
+    catalog: Option<&spg_storage::Catalog>,
 ) -> Result<Vec<ColumnSchema>, EvalError> {
-    let ctx = EvalContext::new(schema_cols, table_alias);
+    let ctx = with_catalog(EvalContext::new(schema_cols, table_alias), catalog);
     // Build synthetic schema: __grp_0..K then __agg_0..N.
     let group_types: Vec<DataType> = if rows.is_empty() {
         // Use Text as a safe stand-in — empty result means schema isn't
@@ -2979,8 +3001,9 @@ fn finalize_synth_rows(
     rows: &[RowRef<'_>],
     schema_cols: &[ColumnSchema],
     table_alias: Option<&str>,
+    catalog: Option<&spg_storage::Catalog>,
 ) -> Result<Vec<Row<'static>>, EvalError> {
-    let ctx = EvalContext::new(schema_cols, table_alias);
+    let ctx = with_catalog(EvalContext::new(schema_cols, table_alias), catalog);
     // v7.32 (round-29) — ordered-set direct arguments (the percentile
     // fraction) are constant per PG, so evaluate each once up front.
     let direct_arg_vals: Vec<Option<Value>> = agg_specs

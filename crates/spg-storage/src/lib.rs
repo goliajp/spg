@@ -1645,6 +1645,7 @@ pub mod priv_bits {
     pub const CREATE: u16 = 1 << 9; // C
     pub const CONNECT: u16 = 1 << 10; // c
     pub const TEMPORARY: u16 = 1 << 11; // T
+    pub const EXECUTE: u16 = 1 << 12; // X
     /// Every TABLE privilege — what `GRANT ALL ON <table>` grants and what a
     /// table's owner holds.
     pub const ALL: u16 = INSERT | SELECT | UPDATE | DELETE | TRUNCATE | REFERENCES | TRIGGER | MAINTAIN;
@@ -1654,6 +1655,8 @@ pub mod priv_bits {
     pub const ALL_SCHEMA: u16 = USAGE | CREATE;
     /// `GRANT ALL ON DATABASE` — `CTc`.
     pub const ALL_DATABASE: u16 = CREATE | CONNECT | TEMPORARY;
+    /// `GRANT ALL ON FUNCTION` — just `X`.
+    pub const ALL_FUNCTION: u16 = EXECUTE;
 }
 
 /// v7.37.6-B — partition 三态(parent / range child / default child)。
@@ -3513,6 +3516,13 @@ pub struct FunctionDef {
     /// statement(s). The engine re-parses on invocation; bad
     /// bodies surface as a parse error at CALL time, not CREATE.
     pub body: String,
+    /// v7.39 (read01 round 61) — the role that ran CREATE FUNCTION.
+    pub owner: Option<String>,
+    /// v7.39 (read01 round 61) — explicit GRANTs (PG `pg_proc.proacl`). EMPTY
+    /// is NOT "nobody may call it": PG grants EXECUTE to PUBLIC by default, and
+    /// leaves proacl NULL to say so. The list materialises on the first
+    /// GRANT / REVOKE.
+    pub acl: Vec<AclItem>,
 }
 
 /// v7.12.4 — catalogued trigger. References its function by
@@ -3915,6 +3925,11 @@ impl Catalog {
     /// v7.39 (read01 round 60) — mutable sequence access, for GRANT.
     pub fn sequence_mut(&mut self, name: &str) -> Option<&mut SequenceDef> {
         self.sequences.get_mut(name)
+    }
+
+    /// v7.39 (read01 round 61) — mutable function access, for GRANT.
+    pub fn function_mut(&mut self, name: &str) -> Option<&mut FunctionDef> {
+        self.functions.get_mut(name)
     }
 
     pub const fn sequences(&self) -> &BTreeMap<String, SequenceDef> {
@@ -6549,7 +6564,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 66;
+const FILE_VERSION: u8 = 67;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7511,6 +7526,26 @@ impl Catalog {
         }
         acl_out(&mut out, &self.schema_acl);
         acl_out(&mut out, &self.database_acl);
+        // v7.39 (read01 round 61) — FUNCTION owner + ACL (FILE_VERSION 67+).
+        // The function block sits mid-image like the sequence one, so this
+        // rides the catalog-wide tail too, keyed by name.
+        let fns: Vec<&FunctionDef> = self
+            .functions
+            .values()
+            .filter(|f| f.owner.is_some() || !f.acl.is_empty())
+            .collect();
+        write_u32(&mut out, u32::try_from(fns.len()).expect("≤ 4G functions"));
+        for f in fns {
+            write_str(&mut out, &f.name);
+            match &f.owner {
+                Some(o) => {
+                    out.push(1);
+                    write_str(&mut out, o);
+                }
+                None => out.push(0),
+            }
+            acl_out(&mut out, &f.acl);
+        }
         // v7.38 (read01 P5.05) — CRC32C trailer over the whole image so a
         // corrupted snapshot is rejected on load. FILE_VERSION is >= the
         // trailer version, so this always runs for freshly-written images.
@@ -7572,6 +7607,8 @@ impl Catalog {
                         returns,
                         language,
                         body,
+                        owner: None,
+                        acl: Vec::new(),
                     },
                 );
             }
@@ -7830,6 +7867,23 @@ impl Catalog {
             }
             cat.schema_acl = read_acl(&mut cur)?;
             cat.database_acl = read_acl(&mut cur)?;
+            // v7.39 (read01 round 61) — FUNCTION owner + ACL (v67+).
+            if version >= 67 {
+                let fn_count = cur.read_u32()? as usize;
+                for _ in 0..fn_count {
+                    let name = cur.read_str()?;
+                    let owner = if cur.read_u8()? == 1 {
+                        Some(cur.read_str()?)
+                    } else {
+                        None
+                    };
+                    let acl = read_acl(&mut cur)?;
+                    if let Some(f) = cat.functions.get_mut(&name) {
+                        f.owner = owner;
+                        f.acl = acl;
+                    }
+                }
+            }
         }
         // v7.38 (read01 P5.05) — v54+ images end with a CRC32C over every
         // preceding byte; verify it before accepting the snapshot. Older

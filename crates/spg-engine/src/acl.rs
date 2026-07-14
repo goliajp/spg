@@ -32,7 +32,7 @@ use crate::session::LOGIN_ROLE;
 use crate::{Engine, EngineError};
 
 /// The privilege letters PG renders an aclitem with, in its order (`arwdDxtm`).
-const PRIV_LETTERS: [(u16, char); 12] = [
+const PRIV_LETTERS: [(u16, char); 13] = [
     (priv_bits::INSERT, 'a'),
     (priv_bits::SELECT, 'r'),
     (priv_bits::UPDATE, 'w'),
@@ -48,6 +48,7 @@ const PRIV_LETTERS: [(u16, char); 12] = [
     (priv_bits::CREATE, 'C'),
     (priv_bits::CONNECT, 'c'),
     (priv_bits::TEMPORARY, 'T'),
+    (priv_bits::EXECUTE, 'X'),
 ];
 
 /// The privilege word → bit. `None` for a word PG would reject.
@@ -71,6 +72,7 @@ pub(crate) fn priv_from_word(w: &str) -> Option<u16> {
         "CREATE" => priv_bits::CREATE,
         "CONNECT" => priv_bits::CONNECT,
         "TEMPORARY" | "TEMP" => priv_bits::TEMPORARY,
+        "EXECUTE" => priv_bits::EXECUTE,
         _ => return None,
     })
 }
@@ -91,6 +93,7 @@ pub(crate) fn priv_word(bit: u16) -> &'static str {
         priv_bits::CREATE => "CREATE",
         priv_bits::CONNECT => "CONNECT",
         priv_bits::TEMPORARY => "TEMPORARY",
+        priv_bits::EXECUTE => "EXECUTE",
         _ => "",
     }
 }
@@ -278,6 +281,79 @@ impl Engine {
                 "must be owner of table {table}"
             )))
         }
+    }
+
+    /// v7.39 (read01 round 61) — `GRANT … ON FUNCTION`, and the
+    /// `ON ALL TABLES IN SCHEMA` expansion.
+    fn exec_grant_functions_or_all_tables(
+        &mut self,
+        g: &GrantStatement,
+        grant: bool,
+    ) -> Result<crate::QueryResult, EngineError> {
+        for r in &g.grantees {
+            self.acl_check_role_exists(r)?;
+        }
+        match &g.object {
+            GrantObject::Functions(names) => {
+                let mut mask = 0u16;
+                if g.privileges.is_empty() {
+                    mask = priv_bits::ALL_FUNCTION;
+                } else {
+                    for p in &g.privileges {
+                        mask |= if p.word.eq_ignore_ascii_case("ALL") {
+                            priv_bits::ALL_FUNCTION
+                        } else {
+                            priv_from_word(&p.word).ok_or_else(|| {
+                                EngineError::Unsupported(alloc::format!(
+                                    "unrecognized privilege type \"{}\"",
+                                    p.word.to_ascii_lowercase()
+                                ))
+                            })?
+                        };
+                    }
+                }
+                for n in names {
+                    if self.active_catalog().functions().get(n).is_none() {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "function {n} does not exist"
+                        )));
+                    }
+                }
+                for n in names {
+                    self.acl_apply_function(n, mask, &g.grantees, grant, g.grant_option)?;
+                }
+            }
+            _ => {
+                // ALL TABLES IN SCHEMA: PG expands it at GRANT time into each
+                // table's own relacl. Reporting success and doing nothing (what
+                // SPG did) tells a DBA the grant landed when it did not.
+                let mut mask = 0u16;
+                if g.privileges.is_empty() {
+                    mask = priv_bits::ALL;
+                } else {
+                    for p in &g.privileges {
+                        mask |= if p.word.eq_ignore_ascii_case("ALL") {
+                            priv_bits::ALL
+                        } else {
+                            priv_from_word(&p.word).ok_or_else(|| {
+                                EngineError::Unsupported(alloc::format!(
+                                    "unrecognized privilege type \"{}\"",
+                                    p.word.to_ascii_lowercase()
+                                ))
+                            })?
+                        };
+                    }
+                }
+                let tables = self.active_catalog().table_names();
+                for t in tables {
+                    self.acl_apply(&t, mask, &g.grantees, grant, g.grant_option)?;
+                }
+            }
+        }
+        Ok(crate::QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: true,
+        })
     }
 
     /// v7.39 (read01 round 60) — `GRANT … ON SEQUENCE / SCHEMA / DATABASE`.
@@ -787,6 +863,11 @@ impl Engine {
             &g.object
         {
             return self.exec_grant_non_table(g, grant);
+        }
+        // v7.39 (read01 round 61) — functions, and the `ALL TABLES IN SCHEMA`
+        // expansion (which used to report success and do nothing).
+        if let GrantObject::Functions(_) | GrantObject::AllTablesInSchema = &g.object {
+            return self.exec_grant_functions_or_all_tables(g, grant);
         }
         let GrantObject::Tables(tables) = &g.object else {
             return Ok(crate::QueryResult::CommandOk {
@@ -1388,6 +1469,114 @@ impl Engine {
                 s.acl[i].grantable &= !mask;
                 if s.acl[i].privs == 0 {
                     s.acl.remove(i);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// v7.39 (read01 round 61) — FUNCTION privileges. Round 60's lesson again, in a
+// third shape: PG's default is not "empty". EXECUTE is granted to PUBLIC out of
+// the box, and `proacl` stays NULL to say so — so a function is callable by
+// everyone until someone REVOKEs it FROM PUBLIC.
+// ===========================================================================
+
+/// v7.39 (read01 round 61) — how many arguments a stored function declares,
+/// out of its `args_repr` (`"(x INT, y TEXT)"`).
+pub(crate) fn function_arg_count(args_repr: &str) -> usize {
+    let inner = args_repr.trim().trim_start_matches('(').trim_end_matches(')');
+    if inner.trim().is_empty() {
+        0
+    } else {
+        inner.split(',').count()
+    }
+}
+
+/// The privileges `roles` hold on a function: the owner's implicit EXECUTE,
+/// plus PG's default grant to PUBLIC when nothing has been granted yet.
+pub(crate) fn function_privs(
+    def: &spg_storage::FunctionDef,
+    roles: &alloc::collections::BTreeSet<String>,
+) -> u16 {
+    if def.acl.is_empty() {
+        // The default: PUBLIC may EXECUTE.
+        return priv_bits::EXECUTE;
+    }
+    let owner = def.owner.as_deref().unwrap_or(crate::session::LOGIN_ROLE);
+    if roles.iter().any(|r| r.eq_ignore_ascii_case(owner)) {
+        return priv_bits::ALL_FUNCTION;
+    }
+    let mut held = 0;
+    for a in &def.acl {
+        if a.grantee.is_empty() || roles.iter().any(|r| a.grantee.eq_ignore_ascii_case(r)) {
+            held |= a.privs;
+        }
+    }
+    held
+}
+
+impl Engine {
+    /// GRANT / REVOKE on a function.
+    pub(crate) fn acl_apply_function(
+        &mut self,
+        name: &str,
+        mask: u16,
+        grantees: &[String],
+        grant: bool,
+        grant_option: bool,
+    ) -> Result<(), EngineError> {
+        let grantor = alloc::string::String::from(self.current_role());
+        let owner = self
+            .active_catalog()
+            .functions()
+            .get(name)
+            .and_then(|f| f.owner.clone())
+            .unwrap_or_else(|| alloc::string::String::from(crate::session::LOGIN_ROLE));
+        let cat = self.active_catalog_mut();
+        let f = cat.function_mut(name).ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!("function {name} does not exist"))
+        })?;
+        if f.acl.is_empty() {
+            // Materialise PG's defaults — the owner's EXECUTE and PUBLIC's —
+            // before layering the change on top. A `REVOKE … FROM PUBLIC` that
+            // started from an empty list would otherwise look like a no-op.
+            f.acl.push(AclItem {
+                grantee: owner.clone(),
+                privs: priv_bits::EXECUTE,
+                grantable: 0,
+                grantor: owner.clone(),
+            });
+            f.acl.push(AclItem {
+                grantee: String::new(),
+                privs: priv_bits::EXECUTE,
+                grantable: 0,
+                grantor: owner.clone(),
+            });
+        }
+        for g in grantees {
+            let at = f.acl.iter().position(|a| a.grantee.eq_ignore_ascii_case(g));
+            if grant {
+                match at {
+                    Some(i) => {
+                        f.acl[i].privs |= mask;
+                        if grant_option {
+                            f.acl[i].grantable |= mask;
+                        }
+                    }
+                    None => f.acl.push(AclItem {
+                        grantee: g.clone(),
+                        privs: mask,
+                        grantable: if grant_option { mask } else { 0 },
+                        grantor: grantor.clone(),
+                    }),
+                }
+            } else if let Some(i) = at {
+                f.acl[i].privs &= !mask;
+                f.acl[i].grantable &= !mask;
+                if f.acl[i].privs == 0 && !f.acl[i].grantee.eq_ignore_ascii_case(&owner) {
+                    f.acl.remove(i);
                 }
             }
         }

@@ -157,6 +157,12 @@ pub struct EvalContext<'a> {
     /// grant to a group role answers `true` for its inheriting members). `None`
     /// in a context with no engine behind it — the role then stands alone.
     pub users: Option<&'a crate::users::UserStore>,
+    /// v7.39 (read01 round 61) — how deep we are inside USER-DEFINED function
+    /// bodies. A function's body is evaluated with a child context, and a body
+    /// may call another function, so this bounds the recursion (a function that
+    /// calls itself would otherwise blow the stack, which an embed host cannot
+    /// catch).
+    pub fn_depth: u16,
     /// v7.38 (read01 U15) — per-scan deterministic sampler state for
     /// `TABLESAMPLE … REPEATABLE(seed)`. A fresh cell is created before a
     /// scan whose predicate may draw `__tsm_fract(seed)`; the cell holds
@@ -254,6 +260,7 @@ impl<'a> EvalContext<'a> {
             catalog: None,
             session_gucs: None,
             users: None,
+            fn_depth: 0,
             sample_rng: None,
             recursion_base: core::cell::Cell::new(0),
             render_style: crate::eval::format::RenderStyle {

@@ -2653,7 +2653,7 @@ pub(crate) fn synth_pg_trigger(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
     (schema, rows)
 }
 
-pub(crate) fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     // v7.37.24 (24.6) — widened from 6 to 20 PG-canonical columns
     // covering the function metadata that ORMs (Diesel, sea-orm)
     // and pgAdmin's function browser query: prolang for language
@@ -2681,6 +2681,9 @@ pub(crate) fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         ColumnSchema::new("prorettype", DataType::BigInt, false),
         ColumnSchema::new("proargtypes", DataType::Text, false),
         ColumnSchema::new("prosrc", DataType::Text, false),
+        // v7.39 (read01 round 61) — the function ACL. NULL means PG's default:
+        // PUBLIC may EXECUTE.
+        ColumnSchema::new("proacl", DataType::Text, true),
     ];
     let funcs: &[(i64, &str, &str, i32, i64)] = PG_PROC_FUNCS;
     let mut rows: Vec<Row<'static>> = Vec::with_capacity(funcs.len());
@@ -2748,6 +2751,43 @@ pub(crate) fn synth_pg_proc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             Value::BigInt(rettype),
             Value::text(argtypes),
             Value::text::<String>(name.into()), // prosrc
+            Value::Null,                        // proacl — a builtin's is never set
+        ]));
+    }
+    // v7.39 (read01 round 61) — and one row per USER-DEFINED function. They were
+    // missing entirely, so `SELECT proacl FROM pg_proc WHERE proname = 'f1'` —
+    // the canonical way to read a function's privileges — came back empty.
+    let mut user_oid: i64 = 400_000;
+    for (name, def) in cat.functions() {
+        user_oid += 1;
+        let nargs = crate::acl::function_arg_count(&def.args_repr);
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(user_oid),
+            Value::text(name.clone()),
+            Value::BigInt(2200), // pronamespace — public
+            Value::BigInt(10),   // proowner
+            // prolang: 14 = sql, 13 = plpgsql (PG's oids).
+            Value::BigInt(if def.language.eq_ignore_ascii_case("plpgsql") {
+                13
+            } else {
+                14
+            }),
+            Value::Float(100.0), // procost — PG's default for a non-internal fn
+            Value::Float(0.0),
+            Value::BigInt(0),
+            Value::text("f"), // prokind — a normal function
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::text("v"), // provolatile — VOLATILE, PG's default
+            Value::text("u"), // proparallel — UNSAFE, PG's default
+            Value::SmallInt(i16::try_from(nargs).unwrap_or(i16::MAX)),
+            Value::SmallInt(0),
+            Value::BigInt(0),
+            Value::text(alloc::string::String::new()),
+            Value::text(def.body.clone()), // prosrc — the real body
+            crate::acl::render_acl_list(&def.acl).map_or(Value::Null, Value::text),
         ]));
     }
     (schema, rows)

@@ -3529,8 +3529,14 @@ pub enum GrantObject {
     Schemas(Vec<String>),
     /// v7.39 (read01 round 60) — `ON DATABASE app`. CREATE / CONNECT / TEMP.
     Databases(Vec<String>),
-    /// `ON FUNCTION / TYPE / LANGUAGE / …`. Carries the object-class word for
-    /// the no-op message.
+    /// v7.39 (read01 round 61) — `ON FUNCTION f(int)`. The names are bare
+    /// (SPG keys functions by name); the argument list parses and is dropped.
+    Functions(Vec<String>),
+    /// v7.39 (read01 round 61) — `ON ALL TABLES IN SCHEMA public`: expands to
+    /// every table at GRANT time, exactly like PG.
+    AllTablesInSchema,
+    /// `ON TYPE / LANGUAGE / …`. Carries the object-class word for the no-op
+    /// message.
     Other(String),
 }
 
@@ -3577,6 +3583,11 @@ impl GrantStatement {
                 let names: Vec<_> = n.iter().map(|x| quote_ident(x)).collect();
                 alloc::format!("DATABASE {}", names.join(", "))
             }
+            GrantObject::Functions(n) => {
+                let names: Vec<_> = n.iter().map(|x| quote_ident(x)).collect();
+                alloc::format!("FUNCTION {}", names.join(", "))
+            }
+            GrantObject::AllTablesInSchema => "ALL TABLES IN SCHEMA public".into(),
             GrantObject::Other(k) => k.clone(),
         };
         let who: Vec<_> = self

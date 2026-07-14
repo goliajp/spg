@@ -811,14 +811,47 @@ impl Parser {
                 self.advance();
             }
             Token::All => {
-                // `ALL TABLES IN SCHEMA x` and friends — accepted, no-op.
+                // v7.39 (read01 round 61) — `ALL TABLES IN SCHEMA x` expands to
+                // every table at GRANT time, like PG. `ALL SEQUENCES/FUNCTIONS
+                // IN SCHEMA` stay no-ops and keep their own object class.
+                self.advance(); // ALL
+                let kind = match self.peek() {
+                    Token::Ident(w) | Token::QuotedIdent(w) => w.to_ascii_lowercase(),
+                    // TABLES has its own token (SHOW TABLES owns it).
+                    Token::Tables | Token::Table => "tables".to_string(),
+                    _ => String::new(),
+                };
+                if !kind.is_empty() {
+                    self.advance();
+                }
+                // `IN SCHEMA <name>`
+                if matches!(self.peek(), Token::In) {
+                    self.advance();
+                    if self.peek_keyword_ident("schema") {
+                        self.advance();
+                        let _schema = self.expect_ident_like()?;
+                    }
+                }
+                if kind != "tables" {
+                    self.consume_until_statement_boundary();
+                    return Ok(finish_grant(
+                        grant,
+                        GrantStatement {
+                            privileges,
+                            object: GrantObject::Other("ALL … IN SCHEMA".into()),
+                            grantees: Vec::new(),
+                            grant_option,
+                        },
+                    ));
+                }
+                let grantees = self.parse_grantee_list(grant)?;
                 self.consume_until_statement_boundary();
                 return Ok(finish_grant(
                     grant,
                     GrantStatement {
                         privileges,
-                        object: GrantObject::Other("ALL … IN SCHEMA".into()),
-                        grantees: Vec::new(),
+                        object: GrantObject::AllTablesInSchema,
+                        grantees,
                         grant_option,
                     },
                 ));
@@ -871,12 +904,61 @@ impl Parser {
                         },
                     ));
                 }
+                // v7.39 (read01 round 61) — `ON FUNCTION f(int)` is real. SPG
+                // keys functions by NAME, so the argument list parses and is
+                // dropped (an overload set shares one ACL — recorded residual).
+                if matches!(lc.as_str(), "function" | "procedure" | "routine") {
+                    self.advance();
+                    let mut names: Vec<String> = Vec::new();
+                    loop {
+                        let mut parts: Vec<String> = Vec::new();
+                        loop {
+                            parts.push(self.expect_ident_like()?);
+                            if matches!(self.peek(), Token::Dot) {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                        names.push(parts.pop().expect("at least one part"));
+                        // The signature: `(int, text)` — parsed, dropped.
+                        if matches!(self.peek(), Token::LParen) {
+                            let mut depth = 0usize;
+                            loop {
+                                match self.advance() {
+                                    Token::LParen => depth += 1,
+                                    Token::RParen => {
+                                        depth -= 1;
+                                        if depth == 0 {
+                                            break;
+                                        }
+                                    }
+                                    Token::Eof => break,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    let grantees = self.parse_grantee_list(grant)?;
+                    self.consume_until_statement_boundary();
+                    return Ok(finish_grant(
+                        grant,
+                        GrantStatement {
+                            privileges,
+                            object: GrantObject::Functions(names),
+                            grantees,
+                            grant_option,
+                        },
+                    ));
+                }
                 if matches!(
                     lc.as_str(),
-                    "function"
-                        | "procedure"
-                        | "routine"
-                        | "type"
+                    "type"
                         | "domain"
                         | "language"
                         | "tablespace"

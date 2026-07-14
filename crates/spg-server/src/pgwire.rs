@@ -3659,6 +3659,7 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         } else if msg.contains("permission denied for table")
             || msg.contains("permission denied for sequence")
             || msg.contains("permission denied for schema")
+            || msg.contains("permission denied for function")
             || msg.contains("must be owner of table")
         {
             "42501"
