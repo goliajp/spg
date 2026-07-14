@@ -252,6 +252,22 @@ impl Engine {
             .map(String::as_str)
     }
 
+    /// v7.39 (read01 round 46) — raise a PG-style NOTICE for the statement
+    /// now executing. The text is PG's exact wording minus the "NOTICE:  "
+    /// banner (the wire layer adds that); e.g. `table "t" does not exist,
+    /// skipping`.
+    pub(crate) fn notice(&mut self, text: alloc::string::String) {
+        self.pending_notices.push(text);
+    }
+
+    /// v7.39 (read01 round 46) — drain the NOTICEs the last statement
+    /// raised. pgwire emits one NoticeResponse per entry ahead of the
+    /// statement's CommandComplete; embedded callers may ignore them.
+    #[must_use]
+    pub fn take_notices(&mut self) -> alloc::vec::Vec<alloc::string::String> {
+        core::mem::take(&mut self.pending_notices)
+    }
+
     /// v7.37.7 — PG `statement_timeout` GUC read accessor. Returns the
     /// session-set value in **milliseconds**, parsed from the raw
     /// `SET statement_timeout = N` string. Returns `None` when:

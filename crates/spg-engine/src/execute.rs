@@ -269,6 +269,10 @@ impl Engine {
         // the store on drop so nested or sibling engines don't see
         // ours. No-op in release builds (feature off).
         let _inj = self.enter_injection_scope();
+        // v7.39 (read01 round 46) — NOTICEs are per-statement: clear the
+        // buffer here so one statement's "…, skipping" can never leak into
+        // the next one's NoticeResponse batch.
+        self.pending_notices.clear();
         let saved = self.current_tx;
         self.current_tx = Some(tx_id);
         // v7.37.15 (Epic W slice 2) — memoized autocommit writer version

@@ -825,6 +825,11 @@ impl Engine {
             .any(|c| c.name.eq_ignore_ascii_case(&column.name))
         {
             if if_not_exists {
+                // v7.39 (read01 round 46) — PG's IF NOT EXISTS skip NOTICE.
+                self.notice(alloc::format!(
+                    "column {:?} of relation {:?} already exists, skipping",
+                    column.name, tbl
+                ));
                 return Ok(());
             }
             // v7.39 (read01 round 45) — PG wording (42701 at the wire).
@@ -1149,6 +1154,11 @@ impl Engine {
             Some(p) => p,
             None => {
                 if if_exists {
+                    // v7.39 (read01 round 46) — PG's IF EXISTS skip NOTICE.
+                    self.notice(alloc::format!(
+                        "column {column:?} of relation {:?} does not exist, skipping",
+                        tbl
+                    ));
                     return Ok(());
                 }
                 // v7.39 (read01 round 45) — PG wording (42703 at the wire).
@@ -1530,6 +1540,12 @@ impl Engine {
             })?;
         // `IF NOT EXISTS` reduces DuplicateIndex to a no-op CommandOk.
         if stmt.if_not_exists && table.indices().iter().any(|i| i.name == stmt.name) {
+            // v7.39 (read01 round 46) — PG's IF NOT EXISTS skip NOTICE
+            // (an index is a relation, so PG says "relation").
+            self.notice(alloc::format!(
+                "relation {:?} already exists, skipping",
+                stmt.name
+            ));
             return Ok(QueryResult::CommandOk {
                 affected: 0,
                 modified_catalog: false,
@@ -1944,12 +1960,16 @@ impl Engine {
                 }
             }
             let dropped = self.active_catalog_mut().drop_table(&name);
-            if !dropped && !if_exists {
-                // v7.39 (read01 round 45) — PG wording (42P01 at the wire);
-                // PG says "table", not "relation", for DROP TABLE.
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "table {name:?} does not exist"
-                )));
+            if !dropped {
+                if !if_exists {
+                    // v7.39 (read01 round 45) — PG wording (42P01 at the wire);
+                    // PG says "table", not "relation", for DROP TABLE.
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "table {name:?} does not exist"
+                    )));
+                }
+                // v7.39 (read01 round 46) — PG's IF EXISTS skip NOTICE.
+                self.notice(alloc::format!("table {name:?} does not exist, skipping"));
             }
         }
         Ok(QueryResult::CommandOk {
@@ -1965,8 +1985,12 @@ impl Engine {
         if_exists: bool,
     ) -> Result<QueryResult, EngineError> {
         let dropped = self.active_catalog_mut().drop_named_index(&name);
-        if !dropped && !if_exists {
-            return Err(EngineError::Storage(StorageError::IndexNotFound { name }));
+        if !dropped {
+            if !if_exists {
+                return Err(EngineError::Storage(StorageError::IndexNotFound { name }));
+            }
+            // v7.39 (read01 round 46) — PG's IF EXISTS skip NOTICE.
+            self.notice(alloc::format!("index {name:?} does not exist, skipping"));
         }
         Ok(QueryResult::CommandOk {
             affected: 0,
@@ -1979,6 +2003,11 @@ impl Engine {
         stmt: CreateTableStatement,
     ) -> Result<QueryResult, EngineError> {
         if stmt.if_not_exists && self.active_catalog().get(&stmt.name).is_some() {
+            // v7.39 (read01 round 46) — PG's IF NOT EXISTS skip NOTICE.
+            self.notice(alloc::format!(
+                "relation {:?} already exists, skipping",
+                stmt.name
+            ));
             // v7.16.2 — PG-strict silent no-op (mailrs round-10
             // surfaced this). v7.13.3's "reconcile by adding
             // missing columns" was friendly for mailrs round-7
@@ -3027,6 +3056,15 @@ impl Engine {
             last_value: start,
             is_called: false,
         };
+        // v7.39 (read01 round 46) — PG's IF NOT EXISTS skip NOTICE. The
+        // storage call swallows the collision when the flag is set, so
+        // detect it here before handing over.
+        if s.if_not_exists && self.active_catalog().sequences().contains_key(&s.name) {
+            self.notice(alloc::format!(
+                "relation {:?} already exists, skipping",
+                s.name
+            ));
+        }
         self.active_catalog_mut()
             .create_sequence(def, s.if_not_exists)
             .map_err(EngineError::Storage)?;
@@ -3307,6 +3345,10 @@ impl Engine {
         name: String,
         if_not_exists: bool,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 (read01 round 46) — PG's IF NOT EXISTS skip NOTICE.
+        if if_not_exists && self.active_catalog().schema_exists(&name) {
+            self.notice(alloc::format!("schema {name:?} already exists, skipping"));
+        }
         self.active_catalog_mut()
             .create_schema(name, if_not_exists)
             .map_err(EngineError::Storage)?;
@@ -3336,6 +3378,9 @@ impl Engine {
                 return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
                     alloc::format!("schema {name:?} does not exist"),
                 )));
+            } else {
+                // v7.39 (read01 round 46) — PG's IF EXISTS skip NOTICE.
+                self.notice(alloc::format!("schema {name:?} does not exist, skipping"));
             }
         }
         Ok(QueryResult::CommandOk {
@@ -3368,6 +3413,9 @@ impl Engine {
                 return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
                     alloc::format!("type {name:?} does not exist"),
                 )));
+            } else {
+                // v7.39 (read01 round 46) — PG's IF EXISTS skip NOTICE.
+                self.notice(alloc::format!("type {name:?} does not exist, skipping"));
             }
         }
         Ok(QueryResult::CommandOk {
@@ -3569,10 +3617,14 @@ impl Engine {
         let mut removed = 0usize;
         for name in names {
             let was_present = self.active_catalog_mut().drop_view(name);
-            if !was_present && !if_exists {
-                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
-                    alloc::format!("view {name:?} does not exist"),
-                )));
+            if !was_present {
+                if !if_exists {
+                    return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                        alloc::format!("view {name:?} does not exist"),
+                    )));
+                }
+                // v7.39 (read01 round 46) — PG's IF EXISTS skip NOTICE.
+                self.notice(alloc::format!("view {name:?} does not exist, skipping"));
             }
             if was_present {
                 removed += 1;
@@ -3593,10 +3645,14 @@ impl Engine {
         let mut removed = 0usize;
         for name in names {
             let was_present = self.active_catalog_mut().drop_sequence(name);
-            if !was_present && !if_exists {
-                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
-                    alloc::format!("sequence {name:?} does not exist"),
-                )));
+            if !was_present {
+                if !if_exists {
+                    return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                        alloc::format!("sequence {name:?} does not exist"),
+                    )));
+                }
+                // v7.39 (read01 round 46) — PG's IF EXISTS skip NOTICE.
+                self.notice(alloc::format!("sequence {name:?} does not exist, skipping"));
             }
             if was_present {
                 removed += 1;
