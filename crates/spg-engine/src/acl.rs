@@ -32,7 +32,7 @@ use crate::session::LOGIN_ROLE;
 use crate::{Engine, EngineError};
 
 /// The privilege letters PG renders an aclitem with, in its order (`arwdDxtm`).
-const PRIV_LETTERS: [(u16, char); 8] = [
+const PRIV_LETTERS: [(u16, char); 12] = [
     (priv_bits::INSERT, 'a'),
     (priv_bits::SELECT, 'r'),
     (priv_bits::UPDATE, 'w'),
@@ -41,6 +41,13 @@ const PRIV_LETTERS: [(u16, char); 8] = [
     (priv_bits::REFERENCES, 'x'),
     (priv_bits::TRIGGER, 't'),
     (priv_bits::MAINTAIN, 'm'),
+    // v7.39 (read01 round 60) — the non-table privileges. PG renders a sequence
+    // owner's default as `rwU` and the public schema's as `UC`, which is what
+    // this ORDER produces.
+    (priv_bits::USAGE, 'U'),
+    (priv_bits::CREATE, 'C'),
+    (priv_bits::CONNECT, 'c'),
+    (priv_bits::TEMPORARY, 'T'),
 ];
 
 /// The privilege word → bit. `None` for a word PG would reject.
@@ -60,6 +67,10 @@ pub(crate) fn priv_from_word(w: &str) -> Option<u16> {
         "REFERENCES" => priv_bits::REFERENCES,
         "TRIGGER" => priv_bits::TRIGGER,
         "MAINTAIN" => priv_bits::MAINTAIN,
+        "USAGE" => priv_bits::USAGE,
+        "CREATE" => priv_bits::CREATE,
+        "CONNECT" => priv_bits::CONNECT,
+        "TEMPORARY" | "TEMP" => priv_bits::TEMPORARY,
         _ => return None,
     })
 }
@@ -76,6 +87,10 @@ pub(crate) fn priv_word(bit: u16) -> &'static str {
         priv_bits::REFERENCES => "REFERENCES",
         priv_bits::TRIGGER => "TRIGGER",
         priv_bits::MAINTAIN => "MAINTAIN",
+        priv_bits::USAGE => "USAGE",
+        priv_bits::CREATE => "CREATE",
+        priv_bits::CONNECT => "CONNECT",
+        priv_bits::TEMPORARY => "TEMPORARY",
         _ => "",
     }
 }
@@ -119,6 +134,49 @@ pub(crate) fn render_acl_list(acl: &[AclItem]) -> Option<String> {
 /// `pg_class.relacl` for a table.
 pub(crate) fn render_relacl(schema: &TableSchema) -> Option<String> {
     render_acl_list(&schema.acl)
+}
+
+/// v7.39 (read01 round 60) — the privileges `roles` hold on the schema
+/// (`on_schema`) or the database, straight off the catalog's ACL — with PG's
+/// defaults when nothing has been granted yet. Shared by the enforcement gate
+/// and the `has_*_privilege` probes, so the two can never drift apart.
+pub(crate) fn catalog_object_privs(
+    cat: &spg_storage::Catalog,
+    on_schema: bool,
+    roles: &alloc::collections::BTreeSet<String>,
+) -> u16 {
+    let acl = if on_schema {
+        cat.schema_acl()
+    } else {
+        cat.database_acl()
+    };
+    if acl.is_empty() {
+        return if on_schema {
+            priv_bits::USAGE
+        } else {
+            priv_bits::CONNECT | priv_bits::TEMPORARY
+        };
+    }
+    let mut held = 0;
+    for a in acl {
+        if a.grantee.is_empty() || roles.iter().any(|r| a.grantee.eq_ignore_ascii_case(r)) {
+            held |= a.privs;
+        }
+    }
+    held
+}
+
+/// v7.39 (read01 round 60) — `pg_namespace.nspacl` for `public`. Unlike a
+/// table's relacl this is NEVER null: PG ships the schema with PUBLIC holding
+/// USAGE, and prints that even before anyone grants anything.
+pub(crate) fn render_nspacl(cat: &spg_storage::Catalog) -> String {
+    if let Some(rendered) = render_acl_list(cat.schema_acl()) {
+        return rendered;
+    }
+    alloc::format!(
+        "{{{o}=UC/{o},=U/{o}}}",
+        o = SCHEMA_OWNER_ROLE
+    )
 }
 
 /// v7.39 (read01 round 59) — the privileges `roles` hold on ONE column: its own
@@ -220,6 +278,70 @@ impl Engine {
                 "must be owner of table {table}"
             )))
         }
+    }
+
+    /// v7.39 (read01 round 60) — `GRANT … ON SEQUENCE / SCHEMA / DATABASE`.
+    fn exec_grant_non_table(
+        &mut self,
+        g: &GrantStatement,
+        grant: bool,
+    ) -> Result<crate::QueryResult, EngineError> {
+        let all_mask = match &g.object {
+            GrantObject::Sequences(_) => priv_bits::ALL_SEQUENCE,
+            GrantObject::Schemas(_) => priv_bits::ALL_SCHEMA,
+            _ => priv_bits::ALL_DATABASE,
+        };
+        let mut mask = 0u16;
+        if g.privileges.is_empty() {
+            mask = all_mask;
+        } else {
+            for p in &g.privileges {
+                mask |= if p.word.eq_ignore_ascii_case("ALL") {
+                    all_mask
+                } else {
+                    priv_from_word(&p.word).ok_or_else(|| {
+                        EngineError::Unsupported(alloc::format!(
+                            "unrecognized privilege type \"{}\"",
+                            p.word.to_ascii_lowercase()
+                        ))
+                    })?
+                };
+            }
+        }
+        for r in &g.grantees {
+            self.acl_check_role_exists(r)?;
+        }
+        match &g.object {
+            GrantObject::Sequences(names) => {
+                for n in names {
+                    if self.active_catalog().sequences().get(n).is_none() {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "relation \"{n}\" does not exist"
+                        )));
+                    }
+                }
+                for n in names {
+                    self.acl_apply_sequence(n, mask, &g.grantees, grant, g.grant_option)?;
+                }
+            }
+            GrantObject::Schemas(names) => {
+                for n in names {
+                    if !spg_storage::is_builtin_schema(n) {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "schema \"{n}\" does not exist"
+                        )));
+                    }
+                }
+                self.acl_apply_catalog(true, mask, &g.grantees, grant, g.grant_option)?;
+            }
+            _ => {
+                self.acl_apply_catalog(false, mask, &g.grantees, grant, g.grant_option)?;
+            }
+        }
+        Ok(crate::QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: true,
+        })
     }
 
     /// v7.39 (read01 round 59) — a column-scoped GRANT / REVOKE. Column grants
@@ -611,6 +733,14 @@ impl Engine {
             }
             Statement::AlterTable(a) => self.acl_require_owner(&a.name)?,
             Statement::CreateIndex(c) => self.acl_require_owner(&c.table)?,
+            // v7.39 (read01 round 60) — creating an object in the schema needs
+            // CREATE on it, which PUBLIC does NOT hold (PG 15 revoked it). So a
+            // policy-subject role cannot create a table until it is granted.
+            Statement::CreateTable(_)
+            | Statement::CreateSequence(_)
+            | Statement::CreateView(_)
+            | Statement::CreateMaterializedView(_)
+            | Statement::CreateType(_) => self.acl_require_schema_create()?,
             _ => {}
         }
         for (t, read) in &reads {
@@ -651,6 +781,12 @@ impl Engine {
     ) -> Result<crate::QueryResult, EngineError> {
         if let GrantObject::Roles(roles) = &g.object {
             return self.exec_role_membership(roles, &g.grantees, grant);
+        }
+        // v7.39 (read01 round 60) — the non-table objects.
+        if let GrantObject::Sequences(_) | GrantObject::Schemas(_) | GrantObject::Databases(_) =
+            &g.object
+        {
+            return self.exec_grant_non_table(g, grant);
         }
         let GrantObject::Tables(tables) = &g.object else {
             return Ok(crate::QueryResult::CommandOk {
@@ -1025,5 +1161,236 @@ fn bare_table_ref(name: String) -> TableRef {
         lateral_subquery: None,
         jsonb_each_text_arg: None,
         table_fn_call: None,
+    }
+}
+
+// ===========================================================================
+// v7.39 (read01 round 60) — the NON-TABLE objects: sequences, the schema, the
+// database.
+//
+// The trap here is that PG's default for these is NOT "nobody holds anything".
+// PUBLIC holds USAGE on the `public` schema, and CONNECT + TEMPORARY on the
+// database, out of the box — but NOT CREATE on either (PG 15 revoked the
+// schema one). A model that started them empty would deny every role's first
+// SELECT, and a model that started them full would let any role create tables.
+// ===========================================================================
+
+/// PG's owner of the `public` schema — a bootstrap role, not a user.
+pub(crate) const SCHEMA_OWNER_ROLE: &str = "pg_database_owner";
+/// What PUBLIC holds on the `public` schema before anyone grants anything.
+const DEFAULT_SCHEMA_PUBLIC: u16 = priv_bits::USAGE;
+/// …and on the database.
+const DEFAULT_DATABASE_PUBLIC: u16 = priv_bits::CONNECT | priv_bits::TEMPORARY;
+
+impl Engine {
+    /// The privileges `roles` hold on the `public` schema. An owner (the login
+    /// role) holds USAGE + CREATE; everyone else gets PG's PUBLIC default until
+    /// a GRANT says otherwise.
+    pub(crate) fn schema_privs(&self, roles: &alloc::collections::BTreeSet<String>) -> u16 {
+        catalog_object_privs(self.active_catalog(), true, roles)
+    }
+
+    /// The privileges `roles` hold on the database.
+    #[allow(dead_code)]
+    pub(crate) fn database_privs(&self, roles: &alloc::collections::BTreeSet<String>) -> u16 {
+        catalog_object_privs(self.active_catalog(), false, roles)
+    }
+
+    /// The privileges `roles` hold on one sequence: the owner's implicit
+    /// `rwU`, plus any explicit grant to them or to PUBLIC.
+    pub(crate) fn sequence_privs(
+        &self,
+        seq: &str,
+        roles: &alloc::collections::BTreeSet<String>,
+    ) -> u16 {
+        let Some(s) = self.active_catalog().sequences().get(seq) else {
+            return 0;
+        };
+        let owner = s.owner.as_deref().unwrap_or(crate::session::LOGIN_ROLE);
+        if roles.iter().any(|r| r.eq_ignore_ascii_case(owner)) {
+            return priv_bits::ALL_SEQUENCE;
+        }
+        let mut held = 0;
+        for a in &s.acl {
+            if a.grantee.is_empty() || roles.iter().any(|r| a.grantee.eq_ignore_ascii_case(r)) {
+                held |= a.privs;
+            }
+        }
+        held
+    }
+
+    /// Enforce a sequence privilege. PG's message names the SEQUENCE, not the
+    /// table: `permission denied for sequence sq`.
+    pub(crate) fn acl_require_sequence(&self, seq: &str, wanted: u16) -> Result<(), EngineError> {
+        if self.is_superuser() {
+            return Ok(());
+        }
+        if self.active_catalog().sequences().get(seq).is_none() {
+            return Ok(());
+        }
+        let roles = self.users.effective_roles(self.current_role());
+        if self.sequence_privs(seq, &roles) & wanted != 0 {
+            Ok(())
+        } else {
+            Err(EngineError::Unsupported(alloc::format!(
+                "permission denied for sequence {seq}"
+            )))
+        }
+    }
+
+    /// Enforce CREATE on the schema — what CREATE TABLE / CREATE SEQUENCE / …
+    /// need. PUBLIC does NOT hold it by default (PG 15 revoked it), so a
+    /// policy-subject role has to be granted it.
+    pub(crate) fn acl_require_schema_create(&self) -> Result<(), EngineError> {
+        if self.is_superuser() {
+            return Ok(());
+        }
+        let roles = self.users.effective_roles(self.current_role());
+        if self.schema_privs(&roles) & priv_bits::CREATE != 0 {
+            Ok(())
+        } else {
+            Err(EngineError::Unsupported(
+                "permission denied for schema public".into(),
+            ))
+        }
+    }
+
+    /// GRANT / REVOKE on the schema or the database. Both materialise the whole
+    /// list on the first grant, PG's default entries included — the same shape
+    /// a table's relacl has.
+    pub(crate) fn acl_apply_catalog(
+        &mut self,
+        on_schema: bool,
+        mask: u16,
+        grantees: &[String],
+        grant: bool,
+        grant_option: bool,
+    ) -> Result<(), EngineError> {
+        // PG's `public` schema is owned by the bootstrap role `pg_database_owner`,
+        // not by a user — that is the name its nspacl carries, so SPG uses it too.
+        let owner = if on_schema {
+            alloc::string::String::from(SCHEMA_OWNER_ROLE)
+        } else {
+            alloc::string::String::from(self.current_role())
+        };
+        let (default_public, owner_all) = if on_schema {
+            (DEFAULT_SCHEMA_PUBLIC, priv_bits::ALL_SCHEMA)
+        } else {
+            (DEFAULT_DATABASE_PUBLIC, priv_bits::ALL_DATABASE)
+        };
+        let cat = self.active_catalog_mut();
+        let acl = if on_schema {
+            cat.schema_acl_mut()
+        } else {
+            cat.database_acl_mut()
+        };
+        if acl.is_empty() {
+            // Materialise PG's defaults before layering the grant on top —
+            // otherwise the first `GRANT CREATE` would silently REVOKE PUBLIC's
+            // implicit USAGE.
+            acl.push(AclItem {
+                grantee: owner.clone(),
+                privs: owner_all,
+                grantable: 0,
+                grantor: owner.clone(),
+            });
+            acl.push(AclItem {
+                grantee: String::new(),
+                privs: default_public,
+                grantable: 0,
+                grantor: owner.clone(),
+            });
+        }
+        for g in grantees {
+            let at = acl.iter().position(|a| a.grantee.eq_ignore_ascii_case(g));
+            if grant {
+                match at {
+                    Some(i) => {
+                        acl[i].privs |= mask;
+                        if grant_option {
+                            acl[i].grantable |= mask;
+                        }
+                    }
+                    None => acl.push(AclItem {
+                        grantee: g.clone(),
+                        privs: mask,
+                        grantable: if grant_option { mask } else { 0 },
+                        grantor: owner.clone(),
+                    }),
+                }
+            } else if let Some(i) = at {
+                if grant_option {
+                    acl[i].grantable &= !mask;
+                } else {
+                    acl[i].privs &= !mask;
+                    acl[i].grantable &= !mask;
+                }
+                if acl[i].privs == 0 && !acl[i].grantee.eq_ignore_ascii_case(&owner) {
+                    acl.remove(i);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// GRANT / REVOKE on a sequence.
+    pub(crate) fn acl_apply_sequence(
+        &mut self,
+        seq: &str,
+        mask: u16,
+        grantees: &[String],
+        grant: bool,
+        grant_option: bool,
+    ) -> Result<(), EngineError> {
+        let grantor = alloc::string::String::from(self.current_role());
+        let owner = self
+            .active_catalog()
+            .sequences()
+            .get(seq)
+            .and_then(|s| s.owner.clone())
+            .unwrap_or_else(|| alloc::string::String::from(crate::session::LOGIN_ROLE));
+        let cat = self.active_catalog_mut();
+        let s = cat.sequence_mut(seq).ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!("relation \"{seq}\" does not exist"))
+        })?;
+        if s.acl.is_empty() {
+            if !grant {
+                return Ok(());
+            }
+            s.acl.push(AclItem {
+                grantee: owner.clone(),
+                privs: priv_bits::ALL_SEQUENCE,
+                grantable: 0,
+                grantor: owner,
+            });
+        }
+        for g in grantees {
+            let at = s.acl.iter().position(|a| a.grantee.eq_ignore_ascii_case(g));
+            if grant {
+                match at {
+                    Some(i) => {
+                        s.acl[i].privs |= mask;
+                        if grant_option {
+                            s.acl[i].grantable |= mask;
+                        }
+                    }
+                    None => s.acl.push(AclItem {
+                        grantee: g.clone(),
+                        privs: mask,
+                        grantable: if grant_option { mask } else { 0 },
+                        grantor: grantor.clone(),
+                    }),
+                }
+            } else if let Some(i) = at
+                && !s.acl[i].grantee.is_empty()
+            {
+                s.acl[i].privs &= !mask;
+                s.acl[i].grantable &= !mask;
+                if s.acl[i].privs == 0 {
+                    s.acl.remove(i);
+                }
+            }
+        }
+        Ok(())
     }
 }

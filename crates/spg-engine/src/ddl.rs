@@ -3337,6 +3337,9 @@ impl Engine {
             owned_by,
             last_value: start,
             is_called: false,
+            // v7.39 (read01 round 60) — whoever runs CREATE SEQUENCE owns it.
+            owner: Some(alloc::string::String::from(self.current_role())),
+            acl: alloc::vec::Vec::new(),
         };
         // v7.39 (read01 round 46) — PG's IF NOT EXISTS skip NOTICE. The
         // storage call swallows the collision when the flag is set, so
