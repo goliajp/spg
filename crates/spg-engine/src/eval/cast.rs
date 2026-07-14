@@ -1204,6 +1204,8 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
                 detail: format!("invalid input syntax for type integer: {s:?}"),
             }),
         Value::Bool(b) => Ok(Value::Int(i32::from(b))),
+        // v7.39 (read01 char.c) — ("char")::int is the byte value.
+        Value::Char1(b) => Ok(Value::Int(i32::from(b))),
         // PG `bit`/`varbit` → int is the MSB-first bit value.
         #[allow(clippy::cast_possible_truncation)]
         Value::BitString { nbits, bytes } => Ok(Value::Int(crate::conversions::bit_string_to_i64(

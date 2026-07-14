@@ -2362,6 +2362,8 @@ fn apply_function_dispatch(
                     // PG: ascii('') is 0 (no first character), not an error.
                     Ok(Value::Int(s.chars().next().map_or(0, |ch| ch as i32)))
                 }
+                // v7.39 (read01 char.c) — ascii("char") is the byte value.
+                Value::Char1(b) => Ok(Value::Int(i32::from(*b))),
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "ascii() needs text, got {:?}",
@@ -3857,6 +3859,8 @@ fn apply_function_dispatch(
                 Value::BitString { nbits, .. } => {
                     Ok(Value::Int(i32::try_from(*nbits).unwrap_or(i32::MAX)))
                 }
+                // v7.39 (read01 char.c) — "char" is always one byte.
+                Value::Char1(_) => Ok(Value::Int(8)),
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
                         "bit_length() needs text or bytea, got {:?}",
