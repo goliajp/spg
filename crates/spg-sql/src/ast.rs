@@ -386,6 +386,14 @@ pub enum Statement {
     /// [{BEFORE | AFTER} 'existing']`. Extends an enum's label list so
     /// enum evolution stops being a silent no-op. `position` is
     /// `Some((is_before, anchor))`.
+    /// v7.39 (read01 round 49) — `ALTER TYPE t RENAME VALUE 'old' TO 'new'`.
+    /// Used to be swallowed by the ALTER TYPE no-op tail, so the rename was
+    /// accepted and silently ignored.
+    AlterTypeRenameValue {
+        type_name: String,
+        old: String,
+        new: String,
+    },
     AlterTypeAddValue {
         type_name: String,
         label: String,
@@ -652,6 +660,9 @@ pub struct AlterSequenceStatement {
     pub name: String,
     pub if_exists: bool,
     pub options: SequenceOptions,
+    /// v7.39 (read01 round 49) — `ALTER SEQUENCE old RENAME TO new`. Set
+    /// instead of `options`; the two forms are mutually exclusive in PG.
+    pub rename_to: Option<String>,
 }
 
 /// v6.1.2 — `CREATE PUBLICATION` AST node. The `scope` field uses
@@ -3426,6 +3437,7 @@ impl Statement {
             | Statement::DropMaterializedView { .. }
             | Statement::CreateType(_)
             | Statement::AlterTypeAddValue { .. }
+            | Statement::AlterTypeRenameValue { .. }
             | Statement::DropType { .. }
             | Statement::CreateDomain(_)
             | Statement::DropDomain { .. }
@@ -3868,6 +3880,17 @@ impl fmt::Display for Statement {
                 Ok(())
             }
             Self::CreateType(t) => t.fmt(f),
+            Self::AlterTypeRenameValue {
+                type_name,
+                old,
+                new,
+            } => write!(
+                f,
+                "ALTER TYPE {} RENAME VALUE '{}' TO '{}'",
+                quote_ident(type_name),
+                old.replace('\'', "''"),
+                new.replace('\'', "''")
+            ),
             Self::AlterTypeAddValue {
                 type_name,
                 label,

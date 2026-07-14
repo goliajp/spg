@@ -3126,12 +3126,32 @@ impl Parser {
     fn parse_alter_sequence_after_keyword(&mut self) -> Result<Statement, ParseError> {
         let if_exists = self.parse_if_exists();
         let name = self.expect_ident_like()?;
+        // v7.39 (read01 round 49) — `RENAME TO new`; mutually exclusive with
+        // the option list (PG allows only one or the other).
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("rename")) {
+            self.advance();
+            if matches!(self.peek(), Token::To) {
+                self.advance();
+            } else {
+                self.expect_keyword_ident("to")?;
+            }
+            let new = self.expect_ident_like()?;
+            return Ok(Statement::AlterSequence(
+                crate::ast::AlterSequenceStatement {
+                    name,
+                    if_exists,
+                    options: crate::ast::SequenceOptions::default(),
+                    rename_to: Some(new),
+                },
+            ));
+        }
         let options = self.parse_sequence_options(/* allow_restart = */ true)?;
         Ok(Statement::AlterSequence(
             crate::ast::AlterSequenceStatement {
                 name,
                 if_exists,
                 options,
+                rename_to: None,
             },
         ))
     }
@@ -6207,6 +6227,30 @@ impl Parser {
                         position,
                     });
                 }
+                // v7.39 (read01 round 49) — `RENAME VALUE 'old' TO 'new'`.
+                // Used to fall into the no-op tail below: accepted, silently
+                // ignored. `RENAME TO <newtype>` keeps falling through.
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("rename"))
+                    && matches!(
+                        self.tokens.get(self.pos + 1),
+                        Some(Token::Ident(s)) if s.eq_ignore_ascii_case("value")
+                    )
+                {
+                    self.advance(); // RENAME
+                    self.advance(); // VALUE
+                    let old = self.expect_string_literal()?;
+                    if matches!(self.peek(), Token::To) {
+                        self.advance();
+                    } else {
+                        self.expect_keyword_ident("to")?;
+                    }
+                    let new = self.expect_string_literal()?;
+                    return Ok(Statement::AlterTypeRenameValue {
+                        type_name,
+                        old,
+                        new,
+                    });
+                }
                 // Other ALTER TYPE forms — accept as no-op (pg_dump tail).
                 self.consume_until_statement_boundary();
                 return Ok(Statement::Empty);
@@ -6477,6 +6521,16 @@ impl Parser {
             // PG sets a hint; SPG doesn't have clustered storage.
             // Accept-and-no-op.
             Token::Ident(s) if s.eq_ignore_ascii_case("cluster") => {
+                self.advance();
+                self.consume_until_statement_boundary();
+                Ok(Vec::new())
+            }
+            // v7.39 (read01 round 49) — ALTER TABLE REPLICA IDENTITY
+            // { DEFAULT | FULL | NOTHING | USING INDEX <name> }. PG records
+            // what a logical decoder puts in the old-tuple image; SPG's
+            // replication is SQL-text, so there is nothing to record.
+            // Accept-and-no-op (it used to be a parse error).
+            Token::Ident(s) if s.eq_ignore_ascii_case("replica") => {
                 self.advance();
                 self.consume_until_statement_boundary();
                 Ok(Vec::new())
