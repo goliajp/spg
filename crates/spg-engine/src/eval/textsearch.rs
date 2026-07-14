@@ -179,6 +179,12 @@ pub(super) fn ts_match(l: Value, r: Value) -> Result<Value<'static>, EvalError> 
         (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
         (Value::TsVector(v), Value::TsQuery(q)) => (v, q),
         (Value::TsQuery(q), Value::TsVector(v)) => (v, q),
+        // v7.39 (read01 round 71) — `ts @@ 'a'`. PG reads the bare literal as a
+        // TSQUERY (an unknown literal takes the other operand's type), which is
+        // how the operator is actually written. Same family as the array and
+        // range coercions.
+        (Value::TsVector(v), Value::Text(q)) => (v, crate::eval::decode_tsquery_external(q.as_ref())?),
+        (Value::Text(q), Value::TsVector(v)) => (v, crate::eval::decode_tsquery_external(q.as_ref())?),
         (l, r) => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
