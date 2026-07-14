@@ -211,6 +211,8 @@ impl Engine {
             owned_by: Some((tname, cname)),
             last_value: last.max(0),
             is_called: last > 0,
+            owner: None,
+            acl: alloc::vec::Vec::new(),
         };
         let _ = self.active_catalog_mut().create_sequence(def, true);
     }
@@ -280,6 +282,21 @@ impl Engine {
             }
         };
         self.ensure_implicit_sequence(&seq_name);
+        // v7.39 (read01 round 60) — sequence privileges. PG: nextval needs USAGE
+        // or UPDATE, currval needs USAGE or SELECT, setval needs UPDATE alone.
+        // The message names the SEQUENCE, not a table.
+        {
+            use spg_storage::priv_bits as pb;
+            let wanted = match op {
+                "nextval" => pb::USAGE | pb::UPDATE,
+                "currval" | "lastval" => pb::USAGE | pb::SELECT,
+                "setval" => pb::UPDATE,
+                _ => 0,
+            };
+            if wanted != 0 {
+                self.acl_require_sequence(&seq_name, wanted)?;
+            }
+        }
         match op {
             "nextval" => {
                 let v = self

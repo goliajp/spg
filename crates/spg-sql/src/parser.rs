@@ -754,6 +754,12 @@ impl Parser {
                         self.advance();
                         "INSERT".to_string()
                     }
+                    // v7.39 (read01 round 60) — CREATE is a privilege word on a
+                    // schema / database, and it lexes as a reserved token.
+                    Token::Create => {
+                        self.advance();
+                        "CREATE".to_string()
+                    }
                     // NOT upper-cased: in the no-ON shape (`GRANT devs TO
                     // alice`) these "privilege words" are ROLE NAMES, and a
                     // role name is case-sensitive. `priv_from_word` folds case
@@ -819,12 +825,55 @@ impl Parser {
             }
             Token::Ident(w) | Token::QuotedIdent(w) => {
                 let lc = w.to_ascii_lowercase();
+                // v7.39 (read01 round 60) — SEQUENCE / SCHEMA / DATABASE are
+                // real objects with real ACLs now.
+                if matches!(lc.as_str(), "sequence" | "schema" | "database") {
+                    self.advance();
+                    let mut names: Vec<String> = Vec::new();
+                    loop {
+                        let mut parts: Vec<String> = Vec::new();
+                        loop {
+                            parts.push(self.expect_ident_like()?);
+                            if matches!(self.peek(), Token::Dot) {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                        names.push(parts.pop().expect("at least one part"));
+                        if matches!(self.peek(), Token::Comma) {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    let grantees = self.parse_grantee_list(grant)?;
+                    let mut grant_option = grant_option;
+                    if grant && self.peek_keyword_ident("with") {
+                        self.advance();
+                        self.expect_keyword_ident("grant")?;
+                        self.expect_keyword_ident("option")?;
+                        grant_option = true;
+                    }
+                    self.consume_until_statement_boundary();
+                    let object = match lc.as_str() {
+                        "sequence" => GrantObject::Sequences(names),
+                        "schema" => GrantObject::Schemas(names),
+                        _ => GrantObject::Databases(names),
+                    };
+                    return Ok(finish_grant(
+                        grant,
+                        GrantStatement {
+                            privileges,
+                            object,
+                            grantees,
+                            grant_option,
+                        },
+                    ));
+                }
                 if matches!(
                     lc.as_str(),
-                    "sequence"
-                        | "schema"
-                        | "database"
-                        | "function"
+                    "function"
                         | "procedure"
                         | "routine"
                         | "type"

@@ -167,6 +167,7 @@ mod e2e_composite_round56;
 mod e2e_acl_round57;
 mod e2e_roles_round58;
 mod e2e_column_acl_round59;
+mod e2e_nontable_acl_round60;
 mod e2e_ddl_errors_round47;
 mod e2e_alter_subcommands_round49;
 mod e2e_comment_on_round50;

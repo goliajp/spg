@@ -14295,10 +14295,79 @@ fn apply_function_dispatch(
                     .any(|r| r.eq_ignore_ascii_case(role)),
             ))
         }
-        "has_schema_privilege"
-        | "has_function_privilege"
-        | "has_sequence_privilege"
-        | "has_database_privilege"
+        // v7.39 (read01 round 60) — the non-table privilege probes answer from
+        // the real ACLs now. PG's defaults are NOT "nobody holds anything":
+        // PUBLIC has USAGE on the public schema (but not CREATE — PG 15 revoked
+        // that), and CONNECT + TEMPORARY on the database.
+        "has_schema_privilege" | "has_database_privilege" | "has_sequence_privilege" => {
+            let is_seq = name.eq_ignore_ascii_case("has_sequence_privilege");
+            let named_role = args.len() == 3;
+            let base = usize::from(named_role);
+            let (Some(obj_arg), Some(priv_arg)) = (args.get(base), args.get(base + 1)) else {
+                return Ok(Value::Bool(true));
+            };
+            if matches!(obj_arg, Value::Null) || matches!(priv_arg, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let Value::Text(p) = priv_arg else {
+                return Ok(Value::Bool(true));
+            };
+            let Some(bit) = crate::acl::priv_from_word(p.as_ref()) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("unrecognized privilege type: \"{}\"", p.as_ref()),
+                });
+            };
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Bool(true));
+            };
+            let role = match args.first() {
+                Some(Value::Text(r)) if named_role => alloc::string::String::from(r.as_ref()),
+                _ => current_role_from_ctx(ctx),
+            };
+            let roles = ctx.users.map_or_else(
+                || {
+                    let mut s = alloc::collections::BTreeSet::new();
+                    s.insert(role.clone());
+                    s
+                },
+                |u| u.effective_roles(&role),
+            );
+            let held = if is_seq {
+                let Some(sname) = regclass_name_of(obj_arg) else {
+                    return Ok(Value::Bool(true));
+                };
+                let Some(seq) = cat.sequences().get(&sname) else {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!("relation \"{sname}\" does not exist"),
+                    });
+                };
+                let owner = seq
+                    .owner
+                    .as_deref()
+                    .unwrap_or(crate::session::LOGIN_ROLE);
+                if roles.iter().any(|r| r.eq_ignore_ascii_case(owner)) {
+                    spg_storage::priv_bits::ALL_SEQUENCE
+                } else {
+                    let mut h = 0;
+                    for a in &seq.acl {
+                        if a.grantee.is_empty()
+                            || roles.iter().any(|r| a.grantee.eq_ignore_ascii_case(r))
+                        {
+                            h |= a.privs;
+                        }
+                    }
+                    h
+                }
+            } else {
+                crate::acl::catalog_object_privs(
+                    cat,
+                    name.eq_ignore_ascii_case("has_schema_privilege"),
+                    &roles,
+                )
+            };
+            Ok(Value::Bool(held & bit != 0))
+        }
+        "has_function_privilege"
         | "has_language_privilege"
         | "has_tablespace_privilege"
         | "has_type_privilege"

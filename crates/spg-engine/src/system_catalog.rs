@@ -2202,6 +2202,44 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             ]));
         }
     }
+    // v7.39 (read01 round 60) — and a row PER SEQUENCE (relkind 'S'). Sequences
+    // were missing from pg_class entirely, so `SELECT relacl FROM pg_class WHERE
+    // relname = '<seq>'` — the canonical way to read a sequence's privileges —
+    // came back empty.
+    let mut seq_oid: i64 = 300_000;
+    for (name, def) in cat.sequences() {
+        seq_oid += 1;
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(seq_oid),
+            Value::text(name.clone()),
+            Value::BigInt(2200), // relnamespace — public
+            Value::BigInt(0),
+            Value::BigInt(0),
+            Value::BigInt(10), // relowner
+            Value::BigInt(0),  // relam — a sequence has no access method
+            Value::BigInt(seq_oid),
+            Value::BigInt(0),
+            Value::Int(1),      // relpages — a sequence is one page
+            Value::Float(1.0),  // reltuples — and one tuple
+            Value::Int(0),
+            Value::BigInt(0),
+            Value::Bool(false), // relhasindex
+            Value::Bool(false),
+            Value::text("p"),
+            Value::text("S"), // relkind — SEQUENCE
+            Value::SmallInt(3),
+            Value::SmallInt(0),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::text("n"),
+            Value::Bool(false),
+            crate::acl::render_acl_list(&def.acl).map_or(Value::Null, Value::text),
+        ]));
+    }
     (schema, rows)
 }
 
@@ -4482,27 +4520,34 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
 /// SPG is single-schema so we expose the canonical PG schemas:
 /// `public` (user-facing), `pg_catalog` (built-in), and
 /// `information_schema` (PG meta).
-pub(crate) fn synth_pg_namespace(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_namespace(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("nspname", DataType::Text, false),
         ColumnSchema::new("nspowner", DataType::BigInt, false),
+        // v7.39 (read01 round 60) — the schema ACL. Never NULL for `public`:
+        // PG ships it with PUBLIC holding USAGE (but NOT create).
+        ColumnSchema::new("nspacl", DataType::Text, true),
     ];
+    let public_acl = crate::acl::render_nspacl(cat);
     let rows = alloc::vec![
         Row::new(alloc::vec![
             Value::BigInt(11),
             Value::text("pg_catalog"),
             Value::BigInt(10),
+            Value::Null,
         ]),
         Row::new(alloc::vec![
             Value::BigInt(2200),
             Value::text("public"),
             Value::BigInt(10),
+            Value::text(public_acl),
         ]),
         Row::new(alloc::vec![
             Value::BigInt(13000),
             Value::text("information_schema"),
             Value::BigInt(10),
+            Value::Null,
         ]),
     ];
     (schema, rows)

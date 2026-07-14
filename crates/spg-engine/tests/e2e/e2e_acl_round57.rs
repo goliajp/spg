@@ -205,9 +205,13 @@ fn information_schema_reports_the_grants() {
 
 #[test]
 fn a_grant_on_any_other_object_class_still_restores() {
-    // pg_dump grants on schemas, sequences and functions. SPG enforces TABLE
-    // privileges only; the rest parse and no-op so a dump loads cleanly.
+    // pg_dump grants on schemas, sequences and functions. v7.39 (read01 round
+    // 60) made schemas, sequences and databases REAL — a grant on one now lands
+    // in its own ACL (and a missing sequence errors, like PG). The classes SPG
+    // still does not model (functions, `ALL TABLES IN SCHEMA`) parse and no-op
+    // so a dump loads cleanly.
     let mut e = seeded();
+    ok(&mut e, "CREATE SEQUENCE some_seq");
     for sql in [
         "GRANT USAGE ON SCHEMA public TO bob",
         "GRANT ALL ON SEQUENCE some_seq TO bob",
@@ -218,7 +222,7 @@ fn a_grant_on_any_other_object_class_still_restores() {
     ] {
         ok(&mut e, sql);
     }
-    // None of them touched the table ACL.
+    // None of them touched the TABLE's ACL — the objects are separate.
     assert_eq!(relacl(&mut e), "NULL");
 }
 

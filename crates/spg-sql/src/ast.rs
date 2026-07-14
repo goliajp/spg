@@ -3522,8 +3522,15 @@ pub enum GrantObject {
     /// alice`: role MEMBERSHIP, which has no ON clause at all. Carries the
     /// granted roles; the grantees are the members.
     Roles(Vec<String>),
-    /// `ON SCHEMA / SEQUENCE / DATABASE / FUNCTION / …`. Carries the
-    /// object-class word for the no-op message.
+    /// v7.39 (read01 round 60) — `ON SEQUENCE a, b`. A sequence's meaningful
+    /// privileges are SELECT (currval), UPDATE (setval) and USAGE (nextval).
+    Sequences(Vec<String>),
+    /// v7.39 (read01 round 60) — `ON SCHEMA public`. USAGE / CREATE.
+    Schemas(Vec<String>),
+    /// v7.39 (read01 round 60) — `ON DATABASE app`. CREATE / CONNECT / TEMP.
+    Databases(Vec<String>),
+    /// `ON FUNCTION / TYPE / LANGUAGE / …`. Carries the object-class word for
+    /// the no-op message.
     Other(String),
 }
 
@@ -3557,6 +3564,18 @@ impl GrantStatement {
             GrantObject::Roles(r) => {
                 let names: Vec<_> = r.iter().map(|n| quote_ident(n)).collect();
                 names.join(", ")
+            }
+            GrantObject::Sequences(n) => {
+                let names: Vec<_> = n.iter().map(|x| quote_ident(x)).collect();
+                alloc::format!("SEQUENCE {}", names.join(", "))
+            }
+            GrantObject::Schemas(n) => {
+                let names: Vec<_> = n.iter().map(|x| quote_ident(x)).collect();
+                alloc::format!("SCHEMA {}", names.join(", "))
+            }
+            GrantObject::Databases(n) => {
+                let names: Vec<_> = n.iter().map(|x| quote_ident(x)).collect();
+                alloc::format!("DATABASE {}", names.join(", "))
             }
             GrantObject::Other(k) => k.clone(),
         };

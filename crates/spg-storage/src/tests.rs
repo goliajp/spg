@@ -894,7 +894,12 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
     const EMPTY_COMMENT_BLOCK: usize = 4;
     let v53 = {
         let mut full = c.serialize();
-        full.truncate(full.len() - 4 - EMPTY_COMMENT_BLOCK);
+        // v7.39 (read01 round 60) — and the v66 catalog-wide non-table-ACL
+        // block, which sits between the comment store and the CRC: an empty
+        // sequence-owner list (u32 = 0) plus an empty schema ACL and an empty
+        // database ACL (u16 = 0 each). SIXTH appendix this test has caught.
+        const EMPTY_NONTABLE_ACL_BLOCK: usize = 4 + 2 + 2;
+        full.truncate(full.len() - 4 - EMPTY_COMMENT_BLOCK - EMPTY_NONTABLE_ACL_BLOCK);
         full
     };
 
@@ -1006,6 +1011,61 @@ fn truncated_mvcc_appendix_errors_cleanly() {
 /// real xmax, some alive) and specific non-dense rowids must serialize +
 /// deserialize with headers AND rowids identical, and next_rowid correct
 /// (strictly above every loaded id).
+#[test]
+fn v66_roundtrip_preserves_sequence_schema_and_database_acls() {
+    // read01 round 60 — the non-table ACLs. The sequence block sits mid-image
+    // and cannot grow without breaking a v65 reader, so a sequence's owner and
+    // ACL ride the catalog-wide v66 tail appendix, keyed by name.
+    use crate::{AclItem, SequenceDataType, SequenceDef, priv_bits};
+
+    let mut c = Catalog::new();
+    c.create_sequence(
+        SequenceDef {
+            name: "sq".into(),
+            data_type: SequenceDataType::BigInt,
+            start: 1,
+            increment: 1,
+            min_value: 1,
+            max_value: i64::MAX,
+            cache: 1,
+            cycle: false,
+            owned_by: None,
+            last_value: 0,
+            is_called: false,
+            owner: Some("alice".into()),
+            acl: alloc::vec![AclItem {
+                grantee: "eve".into(),
+                privs: priv_bits::USAGE,
+                grantable: 0,
+                grantor: "alice".into(),
+            }],
+        },
+        false,
+    )
+    .unwrap();
+    c.schema_acl_mut().push(AclItem {
+        grantee: String::new(),
+        privs: priv_bits::USAGE,
+        grantable: 0,
+        grantor: "pg_database_owner".into(),
+    });
+    c.database_acl_mut().push(AclItem {
+        grantee: "eve".into(),
+        privs: priv_bits::CONNECT | priv_bits::TEMPORARY,
+        grantable: 0,
+        grantor: "admin".into(),
+    });
+
+    let restored = Catalog::deserialize(&c.serialize()).expect("v66 image loads");
+    let sq = restored.sequences().get("sq").unwrap();
+    assert_eq!(sq.owner.as_deref(), Some("alice"));
+    assert_eq!(sq.acl.len(), 1);
+    assert_eq!(sq.acl[0].privs, priv_bits::USAGE);
+    assert_eq!(restored.schema_acl().len(), 1);
+    assert_eq!(restored.schema_acl()[0].grantee, "", "PUBLIC");
+    assert_eq!(restored.database_acl()[0].grantee, "eve");
+}
+
 #[test]
 fn v64_roundtrip_preserves_owner_and_acl() {
     // read01 round 57 — the owner and the aclitem list. A v63 image has

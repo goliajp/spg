@@ -1637,8 +1637,23 @@ pub mod priv_bits {
     pub const REFERENCES: u16 = 1 << 5; // x
     pub const TRIGGER: u16 = 1 << 6; // t
     pub const MAINTAIN: u16 = 1 << 7; // m
-    /// Every table privilege — what `GRANT ALL` grants and what an owner holds.
+    /// v7.39 (read01 round 60) — the non-table privileges. They share the
+    /// bitmask because an aclitem is an aclitem whatever it hangs off; which
+    /// bits are MEANINGFUL depends on the object (a sequence has r / w / U, a
+    /// schema has U / C, a database has C / c / T).
+    pub const USAGE: u16 = 1 << 8; // U
+    pub const CREATE: u16 = 1 << 9; // C
+    pub const CONNECT: u16 = 1 << 10; // c
+    pub const TEMPORARY: u16 = 1 << 11; // T
+    /// Every TABLE privilege — what `GRANT ALL ON <table>` grants and what a
+    /// table's owner holds.
     pub const ALL: u16 = INSERT | SELECT | UPDATE | DELETE | TRUNCATE | REFERENCES | TRIGGER | MAINTAIN;
+    /// `GRANT ALL ON SEQUENCE` — PG renders a sequence owner's default as `rwU`.
+    pub const ALL_SEQUENCE: u16 = SELECT | UPDATE | USAGE;
+    /// `GRANT ALL ON SCHEMA` — `UC`.
+    pub const ALL_SCHEMA: u16 = USAGE | CREATE;
+    /// `GRANT ALL ON DATABASE` — `CTc`.
+    pub const ALL_DATABASE: u16 = CREATE | CONNECT | TEMPORARY;
 }
 
 /// v7.37.6-B — partition 三态(parent / range child / default child)。
@@ -3414,6 +3429,14 @@ pub struct Catalog {
     /// Persisted in catalog FILE_VERSION 26+; older catalogs
     /// deserialise with an empty map.
     sequences: BTreeMap<String, SequenceDef>,
+    /// v7.39 (read01 round 60) — the `public` schema's ACL (PG
+    /// `pg_namespace.nspacl`). EMPTY = PG's default, which is not "nothing":
+    /// PUBLIC holds USAGE and the owner holds USAGE + CREATE. Materialised on
+    /// the first GRANT / REVOKE, exactly like a table's relacl.
+    schema_acl: Vec<AclItem>,
+    /// v7.39 (read01 round 60) — the database's ACL. EMPTY = PG's default:
+    /// PUBLIC holds CONNECT + TEMPORARY, the owner holds all three.
+    database_acl: Vec<AclItem>,
     /// v7.17.0 — catalogued VIEW objects (Phase 1.2). Each
     /// `SELECT FROM v` at engine exec-time looks up `v` here and
     /// prepends the view body as a synthetic CTE. Persisted in
@@ -3554,6 +3577,13 @@ pub struct SequenceDef {
     /// will return `start`.
     pub last_value: i64,
     pub is_called: bool,
+    /// v7.39 (read01 round 60) — the role that ran CREATE SEQUENCE. `None` = an
+    /// image written before FILE_VERSION 66, which predates sequence owners.
+    pub owner: Option<String>,
+    /// v7.39 (read01 round 60) — explicit GRANTs on this sequence. A sequence's
+    /// meaningful privileges are SELECT (`currval`), UPDATE (`setval`) and
+    /// USAGE (`nextval`).
+    pub acl: Vec<AclItem>,
 }
 
 /// v7.17.0 — sequence integer width.
@@ -3817,6 +3847,8 @@ impl Catalog {
             functions: BTreeMap::new(),
             triggers: Vec::new(),
             sequences: BTreeMap::new(),
+            schema_acl: Vec::new(),
+            database_acl: Vec::new(),
             views: BTreeMap::new(),
             materialized_views: BTreeMap::new(),
             enum_types: BTreeMap::new(),
@@ -3860,6 +3892,31 @@ impl Catalog {
     }
 
     /// v7.17.0 — read-only handle to catalogued sequences.
+    /// v7.39 (read01 round 60) — the `public` schema's ACL (PG nspacl).
+    #[must_use]
+    pub fn schema_acl(&self) -> &[AclItem] {
+        &self.schema_acl
+    }
+
+    pub fn schema_acl_mut(&mut self) -> &mut Vec<AclItem> {
+        &mut self.schema_acl
+    }
+
+    /// v7.39 (read01 round 60) — the database's ACL.
+    #[must_use]
+    pub fn database_acl(&self) -> &[AclItem] {
+        &self.database_acl
+    }
+
+    pub fn database_acl_mut(&mut self) -> &mut Vec<AclItem> {
+        &mut self.database_acl
+    }
+
+    /// v7.39 (read01 round 60) — mutable sequence access, for GRANT.
+    pub fn sequence_mut(&mut self, name: &str) -> Option<&mut SequenceDef> {
+        self.sequences.get_mut(name)
+    }
+
     pub const fn sequences(&self) -> &BTreeMap<String, SequenceDef> {
         &self.sequences
     }
@@ -6492,7 +6549,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 65;
+const FILE_VERSION: u8 = 66;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7419,6 +7476,41 @@ impl Catalog {
             write_str(&mut out, k);
             write_str_long(&mut out, v);
         }
+        // v7.39 (read01 round 60) — non-table ACLs (FILE_VERSION 66+), catalog-
+        // wide and written last so a v65 reader stops before them. The sequence
+        // block itself sits mid-image and cannot grow without breaking older
+        // readers, so a sequence's owner + ACL rides here, keyed by name.
+        let acl_out = |out: &mut Vec<u8>, acl: &[AclItem]| {
+            write_u16(out, u16::try_from(acl.len()).expect("≤ 65k aclitems"));
+            for a in acl {
+                write_str(out, &a.grantee);
+                write_u16(out, a.privs);
+                write_u16(out, a.grantable);
+                write_str(out, &a.grantor);
+            }
+        };
+        let owned: Vec<&SequenceDef> = self
+            .sequences
+            .values()
+            .filter(|s| s.owner.is_some() || !s.acl.is_empty())
+            .collect();
+        write_u32(
+            &mut out,
+            u32::try_from(owned.len()).expect("≤ 4G sequences"),
+        );
+        for seq in owned {
+            write_str(&mut out, &seq.name);
+            match &seq.owner {
+                Some(o) => {
+                    out.push(1);
+                    write_str(&mut out, o);
+                }
+                None => out.push(0),
+            }
+            acl_out(&mut out, &seq.acl);
+        }
+        acl_out(&mut out, &self.schema_acl);
+        acl_out(&mut out, &self.database_acl);
         // v7.38 (read01 P5.05) — CRC32C trailer over the whole image so a
         // corrupted snapshot is rejected on load. FILE_VERSION is >= the
         // trailer version, so this always runs for freshly-written images.
@@ -7579,6 +7671,8 @@ impl Catalog {
                         owned_by,
                         last_value,
                         is_called,
+                        owner: None,
+                        acl: Vec::new(),
                     },
                 );
             }
@@ -7700,6 +7794,42 @@ impl Catalog {
                 let text = cur.read_str_long()?;
                 cat.comments.insert(key, text);
             }
+        }
+        // v7.39 (read01 round 60) — non-table ACLs (FILE_VERSION 66+).
+        if version >= 66 {
+            let read_acl = |cur: &mut Cursor| -> Result<Vec<AclItem>, StorageError> {
+                let n = cur.read_u16()? as usize;
+                let mut acl = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let grantee = cur.read_str()?;
+                    let privs = cur.read_u16()?;
+                    let grantable = cur.read_u16()?;
+                    let grantor = cur.read_str()?;
+                    acl.push(AclItem {
+                        grantee,
+                        privs,
+                        grantable,
+                        grantor,
+                    });
+                }
+                Ok(acl)
+            };
+            let seq_count = cur.read_u32()? as usize;
+            for _ in 0..seq_count {
+                let name = cur.read_str()?;
+                let owner = if cur.read_u8()? == 1 {
+                    Some(cur.read_str()?)
+                } else {
+                    None
+                };
+                let acl = read_acl(&mut cur)?;
+                if let Some(seq) = cat.sequences.get_mut(&name) {
+                    seq.owner = owner;
+                    seq.acl = acl;
+                }
+            }
+            cat.schema_acl = read_acl(&mut cur)?;
+            cat.database_acl = read_acl(&mut cur)?;
         }
         // v7.38 (read01 P5.05) — v54+ images end with a CRC32C over every
         // preceding byte; verify it before accepting the snapshot. Older
