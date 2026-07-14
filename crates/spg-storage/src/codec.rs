@@ -49,6 +49,7 @@ pub(crate) fn deserialize_table(
             auto_increment,
             user_enum_type: None,
             user_composite_type: None,
+                acl: alloc::vec::Vec::new(),
             user_domain_type: None,
             on_update_runtime: None,
             collation: Collation::Binary,
@@ -458,6 +459,30 @@ pub(crate) fn deserialize_table(
             });
         }
         t.schema_mut().acl = acl;
+    }
+    // v7.39 (read01 round 59) — column-level ACL (FILE_VERSION 65+).
+    if version >= 65 {
+        let ncols = cur.read_u16()? as usize;
+        for _ in 0..ncols {
+            let col_pos = cur.read_u16()? as usize;
+            let n = cur.read_u16()? as usize;
+            let mut acl = alloc::vec::Vec::with_capacity(n);
+            for _ in 0..n {
+                let grantee = cur.read_str()?;
+                let privs = cur.read_u16()?;
+                let grantable = cur.read_u16()?;
+                let grantor = cur.read_str()?;
+                acl.push(crate::AclItem {
+                    grantee,
+                    privs,
+                    grantable,
+                    grantor,
+                });
+            }
+            if let Some(col) = t.schema_mut().columns.get_mut(col_pos) {
+                col.acl = acl;
+            }
+        }
     }
     let _ = table_name;
     Ok(())

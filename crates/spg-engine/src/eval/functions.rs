@@ -14226,8 +14226,40 @@ fn apply_function_dispatch(
                 },
                 |u| u.effective_roles(&role),
             );
-            let held = crate::acl::privs_of_roles(t.schema(), &owner, &roles);
-            Ok(Value::Bool(held & bit != 0))
+            // v7.39 (read01 round 59) — PG's rule: a column privilege is the
+            // TABLE's privilege OR the column's own. `has_any_column_privilege`
+            // asks whether ANY column carries it.
+            let table_held = crate::acl::privs_of_roles(t.schema(), &owner, &roles);
+            if table_held & bit != 0 {
+                return Ok(Value::Bool(true));
+            }
+            if is_any {
+                return Ok(Value::Bool(
+                    t.schema()
+                        .columns
+                        .iter()
+                        .any(|c| crate::acl::column_privs(c, &roles) & bit != 0),
+                ));
+            }
+            let Some(Value::Text(cname)) = args.get(base + 1) else {
+                return Ok(Value::Bool(false));
+            };
+            let Some(col) = t
+                .schema()
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(cname.as_ref()))
+            else {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "column \"{}\" of relation \"{tname}\" does not exist",
+                        cname.as_ref()
+                    ),
+                });
+            };
+            Ok(Value::Bool(
+                crate::acl::column_privs(col, &roles) & bit != 0,
+            ))
         }
         // v7.39 (read01 round 58) — `pg_has_role(member, role, 'MEMBER'|'USAGE')`
         // is a REAL membership question now. USAGE asks whether the privileges

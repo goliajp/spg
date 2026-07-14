@@ -75,6 +75,7 @@ fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> 
                 let name = alias.clone().unwrap_or(desc.name);
                 out.push(ColumnSchema {
                     user_composite_type: None,
+                acl: alloc::vec::Vec::new(),
                     name,
                     ty: desc.ty,
                     nullable: desc.nullable,

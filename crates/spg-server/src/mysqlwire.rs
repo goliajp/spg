@@ -762,6 +762,7 @@ fn handle_com_stmt_prepare(
             // type byte the client sent.
             let placeholder = ColumnSchema {
                 user_composite_type: None,
+                acl: Vec::new(),
                 name: "?".to_string(),
                 ty: DataType::Text,
                 nullable: true,

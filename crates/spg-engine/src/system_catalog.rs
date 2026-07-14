@@ -2233,6 +2233,9 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         ColumnSchema::new("attislocal", DataType::Bool, false),
         ColumnSchema::new("attinhcount", DataType::Int, false),
         ColumnSchema::new("attcollation", DataType::BigInt, false),
+        // v7.39 (read01 round 59) — column-level privileges. NULL until a
+        // `GRANT SELECT (col)` lands; a column grant never touches relacl.
+        ColumnSchema::new("attacl", DataType::Text, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut attrelid: i64 = 16384;
@@ -2317,6 +2320,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Bool(true),  // attislocal — true (not inherited)
                 Value::Int(0),      // attinhcount
                 Value::BigInt(0),   // attcollation — 0 (default)
+                crate::acl::render_acl_list(&col.acl).map_or(Value::Null, Value::text),
             ]));
         }
         attrelid = attrelid.saturating_add(1);
@@ -4182,6 +4186,51 @@ pub(crate) fn synth_info_role_table_grants(
                         },
                     )),
                 ]));
+            }
+        }
+    }
+    (cols, rows)
+}
+
+/// v7.39 (read01 round 59) — `information_schema.column_privileges`: one row per
+/// (column, grantee, privilege). PG lists a column's own grants here; the
+/// table-wide ones live in `table_privileges`.
+pub(crate) fn synth_info_column_privileges(
+    cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let cols = alloc::vec![
+        ColumnSchema::new("grantor", DataType::Text, false),
+        ColumnSchema::new("grantee", DataType::Text, false),
+        ColumnSchema::new("table_catalog", DataType::Text, false),
+        ColumnSchema::new("table_schema", DataType::Text, false),
+        ColumnSchema::new("table_name", DataType::Text, false),
+        ColumnSchema::new("column_name", DataType::Text, false),
+        ColumnSchema::new("privilege_type", DataType::Text, false),
+        ColumnSchema::new("is_grantable", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        for col in &t.schema().columns {
+            for a in &col.acl {
+                for bit in crate::acl::priv_iter(a.privs & !spg_storage::priv_bits::MAINTAIN) {
+                    rows.push(Row::new(alloc::vec![
+                        Value::text(a.grantor.clone()),
+                        Value::text(if a.grantee.is_empty() {
+                            alloc::string::String::from("PUBLIC")
+                        } else {
+                            a.grantee.clone()
+                        }),
+                        Value::text(alloc::string::String::from("app")),
+                        Value::text(alloc::string::String::from("public")),
+                        Value::text(tname.clone()),
+                        Value::text(col.name.clone()),
+                        Value::text(alloc::string::String::from(crate::acl::priv_word(bit))),
+                        Value::text(alloc::string::String::from(
+                            if a.grantable & bit != 0 { "YES" } else { "NO" },
+                        )),
+                    ]));
+                }
             }
         }
     }

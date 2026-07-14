@@ -3488,8 +3488,10 @@ impl Statement {
 /// both; `Statement::Grant` vs `Statement::Revoke` says which way it runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantStatement {
-    /// The privilege words, upper-cased. EMPTY = `ALL [PRIVILEGES]`.
-    pub privileges: Vec<String>,
+    /// The privileges. EMPTY = `ALL [PRIVILEGES]`. In the role-membership shape
+    /// (`GRANT devs TO alice`, no ON clause) these words are ROLE NAMES, which
+    /// is why they keep the case the user typed.
+    pub privileges: Vec<GrantPriv>,
     /// What the privileges are on.
     pub object: GrantObject,
     /// The roles granted to / revoked from. An empty string entry = PUBLIC.
@@ -3498,6 +3500,15 @@ pub struct GrantStatement {
     /// `GRANT OPTION FOR` (revoke only the right to re-grant, keep the
     /// privilege itself).
     pub grant_option: bool,
+}
+
+/// v7.39 (read01 round 59) — one privilege in a GRANT, with the optional COLUMN
+/// list PG allows per privilege: `GRANT SELECT (a, b), INSERT (c) ON t TO dan`.
+/// An empty column list means the privilege is table-wide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantPriv {
+    pub word: String,
+    pub columns: Vec<String>,
 }
 
 /// v7.39 (read01 round 57) — the object a GRANT names. SPG enforces TABLE
@@ -3522,9 +3533,21 @@ impl GrantStatement {
         use core::fmt::Write as _;
         let mut s = alloc::string::String::new();
         let privs = if self.privileges.is_empty() {
-            "ALL".into()
+            alloc::string::String::from("ALL")
         } else {
-            self.privileges.join(", ")
+            let parts: Vec<_> = self
+                .privileges
+                .iter()
+                .map(|p| {
+                    if p.columns.is_empty() {
+                        p.word.clone()
+                    } else {
+                        let cols: Vec<_> = p.columns.iter().map(|c| quote_ident(c)).collect();
+                        alloc::format!("{} ({})", p.word, cols.join(", "))
+                    }
+                })
+                .collect();
+            parts.join(", ")
         };
         let obj = match &self.object {
             GrantObject::Tables(t) => {

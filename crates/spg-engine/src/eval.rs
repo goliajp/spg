@@ -376,7 +376,6 @@ impl<'a> EvalContext<'a> {
     /// custom (namespaced) settings written with `SET` / `set_config`.
     #[must_use]
     /// v7.39 (read01 round 58) — thread the role store (see `users`).
-    #[must_use]
     pub const fn with_users(mut self, users: &'a crate::users::UserStore) -> Self {
         self.users = Some(users);
         self

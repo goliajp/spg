@@ -23,7 +23,7 @@ use crate::ast::{
     CreateSubscriptionStatement, CreateTableStatement, CreateTriggerStatement, Expr, ExtractField,
     FkAction, ForeignKeyConstraint, FrameBound, FrameExclusion, FrameKind, FromClause, FromJoin,
     FunctionArg, FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, IndexMethod,
-    GrantObject, GrantStatement, InsertStatement, IsolationLevel, JoinKind, Literal, NullTreatment,
+    GrantObject, GrantPriv, GrantStatement, InsertStatement, IsolationLevel, JoinKind, Literal, NullTreatment,
     OrderBy, Overriding,
     PlPgSqlBlock, PlPgSqlDeclare, PlPgSqlStmt, PublicationScope, RaiseLevel, RangeKindAst,
     ReturnTarget, SelectItem, SelectStatement, Statement, TableRef, TriggerEvent, TriggerForEach,
@@ -722,12 +722,22 @@ impl Parser {
             self.expect_keyword_ident("for")?;
             grant_option = true;
         }
-        // The privilege list: `ALL [PRIVILEGES]`, or comma-separated words.
-        let mut privileges: Vec<String> = Vec::new();
+        // The privilege list: `ALL [PRIVILEGES] [(cols)]`, or comma-separated
+        // words each with an optional COLUMN list.
+        let mut privileges: Vec<GrantPriv> = Vec::new();
         if matches!(self.peek(), Token::All) {
             self.advance();
             if self.peek_keyword_ident("privileges") {
                 self.advance();
+            }
+            // `GRANT ALL (col) ON t TO r` — every column privilege, on that
+            // column only.
+            if matches!(self.peek(), Token::LParen) {
+                let columns = self.parse_grant_column_list()?;
+                privileges.push(GrantPriv {
+                    word: "ALL".into(),
+                    columns,
+                });
             }
         } else {
             loop {
@@ -750,7 +760,14 @@ impl Parser {
                     // itself when they really are privileges.
                     _ => self.expect_ident_like()?,
                 };
-                privileges.push(w);
+                // v7.39 (read01 round 59) — the optional per-privilege COLUMN
+                // list: `GRANT SELECT (a, b), INSERT (c) ON t TO dan`.
+                let columns = if matches!(self.peek(), Token::LParen) {
+                    self.parse_grant_column_list()?
+                } else {
+                    Vec::new()
+                };
+                privileges.push(GrantPriv { word: w, columns });
                 if matches!(self.peek(), Token::Comma) {
                     self.advance();
                 } else {
@@ -761,7 +778,10 @@ impl Parser {
         // v7.39 (read01 round 58) — no ON clause at all = `GRANT devs TO alice`:
         // role MEMBERSHIP. The words parsed as "privileges" are the role names.
         if !matches!(self.peek(), Token::On) {
-            let roles = core::mem::take(&mut privileges);
+            let roles: Vec<String> = core::mem::take(&mut privileges)
+                .into_iter()
+                .map(|p| p.word)
+                .collect();
             let grantees = self.parse_grantee_list(grant)?;
             // `WITH ADMIN OPTION` / `GRANTED BY x` — accepted, ignored (SPG has
             // no admin-option layer: a member cannot re-grant).
@@ -873,6 +893,28 @@ impl Parser {
                 grant_option,
             },
         ))
+    }
+
+    /// v7.39 (read01 round 59) — `( col, col, … )` after a privilege word.
+    fn parse_grant_column_list(&mut self) -> Result<Vec<String>, ParseError> {
+        self.advance(); // (
+        let mut cols = Vec::new();
+        loop {
+            cols.push(self.expect_ident_like()?);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(alloc::format!(
+                "expected ')' to close the column list, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // )
+        Ok(cols)
     }
 
     /// `TO <roles>` (grant) / `FROM <roles>` (revoke). An empty-string entry is
