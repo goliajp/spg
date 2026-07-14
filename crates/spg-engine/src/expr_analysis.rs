@@ -355,3 +355,112 @@ pub(crate) fn expr_refers_to(e: &Expr, target: &str) -> bool {
         }
     }
 }
+
+/// v7.39 (read01 round 78) — the one exhaustive top-down rewrite over an
+/// expression tree. `f` sees each node before its children and returns `true`
+/// when it has REPLACED that node, in which case the walk does not descend
+/// into it.
+///
+/// Every mutable rewrite in the engine (clock folding, parameter substitution,
+/// USING-column rewriting, trigger locals…) had spelled out all ~25 `Expr`
+/// variants by hand, so each of them is a place a new variant can be forgotten.
+/// This one is written once and the compiler checks it.
+///
+/// Subquery nodes are LEAVES here on purpose: an inner SELECT has its own scope,
+/// and a rewrite that is right in the outer one is rarely right inside it. A
+/// caller that wants to descend does so itself, deliberately.
+pub(crate) fn rewrite_nodes_mut(e: &mut Expr, f: &mut impl FnMut(&mut Expr) -> bool) {
+    if f(e) {
+        return;
+    }
+    match e {
+        Expr::Literal(_)
+        | Expr::Placeholder(_)
+        | Expr::Column(_)
+        | Expr::ScalarSubquery(_)
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::RowInSubquery { .. }
+        | Expr::RowCmpSubquery { .. } => {}
+        Expr::NamedArg { expr, .. }
+        | Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. }
+        | Expr::Extract { source: expr, .. } => rewrite_nodes_mut(expr, f),
+        Expr::Binary { lhs, rhs, .. } => {
+            rewrite_nodes_mut(lhs, f);
+            rewrite_nodes_mut(rhs, f);
+        }
+        Expr::FunctionCall { args, .. } | Expr::Array(args) => {
+            for a in args {
+                rewrite_nodes_mut(a, f);
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            rewrite_nodes_mut(expr, f);
+            rewrite_nodes_mut(pattern, f);
+        }
+        Expr::AggregateOrdered { call, order_by, .. } => {
+            rewrite_nodes_mut(call, f);
+            for o in order_by.iter_mut() {
+                rewrite_nodes_mut(&mut o.expr, f);
+            }
+        }
+        Expr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args {
+                rewrite_nodes_mut(a, f);
+            }
+            for p in partition_by {
+                rewrite_nodes_mut(p, f);
+            }
+            for (oe, _, _) in order_by {
+                rewrite_nodes_mut(oe, f);
+            }
+        }
+        Expr::ArraySubscript { target, index } => {
+            rewrite_nodes_mut(target, f);
+            rewrite_nodes_mut(index, f);
+        }
+        Expr::ArraySlice { target, lo, hi } => {
+            rewrite_nodes_mut(target, f);
+            if let Some(l) = lo {
+                rewrite_nodes_mut(l, f);
+            }
+            if let Some(h) = hi {
+                rewrite_nodes_mut(h, f);
+            }
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            rewrite_nodes_mut(expr, f);
+            rewrite_nodes_mut(array, f);
+        }
+        Expr::InList { expr, list, .. } => {
+            rewrite_nodes_mut(expr, f);
+            for item in list {
+                rewrite_nodes_mut(item, f);
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(o) = operand {
+                rewrite_nodes_mut(o, f);
+            }
+            for (w, t) in branches {
+                rewrite_nodes_mut(w, f);
+                rewrite_nodes_mut(t, f);
+            }
+            if let Some(eb) = else_branch {
+                rewrite_nodes_mut(eb, f);
+            }
+        }
+    }
+}

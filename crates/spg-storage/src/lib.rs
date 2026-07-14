@@ -1438,6 +1438,12 @@ pub struct ColumnSchema {
     /// `None` for a column with no explicit default. Persisted in catalog
     /// FILE_VERSION 58+; older catalogs deserialise with None.
     pub default_text: Option<String>,
+    /// v7.39 (read01 round 78) — this column is the ONLY column of a FROM item
+    /// that calls a function returning a BASE type, so the item's row type IS
+    /// this column: a whole-row reference collapses to the value
+    /// (`SELECT j FROM jsonb_array_elements('[1]') AS j` → `1`, PG). Runtime
+    /// only — a catalogued table column is never one, and it is not persisted.
+    pub scalar_row_source: bool,
 }
 
 /// v7.17.0 Phase 2.5 — column-level text collation. Drives the
@@ -6372,6 +6378,7 @@ impl ColumnSchema {
             generated_stored_expr: None,
             identity_always: false,
             default_text: None,
+            scalar_row_source: false,
         }
     }
 

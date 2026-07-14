@@ -325,6 +325,15 @@ fn whole_row_composite(row: &Row<'_>, ctx: &EvalContext<'_>, alias: &str) -> Val
         .enumerate()
         .filter_map(|(i, s)| s.name.strip_prefix(&prefix).map(|bare| (i, bare)))
         .collect();
+    // v7.39 (read01 round 78) — a FROM item that calls a function returning a
+    // BASE type has that scalar AS its row type, so a whole-row reference is the
+    // value itself, not a one-field composite. `SELECT j FROM
+    // jsonb_array_elements('[1,2]') AS j` is `1`, `2` in PG; SPG answered
+    // `(1)`, `(2)`. A one-column TABLE or subquery does NOT collapse — hence the
+    // marker, set only where the parser desugared a function item.
+    if ctx.columns.len() == 1 && ctx.columns[0].scalar_row_source {
+        return row.values[0].clone().into_owned();
+    }
     let fields: Vec<(String, Value<'static>)> = if joined.is_empty() {
         ctx.columns
             .iter()

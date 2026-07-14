@@ -2134,6 +2134,13 @@ impl Engine {
                 ColumnSchema::new(name, *dt, true)
             })
             .collect();
+        // v7.39 (read01 round 78) — the item's row type IS this scalar when the
+        // parser desugared a base-type-returning function here (see
+        // TableRef::scalar_fn_item); the marker rides the column so it survives
+        // every EvalContext an inner stage rebuilds.
+        if primary.scalar_fn_item && schema_cols.len() == 1 {
+            schema_cols[0].scalar_row_source = true;
+        }
         // WITH ORDINALITY — trailing BIGINT counting rows from 1
         // in element order. The alias entry after the value
         // columns renames it (PG default: `ordinality`).
@@ -3312,6 +3319,40 @@ impl Engine {
         // `AS t(a, b)` renames the materialised columns positionally
         // (extra inner columns keep their own names, PG behaviour).
         let mut schema_cols: alloc::vec::Vec<ColumnSchema> = inner_cols;
+        // v7.39 (read01 round 78) — a column-alias list longer than the item is
+        // the error PG reports; SPG used to let the extra names through and then
+        // fail two layers downstream with "column not found: <the extra name>".
+        let n_out = schema_cols.len() + usize::from(primary.with_ordinality);
+        if primary.unnest_column_aliases.len() > n_out {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "table \"{alias}\" has {n_out} columns available but {} columns specified",
+                primary.unnest_column_aliases.len()
+            )));
+        }
+        if primary.scalar_fn_item && schema_cols.len() == 1 {
+            schema_cols[0].scalar_row_source = true;
+        }
+        // v7.39 (read01 round 78) — WITH ORDINALITY on a table function that
+        // rides this channel (regexp_matches): a trailing bigint counter, 1-based.
+        // The column-alias list, if given, names it like any other column.
+        let mut rows = rows;
+        if primary.with_ordinality {
+            schema_cols.push(ColumnSchema::new(
+                "ordinality".to_string(),
+                DataType::BigInt,
+                false,
+            ));
+            rows = rows
+                .into_iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let mut v = r.values;
+                    #[allow(clippy::cast_possible_wrap)]
+                    v.push(Value::BigInt(i as i64 + 1));
+                    Row::new(v)
+                })
+                .collect();
+        }
         for (i, new_name) in primary.unnest_column_aliases.iter().enumerate() {
             if let Some(col) = schema_cols.get_mut(i) {
                 col.name = new_name.clone();
@@ -5265,6 +5306,7 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
         jsonb_each_text_arg: None,
         table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
     };
     // Outer window query over the derived rows: aggregates → __aggN column refs.
     let mut outer_items = stmt.items.clone();
@@ -7646,6 +7688,18 @@ fn setof_column_shape(
 /// is zero rows, not one NULL row.
 ///
 /// Non-SRF items repeat, evaluated once per output row from the same input row.
+/// v7.39 (read01 round 78) — an SRF may sit ANYWHERE inside a target-list
+/// expression, not only as the whole item: `upper(unnest(a))`, `unnest(a) + 10`,
+/// `'x:' || unnest(a)`, `(regexp_matches(s, p, 'g'))::text`. PG evaluates the SRF
+/// to a set and then applies the enclosing expression once per element. SPG only
+/// ever recognised an SRF that WAS the item, so everything above died on
+/// "unknown function unnest" — the set-returning call, wrapped in anything at
+/// all, fell through to the scalar function dispatcher which has no such name.
+///
+/// Each SRF node is lifted out into a synthetic column (`__srf_k`), the tree is
+/// rewritten to read that column, and the rewritten expression is evaluated once
+/// per output row against the input row extended with the lifted values. The
+/// lift is by VALUE, not by literal: a text[] or a jsonb keeps its type exactly.
 fn expand_srf_row(
     engine: &Engine,
     projection: &[ProjectedItem],
@@ -7653,22 +7707,84 @@ fn expand_srf_row(
     row: &Row<'static>,
     ctx: &EvalContext<'_>,
 ) -> Result<Vec<Row<'static>>, EngineError> {
-    let mut lists: Vec<Vec<Value<'static>>> = Vec::with_capacity(srf_idxs.len());
+    // Lift every SRF node out of every item that contains one.
+    let mut nodes: Vec<spg_sql::ast::Expr> = Vec::new();
+    let mut rewritten: Vec<(usize, spg_sql::ast::Expr)> = Vec::with_capacity(srf_idxs.len());
+    let mut reject: Option<EngineError> = None;
     for &i in srf_idxs {
-        lists.push(engine.srf_values(&projection[i].expr, row, ctx)?);
+        let mut e = projection[i].expr.clone();
+        crate::expr_analysis::rewrite_nodes_mut(&mut e, &mut |n| {
+            if reject.is_some() {
+                return true;
+            }
+            // PG refuses a set-returning function inside a conditional: the set
+            // would have to be produced before anyone knows whether the branch
+            // is even taken.
+            let conditional = match n {
+                spg_sql::ast::Expr::Case { .. } => Some("CASE"),
+                spg_sql::ast::Expr::FunctionCall { name, .. }
+                    if name.eq_ignore_ascii_case("coalesce") =>
+                {
+                    Some("COALESCE")
+                }
+                _ => None,
+            };
+            if let Some(kind) = conditional
+                && engine.expr_contains_srf(n)
+            {
+                reject = Some(EngineError::Unsupported(alloc::format!(
+                    "set-returning functions are not allowed in {kind}"
+                )));
+                return true;
+            }
+            if !engine.is_srf_node(n) {
+                return false;
+            }
+            let slot = nodes.len();
+            nodes.push(n.clone());
+            *n = spg_sql::ast::Expr::Column(spg_sql::ast::ColumnName {
+                qualifier: None,
+                name: alloc::format!("__srf_{slot}"),
+            });
+            true
+        });
+        rewritten.push((i, e));
     }
-    let n = lists.iter().map(Vec::len).max().unwrap_or(0);
-    let mut out = Vec::with_capacity(n);
-    for k in 0..n {
+    if let Some(err) = reject {
+        return Err(err);
+    }
+    let mut lists: Vec<Vec<Value<'static>>> = Vec::with_capacity(nodes.len());
+    for n in &nodes {
+        lists.push(engine.srf_values(n, row, ctx)?);
+    }
+    let n_rows = lists.iter().map(Vec::len).max().unwrap_or(0);
+    // The input row extended with one column per lifted SRF. Original column
+    // indices are untouched, so every other reference still resolves.
+    let mut ext_cols: Vec<ColumnSchema> = ctx.columns.to_vec();
+    for (slot, list) in lists.iter().enumerate() {
+        let ty = list
+            .iter()
+            .find_map(|v| v.data_type())
+            .unwrap_or(DataType::Text);
+        ext_cols.push(ColumnSchema::new(alloc::format!("__srf_{slot}"), ty, true));
+    }
+    let mut ext_ctx = ctx.clone();
+    ext_ctx.columns = &ext_cols;
+    let mut out = Vec::with_capacity(n_rows);
+    for k in 0..n_rows {
+        let mut ext_vals = row.values.clone();
+        for list in &lists {
+            // Past the end of THIS srf's rows → NULL (PG pads).
+            ext_vals.push(list.get(k).cloned().unwrap_or(Value::Null));
+        }
+        let ext_row = Row::new(ext_vals);
         let mut vals = Vec::with_capacity(projection.len());
         for (i, p) in projection.iter().enumerate() {
-            match srf_idxs.iter().position(|&s| s == i) {
-                // Past the end of THIS srf's rows → NULL (PG pads).
-                Some(slot) => vals.push(lists[slot].get(k).cloned().unwrap_or(Value::Null)),
-                None => {
-                    vals.push(eval::eval_expr(&p.expr, row, ctx).map_err(EngineError::Eval)?);
-                }
-            }
+            let expr = rewritten
+                .iter()
+                .find(|(j, _)| *j == i)
+                .map_or(&p.expr, |(_, e)| e);
+            vals.push(eval::eval_expr(expr, &ext_row, &ext_ctx).map_err(EngineError::Eval)?);
         }
         out.push(Row::new(vals));
     }
@@ -7720,27 +7836,47 @@ impl Engine {
             .collect())
     }
 
-    /// Which projection items are set-returning: the builtin kinds, plus any
-    /// user function declared `RETURNS SETOF` / `RETURNS TABLE`.
+    /// Is THIS node a set-returning call: one of the builtin kinds, or a user
+    /// function declared `RETURNS SETOF` / `RETURNS TABLE`.
+    fn is_srf_node(&self, e: &spg_sql::ast::Expr) -> bool {
+        if is_top_level_unnest(e) {
+            return true;
+        }
+        let spg_sql::ast::Expr::FunctionCall { name, .. } = e else {
+            return false;
+        };
+        self.active_catalog()
+            .functions_named(name)
+            .iter()
+            .any(|f| {
+                let r = f.returns.trim().to_ascii_uppercase();
+                r.starts_with("SETOF") || r.starts_with("TABLE(")
+            })
+    }
+
+    /// Does an SRF appear ANYWHERE in this expression (not only as its root)?
+    fn expr_contains_srf(&self, e: &spg_sql::ast::Expr) -> bool {
+        let mut found = false;
+        let mut probe = e.clone();
+        crate::expr_analysis::rewrite_nodes_mut(&mut probe, &mut |n| {
+            if self.is_srf_node(n) {
+                found = true;
+                return true;
+            }
+            false
+        });
+        found
+    }
+
+    /// Which projection items CONTAIN a set-returning call. Before round 78 this
+    /// asked whether the item WAS one, so `upper(unnest(a))` looked like an
+    /// ordinary scalar call all the way down to the function dispatcher, which
+    /// then reported `unnest` as an unknown function.
     fn srf_target_idxs(&self, projection: &[ProjectedItem]) -> alloc::vec::Vec<usize> {
         projection
             .iter()
             .enumerate()
-            .filter(|(_, p)| {
-                if is_top_level_unnest(&p.expr) {
-                    return true;
-                }
-                let spg_sql::ast::Expr::FunctionCall { name, .. } = &p.expr else {
-                    return false;
-                };
-                self.active_catalog()
-                    .functions_named(name)
-                    .iter()
-                    .any(|f| {
-                        let r = f.returns.trim().to_ascii_uppercase();
-                        r.starts_with("SETOF") || r.starts_with("TABLE(")
-                    })
-            })
+            .filter(|(_, p)| self.expr_contains_srf(&p.expr))
             .map(|(i, _)| i)
             .collect()
     }
@@ -7873,6 +8009,7 @@ fn bare_table_ref_named(name: &str) -> TableRef {
         jsonb_each_text_arg: None,
         table_fn_call: None,
         rows_from: None,
+        scalar_fn_item: false,
     }
 }
 
