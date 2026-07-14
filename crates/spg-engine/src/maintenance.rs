@@ -194,8 +194,10 @@ impl Engine {
         for name in tables {
             let cat = self.active_catalog_mut();
             let Some(t) = cat.get_mut(name) else {
+                // v7.39 (read01 round 50) — PG says "relation" for TRUNCATE
+                // (only DROP TABLE says "table"). 42P01 at the wire.
                 return Err(EngineError::Storage(StorageError::Corrupt(alloc::format!(
-                    "table {name:?} does not exist"
+                    "relation {name:?} does not exist"
                 ))));
             };
             affected = affected.saturating_add(t.row_count());

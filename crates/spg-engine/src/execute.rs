@@ -1370,6 +1370,11 @@ impl Engine {
                 self.exec_drop_materialized_view(&names, if_exists)
             }
             Statement::CreateType(s) => self.exec_create_type(s),
+            Statement::CommentOn {
+                kind,
+                name,
+                comment,
+            } => self.exec_comment_on(&kind, &name, comment.as_deref()),
             Statement::AlterTypeRenameValue {
                 type_name,
                 old,

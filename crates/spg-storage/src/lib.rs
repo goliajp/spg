@@ -3367,6 +3367,14 @@ pub struct Catalog {
     /// Persisted in catalog FILE_VERSION 30+; older catalogs
     /// deserialise with an empty map.
     domain_types: BTreeMap<String, DomainDef>,
+    /// v7.39 (read01 round 50) — `COMMENT ON <kind> <obj> IS '…'` store.
+    /// Keyed by a canonical `"<kind>:<name>"` string (`"table:t"`,
+    /// `"column:t.c"`, `"index:i"`, `"view:v"`, …) so a new commentable
+    /// object kind needs no schema change. `COMMENT … IS NULL` removes the
+    /// entry. Persisted in catalog FILE_VERSION 61+; older catalogs
+    /// deserialise with an empty map. Read back by obj_description /
+    /// col_description and the pg_description view.
+    comments: BTreeMap<String, String>,
     /// v7.37.42-T2 ζ-B — catalogued user-defined COMPOSITE types
     /// (`CREATE TYPE name AS (field_name field_type, …)`). Columns
     /// reference these by name via
@@ -3741,6 +3749,7 @@ impl Catalog {
             materialized_views: BTreeMap::new(),
             enum_types: BTreeMap::new(),
             domain_types: BTreeMap::new(),
+            comments: BTreeMap::new(),
             composite_types: BTreeMap::new(),
             schemas: alloc::collections::BTreeSet::new(),
         }
@@ -4048,6 +4057,43 @@ impl Catalog {
         })?;
         def.labels[at] = new.to_string();
         Ok(())
+    }
+
+    /// v7.39 (read01 round 50) — set (or, with `None`, remove) the comment on
+    /// an object. `key` is the canonical `"<kind>:<name>"` form.
+    pub fn set_comment(&mut self, key: &str, text: Option<&str>) {
+        match text {
+            Some(t) => {
+                self.comments.insert(key.to_string(), t.to_string());
+            }
+            None => {
+                self.comments.remove(key);
+            }
+        }
+    }
+
+    /// v7.39 (read01 round 50) — the comment on an object, if any.
+    #[must_use]
+    pub fn comment(&self, key: &str) -> Option<&str> {
+        self.comments.get(key).map(String::as_str)
+    }
+
+    /// v7.39 (read01 round 50) — every `(key, text)` pair, for the
+    /// pg_description view.
+    #[must_use]
+    pub const fn comments(&self) -> &BTreeMap<String, String> {
+        &self.comments
+    }
+
+    /// v7.39 (read01 round 50) — drop every comment whose key names `obj`
+    /// (the object itself and, for a table, its columns). Called when the
+    /// object is dropped so a later object of the same name doesn't inherit
+    /// a stale comment.
+    pub fn drop_comments_for(&mut self, kind: &str, name: &str) {
+        let exact = alloc::format!("{kind}:{name}");
+        let col_prefix = alloc::format!("column:{name}.");
+        self.comments
+            .retain(|k, _| *k != exact && !k.starts_with(&col_prefix));
     }
 
     pub fn add_enum_value(
@@ -6370,7 +6416,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 60;
+const FILE_VERSION: u8 = 61;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7212,6 +7258,17 @@ impl Catalog {
                 write_data_type(&mut out, *fty);
             }
         }
+        // v7.39 (read01 round 50) — COMMENT store (FILE_VERSION 61+).
+        // Catalog-wide, written last (before the CRC trailer) so every older
+        // reader stops before it. Layout: [u32 count] then [str key][str text].
+        write_u32(
+            &mut out,
+            u32::try_from(self.comments.len()).expect("≤ 4G comments"),
+        );
+        for (k, v) in &self.comments {
+            write_str(&mut out, k);
+            write_str_long(&mut out, v);
+        }
         // v7.38 (read01 P5.05) — CRC32C trailer over the whole image so a
         // corrupted snapshot is rejected on load. FILE_VERSION is >= the
         // trailer version, so this always runs for freshly-written images.
@@ -7483,6 +7540,15 @@ impl Catalog {
                 }
                 cat.composite_types
                     .insert(name.clone(), CompositeDef { name, fields });
+            }
+        }
+        // v7.39 (read01 round 50) — COMMENT store (FILE_VERSION 61+).
+        if version >= 61 {
+            let comment_count = cur.read_u32()? as usize;
+            for _ in 0..comment_count {
+                let key = cur.read_str()?;
+                let text = cur.read_str_long()?;
+                cat.comments.insert(key, text);
             }
         }
         // v7.38 (read01 P5.05) — v54+ images end with a CRC32C over every
