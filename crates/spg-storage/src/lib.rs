@@ -1336,6 +1336,11 @@ pub struct ColumnSchema {
     /// itself did not). Persisted in the composite-column appendix
     /// (FILE_VERSION 63+); older catalogs deserialise with None.
     pub user_composite_type: Option<String>,
+    /// v7.39 (read01 round 59) — column-level privileges (PG
+    /// `pg_attribute.attacl`). `GRANT SELECT (pub) ON t TO dan` lands here and
+    /// does NOT touch the table's `relacl`. Empty = no column grant, which is
+    /// every column until one is made.
+    pub acl: Vec<AclItem>,
     /// v7.17.0 Phase 2.1 — MySQL `ON UPDATE CURRENT_TIMESTAMP`
     /// column attribute. When `Some(expr_src)`, an UPDATE that
     /// does NOT bind this column overrides the new value with
@@ -6140,6 +6145,7 @@ impl ColumnSchema {
             user_enum_type: None,
             user_domain_type: None,
             user_composite_type: None,
+            acl: Vec::new(),
             on_update_runtime: None,
             collation: Collation::Binary,
             is_unsigned: false,
@@ -6486,7 +6492,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 64;
+const FILE_VERSION: u8 = 65;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7194,6 +7200,34 @@ impl Catalog {
                 write_u16(&mut out, a.privs);
                 write_u16(&mut out, a.grantable);
                 write_str(&mut out, &a.grantor);
+            }
+            // v7.39 (read01 round 59) — COLUMN acl appendix (FILE_VERSION 65+),
+            // sparse: only columns that carry a grant land here, so a v64 reader
+            // stops before it and its columns read back un-granted, which is
+            // what they were.
+            let granted: Vec<(usize, &ColumnSchema)> = t
+                .schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !c.acl.is_empty())
+                .collect();
+            write_u16(
+                &mut out,
+                u16::try_from(granted.len()).expect("≤ 65k granted columns/table"),
+            );
+            for (pos, c) in granted {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                write_u16(
+                    &mut out,
+                    u16::try_from(c.acl.len()).expect("≤ 65k aclitems/column"),
+                );
+                for a in &c.acl {
+                    write_str(&mut out, &a.grantee);
+                    write_u16(&mut out, a.privs);
+                    write_u16(&mut out, a.grantable);
+                    write_str(&mut out, &a.grantor);
+                }
             }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions

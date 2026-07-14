@@ -23,7 +23,9 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use spg_sql::ast::{Expr, GrantObject, GrantStatement, SelectItem, SelectStatement, Statement, TableRef};
+use spg_sql::ast::{
+    ColumnName, Expr, GrantObject, GrantStatement, SelectItem, SelectStatement, Statement, TableRef,
+};
 use spg_storage::{AclItem, TableSchema, priv_bits};
 
 use crate::session::LOGIN_ROLE;
@@ -104,14 +106,35 @@ fn render_aclitem(a: &AclItem) -> String {
     s
 }
 
-/// `pg_class.relacl` for a table: the whole aclitem array as PG prints it, or
-/// `None` (SQL NULL) while no GRANT has ever run.
-pub(crate) fn render_relacl(schema: &TableSchema) -> Option<String> {
-    if schema.acl.is_empty() {
+/// An aclitem array as PG prints it, or `None` (SQL NULL) when it is empty —
+/// `pg_class.relacl` for a table, `pg_attribute.attacl` for a column.
+pub(crate) fn render_acl_list(acl: &[AclItem]) -> Option<String> {
+    if acl.is_empty() {
         return None;
     }
-    let items: Vec<String> = schema.acl.iter().map(render_aclitem).collect();
+    let items: Vec<String> = acl.iter().map(render_aclitem).collect();
     Some(alloc::format!("{{{}}}", items.join(",")))
+}
+
+/// `pg_class.relacl` for a table.
+pub(crate) fn render_relacl(schema: &TableSchema) -> Option<String> {
+    render_acl_list(&schema.acl)
+}
+
+/// v7.39 (read01 round 59) — the privileges `roles` hold on ONE column: its own
+/// ACL, which is a DIFFERENT thing from the table's. PG's rule is that either
+/// one suffices, so callers OR the two together.
+pub(crate) fn column_privs(
+    col: &spg_storage::ColumnSchema,
+    roles: &alloc::collections::BTreeSet<String>,
+) -> u16 {
+    let mut held = 0;
+    for a in &col.acl {
+        if a.grantee.is_empty() || roles.iter().any(|r| a.grantee.eq_ignore_ascii_case(r)) {
+            held |= a.privs;
+        }
+    }
+    held
 }
 
 /// The privileges `role` holds on `schema`, ignoring superuser-ness: the
@@ -137,6 +160,16 @@ pub(crate) fn privs_of_roles(
         }
     }
     held
+}
+
+/// v7.39 (read01 round 59) — what a statement reads from ONE table: either
+/// every column (a `SELECT *` reached it) or a specific set. An EMPTY set means
+/// the table is read but no column value is — `SELECT count(*)`, which PG allows
+/// with nothing but a column privilege somewhere on the table.
+#[derive(Default)]
+pub(crate) struct ColRead {
+    pub all: bool,
+    pub cols: alloc::collections::BTreeSet<String>,
 }
 
 impl Engine {
@@ -187,6 +220,67 @@ impl Engine {
                 "must be owner of table {table}"
             )))
         }
+    }
+
+    /// v7.39 (read01 round 59) — a column-scoped GRANT / REVOKE. Column grants
+    /// live in the COLUMN's own acl (PG `pg_attribute.attacl`) and never touch
+    /// the table's `relacl`, which is why a role can hold `SELECT (pub)` while
+    /// `has_table_privilege(…, 'SELECT')` stays false.
+    pub(crate) fn acl_apply_columns(
+        &mut self,
+        table: &str,
+        mask: u16,
+        columns: &[String],
+        grantees: &[String],
+        grant: bool,
+        grant_option: bool,
+    ) -> Result<(), EngineError> {
+        self.acl_require_owner(table)?;
+        let grantor = self.current_role().to_string();
+        let cat = self.active_catalog_mut();
+        let t = cat.get_mut(table).ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!("relation \"{table}\" does not exist"))
+        })?;
+        for cname in columns {
+            let Some(col) = t
+                .schema_mut()
+                .columns
+                .iter_mut()
+                .find(|sc| sc.name.eq_ignore_ascii_case(cname))
+            else {
+                continue;
+            };
+            for g in grantees {
+                let at = col.acl.iter().position(|a| a.grantee.eq_ignore_ascii_case(g));
+                if grant {
+                    match at {
+                        Some(i) => {
+                            col.acl[i].privs |= mask;
+                            if grant_option {
+                                col.acl[i].grantable |= mask;
+                            }
+                        }
+                        None => col.acl.push(AclItem {
+                            grantee: g.clone(),
+                            privs: mask,
+                            grantable: if grant_option { mask } else { 0 },
+                            grantor: grantor.clone(),
+                        }),
+                    }
+                } else if let Some(i) = at {
+                    if grant_option {
+                        col.acl[i].grantable &= !mask;
+                    } else {
+                        col.acl[i].privs &= !mask;
+                        col.acl[i].grantable &= !mask;
+                    }
+                    if col.acl[i].privs == 0 {
+                        col.acl.remove(i);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// v7.39 (read01 round 58) — `GRANT devs TO alice` / `REVOKE devs FROM
@@ -433,44 +527,75 @@ impl Engine {
         if self.is_superuser() {
             return Ok(());
         }
-        let mut reads: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
+        let mut reads: alloc::collections::BTreeMap<String, ColRead> =
+            alloc::collections::BTreeMap::new();
         match stmt {
             Statement::Select(s) => {
-                collect_read_tables(s, &mut reads);
+                self.collect_select_reads(s, &mut reads);
             }
             Statement::Insert(i) => {
-                self.acl_require(&i.table, priv_bits::INSERT)?;
+                // v7.39 (read01 round 59) — an INSERT that names its columns
+                // needs INSERT on THOSE columns; one that does not names them
+                // all, so only a table-wide grant can carry it.
+                let icols: alloc::vec::Vec<String> = i.columns.clone().unwrap_or_default();
+                self.acl_require_write_columns(&i.table, &icols, priv_bits::INSERT)?;
                 if let Some(src) = &i.select_source {
-                    collect_read_tables(src, &mut reads);
+                    self.collect_select_reads(src, &mut reads);
                 }
             }
             Statement::Update(u) => {
-                self.acl_require(&u.table, priv_bits::UPDATE)?;
+                let targets: alloc::vec::Vec<String> =
+                    u.assignments.iter().map(|(t, _)| t.clone()).collect();
+                self.acl_require_write_columns(&u.table, &targets, priv_bits::UPDATE)?;
                 // PG only demands SELECT once the statement READS a value:
                 // `UPDATE t SET v='x'` needs UPDATE alone, but any WHERE — or
                 // an assignment whose right-hand side reads a column — also
-                // needs SELECT on the table.
-                let reads_values = u.where_.is_some()
-                    || u.assignments.iter().any(|(_, e)| expr_reads_column(e))
-                    || u.returning.is_some();
-                if reads_values {
-                    self.acl_require(&u.table, priv_bits::SELECT)?;
+                // needs SELECT, and then only on the columns it reads.
+                let mut sub = SelectStatement::default();
+                sub.from = Some(spg_sql::ast::FromClause {
+                    primary: bare_table_ref(u.table.clone()),
+                    joins: alloc::vec::Vec::new(),
+                });
+                sub.where_ = u.where_.clone();
+                for (_, e) in &u.assignments {
+                    sub.items.push(SelectItem::Expr {
+                        expr: e.clone(),
+                        alias: None,
+                    });
                 }
-                if let Some(w) = &u.where_ {
-                    let mut sub = SelectStatement::default();
-                    sub.where_ = Some(w.clone());
-                    collect_read_tables(&sub, &mut reads);
+                if let Some(r) = &u.returning {
+                    for item in r {
+                        sub.items.push(item.clone());
+                    }
+                }
+                self.collect_select_reads(&sub, &mut reads);
+                // The UPDATE target is not "read" merely by being written to.
+                if let Some(r) = reads.get(&u.table)
+                    && !r.all
+                    && r.cols.is_empty()
+                {
+                    reads.remove(&u.table);
                 }
             }
             Statement::Delete(d) => {
                 self.acl_require(&d.table, priv_bits::DELETE)?;
-                if d.where_.is_some() || d.returning.is_some() {
-                    self.acl_require(&d.table, priv_bits::SELECT)?;
+                let mut sub = SelectStatement::default();
+                sub.from = Some(spg_sql::ast::FromClause {
+                    primary: bare_table_ref(d.table.clone()),
+                    joins: alloc::vec::Vec::new(),
+                });
+                sub.where_ = d.where_.clone();
+                if let Some(r) = &d.returning {
+                    for item in r {
+                        sub.items.push(item.clone());
+                    }
                 }
-                if let Some(w) = &d.where_ {
-                    let mut sub = SelectStatement::default();
-                    sub.where_ = Some(w.clone());
-                    collect_read_tables(&sub, &mut reads);
+                self.collect_select_reads(&sub, &mut reads);
+                if let Some(r) = reads.get(&d.table)
+                    && !r.all
+                    && r.cols.is_empty()
+                {
+                    reads.remove(&d.table);
                 }
             }
             Statement::Truncate { tables, .. } => {
@@ -488,8 +613,8 @@ impl Engine {
             Statement::CreateIndex(c) => self.acl_require_owner(&c.table)?,
             _ => {}
         }
-        for t in &reads {
-            self.acl_require(t, priv_bits::SELECT)?;
+        for (t, read) in &reads {
+            self.acl_require_read(t, read)?;
         }
         Ok(())
     }
@@ -505,10 +630,13 @@ impl Engine {
         if self.is_superuser() {
             return Ok(());
         }
-        let mut reads: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
-        collect_read_tables(s, &mut reads);
-        for t in &reads {
-            self.acl_require(t, priv_bits::SELECT)?;
+        // v7.39 (read01 round 59) — column-aware: a role may hold SELECT on a
+        // few columns and nothing table-wide.
+        let mut reads: alloc::collections::BTreeMap<String, ColRead> =
+            alloc::collections::BTreeMap::new();
+        self.collect_select_reads(s, &mut reads);
+        for (t, read) in &reads {
+            self.acl_require_read(t, read)?;
         }
         Ok(())
     }
@@ -531,34 +659,65 @@ impl Engine {
             });
         };
         // A privilege word PG does not know is an error, not a silent skip.
-        let mut mask = 0u16;
+        // v7.39 (read01 round 59) — split the list into the table-wide privileges
+        // and the column-scoped ones (`GRANT SELECT (a, b), INSERT (c) ON t`).
+        let mut table_mask = 0u16;
+        let mut column_masks: alloc::vec::Vec<(u16, &[String])> = alloc::vec::Vec::new();
         if g.privileges.is_empty() {
-            mask = priv_bits::ALL;
+            table_mask = priv_bits::ALL;
         } else {
-            for w in &g.privileges {
-                let bit = priv_from_word(w).ok_or_else(|| {
-                    // PG's GRANT wording — no colon, and the unquoted ident is
-                    // downcased, exactly as the parser saw it.
-                    EngineError::Unsupported(alloc::format!(
-                        "unrecognized privilege type \"{}\"",
-                        w.to_ascii_lowercase()
-                    ))
-                })?;
-                mask |= bit;
+            for p in &g.privileges {
+                let bit = if p.word.eq_ignore_ascii_case("ALL") {
+                    priv_bits::ALL
+                } else {
+                    priv_from_word(&p.word).ok_or_else(|| {
+                        // PG's GRANT wording — no colon, and the unquoted ident
+                        // is downcased, exactly as the parser saw it.
+                        EngineError::Unsupported(alloc::format!(
+                            "unrecognized privilege type \"{}\"",
+                            p.word.to_ascii_lowercase()
+                        ))
+                    })?
+                };
+                if p.columns.is_empty() {
+                    table_mask |= bit;
+                } else {
+                    column_masks.push((bit, &p.columns));
+                }
             }
         }
         for t in tables {
-            if self.active_catalog().get(t).is_none() {
+            let Some(tb) = self.active_catalog().get(t) else {
                 return Err(EngineError::Unsupported(alloc::format!(
                     "relation \"{t}\" does not exist"
                 )));
+            };
+            // Every named column has to exist, PG's wording and all.
+            for (_, cols) in &column_masks {
+                for c in *cols {
+                    if !tb
+                        .schema()
+                        .columns
+                        .iter()
+                        .any(|sc| sc.name.eq_ignore_ascii_case(c))
+                    {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "column \"{c}\" of relation \"{t}\" does not exist"
+                        )));
+                    }
+                }
             }
         }
         for r in &g.grantees {
             self.acl_check_role_exists(r)?;
         }
         for t in tables {
-            self.acl_apply(t, mask, &g.grantees, grant, g.grant_option)?;
+            if table_mask != 0 {
+                self.acl_apply(t, table_mask, &g.grantees, grant, g.grant_option)?;
+            }
+            for (bit, cols) in &column_masks {
+                self.acl_apply_columns(t, *bit, cols, &g.grantees, grant, g.grant_option)?;
+            }
         }
         Ok(crate::QueryResult::CommandOk {
             affected: 0,
@@ -567,39 +726,304 @@ impl Engine {
     }
 }
 
-/// Does this expression read a column value? Drives PG's rule that an UPDATE
-/// which only writes constants needs UPDATE alone, while one that reads needs
-/// SELECT too.
-fn expr_reads_column(e: &Expr) -> bool {
-    let mut found = false;
-    fn walk(e: &Expr, found: &mut bool) {
-        match e {
-            Expr::Column(_) => *found = true,
-            Expr::Binary { lhs, rhs, .. } => {
-                walk(lhs, found);
-                walk(rhs, found);
+
+impl Engine {
+    /// v7.39 (read01 round 59) — the column-aware SELECT gate for ONE table.
+    ///
+    /// PG's rule, in order: a table-wide SELECT settles it. Otherwise every
+    /// column the statement actually READS must carry a column-level SELECT —
+    /// and `SELECT *`, which reaches every column, therefore needs every column
+    /// granted. A statement that reads NO column value of the table
+    /// (`SELECT count(*)`) needs only *some* column privilege on it, which is
+    /// exactly `has_any_column_privilege`.
+    pub(crate) fn acl_require_read(&self, table: &str, read: &ColRead) -> Result<(), EngineError> {
+        if self.acl_holds(table, priv_bits::SELECT) {
+            return Ok(());
+        }
+        let denied = || {
+            EngineError::Unsupported(alloc::format!("permission denied for table {table}"))
+        };
+        let Some(t) = self.active_catalog().get(table) else {
+            return Ok(());
+        };
+        let roles = self.users.effective_roles(self.current_role());
+        let cols = &t.schema().columns;
+        if read.all {
+            // Every column, so every column must be granted.
+            return if cols
+                .iter()
+                .all(|c| column_privs(c, &roles) & priv_bits::SELECT != 0)
+                && !cols.is_empty()
+            {
+                Ok(())
+            } else {
+                Err(denied())
+            };
+        }
+        if read.cols.is_empty() {
+            // count(*) — any column privilege will do.
+            return if cols
+                .iter()
+                .any(|c| column_privs(c, &roles) & priv_bits::SELECT != 0)
+            {
+                Ok(())
+            } else {
+                Err(denied())
+            };
+        }
+        for name in &read.cols {
+            let Some(c) = cols.iter().find(|c| c.name.eq_ignore_ascii_case(name)) else {
+                continue;
+            };
+            if column_privs(c, &roles) & priv_bits::SELECT == 0 {
+                return Err(denied());
             }
-            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => walk(expr, found),
-            Expr::FunctionCall { args, .. } => args.iter().for_each(|a| walk(a, found)),
+        }
+        Ok(())
+    }
+
+    /// The write-side column gate: `INSERT (id) VALUES …` needs INSERT on `id`,
+    /// `UPDATE t SET v = …` needs UPDATE on `v`. A table-wide grant settles it.
+    pub(crate) fn acl_require_write_columns(
+        &self,
+        table: &str,
+        columns: &[String],
+        wanted: u16,
+    ) -> Result<(), EngineError> {
+        if self.acl_holds(table, wanted) {
+            return Ok(());
+        }
+        let Some(t) = self.active_catalog().get(table) else {
+            return Ok(());
+        };
+        let roles = self.users.effective_roles(self.current_role());
+        // No column list = every column, so the table-wide privilege is the
+        // only thing that can carry it — and we already know it is absent.
+        if columns.is_empty() {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "permission denied for table {table}"
+            )));
+        }
+        for name in columns {
+            let Some(c) = t
+                .schema()
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name))
+            else {
+                continue;
+            };
+            if column_privs(c, &roles) & wanted == 0 {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "permission denied for table {table}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// v7.39 (read01 round 59) — which columns of which base tables a SELECT
+    /// reads. Qualified references resolve through the FROM's alias map;
+    /// unqualified ones go to every base table AT THAT LEVEL that has such a
+    /// column (in PG an unqualified name that two of them share is an error, so
+    /// when the query is legal this is exact). Subqueries recurse with their
+    /// own level.
+    pub(crate) fn collect_select_reads(
+        &self,
+        stmt: &SelectStatement,
+        into: &mut alloc::collections::BTreeMap<String, ColRead>,
+    ) {
+        let cat = self.active_catalog();
+        // This level's base tables, and the aliases that name them.
+        let mut bases: alloc::vec::Vec<(String, Option<String>)> = alloc::vec::Vec::new();
+        let mut note = |t: &TableRef, into: &mut alloc::collections::BTreeMap<String, ColRead>, this: &Self| {
+            if let Some(sub) = &t.lateral_subquery {
+                this.collect_select_reads(sub, into);
+                return None;
+            }
+            if t.unnest_expr.is_some()
+                || t.generate_series_args.is_some()
+                || t.jsonb_each_text_arg.is_some()
+                || t.table_fn_call.is_some()
+            {
+                return None;
+            }
+            into.entry(t.name.clone()).or_default();
+            Some((t.name.clone(), t.alias.clone()))
+        };
+        if let Some(from) = &stmt.from {
+            if let Some(b) = note(&from.primary, into, self) {
+                bases.push(b);
+            }
+            for j in &from.joins {
+                if let Some(b) = note(&j.table, into, self) {
+                    bases.push(b);
+                }
+            }
+        }
+        let owns = |table: &str, col: &str| -> bool {
+            cat.get(table).is_some_and(|t| {
+                t.schema()
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(col))
+            })
+        };
+        let mut add_col = |c: &ColumnName, into: &mut alloc::collections::BTreeMap<String, ColRead>| {
+            match &c.qualifier {
+                Some(q) => {
+                    // The qualifier is a table name or an alias of one.
+                    let target = bases.iter().find(|(t, a)| {
+                        a.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(q))
+                            || t.eq_ignore_ascii_case(q)
+                    });
+                    if let Some((t, _)) = target {
+                        into.entry(t.clone()).or_default().cols.insert(c.name.clone());
+                    }
+                }
+                None => {
+                    for (t, _) in &bases {
+                        if owns(t, &c.name) {
+                            into.entry(t.clone()).or_default().cols.insert(c.name.clone());
+                        }
+                    }
+                }
+            }
+        };
+        // `SELECT *` reaches every column of every base table at this level.
+        if stmt.items.iter().any(|i| matches!(i, SelectItem::Wildcard)) {
+            for (t, _) in &bases {
+                into.entry(t.clone()).or_default().all = true;
+            }
+        }
+        let mut walk = |e: &Expr, into: &mut alloc::collections::BTreeMap<String, ColRead>| {
+            self.walk_expr_reads(e, &mut add_col, into);
+        };
+        for item in &stmt.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                walk(expr, into);
+            }
+        }
+        if let Some(w) = &stmt.where_ {
+            walk(w, into);
+        }
+        if let Some(h) = &stmt.having {
+            walk(h, into);
+        }
+        if let Some(gs) = &stmt.group_by {
+            for g in gs {
+                walk(g, into);
+            }
+        }
+        for o in &stmt.order_by {
+            walk(&o.expr, into);
+        }
+        if let Some(from) = &stmt.from {
+            for j in &from.joins {
+                if let Some(on) = &j.on {
+                    walk(on, into);
+                }
+            }
+        }
+        for (_, peer) in &stmt.unions {
+            self.collect_select_reads(peer, into);
+        }
+        for cte in &stmt.ctes {
+            if let Some(s) = cte.body.as_select() {
+                self.collect_select_reads(s, into);
+            }
+        }
+    }
+
+    /// The expression half of `collect_select_reads`: hand every column
+    /// reference to `add_col`, and recurse into subqueries with their own level.
+    fn walk_expr_reads(
+        &self,
+        e: &Expr,
+        add_col: &mut impl FnMut(&ColumnName, &mut alloc::collections::BTreeMap<String, ColRead>),
+        into: &mut alloc::collections::BTreeMap<String, ColRead>,
+    ) {
+        match e {
+            Expr::Column(c) => add_col(c, into),
+            Expr::ScalarSubquery(s) => self.collect_select_reads(s, into),
+            Expr::Exists { subquery, .. } => self.collect_select_reads(subquery, into),
+            Expr::InSubquery { expr, subquery, .. } => {
+                self.walk_expr_reads(expr, add_col, into);
+                self.collect_select_reads(subquery, into);
+            }
+            Expr::RowInSubquery { row, subquery, .. }
+            | Expr::RowCmpSubquery { row, subquery, .. } => {
+                for x in row {
+                    self.walk_expr_reads(x, add_col, into);
+                }
+                self.collect_select_reads(subquery, into);
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.walk_expr_reads(lhs, add_col, into);
+                self.walk_expr_reads(rhs, add_col, into);
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => {
+                self.walk_expr_reads(expr, add_col, into);
+            }
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    self.walk_expr_reads(a, add_col, into);
+                }
+            }
             Expr::Case {
                 operand,
                 branches,
                 else_branch,
             } => {
                 if let Some(o) = operand {
-                    walk(o, found);
+                    self.walk_expr_reads(o, add_col, into);
                 }
                 for (c, v) in branches {
-                    walk(c, found);
-                    walk(v, found);
+                    self.walk_expr_reads(c, add_col, into);
+                    self.walk_expr_reads(v, add_col, into);
                 }
                 if let Some(x) = else_branch {
-                    walk(x, found);
+                    self.walk_expr_reads(x, add_col, into);
                 }
+            }
+            Expr::InList { expr, list, .. } => {
+                self.walk_expr_reads(expr, add_col, into);
+                for it in list {
+                    self.walk_expr_reads(it, add_col, into);
+                }
+            }
+            Expr::AnyAll { expr, array, .. } => {
+                self.walk_expr_reads(expr, add_col, into);
+                self.walk_expr_reads(array, add_col, into);
+            }
+            Expr::Array(items) => {
+                for it in items {
+                    self.walk_expr_reads(it, add_col, into);
+                }
+            }
+            Expr::ArraySubscript { target, index } => {
+                self.walk_expr_reads(target, add_col, into);
+                self.walk_expr_reads(index, add_col, into);
             }
             _ => {}
         }
     }
-    walk(e, &mut found);
-    found
+}
+
+/// A minimal `TableRef` naming a base table — the synthetic FROM the UPDATE /
+/// DELETE gates build so their WHERE and RETURNING go through the same
+/// column-read walker a SELECT does.
+fn bare_table_ref(name: String) -> TableRef {
+    TableRef {
+        name,
+        alias: None,
+        as_of_segment: None,
+        unnest_expr: None,
+        unnest_column_aliases: Vec::new(),
+        with_ordinality: false,
+        generate_series_args: None,
+        lateral_subquery: None,
+        jsonb_each_text_arg: None,
+        table_fn_call: None,
+    }
 }

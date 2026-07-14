@@ -942,8 +942,13 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
     // empty ACL (a 2-byte zero count). FOURTH trailing appendix this test has
     // caught — that is precisely its job.
     const EMPTY_OWNER_ACL_APPENDIX: usize = 3;
-    let tail_v60plus =
-        EMPTY_CONSTRAINT_NAME_APPENDIX + EMPTY_COMPOSITE_APPENDIX + EMPTY_OWNER_ACL_APPENDIX;
+    // v7.39 (read01 round 59) — and the v65 column-ACL appendix: a zero u16
+    // count when no column carries a grant. FIFTH trailing appendix.
+    const EMPTY_COLUMN_ACL_APPENDIX: usize = 2;
+    let tail_v60plus = EMPTY_CONSTRAINT_NAME_APPENDIX
+        + EMPTY_COMPOSITE_APPENDIX
+        + EMPTY_OWNER_ACL_APPENDIX
+        + EMPTY_COLUMN_ACL_APPENDIX;
     let mut v52 =
         Vec::with_capacity(v53.len() - appendix.len() - trailing_v53plus - tail_v60plus);
     v52.extend_from_slice(&v53[..start - trailing_v53plus]);
