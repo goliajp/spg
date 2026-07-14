@@ -2693,6 +2693,12 @@ pub struct TableRef {
     /// `pg_partition_tree` / `pg_partition_ancestors`; the executor
     /// dispatches by name.
     pub table_fn_call: Option<Box<(String, Vec<Expr>)>>,
+    /// v7.39 (read01 round 74) — `ROWS FROM (f(a), g(b))`: N table functions
+    /// zipped in LOCKSTEP, the shorter padded with NULLs (the same rule the
+    /// target-list SRFs follow — see round 67). The array-returning family keeps
+    /// its own lowering; this channel carries the ones that have no array form
+    /// (`generate_series`, a user `RETURNS SETOF` function).
+    pub rows_from: Option<Vec<(String, Vec<Expr>)>>,
 }
 
 /// FROM clause shape. v1.10 accepts a primary table plus a flat list of
@@ -6188,6 +6194,7 @@ mod tests {
                     lateral_subquery: None,
                     jsonb_each_text_arg: None,
                     table_fn_call: None,
+                    rows_from: None,
                 },
                 joins: vec![],
             }),

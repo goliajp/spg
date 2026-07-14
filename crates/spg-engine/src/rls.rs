@@ -304,6 +304,7 @@ fn bare_table_ref(name: String) -> TableRef {
         lateral_subquery: None,
         jsonb_each_text_arg: None,
         table_fn_call: None,
+        rows_from: None,
     }
 }
 

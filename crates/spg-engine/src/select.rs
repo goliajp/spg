@@ -1669,6 +1669,16 @@ impl Engine {
         // a cancellation race before any row is produced. Release
         // build expands to `let _ = (...);` — zero cost.
         crate::injection_point!("planner_first_row_fetch", &stmt.from);
+        // v7.39 (read01 round 74) — lower `(f(args)).*`. Naming a record's fields
+        // takes the catalog, so the parser leaves a marker and the rewrite lands
+        // here: the call moves into a LATERAL FROM item and the item becomes one
+        // reference per declared column. `SELECT 'p', (rows_of(2)).*` is
+        // `SELECT 'p', __rec.id, __rec.v FROM rows_of(2) AS __rec` — reusing the
+        // set-returning FROM machinery of rounds 65 and 69 rather than growing a
+        // second one.
+        if let Some(lowered) = self.lower_record_expansion(stmt)? {
+            return self.exec_select_cancel_inner(&lowered, cancel);
+        }
         // v7.17.0 Phase 1.2 — user-defined VIEW expansion. If the
         // FROM / JOIN graph references any catalogued view name,
         // re-parse the view body and prepend it as a synthetic
@@ -2619,6 +2629,24 @@ impl Engine {
         }
         // v7.39 (read01 partitionfuncs.c) — FROM-position table functions
         // (pg_partition_tree / pg_partition_ancestors) dispatched by name.
+        // v7.39 (read01 round 74) — `ROWS FROM (f(a), g(b))` whose entries have no
+        // array form. Each function runs; the results zip in LOCKSTEP with the
+        // shorter padded to NULL — the SAME rule the target-list SRFs follow
+        // (round 67), which is why `srf_values` is what evaluates each entry.
+        if from.primary.rows_from.is_some() {
+            let (rows, mut schema_cols) = self.rows_from_rows(&from.primary)?;
+            for (i, new_name) in from.primary.unnest_column_aliases.iter().enumerate() {
+                if let Some(col) = schema_cols.get_mut(i) {
+                    col.name = new_name.clone();
+                }
+            }
+            let alias = from
+                .primary
+                .alias
+                .clone()
+                .unwrap_or_else(|| from.primary.name.clone());
+            return self.exec_select_over_rows(stmt, rows, schema_cols, &alias, cancel);
+        }
         if from.primary.table_fn_call.is_some() {
             let (rows, mut schema_cols) = self.table_fn_rows(&from.primary)?;
             // v7.39 (read01 round 68) — WITH ORDINALITY appends a BIGINT counter
@@ -5157,6 +5185,7 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
         lateral_subquery: Some(alloc::boxed::Box::new(inner)),
         jsonb_each_text_arg: None,
         table_fn_call: None,
+        rows_from: None,
     };
     // Outer window query over the derived rows: aggregates → __aggN column refs.
     let mut outer_items = stmt.items.clone();
@@ -7615,5 +7644,203 @@ impl Engine {
             })
             .map(|(i, _)| i)
             .collect()
+    }
+}
+
+impl Engine {
+    /// v7.39 (read01 round 74) — see the call site. `None` when the statement has
+    /// no `(f(args)).*` item.
+    fn lower_record_expansion(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<Option<SelectStatement>, EngineError> {
+        use spg_sql::ast::{Expr, SelectItem};
+        let is_marker = |it: &SelectItem| {
+            matches!(it, SelectItem::Expr { expr: Expr::FunctionCall { name, .. }, .. }
+                if name == "__record_expand")
+        };
+        if !stmt.items.iter().any(is_marker) {
+            return Ok(None);
+        }
+        let mut out = stmt.clone();
+        let mut items: alloc::vec::Vec<SelectItem> = alloc::vec::Vec::new();
+        let mut lateral_refs: alloc::vec::Vec<TableRef> = alloc::vec::Vec::new();
+        for (n, item) in stmt.items.iter().enumerate() {
+            if !is_marker(item) {
+                items.push(item.clone());
+                continue;
+            }
+            let SelectItem::Expr {
+                expr: Expr::FunctionCall { args, .. },
+                ..
+            } = item
+            else {
+                unreachable!("checked by is_marker");
+            };
+            let Some(Expr::FunctionCall {
+                name: fname,
+                args: fargs,
+            }) = args.first()
+            else {
+                return Err(EngineError::Unsupported(
+                    "(<expr>).* expands a function's record — it needs a function call".into(),
+                ));
+            };
+            let cols = self.setof_declared_columns(fname)?;
+            let alias = alloc::format!("__rec{n}");
+            let mut tref = bare_table_ref_named(&alias);
+            tref.table_fn_call = Some(alloc::boxed::Box::new((
+                fname.to_ascii_lowercase(),
+                fargs.clone(),
+            )));
+            tref.alias = Some(alias.clone());
+            lateral_refs.push(tref);
+            for c in cols {
+                items.push(SelectItem::Expr {
+                    expr: Expr::Column(spg_sql::ast::ColumnName {
+                        qualifier: Some(alias.clone()),
+                        name: c,
+                    }),
+                    alias: None,
+                });
+            }
+        }
+        out.items = items;
+        // The function joins the FROM. With no FROM it BECOMES the FROM; with one
+        // it is a cross join, which is what `SELECT …, (f(t.c)).* FROM t` means
+        // (the arguments may reference the outer row — the round-69 correlation).
+        for tref in lateral_refs {
+            match &mut out.from {
+                None => {
+                    out.from = Some(spg_sql::ast::FromClause {
+                        primary: tref,
+                        joins: alloc::vec::Vec::new(),
+                    });
+                }
+                Some(from) => from.joins.push(spg_sql::ast::FromJoin {
+                    kind: spg_sql::ast::JoinKind::Cross,
+                    table: tref,
+                    on: None,
+                    using_cols: None,
+                    natural: false,
+                }),
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// The column NAMES a set-returning function declares: `RETURNS TABLE(id int,
+    /// v text)` names them; a `SETOF <scalar>` is one column named after the
+    /// function.
+    fn setof_declared_columns(
+        &self,
+        name: &str,
+    ) -> Result<alloc::vec::Vec<alloc::string::String>, EngineError> {
+        let cat = self.active_catalog();
+        let overloads = cat.functions_named(name);
+        let def = overloads.first().ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!("function {name} does not exist"))
+        })?;
+        let declared = def.returns.trim();
+        let upper = declared.to_ascii_uppercase();
+        if upper.starts_with("TABLE(") {
+            let raw = &declared["TABLE(".len()..declared.len() - 1];
+            return Ok(raw
+                .split(',')
+                .map(|d| {
+                    d.trim()
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("col")
+                        .to_string()
+                })
+                .collect());
+        }
+        Ok(alloc::vec![name.to_string()])
+    }
+}
+
+/// A bare `TableRef` with a name — the FROM item a lowered record expansion adds.
+fn bare_table_ref_named(name: &str) -> TableRef {
+    TableRef {
+        name: name.to_string(),
+        alias: None,
+        as_of_segment: None,
+        unnest_expr: None,
+        unnest_column_aliases: alloc::vec::Vec::new(),
+        with_ordinality: false,
+        generate_series_args: None,
+        lateral_subquery: None,
+        jsonb_each_text_arg: None,
+        table_fn_call: None,
+        rows_from: None,
+    }
+}
+
+impl Engine {
+    /// v7.39 (read01 round 74) — run a `ROWS FROM (…)` list. Each entry yields its
+    /// own rows; they zip in lockstep and a short one pads with NULL. `__array`
+    /// entries are the array-able SRFs, already lowered by the parser into their
+    /// scalar array form.
+    fn rows_from_rows(
+        &self,
+        primary: &TableRef,
+    ) -> Result<(alloc::vec::Vec<Row<'static>>, alloc::vec::Vec<ColumnSchema>), EngineError> {
+        let entries = primary
+            .rows_from
+            .as_ref()
+            .expect("caller guards rows_from.is_some()");
+        let empty: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+        let ctx = self.ev_ctx(&empty, None);
+        let dummy = Row::new(alloc::vec::Vec::new());
+        let mut lists: alloc::vec::Vec<alloc::vec::Vec<Value<'static>>> = alloc::vec::Vec::new();
+        let mut cols: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+        for (name, args) in entries {
+            let (vals, colname) = if name == "__array" {
+                // The parser lowered this one to `<array expr>`; its rows are the
+                // array's elements.
+                let arr = eval::eval_expr(&args[0], &dummy, &ctx).map_err(EngineError::Eval)?;
+                (array_value_to_elements(&arr)?, alloc::string::String::from("unnest"))
+            } else {
+                let call = spg_sql::ast::Expr::FunctionCall {
+                    name: name.clone(),
+                    args: args.clone(),
+                };
+                (self.srf_values(&call, &dummy, &ctx)?, name.clone())
+            };
+            let ty = vals
+                .first()
+                .and_then(spg_storage::Value::data_type)
+                .unwrap_or(DataType::Text);
+            cols.push(ColumnSchema::new(colname, ty, true));
+            lists.push(vals);
+        }
+        let n = lists.iter().map(alloc::vec::Vec::len).max().unwrap_or(0);
+        let mut rows: alloc::vec::Vec<Row<'static>> = alloc::vec::Vec::with_capacity(n);
+        for k in 0..n {
+            let mut vals: alloc::vec::Vec<Value<'static>> =
+                alloc::vec::Vec::with_capacity(lists.len() + 1);
+            for l in &lists {
+                vals.push(l.get(k).cloned().unwrap_or(Value::Null));
+            }
+            rows.push(Row::new(vals));
+        }
+        if primary.with_ordinality {
+            cols.push(ColumnSchema::new(
+                "ordinality".to_string(),
+                DataType::BigInt,
+                false,
+            ));
+            rows = rows
+                .into_iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let mut v = r.values;
+                    v.push(Value::BigInt(i as i64 + 1));
+                    Row::new(v)
+                })
+                .collect();
+        }
+        Ok((rows, cols))
     }
 }
