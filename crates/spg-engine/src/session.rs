@@ -359,6 +359,10 @@ impl Engine {
             // v7.39 (read01 round 58) — and the role store, so the privilege
             // builtins can expand role membership.
             .with_users(&self.users)
+            // v7.39 (read01 round 63) — and the engine itself, so a user
+            // function whose body has its own FROM can run that body through
+            // the real executor (visibility filter and all).
+            .with_engine(self)
             // v7.37.16 (16.12) — thread the read-only catalog so
             // builtins like pg_partition_root can walk partition
             // roles. Other EvalContext call sites (scan paths,

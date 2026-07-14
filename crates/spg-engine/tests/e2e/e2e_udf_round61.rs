@@ -172,10 +172,20 @@ fn grant_on_all_tables_in_schema_expands() {
 #[test]
 fn an_unsupported_body_says_so_instead_of_answering_wrongly() {
     let mut e = seeded();
+    // v7.39 (read01 round 63) — a body with its own FROM IS invocable now: it
+    // runs through the real executor (see e2e_udf_query_round63). What is still
+    // unsupported says so instead of answering wrongly — a multi-statement
+    // plpgsql body is the remaining shape.
     ok(
         &mut e,
         "CREATE FUNCTION reads(x int) RETURNS int AS $$ SELECT id FROM t WHERE id = x $$ LANGUAGE sql",
     );
-    let msg = err(&mut e, "SELECT reads(1)");
-    assert!(msg.contains("with its own FROM is not supported"), "{msg}");
+    assert_eq!(r1(&mut e, "SELECT reads(1)"), "1");
+
+    ok(
+        &mut e,
+        "CREATE FUNCTION multi(x int) RETURNS int AS $$ BEGIN x := x + 1; RETURN x; END; $$ LANGUAGE plpgsql",
+    );
+    let msg = err(&mut e, "SELECT multi(1)");
+    assert!(msg.contains("single `RETURN <expr>;`"), "{msg}");
 }
