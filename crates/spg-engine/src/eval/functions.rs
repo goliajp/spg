@@ -12339,10 +12339,12 @@ fn apply_function_dispatch(
                     }
                 }
             } else {
+                // v7.39 (read01 round 44) — unset default resolves to
+                // english, matching PG's initdb default.
                 match ctx.default_text_search_config {
                     Some(n) => crate::fts::TsConfig::from_name(n)
-                        .unwrap_or(crate::fts::TsConfig::Simple),
-                    None => crate::fts::TsConfig::Simple,
+                        .unwrap_or(crate::fts::TsConfig::English),
+                    None => crate::fts::TsConfig::English,
                 }
             };
             // PG runs each selected scalar through to_tsvector separately

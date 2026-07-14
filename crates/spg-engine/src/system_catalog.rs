@@ -3607,6 +3607,17 @@ pub(crate) fn canonical_gucs() -> &'static [(
             "user",
         ),
         (
+            // v7.39 (read01 round 44) — PG's initdb default for a UTF-8 /
+            // english locale. SPG's FTS pipeline resolves an unset value
+            // to the english config so bare to_tsvector / to_tsquery stem
+            // and drop stopwords like PG out of the box.
+            "default_text_search_config",
+            "pg_catalog.english",
+            "Client Connection Defaults",
+            "string",
+            "user",
+        ),
+        (
             "extra_float_digits",
             "1",
             "Client Connection Defaults",

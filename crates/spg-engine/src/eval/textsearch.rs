@@ -323,7 +323,10 @@ fn parse_fts_args(
                     ),
                 }
             })?,
-            None => crate::fts::TsConfig::Simple,
+            // v7.39 (read01 round 44) — PG's initdb default is 'english',
+            // not 'simple': bare to_tsvector / to_tsquery stem + drop
+            // stopwords out of the box.
+            None => crate::fts::TsConfig::English,
         },
         Some(Value::Null) => return Ok((crate::fts::TsConfig::Simple, None)),
         Some(Value::Text(name_str)) => crate::fts::TsConfig::from_name(name_str).ok_or_else(|| {
@@ -881,7 +884,7 @@ pub(super) fn fts_ts_headline(
                     ),
                 }
             })?,
-            None => crate::fts::TsConfig::Simple,
+            None => crate::fts::TsConfig::English,
         },
         Some(Value::Text(name_str)) => {
             crate::fts::TsConfig::from_name(name_str).ok_or_else(|| EvalError::TypeMismatch {
@@ -1431,9 +1434,9 @@ pub(super) fn fts_ts_rewrite(
     }
     let config = match ctx.default_text_search_config {
         Some(name_str) => {
-            crate::fts::TsConfig::from_name(name_str).unwrap_or(crate::fts::TsConfig::Simple)
+            crate::fts::TsConfig::from_name(name_str).unwrap_or(crate::fts::TsConfig::English)
         }
-        None => crate::fts::TsConfig::Simple,
+        None => crate::fts::TsConfig::English,
     };
     let as_query = |v: &Value<'_>, which: &str| -> Result<spg_storage::TsQueryAst, EvalError> {
         match v {
@@ -1507,9 +1510,9 @@ pub(super) fn fts_tsquery_bool(
     }
     let config = match ctx.default_text_search_config {
         Some(name_str) => {
-            crate::fts::TsConfig::from_name(name_str).unwrap_or(crate::fts::TsConfig::Simple)
+            crate::fts::TsConfig::from_name(name_str).unwrap_or(crate::fts::TsConfig::English)
         }
-        None => crate::fts::TsConfig::Simple,
+        None => crate::fts::TsConfig::English,
     };
     let as_query = |v: &Value<'_>| -> Result<spg_storage::TsQueryAst, EvalError> {
         match v {

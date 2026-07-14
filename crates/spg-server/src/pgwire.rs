@@ -3209,6 +3209,8 @@ fn known_defaults() -> &'static [(&'static str, &'static str)] {
         ("application_name", ""),
         ("client_encoding", "UTF8"),
         ("datestyle", "ISO, MDY"),
+        // v7.39 (read01 round 44) — PG's initdb default for english/UTF-8.
+        ("default_text_search_config", "pg_catalog.english"),
         ("default_transaction_isolation", "read committed"),
         ("default_transaction_read_only", "off"),
         ("intervalstyle", "postgres"),

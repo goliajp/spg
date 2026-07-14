@@ -1035,13 +1035,13 @@ fn tsquery_bool_operators() {
         r#"to_tsvector('the quick brown fox') @@ (to_tsquery('cat') && to_tsquery('fox'))"#,
         r#"false"#,
     );
-    // control: tsvector || tsvector concat still works (SPG's default Simple
-    // config does not stem, unlike PG's english default — a separate config
-    // matter, not a bug in the operator).
+    // control: tsvector || tsvector concat still works. v7.39 (read01
+    // round 44) — the default text-search config is now 'english' like
+    // PG, so bare to_tsvector stems: cats→cat, dogs→dog.
     ck(
         &mut e,
         r#"(to_tsvector('cats') || to_tsvector('dogs'))::text"#,
-        r#"'cats':1 'dogs':2"#,
+        r#"'cat':1 'dog':2"#,
     );
 }
 
