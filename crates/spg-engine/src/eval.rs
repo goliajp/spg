@@ -1021,6 +1021,7 @@ fn eval_matrix_subscript(
     match base {
         Value::IntArray2D(rows) => elem!(rows, |n| Value::Int(*n)),
         Value::BigIntArray2D(rows) => elem!(rows, |n| Value::BigInt(*n)),
+        Value::BoolArray2D(rows) => elem!(rows, |b| Value::Bool(*b)),
         Value::TextArray2D(rows) => {
             elem!(rows, |s| Value::Text(alloc::borrow::Cow::Owned(s.clone())))
         }
@@ -1294,7 +1295,16 @@ fn eval_array_arm(
     let all_arrays = !materialised.is_empty()
         && materialised
             .iter()
-            .all(|v| values::array_len(v).is_some() && !matches!(v, Value::TextArray2D(_) | Value::IntArray2D(_) | Value::BigIntArray2D(_)));
+            .all(|v| {
+                values::array_len(v).is_some()
+                    && !matches!(
+                        v,
+                        Value::TextArray2D(_)
+                            | Value::IntArray2D(_)
+                            | Value::BigIntArray2D(_)
+                            | Value::BoolArray2D(_)
+                    )
+            });
     if all_arrays {
         let row_len = values::array_len(&materialised[0]).unwrap_or(0);
         let same_len = materialised
@@ -1306,6 +1316,25 @@ fn eval_array_arm(
                          with matching dimensions"
                     .into(),
             });
+        }
+        // v7.39 (read01 round 75) — all-BOOL rows build a real `bool[][]`. BOOL is
+        // the one element type whose ARRAY rendering (`t`) differs from its
+        // scalar one (`true`), so the text-backed 2-D could not be right for it:
+        // `ARRAY[ARRAY[true,false]]::text` wants `{{t,f}}` while `[1][2]::text`
+        // wants `false`. Every other type renders the same either way — which is
+        // why this is the only typed 2-D SPG needs.
+        if materialised
+            .iter()
+            .all(|v| matches!(v, Value::BoolArray(_)))
+        {
+            let rows: Vec<Vec<Option<bool>>> = materialised
+                .into_iter()
+                .map(|v| match v {
+                    Value::BoolArray(r) => r,
+                    _ => unreachable!("checked above"),
+                })
+                .collect();
+            return Ok(Value::BoolArray2D(rows));
         }
         let any_text = materialised
             .iter()
@@ -2095,7 +2124,10 @@ fn eval_array_subscript_arm(
     let base_v = eval_expr(base, row, ctx)?;
     if matches!(
         base_v,
-        Value::IntArray2D(_) | Value::BigIntArray2D(_) | Value::TextArray2D(_)
+        Value::IntArray2D(_)
+            | Value::BigIntArray2D(_)
+            | Value::TextArray2D(_)
+            | Value::BoolArray2D(_)
     ) {
         return eval_matrix_subscript(&base_v, &idx_exprs, row, ctx);
     }

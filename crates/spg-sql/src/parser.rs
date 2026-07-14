@@ -11838,6 +11838,8 @@ impl Parser {
                     ColumnTypeName::IntArray => ColumnTypeName::IntArray2D,
                     ColumnTypeName::BigIntArray => ColumnTypeName::BigIntArray2D,
                     ColumnTypeName::TextArray => ColumnTypeName::TextArray2D,
+                    // v7.39 (read01 round 75) — bool[][].
+                    ColumnTypeName::BoolArray => ColumnTypeName::BoolArray2D,
                     other => {
                         return Err(self.err(alloc::format!(
                             "v7.17 2D arrays support INT[][] / BIGINT[][] / \

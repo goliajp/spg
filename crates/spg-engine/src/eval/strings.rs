@@ -735,6 +735,7 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
         Value::IntArray2D(_) => "integer[]",
         Value::BigIntArray2D(_) => "bigint[]",
         Value::TextArray2D(_) => "text[]",
+        Value::BoolArray2D(_) => "boolean[]",
         Value::TsVector(_) => "tsvector",
         Value::TsQuery(_) => "tsquery",
         Value::Uuid(_) => "uuid",

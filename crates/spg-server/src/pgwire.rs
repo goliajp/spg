@@ -5921,6 +5921,9 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::IntArray2D => 1007,
         DataType::BigIntArray2D => 1016,
         DataType::TextArray2D => 1009,
+        // v7.39 (read01 round 75) — `_bool` (1000): PG reports the SAME oid for an
+        // array however many dimensions it has.
+        DataType::BoolArray2D => 1000,
         // v7.37.5 β-P4 — PG `_interval` (INTERVAL[]) OID 1187.
         DataType::IntervalArray => 1187,
         // v7.37.5 γ — array-of-scalar family OIDs (pg_type.dat).

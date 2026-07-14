@@ -316,6 +316,7 @@ pub fn value_to_text_styled(v: &Value, style: &crate::eval::RenderStyle) -> Stri
         Value::IntArray2D(rows) => crate::conversions::format_int_2d_text_pub(rows),
         Value::BigIntArray2D(rows) => crate::conversions::format_bigint_2d_text_pub(rows),
         Value::TextArray2D(rows) => crate::conversions::format_text_2d_text_pub(rows),
+        Value::BoolArray2D(rows) => crate::conversions::format_bool_2d_text_pub(rows),
         // v7.37.5 γ — complete array-family rendering for the
         // ζ-A/γ/δ/ε first-class types.
         Value::BoolArray(items) => crate::eval::format_bool_array(items),
@@ -390,6 +391,7 @@ pub(super) fn array_2d_dims(v: &Value) -> Option<(usize, usize)> {
         Value::IntArray2D(m) => Some((m.len(), m.first().map_or(0, alloc::vec::Vec::len))),
         Value::BigIntArray2D(m) => Some((m.len(), m.first().map_or(0, alloc::vec::Vec::len))),
         Value::TextArray2D(m) => Some((m.len(), m.first().map_or(0, alloc::vec::Vec::len))),
+        Value::BoolArray2D(m) => Some((m.len(), m.first().map_or(0, alloc::vec::Vec::len))),
         _ => None,
     }
 }
@@ -699,4 +701,72 @@ pub(crate) fn homogeneous_typed_array(vals: &[Value<'static>]) -> Option<Value<'
         }
         _ => None,
     }
+}
+
+
+/// v7.39 (read01 round 75) — build a 2-D array from rows that are themselves
+/// arrays. `None` when the list is not all-arrays (the caller then treats it as
+/// a 1-D list).
+///
+/// SEVENTH site of the per-variant pattern this campaign has been unpicking: the
+/// INSERT literal path had its OWN array builder, and it did not know 2-D at all
+/// — an `ARRAY[ARRAY[…]]` in a VALUES list collapsed to text[]. One builder now.
+pub(crate) fn build_2d_from_rows(rows: &[Value<'static>]) -> Option<Value<'static>> {
+    if rows.is_empty() || !rows.iter().all(|v| array_len(v).is_some()) {
+        return None;
+    }
+    let width = array_len(&rows[0])?;
+    if !rows.iter().all(|v| array_len(v) == Some(width)) {
+        return None;
+    }
+    if rows.iter().all(|v| matches!(v, Value::BoolArray(_))) {
+        return Some(Value::BoolArray2D(
+            rows.iter()
+                .map(|v| match v {
+                    Value::BoolArray(r) => r.clone(),
+                    _ => unreachable!("checked"),
+                })
+                .collect(),
+        ));
+    }
+    if rows.iter().all(|v| matches!(v, Value::IntArray(_))) {
+        return Some(Value::IntArray2D(
+            rows.iter()
+                .map(|v| match v {
+                    Value::IntArray(r) => r.clone(),
+                    _ => unreachable!("checked"),
+                })
+                .collect(),
+        ));
+    }
+    if rows
+        .iter()
+        .all(|v| matches!(v, Value::IntArray(_) | Value::BigIntArray(_)))
+    {
+        return Some(Value::BigIntArray2D(
+            rows.iter()
+                .map(|v| match v {
+                    Value::BigIntArray(r) => r.clone(),
+                    Value::IntArray(r) => r.iter().map(|c| c.map(i64::from)).collect(),
+                    _ => unreachable!("checked"),
+                })
+                .collect(),
+        ));
+    }
+    // Everything else renders into the text 2-D form, element by element, with
+    // the SCALAR rendering (a cell pulled out with `[i][j]::text` must read like
+    // a scalar).
+    Some(Value::TextArray2D(
+        rows.iter()
+            .map(|v| {
+                let n = array_len(v).unwrap_or(0);
+                (0..n)
+                    .map(|i| match array_element_at(v, i) {
+                        None | Some(Value::Null) => None,
+                        Some(x) => Some(crate::eval::value_to_text(&x)),
+                    })
+                    .collect()
+            })
+            .collect(),
+    ))
 }

@@ -269,6 +269,13 @@ pub(crate) fn array_literal_widen(items: alloc::vec::Vec<Value<'static>>) -> Val
     // Bytes / Interval), build the matching typed array directly
     // so INSERT to a typed column doesn't have to go through the
     // TextArray fallback + coerce chain.
+    // v7.39 (read01 round 75) — rows that are themselves arrays make a 2-D array.
+    // This path (the INSERT literal one) did not know 2-D at all, so an
+    // `ARRAY[ARRAY[…]]` in a VALUES list silently collapsed to text[] — the same
+    // per-variant hole, in the builder next door.
+    if let Some(m) = crate::eval::values::build_2d_from_rows(&items) {
+        return m;
+    }
     if let Some(arr) = widen_uniform_typed(&items) {
         return arr.build(items);
     }
@@ -778,6 +785,34 @@ pub fn format_text_2d_text_pub(
     rows: &[Vec<Option<alloc::string::String>>],
 ) -> alloc::string::String {
     format_text_2d_text(rows)
+}
+
+/// v7.39 (read01 round 75) — `bool[][]` external form. A BOOL element prints as
+/// `t` / `f` INSIDE an array (and `true` / `false` outside it) — the whole reason
+/// this type exists.
+#[must_use]
+pub fn format_bool_2d_text_pub(rows: &[Vec<Option<bool>>]) -> alloc::string::String {
+    use core::fmt::Write as _;
+    let mut out = alloc::string::String::from("{");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        for (j, cell) in row.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            let _ = match cell {
+                None => write!(out, "NULL"),
+                Some(true) => write!(out, "t"),
+                Some(false) => write!(out, "f"),
+            };
+        }
+        out.push('}');
+    }
+    out.push('}');
+    out
 }
 
 /// v7.17.0 Phase 3.P0-38 — parse a PG range literal of the form
@@ -2356,6 +2391,7 @@ pub(crate) const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::IntArray2D => DataType::IntArray2D,
         ColumnTypeName::BigIntArray2D => DataType::BigIntArray2D,
         ColumnTypeName::TextArray2D => DataType::TextArray2D,
+        ColumnTypeName::BoolArray2D => DataType::BoolArray2D,
         ColumnTypeName::Interval => DataType::Interval,
         ColumnTypeName::IntervalArray => DataType::IntervalArray,
         ColumnTypeName::BoolArray => DataType::BoolArray,

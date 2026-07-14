@@ -2044,6 +2044,8 @@ pub enum ColumnTypeName {
     IntArray2D,
     BigIntArray2D,
     TextArray2D,
+    /// v7.39 (read01 round 75) — `bool[][]`.
+    BoolArray2D,
     /// v7.37.5 β-P2 — `INTERVAL` as a column type. Storage is the
     /// three-field {months, days, micros} struct (PG-byte-equal),
     /// catalog tag 34, FILE_VERSION 48+. Wire OID 1186. Prior to
@@ -2201,6 +2203,7 @@ impl fmt::Display for ColumnTypeName {
             Self::IntArray2D => f.write_str("INT[][]"),
             Self::BigIntArray2D => f.write_str("BIGINT[][]"),
             Self::TextArray2D => f.write_str("TEXT[][]"),
+            Self::BoolArray2D => f.write_str("BOOL[][]"),
         }
     }
 }

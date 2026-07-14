@@ -368,6 +368,13 @@ pub enum DataType {
     /// matrix. Storage: row-major Vec<Vec<Option<String>>>.
     /// Tag 33 dense, tag 29 schema-agnostic.
     TextArray2D,
+    /// v7.39 (read01 round 75) — `bool[][]`. BOOL is the ONE element type whose
+    /// ARRAY rendering differs from its scalar one (`t` vs `true`), so a
+    /// text-backed 2-D cannot be PG-faithful for it: rendering the whole array
+    /// wants `t`, and subscripting a cell to text wants `false`. Every other
+    /// element type renders the same either way, which is why this is the only
+    /// typed 2-D variant SPG needs.
+    BoolArray2D,
 }
 
 /// v7.17.0 Phase 3.P0-38 — pins the element type of a range value
@@ -502,6 +509,7 @@ impl fmt::Display for DataType {
             Self::IntArray2D => f.write_str("INT[][]"),
             Self::BigIntArray2D => f.write_str("BIGINT[][]"),
             Self::TextArray2D => f.write_str("TEXT[][]"),
+            Self::BoolArray2D => f.write_str("BOOL[][]"),
         }
     }
 }
@@ -814,6 +822,8 @@ pub enum Value<'arena> {
     BigIntArray2D(Vec<Vec<Option<i64>>>),
     /// v7.17.0 Phase 3.P0-40 — 2D TEXT matrix (row-major).
     TextArray2D(Vec<Vec<Option<String>>>),
+    /// v7.39 (read01 round 75) — see `DataType::BoolArray2D`.
+    BoolArray2D(Vec<Vec<Option<bool>>>),
     /// v7.17.0 Phase 3.P0-38 — PG range value. One shape covers
     /// all six builtin range types; `kind` pins the element type
     /// (must match the column's `DataType::Range(kind)`).
@@ -985,6 +995,7 @@ impl<'arena> Value<'arena> {
             Self::IntArray2D(_) => Some(DataType::IntArray2D),
             Self::BigIntArray2D(_) => Some(DataType::BigIntArray2D),
             Self::TextArray2D(_) => Some(DataType::TextArray2D),
+            Self::BoolArray2D(_) => Some(DataType::BoolArray2D),
             // v7.38 (read01, T9) — a transient composite/record has no storable
             // column DataType (it flows through row_to_json / to_json).
             Self::Composite(_) => None,
@@ -1109,6 +1120,7 @@ impl<'arena> Value<'arena> {
             Value::IntArray2D(a) => Value::IntArray2D(a),
             Value::BigIntArray2D(a) => Value::BigIntArray2D(a),
             Value::TextArray2D(a) => Value::TextArray2D(a),
+            Value::BoolArray2D(a) => Value::BoolArray2D(a),
             Value::Null => Value::Null,
         }
     }
@@ -1969,7 +1981,10 @@ impl IndexKey {
             Value::Hstore(_) => None,
             Value::NumericBig(_) => None,
             // v7.17.0 Phase 3.P0-40: 2D arrays aren't indexable.
-            Value::IntArray2D(_) | Value::BigIntArray2D(_) | Value::TextArray2D(_) => None,
+            Value::IntArray2D(_)
+            | Value::BigIntArray2D(_)
+            | Value::TextArray2D(_)
+            | Value::BoolArray2D(_) => None,
             // v7.37.5 β-P4: INTERVAL[] isn't indexable (PG uses
             // GIN/intarray for array-contains queries; SPG plans
             // that as a separate axis under v7.37.8 GIN-on-jsonb).

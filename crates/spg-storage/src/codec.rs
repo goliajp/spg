@@ -1071,6 +1071,8 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         DataType::IntArray2D => out.push(31),
         DataType::BigIntArray2D => out.push(32),
         DataType::TextArray2D => out.push(33),
+        // v7.39 (read01 round 75) — bool[][].
+        DataType::BoolArray2D => out.push(67),
     }
 }
 
@@ -1155,6 +1157,7 @@ impl Cursor<'_> {
             31 => Ok(DataType::IntArray2D),
             32 => Ok(DataType::BigIntArray2D),
             33 => Ok(DataType::TextArray2D),
+            67 => Ok(DataType::BoolArray2D),
             // v7.37.5 β-P2: tag 34 — INTERVAL. Catalog FILE_VERSION 48+.
             34 => Ok(DataType::Interval),
             // v7.37.5 β-P4: tag 35 — INTERVAL[]. Catalog FILE_VERSION 48+.
@@ -1510,6 +1513,10 @@ fn value_body_encoded_len(v: &Value<'_>, _ty: DataType) -> usize {
         Value::BigIntArray2D(rows) => {
             let cols = rows.first().map(|r| r.len()).unwrap_or(0);
             8 + rows.len() * cols * (1 + 8)
+        }
+        Value::BoolArray2D(rows) => {
+            let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+            8 + rows.len() * cols
         }
         Value::TextArray2D(rows) => {
             let cols = rows.first().map(|r| r.len()).unwrap_or(0);
@@ -2108,6 +2115,7 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
         (Value::IntArray2D(rows), DataType::IntArray2D) => write_int_2d_body(out, rows),
         (Value::BigIntArray2D(rows), DataType::BigIntArray2D) => write_bigint_2d_body(out, rows),
         (Value::TextArray2D(rows), DataType::TextArray2D) => write_text_2d_body(out, rows),
+        (Value::BoolArray2D(rows), DataType::BoolArray2D) => write_bool_2d_body(out, rows),
         // Type mismatch shouldn't happen — `Table::insert` validates
         // value type against column type before pushing. Treat as a
         // bug, not a runtime error.
@@ -2158,6 +2166,10 @@ fn write_value_encoded_len(v: &Value<'_>) -> usize {
         Value::BigIntArray2D(rows) => {
             let cols = rows.first().map(|r| r.len()).unwrap_or(0);
             1 + 8 + rows.len() * cols * (1 + 8)
+        }
+        Value::BoolArray2D(rows) => {
+            let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+            1 + 8 + rows.len() * cols
         }
         Value::TextArray2D(rows) => {
             let cols = rows.first().map(|r| r.len()).unwrap_or(0);
@@ -2533,6 +2545,29 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
         Value::TextArray2D(rows) => {
             out.push(29);
             write_text_2d_body(out, rows);
+        }
+        // v7.39 (read01 round 75) — bool[][].
+        Value::BoolArray2D(rows) => {
+            out.push(67);
+            write_bool_2d_body(out, rows);
+        }
+    }
+}
+
+/// v7.39 (read01 round 75) — 2-D BOOL writer; one byte per cell (0 = false,
+/// 1 = true, 2 = NULL), after the (rows, cols) header the other 2-D bodies use.
+fn write_bool_2d_body(out: &mut Vec<u8>, rows: &[Vec<Option<bool>>]) {
+    let nrows = u32::try_from(rows.len()).expect("≤ 4G rows");
+    let ncols = u32::try_from(rows.first().map(|r| r.len()).unwrap_or(0)).expect("≤ 4G cols");
+    out.extend_from_slice(&nrows.to_le_bytes());
+    out.extend_from_slice(&ncols.to_le_bytes());
+    for row in rows {
+        for cell in row {
+            out.push(match cell {
+                None => 2,
+                Some(false) => 0,
+                Some(true) => 1,
+            });
         }
     }
 }
@@ -3726,6 +3761,7 @@ impl<'a> Cursor<'a> {
             DataType::IntArray2D => Ok(Value::IntArray2D(self.read_int_2d_body()?)),
             DataType::BigIntArray2D => Ok(Value::BigIntArray2D(self.read_bigint_2d_body()?)),
             DataType::TextArray2D => Ok(Value::TextArray2D(self.read_text_2d_body()?)),
+            DataType::BoolArray2D => Ok(Value::BoolArray2D(self.read_bool_2d_body()?)),
             // v7.17.0 Phase 3.P0-38: range dense body. Element
             // type is determined by the surrounding RangeKind.
             DataType::Range(kind) => {
@@ -3759,6 +3795,25 @@ impl<'a> Cursor<'a> {
 
     /// v7.17.0 Phase 3.P0-40 — read a 2D INT array body emitted
     /// by `write_int_2d_body`.
+    /// v7.39 (read01 round 75) — 2-D BOOL reader; mirrors `write_bool_2d_body`.
+    pub(crate) fn read_bool_2d_body(&mut self) -> Result<Vec<Vec<Option<bool>>>, StorageError> {
+        let nrows = self.read_u32()? as usize;
+        let ncols = self.read_u32()? as usize;
+        let mut rows = Vec::with_capacity(nrows);
+        for _ in 0..nrows {
+            let mut row = Vec::with_capacity(ncols);
+            for _ in 0..ncols {
+                row.push(match self.read_u8()? {
+                    0 => Some(false),
+                    1 => Some(true),
+                    _ => None,
+                });
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
     pub(crate) fn read_int_2d_body(&mut self) -> Result<Vec<Vec<Option<i32>>>, StorageError> {
         let nrows = self.read_u32()? as usize;
         let ncols = self.read_u32()? as usize;
@@ -4088,6 +4143,7 @@ impl<'a> Cursor<'a> {
             26 => Ok(Value::Hstore(self.read_hstore_body()?)),
             // v7.17.0 Phase 3.P0-40: tag 27/28/29 — 2D arrays.
             27 => Ok(Value::IntArray2D(self.read_int_2d_body()?)),
+            67 => Ok(Value::BoolArray2D(self.read_bool_2d_body()?)),
             28 => Ok(Value::BigIntArray2D(self.read_bigint_2d_body()?)),
             29 => Ok(Value::TextArray2D(self.read_text_2d_body()?)),
             // v7.37.5 β-P2: tag 30 — INTERVAL (schema-less). Body
