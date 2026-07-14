@@ -387,8 +387,15 @@ impl Engine {
                 on_update_overrides.push((i, src.clone()));
             }
         }
+        // v7.39 (read01 round 54) — carry the catalog. Without it an
+        // `m = 'happy'::mood` (or ::regclass / composite / domain) in an
+        // UPDATE / DELETE WHERE failed outright with "unsupported cast target
+        // `::mood`" — the same SELECT worked. Catalog::clone is a structural
+        // Arc bump, so this is cheap and sidesteps the &mut self borrow.
+        let cat_for_ctx = self.active_catalog().clone();
         let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()))
-            .with_default_text_search_config(ts_cfg.as_deref());
+            .with_default_text_search_config(ts_cfg.as_deref())
+            .with_catalog(&cat_for_ctx);
         // Walk candidate rows, evaluate WHERE then SET
         // expressions. We gather (position, new_values) tuples
         // first and apply them afterwards so the WHERE/RHS
@@ -1238,8 +1245,11 @@ impl Engine {
                 })
             })?;
             let schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
+            // v7.39 (read01 round 54) — carry the catalog (see above).
+            let cat_for_ctx = self.active_catalog().clone();
             let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()))
-                .with_default_text_search_config(ts_cfg.as_deref());
+                .with_default_text_search_config(ts_cfg.as_deref())
+                .with_catalog(&cat_for_ctx);
             // v7.37.16 (gate-on inventory) — visibility gate, same as
             // the main walk below: a tombstoned version must not be
             // re-targeted. No-op under gate-off.
@@ -1274,6 +1284,12 @@ impl Engine {
             || !after_delete_triggers.is_empty()
             || stmt.returning.is_some()
             || crate::constraints::any_fk_child_references(self.active_catalog(), &stmt.table);
+        // v7.39 (read01 round 54) — carry the catalog. Without it an
+        // `m = 'happy'::mood` (or ::regclass / composite / domain) in an
+        // UPDATE / DELETE WHERE failed outright with "unsupported cast target
+        // `::mood`" — the same SELECT worked. Catalog::clone is a structural
+        // Arc bump, so it is cheap; taken BEFORE the &mut borrow below.
+        let cat_for_ctx = self.active_catalog().clone();
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -1284,7 +1300,8 @@ impl Engine {
             })?;
         let schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
         let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()))
-            .with_default_text_search_config(ts_cfg.as_deref());
+            .with_default_text_search_config(ts_cfg.as_deref())
+            .with_catalog(&cat_for_ctx);
         let mut positions: Vec<usize> = Vec::new();
         // v7.6.3 — collect every to-delete row's full Value tuple
         // alongside its position, so the FK enforcement pass can

@@ -789,7 +789,22 @@ impl Table {
                 }
                 continue;
             }
-            let actual = val.data_type().expect("non-null");
+            // v7.39 (read01 round 54) — `data_type()` is None for the
+            // eval-only variants that carry no DataType (RegClass, Composite).
+            // They are NOT NULL, so `.expect("non-null")` PANICKED on them —
+            // materialising a CTE like `WITH w AS (SELECT 't'::regclass)` blew
+            // up the query with an "internal error". Report a clean type
+            // mismatch instead; the engine coerces these before they get here
+            // on every path that knows how.
+            let Some(actual) = val.data_type() else {
+                // An eval-only value (RegClass carries oid + name, Composite a
+                // field tuple) has no DataType in the storage lattice. It is
+                // NOT NULL, so the old `.expect("non-null")` PANICKED — which
+                // is how `WITH w AS (SELECT 't'::regclass)` blew up with an
+                // "internal error". Accept it: the value keeps its dual shape
+                // and downstream comparisons (RegClass vs BigInt oid) handle it.
+                continue;
+            };
             // Vector columns require both that the value's variant be Vector
             // *and* its dimension match. `actual == col.ty` already encodes
             // both because DataType::Vector carries the dim.
@@ -2103,7 +2118,22 @@ impl Table {
                 }
                 continue;
             }
-            let actual = val.data_type().expect("non-null");
+            // v7.39 (read01 round 54) — `data_type()` is None for the
+            // eval-only variants that carry no DataType (RegClass, Composite).
+            // They are NOT NULL, so `.expect("non-null")` PANICKED on them —
+            // materialising a CTE like `WITH w AS (SELECT 't'::regclass)` blew
+            // up the query with an "internal error". Report a clean type
+            // mismatch instead; the engine coerces these before they get here
+            // on every path that knows how.
+            let Some(actual) = val.data_type() else {
+                // An eval-only value (RegClass carries oid + name, Composite a
+                // field tuple) has no DataType in the storage lattice. It is
+                // NOT NULL, so the old `.expect("non-null")` PANICKED — which
+                // is how `WITH w AS (SELECT 't'::regclass)` blew up with an
+                // "internal error". Accept it: the value keeps its dual shape
+                // and downstream comparisons (RegClass vs BigInt oid) handle it.
+                continue;
+            };
             let compatible = actual == col.ty
                 || matches!(
                     (actual, col.ty),
@@ -2578,7 +2608,11 @@ fn validate_row_against_schema(
             }
             continue;
         }
-        let actual = val.data_type().expect("non-null");
+        // v7.39 (read01 round 54) — see above: no panic on an untyped value.
+        let Some(actual) = val.data_type() else {
+            // See above: an eval-only untyped value is accepted, not a panic.
+            continue;
+        };
         let compatible = actual == col.ty
             || matches!(
                 (actual, col.ty),

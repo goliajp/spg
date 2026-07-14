@@ -38,6 +38,11 @@ pub(crate) fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
         },
         Value::Text(s) | Value::Json(s) => Literal::String(s.into_owned()),
         Value::Bool(b) => Literal::Bool(b),
+        // v7.39 (read01 round 54) — the oid-shaped catalog scalars. A subquery
+        // like `WHERE indrelid IN (SELECT 't'::regclass)` used to die on
+        // "subquery result type None not yet materialisable"; a regclass IS an
+        // oid, so it materialises back as the integer the outer comparison wants.
+        Value::RegClass(oid, _) => Literal::Integer(oid),
         // v7.37 D.27 — an array-returning scalar subquery (`(SELECT
         // array_agg(...) FROM …)`) materialises through an `Expr::Array` of
         // element literals so the outer query re-evaluates it to the same array.
@@ -109,6 +114,11 @@ pub(crate) fn value_to_literal_expr_permissive(v: Value) -> Result<Expr, EngineE
         Value::Float(x) => Literal::Float(x),
         Value::Text(s) | Value::Json(s) => Literal::String(s.into_owned()),
         Value::Bool(b) => Literal::Bool(b),
+        // v7.39 (read01 round 54) — the oid-shaped catalog scalars. A subquery
+        // like `WHERE indrelid IN (SELECT 't'::regclass)` used to die on
+        // "subquery result type None not yet materialisable"; a regclass IS an
+        // oid, so it materialises back as the integer the outer comparison wants.
+        Value::RegClass(oid, _) => Literal::Integer(oid),
         Value::Vector(xs) => Literal::Vector(xs.into_owned()),
         // Date / Timestamp / Timestamptz / Numeric round-trip
         // through a TEXT literal that `coerce_value` re-parses
