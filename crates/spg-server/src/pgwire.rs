@@ -3654,6 +3654,14 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             } else {
                 "58030"
             }
+        // v7.39 (read01 round 57) — the table-privilege failures PG raises as
+        // 42501 insufficient_privilege, and the unknown-role one (42704).
+        } else if msg.contains("permission denied for table")
+            || msg.contains("must be owner of table")
+        {
+            "42501"
+        } else if msg.contains("role \"") && msg.contains("does not exist") {
+            "42704"
         } else {
             "42000"
         };

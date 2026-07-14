@@ -14124,7 +14124,38 @@ fn apply_function_dispatch(
                     });
                 }
             }
-            Ok(Value::Bool(true))
+            // v7.39 (read01 round 57) — a REAL answer now: the owner's implicit
+            // ALL, plus whatever the table's ACL grants the role (or PUBLIC).
+            // The 2-arg form asks about the session's effective role; the 3-arg
+            // form names the role. Round 51 answered `true` unconditionally
+            // because there were no grants to consult.
+            let (Some(name), Some(cat)) = (regclass_name_of(tbl_arg), ctx.catalog) else {
+                return Ok(Value::Bool(true));
+            };
+            let Some(t) = cat.get(&name) else {
+                return Ok(Value::Bool(true));
+            };
+            let Value::Text(p) = priv_arg else {
+                return Ok(Value::Bool(true));
+            };
+            let Some(bit) = crate::acl::priv_from_word(p.as_ref()) else {
+                return Ok(Value::Bool(true));
+            };
+            let role = if args.len() == 3 {
+                match &args[0] {
+                    Value::Text(r) => alloc::string::String::from(r.as_ref()),
+                    _ => current_role_from_ctx(ctx),
+                }
+            } else {
+                current_role_from_ctx(ctx)
+            };
+            let owner = t
+                .schema()
+                .owner
+                .clone()
+                .unwrap_or_else(|| alloc::string::String::from(crate::session::LOGIN_ROLE));
+            let held = crate::acl::privs_of(t.schema(), &owner, &role);
+            Ok(Value::Bool(held & bit != 0))
         }
         "has_column_privilege"
         | "has_schema_privilege"

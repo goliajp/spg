@@ -2573,6 +2573,8 @@ impl Engine {
         }
         let _ = parent_kind; // v7.37.6-B locks RANGE; future kinds key off this.
         let mut schema = TableSchema::new(stmt.name.clone(), parent_columns);
+        // v7.39 (read01 round 57) — whoever runs CREATE TABLE owns it.
+        schema.owner = Some(alloc::string::String::from(self.current_role()));
         schema.partition_role = Some(role);
         self.active_catalog_mut().create_table(schema)?;
         // Replay parent's CREATE INDEX templates against the new
@@ -2732,6 +2734,9 @@ impl Engine {
             )?);
         }
         let mut schema = TableSchema::new(table_name.to_string(), cols);
+        // v7.39 (read01 round 57) — whoever runs CREATE TABLE owns it (PG
+        // `pg_class.relowner`); the owner holds every privilege implicitly.
+        schema.owner = Some(alloc::string::String::from(self.current_role()));
         schema.foreign_keys = fks;
         // v7.9.19 — translate AST table_constraints to storage
         // UniquenessConstraints (column name → position) so the

@@ -285,6 +285,10 @@ impl Engine {
         ) -> Result<(), EngineError>,
     {
         cancel.check()?;
+        // v7.39 (read01 round 57) — this path can short-circuit STRAIGHT into
+        // the scalarsq streaming executor, below `exec_select_cancel` and its
+        // gate. Check here too.
+        self.acl_check_select(s)?;
         if crate::scalarsq_streaming::is_scalarsq_streaming_shape(s) {
             return self.exec_scalarsq_streaming(s, cancel, arena, emit);
         }
@@ -317,6 +321,9 @@ impl Engine {
         F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
     {
         cancel.check()?;
+        // v7.39 (read01 round 57) — same story: the joined-streaming shortcut
+        // runs below `exec_select_cancel`.
+        self.acl_check_select(s)?;
         if !crate::expr_tree_has_subquery(s)
             && let Some(n) = self.try_exec_joined_streaming(s, cancel, &mut emit)?
         {
@@ -438,6 +445,11 @@ impl Engine {
         stmt: Statement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 (read01 round 57) — the read path takes the SAME privilege gate
+        // as `execute`. Skipping it here would have made every SELECT a way
+        // around the ACL: the server dispatches read-only statements down this
+        // path, not through `execute`.
+        self.acl_check_statement(&stmt)?;
         let result = match stmt {
             Statement::Select(s) => self.exec_select_cancel(&s, cancel),
             Statement::ShowTables => Ok(self.exec_show_tables()),

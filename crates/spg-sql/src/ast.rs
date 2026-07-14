@@ -151,6 +151,11 @@ pub enum Statement {
     /// `current_user` and RLS enforcement); `None` resets to the login
     /// identity (the Admin superuser).
     SetRole(Option<String>),
+    /// v7.39 (read01 round 57) — `GRANT <privs> ON <object> TO <roles>`.
+    Grant(GrantStatement),
+    /// v7.39 (read01 round 57) — `REVOKE [GRANT OPTION FOR] <privs> ON
+    /// <object> FROM <roles>`.
+    Revoke(GrantStatement),
     /// v7.39 (RLS) — `CREATE POLICY name ON table …`.
     CreatePolicy(CreatePolicyStatement),
     /// v7.39 (RLS) — `ALTER POLICY name ON table …`.
@@ -3420,6 +3425,8 @@ impl Statement {
             | Statement::CreateUser(_)
             | Statement::DropUser(_)
             | Statement::SetRole(_)
+            | Statement::Grant(_)
+            | Statement::Revoke(_)
             | Statement::CreatePolicy(_)
             | Statement::AlterPolicy(_)
             | Statement::DropPolicy(_)
@@ -3459,6 +3466,79 @@ impl Statement {
             | Statement::CreateSchema { .. }
             | Statement::DropSchema { .. } => false,
         }
+    }
+}
+
+/// v7.39 (read01 round 57) — a parsed GRANT / REVOKE. The same shape serves
+/// both; `Statement::Grant` vs `Statement::Revoke` says which way it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantStatement {
+    /// The privilege words, upper-cased. EMPTY = `ALL [PRIVILEGES]`.
+    pub privileges: Vec<String>,
+    /// What the privileges are on.
+    pub object: GrantObject,
+    /// The roles granted to / revoked from. An empty string entry = PUBLIC.
+    pub grantees: Vec<String>,
+    /// GRANT: a trailing `WITH GRANT OPTION`. REVOKE: a leading
+    /// `GRANT OPTION FOR` (revoke only the right to re-grant, keep the
+    /// privilege itself).
+    pub grant_option: bool,
+}
+
+/// v7.39 (read01 round 57) — the object a GRANT names. SPG enforces TABLE
+/// privileges; every other object class parses and is accepted as a no-op, so
+/// a pg_dump that grants on schemas / sequences / functions still restores.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantObject {
+    /// `ON [TABLE] a, b` — the enforced case.
+    Tables(Vec<String>),
+    /// `ON SCHEMA / SEQUENCE / DATABASE / FUNCTION / …`, or
+    /// `GRANT role TO role` (role membership, no ON clause at all). Carries
+    /// the object-class word for the error/no-op message.
+    Other(String),
+}
+
+impl GrantStatement {
+    /// Round-trip text. `grant = false` renders the REVOKE form.
+    fn render(&self, grant: bool) -> alloc::string::String {
+        use core::fmt::Write as _;
+        let mut s = alloc::string::String::new();
+        let privs = if self.privileges.is_empty() {
+            "ALL".into()
+        } else {
+            self.privileges.join(", ")
+        };
+        let obj = match &self.object {
+            GrantObject::Tables(t) => {
+                let names: Vec<_> = t.iter().map(|n| quote_ident(n)).collect();
+                alloc::format!("TABLE {}", names.join(", "))
+            }
+            GrantObject::Other(k) => k.clone(),
+        };
+        let who: Vec<_> = self
+            .grantees
+            .iter()
+            .map(|g| {
+                if g.is_empty() {
+                    "PUBLIC".into()
+                } else {
+                    quote_ident(g)
+                }
+            })
+            .collect();
+        if grant {
+            let _ = write!(s, "GRANT {privs} ON {obj} TO {}", who.join(", "));
+            if self.grant_option {
+                s.push_str(" WITH GRANT OPTION");
+            }
+        } else {
+            s.push_str("REVOKE ");
+            if self.grant_option {
+                s.push_str("GRANT OPTION FOR ");
+            }
+            let _ = write!(s, "{privs} ON {obj} FROM {}", who.join(", "));
+        }
+        s
     }
 }
 
@@ -3628,6 +3708,8 @@ impl fmt::Display for Statement {
             Self::DropUser(n) => write!(f, "DROP USER {}", quote_ident(n)),
             Self::SetRole(Some(r)) => write!(f, "SET ROLE {}", quote_ident(r)),
             Self::SetRole(None) => f.write_str("RESET ROLE"),
+            Self::Grant(g) => write!(f, "{}", g.render(true)),
+            Self::Revoke(g) => write!(f, "{}", g.render(false)),
             Self::CreatePolicy(s) => {
                 write!(
                     f,

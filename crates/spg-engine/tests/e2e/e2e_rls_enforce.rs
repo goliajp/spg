@@ -31,6 +31,10 @@ fn scalar(e: &mut Engine, sql: &str) -> String {
 
 fn owned_docs(e: &mut Engine) {
     e.execute("CREATE TABLE doc(id int, owner text)").unwrap();
+    // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
+    // role needs the GRANT before RLS is even consulted (PG denies first, with
+    // "permission denied for table doc"). Every RLS demo on real PG grants.
+    e.execute("GRANT ALL ON doc TO PUBLIC").unwrap();
     e.execute("INSERT INTO doc VALUES (1,'alice'),(2,'bob'),(3,'alice')")
         .unwrap();
     e.execute("ALTER TABLE doc ENABLE ROW LEVEL SECURITY")
@@ -76,6 +80,10 @@ fn set_role_activates_and_reset_restores() {
 fn default_deny_when_no_policy_applies() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(id int)").unwrap();
+    // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
+    // role needs the GRANT before RLS is even consulted (PG denies first, with
+    // "permission denied for table t"). Every RLS demo on real PG grants.
+    e.execute("GRANT ALL ON t TO PUBLIC").unwrap();
     e.execute("INSERT INTO t VALUES (1),(2)").unwrap();
     e.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY")
         .unwrap();
@@ -89,6 +97,10 @@ fn permissive_or_restrictive_and() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE d(id int, owner text, secret bool)")
         .unwrap();
+    // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
+    // role needs the GRANT before RLS is even consulted (PG denies first, with
+    // "permission denied for table d"). Every RLS demo on real PG grants.
+    e.execute("GRANT ALL ON d TO PUBLIC").unwrap();
     e.execute("INSERT INTO d VALUES (1,'alice',false),(2,'alice',true),(3,'bob',false)")
         .unwrap();
     e.execute("ALTER TABLE d ENABLE ROW LEVEL SECURITY")
@@ -113,6 +125,10 @@ fn permissive_or_restrictive_and() {
 fn role_scoped_policy() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(id int)").unwrap();
+    // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
+    // role needs the GRANT before RLS is even consulted (PG denies first, with
+    // "permission denied for table t"). Every RLS demo on real PG grants.
+    e.execute("GRANT ALL ON t TO PUBLIC").unwrap();
     e.execute("INSERT INTO t VALUES (1),(2),(3)").unwrap();
     e.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY")
         .unwrap();
@@ -156,10 +172,18 @@ fn pair(e: &mut Engine, sql: &str) -> Vec<String> {
 fn join_filters_rls_table_via_security_barrier() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE doc(id int, owner text)").unwrap();
+    // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
+    // role needs the GRANT before RLS is even consulted (PG denies first, with
+    // "permission denied for table doc"). Every RLS demo on real PG grants.
+    e.execute("GRANT ALL ON doc TO PUBLIC").unwrap();
     e.execute("INSERT INTO doc VALUES (1,'alice'),(2,'bob'),(3,'alice')")
         .unwrap();
     e.execute("CREATE TABLE tag(doc_id int, label text)")
         .unwrap();
+    // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
+    // role needs the GRANT before RLS is even consulted (PG denies first, with
+    // "permission denied for table tag"). Every RLS demo on real PG grants.
+    e.execute("GRANT ALL ON tag TO PUBLIC").unwrap();
     e.execute("INSERT INTO tag VALUES (1,'a'),(2,'b'),(3,'c')")
         .unwrap();
     e.execute("ALTER TABLE doc ENABLE ROW LEVEL SECURITY")
@@ -210,6 +234,10 @@ fn insert_with_check_enforced() {
     let mut e = Engine::new();
     // Policy has USING; its WITH CHECK falls back to USING (PG semantics).
     e.execute("CREATE TABLE doc(id int, owner text)").unwrap();
+    // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
+    // role needs the GRANT before RLS is even consulted (PG denies first, with
+    // "permission denied for table doc"). Every RLS demo on real PG grants.
+    e.execute("GRANT ALL ON doc TO PUBLIC").unwrap();
     e.execute("ALTER TABLE doc ENABLE ROW LEVEL SECURITY")
         .unwrap();
     e.execute("CREATE POLICY p ON doc USING (owner = current_user)")
@@ -228,6 +256,10 @@ fn insert_with_check_enforced() {
 fn insert_denied_when_no_policy() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(id int)").unwrap();
+    // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
+    // role needs the GRANT before RLS is even consulted (PG denies first, with
+    // "permission denied for table t"). Every RLS demo on real PG grants.
+    e.execute("GRANT ALL ON t TO PUBLIC").unwrap();
     e.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY")
         .unwrap();
     e.execute("SET ROLE alice").unwrap();
@@ -239,6 +271,10 @@ fn insert_denied_when_no_policy() {
 fn update_using_visibility_and_with_check() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE doc(id int, owner text)").unwrap();
+    // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
+    // role needs the GRANT before RLS is even consulted (PG denies first, with
+    // "permission denied for table doc"). Every RLS demo on real PG grants.
+    e.execute("GRANT ALL ON doc TO PUBLIC").unwrap();
     e.execute("INSERT INTO doc VALUES (1,'alice'),(2,'bob'),(3,'alice')")
         .unwrap();
     e.execute("ALTER TABLE doc ENABLE ROW LEVEL SECURITY")
@@ -260,6 +296,10 @@ fn update_using_visibility_and_with_check() {
 fn delete_using_visibility() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE doc(id int, owner text)").unwrap();
+    // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
+    // role needs the GRANT before RLS is even consulted (PG denies first, with
+    // "permission denied for table doc"). Every RLS demo on real PG grants.
+    e.execute("GRANT ALL ON doc TO PUBLIC").unwrap();
     e.execute("INSERT INTO doc VALUES (1,'alice'),(2,'bob')")
         .unwrap();
     e.execute("ALTER TABLE doc ENABLE ROW LEVEL SECURITY")

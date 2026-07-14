@@ -1612,6 +1612,9 @@ impl Engine {
         stmt: &SelectStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 (read01 round 57) — the table-privilege gate on the common
+        // read core. A superuser session returns from it immediately.
+        self.acl_check_select(stmt)?;
         let result = self.exec_select_cancel_inner(stmt, cancel)?;
         // v7.37.17 (17.6 siblings) — `SELECT DISTINCT ON (exprs)`:
         // rows arrive here already ORDER BY'd; keep the FIRST row of
