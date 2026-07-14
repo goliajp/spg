@@ -205,6 +205,7 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         | DataType::IntArray2D
         | DataType::BigIntArray2D
         | DataType::TextArray2D => WireType::Text,
+        | DataType::BoolArray2D => WireType::Text,
         DataType::Bool => WireType::Bool,
         // RowDescription drops the dimension; DataRow's WireValue::Vector
         // carries the actual element count back to the client.
