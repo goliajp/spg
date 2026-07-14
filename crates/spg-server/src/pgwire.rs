@@ -1250,6 +1250,17 @@ fn run_pg_session(
         .iter()
         .find_map(|(k, v)| (k == "application_name").then(|| v.clone()))
         .unwrap_or_default();
+    // v7.39 (read01 round 51) — surface the startup `user` so current_user /
+    // session_user / pg_get_userbyid report the identity the client actually
+    // connected as (they used to be hardcoded "admin"). This is the REPORTED
+    // identity only: privilege semantics still key on an explicit SET ROLE
+    // (see Engine::is_superuser), so naming a non-admin login here cannot
+    // silently turn a connection into an RLS subject.
+    if !user.is_empty()
+        && let Ok(mut e) = state.engine.write()
+    {
+        e.set_session_user(&user);
+    }
     // v7.39 (read01 misc.c) — surface the startup `database` param so
     // current_database() answers the connection's database name (the
     // engine session is process-wide; every connection names the same
@@ -3581,6 +3592,8 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("cannot call json_object_keys")
             || msg.contains("cannot call jsonb_object_keys")
             || msg.contains("string is not a valid identifier")
+            // v7.39 (read01 round 51) — has_table_privilege's privilege word.
+            || msg.contains("unrecognized privilege type")
         {
             "22023"
         // v7.39 (ts_headline validation) — a malformed key=value list is

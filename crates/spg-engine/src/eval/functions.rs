@@ -38,10 +38,19 @@ pub(super) fn apply_function_lower(
 fn current_role_from_ctx(ctx: &EvalContext<'_>) -> alloc::string::String {
     ctx.session_gucs
         .and_then(|g| g.get(crate::session::CURRENT_ROLE_KEY))
-        .map_or_else(
-            || alloc::string::String::from("admin"),
-            alloc::string::String::clone,
-        )
+        .cloned()
+        // v7.39 (read01 round 51) — no SET ROLE in effect: current_user is the
+        // login identity (the startup packet's `user`), not a hardcoded admin.
+        .unwrap_or_else(|| session_user_from_ctx(ctx))
+}
+
+/// v7.39 (read01 round 51) — the login identity the connection authenticated
+/// as. Absent (embedded engine) = the Admin default.
+fn session_user_from_ctx(ctx: &EvalContext<'_>) -> alloc::string::String {
+    ctx.session_gucs
+        .and_then(|g| g.get(crate::session::SESSION_USER_KEY))
+        .cloned()
+        .unwrap_or_else(|| alloc::string::String::from("admin"))
 }
 
 fn int_width_result(v: i64, a: &Value<'_>, b: &Value<'_>) -> Value<'static> {
@@ -13934,7 +13943,9 @@ fn apply_function_dispatch(
         | "pg_get_statisticsobjdef" => Ok(Value::Null),
         // pg_get_userbyid always returns "admin" — SPG's single-user
         // model; matches CURRENT_USER default.
-        "pg_get_userbyid" => Ok(Value::text::<String>("admin".into())),
+        // v7.39 (read01 round 51) — SPG has one login identity per session, so
+        // every oid resolves to it (the startup packet's `user`).
+        "pg_get_userbyid" => Ok(Value::text(session_user_from_ctx(ctx))),
         // pg_size_pretty(bigint) — commonly used by monitoring
         // queries; format a byte count as a human-readable string.
         // For now return empty text so the SELECT succeeds; real
@@ -14060,8 +14071,62 @@ fn apply_function_dispatch(
         // has_table_privilege / has_column_privilege / has_schema_privilege:
         // permission probes ORMs emit before generating DDL. SPG
         // is single-user, so grant everything.
-        "has_table_privilege"
-        | "has_column_privilege"
+        // v7.39 (read01 round 51) — has_table_privilege validates like PG
+        // before answering: the relation must exist (42P01) and the privilege
+        // word must be a real table privilege (22023). SPG's single-role model
+        // then always grants it. The other members of the family keep the
+        // unconditional `true`.
+        "has_table_privilege" => {
+            // Forms: (table, priv) | (user, table, priv).
+            let (tbl_arg, priv_arg) = match args.len() {
+                2 => (&args[0], &args[1]),
+                3 => (&args[1], &args[2]),
+                n => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "has_table_privilege() takes 2 or 3 args, got {n}"
+                        ),
+                    });
+                }
+            };
+            if matches!(tbl_arg, Value::Null) || matches!(priv_arg, Value::Null) {
+                return Ok(Value::Null);
+            }
+            if let Some(name) = regclass_name_of(tbl_arg)
+                && let Some(cat) = ctx.catalog
+                && cat.get(&name).is_none()
+            {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("relation \"{name}\" does not exist"),
+                });
+            }
+            if let Value::Text(p) = priv_arg {
+                // A trailing " WITH GRANT OPTION" is legal on every word.
+                let bare = p
+                    .as_ref()
+                    .trim()
+                    .split_once(" WITH ")
+                    .map_or(p.as_ref().trim(), |(a, _)| a.trim());
+                let known = matches!(
+                    bare.to_ascii_uppercase().as_str(),
+                    "SELECT"
+                        | "INSERT"
+                        | "UPDATE"
+                        | "DELETE"
+                        | "TRUNCATE"
+                        | "REFERENCES"
+                        | "TRIGGER"
+                        | "MAINTAIN"
+                );
+                if !known {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!("unrecognized privilege type: \"{bare}\""),
+                    });
+                }
+            }
+            Ok(Value::Bool(true))
+        }
+        "has_column_privilege"
         | "has_schema_privilege"
         | "has_function_privilege"
         | "has_sequence_privilege"
@@ -14096,7 +14161,11 @@ fn apply_function_dispatch(
         // no wire-level auth surface yet; return a stable
         // "trust:admin" placeholder so callers get a non-NULL
         // formatted value.
-        "system_user" => Ok(Value::text::<String>("trust:admin".into())),
+        // v7.39 (read01 round 51) — follows the login identity now.
+        "system_user" => Ok(Value::text(alloc::format!(
+            "trust:{}",
+            session_user_from_ctx(ctx)
+        ))),
         // current_query() / pg_stat_get_backend_activity — the SQL
         // string of the currently-executing query. SPG doesn't
         // expose the executing text back to itself; return empty
@@ -15677,7 +15746,7 @@ fn apply_function_dispatch(
         // v7.39 (RLS) — current_user / user follow `SET ROLE`; session_user is
         // the login identity (unaffected by SET ROLE). Both default to admin.
         "current_user" | "user" => Ok(Value::text(current_role_from_ctx(ctx))),
-        "session_user" => Ok(Value::text::<String>("admin".into())),
+        "session_user" => Ok(Value::text(session_user_from_ctx(ctx))),
         // v7.37.17 (17.6 siblings) — SQL:2003 spelling variants.
         // CURRENT_CATALOG is the SQL-standard synonym for
         // CURRENT_DATABASE; CURRENT_ROLE is the SQL-standard synonym

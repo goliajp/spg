@@ -677,6 +677,17 @@ impl Engine {
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.17.0 Phase 3.P0-63 — information_schema.KEY_COLUMN_USAGE.
+                // v7.39 (read01 round 51) — information_schema.role_table_grants
+                // and .table_privileges. Both report the owner's seven implicit
+                // table privileges; SPG's single role owns everything.
+                "__spg_info_role_table_grants" | "__spg_info_table_privileges" => {
+                    let grantee = self.current_role().to_string();
+                    let (schema, rows) = crate::system_catalog::synth_info_role_table_grants(
+                        self.active_catalog(),
+                        &grantee,
+                    );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 "__spg_info_key_column_usage" => {
                     let (schema, rows) = synth_info_key_column_usage(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;

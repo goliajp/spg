@@ -17953,6 +17953,8 @@ impl Parser {
                 | "current_catalog"
                 | "current_schema"
                 | "current_database"
+                // v7.39 (read01 round 51) — PG 16's system_user is parenless too.
+                | "system_user"
         ) {
             return Ok(Expr::FunctionCall {
                 name: lc,

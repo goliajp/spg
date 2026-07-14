@@ -2038,6 +2038,11 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         ColumnSchema::new("relispopulated", DataType::Bool, false),
         ColumnSchema::new("relreplident", DataType::Text, false),
         ColumnSchema::new("relispartition", DataType::Bool, false),
+        // v7.39 (read01 round 51) — PG leaves relacl NULL when only the
+        // owner's implicit privileges apply (no explicit GRANT). SPG's
+        // single-role model is exactly that case, so it is always NULL —
+        // but the COLUMN must exist: ORMs and psql \dp select it.
+        ColumnSchema::new("relacl", DataType::Text, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     // PG starts user-relation OIDs above 16384.
@@ -2096,6 +2101,7 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             Value::Bool(true),                          // relispopulated
             Value::text("d"),                           // relreplident — 'd' default
             Value::Bool(is_partition),
+            Value::Null,
         ]));
         oid = oid.saturating_add(1);
     }
@@ -3960,6 +3966,60 @@ pub(crate) fn synth_pg_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
 /// catalog's COMMENT store. `objsubid` is the 1-based column number for a
 /// column comment, 0 otherwise; `classoid` is pg_class (1259) for relations
 /// and their columns, 0 for the kinds SPG stores by name only.
+/// v7.39 (read01 round 51) — the seven table privileges PG grants a relation's
+/// owner implicitly (no ACL entry needed). SPG has a single role, which owns
+/// everything, so `information_schema.table_privileges` /
+/// `.role_table_grants` report exactly this set per table.
+const OWNER_TABLE_PRIVILEGES: &[&str] = &[
+    "DELETE",
+    "INSERT",
+    "REFERENCES",
+    "SELECT",
+    "TRIGGER",
+    "TRUNCATE",
+    "UPDATE",
+];
+
+/// v7.39 (read01 round 51) — `information_schema.role_table_grants` (and, with
+/// the same shape, `.table_privileges`: PG defines the latter as the former
+/// plus the rows a role can see via PUBLIC, which is the same set here).
+pub(crate) fn synth_info_role_table_grants(
+    cat: &Catalog,
+    grantee: &str,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let cols = alloc::vec![
+        ColumnSchema::new("grantor", DataType::Text, false),
+        ColumnSchema::new("grantee", DataType::Text, false),
+        ColumnSchema::new("table_catalog", DataType::Text, false),
+        ColumnSchema::new("table_schema", DataType::Text, false),
+        ColumnSchema::new("table_name", DataType::Text, false),
+        ColumnSchema::new("privilege_type", DataType::Text, false),
+        ColumnSchema::new("is_grantable", DataType::Text, false),
+        ColumnSchema::new("with_hierarchy", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for tname in cat.table_names() {
+        for p in OWNER_TABLE_PRIVILEGES {
+            rows.push(Row::new(alloc::vec![
+                Value::text(alloc::string::String::from(grantee)),
+                Value::text(alloc::string::String::from(grantee)),
+                Value::text(alloc::string::String::from("app")),
+                Value::text(alloc::string::String::from("public")),
+                Value::text(tname.clone()),
+                Value::text(alloc::string::String::from(*p)),
+                Value::text(alloc::string::String::from("YES")),
+                // PG sets with_hierarchy YES only for SELECT.
+                Value::text(alloc::string::String::from(if *p == "SELECT" {
+                    "YES"
+                } else {
+                    "NO"
+                })),
+            ]));
+        }
+    }
+    (cols, rows)
+}
+
 pub(crate) fn synth_pg_description(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let cols = alloc::vec![
         ColumnSchema::new("objoid", DataType::Int, false),
