@@ -9041,6 +9041,62 @@ impl Parser {
         // column after the function (or its AS alias). Reuses the FROM-SRF
         // machinery. Only fires with no FROM — mixed SRF over a real FROM already
         // works via the targetlist-SRF path.
+        // v7.39 (read01 round 69) — lower `(f(args)).*`. With no FROM it IS
+        // `SELECT * FROM f(args)` — the record's fields become the columns, which
+        // is exactly what the function's own row shape already is. Anywhere else
+        // (per outer row, or beside other items) it would need a real record-typed
+        // projection, so it says so rather than answering something else.
+        if let [SelectItem::Expr {
+            expr: Expr::FunctionCall { name, args },
+            ..
+        }] = items.as_slice()
+            && name == "__record_expand"
+        {
+            let Some(Expr::FunctionCall {
+                name: inner_name,
+                args: inner_args,
+            }) = args.first()
+            else {
+                return Err(self.err(
+                    "(<expr>).* expands a function's record — it needs a function call".into(),
+                ));
+            };
+            if from.is_some() {
+                return Err(self.err(
+                    "(<fn>).* over a FROM clause is not supported — call the function in FROM"
+                        .into(),
+                ));
+            }
+            let fn_ref = TableRef {
+                name: inner_name.clone(),
+                alias: None,
+                as_of_segment: None,
+                unnest_expr: None,
+                unnest_column_aliases: Vec::new(),
+                with_ordinality: false,
+                generate_series_args: None,
+                lateral_subquery: None,
+                jsonb_each_text_arg: None,
+                table_fn_call: Some(Box::new((
+                    inner_name.to_ascii_lowercase(),
+                    inner_args.clone(),
+                ))),
+            };
+            items = alloc::vec![SelectItem::Wildcard];
+            from = Some(FromClause {
+                primary: fn_ref,
+                joins: Vec::new(),
+            });
+        }
+        if items.iter().any(|it| {
+            matches!(it, SelectItem::Expr { expr: Expr::FunctionCall { name, .. }, .. }
+                if name == "__record_expand")
+        }) {
+            return Err(self.err(
+                "(<fn>).* is only supported as the sole select item — call the function in FROM"
+                    .into(),
+            ));
+        }
         // v7.39 (read01 round 67) — the lift moves ONE SRF into FROM. With two
         // (`SELECT generate_series(1,3), generate_series(10,11)`) PG runs them in
         // LOCKSTEP, padding the shorter with NULLs — a shape the lift cannot
@@ -12835,6 +12891,22 @@ impl Parser {
             return Ok(SelectItem::Wildcard);
         }
         let expr = self.parse_expr(0)?;
+        // v7.39 (read01 round 69) — `(f(args)).*`: expand the RECORD a
+        // multi-column function returns into columns. Marked here and lowered in
+        // `parse_bare_select`, where the FROM clause is in hand.
+        if matches!(self.peek(), Token::Dot)
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Star))
+        {
+            self.advance(); // .
+            self.advance(); // *
+            return Ok(SelectItem::Expr {
+                expr: Expr::FunctionCall {
+                    name: "__record_expand".to_string(),
+                    args: alloc::vec![expr],
+                },
+                alias: None,
+            });
+        }
         let alias = self.parse_optional_alias();
         Ok(SelectItem::Expr { expr, alias })
     }
@@ -12912,14 +12984,19 @@ impl Parser {
         // (v7.37.43-T4.5 substitute_outer_in_table_ref), and PG
         // licences the correlation even without the keyword. Absorb
         // it and fall through to the SRF arms below.
+        // v7.39 (read01 round 69) — `LATERAL <fn>(args)` for ANY function, not
+        // just the four builtin SRFs: a user set-returning function on a JOIN's
+        // right side is the whole point of LATERAL. The keyword stays noise at
+        // parse time — the join executor substitutes the outer row into the
+        // call's arguments per outer row.
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("lateral"))
-            && matches!(self.tokens.get(self.pos + 1),
-                Some(Token::Ident(s) | Token::QuotedIdent(s))
-                    if s.eq_ignore_ascii_case("generate_series") || s.eq_ignore_ascii_case("unnest")
-                        // v7.38 (read01, T-srf) — string_to_table / regexp_split_to_table
-                        // rewrite to the unnest channel below; absorb their LATERAL too.
-                        || s.eq_ignore_ascii_case("string_to_table")
-                        || s.eq_ignore_ascii_case("regexp_split_to_table"))
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                // The json_each family has its OWN `LATERAL …` arm below, which
+                // needs to see the keyword — absorbing it here would send those
+                // calls down the generic table-function channel instead.
+                Some(Token::Ident(s) | Token::QuotedIdent(s)) if !is_json_each_name(s)
+            )
             && matches!(self.tokens.get(self.pos + 2), Some(Token::LParen))
         {
             self.advance(); // LATERAL
@@ -13585,7 +13662,20 @@ impl Parser {
         {
             // Body out-of-line — this parse sits on the FROM/subquery
             // recursion chain (debug frame-cliff discipline).
-            return self.parse_table_fn_ref();
+            // v7.39 (read01 round 69) — a call whose arguments reference an outer
+            // column (`t JOIN LATERAL dbl(t.id)`) is CORRELATED: it runs once per
+            // outer row, so it rides the lateral channel. Same rule the unnest
+            // arm uses.
+            let tref = self.parse_table_fn_ref()?;
+            let correlated = tref
+                .table_fn_call
+                .as_deref()
+                .is_some_and(|(_, args)| args.iter().any(Self::expr_has_any_column));
+            return Ok(if correlated {
+                Self::wrap_correlated_srf(tref)
+            } else {
+                tref
+            });
         }
         // v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
         // [, step])` set-returning source. Same shape as unnest:

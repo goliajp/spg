@@ -1874,6 +1874,48 @@ impl Engine {
                     }
                     return Ok(out);
                 }
+                // v7.39 (read01 round 69) — `SELECT * FROM <user fn>(…)`, which is
+                // what a correlated `LATERAL f(t.c)` wraps into. A wildcard has no
+                // name to give, so without this the column came back as `col0` and
+                // the alias (`AS d`) resolved to nothing. Take the shape the
+                // function DECLARES: `RETURNS TABLE(id int, v text)` names its
+                // columns, and a `SETOF <scalar>` is one column named after the
+                // call's alias.
+                if let Some(from) = &inner.from
+                    && from.joins.is_empty()
+                    && matches!(inner.items.as_slice(), [SelectItem::Wildcard])
+                    && let Some((fn_name, _)) = from.primary.table_fn_call.as_deref()
+                {
+                    let cat = self.active_catalog();
+                    let overloads = cat.functions_named(fn_name);
+                    if let Some(def) = overloads.first() {
+                        let declared = def.returns.trim();
+                        let upper = declared.to_ascii_uppercase();
+                        if let Some(rest) = upper.strip_prefix("TABLE(") {
+                            let _ = rest;
+                            let raw = &declared["TABLE(".len()..declared.len() - 1];
+                            let cols: Vec<ColumnSchema> = raw
+                                .split(',')
+                                .map(|decl| {
+                                    let cname =
+                                        decl.trim().split_whitespace().next().unwrap_or("col");
+                                    ColumnSchema::new(cname.to_string(), DataType::Text, true)
+                                })
+                                .collect();
+                            return Ok(cols);
+                        }
+                        let cname = from
+                            .primary
+                            .alias
+                            .clone()
+                            .unwrap_or_else(|| fn_name.clone());
+                        return Ok(alloc::vec![ColumnSchema::new(
+                            cname,
+                            DataType::Text,
+                            true
+                        )]);
+                    }
+                }
                 let mut out: Vec<ColumnSchema> = Vec::new();
                 for (i, item) in inner.items.iter().enumerate() {
                     let name = match item {
@@ -2968,6 +3010,15 @@ fn substitute_outer_in_table_ref(
     }
     if let Some(arg) = t.unnest_expr.as_deref_mut() {
         substitute_outer_in_expr(arg, outer_row, outer_schema, true);
+    }
+    // v7.39 (read01 round 69) — a user function on a JOIN's right side
+    // (`t JOIN LATERAL dbl(t.id) AS d ON true`): its ARGUMENTS reference the
+    // outer row, so they take the substitution too. Without this the call would
+    // see an unresolved column and the correlation would silently not happen.
+    if let Some(call) = t.table_fn_call.as_deref_mut() {
+        for a in call.1.iter_mut() {
+            substitute_outer_in_expr(a, outer_row, outer_schema, true);
+        }
     }
     if let Some(args) = t.generate_series_args.as_mut() {
         for a in args.iter_mut() {
