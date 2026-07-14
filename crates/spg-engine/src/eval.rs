@@ -3328,6 +3328,17 @@ fn substitute_arg_refs_in_select(
             }
         }
     }
+    // v7.39 (read01 round 69) — the UNION peers. A body like
+    // `SELECT k UNION ALL SELECT k * 10` has its second half in `unions`, and
+    // leaving it unsubstituted made the argument look like a missing column.
+    for (_, peer) in &mut stmt.unions {
+        substitute_arg_refs_in_select(peer, binds);
+    }
+    for cte in &mut stmt.ctes {
+        if let Some(s) = cte.body.as_select_mut() {
+            substitute_arg_refs_in_select(s, binds);
+        }
+    }
 }
 
 impl crate::Engine {
