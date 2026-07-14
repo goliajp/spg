@@ -3956,6 +3956,60 @@ pub(crate) fn synth_pg_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
     (schema, rows)
 }
 
+/// v7.39 (read01 round 50) — synthesise `pg_catalog.pg_description` from the
+/// catalog's COMMENT store. `objsubid` is the 1-based column number for a
+/// column comment, 0 otherwise; `classoid` is pg_class (1259) for relations
+/// and their columns, 0 for the kinds SPG stores by name only.
+pub(crate) fn synth_pg_description(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let cols = alloc::vec![
+        ColumnSchema::new("objoid", DataType::Int, false),
+        ColumnSchema::new("classoid", DataType::Int, false),
+        ColumnSchema::new("objsubid", DataType::Int, false),
+        ColumnSchema::new("description", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for (key, text) in cat.comments() {
+        let Some((kind, name)) = key.split_once(':') else {
+            continue;
+        };
+        let (relname, subid) = if kind == "column" {
+            match name.split_once('.') {
+                Some((t, c)) => {
+                    let sub = cat
+                        .get(t)
+                        .and_then(|tb| {
+                            tb.schema()
+                                .columns
+                                .iter()
+                                .position(|sc| sc.name.eq_ignore_ascii_case(c))
+                        })
+                        .map_or(0, |p| i32::try_from(p + 1).unwrap_or(0));
+                    (t, sub)
+                }
+                None => continue,
+            }
+        } else {
+            (name, 0)
+        };
+        let is_relation = matches!(kind, "table" | "view" | "index" | "sequence" | "column");
+        let objoid = if is_relation {
+            crate::eval::regclass_name_to_oid(cat, relname)
+                .and_then(|o| i32::try_from(o).ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let classoid = if is_relation { 1259 } else { 0 };
+        rows.push(Row::new(alloc::vec![
+            Value::Int(objoid),
+            Value::Int(classoid),
+            Value::Int(subid),
+            Value::text(text.clone()),
+        ]));
+    }
+    (cols, rows)
+}
+
 pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Text, false),

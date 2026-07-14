@@ -886,9 +886,15 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
     }
     // v7.38 (P5.05) — the current writer emits v54 with a trailing CRC32C;
     // strip it so what remains is the pre-trailer body we downgrade to v52.
+    // v7.39 (read01 round 50) — and the v61 catalog-wide COMMENT block that
+    // now sits just before the CRC. For this catalog it is an empty u32 count
+    // (4 bytes); a v52 reader stops before it and would report "trailing
+    // bytes: 4 unread". EVERY new trailing appendix has to be stripped here —
+    // this test is the backstop that says so.
+    const EMPTY_COMMENT_BLOCK: usize = 4;
     let v53 = {
         let mut full = c.serialize();
-        full.truncate(full.len() - 4);
+        full.truncate(full.len() - 4 - EMPTY_COMMENT_BLOCK);
         full
     };
 

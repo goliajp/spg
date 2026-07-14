@@ -46,10 +46,10 @@ type WindowDef = (
 fn is_dump_noise_statement(lc: &str) -> bool {
     matches!(
         lc,
-        // Object comments / privileges / ownership — none of
-        // these change schema semantics on SPG.
-        "comment"
-            | "grant"
+        // Privileges / ownership — none of these change schema
+        // semantics on SPG. v7.39 (read01 round 50): "comment" moved OUT —
+        // COMMENT ON is now a real statement with a real store.
+        "grant"
             | "revoke"
             // MySQL bulk-load brackets.
             | "lock"
@@ -601,6 +601,95 @@ impl Parser {
     /// next semicolon / EOF. Used by the dump-noise dispatcher
     /// to consume `COMMENT ON …`, `GRANT …`, `LOCK TABLES …`,
     /// etc. without modeling each grammar.
+    /// v7.39 (read01 round 50) — `COMMENT ON <kind> <name> IS { 'text' | NULL }`.
+    /// Kinds SPG stores by name: TABLE / COLUMN / INDEX / VIEW / SEQUENCE /
+    /// SCHEMA / TYPE / DATABASE / FUNCTION. Anything else (and the multi-word
+    /// `CONSTRAINT c ON t` / `MATERIALIZED VIEW` forms) keeps the old
+    /// swallow-as-no-op behaviour so a pg_dump tail still loads.
+    fn parse_comment_on(&mut self) -> Result<Statement, ParseError> {
+        let start = self.pos;
+        self.advance(); // COMMENT
+        if !matches!(self.peek(), Token::On) {
+            self.pos = start;
+            self.consume_until_statement_boundary();
+            return Ok(Statement::Empty);
+        }
+        self.advance(); // ON
+        let kind = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
+            Token::Table => "table".into(),
+            _ => {
+                self.consume_until_statement_boundary();
+                return Ok(Statement::Empty);
+            }
+        };
+        if !matches!(
+            kind.as_str(),
+            "table"
+                | "column"
+                | "index"
+                | "view"
+                | "sequence"
+                | "schema"
+                | "type"
+                | "database"
+                | "function"
+        ) {
+            self.consume_until_statement_boundary();
+            return Ok(Statement::Empty);
+        }
+        self.advance(); // the kind keyword
+        // The object name. ⚠️ `expect_ident_like` strips a leading
+        // `<schema>.` qualifier and returns only the trailing ident (SPG is
+        // single-schema), which would turn `COMMENT ON COLUMN t.c` into just
+        // `c`. Read the dotted parts from raw tokens instead, then let a
+        // 3-part `schema.t.c` drop its leading schema like everywhere else.
+        let mut parts: alloc::vec::Vec<String> = alloc::vec::Vec::new();
+        loop {
+            match self.advance() {
+                Token::Ident(s) | Token::QuotedIdent(s) => parts.push(s),
+                other if unreserved_keyword_text(&other).is_some() => {
+                    parts.push(unreserved_keyword_text(&other).unwrap());
+                }
+                other => {
+                    return Err(ParseError {
+                        message: alloc::format!("expected identifier, got {other:?}"),
+                        token_pos: self.pos.saturating_sub(1),
+                    });
+                }
+            }
+            if matches!(self.peek(), Token::Dot) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        // COLUMN wants `table.column`; every other kind wants a bare name.
+        let want = if kind == "column" { 2 } else { 1 };
+        while parts.len() > want {
+            parts.remove(0);
+        }
+        let name = parts.join(".");
+        // `IS`
+        if !matches!(self.peek(), Token::Is) {
+            self.expect_keyword_ident("is")?;
+        } else {
+            self.advance();
+        }
+        let comment = match self.peek() {
+            Token::Null => {
+                self.advance();
+                None
+            }
+            _ => Some(self.expect_string_literal()?),
+        };
+        Ok(Statement::CommentOn {
+            kind,
+            name,
+            comment,
+        })
+    }
+
     fn consume_until_statement_boundary(&mut self) {
         loop {
             match self.peek() {
@@ -737,6 +826,10 @@ impl Parser {
         // `BEGIN; COMMIT;` wrappers, etc. all pass through.
         if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek() {
             let lc = s.to_ascii_lowercase();
+            // v7.39 (read01 round 50) — COMMENT ON is a real statement now.
+            if lc == "comment" {
+                return self.parse_comment_on();
+            }
             if is_dump_noise_statement(&lc) {
                 self.consume_until_statement_boundary();
                 return Ok(Statement::Empty);
@@ -7611,6 +7704,8 @@ impl Parser {
             "pg_constraint",
             "pg_database",
             "pg_depend",
+            // v7.39 (read01 round 50) — COMMENT ON store, PG's pg_description.
+            "pg_description",
             "pg_enum",
             "pg_extension",
             "pg_index",

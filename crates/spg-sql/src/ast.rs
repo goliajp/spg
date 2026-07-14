@@ -389,6 +389,16 @@ pub enum Statement {
     /// v7.39 (read01 round 49) — `ALTER TYPE t RENAME VALUE 'old' TO 'new'`.
     /// Used to be swallowed by the ALTER TYPE no-op tail, so the rename was
     /// accepted and silently ignored.
+    /// v7.39 (read01 round 50) — `COMMENT ON <kind> <name> IS { 'text' | NULL }`.
+    /// Used to be swallowed as dump noise, so a comment was accepted and lost
+    /// (and obj_description / col_description always returned NULL).
+    /// `kind` is lowercase ("table" / "column" / "index" / …); for a column
+    /// `name` is the dotted `table.column`. `comment: None` = `IS NULL` = remove.
+    CommentOn {
+        kind: String,
+        name: String,
+        comment: Option<String>,
+    },
     AlterTypeRenameValue {
         type_name: String,
         old: String,
@@ -3438,6 +3448,7 @@ impl Statement {
             | Statement::CreateType(_)
             | Statement::AlterTypeAddValue { .. }
             | Statement::AlterTypeRenameValue { .. }
+            | Statement::CommentOn { .. }
             | Statement::DropType { .. }
             | Statement::CreateDomain(_)
             | Statement::DropDomain { .. }
@@ -3880,6 +3891,17 @@ impl fmt::Display for Statement {
                 Ok(())
             }
             Self::CreateType(t) => t.fmt(f),
+            Self::CommentOn {
+                kind,
+                name,
+                comment,
+            } => {
+                let body = match comment {
+                    Some(c) => alloc::format!("'{}'", c.replace('\'', "''")),
+                    None => "NULL".into(),
+                };
+                write!(f, "COMMENT ON {} {name} IS {body}", kind.to_uppercase())
+            }
             Self::AlterTypeRenameValue {
                 type_name,
                 old,

@@ -14545,10 +14545,63 @@ fn apply_function_dispatch(
                 rendered
             }))
         }
-        // obj_description / col_description / shobj_description —
-        // COMMENT ON reader helpers. SPG doesn't yet retain
-        // comments in the catalog; return NULL.
-        "obj_description" | "col_description" | "shobj_description" => Ok(Value::Null),
+        // v7.39 (read01 round 50) — obj_description / col_description read the
+        // catalog's COMMENT store (COMMENT ON used to be swallowed as dump
+        // noise, so these always returned NULL). The object is named by a
+        // regclass value, which carries its name. shobj_description covers
+        // shared objects (databases / roles) — SPG has no per-database comment
+        // store, so it stays NULL.
+        "obj_description" => {
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Null);
+            };
+            let Some(name) = regclass_name_of(&args[0]) else {
+                return Ok(Value::Null);
+            };
+            // The catalog arg ('pg_class') distinguishes relations from other
+            // object classes; SPG keys relations as table / view / index /
+            // sequence, so probe each.
+            for kind in ["table", "view", "index", "sequence"] {
+                if let Some(t) = cat.comment(&alloc::format!("{kind}:{name}")) {
+                    return Ok(Value::text::<alloc::string::String>(t.into()));
+                }
+            }
+            Ok(Value::Null)
+        }
+        "col_description" => {
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Null);
+            };
+            if args.len() != 2 {
+                return Ok(Value::Null);
+            }
+            let Some(tname) = regclass_name_of(&args[0]) else {
+                return Ok(Value::Null);
+            };
+            let attnum = match &args[1] {
+                Value::SmallInt(n) => i64::from(*n),
+                Value::Int(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                _ => return Ok(Value::Null),
+            };
+            let Some(t) = cat.get(&tname) else {
+                return Ok(Value::Null);
+            };
+            // attnum is 1-based over the schema's column order.
+            let Ok(idx) = usize::try_from(attnum - 1) else {
+                return Ok(Value::Null);
+            };
+            let Some(col) = t.schema().columns.get(idx) else {
+                return Ok(Value::Null);
+            };
+            Ok(
+                match cat.comment(&alloc::format!("column:{tname}.{}", col.name)) {
+                    Some(txt) => Value::text::<alloc::string::String>(txt.into()),
+                    None => Value::Null,
+                },
+            )
+        }
+        "shobj_description" => Ok(Value::Null),
         // acldefault(objtype, owner_oid) — the default ACL for an
         // object type, PG text form '{owner=privs/owner}'. SPG's
         // single-role model maps every oid to 'admin'
@@ -16216,6 +16269,18 @@ fn win1252_char_to_byte(ch: char) -> Option<u8> {
             .iter()
             .position(|&c| c != 0 && c == cp)
             .map(|i| 0x80 + i as u8)
+    }
+}
+
+/// v7.39 (read01 round 50) — the relation name behind an `obj_description` /
+/// `col_description` first argument. A `::regclass` cast yields
+/// `Value::RegClass(oid, name)`; a bare text literal (PG coerces it through
+/// regclass_in) is accepted too.
+fn regclass_name_of(v: &Value<'_>) -> Option<alloc::string::String> {
+    match v {
+        Value::RegClass(_, name) => Some(name.to_string()),
+        Value::Text(s) => Some(s.to_string()),
+        _ => None,
     }
 }
 

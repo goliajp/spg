@@ -1367,6 +1367,79 @@ impl Engine {
     /// one has no name to change, and its synthesised `pg_constraint` name
     /// is derived, not stored. PG's wording here says "for table" (while
     /// DROP CONSTRAINT says "of relation") — matched verbatim.
+    /// v7.39 (read01 round 50) — `COMMENT ON <kind> <name> IS { 'text' | NULL }`.
+    /// The object must exist (PG errors otherwise); `IS NULL` removes the
+    /// comment. Stored in the catalog's comment map under `"<kind>:<name>"`
+    /// and read back by obj_description / col_description / pg_description.
+    pub(crate) fn exec_comment_on(
+        &mut self,
+        kind: &str,
+        name: &str,
+        comment: Option<&str>,
+    ) -> Result<QueryResult, EngineError> {
+        let cat = self.active_catalog();
+        // Validate existence for the kinds SPG catalogues. PG's wording for a
+        // missing relation is "relation \"x\" does not exist" (42P01).
+        match kind {
+            "table" | "view" => {
+                if cat.get(name).is_none() {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "relation {name:?} does not exist"
+                    )));
+                }
+            }
+            "column" => {
+                let (tbl, col) = name.split_once('.').ok_or_else(|| {
+                    EngineError::Unsupported(alloc::format!(
+                        "column {name:?} does not exist"
+                    ))
+                })?;
+                let t = cat.get(tbl).ok_or_else(|| {
+                    EngineError::Unsupported(alloc::format!(
+                        "relation {tbl:?} does not exist"
+                    ))
+                })?;
+                if !t
+                    .schema()
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(col))
+                {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "column {col:?} of relation {tbl:?} does not exist"
+                    )));
+                }
+            }
+            "index" => {
+                let found = cat.table_names().iter().any(|tn| {
+                    cat.get(tn)
+                        .is_some_and(|t| t.indices().iter().any(|i| i.name == name))
+                });
+                if !found {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "relation {name:?} does not exist"
+                    )));
+                }
+            }
+            "sequence" => {
+                if !cat.sequences().contains_key(name) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "relation {name:?} does not exist"
+                    )));
+                }
+            }
+            // schema / type / database / function: accepted and stored without
+            // a catalogue lookup (SPG's registries for these are partial).
+            _ => {}
+        }
+        let key = alloc::format!("{kind}:{name}");
+        self.active_catalog_mut().set_comment(&key, comment);
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
     fn alter_rename_constraint(
         &mut self,
         tbl: &str,
@@ -2071,6 +2144,11 @@ impl Engine {
                 }
             }
             let dropped = self.active_catalog_mut().drop_table(&name);
+            if dropped {
+                // v7.39 (read01 round 50) — purge the table's comments (and its
+                // columns') so a later table of the same name can't inherit them.
+                self.active_catalog_mut().drop_comments_for("table", &name);
+            }
             if !dropped {
                 if !if_exists {
                     // v7.39 (read01 round 45) — PG wording (42P01 at the wire);

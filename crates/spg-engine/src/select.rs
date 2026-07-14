@@ -614,6 +614,13 @@ impl Engine {
                     let (schema, rows) = synth_pg_indexes(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.39 (read01 round 50) — pg_catalog.pg_description, backing
+                // psql's \d+ comment column and pg_dump's COMMENT ON emission.
+                "__spg_pg_description" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_description(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.17.0 Phase 3.P0-53 — pg_catalog.pg_index (raw)
                 // for index introspection by ORM compilers.
                 "__spg_pg_index" => {
