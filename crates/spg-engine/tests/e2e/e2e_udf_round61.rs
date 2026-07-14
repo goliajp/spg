@@ -182,10 +182,21 @@ fn an_unsupported_body_says_so_instead_of_answering_wrongly() {
     );
     assert_eq!(r1(&mut e, "SELECT reads(1)"), "1");
 
+    // v7.39 (read01 round 64) — a multi-statement plpgsql body runs too (see
+    // e2e_plpgsql_scalar_round64). What is still unsupported keeps saying so:
+    // a body that WRITES cannot be called from an expression, because the call
+    // arrives with the engine held immutably. Refusing beats silently dropping
+    // the write.
     ok(
         &mut e,
         "CREATE FUNCTION multi(x int) RETURNS int AS $$ BEGIN x := x + 1; RETURN x; END; $$ LANGUAGE plpgsql",
     );
-    let msg = err(&mut e, "SELECT multi(1)");
-    assert!(msg.contains("single `RETURN <expr>;`"), "{msg}");
+    assert_eq!(r1(&mut e, "SELECT multi(1)"), "2");
+
+    ok(
+        &mut e,
+        "CREATE FUNCTION writes(x int) RETURNS int AS $$ BEGIN INSERT INTO t VALUES (x); RETURN x; END; $$ LANGUAGE plpgsql",
+    );
+    let msg = err(&mut e, "SELECT writes(9)");
+    assert!(msg.contains("cannot be called from an expression"), "{msg}");
 }

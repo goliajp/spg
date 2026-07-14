@@ -4424,6 +4424,21 @@ impl fmt::Display for PlPgSqlBlock {
         for stmt in &self.statements {
             writeln!(f, "  {stmt};")?;
         }
+        // v7.39 (read01 round 64) — the EXCEPTION section. It was MISSING from
+        // this Display, and `CREATE FUNCTION` stores a body by re-rendering the
+        // parsed block through it — so every exception handler a function
+        // declared was thrown away AT STORE TIME. The block executed fine while
+        // it was still an AST (a DO block never round-trips through text), which
+        // is why only functions and triggers lost theirs.
+        if !self.exception_handlers.is_empty() {
+            f.write_str("EXCEPTION\n")?;
+            for h in &self.exception_handlers {
+                write!(f, "  WHEN {} THEN\n", h.conditions.join(" OR "))?;
+                for stmt in &h.body {
+                    writeln!(f, "    {stmt};")?;
+                }
+            }
+        }
         f.write_str("END")
     }
 }
