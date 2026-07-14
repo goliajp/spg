@@ -8793,12 +8793,15 @@ fn apply_function_dispatch(
                 "asin" => libm::asin(x),
                 "acos" => libm::acos(x),
                 "atan" => libm::atan(x),
-                "sinh" => libm::sinh(x),
-                "cosh" => libm::cosh(x),
-                "tanh" => libm::tanh(x),
-                "asinh" => libm::asinh(x),
-                "acosh" => libm::acosh(x),
-                "atanh" => libm::atanh(x),
+                // v7.39 (read01 round 79) — through the platform-libm shim, the
+                // same C library PG calls. The `libm` crate is a ULP off PG on
+                // e.g. cosh(1).
+                "sinh" => super::math::f64_sinh(x),
+                "cosh" => super::math::f64_cosh(x),
+                "tanh" => super::math::f64_tanh(x),
+                "asinh" => super::math::f64_asinh(x),
+                "acosh" => super::math::f64_acosh(x),
+                "atanh" => super::math::f64_atanh(x),
                 _ => unreachable!(),
             };
             Ok(Value::Float(r))
@@ -9174,7 +9177,11 @@ fn apply_function_dispatch(
                 });
             }
             super::math::prng_seed(seed);
-            Ok(Value::Null)
+            // v7.39 (read01 round 79) — setseed returns VOID, which is not NULL:
+            // PG prints it as the empty string, so `'x:' || setseed(0.5)::text`
+            // is `x:`, not NULL. SPG returned NULL and swallowed the whole
+            // surrounding expression.
+            Ok(Value::text(""))
         }
         // v7.17.0 — PG `gen_random_uuid()` (built-in, no extension)
         // and the historical uuid-ossp `uuid_generate_v4()` alias.
@@ -9913,7 +9920,9 @@ fn apply_function_dispatch(
             if x == 0.0 {
                 return Ok(Value::Float(0.0));
             }
-            Ok(Value::Float(f64_exp(y * f64_ln(x))))
+            // v7.39 (read01 round 79) — one correctly-rounded pow(), not
+            // exp(y * ln(x)), which compounds two transcendentals' error.
+            Ok(Value::Float(super::math::f64_pow(x, y)))
         }
         // v7.37.17 (17.6 siblings) — div(y, x) — integer quotient
         // (truncated division). PG's div works on numeric; SPG

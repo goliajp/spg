@@ -1173,8 +1173,11 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
         Value::Int(n) => Ok(Value::Int(n)),
         Value::BigInt(n) => i32::try_from(n)
             .map(Value::Int)
+            // v7.39 (read01 round 79) — PG's wording, which the Float arm two
+            // arms down was already using: "integer out of range". Drivers match
+            // on it. Three arms of one function had two different messages.
             .map_err(|_| EvalError::TypeMismatch {
-                detail: format!("bigint {n} does not fit in int"),
+                detail: "integer out of range".into(),
             }),
         // PG rounds (half-to-even) coercing a real number to an integer, and
         // errors on a non-finite or out-of-range value (`'inf'::int`,
@@ -1194,7 +1197,7 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
             i32::try_from(rounded)
                 .map(Value::Int)
                 .map_err(|_| EvalError::TypeMismatch {
-                    detail: format!("numeric {rounded} does not fit in int"),
+                    detail: "integer out of range".into(),
                 })
         }
         Value::Text(s) => crate::conversions::parse_pg_int(&s)

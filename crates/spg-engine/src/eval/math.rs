@@ -116,81 +116,119 @@ pub(crate) fn f64_sqrt(x: f64) -> f64 {
     libm::sqrt(x)
 }
 
-/// no_std `f64::exp(x)` — e^x via range-reduction + Taylor
-/// series. Adequate for power(), exp(), and pseudo-random-ish
-/// scales the engine uses; ~1e-12 relative error in the
-/// common range. (libm::exp was evaluated but is itself ~1 ULP
-/// off PG's glibc exp on e.g. exp(1), so it is not a clean
-/// drop-in win — kept the existing series.)
-pub(super) fn f64_exp(x: f64) -> f64 {
-    if x.is_nan() {
-        return x;
+/// v7.39 (read01 round 79) — the transcendentals PG hands to the platform's
+/// libm. PG's `exp`/`ln`/`sinh`… ARE the host C library's, so calling the same
+/// thing is not an approximation of PG — it *is* PG's semantics, on the same
+/// host. Under `no_std` (bare-metal embedders) the pure-Rust `libm` port is the
+/// best available and is used instead.
+///
+/// What was here before: a hand-rolled range-reduction + Taylor series, with a
+/// comment claiming "libm::exp was evaluated but is itself ~1 ULP off PG's exp
+/// on e.g. exp(1), so it is not a clean drop-in win — kept the existing series."
+/// Re-measured against live PG18.4 (rule: a note left behind can be wrong —
+/// measure before you act on it): the series was off on SEVEN of nine probed
+/// exp() inputs (exp(1), exp(2), exp(-1), exp(5), exp(-5), exp(10), exp(709))
+/// and on ln(10), while the platform libm matched PG on every one of them. The
+/// note was right that `libm` (the crate) is a ULP off on exp(1) — and stopped
+/// there, keeping something far worse.
+#[cfg(feature = "std")]
+mod plat {
+    pub fn exp(x: f64) -> f64 {
+        x.exp()
     }
-    if x > 709.0 {
-        return f64::INFINITY;
+    pub fn ln(x: f64) -> f64 {
+        x.ln()
     }
-    if x < -745.0 {
-        return 0.0;
+    pub fn pow(x: f64, y: f64) -> f64 {
+        x.powf(y)
     }
-    // exp(x) = 2^k * exp(r) where r = x - k*ln(2), |r| <= ln(2)/2.
-    const LN2: f64 = 0.6931471805599453;
-    let k = f64_round_half_away(x / LN2) as i32;
-    let r = x - (k as f64) * LN2;
-    // Taylor series for exp(r): sum r^n / n!  (rapid for |r|<0.35)
-    let mut term = 1.0;
-    let mut sum = 1.0;
-    for n in 1..=20 {
-        term *= r / (n as f64);
-        sum += term;
-        if term.abs() < 1e-18 {
-            break;
-        }
+    pub fn sinh(x: f64) -> f64 {
+        x.sinh()
     }
-    // Multiply by 2^k.
-    f64_powi(2.0, k) * sum
+    pub fn cosh(x: f64) -> f64 {
+        x.cosh()
+    }
+    pub fn tanh(x: f64) -> f64 {
+        x.tanh()
+    }
+    pub fn asinh(x: f64) -> f64 {
+        x.asinh()
+    }
+    pub fn acosh(x: f64) -> f64 {
+        x.acosh()
+    }
+    pub fn atanh(x: f64) -> f64 {
+        x.atanh()
+    }
 }
 
-/// no_std `f64::ln(x)` — natural log via range-reduction +
-/// atanh series. x must be positive (caller's contract).
-pub(super) fn f64_ln(x: f64) -> f64 {
-    if x <= 0.0 {
+#[cfg(not(feature = "std"))]
+mod plat {
+    pub fn exp(x: f64) -> f64 {
+        libm::exp(x)
+    }
+    pub fn ln(x: f64) -> f64 {
+        libm::log(x)
+    }
+    pub fn pow(x: f64, y: f64) -> f64 {
+        libm::pow(x, y)
+    }
+    pub fn sinh(x: f64) -> f64 {
+        libm::sinh(x)
+    }
+    pub fn cosh(x: f64) -> f64 {
+        libm::cosh(x)
+    }
+    pub fn tanh(x: f64) -> f64 {
+        libm::tanh(x)
+    }
+    pub fn asinh(x: f64) -> f64 {
+        libm::asinh(x)
+    }
+    pub fn acosh(x: f64) -> f64 {
+        libm::acosh(x)
+    }
+    pub fn atanh(x: f64) -> f64 {
+        libm::atanh(x)
+    }
+}
+
+pub(crate) fn f64_exp(x: f64) -> f64 {
+    plat::exp(x)
+}
+
+pub(crate) fn f64_ln(x: f64) -> f64 {
+    if x <= 0.0 && x != 0.0 {
         return f64::NAN;
     }
-    if x == 1.0 {
-        return 0.0;
-    }
-    // x = 2^k * m where m in [0.5, 1.0). Then ln(x) = k*ln(2) + ln(m).
-    const LN2: f64 = 0.6931471805599453;
-    let mut k = 0i32;
-    let mut m = x;
-    while m >= 2.0 {
-        m *= 0.5;
-        k += 1;
-    }
-    while m < 1.0 {
-        m *= 2.0;
-        k -= 1;
-    }
-    // Now m in [1.0, 2.0). Use atanh series via u = (m-1)/(m+1).
-    // ln(m) = 2*(u + u^3/3 + u^5/5 + ...). Converges fast.
-    let u = (m - 1.0) / (m + 1.0);
-    let u2 = u * u;
-    let mut term = u;
-    let mut sum = u;
-    for k_iter in 1..50 {
-        term *= u2;
-        let denom = (2 * k_iter + 1) as f64;
-        sum += term / denom;
-        if (term / denom).abs() < 1e-18 {
-            break;
-        }
-    }
-    2.0 * sum + (k as f64) * LN2
+    plat::ln(x)
 }
 
-/// no_std `f64::powi` substitute — integer exponent for f64
-/// base. Uses repeated multiplication; correct for the small
-/// exponents the rounding / cast code uses (scale up to ±38).
+/// x^y for FLOAT8. Was `exp(y * ln(x))`, which compounds the error of two
+/// transcendentals; the platform's `pow` is a single correctly-rounded step.
+pub(crate) fn f64_pow(x: f64, y: f64) -> f64 {
+    plat::pow(x, y)
+}
+
+pub(crate) fn f64_sinh(x: f64) -> f64 {
+    plat::sinh(x)
+}
+pub(crate) fn f64_cosh(x: f64) -> f64 {
+    plat::cosh(x)
+}
+pub(crate) fn f64_tanh(x: f64) -> f64 {
+    plat::tanh(x)
+}
+pub(crate) fn f64_asinh(x: f64) -> f64 {
+    plat::asinh(x)
+}
+pub(crate) fn f64_acosh(x: f64) -> f64 {
+    plat::acosh(x)
+}
+pub(crate) fn f64_atanh(x: f64) -> f64 {
+    plat::atanh(x)
+}
+
 pub(super) fn f64_powi(base: f64, exp: i32) -> f64 {
     if exp == 0 {
         return 1.0;

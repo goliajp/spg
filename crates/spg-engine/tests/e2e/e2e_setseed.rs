@@ -16,9 +16,18 @@ fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
 #[test]
 fn setseed_returns_void() {
     let mut e = Engine::new();
+    // v7.39 (read01 round 79) — void is NOT null. Live PG18.4:
+    //   SELECT setseed(0.5) IS NULL          -> f
+    //   SELECT 'x' || setseed(0.5)::text     -> x
+    // This asserted Value::Null, so any expression WRAPPING setseed came back
+    // NULL and swallowed itself.
     assert!(matches!(
         first(&mut e, "SELECT setseed(0.5)"),
-        spg_storage::Value::Null
+        spg_storage::Value::Text(ref s) if s.is_empty()
+    ));
+    assert!(matches!(
+        first(&mut e, "SELECT setseed(0.5) IS NULL"),
+        spg_storage::Value::Bool(false)
     ));
 }
 

@@ -1627,6 +1627,7 @@ impl Engine {
         // v7.39 (read01 round 57) — the table-privilege gate on the common
         // read core. A superuser session returns from it immediately.
         self.acl_check_select(stmt)?;
+        validate_aggregate_placement(stmt)?;
         let result = self.exec_select_cancel_inner(stmt, cancel)?;
         // v7.37.17 (17.6 siblings) — `SELECT DISTINCT ON (exprs)`:
         // rows arrive here already ORDER BY'd; keep the FIRST row of
@@ -7688,6 +7689,53 @@ fn setof_column_shape(
 /// is zero rows, not one NULL row.
 ///
 /// Non-SRF items repeat, evaluated once per output row from the same input row.
+/// v7.39 (read01 round 79) — where an aggregate may NOT appear. Both of these
+/// used to reach the scalar function dispatcher, which reported the aggregate as
+/// an *unknown function* — the same "symptom two layers above the cause" shape
+/// round 78 found with SRFs. Neither can be diagnosed down there: the dispatcher
+/// sees a call, not the clause it came from. The statement knows.
+fn validate_aggregate_placement(stmt: &SelectStatement) -> Result<(), EngineError> {
+    use spg_sql::ast::Expr;
+    if let Some(w) = &stmt.where_
+        && aggregate::contains_aggregate(w)
+    {
+        return Err(EngineError::Unsupported(
+            "aggregate functions are not allowed in WHERE".into(),
+        ));
+    }
+    let mut nested = false;
+    let mut check = |e: &Expr| {
+        let mut probe = e.clone();
+        crate::expr_analysis::rewrite_nodes_mut(&mut probe, &mut |n| {
+            let args = match n {
+                Expr::FunctionCall { name, args } if aggregate::is_aggregate_name(name) => args,
+                _ => return false,
+            };
+            if args.iter().any(aggregate::contains_aggregate) {
+                nested = true;
+            }
+            false
+        });
+    };
+    for it in &stmt.items {
+        if let spg_sql::ast::SelectItem::Expr { expr, .. } = it {
+            check(expr);
+        }
+    }
+    if let Some(h) = &stmt.having {
+        check(h);
+    }
+    for o in &stmt.order_by {
+        check(&o.expr);
+    }
+    if nested {
+        return Err(EngineError::Unsupported(
+            "aggregate function calls cannot be nested".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// v7.39 (read01 round 78) — an SRF may sit ANYWHERE inside a target-list
 /// expression, not only as the whole item: `upper(unnest(a))`, `unnest(a) + 10`,
 /// `'x:' || unnest(a)`, `(regexp_matches(s, p, 'g'))::text`. PG evaluates the SRF
