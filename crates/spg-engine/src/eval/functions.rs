@@ -4517,6 +4517,31 @@ fn apply_function_dispatch(
                         .collect();
                     Ok(Value::BigIntArray(out))
                 }
+                // v7.39 (read01 round 71) — TEXT arrays. array_remove handled
+                // int arrays only, and its error said "first arg must be array,
+                // got TextArray" — a message that contradicts itself, because a
+                // TextArray IS an array. The guard was reporting the arm it
+                // lacked as if the CALLER were wrong.
+                (Value::TextArray(items), needle_v) => {
+                    let out: alloc::vec::Vec<Option<alloc::string::String>> = match needle_v {
+                        // PG: `array_remove(a, NULL)` strips the NULL elements.
+                        Value::Null => items.iter().filter(|o| o.is_some()).cloned().collect(),
+                        Value::Text(needle) => items
+                            .iter()
+                            .filter(|o| o.as_deref() != Some(needle.as_ref()))
+                            .cloned()
+                            .collect(),
+                        other => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "array_remove(): needle type {:?} doesn't match TextArray",
+                                    other.data_type()
+                                ),
+                            });
+                        }
+                    };
+                    Ok(Value::TextArray(out))
+                }
                 (other, _) => Err(EvalError::TypeMismatch {
                     detail: format!(
                         "array_remove() first arg must be array, got {:?}",

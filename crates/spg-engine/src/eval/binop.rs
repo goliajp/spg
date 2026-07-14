@@ -5510,6 +5510,29 @@ fn coerce_array_literal_operands(
     l: Value<'static>,
     r: Value<'static>,
 ) -> (Value<'static>, Value<'static>) {
+    // v7.39 (read01 round 71) — a RANGE beside a bare literal takes the same
+    // rule: `r && '[4,11)'` is a range, not an inet operand. Same family as the
+    // array case, found by the same sweep.
+    if matches!(op, BinOp::InetOverlap) {
+        if let (Value::Range { kind, .. }, Value::Text(_)) = (&l, &r) {
+            let k = *kind;
+            if let Ok(coerced) = crate::eval::cast::cast_value(
+                r.clone(),
+                spg_sql::ast::CastTarget::Named(range_type_name(k).into()),
+            ) {
+                return (l, coerced);
+            }
+        }
+        if let (Value::Text(_), Value::Range { kind, .. }) = (&l, &r) {
+            let k = *kind;
+            if let Ok(coerced) = crate::eval::cast::cast_value(
+                l.clone(),
+                spg_sql::ast::CastTarget::Named(range_type_name(k).into()),
+            ) {
+                return (coerced, r);
+            }
+        }
+    }
     if !matches!(
         op,
         BinOp::JsonContains | BinOp::JsonContainedBy | BinOp::InetOverlap
@@ -5536,5 +5559,20 @@ fn coerce_array_literal_operands(
             None => (l, r),
         },
         _ => (l, r),
+    }
+}
+
+
+/// v7.39 (read01 round 71) — the SQL name of a range kind, for coercing a bare
+/// literal beside a range operand.
+fn range_type_name(kind: spg_storage::RangeKind) -> &'static str {
+    use spg_storage::RangeKind as K;
+    match kind {
+        K::Int4 => "int4range",
+        K::Int8 => "int8range",
+        K::Num => "numrange",
+        K::Ts => "tsrange",
+        K::TsTz => "tstzrange",
+        K::Date => "daterange",
     }
 }
