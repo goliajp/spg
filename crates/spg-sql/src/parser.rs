@@ -744,7 +744,11 @@ impl Parser {
                         self.advance();
                         "INSERT".to_string()
                     }
-                    _ => self.expect_ident_like()?.to_ascii_uppercase(),
+                    // NOT upper-cased: in the no-ON shape (`GRANT devs TO
+                    // alice`) these "privilege words" are ROLE NAMES, and a
+                    // role name is case-sensitive. `priv_from_word` folds case
+                    // itself when they really are privileges.
+                    _ => self.expect_ident_like()?,
                 };
                 privileges.push(w);
                 if matches!(self.peek(), Token::Comma) {
@@ -754,15 +758,20 @@ impl Parser {
                 }
             }
         }
-        // No ON clause at all = `GRANT role TO role` (role membership).
+        // v7.39 (read01 round 58) — no ON clause at all = `GRANT devs TO alice`:
+        // role MEMBERSHIP. The words parsed as "privileges" are the role names.
         if !matches!(self.peek(), Token::On) {
+            let roles = core::mem::take(&mut privileges);
+            let grantees = self.parse_grantee_list(grant)?;
+            // `WITH ADMIN OPTION` / `GRANTED BY x` — accepted, ignored (SPG has
+            // no admin-option layer: a member cannot re-grant).
             self.consume_until_statement_boundary();
             return Ok(finish_grant(
                 grant,
                 GrantStatement {
                     privileges: Vec::new(),
-                    object: GrantObject::Other("ROLE".into()),
-                    grantees: Vec::new(),
+                    object: GrantObject::Roles(roles),
+                    grantees,
                     grant_option,
                 },
             ));
@@ -843,7 +852,32 @@ impl Parser {
                 break;
             }
         }
-        // TO (grant) / FROM (revoke).
+        let grantees = self.parse_grantee_list(grant)?;
+        if grant && self.peek_keyword_ident("with") {
+            self.advance();
+            self.expect_keyword_ident("grant")?;
+            self.expect_keyword_ident("option")?;
+            grant_option = true;
+        }
+        // REVOKE's trailing CASCADE / RESTRICT — SPG has no dependent grants
+        // to cascade to (no re-granting), so both are accepted and ignored.
+        if !grant && (self.peek_keyword_ident("cascade") || self.peek_keyword_ident("restrict")) {
+            self.advance();
+        }
+        Ok(finish_grant(
+            grant,
+            GrantStatement {
+                privileges,
+                object: GrantObject::Tables(tables),
+                grantees,
+                grant_option,
+            },
+        ))
+    }
+
+    /// `TO <roles>` (grant) / `FROM <roles>` (revoke). An empty-string entry is
+    /// PUBLIC.
+    fn parse_grantee_list(&mut self, grant: bool) -> Result<Vec<String>, ParseError> {
         if grant {
             if matches!(self.peek(), Token::To) {
                 self.advance();
@@ -873,26 +907,7 @@ impl Parser {
                 break;
             }
         }
-        if grant && self.peek_keyword_ident("with") {
-            self.advance();
-            self.expect_keyword_ident("grant")?;
-            self.expect_keyword_ident("option")?;
-            grant_option = true;
-        }
-        // REVOKE's trailing CASCADE / RESTRICT — SPG has no dependent grants
-        // to cascade to (no re-granting), so both are accepted and ignored.
-        if !grant && (self.peek_keyword_ident("cascade") || self.peek_keyword_ident("restrict")) {
-            self.advance();
-        }
-        Ok(finish_grant(
-            grant,
-            GrantStatement {
-                privileges,
-                object: GrantObject::Tables(tables),
-                grantees,
-                grant_option,
-            },
-        ))
+        Ok(grantees)
     }
 
     fn consume_until_statement_boundary(&mut self) {
@@ -1666,10 +1681,16 @@ impl Parser {
                         let name = self.expect_ident_or_string()?;
                         Ok(Statement::DropSubscription(name))
                     }
-                    Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("user") => {
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("user") || s.eq_ignore_ascii_case("role") =>
+                    {
                         self.advance();
+                        // v7.39 (read01 round 58) — DROP ROLE is DROP USER: a
+                        // login user IS a role in PG, and SPG's store holds
+                        // both. `IF EXISTS` is accepted on either spelling.
+                        let if_exists = self.consume_if_exists();
                         let name = self.expect_ident_or_string()?;
-                        Ok(Statement::DropUser(name))
+                        Ok(Statement::DropUser { name, if_exists })
                     }
                     // v7.12.4 — DROP TRIGGER [IF EXISTS] name ON table.
                     Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("trigger") => {
@@ -2555,7 +2576,14 @@ impl Parser {
             // identifier so the lexer doesn't have to grow a token.
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("user") => {
                 self.advance();
-                self.parse_create_user_after_keyword()
+                self.parse_create_user_after_keyword(true)
+            }
+            // v7.39 (read01 round 58) — `CREATE ROLE name [WITH] [options]`.
+            // PG's CREATE USER *is* CREATE ROLE … LOGIN; the only difference is
+            // the default of the LOGIN attribute.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("role") => {
+                self.advance();
+                self.parse_create_user_after_keyword(false)
             }
             // v7.39 (RLS) — `CREATE POLICY name ON table …`.
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("policy") => {
@@ -5450,23 +5478,99 @@ impl Parser {
     /// `CREATE USER` body — name + WITH PASSWORD '<pw>' + optional
     /// ROLE '<role>' (defaults to readonly). All string slots accept
     /// either a quoted ident or a quoted string literal.
-    fn parse_create_user_after_keyword(&mut self) -> Result<Statement, ParseError> {
+    /// `CREATE {USER|ROLE} name [WITH] [PASSWORD 'x'] [LOGIN|NOLOGIN]
+    /// [INHERIT|NOINHERIT] [SUPERUSER|NOSUPERUSER] [ROLE 'admin']`.
+    ///
+    /// `is_user` = the statement said USER, which in PG means LOGIN by default.
+    /// The legacy SPG `ROLE 'readwrite'` clause (the coarse read/write/admin
+    /// wire role) still parses — it is a different axis from the PG attributes.
+    fn parse_create_user_after_keyword(&mut self, is_user: bool) -> Result<Statement, ParseError> {
         let name = self.expect_ident_or_string()?;
-        self.expect_keyword_ident("with")?;
-        self.expect_keyword_ident("password")?;
-        let password = self.expect_string_literal()?;
-        let role = if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek()
-            && s.eq_ignore_ascii_case("role")
-        {
+        if self.peek_keyword_ident("with") {
             self.advance();
-            self.expect_string_literal()?
-        } else {
-            "readonly".to_string()
-        };
+        }
+        let mut password = String::new();
+        let mut role = String::new();
+        let mut login: Option<bool> = None;
+        let mut inherit: Option<bool> = None;
+        let mut superuser: Option<bool> = None;
+        loop {
+            let (Token::Ident(w) | Token::QuotedIdent(w)) = self.peek() else {
+                break;
+            };
+            match w.to_ascii_lowercase().as_str() {
+                "password" => {
+                    self.advance();
+                    password = self.expect_string_literal()?;
+                }
+                // PG accepts (and pg_dump emits) ENCRYPTED PASSWORD; the value
+                // is the same slot.
+                "encrypted" => {
+                    self.advance();
+                    self.expect_keyword_ident("password")?;
+                    password = self.expect_string_literal()?;
+                }
+                "login" => {
+                    self.advance();
+                    login = Some(true);
+                }
+                "nologin" => {
+                    self.advance();
+                    login = Some(false);
+                }
+                "inherit" => {
+                    self.advance();
+                    inherit = Some(true);
+                }
+                "noinherit" => {
+                    self.advance();
+                    inherit = Some(false);
+                }
+                "superuser" => {
+                    self.advance();
+                    superuser = Some(true);
+                }
+                "nosuperuser" => {
+                    self.advance();
+                    superuser = Some(false);
+                }
+                // SPG's own coarse wire role: `ROLE 'readwrite'`.
+                "role" => {
+                    self.advance();
+                    role = self.expect_string_literal()?;
+                }
+                // Every other PG role option (CREATEDB, CONNECTION LIMIT n,
+                // VALID UNTIL '…', CREATEROLE, REPLICATION, BYPASSRLS …) is
+                // accepted and ignored so a pg_dump role block restores. They
+                // gate capabilities SPG does not have.
+                "createdb" | "nocreatedb" | "createrole" | "nocreaterole" | "replication"
+                | "noreplication" | "bypassrls" | "nobypassrls" => {
+                    self.advance();
+                }
+                "connection" => {
+                    self.advance();
+                    self.expect_keyword_ident("limit")?;
+                    self.advance(); // the number
+                }
+                "valid" => {
+                    self.advance();
+                    self.expect_keyword_ident("until")?;
+                    self.expect_string_literal()?;
+                }
+                _ => break,
+            }
+        }
+        if role.is_empty() {
+            role = "readonly".to_string();
+        }
         Ok(Statement::CreateUser(crate::ast::CreateUserStatement {
             name,
             password,
             role,
+            login,
+            inherit,
+            superuser,
+            is_user,
         }))
     }
 
@@ -7936,6 +8040,7 @@ impl Parser {
             "pg_stat_database",
             "pg_stat_io",
             "pg_stat_progress_analyze",
+            "pg_auth_members",
             "pg_stat_progress_create_index",
             "pg_stat_progress_vacuum",
             "pg_stat_replication",
@@ -20146,7 +20251,7 @@ mod tests {
         // Pre-v6.1.2 DROP USER took the bare-ident path; v6.1.2
         // tokenises DROP. Both targets must still parse.
         let s = parse("DROP USER 'alice'");
-        let Statement::DropUser(name) = s else {
+        let Statement::DropUser { name, .. } = s else {
             panic!("expected DropUser, got {s:?}")
         };
         assert_eq!(name, "alice");

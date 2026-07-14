@@ -46,6 +46,12 @@ fn owned_docs(e: &mut Engine) {
 #[test]
 fn superuser_session_bypasses_rls() {
     let mut e = Engine::new();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE alice LOGIN PASSWORD 'x'").unwrap();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE bob LOGIN PASSWORD 'x'").unwrap();
     owned_docs(&mut e);
     // Default (Admin) session sees every row — superuser bypass.
     assert_eq!(
@@ -57,6 +63,12 @@ fn superuser_session_bypasses_rls() {
 #[test]
 fn set_role_activates_and_reset_restores() {
     let mut e = Engine::new();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE alice LOGIN PASSWORD 'x'").unwrap();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE bob LOGIN PASSWORD 'x'").unwrap();
     owned_docs(&mut e);
     e.execute("SET ROLE alice").unwrap();
     // current_user follows SET ROLE; session_user stays the login.
@@ -79,6 +91,12 @@ fn set_role_activates_and_reset_restores() {
 #[test]
 fn default_deny_when_no_policy_applies() {
     let mut e = Engine::new();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE alice LOGIN PASSWORD 'x'").unwrap();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE bob LOGIN PASSWORD 'x'").unwrap();
     e.execute("CREATE TABLE t(id int)").unwrap();
     // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
     // role needs the GRANT before RLS is even consulted (PG denies first, with
@@ -95,6 +113,12 @@ fn default_deny_when_no_policy_applies() {
 #[test]
 fn permissive_or_restrictive_and() {
     let mut e = Engine::new();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE alice LOGIN PASSWORD 'x'").unwrap();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE bob LOGIN PASSWORD 'x'").unwrap();
     e.execute("CREATE TABLE d(id int, owner text, secret bool)")
         .unwrap();
     // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
@@ -124,6 +148,12 @@ fn permissive_or_restrictive_and() {
 #[test]
 fn role_scoped_policy() {
     let mut e = Engine::new();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE alice LOGIN PASSWORD 'x'").unwrap();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE bob LOGIN PASSWORD 'x'").unwrap();
     e.execute("CREATE TABLE t(id int)").unwrap();
     // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
     // role needs the GRANT before RLS is even consulted (PG denies first, with
@@ -171,6 +201,12 @@ fn pair(e: &mut Engine, sql: &str) -> Vec<String> {
 #[test]
 fn join_filters_rls_table_via_security_barrier() {
     let mut e = Engine::new();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE alice LOGIN PASSWORD 'x'").unwrap();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE bob LOGIN PASSWORD 'x'").unwrap();
     e.execute("CREATE TABLE doc(id int, owner text)").unwrap();
     // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
     // role needs the GRANT before RLS is even consulted (PG denies first, with
@@ -232,6 +268,12 @@ fn affected(e: &mut Engine, sql: &str) -> usize {
 #[test]
 fn insert_with_check_enforced() {
     let mut e = Engine::new();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE alice LOGIN PASSWORD 'x'").unwrap();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE bob LOGIN PASSWORD 'x'").unwrap();
     // Policy has USING; its WITH CHECK falls back to USING (PG semantics).
     e.execute("CREATE TABLE doc(id int, owner text)").unwrap();
     // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
@@ -255,6 +297,12 @@ fn insert_with_check_enforced() {
 #[test]
 fn insert_denied_when_no_policy() {
     let mut e = Engine::new();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE alice LOGIN PASSWORD 'x'").unwrap();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE bob LOGIN PASSWORD 'x'").unwrap();
     e.execute("CREATE TABLE t(id int)").unwrap();
     // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
     // role needs the GRANT before RLS is even consulted (PG denies first, with
@@ -270,6 +318,12 @@ fn insert_denied_when_no_policy() {
 #[test]
 fn update_using_visibility_and_with_check() {
     let mut e = Engine::new();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE alice LOGIN PASSWORD 'x'").unwrap();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE bob LOGIN PASSWORD 'x'").unwrap();
     e.execute("CREATE TABLE doc(id int, owner text)").unwrap();
     // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
     // role needs the GRANT before RLS is even consulted (PG denies first, with
@@ -295,6 +349,12 @@ fn update_using_visibility_and_with_check() {
 #[test]
 fn delete_using_visibility() {
     let mut e = Engine::new();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE alice LOGIN PASSWORD 'x'").unwrap();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE bob LOGIN PASSWORD 'x'").unwrap();
     e.execute("CREATE TABLE doc(id int, owner text)").unwrap();
     // v7.39 (read01 round 57) — table privileges are REAL now: a policy-subject
     // role needs the GRANT before RLS is even consulted (PG denies first, with
@@ -321,6 +381,12 @@ fn delete_using_visibility() {
 #[test]
 fn superuser_writes_bypass() {
     let mut e = Engine::new();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE alice LOGIN PASSWORD 'x'").unwrap();
+    // v7.39 (read01 round 58) — a role must EXIST before SET ROLE (PG errors
+    // otherwise). Before roles were real, any name was accepted.
+    e.execute("CREATE ROLE bob LOGIN PASSWORD 'x'").unwrap();
     owned_docs(&mut e);
     // Default session writes any owner freely (bypass).
     e.execute("INSERT INTO doc VALUES (9,'anyone')").unwrap();

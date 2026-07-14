@@ -176,7 +176,8 @@ fn grant_validates_its_role_and_its_relation() {
     );
     assert_eq!(
         err(&mut e, "GRANT BOGUS ON ac TO bob"),
-        "unsupported: unrecognized privilege type: \"BOGUS\""
+        // PG's GRANT wording: no colon, and the unquoted ident downcased.
+        "unsupported: unrecognized privilege type \"bogus\""
     );
 }
 

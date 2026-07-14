@@ -17,6 +17,10 @@ fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
 #[test]
 fn extended_privilege_probes_return_true() {
     let mut e = Engine::new();
+    // v7.39 (read01 round 58) — has_any_column_privilege answers from the
+    // table's ACL now, so the table has to exist (PG errors otherwise); the
+    // session is the owner here, which is what makes it `true`.
+    e.execute("CREATE TABLE users(id int)").unwrap();
     for f in &[
         "has_any_column_privilege('users', 'SELECT')",
         "has_server_privilege('srv1', 'USAGE')",

@@ -152,6 +152,11 @@ pub struct EvalContext<'a> {
     /// request context / RLS. `None` in read-only contexts that have no
     /// session; unknown names then fall through to PG defaults.
     pub session_gucs: Option<&'a alloc::collections::BTreeMap<String, String>>,
+    /// v7.39 (read01 round 58) — the engine's role store, so
+    /// `has_table_privilege('bob', …)` can expand bob's role MEMBERSHIPS (a
+    /// grant to a group role answers `true` for its inheriting members). `None`
+    /// in a context with no engine behind it — the role then stands alone.
+    pub users: Option<&'a crate::users::UserStore>,
     /// v7.38 (read01 U15) — per-scan deterministic sampler state for
     /// `TABLESAMPLE … REPEATABLE(seed)`. A fresh cell is created before a
     /// scan whose predicate may draw `__tsm_fract(seed)`; the cell holds
@@ -248,6 +253,7 @@ impl<'a> EvalContext<'a> {
             sequence_resolver: None,
             catalog: None,
             session_gucs: None,
+            users: None,
             sample_rng: None,
             recursion_base: core::cell::Cell::new(0),
             render_style: crate::eval::format::RenderStyle {
@@ -369,6 +375,13 @@ impl<'a> EvalContext<'a> {
     /// Attach the session's GUC map so `current_setting` can resolve
     /// custom (namespaced) settings written with `SET` / `set_config`.
     #[must_use]
+    /// v7.39 (read01 round 58) — thread the role store (see `users`).
+    #[must_use]
+    pub const fn with_users(mut self, users: &'a crate::users::UserStore) -> Self {
+        self.users = Some(users);
+        self
+    }
+
     pub const fn with_session_gucs(
         mut self,
         gucs: &'a alloc::collections::BTreeMap<String, String>,

@@ -3574,13 +3574,16 @@ pub(crate) fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'st
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let oid: i64 = 10;
-    for (i, (name, _)) in engine.users.iter().enumerate() {
+    // v7.39 (read01 round 58) — the three attributes are REAL now. They used to
+    // be hard-coded (`false, true, true`) because SPG had no role attributes;
+    // a `CREATE ROLE devs NOLOGIN` would still have reported rolcanlogin=true.
+    for (i, (name, rec)) in engine.users.iter().enumerate() {
         rows.push(Row::new(alloc::vec![
             Value::BigInt(oid + (i as i64) + 1),
             Value::text(name.to_string()),
-            Value::Bool(false),
-            Value::Bool(true),
-            Value::Bool(true),
+            Value::Bool(rec.superuser),
+            Value::Bool(rec.inherit),
+            Value::Bool(rec.can_login),
         ]));
     }
     // Always include `postgres` as the bootstrap superuser if not
@@ -3599,6 +3602,39 @@ pub(crate) fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'st
                 Value::Bool(true),
             ]),
         );
+    }
+    (schema, rows)
+}
+
+/// v7.39 (read01 round 58) — synthesise `pg_catalog.pg_auth_members`: one row
+/// per role membership (`GRANT devs TO alice`). The oids agree with the ones
+/// `synth_pg_roles` hands out, so the canonical
+/// `pg_auth_members JOIN pg_roles ON roleid = oid` join resolves.
+pub(crate) fn synth_pg_auth_members(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("roleid", DataType::BigInt, false),
+        ColumnSchema::new("member", DataType::BigInt, false),
+        ColumnSchema::new("grantor", DataType::BigInt, false),
+        ColumnSchema::new("admin_option", DataType::Bool, false),
+    ];
+    // Same oid assignment as synth_pg_roles: 11, 12, … in name order.
+    let oid_of = |name: &str| -> i64 {
+        engine
+            .users
+            .iter()
+            .position(|(n, _)| n == name)
+            .map_or(10, |i| 10 + (i as i64) + 1)
+    };
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for (i, (member, role)) in engine.users.all_memberships().enumerate() {
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(200_000 + (i as i64)),
+            Value::BigInt(oid_of(role)),
+            Value::BigInt(oid_of(member)),
+            Value::BigInt(10), // grantor — the bootstrap superuser
+            Value::Bool(false),
+        ]));
     }
     (schema, rows)
 }
