@@ -2402,10 +2402,40 @@ pub(crate) const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
 /// expressions, unary-minus over numeric literals, and pgvector-style
 /// `'[..]'::vector` cast (v1.2). Anything more complex returns `Unsupported`.
 pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value<'static>, EngineError> {
+    literal_expr_to_value_in(expr, None)
+}
+
+/// v7.39 (read01 round 55) — the catalog-aware form. `cast_value` cannot
+/// resolve a user-named type (composite / domain / enum) or a regclass on its
+/// own: those live in the catalog. Without it, `INSERT INTO t VALUES
+/// (ROW(1,2)::pt)` failed with "unsupported cast target `::pt`" — the whole
+/// INSERT, so the table stayed empty. Callers that HAVE a catalog pass it;
+/// the ones that don't (DDL default folding, partition bounds) keep the old
+/// literal-only behaviour.
+pub(crate) fn literal_expr_to_value_in(
+    expr: Expr,
+    catalog: Option<&spg_storage::Catalog>,
+) -> Result<Value<'static>, EngineError> {
     match expr {
         Expr::Literal(l) => Ok(literal_to_value(l)),
         Expr::Cast { expr, target } => {
-            let inner_value = literal_expr_to_value(*expr)?;
+            // A catalog-dependent cast target has to go through eval's
+            // pre-hook, which is the only place that knows the user types.
+            if catalog.is_some()
+                && matches!(
+                    target,
+                    spg_sql::ast::CastTarget::Named(_) | spg_sql::ast::CastTarget::RegClass
+                )
+            {
+                return eval_expr_with_catalog(
+                    Expr::Cast {
+                        expr,
+                        target,
+                    },
+                    catalog,
+                );
+            }
+            let inner_value = literal_expr_to_value_in(*expr, catalog)?;
             crate::eval::cast_value(inner_value, target).map_err(EngineError::Eval)
         }
         Expr::Unary {
@@ -2475,10 +2505,13 @@ pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value<'static>, Engine
                         expr: alloc::boxed::Box::new(other),
                     },
                 };
-                literal_expr_to_value(Expr::Cast {
-                    expr: alloc::boxed::Box::new(negated_inner),
-                    target,
-                })
+                literal_expr_to_value_in(
+                    Expr::Cast {
+                        expr: alloc::boxed::Box::new(negated_inner),
+                        target,
+                    },
+                    catalog,
+                )
             }
             other => Err(EngineError::Unsupported(alloc::format!(
                 "unary minus over non-literal expression: {other:?}"
@@ -2495,7 +2528,7 @@ pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value<'static>, Engine
             let mut materialised: alloc::vec::Vec<Value<'static>> =
                 alloc::vec::Vec::with_capacity(items.len());
             for elem in items {
-                materialised.push(literal_expr_to_value(elem)?);
+                materialised.push(literal_expr_to_value_in(elem, catalog)?);
             }
             Ok(array_literal_widen(materialised))
         }
@@ -2511,13 +2544,23 @@ pub(crate) fn literal_expr_to_value(expr: Expr) -> Result<Value<'static>, Engine
         // descriptive error; literals + casts + ARRAY[…] continue
         // to take the fast paths above so the hot INSERT path is
         // unchanged on the common case.
-        other => {
-            let empty_schema: alloc::vec::Vec<spg_storage::ColumnSchema> = alloc::vec::Vec::new();
-            let ctx = EvalContext::new(&empty_schema, None);
-            let empty_row = spg_storage::Row::new(alloc::vec::Vec::new());
-            crate::eval::eval_expr(&other, &empty_row, &ctx).map_err(EngineError::Eval)
-        }
+        other => eval_expr_with_catalog(other, catalog),
     }
+}
+
+/// v7.39 (read01 round 55) — evaluate a row-free expression, threading the
+/// catalog when the caller has one so user-named casts resolve.
+fn eval_expr_with_catalog(
+    expr: Expr,
+    catalog: Option<&spg_storage::Catalog>,
+) -> Result<Value<'static>, EngineError> {
+    let empty_schema: alloc::vec::Vec<spg_storage::ColumnSchema> = alloc::vec::Vec::new();
+    let mut ctx = EvalContext::new(&empty_schema, None);
+    if let Some(cat) = catalog {
+        ctx = ctx.with_catalog(cat);
+    }
+    let empty_row = spg_storage::Row::new(alloc::vec::Vec::new());
+    crate::eval::eval_expr(&expr, &empty_row, &ctx).map_err(EngineError::Eval)
 }
 
 pub(crate) fn literal_to_value(l: Literal) -> Value<'static> {
@@ -2984,6 +3027,31 @@ fn coerce_untyped_value(
         )),
         (Value::RegClass(_, name), DataType::Text) => {
             Ok(Value::text(alloc::string::String::from(name.as_ref())))
+        }
+        // v7.39 (read01 round 55) — SPG stores a composite-typed column as
+        // JSON (an object keyed by field name), so a real Composite value —
+        // which is what `ROW(1,2)::pt` now produces — coerces into it. Before
+        // this the cast resolved but the INSERT died on "cannot coerce
+        // Composite(...) to Jsonb".
+        (Value::Composite(fields), DataType::Jsonb | DataType::Json) => {
+            let mut obj = alloc::string::String::from("{");
+            for (i, (name, val)) in fields.iter().enumerate() {
+                if i > 0 {
+                    obj.push(',');
+                }
+                // Reuse the JSON encoder for the key so escaping is identical.
+                obj.push_str(&crate::json::value_to_json_text(&Value::text(
+                    alloc::string::String::from(name.as_str()),
+                )));
+                obj.push(':');
+                obj.push_str(&crate::json::value_to_json_text(val));
+            }
+            obj.push('}');
+            Ok(Value::Json(alloc::borrow::Cow::Owned(obj)))
+        }
+        // …and its canonical PG text form for a text column.
+        (Value::Composite(_), DataType::Text) => {
+            Ok(Value::text(crate::eval::value_to_text(&v)))
         }
         _ => Err(EngineError::Unsupported(alloc::format!(
             "cannot coerce {:?} to {expected:?} for column {col_name:?} (position {position})",

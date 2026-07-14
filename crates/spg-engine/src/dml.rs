@@ -111,7 +111,7 @@ use crate::{
     apply_on_conflict_assignments, canonicalize_set_value, check_unsigned_range, coerce_value,
     enforce_check_constraints, enforce_enum_label, enforce_fk_inserts,
     enforce_unique_index_inserts, enforce_unique_updates, enforce_uniqueness_inserts, eval,
-    eval_runtime_default_free, expr_has_subquery, literal_expr_to_value,
+    eval_runtime_default_free, expr_has_subquery, literal_expr_to_value, literal_expr_to_value_in,
     lookup_row_position_by_keys, on_conflict_keys_exist, plan_fk_parent_deletions,
     plan_fk_parent_updates, resolve_column_default_free, resolve_on_conflict_columns, triggers,
     try_index_seek_positions, try_pk_predicate, value_to_literal_expr_permissive,
@@ -1733,6 +1733,9 @@ impl Engine {
             set_variant_lookup,
             seq_floors,
         } = self.prepare_insert_snapshots(&stmt.table)?;
+        // v7.39 (read01 round 55) — the catalog for user-named casts in VALUES.
+        // Taken BEFORE the &mut borrow below (Catalog::clone is an Arc bump).
+        let cat_for_insert = self.active_catalog().clone();
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -1761,6 +1764,7 @@ impl Engine {
         let overriding = stmt.overriding;
         let mut all_values = parse_insert_rows(
             table,
+            Some(&cat_for_insert),
             stmt.rows,
             &column_meta,
             &tuple_pos,
@@ -2683,6 +2687,10 @@ mod spg_engine_no_alias {
 #[allow(clippy::too_many_arguments)]
 fn parse_insert_rows(
     table: &spg_storage::Table,
+    // v7.39 (read01 round 55) — the catalog, so a user-named cast in an
+    // INSERT's VALUES (`ROW(1,2)::pt`, `5::posint`) resolves. Without it the
+    // whole INSERT failed with "unsupported cast target `::pt`".
+    catalog: Option<&spg_storage::Catalog>,
     mut rows: Vec<Vec<Expr>>,
     column_meta: &[ColumnSchema],
     tuple_pos: &Option<Vec<Option<usize>>>,
@@ -2815,7 +2823,7 @@ fn parse_insert_rows(
                     if is_column_default_marker(&e) {
                         Ok(None)
                     } else {
-                        literal_expr_to_value(e).map(Some)
+                        literal_expr_to_value_in(e, catalog).map(Some)
                     }
                 })
                 .collect::<Result<_, _>>()?;
@@ -2864,7 +2872,7 @@ fn parse_insert_rows(
                     if is_column_default_marker(&e) {
                         resolve_column_default_free(col, clock)?
                     } else {
-                        literal_expr_to_value(e)?
+                        literal_expr_to_value_in(e, catalog)?
                     }
                 } else {
                     resolve_column_default_free(col, clock)?
