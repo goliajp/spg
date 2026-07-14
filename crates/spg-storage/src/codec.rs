@@ -437,6 +437,28 @@ pub(crate) fn deserialize_table(
             }
         }
     }
+    // v7.39 (read01 round 57) — owner + ACL (FILE_VERSION 64+).
+    if version >= 64 {
+        if cur.read_u8()? == 1 {
+            let owner = cur.read_str()?;
+            t.schema_mut().owner = Some(owner);
+        }
+        let acl_count = cur.read_u16()? as usize;
+        let mut acl = alloc::vec::Vec::with_capacity(acl_count);
+        for _ in 0..acl_count {
+            let grantee = cur.read_str()?;
+            let privs = cur.read_u16()?;
+            let grantable = cur.read_u16()?;
+            let grantor = cur.read_str()?;
+            acl.push(crate::AclItem {
+                grantee,
+                privs,
+                grantable,
+                grantor,
+            });
+        }
+        t.schema_mut().acl = acl;
+    }
     let _ = table_name;
     Ok(())
 }

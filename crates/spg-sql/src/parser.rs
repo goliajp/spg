@@ -23,7 +23,8 @@ use crate::ast::{
     CreateSubscriptionStatement, CreateTableStatement, CreateTriggerStatement, Expr, ExtractField,
     FkAction, ForeignKeyConstraint, FrameBound, FrameExclusion, FrameKind, FromClause, FromJoin,
     FunctionArg, FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, IndexMethod,
-    InsertStatement, IsolationLevel, JoinKind, Literal, NullTreatment, OrderBy, Overriding,
+    GrantObject, GrantStatement, InsertStatement, IsolationLevel, JoinKind, Literal, NullTreatment,
+    OrderBy, Overriding,
     PlPgSqlBlock, PlPgSqlDeclare, PlPgSqlStmt, PublicationScope, RaiseLevel, RangeKindAst,
     ReturnTarget, SelectItem, SelectStatement, Statement, TableRef, TriggerEvent, TriggerForEach,
     TriggerTiming, UnOp, UnionKind, VecEncoding, WindowFrame,
@@ -43,16 +44,25 @@ type WindowDef = (
 /// as a no-op (no behavioural effect on the single-schema /
 /// single-database model). These statements are consumed up to
 /// the next `;` / EOF and returned as `Statement::Empty`.
+/// v7.39 (read01 round 57) — wrap a parsed GRANT body in the right statement.
+fn finish_grant(grant: bool, g: GrantStatement) -> Statement {
+    if grant {
+        Statement::Grant(g)
+    } else {
+        Statement::Revoke(g)
+    }
+}
+
 fn is_dump_noise_statement(lc: &str) -> bool {
     matches!(
         lc,
-        // Privileges / ownership — none of these change schema
-        // semantics on SPG. v7.39 (read01 round 50): "comment" moved OUT —
-        // COMMENT ON is now a real statement with a real store.
-        "grant"
-            | "revoke"
-            // MySQL bulk-load brackets.
-            | "lock"
+        // v7.39 (read01 round 50): "comment" moved OUT — COMMENT ON is now a
+        // real statement with a real store. v7.39 (read01 round 57): "grant" /
+        // "revoke" moved OUT — table privileges are now REAL (stored in
+        // `relacl`, enforced against the session role); a grant on any other
+        // object class still parses and no-ops so dumps restore.
+        // MySQL bulk-load brackets.
+        "lock"
             | "unlock"
             // MySQL OPTIMIZE / ANALYZE TABLE / CHECK TABLE
             // diagnostics that pg_dump-style tools also emit
@@ -690,6 +700,201 @@ impl Parser {
         })
     }
 
+    /// v7.39 (read01 round 57) — `GRANT <privs> ON <obj> TO <roles> [WITH GRANT
+    /// OPTION]` / `REVOKE [GRANT OPTION FOR] <privs> ON <obj> FROM <roles>
+    /// [CASCADE|RESTRICT]`.
+    ///
+    /// TABLE privileges are the real ones (stored, enforced, introspectable).
+    /// Every other object class — SCHEMA / SEQUENCE / DATABASE / FUNCTION / …,
+    /// and the no-ON `GRANT role TO role` membership form — parses into
+    /// `GrantObject::Other` and no-ops in the engine, so a pg_dump that grants
+    /// on them still restores.
+    fn parse_grant_or_revoke(&mut self, grant: bool) -> Result<Statement, ParseError> {
+        self.advance(); // GRANT / REVOKE
+        // REVOKE's optional `GRANT OPTION FOR` prefix.
+        let mut grant_option = false;
+        if !grant
+            && self.peek_keyword_ident("grant")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("option"))
+        {
+            self.advance(); // GRANT
+            self.advance(); // OPTION
+            self.expect_keyword_ident("for")?;
+            grant_option = true;
+        }
+        // The privilege list: `ALL [PRIVILEGES]`, or comma-separated words.
+        let mut privileges: Vec<String> = Vec::new();
+        if matches!(self.peek(), Token::All) {
+            self.advance();
+            if self.peek_keyword_ident("privileges") {
+                self.advance();
+            }
+        } else {
+            loop {
+                // SELECT and INSERT lex as reserved tokens, so they never
+                // reach `expect_ident_like` as plain idents; the rest
+                // (UPDATE / DELETE / TRUNCATE / REFERENCES / TRIGGER /
+                // MAINTAIN) are ordinary identifiers.
+                let w = match self.peek() {
+                    Token::Select => {
+                        self.advance();
+                        "SELECT".to_string()
+                    }
+                    Token::Insert => {
+                        self.advance();
+                        "INSERT".to_string()
+                    }
+                    _ => self.expect_ident_like()?.to_ascii_uppercase(),
+                };
+                privileges.push(w);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        // No ON clause at all = `GRANT role TO role` (role membership).
+        if !matches!(self.peek(), Token::On) {
+            self.consume_until_statement_boundary();
+            return Ok(finish_grant(
+                grant,
+                GrantStatement {
+                    privileges: Vec::new(),
+                    object: GrantObject::Other("ROLE".into()),
+                    grantees: Vec::new(),
+                    grant_option,
+                },
+            ));
+        }
+        self.advance(); // ON
+        // An optional object-class keyword. `TABLE` (or no keyword at all) is
+        // the enforced case; anything else parses and no-ops.
+        let mut class = "TABLE";
+        match self.peek() {
+            Token::Table => {
+                self.advance();
+            }
+            Token::All => {
+                // `ALL TABLES IN SCHEMA x` and friends — accepted, no-op.
+                self.consume_until_statement_boundary();
+                return Ok(finish_grant(
+                    grant,
+                    GrantStatement {
+                        privileges,
+                        object: GrantObject::Other("ALL … IN SCHEMA".into()),
+                        grantees: Vec::new(),
+                        grant_option,
+                    },
+                ));
+            }
+            Token::Ident(w) | Token::QuotedIdent(w) => {
+                let lc = w.to_ascii_lowercase();
+                if matches!(
+                    lc.as_str(),
+                    "sequence"
+                        | "schema"
+                        | "database"
+                        | "function"
+                        | "procedure"
+                        | "routine"
+                        | "type"
+                        | "domain"
+                        | "language"
+                        | "tablespace"
+                        | "large"
+                        | "foreign"
+                        | "parameter"
+                ) {
+                    self.consume_until_statement_boundary();
+                    return Ok(finish_grant(
+                        grant,
+                        GrantStatement {
+                            privileges,
+                            object: GrantObject::Other(lc.to_ascii_uppercase()),
+                            grantees: Vec::new(),
+                            grant_option,
+                        },
+                    ));
+                }
+                class = "TABLE";
+            }
+            _ => {}
+        }
+        let _ = class;
+        // The table list. Schema-qualified names drop their qualifier (SPG is
+        // single-schema) — but read the dotted parts from raw tokens, since
+        // `expect_ident_like` would silently swallow the leading part.
+        let mut tables: Vec<String> = Vec::new();
+        loop {
+            let mut parts: Vec<String> = Vec::new();
+            loop {
+                parts.push(self.expect_ident_like()?);
+                if matches!(self.peek(), Token::Dot) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            tables.push(parts.pop().expect("at least one part"));
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        // TO (grant) / FROM (revoke).
+        if grant {
+            if matches!(self.peek(), Token::To) {
+                self.advance();
+            } else {
+                self.expect_keyword_ident("to")?;
+            }
+        } else if matches!(self.peek(), Token::From) {
+            self.advance();
+        } else {
+            self.expect_keyword_ident("from")?;
+        }
+        let mut grantees: Vec<String> = Vec::new();
+        loop {
+            // `GROUP name` is the legacy spelling of a plain role name.
+            if self.peek_keyword_ident("group") {
+                self.advance();
+            }
+            if self.peek_keyword_ident("public") {
+                self.advance();
+                grantees.push(String::new()); // PUBLIC
+            } else {
+                grantees.push(self.expect_ident_like()?);
+            }
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if grant && self.peek_keyword_ident("with") {
+            self.advance();
+            self.expect_keyword_ident("grant")?;
+            self.expect_keyword_ident("option")?;
+            grant_option = true;
+        }
+        // REVOKE's trailing CASCADE / RESTRICT — SPG has no dependent grants
+        // to cascade to (no re-granting), so both are accepted and ignored.
+        if !grant && (self.peek_keyword_ident("cascade") || self.peek_keyword_ident("restrict")) {
+            self.advance();
+        }
+        Ok(finish_grant(
+            grant,
+            GrantStatement {
+                privileges,
+                object: GrantObject::Tables(tables),
+                grantees,
+                grant_option,
+            },
+        ))
+    }
+
     fn consume_until_statement_boundary(&mut self) {
         loop {
             match self.peek() {
@@ -829,6 +1034,10 @@ impl Parser {
             // v7.39 (read01 round 50) — COMMENT ON is a real statement now.
             if lc == "comment" {
                 return self.parse_comment_on();
+            }
+            // v7.39 (read01 round 57) — so is GRANT / REVOKE.
+            if lc == "grant" || lc == "revoke" {
+                return self.parse_grant_or_revoke(lc == "grant");
             }
             if is_dump_noise_statement(&lc) {
                 self.consume_until_statement_boundary();
@@ -7764,6 +7973,12 @@ impl Parser {
     }
 
     /// Consume a bare ident if its lowercase matches `kw`, else err.
+    /// v7.39 (read01 round 57) — is the next token this bare keyword-ident?
+    /// Peeks only; the caller advances.
+    fn peek_keyword_ident(&self, kw: &str) -> bool {
+        matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case(kw))
+    }
+
     fn expect_keyword_ident(&mut self, kw: &str) -> Result<(), ParseError> {
         match self.advance() {
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case(kw) => Ok(()),

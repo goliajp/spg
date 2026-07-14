@@ -97,6 +97,8 @@ fn brin_summaries_get_emitted_at_freeze_when_brin_index_exists() {
         policies: Vec::new(),
         row_security: false,
         force_row_security: false,
+        owner: None,
+        acl: Vec::new(),
     };
     // Encode 100 rows with sparse keys.
     let pairs: Vec<(u64, Vec<u8>)> = (0..100u64)

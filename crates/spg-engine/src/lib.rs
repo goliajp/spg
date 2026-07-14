@@ -69,6 +69,7 @@ pub mod publications;
 pub mod query_stats;
 mod readonly;
 pub mod reorder;
+mod acl;
 mod rls;
 pub mod scalarsq_streaming;
 mod select;

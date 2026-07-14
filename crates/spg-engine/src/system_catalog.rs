@@ -2086,10 +2086,10 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         ColumnSchema::new("relispopulated", DataType::Bool, false),
         ColumnSchema::new("relreplident", DataType::Text, false),
         ColumnSchema::new("relispartition", DataType::Bool, false),
-        // v7.39 (read01 round 51) — PG leaves relacl NULL when only the
-        // owner's implicit privileges apply (no explicit GRANT). SPG's
-        // single-role model is exactly that case, so it is always NULL —
-        // but the COLUMN must exist: ORMs and psql \dp select it.
+        // v7.39 (read01 round 57) — PG leaves relacl NULL while only the
+        // owner's implicit privileges apply, and materialises the aclitem
+        // array on the first GRANT. SPG now does the same for real (round 51
+        // hard-coded the NULL, because GRANT was a no-op).
         ColumnSchema::new("relacl", DataType::Text, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
@@ -2149,7 +2149,9 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             Value::Bool(true),                          // relispopulated
             Value::text("d"),                           // relreplident — 'd' default
             Value::Bool(is_partition),
-            Value::Null,
+            // v7.39 (read01 round 57) — relacl for real: NULL while no GRANT
+            // has ever run, then the aclitem array PG prints.
+            crate::acl::render_relacl(schema_ref).map_or(Value::Null, Value::text),
         ]));
         oid = oid.saturating_add(1);
     }
@@ -4061,23 +4063,11 @@ pub(crate) fn synth_pg_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
 /// catalog's COMMENT store. `objsubid` is the 1-based column number for a
 /// column comment, 0 otherwise; `classoid` is pg_class (1259) for relations
 /// and their columns, 0 for the kinds SPG stores by name only.
-/// v7.39 (read01 round 51) — the seven table privileges PG grants a relation's
-/// owner implicitly (no ACL entry needed). SPG has a single role, which owns
-/// everything, so `information_schema.table_privileges` /
-/// `.role_table_grants` report exactly this set per table.
-const OWNER_TABLE_PRIVILEGES: &[&str] = &[
-    "DELETE",
-    "INSERT",
-    "REFERENCES",
-    "SELECT",
-    "TRIGGER",
-    "TRUNCATE",
-    "UPDATE",
-];
-
-/// v7.39 (read01 round 51) — `information_schema.role_table_grants` (and, with
-/// the same shape, `.table_privileges`: PG defines the latter as the former
-/// plus the rows a role can see via PUBLIC, which is the same set here).
+/// v7.39 (read01 round 57) — `information_schema.role_table_grants` (and, with
+/// the same shape, `.table_privileges`). One row per (grantee, privilege): the
+/// owner's implicit full set, plus every explicit GRANT recorded in the table's
+/// ACL. Round 51 hard-coded the owner's seven and stopped there — there were no
+/// grants to report, because GRANT was a no-op.
 pub(crate) fn synth_info_role_table_grants(
     cat: &Catalog,
     grantee: &str,
@@ -4093,23 +4083,70 @@ pub(crate) fn synth_info_role_table_grants(
         ColumnSchema::new("with_hierarchy", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
+    let _ = grantee;
     for tname in cat.table_names() {
-        for p in OWNER_TABLE_PRIVILEGES {
-            rows.push(Row::new(alloc::vec![
-                Value::text(alloc::string::String::from(grantee)),
-                Value::text(alloc::string::String::from(grantee)),
-                Value::text(alloc::string::String::from("app")),
-                Value::text(alloc::string::String::from("public")),
-                Value::text(tname.clone()),
-                Value::text(alloc::string::String::from(*p)),
-                Value::text(alloc::string::String::from("YES")),
-                // PG sets with_hierarchy YES only for SELECT.
-                Value::text(alloc::string::String::from(if *p == "SELECT" {
-                    "YES"
-                } else {
-                    "NO"
-                })),
-            ]));
+        let Some(t) = cat.get(&tname) else { continue };
+        let sc = t.schema();
+        let owner = sc
+            .owner
+            .clone()
+            .unwrap_or_else(|| alloc::string::String::from(crate::session::LOGIN_ROLE));
+        // An un-granted table reports only the owner's implicit set; once
+        // relacl materialises, the ACL itself is the whole truth (its first
+        // entry IS the owner's).
+        let acl: Vec<(alloc::string::String, u16, u16, alloc::string::String)> = if sc.acl.is_empty()
+        {
+            alloc::vec![(
+                owner.clone(),
+                spg_storage::priv_bits::ALL,
+                spg_storage::priv_bits::ALL,
+                owner.clone(),
+            )]
+        } else {
+            sc.acl
+                .iter()
+                .map(|a| {
+                    // The owner's own row is grantable throughout; a grantee's
+                    // is grantable only where WITH GRANT OPTION was given.
+                    let grantable = if a.grantee.eq_ignore_ascii_case(&owner) {
+                        a.privs
+                    } else {
+                        a.grantable
+                    };
+                    (a.grantee.clone(), a.privs, grantable, a.grantor.clone())
+                })
+                .collect()
+        };
+        for (who, privs, grantable, grantor) in acl {
+            // information_schema is the SQL standard's view, so it lists only
+            // the standard privileges — PG's non-standard MAINTAIN shows up in
+            // relacl (`m`) but never here.
+            for bit in crate::acl::priv_iter(privs & !spg_storage::priv_bits::MAINTAIN) {
+                let word = crate::acl::priv_word(bit);
+                rows.push(Row::new(alloc::vec![
+                    Value::text(grantor.clone()),
+                    Value::text(if who.is_empty() {
+                        alloc::string::String::from("PUBLIC")
+                    } else {
+                        who.clone()
+                    }),
+                    Value::text(alloc::string::String::from("app")),
+                    Value::text(alloc::string::String::from("public")),
+                    Value::text(tname.clone()),
+                    Value::text(alloc::string::String::from(word)),
+                    Value::text(alloc::string::String::from(
+                        if grantable & bit != 0 { "YES" } else { "NO" },
+                    )),
+                    // PG sets with_hierarchy YES only for SELECT.
+                    Value::text(alloc::string::String::from(
+                        if bit == spg_storage::priv_bits::SELECT {
+                            "YES"
+                        } else {
+                            "NO"
+                        },
+                    )),
+                ]));
+            }
         }
     }
     (cols, rows)

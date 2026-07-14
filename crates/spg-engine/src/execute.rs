@@ -919,6 +919,10 @@ impl Engine {
         // resolver — the walk is O(expr-count) and dwarfed by
         // the parse cost we just paid.
         self.pre_resolve_sequence_calls_in_statement(&mut stmt)?;
+        // v7.39 (read01 round 57) — the table-privilege gate. A superuser
+        // session (the default login, or `SET ROLE admin`) skips it entirely,
+        // so nothing changes for a customer who never assumes another role.
+        self.acl_check_statement(&stmt)?;
         let result = match stmt {
             Statement::CreateTable(s) => self.exec_create_table(s),
             // v7.9.15 — CREATE EXTENSION is a no-op on SPG. Returns
@@ -1055,6 +1059,8 @@ impl Engine {
                     modified_catalog: false,
                 })
             }
+            Statement::Grant(g) => self.exec_grant(&g, true),
+            Statement::Revoke(g) => self.exec_grant(&g, false),
             Statement::CreatePolicy(s) => self.exec_create_policy(s),
             Statement::AlterPolicy(s) => self.exec_alter_policy(s),
             Statement::DropPolicy(s) => self.exec_drop_policy(s),

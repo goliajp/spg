@@ -1590,6 +1590,50 @@ pub struct TableSchema {
     /// (PG `pg_class.relforcerowsecurity`); subjects the table owner to RLS
     /// too. Fresh table = `false`.
     pub force_row_security: bool,
+    /// v7.39 (read01 round 57, ACL) — the role that owns this table: whoever
+    /// ran CREATE TABLE (PG `pg_class.relowner`). The owner holds every
+    /// privilege implicitly and is the only role that may ALTER / DROP it.
+    /// `None` = an image written before FILE_VERSION 64, which predates roles
+    /// entirely; those tables read back as owned by the login role.
+    pub owner: Option<String>,
+    /// v7.39 (read01 round 57, ACL) — explicit GRANTs on this table
+    /// (PG `pg_class.relacl`). EMPTY means "never granted": PG leaves relacl
+    /// NULL while only the owner's implicit privileges apply, and materialises
+    /// the whole list — owner's default entry included — on the first GRANT.
+    /// Once materialised it stays, even after every grant is revoked.
+    pub acl: Vec<AclItem>,
+}
+
+/// v7.39 (read01 round 57) — one PG `aclitem`: what `grantee` may do to a
+/// table, and who granted it. Renders as `grantee=privs/grantor`, with an
+/// EMPTY grantee meaning PUBLIC (`=r/owner`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclItem {
+    /// The role the privileges are held by. Empty string = PUBLIC.
+    pub grantee: String,
+    /// Bitmask over `priv_bits`: which privileges are held.
+    pub privs: u16,
+    /// Bitmask over `priv_bits`: which of them carry WITH GRANT OPTION
+    /// (PG renders those with a trailing `*` — `r*`).
+    pub grantable: u16,
+    /// The role that ran the GRANT.
+    pub grantor: String,
+}
+
+/// v7.39 (read01 round 57) — the table-privilege bits, in PG's `aclitem`
+/// rendering order (`arwdDxtm`). The order matters: `relacl` output is
+/// byte-compared against PG.
+pub mod priv_bits {
+    pub const INSERT: u16 = 1 << 0; // a
+    pub const SELECT: u16 = 1 << 1; // r
+    pub const UPDATE: u16 = 1 << 2; // w
+    pub const DELETE: u16 = 1 << 3; // d
+    pub const TRUNCATE: u16 = 1 << 4; // D
+    pub const REFERENCES: u16 = 1 << 5; // x
+    pub const TRIGGER: u16 = 1 << 6; // t
+    pub const MAINTAIN: u16 = 1 << 7; // m
+    /// Every table privilege — what `GRANT ALL` grants and what an owner holds.
+    pub const ALL: u16 = INSERT | SELECT | UPDATE | DELETE | TRUNCATE | REFERENCES | TRIGGER | MAINTAIN;
 }
 
 /// v7.37.6-B — partition 三态(parent / range child / default child)。
@@ -6147,6 +6191,8 @@ impl TableSchema {
             policies: Vec::new(),
             row_security: false,
             force_row_security: false,
+            owner: None,
+            acl: Vec::new(),
         }
     }
 }
@@ -6440,7 +6486,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 63;
+const FILE_VERSION: u8 = 64;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7126,6 +7172,28 @@ impl Catalog {
             for (pos, n) in comp_bindings {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
                 write_str(&mut out, n);
+            }
+            // v7.39 (read01 round 57) — owner + ACL appendix (FILE_VERSION
+            // 64+), at the very end of the per-table block so a v63 reader
+            // stops before it (its tables then read back owner-less, i.e.
+            // owned by the login role, with no grants — which is exactly what
+            // they were).
+            match &t.schema.owner {
+                Some(o) => {
+                    out.push(1);
+                    write_str(&mut out, o);
+                }
+                None => out.push(0),
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(t.schema.acl.len()).expect("≤ 65k aclitems/table"),
+            );
+            for a in &t.schema.acl {
+                write_str(&mut out, &a.grantee);
+                write_u16(&mut out, a.privs);
+                write_u16(&mut out, a.grantable);
+                write_str(&mut out, &a.grantor);
             }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions

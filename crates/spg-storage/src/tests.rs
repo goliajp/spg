@@ -937,7 +937,13 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
     // THIRD time this test has caught a new trailing appendix — that is exactly
     // its job: every one of them has to be stripped here.
     const EMPTY_COMPOSITE_APPENDIX: usize = 2;
-    let tail_v60plus = EMPTY_CONSTRAINT_NAME_APPENDIX + EMPTY_COMPOSITE_APPENDIX;
+    // v7.39 (read01 round 57) — and the v64 owner+ACL appendix at the very end.
+    // A `TableSchema::new` table has no owner (a 1-byte absent flag) and an
+    // empty ACL (a 2-byte zero count). FOURTH trailing appendix this test has
+    // caught — that is precisely its job.
+    const EMPTY_OWNER_ACL_APPENDIX: usize = 3;
+    let tail_v60plus =
+        EMPTY_CONSTRAINT_NAME_APPENDIX + EMPTY_COMPOSITE_APPENDIX + EMPTY_OWNER_ACL_APPENDIX;
     let mut v52 =
         Vec::with_capacity(v53.len() - appendix.len() - trailing_v53plus - tail_v60plus);
     v52.extend_from_slice(&v53[..start - trailing_v53plus]);
@@ -995,6 +1001,50 @@ fn truncated_mvcc_appendix_errors_cleanly() {
 /// real xmax, some alive) and specific non-dense rowids must serialize +
 /// deserialize with headers AND rowids identical, and next_rowid correct
 /// (strictly above every loaded id).
+#[test]
+fn v64_roundtrip_preserves_owner_and_acl() {
+    // read01 round 57 — the owner and the aclitem list. A v63 image has
+    // neither, and reads back owner-less (= the login role) with no grants,
+    // which is exactly what those tables were.
+    use crate::{AclItem, priv_bits};
+
+    let mut c = Catalog::new();
+    let mut schema = TableSchema::new("ac", vec![ColumnSchema::new("id", DataType::Int, false)]);
+    schema.owner = Some("alice".into());
+    schema.acl = alloc::vec![
+        AclItem {
+            grantee: "alice".into(),
+            privs: priv_bits::ALL,
+            grantable: 0,
+            grantor: "alice".into(),
+        },
+        AclItem {
+            grantee: "bob".into(),
+            privs: priv_bits::SELECT | priv_bits::UPDATE,
+            grantable: priv_bits::SELECT,
+            grantor: "alice".into(),
+        },
+        // PUBLIC is the empty grantee.
+        AclItem {
+            grantee: String::new(),
+            privs: priv_bits::SELECT,
+            grantable: 0,
+            grantor: "alice".into(),
+        },
+    ];
+    c.create_table(schema).unwrap();
+
+    let restored = Catalog::deserialize(&c.serialize()).expect("v64 image loads");
+    let sc = restored.get("ac").unwrap().schema();
+    assert_eq!(sc.owner.as_deref(), Some("alice"));
+    assert_eq!(sc.acl.len(), 3);
+    assert_eq!(sc.acl[1].grantee, "bob");
+    assert_eq!(sc.acl[1].privs, priv_bits::SELECT | priv_bits::UPDATE);
+    assert_eq!(sc.acl[1].grantable, priv_bits::SELECT);
+    assert_eq!(sc.acl[1].grantor, "alice");
+    assert_eq!(sc.acl[2].grantee, "", "PUBLIC rides the empty grantee");
+}
+
 #[test]
 fn v63_roundtrip_preserves_user_composite_type_binding() {
     // read01 round 56 — the marker that tells the engine a JSON-stored column

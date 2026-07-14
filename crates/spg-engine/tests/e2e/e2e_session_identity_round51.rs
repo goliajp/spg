@@ -87,8 +87,8 @@ fn privilege_introspection_views() {
     let mut e = Engine::new();
     ok(&mut e, "CREATE TABLE p1(a int)");
     // relacl exists and is NULL — PG's shape when only the owner's implicit
-    // privileges apply. (Recorded residual: SPG does not record explicit
-    // GRANTs, so relacl stays NULL even after one.)
+    // privileges apply. (Round 57 made the GRANT side real: relacl materialises
+    // on the first GRANT. See e2e_acl_round57.)
     assert_eq!(
         row(
             &mut e,
