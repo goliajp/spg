@@ -5289,11 +5289,14 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("query"))
         {
             self.advance();
+            // v7.39 (read01 round 68) — `RETURN QUERY EXECUTE <sql expr>`: the
+            // rows go to the set, like the static form. It used to desugar to a
+            // bare ExecuteDynamic, whose result was DISCARDED.
             if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("execute"))
             {
                 self.advance();
                 let sql = self.parse_expr(0)?;
-                return Ok(PlPgSqlStmt::ExecuteDynamic { sql });
+                return Ok(PlPgSqlStmt::ReturnQueryExecute { sql });
             }
             // Bare RETURN QUERY <select>. If the current token is
             // not already SELECT (e.g., the user wrote `RETURN QUERY
@@ -14252,6 +14255,10 @@ impl Parser {
             )));
         }
         self.advance();
+        // v7.39 (read01 round 68) — `f(args) WITH ORDINALITY AS a(x, n)`: the
+        // counter column rides after the function's own, and the alias list
+        // names it.
+        let with_ordinality = self.absorb_with_ordinality();
         let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns();
         let name = alias_ident.clone().unwrap_or_else(|| fn_name.clone());
         Ok(TableRef {
@@ -14260,7 +14267,7 @@ impl Parser {
             as_of_segment: None,
             unnest_expr: None,
             unnest_column_aliases,
-            with_ordinality: false,
+            with_ordinality,
             generate_series_args: None,
             lateral_subquery: None,
             jsonb_each_text_arg: None,

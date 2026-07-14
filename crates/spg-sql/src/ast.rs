@@ -1228,6 +1228,11 @@ pub enum PlPgSqlStmt {
     /// statement whose result was DISCARDED — in a SETOF function that is the
     /// whole answer thrown away.
     ReturnQuery(Box<SelectStatement>),
+    /// v7.39 (read01 round 68) — `RETURN QUERY EXECUTE <sql expr>`: the dynamic
+    /// twin. Its rows go to the set too; it used to run and discard them.
+    ReturnQueryExecute {
+        sql: Expr,
+    },
     /// v7.12.6 — `IF cond THEN body [ELSIF cond THEN body]*
     /// [ELSE body] END IF;`. Branches are tried in order; first
     /// truthy condition wins; the optional ELSE runs when no
@@ -4458,6 +4463,7 @@ impl fmt::Display for PlPgSqlStmt {
             Self::SelectInto { var, body } => write!(f, "{body} INTO {var}"),
             Self::ReturnNext(e) => write!(f, "RETURN NEXT {e}"),
             Self::ReturnQuery(s) => write!(f, "RETURN QUERY {s}"),
+            Self::ReturnQueryExecute { sql } => write!(f, "RETURN QUERY EXECUTE {sql}"),
             Self::Return(t) => match t {
                 ReturnTarget::New => f.write_str("RETURN NEW"),
                 ReturnTarget::Old => f.write_str("RETURN OLD"),

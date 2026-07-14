@@ -166,6 +166,9 @@ impl Engine {
                     self.resolve_expr_subqueries(e, cancel)?;
                 }
                 PlPgSqlStmt::ReturnQuery(_) => {}
+                PlPgSqlStmt::ReturnQueryExecute { sql } => {
+                    self.resolve_expr_subqueries(sql, cancel)?;
+                }
                 PlPgSqlStmt::If {
                     branches,
                     else_branch,

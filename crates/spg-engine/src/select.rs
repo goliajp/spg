@@ -2621,6 +2621,27 @@ impl Engine {
         // (pg_partition_tree / pg_partition_ancestors) dispatched by name.
         if from.primary.table_fn_call.is_some() {
             let (rows, mut schema_cols) = self.table_fn_rows(&from.primary)?;
+            // v7.39 (read01 round 68) — WITH ORDINALITY appends a BIGINT counter
+            // (from 1, in output order) AFTER the function's own columns. The
+            // alias list names it like any other, which is why it is appended
+            // BEFORE the renaming pass below.
+            let rows = if from.primary.with_ordinality {
+                schema_cols.push(ColumnSchema::new(
+                    "ordinality".to_string(),
+                    DataType::BigInt,
+                    false,
+                ));
+                rows.into_iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let mut vals = r.values;
+                        vals.push(Value::BigInt(i as i64 + 1));
+                        Row::new(vals)
+                    })
+                    .collect()
+            } else {
+                rows
+            };
             for (i, new_name) in from.primary.unnest_column_aliases.iter().enumerate() {
                 if let Some(col) = schema_cols.get_mut(i) {
                     col.name = new_name.clone();
@@ -7549,19 +7570,26 @@ impl Engine {
         for a in args {
             vals.push(eval::eval_expr(a, row, ctx).map_err(EngineError::Eval)?);
         }
-        let (rows, _cols) = self.setof_rows_of(name, &vals, None)?;
-        // In a target list a SETOF function contributes ONE value per row; a
-        // multi-column RETURNS TABLE would be a record there, which SPG does not
-        // build yet — say so rather than silently taking the first column.
-        for r in &rows {
-            if r.values.len() != 1 {
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "function {name}() returns several columns — call it in FROM, \
-                     not in the SELECT list"
-                )));
-            }
-        }
-        Ok(rows.into_iter().filter_map(|r| r.values.into_iter().next()).collect())
+        let (rows, cols) = self.setof_rows_of(name, &vals, None)?;
+        // v7.39 (read01 round 68) — in a target list a multi-column function is
+        // a RECORD, one composite value per row: `SELECT rows_of(2)` gives
+        // `(2,b)`, `(3,c)`. Value::Composite has existed since round 56; this is
+        // what it is for. A single-column function contributes its bare value.
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                if r.values.len() == 1 {
+                    r.values.into_iter().next().unwrap_or(Value::Null)
+                } else {
+                    Value::Composite(
+                        cols.iter()
+                            .map(|c| c.name.clone())
+                            .zip(r.values)
+                            .collect::<alloc::vec::Vec<_>>(),
+                    )
+                }
+            })
+            .collect())
     }
 
     /// Which projection items are set-returning: the builtin kinds, plus any
