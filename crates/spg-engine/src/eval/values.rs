@@ -443,3 +443,112 @@ pub(super) fn array_element_at(v: &Value, pos: usize) -> Option<Value<'static>> 
         _ => None,
     }
 }
+
+
+/// v7.39 (read01 round 72) — rebuild an array of the SAME variant as `model`
+/// from a list of element values. The mirror of `array_element_at`, and the
+/// piece that was missing: without it, every array function that BUILDS a result
+/// was written variant by variant, and the variants nobody had needed yet were
+/// simply absent (`array_remove` had int arms only — see round 71).
+///
+/// A value that does not fit the model's element type is a caller error, and the
+/// caller phrases it; here it becomes `None`.
+pub(super) fn array_rebuild(
+    model: &Value<'_>,
+    elems: &[Value<'static>],
+) -> Option<Value<'static>> {
+    macro_rules! build {
+        ($variant:ident, $conv:expr) => {{
+            let mut out = alloc::vec::Vec::with_capacity(elems.len());
+            for e in elems {
+                if matches!(e, Value::Null) {
+                    out.push(None);
+                    continue;
+                }
+                out.push(Some(($conv)(e)?));
+            }
+            Some(Value::$variant(out))
+        }};
+    }
+    let as_i64 = |v: &Value<'_>| -> Option<i64> {
+        match v {
+            Value::SmallInt(n) => Some(i64::from(*n)),
+            Value::Int(n) => Some(i64::from(*n)),
+            Value::BigInt(n) => Some(*n),
+            _ => None,
+        }
+    };
+    match model {
+        Value::TextArray(_) => build!(TextArray, |e: &Value<'_>| match e {
+            Value::Text(s) => Some(s.as_ref().to_string()),
+            _ => None,
+        }),
+        Value::VarcharArray(_) => build!(VarcharArray, |e: &Value<'_>| match e {
+            Value::Text(s) => Some(s.as_ref().to_string()),
+            _ => None,
+        }),
+        Value::JsonArray(_) => build!(JsonArray, |e: &Value<'_>| match e {
+            Value::Json(s) | Value::Text(s) => Some(s.as_ref().to_string()),
+            _ => None,
+        }),
+        Value::JsonbArray(_) => build!(JsonbArray, |e: &Value<'_>| match e {
+            Value::Json(s) | Value::Text(s) => Some(s.as_ref().to_string()),
+            _ => None,
+        }),
+        Value::IntArray(_) => build!(IntArray, |e: &Value<'_>| as_i64(e)
+            .and_then(|n| i32::try_from(n).ok())),
+        Value::BigIntArray(_) => build!(BigIntArray, as_i64),
+        Value::SmallIntArray(_) => build!(SmallIntArray, |e: &Value<'_>| as_i64(e)
+            .and_then(|n| i16::try_from(n).ok())),
+        Value::BoolArray(_) => build!(BoolArray, |e: &Value<'_>| match e {
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        }),
+        Value::FloatArray(_) => build!(FloatArray, |e: &Value<'_>| match e {
+            Value::Float(f) => Some(*f),
+            Value::Real(f) => Some(f64::from(*f)),
+            other => as_i64(other).map(|n| n as f64),
+        }),
+        Value::NumericArray(_) => build!(NumericArray, |e: &Value<'_>| match e {
+            Value::Numeric { scaled, scale, .. } => Some((*scaled, *scale)),
+            other => as_i64(other).map(|n| (i128::from(n), 0u8)),
+        }),
+        Value::DateArray(_) => build!(DateArray, |e: &Value<'_>| match e {
+            Value::Date(d) => Some(*d),
+            _ => None,
+        }),
+        Value::TimestampArray(_) => build!(TimestampArray, |e: &Value<'_>| match e {
+            Value::Timestamp(t) => Some(*t),
+            _ => None,
+        }),
+        Value::TimestamptzArray(_) => build!(TimestamptzArray, |e: &Value<'_>| match e {
+            Value::Timestamp(t) => Some(*t),
+            _ => None,
+        }),
+        Value::MoneyArray(_) => build!(MoneyArray, |e: &Value<'_>| match e {
+            Value::Money(m) => Some(*m),
+            _ => None,
+        }),
+        Value::UuidArray(_) => build!(UuidArray, |e: &Value<'_>| match e {
+            Value::Uuid(u) => Some(*u),
+            _ => None,
+        }),
+        Value::BytesArray(_) => build!(BytesArray, |e: &Value<'_>| match e {
+            Value::Bytes(b) => Some(b.as_ref().to_vec()),
+            _ => None,
+        }),
+        Value::IntervalArray(_) => build!(IntervalArray, |e: &Value<'_>| match e {
+            Value::Interval {
+                months,
+                days,
+                micros,
+            } => Some(spg_storage::IntervalSpan {
+                months: *months,
+                days: *days,
+                micros: *micros,
+            }),
+            _ => None,
+        }),
+        _ => None,
+    }
+}

@@ -4455,6 +4455,11 @@ fn apply_function_dispatch(
         // v7.37.17 (17.6 siblings) — array_remove(arr, val) returns
         // the array with every occurrence of val removed. NULL
         // passthrough on NULL array. NULL needle removes NULL items.
+        // v7.39 (read01 round 72) — GENERIC over every element type. It used to
+        // be written variant by variant, with arms for int arrays only, so
+        // `array_remove(tags,'a')` failed — and its guard blamed the caller (see
+        // round 71). `array_element_at` + `array_rebuild` make the element type
+        // somebody else's problem, which is the only way this stays complete.
         "array_remove" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
@@ -4464,91 +4469,29 @@ fn apply_function_dispatch(
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
             }
-            match (&args[0], &args[1]) {
-                (Value::IntArray(items), needle_v) => {
-                    if matches!(needle_v, Value::Null) {
-                        let out: alloc::vec::Vec<Option<i32>> =
-                            items.iter().filter(|o| o.is_some()).copied().collect();
-                        return Ok(Value::IntArray(out));
-                    }
-                    let needle: i64 = match *needle_v {
-                        Value::Int(n) => i64::from(n),
-                        Value::SmallInt(n) => i64::from(n),
-                        Value::BigInt(n) => n,
-                        _ => {
-                            return Err(EvalError::TypeMismatch {
-                                detail: alloc::format!(
-                                    "array_remove(): needle type {:?} doesn't match IntArray",
-                                    needle_v.data_type()
-                                ),
-                            });
-                        }
-                    };
-                    let out: alloc::vec::Vec<Option<i32>> = items
-                        .iter()
-                        .filter(|o| o.map(i64::from) != Some(needle))
-                        .copied()
-                        .collect();
-                    Ok(Value::IntArray(out))
-                }
-                (Value::BigIntArray(items), needle_v) => {
-                    if matches!(needle_v, Value::Null) {
-                        let out: alloc::vec::Vec<Option<i64>> =
-                            items.iter().filter(|o| o.is_some()).copied().collect();
-                        return Ok(Value::BigIntArray(out));
-                    }
-                    let needle: i64 = match *needle_v {
-                        Value::Int(n) => i64::from(n),
-                        Value::SmallInt(n) => i64::from(n),
-                        Value::BigInt(n) => n,
-                        _ => {
-                            return Err(EvalError::TypeMismatch {
-                                detail: alloc::format!(
-                                    "array_remove(): needle type {:?} doesn't match BigIntArray",
-                                    needle_v.data_type()
-                                ),
-                            });
-                        }
-                    };
-                    let out: alloc::vec::Vec<Option<i64>> = items
-                        .iter()
-                        .filter(|o| **o != Some(needle))
-                        .copied()
-                        .collect();
-                    Ok(Value::BigIntArray(out))
-                }
-                // v7.39 (read01 round 71) — TEXT arrays. array_remove handled
-                // int arrays only, and its error said "first arg must be array,
-                // got TextArray" — a message that contradicts itself, because a
-                // TextArray IS an array. The guard was reporting the arm it
-                // lacked as if the CALLER were wrong.
-                (Value::TextArray(items), needle_v) => {
-                    let out: alloc::vec::Vec<Option<alloc::string::String>> = match needle_v {
-                        // PG: `array_remove(a, NULL)` strips the NULL elements.
-                        Value::Null => items.iter().filter(|o| o.is_some()).cloned().collect(),
-                        Value::Text(needle) => items
-                            .iter()
-                            .filter(|o| o.as_deref() != Some(needle.as_ref()))
-                            .cloned()
-                            .collect(),
-                        other => {
-                            return Err(EvalError::TypeMismatch {
-                                detail: alloc::format!(
-                                    "array_remove(): needle type {:?} doesn't match TextArray",
-                                    other.data_type()
-                                ),
-                            });
-                        }
-                    };
-                    Ok(Value::TextArray(out))
-                }
-                (other, _) => Err(EvalError::TypeMismatch {
+            let Some(len) = array_len(&args[0]) else {
+                return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "array_remove() first arg must be array, got {:?}",
-                        other.data_type()
+                        "array_remove() first arg must be an array, got {:?}",
+                        args[0].data_type()
                     ),
-                }),
+                });
+            };
+            let mut kept: alloc::vec::Vec<Value<'static>> = alloc::vec::Vec::new();
+            for i in 0..len {
+                let elem = array_element_at(&args[0], i).unwrap_or(Value::Null);
+                // PG matches with IS NOT DISTINCT FROM, so `array_remove(a, NULL)`
+                // strips the NULLs.
+                if !array_search_match(&elem, &args[1])? {
+                    kept.push(elem);
+                }
             }
+            array_rebuild(&args[0], &kept).ok_or_else(|| EvalError::TypeMismatch {
+                detail: format!(
+                    "array_remove(): value of type {:?} does not fit the array's element type",
+                    args[1].data_type()
+                ),
+            })
         }
         // v7.37.17 (17.6 siblings) — array_replace(arr, from, to)
         // returns the array with every occurrence of `from` replaced
@@ -4563,77 +4506,30 @@ fn apply_function_dispatch(
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
             }
-            match (&args[0], &args[1], &args[2]) {
-                (Value::IntArray(items), from_v, to_v) => {
-                    let from = match from_v {
-                        Value::Null => None,
-                        Value::Int(n) => Some(*n),
-                        Value::SmallInt(n) => Some(i32::from(*n)),
-                        Value::BigInt(n) => i32::try_from(*n).ok(),
-                        _ => {
-                            return Err(EvalError::TypeMismatch {
-                                detail: "array_replace(): from must be integer".into(),
-                            });
-                        }
-                    };
-                    let to = match to_v {
-                        Value::Null => None,
-                        Value::Int(n) => Some(*n),
-                        Value::SmallInt(n) => Some(i32::from(*n)),
-                        Value::BigInt(n) => i32::try_from(*n).ok(),
-                        _ => {
-                            return Err(EvalError::TypeMismatch {
-                                detail: "array_replace(): to must be integer".into(),
-                            });
-                        }
-                    };
-                    let out: alloc::vec::Vec<Option<i32>> = items
-                        .iter()
-                        .map(|o| if *o == from { to } else { *o })
-                        .collect();
-                    Ok(Value::IntArray(out))
-                }
-                (Value::BigIntArray(items), from_v, to_v) => {
-                    let from = match from_v {
-                        Value::Null => None,
-                        Value::Int(n) => Some(i64::from(*n)),
-                        Value::SmallInt(n) => Some(i64::from(*n)),
-                        Value::BigInt(n) => Some(*n),
-                        _ => {
-                            return Err(EvalError::TypeMismatch {
-                                detail: "array_replace(): from must be integer".into(),
-                            });
-                        }
-                    };
-                    let to = match to_v {
-                        Value::Null => None,
-                        Value::Int(n) => Some(i64::from(*n)),
-                        Value::SmallInt(n) => Some(i64::from(*n)),
-                        Value::BigInt(n) => Some(*n),
-                        _ => {
-                            return Err(EvalError::TypeMismatch {
-                                detail: "array_replace(): to must be integer".into(),
-                            });
-                        }
-                    };
-                    let out: alloc::vec::Vec<Option<i64>> = items
-                        .iter()
-                        .map(|o| if *o == from { to } else { *o })
-                        .collect();
-                    Ok(Value::BigIntArray(out))
-                }
-                (other, _, _) => Err(EvalError::TypeMismatch {
+            let Some(len) = array_len(&args[0]) else {
+                return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "array_replace() first arg must be array, got {:?}",
-                        other.data_type()
+                        "array_replace() first arg must be an array, got {:?}",
+                        args[0].data_type()
                     ),
-                }),
+                });
+            };
+            let mut out: alloc::vec::Vec<Value<'static>> = alloc::vec::Vec::with_capacity(len);
+            for i in 0..len {
+                let elem = array_element_at(&args[0], i).unwrap_or(Value::Null);
+                if array_search_match(&elem, &args[1])? {
+                    out.push(args[2].clone().into_owned());
+                } else {
+                    out.push(elem);
+                }
             }
+            array_rebuild(&args[0], &out).ok_or_else(|| EvalError::TypeMismatch {
+                detail: format!(
+                    "array_replace(): value of type {:?} does not fit the array's element type",
+                    args[2].data_type()
+                ),
+            })
         }
-        // v7.37.17 (17.6 siblings) — array_positions(arr, val)
-        // returns an IntArray of all 1-based indices where val
-        // occurs in arr. NULL if arr is NULL. Empty array if not
-        // found. Matches PG semantics.
         "array_positions" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
@@ -12950,37 +12846,33 @@ fn apply_function_dispatch(
                     });
                 }
             };
-            let pieces: alloc::vec::Vec<alloc::string::String> = match &args[0] {
-                Value::IntArray(items) => items
-                    .iter()
-                    .filter_map(|o| match o {
-                        Some(n) => Some(alloc::format!("{n}")),
-                        None => null_replacement.clone(),
-                    })
-                    .collect(),
-                Value::BigIntArray(items) => items
-                    .iter()
-                    .filter_map(|o| match o {
-                        Some(n) => Some(alloc::format!("{n}")),
-                        None => null_replacement.clone(),
-                    })
-                    .collect(),
-                Value::TextArray(items) => items
-                    .iter()
-                    .filter_map(|o| match o {
-                        Some(s) => Some(s.clone()),
-                        None => null_replacement.clone(),
-                    })
-                    .collect(),
-                other => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "array_to_string(): first arg must be array, got {:?}",
-                            other.data_type()
-                        ),
-                    });
-                }
+            // v7.39 (read01 round 72) — GENERIC. This was written variant by
+            // variant too, so a NumericArray (or any newer element type) fell
+            // into "first arg must be array" — the same arm-gap round 71 found
+            // in array_remove, in the function next door.
+            let Some(len) = array_len(&args[0]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "array_to_string(): first arg must be array, got {:?}",
+                        args[0].data_type()
+                    ),
+                });
             };
+            let mut pieces: alloc::vec::Vec<alloc::string::String> =
+                alloc::vec::Vec::with_capacity(len);
+            for i in 0..len {
+                match array_element_at(&args[0], i).unwrap_or(Value::Null) {
+                    // PG drops NULL elements unless a null_string is given.
+                    Value::Null => {
+                        if let Some(ns) = &null_replacement {
+                            pieces.push(ns.clone());
+                        }
+                    }
+                    // The ARRAY rendering, not the scalar one: PG prints a bool
+                    // element as `t` / `f`.
+                    v => pieces.push(crate::eval::value_to_text_for_array(&v, &ctx.render_style)),
+                }
+            }
             Ok(Value::text(pieces.join(&delim)))
         }
         "plainto_tsquery" => fts_plainto_tsquery(args, ctx),
