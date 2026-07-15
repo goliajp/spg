@@ -4368,6 +4368,99 @@ pub(crate) fn synth_pg_description(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row
     (cols, rows)
 }
 
+/// v7.39 (read01 round 83) — the ONE `CREATE [UNIQUE] INDEX …` renderer, PG's
+/// `pg_get_indexdef` spelling. Both `pg_indexes.indexdef` (the catalog view) and
+/// the `pg_get_indexdef(regclass)` function had their own copy; the function's
+/// was the poorer one — it ignored `idx.expression` (so `lower(name)` came back
+/// as `name`), ignored the constraint-backing check (so a primary key's index
+/// printed `CREATE INDEX` instead of `CREATE UNIQUE INDEX`), and only ever
+/// listed column names. One renderer now feeds both.
+pub(crate) fn render_indexdef(
+    t: &spg_storage::Table,
+    idx: &spg_storage::Index,
+    tname: &str,
+) -> alloc::string::String {
+    let col_at = |pos: usize| -> alloc::string::String {
+        t.schema()
+            .columns
+            .get(pos)
+            .map_or_else(|| "?".into(), |c| c.name.clone())
+    };
+    let mut positions = alloc::vec![idx.column_position];
+    positions.extend(idx.extra_column_positions.iter().copied());
+    let cols = positions
+        .iter()
+        .map(|&p| col_at(p))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // v7.39 (read01 round 83) — an index prints UNIQUE only when it is the one
+    // that ENFORCES a uniqueness constraint, not merely when its columns happen
+    // to match one. PG: `CREATE INDEX idx ON t(a)` over a table that also has
+    // `UNIQUE(a)` is a PLAIN index — the constraint is enforced by its own
+    // auto-created index (`t_a_key` / `t_pkey`), a different relation. SPG
+    // enforces uniqueness through the constraint rather than the index flag, so
+    // the witness is the auto-index NAMING PG uses: `<table>_pkey` for a primary
+    // key, `<table>_<col…>_key` for a UNIQUE. Matching by column set alone (the
+    // old test) mislabelled every user index that shadowed a constrained column.
+    let col_name_at = |pos: usize| -> alloc::string::String {
+        t.schema()
+            .columns
+            .get(pos)
+            .map_or_else(|| "?".into(), |c| c.name.clone())
+    };
+    let backs_unique_constraint = t.schema().uniqueness_constraints.iter().any(|uc| {
+        if uc.columns.len() != positions.len() || !positions.iter().all(|p| uc.columns.contains(p)) {
+            return false;
+        }
+        let auto_name = if uc.is_primary_key {
+            alloc::format!("{tname}_pkey")
+        } else {
+            let cols_part = uc
+                .columns
+                .iter()
+                .map(|&p| col_name_at(p))
+                .collect::<Vec<_>>()
+                .join("_");
+            alloc::format!("{tname}_{cols_part}_key")
+        };
+        idx.name == auto_name
+    });
+    let unique_kw = if idx.is_unique || backs_unique_constraint {
+        "UNIQUE "
+    } else {
+        ""
+    };
+    // The key list is the EXPRESSION when the index has one.
+    // v7.39 (read01 round 83) — PG double-parenthesises an operator expression
+    // key (`((a + b))`) but not a bare function call (`abs(a)`, `lower(name)`).
+    // SPG stores a binary/unary expression's Display form already wrapped in one
+    // pair (`(a + b)`), so add the outer pair exactly when the stored form opens
+    // with `(` — which a function call never does.
+    let key = match &idx.expression {
+        Some(expr) if expr.starts_with('(') => alloc::format!("({expr})"),
+        Some(expr) => expr.clone(),
+        None => cols,
+    };
+    match &idx.partial_predicate {
+        Some(pred) => {
+            let p = pred.trim();
+            let wrapped = if p.starts_with('(') && p.ends_with(')') {
+                alloc::string::String::from(p)
+            } else {
+                alloc::format!("({p})")
+            };
+            alloc::format!(
+                "CREATE {unique_kw}INDEX {} ON public.{tname} USING btree ({key}) WHERE {wrapped}",
+                idx.name,
+            )
+        }
+        None => alloc::format!(
+            "CREATE {unique_kw}INDEX {} ON public.{tname} USING btree ({key})",
+            idx.name,
+        ),
+    }
+}
+
 pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Text, false),
@@ -4379,63 +4472,7 @@ pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for idx in t.indices() {
-            let col_at = |pos: usize| -> String {
-                t.schema()
-                    .columns
-                    .get(pos)
-                    .map_or("?".into(), |c| c.name.clone())
-            };
-            let mut positions = alloc::vec![idx.column_position];
-            positions.extend(idx.extra_column_positions.iter().copied());
-            let cols = positions
-                .iter()
-                .map(|&p| col_at(p))
-                .collect::<Vec<_>>()
-                .join(", ");
-            // An index backs a PK / UNIQUE constraint when its column set
-            // equals a uniqueness constraint's — PG reports those as
-            // `CREATE UNIQUE INDEX` even though SPG enforces uniqueness
-            // via the constraint, not the index's own flag. Never
-            // over-claims: a plain index whose columns don't match any
-            // constraint stays non-unique.
-            let backs_unique_constraint = t.schema().uniqueness_constraints.iter().any(|uc| {
-                uc.columns.len() == positions.len()
-                    && positions.iter().all(|p| uc.columns.contains(p))
-            });
-            let unique_kw = if idx.is_unique || backs_unique_constraint {
-                "UNIQUE "
-            } else {
-                ""
-            };
-            // Matches PG's pg_get_indexdef spelling (with `USING btree`).
-            // v7.39 (read01 round 52) — the key list is the EXPRESSION when
-            // the index has one, and a partial index carries its predicate.
-            // Both were already stored on `Index`; this view just dropped
-            // them, so `CREATE INDEX i ON t (lower(b)) WHERE a > 1` came back
-            // as `... USING btree (b)`.
-            let key = idx.expression.clone().unwrap_or(cols);
-            let indexdef = match &idx.partial_predicate {
-                // The stored Display form of a binary predicate is already
-                // parenthesised ("(a > 1)"); only wrap one that isn't.
-                Some(pred) => {
-                    let p = pred.trim();
-                    let wrapped = if p.starts_with('(') && p.ends_with(')') {
-                        alloc::string::String::from(p)
-                    } else {
-                        alloc::format!("({p})")
-                    };
-                    alloc::format!(
-                        "CREATE {unique_kw}INDEX {} ON public.{} USING btree ({key}) WHERE {wrapped}",
-                        idx.name,
-                        tname
-                    )
-                }
-                None => alloc::format!(
-                    "CREATE {unique_kw}INDEX {} ON public.{} USING btree ({key})",
-                    idx.name,
-                    tname
-                ),
-            };
+            let indexdef = render_indexdef(t, idx, &tname);
             rows.push(Row::new(alloc::vec![
                 Value::text("public"),
                 Value::text(tname.clone()),
