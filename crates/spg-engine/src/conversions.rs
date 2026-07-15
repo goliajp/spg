@@ -3127,6 +3127,113 @@ fn datetime_parse_error(ty: &str, s: &str) -> EngineError {
     EngineError::Eval(EvalError::TypeMismatch { detail })
 }
 
+/// v7.39 (read01 round 113) — the underlying scalar of a `jsonb` value being
+/// cast to a numeric or boolean target. PG decodes it first: a JSON number
+/// becomes an unconstrained NUMERIC (so int targets round half-away, matching
+/// `2.5::numeric::int` = 3), true/false become bool, `null` becomes SQL NULL.
+/// A JSON string / array / object is not castable to any scalar target.
+pub(crate) enum JsonbScalar {
+    Numeric(Value<'static>),
+    Bool(bool),
+    Null,
+}
+
+/// PG's "cannot cast jsonb <kind> to type <target>" (SQLSTATE 22023).
+pub(crate) fn jsonb_cast_type_error(kind: &str, target: &str) -> EvalError {
+    EvalError::TypeMismatch {
+        detail: alloc::format!("cannot cast jsonb {kind} to type {target}"),
+    }
+}
+
+/// Decode a serialized `jsonb` scalar for a numeric/bool cast. `target` names
+/// the SQL type only for the error text on the non-scalar kinds.
+pub(crate) fn jsonb_scalar_for_cast(s: &str, target: &str) -> Result<JsonbScalar, EvalError> {
+    use crate::json::JsonValue;
+    match crate::json::parse(s) {
+        Ok(JsonValue::Null) => Ok(JsonbScalar::Null),
+        Ok(JsonValue::Bool(b)) => Ok(JsonbScalar::Bool(b)),
+        // Route the number through the unconstrained NUMERIC input path so the
+        // integer targets inherit PG's numeric (half-away) rounding + range
+        // errors, and scientific / big forms are handled once, centrally.
+        Ok(JsonValue::Number(x)) => {
+            let num = coerce_value(
+                Value::text(alloc::format!("{x}")),
+                DataType::Numeric {
+                    precision: 0,
+                    scale: 0,
+                },
+                "",
+                0,
+            )
+            .map_err(|e| match e {
+                EngineError::Eval(ev) => ev,
+                _ => jsonb_cast_type_error("numeric", target),
+            })?;
+            Ok(JsonbScalar::Numeric(num))
+        }
+        Ok(JsonValue::NumberText(text)) => {
+            let num = coerce_value(
+                Value::text(text),
+                DataType::Numeric {
+                    precision: 0,
+                    scale: 0,
+                },
+                "",
+                0,
+            )
+            .map_err(|e| match e {
+                EngineError::Eval(ev) => ev,
+                _ => jsonb_cast_type_error("numeric", target),
+            })?;
+            Ok(JsonbScalar::Numeric(num))
+        }
+        Ok(JsonValue::String(_)) => Err(jsonb_cast_type_error("string", target)),
+        Ok(JsonValue::Array(_)) => Err(jsonb_cast_type_error("array", target)),
+        Ok(JsonValue::Object(_)) => Err(jsonb_cast_type_error("object", target)),
+        Err(_) => Err(jsonb_cast_type_error("value", target)),
+    }
+}
+
+/// Coerce a `jsonb` value to a scalar numeric/bool `expected`. Returns `None`
+/// when `expected` is not one of those targets (so the caller falls through to
+/// the ordinary coercion table).
+fn try_coerce_json_scalar(
+    s: &str,
+    expected: DataType,
+    col_name: &str,
+    position: usize,
+) -> Option<Result<Value<'static>, EngineError>> {
+    let target = match expected {
+        DataType::Int => "integer",
+        DataType::BigInt => "bigint",
+        DataType::SmallInt => "smallint",
+        DataType::Numeric { .. } => "numeric",
+        DataType::Real => "real",
+        DataType::Float => "double precision",
+        DataType::Bool => "boolean",
+        _ => return None,
+    };
+    Some((|| {
+        match jsonb_scalar_for_cast(s, target).map_err(EngineError::Eval)? {
+            JsonbScalar::Null => Ok(Value::Null),
+            JsonbScalar::Bool(b) => {
+                if matches!(expected, DataType::Bool) {
+                    Ok(Value::Bool(b))
+                } else {
+                    Err(EngineError::Eval(jsonb_cast_type_error("boolean", target)))
+                }
+            }
+            JsonbScalar::Numeric(n) => {
+                if matches!(expected, DataType::Bool) {
+                    Err(EngineError::Eval(jsonb_cast_type_error("numeric", target)))
+                } else {
+                    coerce_value(n, expected, col_name, position)
+                }
+            }
+        }
+    })())
+}
+
 pub(crate) fn coerce_value(
     v: Value<'static>,
     expected: DataType,
@@ -3135,6 +3242,15 @@ pub(crate) fn coerce_value(
 ) -> Result<Value<'static>, EngineError> {
     if v.is_null() {
         return Ok(Value::Null);
+    }
+    // v7.39 (read01 round 113) — a jsonb value cast to a scalar numeric/bool
+    // target decodes its underlying JSON scalar first (PG's jsonb → int/bigint/
+    // smallint/numeric/real/float8/bool casts). Json → Json still takes the
+    // identity fast-path below; this only fires for the scalar targets.
+    if let Value::Json(ref s) = v {
+        if let Some(res) = try_coerce_json_scalar(s, expected, col_name, position) {
+            return res;
+        }
     }
     // v7.39 (read01 round 54) — `data_type()` is None for the eval-only
     // variants that carry no DataType (RegClass, Composite): they are NOT

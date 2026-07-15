@@ -735,10 +735,17 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                 (_, v) => v,
             };
             let coerced =
-                crate::conversions::coerce_value(v, dt, &resolve_name, 0).map_err(|e| {
-                    EvalError::TypeMismatch {
-                        detail: alloc::format!("{e}"),
-                    }
+                crate::conversions::coerce_value(v, dt, &resolve_name, 0).map_err(|e| match e {
+                    // v7.39 (read01 round 113) — pass an already-classed engine
+                    // error through unchanged. Re-stringifying via Display would
+                    // double the "eval: type mismatch: " class prefix (the wire
+                    // strips only the outermost one), leaking it into the message
+                    // — visible now that jsonb → numeric casts error with PG's
+                    // exact "cannot cast jsonb string to type numeric" wording.
+                    crate::EngineError::Eval(ev) => ev,
+                    other => EvalError::TypeMismatch {
+                        detail: alloc::format!("{other}"),
+                    },
                 })?;
             Ok(match temporal_prec {
                 Some(prec) => round_temporal_to_precision(coerced, prec),
@@ -1268,6 +1275,15 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
         Value::BitString { nbits, bytes } => Ok(Value::Int(crate::conversions::bit_string_to_i64(
             nbits, &bytes,
         ) as i32)),
+        // v7.39 (read01 round 113) — jsonb → int: decode the JSON scalar, then
+        // round via the numeric arm above. String/array/object/boolean error.
+        Value::Json(s) => match crate::conversions::jsonb_scalar_for_cast(&s, "integer")? {
+            crate::conversions::JsonbScalar::Numeric(n) => cast_numeric_to_int(n),
+            crate::conversions::JsonbScalar::Bool(_) => {
+                Err(crate::conversions::jsonb_cast_type_error("boolean", "integer"))
+            }
+            crate::conversions::JsonbScalar::Null => Ok(Value::Null),
+        },
         other => Err(EvalError::TypeMismatch {
             detail: format!("cannot cast {:?} to int", other.data_type()),
         }),
@@ -1323,6 +1339,14 @@ fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
         Value::BitString { nbits, bytes } => Ok(Value::BigInt(
             crate::conversions::bit_string_to_i64(nbits, &bytes),
         )),
+        // v7.39 (read01 round 113) — jsonb → bigint.
+        Value::Json(s) => match crate::conversions::jsonb_scalar_for_cast(&s, "bigint")? {
+            crate::conversions::JsonbScalar::Numeric(n) => cast_numeric_to_bigint(n),
+            crate::conversions::JsonbScalar::Bool(_) => {
+                Err(crate::conversions::jsonb_cast_type_error("boolean", "bigint"))
+            }
+            crate::conversions::JsonbScalar::Null => Ok(Value::Null),
+        },
         other => Err(EvalError::TypeMismatch {
             detail: format!("cannot cast {:?} to bigint", other.data_type()),
         }),
@@ -1359,6 +1383,16 @@ fn cast_numeric_to_float(v: Value) -> Result<Value, EvalError> {
                     detail: format!("\"{t}\" is out of range for type double precision"),
                 })
         }
+        // v7.39 (read01 round 113) — jsonb → double precision.
+        Value::Json(s) => {
+            match crate::conversions::jsonb_scalar_for_cast(&s, "double precision")? {
+                crate::conversions::JsonbScalar::Numeric(n) => cast_numeric_to_float(n),
+                crate::conversions::JsonbScalar::Bool(_) => Err(
+                    crate::conversions::jsonb_cast_type_error("boolean", "double precision"),
+                ),
+                crate::conversions::JsonbScalar::Null => Ok(Value::Null),
+            }
+        }
         other => Err(EvalError::TypeMismatch {
             detail: format!("cannot cast {:?} to float", other.data_type()),
         }),
@@ -1387,6 +1421,15 @@ fn cast_to_bool(v: Value) -> Result<Value, EvalError> {
                 }),
             }
         }
+        // v7.39 (read01 round 113) — jsonb → boolean accepts only JSON
+        // true/false; a JSON number/string/array/object errors.
+        Value::Json(s) => match crate::conversions::jsonb_scalar_for_cast(&s, "boolean")? {
+            crate::conversions::JsonbScalar::Bool(b) => Ok(Value::Bool(b)),
+            crate::conversions::JsonbScalar::Numeric(_) => {
+                Err(crate::conversions::jsonb_cast_type_error("numeric", "boolean"))
+            }
+            crate::conversions::JsonbScalar::Null => Ok(Value::Null),
+        },
         other => Err(EvalError::TypeMismatch {
             detail: format!("cannot cast {:?} to bool", other.data_type()),
         }),
