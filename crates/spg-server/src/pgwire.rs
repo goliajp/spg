@@ -553,7 +553,24 @@ fn handle_pg_simple_query(
             None
         }
     };
-    if streaming_select_attempt.is_some() {
+    // v7.39 (read01 round 84) — the streaming SELECT fast path reads through a
+    // read lock against the COMMITTED base tables; it does not thread an open
+    // transaction's uncommitted working set. So inside an explicit `BEGIN … `
+    // block a SELECT streamed here could not see the transaction's own prior
+    // INSERT / UPDATE / DELETE — `BEGIN; INSERT …; SELECT count(*)` returned 0
+    // over the wire (read-your-own-writes broken), and a follow-up write then
+    // tripped a duplicate-key error against the row it "could not see". The
+    // embedded API never hit this because it always uses the materialising
+    // `execute_with_role` path. When THIS connection is in a transaction, skip
+    // streaming and fall to that path, which respects the transaction snapshot.
+    //
+    // The witness is the PER-CONNECTION tx_state, not the engine's global
+    // in_transaction(): the engine is shared across connections, so a global
+    // check would misfire — an autocommit read on one connection would be
+    // dragged onto the write path (and see uncommitted data) merely because a
+    // DIFFERENT connection had a transaction open.
+    let conn_in_tx = *tx_state == b'T';
+    if streaming_select_attempt.is_some() && !conn_in_tx {
         let engine_lock = state
             .engine
             .read()
@@ -806,7 +823,7 @@ fn handle_pg_simple_query(
             .wait_event
             .store(1, std::sync::atomic::Ordering::Relaxed);
     }
-    let result = execute_with_role(state, sql, role, cancel);
+    let result = execute_with_role(state, sql, role, cancel, *tx_state == b'T');
     conn_state
         .wait_event
         .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1042,7 +1059,7 @@ fn handle_pg_simple_query_one_into_wbuf(
     conn_state
         .wait_event
         .store(1, std::sync::atomic::Ordering::Relaxed);
-    let result = execute_with_role(state, sql, role, cancel);
+    let result = execute_with_role(state, sql, role, cancel, *tx_state == b'T');
     conn_state
         .wait_event
         .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1673,6 +1690,10 @@ fn execute_with_role(
     sql: &str,
     role: Role,
     cancel: CancelToken<'_>,
+    // v7.39 (read01 round 84) — whether THIS connection is inside a transaction
+    // (per-connection tx_state, not the engine's global flag). A SELECT here
+    // must then take the write path so it sees the transaction's own writes.
+    conn_in_tx: bool,
 ) -> Result<QueryResult, EngineError> {
     // v5.1: cold-tier preload — kept symmetric with the native
     // Op::Query path so a sweep that drives the server through
@@ -1728,7 +1749,17 @@ fn execute_with_role(
             "permission denied: user management requires admin role".into(),
         ));
     }
-    if is_read {
+    // v7.39 (read01 round 84) — the read-only `&self` executor reads the
+    // COMMITTED base tables; it does not consult an open transaction's
+    // uncommitted working set (that lives in the `&mut` executor's transaction
+    // buffer). So inside a `BEGIN … ` block a SELECT routed to the read path
+    // could not see the transaction's own INSERT / UPDATE / DELETE —
+    // read-your-own-writes was broken over the wire, while the embedded API
+    // (which always uses the `&mut` execute path) saw them and passed its tests.
+    // In a transaction, take the write lock so the SELECT runs through the
+    // executor that threads the transaction snapshot. Autocommit reads keep the
+    // shared read lock (correct: they see committed data, and stay parallel).
+    if is_read && !conn_in_tx {
         let engine = state
             .engine
             .read()
@@ -4478,7 +4509,7 @@ fn handle_copy_to_stdout(
     // does not cross the COPY boundary); bulk-export paths get
     // `CancelToken::none()`. SPG_QUERY_TIMEOUT_MS / server-wide cap
     // still applies via the server-state watchdog.
-    let result = execute_with_role(state, &sql, role, CancelToken::none());
+    let result = execute_with_role(state, &sql, role, CancelToken::none(), *tx_state == b'T');
     let (columns, rows) = match result {
         Ok(QueryResult::Rows { columns, rows }) => (columns, rows),
         Ok(QueryResult::CommandOk { .. }) => {
