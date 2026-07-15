@@ -6351,7 +6351,7 @@ impl fmt::Display for StorageError {
             Self::DuplicateIndex { name } => write!(f, "relation \"{name}\" already exists"),
             Self::ColumnNotFound { column } => write!(f, "column not found: {column}"),
             Self::Corrupt(detail) => write!(f, "corrupt on-disk format: {detail}"),
-            Self::IndexNotFound { name } => write!(f, "index not found: {name}"),
+            Self::IndexNotFound { name } => write!(f, "index \"{name}\" does not exist"),
             Self::Unsupported(detail) => write!(f, "unsupported: {detail}"),
         }
     }

@@ -3599,8 +3599,15 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         } else if (msg.contains("type \"") && msg.contains("\" does not exist"))
             || msg.contains("text search configuration \"")
             || msg.contains("text search dictionary \"")
+            // v7.39 (read01 round 89) — a missing index is PG's 42704
+            // UNDEFINED_OBJECT (DROP INDEX / pg_get_indexdef on a bad name).
+            || (msg.contains("index \"") && msg.contains("\" does not exist"))
         {
             "42704"
+        // v7.39 (read01 round 89) — a column named twice in an INSERT target
+        // list is PG's 42701 DUPLICATE_COLUMN.
+        } else if msg.contains("\" specified more than once") {
+            "42701"
         } else if (msg.contains("function \"") && msg.contains("\" does not exist"))
             || msg.contains("operator does not exist:")
             // v7.39 (read01 round 77) — a named argument aimed at a function
@@ -3658,7 +3665,10 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             "42P07"
         // DROP TABLE on a missing table is 42P01 UNDEFINED_TABLE; every
         // other path (SELECT / ALTER / …) says "relation", same state.
-        } else if (msg.contains("table \"") || msg.contains("relation \""))
+        } else if (msg.contains("table \"")
+            || msg.contains("relation \"")
+            // v7.39 (read01 round 89) — a missing view is PG's 42P01 too.
+            || msg.contains("view \""))
             && msg.contains("does not exist")
         {
             "42P01"

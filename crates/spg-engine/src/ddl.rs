@@ -885,9 +885,10 @@ impl Engine {
         } else if nullable || row_count == 0 {
             Value::Null
         } else {
+            // v7.39 (read01 round 89) — PG's exact wording (23502):
+            // `column "req" of relation "t" contains null values`.
             return Err(EngineError::Unsupported(alloc::format!(
-                "ALTER TABLE ADD COLUMN {col_name:?}: NOT NULL column requires DEFAULT \
-                         when the table has existing rows"
+                "column \"{col_name}\" of relation \"{tbl}\" contains null values"
             )));
         };
         table.add_column(col_schema, fill_value);
@@ -2688,10 +2689,12 @@ impl Engine {
                 col.user_composite_type = Some(name.clone());
                 continue;
             }
+            // v7.39 (read01 round 89) — PG's 42704 wording. The old
+            // "column X: unknown column type Y (...)" carried SPG's own
+            // vocabulary and fell to the generic error class; PG says
+            // simply `type "Y" does not exist`.
             return Err(EngineError::Unsupported(alloc::format!(
-                "column {:?}: unknown column type {:?} (not a built-in, ENUM, DOMAIN, or composite)",
-                col.name,
-                name
+                "type \"{name}\" does not exist"
             )));
         }
         for tc in table_constraints {
@@ -4018,8 +4021,10 @@ impl Engine {
             let was_present = self.active_catalog_mut().drop_view(name);
             if !was_present {
                 if !if_exists {
-                    return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
-                        alloc::format!("view {name:?} does not exist"),
+                    // v7.39 (read01 round 89) — PG's 42P01 wording, without the
+                    // "corrupt on-disk format:" prefix a Storage::Corrupt adds.
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "view \"{name}\" does not exist"
                     )));
                 }
                 // v7.39 (read01 round 46) — PG's IF EXISTS skip NOTICE.

@@ -2586,10 +2586,12 @@ fn build_tuple_pos(
                         ))
                     })?;
                 if map[idx].is_some() {
-                    return Err(EngineError::Storage(StorageError::ArityMismatch {
-                        expected: schema_cols_len,
-                        actual: cols.len(),
-                    }));
+                    // v7.39 (read01 round 89) — a column named twice in the
+                    // INSERT target list is PG's 42701, not an arity error:
+                    // `column "a" specified more than once`.
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "column \"{name}\" specified more than once"
+                    )));
                 }
                 map[idx] = Some(j);
             }
