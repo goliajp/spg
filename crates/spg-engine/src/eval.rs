@@ -1775,6 +1775,18 @@ fn eval_function_call_positional(
     {
         return Ok(Value::text::<alloc::string::String>(cname.into()));
     }
+    // v7.39 (read01 round 116) — a bare, uncoerced string literal is PG's
+    // `unknown` type, not text: `pg_typeof('x')` / `pg_typeof('123')` /
+    // `pg_typeof('2024-01-01')` all report `unknown`. The literal only becomes
+    // text once context coerces it — a cast (`'x'::text`), a concatenation, or
+    // a function argument — each of which is a different Expr node that falls
+    // through to the value-driven path below (which correctly says text).
+    if args.len() == 1
+        && name.eq_ignore_ascii_case("pg_typeof")
+        && matches!(&args[0], Expr::Literal(spg_sql::ast::Literal::String(_)))
+    {
+        return Ok(Value::text::<alloc::string::String>("unknown".into()));
+    }
     // v7.37.16 — pg_typeof of a NULL cell reports the COLUMN's
     // static type when it has one (PG: `VALUES (NULL),(1.5)`
     // types the column numeric and its NULL row's pg_typeof says
