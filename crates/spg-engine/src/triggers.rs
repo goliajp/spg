@@ -165,6 +165,16 @@ impl fmt::Display for TriggerError {
     }
 }
 
+/// v7.39 (read01 round 82) — the firing trigger's identity, for the TG_* magic
+/// variables. `op` is `INSERT` / `UPDATE` / `DELETE`; `level` is `ROW` (SPG
+/// fires row-level triggers only). `TG_WHEN` derives from `is_after`.
+#[derive(Debug)]
+pub struct TgMeta<'a> {
+    pub op: &'a str,
+    pub name: &'a str,
+    pub level: &'a str,
+}
+
 /// Fire a single row-level trigger.
 ///
 /// `is_after` is true for AFTER triggers; the executor enforces
@@ -186,6 +196,12 @@ pub fn fire_row_trigger(
     params: &[Value<'static>],
     default_text_search_config: Option<&str>,
     is_after: bool,
+    // v7.39 (read01 round 82) — the firing trigger's identity, for the TG_*
+    // magic variables (`TG_OP`, `TG_NAME`, `TG_WHEN`, `TG_LEVEL`,
+    // `TG_TABLE_NAME`, `TG_NARGS`). PG exposes these to every trigger function;
+    // SPG bound none, so any function that read `TG_OP` died on
+    // "column tg_op does not exist" — most audit / dispatch triggers do.
+    tg: &TgMeta<'_>,
 ) -> Result<(TriggerOutcome, Vec<DeferredEmbeddedStmt>), TriggerError> {
     if !function.language.eq_ignore_ascii_case("plpgsql") {
         return Err(TriggerError::UnsupportedConstruct {
@@ -208,6 +224,21 @@ pub fn fire_row_trigger(
     // so-far-bound scope + the NEW/OLD context, so later DECLAREs
     // can reference earlier ones.
     let mut locals: BTreeMap<String, Value<'static>> = BTreeMap::new();
+    // v7.39 (read01 round 82) — the TG_* magic variables, bound before the
+    // DECLARE block so an initialiser may reference them. PG names them
+    // case-insensitively; the interpreter lowercases identifiers, so lowercase
+    // keys are what a `TG_OP` reference resolves to.
+    locals.insert("tg_op".into(), Value::text::<alloc::string::String>(tg.op.into()));
+    locals.insert(
+        "tg_when".into(),
+        Value::text::<alloc::string::String>(if is_after { "AFTER" } else { "BEFORE" }.into()),
+    );
+    locals.insert("tg_level".into(), Value::text::<alloc::string::String>(tg.level.into()));
+    locals.insert("tg_name".into(), Value::text::<alloc::string::String>(tg.name.into()));
+    locals.insert("tg_table_name".into(), Value::text::<alloc::string::String>(table_name.into()));
+    locals.insert("tg_table_schema".into(), Value::text::<alloc::string::String>("public".into()));
+    locals.insert("tg_relname".into(), Value::text::<alloc::string::String>(table_name.into()));
+    locals.insert("tg_nargs".into(), Value::Int(0));
     init_locals_from_declarations(
         &block.declarations,
         &mut locals,
@@ -1864,7 +1895,7 @@ impl Engine {
         table: &str,
         event: &str,
         timing: &str,
-    ) -> Vec<spg_storage::FunctionDef> {
+    ) -> Vec<(spg_storage::FunctionDef, alloc::string::String)> {
         let cat = self.active_catalog();
         cat.triggers()
             .iter()
@@ -1880,7 +1911,14 @@ impl Engine {
             // v7.39 (read01 round 62) — functions are keyed by SIGNATURE now. A
             // trigger names its function by NAME, and a trigger function takes
             // no arguments, so there is at most one.
-            .filter_map(|t| cat.functions_named(&t.function).first().map(|f| (*f).clone()))
+            // v7.39 (read01 round 82) — carry the TRIGGER's name alongside the
+            // function, for TG_NAME (which is the trigger name, not the function
+            // name).
+            .filter_map(|t| {
+                cat.functions_named(&t.function)
+                    .first()
+                    .map(|f| ((*f).clone(), t.name.clone()))
+            })
             .collect()
     }
 
@@ -1892,7 +1930,7 @@ impl Engine {
         &self,
         table: &str,
         timing: &str,
-    ) -> Vec<(spg_storage::FunctionDef, Vec<String>)> {
+    ) -> Vec<(spg_storage::FunctionDef, Vec<String>, alloc::string::String)> {
         let cat = self.active_catalog();
         cat.triggers()
             .iter()
@@ -1904,10 +1942,11 @@ impl Engine {
                     && t.for_each.eq_ignore_ascii_case("row")
                     && t.events.iter().any(|e| e.eq_ignore_ascii_case("UPDATE"))
             })
+            // v7.39 (read01 round 82) — third element is the trigger name (TG_NAME).
             .filter_map(|t| {
                 cat.functions_named(&t.function)
                     .first()
-                    .map(|fd| ((*fd).clone(), t.update_columns.clone()))
+                    .map(|fd| ((*fd).clone(), t.update_columns.clone(), t.name.clone()))
             })
             .collect()
     }

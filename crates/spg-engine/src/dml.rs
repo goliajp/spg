@@ -121,8 +121,8 @@ use crate::{
 /// INSERT row loop, taken before the mutable catalog borrow opens.
 struct InsertSnapshots {
     clock: Option<crate::ClockFn>,
-    before_insert_triggers: Vec<spg_storage::FunctionDef>,
-    after_insert_triggers: Vec<spg_storage::FunctionDef>,
+    before_insert_triggers: Vec<(spg_storage::FunctionDef, String)>,
+    after_insert_triggers: Vec<(spg_storage::FunctionDef, String)>,
     trigger_session_cfg: Option<String>,
     enum_label_lookup: alloc::collections::BTreeMap<usize, Vec<String>>,
     set_variant_lookup: alloc::collections::BTreeMap<usize, Vec<String>>,
@@ -609,7 +609,7 @@ impl Engine {
             let old_row = table.rows()[*pos].clone();
             let mut new_row = Row::new(new_vals.clone());
             let mut skip = false;
-            for (fd, filter) in &before_update_triggers {
+            for (fd, filter, tgname) in &before_update_triggers {
                 // v7.13.0 — `UPDATE OF cols` filter (mailrs round-5
                 // G7). Skip this trigger when the filter is set and
                 // no listed column actually differs between OLD and
@@ -628,6 +628,7 @@ impl Engine {
                     &[],
                     trigger_session_cfg.as_deref(),
                     false,
+                    &triggers::TgMeta { op: "UPDATE", name: tgname, level: "ROW" },
                 )
                 .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
                 deferred_embedded.extend(deferred);
@@ -640,6 +641,16 @@ impl Engine {
                 }
             }
             if !skip {
+                // v7.39 (read01 round 82) — recompute stored generated columns
+                // over the BEFORE trigger's OUTPUT. The pre-loop pass above ran
+                // before the triggers, so a `w GENERATED AS (v*2)` kept the value
+                // for the pre-trigger `v` when a BEFORE UPDATE trigger changed
+                // `NEW.v`. PG's order is BEFORE trigger → generated → write.
+                if !before_update_triggers.is_empty() {
+                    let mut one = [core::mem::take(&mut new_row.values)];
+                    apply_generated_stored_columns(&schema_cols, &mut one)?;
+                    new_row.values = core::mem::take(&mut one[0]);
+                }
                 applied_after_before.push((*pos, new_row, old_row));
             }
         }
@@ -683,7 +694,7 @@ impl Engine {
             } else {
                 table.update_row(pos, new_row.values.clone())?;
             }
-            for (fd, filter) in &after_update_triggers {
+            for (fd, filter, tgname) in &after_update_triggers {
                 if !filter.is_empty()
                     && !any_column_changed(filter, &schema_cols, &old_row, &new_row)
                 {
@@ -698,6 +709,7 @@ impl Engine {
                     &[],
                     trigger_session_cfg.as_deref(),
                     true,
+                    &triggers::TgMeta { op: "UPDATE", name: tgname, level: "ROW" },
                 )
                 .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
                 deferred_embedded.extend(deferred);
@@ -1377,7 +1389,7 @@ impl Engine {
             for (pos, old_vals) in positions.iter().zip(to_delete_rows.iter()) {
                 let old_row = Row::new(old_vals.clone());
                 let mut cancel_this = false;
-                for fd in &before_delete_triggers {
+                for (fd, tgname) in &before_delete_triggers {
                     let (outcome, deferred) = triggers::fire_row_trigger(
                         fd,
                         None,
@@ -1387,6 +1399,7 @@ impl Engine {
                         &[],
                         trigger_session_cfg.as_deref(),
                         false,
+                        &triggers::TgMeta { op: "DELETE", name: tgname, level: "ROW" },
                     )
                     .map_err(|e| {
                         EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
@@ -1477,7 +1490,7 @@ impl Engine {
         if !after_delete_triggers.is_empty() {
             for old_vals in &to_delete_rows {
                 let old_row = Row::new(old_vals.clone());
-                for fd in &after_delete_triggers {
+                for (fd, tgname) in &after_delete_triggers {
                     let (_outcome, deferred) = triggers::fire_row_trigger(
                         fd,
                         None,
@@ -1487,6 +1500,7 @@ impl Engine {
                         &[],
                         trigger_session_cfg.as_deref(),
                         true,
+                        &triggers::TgMeta { op: "DELETE", name: tgname, level: "ROW" },
                     )
                     .map_err(|e| {
                         EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
@@ -2930,8 +2944,8 @@ fn insert_parsed_rows(
     inplace: bool,
     all_values: Vec<Vec<Value<'static>>>,
     pending_updates: Vec<(usize, Vec<Value<'static>>)>,
-    before_insert_triggers: &[spg_storage::FunctionDef],
-    after_insert_triggers: &[spg_storage::FunctionDef],
+    before_insert_triggers: &[(spg_storage::FunctionDef, alloc::string::String)],
+    after_insert_triggers: &[(spg_storage::FunctionDef, alloc::string::String)],
     column_meta: &[ColumnSchema],
     table_name: &str,
     trigger_session_cfg: Option<&str>,
@@ -2970,7 +2984,7 @@ fn insert_parsed_rows(
         // trigger may rewrite NEW cells (e.g. populate
         // `search_vector := to_tsvector(...)`) and may return
         // NULL to skip the row entirely.
-        for fd in before_insert_triggers {
+        for (fd, tgname) in before_insert_triggers {
             let (outcome, deferred) = triggers::fire_row_trigger(
                 fd,
                 Some(row.clone()),
@@ -2980,6 +2994,7 @@ fn insert_parsed_rows(
                 &[],
                 trigger_session_cfg,
                 false,
+                &triggers::TgMeta { op: "INSERT", name: tgname, level: "ROW" },
             )
             .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
             deferred_embedded.extend(deferred);
@@ -2987,6 +3002,17 @@ fn insert_parsed_rows(
                 triggers::TriggerOutcome::Row(r) => row = r,
                 triggers::TriggerOutcome::Skip => continue 'rowloop,
             }
+        }
+        // v7.39 (read01 round 82) — a stored generated column is computed AFTER
+        // the BEFORE trigger runs, not before: PG's order is BEFORE trigger →
+        // generated columns → write. The pre-loop `apply_generated_stored_columns`
+        // saw only the incoming NEW, so `w GENERATED AS (v*2)` kept the value for
+        // the ORIGINAL v when a BEFORE trigger changed `NEW.v`. Recompute here
+        // over the trigger's output. (No-op when there are no generated columns.)
+        if !before_insert_triggers.is_empty() {
+            let mut one = [core::mem::take(&mut row.values)];
+            apply_generated_stored_columns(column_meta, &mut one)?;
+            row.values = core::mem::take(&mut one[0]);
         }
         if returning_enabled {
             returning_rows.push(row.values.clone());
@@ -3003,7 +3029,7 @@ fn insert_parsed_rows(
         // v7.12.4 — AFTER INSERT row-level triggers fire post-
         // write. Return value is ignored (PG semantics); we
         // surface any error from the body up to the caller.
-        for fd in after_insert_triggers {
+        for (fd, tgname) in after_insert_triggers {
             let (_outcome, deferred) = triggers::fire_row_trigger(
                 fd,
                 Some(inserted.clone()),
@@ -3013,6 +3039,7 @@ fn insert_parsed_rows(
                 &[],
                 trigger_session_cfg,
                 true,
+                &triggers::TgMeta { op: "INSERT", name: tgname, level: "ROW" },
             )
             .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
             deferred_embedded.extend(deferred);

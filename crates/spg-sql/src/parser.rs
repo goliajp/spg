@@ -2831,6 +2831,27 @@ impl Parser {
                 self.advance();
                 self.parse_create_trigger_after_keyword(false)
             }
+            // v7.39 (read01 round 82) — CREATE CONSTRAINT TRIGGER. A constraint
+            // trigger is a row-level AFTER trigger that additionally carries
+            // DEFERRABLE / INITIALLY DEFERRED timing; the `parse_create_trigger`
+            // path already tolerates and skips those clauses, so consuming the
+            // CONSTRAINT keyword and reusing it makes the statement parse and the
+            // trigger fire. (The deferral timing itself is not yet honoured —
+            // SPG fires it as a plain AFTER trigger, which is correct behaviour
+            // for every non-deferred use.)
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("constraint") => {
+                self.advance();
+                if !matches!(self.peek(), Token::Ident(t) | Token::QuotedIdent(t)
+                    if t.eq_ignore_ascii_case("trigger"))
+                {
+                    return Err(self.err(alloc::format!(
+                        "expected TRIGGER after CREATE CONSTRAINT, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                self.parse_create_trigger_after_keyword(false)
+            }
             // v7.17.0 — CREATE [TEMPORARY] SEQUENCE …
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("sequence") => {
                 self.advance();
@@ -4240,6 +4261,18 @@ impl Parser {
         };
         self.advance();
         let table = self.expect_ident_like()?;
+        // v7.39 (read01 round 82) — a CONSTRAINT TRIGGER may carry `FROM
+        // reftable` and `[NOT] DEFERRABLE [INITIALLY {DEFERRED|IMMEDIATE}]`
+        // between the table and FOR EACH ROW. Accept and skip them: SPG fires
+        // the trigger as a plain AFTER trigger (correct for every non-deferred
+        // use; deferral timing is not yet honoured).
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+            if s.eq_ignore_ascii_case("from"))
+        {
+            self.advance();
+            let _reftable = self.expect_ident_like()?;
+        }
+        self.consume_optional_deferrable_clauses()?;
         // FOR EACH ROW / FOR EACH STATEMENT. FOR is a reserved
         // keyword (Token::For); EACH / ROW / STATEMENT are bare
         // idents.
