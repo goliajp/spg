@@ -10578,8 +10578,19 @@ fn apply_function_dispatch(
                     // decimal rather than routing through f64 (which loses
                     // precision past ~15 significant digits). Truncate toward zero
                     // on the integer mantissa; i128 division already truncates.
-                    if let Value::Numeric { scaled, scale, .. } = &args[0] {
-                        let cur = i32::from(*scale);
+                    // v7.39 (read01 round 99) — an integer argument is the
+                    // `trunc(numeric, int)` overload (implicit int→numeric cast),
+                    // so treat it as a scale-0 mantissa here rather than the f64
+                    // path.
+                    let numeric_input: Option<(i128, u8)> = match &args[0] {
+                        Value::Numeric { scaled, scale, .. } => Some((*scaled, *scale)),
+                        Value::SmallInt(v) => Some((i128::from(*v), 0)),
+                        Value::Int(v) => Some((i128::from(*v), 0)),
+                        Value::BigInt(v) => Some((i128::from(*v), 0)),
+                        _ => None,
+                    };
+                    if let Some((scaled, scale)) = numeric_input {
+                        let cur = i32::from(scale);
                         if (0..=38).contains(&n) {
                             #[allow(clippy::cast_sign_loss)]
                             let out = if n >= cur {
@@ -10595,6 +10606,24 @@ fn apply_function_dispatch(
                             };
                             if let Some(v) = out {
                                 return Ok(v);
+                            }
+                        } else if n < 0 && -n <= 38 && cur - n <= 38 {
+                            // v7.39 (read01 round 99) — a NEGATIVE target scale
+                            // stays NUMERIC in PG (`trunc(1234.5678, -2)` → numeric
+                            // `1200`); SPG used to fall through to f64 and hand back
+                            // `double precision`. Truncate the mantissa toward zero
+                            // to the 10^|n| place (i128 division truncates), then
+                            // rescale to scale 0.
+                            #[allow(clippy::cast_sign_loss)]
+                            let drop = (cur - n) as u8;
+                            let q = scaled / pow10_i128(drop);
+                            #[allow(clippy::cast_sign_loss)]
+                            if let Some(mag) = q.checked_mul(pow10_i128((-n) as u8)) {
+                                return Ok(Value::Numeric {
+                                    scaled: mag,
+                                    scale: 0,
+                                    kind: spg_storage::NumericKind::Finite,
+                                });
                             }
                         }
                     }
