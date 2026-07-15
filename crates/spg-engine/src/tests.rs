@@ -506,12 +506,14 @@ fn insert_arity_mismatch_propagates() {
         }
         _ => panic!("expected rows"),
     }
-    // More values than columns is still an arity error.
+    // More values than columns is still an arity error — v7.39 (round 88)
+    // now carries PG's 42601 wording instead of the generic ArityMismatch.
     let err = e.execute("INSERT INTO foo VALUES (1, 'x', 3)").unwrap_err();
-    assert!(matches!(
-        err,
-        EngineError::Storage(StorageError::ArityMismatch { .. })
-    ));
+    assert!(
+        err.to_string()
+            .contains("INSERT has more expressions than target columns"),
+        "got {err}"
+    );
 }
 
 #[test]
