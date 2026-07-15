@@ -17715,7 +17715,35 @@ impl Parser {
                 "expected string literal after INTERVAL, got {tok:?}"
             )));
         };
-        let (months, days, micros) = parse_interval_text(&text).ok_or_else(|| ParseError {
+        // v7.39 (read01 round 102) — SQL-standard trailing field qualifier
+        // `<FIELD> [TO <FIELD>]` (`INTERVAL '2' YEAR`, `INTERVAL '1-6' YEAR TO
+        // MONTH`, `INTERVAL '1 2:03:04' DAY TO SECOND`). It sets which field a
+        // bare number means and the leading/trailing precision.
+        let field1 = interval_field_of(self.peek());
+        let qualifier = if let Some(f1) = field1 {
+            self.advance();
+            let f2 = if matches!(self.peek(), Token::To) {
+                self.advance();
+                let Some(f) = interval_field_of(self.peek()) else {
+                    return Err(self.err(format!(
+                        "expected an interval field after TO, got {:?}",
+                        self.peek()
+                    )));
+                };
+                self.advance();
+                Some(f)
+            } else {
+                None
+            };
+            Some((f1, f2))
+        } else {
+            None
+        };
+        let (months, days, micros) = match qualifier {
+            Some(q) => interpret_qualified_interval(&text, q),
+            None => parse_interval_text(&text).map(|(m, d, u)| (m, d, u)),
+        }
+        .ok_or_else(|| ParseError {
             message: format!(
                 "cannot parse INTERVAL {text:?}; \
                      expected `<n> <unit> [<n> <unit> ...]` with units \
@@ -19271,6 +19299,100 @@ fn canonical_interval_unit(raw: &str) -> Option<&'static str> {
         "millennium" | "millenniums" | "millennia" | "mil" | "mils" => "millennium",
         _ => return None,
     })
+}
+
+/// v7.39 (read01 round 102) — the six SQL-standard interval fields that can
+/// qualify an `INTERVAL '…' <FIELD> [TO <FIELD>]` literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntervalField {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+/// Recognise an interval field keyword (bare ident, case-insensitive). Plural
+/// spellings aren't standard for the qualifier position, so only the singular
+/// forms are accepted.
+fn interval_field_of(tok: &Token) -> Option<IntervalField> {
+    let Token::Ident(s) = tok else { return None };
+    Some(match () {
+        () if s.eq_ignore_ascii_case("year") => IntervalField::Year,
+        () if s.eq_ignore_ascii_case("month") => IntervalField::Month,
+        () if s.eq_ignore_ascii_case("day") => IntervalField::Day,
+        () if s.eq_ignore_ascii_case("hour") => IntervalField::Hour,
+        () if s.eq_ignore_ascii_case("minute") => IntervalField::Minute,
+        () if s.eq_ignore_ascii_case("second") => IntervalField::Second,
+        () => return None,
+    })
+}
+
+/// v7.39 (read01 round 102) — interpret an interval literal under a field
+/// qualifier. Returns `(months, days, micros)`.
+///
+/// * A single field applied to a bare number sets which unit the number means,
+///   truncated to that field's precision (`INTERVAL '1.5' HOUR` → `01:00:00`);
+///   SECOND keeps its fraction (`'90.5' SECOND` → `00:01:30.5`).
+/// * `YEAR TO MONTH` reads the `Y-M` form (`'1-6'` → 1 year 6 months).
+/// * Every other range, and any literal a single field can't read as a plain
+///   number (`'2 days' DAY`), falls back to the unqualified parse — SPG's
+///   interval-text parser already reads the `D H:MM:SS` / `H:MM` forms exactly
+///   like PG, and the qualifier there only bounds precision.
+fn interpret_qualified_interval(
+    text: &str,
+    (f1, f2): (IntervalField, Option<IntervalField>),
+) -> Option<(i32, i32, i64)> {
+    if let Some(f2) = f2 {
+        if f1 == IntervalField::Year && f2 == IntervalField::Month {
+            if let Some(m) = parse_year_month_literal(text) {
+                return Some((m, 0, 0));
+            }
+        }
+        return parse_interval_text(text);
+    }
+    // Single field: reinterpret a bare number; otherwise the default parse.
+    let trimmed = text.trim();
+    if let Ok(val) = trimmed.parse::<f64>() {
+        // no_std: f64 has no trunc/round; cast toward zero + round-half-away.
+        #[allow(clippy::cast_possible_truncation)]
+        let whole = val as i64;
+        #[allow(clippy::cast_possible_truncation)]
+        let secs_micros = {
+            let m = val * 1_000_000.0;
+            if m >= 0.0 { (m + 0.5) as i64 } else { (m - 0.5) as i64 }
+        };
+        return Some(match f1 {
+            IntervalField::Year => (i32::try_from(whole).ok()?.checked_mul(12)?, 0, 0),
+            IntervalField::Month => (i32::try_from(whole).ok()?, 0, 0),
+            IntervalField::Day => (0, i32::try_from(whole).ok()?, 0),
+            IntervalField::Hour => (0, 0, whole.checked_mul(3_600_000_000)?),
+            IntervalField::Minute => (0, 0, whole.checked_mul(60_000_000)?),
+            IntervalField::Second => (0, 0, secs_micros),
+        });
+    }
+    parse_interval_text(text)
+}
+
+/// Parse the `Y-M` (optionally signed) year-to-month literal into total months.
+fn parse_year_month_literal(text: &str) -> Option<i32> {
+    let t = text.trim();
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let mut it = body.split('-');
+    let years: i32 = it.next()?.trim().parse().ok()?;
+    let months: i32 = match it.next() {
+        Some(m) => m.trim().parse().ok()?,
+        None => 0,
+    };
+    if it.next().is_some() {
+        return None;
+    }
+    let total = years.checked_mul(12)?.checked_add(months)?;
+    Some(if neg { -total } else { total })
 }
 
 pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
