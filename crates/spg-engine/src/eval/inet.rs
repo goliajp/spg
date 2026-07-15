@@ -60,8 +60,6 @@ pub(super) fn inet_network(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
         }
     };
     // For a `host/mask` form return the masked-network address.
-    // SPG ships the simple "drop trailing octets per byte" path
-    // for IPv4; full bit-level masking is out of v7.17 scope.
     let mut split = s.splitn(2, '/');
     let host = split.next().unwrap_or("").to_string();
     let mask: u32 = split.next().and_then(|m| m.parse().ok()).unwrap_or(32);
@@ -69,25 +67,40 @@ pub(super) fn inet_network(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
         // IPv6 / MACADDR — return the input unmasked.
         return Ok(Value::text(s));
     }
+    // v7.39 (read01 round 103) — bit-level masking: zero every host bit, not
+    // just whole trailing octets. The old octet-granular path left `/25`,
+    // `/26`, … unmasked (network('192.168.1.130/25') returned .130 instead of
+    // PG's .128).
+    let Some(addr) = ipv4_to_u32(&host) else {
+        return Ok(Value::text(s));
+    };
+    let mask = mask.min(32);
+    let masked = if mask == 0 { 0 } else { addr & (u32::MAX << (32 - mask)) };
+    Ok(Value::text(alloc::format!(
+        "{}.{}.{}.{}/{mask}",
+        (masked >> 24) & 0xFF,
+        (masked >> 16) & 0xFF,
+        (masked >> 8) & 0xFF,
+        masked & 0xFF
+    )))
+}
+
+/// v7.39 (read01 round 103) — parse a dotted-quad IPv4 host into a u32, or
+/// `None` if it isn't four 0..=255 octets.
+fn ipv4_to_u32(host: &str) -> Option<u32> {
     let octets: Vec<&str> = host.split('.').collect();
     if octets.len() != 4 {
-        return Ok(Value::text(s));
+        return None;
     }
-    let keep_bytes = ((mask + 7) / 8) as usize;
-    let mut out = alloc::string::String::new();
-    for (i, oct) in octets.iter().enumerate() {
-        if i > 0 {
-            out.push('.');
+    let mut addr: u32 = 0;
+    for oct in &octets {
+        let b: u32 = oct.parse().ok()?;
+        if b > 255 {
+            return None;
         }
-        if i < keep_bytes {
-            out.push_str(oct);
-        } else {
-            out.push('0');
-        }
+        addr = (addr << 8) | b;
     }
-    out.push('/');
-    out.push_str(&mask.to_string());
-    Ok(Value::text(out))
+    Some(addr)
 }
 
 /// v7.37.17 (17.6 siblings) — family(inet) returns 4 for IPv4,
