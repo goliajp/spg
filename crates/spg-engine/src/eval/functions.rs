@@ -13518,43 +13518,31 @@ fn apply_function_dispatch(
                     if idx.name != bare {
                         continue;
                     }
-                    let col_at = |pos: usize| -> String {
-                        t.schema()
-                            .columns
-                            .get(pos)
-                            .map_or_else(|| String::from("?"), |c| c.name.clone())
-                    };
-                    // Full ordered column list (leading + trailing keys).
-                    let mut positions = alloc::vec![idx.column_position];
-                    positions.extend(idx.extra_column_positions.iter().copied());
-                    let col_names: Vec<String> = positions.iter().map(|&p| col_at(p)).collect();
                     if col_no > 0 {
                         // Column form: the N-th (1-based) key column.
+                        let col_at = |pos: usize| -> String {
+                            t.schema()
+                                .columns
+                                .get(pos)
+                                .map_or_else(|| String::from("?"), |c| c.name.clone())
+                        };
+                        let mut positions = alloc::vec![idx.column_position];
+                        positions.extend(idx.extra_column_positions.iter().copied());
+                        let col_names: Vec<String> =
+                            positions.iter().map(|&p| col_at(p)).collect();
                         return Ok(col_names.get((col_no - 1) as usize).map_or(
                             Value::Null,
                             |c| Value::text(c.clone()),
                         ));
                     }
-                    let unique_kw = if idx.is_unique { "UNIQUE " } else { "" };
-                    // v7.39 (read01 ruleutils.c) — a partial index carries
-                    // its WHERE predicate (PG parenthesizes it).
-                    let where_sfx = idx.partial_predicate.as_ref().map_or_else(
-                        String::new,
-                        |p| {
-                            let inner = p.trim();
-                            if inner.starts_with('(') && inner.ends_with(')') {
-                                alloc::format!(" WHERE {inner}")
-                            } else {
-                                alloc::format!(" WHERE ({inner})")
-                            }
-                        },
-                    );
-                    return Ok(Value::text(alloc::format!(
-                        "CREATE {unique_kw}INDEX {} ON public.{} USING btree ({}){}",
-                        idx.name,
-                        tname,
-                        col_names.join(", "),
-                        where_sfx
+                    // v7.39 (read01 round 83) — the full statement form was a
+                    // second, poorer copy of the renderer: it ignored the
+                    // index EXPRESSION (so `lower(name)` came back as `name`)
+                    // and the constraint-backing check (so a primary key
+                    // printed `CREATE INDEX`, not `CREATE UNIQUE INDEX`). Share
+                    // the one `pg_indexes.indexdef` already uses.
+                    return Ok(Value::text(crate::system_catalog::render_indexdef(
+                        t, idx, &tname,
                     )));
                 }
             }
