@@ -496,7 +496,11 @@ pub enum EvalError {
 impl core::fmt::Display for EvalError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::ColumnNotFound { name } => write!(f, "column not found: {name}"),
+            // v7.39 (read01 round 81) — PG's wording (and SQLSTATE trigger):
+            // `column "x" does not exist`, 42703. The old "column not found: x"
+            // matched none of the wire layer's `does not exist` patterns, so a
+            // missing column reached the client as the generic error class.
+            Self::ColumnNotFound { name } => write!(f, "column \"{name}\" does not exist"),
             Self::UnknownQualifier { qualifier } => {
                 write!(f, "unknown table qualifier: {qualifier}")
             }
