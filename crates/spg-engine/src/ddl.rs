@@ -1691,10 +1691,59 @@ impl Engine {
         })
     }
 
+    /// v7.39 (read01 round 93) — derive PG's generated index name for an
+    /// unnamed `CREATE INDEX`. PG's `ChooseIndexName` builds
+    /// `<table>_<label1>_<label2>…_idx`, where each label is a key
+    /// column's name, an expression's leading function name, or `expr`
+    /// for a non-function expression; INCLUDE columns contribute labels
+    /// too. On a name clash within the relation an integer counter is
+    /// appended (`_idx`, `_idx1`, `_idx2`, …).
+    fn choose_auto_index_name(&self, stmt: &CreateIndexStatement) -> String {
+        let mut labels: Vec<String> = Vec::new();
+        match &stmt.expression {
+            Some(Expr::FunctionCall { name, .. }) => labels.push(name.to_ascii_lowercase()),
+            Some(_) => labels.push("expr".to_string()),
+            None => labels.push(stmt.column.clone()),
+        }
+        labels.extend(stmt.extra_columns.iter().cloned());
+        labels.extend(stmt.included_columns.iter().cloned());
+        let mut base = alloc::format!("{}_{}_idx", stmt.table, labels.join("_"));
+        // PG truncates the generated name to NAMEDATALEN-1 (63) bytes.
+        truncate_ident(&mut base);
+        // Collision counter — index names live in the relation's index
+        // list (SPG keys index-name uniqueness per table), which is where
+        // a same-column repeat collides, matching PG's observable output.
+        let existing: Vec<String> = self
+            .active_catalog()
+            .get(&stmt.table)
+            .map(|t| t.indices().iter().map(|i| i.name.clone()).collect())
+            .unwrap_or_default();
+        if !existing.iter().any(|n| *n == base) {
+            return base;
+        }
+        let mut counter = 1u32;
+        loop {
+            let mut cand = alloc::format!("{base}{counter}");
+            truncate_ident(&mut cand);
+            if !existing.iter().any(|n| *n == cand) {
+                return cand;
+            }
+            counter += 1;
+        }
+    }
+
     pub(crate) fn exec_create_index(
         &mut self,
-        stmt: CreateIndexStatement,
+        mut stmt: CreateIndexStatement,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 (read01 round 93) — an omitted index name (`CREATE INDEX
+        // ON t (a)`) is filled in with a PG-style generated name here, so
+        // the name is chosen against the live catalog (for the collision
+        // counter). Done before the partition-parent fan-out so children
+        // inherit a fully-named template.
+        if stmt.name.is_empty() {
+            stmt.name = self.choose_auto_index_name(&stmt);
+        }
         // v7.37.6-B(sentori Epic 2 P0)— `CREATE INDEX … ON parent`
         // when `parent` is a partition-parent fans out to every
         // existing child and records the Display-form source so
@@ -4076,6 +4125,21 @@ impl Engine {
 /// with an active `&mut Table` borrow can still use it.
 /// Literal defaults take the cached path (`col.default`);
 /// runtime defaults hit `clock_fn` at each call. mailrs G4.
+/// v7.39 (read01 round 93) — truncate a generated identifier to PG's
+/// NAMEDATALEN-1 (63) byte limit, on a UTF-8 char boundary so a
+/// multi-byte name is never split mid-codepoint.
+fn truncate_ident(name: &mut String) {
+    const MAX: usize = 63;
+    if name.len() <= MAX {
+        return;
+    }
+    let mut cut = MAX;
+    while cut > 0 && !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    name.truncate(cut);
+}
+
 pub(crate) fn resolve_column_default_free(
     col: &ColumnSchema,
     clock_fn: Option<ClockFn>,
