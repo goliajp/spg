@@ -287,7 +287,14 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
         // already TextArray. Anything else is a type mismatch.
         CastTarget::TextArray => match v {
             Value::TextArray(items) => Ok(Value::TextArray(items)),
-            Value::Text(s) => decode_text_array_external(&s).map(Value::TextArray),
+            Value::Text(s) => {
+                if let Some(r) = try_cast_2d_array(&s, |row| {
+                    decode_text_array_external(row).map(Value::TextArray)
+                }) {
+                    return r;
+                }
+                decode_text_array_external(&s).map(Value::TextArray)
+            }
             // Other scalar arrays cast element-wise, each element
             // rendered as its own text (NULLs preserved). PG allows
             // `ARRAY[1,2,3]::text[]`.
@@ -847,7 +854,14 @@ fn cast_to_int_array(v: Value) -> Result<Value, EvalError> {
             }
             Ok(Value::IntArray(out))
         }
-        Value::Text(s) => decode_int_array_external(&s).map(Value::IntArray),
+        Value::Text(s) => {
+            if let Some(r) = try_cast_2d_array(&s, |row| {
+                decode_int_array_external(row).map(Value::IntArray)
+            }) {
+                return r;
+            }
+            decode_int_array_external(&s).map(Value::IntArray)
+        }
         Value::TextArray(items) => {
             let mut out: Vec<Option<i32>> = Vec::with_capacity(items.len());
             for item in items {
@@ -877,7 +891,14 @@ fn cast_to_bigint_array(v: Value) -> Result<Value, EvalError> {
         Value::IntArray(items) => Ok(Value::BigIntArray(
             items.into_iter().map(|x| x.map(i64::from)).collect(),
         )),
-        Value::Text(s) => decode_bigint_array_external(&s).map(Value::BigIntArray),
+        Value::Text(s) => {
+            if let Some(r) = try_cast_2d_array(&s, |row| {
+                decode_bigint_array_external(row).map(Value::BigIntArray)
+            }) {
+                return r;
+            }
+            decode_bigint_array_external(&s).map(Value::BigIntArray)
+        }
         Value::TextArray(items) => {
             let mut out: Vec<Option<i64>> = Vec::with_capacity(items.len());
             for item in items {
@@ -901,6 +922,27 @@ fn cast_to_bigint_array(v: Value) -> Result<Value, EvalError> {
     }
 }
 
+/// Cast a possibly-2-D array literal: parse each top-level row with `elem` (the
+/// 1-D element decoder) and fold into a 2-D value; `None` when the literal is 1-D.
+fn try_cast_2d_array(
+    s: &str,
+    elem: impl Fn(&str) -> Result<Value<'static>, EvalError>,
+) -> Option<Result<Value<'static>, EvalError>> {
+    let rows = crate::eval::values::split_2d_rows(s)?;
+    let mut row_vals: alloc::vec::Vec<Value<'static>> = alloc::vec::Vec::with_capacity(rows.len());
+    for r in &rows {
+        match elem(r) {
+            Ok(v) => row_vals.push(v),
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    Some(
+        crate::eval::values::build_2d_from_rows(&row_vals).ok_or_else(|| EvalError::TypeMismatch {
+            detail: alloc::format!("malformed array literal: {s:?}"),
+        }),
+    )
+}
+
 fn decode_int_array_external(s: &str) -> Result<Vec<Option<i32>>, EvalError> {
     let trimmed = s.trim();
     // v7.39 (read01 jsonfuncs.c) — the json_to_record/populate desugar
@@ -915,7 +957,7 @@ fn decode_int_array_external(s: &str) -> Result<Vec<Option<i32>>, EvalError> {
                 .and_then(|x| x.strip_suffix(']'))
         })
         .ok_or_else(|| EvalError::TypeMismatch {
-            detail: alloc::format!("INT[] literal {s:?} must be enclosed in '{{...}}'"),
+            detail: alloc::format!("malformed array literal: {s:?}"),
         })?;
     if inner.trim().is_empty() {
         return Ok(Vec::new());
@@ -930,7 +972,7 @@ fn decode_int_array_external(s: &str) -> Result<Vec<Option<i32>>, EvalError> {
                 p.parse::<i32>()
                     .map(Some)
                     .map_err(|_| EvalError::TypeMismatch {
-                        detail: alloc::format!("INT[] element {p:?} is not an i32"),
+                        detail: alloc::format!("invalid input syntax for type integer: {p:?}"),
                     })
             }
         })
@@ -948,7 +990,7 @@ fn decode_bigint_array_external(s: &str) -> Result<Vec<Option<i64>>, EvalError> 
                 .and_then(|x| x.strip_suffix(']'))
         })
         .ok_or_else(|| EvalError::TypeMismatch {
-            detail: alloc::format!("BIGINT[] literal {s:?} must be enclosed in '{{...}}'"),
+            detail: alloc::format!("BIGmalformed array literal: {s:?}"),
         })?;
     if inner.trim().is_empty() {
         return Ok(Vec::new());
@@ -963,7 +1005,7 @@ fn decode_bigint_array_external(s: &str) -> Result<Vec<Option<i64>>, EvalError> 
                 p.parse::<i64>()
                     .map(Some)
                     .map_err(|_| EvalError::TypeMismatch {
-                        detail: alloc::format!("BIGINT[] element {p:?} is not an i64"),
+                        detail: alloc::format!("invalid input syntax for type bigint: {p:?}"),
                     })
             }
         })

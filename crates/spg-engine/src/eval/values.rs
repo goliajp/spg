@@ -744,6 +744,55 @@ pub(crate) fn homogeneous_typed_array(vals: &[Value<'static>]) -> Option<Value<'
 /// SEVENTH site of the per-variant pattern this campaign has been unpicking: the
 /// INSERT literal path had its OWN array builder, and it did not know 2-D at all
 /// — an `ARRAY[ARRAY[…]]` in a VALUES list collapsed to text[]. One builder now.
+/// v7.39 (read01 round 92) — a 2-D array literal like `{{1,2},{3,4}}`. If the
+/// brace-stripped inner opens with `{`, split it into the top-level `{…}` rows
+/// (depth-aware, respecting nesting and double-quoted strings), else return None
+/// so the caller runs its 1-D path. The `ARRAY[[…]]` constructor already made
+/// 2-D values (round 75); the text-literal cast — the form pg_dump emits —
+/// never learned nested braces and split the whole thing on the first comma.
+pub(crate) fn split_2d_rows(s: &str) -> Option<Vec<alloc::string::String>> {
+    let trimmed = s.trim();
+    let inner = trimmed
+        .strip_prefix('{')
+        .and_then(|x| x.strip_suffix('}'))?
+        .trim();
+    if !inner.starts_with('{') {
+        return None;
+    }
+    let mut rows = alloc::vec::Vec::new();
+    let bytes = inner.as_bytes();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut in_quote = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_quote {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_quote = false;
+            }
+        } else {
+            match c {
+                b'"' => in_quote = true,
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                b',' if depth == 0 => {
+                    rows.push(inner[start..i].trim().to_string());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    rows.push(inner[start..].trim().to_string());
+    Some(rows)
+}
+
 pub(crate) fn build_2d_from_rows(rows: &[Value<'static>]) -> Option<Value<'static>> {
     if rows.is_empty() || !rows.iter().all(|v| array_len(v).is_some()) {
         return None;
