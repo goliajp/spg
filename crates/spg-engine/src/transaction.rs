@@ -251,8 +251,23 @@ impl Engine {
             // this tx's tombstones applied. A concurrently-taken key
             // fails the statement/COMMIT with 40001.
             {
-                let inserted_rows: Vec<Vec<spg_storage::Value<'static>>> =
-                    ws.inserted.iter().map(|(_, r)| r.values.clone()).collect();
+                // v7.39 (read01 round 85) — an insert this tx later tombstoned
+                // (INSERT then UPDATE / DELETE of the same row in one tx —
+                // `own_cycle`) is a phantom that never becomes visible, so it
+                // must NOT enter the uniqueness pre-check. Otherwise `INSERT (6);
+                // UPDATE … WHERE id=6` staged BOTH the original {6,60} and the
+                // update's new {6,99} as inserts, and the check saw two rows with
+                // key 6 and failed the NEXT statement with a spurious duplicate
+                // key — losing the row.
+                let own_cycle_set: alloc::collections::BTreeSet<
+                    spg_storage::row_header::RowId,
+                > = own_cycle.iter().copied().collect();
+                let inserted_rows: Vec<Vec<spg_storage::Value<'static>>> = ws
+                    .inserted
+                    .iter()
+                    .filter(|(rid, _)| !own_cycle_set.contains(rid))
+                    .map(|(_, r)| r.values.clone())
+                    .collect();
                 if !inserted_rows.is_empty()
                     && let Some(t_ro) = fresh.get(tname.as_str())
                 {
@@ -498,8 +513,19 @@ impl Engine {
                 let leftover = new_t.replay_tx_writeset(&phase1, v);
                 debug_assert!(leftover.is_empty(), "hard conflicts pre-checked");
                 let _ = new_t;
-                let inserted_rows: Vec<Vec<spg_storage::Value<'static>>> =
-                    ws.inserted.iter().map(|(_, r)| r.values.clone()).collect();
+                // v7.39 (read01 round 85) — exclude own insert-then-tombstone
+                // phantoms from the uniqueness pre-check (see the RC-rebase site
+                // above): an INSERT-then-UPDATE of the same key in one tx staged
+                // both versions as inserts and false-tripped a duplicate key.
+                let own_cycle_set: alloc::collections::BTreeSet<
+                    spg_storage::row_header::RowId,
+                > = own_cycle.iter().copied().collect();
+                let inserted_rows: Vec<Vec<spg_storage::Value<'static>>> = ws
+                    .inserted
+                    .iter()
+                    .filter(|(rid, _)| !own_cycle_set.contains(rid))
+                    .map(|(_, r)| r.values.clone())
+                    .collect();
                 if !inserted_rows.is_empty()
                     && let Some(t_ro) = fresh.get(tname)
                 {
