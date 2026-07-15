@@ -195,6 +195,7 @@ mod e2e_round_negative_ndigits_round98;
 mod e2e_trunc_negative_ndigits_round99;
 mod e2e_variadic_array_round100;
 mod e2e_to_char_tm_round101;
+mod e2e_interval_qualifier_round102;
 mod e2e_insert_then_update_round85;
 mod e2e_json_family_round76;
 mod e2e_named_args_round77;
