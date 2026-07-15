@@ -1604,6 +1604,13 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     // `FM` prefix suppresses the leading zeros / blank padding of the
     // one field it precedes.
     let mut fm = false;
+    // v7.39 (read01 round 101) — `TM` prefix = translation mode: emit the
+    // localized day/month name at its natural width (no blank padding). SPG's
+    // locale is C, where the localized names ARE the English ones this
+    // formatter already uses, so TM's only observable effect here is the
+    // trim — the same trim FM applies to a name field. Affects the one field
+    // it precedes; numeric fields ignore it (PG does too).
+    let mut tm = false;
     // v7.37 — the numeric value emitted by the immediately preceding field,
     // so a following `TH`/`th` renders its ordinal suffix (e.g. `DDth` → 21st).
     let mut last_num: Option<i128> = None;
@@ -1615,6 +1622,14 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
         // loop without emitting so it applies to whatever follows.
         if rest.starts_with(b"FM") {
             fm = true;
+            i += 2;
+            continue;
+        }
+        // v7.39 (read01 round 101) — `TM` (translation-mode) prefix. Case-
+        // insensitive like PG's other modifiers. Sets the natural-width flag
+        // for the next name field; without it `TMDay` emitted a literal "TM".
+        if rest.len() >= 2 && rest[..2].eq_ignore_ascii_case(b"TM") {
+            tm = true;
             i += 2;
             continue;
         }
@@ -1635,7 +1650,7 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
         // Blank-padded name fields (Day / Month / RM): FM strips the
         // trailing blanks; the width is the longest member (9 for
         // day/month names, 4 for roman months).
-        let pad = |width: usize| if fm { None } else { Some(width) };
+        let pad = |width: usize| if fm || tm { None } else { Some(width) };
         // Ordinal pending from the previous field (see `last_num`); `take`
         // clears it so a non-`TH` field drops the pending suffix.
         let pending_ord = last_num.take();
@@ -1861,6 +1876,7 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
         }
         last_num = next_num;
         fm = false;
+        tm = false;
         i += consumed;
     }
     Ok(Value::text(out))
