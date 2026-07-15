@@ -206,6 +206,7 @@ mod e2e_window_exclude_group_ties_round109;
 mod e2e_real_to_numeric_round110;
 mod e2e_xmlconcat_xmlagg_round111;
 mod e2e_real_to_int_round112;
+mod e2e_jsonb_scalar_cast_round113;
 mod e2e_insert_then_update_round85;
 mod e2e_json_family_round76;
 mod e2e_named_args_round77;
