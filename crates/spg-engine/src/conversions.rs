@@ -3096,6 +3096,37 @@ fn coerce_untyped_value(
     }
 }
 
+/// v7.39 (read01 round 90) — PG's 22P02 for a text value that will not parse as
+/// the target type: `invalid input syntax for type <T>: "<value>"`. The type
+/// word is PG's own spelling (`integer`, `double precision`, `boolean`, …).
+fn invalid_input_syntax(ty: &str, value: &str) -> EngineError {
+    EngineError::Eval(EvalError::TypeMismatch {
+        detail: alloc::format!("invalid input syntax for type {ty}: \"{value}\""),
+    })
+}
+
+/// v7.39 (read01 round 90) — PG splits a failed date/time text into two states:
+/// a date-shaped string whose fields are out of range (month 13, day 30) is
+/// 22008 `date/time field value out of range: "X"`; anything not date-shaped is
+/// 22007 `invalid input syntax for type <T>: "X"`. SPG's parsers return a single
+/// None, so classify by shape here — runs ONLY on an already-failed parse, so it
+/// only ever picks between two error strings, never changes behaviour. A string
+/// of date punctuation (digits, `- / : . space`, `+`, `T`) with at least one
+/// digit is treated as "well-formed but out of range".
+fn datetime_parse_error(ty: &str, s: &str) -> EngineError {
+    let t = s.trim();
+    let date_shaped = t.chars().any(|c| c.is_ascii_digit())
+        && t.chars().all(|c| {
+            c.is_ascii_digit() || matches!(c, '-' | '/' | ':' | '.' | ' ' | '+' | 'T' | 't')
+        });
+    let detail = if date_shaped {
+        alloc::format!("date/time field value out of range: \"{t}\"")
+    } else {
+        alloc::format!("invalid input syntax for type {ty}: \"{t}\"")
+    };
+    EngineError::Eval(EvalError::TypeMismatch { detail })
+}
+
 pub(crate) fn coerce_value(
     v: Value<'static>,
     expected: DataType,
@@ -3265,13 +3296,7 @@ pub(crate) fn coerce_value(
                     eval::parse_timestamp_literal(&s)
                         .and_then(|t| i32::try_from(t.div_euclid(86_400_000_000)).ok())
                 })
-                .ok_or_else(|| {
-                    EngineError::Eval(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "cannot parse {s:?} as DATE for column `{col_name}`"
-                        ),
-                    })
-                })?;
+                .ok_or_else(|| datetime_parse_error("date", &s))?;
             Some(Value::Date(d))
         }
         // v7.14.0 — MySQL DEFAULT clauses quote integer / float
@@ -3284,14 +3309,26 @@ pub(crate) fn coerce_value(
         // `'  256  '::int2` / `'  3.14  '::float8` (both of which route
         // through this generic coerce path, unlike `::int` / `::float`
         // that trim in the CAST helper) parse rather than error.
-        (Value::Text(s), DataType::SmallInt) => parse_pg_int(&s)
-            .and_then(|n| i16::try_from(n).ok())
-            .map(Value::SmallInt),
-        (Value::Text(s), DataType::Int) => parse_pg_int(&s)
-            .and_then(|n| i32::try_from(n).ok())
-            .map(Value::Int),
-        (Value::Text(s), DataType::BigInt) => parse_pg_int(&s).map(Value::BigInt),
-        (Value::Text(s), DataType::Float) => parse_float8(&s).map(Value::Float),
+        // v7.39 (read01 round 90) — a text value that fails to parse as the
+        // target numeric type is PG's 22P02 `invalid input syntax for type
+        // <T>: "<value>"`, not SPG's generic "type mismatch in column …". The
+        // Numeric arm above already worded it this way; these matched it now.
+        (Value::Text(s), DataType::SmallInt) => Some(Value::SmallInt(
+            parse_pg_int(&s)
+                .and_then(|n| i16::try_from(n).ok())
+                .ok_or_else(|| invalid_input_syntax("smallint", &s))?,
+        )),
+        (Value::Text(s), DataType::Int) => Some(Value::Int(
+            parse_pg_int(&s)
+                .and_then(|n| i32::try_from(n).ok())
+                .ok_or_else(|| invalid_input_syntax("integer", &s))?,
+        )),
+        (Value::Text(s), DataType::BigInt) => Some(Value::BigInt(
+            parse_pg_int(&s).ok_or_else(|| invalid_input_syntax("bigint", &s))?,
+        )),
+        (Value::Text(s), DataType::Float) => Some(Value::Float(
+            parse_float8(&s).ok_or_else(|| invalid_input_syntax("double precision", &s))?,
+        )),
         // v7.38 (read01, T-float4) — coerce to REAL narrows to f32.
         (Value::Int(n), DataType::Real) => Some(Value::Real(n as f32)),
         (Value::SmallInt(n), DataType::Real) => Some(Value::Real(f32::from(n))),
@@ -3312,7 +3349,12 @@ pub(crate) fn coerce_value(
             }))
         }
         (Value::Real(x), DataType::Float) => Some(Value::Float(f64::from(x))),
-        (Value::Text(s), DataType::Real) => s.trim().parse::<f32>().ok().map(Value::Real),
+        (Value::Text(s), DataType::Real) => Some(Value::Real(
+            s.trim()
+                .parse::<f32>()
+                .ok()
+                .ok_or_else(|| invalid_input_syntax("real", &s))?,
+        )),
         // PG boolin accepts any unambiguous prefix of true/false/yes/no,
         // plus on/off/1/0, case-insensitively with surrounding whitespace
         // trimmed. `o` alone is ambiguous (on vs off) → error.
@@ -3323,7 +3365,7 @@ pub(crate) fn coerce_value(
             "1" | "t" | "tr" | "tru" | "true" | "y" | "ye" | "yes" | "on" => {
                 Some(Value::Bool(true))
             }
-            _ => None,
+            _ => return Err(invalid_input_syntax("boolean", &s)),
         },
         // v7.17.0 Phase 3.P0-46 — MySQL TINYINT(1) (which Phase 4.3
         // classifies as DataType::Bool) is the storage shape every
@@ -4357,13 +4399,8 @@ pub(crate) fn coerce_value(
             Some(Value::TsVector(lexs))
         }
         (Value::Text(s), DataType::Timestamp | DataType::Timestamptz) => {
-            let t = eval::parse_timestamp_literal(&s).ok_or_else(|| {
-                EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "cannot parse {s:?} as TIMESTAMP for column `{col_name}`"
-                    ),
-                })
-            })?;
+            let t = eval::parse_timestamp_literal(&s)
+                .ok_or_else(|| datetime_parse_error("timestamp", &s))?;
             Some(Value::Timestamp(t))
         }
         // DATE ↔ TIMESTAMP convertibility (DATE → midnight,
