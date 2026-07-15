@@ -4795,6 +4795,30 @@ fn apply_function_dispatch(
                     out.extend(b.iter().copied());
                     Ok(Value::BigIntArray(out))
                 }
+                // v7.39 (read01 round 108) — 2-D matrices append their rows,
+                // like PG (and like the `||` operator). Without these arms two
+                // identically-typed matrices hit the catch-all and were
+                // wrongly reported as differing element types.
+                (Value::IntArray2D(a), Value::IntArray2D(b)) => {
+                    let mut out = a.clone();
+                    out.extend(b.iter().cloned());
+                    Ok(Value::IntArray2D(out))
+                }
+                (Value::BigIntArray2D(a), Value::BigIntArray2D(b)) => {
+                    let mut out = a.clone();
+                    out.extend(b.iter().cloned());
+                    Ok(Value::BigIntArray2D(out))
+                }
+                (Value::TextArray2D(a), Value::TextArray2D(b)) => {
+                    let mut out = a.clone();
+                    out.extend(b.iter().cloned());
+                    Ok(Value::TextArray2D(out))
+                }
+                (Value::BoolArray2D(a), Value::BoolArray2D(b)) => {
+                    let mut out = a.clone();
+                    out.extend(b.iter().cloned());
+                    Ok(Value::BoolArray2D(out))
+                }
                 (a, b) => Err(EvalError::TypeMismatch {
                     detail: format!(
                         "array_cat() element types differ: {:?} vs {:?}",

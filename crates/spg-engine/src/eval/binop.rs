@@ -2317,6 +2317,30 @@ fn text_concat(l: &Value<'static>, r: &Value<'static>) -> Value<'static> {
             out.extend(b.iter().copied());
             return Value::IntArray(out);
         }
+        // v7.39 (read01 round 108) — 2-D array `||` appends the second matrix's
+        // rows to the first (`ARRAY[[1,2]] || ARRAY[[3,4]]` → `{{1,2},{3,4}}`).
+        // Without these arms two matrices fell through to text_concat, giving
+        // the malformed `{{1,2}}{{3,4}}`.
+        (Value::IntArray2D(a), Value::IntArray2D(b)) => {
+            let mut out = a.clone();
+            out.extend(b.iter().cloned());
+            return Value::IntArray2D(out);
+        }
+        (Value::BigIntArray2D(a), Value::BigIntArray2D(b)) => {
+            let mut out = a.clone();
+            out.extend(b.iter().cloned());
+            return Value::BigIntArray2D(out);
+        }
+        (Value::TextArray2D(a), Value::TextArray2D(b)) => {
+            let mut out = a.clone();
+            out.extend(b.iter().cloned());
+            return Value::TextArray2D(out);
+        }
+        (Value::BoolArray2D(a), Value::BoolArray2D(b)) => {
+            let mut out = a.clone();
+            out.extend(b.iter().cloned());
+            return Value::BoolArray2D(out);
+        }
         (Value::IntArray(a), Value::Int(n)) => {
             let mut out = a.clone();
             out.push(Some(*n));
