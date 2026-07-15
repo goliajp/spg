@@ -315,6 +315,41 @@ fn handle_pg_simple_query(
             );
         }
     }
+    // v7.39 (read01 round 85 follow-up) — abort-firewall at the wire level,
+    // placed ahead of EVERY short-circuit (the pure-int `SELECT <n>` fast path,
+    // the SHOW / SET / COPY / canned handlers, and the main execute path). In an
+    // aborted transaction ('E') PG rejects every statement except a
+    // transaction-control command with 25P02; without this guard a short-circuit
+    // answered as if nothing were wrong (`SELECT 1`, `SHOW …`, `SET …`). A
+    // transaction-control command is let through to the engine firewall, which
+    // ends the block (and downgrades a COMMIT to a ROLLBACK).
+    if *tx_state == b'E' {
+        // Strip a trailing `;` before reading the verb — `COMMIT;` must still be
+        // recognised as transaction control, or the block would never end.
+        let mut vb = trim_ascii(sql_bytes);
+        if vb.last() == Some(&b';') {
+            vb = trim_ascii(&vb[..vb.len() - 1]);
+        }
+        let verb = vb
+            .split(|&b| b == b' ' || b == b'\t' || b == b'\n' || b == b'\r')
+            .next()
+            .unwrap_or(b"");
+        let is_tx_control = ci_eq(verb, b"commit")
+            || ci_eq(verb, b"rollback")
+            || ci_eq(verb, b"end")
+            || ci_eq(verb, b"abort");
+        if !is_tx_control {
+            send_error(
+                wbuf,
+                "25P02",
+                "current transaction is aborted, commands ignored until end of transaction block",
+            )?;
+            send_ready_for_query(wbuf, *tx_state)?;
+            stream.write_all(wbuf)?;
+            wbuf.clear();
+            return Ok(());
+        }
+    }
     // v7.37.x (SPGS PLUCK 红线) — ultra-hot early-out for pure-int
     // `SELECT <int>` BEFORE the per-query activity-registry update
     // (RWLock::write + String alloc per query). Liveness probes /
@@ -569,7 +604,13 @@ fn handle_pg_simple_query(
     // check would misfire — an autocommit read on one connection would be
     // dragged onto the write path (and see uncommitted data) merely because a
     // DIFFERENT connection had a transaction open.
-    let conn_in_tx = *tx_state == b'T';
+    // v7.39 (read01 round 85 follow-up) — 'T' is an open transaction, 'E' is an
+    // ABORTED one (a statement errored inside it). Both must route reads to the
+    // firewalled write path: 'T' so a SELECT sees the transaction's own writes
+    // (round 84), 'E' so a SELECT / SHOW in an aborted block is rejected with
+    // 25P02 instead of silently running against committed data. The read-only
+    // `&self` path checks neither.
+    let conn_in_tx = matches!(*tx_state, b'T' | b'E');
     if streaming_select_attempt.is_some() && !conn_in_tx {
         let engine_lock = state
             .engine
@@ -823,7 +864,12 @@ fn handle_pg_simple_query(
             .wait_event
             .store(1, std::sync::atomic::Ordering::Relaxed);
     }
-    let result = execute_with_role(state, sql, role, cancel, *tx_state == b'T');
+    // v7.39 (read01 round 85 follow-up) — a COMMIT issued in an aborted
+    // transaction is downgraded to a ROLLBACK by the engine firewall; PG tags
+    // the wire response ROLLBACK, not COMMIT. Capture the pre-execute abort
+    // state so the tag below can reflect the downgrade.
+    let was_aborted = *tx_state == b'E';
+    let result = execute_with_role(state, sql, role, cancel, matches!(*tx_state, b'T' | b'E'));
     conn_state
         .wait_event
         .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -873,7 +919,15 @@ fn handle_pg_simple_query(
             send_command_complete_select_count(wbuf, n)?;
         }
         Ok(QueryResult::CommandOk { affected, .. }) => {
-            let tag = command_tag(sql, affected);
+            // A COMMIT/END that ran in an aborted tx was rolled back — tag it so.
+            let verb = sql.split_ascii_whitespace().next().unwrap_or("");
+            let tag = if was_aborted
+                && (verb.eq_ignore_ascii_case("commit") || verb.eq_ignore_ascii_case("end"))
+            {
+                "ROLLBACK".to_string()
+            } else {
+                command_tag(sql, affected)
+            };
             send_command_complete(wbuf, &tag)?;
             // Sync tx state from engine after writes.
             *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
@@ -1059,7 +1113,7 @@ fn handle_pg_simple_query_one_into_wbuf(
     conn_state
         .wait_event
         .store(1, std::sync::atomic::Ordering::Relaxed);
-    let result = execute_with_role(state, sql, role, cancel, *tx_state == b'T');
+    let result = execute_with_role(state, sql, role, cancel, matches!(*tx_state, b'T' | b'E'));
     conn_state
         .wait_event
         .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -4509,7 +4563,7 @@ fn handle_copy_to_stdout(
     // does not cross the COPY boundary); bulk-export paths get
     // `CancelToken::none()`. SPG_QUERY_TIMEOUT_MS / server-wide cap
     // still applies via the server-state watchdog.
-    let result = execute_with_role(state, &sql, role, CancelToken::none(), *tx_state == b'T');
+    let result = execute_with_role(state, &sql, role, CancelToken::none(), matches!(*tx_state, b'T' | b'E'));
     let (columns, rows) = match result {
         Ok(QueryResult::Rows { columns, rows }) => (columns, rows),
         Ok(QueryResult::CommandOk { .. }) => {
