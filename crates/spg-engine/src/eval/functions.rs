@@ -5785,8 +5785,13 @@ fn apply_function_dispatch(
                     detail: "date_bin(): stride must be positive".into(),
                 });
             }
+            // v7.39 (read01 round 114) — PG's date_bin resolves a `date` arg to
+            // the timestamptz overload (like date_trunc), so a date is UTC
+            // midnight micros. The result type is tagged timestamptz in
+            // `describe`, giving the `+00` on the way out.
             let ts_us = match &args[1] {
                 Value::Timestamp(t) => *t,
+                Value::Date(d) => i64::from(*d) * 86_400_000_000,
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
@@ -5798,6 +5803,7 @@ fn apply_function_dispatch(
             };
             let origin_us = match &args[2] {
                 Value::Timestamp(t) => *t,
+                Value::Date(d) => i64::from(*d) * 86_400_000_000,
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(

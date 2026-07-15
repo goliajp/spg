@@ -554,11 +554,15 @@ fn function_return_shape(
         // the timestamp they were HANDED (PG has a timestamptz overload of
         // each), so a truncated timestamptz keeps its `+00` on the way out.
         // Pinning them to Timestamp silently dropped the offset.
+        // v7.39 (read01 round 114) — a `date` argument resolves to PG's
+        // *timestamptz* overload (timestamptz is date's preferred implicit
+        // cast), so `date_trunc('q', date '…')` is timestamptz (`…+00`), not a
+        // plain timestamp. Only a bare `timestamp` stays timestamp.
         "date_trunc" | "date_bin" => {
             let src = args.get(1)?;
             let ty = describe_expr(src, schema_cols)
                 .map_or(DataType::Timestamp, |s| match s.ty {
-                    DataType::Timestamptz => DataType::Timestamptz,
+                    DataType::Timestamptz | DataType::Date => DataType::Timestamptz,
                     _ => DataType::Timestamp,
                 });
             (ty, true)
