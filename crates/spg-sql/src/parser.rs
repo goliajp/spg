@@ -18604,6 +18604,15 @@ impl Parser {
                         }
                         _ => None,
                     };
+                    // v7.39 (read01 round 100) — `VARIADIC <array>` spreads an
+                    // array's elements into a variadic call's trailing args
+                    // (`concat_ws(',', VARIADIC ARRAY[…])`). VARIADIC isn't
+                    // reserved, so it arrives as a bare ident before the arg.
+                    let is_variadic = this_name.is_none()
+                        && matches!(&self.tokens[self.pos], Token::Ident(s) if s.eq_ignore_ascii_case("variadic"));
+                    if is_variadic {
+                        self.advance();
+                    }
                     let arg = self.parse_expr(0)?;
                     args.push(match &this_name {
                         // The callee's parameter names decide the slot, and a
@@ -18613,6 +18622,7 @@ impl Parser {
                             name: n.clone(),
                             expr: Box::new(arg),
                         },
+                        None if is_variadic => Expr::Variadic(Box::new(arg)),
                         None => arg,
                     });
                     arg_names.push(this_name);

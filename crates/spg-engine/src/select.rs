@@ -1392,6 +1392,7 @@ impl Engine {
         }
         match e {
             Expr::NamedArg { expr, .. } => self.resolve_expr_subqueries(expr, cancel)?,
+            Expr::Variadic(expr) => self.resolve_expr_subqueries(expr, cancel)?,
             Expr::AggregateOrdered { call, order_by, .. } => {
                 self.resolve_expr_subqueries(call, cancel)?;
                 for o in order_by.iter_mut() {
@@ -6927,7 +6928,7 @@ fn top_level_srf_output(
 /// `unnest()` projection emits. NULL → empty list (PG: `unnest(NULL)
 /// = (no rows)`). Non-array values fall through to a type-mismatch
 /// error.
-fn array_value_to_elements(v: &Value) -> Result<Vec<Value<'static>>, EngineError> {
+pub(crate) fn array_value_to_elements(v: &Value) -> Result<Vec<Value<'static>>, EngineError> {
     match v {
         Value::Null => Ok(Vec::new()),
         Value::TextArray(items) => Ok(items

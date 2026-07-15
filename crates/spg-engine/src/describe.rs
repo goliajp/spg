@@ -868,6 +868,7 @@ fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
     f(e);
     match e {
         Expr::NamedArg { expr, .. } => walk_expr(expr, f),
+        Expr::Variadic(expr) => walk_expr(expr, f),
         Expr::AggregateOrdered { call, order_by, .. } => {
             walk_expr(call, f);
             for o in order_by {

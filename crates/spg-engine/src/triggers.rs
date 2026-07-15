@@ -1520,6 +1520,7 @@ fn substitute_locals(expr: &mut Expr, locals: &BTreeMap<String, Value>) {
     }
     match expr {
         Expr::NamedArg { expr, .. } => substitute_locals(expr, locals),
+        Expr::Variadic(expr) => substitute_locals(expr, locals),
         Expr::AggregateOrdered { call, order_by, .. } => {
             substitute_locals(call, locals);
             for o in order_by.iter_mut() {
@@ -1661,6 +1662,7 @@ fn substitute_new_old(
     }
     match expr {
         Expr::NamedArg { expr, .. } => substitute_new_old(expr, new_row, old_row, columns)?,
+        Expr::Variadic(expr) => substitute_new_old(expr, new_row, old_row, columns)?,
         Expr::AggregateOrdered { call, order_by, .. } => {
             substitute_new_old(call, new_row, old_row, columns)?;
             for o in order_by.iter_mut() {

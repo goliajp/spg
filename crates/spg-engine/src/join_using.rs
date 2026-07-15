@@ -298,6 +298,7 @@ fn col_ref(qual: &str, name: &str) -> Expr {
 fn rewrite_unqualified(e: &mut Expr, pick: &BTreeMap<String, Expr>) {
     match e {
         Expr::NamedArg { expr, .. } => rewrite_unqualified(expr, pick),
+        Expr::Variadic(expr) => rewrite_unqualified(expr, pick),
         Expr::Column(c) => {
             if c.qualifier.is_none()
                 && let Some(replacement) = pick.get(&c.name)

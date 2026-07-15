@@ -2783,6 +2783,12 @@ pub enum Expr {
         name: String,
         expr: Box<Expr>,
     },
+    /// v7.39 (read01 round 100) — `VARIADIC <array>` as the last argument of a
+    /// variadic function call (`concat_ws(',', VARIADIC ARRAY[…])`). The inner
+    /// expression evaluates to an array whose elements the evaluator splices
+    /// into the call as individual trailing arguments. Appears only inside a
+    /// `FunctionCall`'s argument list.
+    Variadic(Box<Expr>),
     /// v6.1.1 — `$N` parameter placeholder for the extended query
     /// protocol. The number is 1-based per PostgreSQL convention.
     /// Evaluation looks up `params[N-1]` from the prepared-statement
@@ -5610,6 +5616,7 @@ impl fmt::Display for Expr {
             Self::Placeholder(n) => write!(f, "${n}"),
             // Round-trips as the spelling PG's docs lead with.
             Self::NamedArg { name, expr } => write!(f, "{} := {expr}", quote_ident(name)),
+            Self::Variadic(expr) => write!(f, "VARIADIC {expr}"),
             Self::Binary { lhs, op, rhs } => write!(f, "({lhs} {op} {rhs})"),
             Self::Unary { op, expr } => match op {
                 UnOp::Not => write!(f, "(NOT {expr})"),
