@@ -18202,7 +18202,15 @@ impl Parser {
                 self.advance();
                 Ok(FrameExclusion::CurrentRow)
             }
+            // v7.39 (read01 round 109) — GROUP is a reserved keyword token, so
+            // `EXCLUDE GROUP` arrives as `Token::Group`, not `Ident("group")`.
+            // Without this arm it fell to the catch-all, whose message
+            // self-contradictingly listed GROUP as expected.
             Token::Ident(s) if s.eq_ignore_ascii_case("group") => {
+                self.advance();
+                Ok(FrameExclusion::Group)
+            }
+            Token::Group => {
                 self.advance();
                 Ok(FrameExclusion::Group)
             }

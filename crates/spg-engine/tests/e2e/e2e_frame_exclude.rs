@@ -64,11 +64,24 @@ fn exclude_current_row_count() {
          AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM fx ORDER BY id",
     );
     assert_eq!(got, vec![2, 2, 2]);
-    // GROUP / TIES honestly error.
-    assert!(
-        e.execute(
-            "SELECT sum(v) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING EXCLUDE GROUP) FROM fx"
+    // v7.39 (read01 round 109) — EXCLUDE GROUP now works. With distinct ids each
+    // row is its own peer group, so it matches EXCLUDE CURRENT ROW here:
+    // running sum minus the current row → NULL, 10, 30 (PG18-verified).
+    let out = match e
+        .execute(
+            "SELECT sum(v) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING EXCLUDE GROUP) \
+             FROM fx ORDER BY id",
         )
-        .is_err()
-    );
+        .unwrap()
+    {
+        spg_engine::QueryResult::Rows { rows, .. } => rows
+            .iter()
+            .map(|r| match &r.values[0] {
+                spg_storage::Value::Null => "NULL".to_string(),
+                v => spg_engine::eval::value_to_text(v),
+            })
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(out, vec!["NULL", "10", "30"]);
 }

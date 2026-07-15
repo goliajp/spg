@@ -309,6 +309,14 @@ pub(crate) fn compute_window_partition(
             #[allow(clippy::needless_range_loop)]
             for i in 0..slice.len() {
                 let (lo, hi) = frame_bounds_for_row(&eff, i, slice)?;
+                // v7.39 (read01 round 109) — the current row's peer group, for
+                // EXCLUDE GROUP / TIES (only computed when one is in effect).
+                let (peer_start, peer_end) =
+                    if matches!(exclude, FrameExclusion::Group | FrameExclusion::Ties) {
+                        (peer_group_start(slice, i), peer_group_end(slice, i))
+                    } else {
+                        (0, 0)
+                    };
                 let mut sum: f64 = 0.0;
                 // v7.37.16 — exact NUMERIC accumulator for sum/avg over a
                 // Numeric frame (was deferred → NULL). Only written when a
@@ -333,9 +341,9 @@ pub(crate) fn compute_window_partition(
                 let mut row_count: i64 = 0;
                 if lo <= hi {
                     for j in lo..=hi {
-                        // EXCLUDE CURRENT ROW drops the current row
-                        // from the aggregate frame.
-                        if exclude == FrameExclusion::CurrentRow && j == i {
+                        // EXCLUDE {CURRENT ROW | GROUP | TIES} drops the current
+                        // row and/or its peer group from the aggregate frame.
+                        if frame_row_excluded(exclude, j, i, peer_start, peer_end) {
                             continue;
                         }
                         // v7.37 D.40 — a FILTER (WHERE …) predicate that this peer
@@ -580,42 +588,49 @@ pub(crate) fn compute_window_partition(
                 0
             };
             let eff = effective_frame(frame, ordered)?;
+            // v7.39 (read01 round 109) — value functions honour EXCLUDE too. For
+            // the default NO OTHERS the fast path (values[lo] / values[hi] / …)
+            // is unchanged; any exclusion filters the frame indices first.
+            let exclude = frame_exclusion(frame)?;
             for i in 0..slice.len() {
                 let (lo, hi) = frame_bounds_for_row(&eff, i, slice)?;
                 let (_, _, idx) = &slice[i];
-                let v = if lo > hi {
+                let (peer_start, peer_end) =
+                    if matches!(exclude, FrameExclusion::Group | FrameExclusion::Ties) {
+                        (peer_group_start(slice, i), peer_group_end(slice, i))
+                    } else {
+                        (0, 0)
+                    };
+                // The frame index list this row sees, with EXCLUDE applied.
+                let frame_idxs: Vec<usize> = if lo > hi {
+                    Vec::new()
+                } else if exclude == FrameExclusion::NoOthers {
+                    (lo..=hi).collect()
+                } else {
+                    (lo..=hi)
+                        .filter(|&j| !frame_row_excluded(exclude, j, i, peer_start, peer_end))
+                        .collect()
+                };
+                let pick = |j: usize| values[j].clone();
+                let v = if frame_idxs.is_empty() {
                     Value::Null
                 } else if ignore_nulls && matches!(lower.as_str(), "first_value" | "last_value") {
-                    // v6.4.2 — IGNORE NULLS: skip NULL cells when
-                    // selecting the boundary value within the frame.
-                    if lower == "first_value" {
-                        (lo..=hi)
-                            .find_map(|j| {
-                                let v = &values[j];
-                                (!v.is_null()).then(|| v.clone())
-                            })
-                            .unwrap_or(Value::Null)
+                    // v6.4.2 — IGNORE NULLS: skip NULL cells when selecting the
+                    // boundary value within the (post-exclude) frame.
+                    let found = if lower == "first_value" {
+                        frame_idxs.iter().copied().find(|&j| !values[j].is_null())
                     } else {
-                        (lo..=hi)
-                            .rev()
-                            .find_map(|j| {
-                                let v = &values[j];
-                                (!v.is_null()).then(|| v.clone())
-                            })
-                            .unwrap_or(Value::Null)
-                    }
+                        frame_idxs.iter().rev().copied().find(|&j| !values[j].is_null())
+                    };
+                    found.map(pick).unwrap_or(Value::Null)
                 } else {
                     match lower.as_str() {
-                        "first_value" => values[lo].clone(),
-                        "last_value" => values[hi].clone(),
-                        "nth_value" => {
-                            let pos = lo + nth - 1;
-                            if pos > hi {
-                                Value::Null
-                            } else {
-                                values[pos].clone()
-                            }
-                        }
+                        "first_value" => pick(frame_idxs[0]),
+                        "last_value" => pick(*frame_idxs.last().unwrap()),
+                        "nth_value" => frame_idxs
+                            .get(nth - 1)
+                            .copied()
+                            .map_or(Value::Null, pick),
                         _ => unreachable!(),
                     }
                 };
@@ -727,17 +742,28 @@ pub(crate) fn compute_window_partition(
 /// unordered ⇒ ROWS UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING.
 /// Single-bound shorthand (e.g. `ROWS 5 PRECEDING`) normalises
 /// end → CURRENT ROW per the PG spec.
-/// The frame's EXCLUDE mode. GROUP / TIES need peer-group awareness
-/// that the aggregate loop doesn't have yet, so they error honestly;
-/// CURRENT ROW and the default NO OTHERS are supported.
+/// The frame's EXCLUDE mode.
 fn frame_exclusion(frame: Option<&WindowFrame>) -> Result<FrameExclusion, EngineError> {
-    let ex = frame.map_or(FrameExclusion::NoOthers, |f| f.exclude);
-    if matches!(ex, FrameExclusion::Group | FrameExclusion::Ties) {
-        return Err(EngineError::Unsupported(
-            "EXCLUDE GROUP / TIES is not supported yet (only CURRENT ROW / NO OTHERS)".into(),
-        ));
+    Ok(frame.map_or(FrameExclusion::NoOthers, |f| f.exclude))
+}
+
+/// v7.39 (read01 round 109) — is frame row `j` excluded, given the current row
+/// `i` and its peer group `[peer_start, peer_end]` (rows with the same ORDER BY
+/// key)? CURRENT ROW drops `i`; GROUP drops `i` and all its peers; TIES drops
+/// the peers but keeps `i`.
+fn frame_row_excluded(
+    exclude: FrameExclusion,
+    j: usize,
+    i: usize,
+    peer_start: usize,
+    peer_end: usize,
+) -> bool {
+    match exclude {
+        FrameExclusion::NoOthers => false,
+        FrameExclusion::CurrentRow => j == i,
+        FrameExclusion::Group => peer_start <= j && j <= peer_end,
+        FrameExclusion::Ties => peer_start <= j && j <= peer_end && j != i,
     }
-    Ok(ex)
 }
 
 fn effective_frame(
