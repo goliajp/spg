@@ -523,8 +523,12 @@ fn handle_pg_simple_query(
                     stream, state, role, &table, cols.as_deref(), &opts, tx_state,
                 )?;
             }
-            CopyIntent::To(table) => {
-                handle_copy_to_stdout(stream, state, role, &table, tx_state)?;
+            CopyIntent::To(table, opts) => {
+                let sql = format!("SELECT * FROM {table}");
+                handle_copy_to_stdout(stream, state, role, &sql, &opts, tx_state)?;
+            }
+            CopyIntent::ToQuery(query, opts) => {
+                handle_copy_to_stdout(stream, state, role, &query, &opts, tx_state)?;
             }
         }
         send_ready_for_query(wbuf, *tx_state)?;
@@ -3948,7 +3952,12 @@ enum CopyIntent {
     // parsed-and-discarded) so the row-arity check knows how many values each
     // COPY row must carry and can name a missing column.
     From(String, Option<Vec<String>>, CopyOptions),
-    To(String),
+    // v7.39 (read01 round 94) — `To` now carries the parsed options (was
+    // silently dropped: `COPY t TO STDOUT WITH (FORMAT csv, HEADER)` streamed
+    // plain text). `ToQuery` is the `COPY (<query>) TO STDOUT` form — the
+    // inner SQL is run and its result set streamed in COPY format.
+    To(String, CopyOptions),
+    ToQuery(String, CopyOptions),
 }
 
 /// v6.4.7 — `COPY FROM STDIN WITH (...)` option parser. PG-style
@@ -3980,6 +3989,11 @@ struct CopyOptions {
     /// `NULL 'token'` — the text that decodes to NULL. CSV default is the
     /// empty unquoted field; text default is `\N`. v7.39 (read01 round 91).
     pub null_string: Option<String>,
+    /// `HEADER` on the `TO STDOUT` direction — emit a leading row of column
+    /// names (the FROM direction reuses `skip` to drop it instead). v7.39
+    /// (read01 round 94). Kept separate from `skip` because the same option
+    /// word means "emit" going out and "drop" coming in.
+    pub header: bool,
 }
 
 /// Detects `COPY <table> [(col1, col2, …)] FROM STDIN [WITH
@@ -4009,6 +4023,13 @@ fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
     // mistakes `(col1,` for the FROM direction word.
     let bytes = rest.as_bytes();
     let mut i = skip_ws_bytes(bytes, 0);
+    // v7.39 (read01 round 94) — `COPY (<query>) TO STDOUT`. When the first
+    // token after COPY is `(` there is no table name; the parens wrap a
+    // SELECT/VALUES/WITH whose result set is streamed. (The `COPY t (a,b)`
+    // column-list form has a table name first, so it never lands here.)
+    if bytes.get(i) == Some(&b'(') {
+        return parse_copy_query_intent(trimmed, rest, i);
+    }
     // Table name (may be schema-qualified `s.t`, MySQL-style
     // backtick-quoted, or PG double-quoted). Read until the next
     // whitespace OR `(`.
@@ -4093,9 +4114,65 @@ fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
             let opts = parse_copy_options(trimmed);
             Some(CopyIntent::From(table, column_list, opts))
         }
-        ("to", "stdout") => Some(CopyIntent::To(table)),
+        ("to", "stdout") => {
+            let opts = parse_copy_options(trimmed);
+            Some(CopyIntent::To(table, opts))
+        }
         _ => None,
     }
+}
+
+/// v7.39 (read01 round 94) — parse `COPY (<query>) TO STDOUT [WITH (…)]`.
+/// `lparen` is the byte offset of the opening `(` within `rest` (the
+/// lower-cased tail after `copy `); `trimmed` is the original-case SQL so
+/// the inner query keeps its case. Returns `None` (falls through to the
+/// normal parse-error path) if the parens are unbalanced or `TO STDOUT`
+/// doesn't follow.
+fn parse_copy_query_intent(trimmed: &str, rest: &str, lparen: usize) -> Option<CopyIntent> {
+    let bytes = rest.as_bytes();
+    // Find the matching close paren for the wrapping `(`.
+    let mut depth = 0usize;
+    let mut j = lparen;
+    let mut close = None;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(j);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    let close = close?;
+    // Inner query, taken from the ORIGINAL-case SQL (offsets map through the
+    // shared `copy ` prefix length).
+    let prefix = trimmed.len() - rest.len();
+    let query = trimmed[prefix + lparen + 1..prefix + close].trim().to_string();
+    if query.is_empty() {
+        return None;
+    }
+    // After the `)` we require `TO STDOUT`; anything else (e.g. `TO '/file'`)
+    // falls through to the engine, which reports it honestly.
+    let after = &rest[close + 1..];
+    let lower_after = after.trim_start();
+    let mut it = lower_after.split_ascii_whitespace();
+    if !matches!(it.next(), Some("to")) {
+        return None;
+    }
+    // `stdout` may be trailed by `;` or a `WITH (...)` clause.
+    let ep = it.next().unwrap_or("");
+    if ep.trim_end_matches(';') != "stdout" {
+        return None;
+    }
+    // Options come from the tail after the wrapping `)` so the query's own
+    // parens/`WITH` CTE can't be mistaken for the COPY option list.
+    let opts = parse_copy_options(&trimmed[prefix + close + 1..]);
+    Some(CopyIntent::ToQuery(query, opts))
 }
 
 fn skip_ws_bytes(bytes: &[u8], mut i: usize) -> usize {
@@ -4149,6 +4226,7 @@ fn parse_copy_options(sql: &str) -> CopyOptions {
             "header" => {
                 if val.is_empty() || val == "true" || val == "on" {
                     opts.skip = opts.skip.max(1);
+                    opts.header = true;
                 }
             }
             "delimiter" => {
@@ -4698,17 +4776,17 @@ fn handle_copy_to_stdout(
     stream: &mut dyn ReadWrite,
     state: &Arc<ServerState>,
     role: Role,
-    table: &str,
+    sql: &str,
+    opts: &CopyOptions,
     tx_state: &mut u8,
 ) -> std::io::Result<()> {
     let _ = role.can_read(); // every role can read
-    let sql = format!("SELECT * FROM {table}");
     // v7.17.0 Phase 2.3 — COPY TO STDOUT does not honor
     // `statement_timeout` in this phase (the existing settings map
     // does not cross the COPY boundary); bulk-export paths get
     // `CancelToken::none()`. SPG_QUERY_TIMEOUT_MS / server-wide cap
     // still applies via the server-state watchdog.
-    let result = execute_with_role(state, &sql, role, CancelToken::none(), matches!(*tx_state, b'T' | b'E'));
+    let result = execute_with_role(state, sql, role, CancelToken::none(), matches!(*tx_state, b'T' | b'E'));
     let (columns, rows) = match result {
         Ok(QueryResult::Rows { columns, rows }) => (columns, rows),
         Ok(QueryResult::CommandOk { .. }) => {
@@ -4740,21 +4818,44 @@ fn handle_copy_to_stdout(
         .read()
         .map(|e| (e.render_style(), e.session_tz()))
         .unwrap_or((Default::default(), spg_engine::SessionTz::Utc));
-    for row in &rows {
-        let mut line = String::new();
-        for (i, v) in row.values.iter().enumerate() {
-            if i > 0 {
-                line.push('\t');
-            }
-            line.push_str(&encode_copy_cell(
-                v,
-                columns.get(i).map(|c| c.ty),
-                &wire_style,
-                &wire_tz,
-            ));
+    // v7.39 (read01 round 94) — honor WITH (FORMAT csv, HEADER, DELIMITER,
+    // NULL). Format-specific escaping lives in the engine's copy encoders so
+    // the TO path can't drift from the FROM path; the wire only builds the
+    // per-cell Option<String> (None = SQL NULL) and picks text vs csv.
+    let is_csv = opts.format_csv;
+    let delimiter = opts
+        .csv_delimiter
+        .unwrap_or(if is_csv { ',' } else { '\t' });
+    let quote = opts.csv_quote.unwrap_or('"');
+    let null_str = opts
+        .null_string
+        .clone()
+        .unwrap_or_else(|| if is_csv { String::new() } else { "\\N".to_string() });
+    let encode_line = |cells: &[Option<String>]| -> String {
+        if is_csv {
+            spg_engine::copy::encode_copy_csv_cells(cells, delimiter, quote, &null_str)
+        } else {
+            spg_engine::copy::encode_copy_text_cells_opts(cells, delimiter, &null_str)
         }
+    };
+    let mut send_line = |stream: &mut dyn ReadWrite, cells: &[Option<String>]| -> std::io::Result<()> {
+        let mut line = encode_line(cells);
         line.push('\n');
-        send_msg(stream, b'd', line.as_bytes())?;
+        send_msg(stream, b'd', line.as_bytes())
+    };
+    if opts.header {
+        let names: Vec<Option<String>> =
+            columns.iter().map(|c| Some(c.name.clone())).collect();
+        send_line(stream, &names)?;
+    }
+    for row in &rows {
+        let cells: Vec<Option<String>> = row
+            .values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| copy_cell_raw(v, columns.get(i).map(|c| c.ty), &wire_style, &wire_tz))
+            .collect();
+        send_line(stream, &cells)?;
     }
     send_msg(stream, b'c', &[])?; // CopyDone
     send_command_complete(stream, &format!("COPY {n}"))?;
@@ -4763,35 +4864,35 @@ fn handle_copy_to_stdout(
     Ok(())
 }
 
-/// Inverse of decode_copy_text_row's cell decode: render a Value
-/// as a tab-safe text cell with `\N` for NULL.
-/// v7.38 (T-tstz Phase 1) — `ty` is the column's declared type. It exists only
-/// to tell `timestamptz` from `timestamp`: PG's COPY renders the former with
-/// its offset (`2024-01-15 10:30:00+00`), the latter without. Every other
-/// value renders identically either way.
-fn encode_copy_cell(
+/// v7.39 (read01 round 94) — render a value as the RAW COPY cell text
+/// (`None` for SQL NULL), BEFORE any format-specific escaping. The engine's
+/// `encode_copy_{text,csv}_cells` apply the delimiter/quote/null escaping on
+/// top, so keeping escaping out of here is what lets the same cell feed both
+/// the text and csv encoders without double-escaping.
+///
+/// `ty` exists only to tell `timestamptz` from `timestamp`: PG's COPY renders
+/// the former with its offset (`2024-01-15 10:30:00+00`), the latter without.
+fn copy_cell_raw(
     v: &spg_storage::Value,
     ty: Option<spg_storage::DataType>,
     style: &spg_engine::eval::RenderStyle,
     tz: &spg_engine::SessionTz,
-) -> String {
+) -> Option<String> {
     use spg_storage::Value;
-    match v {
-        Value::Null => "\\N".to_string(),
+    let s = match v {
+        Value::Null => return None,
         Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
         Value::SmallInt(n) => n.to_string(),
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
         Value::Float(x) => spg_engine::eval::format_float_styled(*x, style),
         Value::Real(x) => spg_engine::eval::format_real_styled(*x, style),
-        Value::Text(s) | Value::Json(s) => escape_copy_cell(s),
+        Value::Text(s) | Value::Json(s) => s.to_string(),
         // v7.39 (bpchar epic) — COPY emits the padded stored form.
-        Value::BpChar(s) => escape_copy_cell(s),
+        Value::BpChar(s) => s.to_string(),
         // v7.39 (FTS) — canonical text forms for COPY too.
-        Value::TsVector(lexs) => {
-            escape_copy_cell(&spg_engine::eval::format_tsvector(lexs))
-        }
-        Value::TsQuery(ast) => escape_copy_cell(&spg_engine::eval::format_tsquery(ast)),
+        Value::TsVector(lexs) => spg_engine::eval::format_tsvector(lexs),
+        Value::TsQuery(ast) => spg_engine::eval::format_tsquery(ast),
         Value::Numeric {
             scaled,
             scale,
@@ -4813,51 +4914,30 @@ fn encode_copy_cell(
         } => spg_engine::eval::format_interval_styled(*months, *days, *micros, style),
         Value::Vector(v) => {
             let parts: Vec<String> = v.iter().map(std::string::ToString::to_string).collect();
-            escape_copy_cell(&format!("[{}]", parts.join(",")))
+            format!("[{}]", parts.join(","))
         }
-        // v6.0.1: COPY OUT a `VECTOR(N) USING SQ8` column —
-        // dequantise to f32 so the COPY text stream stays
-        // pgvector-compatible.
+        // v6.0.1: COPY OUT a `VECTOR(N) USING SQ8` column — dequantise to f32
+        // so the COPY text stream stays pgvector-compatible.
         Value::Sq8Vector(q) => {
             let parts: Vec<String> = spg_storage::quantize::dequantize(q)
                 .iter()
                 .map(std::string::ToString::to_string)
                 .collect();
-            escape_copy_cell(&format!("[{}]", parts.join(",")))
+            format!("[{}]", parts.join(","))
         }
-        // v6.0.3: COPY OUT for `VECTOR(N) USING HALF` — bit-exact
-        // dequantise to f32.
+        // v6.0.3: COPY OUT for `VECTOR(N) USING HALF` — bit-exact dequantise.
         Value::HalfVector(h) => {
             let parts: Vec<String> = h
                 .to_f32_vec()
                 .iter()
                 .map(std::string::ToString::to_string)
                 .collect();
-            escape_copy_cell(&format!("[{}]", parts.join(",")))
+            format!("[{}]", parts.join(","))
         }
         // v7.5.0 — Value is #[non_exhaustive].
-        other => escape_copy_cell(&spg_engine::eval::value_to_text(other)),
-    }
-}
-
-/// Escape a text cell per PG COPY text-format rules: backslash,
-/// tab, newline, CR, and a literal `\b`/`\f`/`\v` get the standard
-/// escape sequences.
-fn escape_copy_cell(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            '\u{0b}' => out.push_str("\\v"),
-            c => out.push(c),
-        }
-    }
-    out
+        other => spg_engine::eval::value_to_text(other),
+    };
+    Some(s)
 }
 
 // ---- Auth helpers (cleartext + SCRAM) ----
@@ -6871,8 +6951,36 @@ mod tests {
     fn parse_copy_to_stdout_with_column_list() {
         let sql = "COPY t (a, b) TO STDOUT";
         match parse_copy_intent(sql) {
-            Some(CopyIntent::To(table)) => assert_eq!(table, "t"),
+            Some(CopyIntent::To(table, _)) => assert_eq!(table, "t"),
             other => panic!("expected To(t), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_copy_query_to_stdout() {
+        // v7.39 (read01 round 94) — the parenthesised query form.
+        let sql = "COPY (SELECT a, b FROM t WHERE a > 1 ORDER BY a) TO STDOUT WITH (FORMAT csv, HEADER)";
+        match parse_copy_intent(sql) {
+            Some(CopyIntent::ToQuery(query, opts)) => {
+                assert_eq!(query, "SELECT a, b FROM t WHERE a > 1 ORDER BY a");
+                assert!(opts.format_csv);
+                assert!(opts.header);
+            }
+            other => panic!("expected ToQuery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_copy_query_with_cte_not_confused_by_inner_with() {
+        // The inner `WITH` CTE must not be mistaken for the COPY option list.
+        let sql = "COPY (WITH x AS (SELECT 1 AS n) SELECT n FROM x) TO STDOUT";
+        match parse_copy_intent(sql) {
+            Some(CopyIntent::ToQuery(query, opts)) => {
+                assert_eq!(query, "WITH x AS (SELECT 1 AS n) SELECT n FROM x");
+                assert!(!opts.format_csv);
+                assert!(!opts.header);
+            }
+            other => panic!("expected ToQuery, got {other:?}"),
         }
     }
 

@@ -68,6 +68,12 @@ pub enum Statement {
     CopyTo {
         table: String,
         columns: Option<Vec<String>>,
+        /// v7.39 (read01 round 94) — `COPY (<query>) TO STDOUT`: an
+        /// arbitrary SELECT/VALUES/CTE (a whole [`Statement`], so set-ops and
+        /// VALUES ride through unchanged) whose result set is streamed in COPY
+        /// format. `Some` overrides `table`/`columns` (which are empty then);
+        /// `None` is the classic `COPY <table> …` shape.
+        query: Option<Box<Statement>>,
         /// v7.37.x — `WITH (FORMAT csv, HEADER, DELIMITER, NULL, QUOTE)`
         /// and the legacy `WITH CSV HEADER …` spelling. Default =
         /// text format, no header (bare `COPY … TO STDOUT`).
@@ -3682,11 +3688,16 @@ impl fmt::Display for Statement {
             Self::CopyTo {
                 table,
                 columns,
+                query,
                 options,
             } => {
-                write!(f, "COPY {table}")?;
-                if let Some(cols) = columns {
-                    write!(f, " ({})", cols.join(", "))?;
+                if let Some(q) = query {
+                    write!(f, "COPY ({q})")?;
+                } else {
+                    write!(f, "COPY {table}")?;
+                    if let Some(cols) = columns {
+                        write!(f, " ({})", cols.join(", "))?;
+                    }
                 }
                 write!(f, " TO STDOUT")?;
                 let mut parts: Vec<String> = Vec::new();

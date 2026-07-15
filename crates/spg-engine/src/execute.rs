@@ -1021,8 +1021,9 @@ impl Engine {
             Statement::CopyTo {
                 table,
                 columns,
+                query,
                 options,
-            } => self.exec_copy_to(&table, columns.as_deref(), &options, cancel),
+            } => self.exec_copy_to(&table, columns.as_deref(), query.as_deref(), &options, cancel),
             Statement::Begin => self.exec_begin(),
             Statement::Commit => self.exec_commit(),
             Statement::Rollback => self.exec_rollback(),
@@ -1453,10 +1454,18 @@ impl Engine {
         &mut self,
         table_name: &str,
         columns: Option<&[String]>,
+        query: Option<&Statement>,
         options: &spg_sql::ast::CopyOptions,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         use spg_sql::ast::CopyFormat;
+        // v7.39 (read01 round 94) — `COPY (<query>) TO STDOUT`: run the inner
+        // statement and render its result set with the same per-format cell
+        // encoder the table form uses. Kept as an early branch so the
+        // battle-tested table path below is untouched.
+        if let Some(q) = query {
+            return self.exec_copy_to_query(q, options, cancel);
+        }
         let table = self.active_catalog().get(table_name).ok_or_else(|| {
             EngineError::Storage(spg_storage::StorageError::TableNotFound {
                 name: alloc::string::String::from(table_name),
@@ -1543,6 +1552,81 @@ impl Engine {
             out_rows.push(spg_storage::Row::new(alloc::vec![Value::text(encode(
                 &row
             ))]));
+        }
+        Ok(QueryResult::Rows {
+            columns: alloc::vec![spg_storage::ColumnSchema::new(
+                alloc::string::String::from("copy"),
+                spg_storage::DataType::Text,
+                false,
+            )],
+            rows: out_rows,
+        })
+    }
+
+    /// v7.39 (read01 round 94) — the `COPY (<query>) TO STDOUT` renderer.
+    /// Executes the inner statement and encodes its result set into a single
+    /// `copy` text column (one row per COPY line, header first when asked),
+    /// exactly like the table form's tail — the difference is only where the
+    /// rows and their column types come from.
+    fn exec_copy_to_query(
+        &mut self,
+        query: &Statement,
+        options: &spg_sql::ast::CopyOptions,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        use spg_sql::ast::CopyFormat;
+        let (result_cols, result_rows) = match self.dispatch_stmt_inner(query.clone(), cancel)? {
+            QueryResult::Rows { columns, rows } => (columns, rows),
+            _ => {
+                return Err(EngineError::Unsupported(
+                    "COPY (query) source did not produce a result set".into(),
+                ));
+            }
+        };
+        let is_csv = options.format == CopyFormat::Csv;
+        let delimiter = options.delimiter.unwrap_or(if is_csv { ',' } else { '\t' });
+        let quote = options.quote.unwrap_or('"');
+        let null_str = options
+            .null_str
+            .clone()
+            .unwrap_or_else(|| alloc::string::String::from(if is_csv { "" } else { "\\N" }));
+        let encode_cells = |cells: &[Option<alloc::string::String>]| -> alloc::string::String {
+            if is_csv {
+                crate::copy::encode_copy_csv_cells(cells, delimiter, quote, &null_str)
+            } else {
+                crate::copy::encode_copy_text_cells_opts(cells, delimiter, &null_str)
+            }
+        };
+        let cell_text = |v: &Value, ty: spg_storage::DataType| -> Option<alloc::string::String> {
+            match v {
+                Value::Null => None,
+                Value::Bool(b) => Some(alloc::string::String::from(if *b { "t" } else { "f" })),
+                Value::Timestamp(t) if matches!(ty, spg_storage::DataType::Timestamptz) => {
+                    Some(crate::eval::format_timestamptz(*t))
+                }
+                other => Some(crate::eval::values::value_to_text(other)),
+            }
+        };
+        let mut out_rows: alloc::vec::Vec<spg_storage::Row<'static>> = alloc::vec::Vec::new();
+        if options.header {
+            let names: alloc::vec::Vec<Option<alloc::string::String>> = result_cols
+                .iter()
+                .map(|c| Some(c.name.clone()))
+                .collect();
+            out_rows.push(spg_storage::Row::new(alloc::vec![Value::text(
+                encode_cells(&names)
+            )]));
+        }
+        for row in &result_rows {
+            cancel.check()?;
+            let cells: alloc::vec::Vec<Option<alloc::string::String>> = result_cols
+                .iter()
+                .enumerate()
+                .map(|(p, c)| row.values.get(p).and_then(|v| cell_text(v, c.ty)))
+                .collect();
+            out_rows.push(spg_storage::Row::new(alloc::vec![Value::text(
+                encode_cells(&cells)
+            )]));
         }
         Ok(QueryResult::Rows {
             columns: alloc::vec![spg_storage::ColumnSchema::new(
