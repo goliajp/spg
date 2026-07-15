@@ -482,6 +482,7 @@ mod e2e_two_tier_server;
 #[allow(unused_mut, unused_variables)]
 mod e2e_tx;
 mod e2e_pg_tx_visibility_round84;
+mod e2e_pg_abort_firewall_round86;
 #[allow(clippy::doc_markdown, clippy::uninlined_format_args)]
 mod e2e_update_delete;
 mod e2e_vector;
