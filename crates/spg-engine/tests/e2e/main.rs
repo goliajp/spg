@@ -191,6 +191,7 @@ mod e2e_create_index_autoname_round93;
 mod e2e_copy_query_embedded_round94;
 mod e2e_multi_srf_temporal_round96;
 mod e2e_age_wallclock_round97;
+mod e2e_round_negative_ndigits_round98;
 mod e2e_insert_then_update_round85;
 mod e2e_json_family_round76;
 mod e2e_named_args_round77;
