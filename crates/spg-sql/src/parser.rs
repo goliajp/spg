@@ -15643,6 +15643,97 @@ impl Parser {
     /// v7.37 D.43 — `#[inline(never)]` keeps the large `Statement` local and the
     /// SELECT/WITH parse machinery off `parse_atom`'s stack frame; parse_atom sits
     /// on the recursive `((…))` cycle whose depth budget is tuned to that frame.
+    /// v7.39 (read01 round 105) — is the current position `( <subquery-start>`,
+    /// i.e. an `ARRAY(<subquery>)` and not `ARRAY[...]`? A subquery starts with
+    /// SELECT, VALUES, or WITH (WITH lexes as a bare ident).
+    /// `#[inline(never)]`: keeps this guard's locals off parse_atom's frame,
+    /// which sits on the recursive nesting-budget cycle (a few extra bytes there
+    /// tips the deep-nesting test into a stack overflow).
+    #[inline(never)]
+    fn array_subquery_ahead(&self) -> bool {
+        if !matches!(self.peek(), Token::LParen) {
+            return false;
+        }
+        matches!(
+            self.tokens.get(self.pos + 1),
+            Some(Token::Select | Token::Values)
+        ) || matches!(
+            self.tokens.get(self.pos + 1),
+            Some(Token::Ident(w) | Token::QuotedIdent(w)) if w.eq_ignore_ascii_case("with")
+        )
+    }
+
+    /// v7.10.10 — `ARRAY[expr, …]` literal body. The `array` ident is consumed
+    /// and the current token is `[`. `#[inline(never)]` so its `Vec`/loop
+    /// locals stay off parse_atom's recursive frame (round 105).
+    #[inline(never)]
+    fn parse_array_literal_body(&mut self) -> Result<Expr, ParseError> {
+        self.advance(); // consume `[`
+        let mut items: Vec<Expr> = Vec::new();
+        if !matches!(self.peek(), Token::RBracket) {
+            loop {
+                // Inside `ARRAY[...]`, a nested `[...]` is a sub-array
+                // (`ARRAY[[1,2],[3,4]]`), not a pgvector literal.
+                if matches!(self.peek(), Token::LBracket) {
+                    items.push(self.parse_array_bracket_body()?);
+                } else {
+                    items.push(self.parse_expr(0)?);
+                }
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RBracket => break,
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "expected ',' or ']' in ARRAY literal, got {other:?}"
+                        )));
+                    }
+                }
+            }
+        }
+        self.advance(); // consume `]`
+        Ok(Expr::Array(items))
+    }
+
+    /// v7.39 (read01 round 105) — parse `ARRAY(<subquery>)`. The `array` ident
+    /// is already consumed; the current token is `(`. Desugars to a scalar
+    /// subquery `SELECT array_agg(c) FROM (<subquery>) AS t(c)`, which collects
+    /// the subquery's single-column rows in order — reusing the existing
+    /// ScalarSubquery machinery rather than adding an AST node. `#[inline(never)]`
+    /// keeps the large `Statement` local off parse_atom's recursive frame.
+    #[inline(never)]
+    fn parse_array_subquery(&mut self) -> Result<Expr, ParseError> {
+        self.advance(); // consume `(`
+        let is_with = matches!(self.peek(), Token::Ident(w) | Token::QuotedIdent(w)
+            if w.eq_ignore_ascii_case("with"));
+        let sub = if is_with {
+            self.advance(); // WITH
+            self.parse_with_cte_then_select()?
+        } else {
+            self.parse_select_stmt()?
+        };
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(alloc::format!(
+                "expected ')' to close ARRAY(subquery), got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance(); // consume `)`
+        // Reuse the parser to build the array_agg wrapper from the subquery's
+        // canonical text — avoids hand-constructing the derived-table AST.
+        let wrapper = alloc::format!(
+            "SELECT array_agg(\"__spg_arr_c\") FROM ({sub}) AS \"__spg_arr_t\"(\"__spg_arr_c\")"
+        );
+        let stmt = parse_statement(&wrapper).map_err(|e| {
+            self.err(alloc::format!("ARRAY(subquery): {}", e.message))
+        })?;
+        let Statement::Select(sel) = stmt else {
+            return Err(self.err("ARRAY(subquery) did not desugar to a SELECT".into()));
+        };
+        Ok(Expr::ScalarSubquery(alloc::boxed::Box::new(sel)))
+    }
+
     #[inline(never)]
     fn parse_paren_scalar_subquery(&mut self, is_with: bool) -> Result<Expr, ParseError> {
         let inner = if is_with {
@@ -15837,39 +15928,25 @@ impl Parser {
                     target,
                 })
             }
+            // v7.39 (read01 round 105) — `ARRAY(<subquery>)` constructor:
+            // gathers the subquery's single-column rows (in its row order)
+            // into an array. Desugared to `array_agg` over the subquery as a
+            // derived table; out-of-line to keep parse_atom's frame small (it
+            // sits on the recursive nesting-budget cycle).
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("array") && self.array_subquery_ahead() =>
+            {
+                self.parse_array_subquery()
+            }
             // v7.10.10 — `ARRAY[expr, expr, …]` constructor. ARRAY
             // is not a reserved token; we match by case-insensitive
-            // ident. The opening `[` must follow immediately.
+            // ident. The opening `[` must follow immediately. v7.39 (read01
+            // round 105) — the body moved out-of-line so its `Vec`/loop locals
+            // leave parse_atom's frame (which sits on the nesting-budget cycle).
             Token::Ident(s) | Token::QuotedIdent(s)
                 if s.eq_ignore_ascii_case("array") && matches!(self.peek(), Token::LBracket) =>
             {
-                self.advance(); // consume `[`
-                let mut items: Vec<Expr> = Vec::new();
-                if !matches!(self.peek(), Token::RBracket) {
-                    loop {
-                        // v7.38 (read01, T10) — inside `ARRAY[...]`, a nested
-                        // `[...]` is a sub-array (`ARRAY[[1,2],[3,4]]`), not a
-                        // pgvector literal.
-                        if matches!(self.peek(), Token::LBracket) {
-                            items.push(self.parse_array_bracket_body()?);
-                        } else {
-                            items.push(self.parse_expr(0)?);
-                        }
-                        match self.peek() {
-                            Token::Comma => {
-                                self.advance();
-                            }
-                            Token::RBracket => break,
-                            other => {
-                                return Err(self.err(alloc::format!(
-                                    "expected ',' or ']' in ARRAY literal, got {other:?}"
-                                )));
-                            }
-                        }
-                    }
-                }
-                self.advance(); // consume `]`
-                Ok(Expr::Array(items))
+                self.parse_array_literal_body()
             }
             // v7.17.0 Phase 2.2 — MySQL `MATCH(col, ...) AGAINST
             // ('term' [IN BOOLEAN MODE | IN NATURAL LANGUAGE MODE])`.
