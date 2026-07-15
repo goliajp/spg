@@ -1645,6 +1645,46 @@ impl Parser {
                 Ok(Statement::CopyTo {
                     table,
                     columns,
+                    query: None,
+                    options,
+                })
+            }
+            // v7.39 (read01 round 94) — `COPY (<query>) TO STDOUT [WITH (…)]`.
+            // The parens directly after COPY wrap a SELECT/VALUES/CTE whose
+            // result set is streamed in COPY format (PG's query form).
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("copy")
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) =>
+            {
+                self.advance(); // COPY
+                self.advance(); // (
+                let query = self.parse_select_stmt()?;
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(format!(
+                        "expected ')' after COPY query, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance(); // )
+                if !matches!(self.peek(), Token::To) {
+                    return Err(self.err(format!(
+                        "COPY (query): only TO STDOUT is supported, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("stdout")) {
+                    return Err(self.err(format!(
+                        "COPY TO supports STDOUT only (no file endpoints), got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let options = self.parse_copy_to_options()?;
+                Ok(Statement::CopyTo {
+                    table: String::new(),
+                    columns: None,
+                    query: Some(alloc::boxed::Box::new(query)),
                     options,
                 })
             }
