@@ -3952,7 +3952,7 @@ pub(crate) fn coerce_value(
                         let n: i32 = t.parse().map_err(|_| {
                             EngineError::Eval(EvalError::TypeMismatch {
                                 detail: alloc::format!(
-                                    "cannot parse {t:?} as INT element for `{col_name}`"
+                                    "invalid input syntax for type integer: {t:?}"
                                 ),
                             })
                         })?;
@@ -3974,15 +3974,40 @@ pub(crate) fn coerce_value(
                 })
                 .collect(),
         )),
-        (Value::Text(s), DataType::BoolArray) => Some(Value::BoolArray(
-            decode_array_elems(&s, DataType::Bool, col_name, position)?
-                .into_iter()
-                .map(|o| match o {
-                    Some(Value::Bool(b)) => Some(b),
-                    _ => None,
-                })
-                .collect(),
-        )),
+        (Value::Text(s), DataType::BoolArray) => {
+            // v7.39 (read01 round 92) — a 2-D bool literal `{{t,f},{f,t}}`
+            // becomes a BoolArray2D (the ::int[]/::text[] cast path learned this
+            // separately; the typed-array coerce path routes here). 1-D stays a
+            // BoolArray.
+            if let Some(rows) = crate::eval::values::split_2d_rows(&s) {
+                let mut row_vals: Vec<Value<'static>> = Vec::with_capacity(rows.len());
+                for r in &rows {
+                    let bools: Vec<Option<bool>> =
+                        decode_array_elems(r, DataType::Bool, col_name, position)?
+                            .into_iter()
+                            .map(|o| match o {
+                                Some(Value::Bool(b)) => Some(b),
+                                _ => None,
+                            })
+                            .collect();
+                    row_vals.push(Value::BoolArray(bools));
+                }
+                return crate::eval::values::build_2d_from_rows(&row_vals).ok_or_else(|| {
+                    EngineError::Eval(EvalError::TypeMismatch {
+                        detail: alloc::format!("malformed array literal: {s:?}"),
+                    })
+                });
+            }
+            Some(Value::BoolArray(
+                decode_array_elems(&s, DataType::Bool, col_name, position)?
+                    .into_iter()
+                    .map(|o| match o {
+                        Some(Value::Bool(b)) => Some(b),
+                        _ => None,
+                    })
+                    .collect(),
+            ))
+        }
         (Value::Text(s), DataType::FloatArray) => Some(Value::FloatArray(
             decode_array_elems(&s, DataType::Float, col_name, position)?
                 .into_iter()
@@ -4043,7 +4068,7 @@ pub(crate) fn coerce_value(
                         let n: i64 = t.parse().map_err(|_| {
                             EngineError::Eval(EvalError::TypeMismatch {
                                 detail: alloc::format!(
-                                    "cannot parse {t:?} as BIGINT element for `{col_name}`"
+                                    "invalid input syntax for type bigint: {t:?}"
                                 ),
                             })
                         })?;
