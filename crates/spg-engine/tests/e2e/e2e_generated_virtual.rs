@@ -3,7 +3,7 @@
 //! when a base column changes, and NOT NULL is enforced on the computed
 //! value. (SPG computes-and-stores; observably identical to PG's VIRTUAL.)
 
-use spg_engine::{Engine, EngineError, QueryResult};
+use spg_engine::{Engine, QueryResult};
 
 fn one(e: &mut Engine, sql: &str) -> Vec<spg_storage::Value<'static>> {
     match e.execute(sql).unwrap() {

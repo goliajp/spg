@@ -10920,7 +10920,16 @@ impl Parser {
             self.advance();
         }
         let if_not_exists = self.consume_if_not_exists();
-        let name = self.expect_ident_like()?;
+        // v7.39 (read01 round 93) — the index name is optional (PG since
+        // forever): `CREATE INDEX ON t (a)` lets the server pick a name.
+        // When the token after `[IF NOT EXISTS]` is already `ON`, no name
+        // was given; leave it empty and the engine derives a PG-style
+        // `<table>_<cols>_idx` name at CREATE time (with collision counter).
+        let name = if matches!(self.peek(), Token::On) {
+            String::new()
+        } else {
+            self.expect_ident_like()?
+        };
         if !matches!(self.peek(), Token::On) {
             return Err(self.err(format!(
                 "expected ON after CREATE INDEX <name>, got {:?}",
@@ -18883,6 +18892,11 @@ fn extract_first_column(expr: &Expr) -> Option<String> {
             extract_first_column(lhs).or_else(|| extract_first_column(rhs))
         }
         Expr::Unary { expr: e, .. } => extract_first_column(e),
+        // v7.39 (read01 round 93) — a cast wraps its operand: a common
+        // expression-index key is `lower(col::text)`, where the column
+        // sits under the `::text` cast inside the function arg. Without
+        // descending here the key was rejected as "references no column".
+        Expr::Cast { expr: e, .. } => extract_first_column(e),
         _ => None,
     }
 }
