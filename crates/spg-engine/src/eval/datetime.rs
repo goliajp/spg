@@ -163,6 +163,17 @@ pub(super) fn extract_field(
     match field {
         F::Epoch => {
             let total_secs = i64::from(days) * 86_400 + secs;
+            // v7.39 (read01 round 104) — epoch from a DATE is a whole-second
+            // integer (PG scale 0: `1704067200`); a TIMESTAMP carries the
+            // microsecond scale 6 (`1704067200.000000`). SPG used scale 6 for
+            // both.
+            if matches!(*v, Value::Date(_)) {
+                return Ok(Value::Numeric {
+                    scaled: i128::from(total_secs),
+                    scale: 0,
+                    kind: spg_storage::NumericKind::Finite,
+                });
+            }
             return Ok(Value::Numeric {
                 scaled: i128::from(total_secs) * 1_000_000 + i128::from(frac),
                 scale: 6,
