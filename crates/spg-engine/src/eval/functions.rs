@@ -10693,8 +10693,19 @@ fn apply_function_dispatch(
                     // lands at 1.25 instead of PG's 1.26). Do half-away-from-zero
                     // on the integer mantissa. Negative target scales fall
                     // through to the f64 path below (existing behaviour).
-                    if let Value::Numeric { scaled, scale, .. } = &args[0] {
-                        let cur = i32::from(*scale);
+                    // v7.39 (read01 round 98) — an integer argument is the
+                    // `round(numeric, int)` overload with an implicit int→numeric
+                    // cast (PG returns numeric), so treat it as a scale-0
+                    // mantissa here rather than letting it reach the f64 path.
+                    let numeric_input: Option<(i128, u8)> = match &args[0] {
+                        Value::Numeric { scaled, scale, .. } => Some((*scaled, *scale)),
+                        Value::SmallInt(v) => Some((i128::from(*v), 0)),
+                        Value::Int(v) => Some((i128::from(*v), 0)),
+                        Value::BigInt(v) => Some((i128::from(*v), 0)),
+                        _ => None,
+                    };
+                    if let Some((scaled, scale)) = numeric_input {
+                        let cur = i32::from(scale);
                         if (0..=38).contains(&n) {
                             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                             let out = if n >= cur {
@@ -10703,7 +10714,7 @@ fn apply_function_dispatch(
                                 })
                             } else {
                                 let factor = pow10_i128((cur - n) as u8);
-                                let neg = *scaled < 0;
+                                let neg = scaled < 0;
                                 let abs = scaled.unsigned_abs() as i128;
                                 let q = abs / factor;
                                 let r = abs % factor;
@@ -10715,6 +10726,29 @@ fn apply_function_dispatch(
                             };
                             if let Some(v) = out {
                                 return Ok(v);
+                            }
+                        } else if n < 0 && -n <= 38 && cur - n <= 38 {
+                            // v7.39 (read01 round 98) — a NEGATIVE target scale
+                            // (round to tens / hundreds / …) stays NUMERIC in PG
+                            // (`round(1234.5678, -2)` → numeric `1200`); SPG used
+                            // to drop through to the f64 path and hand back
+                            // `double precision`. Round the mantissa to the
+                            // 10^|n| place exactly, then rescale to scale 0.
+                            #[allow(clippy::cast_sign_loss)]
+                            let drop = (cur - n) as u8;
+                            let factor = pow10_i128(drop);
+                            let neg = scaled < 0;
+                            let abs = scaled.unsigned_abs() as i128;
+                            let q = abs / factor;
+                            let r = abs % factor;
+                            let units = if 2 * r >= factor { q + 1 } else { q };
+                            #[allow(clippy::cast_sign_loss)]
+                            if let Some(mag) = units.checked_mul(pow10_i128((-n) as u8)) {
+                                return Ok(Value::Numeric {
+                                    scaled: if neg { -mag } else { mag },
+                                    scale: 0,
+                                    kind: spg_storage::NumericKind::Finite,
+                                });
                             }
                         }
                     }
