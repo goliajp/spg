@@ -1765,7 +1765,7 @@ impl Engine {
         // reading schema fields.
         let column_meta: Vec<ColumnSchema> = table.schema().columns.clone();
         let schema_cols_len = column_meta.len();
-        let tuple_pos = build_tuple_pos(&stmt.columns, &column_meta)?;
+        let tuple_pos = build_tuple_pos(&stmt.columns, &column_meta, &stmt.table)?;
         let expected_tuple_len = stmt.columns.as_ref().map_or(schema_cols_len, Vec::len);
         // v7.6.2 — snapshot this table's FK list before the
         // mutable-borrow window so we can run parent lookups
@@ -2561,6 +2561,7 @@ fn column_default_marker() -> Expr {
 fn build_tuple_pos(
     columns: &Option<Vec<String>>,
     column_meta: &[ColumnSchema],
+    table_name: &str,
 ) -> Result<Option<Vec<Option<usize>>>, EngineError> {
     let schema_cols_len = column_meta.len();
     // Build a permutation `tuple_pos[c] = Some(j)` meaning schema
@@ -2575,7 +2576,14 @@ fn build_tuple_pos(
                     .iter()
                     .position(|c| c.name == *name)
                     .ok_or_else(|| {
-                        EngineError::Eval(EvalError::ColumnNotFound { name: name.clone() })
+                        // v7.39 (read01 round 88) — PG names the relation in an
+                        // INSERT target-column miss: `column "x" of relation "t"
+                        // does not exist` (42703). The bare ColumnNotFound
+                        // ("column \"x\" does not exist") dropped the relation.
+                        EngineError::Unsupported(alloc::format!(
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            name, table_name
+                        ))
                     })?;
                 if map[idx].is_some() {
                     return Err(EngineError::Storage(StorageError::ArityMismatch {
@@ -2822,10 +2830,18 @@ fn parse_insert_rows(
         let too_many = tuple.len() > expected_tuple_len;
         let list_mismatch = tuple_pos.is_some() && tuple.len() != expected_tuple_len;
         if too_many || list_mismatch {
-            return Err(EngineError::Storage(StorageError::ArityMismatch {
-                expected: expected_tuple_len,
-                actual: tuple.len(),
-            }));
+            // v7.39 (read01 round 88) — PG's 42601 wording, distinguishing the
+            // two directions. Before, both came out as SPG's generic
+            // "row arity mismatch: expected N columns, got M", which no client
+            // matches. (More values → "more expressions than target columns";
+            // a column list with fewer values → "more target columns than
+            // expressions".)
+            let msg = if tuple.len() > expected_tuple_len {
+                "INSERT has more expressions than target columns"
+            } else {
+                "INSERT has more target columns than expressions"
+            };
+            return Err(EngineError::Unsupported(msg.into()));
         }
         // Fast path: no column-list permutation → tuple slot j
         // maps to schema column j. We can zip schema with tuple

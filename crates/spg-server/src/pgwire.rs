@@ -3714,6 +3714,10 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // PG's 42601 SYNTAX_ERROR.
         } else if msg.contains("invalid parameter list format")
             || msg.contains("of jsonpath input")
+            // v7.39 (read01 round 88) — INSERT value/column arity mismatch is
+            // PG's 42601 SYNTAX_ERROR.
+            || msg.contains("INSERT has more expressions than target columns")
+            || msg.contains("INSERT has more target columns than expressions")
         {
             "42601"
         // v7.39 (read01 utils/adt) — PG's multidim-search refusal is
