@@ -1234,6 +1234,18 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
             }
             Ok(Value::Int(r as i32))
         }
+        // v7.39 (read01 round 112) — `real` (float4) rounds/range-checks the
+        // same way float8 does; only the float8 arm existed.
+        #[allow(clippy::cast_possible_truncation)]
+        Value::Real(x) => {
+            let r = f64_round_half_even(f64::from(x));
+            if !r.is_finite() || !(-2_147_483_648.0..=2_147_483_647.0).contains(&r) {
+                return Err(EvalError::TypeMismatch {
+                    detail: "integer out of range".into(),
+                });
+            }
+            Ok(Value::Int(r as i32))
+        }
         Value::Numeric { scaled, scale, .. } => {
             let rounded = numeric_round_to_i128(scaled, scale);
             i32::try_from(rounded)
@@ -1271,6 +1283,19 @@ fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
         #[allow(clippy::cast_possible_truncation)]
         Value::Float(x) => {
             let r = f64_round_half_even(x);
+            if !r.is_finite()
+                || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&r)
+            {
+                return Err(EvalError::TypeMismatch {
+                    detail: "bigint out of range".into(),
+                });
+            }
+            Ok(Value::BigInt(r as i64))
+        }
+        // v7.39 (read01 round 112) — `real` (float4) → bigint, matching float8.
+        #[allow(clippy::cast_possible_truncation)]
+        Value::Real(x) => {
+            let r = f64_round_half_even(f64::from(x));
             if !r.is_finite()
                 || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&r)
             {

@@ -4563,6 +4563,40 @@ pub(crate) fn coerce_value(
             #[allow(clippy::cast_possible_truncation)]
             Some(Value::SmallInt(r as i16))
         }
+        // v7.39 (read01 round 112) — REAL (float4) → integer types. Mirrors the
+        // float8 arms above (round half-to-even, PG's rule); these had no arm at
+        // all, so `real::int` errored "cannot cast Real to int".
+        (Value::Real(x), DataType::Int) => {
+            let r = crate::eval::math::f64_round_half_even(f64::from(x));
+            if !r.is_finite() || !(-2_147_483_648.0..=2_147_483_647.0).contains(&r) {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: "integer out of range".into(),
+                }));
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            Some(Value::Int(r as i32))
+        }
+        (Value::Real(x), DataType::BigInt) => {
+            let r = crate::eval::math::f64_round_half_even(f64::from(x));
+            if !r.is_finite() || !(-9.223_372_036_854_776e18..=9.223_372_036_854_776e18).contains(&r)
+            {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: "bigint out of range".into(),
+                }));
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            Some(Value::BigInt(r as i64))
+        }
+        (Value::Real(x), DataType::SmallInt) => {
+            let r = crate::eval::math::f64_round_half_even(f64::from(x));
+            if !r.is_finite() || !(-32768.0..=32767.0).contains(&r) {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: "smallint out of range".into(),
+                }));
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            Some(Value::SmallInt(r as i16))
+        }
         (Value::Numeric { scaled, scale, .. }, DataType::Int) => {
             let rounded = numeric_round_to_integer(scaled, scale);
             i32::try_from(rounded).ok().map(Value::Int)
