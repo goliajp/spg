@@ -198,6 +198,7 @@ mod e2e_to_char_tm_round101;
 mod e2e_interval_qualifier_round102;
 mod e2e_inet_masking_round103;
 mod e2e_extract_epoch_date_round104;
+mod e2e_array_subquery_round105;
 mod e2e_insert_then_update_round85;
 mod e2e_json_family_round76;
 mod e2e_named_args_round77;
