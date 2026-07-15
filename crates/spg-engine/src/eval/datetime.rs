@@ -386,11 +386,12 @@ pub(super) fn age(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     };
     // v7.37.17 (17.6 siblings) — PG's single-arg form:
     //   age(ts) == age(date_trunc('day', current_timestamp), ts)
-    // ie the "wall-clock" age relative to midnight today. SPG
-    // uses UNIX_EPOCH-based micros without a wall clock; without
-    // a plausible "today" we anchor at 2020-01-01 UTC which is
-    // predictable (any test using single-arg age can subtract).
-    // v7.38 will thread real current_timestamp through.
+    // ie the "wall-clock" age relative to midnight today.
+    // v7.39 (read01 round 97) — when a clock IS set, `rewrite_clock_calls`
+    // rewrites `age(t)` to the two-arg form with today's real midnight before
+    // eval, so this single-arg path is only reached with NO clock (the
+    // embedded engine). There we anchor at 2020-01-01 UTC — predictable and
+    // deterministic (any test using single-arg age can subtract).
     let (a, b) = if args.len() == 1 {
         // 2020-01-01 UTC as micros since epoch — no wall-clock
         // dependency, deterministic across runs.

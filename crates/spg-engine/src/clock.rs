@@ -165,7 +165,25 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
         | Expr::FieldAccess { base: expr, .. } => {
             rewrite_expr_clock(expr, now);
         }
-        Expr::FunctionCall { args, .. } => {
+        Expr::FunctionCall { name, args } => {
+            // v7.39 (read01 round 97) — the single-arg `age(t)` form is PG's
+            // `age(date_trunc('day', current_timestamp), t)`: the age of `t`
+            // relative to midnight today. The eval-time fallback anchors at
+            // 2020-01-01 (no clock available there); when a real clock IS set,
+            // inject today's midnight as an explicit first argument so the
+            // two-arg path computes the correct wall-clock age. An integer
+            // literal is the `age(xid)` overload and is left untouched.
+            if args.len() == 1
+                && name.eq_ignore_ascii_case("age")
+                && !matches!(args[0], Expr::Literal(Literal::Integer(_)))
+            {
+                let midnight = now.div_euclid(86_400_000_000) * 86_400_000_000;
+                let today = Expr::Cast {
+                    expr: alloc::boxed::Box::new(Expr::Literal(Literal::Integer(midnight))),
+                    target: spg_sql::ast::CastTarget::Timestamp,
+                };
+                args.insert(0, today);
+            }
             for a in args {
                 rewrite_expr_clock(a, now);
             }
