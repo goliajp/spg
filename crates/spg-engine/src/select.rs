@@ -858,9 +858,16 @@ impl Engine {
         // INSERT, not a SELECT, so this restriction is harmless
         // in practice.
         if stmt.ctes.iter().any(|c| c.body.is_modifying()) {
-            return Err(EngineError::Unsupported(alloc::format!(
-                "SELECT with a data-modifying CTE body must run via the top-level mutable entry"
-            )));
+            // v7.39 (read01 round 81) — PG's wording. A data-modifying CTE
+            // (`WITH d AS (DELETE … RETURNING …) …`) is only legal at the top
+            // of a statement, not nested inside a subquery; this path is
+            // reached exactly when one is nested. The old text described SPG's
+            // own executor plumbing ("the top-level mutable entry"), which
+            // means nothing to a client.
+            return Err(EngineError::Unsupported(
+                "WITH clause containing a data-modifying statement must be at the top level"
+                    .into(),
+            ));
         }
         let catalog = self.materialise_ctes_readonly(&stmt.ctes, cancel)?;
         // Strip CTEs from the body before running on the temp engine

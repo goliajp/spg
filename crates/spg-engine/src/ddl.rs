@@ -3451,22 +3451,105 @@ impl Engine {
         &mut self,
         s: spg_sql::ast::CreateViewStatement,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 (read01 round 81) — CREATE OR REPLACE VIEW may only APPEND
+        // columns; PG forbids renaming, dropping, reordering or retyping an
+        // existing column ("cannot change name of view column …", "cannot drop
+        // columns from view", "cannot change data type of view column …"). SPG
+        // let every one of these through and silently swapped the view's shape,
+        // so a downstream `SELECT known_col FROM v` would start resolving to a
+        // different column, or vanish — data corruption disguised as a DDL.
+        if s.or_replace && self.active_catalog().views().contains_key(&s.name) {
+            self.check_view_replace_columns(&s)?;
+        }
         // Render the SELECT body to canonical form so the catalog
         // round-trips a deterministic source (no whitespace /
         // comment surprises in the on-disk snapshot).
+        let columns = s.columns.clone();
+        let name = s.name.clone();
+        let or_replace = s.or_replace;
+        let if_not_exists = s.if_not_exists;
         let body_repr = alloc::format!("{}", spg_sql::ast::Statement::Select(s.body));
         let def = spg_storage::ViewDef {
-            name: s.name.clone(),
-            columns: s.columns,
+            name,
+            columns,
             body: body_repr,
         };
         self.active_catalog_mut()
-            .create_view(def, s.or_replace, s.if_not_exists)
+            .create_view(def, or_replace, if_not_exists)
             .map_err(EngineError::Storage)?;
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: !self.in_transaction(),
         })
+    }
+
+    /// The (name, type) of each column a view body produces. Runs the body
+    /// through the real executor with a zero-row bound, so it reflects exactly
+    /// what a SELECT from the view would return — column overrides, view-on-view
+    /// expansion, joins and all. Types come from the empty result's schema.
+    fn view_output_columns(
+        &self,
+        body: &spg_sql::ast::SelectStatement,
+        overrides: &[String],
+    ) -> Result<alloc::vec::Vec<(String, spg_storage::DataType)>, EngineError> {
+        let mut probe = body.clone();
+        probe.limit = Some(spg_sql::ast::LimitExpr::Literal(0));
+        let QueryResult::Rows { mut columns, .. } =
+            self.exec_select_cancel(&probe, crate::CancelToken::none())?
+        else {
+            return Err(EngineError::Unsupported(
+                "view body must be a row-returning SELECT".into(),
+            ));
+        };
+        for (i, ov) in overrides.iter().enumerate() {
+            if let Some(c) = columns.get_mut(i) {
+                c.name = ov.clone();
+            }
+        }
+        Ok(columns.into_iter().map(|c| (c.name, c.ty)).collect())
+    }
+
+    /// PG's CREATE OR REPLACE VIEW column rule: the new column list must be the
+    /// old one, optionally with columns appended. Same names, same order, same
+    /// types for every pre-existing position.
+    fn check_view_replace_columns(
+        &self,
+        s: &spg_sql::ast::CreateViewStatement,
+    ) -> Result<(), EngineError> {
+        let old_def = self.active_catalog().views().get(&s.name).cloned();
+        let Some(old_def) = old_def else {
+            return Ok(());
+        };
+        let old_body = match spg_sql::parser::parse_statement(&old_def.body) {
+            Ok(spg_sql::ast::Statement::Select(b)) => b,
+            // A body we can no longer parse is not something to block a replace
+            // on — let the replace proceed rather than wedge the view.
+            _ => return Ok(()),
+        };
+        let old_cols = self.view_output_columns(&old_body, &old_def.columns)?;
+        let new_cols = self.view_output_columns(&s.body, &s.columns)?;
+        if new_cols.len() < old_cols.len() {
+            return Err(EngineError::Unsupported(
+                "cannot drop columns from view".into(),
+            ));
+        }
+        for (old, new) in old_cols.iter().zip(new_cols.iter()) {
+            if old.0 != new.0 {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "cannot change name of view column \"{}\" to \"{}\"",
+                    old.0, new.0
+                )));
+            }
+            if old.1 != new.1 {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "cannot change data type of view column \"{}\" from {} to {}",
+                    old.0,
+                    crate::system_catalog::pg_data_type_text(old.1),
+                    crate::system_catalog::pg_data_type_text(new.1),
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// v7.17.0 Phase 1.4 — `CREATE TYPE name AS ENUM (…)` engine
