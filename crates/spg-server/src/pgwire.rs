@@ -518,8 +518,10 @@ fn handle_pg_simple_query(
             wbuf.clear();
         }
         match copy {
-            CopyIntent::From(table, opts) => {
-                handle_copy_from_stdin(stream, state, role, &table, &opts, tx_state)?;
+            CopyIntent::From(table, cols, opts) => {
+                handle_copy_from_stdin(
+                    stream, state, role, &table, cols.as_deref(), &opts, tx_state,
+                )?;
             }
             CopyIntent::To(table) => {
                 handle_copy_to_stdout(stream, state, role, &table, tx_state)?;
@@ -3942,7 +3944,10 @@ mod engine_error_sqlstate_tests {
 
 #[derive(Debug)]
 enum CopyIntent {
-    From(String, CopyOptions),
+    // v7.39 (read01 round 91) — the explicit `(col, …)` list, captured (was
+    // parsed-and-discarded) so the row-arity check knows how many values each
+    // COPY row must carry and can name a missing column.
+    From(String, Option<Vec<String>>, CopyOptions),
     To(String),
 }
 
@@ -3972,6 +3977,9 @@ struct CopyOptions {
     pub csv_delimiter: Option<char>,
     /// CSV `QUOTE 'c'` (default `"`).
     pub csv_quote: Option<char>,
+    /// `NULL 'token'` — the text that decodes to NULL. CSV default is the
+    /// empty unquoted field; text default is `\N`. v7.39 (read01 round 91).
+    pub null_string: Option<String>,
 }
 
 /// Detects `COPY <table> [(col1, col2, …)] FROM STDIN [WITH
@@ -4031,7 +4039,9 @@ fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
     // list per-COPY is a v7.15.x follow-up if mismatched-arity
     // dumps surface.
     i = skip_ws_bytes(bytes, i);
+    let mut column_list: Option<Vec<String>> = None;
     if bytes.get(i) == Some(&b'(') {
+        let list_start = i + 1;
         let mut depth = 1usize;
         i += 1;
         while i < bytes.len() && depth > 0 {
@@ -4041,6 +4051,18 @@ fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
                 _ => {}
             }
             i += 1;
+        }
+        // `i-1` is the matching ')'. Take the names from the ORIGINAL-case SQL.
+        // `rest` is the lowercased tail after "copy "; map the offsets onto the
+        // trimmed original by the same prefix length.
+        let prefix = trimmed.len() - rest.len();
+        let names: Vec<String> = trimmed[prefix + list_start..prefix + i - 1]
+            .split(',')
+            .map(|c| c.trim().trim_matches('"').to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if !names.is_empty() {
+            column_list = Some(names);
         }
         i = skip_ws_bytes(bytes, i);
     }
@@ -4064,9 +4086,12 @@ fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
     let endpoint = &rest[ep_start..i];
     match (dir, endpoint) {
         ("from", "stdin") => {
-            // Look for the WITH (...) tail and parse options.
-            let opts = parse_copy_options(&lower);
-            Some(CopyIntent::From(table, opts))
+            // v7.39 (read01 round 91) — parse options from the ORIGINAL-case
+            // SQL: option VALUES like `NULL 'NULLTOKEN'` / DELIMITER '|' are
+            // case-sensitive (the null token must match the data byte-for-byte),
+            // so only KEYS get lowercased inside the parser.
+            let opts = parse_copy_options(trimmed);
+            Some(CopyIntent::From(table, column_list, opts))
         }
         ("to", "stdout") => Some(CopyIntent::To(table)),
         _ => None,
@@ -4081,23 +4106,30 @@ fn skip_ws_bytes(bytes: &[u8], mut i: usize) -> usize {
 }
 
 /// Find a `WITH (...)` chunk in the SQL and decode the options.
-fn parse_copy_options(lower: &str) -> CopyOptions {
+fn parse_copy_options(sql: &str) -> CopyOptions {
     let mut opts = CopyOptions::default();
-    let Some(open) = lower.find('(') else {
+    // Find the WITH (...) group. A `NULL '('`-style token could contain a paren,
+    // but PG's option grammar keeps these simple; the outer WITH ( … ) is what
+    // we split. Find the LAST '(' after "with" to skip a table column list.
+    let with_pos = sql.to_ascii_lowercase().rfind("with");
+    let search_from = with_pos.unwrap_or(0);
+    let Some(open) = sql[search_from..].find('(').map(|p| search_from + p) else {
         return opts;
     };
-    let Some(close) = lower[open..].find(')') else {
+    let Some(close) = sql[open..].rfind(')').map(|p| open + p) else {
         return opts;
     };
-    let inner = &lower[open + 1..open + close];
+    let inner = &sql[open + 1..close];
     for pair in inner.split(',') {
         let pair = pair.trim();
         if pair.is_empty() {
             continue;
         }
         let mut it = pair.split_ascii_whitespace();
-        let key = it.next().unwrap_or("");
-        let val = it.next().unwrap_or("");
+        let key = it.next().unwrap_or("").to_ascii_lowercase();
+        let val_raw = it.next().unwrap_or("");
+        let val_lc = val_raw.to_ascii_lowercase();
+        let (key, val) = (key.as_str(), val_lc.as_str());
         match key {
             "skip" => {
                 opts.skip = val.parse().unwrap_or(0);
@@ -4120,10 +4152,19 @@ fn parse_copy_options(lower: &str) -> CopyOptions {
                 }
             }
             "delimiter" => {
-                opts.csv_delimiter = unquote_copy_char(val);
+                opts.csv_delimiter = unquote_copy_char(val_raw);
             }
             "quote" => {
-                opts.csv_quote = unquote_copy_char(val);
+                opts.csv_quote = unquote_copy_char(val_raw);
+            }
+            // v7.39 (read01 round 91) — `NULL 'token'`: the string that reads as
+            // NULL. Ignored before, so `WITH (NULL 'X')` left the literal "X" in
+            // the column instead of a NULL.
+            "null" => {
+                let t = val_raw.trim_matches(|c| c == '\'' || c == '"');
+                if !t.is_empty() {
+                    opts.null_string = Some(t.to_string());
+                }
             }
             _ => {}
         }
@@ -4149,11 +4190,40 @@ fn unquote_copy_char(val: &str) -> Option<char> {
 /// frames, parses each row (tab-delimited text, `\N` = NULL),
 /// inserts via engine.execute("INSERT ..."). CopyDone commits;
 /// CopyFail aborts.
+/// v7.39 (read01 round 91) — after an error mid-COPY-FROM the client is still
+/// streaming CopyData; the server must consume its frames up to CopyDone/CopyFail
+/// before it may send ReadyForQuery, or the client's later frames arrive "while
+/// idle" and desync the protocol.
+fn drain_copy_in_frames(stream: &mut dyn ReadWrite) -> std::io::Result<()> {
+    loop {
+        let mut header = [0u8; 5];
+        if stream.read_exact(&mut header).is_err() {
+            return Ok(());
+        }
+        let ty = header[0];
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let body_len = len.saturating_sub(4);
+        if body_len > 0 {
+            let mut body = vec![0u8; body_len];
+            if stream.read_exact(&mut body).is_err() {
+                return Ok(());
+            }
+        }
+        // CopyDone / CopyFail end the input stream.
+        if ty == b'c' || ty == b'f' {
+            return Ok(());
+        }
+    }
+}
+
 fn handle_copy_from_stdin(
     stream: &mut dyn ReadWrite,
     state: &Arc<ServerState>,
     role: Role,
     table: &str,
+    // v7.39 (read01 round 91) — the explicit `(col, …)` list, or None for the
+    // whole-row form. Drives the per-row arity check and the INSERT mapping.
+    column_list: Option<&[String]>,
     opts: &CopyOptions,
     tx_state: &mut u8,
 ) -> std::io::Result<()> {
@@ -4167,6 +4237,22 @@ fn handle_copy_from_stdin(
     }
     // Look up the column count so we can size the CopyInResponse
     // and validate row arity.
+    let table_col_names: Vec<String> = state
+        .engine
+        .read()
+        .ok()
+        .and_then(|e| {
+            e.catalog()
+                .get(table)
+                .map(|t| t.schema().columns.iter().map(|c| c.name.clone()).collect())
+        })
+        .unwrap_or_default();
+    // v7.39 (read01 round 91) — the columns each row must fill: the explicit
+    // list when given, else the whole table. Used to name a missing column.
+    let expected_names: Vec<String> = match column_list {
+        Some(cols) => cols.to_vec(),
+        None => table_col_names.clone(),
+    };
     let Some(col_count) = state
         .engine
         .read()
@@ -4232,16 +4318,31 @@ fn handle_copy_from_stdin(
         }
         // Process whatever full lines we have.
         if let Err(msg) =
-            process_copy_chunk(state, table, &mut buf, &mut inserted, &mut skipped, opts)
+            process_copy_chunk(state, table, column_list, &expected_names, &mut buf, &mut inserted, &mut skipped, opts)
         {
-            send_error(stream, "22P02", &msg)?;
+            let code = if msg.contains("missing data for column")
+                || msg.contains("extra data after last expected column")
+            {
+                "22P04"
+            } else {
+                "22P02"
+            };
+            send_error(stream, code, &msg)?;
+            drain_copy_in_frames(stream)?;
             return Ok(());
         }
     }
     // Final drain.
-    if let Err(msg) = process_copy_chunk(state, table, &mut buf, &mut inserted, &mut skipped, opts)
+    if let Err(msg) = process_copy_chunk(state, table, column_list, &expected_names, &mut buf, &mut inserted, &mut skipped, opts)
     {
-        send_error(stream, "22P02", &msg)?;
+        let code = if msg.contains("missing data for column")
+            || msg.contains("extra data after last expected column")
+        {
+            "22P04"
+        } else {
+            "22P02"
+        };
+        send_error(stream, code, &msg)?;
         return Ok(());
     }
     send_command_complete(stream, &format!("COPY {inserted}"))?;
@@ -4259,6 +4360,8 @@ fn handle_copy_from_stdin(
 fn process_copy_chunk(
     state: &Arc<ServerState>,
     table: &str,
+    column_list: Option<&[String]>,
+    expected_names: &[String],
     buf: &mut Vec<u8>,
     inserted: &mut u64,
     skipped: &mut u64,
@@ -4293,9 +4396,15 @@ fn process_copy_chunk(
                 row_text,
                 delim as char,
                 quote as char,
-                "",
+                opts.null_string.as_deref().unwrap_or(""),
             );
-            let sql = build_copy_insert(table, &values);
+            if let Err(msg) = copy_row_arity(&values, expected_names) {
+                if opts.on_error_set_null {
+                    continue;
+                }
+                return Err(msg);
+            }
+            let sql = spg_engine::copy::build_copy_insert(table, column_list, &values);
             let mut engine = state
                 .engine
                 .write()
@@ -4349,7 +4458,13 @@ fn process_copy_chunk(
             }
         } else {
             let values = decode_copy_text_row(row_text);
-            build_copy_insert(table, &values)
+            if let Err(msg) = copy_row_arity(&values, expected_names) {
+                if opts.on_error_set_null {
+                    continue;
+                }
+                return Err(msg);
+            }
+            spg_engine::copy::build_copy_insert(table, column_list, &values)
         };
         let mut engine = state
             .engine
@@ -4558,6 +4673,22 @@ fn decode_copy_text_row(line: &str) -> Vec<Option<String>> {
 /// positional form.
 fn build_copy_insert(table: &str, values: &[Option<String>]) -> String {
     spg_engine::copy::build_copy_insert(table, None, values)
+}
+
+/// v7.39 (read01 round 91) — PG rejects a COPY row that does not carry exactly
+/// one value per expected column: `missing data for column "X"` (naming the
+/// first column left without data) for too few, `extra data after last expected
+/// column` for too many. SPG used to feed a short row straight into an INSERT,
+/// which quietly filled the trailing columns with NULL — silent data loss.
+fn copy_row_arity(values: &[Option<String>], expected_names: &[String]) -> Result<(), String> {
+    if values.len() < expected_names.len() {
+        let missing = &expected_names[values.len()];
+        return Err(format!("missing data for column \"{missing}\""));
+    }
+    if values.len() > expected_names.len() {
+        return Err("extra data after last expected column".to_string());
+    }
+    Ok(())
 }
 
 /// COPY TO STDOUT — server runs `SELECT * FROM <table>`, sends
@@ -6722,7 +6853,7 @@ mod tests {
     fn parse_copy_with_column_list() {
         let sql = "COPY posts (id, title, body) FROM stdin;";
         match parse_copy_intent(sql) {
-            Some(CopyIntent::From(table, _)) => assert_eq!(table, "posts"),
+            Some(CopyIntent::From(table, _, _)) => assert_eq!(table, "posts"),
             other => panic!("expected From(posts), got {other:?}"),
         }
     }
@@ -6731,7 +6862,7 @@ mod tests {
     fn parse_copy_without_column_list() {
         let sql = "COPY accounts FROM STDIN";
         match parse_copy_intent(sql) {
-            Some(CopyIntent::From(table, _)) => assert_eq!(table, "accounts"),
+            Some(CopyIntent::From(table, _, _)) => assert_eq!(table, "accounts"),
             other => panic!("expected From(accounts), got {other:?}"),
         }
     }
@@ -6749,7 +6880,7 @@ mod tests {
     fn parse_copy_with_with_options() {
         let sql = "COPY t FROM stdin WITH (format json)";
         match parse_copy_intent(sql) {
-            Some(CopyIntent::From(table, opts)) => {
+            Some(CopyIntent::From(table, _, opts)) => {
                 assert_eq!(table, "t");
                 assert!(opts.format_json);
             }
@@ -6768,7 +6899,7 @@ mod tests {
     fn parse_copy_from_csv_options() {
         let sql = "COPY t FROM stdin WITH (FORMAT csv, HEADER true, DELIMITER ';', QUOTE '#')";
         match parse_copy_intent(sql) {
-            Some(CopyIntent::From(table, opts)) => {
+            Some(CopyIntent::From(table, _, opts)) => {
                 assert_eq!(table, "t");
                 assert!(opts.format_csv);
                 assert!(!opts.format_json);
@@ -6785,7 +6916,7 @@ mod tests {
         // Bare HEADER (no boolean) still skips the header row.
         let sql = "COPY t FROM stdin WITH (FORMAT csv, HEADER)";
         match parse_copy_intent(sql) {
-            Some(CopyIntent::From(_, opts)) => {
+            Some(CopyIntent::From(_, _, opts)) => {
                 assert!(opts.format_csv);
                 assert_eq!(opts.skip, 1);
             }
