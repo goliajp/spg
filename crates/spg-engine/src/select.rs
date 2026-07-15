@@ -3541,6 +3541,35 @@ impl Engine {
     fn exec_constant_select(&self, stmt: &SelectStatement) -> Result<QueryResult, EngineError> {
         let empty_schema: Vec<ColumnSchema> = Vec::new();
         let ctx = self.ev_ctx(&empty_schema, None);
+        // v7.39 (read01 round 106) — an aggregate with no FROM runs over the
+        // single implicit row (`SELECT count(*)` → 1, `SELECT sum(5)` → 5,
+        // `SELECT string_agg('x',',')` → x). Before this it fell through to the
+        // scalar projection, where the aggregate name looked like an unknown
+        // function. The WHERE filters that one row, so `… WHERE false` leaves
+        // the aggregate zero input rows (`count(*)` → 0).
+        if aggregate::uses_aggregate(stmt) {
+            let dummy = Row::new(Vec::new());
+            let passes = match &stmt.where_ {
+                Some(w) => matches!(eval::eval_expr(w, &dummy, &ctx)?, Value::Bool(true)),
+                None => true,
+            };
+            let rows: Vec<RowRef<'_>> = if passes {
+                alloc::vec![RowRef::Owned(&dummy)]
+            } else {
+                Vec::new()
+            };
+            let agg = aggregate::run(
+                stmt,
+                &rows,
+                &empty_schema,
+                None,
+                None,
+                self.parallel_runner.0.as_deref(),
+                Some(self.active_catalog()),
+                Some(self),
+            )?;
+            return self.finish_agg_result(agg, stmt, CancelToken::none());
+        }
         let projection = build_projection(&stmt.items, &empty_schema, "")?;
         // `SELECT … WHERE cond` with no FROM — the one conceptual
         // row survives only when the condition is true (previously
