@@ -858,7 +858,7 @@ fn handle_pg_simple_query(
                 // a wire error so the client doesn't see a torn row.
                 wbuf.truncate(pre_len);
                 let (sqlstate, msg) = engine_error_to_wire_conn(&e, conn_state);
-                send_error(wbuf, sqlstate, &msg)?;
+                send_error_pos(wbuf, sqlstate, &msg, parse_error_position(&e, sql))?;
                 send_ready_for_query(wbuf, *tx_state)?;
                 stream.write_all(wbuf)?;
                 wbuf.clear();
@@ -948,7 +948,7 @@ fn handle_pg_simple_query(
             // surface it as a statement-timeout, not a
             // generic `42000` syntax / access error.
             let (sqlstate, msg) = engine_error_to_wire_conn(&e, conn_state);
-            send_error(wbuf, sqlstate, &msg)?;
+            send_error_pos(wbuf, sqlstate, &msg, parse_error_position(&e, sql))?;
             // After an error inside a TX, PG goes to 'E'
             // and stays there until ROLLBACK. We track
             // best-effort: if engine still in TX, mark
@@ -1155,7 +1155,7 @@ fn handle_pg_simple_query_one_into_wbuf(
         }
         Err(e) => {
             let (sqlstate, msg) = engine_error_to_wire_conn(&e, conn_state);
-            send_error(wbuf, sqlstate, &msg)?;
+            send_error_pos(wbuf, sqlstate, &msg, parse_error_position(&e, sql))?;
             *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
                 b'E'
             } else {
@@ -3496,6 +3496,21 @@ fn strip_error_class(msg: &str) -> String {
     msg.to_string()
 }
 
+/// v7.39 (read01 round 95) — recover PG's 1-based error position for a parse
+/// failure so the wire can attach the ErrorResponse `P` field. The position is
+/// re-derived from the query text on this cold error path (rather than carried
+/// on `ParseError`, which would grow the recursive parse stack). Standard PG
+/// string mode (`backslash_escapes = false`) is used — it doesn't shift token
+/// offsets in practice. Only syntax errors carry a position today; semantic
+/// errors (column-not-found, type mismatch) would need analyzer/eval plumbing
+/// and are deferred.
+fn parse_error_position(e: &EngineError, sql: &str) -> Option<usize> {
+    match e {
+        EngineError::Parse(pe) => spg_sql::parser::syntax_error_position(sql, false, pe.token_pos),
+        _ => None,
+    }
+}
+
 fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
     if let EngineError::Cancelled = e {
         return (
@@ -3517,6 +3532,12 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
     // conflict is PG's 40001 SERIALIZATION_FAILURE (clients retry).
     if let EngineError::SerializationFailure(_) = e {
         return ("40001", e.to_string());
+    }
+    // v7.39 (read01 round 95) — a parse failure is PG's 42601 SYNTAX_ERROR
+    // (was the generic 42000). The character position rides the separate `P`
+    // field (see parse_error_position).
+    if let EngineError::Parse(_) = e {
+        return ("42601", e.to_string());
     }
     let msg = e.to_string();
     // Map constraint violations to their PG SQLSTATE class-23 codes so
@@ -5484,6 +5505,19 @@ fn send_notice(stream: &mut dyn Write, msg: &str) -> std::io::Result<()> {
 }
 
 fn send_error(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Result<()> {
+    send_error_pos(stream, sqlstate, msg, None)
+}
+
+/// v7.39 (read01 round 95) — `send_error` plus PG's `P` (error position)
+/// field: a 1-based character offset into the query the client sent. psql
+/// renders it as the `LINE n: … ^` caret. `None` omits the field (the common
+/// case — only syntax errors currently carry a position).
+fn send_error_pos(
+    stream: &mut dyn Write,
+    sqlstate: &str,
+    msg: &str,
+    position: Option<usize>,
+) -> std::io::Result<()> {
     // ErrorResponse: each field is `[fieldcode byte][value][\0]`,
     // terminated by a single `\0`. Base set: S (severity), C
     // (sqlstate), M (message). v7.39 (SQLSTATE fidelity) — when the
@@ -5595,6 +5629,14 @@ fn send_error(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Res
     if let Some(c) = quoted_after("null value in column ") {
         body.push(b'c');
         body.extend_from_slice(c.as_bytes());
+        body.push(0);
+    }
+    // v7.39 (read01 round 95) — the P (position) field, when the error carries
+    // one. PG numbers characters from 1; psql draws the `LINE n: … ^` caret at
+    // this offset.
+    if let Some(p) = position {
+        body.push(b'P');
+        body.extend_from_slice(p.to_string().as_bytes());
         body.push(0);
     }
     body.push(0);

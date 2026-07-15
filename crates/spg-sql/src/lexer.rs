@@ -336,13 +336,31 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 /// sections, and pg_dump ALWAYS announces PG semantics via
 /// `SET standard_conforming_strings = on` — the engine flips this
 /// flag off/on from those deterministic session signals.
-#[allow(clippy::too_many_lines)] // big match — splitting would obscure the dispatch table
 pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>, LexError> {
+    tokenize_with_offsets(input, backslash_escapes).map(|(tokens, _)| tokens)
+}
+
+/// v7.39 (read01 round 95) — like [`tokenize_with`] but also returns, for each
+/// token, the byte offset in `input` where it started (the `Eof` token maps to
+/// `input.len()`). The parser uses this to translate a failing token index into
+/// PG's 1-based character error position (the ErrorResponse `P` field that psql
+/// renders as `LINE n: … ^`).
+#[allow(clippy::too_many_lines)] // big match — splitting would obscure the dispatch table
+pub fn tokenize_with_offsets(
+    input: &str,
+    backslash_escapes: bool,
+) -> Result<(Vec<Token>, Vec<usize>), LexError> {
     let bytes = input.as_bytes();
     let mut i = 0usize;
     let mut out = Vec::new();
+    // Parallel to `out`: the start byte of each token. Filled at the tail of
+    // every loop iteration for whatever token(s) that iteration pushed, so no
+    // per-push-site bookkeeping is needed. (The only `continue` inside a
+    // token-producing arm — the lone `@` — was rewritten to fall through.)
+    let mut offsets: Vec<usize> = Vec::new();
 
     while i < bytes.len() {
+        let start = i;
         let b = bytes[i];
         match b {
             b' ' | b'\t' | b'\n' | b'\r' => {
@@ -588,12 +606,15 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
                         // tokens. Single `@@` already short-circuits
                         // to Token::TsMatch above, so this only
                         // fires for a true lone `@`.
+                        // v7.39 (read01 round 95) — falls through to the
+                        // per-token offset fill at the loop tail (was a
+                        // `continue`, which would have skipped it).
                         out.push(Token::At);
                         i = prefix_end;
-                        continue;
+                    } else {
+                        out.push(Token::SessionVar(input[i..end].to_string()));
+                        i = end;
                     }
-                    out.push(Token::SessionVar(input[i..end].to_string()));
-                    i = end;
                 }
             }
             b'*' => single(&mut out, Token::Star, &mut i),
@@ -862,9 +883,15 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
                 });
             }
         }
+        // Assign the iteration's start byte to any token(s) pushed above.
+        // Whitespace/comment arms push nothing, so this adds nothing for them.
+        while offsets.len() < out.len() {
+            offsets.push(start);
+        }
     }
     out.push(Token::Eof);
-    Ok(out)
+    offsets.push(bytes.len());
+    Ok((out, offsets))
 }
 
 fn peek_eq(bytes: &[u8], i: usize, target: u8) -> bool {

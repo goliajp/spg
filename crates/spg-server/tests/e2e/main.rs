@@ -111,6 +111,7 @@ mod e2e_compression_metrics;
 mod e2e_copy_options;
 mod e2e_copy_errors_round91;
 mod e2e_copy_query_to_stdout_round94;
+mod e2e_error_position_round95;
 #[allow(clippy::doc_markdown, clippy::uninlined_format_args)]
 mod e2e_correlated;
 #[allow(clippy::doc_markdown, clippy::uninlined_format_args)]

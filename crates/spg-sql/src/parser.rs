@@ -445,6 +445,11 @@ fn is_vector_opclass_name(name: &str) -> bool {
 pub struct ParseError {
     pub message: String,
     /// Index into the token stream where parsing tripped. Not a byte offset.
+    /// v7.39 (read01 round 95) — the byte/char position is NOT stored here: a
+    /// field would grow every `Result<_, ParseError>` slot on the deeply
+    /// recursive parse stack and tip the nesting-budget frame cliff. PG's
+    /// 1-based char position is recovered on the cold error path by
+    /// [`syntax_error_position`], which re-tokenizes to map this token index.
     pub token_pos: usize,
 }
 
@@ -498,6 +503,28 @@ pub fn parse_statement_with(input: &str, backslash_escapes: bool) -> Result<Stat
     }
     p.expect_eof()?;
     Ok(stmt)
+}
+
+/// v7.39 (read01 round 95) — recover PG's 1-based CHARACTER error position for
+/// a [`ParseError::token_pos`]. Kept off the `ParseError` struct (and so off
+/// every recursive `Result` slot) to protect the nesting-budget frame cliff:
+/// this re-tokenizes `input` on the cold error path to map the failing token
+/// index to its start byte, then to a character offset. `backslash_escapes`
+/// must match the parse that produced `token_pos` (it barely shifts offsets,
+/// but stay consistent). Returns `None` when the index has no offset or the
+/// byte isn't a char boundary. The wire attaches it as the ErrorResponse `P`.
+#[must_use]
+pub fn syntax_error_position(
+    input: &str,
+    backslash_escapes: bool,
+    token_pos: usize,
+) -> Option<usize> {
+    let (_, offsets) = lexer::tokenize_with_offsets(input, backslash_escapes).ok()?;
+    let byte_off = *offsets.get(token_pos)?;
+    if byte_off > input.len() || !input.is_char_boundary(byte_off) {
+        return None;
+    }
+    Some(input[..byte_off].chars().count() + 1)
 }
 
 struct Parser {
