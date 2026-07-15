@@ -3951,6 +3951,10 @@ fn update_state(
             // string_agg(v::text, sep)).
             let rendered: Option<Value<'static>> = match v {
                 Value::Text(s) => Some(Value::text(s.clone())),
+                // v7.39 (read01 round 111) — xmlagg feeds xml values through this
+                // shared StringAgg path; render the fragment's text (it joins
+                // separator-less into the concatenated document).
+                Value::Xml(s) => Some(Value::text(s.to_string())),
                 Value::Int(n) => Some(Value::text(n.to_string())),
                 Value::BigInt(n) => Some(Value::text(n.to_string())),
                 Value::SmallInt(n) => Some(Value::text(n.to_string())),

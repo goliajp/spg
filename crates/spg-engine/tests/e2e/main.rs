@@ -204,6 +204,7 @@ mod e2e_abs_neg_types_round107;
 mod e2e_array2d_concat_round108;
 mod e2e_window_exclude_group_ties_round109;
 mod e2e_real_to_numeric_round110;
+mod e2e_xmlconcat_xmlagg_round111;
 mod e2e_insert_then_update_round85;
 mod e2e_json_family_round76;
 mod e2e_named_args_round77;
