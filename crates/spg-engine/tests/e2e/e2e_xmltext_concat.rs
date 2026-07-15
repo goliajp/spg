@@ -15,8 +15,10 @@ fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
 
 fn text(v: &spg_storage::Value<'_>) -> String {
     match v {
-        spg_storage::Value::Text(s) => s.to_string(),
-        other => panic!("expected Text, got {other:?}"),
+        // v7.39 (read01 round 111) — xmlconcat now returns `xml` (PG's type),
+        // xmltext still returns text; accept both string-bearing shapes.
+        spg_storage::Value::Text(s) | spg_storage::Value::Xml(s) => s.to_string(),
+        other => panic!("expected Text/Xml, got {other:?}"),
     }
 }
 

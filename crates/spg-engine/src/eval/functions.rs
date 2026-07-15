@@ -7737,6 +7737,14 @@ fn apply_function_dispatch(
             for arg in args {
                 match arg {
                     Value::Null => {}
+                    // v7.39 (read01 round 111) — the arguments are `xml` values
+                    // (`xmlconcat('<a/>'::xml, '<b/>'::xml)`); the Xml arm was
+                    // missing, so every real call errored "needs xml text". Text
+                    // stays accepted for the unquoted-literal shape.
+                    Value::Xml(s) => {
+                        out.push_str(s);
+                        any = true;
+                    }
                     Value::Text(s) => {
                         out.push_str(s);
                         any = true;
@@ -7752,7 +7760,9 @@ fn apply_function_dispatch(
                 }
             }
             if any {
-                Ok(Value::text(out))
+                // PG's xmlconcat returns `xml`, so the result keeps that type —
+                // nesting it in xmlelement inlines it instead of escaping it.
+                Ok(Value::Xml(alloc::borrow::Cow::Owned(out)))
             } else {
                 Ok(Value::Null)
             }
