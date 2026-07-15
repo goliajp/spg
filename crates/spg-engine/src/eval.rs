@@ -1523,11 +1523,49 @@ fn eval_function_call_arm(
     // The parser leaves them in the tree because only the catalog knows a user
     // function's parameter names; here they become positional, once, for
     // builtins and user functions alike.
+    // v7.39 (read01 round 100) — `VARIADIC <array>` splices the array's
+    // elements in as individual trailing arguments before dispatch, so a
+    // variadic builtin (concat / concat_ws / format / …) sees them exactly as
+    // if they had been written out. Done before the named-arg pass and the
+    // positional dispatch.
+    if args.iter().any(|a| matches!(a, Expr::Variadic(_))) {
+        let expanded = expand_variadic_args(args, row, ctx)?;
+        return eval_function_call_arm(name, &expanded, row, ctx);
+    }
     if args.iter().any(|a| matches!(a, Expr::NamedArg { .. })) {
         let positional = resolve_named_args(name, args, ctx)?;
         return eval_function_call_arm(name, &positional, row, ctx);
     }
     eval_function_call_positional(name, args, row, ctx)
+}
+
+/// v7.39 (read01 round 100) — rewrite a call's argument list, replacing each
+/// `VARIADIC <array>` with the array's elements as literal arguments. A NULL
+/// array contributes no elements (PG treats `VARIADIC NULL` as empty). Regular
+/// arguments are carried through untouched so they still evaluate against the
+/// row in the recursive call.
+fn expand_variadic_args(
+    args: &[Expr],
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<alloc::vec::Vec<Expr>, EvalError> {
+    let mut out = alloc::vec::Vec::with_capacity(args.len());
+    for a in args {
+        if let Expr::Variadic(inner) = a {
+            let v = eval_expr(inner, row, ctx)?;
+            let elems = crate::select::array_value_to_elements(&v).map_err(|_| {
+                EvalError::TypeMismatch {
+                    detail: "VARIADIC argument must be an array".into(),
+                }
+            })?;
+            for e in elems {
+                out.push(Expr::Literal(crate::value_to_literal(e)));
+            }
+        } else {
+            out.push(a.clone());
+        }
+    }
+    Ok(out)
 }
 
 /// The declared parameter names of `fname`, or `None` when it takes none.
@@ -2460,6 +2498,12 @@ pub fn eval_expr(
         Expr::FieldAccess { base, field } => eval_field_access_arm(base, field, row, ctx),
         Expr::IsNull { expr, negated } => eval_is_null_arm(expr, *negated, row, ctx),
         Expr::FunctionCall { name, args } => eval_function_call_arm(name, args, row, ctx),
+        // v7.39 (read01 round 100) — VARIADIC is spliced into its enclosing
+        // call before the args are evaluated (see eval_function_call_arm); a
+        // bare one reaching here was written outside a function call.
+        Expr::Variadic(_) => Err(EvalError::TypeMismatch {
+            detail: "VARIADIC is only valid as a function-call argument".into(),
+        }),
         Expr::Like {
             expr,
             pattern,
