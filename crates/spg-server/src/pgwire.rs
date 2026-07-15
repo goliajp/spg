@@ -1824,6 +1824,10 @@ fn command_tag(sql: &str, affected: usize) -> String {
                     && !w.eq_ignore_ascii_case("local")
                     && !w.eq_ignore_ascii_case("recursive")
                     && !w.eq_ignore_ascii_case("concurrently")
+                    // v7.39 (read01 round 82) — CREATE CONSTRAINT TRIGGER tags
+                    // as CREATE TRIGGER in PG; skip the CONSTRAINT modifier so
+                    // the object keyword (TRIGGER) is what's found.
+                    && !w.eq_ignore_ascii_case("constraint")
             });
             const OBJECTS: &[&str] = &[
                 "TABLE",
