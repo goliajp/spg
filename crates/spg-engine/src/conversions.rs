@@ -3222,6 +3222,26 @@ pub(crate) fn coerce_value(
                 Some(numeric_from_float(x, precision, scale, col_name)?)
             }
         }
+        // v7.39 (read01 round 110) — REAL (float4) → NUMERIC. Mirrors the
+        // Float arm above; `real::numeric` used to have no arm at all, so the
+        // value stayed a REAL and the column check rejected it. Format the f32
+        // via its OWN shortest round-trip decimal (not through f64) so
+        // `0.1::real::numeric` matches PG's float4 text.
+        (Value::Real(x), DataType::Numeric { precision, scale }) => {
+            if precision == 0 && scale == 0 && x.is_finite() {
+                if let Some((mantissa, src_scale)) = parse_numeric_text(&alloc::format!("{x}")) {
+                    Some(Value::Numeric {
+                        scaled: mantissa,
+                        scale: src_scale,
+                        kind: spg_storage::NumericKind::Finite,
+                    })
+                } else {
+                    Some(numeric_from_float(f64::from(x), precision, scale, col_name)?)
+                }
+            } else {
+                Some(numeric_from_float(f64::from(x), precision, scale, col_name)?)
+            }
+        }
         // v7.17.0 Phase 3.P0-67 — Text → NUMERIC. Parse a
         // canonical decimal text (`"-1234.56"` / `"42"` /
         // `"0.0001"`) into `(mantissa, source_scale)` and rescale
