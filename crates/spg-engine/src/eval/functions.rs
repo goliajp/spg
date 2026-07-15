@@ -5663,6 +5663,14 @@ fn apply_function_dispatch(
                 // v7.38 (read01 P4.18) — abs(INT_MIN) has no representable
                 // result; error like PG ("out of range") instead of wrapping
                 // back to the negative INT_MIN.
+                // v7.39 (read01 round 107) — abs(smallint) / abs(real) were
+                // missing; PG has both. checked_abs on i16::MIN errors like PG
+                // ("smallint out of range").
+                Value::SmallInt(n) => n.checked_abs().map(Value::SmallInt).ok_or_else(|| {
+                    EvalError::TypeMismatch {
+                        detail: "smallint out of range".into(),
+                    }
+                }),
                 Value::Int(n) => n.checked_abs().map(Value::Int).ok_or_else(|| {
                     EvalError::TypeMismatch {
                         detail: "integer out of range".into(),
@@ -5674,6 +5682,7 @@ fn apply_function_dispatch(
                     }
                 }),
                 Value::Float(x) => Ok(Value::Float(x.abs())),
+                Value::Real(x) => Ok(Value::Real(x.abs())),
                 // PG `abs(numeric)` returns numeric — preserve the type
                 // and scale, negating only the sign of the mantissa.
                 Value::Numeric { scaled, scale, .. } => Ok(Value::Numeric {

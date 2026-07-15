@@ -41,6 +41,9 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
                 })
         }
         (UnOp::Neg, Value::Float(x)) => Ok(Value::Float(-x)),
+        // v7.39 (read01 round 107) — unary minus on REAL (f32) was missing, so
+        // `-3.5::real` errored "unary - applied to Real".
+        (UnOp::Neg, Value::Real(x)) => Ok(Value::Real(-x)),
         (UnOp::Neg, Value::SmallInt(n)) => {
             n.checked_neg()
                 .map(Value::SmallInt)
