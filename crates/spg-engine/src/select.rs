@@ -6375,6 +6375,22 @@ pub(crate) fn generate_series_rows(
     for a in args {
         arg_values.push(eval::eval_expr(a, &dummy_row, &ctx).map_err(EngineError::Eval)?);
     }
+    generate_series_from_values(arg_values, args, cancel)
+}
+
+/// v7.39 (read01 round 96) — the value-producing core of `generate_series`,
+/// split out so the SELECT-list SRF path (`top_level_srf_output`) shares the
+/// full integer / numeric / timestamp overload set with the FROM-clause path.
+/// Before this split the target-list arm reimplemented only the integer case,
+/// so `SELECT generate_series(1,2), generate_series(ts, ts, interval)` yielded
+/// NULL for the timestamp column instead of the series. `arg_values` are the
+/// already-evaluated arguments; `args` is kept only for the timestamptz-vs-
+/// timestamp type resolution (it inspects the argument expressions' types).
+pub(crate) fn generate_series_from_values(
+    mut arg_values: alloc::vec::Vec<Value<'static>>,
+    args: &[Expr],
+    cancel: &CancelToken<'_>,
+) -> Result<(DataType, alloc::vec::Vec<Row<'static>>), EngineError> {
     // PG: a NULL bound or step yields zero rows (also keeps the
     // NULL-padded lateral probe alive — schema without data).
     if arg_values.iter().any(|v| matches!(v, Value::Null)) {
@@ -6805,37 +6821,20 @@ fn top_level_srf_output(
             array_value_to_elements(&arr)
         }
         SrfKind::GenerateSeries => {
-            let start = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
-            let stop = eval::eval_expr(&args[1], row, ctx).map_err(EngineError::Eval)?;
-            let step = match args.get(2) {
-                Some(e) => eval::eval_expr(e, row, ctx).map_err(EngineError::Eval)?,
-                None => Value::BigInt(1),
-            };
-            let as_i64 = |v: &Value| -> Option<i64> {
-                match v {
-                    Value::SmallInt(n) => Some(i64::from(*n)),
-                    Value::Int(n) => Some(i64::from(*n)),
-                    Value::BigInt(n) => Some(*n),
-                    _ => None,
-                }
-            };
-            let (Some(a), Some(b), Some(st)) = (as_i64(&start), as_i64(&stop), as_i64(&step))
-            else {
-                // A NULL bound yields the empty set (PG).
-                return Ok(Vec::new());
-            };
-            if st == 0 {
-                return Err(EngineError::Unsupported(
-                    "step size cannot equal zero".into(),
-                ));
+            // v7.39 (read01 round 96) — evaluate the args against the actual
+            // row, then hand off to the shared core so the numeric and
+            // timestamp/timestamptz overloads work here too (this arm used to
+            // handle only integers, silently NULLing a temporal/numeric series
+            // when it shared a target list with another SRF).
+            let mut arg_values: Vec<Value<'static>> = Vec::with_capacity(args.len());
+            for a in args {
+                arg_values.push(eval::eval_expr(a, row, ctx).map_err(EngineError::Eval)?);
             }
-            let mut out = Vec::new();
-            let mut i = a;
-            while (st > 0 && i <= b) || (st < 0 && i >= b) {
-                out.push(Value::BigInt(i));
-                i += st;
-            }
-            Ok(out)
+            let (_, rows) = generate_series_from_values(arg_values, args, &CancelToken::none())?;
+            Ok(rows
+                .into_iter()
+                .map(|r| r.values.into_iter().next().unwrap_or(Value::Null))
+                .collect())
         }
         SrfKind::GenerateSubscripts => {
             let arr = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
