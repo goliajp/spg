@@ -4101,12 +4101,27 @@ fn update_state(
             let (Some(y), Some(x)) = (agg_value_to_f64(v), arg2.and_then(agg_value_to_f64)) else {
                 return Ok(()); // NULL (or non-numeric) in either input
             };
+            // v7.39 (read01 round 115) — accumulate the sums of squared
+            // deviations (Sxx / Syy / Sxy) incrementally via the Youngs-Cramer
+            // update, matching PG's float8 regression aggregates to the last
+            // ULP. The old naive form (`Σx² − (Σx)²/n` at finalize time) is
+            // mathematically equal but rounds differently, so `corr` drifted in
+            // the 16th digit. reg_sx / reg_sy stay raw sums (for the averages).
             st.reg_n += 1;
-            st.reg_sx += x;
-            st.reg_sy += y;
-            st.reg_sxx += x * x;
-            st.reg_syy += y * y;
-            st.reg_sxy += x * y;
+            let new_n = st.reg_n as f64;
+            let new_sx = st.reg_sx + x;
+            let new_sy = st.reg_sy + y;
+            if st.reg_n > 1 {
+                let n_prev = new_n - 1.0;
+                let tmp_x = x * new_n - new_sx;
+                let tmp_y = y * new_n - new_sy;
+                let scale = 1.0 / (n_prev * new_n);
+                st.reg_sxx += tmp_x * tmp_x * scale;
+                st.reg_syy += tmp_y * tmp_y * scale;
+                st.reg_sxy += tmp_x * tmp_y * scale;
+            }
+            st.reg_sx = new_sx;
+            st.reg_sy = new_sy;
         }
         // v7.32 (round-29) — json_agg / jsonb_agg collect every input
         // (NULL becomes JSON null, per PG) in row order.
@@ -4437,9 +4452,12 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                 return Value::Null;
             }
             let nf = n as f64;
-            let sxx = st.reg_sxx - st.reg_sx * st.reg_sx / nf;
-            let syy = st.reg_syy - st.reg_sy * st.reg_sy / nf;
-            let sxy = st.reg_sxy - st.reg_sx * st.reg_sy / nf;
+            // v7.39 (read01 round 115) — Sxx / Syy / Sxy are now the
+            // Youngs-Cramer running deviation sums (accumulated above), so they
+            // are used directly rather than re-derived from the raw squares.
+            let sxx = st.reg_sxx;
+            let syy = st.reg_syy;
+            let sxy = st.reg_sxy;
             let avgx = st.reg_sx / nf;
             let avgy = st.reg_sy / nf;
             let out = match name {
