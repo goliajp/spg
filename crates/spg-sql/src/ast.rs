@@ -1435,6 +1435,10 @@ pub struct CreateTriggerStatement {
     /// rewriting them at the row level. Empty vec = no filter
     /// (fire on every UPDATE).
     pub update_columns: Vec<String>,
+    /// v7.39 (round 138) — `WHEN ( condition )` row-level filter: the row
+    /// trigger fires only when the condition (over NEW / OLD) is true. `None`
+    /// = no WHEN (fire unconditionally). Not allowed on INSTEAD OF triggers.
+    pub when_condition: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

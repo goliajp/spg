@@ -327,8 +327,8 @@ use crate::{
 /// INSERT row loop, taken before the mutable catalog borrow opens.
 struct InsertSnapshots {
     clock: Option<crate::ClockFn>,
-    before_insert_triggers: Vec<(spg_storage::FunctionDef, String)>,
-    after_insert_triggers: Vec<(spg_storage::FunctionDef, String)>,
+    before_insert_triggers: Vec<(spg_storage::FunctionDef, String, String)>,
+    after_insert_triggers: Vec<(spg_storage::FunctionDef, String, String)>,
     trigger_session_cfg: Option<String>,
     enum_label_lookup: alloc::collections::BTreeMap<usize, Vec<String>>,
     set_variant_lookup: alloc::collections::BTreeMap<usize, Vec<String>>,
@@ -911,7 +911,7 @@ impl Engine {
             let old_row = table.rows()[*pos].clone();
             let mut new_row = Row::new(new_vals.clone());
             let mut skip = false;
-            for (fd, filter, tgname) in &before_update_triggers {
+            for (fd, filter, when, tgname) in &before_update_triggers {
                 // v7.13.0 — `UPDATE OF cols` filter (mailrs round-5
                 // G7). Skip this trigger when the filter is set and
                 // no listed column actually differs between OLD and
@@ -919,6 +919,15 @@ impl Engine {
                 if !filter.is_empty()
                     && !any_column_changed(filter, &schema_cols, &old_row, &new_row)
                 {
+                    continue;
+                }
+                // v7.39 (round 138) — WHEN filter over OLD / NEW.
+                if !triggers::trigger_when_holds(
+                    when,
+                    Some(&new_row),
+                    Some(&old_row),
+                    &schema_cols,
+                )? {
                     continue;
                 }
                 let (outcome, deferred) = triggers::fire_row_trigger(
@@ -1005,10 +1014,19 @@ impl Engine {
             } else {
                 table.update_row(pos, new_row.values.clone())?;
             }
-            for (fd, filter, tgname) in &after_update_triggers {
+            for (fd, filter, when, tgname) in &after_update_triggers {
                 if !filter.is_empty()
                     && !any_column_changed(filter, &schema_cols, &old_row, &new_row)
                 {
+                    continue;
+                }
+                // v7.39 (round 138) — WHEN filter over OLD / NEW.
+                if !triggers::trigger_when_holds(
+                    when,
+                    Some(&new_row),
+                    Some(&old_row),
+                    &schema_cols,
+                )? {
                     continue;
                 }
                 let (_outcome, deferred) = triggers::fire_row_trigger(
@@ -1881,7 +1899,10 @@ impl Engine {
             for (pos, old_vals) in positions.iter().zip(to_delete_rows.iter()) {
                 let old_row = Row::new(old_vals.clone());
                 let mut cancel_this = false;
-                for (fd, tgname) in &before_delete_triggers {
+                for (fd, when, tgname) in &before_delete_triggers {
+                    if !triggers::trigger_when_holds(when, None, Some(&old_row), &schema_cols)? {
+                        continue;
+                    }
                     let (outcome, deferred) = triggers::fire_row_trigger(
                         fd,
                         None,
@@ -1982,7 +2003,10 @@ impl Engine {
         if !after_delete_triggers.is_empty() {
             for old_vals in &to_delete_rows {
                 let old_row = Row::new(old_vals.clone());
-                for (fd, tgname) in &after_delete_triggers {
+                for (fd, when, tgname) in &after_delete_triggers {
+                    if !triggers::trigger_when_holds(when, None, Some(&old_row), &schema_cols)? {
+                        continue;
+                    }
                     let (_outcome, deferred) = triggers::fire_row_trigger(
                         fd,
                         None,
@@ -2145,7 +2169,7 @@ impl Engine {
     fn exec_insert_view_instead_of(
         &mut self,
         stmt: &spg_sql::ast::InsertStatement,
-        triggers_list: Vec<(spg_storage::FunctionDef, alloc::string::String)>,
+        triggers_list: Vec<(spg_storage::FunctionDef, alloc::string::String, alloc::string::String)>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let view_def = self
@@ -2208,7 +2232,7 @@ impl Engine {
             // (chained through multiple INSTEAD OF triggers); RETURN NULL skips.
             let mut current = Row::new(new_vals);
             let mut skipped = false;
-            for (fd, tgname) in &triggers_list {
+            for (fd, _when, tgname) in &triggers_list {
                 let (outcome, deferred) = triggers::fire_row_trigger(
                     fd,
                     Some(current.clone()),
@@ -2303,7 +2327,7 @@ impl Engine {
     fn exec_update_view_instead_of(
         &mut self,
         stmt: &spg_sql::ast::UpdateStatement,
-        triggers_list: Vec<(spg_storage::FunctionDef, alloc::string::String)>,
+        triggers_list: Vec<(spg_storage::FunctionDef, alloc::string::String, alloc::string::String)>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let (columns, old_rows) =
@@ -2330,7 +2354,7 @@ impl Engine {
                 }
                 let mut current = Row::new(new_vals);
                 let mut skipped = false;
-                for (fd, tgname) in &triggers_list {
+                for (fd, _when, tgname) in &triggers_list {
                     let (outcome, deferred) = triggers::fire_row_trigger(
                         fd,
                         Some(current.clone()),
@@ -2380,7 +2404,7 @@ impl Engine {
     fn exec_delete_view_instead_of(
         &mut self,
         stmt: &spg_sql::ast::DeleteStatement,
-        triggers_list: Vec<(spg_storage::FunctionDef, alloc::string::String)>,
+        triggers_list: Vec<(spg_storage::FunctionDef, alloc::string::String, alloc::string::String)>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let (columns, old_rows) =
@@ -2396,7 +2420,7 @@ impl Engine {
             // RETURNING on DELETE projects the OLD row the trigger returns.
             let mut current = old.clone();
             let mut skipped = false;
-            for (fd, tgname) in &triggers_list {
+            for (fd, _when, tgname) in &triggers_list {
                 let (outcome, deferred) = triggers::fire_row_trigger(
                     fd,
                     None,
@@ -4111,8 +4135,8 @@ fn insert_parsed_rows(
     inplace: bool,
     all_values: Vec<Vec<Value<'static>>>,
     pending_updates: Vec<(usize, Vec<Value<'static>>, Vec<Value<'static>>)>,
-    before_insert_triggers: &[(spg_storage::FunctionDef, alloc::string::String)],
-    after_insert_triggers: &[(spg_storage::FunctionDef, alloc::string::String)],
+    before_insert_triggers: &[(spg_storage::FunctionDef, alloc::string::String, alloc::string::String)],
+    after_insert_triggers: &[(spg_storage::FunctionDef, alloc::string::String, alloc::string::String)],
     column_meta: &[ColumnSchema],
     table_name: &str,
     trigger_session_cfg: Option<&str>,
@@ -4158,7 +4182,11 @@ fn insert_parsed_rows(
         // trigger may rewrite NEW cells (e.g. populate
         // `search_vector := to_tsvector(...)`) and may return
         // NULL to skip the row entirely.
-        for (fd, tgname) in before_insert_triggers {
+        for (fd, when, tgname) in before_insert_triggers {
+            // v7.39 (round 138) — WHEN filter over the incoming NEW row.
+            if !triggers::trigger_when_holds(when, Some(&row), None, column_meta)? {
+                continue;
+            }
             let (outcome, deferred) = triggers::fire_row_trigger(
                 fd,
                 Some(row.clone()),
@@ -4205,7 +4233,11 @@ fn insert_parsed_rows(
         // v7.12.4 — AFTER INSERT row-level triggers fire post-
         // write. Return value is ignored (PG semantics); we
         // surface any error from the body up to the caller.
-        for (fd, tgname) in after_insert_triggers {
+        for (fd, when, tgname) in after_insert_triggers {
+            // v7.39 (round 138) — WHEN filter over the inserted NEW row.
+            if !triggers::trigger_when_holds(when, Some(&inserted), None, column_meta)? {
+                continue;
+            }
             let (_outcome, deferred) = triggers::fire_row_trigger(
                 fd,
                 Some(inserted.clone()),

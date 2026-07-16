@@ -3287,6 +3287,12 @@ impl Engine {
                     "INSTEAD OF triggers must be FOR EACH ROW".into(),
                 ));
             }
+            // v7.39 (round 138) — PG: INSTEAD OF triggers cannot have WHEN.
+            if s.when_condition.is_some() {
+                return Err(EngineError::Unsupported(
+                    "INSTEAD OF triggers cannot have WHEN conditions".into(),
+                ));
+            }
         } else if target_is_view {
             return Err(EngineError::Unsupported(alloc::format!(
                 "\"{}\" is a view DETAIL: Views cannot have row-level BEFORE or AFTER triggers.",
@@ -3304,6 +3310,13 @@ impl Engine {
             // v7.16.1 — every trigger is born enabled. Toggled
             // by ALTER TABLE … { ENABLE | DISABLE } TRIGGER.
             enabled: true,
+            // v7.39 (round 138) — deparse the WHEN predicate to text; re-parsed
+            // at fire time. Empty when there is no WHEN.
+            when_condition: s
+                .when_condition
+                .as_ref()
+                .map(|e| e.to_string())
+                .unwrap_or_default(),
         };
         self.active_catalog_mut()
             .create_trigger(def, s.or_replace)
