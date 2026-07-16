@@ -109,7 +109,10 @@ pub enum Statement {
     /// source is a follow-up); BY SOURCE / BY TARGET and RETURNING
     /// are also follow-ups.
     Merge(MergeStatement),
-    Begin,
+    /// `BEGIN` / `START TRANSACTION` — with an optional explicit
+    /// `ISOLATION LEVEL …` mode (`None` = use the session default). PG
+    /// applies the level for the duration of this transaction only.
+    Begin(Option<IsolationLevel>),
     Commit,
     Rollback,
     /// `SAVEPOINT <name>` — push a named savepoint onto the active TX's
@@ -3487,7 +3490,7 @@ impl Statement {
             | Statement::Update(_)
             | Statement::Delete(_)
             | Statement::Merge(_)
-            | Statement::Begin
+            | Statement::Begin(_)
             | Statement::Commit
             | Statement::Rollback
             | Statement::Savepoint(_)
@@ -3835,7 +3838,8 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
-            Self::Begin => f.write_str("BEGIN"),
+            Self::Begin(None) => f.write_str("BEGIN"),
+            Self::Begin(Some(level)) => write!(f, "BEGIN ISOLATION LEVEL {level}"),
             Self::Commit => f.write_str("COMMIT"),
             Self::Rollback => f.write_str("ROLLBACK"),
             Self::Savepoint(n) => write!(f, "SAVEPOINT {}", quote_ident(n)),

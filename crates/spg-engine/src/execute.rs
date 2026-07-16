@@ -1024,7 +1024,7 @@ impl Engine {
                 query,
                 options,
             } => self.exec_copy_to(&table, columns.as_deref(), query.as_deref(), &options, cancel),
-            Statement::Begin => self.exec_begin(),
+            Statement::Begin(isolation) => self.exec_begin(isolation),
             Statement::Commit => self.exec_commit(),
             Statement::Rollback => self.exec_rollback(),
             Statement::Savepoint(name) => self.exec_savepoint(name),
