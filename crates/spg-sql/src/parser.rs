@@ -4404,6 +4404,15 @@ impl Parser {
                 )));
             }
         };
+        // v7.39 (round 138) — optional `WHEN ( condition )` before EXECUTE.
+        let when_condition = if matches!(self.peek(),
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("when"))
+        {
+            self.advance();
+            Some(self.parse_paren_expr("WHEN")?)
+        } else {
+            None
+        };
         // EXECUTE FUNCTION/PROCEDURE name(...)
         let exec = self.expect_ident_like()?;
         if !exec.eq_ignore_ascii_case("execute") {
@@ -4440,6 +4449,7 @@ impl Parser {
             for_each,
             function,
             update_columns,
+            when_condition,
         }))
     }
 

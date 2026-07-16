@@ -3671,6 +3671,10 @@ pub struct TriggerDef {
     /// catalog FILE_VERSION 25+; older catalogs deserialise
     /// with `enabled = true`.
     pub enabled: bool,
+    /// v7.39 (round 138) — the deparsed `WHEN ( condition )` predicate text
+    /// (re-parsed at fire time to filter row triggers). Empty = no WHEN.
+    /// Persisted from FILE_VERSION 70; older catalogs read back empty.
+    pub when_condition: String,
 }
 
 /// v7.17.0 — catalogued SEQUENCE. PG semantics: a counter object
@@ -6724,7 +6728,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 69;
+const FILE_VERSION: u8 = 70;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7514,6 +7518,8 @@ impl Catalog {
             }
             // v7.16.1 — TriggerDef.enabled (FILE_VERSION 25+).
             out.push(u8::from(td.enabled));
+            // v7.39 (round 138) — WHEN condition text (FILE_VERSION 70+).
+            write_str(&mut out, &td.when_condition);
         }
         // v7.17.0 Phase 1.1 — SEQUENCE catalog block (FILE_VERSION 26+).
         write_u32(
@@ -7810,6 +7816,13 @@ impl Catalog {
                 } else {
                     true
                 };
+                // v7.39 (round 138) — WHEN condition text added at FILE_VERSION
+                // 70; older catalogs read back empty (no WHEN filter).
+                let when_condition = if version >= 70 {
+                    cur.read_str()?
+                } else {
+                    String::new()
+                };
                 cat.triggers.push(TriggerDef {
                     name,
                     table,
@@ -7819,6 +7832,7 @@ impl Catalog {
                     function,
                     update_columns,
                     enabled,
+                    when_condition,
                 });
             }
         }

@@ -1630,7 +1630,30 @@ fn eval_with_new_old(
 /// `to_tsvector('english', NEW.subject || ' ' || NEW.sender)`
 /// substitutes cleanly even though the references nest inside
 /// function calls + binary operators.
-fn substitute_new_old(
+/// v7.39 (round 138) — does a row trigger's `WHEN ( condition )` hold for the
+/// NEW / OLD row? Empty text = no condition (always fires). After NEW/OLD are
+/// substituted to literals the predicate is constant, so a minimal eval context
+/// suffices — this is a free fn callable from the borrow-constrained INSERT row
+/// loop. Only a definite TRUE fires (NULL / FALSE skip), matching PG.
+pub(crate) fn trigger_when_holds(
+    when_text: &str,
+    new_row: Option<&Row<'static>>,
+    old_row: Option<&Row<'static>>,
+    columns: &[ColumnSchema],
+) -> Result<bool, EngineError> {
+    if when_text.is_empty() {
+        return Ok(true);
+    }
+    let mut expr = spg_sql::parser::parse_expression(when_text)
+        .map_err(|e| EngineError::Unsupported(alloc::format!("trigger WHEN: {e}")))?;
+    substitute_new_old(&mut expr, new_row, old_row, columns).map_err(EngineError::Eval)?;
+    let ctx = crate::eval::EvalContext::new(&[], None);
+    let empty = Row::new(alloc::vec::Vec::new());
+    let v = crate::eval::eval_expr(&expr, &empty, &ctx).map_err(EngineError::Eval)?;
+    Ok(matches!(v, Value::Bool(true)))
+}
+
+pub(crate) fn substitute_new_old(
     expr: &mut Expr,
     new_row: Option<&Row<'static>>,
     old_row: Option<&Row<'static>>,
@@ -1897,7 +1920,7 @@ impl Engine {
         table: &str,
         event: &str,
         timing: &str,
-    ) -> Vec<(spg_storage::FunctionDef, alloc::string::String)> {
+    ) -> Vec<(spg_storage::FunctionDef, alloc::string::String, alloc::string::String)> {
         let cat = self.active_catalog();
         cat.triggers()
             .iter()
@@ -1919,7 +1942,7 @@ impl Engine {
             .filter_map(|t| {
                 cat.functions_named(&t.function)
                     .first()
-                    .map(|f| ((*f).clone(), t.name.clone()))
+                    .map(|f| ((*f).clone(), t.when_condition.clone(), t.name.clone()))
             })
             .collect()
     }
@@ -1932,7 +1955,12 @@ impl Engine {
         &self,
         table: &str,
         timing: &str,
-    ) -> Vec<(spg_storage::FunctionDef, Vec<String>, alloc::string::String)> {
+    ) -> Vec<(
+        spg_storage::FunctionDef,
+        Vec<String>,
+        alloc::string::String,
+        alloc::string::String,
+    )> {
         let cat = self.active_catalog();
         cat.triggers()
             .iter()
@@ -1944,11 +1972,16 @@ impl Engine {
                     && t.for_each.eq_ignore_ascii_case("row")
                     && t.events.iter().any(|e| e.eq_ignore_ascii_case("UPDATE"))
             })
-            // v7.39 (read01 round 82) — third element is the trigger name (TG_NAME).
+            // (fd, UPDATE-OF cols, WHEN text, trigger name).
             .filter_map(|t| {
-                cat.functions_named(&t.function)
-                    .first()
-                    .map(|fd| ((*fd).clone(), t.update_columns.clone(), t.name.clone()))
+                cat.functions_named(&t.function).first().map(|fd| {
+                    (
+                        (*fd).clone(),
+                        t.update_columns.clone(),
+                        t.when_condition.clone(),
+                        t.name.clone(),
+                    )
+                })
             })
             .collect()
     }
