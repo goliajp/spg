@@ -515,6 +515,12 @@ fn alias_referenced_elsewhere(
     for it in &stmt.items {
         match it {
             SelectItem::Wildcard => continue,
+            // `q.*` references alias `q`; a wildcard for another table does not.
+            SelectItem::QualifiedWildcard(q) => {
+                if q.eq_ignore_ascii_case(alias) {
+                    return true;
+                }
+            }
             SelectItem::Expr { expr, .. } => {
                 if expr_references_alias(expr, alias) {
                     return true;

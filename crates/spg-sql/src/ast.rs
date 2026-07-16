@@ -2626,6 +2626,10 @@ pub enum UnionKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
     Wildcard,
+    /// v7.39 (read01 round 128) — qualified wildcard `qualifier.*`: every column
+    /// of the table / alias `qualifier` (or, in a RETURNING list, the `OLD` /
+    /// `NEW` pseudo-relation).
+    QualifiedWildcard(String),
     Expr { expr: Expr, alias: Option<String> },
 }
 
@@ -5500,6 +5504,7 @@ impl fmt::Display for SelectItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Wildcard => f.write_str("*"),
+            Self::QualifiedWildcard(q) => write!(f, "{}.*", quote_ident(q)),
             Self::Expr { expr, alias } => {
                 write!(f, "{expr}")?;
                 if let Some(a) = alias {

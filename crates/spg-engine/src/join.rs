@@ -1921,7 +1921,9 @@ impl Engine {
                     let name = match item {
                         SelectItem::Expr { alias: Some(a), .. } => a.clone(),
                         SelectItem::Expr { expr, .. } => synth_lateral_col_name(expr, i),
-                        SelectItem::Wildcard => alloc::format!("col{i}"),
+                        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                            alloc::format!("col{i}")
+                        }
                     };
                     out.push(ColumnSchema::new(name, DataType::Text, true));
                 }
@@ -2927,7 +2929,7 @@ fn is_constant_values_derived(s: &SelectStatement) -> bool {
             && p.having.is_none()
             && p.items.iter().all(|it| match it {
                 SelectItem::Expr { expr, .. } => expr_is_constant(expr),
-                SelectItem::Wildcard => false,
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
             })
     };
     peer_ok(s) && s.unions.iter().all(|(_, peer)| peer_ok(peer))

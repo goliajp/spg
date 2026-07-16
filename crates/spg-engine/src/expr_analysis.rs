@@ -57,7 +57,7 @@ pub(crate) fn collect_qualified_refs(
 ) -> Option<()> {
     for item in &stmt.items {
         match item {
-            SelectItem::Wildcard => return None,
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => return None,
             SelectItem::Expr { expr, .. } => collect_qualified_refs_expr(expr, out)?,
         }
     }

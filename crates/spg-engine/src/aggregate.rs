@@ -3134,9 +3134,11 @@ fn project_groups(
         .items
         .iter()
         .map(|item| match item {
-            SelectItem::Wildcard => Err(EvalError::TypeMismatch {
-                detail: "SELECT * with aggregates is not supported".into(),
-            }),
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                Err(EvalError::TypeMismatch {
+                    detail: "SELECT * with aggregates is not supported".into(),
+                })
+            }
             SelectItem::Expr { expr, alias } => {
                 let rewritten = rewrite_expr(expr, group_exprs, agg_specs);
                 let name = alias.clone().unwrap_or_else(|| expr.to_string());
@@ -3174,7 +3176,7 @@ fn project_groups(
         .iter()
         .map(|item| match item {
             SelectItem::Expr { expr, .. } => Some(rewrite_expr(expr, group_exprs, agg_specs)),
-            SelectItem::Wildcard => None,
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => None,
         })
         .collect();
     // v7.31 (perf — PG lesson #1): subquery-bearing select items

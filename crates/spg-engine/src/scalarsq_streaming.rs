@@ -100,7 +100,7 @@ pub fn is_scalarsq_streaming_shape(stmt: &SelectStatement) -> bool {
     let mut has_scalar_sub = false;
     for item in &stmt.items {
         match item {
-            SelectItem::Wildcard => return false,
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => return false,
             SelectItem::Expr { expr, .. } => {
                 if expr_has_streaming_disqualifier(expr) {
                     return false;
