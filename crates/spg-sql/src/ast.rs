@@ -2329,7 +2329,13 @@ pub struct MergeWhenClause {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeMatched {
     Matched,
+    /// `WHEN NOT MATCHED [BY TARGET]` — a source row with no matching
+    /// target row (the classic insert branch).
     NotMatched,
+    /// v7.39 (round 146, PG17) — `WHEN NOT MATCHED BY SOURCE`: a TARGET
+    /// row no source row matches. Actions are UPDATE / DELETE / DO
+    /// NOTHING only (INSERT is a syntax error, as in PG).
+    NotMatchedBySource,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3853,6 +3859,7 @@ impl fmt::Display for Statement {
                     f.write_str(match clause.matched {
                         MergeMatched::Matched => "MATCHED",
                         MergeMatched::NotMatched => "NOT MATCHED",
+                        MergeMatched::NotMatchedBySource => "NOT MATCHED BY SOURCE",
                     })?;
                     if let Some(c) = &clause.condition {
                         write!(f, " AND {c}")?;
