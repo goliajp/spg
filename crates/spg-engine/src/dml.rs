@@ -1007,9 +1007,29 @@ impl Engine {
                     let synth_row = Row::new(vals);
                     let mut new_row_values: Vec<Value<'static>> =
                         (0..target_arity).map(|_| Value::Null).collect();
-                    for (col, expr) in columns.iter().zip(values.iter()) {
-                        let pos =
-                            target_cols
+                    // v7.39 (read01 round 123) — an omitted column list (`INSERT
+                    // VALUES (…)`) maps the values positionally to every column
+                    // in declaration order, like a plain INSERT.
+                    if columns.is_empty() {
+                        if values.len() > target_arity {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "MERGE INSERT has more expressions ({}) than target columns ({target_arity})",
+                                values.len()
+                            )));
+                        }
+                        for (pos, expr) in values.iter().enumerate() {
+                            let raw = eval::eval_expr(expr, &synth_row, &source_only_ctx)?;
+                            let coerced = coerce_value(
+                                raw,
+                                target_cols[pos].ty,
+                                &target_cols[pos].name,
+                                pos,
+                            )?;
+                            new_row_values[pos] = coerced;
+                        }
+                    } else {
+                        for (col, expr) in columns.iter().zip(values.iter()) {
+                            let pos = target_cols
                                 .iter()
                                 .position(|c| c.name == *col)
                                 .ok_or_else(|| {
@@ -1017,10 +1037,15 @@ impl Engine {
                                         name: col.clone(),
                                     })
                                 })?;
-                        let raw = eval::eval_expr(expr, &synth_row, &source_only_ctx)?;
-                        let coerced =
-                            coerce_value(raw, target_cols[pos].ty, &target_cols[pos].name, pos)?;
-                        new_row_values[pos] = coerced;
+                            let raw = eval::eval_expr(expr, &synth_row, &source_only_ctx)?;
+                            let coerced = coerce_value(
+                                raw,
+                                target_cols[pos].ty,
+                                &target_cols[pos].name,
+                                pos,
+                            )?;
+                            new_row_values[pos] = coerced;
+                        }
                     }
                     inserts.push(new_row_values);
                     affected += 1;

@@ -6722,30 +6722,29 @@ impl Parser {
             let action = match self.peek().clone() {
                 Token::Insert => {
                     self.advance();
-                    // (cols)
-                    if !matches!(self.peek(), Token::LParen) {
-                        return Err(self.err(format!(
-                            "expected '(' after INSERT in MERGE, got {:?}",
-                            self.peek()
-                        )));
-                    }
-                    self.advance();
+                    // v7.39 (read01 round 123) — the `(cols)` list is OPTIONAL,
+                    // exactly like a plain INSERT: `WHEN NOT MATCHED THEN INSERT
+                    // VALUES (…)` omits it and fills every column in declaration
+                    // order. PG accepts this; SPG used to require the list.
                     let mut columns: Vec<String> = Vec::new();
-                    loop {
-                        columns.push(self.expect_ident_like()?);
-                        if matches!(self.peek(), Token::Comma) {
-                            self.advance();
-                            continue;
+                    if matches!(self.peek(), Token::LParen) {
+                        self.advance();
+                        loop {
+                            columns.push(self.expect_ident_like()?);
+                            if matches!(self.peek(), Token::Comma) {
+                                self.advance();
+                                continue;
+                            }
+                            break;
                         }
-                        break;
+                        if !matches!(self.peek(), Token::RParen) {
+                            return Err(self.err(format!(
+                                "expected ')' after INSERT column list, got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
                     }
-                    if !matches!(self.peek(), Token::RParen) {
-                        return Err(self.err(format!(
-                            "expected ')' after INSERT column list, got {:?}",
-                            self.peek()
-                        )));
-                    }
-                    self.advance();
                     // VALUES (...)
                     if !matches!(self.peek(), Token::Values) {
                         return Err(self.err(format!(
@@ -6777,7 +6776,9 @@ impl Parser {
                         )));
                     }
                     self.advance();
-                    if columns.len() != values.len() {
+                    // Empty column list = positional into every column, so the
+                    // count is checked against the table arity at execution.
+                    if !columns.is_empty() && columns.len() != values.len() {
                         return Err(self.err(format!(
                             "MERGE INSERT column count ({}) ≠ value count ({})",
                             columns.len(),
