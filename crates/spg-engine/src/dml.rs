@@ -2124,6 +2124,105 @@ impl Engine {
         })
     }
 
+    /// v7.39 (round 137) — INSERT through a view carrying an INSTEAD OF INSERT
+    /// trigger: build a NEW row over the view's columns for each VALUES tuple and
+    /// fire the trigger(s). The function body does the real write; no row is
+    /// written to the view itself.
+    fn exec_insert_view_instead_of(
+        &mut self,
+        stmt: &spg_sql::ast::InsertStatement,
+        triggers_list: Vec<(spg_storage::FunctionDef, alloc::string::String)>,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        if stmt.returning.is_some() {
+            return Err(EngineError::Unsupported(
+                "RETURNING through an INSTEAD OF trigger is not yet supported".into(),
+            ));
+        }
+        let view_def = self
+            .active_catalog()
+            .views()
+            .get(&stmt.table)
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.table.clone(),
+                })
+            })?;
+        let body = match spg_sql::parser::parse_statement(&view_def.body) {
+            Ok(spg_sql::ast::Statement::Select(b)) => b,
+            _ => {
+                return Err(EngineError::Unsupported(
+                    "INSTEAD OF: view body is not a SELECT".into(),
+                ));
+            }
+        };
+        let cols = self.view_output_columns(&body, &view_def.columns)?;
+        let col_schemas: Vec<ColumnSchema> = cols
+            .iter()
+            .map(|(n, t)| ColumnSchema::new(n.clone(), *t, true))
+            .collect();
+        let trigger_cfg: Option<String> = self
+            .session_params
+            .get("default_text_search_config")
+            .cloned();
+        let eval_ctx = self.ev_ctx(&[], None);
+        let empty = Row::new(Vec::new());
+        let mut deferred_all: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
+        let mut affected = 0usize;
+        for tuple in &stmt.rows {
+            let mut new_vals: Vec<Value<'static>> = alloc::vec![Value::Null; col_schemas.len()];
+            match &stmt.columns {
+                Some(names) => {
+                    for (name, expr) in names.iter().zip(tuple) {
+                        let pos = col_schemas
+                            .iter()
+                            .position(|c| &c.name == name)
+                            .ok_or_else(|| {
+                                EngineError::Eval(EvalError::ColumnNotFound { name: name.clone() })
+                            })?;
+                        new_vals[pos] =
+                            self.eval_expr_with_correlated(expr, &empty, &eval_ctx, cancel, None)?;
+                    }
+                }
+                None => {
+                    for (i, expr) in tuple.iter().enumerate() {
+                        if let Some(slot) = new_vals.get_mut(i) {
+                            *slot = self
+                                .eval_expr_with_correlated(expr, &empty, &eval_ctx, cancel, None)?;
+                        }
+                    }
+                }
+            }
+            let new_row = Row::new(new_vals);
+            for (fd, tgname) in &triggers_list {
+                let (_outcome, deferred) = triggers::fire_row_trigger(
+                    fd,
+                    Some(new_row.clone()),
+                    None,
+                    &stmt.table,
+                    &col_schemas,
+                    &[],
+                    trigger_cfg.as_deref(),
+                    false,
+                    &triggers::TgMeta {
+                        op: "INSERT",
+                        name: tgname,
+                        level: "ROW",
+                    },
+                )
+                .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                deferred_all.extend(deferred);
+            }
+            affected += 1;
+        }
+        self.execute_deferred_trigger_stmts(deferred_all, cancel)?;
+        Ok(QueryResult::CommandOk {
+            affected,
+            modified_catalog: true,
+        })
+    }
+
     pub(crate) fn exec_insert(
         &mut self,
         stmt: InsertStatement,
@@ -2165,6 +2264,13 @@ impl Engine {
             for cell in tuple.iter_mut() {
                 self.resolve_sequence_calls_in_expr(cell)?;
             }
+        }
+        // v7.39 (round 137) — INSTEAD OF INSERT trigger on the target view: fire
+        // the trigger per row instead of the auto-updatable redirect. The
+        // function body does the real write. Takes precedence over redirect.
+        let iof_triggers = self.snapshot_row_triggers(&stmt.table, "INSERT", "INSTEAD OF");
+        if !iof_triggers.is_empty() {
+            return self.exec_insert_view_instead_of(&stmt, iof_triggers, CancelToken::none());
         }
         // v7.37.19 (19.13) — auto-updatable view redirect.
         // INSERT INTO simple_view (cols) VALUES (...) rewrites to

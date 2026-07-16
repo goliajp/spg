@@ -3271,6 +3271,22 @@ impl Engine {
             spg_sql::ast::TriggerForEach::Row => "ROW",
             spg_sql::ast::TriggerForEach::Statement => "STATEMENT",
         };
+        // v7.39 (round 137) — INSTEAD OF triggers may only target views; BEFORE /
+        // AFTER row triggers may only target base tables. PG's exact wording.
+        let target_is_view = self.active_catalog().views().contains_key(&s.table);
+        if matches!(s.timing, spg_sql::ast::TriggerTiming::InsteadOf) {
+            if !target_is_view {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "\"{}\" is a table DETAIL: Tables cannot have INSTEAD OF triggers.",
+                    s.table
+                )));
+            }
+        } else if target_is_view {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "\"{}\" is a view DETAIL: Views cannot have row-level BEFORE or AFTER triggers.",
+                s.table
+            )));
+        }
         let def = spg_storage::TriggerDef {
             name: s.name.clone(),
             table: s.table.clone(),
@@ -3546,7 +3562,7 @@ impl Engine {
     /// through the real executor with a zero-row bound, so it reflects exactly
     /// what a SELECT from the view would return — column overrides, view-on-view
     /// expansion, joins and all. Types come from the empty result's schema.
-    fn view_output_columns(
+    pub(crate) fn view_output_columns(
         &self,
         body: &spg_sql::ast::SelectStatement,
         overrides: &[String],
