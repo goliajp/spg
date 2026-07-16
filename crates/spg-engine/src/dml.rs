@@ -2148,11 +2148,6 @@ impl Engine {
         triggers_list: Vec<(spg_storage::FunctionDef, alloc::string::String)>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
-        if stmt.returning.is_some() {
-            return Err(EngineError::Unsupported(
-                "RETURNING through an INSTEAD OF trigger is not yet supported".into(),
-            ));
-        }
         let view_def = self
             .active_catalog()
             .views()
@@ -2183,6 +2178,7 @@ impl Engine {
         let eval_ctx = self.ev_ctx(&[], None);
         let empty = Row::new(Vec::new());
         let mut deferred_all: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
+        let mut returned: Vec<Row<'static>> = Vec::new();
         let mut affected = 0usize;
         for tuple in &stmt.rows {
             let mut new_vals: Vec<Value<'static>> = alloc::vec![Value::Null; col_schemas.len()];
@@ -2208,11 +2204,14 @@ impl Engine {
                     }
                 }
             }
-            let new_row = Row::new(new_vals);
+            // The row RETURNING projects over is the one the trigger returns
+            // (chained through multiple INSTEAD OF triggers); RETURN NULL skips.
+            let mut current = Row::new(new_vals);
+            let mut skipped = false;
             for (fd, tgname) in &triggers_list {
-                let (_outcome, deferred) = triggers::fire_row_trigger(
+                let (outcome, deferred) = triggers::fire_row_trigger(
                     fd,
-                    Some(new_row.clone()),
+                    Some(current.clone()),
                     None,
                     &stmt.table,
                     &col_schemas,
@@ -2227,14 +2226,45 @@ impl Engine {
                 )
                 .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
                 deferred_all.extend(deferred);
+                match outcome {
+                    triggers::TriggerOutcome::Row(r) => current = r,
+                    triggers::TriggerOutcome::Skip => {
+                        skipped = true;
+                        break;
+                    }
+                }
             }
-            affected += 1;
+            if !skipped {
+                returned.push(current);
+                affected += 1;
+            }
         }
         self.execute_deferred_trigger_stmts(deferred_all, cancel)?;
+        if let Some(items) = &stmt.returning {
+            return self.project_instead_of_returning(items, &stmt.table, &col_schemas, &returned);
+        }
         Ok(QueryResult::CommandOk {
             affected,
             modified_catalog: true,
         })
+    }
+
+    /// v7.39 (round 137, Phase 3) — project a RETURNING list over the rows an
+    /// INSTEAD OF trigger returned (NEW for INSERT/UPDATE, OLD for DELETE). The
+    /// items resolve against the view's column schema.
+    fn project_instead_of_returning(
+        &self,
+        items: &[spg_sql::ast::SelectItem],
+        view_name: &str,
+        col_schemas: &[ColumnSchema],
+        returned: &[Row<'static>],
+    ) -> Result<QueryResult, EngineError> {
+        let columns = self.derive_output_columns(items, col_schemas, view_name);
+        let mut out: Vec<Row<'static>> = Vec::with_capacity(returned.len());
+        for row in returned {
+            out.push(self.project_row_simple(row, items, col_schemas, view_name)?);
+        }
+        Ok(QueryResult::Rows { columns, rows: out })
     }
 
     /// v7.39 (round 137, Phase 2) — materialise the view rows an UPDATE / DELETE
@@ -2276,11 +2306,6 @@ impl Engine {
         triggers_list: Vec<(spg_storage::FunctionDef, alloc::string::String)>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
-        if stmt.returning.is_some() {
-            return Err(EngineError::Unsupported(
-                "RETURNING through an INSTEAD OF trigger is not yet supported".into(),
-            ));
-        }
         let (columns, old_rows) =
             self.scan_instead_of_view_rows(&stmt.table, &stmt.where_, cancel)?;
         let trigger_cfg: Option<String> = self
@@ -2288,6 +2313,7 @@ impl Engine {
             .get("default_text_search_config")
             .cloned();
         let mut deferred_all: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
+        let mut returned: Vec<Row<'static>> = Vec::new();
         let mut affected = 0usize;
         {
             let ctx = self.ev_ctx(&columns, Some(&stmt.table));
@@ -2302,11 +2328,12 @@ impl Engine {
                     new_vals[pos] =
                         self.eval_expr_with_correlated(expr, old, &ctx, cancel, None)?;
                 }
-                let new_row = Row::new(new_vals);
+                let mut current = Row::new(new_vals);
+                let mut skipped = false;
                 for (fd, tgname) in &triggers_list {
-                    let (_o, deferred) = triggers::fire_row_trigger(
+                    let (outcome, deferred) = triggers::fire_row_trigger(
                         fd,
-                        Some(new_row.clone()),
+                        Some(current.clone()),
                         Some(old),
                         &stmt.table,
                         &columns,
@@ -2323,11 +2350,24 @@ impl Engine {
                         EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
                     })?;
                     deferred_all.extend(deferred);
+                    match outcome {
+                        triggers::TriggerOutcome::Row(r) => current = r,
+                        triggers::TriggerOutcome::Skip => {
+                            skipped = true;
+                            break;
+                        }
+                    }
                 }
-                affected += 1;
+                if !skipped {
+                    returned.push(current);
+                    affected += 1;
+                }
             }
         }
         self.execute_deferred_trigger_stmts(deferred_all, cancel)?;
+        if let Some(items) = &stmt.returning {
+            return self.project_instead_of_returning(items, &stmt.table, &columns, &returned);
+        }
         Ok(QueryResult::CommandOk {
             affected,
             modified_catalog: true,
@@ -2343,11 +2383,6 @@ impl Engine {
         triggers_list: Vec<(spg_storage::FunctionDef, alloc::string::String)>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
-        if stmt.returning.is_some() {
-            return Err(EngineError::Unsupported(
-                "RETURNING through an INSTEAD OF trigger is not yet supported".into(),
-            ));
-        }
         let (columns, old_rows) =
             self.scan_instead_of_view_rows(&stmt.table, &stmt.where_, cancel)?;
         let trigger_cfg: Option<String> = self
@@ -2355,10 +2390,14 @@ impl Engine {
             .get("default_text_search_config")
             .cloned();
         let mut deferred_all: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
+        let mut returned: Vec<Row<'static>> = Vec::new();
         let mut affected = 0usize;
         for old in &old_rows {
+            // RETURNING on DELETE projects the OLD row the trigger returns.
+            let mut current = old.clone();
+            let mut skipped = false;
             for (fd, tgname) in &triggers_list {
-                let (_o, deferred) = triggers::fire_row_trigger(
+                let (outcome, deferred) = triggers::fire_row_trigger(
                     fd,
                     None,
                     Some(old),
@@ -2375,10 +2414,23 @@ impl Engine {
                 )
                 .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
                 deferred_all.extend(deferred);
+                match outcome {
+                    triggers::TriggerOutcome::Row(r) => current = r,
+                    triggers::TriggerOutcome::Skip => {
+                        skipped = true;
+                        break;
+                    }
+                }
             }
-            affected += 1;
+            if !skipped {
+                returned.push(current);
+                affected += 1;
+            }
         }
         self.execute_deferred_trigger_stmts(deferred_all, cancel)?;
+        if let Some(items) = &stmt.returning {
+            return self.project_instead_of_returning(items, &stmt.table, &columns, &returned);
+        }
         Ok(QueryResult::CommandOk {
             affected,
             modified_catalog: true,
