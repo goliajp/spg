@@ -33,16 +33,49 @@ use spg_sql::ast::{Expr, InsertStatement, SelectItem};
 /// view rewrite to the base table AND-ing the view's WHERE onto the caller's;
 /// INSERT ignores the WHERE (no WITH CHECK OPTION support yet). Returns `None`
 /// when the view is not a simple single-table projection.
+/// v7.39 (round 136) — the resolved target of a write through an auto-updatable
+/// view, following nested views down to the real base table.
+struct ViewRedirect {
+    /// The real base table (bottom of the view chain).
+    base: String,
+    /// Composed WHERE (every level's predicate AND-ed), in base columns. Filters
+    /// which base rows an UPDATE / DELETE through the view may touch.
+    where_at_base: Option<spg_sql::ast::Expr>,
+    /// Outermost-view-col → base-table-col map (composed across the chain).
+    /// Empty when no level renames columns (the common path).
+    col_map: Vec<(String, String)>,
+    /// Per-level `(view_name, qual_at_base, check_option)`, outermost first, for
+    /// WITH CHECK OPTION enforcement (only WHERE-bearing levels appear).
+    check_chain: Vec<(String, spg_sql::ast::Expr, u8)>,
+}
+
+/// Compose two view column maps: `a` maps outer→mid, `b` maps mid→base; the
+/// result maps outer→base. An empty map is the identity.
+fn compose_view_maps(a: &[(String, String)], b: &[(String, String)]) -> Vec<(String, String)> {
+    if a.is_empty() {
+        return b.to_vec();
+    }
+    if b.is_empty() {
+        return a.to_vec();
+    }
+    let bm: alloc::collections::BTreeMap<&String, &String> =
+        b.iter().map(|(k, v)| (k, v)).collect();
+    a.iter()
+        .map(|(outer, mid)| {
+            let base = bm.get(mid).map(|s| (*s).clone()).unwrap_or_else(|| mid.clone());
+            (outer.clone(), base)
+        })
+        .collect()
+}
+
 fn view_redirect_to_simple_base(
     catalog: &spg_storage::Catalog,
     view_name: &str,
-) -> Option<(String, Option<spg_sql::ast::Expr>, bool, Vec<(String, String)>)> {
+) -> Option<ViewRedirect> {
     let view = catalog.views().get(view_name)?;
-    // v7.39 (round 132) — WITH CHECK OPTION marker (0 = none).
-    let has_check_option = view.check_option != 0;
-    // v7.39 (round 133) — a column-rename list is handled by mapping the view's
-    // column names back to the base columns (built below); the write's column
-    // refs are rewritten accordingly.
+    let this_check = view.check_option;
+    // v7.39 (round 133) — a column-rename list maps the view's column names back
+    // to the primary's columns.
     let rename_cols = view.columns.clone();
     let stmt = spg_sql::parser::parse_statement(&view.body).ok()?;
     let select = match stmt {
@@ -50,7 +83,7 @@ fn view_redirect_to_simple_base(
         _ => return None,
     };
     // simple-query shape: every reject clause must be empty / None. A WHERE is
-    // allowed (PG-auto-updatable) — it is threaded back to the caller.
+    // allowed (PG-auto-updatable).
     if !select.ctes.is_empty()
         || select.distinct
         || select.group_by.is_some()
@@ -64,50 +97,92 @@ fn view_redirect_to_simple_base(
         return None;
     }
     let from = select.from.as_ref()?;
-    // No joins.
     if !from.joins.is_empty() {
         return None;
     }
-    // Primary table must be a plain TableRef (not unnest, not AS OF).
     if from.primary.unnest_expr.is_some() || from.primary.as_of_segment.is_some() {
         return None;
     }
-    // Every projected item must be a bare column reference or wildcard
-    // (aggregates / function calls / arithmetic = not simple). Collect the base
-    // column each view column maps to, in view-column order.
-    let mut base_cols: Vec<String> = Vec::new();
+    let primary_name = from.primary.name.clone();
+    // Validate the projection is a bare-column / wildcard list, and (only when
+    // renamed) build this level's view-col → primary-col map. `*` projects the
+    // primary's columns in declaration order.
+    let mut primary_cols: Vec<String> = Vec::new();
+    let mut need_primary_cols = !rename_cols.is_empty();
     for item in &select.items {
         match item {
             spg_sql::ast::SelectItem::Wildcard
             | spg_sql::ast::SelectItem::QualifiedWildcard(_) => {
-                // `*` projects every base column in declaration order.
-                let base = catalog.get(&from.primary.name)?;
-                for c in &base.schema().columns {
-                    base_cols.push(c.name.clone());
+                if need_primary_cols {
+                    // Renamed wildcard view: resolve the primary's output columns
+                    // (a base table's schema). Renamed-over-nested-view is a rare
+                    // case we don't compose column-wise — bail rather than guess.
+                    let base = catalog.get(&primary_name)?;
+                    for c in &base.schema().columns {
+                        primary_cols.push(c.name.clone());
+                    }
+                    need_primary_cols = false;
                 }
             }
             spg_sql::ast::SelectItem::Expr { expr, .. } => match expr {
-                spg_sql::ast::Expr::Column(c) => base_cols.push(c.name.clone()),
+                spg_sql::ast::Expr::Column(c) => {
+                    if need_primary_cols {
+                        primary_cols.push(c.name.clone());
+                    }
+                }
                 _ => return None,
             },
         }
     }
-    // v7.39 (round 133) — build the (view col → base col) map. Empty when the
-    // view is not column-renamed (the common identity path stays byte-for-byte).
-    let col_map: Vec<(String, String)> = if rename_cols.is_empty() {
+    let this_map: Vec<(String, String)> = if rename_cols.is_empty() {
         Vec::new()
     } else {
-        if rename_cols.len() != base_cols.len() {
+        if rename_cols.len() != primary_cols.len() {
             return None;
         }
-        rename_cols.into_iter().zip(base_cols).collect()
+        rename_cols.into_iter().zip(primary_cols).collect()
     };
-    Some((
-        from.primary.name.clone(),
-        select.where_,
-        has_check_option,
-        col_map,
-    ))
+    let this_where = select.where_;
+
+    // Leaf: the primary is a real base table.
+    if catalog.get(&primary_name).is_some() {
+        let mut chain = Vec::new();
+        if let Some(w) = &this_where {
+            chain.push((alloc::string::String::from(view_name), w.clone(), this_check));
+        }
+        return Some(ViewRedirect {
+            base: primary_name,
+            where_at_base: this_where,
+            col_map: this_map,
+            check_chain: chain,
+        });
+    }
+    // Nested: the primary is itself an auto-updatable view — recurse and compose.
+    if catalog.views().contains_key(&primary_name) {
+        let inner = view_redirect_to_simple_base(catalog, &primary_name)?;
+        // This view's WHERE references the inner view's columns; translate them
+        // to base columns through the inner map.
+        let this_where_at_base = this_where.map(|mut w| {
+            if !inner.col_map.is_empty() {
+                let m: alloc::collections::BTreeMap<String, String> =
+                    inner.col_map.iter().cloned().collect();
+                rewrite_view_col_refs(&mut w, &m);
+            }
+            w
+        });
+        let mut chain = Vec::new();
+        if let Some(w) = &this_where_at_base {
+            chain.push((alloc::string::String::from(view_name), w.clone(), this_check));
+        }
+        chain.extend(inner.check_chain);
+        return Some(ViewRedirect {
+            base: inner.base,
+            where_at_base: and_optional_predicates(this_where_at_base, inner.where_at_base),
+            col_map: compose_view_maps(&this_map, &inner.col_map),
+            check_chain: chain,
+        });
+    }
+    None
 }
 
 /// v7.39 (round 133) — rewrite an auto-updatable view's column references in a
@@ -207,12 +282,14 @@ fn rewrite_view_returning_items(
     out
 }
 
-/// v7.39 (round 132) — a pending `WITH CHECK OPTION` to enforce on the base rows
-/// a write through an auto-updatable view produces. `qual` is the view's WHERE.
+/// v7.39 (round 132/136) — a pending `WITH CHECK OPTION` to enforce on the base
+/// rows a write through an auto-updatable view produces. `chain` is the per-view
+/// `(name, qual_at_base, own_check_option)` list (outermost first) down the
+/// nested-view stack; `written_opt` is the outermost (written) view's option.
 #[derive(Clone)]
 struct ViewCheck {
-    view_name: String,
-    qual: spg_sql::ast::Expr,
+    written_opt: u8,
+    chain: Vec<(String, spg_sql::ast::Expr, u8)>,
 }
 
 /// v7.38 (read01 P6.46) — AND two optional predicates (the view's WHERE and the
@@ -265,10 +342,15 @@ impl Engine {
     /// row, then call `Table::update_row` which rebuilds indices.
     /// Indexed columns are correctly reflected because rebuild
     /// happens after the cell rewrite.
-    /// v7.39 (round 132) — enforce a view's `WITH CHECK OPTION` over the base
-    /// rows a write produced: every row must satisfy the view's WHERE (only a
-    /// definite TRUE passes — NULL / FALSE fail, mirroring row visibility).
-    /// PG's SQLSTATE 44000 + `DETAIL: Failing row contains (…).`.
+    /// v7.39 (round 132/136) — enforce a view's `WITH CHECK OPTION` over the base
+    /// rows a write produced. Each row must satisfy the qual of every checked
+    /// view in the chain (only a definite TRUE passes — NULL / FALSE fail,
+    /// mirroring row visibility). PG's cascade rule: the written view's qual is
+    /// always checked; an underlying view's qual is checked iff the written view
+    /// is CASCADED or that underlying view itself has a check option (and a
+    /// CASCADED underlying re-arms the cascade for its own underlyings). The
+    /// error names the specific failing view (SQLSTATE 44000 + failing-row
+    /// DETAIL). Constant `2` = CASCADED, `1` = LOCAL, `0` = none.
     fn enforce_view_check(
         &self,
         check: &ViewCheck,
@@ -280,14 +362,21 @@ impl Engine {
         let cancel = CancelToken::none();
         for vals in rows {
             let row = Row::new(vals.clone());
-            let v = self.eval_expr_with_correlated(&check.qual, &row, &ctx, cancel, None)?;
-            if !matches!(v, Value::Bool(true)) {
-                let failing = crate::constraints::format_failing_row(vals);
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "new row violates check option for view \"{}\" \
-                     DETAIL: Failing row contains ({failing}).",
-                    check.view_name
-                )));
+            let mut cascade = check.written_opt == 2;
+            for (view_name, qual, opt) in &check.chain {
+                if cascade || *opt != 0 {
+                    let v = self.eval_expr_with_correlated(qual, &row, &ctx, cancel, None)?;
+                    if !matches!(v, Value::Bool(true)) {
+                        let failing = crate::constraints::format_failing_row(vals);
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "new row violates check option for view \"{view_name}\" \
+                             DETAIL: Failing row contains ({failing})."
+                        )));
+                    }
+                }
+                if *opt == 2 {
+                    cascade = true;
+                }
             }
         }
         Ok(())
@@ -331,15 +420,25 @@ impl Engine {
         // v7.37.19 (19.13) — auto-updatable view redirect. v7.38 (P6.46) — a
         // view WHERE is AND-ed onto the caller's so only rows visible through
         // the view are updated.
-        if let Some((base, view_where, has_check, col_map)) =
-            view_redirect_to_simple_base(self.active_catalog(), &stmt.table)
-        {
-            // v7.39 (round 132) — WITH CHECK OPTION: the updated row must still
-            // satisfy the view's WHERE. Carry the qual into the base update.
-            let check = if has_check {
-                view_where.clone().map(|qual| ViewCheck {
-                    view_name: stmt.table.clone(),
-                    qual,
+        if let Some(vr) = view_redirect_to_simple_base(self.active_catalog(), &stmt.table) {
+            let ViewRedirect {
+                base,
+                where_at_base,
+                col_map,
+                check_chain,
+            } = vr;
+            // v7.39 (round 132/136) — WITH CHECK OPTION: the updated row must
+            // still satisfy the view chain's quals. The written (outermost)
+            // view's own option drives the cascade.
+            let written_opt = self
+                .active_catalog()
+                .views()
+                .get(&stmt.table)
+                .map_or(0, |v| v.check_option);
+            let check = if written_opt != 0 {
+                Some(ViewCheck {
+                    written_opt,
+                    chain: check_chain,
                 })
             } else {
                 None
@@ -366,7 +465,7 @@ impl Engine {
                 }
             }
             rewritten.table = base;
-            rewritten.where_ = and_optional_predicates(view_where, rewritten.where_);
+            rewritten.where_ = and_optional_predicates(where_at_base, rewritten.where_);
             return self.exec_update_cancel_inner(&rewritten, check, cancel);
         }
         // v7.37 D.47 (partial) — UPDATE on a partition parent fans out to every
@@ -1469,27 +1568,26 @@ impl Engine {
         // v7.37.19 (19.13) — auto-updatable view redirect. v7.38 (P6.46) — a
         // view WHERE is AND-ed onto the caller's so only rows visible through
         // the view are deleted.
-        if let Some((base, view_where, _has_check, col_map)) =
-            view_redirect_to_simple_base(self.active_catalog(), &stmt.table)
-        {
+        if let Some(vr) = view_redirect_to_simple_base(self.active_catalog(), &stmt.table) {
             // DELETE removes rows; there is no post-image to check, so
-            // WITH CHECK OPTION does not apply.
+            // WITH CHECK OPTION does not apply. The composed WHERE (all nested
+            // levels AND-ed) still restricts which base rows are visible.
             let mut rewritten = stmt.clone();
             // v7.39 (round 133) — column-renamed view: rewrite the WHERE's view
             // columns to base columns before AND-ing the view WHERE.
-            if !col_map.is_empty() {
+            if !vr.col_map.is_empty() {
                 let map: alloc::collections::BTreeMap<String, String> =
-                    col_map.iter().cloned().collect();
+                    vr.col_map.iter().cloned().collect();
                 if let Some(w) = &mut rewritten.where_ {
                     rewrite_view_col_refs(w, &map);
                 }
                 // v7.39 (round 134) — rewrite RETURNING view cols → base cols.
                 if let Some(ret) = &rewritten.returning {
-                    rewritten.returning = Some(rewrite_view_returning_items(ret, &col_map));
+                    rewritten.returning = Some(rewrite_view_returning_items(ret, &vr.col_map));
                 }
             }
-            rewritten.table = base;
-            rewritten.where_ = and_optional_predicates(view_where, rewritten.where_);
+            rewritten.table = vr.base;
+            rewritten.where_ = and_optional_predicates(vr.where_at_base, rewritten.where_);
             return self.exec_delete_cancel(&rewritten, cancel);
         }
         // v7.37 D.46 — DELETE on a partition parent fans out to every child;
@@ -2079,13 +2177,22 @@ impl Engine {
         // the view's WHERE. Captured here (view name = the pre-redirect table),
         // enforced below once the full base rows are assembled.
         let mut view_check: Option<ViewCheck> = None;
-        if let Some((base, view_where, has_check, col_map)) =
-            view_redirect_to_simple_base(self.active_catalog(), &stmt.table)
-        {
-            if has_check {
-                view_check = view_where.map(|qual| ViewCheck {
-                    view_name: stmt.table.clone(),
-                    qual,
+        if let Some(vr) = view_redirect_to_simple_base(self.active_catalog(), &stmt.table) {
+            let ViewRedirect {
+                base,
+                where_at_base: _,
+                col_map,
+                check_chain,
+            } = vr;
+            let written_opt = self
+                .active_catalog()
+                .views()
+                .get(&stmt.table)
+                .map_or(0, |v| v.check_option);
+            if written_opt != 0 {
+                view_check = Some(ViewCheck {
+                    written_opt,
+                    chain: check_chain,
                 });
             }
             // v7.39 (round 133) — column-renamed view: translate the target
