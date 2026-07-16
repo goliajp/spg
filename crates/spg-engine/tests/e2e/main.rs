@@ -738,6 +738,7 @@ mod e2e_power;
 mod e2e_query_clause_pg_differential;
 mod e2e_random;
 mod e2e_recursive_cte_values;
+mod e2e_recursive_cte_wellformed_round145;
 mod e2e_redo_capture;
 mod e2e_regexp_family;
 mod e2e_repeat;

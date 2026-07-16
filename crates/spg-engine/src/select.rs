@@ -914,7 +914,12 @@ impl Engine {
                     "data-modifying CTE not supported on this SELECT entry"
                 ))
             })?;
-            let (columns, rows) = if cte.recursive {
+            // v7.39 (round 145) — RECURSIVE routes to the iterating
+            // materialiser only when the body actually references itself. A
+            // non-self-referencing CTE under WITH RECURSIVE is an ordinary
+            // CTE; the iterator concatenates union arms and would lose
+            // INTERSECT / EXCEPT / UNION-distinct set-op semantics.
+            let (columns, rows) = if cte.recursive && select_refers_to(body_select, &cte.name) {
                 let synthetic = spg_sql::ast::Cte {
                     name: cte.name.clone(),
                     body: spg_sql::ast::CteBody::Select(body_select.clone()),
@@ -999,7 +1004,11 @@ impl Engine {
                 )));
             }
             let (columns, rows) = match &cte.body {
-                spg_sql::ast::CteBody::Select(body) if cte.recursive => {
+                // v7.39 (round 145) — see the sibling site: only a body that
+                // truly self-references takes the iterating materialiser.
+                spg_sql::ast::CteBody::Select(body)
+                    if cte.recursive && select_refers_to(body, &cte.name) =>
+                {
                     // Recursive CTE — the existing helper takes a
                     // SELECT body and the snapshot catalog.
                     let synthetic = spg_sql::ast::Cte {
