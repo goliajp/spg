@@ -436,6 +436,15 @@ impl Engine {
         } else {
             stmt
         };
+        // v7.39 (round 140) — DO ALSO UPDATE rules: pre-scan OLD + derive NEW,
+        // run the real update (rewrite suppressed), then fire each rule's command
+        // per updated row (OLD + NEW). The guard bounds a rule → update cycle.
+        if !self.rule_rewrite_active {
+            let also_upd = self.also_rules(&stmt.table, "UPDATE");
+            if !also_upd.is_empty() {
+                return self.exec_update_with_also(stmt, also_upd, view_check, cancel);
+            }
+        }
         // v7.39 (round 137, Phase 2) — INSTEAD OF UPDATE trigger on the target
         // view fires per matching view row instead of the auto-updatable
         // redirect. Takes precedence.
@@ -1629,6 +1638,16 @@ impl Engine {
         } else {
             stmt
         };
+        // v7.39 (round 140) — DO ALSO DELETE rules: pre-scan the OLD rows, run
+        // the real delete (rule rewrite suppressed so it does not re-enter here),
+        // then fire each rule's command per deleted row (OLD only). The guard
+        // stops an unbounded rule → delete → rule cycle.
+        if !self.rule_rewrite_active {
+            let also_del = self.also_rules(&stmt.table, "DELETE");
+            if !also_del.is_empty() {
+                return self.exec_delete_with_also(stmt, also_del, cancel);
+            }
+        }
         // v7.39 (round 137, Phase 2) — INSTEAD OF DELETE trigger on the target
         // view fires per matching view row instead of the auto-updatable
         // redirect.
@@ -2330,10 +2349,11 @@ impl Engine {
         Ok(QueryResult::Rows { columns, rows: out })
     }
 
-    /// v7.39 (round 137, Phase 2) — materialise the view rows an UPDATE / DELETE
-    /// through an INSTEAD OF view targets: `SELECT * FROM <view> [WHERE <pred>]`.
-    /// Returns the view's output columns + the matching OLD rows.
-    fn scan_instead_of_view_rows(
+    /// v7.39 (round 137/140) — materialise the OLD rows an UPDATE / DELETE
+    /// targets: `SELECT * FROM <relation> [WHERE <pred>]`. Used both by the
+    /// INSTEAD OF view path and by the DO ALSO rule wrapper (base tables).
+    /// Returns the relation's output columns + the matching rows.
+    fn scan_relation_rows(
         &self,
         view_name: &str,
         where_: &Option<spg_sql::ast::Expr>,
@@ -2359,6 +2379,61 @@ impl Engine {
         }
     }
 
+    /// v7.39 (round 140) — a DELETE carrying DO ALSO rules: capture the OLD rows
+    /// first, run the real delete with rule rewrite suppressed, then fire each
+    /// rule's command once per deleted row (OLD bound, no NEW).
+    fn exec_delete_with_also(
+        &mut self,
+        stmt: &spg_sql::ast::DeleteStatement,
+        also: Vec<spg_storage::RuleDef>,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let (columns, old_rows) = self.scan_relation_rows(&stmt.table, &stmt.where_, cancel)?;
+        self.rule_rewrite_active = true;
+        let res = self.exec_delete_cancel(stmt, cancel);
+        self.rule_rewrite_active = false;
+        let res = res?;
+        let rows: Vec<(Option<Row<'static>>, Option<Row<'static>>)> =
+            old_rows.into_iter().map(|r| (None, Some(r))).collect();
+        self.run_also_rules(&also, &columns, &rows, cancel)?;
+        Ok(res)
+    }
+
+    /// v7.39 (round 140) — an UPDATE carrying DO ALSO rules: capture OLD, derive
+    /// NEW per row by applying the SET assignments (mirroring the INSTEAD OF view
+    /// path), run the real update with rule rewrite suppressed, then fire each
+    /// rule's command once per updated row (OLD + NEW bound).
+    fn exec_update_with_also(
+        &mut self,
+        stmt: &spg_sql::ast::UpdateStatement,
+        also: Vec<spg_storage::RuleDef>,
+        view_check: Option<ViewCheck>,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let (columns, old_rows) = self.scan_relation_rows(&stmt.table, &stmt.where_, cancel)?;
+        let mut pairs: Vec<(Option<Row<'static>>, Option<Row<'static>>)> =
+            Vec::with_capacity(old_rows.len());
+        {
+            let ctx = self.ev_ctx(&columns, Some(&stmt.table));
+            for old in &old_rows {
+                let mut new_vals = old.values.clone();
+                for (col, expr) in &stmt.assignments {
+                    let pos = columns.iter().position(|c| &c.name == col).ok_or_else(|| {
+                        EngineError::Eval(EvalError::ColumnNotFound { name: col.clone() })
+                    })?;
+                    new_vals[pos] = self.eval_expr_with_correlated(expr, old, &ctx, cancel, None)?;
+                }
+                pairs.push((Some(Row::new(new_vals)), Some(old.clone())));
+            }
+        }
+        self.rule_rewrite_active = true;
+        let res = self.exec_update_cancel_inner(stmt, view_check, cancel);
+        self.rule_rewrite_active = false;
+        let res = res?;
+        self.run_also_rules(&also, &columns, &pairs, cancel)?;
+        Ok(res)
+    }
+
     /// v7.39 (round 137, Phase 2) — UPDATE through a view with an INSTEAD OF
     /// UPDATE trigger: scan the view for matching OLD rows, derive NEW per row by
     /// applying the SET assignments, and fire the trigger(s). The function body
@@ -2370,7 +2445,7 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let (columns, old_rows) =
-            self.scan_instead_of_view_rows(&stmt.table, &stmt.where_, cancel)?;
+            self.scan_relation_rows(&stmt.table, &stmt.where_, cancel)?;
         let trigger_cfg: Option<String> = self
             .session_params
             .get("default_text_search_config")
@@ -2447,7 +2522,7 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let (columns, old_rows) =
-            self.scan_instead_of_view_rows(&stmt.table, &stmt.where_, cancel)?;
+            self.scan_relation_rows(&stmt.table, &stmt.where_, cancel)?;
         let trigger_cfg: Option<String> = self
             .session_params
             .get("default_text_search_config")
@@ -2777,6 +2852,10 @@ impl Engine {
         // reroute), so what remains must be genuinely unique.
         enforce_uniqueness_inserts(self.active_catalog(), &stmt.table, &uniqueness, &all_values)?;
         enforce_unique_index_inserts(self.active_catalog(), &stmt.table, &all_values)?;
+        // v7.39 (round 140) — DO ALSO INSERT rules: capture the post-image rows
+        // (RETURNING is forced on so defaults / sequences are reflected) and run
+        // each rule's command per inserted row after the write completes.
+        let also_ins = self.also_rules(&stmt.table, "INSERT");
         // v7.37.15 Phase C — pre-fetch the writer version BEFORE
         // the table mut borrow; otherwise the call below would
         // need &mut self while `table` already holds it. Shared
@@ -2809,7 +2888,7 @@ impl Engine {
             &column_meta,
             &stmt.table,
             trigger_session_cfg.as_deref(),
-            stmt.returning.is_some(),
+            stmt.returning.is_some() || !also_ins.is_empty(),
         )?;
         let _ = skipped_count;
         // v7.12.7 — drop the table mut borrow and drain any
@@ -2822,6 +2901,15 @@ impl Engine {
         // (after the table borrow drops).
         self.record_update_pairs(&stmt.table, oc_pairs);
         self.execute_deferred_trigger_stmts(deferred_embedded, CancelToken::none())?;
+        // v7.39 (round 140) — fire DO ALSO INSERT rules per inserted row. NEW is
+        // the post-image (defaults / sequences applied); there is no OLD.
+        if !also_ins.is_empty() {
+            let rows: Vec<(Option<Row<'static>>, Option<Row<'static>>)> = returning_rows
+                .iter()
+                .map(|v| (Some(Row::new(v.clone())), None))
+                .collect();
+            self.run_also_rules(&also_ins, &column_meta, &rows, CancelToken::none())?;
+        }
         // v7.9.4/v7.9.9 — RETURNING streams the rows that ended
         // up in the table after this statement (insert or
         // post-update on conflict).

@@ -99,18 +99,18 @@ fn unsupported_rule_forms_are_rejected_not_swallowed() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u(id int, v int)").unwrap();
     e.execute("CREATE TABLE aud(id int)").unwrap();
-    // DO ALSO — Phase 2.
-    let m = match e.execute("CREATE RULE ra AS ON INSERT TO u DO ALSO INSERT INTO aud VALUES (1)") {
+    // DO INSTEAD <command> — still Phase 3.
+    let m = match e.execute("CREATE RULE ra AS ON INSERT TO u DO INSTEAD INSERT INTO aud VALUES (1)") {
         Err(x) => format!("{x}"),
         Ok(_) => panic!("expected error"),
     };
-    assert!(m.contains("DO ALSO / DO INSTEAD <command> is not yet implemented"), "{m}");
-    // Conditional WHERE — Phase 2.
+    assert!(m.contains("DO INSTEAD <command> rules are not yet implemented"), "{m}");
+    // Conditional DO INSTEAD NOTHING — still Phase 3 (DO ALSO WHERE is supported).
     let m = match e.execute("CREATE RULE rw AS ON UPDATE TO u WHERE NEW.v < 0 DO INSTEAD NOTHING") {
         Err(x) => format!("{x}"),
         Ok(_) => panic!("expected error"),
     };
-    assert!(m.contains("conditional (WHERE) rules are not yet implemented"), "{m}");
+    assert!(m.contains("conditional (WHERE) DO INSTEAD NOTHING rules are not yet implemented"), "{m}");
     // ON SELECT — use CREATE VIEW.
     let m = match e.execute("CREATE RULE rs AS ON SELECT TO u DO INSTEAD NOTHING") {
         Err(x) => format!("{x}"),

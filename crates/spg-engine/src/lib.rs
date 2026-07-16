@@ -838,6 +838,11 @@ pub struct Engine {
     /// fires trigger B which UPDATEs table A which fires trigger
     /// A again…). Reset to 0 once the original DML returns.
     trigger_recursion_depth: u32,
+    /// v7.39 (round 140) — set while a DELETE / UPDATE is being re-run by the
+    /// DO ALSO rule wrapper so the wrapper's inner call does not re-enter the
+    /// rule-rewrite path (which would recurse forever). INSERT captures its
+    /// post-image rows directly and needs no such guard.
+    rule_rewrite_active: bool,
     /// v7.14.0 — when `SET FOREIGN_KEY_CHECKS=0` is in effect
     /// (mysqldump preamble), the FK existence + arity check at
     /// CREATE TABLE time is deferred. FKs referencing a
@@ -998,6 +1003,7 @@ impl Engine {
             savepoint_guc_marks: Vec::new(),
             tx_aborted: false,
             trigger_recursion_depth: 0,
+            rule_rewrite_active: false,
             foreign_key_checks: true,
             meta_views_materialised: false,
             pending_foreign_keys: Vec::new(),
@@ -1340,6 +1346,7 @@ impl Engine {
             savepoint_guc_marks: Vec::new(),
             tx_aborted: false,
             trigger_recursion_depth: 0,
+            rule_rewrite_active: false,
             foreign_key_checks: true,
             meta_views_materialised: false,
             pending_foreign_keys: Vec::new(),
@@ -1438,6 +1445,7 @@ impl Engine {
                     savepoint_guc_marks: Vec::new(),
                     tx_aborted: false,
                     trigger_recursion_depth: 0,
+            rule_rewrite_active: false,
                     foreign_key_checks: true,
                     meta_views_materialised: false,
                     pending_foreign_keys: Vec::new(),
