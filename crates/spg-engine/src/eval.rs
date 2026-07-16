@@ -2200,16 +2200,6 @@ fn eval_like_arm(
 ) -> Result<Value<'static>, EvalError> {
     let v = eval_expr(expr, row, ctx)?;
     let p = eval_expr(pattern, row, ctx)?;
-    // v7.39 (read01 like_match.c) — a pattern ending in an UNPAIRED
-    // escape character is PG's 22025 error, not a silent non-match.
-    if let Value::Text(ps) = &p {
-        let trailing = ps.chars().rev().take_while(|c| *c == '\\').count();
-        if trailing % 2 == 1 {
-            return Err(EvalError::TypeMismatch {
-                detail: "LIKE pattern must not end with escape character".into(),
-            });
-        }
-    }
     // NULL on either side propagates to NULL — same as PG.
     // v7.39 (bpchar epic) — LIKE matches bpchar on its PADDED
     // stored form, per PG's bpchar pattern operators.
@@ -2225,9 +2215,9 @@ fn eval_like_arm(
     // v7.25 (round-17) — ILIKE folds both operands (PG
     // lowercases per the default collation).
     let m = if case_insensitive {
-        like_match(&text.to_lowercase(), &pat.to_lowercase())
+        like_match(&text.to_lowercase(), &pat.to_lowercase())?
     } else {
-        like_match(&text, &pat)
+        like_match(&text, &pat)?
     };
     Ok(Value::Bool(if negated { !m } else { m }))
 }
@@ -2708,8 +2698,9 @@ pub(crate) fn value_to_text_for_array(v: &Value, style: &format::RenderStyle) ->
 /// SQL `LIKE` matcher. Wildcards are `%` (any run, possibly empty) and `_`
 /// (exactly one char). `\` escapes the next pattern char so `\%` matches a
 /// literal `%`. Matches the whole input — no implicit anchoring needed
-/// since SQL `LIKE` is always full-string.
-fn like_match(text: &str, pattern: &str) -> bool {
+/// since SQL `LIKE` is always full-string. Errs on a trailing unpaired
+/// escape the matcher actually reaches with text left (PG's lazy 22025).
+fn like_match(text: &str, pattern: &str) -> Result<bool, EvalError> {
     let pat: Vec<char> = pattern.chars().collect();
     like_match_str(text, &pat, 0)
 }
@@ -2746,7 +2737,7 @@ pub(crate) fn pg_typeof_name_for_datatype(t: spg_storage::DataType) -> Option<&'
 /// traffic on a 50 k-row `WHERE s LIKE '%…%'` scan (the heavy.rs
 /// like_filter 2.8× loss); the pattern side stays a compile-once
 /// `&[char]` (see `Step::Like`).
-pub(crate) fn like_match_str(text: &str, pat: &[char], mut pi: usize) -> bool {
+pub(crate) fn like_match_str(text: &str, pat: &[char], mut pi: usize) -> Result<bool, EvalError> {
     let mut t = text;
     while pi < pat.len() {
         match pat[pi] {
@@ -2756,16 +2747,16 @@ pub(crate) fn like_match_str(text: &str, pat: &[char], mut pi: usize) -> bool {
                     pi += 1;
                 }
                 if pi == pat.len() {
-                    return true;
+                    return Ok(true);
                 }
                 let mut rest = t;
                 loop {
-                    if like_match_str(rest, pat, pi) {
-                        return true;
+                    if like_match_str(rest, pat, pi)? {
+                        return Ok(true);
                     }
                     match rest.chars().next() {
                         Some(c) => rest = &rest[c.len_utf8()..],
-                        None => return false,
+                        None => return Ok(false),
                     }
                 }
             }
@@ -2774,16 +2765,29 @@ pub(crate) fn like_match_str(text: &str, pat: &[char], mut pi: usize) -> bool {
                     t = &t[c.len_utf8()..];
                     pi += 1;
                 }
-                None => return false,
+                None => return Ok(false),
             },
-            '\\' if pi + 1 < pat.len() => {
+            // v7.39 (round 144, like_match.c) — a trailing unpaired escape is
+            // PG's 22025 error, but LAZILY: only when the matcher reaches it
+            // with text left. A branch where the text is already exhausted
+            // returns false without ever "seeing" the trailing escape
+            // ('x' LIKE 'x\' is false; 'xy' LIKE 'x\' errors).
+            '\\' if pi + 1 >= pat.len() => {
+                if t.is_empty() {
+                    return Ok(false);
+                }
+                return Err(EvalError::TypeMismatch {
+                    detail: "LIKE pattern must not end with escape character".into(),
+                });
+            }
+            '\\' => {
                 let want = pat[pi + 1];
                 match t.chars().next() {
                     Some(c) if c == want => {
                         t = &t[c.len_utf8()..];
                         pi += 2;
                     }
-                    _ => return false,
+                    _ => return Ok(false),
                 }
             }
             c => match t.chars().next() {
@@ -2791,11 +2795,11 @@ pub(crate) fn like_match_str(text: &str, pat: &[char], mut pi: usize) -> bool {
                     t = &t[c.len_utf8()..];
                     pi += 1;
                 }
-                _ => return false,
+                _ => return Ok(false),
             },
         }
     }
-    t.is_empty()
+    Ok(t.is_empty())
 }
 
 /// v7.24 (round-15) — `string_to_array(text, delimiter)`.
