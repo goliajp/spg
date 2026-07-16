@@ -1642,6 +1642,12 @@ impl Engine {
         self.acl_check_select(stmt)?;
         validate_aggregate_placement(stmt)?;
         let result = self.exec_select_cancel_inner(stmt, cancel)?;
+        // v7.39 (round 135) — drop the synthetic `__grp_ord_*` ordering columns
+        // the parser injects for GROUPING() in ORDER BY on a grouping-set query.
+        // They carry the per-branch mask through the UNION-ALL sort and must not
+        // appear in the output. Stripped per SELECT level (grouping-set queries
+        // are often wrapped in a derived subquery), before DISTINCT ON.
+        let result = strip_synthetic_order_cols(result);
         // v7.37.17 (17.6 siblings) — `SELECT DISTINCT ON (exprs)`:
         // rows arrive here already ORDER BY'd; keep the FIRST row of
         // each group the expressions define (PG semantics). The
@@ -5983,6 +5989,34 @@ pub(crate) fn resolve_projection_column<'a>(
         _ => Err(EngineError::Eval(EvalError::ColumnNotFound {
             name: c.name.clone(),
         })),
+    }
+}
+
+/// v7.39 (round 135) — drop the synthetic `__grp_ord_*` columns injected by the
+/// parser to carry per-branch GROUPING() masks into a grouping-set query's
+/// ORDER BY. They must never reach the output. No-op unless such a column is
+/// present, so the common path is untouched.
+fn strip_synthetic_order_cols(result: QueryResult) -> QueryResult {
+    let QueryResult::Rows { columns, rows } = result else {
+        return result;
+    };
+    if !columns.iter().any(|c| c.name.starts_with("__grp_ord_")) {
+        return QueryResult::Rows { columns, rows };
+    }
+    let keep: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.name.starts_with("__grp_ord_"))
+        .map(|(i, _)| i)
+        .collect();
+    let new_cols: Vec<ColumnSchema> = keep.iter().map(|&i| columns[i].clone()).collect();
+    let new_rows: Vec<Row<'static>> = rows
+        .into_iter()
+        .map(|r| Row::new(keep.iter().map(|&i| r.values[i].clone()).collect()))
+        .collect();
+    QueryResult::Rows {
+        columns: new_cols,
+        rows: new_rows,
     }
 }
 

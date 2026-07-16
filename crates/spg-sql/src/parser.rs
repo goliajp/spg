@@ -8611,62 +8611,73 @@ impl Parser {
     /// v7.37.17 (17.6 siblings) — the shared SELECT tail: ORDER BY /
     /// LIMIT / OFFSET / FETCH FIRST / FOR-lock clauses. Extracted so
     /// the top-level bare VALUES statement reuses it verbatim.
-    fn parse_select_tail_into(&mut self, head: &mut SelectStatement) -> Result<(), ParseError> {
-        head.order_by = if matches!(self.peek(), Token::Order) {
-            self.advance();
-            if !matches!(self.peek(), Token::By) {
-                return Err(self.err(format!("expected BY after ORDER, got {:?}", self.peek())));
-            }
-            self.advance();
-            // v6.4.0 — multi-key ORDER BY. Loop over comma-separated
-            // `<expr> [ASC|DESC]` items.
-            let mut keys = Vec::new();
-            loop {
-                let expr = self.parse_expr(0)?;
-                let desc = if matches!(self.peek(), Token::Desc) {
-                    self.advance();
-                    true
-                } else if matches!(self.peek(), Token::Asc) {
-                    self.advance();
-                    false
-                } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using"))
-                {
-                    // `ORDER BY x USING <op>` — PG's operator-class
-                    // spelling. SPG has one ordering per type, so
-                    // the btree comparison operators map onto it:
-                    // < / <= are ASC, > / >= are DESC. Any other
-                    // operator would need a custom operator class —
-                    // honest error.
-                    self.advance();
-                    match self.advance() {
-                        Token::Lt | Token::LtEq => false,
-                        Token::Gt | Token::GtEq => true,
-                        other => {
-                            return Err(self.err(alloc::format!(
-                                "ORDER BY USING supports the btree comparison \
-                                 operators (< <= > >=); got {other:?}"
-                            )));
-                        }
+    /// v6.4.0 — parse an optional `ORDER BY <expr> [ASC|DESC] [NULLS …], …`
+    /// clause into its key list (empty when no `ORDER BY` follows). Extracted
+    /// (v7.39 round 135) so the grouping-set path can parse ORDER BY early,
+    /// where the grouping-set universe is still in scope.
+    fn parse_order_by_keys(&mut self) -> Result<Vec<OrderBy>, ParseError> {
+        if !matches!(self.peek(), Token::Order) {
+            return Ok(Vec::new());
+        }
+        self.advance();
+        if !matches!(self.peek(), Token::By) {
+            return Err(self.err(format!("expected BY after ORDER, got {:?}", self.peek())));
+        }
+        self.advance();
+        let mut keys = Vec::new();
+        loop {
+            let expr = self.parse_expr(0)?;
+            let desc = if matches!(self.peek(), Token::Desc) {
+                self.advance();
+                true
+            } else if matches!(self.peek(), Token::Asc) {
+                self.advance();
+                false
+            } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using")) {
+                // `ORDER BY x USING <op>` — PG's operator-class spelling. SPG has
+                // one ordering per type, so the btree comparison operators map
+                // onto it: < / <= are ASC, > / >= are DESC. Any other operator
+                // would need a custom operator class — honest error.
+                self.advance();
+                match self.advance() {
+                    Token::Lt | Token::LtEq => false,
+                    Token::Gt | Token::GtEq => true,
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "ORDER BY USING supports the btree comparison \
+                             operators (< <= > >=); got {other:?}"
+                        )));
                     }
-                } else {
-                    false
-                };
-                // v7.24 (round-16 A) — explicit NULLS FIRST/LAST.
-                let nulls_first = self.parse_optional_nulls_placement()?;
-                keys.push(OrderBy {
-                    expr,
-                    desc,
-                    nulls_first,
-                });
-                if matches!(self.peek(), Token::Comma) {
-                    self.advance();
-                } else {
-                    break;
                 }
+            } else {
+                false
+            };
+            // v7.24 (round-16 A) — explicit NULLS FIRST/LAST.
+            let nulls_first = self.parse_optional_nulls_placement()?;
+            keys.push(OrderBy {
+                expr,
+                desc,
+                nulls_first,
+            });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
             }
-            keys
+        }
+        Ok(keys)
+    }
+
+    fn parse_select_tail_into(&mut self, head: &mut SelectStatement) -> Result<(), ParseError> {
+        // v7.39 (round 135) — a grouping-set query may have already parsed +
+        // rewritten its ORDER BY (to reference synthetic grouping columns); if
+        // no ORDER BY token is present, keep that pre-set order_by rather than
+        // clobbering it with an empty list.
+        let parsed_keys = self.parse_order_by_keys()?;
+        head.order_by = if parsed_keys.is_empty() {
+            core::mem::take(&mut head.order_by)
         } else {
-            Vec::new()
+            parsed_keys
         };
         head.limit = if matches!(self.peek(), Token::Limit) {
             self.advance();
@@ -8931,6 +8942,98 @@ impl Parser {
     /// (PG semantics: one bit per argument, MSB first; 1 = the key
     /// is dropped in this grouping set). Runs during the ROLLUP /
     /// CUBE / GROUPING SETS expansion, where the set is known.
+    /// v7.39 (round 135) — collect the distinct `grouping(...)` calls appearing
+    /// anywhere in `expr` (an ORDER BY key), without recursing into their args.
+    fn collect_grouping_calls(expr: &Expr, out: &mut Vec<Expr>) {
+        if let Expr::FunctionCall { name, .. } = expr
+            && name.eq_ignore_ascii_case("grouping")
+        {
+            if !out.iter().any(|e| e == expr) {
+                out.push(expr.clone());
+            }
+            return;
+        }
+        match expr {
+            Expr::Binary { lhs, rhs, .. } => {
+                Self::collect_grouping_calls(lhs, out);
+                Self::collect_grouping_calls(rhs, out);
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+                Self::collect_grouping_calls(expr, out)
+            }
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    Self::collect_grouping_calls(a, out);
+                }
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                if let Some(o) = operand {
+                    Self::collect_grouping_calls(o, out);
+                }
+                for (c, v) in branches {
+                    Self::collect_grouping_calls(c, out);
+                    Self::collect_grouping_calls(v, out);
+                }
+                if let Some(x) = else_branch {
+                    Self::collect_grouping_calls(x, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// v7.39 (round 135) — replace each `grouping(...)` call in `expr` equal to
+    /// `grp_exprs[k]` with a reference to the synthetic ordering column
+    /// `__grp_ord_k` (injected per grouping-set branch).
+    fn rewrite_grouping_to_col(expr: &mut Expr, grp_exprs: &[Expr]) {
+        if let Expr::FunctionCall { name, .. } = expr
+            && name.eq_ignore_ascii_case("grouping")
+        {
+            if let Some(k) = grp_exprs.iter().position(|e| e == expr) {
+                *expr = Expr::Column(crate::ast::ColumnName {
+                    qualifier: None,
+                    name: alloc::format!("__grp_ord_{k}"),
+                });
+            }
+            return;
+        }
+        match expr {
+            Expr::Binary { lhs, rhs, .. } => {
+                Self::rewrite_grouping_to_col(lhs, grp_exprs);
+                Self::rewrite_grouping_to_col(rhs, grp_exprs);
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+                Self::rewrite_grouping_to_col(expr, grp_exprs)
+            }
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    Self::rewrite_grouping_to_col(a, grp_exprs);
+                }
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                if let Some(o) = operand {
+                    Self::rewrite_grouping_to_col(o, grp_exprs);
+                }
+                for (c, v) in branches {
+                    Self::rewrite_grouping_to_col(c, grp_exprs);
+                    Self::rewrite_grouping_to_col(v, grp_exprs);
+                }
+                if let Some(x) = else_branch {
+                    Self::rewrite_grouping_to_col(x, grp_exprs);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn substitute_grouping_calls(expr: &mut Expr, dropped: &[Expr]) {
         // v7.38 (read01) — a reference to a key that is dropped in this grouping
         // set evaluates to NULL, at any depth. Previously only a *top-level*
@@ -9706,6 +9809,50 @@ impl Parser {
             }
             if let Some(h) = &mut stmt.having {
                 Self::substitute_grouping_calls(h, &head_dropped);
+            }
+            // v7.39 (round 135) — GROUPING() in ORDER BY. Parse the ORDER BY now
+            // (while `grouping_universe` / the per-branch sets are in scope). For
+            // each grouping() call in it, inject a per-branch hidden column
+            // `__grp_ord_K` carrying that branch's mask into the head + every
+            // peer, and rewrite the ORDER BY to reference it. `parse_select_tail_into`
+            // preserves this pre-set order_by; the engine strips `__grp_ord_*`
+            // from the final output. A standalone grouping-set query has ORDER BY
+            // (not an explicit set-op) next, so consuming it here is safe.
+            if matches!(self.peek(), Token::Order) {
+                let mut order_keys = self.parse_order_by_keys()?;
+                let mut grp_exprs: Vec<Expr> = Vec::new();
+                for ob in &order_keys {
+                    Self::collect_grouping_calls(&ob.expr, &mut grp_exprs);
+                }
+                for (k, gexpr) in grp_exprs.iter().enumerate() {
+                    let colname = alloc::format!("__grp_ord_{k}");
+                    // Head branch (primary set) uses `head_dropped`.
+                    let mut he = gexpr.clone();
+                    Self::substitute_grouping_calls(&mut he, &head_dropped);
+                    stmt.items.push(SelectItem::Expr {
+                        expr: he,
+                        alias: Some(colname.clone()),
+                    });
+                    // Each peer `stmt.unions[i]` corresponds to `grouping_sets[i+1]`.
+                    for (i, (_, peer)) in stmt.unions.iter_mut().enumerate() {
+                        let set = &grouping_sets[i + 1];
+                        let dropped: Vec<Expr> = grouping_universe
+                            .iter()
+                            .filter(|u| !set.iter().any(|k| k == *u))
+                            .cloned()
+                            .collect();
+                        let mut pe = gexpr.clone();
+                        Self::substitute_grouping_calls(&mut pe, &dropped);
+                        peer.items.push(SelectItem::Expr {
+                            expr: pe,
+                            alias: Some(colname.clone()),
+                        });
+                    }
+                }
+                for ob in &mut order_keys {
+                    Self::rewrite_grouping_to_col(&mut ob.expr, &grp_exprs);
+                }
+                stmt.order_by = order_keys;
             }
         }
         Ok(stmt)
