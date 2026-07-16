@@ -3819,6 +3819,9 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("encoding conversion from UTF8 to ASCII")
             // v7.39 (read01 pseudotypes.c) — dummy pseudotype input funcs.
             || msg.contains("cannot accept a value of type")
+            // v7.39 (round 150) — referencing a no-RETURNING data-modifying
+            // CTE (parse_relation.c addRangeTableEntryForCTE).
+            || msg.contains("does not have a RETURNING clause")
         {
             "0A000"
         } else if msg.contains("duplicate key value violates unique constraint")

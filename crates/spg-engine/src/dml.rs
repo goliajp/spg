@@ -3674,7 +3674,52 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         let cte_defs = core::mem::take(&mut stmt.ctes);
         self.guard_dml_target_not_cte(&stmt.table, &cte_defs)?;
+        let mut outer_reads = alloc::collections::BTreeSet::new();
+        collect_insert_reads(&stmt, &mut outer_reads);
+        Self::guard_no_returning_cte_refs(&cte_defs, &outer_reads)?;
         self.run_with_cte_temps(&cte_defs, |engine| engine.exec_insert(stmt))
+    }
+
+    /// v7.39 (round 150) — PG rejects REFERENCING a data-modifying CTE
+    /// that has no RETURNING clause at parse analysis ("WITH query
+    /// \"d\" does not have a RETURNING clause", 0A000,
+    /// parse_relation.c addRangeTableEntryForCTE): the alias has no
+    /// result shape to scan. An unreferenced no-RETURNING body stays
+    /// legal and still runs. Checked BEFORE any CTE materialises —
+    /// PG errors before execution, so no side effect may land.
+    fn guard_no_returning_cte_refs(
+        ctes: &[spg_sql::ast::Cte],
+        outer_reads: &alloc::collections::BTreeSet<String>,
+    ) -> Result<(), EngineError> {
+        for (i, cte) in ctes.iter().enumerate() {
+            let no_returning = match &cte.body {
+                spg_sql::ast::CteBody::Select(_) => continue,
+                spg_sql::ast::CteBody::Insert(b) => b.returning.is_none(),
+                spg_sql::ast::CteBody::Update(b) => b.returning.is_none(),
+                spg_sql::ast::CteBody::Delete(b) => b.returning.is_none(),
+                spg_sql::ast::CteBody::Merge(b) => b.returning.is_none(),
+            };
+            if !no_returning {
+                continue;
+            }
+            let named = |t: &String| t.eq_ignore_ascii_case(&cte.name);
+            let referenced = outer_reads.iter().any(named)
+                || ctes.iter().enumerate().any(|(j, other)| {
+                    if j == i {
+                        return false;
+                    }
+                    let mut reads = alloc::collections::BTreeSet::new();
+                    collect_cte_body_reads(&other.body, &mut reads);
+                    reads.iter().any(named)
+                });
+            if referenced {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "WITH query \"{}\" does not have a RETURNING clause",
+                    cte.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// v7.39 (round 149) — PG resolves a DML target only against real
@@ -3709,6 +3754,9 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         let cte_defs = core::mem::take(&mut stmt.ctes);
         self.guard_dml_target_not_cte(&stmt.table, &cte_defs)?;
+        let mut outer_reads = alloc::collections::BTreeSet::new();
+        collect_update_reads(&stmt, &mut outer_reads);
+        Self::guard_no_returning_cte_refs(&cte_defs, &outer_reads)?;
         self.run_with_cte_temps(&cte_defs, |engine| engine.exec_update_cancel(&stmt, cancel))
     }
 
@@ -3722,6 +3770,9 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let cte_defs = core::mem::take(&mut stmt.ctes);
+        let mut outer_reads = alloc::collections::BTreeSet::new();
+        crate::acl::collect_read_tables(&stmt, &mut outer_reads);
+        Self::guard_no_returning_cte_refs(&cte_defs, &outer_reads)?;
         self.run_with_cte_temps(&cte_defs, |engine| engine.exec_select_cancel(&stmt, cancel))
     }
 
@@ -3733,6 +3784,9 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         let cte_defs = core::mem::take(&mut stmt.ctes);
         self.guard_dml_target_not_cte(&stmt.target, &cte_defs)?;
+        let mut outer_reads = alloc::collections::BTreeSet::new();
+        collect_merge_reads(&stmt, &mut outer_reads);
+        Self::guard_no_returning_cte_refs(&cte_defs, &outer_reads)?;
         self.run_with_cte_temps(&cte_defs, |engine| engine.exec_merge_cancel(&stmt, cancel))
     }
 
@@ -3744,6 +3798,9 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         let cte_defs = core::mem::take(&mut stmt.ctes);
         self.guard_dml_target_not_cte(&stmt.table, &cte_defs)?;
+        let mut outer_reads = alloc::collections::BTreeSet::new();
+        collect_delete_reads(&stmt, &mut outer_reads);
+        Self::guard_no_returning_cte_refs(&cte_defs, &outer_reads)?;
         self.run_with_cte_temps(&cte_defs, |engine| engine.exec_delete_cancel(&stmt, cancel))
     }
 
@@ -4831,4 +4888,129 @@ fn enrich_not_null(e: EngineError, table: &str) -> EngineError {
         }
         other => other,
     }
+}
+
+/// v7.39 (round 150) — relation reads of a CTE body, for the
+/// no-RETURNING-reference guard. Modifying bodies reuse the deep
+/// SELECT walker via a synthetic SELECT carrying their expression
+/// slots (the acl privilege pass uses the same trick), so subquery
+/// references are seen too.
+pub(crate) fn collect_cte_body_reads(
+    body: &spg_sql::ast::CteBody,
+    into: &mut alloc::collections::BTreeSet<String>,
+) {
+    match body {
+        spg_sql::ast::CteBody::Select(s) => crate::acl::collect_read_tables(s, into),
+        spg_sql::ast::CteBody::Insert(b) => collect_insert_reads(b, into),
+        spg_sql::ast::CteBody::Update(b) => collect_update_reads(b, into),
+        spg_sql::ast::CteBody::Delete(b) => collect_delete_reads(b, into),
+        spg_sql::ast::CteBody::Merge(b) => collect_merge_reads(b, into),
+    }
+}
+
+fn push_items(sub: &mut spg_sql::ast::SelectStatement, items: &[SelectItem]) {
+    for item in items {
+        sub.items.push(item.clone());
+    }
+}
+
+fn push_expr(sub: &mut spg_sql::ast::SelectStatement, e: &spg_sql::ast::Expr) {
+    sub.items.push(SelectItem::Expr {
+        expr: e.clone(),
+        alias: None,
+    });
+}
+
+pub(crate) fn collect_insert_reads(
+    i: &spg_sql::ast::InsertStatement,
+    into: &mut alloc::collections::BTreeSet<String>,
+) {
+    let mut sub = spg_sql::ast::SelectStatement::default();
+    for row in &i.rows {
+        for e in row {
+            push_expr(&mut sub, e);
+        }
+    }
+    if let Some(oc) = &i.on_conflict
+        && let spg_sql::ast::OnConflictAction::Update {
+            assignments,
+            where_,
+        } = &oc.action
+    {
+        for (_, e) in assignments {
+            push_expr(&mut sub, e);
+        }
+        if let Some(w) = where_ {
+            push_expr(&mut sub, w);
+        }
+    }
+    if let Some(r) = &i.returning {
+        push_items(&mut sub, r);
+    }
+    crate::acl::collect_read_tables(&sub, into);
+    if let Some(src) = &i.select_source {
+        crate::acl::collect_read_tables(src, into);
+    }
+}
+
+pub(crate) fn collect_update_reads(
+    u: &spg_sql::ast::UpdateStatement,
+    into: &mut alloc::collections::BTreeSet<String>,
+) {
+    let mut sub = spg_sql::ast::SelectStatement::default();
+    for (_, e) in &u.assignments {
+        push_expr(&mut sub, e);
+    }
+    sub.where_ = u.where_.clone();
+    if let Some(r) = &u.returning {
+        push_items(&mut sub, r);
+    }
+    crate::acl::collect_read_tables(&sub, into);
+}
+
+pub(crate) fn collect_delete_reads(
+    d: &spg_sql::ast::DeleteStatement,
+    into: &mut alloc::collections::BTreeSet<String>,
+) {
+    let mut sub = spg_sql::ast::SelectStatement::default();
+    sub.where_ = d.where_.clone();
+    if let Some(r) = &d.returning {
+        push_items(&mut sub, r);
+    }
+    crate::acl::collect_read_tables(&sub, into);
+}
+
+pub(crate) fn collect_merge_reads(
+    m: &spg_sql::ast::MergeStatement,
+    into: &mut alloc::collections::BTreeSet<String>,
+) {
+    if let Some(src) = &m.source_select {
+        crate::acl::collect_read_tables(src, into);
+    } else {
+        into.insert(m.source.clone());
+    }
+    let mut sub = spg_sql::ast::SelectStatement::default();
+    push_expr(&mut sub, &m.on);
+    for clause in &m.clauses {
+        if let Some(c) = &clause.condition {
+            push_expr(&mut sub, c);
+        }
+        match &clause.action {
+            spg_sql::ast::MergeAction::Insert { values, .. } => {
+                for v in values {
+                    push_expr(&mut sub, v);
+                }
+            }
+            spg_sql::ast::MergeAction::Update { assignments } => {
+                for (_, e) in assignments {
+                    push_expr(&mut sub, e);
+                }
+            }
+            spg_sql::ast::MergeAction::Delete | spg_sql::ast::MergeAction::DoNothing => {}
+        }
+    }
+    if let Some(r) = &m.returning {
+        push_items(&mut sub, r);
+    }
+    crate::acl::collect_read_tables(&sub, into);
 }

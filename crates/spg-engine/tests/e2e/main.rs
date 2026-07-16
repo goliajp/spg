@@ -228,6 +228,7 @@ mod e2e_subplan_null_semantics_round127;
 mod e2e_qualified_wildcard_round128;
 mod e2e_on_conflict_returning_old_round129;
 mod e2e_merge_returning_round130;
+mod e2e_cte_no_returning_ref_round150;
 mod e2e_dml_target_not_cte_round149;
 mod e2e_merge_by_source_round146;
 mod e2e_merge_into_view_round148;
