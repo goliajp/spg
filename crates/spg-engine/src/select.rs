@@ -697,6 +697,13 @@ impl Engine {
                     let (schema, rows) = synth_pg_views(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.39 (round 143) — pg_catalog.pg_rules: one row per
+                // catalogued query-rewrite RULE.
+                "__spg_pg_rules" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_rules(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.17.0 Phase 3.P0-56 — pg_catalog.pg_matviews.
                 // SPG has no materialised view surface yet so the
                 // table shares pg_views's schema but stays empty.
