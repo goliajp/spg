@@ -214,6 +214,7 @@ mod e2e_not_null_detail_round117;
 mod e2e_begin_isolation_round118;
 mod e2e_srf_semantics_round120;
 mod e2e_setop_multiplicity_round121;
+mod e2e_window_frame_modes_round122;
 mod e2e_insert_then_update_round85;
 mod e2e_json_family_round76;
 mod e2e_named_args_round77;
