@@ -1924,7 +1924,8 @@ impl Engine {
             })?;
         // Stage 3 — insert the surviving rows + fire row triggers under
         // a fresh mutable borrow, then apply queued ON CONFLICT updates.
-        let (returning_rows, deferred_embedded, affected, oc_pairs) = insert_parsed_rows(
+        let (returning_rows, deferred_embedded, affected, oc_pairs, oc_old_images) =
+            insert_parsed_rows(
             table,
             xmin_for_stmt,
             inplace_for_stmt,
@@ -1952,16 +1953,16 @@ impl Engine {
         // up in the table after this statement (insert or
         // post-update on conflict).
         if let Some(items) = &stmt.returning {
-            // v7.39 (round 126) — INSERT: NEW = the inserted row (= default),
-            // OLD = NULL (no prior row). Known limitation: for ON CONFLICT DO
-            // UPDATE, PG's OLD is the pre-update conflicting row; SPG reports
-            // NULL there for now (the pre-update snapshot is not threaded here).
+            // v7.39 (round 126/129) — INSERT: NEW = the inserted-or-updated row
+            // (= default). OLD is all-NULL for a plain insert and the pre-update
+            // conflicting row for an ON CONFLICT DO UPDATE (r129 threads the
+            // per-row OLD image out of insert_parsed_rows).
             let new_for_returning = returning_rows.clone();
             return self.build_returning_rows_old_new(
                 &stmt.table,
                 items,
                 returning_rows,
-                None,
+                Some(oc_old_images),
                 Some(new_for_returning),
             );
         }
@@ -1992,12 +1993,15 @@ impl Engine {
     ) -> Result<
         (
             Vec<Vec<Value<'static>>>,
-            Vec<(usize, Vec<Value<'static>>)>,
+            // (target_pos, new_row, old_row) — the pre-update row is the OLD
+            // image for `RETURNING OLD.*` on the DO UPDATE path (v7.39 r129).
+            Vec<(usize, Vec<Value<'static>>, Vec<Value<'static>>)>,
             usize,
         ),
         EngineError,
     > {
-        let mut pending_updates: Vec<(usize, Vec<Value<'static>>)> = Vec::new();
+        let mut pending_updates: Vec<(usize, Vec<Value<'static>>, Vec<Value<'static>>)> =
+            Vec::new();
         let mut skipped_count = 0usize;
         // v7.37.17 (17.6 siblings) — `ON CONFLICT ON CONSTRAINT
         // <name>` resolves the name to the constraint's columns via
@@ -2102,6 +2106,14 @@ impl Engine {
                                 .into(),
                         )
                     })?;
+                    // Snapshot the pre-update row: PG's `RETURNING OLD.*` on a
+                    // DO UPDATE returns the conflicting row as it was BEFORE the
+                    // update applied.
+                    let old_row_vals: Vec<Value<'static>> = self
+                        .active_catalog()
+                        .get(table_name)
+                        .and_then(|t| t.rows().get(target_pos).map(|r| r.values.clone()))
+                        .unwrap_or_default();
                     let updated = apply_on_conflict_assignments(
                         self.active_catalog(),
                         table_name,
@@ -2111,7 +2123,7 @@ impl Engine {
                         where_.as_ref(),
                     )?;
                     if let Some(new_row) = updated {
-                        pending_updates.push((target_pos, new_row));
+                        pending_updates.push((target_pos, new_row, old_row_vals));
                     } else {
                         skipped_count += 1;
                     }
@@ -3168,7 +3180,7 @@ fn insert_parsed_rows(
     // of in-place update_row. Default OFF → legacy update_row.
     inplace: bool,
     all_values: Vec<Vec<Value<'static>>>,
-    pending_updates: Vec<(usize, Vec<Value<'static>>)>,
+    pending_updates: Vec<(usize, Vec<Value<'static>>, Vec<Value<'static>>)>,
     before_insert_triggers: &[(spg_storage::FunctionDef, alloc::string::String)],
     after_insert_triggers: &[(spg_storage::FunctionDef, alloc::string::String)],
     column_meta: &[ColumnSchema],
@@ -3187,9 +3199,14 @@ fn insert_parsed_rows(
             spg_storage::row_header::RowId,
             spg_storage::row_header::RowId,
         )>,
+        // v7.39 (r129) — per-returning-row OLD image, aligned 1:1 with the
+        // returning rows: a NULL block for a plain insert, the pre-update row
+        // for an ON CONFLICT DO UPDATE. Empty when RETURNING is off.
+        Vec<Vec<Value<'static>>>,
     ),
     EngineError,
 > {
+    let arity = column_meta.len();
     let mut affected = 0usize;
     let mut oc_pairs: Vec<(
         spg_storage::row_header::RowId,
@@ -3199,6 +3216,8 @@ fn insert_parsed_rows(
     // INSERT and per UPDATE branch so DO UPDATE pushes the new
     // post-update state, not the incoming-only values.
     let mut returning_rows: Vec<Vec<Value<'static>>> = Vec::new();
+    // v7.39 (r129) — OLD image aligned with returning_rows (see return type).
+    let mut old_images: Vec<Vec<Value<'static>>> = Vec::new();
     // v7.12.7 — collect embedded SQL emitted by any trigger
     // fire across the row loop; engine drains the queue after
     // the table mut borrow drops.
@@ -3241,6 +3260,8 @@ fn insert_parsed_rows(
         }
         if returning_enabled {
             returning_rows.push(row.values.clone());
+            // A plain insert has no prior row — OLD is all-NULL.
+            old_images.push(alloc::vec![Value::Null; arity]);
         }
         // v7.12.4 — clone for the AFTER trigger view; insert
         // moves the row into the table.
@@ -3273,9 +3294,11 @@ fn insert_parsed_rows(
     // v7.9.9 — apply ON CONFLICT DO UPDATE rewrites collected
     // in the conflict-resolution pass. update_row handles
     // index maintenance + body re-encoding.
-    for (pos, new_row) in pending_updates {
+    for (pos, new_row, old_row) in pending_updates {
         if returning_enabled {
             returning_rows.push(new_row.clone());
+            // DO UPDATE: OLD is the pre-update conflicting row.
+            old_images.push(old_row);
         }
         if inplace {
             // MVCC: tombstone the conflicting old version (xmax = xmin)
@@ -3299,7 +3322,7 @@ fn insert_parsed_rows(
         }
         affected += 1;
     }
-    Ok((returning_rows, deferred_embedded, affected, oc_pairs))
+    Ok((returning_rows, deferred_embedded, affected, oc_pairs, old_images))
 }
 
 /// v7.39 (SQLSTATE fidelity) — PG's full 23502 message needs the
