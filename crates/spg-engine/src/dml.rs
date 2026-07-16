@@ -417,20 +417,24 @@ impl Engine {
             }
             None => stmt,
         };
-        // v7.39 (round 139) — unconditional DO INSTEAD NOTHING rule blocks the
-        // UPDATE. PG rejects a RETURNING on a suppressed statement; otherwise AND
-        // a constant FALSE into the WHERE so the normal path runs (the `UPDATE 0`
-        // tag stays byte-identical) but touches no rows.
+        // v7.39 (round 139/141) — DO INSTEAD NOTHING rules narrow the UPDATE.
+        // Unconditional → AND a constant FALSE. Conditional (WHERE over NEW/OLD)
+        // → AND `COALESCE(NOT(cond), TRUE)` with `NEW.col` rewritten to the SET
+        // expression, so the predicate — evaluated against the pre-image row —
+        // reproduces the rule's post-image test. RETURNING on a fully suppressed
+        // statement is rejected as PG does.
         let rule_blocked_upd;
-        let stmt = if self.rule_blocks_statement(&stmt.table, "UPDATE") {
+        let upd_block = if self.rule_blocks_statement(&stmt.table, "UPDATE") {
             if stmt.returning.is_some() {
                 return Err(crate::rules::rule_returning_error("UPDATE", &stmt.table));
             }
+            Some(spg_sql::ast::Expr::Literal(spg_sql::ast::Literal::Bool(false)))
+        } else {
+            self.conditional_block_predicate(&stmt.table, "UPDATE", &stmt.assignments)?
+        };
+        let stmt = if let Some(pred) = upd_block {
             let mut s = stmt.clone();
-            s.where_ = and_optional_predicates(
-                s.where_.take(),
-                Some(spg_sql::ast::Expr::Literal(spg_sql::ast::Literal::Bool(false))),
-            );
+            s.where_ = and_optional_predicates(s.where_.take(), Some(pred));
             rule_blocked_upd = s;
             &rule_blocked_upd
         } else {
@@ -1618,21 +1622,24 @@ impl Engine {
             }
             None => stmt,
         };
-        // v7.39 (round 139) — unconditional DO INSTEAD NOTHING rule blocks the
-        // DELETE. PG rejects a RETURNING on a suppressed statement (the rows can
-        // never be produced); otherwise AND a constant FALSE into the WHERE so
-        // the normal path runs (the `DELETE 0` tag stays byte-identical) but
-        // matches no rows.
+        // v7.39 (round 139/141) — DO INSTEAD NOTHING rules narrow the DELETE.
+        // Unconditional → AND a constant FALSE (deletes nothing). Conditional
+        // (WHERE over OLD) → AND `COALESCE(NOT(cond), TRUE)` so only rows the
+        // rule does not block are deleted. Either way the normal path runs so the
+        // `DELETE n` tag / RETURNING stay byte-identical. A RETURNING on a fully
+        // (unconditionally) suppressed statement is rejected as PG does.
         let rule_blocked_del;
-        let stmt = if self.rule_blocks_statement(&stmt.table, "DELETE") {
+        let del_block = if self.rule_blocks_statement(&stmt.table, "DELETE") {
             if stmt.returning.is_some() {
                 return Err(crate::rules::rule_returning_error("DELETE", &stmt.table));
             }
+            Some(spg_sql::ast::Expr::Literal(spg_sql::ast::Literal::Bool(false)))
+        } else {
+            self.conditional_block_predicate(&stmt.table, "DELETE", &[])?
+        };
+        let stmt = if let Some(pred) = del_block {
             let mut s = stmt.clone();
-            s.where_ = and_optional_predicates(
-                s.where_.take(),
-                Some(spg_sql::ast::Expr::Literal(spg_sql::ast::Literal::Bool(false))),
-            );
+            s.where_ = and_optional_predicates(s.where_.take(), Some(pred));
             rule_blocked_del = s;
             &rule_blocked_del
         } else {
@@ -2801,6 +2808,32 @@ impl Engine {
         // FK / CHECK / UNIQUE so those guards reason about the
         // computed value the way they would for any literal column.
         apply_generated_stored_columns(&column_meta, &mut all_values)?;
+        // v7.39 (round 141) — conditional DO INSTEAD NOTHING: drop the proposed
+        // rows a rule's WHERE (over NEW = the post-default row) blocks, before any
+        // constraint check, matching PG's query-rewrite ordering.
+        let cond_ins = self.conditional_instead_nothing_rules(&stmt.table, "INSERT");
+        if !cond_ins.is_empty() {
+            let mut kept: Vec<Vec<Value<'static>>> = Vec::with_capacity(all_values.len());
+            for row in all_values {
+                let new_row = Row::new(row.clone());
+                let mut blocked = false;
+                for r in &cond_ins {
+                    if triggers::trigger_when_holds(
+                        &r.when_condition,
+                        Some(&new_row),
+                        None,
+                        &column_meta,
+                    )? {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if !blocked {
+                    kept.push(row);
+                }
+            }
+            all_values = kept;
+        }
         // v7.39 (read01 round 117) — NOT NULL, checked pre-write over the fully
         // assembled rows so a violation aborts the whole statement (no partial
         // rows) and carries PG's `DETAIL: Failing row contains (...)`. Runs
