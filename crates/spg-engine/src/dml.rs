@@ -417,6 +417,13 @@ impl Engine {
             }
             None => stmt,
         };
+        // v7.39 (round 137, Phase 2) — INSTEAD OF UPDATE trigger on the target
+        // view fires per matching view row instead of the auto-updatable
+        // redirect. Takes precedence.
+        let iof_upd = self.snapshot_row_triggers(&stmt.table, "UPDATE", "INSTEAD OF");
+        if !iof_upd.is_empty() {
+            return self.exec_update_view_instead_of(stmt, iof_upd, cancel);
+        }
         // v7.37.19 (19.13) — auto-updatable view redirect. v7.38 (P6.46) — a
         // view WHERE is AND-ed onto the caller's so only rows visible through
         // the view are updated.
@@ -1565,6 +1572,13 @@ impl Engine {
             }
             None => stmt,
         };
+        // v7.39 (round 137, Phase 2) — INSTEAD OF DELETE trigger on the target
+        // view fires per matching view row instead of the auto-updatable
+        // redirect.
+        let iof_del = self.snapshot_row_triggers(&stmt.table, "DELETE", "INSTEAD OF");
+        if !iof_del.is_empty() {
+            return self.exec_delete_view_instead_of(stmt, iof_del, cancel);
+        }
         // v7.37.19 (19.13) — auto-updatable view redirect. v7.38 (P6.46) — a
         // view WHERE is AND-ed onto the caller's so only rows visible through
         // the view are deleted.
@@ -2207,6 +2221,154 @@ impl Engine {
                     false,
                     &triggers::TgMeta {
                         op: "INSERT",
+                        name: tgname,
+                        level: "ROW",
+                    },
+                )
+                .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                deferred_all.extend(deferred);
+            }
+            affected += 1;
+        }
+        self.execute_deferred_trigger_stmts(deferred_all, cancel)?;
+        Ok(QueryResult::CommandOk {
+            affected,
+            modified_catalog: true,
+        })
+    }
+
+    /// v7.39 (round 137, Phase 2) — materialise the view rows an UPDATE / DELETE
+    /// through an INSTEAD OF view targets: `SELECT * FROM <view> [WHERE <pred>]`.
+    /// Returns the view's output columns + the matching OLD rows.
+    fn scan_instead_of_view_rows(
+        &self,
+        view_name: &str,
+        where_: &Option<spg_sql::ast::Expr>,
+        cancel: CancelToken<'_>,
+    ) -> Result<(Vec<ColumnSchema>, Vec<Row<'static>>), EngineError> {
+        let sql = match where_ {
+            Some(w) => alloc::format!("SELECT * FROM {view_name} WHERE {w}"),
+            None => alloc::format!("SELECT * FROM {view_name}"),
+        };
+        let scan = match spg_sql::parser::parse_statement(&sql) {
+            Ok(spg_sql::ast::Statement::Select(s)) => s,
+            _ => {
+                return Err(EngineError::Unsupported(
+                    "INSTEAD OF: could not build the view scan".into(),
+                ));
+            }
+        };
+        match self.exec_select_cancel(&scan, cancel)? {
+            QueryResult::Rows { columns, rows } => Ok((columns, rows)),
+            _ => Err(EngineError::Unsupported(
+                "INSTEAD OF: view scan did not return rows".into(),
+            )),
+        }
+    }
+
+    /// v7.39 (round 137, Phase 2) — UPDATE through a view with an INSTEAD OF
+    /// UPDATE trigger: scan the view for matching OLD rows, derive NEW per row by
+    /// applying the SET assignments, and fire the trigger(s). The function body
+    /// does the real write.
+    fn exec_update_view_instead_of(
+        &mut self,
+        stmt: &spg_sql::ast::UpdateStatement,
+        triggers_list: Vec<(spg_storage::FunctionDef, alloc::string::String)>,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        if stmt.returning.is_some() {
+            return Err(EngineError::Unsupported(
+                "RETURNING through an INSTEAD OF trigger is not yet supported".into(),
+            ));
+        }
+        let (columns, old_rows) =
+            self.scan_instead_of_view_rows(&stmt.table, &stmt.where_, cancel)?;
+        let trigger_cfg: Option<String> = self
+            .session_params
+            .get("default_text_search_config")
+            .cloned();
+        let mut deferred_all: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
+        let mut affected = 0usize;
+        {
+            let ctx = self.ev_ctx(&columns, Some(&stmt.table));
+            for old in &old_rows {
+                // NEW = OLD with the SET assignments applied (assignments and
+                // WHERE reference the view's columns).
+                let mut new_vals = old.values.clone();
+                for (col, expr) in &stmt.assignments {
+                    let pos = columns.iter().position(|c| &c.name == col).ok_or_else(|| {
+                        EngineError::Eval(EvalError::ColumnNotFound { name: col.clone() })
+                    })?;
+                    new_vals[pos] =
+                        self.eval_expr_with_correlated(expr, old, &ctx, cancel, None)?;
+                }
+                let new_row = Row::new(new_vals);
+                for (fd, tgname) in &triggers_list {
+                    let (_o, deferred) = triggers::fire_row_trigger(
+                        fd,
+                        Some(new_row.clone()),
+                        Some(old),
+                        &stmt.table,
+                        &columns,
+                        &[],
+                        trigger_cfg.as_deref(),
+                        false,
+                        &triggers::TgMeta {
+                            op: "UPDATE",
+                            name: tgname,
+                            level: "ROW",
+                        },
+                    )
+                    .map_err(|e| {
+                        EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
+                    })?;
+                    deferred_all.extend(deferred);
+                }
+                affected += 1;
+            }
+        }
+        self.execute_deferred_trigger_stmts(deferred_all, cancel)?;
+        Ok(QueryResult::CommandOk {
+            affected,
+            modified_catalog: true,
+        })
+    }
+
+    /// v7.39 (round 137, Phase 2) — DELETE through a view with an INSTEAD OF
+    /// DELETE trigger: scan the view for matching OLD rows and fire the
+    /// trigger(s) per row (OLD only).
+    fn exec_delete_view_instead_of(
+        &mut self,
+        stmt: &spg_sql::ast::DeleteStatement,
+        triggers_list: Vec<(spg_storage::FunctionDef, alloc::string::String)>,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        if stmt.returning.is_some() {
+            return Err(EngineError::Unsupported(
+                "RETURNING through an INSTEAD OF trigger is not yet supported".into(),
+            ));
+        }
+        let (columns, old_rows) =
+            self.scan_instead_of_view_rows(&stmt.table, &stmt.where_, cancel)?;
+        let trigger_cfg: Option<String> = self
+            .session_params
+            .get("default_text_search_config")
+            .cloned();
+        let mut deferred_all: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
+        let mut affected = 0usize;
+        for old in &old_rows {
+            for (fd, tgname) in &triggers_list {
+                let (_o, deferred) = triggers::fire_row_trigger(
+                    fd,
+                    None,
+                    Some(old),
+                    &stmt.table,
+                    &columns,
+                    &[],
+                    trigger_cfg.as_deref(),
+                    false,
+                    &triggers::TgMeta {
+                        op: "DELETE",
                         name: tgname,
                         level: "ROW",
                     },
