@@ -3140,7 +3140,7 @@ impl Parser {
         let tok = self.peek();
         let (Token::Ident(s) | Token::QuotedIdent(s)) = tok else {
             return Err(self.err(alloc::format!(
-                "expected FUNCTION / TRIGGER / VIEW after CREATE OR REPLACE, got {tok:?}"
+                "expected FUNCTION / TRIGGER / RULE / VIEW after CREATE OR REPLACE, got {tok:?}"
             )));
         };
         if s.eq_ignore_ascii_case("function") {
@@ -3149,6 +3149,10 @@ impl Parser {
         } else if s.eq_ignore_ascii_case("trigger") {
             self.advance();
             self.parse_create_trigger_after_keyword(or_replace)
+        } else if s.eq_ignore_ascii_case("rule") {
+            // v7.39 (round 143) — CREATE OR REPLACE RULE name AS ON …
+            self.advance();
+            self.parse_create_rule_after_keyword(or_replace)
         } else if s.eq_ignore_ascii_case("view") {
             // v7.17.0 Phase 1.2 — CREATE OR REPLACE VIEW name AS SELECT …
             self.advance();
@@ -3168,7 +3172,7 @@ impl Parser {
             }
         } else {
             Err(self.err(alloc::format!(
-                "expected FUNCTION / TRIGGER / VIEW after CREATE OR REPLACE, got {s:?}"
+                "expected FUNCTION / TRIGGER / RULE / VIEW after CREATE OR REPLACE, got {s:?}"
             )))
         }
     }
@@ -8601,6 +8605,8 @@ impl Parser {
             "pg_publication",
             "pg_replication_slots",
             "pg_roles",
+            // v7.39 (round 143) — the rewrite-rule listing view.
+            "pg_rules",
             "pg_sequence",
             "pg_settings",
             "pg_stat_archiver",

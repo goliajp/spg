@@ -3760,6 +3760,52 @@ pub(crate) fn synth_pg_extension() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     (schema, rows)
 }
 
+/// v7.39 (round 143) — synthesise `pg_catalog.pg_rules`: one row per
+/// catalogued query-rewrite RULE. PG's `definition` column is
+/// `pg_get_ruledef`'s pretty-printed deparse; SPG reconstructs the canonical
+/// single-line CREATE RULE text from the stored `RuleDef` (the same fidelity
+/// level as `pg_views.definition`, which surfaces the stored view body).
+pub(crate) fn synth_pg_rules(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("schemaname", DataType::Text, false),
+        ColumnSchema::new("tablename", DataType::Text, false),
+        ColumnSchema::new("rulename", DataType::Text, false),
+        ColumnSchema::new("definition", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for r in cat.rules() {
+        let mut def = alloc::format!(
+            "CREATE RULE {} AS ON {} TO public.{}",
+            r.name, r.event, r.table
+        );
+        if !r.when_condition.is_empty() {
+            def.push_str(" WHERE ");
+            def.push_str(&r.when_condition);
+        }
+        def.push_str(" DO ");
+        if r.instead {
+            def.push_str("INSTEAD ");
+        }
+        match r.commands.len() {
+            0 => def.push_str("NOTHING"),
+            1 => def.push_str(&r.commands[0]),
+            _ => {
+                def.push('(');
+                def.push_str(&r.commands.join("; "));
+                def.push(')');
+            }
+        }
+        def.push(';');
+        rows.push(Row::new(alloc::vec![
+            Value::text("public"),
+            Value::text(r.table.clone()),
+            Value::text(r.name.clone()),
+            Value::text(def),
+        ]));
+    }
+    (schema, rows)
+}
+
 pub(crate) fn synth_pg_views(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Text, false),
