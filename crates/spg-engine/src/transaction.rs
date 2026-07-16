@@ -40,6 +40,10 @@ pub(crate) fn classify_stmt_for_tx(stmt: &spg_sql::ast::Statement) -> TxStmtClas
                 CteBody::Insert(i) => targets.push(i.table.clone()),
                 CteBody::Update(u) => targets.push(u.table.clone()),
                 CteBody::Delete(d) => targets.push(d.table.clone()),
+                // v7.39 (round 149) — a MERGE body poisons the rebase
+                // for the same reason top-level `S::Merge` does below:
+                // its DELETE branch's write-set is unextractable.
+                CteBody::Merge(_) => return None,
             }
         }
         Some(targets)

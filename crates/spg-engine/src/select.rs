@@ -996,6 +996,26 @@ impl Engine {
         // commit the modifying writes directly to `self`'s active
         // catalog so the surface is consistent.
         let mut catalog = self.active_catalog().clone();
+        // v7.39 (round 149) — a modifying CTE body's target must be a
+        // real relation, never a sibling CTE (PG: relation does not
+        // exist); checked before any alias lands in the accumulator.
+        for cte in ctes {
+            let body_target = match &cte.body {
+                spg_sql::ast::CteBody::Select(_) => None,
+                spg_sql::ast::CteBody::Insert(i) => Some(i.table.as_str()),
+                spg_sql::ast::CteBody::Update(u) => Some(u.table.as_str()),
+                spg_sql::ast::CteBody::Delete(d) => Some(d.table.as_str()),
+                spg_sql::ast::CteBody::Merge(m) => Some(m.target.as_str()),
+            };
+            if let Some(t) = body_target
+                && ctes.iter().any(|c| c.name.eq_ignore_ascii_case(t))
+                && catalog.get(t).is_none()
+            {
+                return Err(EngineError::Storage(
+                    spg_storage::StorageError::TableNotFound { name: t.into() },
+                ));
+            }
+        }
         for cte in ctes {
             if catalog.get(&cte.name).is_some() {
                 return Err(EngineError::Unsupported(alloc::format!(
@@ -1049,6 +1069,9 @@ impl Engine {
                 }
                 spg_sql::ast::CteBody::Delete(body) => {
                     self.exec_modifying_cte_delete(&cte.name, body, cancel)?
+                }
+                spg_sql::ast::CteBody::Merge(body) => {
+                    self.exec_modifying_cte_merge(&cte.name, body, cancel)?
                 }
             };
             // v4.22: the projection builder labels any non-column
@@ -1170,6 +1193,35 @@ impl Engine {
         let mut body = body.clone();
         body.ctes = Vec::new();
         let result = self.exec_delete_cancel(&body, cancel)?;
+        match result {
+            QueryResult::Rows { columns, rows } => Ok((columns, rows)),
+            QueryResult::CommandOk { .. } => {
+                let placeholder = spg_storage::ColumnSchema::new(
+                    alloc::format!("{cte_name}_returning_absent"),
+                    spg_storage::DataType::Text,
+                    true,
+                );
+                Ok((alloc::vec![placeholder], Vec::new()))
+            }
+        }
+    }
+
+    /// v7.39 (round 149) — execute a MERGE CTE body (PG 17).
+    fn exec_modifying_cte_merge(
+        &mut self,
+        cte_name: &str,
+        body: &spg_sql::ast::MergeStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<
+        (
+            Vec<spg_storage::ColumnSchema>,
+            Vec<spg_storage::Row<'static>>,
+        ),
+        EngineError,
+    > {
+        let mut body = body.clone();
+        body.ctes = Vec::new();
+        let result = self.exec_merge_cancel(&body, cancel)?;
         match result {
             QueryResult::Rows { columns, rows } => Ok((columns, rows)),
             QueryResult::CommandOk { .. } => {

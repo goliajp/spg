@@ -430,6 +430,9 @@ pub fn substitute_placeholders(
             }
         }
         Statement::Explain(e) => substitute_select(&mut e.inner, params)?,
+        // v7.39 (round 149) — prepared MERGE: `$N` may appear in the ON
+        // condition, WHEN filters, action exprs, and RETURNING.
+        Statement::Merge(m) => walk_merge_exprs_mut(m, &mut |e| substitute_expr(e, params))?,
         // Other statements (CREATE / BEGIN / SHOW / …) have no
         // expression slots; no walk needed.
         _ => {}
@@ -459,6 +462,7 @@ pub(crate) fn walk_select_exprs_mut(
             spg_sql::ast::CteBody::Insert(ins) => walk_insert_exprs_mut(ins, f)?,
             spg_sql::ast::CteBody::Update(upd) => walk_update_exprs_mut(upd, f)?,
             spg_sql::ast::CteBody::Delete(del) => walk_delete_exprs_mut(del, f)?,
+            spg_sql::ast::CteBody::Merge(m2) => walk_merge_exprs_mut(m2, f)?,
         }
     }
     for item in &mut s.items {
@@ -512,6 +516,7 @@ pub(crate) fn walk_insert_exprs_mut(
             spg_sql::ast::CteBody::Insert(i2) => walk_insert_exprs_mut(i2, f)?,
             spg_sql::ast::CteBody::Update(u2) => walk_update_exprs_mut(u2, f)?,
             spg_sql::ast::CteBody::Delete(d2) => walk_delete_exprs_mut(d2, f)?,
+            spg_sql::ast::CteBody::Merge(m2) => walk_merge_exprs_mut(m2, f)?,
         }
     }
     for row in &mut ins.rows {
@@ -556,6 +561,7 @@ pub(crate) fn walk_update_exprs_mut(
             spg_sql::ast::CteBody::Insert(i2) => walk_insert_exprs_mut(i2, f)?,
             spg_sql::ast::CteBody::Update(u2) => walk_update_exprs_mut(u2, f)?,
             spg_sql::ast::CteBody::Delete(d2) => walk_delete_exprs_mut(d2, f)?,
+            spg_sql::ast::CteBody::Merge(m2) => walk_merge_exprs_mut(m2, f)?,
         }
     }
     for (_, e) in upd.assignments.iter_mut() {
@@ -585,12 +591,62 @@ pub(crate) fn walk_delete_exprs_mut(
             spg_sql::ast::CteBody::Insert(i2) => walk_insert_exprs_mut(i2, f)?,
             spg_sql::ast::CteBody::Update(u2) => walk_update_exprs_mut(u2, f)?,
             spg_sql::ast::CteBody::Delete(d2) => walk_delete_exprs_mut(d2, f)?,
+            spg_sql::ast::CteBody::Merge(m2) => walk_merge_exprs_mut(m2, f)?,
         }
     }
     if let Some(w) = &mut del.where_ {
         f(w)?;
     }
     if let Some(items) = &mut del.returning {
+        for it in items.iter_mut() {
+            if let SelectItem::Expr { expr, .. } = it {
+                f(expr)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v7.39 (round 149) — walk every Expr slot in a MERGE body: the ON
+/// join condition, each WHEN clause's AND-filter and action exprs
+/// (INSERT values / UPDATE assignments), the RETURNING projection,
+/// the optional subquery source, and any nested CTEs.
+pub(crate) fn walk_merge_exprs_mut(
+    m: &mut spg_sql::ast::MergeStatement,
+    f: &mut impl FnMut(&mut Expr) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    for cte in &mut m.ctes {
+        match &mut cte.body {
+            spg_sql::ast::CteBody::Select(s2) => walk_select_exprs_mut(s2, f)?,
+            spg_sql::ast::CteBody::Insert(i2) => walk_insert_exprs_mut(i2, f)?,
+            spg_sql::ast::CteBody::Update(u2) => walk_update_exprs_mut(u2, f)?,
+            spg_sql::ast::CteBody::Delete(d2) => walk_delete_exprs_mut(d2, f)?,
+            spg_sql::ast::CteBody::Merge(m2) => walk_merge_exprs_mut(m2, f)?,
+        }
+    }
+    if let Some(sel) = &mut m.source_select {
+        walk_select_exprs_mut(sel, f)?;
+    }
+    f(&mut m.on)?;
+    for clause in &mut m.clauses {
+        if let Some(c) = &mut clause.condition {
+            f(c)?;
+        }
+        match &mut clause.action {
+            spg_sql::ast::MergeAction::Insert { values, .. } => {
+                for v in values.iter_mut() {
+                    f(v)?;
+                }
+            }
+            spg_sql::ast::MergeAction::Update { assignments } => {
+                for (_, e) in assignments.iter_mut() {
+                    f(e)?;
+                }
+            }
+            spg_sql::ast::MergeAction::Delete | spg_sql::ast::MergeAction::DoNothing => {}
+        }
+    }
+    if let Some(items) = &mut m.returning {
         for it in items.iter_mut() {
             if let SelectItem::Expr { expr, .. } = it {
                 f(expr)?;

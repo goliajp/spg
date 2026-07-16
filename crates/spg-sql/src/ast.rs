@@ -2299,6 +2299,11 @@ pub struct DeleteStatement {
 /// `matched` kind and optional `condition` are both satisfied.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeStatement {
+    /// v7.39 (read01 round 149) — leading `WITH <cte> [, …]` (PG 15 allows
+    /// a WITH clause on MERGE; `WITH RECURSIVE` is rejected at parse, as
+    /// in PG). Each CTE materialises before the merge runs and its alias
+    /// resolves as a source relation.
+    pub ctes: Vec<Cte>,
     pub target: String,
     pub target_alias: Option<String>,
     pub source: String,
@@ -2618,6 +2623,9 @@ pub enum CteBody {
     Insert(Box<InsertStatement>),
     Update(Box<UpdateStatement>),
     Delete(Box<DeleteStatement>),
+    /// v7.39 (read01 round 149) — PG 17 allows MERGE as a
+    /// data-modifying CTE body (`WITH m AS (MERGE … RETURNING …)`).
+    Merge(Box<MergeStatement>),
 }
 
 impl CteBody {
@@ -3835,69 +3843,7 @@ impl fmt::Display for Statement {
             Self::Insert(s) => s.fmt(f),
             Self::Update(s) => s.fmt(f),
             Self::Delete(s) => s.fmt(f),
-            Self::Merge(s) => {
-                // v7.17.0 Phase 3.P0-42 — MERGE display is approximate
-                // (it round-trips for the cases tests cover, not for
-                // round-tripping every edge of the surface).
-                f.write_str("MERGE INTO ")?;
-                write!(f, "{}", quote_ident(&s.target))?;
-                if let Some(a) = &s.target_alias {
-                    write!(f, " {}", quote_ident(a))?;
-                }
-                f.write_str(" USING ")?;
-                if let Some(sub) = &s.source_select {
-                    write!(f, "({sub})")?;
-                } else {
-                    write!(f, "{}", quote_ident(&s.source))?;
-                }
-                if let Some(a) = &s.source_alias {
-                    write!(f, " {}", quote_ident(a))?;
-                }
-                write!(f, " ON {}", s.on)?;
-                for clause in &s.clauses {
-                    f.write_str(" WHEN ")?;
-                    f.write_str(match clause.matched {
-                        MergeMatched::Matched => "MATCHED",
-                        MergeMatched::NotMatched => "NOT MATCHED",
-                        MergeMatched::NotMatchedBySource => "NOT MATCHED BY SOURCE",
-                    })?;
-                    if let Some(c) = &clause.condition {
-                        write!(f, " AND {c}")?;
-                    }
-                    f.write_str(" THEN ")?;
-                    match &clause.action {
-                        MergeAction::Insert { columns, values } => {
-                            f.write_str("INSERT (")?;
-                            for (i, c) in columns.iter().enumerate() {
-                                if i > 0 {
-                                    f.write_str(", ")?;
-                                }
-                                write!(f, "{}", quote_ident(c))?;
-                            }
-                            f.write_str(") VALUES (")?;
-                            for (i, v) in values.iter().enumerate() {
-                                if i > 0 {
-                                    f.write_str(", ")?;
-                                }
-                                write!(f, "{v}")?;
-                            }
-                            f.write_str(")")?;
-                        }
-                        MergeAction::Update { assignments } => {
-                            f.write_str("UPDATE SET ")?;
-                            for (i, (c, e)) in assignments.iter().enumerate() {
-                                if i > 0 {
-                                    f.write_str(", ")?;
-                                }
-                                write!(f, "{} = {e}", quote_ident(c))?;
-                            }
-                        }
-                        MergeAction::Delete => f.write_str("DELETE")?,
-                        MergeAction::DoNothing => f.write_str("DO NOTHING")?,
-                    }
-                }
-                Ok(())
-            }
+            Self::Merge(s) => s.fmt(f),
             Self::Begin(None) => f.write_str("BEGIN"),
             Self::Begin(Some(level)) => write!(f, "BEGIN ISOLATION LEVEL {level}"),
             Self::Commit => f.write_str("COMMIT"),
@@ -5477,8 +5423,121 @@ impl fmt::Display for CteBody {
             Self::Insert(s) => write!(f, "{s}"),
             Self::Update(s) => write!(f, "{s}"),
             Self::Delete(s) => write!(f, "{s}"),
+            Self::Merge(s) => write!(f, "{s}"),
         }
     }
+}
+
+impl fmt::Display for MergeStatement {
+    // v7.17.0 Phase 3.P0-42 — MERGE display is approximate
+    // (it round-trips for the cases tests cover, not for
+    // round-tripping every edge of the surface).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_with_clause(&self.ctes, f)?;
+        f.write_str("MERGE INTO ")?;
+        write!(f, "{}", quote_ident(&self.target))?;
+        if let Some(a) = &self.target_alias {
+            write!(f, " {}", quote_ident(a))?;
+        }
+        f.write_str(" USING ")?;
+        if let Some(sub) = &self.source_select {
+            write!(f, "({sub})")?;
+        } else {
+            write!(f, "{}", quote_ident(&self.source))?;
+        }
+        if let Some(a) = &self.source_alias {
+            write!(f, " {}", quote_ident(a))?;
+        }
+        write!(f, " ON {}", self.on)?;
+        for clause in &self.clauses {
+            f.write_str(" WHEN ")?;
+            f.write_str(match clause.matched {
+                MergeMatched::Matched => "MATCHED",
+                MergeMatched::NotMatched => "NOT MATCHED",
+                MergeMatched::NotMatchedBySource => "NOT MATCHED BY SOURCE",
+            })?;
+            if let Some(c) = &clause.condition {
+                write!(f, " AND {c}")?;
+            }
+            f.write_str(" THEN ")?;
+            match &clause.action {
+                MergeAction::Insert { columns, values } => {
+                    f.write_str("INSERT ")?;
+                    // A column list is optional (round 146): the bare
+                    // `INSERT VALUES (…)` form maps positionally.
+                    if !columns.is_empty() {
+                        f.write_str("(")?;
+                        for (i, c) in columns.iter().enumerate() {
+                            if i > 0 {
+                                f.write_str(", ")?;
+                            }
+                            write!(f, "{}", quote_ident(c))?;
+                        }
+                        f.write_str(") ")?;
+                    }
+                    f.write_str("VALUES (")?;
+                    for (i, v) in values.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{v}")?;
+                    }
+                    f.write_str(")")?;
+                }
+                MergeAction::Update { assignments } => {
+                    f.write_str("UPDATE SET ")?;
+                    for (i, (c, e)) in assignments.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{} = {e}", quote_ident(c))?;
+                    }
+                }
+                MergeAction::Delete => f.write_str("DELETE")?,
+                MergeAction::DoNothing => f.write_str("DO NOTHING")?,
+            }
+        }
+        if let Some(items) = &self.returning {
+            f.write_str(" RETURNING ")?;
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{it}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Shared `WITH <cte> [, …] ` prefix renderer — SELECT and MERGE both
+/// carry a CTE list and must round-trip it identically.
+fn fmt_with_clause(ctes: &[Cte], f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    if ctes.is_empty() {
+        return Ok(());
+    }
+    f.write_str("WITH ")?;
+    if ctes.iter().any(|c| c.recursive) {
+        f.write_str("RECURSIVE ")?;
+    }
+    for (i, cte) in ctes.iter().enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        f.write_str(&quote_ident(&cte.name))?;
+        if !cte.column_overrides.is_empty() {
+            f.write_str(" (")?;
+            for (ci, c) in cte.column_overrides.iter().enumerate() {
+                if ci > 0 {
+                    f.write_str(", ")?;
+                }
+                f.write_str(&quote_ident(c))?;
+            }
+            f.write_str(")")?;
+        }
+        write!(f, " AS ({})", cte.body)?;
+    }
+    f.write_str(" ")
 }
 
 impl fmt::Display for SelectStatement {
@@ -5486,30 +5545,7 @@ impl fmt::Display for SelectStatement {
         // v7.30.1 (mailrs round-24 class audit) — the WITH clause
         // must survive the round trip; a CTE-using statement
         // re-parsed without it references undefined tables.
-        if !self.ctes.is_empty() {
-            f.write_str("WITH ")?;
-            if self.ctes.iter().any(|c| c.recursive) {
-                f.write_str("RECURSIVE ")?;
-            }
-            for (i, cte) in self.ctes.iter().enumerate() {
-                if i > 0 {
-                    f.write_str(", ")?;
-                }
-                f.write_str(&quote_ident(&cte.name))?;
-                if !cte.column_overrides.is_empty() {
-                    f.write_str(" (")?;
-                    for (ci, c) in cte.column_overrides.iter().enumerate() {
-                        if ci > 0 {
-                            f.write_str(", ")?;
-                        }
-                        f.write_str(&quote_ident(c))?;
-                    }
-                    f.write_str(")")?;
-                }
-                write!(f, " AS ({})", cte.body)?;
-            }
-            f.write_str(" ")?;
-        }
+        fmt_with_clause(&self.ctes, f)?;
         write_bare_select(self, f)?;
         for (kind, peer) in &self.unions {
             f.write_str(match kind {

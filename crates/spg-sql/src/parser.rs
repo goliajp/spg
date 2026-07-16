@@ -7113,6 +7113,9 @@ impl Parser {
         // v7.39 (round 130) — optional trailing `RETURNING <projection>` (PG17+).
         let returning = self.parse_optional_returning()?;
         Ok(Statement::Merge(crate::ast::MergeStatement {
+            // Attached by `parse_with_cte_then_select` when the MERGE
+            // heads a WITH clause (round 149).
+            ctes: Vec::new(),
             target,
             target_alias,
             source,
@@ -17785,6 +17788,7 @@ impl Parser {
             // idents).
             let is_update_kw = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("update"));
             let is_delete_kw = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("delete"));
+            let is_merge_kw = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("merge"));
             let body = match self.peek() {
                 Token::Select => {
                     let inner = self.parse_select_stmt()?;
@@ -17832,9 +17836,20 @@ impl Parser {
                     };
                     crate::ast::CteBody::Delete(alloc::boxed::Box::new(s))
                 }
+                // v7.39 (round 149) — PG 17 allows MERGE as a
+                // data-modifying CTE body.
+                _ if is_merge_kw => {
+                    let inner = self.parse_one_statement()?;
+                    let Statement::Merge(s) = inner else {
+                        return Err(
+                            self.err(format!("expected MERGE inside WITH (…), got {inner:?}"))
+                        );
+                    };
+                    crate::ast::CteBody::Merge(alloc::boxed::Box::new(s))
+                }
                 other => {
                     return Err(self.err(format!(
-                        "WITH body must be SELECT / INSERT / UPDATE / DELETE, got {other:?}"
+                        "WITH body must be SELECT / INSERT / UPDATE / DELETE / MERGE, got {other:?}"
                     )));
                 }
             };
@@ -17871,6 +17886,7 @@ impl Parser {
         // the parsed CTEs to whichever statement the body produces.
         let outer_is_update = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("update"));
         let outer_is_delete = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("delete"));
+        let outer_is_merge = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("merge"));
         match self.peek() {
             Token::Select => {
                 let body_stmt = self.parse_select_stmt()?;
@@ -17904,8 +17920,24 @@ impl Parser {
                 body.ctes = ctes;
                 Ok(Statement::Delete(body))
             }
+            // v7.39 (round 149) — PG 15 allows a WITH clause on MERGE;
+            // WITH RECURSIVE is rejected with PG's exact message
+            // (parse analysis, transformWithClause).
+            _ if outer_is_merge => {
+                if recursive {
+                    return Err(self.err(String::from(
+                        "WITH RECURSIVE is not supported for MERGE statement",
+                    )));
+                }
+                let body_stmt = self.parse_one_statement()?;
+                let Statement::Merge(mut body) = body_stmt else {
+                    return Err(self.err(format!("expected MERGE after WITH clause")));
+                };
+                body.ctes = ctes;
+                Ok(Statement::Merge(body))
+            }
             other => Err(self.err(format!(
-                "expected SELECT / INSERT / UPDATE / DELETE after WITH clause, got {other:?}"
+                "expected SELECT / INSERT / UPDATE / DELETE / MERGE after WITH clause, got {other:?}"
             ))),
         }
     }

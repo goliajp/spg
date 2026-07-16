@@ -368,6 +368,13 @@ pub(crate) fn explain_select(
                     s.table
                 ));
             }
+            spg_sql::ast::CteBody::Merge(s) => {
+                out.push(alloc::format!(
+                    "{}ModifyingCTE (MERGE {})",
+                    "  ".repeat(depth + 2),
+                    s.target
+                ));
+            }
             spg_sql::ast::CteBody::Update(s) => {
                 out.push(alloc::format!(
                     "{}ModifyingCTE (UPDATE {})",

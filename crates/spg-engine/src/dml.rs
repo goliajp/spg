@@ -1151,6 +1151,12 @@ impl Engine {
         stmt: &spg_sql::ast::MergeStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 (round 149) — writable CTE outer body (MERGE): PG 15
+        // allows `WITH <ctes> MERGE INTO …`; each CTE materialises
+        // first and its alias resolves as a source relation.
+        if !stmt.ctes.is_empty() {
+            return self.exec_merge_with_ctes(stmt.clone(), cancel);
+        }
         // v7.39 (round 148, PG17) — MERGE INTO an auto-updatable view rewrites
         // to the base table: column names map view → base (qualified by the
         // view's alias), the view's WHERE narrows which target rows the merge
@@ -3667,7 +3673,32 @@ impl Engine {
         mut stmt: InsertStatement,
     ) -> Result<QueryResult, EngineError> {
         let cte_defs = core::mem::take(&mut stmt.ctes);
+        self.guard_dml_target_not_cte(&stmt.table, &cte_defs)?;
         self.run_with_cte_temps(&cte_defs, |engine| engine.exec_insert(stmt))
+    }
+
+    /// v7.39 (round 149) — PG resolves a DML target only against real
+    /// relations, never a CTE of the same statement (`WITH c AS (…)
+    /// DELETE FROM c` errors "relation \"c\" does not exist"). SPG's
+    /// temp-table CTE machinery would otherwise resolve the target to
+    /// the just-installed temp — the write lands there and vanishes
+    /// when the statement ends. Must run BEFORE the temps install
+    /// (the catalog probe distinguishes a real same-named table).
+    fn guard_dml_target_not_cte(
+        &self,
+        target: &str,
+        ctes: &[spg_sql::ast::Cte],
+    ) -> Result<(), EngineError> {
+        if ctes.iter().any(|c| c.name.eq_ignore_ascii_case(target))
+            && self.active_catalog().get(target).is_none()
+        {
+            return Err(EngineError::Storage(
+                spg_storage::StorageError::TableNotFound {
+                    name: target.into(),
+                },
+            ));
+        }
+        Ok(())
     }
 
     /// v7.37.43-T4.4 — UPDATE counterpart of `exec_insert_with_ctes`.
@@ -3677,6 +3708,7 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let cte_defs = core::mem::take(&mut stmt.ctes);
+        self.guard_dml_target_not_cte(&stmt.table, &cte_defs)?;
         self.run_with_cte_temps(&cte_defs, |engine| engine.exec_update_cancel(&stmt, cancel))
     }
 
@@ -3693,6 +3725,17 @@ impl Engine {
         self.run_with_cte_temps(&cte_defs, |engine| engine.exec_select_cancel(&stmt, cancel))
     }
 
+    /// v7.39 (round 149) — MERGE counterpart of `exec_insert_with_ctes`.
+    pub(crate) fn exec_merge_with_ctes(
+        &mut self,
+        mut stmt: spg_sql::ast::MergeStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let cte_defs = core::mem::take(&mut stmt.ctes);
+        self.guard_dml_target_not_cte(&stmt.target, &cte_defs)?;
+        self.run_with_cte_temps(&cte_defs, |engine| engine.exec_merge_cancel(&stmt, cancel))
+    }
+
     /// v7.37.43-T4.4 — DELETE counterpart of `exec_insert_with_ctes`.
     pub(crate) fn exec_delete_with_ctes(
         &mut self,
@@ -3700,6 +3743,7 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let cte_defs = core::mem::take(&mut stmt.ctes);
+        self.guard_dml_target_not_cte(&stmt.table, &cte_defs)?;
         self.run_with_cte_temps(&cte_defs, |engine| engine.exec_delete_cancel(&stmt, cancel))
     }
 
@@ -3718,6 +3762,22 @@ impl Engine {
     where
         F: FnOnce(&mut Engine) -> Result<QueryResult, EngineError>,
     {
+        // v7.39 (round 149) — a modifying CTE body's target must be a
+        // real relation too, never a sibling CTE (PG: relation does
+        // not exist). Checked before any temp installs so the catalog
+        // probe still distinguishes a real same-named table.
+        for cte in ctes {
+            let body_target = match &cte.body {
+                spg_sql::ast::CteBody::Select(_) => None,
+                spg_sql::ast::CteBody::Insert(i) => Some(i.table.as_str()),
+                spg_sql::ast::CteBody::Update(u) => Some(u.table.as_str()),
+                spg_sql::ast::CteBody::Delete(d) => Some(d.table.as_str()),
+                spg_sql::ast::CteBody::Merge(m) => Some(m.target.as_str()),
+            };
+            if let Some(t) = body_target {
+                self.guard_dml_target_not_cte(t, ctes)?;
+            }
+        }
         // Phase 1 — execute / materialise each CTE in declaration
         // order, mutating self (real-table writes go through) and
         // capturing the rows that will populate the CTE alias.
@@ -3844,6 +3904,15 @@ impl Engine {
                 let mut body = (**body).clone();
                 body.ctes = alloc::vec::Vec::new();
                 let result = self.exec_delete_cancel(&body, cancel)?;
+                self.cte_returning_or_empty(&cte.name, result)
+            }
+            // v7.39 (round 149) — PG 17 allows MERGE as a CTE body;
+            // without RETURNING the alias materialises empty, as with
+            // the other data-modifying bodies.
+            CteBody::Merge(body) => {
+                let mut body = (**body).clone();
+                body.ctes = alloc::vec::Vec::new();
+                let result = self.exec_merge_cancel(&body, cancel)?;
                 self.cte_returning_or_empty(&cte.name, result)
             }
         }
