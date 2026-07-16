@@ -109,7 +109,7 @@ use crate::eval::{EvalContext, EvalError};
 use crate::{
     CancelToken, Engine, EngineError, QueryResult, any_column_changed, apply_fk_child_step,
     apply_on_conflict_assignments, canonicalize_set_value, check_unsigned_range, coerce_value,
-    enforce_check_constraints, enforce_enum_label, enforce_fk_inserts,
+    enforce_check_constraints, enforce_enum_label, enforce_fk_inserts, enforce_not_null,
     enforce_unique_index_inserts, enforce_unique_updates, enforce_uniqueness_inserts, eval,
     eval_runtime_default_free, expr_has_subquery, literal_expr_to_value, literal_expr_to_value_in,
     lookup_row_position_by_keys, on_conflict_keys_exist, plan_fk_parent_deletions,
@@ -537,6 +537,10 @@ impl Engine {
                 .iter()
                 .map(|(_pos, new_vals)| new_vals.clone())
                 .collect();
+            // v7.39 (read01 round 117) — NOT NULL on the post-update rows,
+            // pre-write with PG's `DETAIL: Failing row contains (...)`. Before
+            // CHECK, matching PG's ordering.
+            enforce_not_null(self.active_catalog(), &stmt.table, &new_rows)?;
             enforce_check_constraints(self.active_catalog(), &stmt.table, &new_rows)?;
             // v7.39 (RLS) Phase 2 — UPDATE WITH CHECK on the post-update rows.
             let cols = self
@@ -1801,6 +1805,11 @@ impl Engine {
         // FK / CHECK / UNIQUE so those guards reason about the
         // computed value the way they would for any literal column.
         apply_generated_stored_columns(&column_meta, &mut all_values)?;
+        // v7.39 (read01 round 117) — NOT NULL, checked pre-write over the fully
+        // assembled rows so a violation aborts the whole statement (no partial
+        // rows) and carries PG's `DETAIL: Failing row contains (...)`. Runs
+        // before FK / CHECK, matching PG's not-null-first ordering.
+        enforce_not_null(self.active_catalog(), &stmt.table, &all_values)?;
         if !fks.is_empty() {
             enforce_fk_inserts(self.active_catalog(), &stmt.table, &fks, &all_values)?;
         }
@@ -2595,21 +2604,13 @@ fn build_tuple_pos(
                 }
                 map[idx] = Some(j);
             }
-            // Omitted columns must either be nullable, carry a
-            // DEFAULT, or be AUTO_INCREMENT. Catch NOT NULL
-            // omissions up front so the WAL stays clean.
-            for (i, col) in column_meta.iter().enumerate() {
-                if map[i].is_none()
-                    && !col.nullable
-                    && col.default.is_none()
-                    && col.runtime_default.is_none()
-                    && !col.auto_increment
-                {
-                    return Err(EngineError::Storage(StorageError::NullInNotNull {
-                        column: col.name.clone(),
-                    }));
-                }
-            }
+            // v7.39 (read01 round 117) — the omitted-column NOT NULL pre-check
+            // used to fire here (before row values existed), so it could not
+            // carry PG's `DETAIL: Failing row contains (...)`. It is now
+            // subsumed by `enforce_not_null` over the fully assembled rows: an
+            // omitted no-default not-null column lands as NULL and is caught
+            // there (pre-write, with the row for the DETAIL), together with an
+            // explicitly-supplied NULL — one path, one message shape.
             Some(map)
         }
     };

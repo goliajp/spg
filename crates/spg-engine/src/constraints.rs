@@ -1253,6 +1253,55 @@ pub(crate) fn any_column_changed(
     false
 }
 
+/// v7.39 (read01 round 117) — PG's "Failing row contains (...)" tuple text,
+/// shared by the 23514 (CHECK) and 23502 (NOT NULL) DETAIL lines. Each cell is
+/// rendered as PG prints it in a row constructor: a JSON `null` → `null`, text
+/// verbatim (unquoted, commas and all), everything else via `value_to_text`.
+pub(crate) fn format_failing_row(row_values: &[Value<'static>]) -> String {
+    row_values
+        .iter()
+        .map(|v| match v {
+            Value::Null => "null".to_string(),
+            Value::Text(s) => s.to_string(),
+            other => crate::eval::value_to_text(other),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// v7.39 (read01 round 117) — PG's 23502 NOT NULL check over a batch of
+/// fully-assembled rows (defaults / generated columns already applied).
+/// Raised PRE-WRITE alongside the FK / CHECK guards, so a violating row aborts
+/// the whole statement before any row is written (no partial rows) and carries
+/// PG's `DETAIL: Failing row contains (...)`. Nullability is the schema's own
+/// per-column flag — the same one the storage insert path checks — so this is a
+/// pre-write mirror with the row context, not a second policy.
+pub(crate) fn enforce_not_null(
+    catalog: &Catalog,
+    table_name: &str,
+    rows: &[alloc::vec::Vec<Value<'static>>],
+) -> Result<(), EngineError> {
+    let table = catalog.get(table_name).ok_or_else(|| {
+        EngineError::Storage(StorageError::TableNotFound {
+            name: table_name.into(),
+        })
+    })?;
+    let cols = &table.schema().columns;
+    for row in rows {
+        for (val, col) in row.iter().zip(cols) {
+            if val.is_null() && !col.nullable {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "null value in column \"{}\" of relation \"{table_name}\" \
+                     violates not-null constraint DETAIL: Failing row contains ({}).",
+                    col.name,
+                    format_failing_row(row)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// v7.13.0 — evaluate every CHECK predicate on the schema against
 /// each candidate row. Mirrors PG semantics: a `false` result
 /// rejects the mutation; a NULL result *passes* (CHECK rejects
@@ -1331,15 +1380,7 @@ pub(crate) fn enforce_check_constraints(
                     .get(*i)
                     .cloned()
                     .unwrap_or_else(|| alloc::format!("{table_name}_check"));
-                let failing = row_values
-                    .iter()
-                    .map(|v| match v {
-                        spg_storage::Value::Null => "null".to_string(),
-                        spg_storage::Value::Text(s) => s.to_string(),
-                        other => crate::eval::value_to_text(other),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let failing = format_failing_row(row_values);
                 return Err(EngineError::Unsupported(alloc::format!(
                     "new row for relation \"{table_name}\" violates check constraint \
                      \"{conname}\" DETAIL: Failing row contains ({failing})."
