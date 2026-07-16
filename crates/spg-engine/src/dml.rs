@@ -440,10 +440,15 @@ impl Engine {
         } else {
             stmt
         };
-        // v7.39 (round 140) — DO ALSO UPDATE rules: pre-scan OLD + derive NEW,
-        // run the real update (rewrite suppressed), then fire each rule's command
-        // per updated row (OLD + NEW). The guard bounds a rule → update cycle.
+        // v7.39 (round 140/142) — rule-command forms. DO INSTEAD <command>
+        // replaces the UPDATE (original op never runs, tag `UPDATE 0`); DO ALSO
+        // runs the real update first, then the commands. Both bind OLD + derived
+        // NEW per matching row. The guard bounds a rule → update cycle.
         if !self.rule_rewrite_active {
+            let instead_upd = self.instead_command_rules(&stmt.table, "UPDATE");
+            if !instead_upd.is_empty() {
+                return self.exec_update_instead_command(stmt, instead_upd, cancel);
+            }
             let also_upd = self.also_rules(&stmt.table, "UPDATE");
             if !also_upd.is_empty() {
                 return self.exec_update_with_also(stmt, also_upd, view_check, cancel);
@@ -1645,11 +1650,15 @@ impl Engine {
         } else {
             stmt
         };
-        // v7.39 (round 140) — DO ALSO DELETE rules: pre-scan the OLD rows, run
-        // the real delete (rule rewrite suppressed so it does not re-enter here),
-        // then fire each rule's command per deleted row (OLD only). The guard
-        // stops an unbounded rule → delete → rule cycle.
+        // v7.39 (round 140/142) — rule-command forms. DO INSTEAD <command>
+        // replaces the DELETE (original op never runs, tag `DELETE 0`); DO ALSO
+        // runs the real delete first, then the commands. Both bind OLD per
+        // matching row. The guard bounds a rule → delete cycle.
         if !self.rule_rewrite_active {
+            let instead_del = self.instead_command_rules(&stmt.table, "DELETE");
+            if !instead_del.is_empty() {
+                return self.exec_delete_instead_command(stmt, instead_del, cancel);
+            }
             let also_del = self.also_rules(&stmt.table, "DELETE");
             if !also_del.is_empty() {
                 return self.exec_delete_with_also(stmt, also_del, cancel);
@@ -2386,6 +2395,66 @@ impl Engine {
         }
     }
 
+    /// v7.39 (round 142) — a DELETE replaced by DO INSTEAD <command> rules: the
+    /// matching rows are scanned only to bind OLD; the delete itself never runs.
+    /// PG reports `DELETE 0` and rejects an outer RETURNING. The commands are
+    /// full statements (they may themselves hit rules; the trigger-cascade
+    /// recursion guard bounds a cycle).
+    fn exec_delete_instead_command(
+        &mut self,
+        stmt: &spg_sql::ast::DeleteStatement,
+        rules: Vec<spg_storage::RuleDef>,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        if stmt.returning.is_some() {
+            return Err(crate::rules::rule_returning_error("DELETE", &stmt.table));
+        }
+        let (columns, old_rows) = self.scan_relation_rows(&stmt.table, &stmt.where_, cancel)?;
+        let rows: Vec<(Option<Row<'static>>, Option<Row<'static>>)> =
+            old_rows.into_iter().map(|r| (None, Some(r))).collect();
+        self.run_also_rules(&rules, &columns, &rows, cancel)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.39 (round 142) — an UPDATE replaced by DO INSTEAD <command> rules:
+    /// scan the matching rows for OLD, derive NEW from the SET assignments, and
+    /// run the commands per row. The update itself never runs; PG reports
+    /// `UPDATE 0` and rejects an outer RETURNING.
+    fn exec_update_instead_command(
+        &mut self,
+        stmt: &spg_sql::ast::UpdateStatement,
+        rules: Vec<spg_storage::RuleDef>,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        if stmt.returning.is_some() {
+            return Err(crate::rules::rule_returning_error("UPDATE", &stmt.table));
+        }
+        let (columns, old_rows) = self.scan_relation_rows(&stmt.table, &stmt.where_, cancel)?;
+        let mut pairs: Vec<(Option<Row<'static>>, Option<Row<'static>>)> =
+            Vec::with_capacity(old_rows.len());
+        {
+            let ctx = self.ev_ctx(&columns, Some(&stmt.table));
+            for old in &old_rows {
+                let mut new_vals = old.values.clone();
+                for (col, expr) in &stmt.assignments {
+                    let pos = columns.iter().position(|c| &c.name == col).ok_or_else(|| {
+                        EngineError::Eval(EvalError::ColumnNotFound { name: col.clone() })
+                    })?;
+                    new_vals[pos] = self.eval_expr_with_correlated(expr, old, &ctx, cancel, None)?;
+                }
+                pairs.push((Some(Row::new(new_vals)), Some(old.clone())));
+            }
+        }
+        self.run_also_rules(&rules, &columns, &pairs, cancel)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
     /// v7.39 (round 140) — a DELETE carrying DO ALSO rules: capture the OLD rows
     /// first, run the real delete with rule rewrite suppressed, then fire each
     /// rule's command once per deleted row (OLD bound, no NEW).
@@ -2833,6 +2902,27 @@ impl Engine {
                 }
             }
             all_values = kept;
+        }
+        // v7.39 (round 142) — DO INSTEAD <command>: the original INSERT is
+        // suppressed entirely (no constraint checks against this table — nothing
+        // lands in it); the command runs once per proposed row with NEW = the
+        // post-default tuple. PG reports the SOURCE row count in the tag
+        // (`INSERT 0 n`) and rejects an outer RETURNING.
+        let instead_ins = self.instead_command_rules(&stmt.table, "INSERT");
+        if !instead_ins.is_empty() {
+            if stmt.returning.is_some() {
+                return Err(crate::rules::rule_returning_error("INSERT", &stmt.table));
+            }
+            let n = all_values.len();
+            let rows: Vec<(Option<Row<'static>>, Option<Row<'static>>)> = all_values
+                .into_iter()
+                .map(|v| (Some(Row::new(v)), None))
+                .collect();
+            self.run_also_rules(&instead_ins, &column_meta, &rows, CancelToken::none())?;
+            return Ok(QueryResult::CommandOk {
+                affected: n,
+                modified_catalog: !self.in_transaction(),
+            });
         }
         // v7.39 (read01 round 117) — NOT NULL, checked pre-write over the fully
         // assembled rows so a violation aborts the whole statement (no partial

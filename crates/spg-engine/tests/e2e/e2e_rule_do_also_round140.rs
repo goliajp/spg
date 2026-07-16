@@ -126,13 +126,17 @@ fn multi_command_do_also() {
 }
 
 #[test]
-fn do_instead_command_rejected_phase3() {
+fn conditional_do_instead_command_rejected() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(id int)").unwrap();
     e.execute("CREATE TABLE r(id int)").unwrap();
-    let m = match e.execute("CREATE RULE ri AS ON INSERT TO t DO INSTEAD INSERT INTO r VALUES (NEW.id)") {
+    // Unconditional DO INSTEAD <command> is supported since round 142; only the
+    // conditional form remains refused.
+    let m = match e.execute(
+        "CREATE RULE ri AS ON INSERT TO t WHERE NEW.id < 0 DO INSTEAD INSERT INTO r VALUES (NEW.id)",
+    ) {
         Err(x) => format!("{x}"),
         Ok(_) => panic!("expected error"),
     };
-    assert!(m.contains("DO INSTEAD <command> rules are not yet implemented"), "{m}");
+    assert!(m.contains("conditional (WHERE) DO INSTEAD <command> rules are not yet implemented"), "{m}");
 }
