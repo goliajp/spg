@@ -3668,11 +3668,21 @@ impl Parser {
             )));
         }
         self.advance();
-        let body_stmt = self.parse_select_stmt()?;
-        let Statement::Select(body) = body_stmt else {
-            return Err(self.err(alloc::format!(
-                "CREATE MATERIALIZED VIEW body must be a SELECT, got {body_stmt:?}"
-            )));
+        // v7.39 (round 151) — a WITH-headed body is legal (read-only
+        // CTEs only; the engine rejects data-modifying ones with PG's
+        // message). A trailing `WITH [NO] DATA` can't START the body,
+        // so WITH here heads the query.
+        let body = if self.peek_is_with_kw() {
+            self.advance();
+            self.parse_nested_with_select()?
+        } else {
+            let body_stmt = self.parse_select_stmt()?;
+            let Statement::Select(body) = body_stmt else {
+                return Err(self.err(alloc::format!(
+                    "CREATE MATERIALIZED VIEW body must be a SELECT, got {body_stmt:?}"
+                )));
+            };
+            body
         };
         // Optional trailing `WITH [NO] DATA`.
         let with_data = self.parse_optional_with_data(true)?;
@@ -3770,12 +3780,22 @@ impl Parser {
             )));
         }
         self.advance();
-        // Body: a regular SELECT statement.
-        let body_stmt = self.parse_select_stmt()?;
-        let Statement::Select(body) = body_stmt else {
-            return Err(self.err(alloc::format!(
-                "CREATE VIEW body must be a SELECT statement, got {body_stmt:?}"
-            )));
+        // Body: a regular SELECT statement. v7.39 (round 151) — a
+        // WITH-headed body is legal too (read-only CTEs only; the
+        // engine rejects data-modifying ones with PG's message).
+        // Disambiguation vs `WITH CHECK OPTION`: a body can't START
+        // with the check-option clause, so WITH here heads the query.
+        let body = if self.peek_is_with_kw() {
+            self.advance();
+            self.parse_nested_with_select()?
+        } else {
+            let body_stmt = self.parse_select_stmt()?;
+            let Statement::Select(body) = body_stmt else {
+                return Err(self.err(alloc::format!(
+                    "CREATE VIEW body must be a SELECT statement, got {body_stmt:?}"
+                )));
+            };
+            body
         };
         // v7.39 (round 132) — optional `WITH [ LOCAL | CASCADED ] CHECK OPTION`.
         // The SELECT parser stops before a trailing WITH, so it lands here.
@@ -12943,8 +12963,47 @@ impl Parser {
         self.advance();
         let table = self.expect_ident_like()?;
         // Optional column list — `INSERT INTO t (a, b) VALUES ...`.
+        // v7.39 (round 151) — a SELECT or WITH right after the paren is
+        // a parenthesized query source instead (PG select_with_parens:
+        // `INSERT INTO t (SELECT …)` / `INSERT INTO t (WITH … SELECT …)`);
+        // both keywords are reserved in PG, so no column list can start
+        // with them.
         let columns = if matches!(self.peek(), Token::LParen) {
             self.advance();
+            if matches!(self.peek(), Token::Select) || self.peek_is_with_kw() {
+                let select_stmt = if self.peek_is_with_kw() {
+                    self.advance();
+                    self.parse_nested_with_select()?
+                } else {
+                    match self.parse_select_stmt()? {
+                        Statement::Select(s) => s,
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected SELECT in parenthesized INSERT source, got {other:?}"
+                            )));
+                        }
+                    }
+                };
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(format!(
+                        "expected ')' after parenthesized INSERT source, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let on_conflict = self.parse_optional_on_conflict()?;
+                let returning = self.parse_optional_returning()?;
+                return Ok(Statement::Insert(InsertStatement {
+                    ctes: Vec::new(),
+                    table,
+                    columns: None,
+                    rows: Vec::new(),
+                    select_source: Some(Box::new(select_stmt)),
+                    on_conflict,
+                    returning,
+                    overriding: Overriding::None,
+                }));
+            }
             let mut names = Vec::new();
             loop {
                 names.push(self.expect_ident_like()?);
@@ -13027,14 +13086,22 @@ impl Parser {
             }));
         }
         // v7.13.0 — `INSERT INTO t [(cols)] SELECT …` (mailrs
-        // round-5 G4). Dispatch on VALUES vs SELECT.
-        if matches!(self.peek(), Token::Select) {
-            let select_stmt = match self.parse_select_stmt()? {
-                Statement::Select(s) => s,
-                other => {
-                    return Err(self.err(alloc::format!(
-                        "expected SELECT after INSERT INTO ... target, got {other:?}"
-                    )));
+        // round-5 G4). Dispatch on VALUES vs SELECT. v7.39 (round 151)
+        // — a WITH-headed source query (`INSERT INTO t WITH c AS (…)
+        // SELECT …`) heads the SOURCE select, as in PG (the statement's
+        // own WITH comes before INSERT).
+        if matches!(self.peek(), Token::Select) || self.peek_is_with_kw() {
+            let select_stmt = if self.peek_is_with_kw() {
+                self.advance();
+                self.parse_nested_with_select()?
+            } else {
+                match self.parse_select_stmt()? {
+                    Statement::Select(s) => s,
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "expected SELECT after INSERT INTO ... target, got {other:?}"
+                        )));
+                    }
                 }
             };
             let on_conflict = self.parse_optional_on_conflict()?;
@@ -17847,6 +17914,34 @@ impl Parser {
                     };
                     crate::ast::CteBody::Merge(alloc::boxed::Box::new(s))
                 }
+                // v7.39 (round 151) — a CTE body may itself be
+                // WITH-headed (PG grammar: PreparableStmt carries its
+                // own with_clause). The nested statement keeps its own
+                // ctes; the modifying-CTE-at-top-level rule is enforced
+                // at execution.
+                Token::Ident(s) if s.eq_ignore_ascii_case("with") => {
+                    self.advance(); // WITH
+                    match self.parse_with_cte_then_select()? {
+                        Statement::Select(s) => crate::ast::CteBody::Select(s),
+                        Statement::Insert(s) => {
+                            crate::ast::CteBody::Insert(alloc::boxed::Box::new(s))
+                        }
+                        Statement::Update(s) => {
+                            crate::ast::CteBody::Update(alloc::boxed::Box::new(s))
+                        }
+                        Statement::Delete(s) => {
+                            crate::ast::CteBody::Delete(alloc::boxed::Box::new(s))
+                        }
+                        Statement::Merge(s) => {
+                            crate::ast::CteBody::Merge(alloc::boxed::Box::new(s))
+                        }
+                        other => {
+                            return Err(self.err(format!(
+                                "WITH body must be SELECT / INSERT / UPDATE / DELETE / MERGE, got {other:?}"
+                            )));
+                        }
+                    }
+                }
                 other => {
                     return Err(self.err(format!(
                         "WITH body must be SELECT / INSERT / UPDATE / DELETE / MERGE, got {other:?}"
@@ -18008,12 +18103,45 @@ impl Parser {
         })
     }
 
+    /// v7.39 (round 151) — nested `WITH … SELECT …` in a subquery /
+    /// query-source position (EXISTS / IN / INSERT source / CTE body /
+    /// view body). Caller consumed the WITH keyword. Only a SELECT
+    /// outer is grammatical here; the data-modifying-CTE-at-top-level
+    /// rule (PG 0A000) is enforced at execution, where the SQLSTATE
+    /// maps correctly.
+    fn parse_nested_with_select(&mut self) -> Result<crate::ast::SelectStatement, ParseError> {
+        let inner = self.parse_with_cte_then_select()?;
+        match inner {
+            Statement::Select(s) => Ok(s),
+            other => Err(self.err(format!(
+                "expected SELECT after WITH in a subquery, got {other:?}"
+            ))),
+        }
+    }
+
+    /// True when the next token is the (unquoted) WITH keyword. WITH is
+    /// reserved in PG, so a bare `with` can never be a column reference
+    /// in these positions; a quoted `"with"` stays an identifier.
+    fn peek_is_with_kw(&self) -> bool {
+        matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("with"))
+    }
+
     fn parse_exists_atom(&mut self, negated: bool) -> Result<Expr, ParseError> {
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(format!("expected '(' after EXISTS, got {:?}", self.peek())));
         }
         self.advance();
-        let inner = self.parse_select_stmt()?;
+        // v7.39 (round 151) — `EXISTS (WITH … SELECT …)` is legal PG.
+        let s = if self.peek_is_with_kw() {
+            self.advance();
+            self.parse_nested_with_select()?
+        } else {
+            let inner = self.parse_select_stmt()?;
+            let Statement::Select(s) = inner else {
+                unreachable!("parse_select_stmt returns Select")
+            };
+            s
+        };
         if !matches!(self.peek(), Token::RParen) {
             return Err(self.err(format!(
                 "expected ')' after EXISTS-subquery, got {:?}",
@@ -18021,9 +18149,6 @@ impl Parser {
             )));
         }
         self.advance();
-        let Statement::Select(s) = inner else {
-            unreachable!("parse_select_stmt returns Select")
-        };
         Ok(Expr::Exists {
             subquery: Box::new(s),
             negated,
@@ -18036,9 +18161,19 @@ impl Parser {
             return Err(self.err(format!("expected '(' after IN, got {:?}", self.peek())));
         }
         self.advance();
-        // v4.10: `IN (SELECT ...)` — subquery branch.
-        if matches!(self.peek(), Token::Select) {
-            let inner = self.parse_select_stmt()?;
+        // v4.10: `IN (SELECT ...)` — subquery branch. v7.39 (round 151)
+        // also accepts a WITH-headed subquery (`IN (WITH … SELECT …)`).
+        if matches!(self.peek(), Token::Select) || self.peek_is_with_kw() {
+            let s = if self.peek_is_with_kw() {
+                self.advance();
+                self.parse_nested_with_select()?
+            } else {
+                let inner = self.parse_select_stmt()?;
+                let Statement::Select(s) = inner else {
+                    unreachable!("parse_select_stmt always returns Statement::Select")
+                };
+                s
+            };
             if !matches!(self.peek(), Token::RParen) {
                 return Err(self.err(format!(
                     "expected ')' after IN-subquery, got {:?}",
@@ -18046,9 +18181,6 @@ impl Parser {
                 )));
             }
             self.advance();
-            let Statement::Select(s) = inner else {
-                unreachable!("parse_select_stmt always returns Statement::Select")
-            };
             return Ok(Expr::InSubquery {
                 expr: Box::new(expr),
                 subquery: Box::new(s),

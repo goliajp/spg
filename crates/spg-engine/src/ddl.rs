@@ -3612,6 +3612,14 @@ impl Engine {
         &mut self,
         s: spg_sql::ast::CreateViewStatement,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 (round 151) — PG rejects data-modifying CTEs in a view
+        // body (DefineView, view.c): the definition would run the write
+        // on every reference. Read-only WITH is fine.
+        if s.body.ctes.iter().any(|c| c.body.is_modifying()) {
+            return Err(EngineError::Unsupported(
+                "views must not contain data-modifying statements in WITH".into(),
+            ));
+        }
         // v7.39 (read01 round 81) — CREATE OR REPLACE VIEW may only APPEND
         // columns; PG forbids renaming, dropping, reordering or retyping an
         // existing column ("cannot change name of view column …", "cannot drop
@@ -3999,6 +4007,13 @@ impl Engine {
         &mut self,
         s: spg_sql::ast::CreateMaterializedViewStatement,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 (round 151) — PG's matview wording differs from the
+        // plain-view one (transformCreateTableAsStmt, analyze.c).
+        if s.body.ctes.iter().any(|c| c.body.is_modifying()) {
+            return Err(EngineError::Unsupported(
+                "materialized views must not use data-modifying statements in WITH".into(),
+            ));
+        }
         // Name-collision check (table / view / sequence / mat-view).
         let cat = self.active_catalog();
         if cat.materialized_views().contains_key(&s.name) || cat.get(&s.name).is_some() {

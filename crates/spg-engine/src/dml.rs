@@ -3946,20 +3946,23 @@ impl Engine {
                 }
             }
             CteBody::Insert(body) => {
-                let mut body = (**body).clone();
-                body.ctes = alloc::vec::Vec::new();
+                // round 151 — a WITH-headed body keeps its own ctes; the
+                // body statement routes through its writable-CTE entry.
+                let body = (**body).clone();
                 let result = self.exec_insert(body)?;
                 self.cte_returning_or_empty(&cte.name, result)
             }
             CteBody::Update(body) => {
-                let mut body = (**body).clone();
-                body.ctes = alloc::vec::Vec::new();
+                // round 151 — a WITH-headed body keeps its own ctes; the
+                // body statement routes through its writable-CTE entry.
+                let body = (**body).clone();
                 let result = self.exec_update_cancel(&body, cancel)?;
                 self.cte_returning_or_empty(&cte.name, result)
             }
             CteBody::Delete(body) => {
-                let mut body = (**body).clone();
-                body.ctes = alloc::vec::Vec::new();
+                // round 151 — a WITH-headed body keeps its own ctes; the
+                // body statement routes through its writable-CTE entry.
+                let body = (**body).clone();
                 let result = self.exec_delete_cancel(&body, cancel)?;
                 self.cte_returning_or_empty(&cte.name, result)
             }
@@ -3967,8 +3970,9 @@ impl Engine {
             // without RETURNING the alias materialises empty, as with
             // the other data-modifying bodies.
             CteBody::Merge(body) => {
-                let mut body = (**body).clone();
-                body.ctes = alloc::vec::Vec::new();
+                // round 151 — a WITH-headed body keeps its own ctes; the
+                // body statement routes through its writable-CTE entry.
+                let body = (**body).clone();
                 let result = self.exec_merge_cancel(&body, cancel)?;
                 self.cte_returning_or_empty(&cte.name, result)
             }
