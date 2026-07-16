@@ -1151,6 +1151,83 @@ impl Engine {
         stmt: &spg_sql::ast::MergeStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 (round 148, PG17) — MERGE INTO an auto-updatable view rewrites
+        // to the base table: column names map view → base (qualified by the
+        // view's alias), the view's WHERE narrows which target rows the merge
+        // can see, and a positional INSERT follows the VIEW's column order.
+        if let Some(vr) = view_redirect_to_simple_base(self.active_catalog(), &stmt.target) {
+            let mut s = stmt.clone();
+            let alias = s.target_alias.clone().unwrap_or_else(|| s.target.clone());
+            // Keep resolving `<view>.col` references: the view name stays the
+            // target's alias while the storage target becomes the base table.
+            s.target_alias = Some(alias.clone());
+            s.target = vr.base.clone();
+            if !vr.col_map.is_empty() {
+                let map: alloc::collections::BTreeMap<String, String> =
+                    vr.col_map.iter().cloned().collect();
+                let rw = |e: &mut Expr| {
+                    crate::expr_analysis::rewrite_nodes_mut(e, &mut |n| {
+                        if let Expr::Column(c) = n {
+                            if c.qualifier
+                                .as_deref()
+                                .is_some_and(|q| q.eq_ignore_ascii_case(&alias))
+                                && let Some(b) = map.get(&c.name)
+                            {
+                                c.name = b.clone();
+                            }
+                            return true;
+                        }
+                        false
+                    });
+                };
+                rw(&mut s.on);
+                for cl in &mut s.clauses {
+                    if let Some(cond) = &mut cl.condition {
+                        rw(cond);
+                    }
+                    match &mut cl.action {
+                        spg_sql::ast::MergeAction::Update { assignments } => {
+                            for (col, e) in assignments {
+                                if let Some(b) = map.get(col) {
+                                    *col = b.clone();
+                                }
+                                rw(e);
+                            }
+                        }
+                        spg_sql::ast::MergeAction::Insert { columns, values } => {
+                            if columns.is_empty() {
+                                // Positional tuples follow the VIEW's column
+                                // order; make that explicit as base columns.
+                                *columns = vr.col_map.iter().map(|(_, b)| b.clone()).collect();
+                            } else {
+                                for c in columns.iter_mut() {
+                                    if let Some(b) = map.get(c) {
+                                        *c = b.clone();
+                                    }
+                                }
+                            }
+                            for e in values {
+                                rw(e);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return self.exec_merge_filtered(&s, vr.where_at_base, cancel);
+        }
+        self.exec_merge_filtered(stmt, None, cancel)
+    }
+
+    /// The MERGE executor proper. `target_filter` (the view's WHERE, over bare
+    /// base columns) narrows which target rows the merge can see — rows outside
+    /// it are neither matched nor eligible for a BY SOURCE clause, as in PG.
+    fn exec_merge_filtered(
+        &mut self,
+        stmt: &spg_sql::ast::MergeStatement,
+        target_filter: Option<Expr>,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
         let target_alias = stmt
             .target_alias
             .clone()
@@ -1192,12 +1269,20 @@ impl Engine {
             // mutated the wrong rows once dead versions (any prior MVCC
             // update/delete) preceded a target row.
             let snap = self.current_snapshot();
-            (
-                t.schema().columns.clone(),
-                t.scan_visible(&snap)
-                    .map(|(pos, r)| (pos, r.clone()))
-                    .collect::<Vec<(usize, Row<'static>)>>(),
-            )
+            let cols = t.schema().columns.clone();
+            // v7.39 (round 148) — a view-redirected merge only sees the target
+            // rows satisfying the view's WHERE (bare base-column predicate).
+            let filter_ctx = EvalContext::new(&cols, None);
+            let mut rows: Vec<(usize, Row<'static>)> = Vec::new();
+            for (pos, r) in t.scan_visible(&snap) {
+                if let Some(f) = &target_filter
+                    && !matches!(eval::eval_expr(f, r, &filter_ctx), Ok(Value::Bool(true)))
+                {
+                    continue;
+                }
+                rows.push((pos, r.clone()));
+            }
+            (cols, rows)
         };
         let (source_cols, source_rows) = if let Some(sub) = &stmt.source_select {
             // v7.37 D.44 — `USING (SELECT …) alias` subquery source: materialise
