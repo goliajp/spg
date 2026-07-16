@@ -505,8 +505,16 @@ fn commit_received_segment(
     std::fs::create_dir_all(&seg_dir)?;
     let final_path = seg_dir.join(format!("seg_{segment_id}.spg"));
     let tmp_path = seg_dir.join(format!("seg_{segment_id}.spg.tmp"));
-    std::fs::write(&tmp_path, &bytes)?;
+    // v7.39 (round 147, durable-rename audit) — a follower crash after the
+    // rename must not leave an unflushed segment its catalog references.
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
     std::fs::rename(&tmp_path, &final_path)?;
+    crate::fsync_dir(&seg_dir);
     {
         let mut eng = state
             .engine
@@ -952,12 +960,23 @@ fn read_applied_pos_sidecar(wal_path: &Path) -> Option<u64> {
 fn write_applied_pos_sidecar(wal_path: &Path, pos: u64) -> std::io::Result<()> {
     let tmp = applied_pos_sidecar_tmp_path(wal_path);
     let dst = applied_pos_sidecar_path(wal_path);
-    std::fs::write(&tmp, pos.to_le_bytes())?;
+    // v7.39 (round 147, durable-rename audit) — fsync the position bytes and
+    // the directory entry; a torn/lost sidecar would rewind the follower's
+    // applied position on restart.
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&pos.to_le_bytes())?;
+        f.sync_all()?;
+    }
     // POSIX rename within the same directory is atomic; Windows
     // tolerates this too. Either both files coexist briefly or only
     // `dst` does — no corrupted intermediate state visible to a
     // restarting follower reader.
     std::fs::rename(&tmp, &dst)?;
+    if let Some(dir) = dst.parent() {
+        crate::fsync_dir(dir);
+    }
     Ok(())
 }
 

@@ -365,8 +365,18 @@ fn persist_segment(db_path: &Path, report: &FreezeReport) -> std::io::Result<std
     } else {
         report.segment_bytes.clone()
     };
-    std::fs::write(&tmp_path, &bytes_to_write)?;
+    // v7.39 (round 147, durable-rename audit) — the embedded freezer twin
+    // gained fsync(bytes) + fsync_dir in v7.38 P5.09 / v7.37.13 A1.6; the
+    // server-side freeze path had neither, so a crash after rename could
+    // expose a named-but-unflushed segment the catalog already references.
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(&bytes_to_write)?;
+        f.sync_all()?;
+    }
     std::fs::rename(&tmp_path, &final_path)?;
+    crate::fsync_dir(&seg_dir);
     Ok(final_path)
 }
 

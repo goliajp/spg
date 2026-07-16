@@ -340,8 +340,16 @@ pub(crate) fn persist_compact_merged_segment(
     } else {
         merged_segment_bytes.to_vec()
     };
-    fs::write(&tmp_path, &bytes_to_write)?;
+    // v7.39 (round 147, durable-rename audit) — fsync bytes + dir entry so a
+    // crash cannot leave the catalog referencing an empty / missing segment.
+    {
+        use std::io::Write;
+        let mut f = fs::File::create(&tmp_path)?;
+        f.write_all(&bytes_to_write)?;
+        f.sync_all()?;
+    }
     fs::rename(&tmp_path, &final_path)?;
+    crate::fsync_dir(&seg_dir);
     Ok(final_path)
 }
 
