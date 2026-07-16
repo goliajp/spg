@@ -6874,6 +6874,8 @@ impl Parser {
                 *seen = true;
             }
         }
+        // v7.39 (round 130) — optional trailing `RETURNING <projection>` (PG17+).
+        let returning = self.parse_optional_returning()?;
         Ok(Statement::Merge(crate::ast::MergeStatement {
             target,
             target_alias,
@@ -6882,6 +6884,7 @@ impl Parser {
             source_select,
             on,
             clauses,
+            returning,
         }))
     }
 

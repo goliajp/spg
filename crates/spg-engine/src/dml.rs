@@ -104,12 +104,13 @@ fn and_optional_predicates(
         (None, None) => None,
     }
 }
-use spg_storage::{ColumnSchema, Row, StorageError, Value};
+use spg_storage::{ColumnSchema, DataType, Row, StorageError, Value};
 
 use crate::eval::{EvalContext, EvalError};
 use crate::{
     CancelToken, Engine, EngineError, QueryResult, any_column_changed, apply_fk_child_step,
-    apply_on_conflict_assignments, canonicalize_set_value, check_unsigned_range, coerce_value,
+    apply_on_conflict_assignments, build_projection, canonicalize_set_value, check_unsigned_range,
+    coerce_value,
     enforce_check_constraints, enforce_enum_label, enforce_fk_inserts, enforce_not_null,
     enforce_unique_index_inserts, enforce_unique_updates, enforce_uniqueness_inserts, eval,
     eval_runtime_default_free, expr_has_subquery, literal_expr_to_value, literal_expr_to_value_in,
@@ -916,6 +917,10 @@ impl Engine {
         let mut updates: Vec<(usize, Vec<Value<'static>>)> = Vec::new();
         let mut inserts: Vec<Vec<Value<'static>>> = Vec::new();
         let mut affected: usize = 0;
+        // v7.39 (round 130) — RETURNING records, collected only when the
+        // statement has a RETURNING clause.
+        let want_returning = stmt.returning.is_some();
+        let mut ret_records: Vec<MergeRetRecord> = Vec::new();
 
         for (src_idx, src_row) in source_rows.iter().enumerate() {
             if src_idx.is_multiple_of(256) {
@@ -978,6 +983,16 @@ impl Engine {
                         if !delete_indices.contains(&t_idx) {
                             delete_indices.push(t_idx);
                             affected += 1;
+                            if want_returning {
+                                let t_row = &target_rows_snapshot[t_idx];
+                                ret_records.push(MergeRetRecord {
+                                    action: "DELETE",
+                                    target_final: t_row.values.clone(),
+                                    old: Some(t_row.values.clone()),
+                                    new: None,
+                                    source: src_row.values.clone(),
+                                });
+                            }
                         }
                     }
                 }
@@ -1012,6 +1027,15 @@ impl Engine {
                                 *pos,
                             )?;
                             new_values[*pos] = coerced;
+                        }
+                        if want_returning {
+                            ret_records.push(MergeRetRecord {
+                                action: "UPDATE",
+                                target_final: new_values.clone(),
+                                old: Some(t_row.values.clone()),
+                                new: Some(new_values.clone()),
+                                source: src_row.values.clone(),
+                            });
                         }
                         updates.push((t_idx, new_values));
                         affected += 1;
@@ -1064,6 +1088,15 @@ impl Engine {
                             )?;
                             new_row_values[pos] = coerced;
                         }
+                    }
+                    if want_returning {
+                        ret_records.push(MergeRetRecord {
+                            action: "INSERT",
+                            target_final: new_row_values.clone(),
+                            old: None,
+                            new: Some(new_row_values.clone()),
+                            source: src_row.values.clone(),
+                        });
                     }
                     inserts.push(new_row_values);
                     affected += 1;
@@ -1120,9 +1153,104 @@ impl Engine {
                 .insert_with_xmin(Row::new(vals), xmin)
                 .map_err(EngineError::Storage)?;
         }
+        let _ = table; // drop the mut borrow before building RETURNING.
+        if let Some(items) = &stmt.returning {
+            return self.build_merge_returning(
+                &target_alias,
+                &source_alias,
+                &target_cols,
+                &source_cols,
+                ret_records,
+                items,
+            );
+        }
         Ok(QueryResult::CommandOk {
             affected,
             modified_catalog: affected > 0,
+        })
+    }
+
+    /// v7.39 (round 130) — project a MERGE's `RETURNING` list over the actions
+    /// it took. Each `MergeRetRecord` is flattened into a synthetic row whose
+    /// columns cover the target alias (`t.col` = post-image), the source alias
+    /// (`s.col`), the bare target names, `OLD.*`/`NEW.*` blocks, and a
+    /// `__merge_action` cell; RETURNING expressions are rewritten onto those
+    /// names (`merge_action()` → `__merge_action`, `OLD.c`/`NEW.c` → the block
+    /// cells) and evaluated. Matches PG18 byte-identical.
+    fn build_merge_returning(
+        &self,
+        target_alias: &str,
+        source_alias: &str,
+        target_cols: &[ColumnSchema],
+        source_cols: &[ColumnSchema],
+        records: Vec<MergeRetRecord>,
+        items: &[SelectItem],
+    ) -> Result<QueryResult, EngineError> {
+        let t_arity = target_cols.len();
+        // Synthetic schema: [t.col…] [s.col…] [bare target col…]
+        //                   [__ret_old_col…] [__ret_new_col…] [__merge_action]
+        let mut syn: Vec<ColumnSchema> = Vec::new();
+        for c in target_cols {
+            syn.push(ColumnSchema::new(
+                alloc::format!("{target_alias}.{}", c.name),
+                c.ty,
+                c.nullable,
+            ));
+        }
+        for c in source_cols {
+            syn.push(ColumnSchema::new(
+                alloc::format!("{source_alias}.{}", c.name),
+                c.ty,
+                c.nullable,
+            ));
+        }
+        for c in target_cols {
+            syn.push(ColumnSchema::new(c.name.clone(), c.ty, true));
+        }
+        for c in target_cols {
+            syn.push(ColumnSchema::new(alloc::format!("__ret_old_{}", c.name), c.ty, true));
+        }
+        for c in target_cols {
+            syn.push(ColumnSchema::new(alloc::format!("__ret_new_{}", c.name), c.ty, true));
+        }
+        syn.push(ColumnSchema::new(
+            alloc::string::String::from("__merge_action"),
+            DataType::Text,
+            false,
+        ));
+
+        // Expand + rewrite the projection into flat (output_name, ty, expr)
+        // triples against the synthetic schema.
+        let expanded =
+            expand_merge_returning_items(items, target_alias, source_alias, target_cols);
+        let projection = build_projection(&expanded, &syn, "")?;
+        let columns: Vec<ColumnSchema> = projection
+            .iter()
+            .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))
+            .collect();
+
+        let ctx = self.ev_ctx(&syn, None);
+        let cancel = CancelToken::none();
+        let mut out_rows: Vec<Row<'static>> = Vec::with_capacity(records.len());
+        for rec in &records {
+            let null_block = || alloc::vec![Value::Null; t_arity];
+            let mut vals: Vec<Value<'static>> = Vec::with_capacity(syn.len());
+            vals.extend(rec.target_final.iter().cloned()); // t.col
+            vals.extend(rec.source.iter().cloned()); // s.col
+            vals.extend(rec.target_final.iter().cloned()); // bare target col
+            vals.extend(rec.old.clone().unwrap_or_else(null_block)); // __ret_old_
+            vals.extend(rec.new.clone().unwrap_or_else(null_block)); // __ret_new_
+            vals.push(Value::Text(rec.action.into())); // __merge_action
+            let syn_row = Row::new(vals);
+            let mut proj: Vec<Value<'static>> = Vec::with_capacity(projection.len());
+            for p in &projection {
+                proj.push(self.eval_expr_with_correlated(&p.expr, &syn_row, &ctx, cancel, None)?);
+            }
+            out_rows.push(Row::new(proj));
+        }
+        Ok(QueryResult::Rows {
+            columns,
+            rows: out_rows,
         })
     }
 
@@ -2765,6 +2893,122 @@ fn rewrite_returning_old_new(expr: &mut Expr) -> bool {
     }
 }
 
+/// v7.39 (round 130) — is `e` a bare `merge_action()` call?
+fn is_merge_action_call(e: &Expr) -> bool {
+    matches!(e, Expr::FunctionCall { name, args }
+        if name.eq_ignore_ascii_case("merge_action") && args.is_empty())
+}
+
+/// v7.39 (round 130) — replace `merge_action()` calls anywhere in `expr` with a
+/// reference to the synthetic `__merge_action` column (the per-row action
+/// string). Mirrors `rewrite_returning_old_new`'s tree walk.
+fn rewrite_merge_action(expr: &mut Expr) {
+    match expr {
+        Expr::FunctionCall { name, args }
+            if name.eq_ignore_ascii_case("merge_action") && args.is_empty() =>
+        {
+            *expr = Expr::Column(spg_sql::ast::ColumnName {
+                qualifier: None,
+                name: String::from("__merge_action"),
+            });
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            rewrite_merge_action(lhs);
+            rewrite_merge_action(rhs);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            rewrite_merge_action(expr)
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                rewrite_merge_action(a);
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(o) = operand {
+                rewrite_merge_action(o);
+            }
+            for (c, v) in branches {
+                rewrite_merge_action(c);
+                rewrite_merge_action(v);
+            }
+            if let Some(x) = else_branch {
+                rewrite_merge_action(x);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// v7.39 (round 130) — expand a MERGE RETURNING list against the synthetic
+/// schema `build_merge_returning` builds. `*` → bare target columns; `OLD.*` /
+/// `NEW.*` → the pre/post-image blocks (aliased back to the bare column name);
+/// `t.*` / `s.*` are left for `build_projection`'s prefix expansion. Scalar
+/// expressions have `merge_action()` and `OLD.`/`NEW.` qualifiers rewritten onto
+/// the synthetic column names.
+fn expand_merge_returning_items(
+    items: &[SelectItem],
+    target_alias: &str,
+    source_alias: &str,
+    target_cols: &[ColumnSchema],
+) -> Vec<SelectItem> {
+    let mut out: Vec<SelectItem> = Vec::new();
+    for it in items {
+        match it {
+            // PG expands a bare `*` in MERGE RETURNING to the source columns
+            // first, then the target columns (the MERGE range-table order).
+            SelectItem::Wildcard => {
+                out.push(SelectItem::QualifiedWildcard(source_alias.into()));
+                out.push(SelectItem::QualifiedWildcard(target_alias.into()));
+            }
+            SelectItem::QualifiedWildcard(q) => {
+                let ql = q.to_ascii_lowercase();
+                if ql == "old" || ql == "new" {
+                    let prefix = if ql == "old" { "__ret_old_" } else { "__ret_new_" };
+                    for c in target_cols {
+                        out.push(SelectItem::Expr {
+                            expr: Expr::Column(spg_sql::ast::ColumnName {
+                                qualifier: None,
+                                name: alloc::format!("{prefix}{}", c.name),
+                            }),
+                            alias: Some(c.name.clone()),
+                        });
+                    }
+                } else {
+                    out.push(SelectItem::QualifiedWildcard(q.clone()));
+                }
+            }
+            SelectItem::Expr { expr, alias } => {
+                let mut e = expr.clone();
+                // PG labels an unaliased column by its bare name (dropping the
+                // qualifier) and a bare `merge_action()` "merge_action". Capture
+                // that from the ORIGINAL expr, before the OLD./NEW. rewrite
+                // mangles the name into `__ret_old_*`.
+                let out_alias = if alias.is_some() {
+                    alias.clone()
+                } else if is_merge_action_call(&e) {
+                    Some(String::from("merge_action"))
+                } else if let Expr::Column(c) = &e {
+                    Some(c.name.clone())
+                } else {
+                    None
+                };
+                rewrite_merge_action(&mut e);
+                rewrite_returning_old_new(&mut e);
+                out.push(SelectItem::Expr {
+                    expr: e,
+                    alias: out_alias,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Build the INSERT column permutation `tuple_pos[c] = Some(j)` (schema
 /// column `c` is filled from the `j`-th tuple slot; `None` = fill with
 /// NULL / DEFAULT). `None` overall means the 1-1 fast path. Validates
@@ -3171,6 +3415,21 @@ fn parse_insert_rows(
 // all rows in the same statement share xmin (atomic commit at the
 // tx boundary).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+/// v7.39 (round 130) — one per action a MERGE actually took, captured so a
+/// trailing `RETURNING` can project `merge_action()` / `OLD.*` / `NEW.*` / the
+/// target+source aliases after the plan applies.
+struct MergeRetRecord {
+    action: &'static str,
+    /// The row as `t.*` sees it: NEW for UPDATE/INSERT, the deleted row for DELETE.
+    target_final: Vec<Value<'static>>,
+    /// Pre-image (UPDATE/DELETE); `None` (→ NULL block) for INSERT.
+    old: Option<Vec<Value<'static>>>,
+    /// Post-image (UPDATE/INSERT); `None` (→ NULL block) for DELETE.
+    new: Option<Vec<Value<'static>>>,
+    /// The source row that drove this action (for `s.*` references).
+    source: Vec<Value<'static>>,
+}
+
 fn insert_parsed_rows(
     table: &mut spg_storage::Table,
     xmin: u64,

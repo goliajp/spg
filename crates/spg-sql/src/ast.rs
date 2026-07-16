@@ -2267,6 +2267,10 @@ pub struct MergeStatement {
     pub source_select: Option<Box<SelectStatement>>,
     pub on: Expr,
     pub clauses: Vec<MergeWhenClause>,
+    /// v7.39 (read01 round 130) — PG17+ `MERGE … RETURNING <projection>`.
+    /// The projection may use `merge_action()`, `OLD.*`/`NEW.*`, and the
+    /// target/source aliases. `None` = no RETURNING (the common form).
+    pub returning: Option<Vec<SelectItem>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
