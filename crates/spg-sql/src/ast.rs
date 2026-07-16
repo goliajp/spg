@@ -670,6 +670,15 @@ pub struct CreateMaterializedViewStatement {
     pub as_plain_table: bool,
 }
 
+/// v7.39 (read01 round 132) — `WITH [LOCAL | CASCADED] CHECK OPTION` on an
+/// auto-updatable view. `Cascaded` is PG's default when the bare
+/// `WITH CHECK OPTION` is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewCheckOption {
+    Local,
+    Cascaded,
+}
+
 /// v7.17.0 Phase 1.2 — `CREATE VIEW` AST node.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateViewStatement {
@@ -684,6 +693,10 @@ pub struct CreateViewStatement {
     /// Underlying SELECT. Re-parsed lazily at SELECT-from-view
     /// time to materialise the view as a synthetic CTE.
     pub body: SelectStatement,
+    /// v7.39 (round 132) — `WITH CHECK OPTION`. When set, a write through this
+    /// view whose resulting row fails the view's WHERE is rejected (SQLSTATE
+    /// 44000). `None` = no check option.
+    pub check_option: Option<ViewCheckOption>,
 }
 
 /// v7.17.0 — `ALTER SEQUENCE` AST node.
@@ -4344,7 +4357,12 @@ impl fmt::Display for CreateViewStatement {
             }
             f.write_str(")")?;
         }
-        write!(f, " AS {}", self.body)
+        write!(f, " AS {}", self.body)?;
+        match self.check_option {
+            Some(ViewCheckOption::Local) => f.write_str(" WITH LOCAL CHECK OPTION"),
+            Some(ViewCheckOption::Cascaded) => f.write_str(" WITH CASCADED CHECK OPTION"),
+            None => Ok(()),
+        }
     }
 }
 

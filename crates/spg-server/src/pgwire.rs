@@ -3831,6 +3831,9 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("FOREIGN KEY violation")
         {
             "23503"
+        } else if msg.contains("violates check option") {
+            // v7.39 (round 132) — WITH CHECK OPTION violation.
+            "44000"
         } else if msg.contains("violates check constraint")
             || msg.contains("CHECK constraint violation")
         {
@@ -3940,6 +3943,11 @@ mod engine_error_sqlstate_tests {
         assert_eq!(
             code("CHECK constraint violation on \"t\" (row #0): \"(y > 0)\""),
             "23514"
+        );
+        // v7.39 (round 132) — WITH CHECK OPTION violation maps to 44000.
+        assert_eq!(
+            code("new row violates check option for view \"vv\""),
+            "44000"
         );
         // NOT NULL flows through Storage(NullInNotNull) whose Display is
         // "NULL value in NOT NULL column …".

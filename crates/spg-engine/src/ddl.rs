@@ -3520,11 +3520,18 @@ impl Engine {
         let name = s.name.clone();
         let or_replace = s.or_replace;
         let if_not_exists = s.if_not_exists;
+        // v7.39 (round 132) — persist WITH CHECK OPTION as a u8 (0/1/2).
+        let check_option = match s.check_option {
+            None => 0,
+            Some(spg_sql::ast::ViewCheckOption::Local) => 1,
+            Some(spg_sql::ast::ViewCheckOption::Cascaded) => 2,
+        };
         let body_repr = alloc::format!("{}", spg_sql::ast::Statement::Select(s.body));
         let def = spg_storage::ViewDef {
             name,
             columns,
             body: body_repr,
+            check_option,
         };
         self.active_catalog_mut()
             .create_view(def, or_replace, if_not_exists)

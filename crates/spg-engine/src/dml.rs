@@ -36,8 +36,10 @@ use spg_sql::ast::{Expr, InsertStatement, SelectItem};
 fn view_redirect_to_simple_base(
     catalog: &spg_storage::Catalog,
     view_name: &str,
-) -> Option<(String, Option<spg_sql::ast::Expr>)> {
+) -> Option<(String, Option<spg_sql::ast::Expr>, bool)> {
     let view = catalog.views().get(view_name)?;
+    // v7.39 (round 132) — WITH CHECK OPTION marker (0 = none).
+    let has_check_option = view.check_option != 0;
     // Column-rename views are NOT auto-updatable: PG-faithful behavior
     // because the rename would need to be applied to caller's column
     // list (a per-column map) and SPG doesn't ship that today.
@@ -85,7 +87,15 @@ fn view_redirect_to_simple_base(
             }
         }
     }
-    Some((from.primary.name.clone(), select.where_))
+    Some((from.primary.name.clone(), select.where_, has_check_option))
+}
+
+/// v7.39 (round 132) — a pending `WITH CHECK OPTION` to enforce on the base rows
+/// a write through an auto-updatable view produces. `qual` is the view's WHERE.
+#[derive(Clone)]
+struct ViewCheck {
+    view_name: String,
+    qual: spg_sql::ast::Expr,
 }
 
 /// v7.38 (read01 P6.46) — AND two optional predicates (the view's WHERE and the
@@ -138,19 +148,48 @@ impl Engine {
     /// row, then call `Table::update_row` which rebuilds indices.
     /// Indexed columns are correctly reflected because rebuild
     /// happens after the cell rewrite.
+    /// v7.39 (round 132) — enforce a view's `WITH CHECK OPTION` over the base
+    /// rows a write produced: every row must satisfy the view's WHERE (only a
+    /// definite TRUE passes — NULL / FALSE fail, mirroring row visibility).
+    /// PG's SQLSTATE 44000 + `DETAIL: Failing row contains (…).`.
+    fn enforce_view_check(
+        &self,
+        check: &ViewCheck,
+        rows: &[Vec<Value<'static>>],
+        schema_cols: &[ColumnSchema],
+        base_table: &str,
+    ) -> Result<(), EngineError> {
+        let ctx = self.ev_ctx(schema_cols, Some(base_table));
+        let cancel = CancelToken::none();
+        for vals in rows {
+            let row = Row::new(vals.clone());
+            let v = self.eval_expr_with_correlated(&check.qual, &row, &ctx, cancel, None)?;
+            if !matches!(v, Value::Bool(true)) {
+                let failing = crate::constraints::format_failing_row(vals);
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "new row violates check option for view \"{}\" \
+                     DETAIL: Failing row contains ({failing}).",
+                    check.view_name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn exec_update_cancel(
         &mut self,
         stmt: &spg_sql::ast::UpdateStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let table = stmt.table.clone();
-        self.exec_update_cancel_inner(stmt, cancel)
+        self.exec_update_cancel_inner(stmt, None, cancel)
             .map_err(|e| enrich_not_null(e, &table))
     }
 
     fn exec_update_cancel_inner(
         &mut self,
         stmt: &spg_sql::ast::UpdateStatement,
+        view_check: Option<ViewCheck>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         // v7.37.43-T4.4 — writable CTE outer body (UPDATE).
@@ -175,13 +214,23 @@ impl Engine {
         // v7.37.19 (19.13) — auto-updatable view redirect. v7.38 (P6.46) — a
         // view WHERE is AND-ed onto the caller's so only rows visible through
         // the view are updated.
-        if let Some((base, view_where)) =
+        if let Some((base, view_where, has_check)) =
             view_redirect_to_simple_base(self.active_catalog(), &stmt.table)
         {
+            // v7.39 (round 132) — WITH CHECK OPTION: the updated row must still
+            // satisfy the view's WHERE. Carry the qual into the base update.
+            let check = if has_check {
+                view_where.clone().map(|qual| ViewCheck {
+                    view_name: stmt.table.clone(),
+                    qual,
+                })
+            } else {
+                None
+            };
             let mut rewritten = stmt.clone();
             rewritten.table = base;
             rewritten.where_ = and_optional_predicates(view_where, rewritten.where_);
-            return self.exec_update_cancel(&rewritten, cancel);
+            return self.exec_update_cancel_inner(&rewritten, check, cancel);
         }
         // v7.37 D.47 (partial) — UPDATE on a partition parent fans out to every
         // child (the parent holds no rows of its own, so a parent-targeted UPDATE
@@ -556,6 +605,10 @@ impl Engine {
                 &cols,
                 &new_rows,
             )?;
+            // v7.39 (round 132) — WITH CHECK OPTION on the post-update rows.
+            if let Some(check) = &view_check {
+                self.enforce_view_check(check, &new_rows, &cols, &stmt.table)?;
+            }
         }
         // v7.38 (read01 U1) — UNIQUE / PRIMARY KEY + unique-index
         // enforcement on UPDATE. The pre-image of each updated row is
@@ -1279,9 +1332,11 @@ impl Engine {
         // v7.37.19 (19.13) — auto-updatable view redirect. v7.38 (P6.46) — a
         // view WHERE is AND-ed onto the caller's so only rows visible through
         // the view are deleted.
-        if let Some((base, view_where)) =
+        if let Some((base, view_where, _has_check)) =
             view_redirect_to_simple_base(self.active_catalog(), &stmt.table)
         {
+            // DELETE removes rows; there is no post-image to check, so
+            // WITH CHECK OPTION does not apply.
             let mut rewritten = stmt.clone();
             rewritten.table = base;
             rewritten.where_ = and_optional_predicates(view_where, rewritten.where_);
@@ -1870,9 +1925,19 @@ impl Engine {
         // with no joins / WHERE / GROUP BY / aggregates / etc).
         // v7.38 (P6.46) — INSERT into a WHERE-view goes straight to the base;
         // the view's WHERE only filters reads (no WITH CHECK OPTION yet).
-        if let Some((base, _view_where)) =
+        // v7.39 (round 132) — WITH CHECK OPTION: an inserted row must satisfy
+        // the view's WHERE. Captured here (view name = the pre-redirect table),
+        // enforced below once the full base rows are assembled.
+        let mut view_check: Option<ViewCheck> = None;
+        if let Some((base, view_where, has_check)) =
             view_redirect_to_simple_base(self.active_catalog(), &stmt.table)
         {
+            if has_check {
+                view_check = view_where.map(|qual| ViewCheck {
+                    view_name: stmt.table.clone(),
+                    qual,
+                });
+            }
             stmt.table = base;
         }
         // v7.37.6-B(sentori Epic 2 P0)— route INSERTs that target
@@ -2003,6 +2068,10 @@ impl Engine {
             &column_meta,
             &all_values,
         )?;
+        // v7.39 (round 132) — WITH CHECK OPTION on the assembled base rows.
+        if let Some(check) = &view_check {
+            self.enforce_view_check(check, &all_values, &column_meta, &stmt.table)?;
+        }
         // NOTE (mailrs embed round-12): UNIQUE / PRIMARY KEY and
         // UNIQUE INDEX enforcement moved BELOW the ON CONFLICT
         // resolution pass. Running them first made every
