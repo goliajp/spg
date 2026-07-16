@@ -219,6 +219,7 @@ mod e2e_merge_insert_no_collist_round123;
 mod e2e_grouping_sets_round124;
 mod e2e_limit_fetch_ties_round125;
 mod e2e_returning_old_new_round126;
+mod e2e_rule_instead_nothing_round139;
 mod e2e_subplan_null_semantics_round127;
 mod e2e_qualified_wildcard_round128;
 mod e2e_on_conflict_returning_old_round129;

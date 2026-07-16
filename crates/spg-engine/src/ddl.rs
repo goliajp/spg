@@ -3345,6 +3345,84 @@ impl Engine {
         })
     }
 
+    // v7.39 (round 139) — CREATE RULE (query-rewrite rules). Phase 1 supports
+    // ON {INSERT|UPDATE|DELETE} TO table [WHERE cond] DO [ALSO|INSTEAD]
+    // {NOTHING | command}. ON SELECT rules are PG's view mechanism; use CREATE
+    // VIEW instead. The WHEN/commands are deparsed to text and re-parsed at DML
+    // rewrite time, mirroring how triggers carry their WHEN predicate.
+    pub(crate) fn exec_create_rule(
+        &mut self,
+        s: spg_sql::ast::CreateRuleStatement,
+    ) -> Result<QueryResult, EngineError> {
+        if s.event.eq_ignore_ascii_case("SELECT") {
+            return Err(EngineError::Unsupported(
+                "ON SELECT rules are not supported; use CREATE VIEW".into(),
+            ));
+        }
+        // Phase 1 supports only the unconditional `DO INSTEAD NOTHING` form. The
+        // conditional / DO ALSO / DO INSTEAD-command forms are refused up front
+        // (rather than stored and silently ignored) so the catalogue only ever
+        // holds rules the rewrite engine can honour.
+        if !s.instead || !s.commands.is_empty() {
+            return Err(EngineError::Unsupported(
+                "only DO INSTEAD NOTHING rules are supported so far; \
+                 DO ALSO / DO INSTEAD <command> is not yet implemented".into(),
+            ));
+        }
+        if s.when_condition.is_some() {
+            return Err(EngineError::Unsupported(
+                "conditional (WHERE) rules are not yet implemented".into(),
+            ));
+        }
+        // Rules may target base tables (and, in PG, views); require the relation
+        // to exist so a typo does not silently create a dead rule.
+        let known = self.active_catalog().table_names().contains(&s.table)
+            || self.active_catalog().views().contains_key(&s.table);
+        if !known {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "relation \"{}\" does not exist",
+                s.table
+            )));
+        }
+        let def = spg_storage::RuleDef {
+            name: s.name.clone(),
+            table: s.table.clone(),
+            event: s.event.to_ascii_uppercase(),
+            instead: s.instead,
+            when_condition: s
+                .when_condition
+                .as_ref()
+                .map(|e| e.to_string())
+                .unwrap_or_default(),
+            commands: s.commands.iter().map(|c| c.to_string()).collect(),
+        };
+        self.active_catalog_mut()
+            .create_rule(def, s.or_replace)
+            .map_err(EngineError::Storage)?;
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: true,
+        })
+    }
+
+    pub(crate) fn exec_drop_rule(
+        &mut self,
+        name: &str,
+        table: &str,
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let removed = self.active_catalog_mut().drop_rule(name, table);
+        if !removed && !if_exists {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("rule {name:?} on {table:?} does not exist"),
+            )));
+        }
+        Ok(QueryResult::CommandOk {
+            affected: usize::from(removed),
+            modified_catalog: removed,
+        })
+    }
+
     pub(crate) fn exec_drop_function(
         &mut self,
         name: &str,

@@ -319,6 +319,15 @@ pub enum Statement {
     /// triggers and column-list / WHEN clauses are out of scope
     /// for v7.12.4.
     CreateTrigger(CreateTriggerStatement),
+    /// v7.39 (round 139) — `CREATE RULE name AS ON event TO table [WHERE cond]
+    /// DO [ALSO|INSTEAD] { NOTHING | command }` query-rewrite rule.
+    CreateRule(CreateRuleStatement),
+    /// v7.39 (round 139) — `DROP RULE [IF EXISTS] name ON table`.
+    DropRule {
+        name: String,
+        table: String,
+        if_exists: bool,
+    },
     /// v7.12.4 — `DROP TRIGGER [IF EXISTS] name ON tbl`. Silent
     /// no-op when missing if `IF EXISTS` is set.
     DropTrigger {
@@ -1439,6 +1448,23 @@ pub struct CreateTriggerStatement {
     /// trigger fires only when the condition (over NEW / OLD) is true. `None`
     /// = no WHEN (fire unconditionally). Not allowed on INSTEAD OF triggers.
     pub when_condition: Option<Expr>,
+}
+
+/// v7.39 (round 139) — `CREATE RULE` query-rewrite rule AST node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateRuleStatement {
+    pub name: String,
+    pub or_replace: bool,
+    /// Event keyword, uppercased: `INSERT` / `UPDATE` / `DELETE` / `SELECT`.
+    pub event: String,
+    pub table: String,
+    /// `true` = `DO INSTEAD` (replace the operation), `false` = `DO ALSO`
+    /// (run alongside; PG's default when neither keyword is written).
+    pub instead: bool,
+    /// Optional `WHERE ( condition )` — the rule applies only when it holds.
+    pub when_condition: Option<Expr>,
+    /// The `DO` commands (over NEW / OLD). Empty = `NOTHING`.
+    pub commands: Vec<Statement>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3546,6 +3572,8 @@ impl Statement {
             | Statement::CreateFunction(_)
             | Statement::CreateTrigger(_)
             | Statement::DropTrigger { .. }
+            | Statement::CreateRule(_)
+            | Statement::DropRule { .. }
             | Statement::DropFunction { .. }
             | Statement::CreateSequence(_)
             | Statement::AlterSequence(_)
@@ -4258,6 +4286,49 @@ impl fmt::Display for Statement {
                     write!(f, "{}", quote_ident(n))?;
                 }
                 Ok(())
+            }
+            Self::CreateRule(r) => {
+                f.write_str("CREATE ")?;
+                if r.or_replace {
+                    f.write_str("OR REPLACE ")?;
+                }
+                write!(
+                    f,
+                    "RULE {} AS ON {} TO {}",
+                    quote_ident(&r.name),
+                    r.event,
+                    quote_ident(&r.table)
+                )?;
+                if let Some(w) = &r.when_condition {
+                    write!(f, " WHERE {w}")?;
+                }
+                f.write_str(if r.instead { " DO INSTEAD " } else { " DO ALSO " })?;
+                if r.commands.is_empty() {
+                    f.write_str("NOTHING")?;
+                } else if r.commands.len() == 1 {
+                    write!(f, "{}", r.commands[0])?;
+                } else {
+                    f.write_str("(")?;
+                    for (i, c) in r.commands.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str("; ")?;
+                        }
+                        write!(f, "{c}")?;
+                    }
+                    f.write_str(")")?;
+                }
+                Ok(())
+            }
+            Self::DropRule {
+                name,
+                table,
+                if_exists,
+            } => {
+                f.write_str("DROP RULE ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                write!(f, "{} ON {}", quote_ident(name), quote_ident(table))
             }
         }
     }

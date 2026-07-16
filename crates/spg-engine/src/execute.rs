@@ -1365,6 +1365,12 @@ impl Engine {
                 table,
                 if_exists,
             } => self.exec_drop_trigger(&name, &table, if_exists),
+            Statement::CreateRule(s) => self.exec_create_rule(s),
+            Statement::DropRule {
+                name,
+                table,
+                if_exists,
+            } => self.exec_drop_rule(&name, &table, if_exists),
             Statement::DropFunction {
                 name,
                 args,
