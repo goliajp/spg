@@ -158,6 +158,55 @@ fn rewrite_view_col_refs(
     }
 }
 
+/// v7.39 (round 134) — rewrite a RETURNING projection on a column-renamed view:
+/// each item's column refs map from view columns to base columns, but the
+/// OUTPUT name stays the view column (PG labels `RETURNING a` "a", not the base
+/// "id"). A bare `*` expands to `base AS view` for every mapped column.
+fn rewrite_view_returning_items(
+    items: &[spg_sql::ast::SelectItem],
+    col_map: &[(String, String)],
+) -> Vec<spg_sql::ast::SelectItem> {
+    use spg_sql::ast::{Expr, SelectItem};
+    let map: alloc::collections::BTreeMap<String, String> = col_map.iter().cloned().collect();
+    let mut out: Vec<SelectItem> = Vec::new();
+    for it in items {
+        match it {
+            // `RETURNING *` / `v.*` → the view's columns (base value, view name).
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                for (view_col, base_col) in col_map {
+                    out.push(SelectItem::Expr {
+                        expr: Expr::Column(spg_sql::ast::ColumnName {
+                            qualifier: None,
+                            name: base_col.clone(),
+                        }),
+                        alias: Some(view_col.clone()),
+                    });
+                }
+            }
+            SelectItem::Expr { expr, alias } => {
+                // Preserve the view column name as the output name before the
+                // ref rewrite renames it to the base column.
+                let out_alias = if alias.is_some() {
+                    alias.clone()
+                } else if let Expr::Column(c) = expr
+                    && map.contains_key(&c.name)
+                {
+                    Some(c.name.clone())
+                } else {
+                    alias.clone()
+                };
+                let mut e = expr.clone();
+                rewrite_view_col_refs(&mut e, &map);
+                out.push(SelectItem::Expr {
+                    expr: e,
+                    alias: out_alias,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// v7.39 (round 132) — a pending `WITH CHECK OPTION` to enforce on the base rows
 /// a write through an auto-updatable view produces. `qual` is the view's WHERE.
 #[derive(Clone)]
@@ -310,6 +359,10 @@ impl Engine {
                 }
                 if let Some(w) = &mut rewritten.where_ {
                     rewrite_view_col_refs(w, &map);
+                }
+                // v7.39 (round 134) — rewrite RETURNING view cols → base cols.
+                if let Some(ret) = &rewritten.returning {
+                    rewritten.returning = Some(rewrite_view_returning_items(ret, &col_map));
                 }
             }
             rewritten.table = base;
@@ -1424,12 +1477,16 @@ impl Engine {
             let mut rewritten = stmt.clone();
             // v7.39 (round 133) — column-renamed view: rewrite the WHERE's view
             // columns to base columns before AND-ing the view WHERE.
-            if !col_map.is_empty()
-                && let Some(w) = &mut rewritten.where_
-            {
+            if !col_map.is_empty() {
                 let map: alloc::collections::BTreeMap<String, String> =
                     col_map.iter().cloned().collect();
-                rewrite_view_col_refs(w, &map);
+                if let Some(w) = &mut rewritten.where_ {
+                    rewrite_view_col_refs(w, &map);
+                }
+                // v7.39 (round 134) — rewrite RETURNING view cols → base cols.
+                if let Some(ret) = &rewritten.returning {
+                    rewritten.returning = Some(rewrite_view_returning_items(ret, &col_map));
+                }
             }
             rewritten.table = base;
             rewritten.where_ = and_optional_predicates(view_where, rewritten.where_);
@@ -2050,6 +2107,10 @@ impl Engine {
                         stmt.columns =
                             Some(col_map.iter().map(|(_, b)| b.clone()).collect());
                     }
+                }
+                // v7.39 (round 134) — rewrite RETURNING view cols → base cols.
+                if let Some(ret) = &stmt.returning {
+                    stmt.returning = Some(rewrite_view_returning_items(ret, &col_map));
                 }
             }
             stmt.table = base;
