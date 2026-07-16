@@ -15963,15 +15963,13 @@ impl Parser {
                 // element makes PG return NULL where this lowering
                 // returns true — the NOT NULL column case (the
                 // practical one) is exact.
-                if matches!(self.peek(), Token::Select) {
-                    let mut sub = match self.parse_select_stmt()? {
-                        Statement::Select(s) => s,
-                        other => {
-                            return Err(self.err(alloc::format!(
-                                "expected SELECT inside ANY/ALL, got {other:?}"
-                            )));
-                        }
-                    };
+                if matches!(self.peek(), Token::Select) || self.peek_is_with_kw() {
+                    // v7.39 (round 153) — `ANY (WITH … SELECT …)` is
+                    // legal PG too (round-151 sibling). Out-of-line
+                    // (#[inline(never)] helper) — this sits on
+                    // parse_expr's recursive frame and the two-armed
+                    // SELECT temporary blew the nesting-budget stack.
+                    let mut sub = self.parse_any_all_select_body()?;
                     if !matches!(self.peek(), Token::RParen) {
                         return Err(self.err(alloc::format!(
                             "expected ')' after ANY/ALL subquery, got {:?}",
@@ -18124,6 +18122,25 @@ impl Parser {
     /// in these positions; a quoted `"with"` stays an identifier.
     fn peek_is_with_kw(&self) -> bool {
         matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("with"))
+    }
+
+    /// v7.39 (round 153) — the `ANY / ALL ( [WITH …] SELECT … )` body.
+    /// `#[inline(never)]` keeps the large SelectStatement temporaries
+    /// off parse_expr's recursive frame (the nesting-budget stack
+    /// cliff — see the round-153 gate regression).
+    #[inline(never)]
+    fn parse_any_all_select_body(&mut self) -> Result<crate::ast::SelectStatement, ParseError> {
+        if self.peek_is_with_kw() {
+            self.advance();
+            self.parse_nested_with_select()
+        } else {
+            match self.parse_select_stmt()? {
+                Statement::Select(s) => Ok(s),
+                other => Err(self.err(alloc::format!(
+                    "expected SELECT inside ANY/ALL, got {other:?}"
+                ))),
+            }
+        }
     }
 
     fn parse_exists_atom(&mut self, negated: bool) -> Result<Expr, ParseError> {
