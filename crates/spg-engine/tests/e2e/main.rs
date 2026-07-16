@@ -233,6 +233,7 @@ mod e2e_nested_with_round151;
 mod e2e_dml_target_not_cte_round149;
 mod e2e_merge_by_source_round146;
 mod e2e_merge_into_view_round148;
+mod e2e_merge_view_check_returning_round152;
 mod e2e_merge_with_ctes_round149;
 mod e2e_view_check_option_round132;
 mod e2e_renamed_view_dml_round133;

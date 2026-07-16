@@ -479,7 +479,11 @@ impl Engine {
                 .views()
                 .get(&stmt.table)
                 .map_or(0, |v| v.check_option);
-            let check = if written_opt != 0 {
+            // v7.39 (round 152) — a lower view carrying its OWN check
+            // option enforces even when the written view has none (PG,
+            // r152 probe P6; enforce_view_check already walks the chain
+            // that way — the gate here just failed to arm it).
+            let check = if written_opt != 0 || check_chain.iter().any(|(_, _, o)| *o != 0) {
                 Some(ViewCheck {
                     written_opt,
                     chain: check_chain,
@@ -1219,10 +1223,93 @@ impl Engine {
                         _ => {}
                     }
                 }
+                // v7.39 (round 152) — RETURNING through a column-renamed
+                // view: rewrite view-column references to base columns
+                // while keeping the VIEW name as the output name (PG).
+                // Qualifier-aware: bare refs and refs qualified by the
+                // view alias / OLD / NEW remap; source-alias refs don't.
+                if let Some(items) = &mut s.returning {
+                    let is_target_q = |q: &Option<String>| match q.as_deref() {
+                        None => true,
+                        Some(x) => {
+                            x.eq_ignore_ascii_case(&alias)
+                                || x.eq_ignore_ascii_case("old")
+                                || x.eq_ignore_ascii_case("new")
+                        }
+                    };
+                    let mut out: alloc::vec::Vec<spg_sql::ast::SelectItem> =
+                        alloc::vec::Vec::with_capacity(items.len());
+                    for it in items.iter() {
+                        match it {
+                            spg_sql::ast::SelectItem::QualifiedWildcard(q)
+                                if q.eq_ignore_ascii_case(&alias) =>
+                            {
+                                // `v.*` → the view's columns: base value,
+                                // view-name output.
+                                for (view_col, base_col) in &vr.col_map {
+                                    out.push(spg_sql::ast::SelectItem::Expr {
+                                        expr: Expr::Column(spg_sql::ast::ColumnName {
+                                            qualifier: Some(alias.clone()),
+                                            name: base_col.clone(),
+                                        }),
+                                        alias: Some(view_col.clone()),
+                                    });
+                                }
+                            }
+                            spg_sql::ast::SelectItem::Expr { expr, alias: a } => {
+                                let out_alias = if a.is_some() {
+                                    a.clone()
+                                } else if let Expr::Column(c) = expr
+                                    && is_target_q(&c.qualifier)
+                                    && map.contains_key(&c.name)
+                                {
+                                    Some(c.name.clone())
+                                } else {
+                                    a.clone()
+                                };
+                                let mut e = expr.clone();
+                                crate::expr_analysis::rewrite_nodes_mut(&mut e, &mut |n| {
+                                    if let Expr::Column(c) = n {
+                                        if is_target_q(&c.qualifier)
+                                            && let Some(b) = map.get(&c.name)
+                                        {
+                                            c.name = b.clone();
+                                        }
+                                        return true;
+                                    }
+                                    false
+                                });
+                                out.push(spg_sql::ast::SelectItem::Expr {
+                                    expr: e,
+                                    alias: out_alias,
+                                });
+                            }
+                            other => out.push(other.clone()),
+                        }
+                    }
+                    *items = out;
+                }
             }
-            return self.exec_merge_filtered(&s, vr.where_at_base, cancel);
+            // v7.39 (round 152) — WITH CHECK OPTION rides the merge: the
+            // outermost (written) view's own option drives the cascade,
+            // and any lower view carrying its OWN option enforces
+            // regardless of it (PG, probe P6).
+            let written_opt = self
+                .active_catalog()
+                .views()
+                .get(&stmt.target)
+                .map_or(0, |v| v.check_option);
+            let check = if written_opt != 0 || vr.check_chain.iter().any(|(_, _, o)| *o != 0) {
+                Some(ViewCheck {
+                    written_opt,
+                    chain: vr.check_chain,
+                })
+            } else {
+                None
+            };
+            return self.exec_merge_filtered(&s, vr.where_at_base, check, cancel);
         }
-        self.exec_merge_filtered(stmt, None, cancel)
+        self.exec_merge_filtered(stmt, None, None, cancel)
     }
 
     /// The MERGE executor proper. `target_filter` (the view's WHERE, over bare
@@ -1232,6 +1319,7 @@ impl Engine {
         &mut self,
         stmt: &spg_sql::ast::MergeStatement,
         target_filter: Option<Expr>,
+        view_check: Option<ViewCheck>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let target_alias = stmt
@@ -1663,6 +1751,22 @@ impl Engine {
         }
         let _ = source_arity; // captured for symmetry; cancellation cost negligible.
 
+        // v7.39 (round 152) — WITH CHECK OPTION through a MERGE: every
+        // row an UPDATE or INSERT action produces must still satisfy
+        // the view chain's quals (DELETE is exempt, as in PG). Checked
+        // before anything applies so a violation leaves the table
+        // untouched — PG never half-applies a MERGE.
+        if let Some(check) = &view_check {
+            let mut pending: alloc::vec::Vec<alloc::vec::Vec<Value<'static>>> =
+                alloc::vec::Vec::with_capacity(updates.len() + inserts.len());
+            for (_, new_vals) in &updates {
+                pending.push(new_vals.clone());
+            }
+            for vals in &inserts {
+                pending.push(vals.clone());
+            }
+            self.enforce_view_check(check, &pending, &target_cols, &stmt.target)?;
+        }
         // v7.37.15 Phase C — fetch the writer version BEFORE
         // taking the table mut borrow (so we don't double-mut
         // self). Shared across MERGE INSERT / UPDATE / DELETE so
@@ -2941,7 +3045,9 @@ impl Engine {
                 .views()
                 .get(&stmt.table)
                 .map_or(0, |v| v.check_option);
-            if written_opt != 0 {
+            // v7.39 (round 152) — arm the check whenever any level of the
+            // chain carries its own option too (PG, r152 probe P6).
+            if written_opt != 0 || check_chain.iter().any(|(_, _, o)| *o != 0) {
                 view_check = Some(ViewCheck {
                     written_opt,
                     chain: check_chain,
