@@ -205,6 +205,16 @@ impl Engine {
             .collect()
     }
 
+    /// v7.39 (round 142) — the `DO INSTEAD <command>` rules for `(table, event)`:
+    /// INSTEAD rules that carry a command body. Always unconditional — the
+    /// conditional form is refused at CREATE RULE time.
+    pub(crate) fn instead_command_rules(&self, table: &str, event: &str) -> Vec<RuleDef> {
+        self.snapshot_rules(table, event)
+            .into_iter()
+            .filter(|r| r.instead && !r.commands.is_empty())
+            .collect()
+    }
+
     /// v7.39 (round 140) — the `DO ALSO <command>` rules for `(table, event)`:
     /// non-INSTEAD rules that carry a command body.
     pub(crate) fn also_rules(&self, table: &str, event: &str) -> Vec<RuleDef> {

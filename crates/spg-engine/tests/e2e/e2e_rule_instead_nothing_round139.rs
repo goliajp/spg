@@ -99,14 +99,16 @@ fn unsupported_rule_forms_are_rejected_not_swallowed() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u(id int, v int)").unwrap();
     e.execute("CREATE TABLE aud(id int)").unwrap();
-    // DO INSTEAD <command> — still Phase 3.
-    let m = match e.execute("CREATE RULE ra AS ON INSERT TO u DO INSTEAD INSERT INTO aud VALUES (1)") {
+    // Conditional DO INSTEAD <command> — the one remaining unsupported form.
+    let m = match e.execute(
+        "CREATE RULE ra AS ON INSERT TO u WHERE NEW.v < 0 DO INSTEAD INSERT INTO aud VALUES (1)",
+    ) {
         Err(x) => format!("{x}"),
         Ok(_) => panic!("expected error"),
     };
-    assert!(m.contains("DO INSTEAD <command> rules are not yet implemented"), "{m}");
-    // Conditional DO INSTEAD NOTHING is supported since round 141 (Phase 3) —
-    // covered in e2e_rule_conditional_instead_nothing_round141.
+    assert!(m.contains("conditional (WHERE) DO INSTEAD <command> rules are not yet implemented"), "{m}");
+    // Unconditional DO INSTEAD <command> is supported since round 142; the
+    // conditional DO INSTEAD NOTHING form since round 141.
     // ON SELECT — use CREATE VIEW.
     let m = match e.execute("CREATE RULE rs AS ON SELECT TO u DO INSTEAD NOTHING") {
         Err(x) => format!("{x}"),
