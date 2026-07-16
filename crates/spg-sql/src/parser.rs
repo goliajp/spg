@@ -17251,6 +17251,91 @@ impl Parser {
                 cte.name
             )));
         }
+        // v7.39 (round 145, parse_cte.c) — the remaining well-formedness rules
+        // apply only when the body actually references itself (a non-self-
+        // referencing CTE under WITH RECURSIVE may use any set-op shape).
+        let anchor_refs = self_refs(body);
+        let union_refs = body.unions.iter().any(|(_, u)| self_refs(u) > 0);
+        if anchor_refs > 0 || union_refs {
+            // Shape: the top level must be UNION [ALL] arms only. A self-ref
+            // under INTERSECT / EXCEPT (or with no set-op at all) is PG's
+            // "does not have the form" error — SPG used to compute a value.
+            if body.unions.is_empty()
+                || body
+                    .unions
+                    .iter()
+                    .any(|(k, _)| !matches!(k, crate::ast::UnionKind::Distinct | crate::ast::UnionKind::All))
+            {
+                return Err(self.err(alloc::format!(
+                    "recursive query \"{}\" does not have the form non-recursive-term \
+                     UNION [ALL] recursive-term",
+                    cte.name
+                )));
+            }
+            if anchor_refs > 0 {
+                return Err(self.err(alloc::format!(
+                    "recursive reference to query \"{}\" must not appear within its non-recursive term",
+                    cte.name
+                )));
+            }
+        }
+        let is_self = |t: &crate::ast::TableRef| t.name.eq_ignore_ascii_case(&cte.name);
+        for (_, u) in &body.unions {
+            if self_refs(u) == 0 {
+                continue;
+            }
+            // The self-reference must not sit on the nullable side of an outer
+            // join (LEFT: right side; RIGHT: everything before it; FULL: both).
+            if let Some(from) = &u.from {
+                for (i, j) in from.joins.iter().enumerate() {
+                    let left_has_self =
+                        is_self(&from.primary) || from.joins[..i].iter().any(|pj| is_self(&pj.table));
+                    let violated = match j.kind {
+                        crate::ast::JoinKind::Left => is_self(&j.table),
+                        crate::ast::JoinKind::Right => left_has_self,
+                        crate::ast::JoinKind::FullOuter => is_self(&j.table) || left_has_self,
+                        _ => false,
+                    };
+                    if violated {
+                        return Err(self.err(alloc::format!(
+                            "recursive reference to query \"{}\" must not appear within an outer join",
+                            cte.name
+                        )));
+                    }
+                }
+            }
+            // No aggregates at the top level of the recursive term (SPG used
+            // to run them and surface a misleading downstream error).
+            let mut items_and_having: Vec<&Expr> = Vec::new();
+            for it in &u.items {
+                if let crate::ast::SelectItem::Expr { expr, .. } = it {
+                    items_and_having.push(expr);
+                }
+            }
+            if let Some(h) = &u.having {
+                items_and_having.push(h);
+            }
+            for e in items_and_having {
+                if expr_has_toplevel_aggregate(e) {
+                    return Err(self.err(String::from(
+                        "aggregate functions are not allowed in a recursive query's recursive term",
+                    )));
+                }
+            }
+        }
+        // A self-reference inside a sublink expression (EXISTS / IN / scalar
+        // subquery) anywhere in the body is rejected; a plain FROM derived
+        // table is legal in PG and untouched here.
+        let mut all_terms: Vec<&SelectStatement> = alloc::vec![body];
+        all_terms.extend(body.unions.iter().map(|(_, u)| u));
+        for term in all_terms {
+            if select_has_self_ref_in_sublink(term, &cte.name) {
+                return Err(self.err(alloc::format!(
+                    "recursive reference to query \"{}\" must not appear within a subquery",
+                    cte.name
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -21671,4 +21756,195 @@ fn set_value_text(v: &crate::ast::SetValue) -> alloc::string::String {
         | crate::ast::SetValue::Number(s) => s.clone(),
         crate::ast::SetValue::Default => "DEFAULT".into(),
     }
+}
+
+/// v7.39 (round 145, parse_cte.c / parse_agg.c) — true when an expression
+/// contains an aggregate call at ITS OWN query level (recursion stops at
+/// sublink boundaries — a sublink's aggregates belong to the sublink).
+/// Backs the "aggregate functions are not allowed in a recursive query's
+/// recursive term" well-formedness check.
+fn expr_has_toplevel_aggregate(e: &Expr) -> bool {
+    const AGG_NAMES: &[&str] = &[
+        "count", "sum", "min", "max", "avg", "string_agg", "array_agg", "bool_and", "bool_or",
+        "every", "any_value", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg",
+        "bit_and", "bit_or", "bit_xor", "var_pop", "var_samp", "variance", "stddev", "stddev_pop",
+        "stddev_samp", "range_agg", "range_intersect_agg", "percentile_cont", "percentile_disc",
+        "mode", "corr", "covar_pop", "covar_samp",
+    ];
+    match e {
+        Expr::AggregateOrdered { .. } => true,
+        Expr::FunctionCall { name, args } => {
+            AGG_NAMES.contains(&name.to_ascii_lowercase().as_str())
+                || args.iter().any(expr_has_toplevel_aggregate)
+        }
+        Expr::NamedArg { expr, .. }
+        | Expr::Variadic(expr)
+        | Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. }
+        | Expr::Extract { source: expr, .. } => expr_has_toplevel_aggregate(expr),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_has_toplevel_aggregate(lhs) || expr_has_toplevel_aggregate(rhs)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_has_toplevel_aggregate(expr) || expr_has_toplevel_aggregate(pattern)
+        }
+        Expr::Array(items) => items.iter().any(expr_has_toplevel_aggregate),
+        Expr::InList { expr, list, .. } => {
+            expr_has_toplevel_aggregate(expr) || list.iter().any(expr_has_toplevel_aggregate)
+        }
+        Expr::ArraySubscript { target, index } => {
+            expr_has_toplevel_aggregate(target) || expr_has_toplevel_aggregate(index)
+        }
+        Expr::ArraySlice { target, lo, hi } => {
+            expr_has_toplevel_aggregate(target)
+                || lo.as_deref().is_some_and(expr_has_toplevel_aggregate)
+                || hi.as_deref().is_some_and(expr_has_toplevel_aggregate)
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            expr_has_toplevel_aggregate(expr) || expr_has_toplevel_aggregate(array)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            operand.as_deref().is_some_and(expr_has_toplevel_aggregate)
+                || branches.iter().any(|(w, t)| {
+                    expr_has_toplevel_aggregate(w) || expr_has_toplevel_aggregate(t)
+                })
+                || else_branch.as_deref().is_some_and(expr_has_toplevel_aggregate)
+        }
+        // The outer-level operands of a sublink can aggregate; the sublink's
+        // own body cannot leak its aggregates up here.
+        Expr::InSubquery { expr, .. } => expr_has_toplevel_aggregate(expr),
+        Expr::RowInSubquery { row, .. } | Expr::RowCmpSubquery { row, .. } => {
+            row.iter().any(expr_has_toplevel_aggregate)
+        }
+        _ => false,
+    }
+}
+
+/// v7.39 (round 145, parse_cte.c) — true when any sublink expression
+/// (EXISTS / IN / scalar subquery) inside this SELECT term references the
+/// named table anywhere in its subtree. A plain FROM derived table is NOT a
+/// sublink and is legal in a recursive term, so it is not walked here.
+fn select_has_self_ref_in_sublink(s: &crate::ast::SelectStatement, name: &str) -> bool {
+    let mut exprs: Vec<&Expr> = Vec::new();
+    for it in &s.items {
+        if let crate::ast::SelectItem::Expr { expr, .. } = it {
+            exprs.push(expr);
+        }
+    }
+    if let Some(w) = &s.where_ {
+        exprs.push(w);
+    }
+    if let Some(h) = &s.having {
+        exprs.push(h);
+    }
+    if let Some(g) = &s.group_by {
+        exprs.extend(g.iter());
+    }
+    if let Some(from) = &s.from {
+        for j in &from.joins {
+            if let Some(on) = &j.on {
+                exprs.push(on);
+            }
+        }
+    }
+    exprs.into_iter().any(|e| expr_sublink_mentions(e, name))
+}
+
+/// Does this expression contain a sublink whose subquery mentions `name`?
+fn expr_sublink_mentions(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::ScalarSubquery(sub) => select_mentions_table(sub, name),
+        Expr::Exists { subquery, .. } => select_mentions_table(subquery, name),
+        Expr::InSubquery { expr, subquery, .. } => {
+            expr_sublink_mentions(expr, name) || select_mentions_table(subquery, name)
+        }
+        Expr::RowInSubquery { row, subquery, .. } => {
+            row.iter().any(|x| expr_sublink_mentions(x, name))
+                || select_mentions_table(subquery, name)
+        }
+        Expr::RowCmpSubquery { row, subquery, .. } => {
+            row.iter().any(|x| expr_sublink_mentions(x, name))
+                || select_mentions_table(subquery, name)
+        }
+        Expr::NamedArg { expr, .. }
+        | Expr::Variadic(expr)
+        | Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. }
+        | Expr::Extract { source: expr, .. } => expr_sublink_mentions(expr, name),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_sublink_mentions(lhs, name) || expr_sublink_mentions(rhs, name)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_sublink_mentions(expr, name) || expr_sublink_mentions(pattern, name)
+        }
+        Expr::FunctionCall { args, .. } | Expr::Array(args) => {
+            args.iter().any(|x| expr_sublink_mentions(x, name))
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_sublink_mentions(expr, name)
+                || list.iter().any(|x| expr_sublink_mentions(x, name))
+        }
+        Expr::ArraySubscript { target, index } => {
+            expr_sublink_mentions(target, name) || expr_sublink_mentions(index, name)
+        }
+        Expr::ArraySlice { target, lo, hi } => {
+            expr_sublink_mentions(target, name)
+                || lo.as_deref().is_some_and(|x| expr_sublink_mentions(x, name))
+                || hi.as_deref().is_some_and(|x| expr_sublink_mentions(x, name))
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            expr_sublink_mentions(expr, name) || expr_sublink_mentions(array, name)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            operand.as_deref().is_some_and(|x| expr_sublink_mentions(x, name))
+                || branches.iter().any(|(w, t)| {
+                    expr_sublink_mentions(w, name) || expr_sublink_mentions(t, name)
+                })
+                || else_branch
+                    .as_deref()
+                    .is_some_and(|x| expr_sublink_mentions(x, name))
+        }
+        _ => false,
+    }
+}
+
+/// Does this SELECT (in full — FROM tables, derived tables, its own
+/// sublinks, and union arms) mention the named table?
+fn select_mentions_table(s: &crate::ast::SelectStatement, name: &str) -> bool {
+    if let Some(from) = &s.from {
+        if from.primary.name.eq_ignore_ascii_case(name) {
+            return true;
+        }
+        if let Some(sub) = &from.primary.lateral_subquery
+            && select_mentions_table(sub, name)
+        {
+            return true;
+        }
+        for j in &from.joins {
+            if j.table.name.eq_ignore_ascii_case(name) {
+                return true;
+            }
+            if let Some(sub) = &j.table.lateral_subquery
+                && select_mentions_table(sub, name)
+            {
+                return true;
+            }
+        }
+    }
+    if select_has_self_ref_in_sublink(s, name) {
+        return true;
+    }
+    s.unions.iter().any(|(_, u)| select_mentions_table(u, name))
 }
