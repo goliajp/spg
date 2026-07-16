@@ -3748,6 +3748,46 @@ impl Parser {
                 "CREATE VIEW body must be a SELECT statement, got {body_stmt:?}"
             )));
         };
+        // v7.39 (round 132) — optional `WITH [ LOCAL | CASCADED ] CHECK OPTION`.
+        // The SELECT parser stops before a trailing WITH, so it lands here.
+        let check_option = if matches!(self.peek(),
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("with"))
+        {
+            self.advance(); // WITH
+            let opt = match self.peek() {
+                Token::Ident(s) if s.eq_ignore_ascii_case("local") => {
+                    self.advance();
+                    crate::ast::ViewCheckOption::Local
+                }
+                Token::Ident(s) if s.eq_ignore_ascii_case("cascaded") => {
+                    self.advance();
+                    crate::ast::ViewCheckOption::Cascaded
+                }
+                // Bare `WITH CHECK OPTION` defaults to CASCADED (PG).
+                _ => crate::ast::ViewCheckOption::Cascaded,
+            };
+            if !matches!(self.peek(),
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("check"))
+            {
+                return Err(self.err(alloc::format!(
+                    "expected CHECK in CREATE VIEW … WITH [LOCAL|CASCADED] CHECK OPTION, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance(); // CHECK
+            if !matches!(self.peek(),
+                Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("option"))
+            {
+                return Err(self.err(alloc::format!(
+                    "expected OPTION after WITH CHECK in CREATE VIEW, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance(); // OPTION
+            Some(opt)
+        } else {
+            None
+        };
         Ok(Statement::CreateView(crate::ast::CreateViewStatement {
             name,
             or_replace,
@@ -3755,6 +3795,7 @@ impl Parser {
             temporary,
             columns,
             body,
+            check_option,
         }))
     }
 

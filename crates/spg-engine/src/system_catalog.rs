@@ -427,7 +427,12 @@ pub(crate) fn synth_information_schema_views(
                 Value::text("public"),
                 Value::text(v.name.clone()),
                 Value::text(v.body.clone()),
-                Value::text("NONE"),
+                // v7.39 (round 132) — WITH CHECK OPTION: 0=NONE, 1=LOCAL, 2=CASCADED.
+                Value::text(match v.check_option {
+                    1 => "LOCAL",
+                    2 => "CASCADED",
+                    _ => "NONE",
+                }),
                 Value::text("NO"), // is_updatable — view-update lands in 19.13
                 Value::text("NO"), // is_insertable_into
                 Value::text("NO"),

@@ -3888,6 +3888,10 @@ pub struct ViewDef {
     /// whitespace / comments in the original input. Re-parsed at
     /// SELECT-from-view time to materialise as a synthetic CTE.
     pub body: String,
+    /// v7.39 (round 132) — `WITH CHECK OPTION`: 0 = none, 1 = LOCAL,
+    /// 2 = CASCADED. A storage-local u8 (no dependency on the SQL AST).
+    /// Persisted from FILE_VERSION 69; older catalogs read back as 0.
+    pub check_option: u8,
 }
 
 impl SequenceDataType {
@@ -6717,7 +6721,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 68;
+const FILE_VERSION: u8 = 69;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7552,6 +7556,8 @@ impl Catalog {
                 write_str(&mut out, c);
             }
             write_str_long(&mut out, &view.body);
+            // v7.39 (round 132, FILE_VERSION 69+) — WITH CHECK OPTION marker.
+            out.push(view.check_option);
         }
         // v7.17.0 Phase 1.3 — MATERIALIZED VIEW source registry
         // (FILE_VERSION 28+). The backing rows live as a regular
@@ -7882,12 +7888,16 @@ impl Catalog {
                     columns.push(cur.read_str()?);
                 }
                 let body = cur.read_str_long()?;
+                // v7.39 (round 132) — check-option marker added at FILE_VERSION
+                // 69; older catalogs default to 0 (no check option).
+                let check_option = if version >= 69 { cur.read_u8()? } else { 0 };
                 cat.views.insert(
                     name.clone(),
                     ViewDef {
                         name,
                         columns,
                         body,
+                        check_option,
                     },
                 );
             }
