@@ -4620,7 +4620,10 @@ impl Catalog {
         def: TriggerDef,
         or_replace: bool,
     ) -> Result<(), StorageError> {
-        if !self.by_name.contains_key(&def.table) {
+        // v7.39 (round 137) — a trigger may target a base table (BEFORE / AFTER)
+        // or a view (INSTEAD OF). The engine enforces the timing↔target rule;
+        // storage only requires the relation to exist as one or the other.
+        if !self.by_name.contains_key(&def.table) && !self.views.contains_key(&def.table) {
             return Err(StorageError::TableNotFound {
                 name: def.table.clone(),
             });
