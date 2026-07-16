@@ -230,6 +230,7 @@ mod e2e_grouping_in_order_by_round135;
 mod e2e_nested_view_dml_round136;
 mod e2e_instead_of_insert_round137;
 mod e2e_instead_of_update_delete_round137b;
+mod e2e_instead_of_returning_round137c;
 mod e2e_insert_then_update_round85;
 mod e2e_json_family_round76;
 mod e2e_named_args_round77;
