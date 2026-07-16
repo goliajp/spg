@@ -36,16 +36,14 @@ use spg_sql::ast::{Expr, InsertStatement, SelectItem};
 fn view_redirect_to_simple_base(
     catalog: &spg_storage::Catalog,
     view_name: &str,
-) -> Option<(String, Option<spg_sql::ast::Expr>, bool)> {
+) -> Option<(String, Option<spg_sql::ast::Expr>, bool, Vec<(String, String)>)> {
     let view = catalog.views().get(view_name)?;
     // v7.39 (round 132) — WITH CHECK OPTION marker (0 = none).
     let has_check_option = view.check_option != 0;
-    // Column-rename views are NOT auto-updatable: PG-faithful behavior
-    // because the rename would need to be applied to caller's column
-    // list (a per-column map) and SPG doesn't ship that today.
-    if !view.columns.is_empty() {
-        return None;
-    }
+    // v7.39 (round 133) — a column-rename list is handled by mapping the view's
+    // column names back to the base columns (built below); the write's column
+    // refs are rewritten accordingly.
+    let rename_cols = view.columns.clone();
     let stmt = spg_sql::parser::parse_statement(&view.body).ok()?;
     let select = match stmt {
         spg_sql::ast::Statement::Select(s) => s,
@@ -74,20 +72,90 @@ fn view_redirect_to_simple_base(
     if from.primary.unnest_expr.is_some() || from.primary.as_of_segment.is_some() {
         return None;
     }
-    // Every projected item must be a bare column reference or
-    // wildcard. Aggregates / function calls / arithmetic = not simple.
+    // Every projected item must be a bare column reference or wildcard
+    // (aggregates / function calls / arithmetic = not simple). Collect the base
+    // column each view column maps to, in view-column order.
+    let mut base_cols: Vec<String> = Vec::new();
     for item in &select.items {
         match item {
             spg_sql::ast::SelectItem::Wildcard
-            | spg_sql::ast::SelectItem::QualifiedWildcard(_) => {}
-            spg_sql::ast::SelectItem::Expr { expr, .. } => {
-                if !matches!(expr, spg_sql::ast::Expr::Column(_)) {
-                    return None;
+            | spg_sql::ast::SelectItem::QualifiedWildcard(_) => {
+                // `*` projects every base column in declaration order.
+                let base = catalog.get(&from.primary.name)?;
+                for c in &base.schema().columns {
+                    base_cols.push(c.name.clone());
                 }
             }
+            spg_sql::ast::SelectItem::Expr { expr, .. } => match expr {
+                spg_sql::ast::Expr::Column(c) => base_cols.push(c.name.clone()),
+                _ => return None,
+            },
         }
     }
-    Some((from.primary.name.clone(), select.where_, has_check_option))
+    // v7.39 (round 133) — build the (view col → base col) map. Empty when the
+    // view is not column-renamed (the common identity path stays byte-for-byte).
+    let col_map: Vec<(String, String)> = if rename_cols.is_empty() {
+        Vec::new()
+    } else {
+        if rename_cols.len() != base_cols.len() {
+            return None;
+        }
+        rename_cols.into_iter().zip(base_cols).collect()
+    };
+    Some((
+        from.primary.name.clone(),
+        select.where_,
+        has_check_option,
+        col_map,
+    ))
+}
+
+/// v7.39 (round 133) — rewrite an auto-updatable view's column references in a
+/// write predicate / assignment to the base table's columns (the view rename
+/// map is view-col → base-col). Bare and view-qualified refs both remap; the
+/// qualifier is dropped since the base is a single table.
+fn rewrite_view_col_refs(
+    expr: &mut spg_sql::ast::Expr,
+    map: &alloc::collections::BTreeMap<String, String>,
+) {
+    use spg_sql::ast::Expr;
+    match expr {
+        Expr::Column(c) => {
+            if let Some(base) = map.get(&c.name) {
+                c.name = base.clone();
+                c.qualifier = None;
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            rewrite_view_col_refs(lhs, map);
+            rewrite_view_col_refs(rhs, map);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            rewrite_view_col_refs(expr, map)
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                rewrite_view_col_refs(a, map);
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(o) = operand {
+                rewrite_view_col_refs(o, map);
+            }
+            for (c, v) in branches {
+                rewrite_view_col_refs(c, map);
+                rewrite_view_col_refs(v, map);
+            }
+            if let Some(x) = else_branch {
+                rewrite_view_col_refs(x, map);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// v7.39 (round 132) — a pending `WITH CHECK OPTION` to enforce on the base rows
@@ -214,7 +282,7 @@ impl Engine {
         // v7.37.19 (19.13) — auto-updatable view redirect. v7.38 (P6.46) — a
         // view WHERE is AND-ed onto the caller's so only rows visible through
         // the view are updated.
-        if let Some((base, view_where, has_check)) =
+        if let Some((base, view_where, has_check, col_map)) =
             view_redirect_to_simple_base(self.active_catalog(), &stmt.table)
         {
             // v7.39 (round 132) — WITH CHECK OPTION: the updated row must still
@@ -228,6 +296,22 @@ impl Engine {
                 None
             };
             let mut rewritten = stmt.clone();
+            // v7.39 (round 133) — a column-renamed view: rewrite SET targets and
+            // WHERE / assignment expressions from view columns to base columns
+            // before AND-ing the (base-column) view WHERE.
+            if !col_map.is_empty() {
+                let map: alloc::collections::BTreeMap<String, String> =
+                    col_map.iter().cloned().collect();
+                for (target, e) in &mut rewritten.assignments {
+                    if let Some(b) = map.get(target) {
+                        *target = b.clone();
+                    }
+                    rewrite_view_col_refs(e, &map);
+                }
+                if let Some(w) = &mut rewritten.where_ {
+                    rewrite_view_col_refs(w, &map);
+                }
+            }
             rewritten.table = base;
             rewritten.where_ = and_optional_predicates(view_where, rewritten.where_);
             return self.exec_update_cancel_inner(&rewritten, check, cancel);
@@ -1332,12 +1416,21 @@ impl Engine {
         // v7.37.19 (19.13) — auto-updatable view redirect. v7.38 (P6.46) — a
         // view WHERE is AND-ed onto the caller's so only rows visible through
         // the view are deleted.
-        if let Some((base, view_where, _has_check)) =
+        if let Some((base, view_where, _has_check, col_map)) =
             view_redirect_to_simple_base(self.active_catalog(), &stmt.table)
         {
             // DELETE removes rows; there is no post-image to check, so
             // WITH CHECK OPTION does not apply.
             let mut rewritten = stmt.clone();
+            // v7.39 (round 133) — column-renamed view: rewrite the WHERE's view
+            // columns to base columns before AND-ing the view WHERE.
+            if !col_map.is_empty()
+                && let Some(w) = &mut rewritten.where_
+            {
+                let map: alloc::collections::BTreeMap<String, String> =
+                    col_map.iter().cloned().collect();
+                rewrite_view_col_refs(w, &map);
+            }
             rewritten.table = base;
             rewritten.where_ = and_optional_predicates(view_where, rewritten.where_);
             return self.exec_delete_cancel(&rewritten, cancel);
@@ -1929,7 +2022,7 @@ impl Engine {
         // the view's WHERE. Captured here (view name = the pre-redirect table),
         // enforced below once the full base rows are assembled.
         let mut view_check: Option<ViewCheck> = None;
-        if let Some((base, view_where, has_check)) =
+        if let Some((base, view_where, has_check, col_map)) =
             view_redirect_to_simple_base(self.active_catalog(), &stmt.table)
         {
             if has_check {
@@ -1937,6 +2030,27 @@ impl Engine {
                     view_name: stmt.table.clone(),
                     qual,
                 });
+            }
+            // v7.39 (round 133) — column-renamed view: translate the target
+            // column list to base columns. An explicit `(a, b)` list maps each
+            // name; a positional insert becomes an explicit base-column list in
+            // view-column order (so a subset / reordered view lands correctly).
+            if !col_map.is_empty() {
+                let map: alloc::collections::BTreeMap<String, String> =
+                    col_map.iter().cloned().collect();
+                match &mut stmt.columns {
+                    Some(cols) => {
+                        for c in cols.iter_mut() {
+                            if let Some(b) = map.get(c) {
+                                *c = b.clone();
+                            }
+                        }
+                    }
+                    None => {
+                        stmt.columns =
+                            Some(col_map.iter().map(|(_, b)| b.clone()).collect());
+                    }
+                }
             }
             stmt.table = base;
         }

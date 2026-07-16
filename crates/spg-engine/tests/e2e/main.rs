@@ -224,6 +224,7 @@ mod e2e_qualified_wildcard_round128;
 mod e2e_on_conflict_returning_old_round129;
 mod e2e_merge_returning_round130;
 mod e2e_view_check_option_round132;
+mod e2e_renamed_view_dml_round133;
 mod e2e_insert_then_update_round85;
 mod e2e_json_family_round76;
 mod e2e_named_args_round77;
