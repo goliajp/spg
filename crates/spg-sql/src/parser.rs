@@ -6903,6 +6903,29 @@ impl Parser {
                 )));
             }
             self.advance();
+            // v7.39 (round 146, PG17) — `NOT MATCHED [BY TARGET | BY SOURCE]`.
+            // BY TARGET is the default (a synonym); BY SOURCE flips the clause
+            // to fire for target rows no source row matches.
+            let mut matched = matched;
+            if matches!(matched, crate::ast::MergeMatched::NotMatched)
+                && matches!(self.peek(), Token::By)
+            {
+                self.advance();
+                match self.peek() {
+                    Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("source") => {
+                        self.advance();
+                        matched = crate::ast::MergeMatched::NotMatchedBySource;
+                    }
+                    Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("target") => {
+                        self.advance();
+                    }
+                    other => {
+                        return Err(self.err(format!(
+                            "expected SOURCE or TARGET after NOT MATCHED BY, got {other:?}"
+                        )));
+                    }
+                }
+            }
             // Optional AND <expr>
             let condition = if matches!(self.peek(), Token::And) {
                 self.advance();
@@ -7050,6 +7073,13 @@ impl Parser {
                     )));
                 }
             };
+            // PG's grammar simply has no INSERT production under BY SOURCE
+            // (a target row already exists there) — same syntax error.
+            if matches!(matched, crate::ast::MergeMatched::NotMatchedBySource)
+                && matches!(action, crate::ast::MergeAction::Insert { .. })
+            {
+                return Err(self.err(String::from("syntax error at or near \"INSERT\"")));
+            }
             clauses.push(crate::ast::MergeWhenClause {
                 matched,
                 condition,
@@ -7064,10 +7094,12 @@ impl Parser {
         // never fire. Check per match kind in clause order.
         let mut seen_unconditional_matched = false;
         let mut seen_unconditional_not_matched = false;
+        let mut seen_unconditional_by_source = false;
         for c in &clauses {
             let seen = match c.matched {
                 crate::ast::MergeMatched::Matched => &mut seen_unconditional_matched,
                 crate::ast::MergeMatched::NotMatched => &mut seen_unconditional_not_matched,
+                crate::ast::MergeMatched::NotMatchedBySource => &mut seen_unconditional_by_source,
             };
             if *seen {
                 return Err(self.err(String::from(

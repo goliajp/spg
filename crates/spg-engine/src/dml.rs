@@ -1186,12 +1186,17 @@ impl Engine {
             // is not merged against. Phase B's `current_snapshot()`
             // returns unbounded (every row visible) — behaviour
             // matches pre-v7.37.15 exactly.
+            // v7.39 (round 146) — keep each visible row's TRUE storage
+            // position. The apply phase feeds update_row / delete_rows
+            // storage positions; using the snapshot ordinal instead
+            // mutated the wrong rows once dead versions (any prior MVCC
+            // update/delete) preceded a target row.
             let snap = self.current_snapshot();
             (
                 t.schema().columns.clone(),
                 t.scan_visible(&snap)
-                    .map(|(_, r)| r.clone())
-                    .collect::<Vec<Row<'static>>>(),
+                    .map(|(pos, r)| (pos, r.clone()))
+                    .collect::<Vec<(usize, Row<'static>)>>(),
             )
         };
         let (source_cols, source_rows) = if let Some(sub) = &stmt.source_select {
@@ -1272,6 +1277,14 @@ impl Engine {
         // statement has a RETURNING clause.
         let want_returning = stmt.returning.is_some();
         let mut ret_records: Vec<MergeRetRecord> = Vec::new();
+        // v7.39 (round 146, PG17) — target rows matched by ANY source row,
+        // for the WHEN NOT MATCHED BY SOURCE pass below.
+        let has_by_source = stmt
+            .clauses
+            .iter()
+            .any(|c| matches!(c.matched, spg_sql::ast::MergeMatched::NotMatchedBySource));
+        let mut ever_matched: alloc::collections::BTreeSet<usize> =
+            alloc::collections::BTreeSet::new();
 
         for (src_idx, src_row) in source_rows.iter().enumerate() {
             if src_idx.is_multiple_of(256) {
@@ -1279,7 +1292,7 @@ impl Engine {
             }
             // Find every matched target index (per the ON predicate).
             let mut matched_targets: Vec<usize> = Vec::new();
-            for (t_idx, t_row) in target_rows_snapshot.iter().enumerate() {
+            for (t_idx, (_, t_row)) in target_rows_snapshot.iter().enumerate() {
                 let mut combined_vals = t_row.values.clone();
                 combined_vals.extend(src_row.values.iter().cloned());
                 let combined_row = Row::new(combined_vals);
@@ -1289,6 +1302,7 @@ impl Engine {
                 }
             }
             let is_matched = !matched_targets.is_empty();
+            ever_matched.extend(matched_targets.iter().copied());
             // Pick the first WHEN clause whose kind agrees with
             // `is_matched` and whose AND condition (if any) holds.
             // AND condition for MATCHED: evaluated against the
@@ -1298,6 +1312,8 @@ impl Engine {
                 let kind_ok = match c.matched {
                     spg_sql::ast::MergeMatched::Matched => is_matched,
                     spg_sql::ast::MergeMatched::NotMatched => !is_matched,
+                    // Fires from the target-side pass below, never per source row.
+                    spg_sql::ast::MergeMatched::NotMatchedBySource => false,
                 };
                 if !kind_ok {
                     return false;
@@ -1306,7 +1322,7 @@ impl Engine {
                     return true;
                 };
                 let row = if is_matched {
-                    let t = &target_rows_snapshot[matched_targets[0]];
+                    let t = &target_rows_snapshot[matched_targets[0]].1;
                     let mut vals = t.values.clone();
                     vals.extend(src_row.values.iter().cloned());
                     Row::new(vals)
@@ -1331,11 +1347,12 @@ impl Engine {
                 spg_sql::ast::MergeAction::DoNothing => {}
                 spg_sql::ast::MergeAction::Delete => {
                     for &t_idx in &matched_targets {
-                        if !delete_indices.contains(&t_idx) {
-                            delete_indices.push(t_idx);
+                        let pos = target_rows_snapshot[t_idx].0;
+                        if !delete_indices.contains(&pos) {
+                            delete_indices.push(pos);
                             affected += 1;
                             if want_returning {
-                                let t_row = &target_rows_snapshot[t_idx];
+                                let t_row = &target_rows_snapshot[t_idx].1;
                                 ret_records.push(MergeRetRecord {
                                     action: "DELETE",
                                     target_final: t_row.values.clone(),
@@ -1364,7 +1381,7 @@ impl Engine {
                         planned_sets.push((pos, expr));
                     }
                     for &t_idx in &matched_targets {
-                        let t_row = &target_rows_snapshot[t_idx];
+                        let (t_pos, t_row) = &target_rows_snapshot[t_idx];
                         let mut new_values = t_row.values.clone();
                         let mut combined_vals = t_row.values.clone();
                         combined_vals.extend(src_row.values.iter().cloned());
@@ -1388,7 +1405,7 @@ impl Engine {
                                 source: src_row.values.clone(),
                             });
                         }
-                        updates.push((t_idx, new_values));
+                        updates.push((*t_pos, new_values));
                         affected += 1;
                     }
                 }
@@ -1451,6 +1468,105 @@ impl Engine {
                     }
                     inserts.push(new_row_values);
                     affected += 1;
+                }
+            }
+        }
+        // v7.39 (round 146, PG17) — WHEN NOT MATCHED BY SOURCE: a second pass
+        // over the TARGET rows no source row matched. The source side does not
+        // exist for these rows, so a source-alias column reference anywhere in
+        // the clause is PG's "invalid reference" error, the eval row NULL-pads
+        // the source columns, and the RETURNING record carries a NULL source.
+        if has_by_source {
+            for c in &stmt.clauses {
+                if !matches!(c.matched, spg_sql::ast::MergeMatched::NotMatchedBySource) {
+                    continue;
+                }
+                let mut quals: Vec<&str> = Vec::new();
+                let mut all_q = true;
+                if let Some(cond) = &c.condition {
+                    crate::expr_analysis::collect_column_qualifiers(cond, &mut quals, &mut all_q);
+                }
+                if let spg_sql::ast::MergeAction::Update { assignments } = &c.action {
+                    for (_, e) in assignments {
+                        crate::expr_analysis::collect_column_qualifiers(e, &mut quals, &mut all_q);
+                    }
+                }
+                if quals.iter().any(|q| q.eq_ignore_ascii_case(&source_alias)) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "invalid reference to FROM-clause entry for table \"{source_alias}\" \
+                         DETAIL: There is an entry for table \"{source_alias}\", but it cannot \
+                         be referenced from this part of the query."
+                    )));
+                }
+            }
+            for (t_idx, (t_pos, t_row)) in target_rows_snapshot.iter().enumerate() {
+                if ever_matched.contains(&t_idx) {
+                    continue;
+                }
+                // Eval row: target values + NULL-padded source side.
+                let mut vals = t_row.values.clone();
+                vals.extend((0..source_arity).map(|_| Value::Null));
+                let eval_row = Row::new(vals);
+                let fired = stmt.clauses.iter().find(|c| {
+                    if !matches!(c.matched, spg_sql::ast::MergeMatched::NotMatchedBySource) {
+                        return false;
+                    }
+                    let Some(cond) = &c.condition else { return true };
+                    matches!(
+                        eval::eval_expr(cond, &eval_row, &combined_ctx),
+                        Ok(Value::Bool(true))
+                    )
+                });
+                let Some(clause) = fired else { continue };
+                let null_source: Vec<Value<'static>> =
+                    (0..source_arity).map(|_| Value::Null).collect();
+                match &clause.action {
+                    spg_sql::ast::MergeAction::DoNothing => {}
+                    spg_sql::ast::MergeAction::Delete => {
+                        if !delete_indices.contains(t_pos) {
+                            delete_indices.push(*t_pos);
+                            affected += 1;
+                            if want_returning {
+                                ret_records.push(MergeRetRecord {
+                                    action: "DELETE",
+                                    target_final: t_row.values.clone(),
+                                    old: Some(t_row.values.clone()),
+                                    new: None,
+                                    source: null_source,
+                                });
+                            }
+                        }
+                    }
+                    spg_sql::ast::MergeAction::Update { assignments } => {
+                        let mut new_values = t_row.values.clone();
+                        for (col, expr) in assignments {
+                            let pos = target_cols
+                                .iter()
+                                .position(|c| c.name == *col)
+                                .ok_or_else(|| {
+                                    EngineError::Eval(EvalError::ColumnNotFound {
+                                        name: col.clone(),
+                                    })
+                                })?;
+                            let raw = eval::eval_expr(expr, &eval_row, &combined_ctx)?;
+                            let coerced =
+                                coerce_value(raw, target_cols[pos].ty, &target_cols[pos].name, pos)?;
+                            new_values[pos] = coerced;
+                        }
+                        if want_returning {
+                            ret_records.push(MergeRetRecord {
+                                action: "UPDATE",
+                                target_final: new_values.clone(),
+                                old: Some(t_row.values.clone()),
+                                new: Some(new_values.clone()),
+                                source: null_source,
+                            });
+                        }
+                        updates.push((*t_pos, new_values));
+                        affected += 1;
+                    }
+                    // The parser has no INSERT production under BY SOURCE.
+                    spg_sql::ast::MergeAction::Insert { .. } => unreachable!(),
                 }
             }
         }
