@@ -105,12 +105,8 @@ fn unsupported_rule_forms_are_rejected_not_swallowed() {
         Ok(_) => panic!("expected error"),
     };
     assert!(m.contains("DO INSTEAD <command> rules are not yet implemented"), "{m}");
-    // Conditional DO INSTEAD NOTHING — still Phase 3 (DO ALSO WHERE is supported).
-    let m = match e.execute("CREATE RULE rw AS ON UPDATE TO u WHERE NEW.v < 0 DO INSTEAD NOTHING") {
-        Err(x) => format!("{x}"),
-        Ok(_) => panic!("expected error"),
-    };
-    assert!(m.contains("conditional (WHERE) DO INSTEAD NOTHING rules are not yet implemented"), "{m}");
+    // Conditional DO INSTEAD NOTHING is supported since round 141 (Phase 3) —
+    // covered in e2e_rule_conditional_instead_nothing_round141.
     // ON SELECT — use CREATE VIEW.
     let m = match e.execute("CREATE RULE rs AS ON SELECT TO u DO INSTEAD NOTHING") {
         Err(x) => format!("{x}"),
