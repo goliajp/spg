@@ -64,7 +64,8 @@ impl Engine {
                 spg_sql::ast::SelectItem::Expr { expr, .. } => {
                     self.resolve_sequence_calls_in_expr(expr)?;
                 }
-                spg_sql::ast::SelectItem::Wildcard => {}
+                spg_sql::ast::SelectItem::Wildcard
+                | spg_sql::ast::SelectItem::QualifiedWildcard(_) => {}
             }
         }
         if let Some(w) = &mut s.where_ {

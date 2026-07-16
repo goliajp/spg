@@ -76,7 +76,8 @@ fn view_redirect_to_simple_base(
     // wildcard. Aggregates / function calls / arithmetic = not simple.
     for item in &select.items {
         match item {
-            spg_sql::ast::SelectItem::Wildcard => {}
+            spg_sql::ast::SelectItem::Wildcard
+            | spg_sql::ast::SelectItem::QualifiedWildcard(_) => {}
             spg_sql::ast::SelectItem::Expr { expr, .. } => {
                 if !matches!(expr, spg_sql::ast::Expr::Column(_)) {
                     return None;
@@ -2622,8 +2623,15 @@ impl Engine {
         let mut items_rw = items.to_vec();
         let mut uses_old_new = false;
         for it in &mut items_rw {
-            if let SelectItem::Expr { expr, .. } = it {
-                uses_old_new |= rewrite_returning_old_new(expr);
+            match it {
+                SelectItem::Expr { expr, .. } => uses_old_new |= rewrite_returning_old_new(expr),
+                // v7.39 (round 128) — `OLD.*` / `NEW.*` also need the synthetic
+                // path (a plain `t.*` / `*` stays on the fast path).
+                SelectItem::QualifiedWildcard(q) => {
+                    let ql = q.to_ascii_lowercase();
+                    uses_old_new |= ql == "old" || ql == "new";
+                }
+                SelectItem::Wildcard => {}
             }
         }
         if !uses_old_new {
@@ -2667,9 +2675,16 @@ impl Engine {
             let mut vals: Vec<Value<'static>> = Vec::with_capacity(items_rw.len());
             for it in &items_rw {
                 match it {
-                    // A wildcard expands to the default (table) columns only,
-                    // never the synthetic OLD/NEW blocks.
+                    // A bare wildcard expands to the default (table) columns
+                    // only, never the synthetic OLD/NEW blocks.
                     SelectItem::Wildcard => vals.extend(default_rows[i].iter().cloned()),
+                    // `OLD.*` / `NEW.*` expand the pre-image / post-image block;
+                    // a table-qualified `t.*` expands the default columns.
+                    SelectItem::QualifiedWildcard(q) => match q.to_ascii_lowercase().as_str() {
+                        "old" => vals.extend(old_rows[i].iter().cloned()),
+                        "new" => vals.extend(new_rows[i].iter().cloned()),
+                        _ => vals.extend(default_rows[i].iter().cloned()),
+                    },
                     SelectItem::Expr { expr, .. } => {
                         vals.push(self.eval_expr_with_correlated(expr, &syn_row, &ctx, cancel, None)?);
                     }

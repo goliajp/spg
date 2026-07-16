@@ -9565,7 +9565,7 @@ impl Parser {
                         }
                         match &items[(idx - 1) as usize] {
                             SelectItem::Expr { expr, .. } => *k = expr.clone(),
-                            SelectItem::Wildcard => {
+                            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
                                 return Err(self.err(alloc::format!(
                                     "GROUP BY position {idx} references a wildcard item"
                                 )));
@@ -13004,6 +13004,20 @@ impl Parser {
         if matches!(self.peek(), Token::Star) {
             self.advance();
             return Ok(SelectItem::Wildcard);
+        }
+        // v7.39 (read01 round 128) — qualified wildcard `qualifier.*`. Intercept
+        // BEFORE `parse_expr`, which would treat `q.` as a qualified column and
+        // choke on the `*` ("expected identifier, got Star"). The lookahead is
+        // `<ident> . *` with nothing binding tighter.
+        if let Token::Ident(q) | Token::QuotedIdent(q) = self.peek().clone() {
+            if matches!(self.tokens.get(self.pos + 1), Some(Token::Dot))
+                && matches!(self.tokens.get(self.pos + 2), Some(Token::Star))
+            {
+                self.advance(); // qualifier
+                self.advance(); // .
+                self.advance(); // *
+                return Ok(SelectItem::QualifiedWildcard(q));
+            }
         }
         let expr = self.parse_expr(0)?;
         // v7.39 (read01 round 69) — `(f(args)).*`: expand the RECORD a

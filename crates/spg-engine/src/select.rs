@@ -286,6 +286,7 @@ impl Engine {
         for item in &stmt.items {
             let new_item = match item {
                 SelectItem::Wildcard => SelectItem::Wildcard,
+                SelectItem::QualifiedWildcard(q) => SelectItem::QualifiedWildcard(q.clone()),
                 SelectItem::Expr { expr, alias } => {
                     let mut e = expr.clone();
                     rewrite_window_to_columns(&mut e, &window_nodes);
@@ -1526,7 +1527,9 @@ impl Engine {
         let mut out_vals = Vec::new();
         for item in items {
             match item {
-                SelectItem::Wildcard => {
+                // In a single-table projection (AS OF SEGMENT / RETURNING) a
+                // qualified `t.*` covers exactly the same columns as a bare `*`.
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
                     out_vals.extend(row.values.iter().cloned());
                 }
                 SelectItem::Expr { expr, .. } => {
@@ -1551,7 +1554,9 @@ impl Engine {
         let mut out = Vec::new();
         for item in items {
             match item {
-                SelectItem::Wildcard => {
+                // `t.*` / `OLD.*` / `NEW.*` all mirror the full table schema in
+                // a single-table projection.
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
                     out.extend(schema_cols.iter().cloned());
                 }
                 SelectItem::Expr { expr, alias } => {
@@ -6001,6 +6006,44 @@ pub(crate) fn build_projection(
                         nullable: col.nullable,
                         user_enum_type: col.user_enum_type.clone(),
                     });
+                }
+            }
+            // v7.39 (round 128) — `q.*` expands to every column belonging to
+            // the qualifier `q`. Single-table schemas carry bare column names
+            // reachable via `table_alias`; a join's combined schema carries
+            // `alias.col` names, so a column belongs to `q` when its name has
+            // the `q.` prefix. PG labels the expanded columns by their bare
+            // name, so the `alias.` prefix is stripped from the output name.
+            SelectItem::QualifiedWildcard(q) => {
+                let prefix = alloc::format!("{q}.");
+                let single_table = !table_alias.is_empty() && q == table_alias;
+                let mut matched = 0usize;
+                for col in schema_cols {
+                    let belongs = col.name.starts_with(&prefix) || (single_table && !col.name.contains('.'));
+                    if !belongs {
+                        continue;
+                    }
+                    matched += 1;
+                    let output_name = col
+                        .name
+                        .strip_prefix(&prefix)
+                        .unwrap_or(&col.name)
+                        .to_string();
+                    out.push(ProjectedItem {
+                        expr: Expr::Column(ColumnName {
+                            qualifier: None,
+                            name: col.name.clone(),
+                        }),
+                        output_name,
+                        ty: col.ty,
+                        nullable: col.nullable,
+                        user_enum_type: col.user_enum_type.clone(),
+                    });
+                }
+                if matched == 0 {
+                    return Err(EngineError::Eval(EvalError::UnknownQualifier {
+                        qualifier: q.clone(),
+                    }));
                 }
             }
             SelectItem::Expr { expr, alias } => {

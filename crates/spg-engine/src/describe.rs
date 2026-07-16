@@ -63,7 +63,9 @@ fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> 
     let mut out: Vec<ColumnSchema> = Vec::with_capacity(items.len());
     for item in items {
         match item {
-            SelectItem::Wildcard => {
+            // A qualified wildcard describes the same as `*` here (single-table
+            // describe); a joined describe degrades to NoData elsewhere anyway.
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
                 for c in schema_cols {
                     out.push(c.clone());
                 }
