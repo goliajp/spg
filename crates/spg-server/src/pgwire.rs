@@ -922,7 +922,10 @@ fn handle_pg_simple_query(
                     encode_data_row(wbuf, &columns, row, &mat_arena, &wire_style, &wire_tz)?;
                 }
             }
-            send_command_complete_select_count(wbuf, n)?;
+            // v7.39 (round 131) — a RETURNING result keeps its DML tag
+            // (`INSERT 0 n` / `UPDATE n` / `DELETE n` / `MERGE n`), only a real
+            // SELECT/VALUES/SHOW tags `SELECT n`.
+            send_command_complete(wbuf, &command_tag_for_rows_sql(sql, n))?;
         }
         Ok(QueryResult::CommandOk { affected, .. }) => {
             // A COMMIT/END that ran in an aborted tx was rolled back — tag it so.
@@ -1142,7 +1145,8 @@ fn handle_pg_simple_query_one_into_wbuf(
             for row in &rows {
                 encode_data_row(wbuf, &columns, row, &mat_arena, &wire_style, &wire_tz)?;
             }
-            send_command_complete_select_count(wbuf, rows.len())?;
+            // v7.39 (round 131) — RETURNING keeps its DML tag; SELECT tags `SELECT n`.
+            send_command_complete(wbuf, &command_tag_for_rows_sql(sql, rows.len()))?;
         }
         Ok(QueryResult::CommandOk { affected, .. }) => {
             let tag = command_tag(sql, affected);
@@ -2337,6 +2341,10 @@ struct SuspendedRows {
     rows: Vec<Row<'static>>,
     cursor: usize,
     formats: Vec<i16>,
+    /// v7.39 (round 131) — the CommandComplete tag to emit once the portal is
+    /// exhausted, computed from the statement kind at suspend time (a RETURNING
+    /// DML keeps its own tag, not `SELECT n`).
+    tag: String,
 }
 
 /// Parse a null-terminated C string starting at `pos` of `body`.
@@ -2964,10 +2972,12 @@ fn handle_execute(
         if end < susp.rows.len() {
             send_msg(stream, b's', &[]).map_err(|e| proto(e.to_string()))?;
         } else {
-            let n = susp.rows.len();
+            // v7.39 (round 131) — reuse the verb-correct tag captured at suspend
+            // time (a RETURNING DML is tagged `INSERT 0 n` / `MERGE n`, not
+            // `SELECT n`).
+            let tag = susp.tag.clone();
             p.suspended = None;
-            send_command_complete(stream, &format!("SELECT {n}"))
-                .map_err(|e| proto(e.to_string()))?;
+            send_command_complete(stream, &tag).map_err(|e| proto(e.to_string()))?;
         }
         return Ok(());
     }
@@ -3121,6 +3131,7 @@ fn handle_execute(
                         .map_err(|e| proto(e.to_string()))?;
                 }
             }
+            let tag = command_tag_for_rows_ast(&stmt.ast, n);
             if emit_end < n {
                 send_msg(stream, b's', &[]).map_err(|e| proto(e.to_string()))?;
                 if let Some(p) = portals.get_mut(&portal_key) {
@@ -3129,11 +3140,11 @@ fn handle_execute(
                         rows,
                         cursor: emit_end,
                         formats,
+                        tag,
                     });
                 }
             } else {
-                send_command_complete(stream, &format!("SELECT {n}"))
-                    .map_err(|e| proto(e.to_string()))?;
+                send_command_complete(stream, &tag).map_err(|e| proto(e.to_string()))?;
             }
         }
         Ok(QueryResult::CommandOk { affected, .. }) => {
@@ -3164,6 +3175,47 @@ fn handle_execute(
 /// avoiding the simple-query path's text-based heuristics. PG's
 /// "tag" string is what shows up in psql as "INSERT 0 1" / "UPDATE
 /// 3" — most drivers parse it, so the shape matters.
+/// v7.39 (round 131) — command tag for a Rows result. A data-modifying
+/// statement with RETURNING keeps its own tag (`INSERT 0 n` / `UPDATE n` /
+/// `DELETE n` / `MERGE n`, `n` = returned rows); everything else that yields
+/// rows (SELECT / VALUES / SHOW / a read-only CTE) tags `SELECT n`. PG tags all
+/// four RETURNING forms this way — the pre-7.39 `SELECT n` was a divergence
+/// shared across INSERT/UPDATE/DELETE/MERGE RETURNING.
+fn command_tag_for_rows_ast(stmt: &spg_sql::ast::Statement, n: usize) -> String {
+    use spg_sql::ast::Statement;
+    match stmt {
+        Statement::Insert(_) => format!("INSERT 0 {n}"),
+        Statement::Update(_) => format!("UPDATE {n}"),
+        Statement::Delete(_) => format!("DELETE {n}"),
+        Statement::Merge(_) => format!("MERGE {n}"),
+        _ => format!("SELECT {n}"),
+    }
+}
+
+/// v7.39 (round 131) — `command_tag_for_rows_ast` for the simple-query path,
+/// which holds the SQL text rather than the AST. Only a Rows-yielding statement
+/// reaches this, so an `INSERT`/`UPDATE`/`DELETE`/`MERGE` first word implies a
+/// RETURNING clause. A data-modifying `WITH … RETURNING` is tagged by its
+/// top-level statement (recovered by parsing).
+fn command_tag_for_rows_sql(sql: &str, n: usize) -> String {
+    let first = sql
+        .trim_start()
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    match first.as_str() {
+        "INSERT" => format!("INSERT 0 {n}"),
+        "UPDATE" => format!("UPDATE {n}"),
+        "DELETE" => format!("DELETE {n}"),
+        "MERGE" => format!("MERGE {n}"),
+        "WITH" => spg_sql::parser::parse_statement(sql)
+            .map(|s| command_tag_for_rows_ast(&s, n))
+            .unwrap_or_else(|_| format!("SELECT {n}")),
+        _ => format!("SELECT {n}"),
+    }
+}
+
 fn command_tag_for_ast(stmt: &spg_sql::ast::Statement, affected: usize) -> String {
     use spg_sql::ast::Statement;
     match stmt {
