@@ -83,6 +83,23 @@ fn instead_of_on_table_rejected() {
 }
 
 #[test]
+fn statement_level_instead_of_rejected() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE base(id int, v int)").unwrap();
+    e.execute("CREATE VIEW jv AS SELECT id, v FROM base").unwrap();
+    e.execute("CREATE FUNCTION f() RETURNS trigger AS $x$ BEGIN RETURN NEW; END; $x$ LANGUAGE plpgsql")
+        .unwrap();
+    // PG: INSTEAD OF triggers must be FOR EACH ROW.
+    let m = match e
+        .execute("CREATE TRIGGER x INSTEAD OF INSERT ON jv FOR EACH STATEMENT EXECUTE FUNCTION f()")
+    {
+        Err(x) => format!("{x}"),
+        Ok(_) => panic!("expected error"),
+    };
+    assert!(m.contains("INSTEAD OF triggers must be FOR EACH ROW"), "{m}");
+}
+
+#[test]
 fn before_on_view_rejected() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE base(id int, v int)").unwrap();

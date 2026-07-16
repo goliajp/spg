@@ -3281,6 +3281,12 @@ impl Engine {
                     s.table
                 )));
             }
+            // v7.39 (round 137) — PG: INSTEAD OF triggers must be row-level.
+            if matches!(s.for_each, spg_sql::ast::TriggerForEach::Statement) {
+                return Err(EngineError::Unsupported(
+                    "INSTEAD OF triggers must be FOR EACH ROW".into(),
+                ));
+            }
         } else if target_is_view {
             return Err(EngineError::Unsupported(alloc::format!(
                 "\"{}\" is a view DETAIL: Views cannot have row-level BEFORE or AFTER triggers.",
