@@ -1727,22 +1727,19 @@ impl Parser {
             }
             Token::Begin => {
                 self.advance();
-                // v7.38 轴 4 — PG-standard `BEGIN [WORK|TRANSACTION]
-                // [ISOLATION LEVEL …] [READ ONLY|WRITE]
-                // [[NOT] DEFERRABLE]`. We accept the optional
-                // TRANSACTION/WORK noise word and parse-and-ignore
-                // trailing iso modes (parser doesn't reject the
-                // syntax; the iso level is only honoured when set
-                // via the dedicated `SET TRANSACTION` statement
-                // until the v7.38 isolation framework lands a
-                // per-TX level field on the engine).
+                // v7.38 轴 4 / v7.39 (read01 round 118, B3) — PG-standard
+                // `BEGIN [WORK|TRANSACTION] [ISOLATION LEVEL …] [READ ONLY|WRITE]
+                // [[NOT] DEFERRABLE]`. The optional WORK/TRANSACTION noise word
+                // is consumed first, then the trailing modes — including the
+                // case where `ISOLATION LEVEL …` follows BEGIN directly (no
+                // WORK/TRANSACTION). The explicit level, when present, rides the
+                // statement so `exec_begin` applies it for this transaction.
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("work") || s.eq_ignore_ascii_case("transaction"))
                 {
                     self.advance();
-                    // Parse-and-ignore any trailing modes.
-                    let _ = self.parse_isolation_level_clauses()?;
                 }
-                Ok(Statement::Begin)
+                let iso = self.parse_isolation_level_clauses()?;
+                Ok(Statement::Begin(iso))
             }
             // v7.38 轴 4 — PG-standard `START TRANSACTION …` synonym
             // for BEGIN. START is contextual in PG too; pattern-match
@@ -1758,8 +1755,8 @@ impl Parser {
                     )));
                 }
                 self.advance();
-                let _ = self.parse_isolation_level_clauses()?;
-                Ok(Statement::Begin)
+                let iso = self.parse_isolation_level_clauses()?;
+                Ok(Statement::Begin(iso))
             }
             Token::Commit => {
                 self.advance();
@@ -2660,7 +2657,7 @@ impl Parser {
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("transaction"))
                 {
                     self.advance(); // TRANSACTION
-                    let level = self.parse_isolation_level_clauses()?;
+                    let level = self.parse_isolation_level_clauses()?.unwrap_or_default();
                     return Ok(Statement::SetTransaction { isolation: level });
                 }
                 // v7.14.0 — MySQL `SET CHARACTER SET <charset>`
@@ -5705,7 +5702,12 @@ impl Parser {
     /// accepts space-separated for tolerance. READ ONLY / WRITE
     /// / DEFERRABLE are parsed-and-ignored (recorded for future
     /// surface but not behaviorally honoured today).
-    fn parse_isolation_level_clauses(&mut self) -> Result<IsolationLevel, ParseError> {
+    /// Parse the trailing `[ISOLATION LEVEL …] [READ ONLY|WRITE]
+    /// [[NOT] DEFERRABLE]` modes of BEGIN / START TRANSACTION / SET
+    /// TRANSACTION. Returns `Some(level)` only when an explicit `ISOLATION
+    /// LEVEL` clause was given, so a bare `BEGIN` / `BEGIN READ ONLY` keeps the
+    /// session default rather than forcing READ COMMITTED.
+    fn parse_isolation_level_clauses(&mut self) -> Result<Option<IsolationLevel>, ParseError> {
         let mut level = IsolationLevel::default();
         let mut have_level = false;
         loop {
@@ -5796,8 +5798,7 @@ impl Parser {
                 self.advance();
             }
         }
-        let _ = have_level;
-        Ok(level)
+        Ok(have_level.then_some(level))
     }
 
     fn parse_wait_after_keyword(&mut self) -> Result<Statement, ParseError> {
@@ -20763,11 +20764,23 @@ mod tests {
 
     #[test]
     fn begin_commit_rollback_parse_as_unit_variants() {
-        assert_eq!(parse("BEGIN"), Statement::Begin);
+        assert_eq!(parse("BEGIN"), Statement::Begin(None));
         assert_eq!(parse("COMMIT"), Statement::Commit);
         assert_eq!(parse("ROLLBACK"), Statement::Rollback);
         // Trailing semicolons accepted too.
-        assert_eq!(parse("BEGIN;"), Statement::Begin);
+        assert_eq!(parse("BEGIN;"), Statement::Begin(None));
+        // v7.39 (read01 round 118, B3) — an explicit ISOLATION LEVEL rides the
+        // statement (with or without the WORK/TRANSACTION noise word).
+        assert_eq!(
+            parse("BEGIN ISOLATION LEVEL REPEATABLE READ"),
+            Statement::Begin(Some(IsolationLevel::RepeatableRead))
+        );
+        assert_eq!(
+            parse("START TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+            Statement::Begin(Some(IsolationLevel::Serializable))
+        );
+        // A non-isolation mode keeps the session default (None).
+        assert_eq!(parse("BEGIN READ ONLY"), Statement::Begin(None));
     }
 
     // --- v1.2: pgvector distance ops + ::vector cast --------------------

@@ -294,9 +294,16 @@ impl Engine {
 
     #[must_use]
     pub fn session_param(&self, name: &str) -> Option<&str> {
-        self.session_params
-            .get(&name.to_ascii_lowercase())
-            .map(String::as_str)
+        let lower = name.to_ascii_lowercase();
+        // v7.39 (read01 round 118, B3) — `transaction_isolation` is not a plain
+        // session GUC in the params map; it tracks the live per-transaction
+        // level (`BEGIN ISOLATION LEVEL …`, reset at COMMIT/ROLLBACK). The wire
+        // `SHOW` handler reads this, so it must report the live value rather
+        // than a seeded "read committed".
+        if lower == "transaction_isolation" {
+            return Some(self.current_isolation_level.as_pg_str());
+        }
+        self.session_params.get(&lower).map(String::as_str)
     }
 
     /// v7.39 (read01 round 46) — raise a PG-style NOTICE for the statement

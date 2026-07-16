@@ -2037,14 +2037,11 @@ fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse
     // predated the engine's PG-compatible version() ("PostgreSQL 18.4
     // (SPG-compat)"), and its starts_with match hijacked compound
     // selects like `SELECT version(), now()`.
-    if ci_starts_with(b, b"show transaction_isolation")
-        || ci_starts_with(b, b"show transaction isolation level")
-    {
-        return Some(CannedResponse::single_text(
-            "transaction_isolation",
-            "read committed",
-        ));
-    }
+    // v7.39 (read01 round 118, B3) — `SHOW transaction_isolation` is NO LONGER
+    // canned here: a hard-coded "read committed" shadowed the engine handler,
+    // so `BEGIN ISOLATION LEVEL REPEATABLE READ; SHOW transaction_isolation`
+    // wrongly reported "read committed". Let it fall through to the engine,
+    // which reads the live `current_isolation_level`.
     if ci_starts_with(b, b"show search_path") || ci_eq(b, b"show search_path") {
         return Some(CannedResponse::single_text(
             "search_path",
@@ -3185,7 +3182,7 @@ fn command_tag_for_ast(stmt: &spg_sql::ast::Statement, affected: usize) -> Strin
         Statement::DropView { .. } => "DROP VIEW".to_string(),
         Statement::CreateSequence(_) => "CREATE SEQUENCE".to_string(),
         Statement::Truncate { .. } => "TRUNCATE TABLE".to_string(),
-        Statement::Begin => "BEGIN".to_string(),
+        Statement::Begin(_) => "BEGIN".to_string(),
         Statement::Commit => "COMMIT".to_string(),
         Statement::Rollback => "ROLLBACK".to_string(),
         Statement::Savepoint(_) => "SAVEPOINT".to_string(),
@@ -3260,6 +3257,13 @@ fn parse_show_statement(sql: &str) -> Option<String> {
     // PG spells the timezone GUC as two words in SHOW.
     if rest.trim().trim_end_matches(';').trim() == "time zone" {
         return Some("timezone".to_string());
+    }
+    // v7.39 (read01 round 118, B3) — `SHOW TRANSACTION ISOLATION LEVEL` is PG's
+    // multi-word spelling of the `transaction_isolation` GUC; normalise it so
+    // the live-value path (`session_param`) serves it, not the first word
+    // ("transaction").
+    if rest.trim().trim_end_matches(';').trim() == "transaction isolation level" {
+        return Some("transaction_isolation".to_string());
     }
     let name = rest.split_ascii_whitespace().next()?.to_string();
     Some(name)

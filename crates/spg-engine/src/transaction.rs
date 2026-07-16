@@ -45,7 +45,7 @@ pub(crate) fn classify_stmt_for_tx(stmt: &spg_sql::ast::Statement) -> TxStmtClas
         Some(targets)
     };
     match stmt {
-        S::Begin
+        S::Begin(_)
         | S::Commit
         | S::Rollback
         | S::Savepoint(_)
@@ -365,10 +365,21 @@ impl Engine {
         }
     }
 
-    pub(crate) fn exec_begin(&mut self) -> Result<QueryResult, EngineError> {
+    pub(crate) fn exec_begin(
+        &mut self,
+        isolation: Option<spg_sql::ast::IsolationLevel>,
+    ) -> Result<QueryResult, EngineError> {
         let tx_id = self.current_tx.ok_or(EngineError::NoActiveTransaction)?;
         if self.tx_catalogs.contains_key(&tx_id) {
             return Err(EngineError::TransactionAlreadyOpen);
+        }
+        // v7.39 (read01 round 118, B3) — `BEGIN ISOLATION LEVEL …` applies the
+        // level for THIS transaction (PG scopes it to the block, reverting to
+        // the default at COMMIT/ROLLBACK). Set it before the RR/SER snapshot is
+        // cached below so a fresh `BEGIN ISOLATION LEVEL REPEATABLE READ` freezes
+        // its view without a preceding `SET TRANSACTION`.
+        if let Some(level) = isolation {
+            self.current_isolation_level = level;
         }
         // v7.37.15 Phase C — allocate the tx's writer version FIRST
         // (before caching any snapshot). Concurrent readers that build
@@ -429,6 +440,8 @@ impl Engine {
                 self.release_tx_locks(v);
             }
             self.restore_all_local_gucs();
+            // v7.39 (read01 round 118, B3) — a failed COMMIT ends the tx too.
+            self.current_isolation_level = spg_sql::ast::IsolationLevel::ReadCommitted;
             // v7.39 (pg_stat knife A) — a failed COMMIT rolls back.
             self.xact_rollback
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -653,6 +666,9 @@ impl Engine {
         // v7.38 (read01 P3.19) — SET LOCAL settings expire at the
         // transaction boundary, reverting to the pre-transaction values.
         self.restore_all_local_gucs();
+        // v7.39 (read01 round 118, B3) — a transaction's isolation level is
+        // scoped to the block; PG reverts to the default at COMMIT/ROLLBACK.
+        self.current_isolation_level = spg_sql::ast::IsolationLevel::ReadCommitted;
         // v7.39 (pg_stat knife A) — one committed transaction.
         self.xact_commit
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -685,6 +701,9 @@ impl Engine {
         // savepoints discarded with the TxState
         // v7.38 (read01 P3.19) — SET LOCAL settings expire at ROLLBACK too.
         self.restore_all_local_gucs();
+        // v7.39 (read01 round 118, B3) — isolation reverts to the default at
+        // transaction end (see exec_commit).
+        self.current_isolation_level = spg_sql::ast::IsolationLevel::ReadCommitted;
         // v7.39 (pg_stat knife A) — one rolled-back transaction (a
         // COMMIT inside an aborted tx dispatches here too, like PG).
         self.xact_rollback

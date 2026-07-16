@@ -211,6 +211,7 @@ mod e2e_date_trunc_date_tstz_round114;
 mod e2e_corr_youngs_cramer_round115;
 mod e2e_pg_typeof_unknown_literal_round116;
 mod e2e_not_null_detail_round117;
+mod e2e_begin_isolation_round118;
 mod e2e_insert_then_update_round85;
 mod e2e_json_family_round76;
 mod e2e_named_args_round77;
