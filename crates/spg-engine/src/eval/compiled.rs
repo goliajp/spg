@@ -948,9 +948,9 @@ where
                     // pattern operators.
                     Value::Text(t) | Value::BpChar(t) => {
                         let m = if *case_insensitive {
-                            like_match_str(&t.to_lowercase(), pattern, 0)
+                            like_match_str(&t.to_lowercase(), pattern, 0)?
                         } else {
-                            like_match_str(t.as_ref(), pattern, 0)
+                            like_match_str(t.as_ref(), pattern, 0)?
                         };
                         stack.push(Value::Bool(if *negated { !m } else { m }));
                     }

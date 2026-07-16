@@ -297,6 +297,7 @@ mod e2e_lastval;
 mod e2e_lateral_correlated_srf;
 mod e2e_levenshtein;
 mod e2e_like_empty_escape;
+mod e2e_like_lazy_trailing_escape_round144;
 mod e2e_load_call_pg_dump_compat;
 mod e2e_logging_replication_probes;
 mod e2e_logical_decoding_probes;
