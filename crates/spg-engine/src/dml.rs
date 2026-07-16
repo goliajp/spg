@@ -668,6 +668,15 @@ impl Engine {
         } else {
             Vec::new()
         };
+        // v7.39 (read01 round 126) — pre-update snapshot for RETURNING OLD.*.
+        let old_for_returning: Vec<Vec<Value<'static>>> = if stmt.returning.is_some() {
+            applied_after_before
+                .iter()
+                .map(|(_pos, _new, old_row)| old_row.values.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let affected = applied_after_before.len();
         // Apply, then fire AFTER triggers per row. AFTER runs read-
         // only against the freshly-written row; v7.12.4-shape
@@ -736,9 +745,17 @@ impl Engine {
         if affected > 0 {
             self.maybe_autovacuum(&stmt.table);
         }
-        // v7.9.4 — RETURNING projection.
+        // v7.9.4 — RETURNING projection. v7.39 (round 126) — UPDATE exposes both
+        // OLD (pre-update) and NEW (post-update = the default row).
         if let Some(items) = &stmt.returning {
-            return self.build_returning_rows(&stmt.table, items, updated_for_returning);
+            let new_for_returning = updated_for_returning.clone();
+            return self.build_returning_rows_old_new(
+                &stmt.table,
+                items,
+                updated_for_returning,
+                Some(old_for_returning),
+                Some(new_for_returning),
+            );
         }
         Ok(QueryResult::CommandOk {
             affected,
@@ -1556,7 +1573,16 @@ impl Engine {
         // (matches PG semantics: DELETE RETURNING returns the row
         // as it was just before removal).
         if let Some(items) = &stmt.returning {
-            return self.build_returning_rows(&stmt.table, items, to_delete_rows);
+            // v7.39 (round 126) — DELETE: OLD = the deleted row (= default),
+            // NEW = NULL (the row no longer exists).
+            let old_for_returning = to_delete_rows.clone();
+            return self.build_returning_rows_old_new(
+                &stmt.table,
+                items,
+                to_delete_rows,
+                Some(old_for_returning),
+                None,
+            );
         }
         Ok(QueryResult::CommandOk {
             affected,
@@ -1925,7 +1951,18 @@ impl Engine {
         // up in the table after this statement (insert or
         // post-update on conflict).
         if let Some(items) = &stmt.returning {
-            return self.build_returning_rows(&stmt.table, items, returning_rows);
+            // v7.39 (round 126) — INSERT: NEW = the inserted row (= default),
+            // OLD = NULL (no prior row). Known limitation: for ON CONFLICT DO
+            // UPDATE, PG's OLD is the pre-update conflicting row; SPG reports
+            // NULL there for now (the pre-update snapshot is not threaded here).
+            let new_for_returning = returning_rows.clone();
+            return self.build_returning_rows_old_new(
+                &stmt.table,
+                items,
+                returning_rows,
+                None,
+                Some(new_for_returning),
+            );
         }
         // v6.2.1 — auto-analyze: track per-table modified-row
         // counter so the background sweep can decide when to
@@ -2552,23 +2589,152 @@ impl Engine {
         items: &[SelectItem],
         mutated_rows: Vec<Vec<Value<'static>>>,
     ) -> Result<QueryResult, EngineError> {
+        self.build_returning_rows_old_new(table_name, items, mutated_rows, None, None)
+    }
+
+    /// v7.39 (read01 round 126) — RETURNING with optional `OLD.col` / `NEW.col`
+    /// references (PG18). `default_rows` are the bare-column source (NEW for
+    /// INSERT/UPDATE, OLD for DELETE); `old_rows` / `new_rows` back the `OLD.`
+    /// / `NEW.` qualifiers (`None` = the row didn't exist on that side, so those
+    /// columns read NULL — OLD for INSERT, NEW for DELETE). When no OLD/NEW
+    /// reference is present this is the plain single-row projection.
+    fn build_returning_rows_old_new(
+        &self,
+        table_name: &str,
+        items: &[SelectItem],
+        default_rows: Vec<Vec<Value<'static>>>,
+        old_rows: Option<Vec<Vec<Value<'static>>>>,
+        new_rows: Option<Vec<Vec<Value<'static>>>>,
+    ) -> Result<QueryResult, EngineError> {
         let table = self.active_catalog().get(table_name).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound {
                 name: table_name.into(),
             })
         })?;
         let schema_cols = table.schema().columns.clone();
+        // Output columns come from the ORIGINAL items: `derive_output_columns`
+        // resolves `OLD.v` / `NEW.v` by name (ignoring the qualifier) to v's
+        // name + type, matching PG.
         let columns = self.derive_output_columns(items, &schema_cols, table_name);
-        let mut out_rows: Vec<Row<'static>> = Vec::with_capacity(mutated_rows.len());
-        for values in mutated_rows {
-            let row = Row::new(values);
-            let projected = self.project_row_simple(&row, items, &schema_cols, table_name)?;
-            out_rows.push(projected);
+
+        // Rewrite OLD./NEW. qualifiers to synthetic bare columns for value
+        // resolution. If none appear, take the plain fast path.
+        let mut items_rw = items.to_vec();
+        let mut uses_old_new = false;
+        for it in &mut items_rw {
+            if let SelectItem::Expr { expr, .. } = it {
+                uses_old_new |= rewrite_returning_old_new(expr);
+            }
+        }
+        if !uses_old_new {
+            let mut out_rows: Vec<Row<'static>> = Vec::with_capacity(default_rows.len());
+            for values in default_rows {
+                let row = Row::new(values);
+                let projected = self.project_row_simple(&row, items, &schema_cols, table_name)?;
+                out_rows.push(projected);
+            }
+            return Ok(QueryResult::Rows {
+                columns,
+                rows: out_rows,
+            });
+        }
+
+        // Synthetic schema: [table cols | __ret_old_<c> | __ret_new_<c>].
+        let arity = schema_cols.len();
+        let mut syn_schema = schema_cols.clone();
+        for c in &schema_cols {
+            let mut oc = c.clone();
+            oc.name = alloc::format!("__ret_old_{}", c.name);
+            syn_schema.push(oc);
+        }
+        for c in &schema_cols {
+            let mut nc = c.clone();
+            nc.name = alloc::format!("__ret_new_{}", c.name);
+            syn_schema.push(nc);
+        }
+        let n = default_rows.len();
+        let null_block = || alloc::vec![alloc::vec![Value::Null; arity]; n];
+        let old_rows = old_rows.unwrap_or_else(null_block);
+        let new_rows = new_rows.unwrap_or_else(null_block);
+        let ctx = self.ev_ctx(&syn_schema, Some(table_name));
+        let cancel = CancelToken::none();
+        let mut out_rows: Vec<Row<'static>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut syn_vals = default_rows[i].clone();
+            syn_vals.extend(old_rows[i].iter().cloned());
+            syn_vals.extend(new_rows[i].iter().cloned());
+            let syn_row = Row::new(syn_vals);
+            let mut vals: Vec<Value<'static>> = Vec::with_capacity(items_rw.len());
+            for it in &items_rw {
+                match it {
+                    // A wildcard expands to the default (table) columns only,
+                    // never the synthetic OLD/NEW blocks.
+                    SelectItem::Wildcard => vals.extend(default_rows[i].iter().cloned()),
+                    SelectItem::Expr { expr, .. } => {
+                        vals.push(self.eval_expr_with_correlated(expr, &syn_row, &ctx, cancel, None)?);
+                    }
+                }
+            }
+            out_rows.push(Row::new(vals));
         }
         Ok(QueryResult::Rows {
             columns,
             rows: out_rows,
         })
+    }
+}
+
+/// v7.39 (read01 round 126) — rewrite `OLD.col` / `NEW.col` references in a
+/// RETURNING expression to synthetic bare columns (`__ret_old_col` /
+/// `__ret_new_col`) so they resolve against the OLD/NEW blocks of the synthetic
+/// RETURNING row. Returns whether any OLD/NEW reference was found. Covers the
+/// expression shapes a RETURNING item realistically uses.
+fn rewrite_returning_old_new(expr: &mut Expr) -> bool {
+    match expr {
+        Expr::Column(c) => {
+            if let Some(q) = &c.qualifier {
+                let ql = q.to_ascii_lowercase();
+                if ql == "old" || ql == "new" {
+                    c.name = alloc::format!("__ret_{ql}_{}", c.name);
+                    c.qualifier = None;
+                    return true;
+                }
+            }
+            false
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            let a = rewrite_returning_old_new(lhs);
+            rewrite_returning_old_new(rhs) || a
+        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. } => rewrite_returning_old_new(expr),
+        Expr::FunctionCall { args, .. } => {
+            let mut found = false;
+            for a in args {
+                found |= rewrite_returning_old_new(a);
+            }
+            found
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            let mut found = false;
+            if let Some(o) = operand {
+                found |= rewrite_returning_old_new(o);
+            }
+            for (c, v) in branches {
+                found |= rewrite_returning_old_new(c);
+                found |= rewrite_returning_old_new(v);
+            }
+            if let Some(x) = else_branch {
+                found |= rewrite_returning_old_new(x);
+            }
+            found
+        }
+        _ => false,
     }
 }
 
