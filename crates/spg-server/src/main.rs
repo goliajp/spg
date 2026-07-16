@@ -2849,12 +2849,32 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
     let tmp = dir.join(format!(".spg-tmp-{pid}-{nanos}"));
-    fs::write(&tmp, data)?;
+    // v7.39 (round 147, durable-rename audit) — fsync the tmp bytes before
+    // the rename and the directory entry after it, so a power loss cannot
+    // leave the final name pointing at unflushed (empty / torn) content or
+    // lose the rename itself. Mirrors the embedded snapshot path and PG's
+    // durable_rename.
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
+    fsync_dir(dir);
     Ok(())
+}
+
+/// v7.39 (round 147, durable-rename audit) — fsync a directory so a
+/// just-renamed entry survives power loss. `std::fs::rename` makes the new
+/// name visible to this process but does not flush the directory inode.
+/// Best-effort (matches the embedded twin): an unreadable dir is not fatal.
+pub(crate) fn fsync_dir(dir: &Path) {
+    if let Ok(f) = File::open(dir) {
+        let _ = f.sync_all();
+    }
 }
 
 /// v5.3.1 — write a `CatalogManifest` for `db_path` alongside the
