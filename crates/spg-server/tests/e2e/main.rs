@@ -114,6 +114,7 @@ mod e2e_copy_query_to_stdout_round94;
 mod e2e_error_position_round95;
 mod e2e_not_null_detail_round117;
 mod e2e_show_isolation_round118;
+mod e2e_gen_series_tstz_round119;
 #[allow(clippy::doc_markdown, clippy::uninlined_format_args)]
 mod e2e_correlated;
 #[allow(clippy::doc_markdown, clippy::uninlined_format_args)]
