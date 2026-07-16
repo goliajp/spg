@@ -229,6 +229,7 @@ mod e2e_qualified_wildcard_round128;
 mod e2e_on_conflict_returning_old_round129;
 mod e2e_merge_returning_round130;
 mod e2e_cte_no_returning_ref_round150;
+mod e2e_any_all_with_merge_star_round153;
 mod e2e_nested_with_round151;
 mod e2e_dml_target_not_cte_round149;
 mod e2e_merge_by_source_round146;

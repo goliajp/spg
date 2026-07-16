@@ -1239,6 +1239,18 @@ impl Engine {
                     };
                     let mut out: alloc::vec::Vec<spg_sql::ast::SelectItem> =
                         alloc::vec::Vec::with_capacity(items.len());
+                    let push_view_cols =
+                        |out: &mut alloc::vec::Vec<spg_sql::ast::SelectItem>| {
+                            for (view_col, base_col) in &vr.col_map {
+                                out.push(spg_sql::ast::SelectItem::Expr {
+                                    expr: Expr::Column(spg_sql::ast::ColumnName {
+                                        qualifier: Some(alias.clone()),
+                                        name: base_col.clone(),
+                                    }),
+                                    alias: Some(view_col.clone()),
+                                });
+                            }
+                        };
                     for it in items.iter() {
                         match it {
                             spg_sql::ast::SelectItem::QualifiedWildcard(q)
@@ -1246,15 +1258,18 @@ impl Engine {
                             {
                                 // `v.*` → the view's columns: base value,
                                 // view-name output.
-                                for (view_col, base_col) in &vr.col_map {
-                                    out.push(spg_sql::ast::SelectItem::Expr {
-                                        expr: Expr::Column(spg_sql::ast::ColumnName {
-                                            qualifier: Some(alias.clone()),
-                                            name: base_col.clone(),
-                                        }),
-                                        alias: Some(view_col.clone()),
-                                    });
-                                }
+                                push_view_cols(&mut out);
+                            }
+                            // Bare `*` keeps PG's MERGE range-table order —
+                            // source columns first, then the view's columns
+                            // under their VIEW names.
+                            spg_sql::ast::SelectItem::Wildcard => {
+                                let src = s
+                                    .source_alias
+                                    .clone()
+                                    .unwrap_or_else(|| s.source.clone());
+                                out.push(spg_sql::ast::SelectItem::QualifiedWildcard(src));
+                                push_view_cols(&mut out);
                             }
                             spg_sql::ast::SelectItem::Expr { expr, alias: a } => {
                                 let out_alias = if a.is_some() {
