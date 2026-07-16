@@ -1126,11 +1126,10 @@ impl Engine {
         ),
         EngineError,
     > {
-        // v7.37.43-T4.4 — strip any nested CTEs from the body
-        // (already materialised in the outer pass) before
-        // dispatch to avoid infinite recursion.
-        let mut body = body.clone();
-        body.ctes = Vec::new();
+        // round 151 — a WITH-headed body keeps its own ctes; the body
+        // statement routes through its writable-CTE entry (outer CTEs
+        // are never copied into bodies, so no recursion risk).
+        let body = body.clone();
         let result = self.exec_insert(body)?;
         match result {
             QueryResult::Rows { columns, rows } => Ok((columns, rows)),
@@ -1161,8 +1160,7 @@ impl Engine {
         ),
         EngineError,
     > {
-        let mut body = body.clone();
-        body.ctes = Vec::new();
+        let body = body.clone();
         let result = self.exec_update_cancel(&body, cancel)?;
         match result {
             QueryResult::Rows { columns, rows } => Ok((columns, rows)),
@@ -1190,8 +1188,7 @@ impl Engine {
         ),
         EngineError,
     > {
-        let mut body = body.clone();
-        body.ctes = Vec::new();
+        let body = body.clone();
         let result = self.exec_delete_cancel(&body, cancel)?;
         match result {
             QueryResult::Rows { columns, rows } => Ok((columns, rows)),
@@ -1219,8 +1216,7 @@ impl Engine {
         ),
         EngineError,
     > {
-        let mut body = body.clone();
-        body.ctes = Vec::new();
+        let body = body.clone();
         let result = self.exec_merge_cancel(&body, cancel)?;
         match result {
             QueryResult::Rows { columns, rows } => Ok((columns, rows)),

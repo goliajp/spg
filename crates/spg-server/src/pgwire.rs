@@ -3822,6 +3822,13 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             // v7.39 (round 150) — referencing a no-RETURNING data-modifying
             // CTE (parse_relation.c addRangeTableEntryForCTE).
             || msg.contains("does not have a RETURNING clause")
+            // v7.39 (round 151) — the modifying-CTE placement rules: nested
+            // WITH (parse_cte.c) and view / matview bodies (view.c,
+            // analyze.c). Round 81 introduced the first message with the
+            // then-default 42000; PG uses 0A000 for all three.
+            || msg.contains("must be at the top level")
+            || msg.contains("must not contain data-modifying statements in WITH")
+            || msg.contains("must not use data-modifying statements in WITH")
         {
             "0A000"
         } else if msg.contains("duplicate key value violates unique constraint")
