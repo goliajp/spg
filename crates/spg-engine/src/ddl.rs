@@ -3359,19 +3359,19 @@ impl Engine {
                 "ON SELECT rules are not supported; use CREATE VIEW".into(),
             ));
         }
-        // Phase 1 supports only the unconditional `DO INSTEAD NOTHING` form. The
-        // conditional / DO ALSO / DO INSTEAD-command forms are refused up front
-        // (rather than stored and silently ignored) so the catalogue only ever
-        // holds rules the rewrite engine can honour.
-        if !s.instead || !s.commands.is_empty() {
+        // Supported so far: unconditional `DO INSTEAD NOTHING` (Phase 1) and
+        // `DO ALSO [WHERE …] <command(s)>` (Phase 2, per-row NEW/OLD). The
+        // remaining forms are refused up front — never stored and silently
+        // ignored — so the catalogue only holds rules the rewriter can honour.
+        if s.instead && !s.commands.is_empty() {
             return Err(EngineError::Unsupported(
-                "only DO INSTEAD NOTHING rules are supported so far; \
-                 DO ALSO / DO INSTEAD <command> is not yet implemented".into(),
+                "DO INSTEAD <command> rules are not yet implemented; \
+                 use DO INSTEAD NOTHING or DO ALSO <command>".into(),
             ));
         }
-        if s.when_condition.is_some() {
+        if s.instead && s.when_condition.is_some() {
             return Err(EngineError::Unsupported(
-                "conditional (WHERE) rules are not yet implemented".into(),
+                "conditional (WHERE) DO INSTEAD NOTHING rules are not yet implemented".into(),
             ));
         }
         // Rules may target base tables (and, in PG, views); require the relation

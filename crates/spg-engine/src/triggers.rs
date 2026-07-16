@@ -1799,7 +1799,7 @@ fn value_to_literal_expr(_columns: &[ColumnSchema], _pos: usize, v: Value) -> Ex
 /// embedded SQL statement's NEW.col / OLD.col / local-var refs as
 /// literals so the engine can re-execute it without holding the
 /// trigger context.
-fn substitute_trigger_context_in_statement(
+pub(crate) fn substitute_trigger_context_in_statement(
     stmt: &mut spg_sql::ast::Statement,
     new_row: Option<&Row<'static>>,
     old_row: Option<&Row<'static>>,
