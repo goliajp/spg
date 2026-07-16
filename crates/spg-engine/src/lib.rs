@@ -71,6 +71,7 @@ mod readonly;
 pub mod reorder;
 mod acl;
 mod rls;
+mod rules;
 pub mod scalarsq_streaming;
 mod select;
 pub mod selectivity;

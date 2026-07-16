@@ -3447,6 +3447,8 @@ pub struct Catalog {
     /// alphabetical-by-default with insertion-stable tie-break
     /// behaviour — we just keep insertion order for now).
     triggers: Vec<TriggerDef>,
+    /// v7.39 (round 139) — query-rewrite RULEs, flat like triggers.
+    rules: Vec<RuleDef>,
     /// v7.17.0 — catalogued SEQUENCE objects (Phase 1.1). Each
     /// `nextval(name)` reaches in here, atomically increments
     /// `last_value` / flips `is_called`, returns the new value.
@@ -3675,6 +3677,24 @@ pub struct TriggerDef {
     /// (re-parsed at fire time to filter row triggers). Empty = no WHEN.
     /// Persisted from FILE_VERSION 70; older catalogs read back empty.
     pub when_condition: String,
+}
+
+/// v7.39 (round 139) — a catalogued query-rewrite RULE. Stored flat like
+/// `TriggerDef`, keyed by `(name, table)`. Command / WHEN text is deparsed SQL
+/// re-parsed at rewrite time (the same round-trip trick as
+/// `TriggerDef.when_condition`). Persisted from FILE_VERSION 71.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleDef {
+    pub name: String,
+    pub table: String,
+    /// Event keyword, uppercased: `INSERT` / `UPDATE` / `DELETE` / `SELECT`.
+    pub event: String,
+    /// `true` = `DO INSTEAD`, `false` = `DO ALSO`.
+    pub instead: bool,
+    /// Deparsed `WHERE` predicate text; empty = unconditional.
+    pub when_condition: String,
+    /// Deparsed DO command statements; empty = `NOTHING`.
+    pub commands: Vec<String>,
 }
 
 /// v7.17.0 — catalogued SEQUENCE. PG semantics: a counter object
@@ -3973,6 +3993,7 @@ impl Catalog {
             cold_segments: Vec::new(),
             functions: BTreeMap::new(),
             triggers: Vec::new(),
+            rules: Vec::new(),
             sequences: BTreeMap::new(),
             schema_acl: Vec::new(),
             database_acl: Vec::new(),
@@ -4668,6 +4689,47 @@ impl Catalog {
         self.triggers
             .retain(|t| !(t.name == name && t.table == table));
         before != self.triggers.len()
+    }
+
+    /// v7.39 (round 139) — the catalogued query-rewrite RULEs.
+    pub fn rules(&self) -> &[RuleDef] {
+        &self.rules
+    }
+
+    /// v7.39 (round 139) — register a RULE. Its target relation (table or view)
+    /// must exist; `or_replace` overwrites a same-(name,table) rule.
+    pub fn create_rule(&mut self, def: RuleDef, or_replace: bool) -> Result<(), StorageError> {
+        if !self.by_name.contains_key(&def.table) && !self.views.contains_key(&def.table) {
+            return Err(StorageError::TableNotFound {
+                name: def.table.clone(),
+            });
+        }
+        let dup = self
+            .rules
+            .iter()
+            .position(|r| r.name == def.name && r.table == def.table);
+        match (dup, or_replace) {
+            (Some(_), false) => Err(StorageError::Corrupt(format!(
+                "rule {:?} for relation {:?} already exists",
+                def.name, def.table
+            ))),
+            (Some(i), true) => {
+                self.rules[i] = def;
+                Ok(())
+            }
+            (None, _) => {
+                self.rules.push(def);
+                Ok(())
+            }
+        }
+    }
+
+    /// v7.39 (round 139) — drop a RULE by `(name, table)`.
+    pub fn drop_rule(&mut self, name: &str, table: &str) -> bool {
+        let before = self.rules.len();
+        self.rules
+            .retain(|r| !(r.name == name && r.table == table));
+        before != self.rules.len()
     }
 
     pub fn create_table(&mut self, schema: TableSchema) -> Result<(), StorageError> {
@@ -6728,7 +6790,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 70;
+const FILE_VERSION: u8 = 71;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7716,6 +7778,26 @@ impl Catalog {
             }
             acl_out(&mut out, &f.acl);
         }
+        // v7.39 (round 139) — RULE catalog block (FILE_VERSION 71+), catalog-
+        // wide and written last (right before the CRC trailer) so every older
+        // reader stops cleanly before it. Layout: [u32 count] then per rule
+        // [str name][str table][str event][u8 instead][str when]
+        // [u16 cmd_count]([str cmd] × cmd_count).
+        write_u32(&mut out, u32::try_from(self.rules.len()).expect("≤ 4G rules"));
+        for r in &self.rules {
+            write_str(&mut out, &r.name);
+            write_str(&mut out, &r.table);
+            write_str(&mut out, &r.event);
+            out.push(u8::from(r.instead));
+            write_str(&mut out, &r.when_condition);
+            write_u16(
+                &mut out,
+                u16::try_from(r.commands.len()).expect("≤ 65k commands / rule"),
+            );
+            for c in &r.commands {
+                write_str(&mut out, c);
+            }
+        }
         // v7.38 (read01 P5.05) — CRC32C trailer over the whole image so a
         // corrupted snapshot is rejected on load. FILE_VERSION is >= the
         // trailer version, so this always runs for freshly-written images.
@@ -8067,6 +8149,31 @@ impl Catalog {
                         f.acl = acl;
                     }
                 }
+            }
+        }
+        // v7.39 (round 139) — RULE catalog block (FILE_VERSION 71+), read from
+        // the tail right before the CRC trailer. Pre-71 images stop before it.
+        if version >= 71 {
+            let rule_count = cur.read_u32()? as usize;
+            for _ in 0..rule_count {
+                let name = cur.read_str()?;
+                let table = cur.read_str()?;
+                let event = cur.read_str()?;
+                let instead = cur.read_u8()? != 0;
+                let when_condition = cur.read_str()?;
+                let cmd_count = cur.read_u16()? as usize;
+                let mut commands = Vec::with_capacity(cmd_count);
+                for _ in 0..cmd_count {
+                    commands.push(cur.read_str()?);
+                }
+                cat.rules.push(RuleDef {
+                    name,
+                    table,
+                    event,
+                    instead,
+                    when_condition,
+                    commands,
+                });
             }
         }
         // v7.38 (read01 P5.05) — v54+ images end with a CRC32C over every

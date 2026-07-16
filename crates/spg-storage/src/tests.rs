@@ -901,7 +901,13 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         // v7.39 (read01 round 61) — the v67 function-ACL list joins it (a u32
         // zero count). SEVENTH appendix.
         const EMPTY_NONTABLE_ACL_BLOCK: usize = 4 + 2 + 2 + 4;
-        full.truncate(full.len() - 4 - EMPTY_COMMENT_BLOCK - EMPTY_NONTABLE_ACL_BLOCK);
+        // v7.39 (read01 round 139) — the v71 RULE block rides the catalog-wide
+        // tail (between the non-table-ACL block and the CRC): an empty rule list
+        // is a single u32 zero count. EIGHTH appendix this test has caught.
+        const EMPTY_RULE_BLOCK: usize = 4;
+        full.truncate(
+            full.len() - 4 - EMPTY_COMMENT_BLOCK - EMPTY_NONTABLE_ACL_BLOCK - EMPTY_RULE_BLOCK,
+        );
         full
     };
 

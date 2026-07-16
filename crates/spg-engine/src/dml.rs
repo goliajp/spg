@@ -417,6 +417,25 @@ impl Engine {
             }
             None => stmt,
         };
+        // v7.39 (round 139) — unconditional DO INSTEAD NOTHING rule blocks the
+        // UPDATE. PG rejects a RETURNING on a suppressed statement; otherwise AND
+        // a constant FALSE into the WHERE so the normal path runs (the `UPDATE 0`
+        // tag stays byte-identical) but touches no rows.
+        let rule_blocked_upd;
+        let stmt = if self.rule_blocks_statement(&stmt.table, "UPDATE") {
+            if stmt.returning.is_some() {
+                return Err(crate::rules::rule_returning_error("UPDATE", &stmt.table));
+            }
+            let mut s = stmt.clone();
+            s.where_ = and_optional_predicates(
+                s.where_.take(),
+                Some(spg_sql::ast::Expr::Literal(spg_sql::ast::Literal::Bool(false))),
+            );
+            rule_blocked_upd = s;
+            &rule_blocked_upd
+        } else {
+            stmt
+        };
         // v7.39 (round 137, Phase 2) — INSTEAD OF UPDATE trigger on the target
         // view fires per matching view row instead of the auto-updatable
         // redirect. Takes precedence.
@@ -1590,6 +1609,26 @@ impl Engine {
             }
             None => stmt,
         };
+        // v7.39 (round 139) — unconditional DO INSTEAD NOTHING rule blocks the
+        // DELETE. PG rejects a RETURNING on a suppressed statement (the rows can
+        // never be produced); otherwise AND a constant FALSE into the WHERE so
+        // the normal path runs (the `DELETE 0` tag stays byte-identical) but
+        // matches no rows.
+        let rule_blocked_del;
+        let stmt = if self.rule_blocks_statement(&stmt.table, "DELETE") {
+            if stmt.returning.is_some() {
+                return Err(crate::rules::rule_returning_error("DELETE", &stmt.table));
+            }
+            let mut s = stmt.clone();
+            s.where_ = and_optional_predicates(
+                s.where_.take(),
+                Some(spg_sql::ast::Expr::Literal(spg_sql::ast::Literal::Bool(false))),
+            );
+            rule_blocked_del = s;
+            &rule_blocked_del
+        } else {
+            stmt
+        };
         // v7.39 (round 137, Phase 2) — INSTEAD OF DELETE trigger on the target
         // view fires per matching view row instead of the auto-updatable
         // redirect.
@@ -2502,6 +2541,17 @@ impl Engine {
             for cell in tuple.iter_mut() {
                 self.resolve_sequence_calls_in_expr(cell)?;
             }
+        }
+        // v7.39 (round 139) — unconditional DO INSTEAD NOTHING rule blocks the
+        // INSERT. PG rejects a RETURNING on a suppressed statement; otherwise
+        // drop every source row so the normal path inserts nothing (the
+        // `INSERT 0 0` tag stays byte-identical).
+        if self.rule_blocks_statement(&stmt.table, "INSERT") {
+            if stmt.returning.is_some() {
+                return Err(crate::rules::rule_returning_error("INSERT", &stmt.table));
+            }
+            stmt.rows.clear();
+            stmt.select_source = None;
         }
         // v7.39 (round 137) — INSTEAD OF INSERT trigger on the target view: fire
         // the trigger per row instead of the auto-updatable redirect. The

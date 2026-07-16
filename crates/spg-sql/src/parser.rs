@@ -1987,6 +1987,28 @@ impl Parser {
                             if_exists,
                         })
                     }
+                    // v7.39 (round 139) — DROP RULE [IF EXISTS] name ON table
+                    // [CASCADE|RESTRICT]. Mirrors DROP TRIGGER's shape.
+                    Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("rule") => {
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let name = self.expect_ident_like()?;
+                        if !matches!(self.peek(), Token::On) {
+                            return Err(self.err(alloc::format!(
+                                "expected ON <table> after DROP RULE {name:?}, got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.advance();
+                        let table = self.expect_ident_like()?;
+                        // Optional CASCADE / RESTRICT — accepted, no effect.
+                        self.consume_until_statement_boundary();
+                        Ok(Statement::DropRule {
+                            name,
+                            table,
+                            if_exists,
+                        })
+                    }
                     // v7.12.4 — DROP FUNCTION [IF EXISTS] name [(args)].
                     // v7.12.4 ignores any optional arg-list (signature-
                     // based overload disambiguation lands in v7.12.5+).
@@ -2225,7 +2247,6 @@ impl Parser {
                                 | "materialized"
                                 | "event"
                                 | "tablespace"
-                                | "rule"
                                 | "large"
                                 | "role"
                                 | "access"
@@ -2895,6 +2916,11 @@ impl Parser {
                 self.advance();
                 self.parse_create_trigger_after_keyword(false)
             }
+            // v7.39 (round 139) — CREATE RULE …
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("rule") => {
+                self.advance();
+                self.parse_create_rule_after_keyword(false)
+            }
             // v7.39 (read01 round 82) — CREATE CONSTRAINT TRIGGER. A constraint
             // trigger is a row-level AFTER trigger that additionally carries
             // DEFERRABLE / INITIALLY DEFERRED timing; the `parse_create_trigger`
@@ -3069,7 +3095,6 @@ impl Parser {
                         | "role"
                         | "operator"
                         | "cast"
-                        | "rule"
                         | "aggregate"
                         | "language"
                         | "collation"
@@ -4451,6 +4476,130 @@ impl Parser {
             update_columns,
             when_condition,
         }))
+    }
+
+    /// v7.39 (round 139) — `CREATE RULE <name> AS ON <event> TO <table>
+    /// [WHERE <cond>] DO [ALSO|INSTEAD] { NOTHING | cmd | ( cmd; … ) }`.
+    fn parse_create_rule_after_keyword(
+        &mut self,
+        or_replace: bool,
+    ) -> Result<Statement, ParseError> {
+        let name = self.expect_ident_like()?;
+        if !matches!(self.peek(), Token::As) {
+            return Err(self.err(alloc::format!(
+                "expected AS in CREATE RULE, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        if !matches!(self.peek(), Token::On) {
+            return Err(self.err(alloc::format!(
+                "expected ON in CREATE RULE, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let event = self.parse_rule_event()?;
+        if !matches!(self.peek(), Token::To)
+            && !matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("to"))
+        {
+            return Err(self.err(alloc::format!(
+                "expected TO after rule event, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let table = self.expect_ident_like()?;
+        // Optional `WHERE <cond>` (no parentheses, unlike a trigger WHEN).
+        let when_condition = if matches!(self.peek(), Token::Where) {
+            self.advance();
+            Some(self.parse_expr(0)?)
+        } else {
+            None
+        };
+        if !matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("do"))
+        {
+            return Err(self.err(alloc::format!(
+                "expected DO in CREATE RULE, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        // `DO [ ALSO | INSTEAD ]` — ALSO is the default when neither is written.
+        let instead = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("instead"))
+        {
+            self.advance();
+            true
+        } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("also")) {
+            self.advance();
+            false
+        } else {
+            false
+        };
+        // `NOTHING` | `( cmd; … )` | `cmd`.
+        let commands = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("nothing"))
+        {
+            self.advance();
+            Vec::new()
+        } else if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let mut cmds = Vec::new();
+            loop {
+                cmds.push(self.parse_one_statement()?);
+                if matches!(self.peek(), Token::Semicolon) {
+                    self.advance();
+                    if matches!(self.peek(), Token::RParen) {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ) closing the CREATE RULE command list, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            cmds
+        } else {
+            alloc::vec![self.parse_one_statement()?]
+        };
+        Ok(Statement::CreateRule(crate::ast::CreateRuleStatement {
+            name,
+            or_replace,
+            event,
+            table,
+            instead,
+            when_condition,
+            commands,
+        }))
+    }
+
+    /// v7.39 (round 139) — a rule event keyword → uppercase string.
+    fn parse_rule_event(&mut self) -> Result<alloc::string::String, ParseError> {
+        if matches!(self.peek(), Token::Insert) {
+            self.advance();
+            return Ok(alloc::string::String::from("INSERT"));
+        }
+        if matches!(self.peek(), Token::Select) {
+            self.advance();
+            return Ok(alloc::string::String::from("SELECT"));
+        }
+        match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("update") => {
+                self.advance();
+                Ok(alloc::string::String::from("UPDATE"))
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("delete") => {
+                self.advance();
+                Ok(alloc::string::String::from("DELETE"))
+            }
+            other => Err(self.err(alloc::format!(
+                "expected INSERT / UPDATE / DELETE / SELECT in CREATE RULE, got {other:?}"
+            ))),
+        }
     }
 
     /// v7.13.0 — parse one trigger event, then optionally consume
