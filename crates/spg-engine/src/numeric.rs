@@ -22,7 +22,7 @@ pub(crate) fn numeric_from_integer(
             "integer overflow scaling value for column `{col_name}` to scale {scale}"
         ))
     })?;
-    check_precision(scaled, precision, col_name)?;
+    check_precision(scaled, precision, scale, col_name)?;
     Ok(Value::Numeric {
         scaled,
         scale,
@@ -66,7 +66,7 @@ pub(crate) fn numeric_from_float(
         )));
     }
     let scaled = biased as i128;
-    check_precision(scaled, precision, col_name)?;
+    check_precision(scaled, precision, scale, col_name)?;
     Ok(Value::Numeric {
         scaled,
         scale,
@@ -215,7 +215,7 @@ pub(crate) fn numeric_rescale(
             (scaled - half) / drop
         }
     };
-    check_precision(new_scaled, precision, col_name)?;
+    check_precision(new_scaled, precision, dst_scale, col_name)?;
     Ok(Value::Numeric {
         scaled: new_scaled,
         scale: dst_scale,
@@ -253,14 +253,26 @@ pub(crate) const fn numeric_round_to_integer(scaled: i128, scale: u8) -> i128 {
 /// Verify a scaled NUMERIC value fits the column's declared precision.
 /// `precision == 0` is the "unconstrained" form (bare `NUMERIC`); we
 /// skip the check there.
-fn check_precision(scaled: i128, precision: u8, col_name: &str) -> Result<(), EngineError> {
+///
+/// v7.39 (round 193) — PG's exact wording + DETAIL (live-verified):
+/// `numeric field overflow` / `A field with precision P, scale S must
+/// round to an absolute value less than 10^(P-S).` The wire layer
+/// splits the " DETAIL: " tail into the ErrorResponse D field.
+fn check_precision(
+    scaled: i128,
+    precision: u8,
+    scale: u8,
+    _col_name: &str,
+) -> Result<(), EngineError> {
     if precision == 0 {
         return Ok(());
     }
     let limit = pow10_i128(precision);
     if scaled.unsigned_abs() >= limit.unsigned_abs() {
         return Err(EngineError::Unsupported(alloc::format!(
-            "NUMERIC value exceeds precision {precision} for column `{col_name}`"
+            "numeric field overflow DETAIL: A field with precision {precision}, \
+             scale {scale} must round to an absolute value less than 10^{}.",
+            precision.saturating_sub(scale)
         )));
     }
     Ok(())

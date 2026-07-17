@@ -3886,6 +3886,8 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("is out of range for type real")
             // v7.39 (read01 orderedsetaggs.c) — percentile fraction range.
             || msg.contains("is not between 0 and 1")
+            // r193 — numeric(p,s) precision overflow (PG's exact text).
+            || msg.contains("numeric field overflow")
         {
             "22003"
         // v7.39 (read01 int.c) — PG's 22012 DIVISION_BY_ZERO.
