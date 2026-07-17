@@ -170,6 +170,14 @@ impl Engine {
         if state.cached_snapshot.is_some() || state.rebase_poisoned || state.stmts_run == 0 {
             return Ok(());
         }
+        // r196 — epoch gate: nothing committed to the base since this
+        // tx's last rebase (or its BEGIN), so the rebase — whose
+        // write-set extraction full-scans every touched table — would
+        // fold nothing. This was ~200 µs per in-tx statement on a
+        // 20k-row table (the wire panel's tx_batch 2.8×).
+        if state.rebased_at_epoch == self.commit_epoch {
+            return Ok(());
+        }
         let Some(&v) = self.tx_writer_versions.get(&tx_id) else {
             return Ok(());
         };
@@ -307,6 +315,9 @@ impl Engine {
         }
         if let Some(st) = self.tx_catalogs.get_mut(&tx_id) {
             st.catalog = fresh;
+            // r196 — this rebase folded everything up to the current
+            // epoch; the next statement skips unless it moves again.
+            st.rebased_at_epoch = self.commit_epoch;
         }
         Ok(())
     }
@@ -418,6 +429,8 @@ impl Engine {
                 rebase_poisoned: false,
                 stmts_run: 0,
                 update_pairs: alloc::collections::BTreeMap::new(),
+                // r196 — the BEGIN-time clone IS the current base.
+                rebased_at_epoch: self.commit_epoch,
             },
         );
         Ok(QueryResult::CommandOk {
@@ -746,6 +759,9 @@ impl Engine {
         name: &str,
     ) -> Result<QueryResult, EngineError> {
         let tx_id = self.current_tx.ok_or(EngineError::NoActiveTransaction)?;
+        // r196 — captured before the &mut borrow below; forces the
+        // next statement's rebase after the shadow restore.
+        let epoch_for_invalidate = self.commit_epoch.wrapping_sub(1);
         let state = self
             .tx_catalogs
             .get_mut(&tx_id)
@@ -763,6 +779,10 @@ impl Engine {
         let snapshot = state.savepoints[pos].1.clone();
         state.savepoints.truncate(pos + 1);
         state.catalog = snapshot;
+        // r196 — the restored shadow predates any rebase that ran
+        // after the savepoint; invalidate the epoch gate so the next
+        // statement re-folds concurrent commits into it.
+        state.rebased_at_epoch = epoch_for_invalidate;
         // v7.38 (read01 P3.19) — undo any SET LOCAL made after this
         // savepoint (they roll back with the subtransaction), and drop the
         // marks nested under it.

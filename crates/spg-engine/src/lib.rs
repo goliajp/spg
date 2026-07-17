@@ -478,6 +478,18 @@ struct TxState {
     /// first statement sees the BEGIN-time clone unchanged (it IS the
     /// latest base at that point); rebasing starts from the second.
     stmts_run: u32,
+    /// v7.39 (round 196) — the engine `commit_epoch` this tx last
+    /// rebased against (BEGIN seeds it). When the epoch hasn't moved,
+    /// no other path committed to the base catalog, so the
+    /// per-statement RC rebase — whose write-set extraction is a full
+    /// scan of every touched table — is skipped entirely. The r196
+    /// wire panel traced tx_batch's 2.8× LOSS to exactly that scan
+    /// running before EVERY in-tx statement (~200 µs/stmt on a
+    /// 20k-row table, 58× the statement itself). Over-incrementing
+    /// the epoch is safe (an extra rebase is only slower, never
+    /// wrong); missing an increment would be a correctness bug, so
+    /// the epoch bumps on every completed non-tx statement.
+    rebased_at_epoch: u64,
     /// v7.37.17 (Phase E4 fix) — (old RowId → new RowId) pairs recorded
     /// by every in-place UPDATE this tx ran, keyed by table (RowIds are
     /// per-relation). An UPDATE's write-set is tombstone(old) +
@@ -833,6 +845,15 @@ pub struct Engine {
     /// on the shadow — the r192 probe's tx-wrapped inserts read 0).
     /// Keyed by table name; DROP TABLE clears, RENAME re-keys.
     pub(crate) table_write_stats: alloc::collections::BTreeMap<String, (u64, u64, u64)>,
+    /// v7.39 (round 196) — bumped after every completed statement that
+    /// ran OUTSIDE a transaction block (any autocommit statement, plus
+    /// COMMIT itself via the post-statement check). An open tx whose
+    /// `rebased_at_epoch` equals this value knows the committed base
+    /// hasn't moved and skips the per-statement RC rebase (whose
+    /// write-set extraction full-scans every touched table).
+    /// Over-approximation is deliberate: read-only statements bump it
+    /// too, which only costs an extra (correct) rebase.
+    pub(crate) commit_epoch: u64,
     /// v7.38 (read01 P3.19) — `SET LOCAL` undo log for the current
     /// transaction. Each entry is `(param_name, prior_value)` captured
     /// just before a `SET LOCAL` overwrote it (`None` = the param had no
@@ -1020,6 +1041,7 @@ impl Engine {
             tz_abbrev_fn: None,
             stat_tup_inserted: 0,
             table_write_stats: alloc::collections::BTreeMap::new(),
+            commit_epoch: 0,
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
             local_guc_saves: Vec::new(),
@@ -1365,6 +1387,7 @@ impl Engine {
             tz_abbrev_fn: None,
             stat_tup_inserted: 0,
             table_write_stats: alloc::collections::BTreeMap::new(),
+            commit_epoch: 0,
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
             local_guc_saves: Vec::new(),
@@ -1466,6 +1489,7 @@ impl Engine {
                     tz_abbrev_fn: None,
                     stat_tup_inserted: 0,
                     table_write_stats: alloc::collections::BTreeMap::new(),
+                    commit_epoch: 0,
                     stat_tup_updated: 0,
                     stat_tup_deleted: 0,
                     local_guc_saves: Vec::new(),
