@@ -940,7 +940,7 @@ pub enum AlterTableTarget {
     /// v7.38 (read01 U10) — `ALTER TABLE … ALTER COLUMN col DROP
     /// EXPRESSION` turns a stored generated column into a plain column
     /// (its generation expression is removed; existing values are kept).
-    AlterColumnDropExpression { column: String },
+    AlterColumnDropExpression { column: String, if_exists: bool },
     /// v7.38 (read01, T28) — `ALTER COLUMN col DROP IDENTITY [IF EXISTS]`:
     /// de-generate an identity column into a plain column.
     AlterColumnDropIdentity { column: String, if_exists: bool },
@@ -5094,8 +5094,13 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
         AlterTableTarget::AlterColumnDropNotNull { column } => {
             write!(f, "ALTER COLUMN {} DROP NOT NULL", quote_ident(column))
         }
-        AlterTableTarget::AlterColumnDropExpression { column } => {
-            write!(f, "ALTER COLUMN {} DROP EXPRESSION", quote_ident(column))
+        AlterTableTarget::AlterColumnDropExpression { column, if_exists } => {
+            write!(
+                f,
+                "ALTER COLUMN {} DROP EXPRESSION{}",
+                quote_ident(column),
+                if *if_exists { " IF EXISTS" } else { "" }
+            )
         }
         AlterTableTarget::AlterColumnDropIdentity { column, if_exists } => {
             write!(

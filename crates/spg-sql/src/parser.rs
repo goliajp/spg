@@ -8301,14 +8301,22 @@ impl Parser {
             // generated column into a plain column.
             Token::Ident(s) if s.eq_ignore_ascii_case("expression") => {
                 self.advance();
+                // v7.39 (round 187, U10) — IF EXISTS was consumed but
+                // dropped, so the engine still errored on a plain
+                // column; PG's semantics are NOTICE + skip.
+                let mut if_exists = false;
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if")) {
                     self.advance();
                     if matches!(self.peek(), Token::Ident(e) if e.eq_ignore_ascii_case("exists")) {
                         self.advance();
+                        if_exists = true;
                     }
                 }
                 Ok(alloc::vec![
-                    crate::ast::AlterTableTarget::AlterColumnDropExpression { column: col_name }
+                    crate::ast::AlterTableTarget::AlterColumnDropExpression {
+                        column: col_name,
+                        if_exists,
+                    }
                 ])
             }
             // v7.38 (read01, T28) — `DROP IDENTITY [IF EXISTS]` — de-generate an
