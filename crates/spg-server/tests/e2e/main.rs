@@ -251,6 +251,7 @@ mod e2e_mysqlwire_query;
     clippy::uninlined_format_args
 )]
 mod e2e_mysqlwire_ssl;
+mod e2e_mysqlwire_returning_durability_round181;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
