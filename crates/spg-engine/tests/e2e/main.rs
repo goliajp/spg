@@ -123,6 +123,7 @@ mod e2e_cte_shadows_table_round156;
 mod e2e_cte_shadows_table_write_round157;
 mod e2e_cte_shadows_view_round158;
 mod e2e_autovacuum_tick_round173;
+mod e2e_numeric_literal_junk_round184;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;

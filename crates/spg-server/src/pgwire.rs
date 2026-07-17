@@ -3778,6 +3778,11 @@ fn strip_error_class(msg: &str) -> String {
         "eval: type mismatch: ",
         "eval: ",
         "unsupported: ",
+        // r184 — lexer errors surface as "parse: lex: …"; the combined
+        // prefix must strip in one pass (the list strips only the first
+        // match) so psql shows PG's exact message shape. Longest first.
+        "parse: lex: ",
+        "lex: ",
         "parse: ",
         "storage: ",
     ];
@@ -5921,7 +5926,11 @@ fn send_error_pos(
                         return None;
                     }
                     r[digits..].strip_prefix(": ")
-                });
+                })
+                // r184 — lexer-level errors ride ParseError as
+                // "lex: <message>"; PG's wire message carries none of
+                // SPG's internal class vocabulary.
+                .or_else(|| m.strip_prefix("lex: "));
             match next {
                 Some(n) => m = n,
                 None => break,
