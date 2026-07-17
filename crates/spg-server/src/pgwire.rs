@@ -2465,6 +2465,12 @@ struct PreparedStmt {
     /// `None` when the prepared statement isn't a SELECT (or
     /// describe_prepared couldn't infer columns).
     row_desc_body: Option<Vec<u8>>,
+    /// v7.39 (round 198) — the Parse message's original SQL text.
+    /// For a parameterless statement the bind-final SQL IS this
+    /// text, so the commit-queue route reuses it instead of deep-
+    /// cloning the AST + re-rendering it (~2 ms on a 1000-row
+    /// VALUES batch — the r198 zoom's extended-vs-simple gap).
+    sql: String,
 }
 
 #[derive(Debug, Clone)]
@@ -2611,6 +2617,7 @@ fn handle_parse(
             placeholder_count,
             param_type_oids,
             row_desc_body,
+            sql,
         },
     );
     Ok(())
@@ -3270,10 +3277,17 @@ fn handle_execute(
         if matches!(role, Role::ReadOnly) {
             return Err(proto("permission denied: readonly role".to_string()));
         }
-        let mut bind_ast = stmt.ast.clone();
-        spg_engine::substitute_placeholders(&mut bind_ast, &portal.params)
-            .map_err(|e| proto(format!("Execute: bind-final render failed: {e}")))?;
-        let bind_sql = bind_ast.to_string();
+        // r198 — a parameterless statement's bind-final SQL IS the
+        // Parse text; skip the AST deep-clone + re-render (~2 ms on
+        // a 1000-row VALUES batch).
+        let bind_sql = if portal.params.is_empty() {
+            stmt.sql.clone()
+        } else {
+            let mut bind_ast = stmt.ast.clone();
+            spg_engine::substitute_placeholders(&mut bind_ast, &portal.params)
+                .map_err(|e| proto(format!("Execute: bind-final render failed: {e}")))?;
+            bind_ast.to_string()
+        };
         // Fresh per-task flag — same reasoning as the simple-query
         // route (no watchdog on this path; timeout sessions excluded).
         let queue_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
