@@ -28,6 +28,7 @@ mod e2e_application_name;
 )]
 mod e2e_async_commit;
 mod e2e_autovacuum_worker_round173;
+mod e2e_nowal_returning_round182;
 mod e2e_pgwire_group_commit_round178;
 mod e2e_session_sync_commit_round172;
 mod e2e_tx_single_fsync_round177;

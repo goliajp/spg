@@ -2598,6 +2598,17 @@ fn handle_query_op(
                     modified_catalog: true,
                     ..
                 }) => Some(engine.snapshot()),
+                // r182 — RETURNING DML answers Rows; in no-WAL
+                // snapshot mode it must capture a snapshot too or the
+                // acked write vanishes on restart (last member of the
+                // r178/r180 CommandOk-only gate family). In-tx
+                // statements skip: the base catalog only moves at
+                // COMMIT, and an uncommitted tx must not persist.
+                Ok(QueryResult::Rows { .. })
+                    if sql_is_dmlish(&sql) && !engine.in_transaction() =>
+                {
+                    Some(engine.snapshot())
+                }
                 _ => None,
             }
         } else {
