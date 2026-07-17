@@ -96,8 +96,8 @@ impl Engine {
             T::AlterColumnDropDefault { column } => self.alter_column_drop_default(tbl, column),
             T::AlterColumnSetNotNull { column } => self.alter_column_set_not_null(tbl, column),
             T::AlterColumnDropNotNull { column } => self.alter_column_drop_not_null(tbl, column),
-            T::AlterColumnDropExpression { column } => {
-                self.alter_column_drop_expression(tbl, column)
+            T::AlterColumnDropExpression { column, if_exists } => {
+                self.alter_column_drop_expression(tbl, column, if_exists)
             }
             T::AlterColumnDropIdentity { column, if_exists } => {
                 self.alter_column_drop_identity(tbl, column, if_exists)
@@ -196,6 +196,7 @@ impl Engine {
         &mut self,
         tbl: &str,
         column: String,
+        if_exists: bool,
     ) -> Result<(), EngineError> {
         let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
@@ -211,8 +212,18 @@ impl Engine {
                 ))
             })?;
         if table.schema().columns[pos].generated_stored_expr.is_none() {
+            // v7.39 (round 187, U10) — PG's wordings, live-verified
+            // 2026-07-18: plain form errors, IF EXISTS raises a NOTICE
+            // and skips (`ALTER TABLE` still succeeds — pg_dump
+            // restore scripts rely on that).
+            if if_exists {
+                self.notice(alloc::format!(
+                    "column \"{column}\" of relation \"{tbl}\" is not a generated column, skipping"
+                ));
+                return Ok(());
+            }
             return Err(EngineError::Unsupported(alloc::format!(
-                "ALTER COLUMN DROP EXPRESSION: column {column:?} is not a stored generated column"
+                "column \"{column}\" of relation \"{tbl}\" is not a generated column"
             )));
         }
         table.schema_mut().columns[pos].generated_stored_expr = None;
