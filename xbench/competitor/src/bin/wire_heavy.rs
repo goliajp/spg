@@ -121,7 +121,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // ---- SPGS over pgwire, fresh durable server per mode ----
+    //
+    // r195 (docker-fair) — `SPGS_URL` overrides the local spawn: point
+    // it at a containerized SPGS so both engines pay the same
+    // container-filesystem fsync cost. The caller owns the container's
+    // lifecycle and state reset between runs.
     let bench_spgs = |mode: &'static str| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+        if let Ok(url) = std::env::var("SPGS_URL") {
+            return bench_url(url, mode).map_err(Into::into);
+        }
         let dir = std::env::temp_dir().join(format!(
             "spgs-wire-heavy-{mode}-{}",
             std::time::SystemTime::now()
