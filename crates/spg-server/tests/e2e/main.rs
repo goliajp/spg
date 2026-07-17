@@ -139,6 +139,7 @@ mod e2e_explain;
     unused_variables
 )]
 mod e2e_flusher;
+mod e2e_dml_kill_restart_matrix_round179;
 mod e2e_flusher_idle_gate_round176;
 #[allow(
     clippy::cast_possible_truncation,
