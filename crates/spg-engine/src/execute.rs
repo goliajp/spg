@@ -974,11 +974,19 @@ impl Engine {
                 // since v4.10; UPDATE gained it for mailrs's
                 // `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP
                 // LOCKED)` claim pattern (embed round-12).
-                for (_, e) in &mut s.assignments {
-                    self.resolve_expr_subqueries(e, cancel)?;
-                }
-                if let Some(w) = &mut s.where_ {
-                    self.resolve_expr_subqueries(w, cancel)?;
+                // v7.39 (round 157) — NOT with a WITH clause: the CTE
+                // temps aren't installed yet here, so a subquery reading
+                // a CTE either failed ("relation does not exist") or —
+                // when a same-named real table existed — silently read
+                // THAT. exec_update_with_ctes resolves after the temps
+                // install instead.
+                if s.ctes.is_empty() {
+                    for (_, e) in &mut s.assignments {
+                        self.resolve_expr_subqueries(e, cancel)?;
+                    }
+                    if let Some(w) = &mut s.where_ {
+                        self.resolve_expr_subqueries(w, cancel)?;
+                    }
                 }
                 let r = self.exec_update_cancel(&s, cancel)?;
                 if let QueryResult::CommandOk { affected, .. } = &r {
@@ -990,7 +998,11 @@ impl Engine {
                 Ok(r)
             }
             Statement::Delete(mut s) => {
-                if let Some(w) = &mut s.where_ {
+                // v7.39 (round 157) — see the Update arm: with a WITH
+                // clause the resolve runs after the CTE temps install.
+                if s.ctes.is_empty()
+                    && let Some(w) = &mut s.where_
+                {
                     self.resolve_expr_subqueries(w, cancel)?;
                 }
                 let r = self.exec_delete_cancel(&s, cancel)?;

@@ -230,6 +230,7 @@ mod e2e_on_conflict_returning_old_round129;
 mod e2e_merge_returning_round130;
 mod e2e_cte_no_returning_ref_round150;
 mod e2e_cte_shadows_table_round156;
+mod e2e_cte_shadows_table_write_round157;
 mod e2e_any_all_with_merge_star_round153;
 mod e2e_computed_col_view_dml_round154;
 mod e2e_nested_over_computed_view_round155;

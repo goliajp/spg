@@ -4252,6 +4252,19 @@ impl Engine {
         let mut outer_reads = alloc::collections::BTreeSet::new();
         collect_insert_reads(&stmt, &mut outer_reads);
         Self::guard_no_returning_cte_refs(&cte_defs, &outer_reads)?;
+        let mut cte_defs = cte_defs;
+        // v7.39 (round 157) — CTE-shadows-table on the write path: rename
+        // the shadow temps and rewrite this statement's read references,
+        // then re-verify nothing still reads the old name.
+        let shadow_renames = self.resolve_cte_table_shadows(&mut cte_defs)?;
+        if !shadow_renames.is_empty() {
+            for (old, new) in &shadow_renames {
+                rename_rel_in_insert(&mut stmt, old, new);
+            }
+            let mut reads = alloc::collections::BTreeSet::new();
+            collect_insert_reads(&stmt, &mut reads);
+            shadow_rename_leak_check(&shadow_renames, &reads)?;
+        }
         self.run_with_cte_temps(&cte_defs, |engine| engine.exec_insert(stmt))
     }
 
@@ -4297,6 +4310,60 @@ impl Engine {
         Ok(())
     }
 
+    /// v7.39 (round 157) — write-path half of the CTE-shadows-table
+    /// support (the read path is round 156): rename each shadowing CTE's
+    /// temp to a fresh `__cte_shadow_*` name and rewrite the LATER
+    /// sibling bodies' read references (the shadowing CTE's own
+    /// non-recursive body keeps seeing the real table; a RECURSIVE
+    /// self-reference renames — it is the CTE). Returns the rename
+    /// pairs; the CALLER must rewrite the outer statement's reads and
+    /// re-verify with `shadow_rename_leak_check`. Later bodies are
+    /// verified here: a surviving old-name read means the rewriter
+    /// missed a spot — fail honestly rather than read the table.
+    fn resolve_cte_table_shadows(
+        &self,
+        ctes: &mut [spg_sql::ast::Cte],
+    ) -> Result<alloc::vec::Vec<(String, String)>, EngineError> {
+        let mut renames: alloc::vec::Vec<(usize, String, String)> = alloc::vec::Vec::new();
+        for i in 0..ctes.len() {
+            let old = ctes[i].name.clone();
+            if self.active_catalog().get(&old).is_none() {
+                continue;
+            }
+            let mut new = alloc::format!("__cte_shadow_{old}");
+            let mut k = 0usize;
+            while self.active_catalog().get(&new).is_some()
+                || ctes.iter().any(|c| c.name.eq_ignore_ascii_case(&new))
+            {
+                k += 1;
+                new = alloc::format!("__cte_shadow_{old}_{k}");
+            }
+            ctes[i].name = new.clone();
+            if ctes[i].recursive {
+                rename_rel_in_cte_body(&mut ctes[i].body, &old, &new);
+            }
+            for c in ctes.iter_mut().skip(i + 1) {
+                if c.name.eq_ignore_ascii_case(&old) {
+                    break;
+                }
+                rename_rel_in_cte_body(&mut c.body, &old, &new);
+            }
+            renames.push((i, old, new));
+        }
+        // Leak check over the later sibling bodies (the shadowing CTE's
+        // own body and EARLIER bodies legitimately read the real table).
+        for (i, old, _) in &renames {
+            for c in ctes.iter().skip(i + 1) {
+                let mut reads = alloc::collections::BTreeSet::new();
+                collect_cte_body_reads(&c.body, &mut reads);
+                if reads.iter().any(|t| t.eq_ignore_ascii_case(old)) {
+                    return Err(cte_shadow_err(old));
+                }
+            }
+        }
+        Ok(renames.into_iter().map(|(_, o, n)| (o, n)).collect())
+    }
+
     /// v7.39 (round 149) — PG resolves a DML target only against real
     /// relations, never a CTE of the same statement (`WITH c AS (…)
     /// DELETE FROM c` errors "relation \"c\" does not exist"). SPG's
@@ -4332,7 +4399,28 @@ impl Engine {
         let mut outer_reads = alloc::collections::BTreeSet::new();
         collect_update_reads(&stmt, &mut outer_reads);
         Self::guard_no_returning_cte_refs(&cte_defs, &outer_reads)?;
-        self.run_with_cte_temps(&cte_defs, |engine| engine.exec_update_cancel(&stmt, cancel))
+        let mut cte_defs = cte_defs;
+        let shadow_renames = self.resolve_cte_table_shadows(&mut cte_defs)?;
+        if !shadow_renames.is_empty() {
+            for (old, new) in &shadow_renames {
+                rename_rel_in_update(&mut stmt, old, new);
+            }
+            let mut reads = alloc::collections::BTreeSet::new();
+            collect_update_reads(&stmt, &mut reads);
+            shadow_rename_leak_check(&shadow_renames, &reads)?;
+        }
+        self.run_with_cte_temps(&cte_defs, |engine| {
+            // v7.39 (round 157) — uncorrelated-subquery materialisation
+            // for SET / WHERE runs HERE, after the CTE temps installed
+            // (the dispatch-level pass skips statements with a WITH).
+            for (_, e) in &mut stmt.assignments {
+                engine.resolve_expr_subqueries(e, cancel)?;
+            }
+            if let Some(w) = &mut stmt.where_ {
+                engine.resolve_expr_subqueries(w, cancel)?;
+            }
+            engine.exec_update_cancel(&stmt, cancel)
+        })
     }
 
     /// SELECT with a data-modifying CTE body (`WITH d AS (DELETE …
@@ -4348,6 +4436,16 @@ impl Engine {
         let mut outer_reads = alloc::collections::BTreeSet::new();
         crate::acl::collect_read_tables(&stmt, &mut outer_reads);
         Self::guard_no_returning_cte_refs(&cte_defs, &outer_reads)?;
+        let mut cte_defs = cte_defs;
+        let shadow_renames = self.resolve_cte_table_shadows(&mut cte_defs)?;
+        if !shadow_renames.is_empty() {
+            for (old, new) in &shadow_renames {
+                rename_rel_in_select(&mut stmt, old, new);
+            }
+            let mut reads = alloc::collections::BTreeSet::new();
+            crate::acl::collect_read_tables(&stmt, &mut reads);
+            shadow_rename_leak_check(&shadow_renames, &reads)?;
+        }
         self.run_with_cte_temps(&cte_defs, |engine| engine.exec_select_cancel(&stmt, cancel))
     }
 
@@ -4362,6 +4460,16 @@ impl Engine {
         let mut outer_reads = alloc::collections::BTreeSet::new();
         collect_merge_reads(&stmt, &mut outer_reads);
         Self::guard_no_returning_cte_refs(&cte_defs, &outer_reads)?;
+        let mut cte_defs = cte_defs;
+        let shadow_renames = self.resolve_cte_table_shadows(&mut cte_defs)?;
+        if !shadow_renames.is_empty() {
+            for (old, new) in &shadow_renames {
+                rename_rel_in_merge(&mut stmt, old, new);
+            }
+            let mut reads = alloc::collections::BTreeSet::new();
+            collect_merge_reads(&stmt, &mut reads);
+            shadow_rename_leak_check(&shadow_renames, &reads)?;
+        }
         self.run_with_cte_temps(&cte_defs, |engine| engine.exec_merge_cancel(&stmt, cancel))
     }
 
@@ -4376,7 +4484,24 @@ impl Engine {
         let mut outer_reads = alloc::collections::BTreeSet::new();
         collect_delete_reads(&stmt, &mut outer_reads);
         Self::guard_no_returning_cte_refs(&cte_defs, &outer_reads)?;
-        self.run_with_cte_temps(&cte_defs, |engine| engine.exec_delete_cancel(&stmt, cancel))
+        let mut cte_defs = cte_defs;
+        let shadow_renames = self.resolve_cte_table_shadows(&mut cte_defs)?;
+        if !shadow_renames.is_empty() {
+            for (old, new) in &shadow_renames {
+                rename_rel_in_delete(&mut stmt, old, new);
+            }
+            let mut reads = alloc::collections::BTreeSet::new();
+            collect_delete_reads(&stmt, &mut reads);
+            shadow_rename_leak_check(&shadow_renames, &reads)?;
+        }
+        self.run_with_cte_temps(&cte_defs, |engine| {
+            // v7.39 (round 157) — see exec_update_with_ctes: the
+            // uncorrelated-subquery pass runs after the temps install.
+            if let Some(w) = &mut stmt.where_ {
+                engine.resolve_expr_subqueries(w, cancel)?;
+            }
+            engine.exec_delete_cancel(&stmt, cancel)
+        })
     }
 
     /// v7.37.43-T4.4 — install each CTE alias as a temp table on
@@ -5592,4 +5717,245 @@ pub(crate) fn collect_merge_reads(
         push_items(&mut sub, r);
     }
     crate::acl::collect_read_tables(&sub, into);
+}
+
+// ---------------------------------------------------------------------------
+// v7.39 (round 157) — write-path CTE-shadows-table support. The write-path
+// CTE machinery installs temps on the LIVE catalog, so a CTE that shadows a
+// real table gets a renamed temp (`__cte_shadow_<name>`) and every READ
+// reference to the name is rewritten to it, honouring PG's WITH scoping:
+//   * the shadowing CTE's own (non-recursive) body still sees the real
+//     table (probe P2/P8); a RECURSIVE self-reference is the CTE (P6);
+//   * later sibling bodies and the outer statement see the CTE (P1-P5);
+//   * DML TARGETS are never renamed — they resolve to real relations only
+//     (probe P6/P7: `INSERT INTO t … FROM t` writes the table, reads the CTE);
+//   * a nested WITH that REDEFINES the name owns it for its whole subtree.
+// After rewriting, the caller re-collects the statement's read set: any
+// surviving reference to the old name means the rewriter missed a spot —
+// fail with the historic honest error instead of silently reading the table.
+
+/// The historic honest error for an unsupported shadow shape.
+fn cte_shadow_err(name: &str) -> EngineError {
+    EngineError::Unsupported(alloc::format!(
+        "CTE name {name:?} shadows an existing table; rename the CTE"
+    ))
+}
+
+/// v7.39 (round 157) — post-rewrite verification: any surviving read of a
+/// renamed (shadowed) name means the rewriter missed a reference — fail
+/// honestly instead of silently reading the real table.
+fn shadow_rename_leak_check(
+    renames: &[(String, String)],
+    reads: &alloc::collections::BTreeSet<String>,
+) -> Result<(), EngineError> {
+    for (old, _) in renames {
+        if reads.iter().any(|t| t.eq_ignore_ascii_case(old)) {
+            return Err(cte_shadow_err(old));
+        }
+    }
+    Ok(())
+}
+
+fn rename_rel_in_table_ref(t: &mut spg_sql::ast::TableRef, old: &str, new: &str) {
+    if let Some(sub) = &mut t.lateral_subquery {
+        rename_rel_in_select(sub, old, new);
+        return;
+    }
+    let synthetic = t.unnest_expr.is_some()
+        || t.generate_series_args.is_some()
+        || t.jsonb_each_text_arg.is_some()
+        || t.table_fn_call.is_some();
+    if synthetic {
+        // The synthetic sources aren't tables, but their argument
+        // expressions may carry subqueries that read the name.
+        if let Some(e) = &mut t.unnest_expr {
+            rename_rel_in_expr(e, old, new);
+        }
+        if let Some(args) = &mut t.generate_series_args {
+            for a in args {
+                rename_rel_in_expr(a, old, new);
+            }
+        }
+        if let Some((_, e)) = &mut t.jsonb_each_text_arg {
+            rename_rel_in_expr(e, old, new);
+        }
+        if let Some(b) = &mut t.table_fn_call {
+            for a in &mut b.1 {
+                rename_rel_in_expr(a, old, new);
+            }
+        }
+        return;
+    }
+    if t.name.eq_ignore_ascii_case(old) {
+        // Keep the user-visible alias: an unaliased table ref is referred
+        // to by its name in column qualifiers, which must keep resolving.
+        if t.alias.is_none() {
+            t.alias = Some(t.name.clone());
+        }
+        t.name = new.into();
+    }
+}
+
+fn rename_rel_in_expr(e: &mut spg_sql::ast::Expr, old: &str, new: &str) {
+    use spg_sql::ast::Expr;
+    crate::expr_analysis::rewrite_nodes_mut(e, &mut |n| match n {
+        Expr::ScalarSubquery(s) => {
+            rename_rel_in_select(s, old, new);
+            true
+        }
+        Expr::Exists { subquery, .. } => {
+            rename_rel_in_select(subquery, old, new);
+            true
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            rename_rel_in_expr(expr, old, new);
+            rename_rel_in_select(subquery, old, new);
+            true
+        }
+        Expr::RowInSubquery { row, subquery, .. }
+        | Expr::RowCmpSubquery { row, subquery, .. } => {
+            for x in row {
+                rename_rel_in_expr(x, old, new);
+            }
+            rename_rel_in_select(subquery, old, new);
+            true
+        }
+        _ => false,
+    });
+}
+
+pub(crate) fn rename_rel_in_select(s: &mut spg_sql::ast::SelectStatement, old: &str, new: &str) {
+    // A nested WITH redefining the name owns it for this whole subtree.
+    if s.ctes.iter().any(|c| c.name.eq_ignore_ascii_case(old)) {
+        return;
+    }
+    for cte in &mut s.ctes {
+        rename_rel_in_cte_body(&mut cte.body, old, new);
+    }
+    if let Some(from) = &mut s.from {
+        rename_rel_in_table_ref(&mut from.primary, old, new);
+        for j in &mut from.joins {
+            rename_rel_in_table_ref(&mut j.table, old, new);
+            if let Some(on) = &mut j.on {
+                rename_rel_in_expr(on, old, new);
+            }
+        }
+    }
+    for item in &mut s.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            rename_rel_in_expr(expr, old, new);
+        }
+    }
+    if let Some(w) = &mut s.where_ {
+        rename_rel_in_expr(w, old, new);
+    }
+    if let Some(h) = &mut s.having {
+        rename_rel_in_expr(h, old, new);
+    }
+    if let Some(gs) = &mut s.group_by {
+        for g in gs {
+            rename_rel_in_expr(g, old, new);
+        }
+    }
+    for o in &mut s.order_by {
+        rename_rel_in_expr(&mut o.expr, old, new);
+    }
+    for (_, peer) in &mut s.unions {
+        rename_rel_in_select(peer, old, new);
+    }
+}
+
+fn rename_rel_in_returning(items: &mut Option<Vec<SelectItem>>, old: &str, new: &str) {
+    if let Some(items) = items {
+        for it in items.iter_mut() {
+            if let SelectItem::Expr { expr, .. } = it {
+                rename_rel_in_expr(expr, old, new);
+            }
+        }
+    }
+}
+
+pub(crate) fn rename_rel_in_insert(i: &mut InsertStatement, old: &str, new: &str) {
+    // `i.table` is the DML target — never renamed.
+    for row in &mut i.rows {
+        for e in row {
+            rename_rel_in_expr(e, old, new);
+        }
+    }
+    if let Some(src) = &mut i.select_source {
+        rename_rel_in_select(src, old, new);
+    }
+    if let Some(oc) = &mut i.on_conflict
+        && let spg_sql::ast::OnConflictAction::Update {
+            assignments,
+            where_,
+        } = &mut oc.action
+    {
+        for (_, e) in assignments {
+            rename_rel_in_expr(e, old, new);
+        }
+        if let Some(w) = where_ {
+            rename_rel_in_expr(w, old, new);
+        }
+    }
+    rename_rel_in_returning(&mut i.returning, old, new);
+}
+
+pub(crate) fn rename_rel_in_update(u: &mut spg_sql::ast::UpdateStatement, old: &str, new: &str) {
+    for (_, e) in &mut u.assignments {
+        rename_rel_in_expr(e, old, new);
+    }
+    if let Some(w) = &mut u.where_ {
+        rename_rel_in_expr(w, old, new);
+    }
+    rename_rel_in_returning(&mut u.returning, old, new);
+}
+
+pub(crate) fn rename_rel_in_delete(d: &mut spg_sql::ast::DeleteStatement, old: &str, new: &str) {
+    if let Some(w) = &mut d.where_ {
+        rename_rel_in_expr(w, old, new);
+    }
+    rename_rel_in_returning(&mut d.returning, old, new);
+}
+
+pub(crate) fn rename_rel_in_merge(m: &mut spg_sql::ast::MergeStatement, old: &str, new: &str) {
+    // `m.target` is the DML target — never renamed. The SOURCE is a read.
+    if let Some(src) = &mut m.source_select {
+        rename_rel_in_select(src, old, new);
+    } else if m.source.eq_ignore_ascii_case(old) {
+        if m.source_alias.is_none() {
+            m.source_alias = Some(m.source.clone());
+        }
+        m.source = new.into();
+    }
+    rename_rel_in_expr(&mut m.on, old, new);
+    for cl in &mut m.clauses {
+        if let Some(c) = &mut cl.condition {
+            rename_rel_in_expr(c, old, new);
+        }
+        match &mut cl.action {
+            spg_sql::ast::MergeAction::Insert { values, .. } => {
+                for v in values {
+                    rename_rel_in_expr(v, old, new);
+                }
+            }
+            spg_sql::ast::MergeAction::Update { assignments } => {
+                for (_, e) in assignments {
+                    rename_rel_in_expr(e, old, new);
+                }
+            }
+            spg_sql::ast::MergeAction::Delete | spg_sql::ast::MergeAction::DoNothing => {}
+        }
+    }
+    rename_rel_in_returning(&mut m.returning, old, new);
+}
+
+pub(crate) fn rename_rel_in_cte_body(body: &mut spg_sql::ast::CteBody, old: &str, new: &str) {
+    match body {
+        spg_sql::ast::CteBody::Select(s) => rename_rel_in_select(s, old, new),
+        spg_sql::ast::CteBody::Insert(b) => rename_rel_in_insert(b, old, new),
+        spg_sql::ast::CteBody::Update(b) => rename_rel_in_update(b, old, new),
+        spg_sql::ast::CteBody::Delete(b) => rename_rel_in_delete(b, old, new),
+        spg_sql::ast::CteBody::Merge(b) => rename_rel_in_merge(b, old, new),
+    }
 }
