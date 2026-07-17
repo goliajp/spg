@@ -390,6 +390,31 @@ impl UserStore {
 
     /// The roles `member` directly belongs to.
     #[must_use]
+    /// v7.39 (round 202) — transitive role membership closure (PG
+    /// role inheritance: a policy `TO grp` applies to a member of
+    /// `grp`, including through nested grants). BFS with a seen-set
+    /// so a grant cycle can't loop. Names are stored as given; the
+    /// caller compares case-insensitively.
+    pub fn memberships_of_transitive(
+        &self,
+        member: &str,
+    ) -> alloc::collections::BTreeSet<String> {
+        let mut seen: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
+        let mut queue: alloc::vec::Vec<String> = alloc::vec![String::from(member)];
+        while let Some(cur) = queue.pop() {
+            for (m, roles) in &self.memberships {
+                if m.eq_ignore_ascii_case(&cur) {
+                    for r in roles {
+                        if seen.insert(r.to_ascii_lowercase()) {
+                            queue.push(r.clone());
+                        }
+                    }
+                }
+            }
+        }
+        seen
+    }
+
     pub fn memberships_of(&self, member: &str) -> Vec<String> {
         self.memberships
             .get(member)
