@@ -2531,7 +2531,12 @@ fn handle_query_op(
             // `sync_commit` was captured before this branch took the
             // engine write lock — `append_wal` can't read the session
             // GUC itself here without self-deadlocking on the RwLock.
-            append_wal(state, &sql, sync_commit)
+            //
+            // v7.39 (round 177) — PG fsyncs only at COMMIT points: a
+            // statement that leaves the engine inside an open
+            // transaction appends without fsync; the COMMIT (which
+            // leaves the tx) fsyncs once for the whole tx.
+            append_wal(state, &sql, sync_commit && !engine.in_transaction())
         } else {
             Ok(())
         };
