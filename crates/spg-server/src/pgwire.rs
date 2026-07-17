@@ -1899,7 +1899,22 @@ pub(crate) fn persist_wire_write(
         // v7.37.15 (r172) — session synchronous_commit decides whether
         // this append fsyncs. Safe to read here: no engine lock is
         // held (the no-WAL branch below takes engine.read() itself).
-        crate::append_wal(state, sql, crate::session_sync_commit(state))?;
+        //
+        // v7.39 (round 177) — PG only fsyncs at COMMIT points, never
+        // per-statement inside an open transaction. If the engine is
+        // still in a transaction AFTER this statement (BEGIN, or any
+        // statement between BEGIN and COMMIT), the bytes are appended
+        // without fsync; the COMMIT statement leaves the transaction
+        // → its append fsyncs once, covering the whole tx. Pre-r177
+        // an explicit tx over pgwire paid one fsync PER STATEMENT
+        // (tx_batch_100 = 100 fsyncs ≈ 740 ms, the panel's 24× worst
+        // cell). A crash before the COMMIT fsync loses only the
+        // uncommitted tx — exactly PG's contract.
+        let in_tx = state
+            .engine
+            .read()
+            .is_ok_and(|e| e.in_transaction());
+        crate::append_wal(state, sql, crate::session_sync_commit(state) && !in_tx)?;
     } else if *modified_catalog && state.db_path.is_some() {
         // No-WAL mode: capture the current committed state.
         let bytes = state
