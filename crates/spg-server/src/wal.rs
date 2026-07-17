@@ -212,10 +212,20 @@ pub(crate) fn wal_compression_min_bytes() -> usize {
 
 /// v6.6.1 — runtime check of `SPG_WAL_COMPRESSION` env. Default
 /// `lzss` (enabled). `none` disables. Cached after first call.
+/// v7.39 (round 194) — WAL compression is now OPT-IN
+/// (`SPG_WAL_COMPRESSION=lzss`), default off. The v6.6.1 default-on
+/// put the LZSS encoder on the commit critical path INSIDE the engine
+/// write lock: compressing a 24 KB multi-row VALUES statement costs
+/// ~12 ms (~2 MB/s), 6× the write itself — the r194 wire panel showed
+/// insert_batch_1k at 14.6 ms vs 2.3 ms with compression off, for a
+/// saving of ~14 KB whose write cost is microseconds. Disk-constrained
+/// operators can still opt in; an LZSS throughput attack is the
+/// recorded follow-up that could earn the default back.
 pub(crate) fn wal_compression_enabled() -> bool {
     static CHECKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CHECKED.get_or_init(|| {
-        std::env::var("SPG_WAL_COMPRESSION").map_or(true, |v| !v.eq_ignore_ascii_case("none"))
+        std::env::var("SPG_WAL_COMPRESSION")
+            .is_ok_and(|v| v.eq_ignore_ascii_case("lzss") || v.eq_ignore_ascii_case("on"))
     })
 }
 
@@ -657,10 +667,21 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
         };
 
         // ----- 2. Sequential prepare + in-memory commit -----
-        // Tracks every task that successfully made it through
-        // `BEGIN` + sql + `COMMIT` (mutation already merged into
-        // `engine.catalog`). Their WAL bytes are concatenated and
-        // batched-fsync'd in step 3.
+        //
+        // v7.39 (round 194) — each task executes as a plain
+        // AUTOCOMMIT statement (`execute_in` with no BEGIN/COMMIT).
+        // The v4.42 BEGIN + sql + COMMIT wrap routed every queued
+        // write through the engine's TRANSACTION path — shadow
+        // catalog + RC rebase — which replays the statement's whole
+        // write-set at commit: O(rows) on top of the write itself.
+        // Once r178 routed pgwire's bare DML through this queue, a
+        // 20k-row UPDATE went 25 ms → 1.9 s and a 1k-row
+        // delete+reinsert 2 ms → 205 ms on the wire panel. A single
+        // autocommit statement is already atomic (the engine rolls a
+        // failed statement back itself), so per-task isolation needs
+        // no tx wrap, and the fsync-failure path still restores the
+        // whole group via `pre_image` + `replace_catalog`. Their WAL
+        // bytes are concatenated and batched-fsync'd in step 3.
         let mut prepared: Vec<Prepared> = Vec::with_capacity(group.len());
         let pre_image: Option<spg_storage::Catalog> = {
             let Ok(mut engine) = state.engine.write() else {
@@ -681,14 +702,24 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
             // backing). Stays cheap regardless of row count.
             let pre = engine.catalog().clone();
             for task in group {
+                // r194 — encode the WAL frame BEFORE executing: it
+                // depends only on the SQL text, and an autocommit
+                // statement can't be rolled back individually after
+                // the fact (the old tx wrap could). A failed encode
+                // now skips the task with zero side effects.
+                let wal_bytes = match encode_wal_auto_commit_sql_metrics(&task.sql, &state.metrics)
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = task.ack.send(CommitResult {
+                            result: Err(spg_engine::EngineError::Unsupported(format!(                                "WAL encode failed: {e}"
+                            ))),
+                            wal_outcome: Err(e),
+                        });
+                        continue;
+                    }
+                };
                 let tx_id = engine.alloc_tx_id();
-                if let Err(e) = engine.execute_in("BEGIN", tx_id) {
-                    let _ = task.ack.send(CommitResult {
-                        result: Err(e),
-                        wal_outcome: Ok(()),
-                    });
-                    continue;
-                }
                 let exec_res = engine.execute_in_with_cancel(
                     &task.sql,
                     tx_id,
@@ -707,49 +738,20 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
                     || (matches!(exec_res, Ok(QueryResult::Rows { .. }))
                         && crate::sql_is_dmlish(&task.sql));
                 if !commit_worthy {
-                    // SQL itself failed (parse / type / cancel) —
-                    // discard the slot via ROLLBACK in isolation
-                    // so other tasks in the group aren't affected,
+                    // SQL itself failed (parse / type / cancel) — a
+                    // failed autocommit statement rolled itself back
+                    // in the engine (r194: no tx wrap to discard);
                     // ack with the engine error.
-                    let _ = engine.execute_in("ROLLBACK", tx_id);
+                    let _ = tx_id;
                     let _ = task.ack.send(CommitResult {
                         result: exec_res,
                         wal_outcome: Ok(()),
                     });
                     continue;
                 }
-                // Encode v3 framed bytes — v6.6.1 chooses between
-                // uncompressed (type=0x01) and LZSS-compressed
-                // (type=0x03) based on payload size + env knob.
-                // v6.6.3 — tracks bytes-in/bytes-out via Metrics.
-                let wal_bytes = match encode_wal_auto_commit_sql_metrics(&task.sql, &state.metrics)
-                {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = engine.execute_in("ROLLBACK", tx_id);
-                        let _ = task.ack.send(CommitResult {
-                            result: exec_res,
-                            wal_outcome: Err(e),
-                        });
-                        continue;
-                    }
-                };
-                // In-memory COMMIT — merges this slot's catalog
-                // over `engine.catalog`. The next task's BEGIN
-                // (above) clones *this* catalog, so per-task
-                // mutations accumulate. If COMMIT itself fails
-                // (rare — would mean `NoActiveTransaction`,
-                // which it isn't since we just BEGIN'd) ROLLBACK
-                // the slot and ack the task with the engine
-                // error; carry on with the rest of the group.
-                if let Err(e) = engine.execute_in("COMMIT", tx_id) {
-                    let _ = engine.execute_in("ROLLBACK", tx_id);
-                    let _ = task.ack.send(CommitResult {
-                        result: Err(e),
-                        wal_outcome: Ok(()),
-                    });
-                    continue;
-                }
+                // r194 — no COMMIT step: the autocommit statement
+                // already applied to `engine.catalog` (the next
+                // task sees its effects directly).
                 prepared.push(Prepared {
                     task,
                     result: exec_res.unwrap(),
