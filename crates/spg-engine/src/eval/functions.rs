@@ -13530,6 +13530,17 @@ fn apply_function_dispatch(
                 "application_name" => "",
                 "backslash_quote" => "safe_encoding",
                 _ => {
+                    // v7.39 (round 204) — a recognised GUC that was never
+                    // SET reads its boot default (PG: `current_setting
+                    // ('work_mem')` → '4MB' on a fresh session). The
+                    // canonical table is the same source pg_settings and
+                    // SHOW use, so all three agree.
+                    if let Some((_, boot, _, _, _)) = crate::system_catalog::canonical_gucs()
+                        .iter()
+                        .find(|(n, ..)| n.eq_ignore_ascii_case(&lname))
+                    {
+                        return Ok(Value::text::<String>((*boot).into()));
+                    }
                     if missing_ok {
                         return Ok(Value::Null);
                     }

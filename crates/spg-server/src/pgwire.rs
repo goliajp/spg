@@ -3628,6 +3628,15 @@ fn known_defaults() -> &'static [(&'static str, &'static str)] {
         ("default_text_search_config", "pg_catalog.english"),
         ("default_transaction_isolation", "read committed"),
         ("default_transaction_read_only", "off"),
+        // v7.39 (round 204) — memory GUC boot defaults so `SHOW
+        // work_mem` on a fresh connection reports PG's value, not
+        // empty. Canonicalized human units (the engine stores + SHOWs
+        // these forms; see session::render_pg_mem_kb).
+        ("work_mem", "4MB"),
+        ("maintenance_work_mem", "64MB"),
+        ("shared_buffers", "128MB"),
+        ("effective_cache_size", "4GB"),
+        ("client_min_messages", "notice"),
         ("intervalstyle", "postgres"),
         ("search_path", "\"$user\", public"),
         ("server_encoding", "UTF8"),
