@@ -35,6 +35,21 @@ use spg_sql::ast::{Expr, InsertStatement, SelectItem};
 /// when the view is not a simple single-table projection.
 /// v7.39 (round 136) — the resolved target of a write through an auto-updatable
 /// view, following nested views down to the real base table.
+/// v7.39 (round 154/155) — one computed (expression) column of a view,
+/// as seen from the OUTERMOST redirected view.
+#[derive(Clone)]
+struct ComputedViewCol {
+    /// The column's name at the outermost view.
+    name: String,
+    /// Defining expression, over base-table columns.
+    def: spg_sql::ast::Expr,
+    /// The view level that defines the expression and its column name
+    /// THERE — PG attributes a write-target error to that level even
+    /// when an outer view re-exports the column under another name.
+    origin_view: String,
+    origin_col: String,
+}
+
 struct ViewRedirect {
     /// The real base table (bottom of the view chain).
     base: String,
@@ -44,12 +59,14 @@ struct ViewRedirect {
     /// Outermost-view-col → base-table-col map (composed across the chain).
     /// Empty when no level renames columns (the common path).
     col_map: Vec<(String, String)>,
-    /// v7.39 (round 154) — computed (expression) view columns, leaf level
-    /// only: `(view_col, defining expr over base columns)`. PG keeps such
-    /// a view auto-updatable; a write TARGETING one of these errors
+    /// v7.39 (round 154) — computed (expression) view columns. PG keeps
+    /// such a view auto-updatable; a write TARGETING one of these errors
     /// ("View columns that are not columns of their base relation are
-    /// not updatable"), reads of them rewrite to the expression.
-    computed: Vec<(String, spg_sql::ast::Expr)>,
+    /// not updatable"), reads of them rewrite to the expression. Round
+    /// 155 — a plain projection over a computed view composes: the
+    /// re-exported column carries the DEFINING level's view and column
+    /// name (PG attributes the error there, through any outer rename).
+    computed: Vec<ComputedViewCol>,
     /// v7.39 (round 154) — the view's full output column order,
     /// `(view_col, Some(base_col) = simple | None = computed)`. Filled
     /// only when `computed` is non-empty (positional writes can no
@@ -174,9 +191,16 @@ fn view_redirect_to_simple_base(
             slot.0 = name;
         }
     }
-    let computed: Vec<(String, spg_sql::ast::Expr)> = out_cols
+    let computed: Vec<ComputedViewCol> = out_cols
         .iter()
-        .filter_map(|(n, _, e)| e.clone().map(|e| (n.clone(), e)))
+        .filter_map(|(n, _, e)| {
+            e.clone().map(|def| ComputedViewCol {
+                name: n.clone(),
+                def,
+                origin_view: String::from(view_name),
+                origin_col: n.clone(),
+            })
+        })
         .collect();
     // The simple view→base pairs. `col_map` stays EMPTY on the pure
     // identity shape (no rename, no alias, no computed column) so the
@@ -216,20 +240,19 @@ fn view_redirect_to_simple_base(
     // Nested: the primary is itself an auto-updatable view — recurse and compose.
     if catalog.views().contains_key(&primary_name) {
         let inner = view_redirect_to_simple_base(catalog, &primary_name)?;
-        // v7.39 (round 154) — computed columns are supported at the LEAF
-        // level only; composing a rename/projection over a computed
-        // inner view is a recorded residual (PG allows it) — bail to
-        // the honest error rather than mis-compose.
-        if !inner.computed.is_empty() {
-            return None;
-        }
+        let inner_map: alloc::collections::BTreeMap<String, String> =
+            inner.col_map.iter().cloned().collect();
+        let inner_cmap: alloc::collections::BTreeMap<String, spg_sql::ast::Expr> = inner
+            .computed
+            .iter()
+            .map(|c| (c.name.clone(), c.def.clone()))
+            .collect();
         // This view's WHERE references the inner view's columns; translate them
-        // to base columns through the inner map.
+        // to base columns through the inner map (round 155 — a computed
+        // reference substitutes its defining expression).
         let this_where_at_base = this_where.map(|mut w| {
-            if !inner.col_map.is_empty() {
-                let m: alloc::collections::BTreeMap<String, String> =
-                    inner.col_map.iter().cloned().collect();
-                rewrite_view_col_refs(&mut w, &m);
+            if !inner_map.is_empty() || !inner_cmap.is_empty() {
+                rewrite_view_refs_to_base(&mut w, &inner_map, &inner_cmap, None);
             }
             w
         });
@@ -238,12 +261,72 @@ fn view_redirect_to_simple_base(
             chain.push((alloc::string::String::from(view_name), w.clone(), this_check));
         }
         chain.extend(inner.check_chain);
+        if inner.computed.is_empty() {
+            return Some(ViewRedirect {
+                base: inner.base,
+                where_at_base: and_optional_predicates(this_where_at_base, inner.where_at_base),
+                col_map: compose_view_maps(&this_map, &inner.col_map),
+                computed: Vec::new(),
+                view_cols: Vec::new(),
+                check_chain: chain,
+            });
+        }
+        // v7.39 (round 155) — compose over a computed inner view: each of
+        // this level's (all-simple — expressions bailed above for a
+        // non-leaf) columns resolves through the inner's columns. A
+        // re-exported computed column keeps the inner's origin for error
+        // attribution. A wildcard pass-through (empty out_cols) adopts
+        // the inner's columns unchanged.
+        let inner_by_name: alloc::collections::BTreeMap<&str, &Option<String>> = inner
+            .view_cols
+            .iter()
+            .map(|(n, b)| (n.as_str(), b))
+            .collect();
+        let mut composed: Vec<(String, Option<String>, Option<&ComputedViewCol>)> = Vec::new();
+        if out_cols.is_empty() {
+            for (n, b) in &inner.view_cols {
+                let c = inner.computed.iter().find(|c| c.name == *n);
+                composed.push((n.clone(), b.clone(), c));
+            }
+        } else {
+            for (name, inner_ref, _) in &out_cols {
+                let inner_ref = inner_ref.as_ref()?; // all-simple here
+                if let Some(c) = inner.computed.iter().find(|c| c.name == *inner_ref) {
+                    composed.push((name.clone(), None, Some(c)));
+                } else if let Some(base) = inner_by_name.get(inner_ref.as_str()) {
+                    // A simple inner column — its base name is right there.
+                    composed.push((name.clone(), (*base).clone(), None));
+                } else {
+                    // Not a column of the inner view; bail to the honest error.
+                    return None;
+                }
+            }
+        }
+        let computed: Vec<ComputedViewCol> = composed
+            .iter()
+            .filter_map(|(n, _, c)| {
+                c.map(|c| ComputedViewCol {
+                    name: n.clone(),
+                    def: c.def.clone(),
+                    origin_view: c.origin_view.clone(),
+                    origin_col: c.origin_col.clone(),
+                })
+            })
+            .collect();
+        let col_map: Vec<(String, String)> = composed
+            .iter()
+            .filter_map(|(n, b, _)| b.clone().map(|b| (n.clone(), b)))
+            .collect();
+        let view_cols: Vec<(String, Option<String>)> = composed
+            .iter()
+            .map(|(n, b, _)| (n.clone(), b.clone()))
+            .collect();
         return Some(ViewRedirect {
             base: inner.base,
             where_at_base: and_optional_predicates(this_where_at_base, inner.where_at_base),
-            col_map: compose_view_maps(&this_map, &inner.col_map),
-            computed: Vec::new(),
-            view_cols: Vec::new(),
+            col_map,
+            computed,
+            view_cols,
             check_chain: chain,
         });
     }
@@ -386,12 +469,15 @@ fn rewrite_view_col_refs(
 fn rewrite_view_returning_items(
     items: &[spg_sql::ast::SelectItem],
     col_map: &[(String, String)],
-    computed: &[(String, spg_sql::ast::Expr)],
+    computed: &[ComputedViewCol],
     view_cols: &[(String, Option<String>)],
 ) -> Vec<spg_sql::ast::SelectItem> {
     use spg_sql::ast::{Expr, SelectItem};
     let map: alloc::collections::BTreeMap<String, String> = col_map.iter().cloned().collect();
-    let cmap: alloc::collections::BTreeMap<String, Expr> = computed.iter().cloned().collect();
+    let cmap: alloc::collections::BTreeMap<String, Expr> = computed
+                    .iter()
+                    .map(|c| (c.name.clone(), c.def.clone()))
+                    .collect();
     let mut out: Vec<SelectItem> = Vec::new();
     for it in items {
         match it {
@@ -647,8 +733,12 @@ impl Engine {
             // v7.39 (round 154) — a computed view column is never a write
             // target (PG: the view stays updatable, the column doesn't).
             for (target, _) in &stmt.assignments {
-                if computed.iter().any(|(n, _)| n == target) {
-                    return Err(view_computed_col_write_err("update", target, &stmt.table));
+                if let Some(cc) = computed.iter().find(|c| c.name == *target) {
+                    return Err(view_computed_col_write_err(
+                        "update",
+                        &cc.origin_col,
+                        &cc.origin_view,
+                    ));
                 }
             }
             // v7.39 (round 132/136) — WITH CHECK OPTION: the updated row must
@@ -680,7 +770,10 @@ impl Engine {
                 let map: alloc::collections::BTreeMap<String, String> =
                     col_map.iter().cloned().collect();
                 let cmap: alloc::collections::BTreeMap<String, Expr> =
-                    computed.iter().cloned().collect();
+                    computed
+                    .iter()
+                    .map(|c| (c.name.clone(), c.def.clone()))
+                    .collect();
                 for (target, e) in &mut rewritten.assignments {
                     if let Some(b) = map.get(target) {
                         *target = b.clone();
@@ -1361,7 +1454,10 @@ impl Engine {
                 let map: alloc::collections::BTreeMap<String, String> =
                     vr.col_map.iter().cloned().collect();
                 let cmap: alloc::collections::BTreeMap<String, Expr> =
-                    vr.computed.iter().cloned().collect();
+                    vr.computed
+                    .iter()
+                    .map(|c| (c.name.clone(), c.def.clone()))
+                    .collect();
                 let rw = |e: &mut Expr| {
                     rewrite_view_refs_to_base(e, &map, &cmap, Some(&alias));
                 };
@@ -1375,11 +1471,13 @@ impl Engine {
                             for (col, e) in assignments {
                                 // v7.39 (round 154) — a computed view column
                                 // is never a write target.
-                                if cmap.contains_key(col.as_str()) {
+                                if let Some(cc) =
+                                    vr.computed.iter().find(|cc| cc.name == *col)
+                                {
                                     return Err(view_computed_col_write_err(
                                         "merge into",
-                                        col,
-                                        &stmt.target,
+                                        &cc.origin_col,
+                                        &cc.origin_view,
                                     ));
                                 }
                                 if let Some(b) = map.get(col) {
@@ -1405,10 +1503,15 @@ impl Engine {
                                         match base_col {
                                             Some(b) => cols.push(b.clone()),
                                             None => {
+                                                let cc = vr
+                                                    .computed
+                                                    .iter()
+                                                    .find(|cc| cc.name == *view_col)
+                                                    .expect("computed slot has an entry");
                                                 return Err(view_computed_col_write_err(
                                                     "merge into",
-                                                    view_col,
-                                                    &stmt.target,
+                                                    &cc.origin_col,
+                                                    &cc.origin_view,
                                                 ));
                                             }
                                         }
@@ -1417,11 +1520,13 @@ impl Engine {
                                 }
                             } else {
                                 for c in columns.iter_mut() {
-                                    if cmap.contains_key(c.as_str()) {
+                                    if let Some(cc) =
+                                        vr.computed.iter().find(|cc| cc.name == *c)
+                                    {
                                         return Err(view_computed_col_write_err(
                                             "merge into",
-                                            c,
-                                            &stmt.target,
+                                            &cc.origin_col,
+                                            &cc.origin_view,
                                         ));
                                     }
                                     if let Some(b) = map.get(c) {
@@ -1457,7 +1562,7 @@ impl Engine {
                                         if c.qualifier.as_deref().is_some_and(|q| {
                                             q.eq_ignore_ascii_case("old")
                                                 || q.eq_ignore_ascii_case("new")
-                                        }) && vr.computed.iter().any(|(m, _)| *m == c.name)
+                                        }) && vr.computed.iter().any(|cc| cc.name == c.name)
                                         {
                                             bad = true;
                                         }
@@ -2308,7 +2413,10 @@ impl Engine {
                 let map: alloc::collections::BTreeMap<String, String> =
                     vr.col_map.iter().cloned().collect();
                 let cmap: alloc::collections::BTreeMap<String, Expr> =
-                    vr.computed.iter().cloned().collect();
+                    vr.computed
+                    .iter()
+                    .map(|c| (c.name.clone(), c.def.clone()))
+                    .collect();
                 if let Some(w) = &mut rewritten.where_ {
                     rewrite_view_refs_to_base(w, &map, &cmap, None);
                 }
@@ -3365,11 +3473,11 @@ impl Engine {
             // target (PG: "cannot insert into column … of view …").
             if let Some(cols) = &stmt.columns {
                 for c in cols {
-                    if computed.iter().any(|(n, _)| n == c) {
+                    if let Some(cc) = computed.iter().find(|cc| cc.name == *c) {
                         return Err(view_computed_col_write_err(
                             "insert into",
-                            c,
-                            &stmt.table,
+                            &cc.origin_col,
+                            &cc.origin_view,
                         ));
                     }
                 }
@@ -3417,10 +3525,14 @@ impl Engine {
                             match base_col {
                                 Some(b) => cols.push(b.clone()),
                                 None => {
+                                    let cc = computed
+                                        .iter()
+                                        .find(|cc| cc.name == *view_col)
+                                        .expect("computed slot has an entry");
                                     return Err(view_computed_col_write_err(
                                         "insert into",
-                                        view_col,
-                                        &stmt.table,
+                                        &cc.origin_col,
+                                        &cc.origin_view,
                                     ));
                                 }
                             }
