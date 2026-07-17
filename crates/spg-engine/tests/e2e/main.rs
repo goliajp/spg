@@ -127,6 +127,7 @@ mod e2e_numeric_literal_junk_round184;
 mod e2e_orderby_implicit_label_round185;
 mod e2e_recursive_paren_peer_round186;
 mod e2e_drop_expression_if_exists_round187;
+mod e2e_executor_3vl_verify_round188;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;
