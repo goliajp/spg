@@ -1116,6 +1116,23 @@ impl Engine {
     /// live` (absolute floor keeps small tables from thrashing). The
     /// vacuum floor (`vacuum_oldest_active`) is conservative, so rows a
     /// held snapshot can still see survive and re-trigger later.
+    /// v7.39 (round 169) — explicit per-table vacuum, the manual twin of
+    /// `maybe_autovacuum` without the thresholds (a customer's VACUUM
+    /// means "reclaim now"). Gate-off / unknown table are no-ops.
+    pub(crate) fn vacuum_one_table(&mut self, table_name: &str) {
+        if !self.mvcc_inplace {
+            return;
+        }
+        let oldest_active = self.vacuum_oldest_active();
+        let now_us = self.clock.map(|f| f());
+        if let Some(t) = self.active_catalog_mut().get_mut(table_name) {
+            let _report = t.vacuum(oldest_active, false);
+            if let Some(us) = now_us {
+                t.stamp_autovacuum(us);
+            }
+        }
+    }
+
     pub(crate) fn maybe_autovacuum(&mut self, table_name: &str) {
         // NB: `in_transaction()` (an EXPLICIT tx has a shadow catalog),
         // not `current_tx.is_some()` — the execute path pins an
