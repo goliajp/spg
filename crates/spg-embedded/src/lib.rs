@@ -3629,9 +3629,32 @@ impl Database {
         let _busy_guard = ActiveQueryGuard::new(&counter_arc);
         let (result, ticket) = self.execute_buffered(sql)?;
         if let Some(t) = ticket {
-            t.wait()?;
+            // v7.39 (round 171) — session `synchronous_commit = off`
+            // skips the durability wait (PG semantics); the ticket's
+            // record is already enqueued and flushes asynchronously.
+            if self.session_synchronous_commit() {
+                t.wait()?;
+            }
         }
         Ok(result)
+    }
+
+    /// v7.39 (round 171) — session-level `synchronous_commit` (the PG
+    /// GUC): `SET synchronous_commit = off` makes execute() return
+    /// after the WAL enqueue without waiting for the fsync — the
+    /// background flusher / next synchronous commit / clean shutdown
+    /// makes it durable (exactly PG's documented trade). `local` /
+    /// `remote_*` levels all wait locally, like PG on a standalone
+    /// primary. Falls back to the process-level
+    /// SPG_SYNCHRONOUS_COMMIT env default when the session never set
+    /// the GUC.
+    fn session_synchronous_commit(&self) -> bool {
+        match self.engine.session_param("synchronous_commit") {
+            Some(v) => !(v.eq_ignore_ascii_case("off")
+                || v == "0"
+                || v.eq_ignore_ascii_case("false")),
+            None => synchronous_commit_on(),
+        }
     }
 
     /// v7.37.14 (A2.2) — clone the shared active-query counter
@@ -4090,7 +4113,11 @@ impl Database {
     ) -> Result<QueryResult, EngineError> {
         let (result, ticket) = self.execute_prepared_buffered(stmt, params)?;
         if let Some(t) = ticket {
-            t.wait()?;
+            // v7.39 (round 171) — see execute(): session-level
+            // synchronous_commit gates the durability wait.
+            if self.session_synchronous_commit() {
+                t.wait()?;
+            }
         }
         Ok(result)
     }

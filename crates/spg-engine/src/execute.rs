@@ -92,6 +92,18 @@ fn validate_known_guc(name: &str, value: &str) -> Result<(), EngineError> {
                 return Err(bad());
             }
         }
+        // v7.39 (round 171) — synchronous_commit is a real, session-level
+        // durability control now (the embedded execute path gates its
+        // WAL-fsync wait on it); validate PG's value domain.
+        "synchronous_commit" => {
+            if !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "on" | "off" | "local" | "remote_write" | "remote_apply" | "true" | "false"
+                    | "0" | "1"
+            ) {
+                return Err(bad());
+            }
+        }
         // v7.39 (GUC knife 3) — the render GUCs reject invalid values
         // with PG's own texts (canonical-caps parameter names).
         "datestyle" => {
