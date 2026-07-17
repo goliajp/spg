@@ -4,6 +4,8 @@
 //! `smoke` ping-all binary all import `connection_strings` so any
 //! port change happens in exactly one place.
 
+pub mod write_shapes;
+
 /// `(label, sqlx_connection_string)` for each competitor DB. Matches
 /// the docker-compose.yml ports / credentials.
 #[must_use]
