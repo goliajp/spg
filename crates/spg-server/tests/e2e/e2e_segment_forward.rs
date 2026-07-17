@@ -101,6 +101,9 @@ fn spawn_follower(
         // Disable the freezer on the follower; the cold tier
         // arrives via forwarding, not via local freeze.
         .env("SPG_FREEZER_DISABLE", "1")
+        // v7.39 (round 159 forensics) — echo the follower's stderr into
+        // the test output so a failure shows its boot/replay decisions.
+        .echo_stderr(true)
         .spawn()
 }
 
@@ -419,7 +422,17 @@ fn resumable_after_disconnect() {
         // Snapshot the segment files post-bootstrap so the
         // post-resume comparison knows what the steady state is.
         drop(fs);
-        // Drop the guard kills the follower (graceful via Drop).
+        // v7.39 (round 159 forensics) — record the pre-kill disk state.
+        let p1_segs = list_segment_files(&segments_dir_of(&follower_db));
+        let p1_db = std::fs::metadata(&follower_db).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "[r159] phase-1 pre-kill: follower.db={p1_db}B, segments={:?}",
+            p1_segs
+                .iter()
+                .map(|q| q.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        );
+        // Drop the guard kills the follower (SIGKILL via Drop).
         std::mem::drop(follower_guard);
     }
 
@@ -460,7 +473,18 @@ fn resumable_after_disconnect() {
             if Instant::now() > deadline {
                 // v7.30 forensics — this stalled 4 times under the
                 // fully parallel suite and never solo; capture what
-                // the follower actually said before dying.
+                // the follower actually said before dying. v7.39
+                // (round 159) — also capture WHICH PKs are missing,
+                // the segment dir listing, and the manifest state,
+                // to separate a lost-WAL-tail from a lost-segment.
+                let mut missing: Vec<i64> = Vec::new();
+                for id in 0..N_ROWS {
+                    if count_rows(&mut fs, &format!("SELECT id FROM t WHERE id = {id}"))
+                        .is_none_or(|n| n == 0)
+                    {
+                        missing.push(id);
+                    }
+                }
                 drop(fs);
                 let _ = follower_guard.0.kill();
                 let mut err = String::new();
@@ -468,9 +492,38 @@ fn resumable_after_disconnect() {
                     use std::io::Read;
                     let _ = pipe.read_to_string(&mut err);
                 }
+                let seg_listing: Vec<String> = list_segment_files(&follower_dir)
+                    .iter()
+                    .map(|p| {
+                        let sz = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                        format!("{}({sz}B)", p.file_name().unwrap_or_default().to_string_lossy())
+                    })
+                    .collect();
+                let manifest_path = follower_dir
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join("manifest.v10");
+                let manifest_note = std::fs::metadata(&manifest_path)
+                    .map(|m| format!("{}B", m.len()))
+                    .unwrap_or_else(|_| "ABSENT".into());
+                let sidecar = follower_wal.parent().map(|p| {
+                    p.join(format!(
+                        "{}.applied_pos",
+                        follower_wal.file_name().unwrap_or_default().to_string_lossy()
+                    ))
+                });
+                let sidecar_note = sidecar
+                    .as_ref()
+                    .and_then(|p| std::fs::read(p).ok())
+                    .map(|b| format!("{:?}", b.as_slice().try_into().map(u64::from_le_bytes)))
+                    .unwrap_or_else(|| "ABSENT".into());
+                let wal_len = std::fs::metadata(&follower_wal).map(|m| m.len()).unwrap_or(0);
                 panic!(
                     "phase-2 follower never re-bootstrapped \
-                     (reachable={reachable:?} of {N_ROWS}); follower stderr:\n{err}"
+                     (reachable={reachable:?} of {N_ROWS}); missing PKs: {missing:?}; \
+                     segments: {seg_listing:?}; manifest: {manifest_note}; \
+                     sidecar applied_pos: {sidecar_note}; follower.wal: {wal_len}B; \
+                     follower stderr:\n{err}"
                 );
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -490,9 +543,22 @@ fn resumable_after_disconnect() {
         .iter()
         .filter_map(|p| std::fs::metadata(p).ok().and_then(|m| m.modified().ok()))
         .collect();
-    assert_eq!(
-        pre_mtimes, post_mtimes,
-        "segment file mtimes changed across reconnect — file was rewritten"
+    // v7.39 (round 159) — segment-level resume skips a segment only when
+    // the follower actually OWNS it (file on disk AND registered in the
+    // manifest). A kill can land between the last segment's file rename
+    // and its manifest refresh; that ORPHAN is deliberately re-received
+    // on reconnect (self-healing — without it the rows were permanently
+    // unreachable, the historic flake). So: at most ONE segment may have
+    // been rewritten, every other file must be untouched (resume works).
+    let rewritten = pre_mtimes
+        .iter()
+        .zip(post_mtimes.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(
+        pre_mtimes.len() == post_mtimes.len() && rewritten <= 1,
+        "resume rewrote {rewritten} segment files (only the one orphaned \
+         by the kill may be re-received): pre={pre_mtimes:?} post={post_mtimes:?}"
     );
     let master_segs = list_segment_files(&segments_dir_of(&master_db));
     for master_path in &master_segs {
