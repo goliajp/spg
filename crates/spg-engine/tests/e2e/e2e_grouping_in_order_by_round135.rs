@@ -66,11 +66,7 @@ fn c2_grouping_only_in_order_by() {
             &mut e,
             "SELECT a,sum(v) FROM gt GROUP BY ROLLUP(a) ORDER BY grouping(a) DESC, a"
         ),
-        vec![
-            vec!["NULL", "430"],
-            vec!["1", "300"],
-            vec!["2", "130"],
-        ]
+        vec![vec!["NULL", "430"], vec!["1", "300"], vec!["2", "130"],]
     );
 }
 

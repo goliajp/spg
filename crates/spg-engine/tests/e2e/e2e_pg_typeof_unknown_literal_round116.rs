@@ -22,7 +22,10 @@ fn bare_string_literal_is_unknown() {
     let mut e = Engine::new();
     assert_eq!(one(&mut e, "SELECT pg_typeof('x')::text"), "unknown");
     assert_eq!(one(&mut e, "SELECT pg_typeof('123')::text"), "unknown");
-    assert_eq!(one(&mut e, "SELECT pg_typeof('2024-01-01')::text"), "unknown");
+    assert_eq!(
+        one(&mut e, "SELECT pg_typeof('2024-01-01')::text"),
+        "unknown"
+    );
 }
 
 #[test]

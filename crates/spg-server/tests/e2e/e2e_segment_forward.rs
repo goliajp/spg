@@ -424,12 +424,18 @@ fn resumable_after_disconnect() {
         drop(fs);
         // v7.39 (round 159 forensics) — record the pre-kill disk state.
         let p1_segs = list_segment_files(&segments_dir_of(&follower_db));
-        let p1_db = std::fs::metadata(&follower_db).map(|m| m.len()).unwrap_or(0);
+        let p1_db = std::fs::metadata(&follower_db)
+            .map(|m| m.len())
+            .unwrap_or(0);
         eprintln!(
             "[r159] phase-1 pre-kill: follower.db={p1_db}B, segments={:?}",
             p1_segs
                 .iter()
-                .map(|q| q.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                .map(|q| q
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned())
                 .collect::<Vec<_>>()
         );
         // Drop the guard kills the follower (SIGKILL via Drop).
@@ -496,7 +502,10 @@ fn resumable_after_disconnect() {
                     .iter()
                     .map(|p| {
                         let sz = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-                        format!("{}({sz}B)", p.file_name().unwrap_or_default().to_string_lossy())
+                        format!(
+                            "{}({sz}B)",
+                            p.file_name().unwrap_or_default().to_string_lossy()
+                        )
                     })
                     .collect();
                 let manifest_path = follower_dir
@@ -509,7 +518,10 @@ fn resumable_after_disconnect() {
                 let sidecar = follower_wal.parent().map(|p| {
                     p.join(format!(
                         "{}.applied_pos",
-                        follower_wal.file_name().unwrap_or_default().to_string_lossy()
+                        follower_wal
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
                     ))
                 });
                 let sidecar_note = sidecar
@@ -517,7 +529,9 @@ fn resumable_after_disconnect() {
                     .and_then(|p| std::fs::read(p).ok())
                     .map(|b| format!("{:?}", b.as_slice().try_into().map(u64::from_le_bytes)))
                     .unwrap_or_else(|| "ABSENT".into());
-                let wal_len = std::fs::metadata(&follower_wal).map(|m| m.len()).unwrap_or(0);
+                let wal_len = std::fs::metadata(&follower_wal)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
                 panic!(
                     "phase-2 follower never re-bootstrapped \
                      (reachable={reachable:?} of {N_ROWS}); missing PKs: {missing:?}; \

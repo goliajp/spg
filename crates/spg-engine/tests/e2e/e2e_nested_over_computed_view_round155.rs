@@ -77,7 +77,8 @@ fn simple_columns_through_nested_levels() {
 fn reexported_computed_column_error_attribution() {
     let mut e = Engine::new();
     setup(&mut e);
-    e.execute("CREATE VIEW o2 AS SELECT id, dbl FROM cv").unwrap();
+    e.execute("CREATE VIEW o2 AS SELECT id, dbl FROM cv")
+        .unwrap();
     assert_eq!(affected(&mut e, "UPDATE o2 SET id = 9 WHERE id = 2"), 1);
     errs(
         &mut e,
@@ -135,7 +136,8 @@ fn merge_and_returning_through_nested() {
         pairs(&mut e, "SELECT id, v FROM t ORDER BY id"),
         vec![(1, 100), (2, 20), (3, 300)]
     );
-    e.execute("CREATE VIEW o2 AS SELECT id, dbl FROM cv").unwrap();
+    e.execute("CREATE VIEW o2 AS SELECT id, dbl FROM cv")
+        .unwrap();
     let r = e
         .execute("UPDATE o2 SET id = 5 WHERE id = 2 RETURNING id, dbl")
         .unwrap();

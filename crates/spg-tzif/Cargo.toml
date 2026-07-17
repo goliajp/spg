@@ -12,3 +12,6 @@ keywords     = ["spg", "timezone", "tzif", "iana", "zoneinfo"]
 [dependencies]
 
 [dev-dependencies]
+
+[lints]
+workspace = true

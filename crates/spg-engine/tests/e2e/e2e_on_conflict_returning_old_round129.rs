@@ -24,7 +24,8 @@ fn row1(e: &mut Engine, sql: &str) -> Vec<String> {
 }
 
 fn setup(e: &mut Engine) {
-    e.execute("CREATE TABLE oc(id int primary key, v int)").unwrap();
+    e.execute("CREATE TABLE oc(id int primary key, v int)")
+        .unwrap();
     e.execute("INSERT INTO oc VALUES(1,10)").unwrap();
 }
 
@@ -111,8 +112,14 @@ fn multi_row_mixed_insert_and_conflict() {
                 })
                 .collect();
             // Inserted row (id=5): OLD=NULL, NEW=50. Updated row (id=1): OLD=10, NEW=11.
-            assert!(got.contains(&vec!["5".into(), "NULL".into(), "50".into()]), "{got:?}");
-            assert!(got.contains(&vec!["1".into(), "10".into(), "11".into()]), "{got:?}");
+            assert!(
+                got.contains(&vec!["5".into(), "NULL".into(), "50".into()]),
+                "{got:?}"
+            );
+            assert!(
+                got.contains(&vec!["1".into(), "10".into(), "11".into()]),
+                "{got:?}"
+            );
         }
         other => panic!("{other:?}"),
     }

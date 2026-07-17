@@ -115,7 +115,8 @@ fn cube_and_grouping_sets_nested_keys() {
 fn grouping_sets_multi_column_order_by_resolves() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE gs (g INT, x INT)").unwrap();
-    e.execute("INSERT INTO gs VALUES (1,10),(1,20),(2,5)").unwrap();
+    e.execute("INSERT INTO gs VALUES (1,10),(1,20),(2,5)")
+        .unwrap();
     // The head set drops `x` (NULL literal); its column name must
     // survive so the ORDER BY on the union output still resolves.
     let QueryResult::Rows { rows, .. } = e

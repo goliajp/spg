@@ -25,7 +25,10 @@ fn errs(e: &mut Engine, sql: &str) {
         Err(x) => format!("{x}"),
         Ok(_) => panic!("expected error for {sql}"),
     };
-    assert!(m.contains("LIKE pattern must not end with escape character"), "{m}");
+    assert!(
+        m.contains("LIKE pattern must not end with escape character"),
+        "{m}"
+    );
 }
 
 #[test]

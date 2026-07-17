@@ -365,9 +365,8 @@ fn engine_with_query_byte_budget(engine: Engine) -> Engine {
     // now a two-way override (the no_std engine can't read it itself):
     // `SPG_MVCC_INPLACE=0|false|off` reverts to the legacy physical
     // delete, `=1|true|on` forces on (redundant but harmless).
-    match mvcc_inplace_env() {
-        Some(on) => engine.set_mvcc_inplace(on),
-        None => {}
+    if let Some(on) = mvcc_inplace_env() {
+        engine.set_mvcc_inplace(on)
     }
     // v7.37.16 — autovacuum defaults ON; `SPG_AUTOVACUUM=0|false|off`
     // disables (operators running their own vacuum cadence).
@@ -5822,6 +5821,28 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
     stmts
 }
 
+/// v7.39 (parallel-agg P0) — std-side ParallelRunner: scoped threads,
+/// one per shard. Shard counts are small (<= 8) and gated to scans of
+/// 100k+ rows, so per-query spawn cost (~10-20 us/thread) is noise
+/// next to the scan itself; a pooled runner is a P3 refinement.
+struct ScopedThreadRunner;
+
+impl spg_engine::ParallelRunner for ScopedThreadRunner {
+    fn run_shards(
+        &self,
+        n: usize,
+        f: &(dyn Fn(usize) -> Box<dyn core::any::Any + Send> + Sync),
+    ) -> Vec<Box<dyn core::any::Any + Send>> {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..n).map(|i| s.spawn(move || f(i))).collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("shard panicked"))
+                .collect()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7059,27 +7080,5 @@ mod tests {
             "ask3_apply_redo_batches_index_rebuilds: {N_DELETE_RECORDS} DELETE records \
              on {N_ROWS}-row × {N_INDICES}-index table replayed in {elapsed:?}"
         );
-    }
-}
-
-/// v7.39 (parallel-agg P0) — std-side ParallelRunner: scoped threads,
-/// one per shard. Shard counts are small (<= 8) and gated to scans of
-/// 100k+ rows, so per-query spawn cost (~10-20 us/thread) is noise
-/// next to the scan itself; a pooled runner is a P3 refinement.
-struct ScopedThreadRunner;
-
-impl spg_engine::ParallelRunner for ScopedThreadRunner {
-    fn run_shards(
-        &self,
-        n: usize,
-        f: &(dyn Fn(usize) -> Box<dyn core::any::Any + Send> + Sync),
-    ) -> Vec<Box<dyn core::any::Any + Send>> {
-        std::thread::scope(|s| {
-            let handles: Vec<_> = (0..n).map(|i| s.spawn(move || f(i))).collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("shard panicked"))
-                .collect()
-        })
     }
 }

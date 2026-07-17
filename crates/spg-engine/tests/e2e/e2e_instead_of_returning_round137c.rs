@@ -9,7 +9,8 @@ use spg_engine::{Engine, QueryResult};
 fn setup(e: &mut Engine) {
     e.execute("CREATE TABLE base(id int, v int)").unwrap();
     e.execute("INSERT INTO base VALUES(2,20)").unwrap();
-    e.execute("CREATE VIEW jv AS SELECT id, v, v*2 AS dbl FROM base").unwrap();
+    e.execute("CREATE VIEW jv AS SELECT id, v, v*2 AS dbl FROM base")
+        .unwrap();
     e.execute(
         "CREATE FUNCTION jv_ins() RETURNS trigger AS $x$ BEGIN \
          INSERT INTO base(id,v) VALUES(NEW.id,NEW.v); RETURN NEW; END; $x$ LANGUAGE plpgsql",
@@ -60,7 +61,10 @@ fn insert_returning_projects_new() {
     setup(&mut e);
     // NEW = (id=1, v=10, dbl=NULL) — dbl is not computed for the trigger's NEW.
     assert_eq!(
-        row1(&mut e, "INSERT INTO jv(id,v) VALUES(1,10) RETURNING id, v, dbl"),
+        row1(
+            &mut e,
+            "INSERT INTO jv(id,v) VALUES(1,10) RETURNING id, v, dbl"
+        ),
         vec!["1", "10", "NULL"]
     );
 }
@@ -93,7 +97,10 @@ fn returning_column_names() {
     let mut e = Engine::new();
     setup(&mut e);
     assert_eq!(
-        cols(&mut e, "INSERT INTO jv(id,v) VALUES(5,50) RETURNING id, v, dbl"),
+        cols(
+            &mut e,
+            "INSERT INTO jv(id,v) VALUES(5,50) RETURNING id, v, dbl"
+        ),
         vec!["id", "v", "dbl"]
     );
 }

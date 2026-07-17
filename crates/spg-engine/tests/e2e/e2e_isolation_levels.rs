@@ -31,7 +31,8 @@ fn read_committed_sees_concurrent_commits_per_statement() {
     let tx = e.alloc_tx_id();
     e.execute_in("BEGIN", tx).unwrap();
     assert_eq!(count(&mut e, tx), 1);
-    e.execute_in("INSERT INTO t VALUES (2)", IMPLICIT_TX).unwrap();
+    e.execute_in("INSERT INTO t VALUES (2)", IMPLICIT_TX)
+        .unwrap();
     let expect = if e.mvcc_inplace() { 2 } else { 1 };
     assert_eq!(
         count(&mut e, tx),
@@ -40,7 +41,8 @@ fn read_committed_sees_concurrent_commits_per_statement() {
     );
     // The tx's own writes survive the rebase.
     e.execute_in("INSERT INTO t VALUES (3)", tx).unwrap();
-    e.execute_in("INSERT INTO t VALUES (4)", IMPLICIT_TX).unwrap();
+    e.execute_in("INSERT INTO t VALUES (4)", IMPLICIT_TX)
+        .unwrap();
     let expect = if e.mvcc_inplace() { 4 } else { 2 };
     assert_eq!(
         count(&mut e, tx),
@@ -65,7 +67,8 @@ fn repeatable_read_keeps_its_first_view() {
     e.execute_in("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", tx)
         .unwrap();
     assert_eq!(count(&mut e, tx), 1);
-    e.execute_in("INSERT INTO t VALUES (2)", IMPLICIT_TX).unwrap();
+    e.execute_in("INSERT INTO t VALUES (2)", IMPLICIT_TX)
+        .unwrap();
     assert_eq!(
         count(&mut e, tx),
         1,
@@ -82,8 +85,10 @@ fn rc_rebase_stands_down_after_ddl() {
     assert_eq!(count(&mut e, tx), 1);
     // DDL inside the tx poisons the rebase — the tx keeps its frozen
     // view from here on (never risks losing the DDL's shadow effect).
-    e.execute_in("CREATE TABLE side (y INT NOT NULL)", tx).unwrap();
-    e.execute_in("INSERT INTO t VALUES (2)", IMPLICIT_TX).unwrap();
+    e.execute_in("CREATE TABLE side (y INT NOT NULL)", tx)
+        .unwrap();
+    e.execute_in("INSERT INTO t VALUES (2)", IMPLICIT_TX)
+        .unwrap();
     assert_eq!(
         count(&mut e, tx),
         1,
@@ -102,7 +107,8 @@ fn rc_delete_conflict_is_skipped_like_pg() {
     let tx = e.alloc_tx_id();
     e.execute_in("BEGIN", tx).unwrap();
     e.execute_in("DELETE FROM t WHERE x = 5", tx).unwrap();
-    e.execute_in("DELETE FROM t WHERE x = 5", IMPLICIT_TX).unwrap();
+    e.execute_in("DELETE FROM t WHERE x = 5", IMPLICIT_TX)
+        .unwrap();
     // Next statement rebases; the conflicting tombstone is skipped.
     assert_eq!(count(&mut e, tx), if e.mvcc_inplace() { 1 } else { 1 });
     e.execute_in("COMMIT", tx).unwrap();
@@ -124,7 +130,8 @@ fn rr_commit_merges_concurrent_inserts_instead_of_overwriting() {
     e.execute_in("INSERT INTO t VALUES (2)", tx).unwrap();
     // Concurrent autocommit insert AFTER the tx's last statement —
     // the old wholesale install would have silently dropped it.
-    e.execute_in("INSERT INTO t VALUES (3)", IMPLICIT_TX).unwrap();
+    e.execute_in("INSERT INTO t VALUES (3)", IMPLICIT_TX)
+        .unwrap();
     e.execute_in("COMMIT", tx).unwrap();
     assert_eq!(
         count(&mut e, IMPLICIT_TX),
@@ -146,7 +153,8 @@ fn rr_commit_conflict_raises_serialization_failure() {
         .unwrap();
     e.execute_in("DELETE FROM t WHERE x = 5", tx).unwrap();
     // A concurrent committed delete wins (first-committer-wins).
-    e.execute_in("DELETE FROM t WHERE x = 5", IMPLICIT_TX).unwrap();
+    e.execute_in("DELETE FROM t WHERE x = 5", IMPLICIT_TX)
+        .unwrap();
     let err = e.execute_in("COMMIT", tx).unwrap_err();
     assert!(
         matches!(err, spg_engine::EngineError::SerializationFailure(_)),
@@ -169,7 +177,8 @@ fn rr_commit_unique_conflict_raises_serialization_failure() {
         .unwrap();
     e.execute_in("INSERT INTO u VALUES (7)", tx).unwrap();
     // Concurrent committed insert takes the key first.
-    e.execute_in("INSERT INTO u VALUES (7)", IMPLICIT_TX).unwrap();
+    e.execute_in("INSERT INTO u VALUES (7)", IMPLICIT_TX)
+        .unwrap();
     let err = e.execute_in("COMMIT", tx).unwrap_err();
     assert!(
         matches!(err, spg_engine::EngineError::SerializationFailure(_)),
@@ -243,9 +252,7 @@ fn rr_concurrent_update_update_raises_serialization_failure() {
         matches!(err, spg_engine::EngineError::SerializationFailure(_)),
         "RR update-update is first-committer-wins with 40001, got {err:?}"
     );
-    let QueryResult::Rows { rows, .. } = e
-        .execute_in("SELECT x FROM t", IMPLICIT_TX)
-        .unwrap()
+    let QueryResult::Rows { rows, .. } = e.execute_in("SELECT x FROM t", IMPLICIT_TX).unwrap()
     else {
         panic!("rows")
     };
@@ -267,7 +274,8 @@ fn savepoint_rollback_interleaves_with_rebase() {
     e.execute_in("INSERT INTO t VALUES (1)", tx).unwrap();
     e.execute_in("SAVEPOINT s", tx).unwrap();
     e.execute_in("INSERT INTO t VALUES (2)", tx).unwrap();
-    e.execute_in("INSERT INTO t VALUES (100)", IMPLICIT_TX).unwrap();
+    e.execute_in("INSERT INTO t VALUES (100)", IMPLICIT_TX)
+        .unwrap();
     assert_eq!(count(&mut e, tx), 3, "own 1,2 + concurrent 100");
     e.execute_in("ROLLBACK TO SAVEPOINT s", tx).unwrap();
     assert_eq!(
@@ -294,20 +302,20 @@ fn fk_child_insert_vs_concurrent_parent_delete_keeps_integrity() {
     }
     let mut e = Engine::new();
     e.execute("CREATE TABLE p (id INT PRIMARY KEY)").unwrap();
-    e.execute("CREATE TABLE c (pid INT REFERENCES p(id))").unwrap();
+    e.execute("CREATE TABLE c (pid INT REFERENCES p(id))")
+        .unwrap();
     e.execute("INSERT INTO p VALUES (1)").unwrap();
     let tx = e.alloc_tx_id();
     e.execute_in("BEGIN", tx).unwrap();
     e.execute_in("INSERT INTO c VALUES (1)", tx).unwrap();
-    e.execute_in("DELETE FROM p WHERE id = 1", IMPLICIT_TX).unwrap();
+    e.execute_in("DELETE FROM p WHERE id = 1", IMPLICIT_TX)
+        .unwrap();
     let err = e.execute_in("COMMIT", tx).unwrap_err();
     assert!(
         matches!(err, spg_engine::EngineError::SerializationFailure(_)),
         "orphaning commit must fail with 40001, got {err:?}"
     );
-    let QueryResult::Rows { rows, .. } = e
-        .execute_in("SELECT pid FROM c", IMPLICIT_TX)
-        .unwrap()
+    let QueryResult::Rows { rows, .. } = e.execute_in("SELECT pid FROM c", IMPLICIT_TX).unwrap()
     else {
         panic!("rows")
     };
@@ -326,8 +334,10 @@ fn multi_table_tx_rebases_every_touched_table() {
     e.execute_in("BEGIN", tx).unwrap();
     e.execute_in("INSERT INTO a VALUES (1)", tx).unwrap();
     e.execute_in("INSERT INTO b VALUES (10)", tx).unwrap();
-    e.execute_in("INSERT INTO a VALUES (2)", IMPLICIT_TX).unwrap();
-    e.execute_in("INSERT INTO b VALUES (20)", IMPLICIT_TX).unwrap();
+    e.execute_in("INSERT INTO a VALUES (2)", IMPLICIT_TX)
+        .unwrap();
+    e.execute_in("INSERT INTO b VALUES (20)", IMPLICIT_TX)
+        .unwrap();
     e.execute_in("COMMIT", tx).unwrap();
     let n = |e: &mut Engine, sql: &str| -> usize {
         match e.execute_in(sql, IMPLICIT_TX) {
@@ -352,11 +362,10 @@ fn delete_then_reinsert_same_pk_survives_concurrent_delete() {
     e.execute_in("BEGIN", tx).unwrap();
     e.execute_in("DELETE FROM t WHERE id = 1", tx).unwrap();
     e.execute_in("INSERT INTO t VALUES (1, 11)", tx).unwrap();
-    e.execute_in("DELETE FROM t WHERE id = 1", IMPLICIT_TX).unwrap();
+    e.execute_in("DELETE FROM t WHERE id = 1", IMPLICIT_TX)
+        .unwrap();
     e.execute_in("COMMIT", tx).unwrap();
-    let QueryResult::Rows { rows, .. } = e
-        .execute_in("SELECT id, v FROM t", IMPLICIT_TX)
-        .unwrap()
+    let QueryResult::Rows { rows, .. } = e.execute_in("SELECT id, v FROM t", IMPLICIT_TX).unwrap()
     else {
         panic!("rows")
     };
@@ -376,19 +385,16 @@ fn rc_insert_insert_unique_collision_raises_40001() {
     let tx = e.alloc_tx_id();
     e.execute_in("BEGIN", tx).unwrap();
     e.execute_in("INSERT INTO u VALUES (7)", tx).unwrap();
-    e.execute_in("INSERT INTO u VALUES (7)", IMPLICIT_TX).unwrap();
+    e.execute_in("INSERT INTO u VALUES (7)", IMPLICIT_TX)
+        .unwrap();
     // The next tx statement rebases and hits the taken key.
-    let err = e
-        .execute_in("SELECT count(*) FROM u", tx)
-        .unwrap_err();
+    let err = e.execute_in("SELECT count(*) FROM u", tx).unwrap_err();
     assert!(
         matches!(err, spg_engine::EngineError::SerializationFailure(_)),
         "insert-insert collision -> 40001, got {err:?}"
     );
     e.execute_in("ROLLBACK", tx).unwrap();
-    let QueryResult::Rows { rows, .. } = e
-        .execute_in("SELECT x FROM u", IMPLICIT_TX)
-        .unwrap()
+    let QueryResult::Rows { rows, .. } = e.execute_in("SELECT x FROM u", IMPLICIT_TX).unwrap()
     else {
         panic!("rows")
     };
@@ -423,9 +429,7 @@ fn on_conflict_vs_concurrent_on_conflict_stays_single_row() {
     // the winner (n = 100) — recorded delta, retry converges.
     e.execute_in("COMMIT", tx)
         .expect("RC on-conflict loser commits cleanly (its update skipped)");
-    let QueryResult::Rows { rows, .. } = e
-        .execute_in("SELECT x, n FROM u", IMPLICIT_TX)
-        .unwrap()
+    let QueryResult::Rows { rows, .. } = e.execute_in("SELECT x, n FROM u", IMPLICIT_TX).unwrap()
     else {
         panic!("rows")
     };
@@ -559,9 +563,11 @@ fn rr_savepoint_rollback_excludes_rows_from_merge() {
     e.execute_in("BEGIN", tx).unwrap();
     e.execute_in("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", tx)
         .unwrap();
-    e.execute_in("UPDATE t SET n = 11 WHERE id = 1", tx).unwrap();
+    e.execute_in("UPDATE t SET n = 11 WHERE id = 1", tx)
+        .unwrap();
     e.execute_in("SAVEPOINT s1", tx).unwrap();
-    e.execute_in("UPDATE t SET n = 22 WHERE id = 2", tx).unwrap();
+    e.execute_in("UPDATE t SET n = 22 WHERE id = 2", tx)
+        .unwrap();
     e.execute_in("ROLLBACK TO SAVEPOINT s1", tx).unwrap();
     e.execute_in("UPDATE t SET n = 33 WHERE id = 3", IMPLICIT_TX)
         .unwrap();

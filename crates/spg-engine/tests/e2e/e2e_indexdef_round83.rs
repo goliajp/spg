@@ -25,7 +25,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn r1(e: &mut Engine, sql: &str) -> String {
@@ -38,7 +39,10 @@ fn r1(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn a_expression_and_unique_and_parens() {
     let mut e = Engine::new();
-    ok(&mut e, "CREATE TABLE t (id int PRIMARY KEY, name text, a int, b int)");
+    ok(
+        &mut e,
+        "CREATE TABLE t (id int PRIMARY KEY, name text, a int, b int)",
+    );
     ok(&mut e, "CREATE INDEX i1 ON t (name)");
     ok(&mut e, "CREATE INDEX i2 ON t (lower(name))");
     ok(&mut e, "CREATE INDEX i3 ON t (a, b)");
@@ -47,32 +51,62 @@ fn a_expression_and_unique_and_parens() {
     ok(&mut e, "CREATE INDEX i7 ON t (name) WHERE a > 0");
 
     let d = |e: &mut Engine, n: &str| r1(e, &format!("SELECT pg_get_indexdef('{n}'::regclass)"));
-    assert_eq!(d(&mut e, "i1"), "CREATE INDEX i1 ON public.t USING btree (name)");
+    assert_eq!(
+        d(&mut e, "i1"),
+        "CREATE INDEX i1 ON public.t USING btree (name)"
+    );
     // The expression is preserved, not collapsed to the column name.
-    assert_eq!(d(&mut e, "i2"), "CREATE INDEX i2 ON public.t USING btree (lower(name))");
-    assert_eq!(d(&mut e, "i3"), "CREATE INDEX i3 ON public.t USING btree (a, b)");
+    assert_eq!(
+        d(&mut e, "i2"),
+        "CREATE INDEX i2 ON public.t USING btree (lower(name))"
+    );
+    assert_eq!(
+        d(&mut e, "i3"),
+        "CREATE INDEX i3 ON public.t USING btree (a, b)"
+    );
     // Operator expression key is double-parenthesised; function call is not.
-    assert_eq!(d(&mut e, "i5"), "CREATE INDEX i5 ON public.t USING btree (((a + b)))");
-    assert_eq!(d(&mut e, "i6"), "CREATE UNIQUE INDEX i6 ON public.t USING btree (name)");
+    assert_eq!(
+        d(&mut e, "i5"),
+        "CREATE INDEX i5 ON public.t USING btree (((a + b)))"
+    );
+    assert_eq!(
+        d(&mut e, "i6"),
+        "CREATE UNIQUE INDEX i6 ON public.t USING btree (name)"
+    );
     assert_eq!(
         d(&mut e, "i7"),
         "CREATE INDEX i7 ON public.t USING btree (name) WHERE (a > 0)"
     );
     // The primary key's index is UNIQUE.
-    assert_eq!(d(&mut e, "t_pkey"), "CREATE UNIQUE INDEX t_pkey ON public.t USING btree (id)");
+    assert_eq!(
+        d(&mut e, "t_pkey"),
+        "CREATE UNIQUE INDEX t_pkey ON public.t USING btree (id)"
+    );
 }
 
 #[test]
 fn b_plain_index_over_a_constrained_column_stays_plain() {
     let mut e = Engine::new();
-    ok(&mut e, "CREATE TABLE d (id int PRIMARY KEY, a int, UNIQUE (a))");
+    ok(
+        &mut e,
+        "CREATE TABLE d (id int PRIMARY KEY, a int, UNIQUE (a))",
+    );
     ok(&mut e, "CREATE INDEX idx_d_a ON d (a)");
     let d = |e: &mut Engine, n: &str| r1(e, &format!("SELECT pg_get_indexdef('{n}'::regclass)"));
     // The constraint's OWN auto-index is UNIQUE…
-    assert_eq!(d(&mut e, "d_a_key"), "CREATE UNIQUE INDEX d_a_key ON public.d USING btree (a)");
-    assert_eq!(d(&mut e, "d_pkey"), "CREATE UNIQUE INDEX d_pkey ON public.d USING btree (id)");
+    assert_eq!(
+        d(&mut e, "d_a_key"),
+        "CREATE UNIQUE INDEX d_a_key ON public.d USING btree (a)"
+    );
+    assert_eq!(
+        d(&mut e, "d_pkey"),
+        "CREATE UNIQUE INDEX d_pkey ON public.d USING btree (id)"
+    );
     // …but a user index that merely shadows the same column is PLAIN.
-    assert_eq!(d(&mut e, "idx_d_a"), "CREATE INDEX idx_d_a ON public.d USING btree (a)");
+    assert_eq!(
+        d(&mut e, "idx_d_a"),
+        "CREATE INDEX idx_d_a ON public.d USING btree (a)"
+    );
 }
 
 #[test]
@@ -87,5 +121,8 @@ fn c_view_and_function_forms_agree_between_the_two_paths() {
     );
     let via_fn = r1(&mut e, "SELECT pg_get_indexdef('i2'::regclass)");
     assert_eq!(via_view, via_fn);
-    assert_eq!(via_view, "CREATE INDEX i2 ON public.t USING btree (lower(name))");
+    assert_eq!(
+        via_view,
+        "CREATE INDEX i2 ON public.t USING btree (lower(name))"
+    );
 }

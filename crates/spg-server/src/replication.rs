@@ -441,22 +441,19 @@ fn absorb_segment_chunk(
     // segment(s)", the last segment's rows unreachable forever).
     // Re-receiving overwrites the orphan atomically and re-registers
     // it: the crash window self-heals.
-    let entry = segment_buffers
-        .entry(chunk.segment_id)
-        .or_insert_with(|| {
-            let registered = state
-                .cold_segment_paths
-                .lock()
-                .map(|p| p.contains_key(&chunk.segment_id))
-                .unwrap_or(false);
-            SegmentReceiveState {
-                bytes: Vec::new(),
-                expected_total: chunk.chunk_total,
-                next_seq: 0,
-                skip: registered
-                    && cold_segment_file_already_present(db_path, chunk.segment_id),
-            }
-        });
+    let entry = segment_buffers.entry(chunk.segment_id).or_insert_with(|| {
+        let registered = state
+            .cold_segment_paths
+            .lock()
+            .map(|p| p.contains_key(&chunk.segment_id))
+            .unwrap_or(false);
+        SegmentReceiveState {
+            bytes: Vec::new(),
+            expected_total: chunk.chunk_total,
+            next_seq: 0,
+            skip: registered && cold_segment_file_already_present(db_path, chunk.segment_id),
+        }
+    });
     if entry.skip {
         // Drop the chunk on the floor. After the last chunk in the
         // group we tear down the entry so memory is bounded.

@@ -15,7 +15,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn r1(e: &mut Engine, sql: &str) -> String {
@@ -58,7 +59,10 @@ fn no_matching_row_is_null_not_an_error() {
 fn it_works_per_row_and_inside_an_aggregate() {
     let mut e = seeded();
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(lookup(id), ',' ORDER BY id) FROM t"),
+        r1(
+            &mut e,
+            "SELECT string_agg(lookup(id), ',' ORDER BY id) FROM t"
+        ),
         "a,b,c"
     );
 }

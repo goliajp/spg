@@ -71,7 +71,10 @@ fn integer_multi_srf_unchanged() {
     // the shorter series must still hold.
     let mut e = Engine::new();
     assert_eq!(
-        rows(&mut e, "SELECT generate_series(1,3), generate_series(10,11)"),
+        rows(
+            &mut e,
+            "SELECT generate_series(1,3), generate_series(10,11)"
+        ),
         ["1|10", "2|11", "3|NULL"]
     );
     // SRF + scalar broadcast.

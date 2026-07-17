@@ -55,7 +55,10 @@ fn single_table_star() {
         rows(&mut e, "SELECT wa.* FROM wa ORDER BY id"),
         vec![vec!["1", "x"], vec!["2", "y"]]
     );
-    assert_eq!(headers(&mut e, "SELECT wa.* FROM wa ORDER BY id"), vec!["id", "v"]);
+    assert_eq!(
+        headers(&mut e, "SELECT wa.* FROM wa ORDER BY id"),
+        vec!["id", "v"]
+    );
 }
 
 #[test]
@@ -96,7 +99,10 @@ fn returning_old_new_star() {
     e.execute("INSERT INTO wr VALUES(1,'a'),(2,'b')").unwrap();
     // OLD.* = pre-image (1,a), then new.v = z.
     assert_eq!(
-        rows(&mut e, "UPDATE wr SET v='z' WHERE id=1 RETURNING OLD.*, NEW.v"),
+        rows(
+            &mut e,
+            "UPDATE wr SET v='z' WHERE id=1 RETURNING OLD.*, NEW.v"
+        ),
         vec![vec!["1", "a", "z"]]
     );
     // NEW.* = post-image (2,k).
@@ -113,7 +119,10 @@ fn returning_old_star_headers() {
     e.execute("INSERT INTO wr VALUES(1,'a')").unwrap();
     // PG names OLD.* columns by their bare table-column names.
     assert_eq!(
-        headers(&mut e, "UPDATE wr SET v='z' WHERE id=1 RETURNING OLD.*, NEW.v"),
+        headers(
+            &mut e,
+            "UPDATE wr SET v='z' WHERE id=1 RETURNING OLD.*, NEW.v"
+        ),
         vec!["id", "v", "v"]
     );
 }

@@ -892,9 +892,7 @@ pub(crate) fn range_bounds_misordered(
     upper: &Option<Value<'static>>,
 ) -> bool {
     match (lower, upper) {
-        (Some(l), Some(u)) => {
-            crate::orderby::value_cmp(l, u) == core::cmp::Ordering::Greater
-        }
+        (Some(l), Some(u)) => crate::orderby::value_cmp(l, u) == core::cmp::Ordering::Greater,
         _ => false,
     }
 }
@@ -1419,10 +1417,7 @@ pub fn parse_line_text(s: &str) -> Option<(f64, f64, f64)> {
 }
 
 /// PG's line_construct from two points (geo_ops.c behavior).
-pub fn line_from_points(
-    p1: spg_storage::Point2D,
-    p2: spg_storage::Point2D,
-) -> (f64, f64, f64) {
+pub fn line_from_points(p1: spg_storage::Point2D, p2: spg_storage::Point2D) -> (f64, f64, f64) {
     if p1.x == p2.x {
         (-1.0, 0.0, p1.x)
     } else if p1.y == p2.y {
@@ -1813,11 +1808,7 @@ pub fn parse_cidr_text(s: &str) -> Result<Option<(u8, u8, [u8; 16])>, ()> {
     for byte in 0..nbytes {
         let bit_base = (byte as u16) * 8;
         let keep = (u16::from(bits)).saturating_sub(bit_base).min(8) as u8;
-        let mask: u8 = if keep == 0 {
-            0
-        } else {
-            0xffu8 << (8 - keep)
-        };
+        let mask: u8 = if keep == 0 { 0 } else { 0xffu8 << (8 - keep) };
         if addr[byte] & !mask != 0 {
             return Err(());
         }
@@ -1885,9 +1876,7 @@ pub fn parse_macaddr8_text(s: &str) -> Option<[u8; 8]> {
         for i in 0..6 {
             six[i] = u8::from_str_radix(&cleaned[i * 2..i * 2 + 2], 16).ok()?;
         }
-        return Some([
-            six[0], six[1], six[2], 0xff, 0xfe, six[3], six[4], six[5],
-        ]);
+        return Some([six[0], six[1], six[2], 0xff, 0xfe, six[3], six[4], six[5]]);
     }
     if cleaned.len() != 16 {
         return None;
@@ -2026,9 +2015,7 @@ pub(crate) fn parse_money_str(s: &str) -> Option<i64> {
     let (mut cents, tail) = match tail.strip_prefix('.') {
         None => (0i64, tail),
         Some(f) => {
-            let end = f
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(f.len());
+            let end = f.find(|c: char| !c.is_ascii_digit()).unwrap_or(f.len());
             let (digits, rest_tail) = (&f[..end], &f[end..]);
             if digits.is_empty() {
                 return None;
@@ -2463,13 +2450,7 @@ pub(crate) fn literal_expr_to_value_in(
                     spg_sql::ast::CastTarget::Named(_) | spg_sql::ast::CastTarget::RegClass
                 )
             {
-                return eval_expr_with_catalog(
-                    Expr::Cast {
-                        expr,
-                        target,
-                    },
-                    catalog,
-                );
+                return eval_expr_with_catalog(Expr::Cast { expr, target }, catalog);
             }
             let inner_value = literal_expr_to_value_in(*expr, catalog)?;
             crate::eval::cast_value(inner_value, target).map_err(EngineError::Eval)
@@ -3058,9 +3039,9 @@ fn coerce_untyped_value(
         // A regclass IS an oid — it coerces to any integer width, and to text
         // through its relation name.
         (Value::RegClass(oid, _), DataType::BigInt) => Ok(Value::BigInt(*oid)),
-        (Value::RegClass(oid, _), DataType::Int) => Ok(Value::Int(
-            i32::try_from(*oid).unwrap_or(i32::MAX),
-        )),
+        (Value::RegClass(oid, _), DataType::Int) => {
+            Ok(Value::Int(i32::try_from(*oid).unwrap_or(i32::MAX)))
+        }
         (Value::RegClass(_, name), DataType::Text) => {
             Ok(Value::text(alloc::string::String::from(name.as_ref())))
         }
@@ -3086,9 +3067,7 @@ fn coerce_untyped_value(
             Ok(Value::Json(alloc::borrow::Cow::Owned(obj)))
         }
         // …and its canonical PG text form for a text column.
-        (Value::Composite(_), DataType::Text) => {
-            Ok(Value::text(crate::eval::value_to_text(&v)))
-        }
+        (Value::Composite(_), DataType::Text) => Ok(Value::text(crate::eval::value_to_text(&v))),
         _ => Err(EngineError::Unsupported(alloc::format!(
             "cannot coerce {:?} to {expected:?} for column {col_name:?} (position {position})",
             v
@@ -3213,8 +3192,8 @@ fn try_coerce_json_scalar(
         DataType::Bool => "boolean",
         _ => return None,
     };
-    Some((|| {
-        match jsonb_scalar_for_cast(s, target).map_err(EngineError::Eval)? {
+    Some(
+        (|| match jsonb_scalar_for_cast(s, target).map_err(EngineError::Eval)? {
             JsonbScalar::Null => Ok(Value::Null),
             JsonbScalar::Bool(b) => {
                 if matches!(expected, DataType::Bool) {
@@ -3230,8 +3209,8 @@ fn try_coerce_json_scalar(
                     coerce_value(n, expected, col_name, position)
                 }
             }
-        }
-    })())
+        })(),
+    )
 }
 
 pub(crate) fn coerce_value(
@@ -3352,10 +3331,20 @@ pub(crate) fn coerce_value(
                         kind: spg_storage::NumericKind::Finite,
                     })
                 } else {
-                    Some(numeric_from_float(f64::from(x), precision, scale, col_name)?)
+                    Some(numeric_from_float(
+                        f64::from(x),
+                        precision,
+                        scale,
+                        col_name,
+                    )?)
                 }
             } else {
-                Some(numeric_from_float(f64::from(x), precision, scale, col_name)?)
+                Some(numeric_from_float(
+                    f64::from(x),
+                    precision,
+                    scale,
+                    col_name,
+                )?)
             }
         }
         // v7.17.0 Phase 3.P0-67 — Text → NUMERIC. Parse a
@@ -3462,28 +3451,35 @@ pub(crate) fn coerce_value(
         (Value::Text(s), DataType::BigInt) => Some(Value::BigInt(
             parse_pg_int(&s).ok_or_else(|| invalid_input_syntax("bigint", &s))?,
         )),
-        (Value::Text(s), DataType::Float) => Some(Value::Float(
-            parse_float8(&s).ok_or_else(|| invalid_input_syntax("double precision", &s))?,
-        )),
+        (Value::Text(s), DataType::Float) => {
+            Some(Value::Float(parse_float8(&s).ok_or_else(|| {
+                invalid_input_syntax("double precision", &s)
+            })?))
+        }
         // v7.38 (read01, T-float4) — coerce to REAL narrows to f32.
         (Value::Int(n), DataType::Real) => Some(Value::Real(n as f32)),
         (Value::SmallInt(n), DataType::Real) => Some(Value::Real(f32::from(n))),
         (Value::BigInt(n), DataType::Real) => Some(Value::Real(n as f32)),
         (Value::Float(x), DataType::Real) => Some(Value::Real(x as f32)),
-        (Value::Numeric { scaled, scale, kind }, DataType::Real) => {
-            Some(Value::Real(match kind {
-                spg_storage::NumericKind::NaN => f32::NAN,
-                spg_storage::NumericKind::PosInf => f32::INFINITY,
-                spg_storage::NumericKind::NegInf => f32::NEG_INFINITY,
-                spg_storage::NumericKind::Finite => {
-                    let mut div = 1.0f64;
-                    for _ in 0..scale {
-                        div *= 10.0;
-                    }
-                    (scaled as f64 / div) as f32
+        (
+            Value::Numeric {
+                scaled,
+                scale,
+                kind,
+            },
+            DataType::Real,
+        ) => Some(Value::Real(match kind {
+            spg_storage::NumericKind::NaN => f32::NAN,
+            spg_storage::NumericKind::PosInf => f32::INFINITY,
+            spg_storage::NumericKind::NegInf => f32::NEG_INFINITY,
+            spg_storage::NumericKind::Finite => {
+                let mut div = 1.0f64;
+                for _ in 0..scale {
+                    div *= 10.0;
                 }
-            }))
-        }
+                (scaled as f64 / div) as f32
+            }
+        })),
         (Value::Real(x), DataType::Float) => Some(Value::Float(f64::from(x))),
         (Value::Text(s), DataType::Real) => Some(Value::Real(
             s.trim()
@@ -3733,9 +3729,7 @@ pub(crate) fn coerce_value(
             }
             Ok(None) => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type cidr: {s:?}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for type cidr: {s:?}"),
                 }));
             }
         },
@@ -3759,9 +3753,7 @@ pub(crate) fn coerce_value(
             Some(m) => Some(Value::Macaddr(m)),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type macaddr: {s:?}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for type macaddr: {s:?}"),
                 }));
             }
         },
@@ -3770,9 +3762,7 @@ pub(crate) fn coerce_value(
             Some(l) => Some(Value::PgLsn(l)),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type pg_lsn: \"{s}\""
-                    ),
+                    detail: alloc::format!("invalid input syntax for type pg_lsn: \"{s}\""),
                 }));
             }
         },
@@ -3780,9 +3770,7 @@ pub(crate) fn coerce_value(
             Some(m) => Some(Value::Macaddr8(m)),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type macaddr8: {s:?}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for type macaddr8: {s:?}"),
                 }));
             }
         },
@@ -4661,7 +4649,9 @@ pub(crate) fn coerce_value(
         }
         (Value::Float(x), DataType::BigInt) => {
             let r = crate::eval::math::f64_round_half_even(x);
-            if !r.is_finite() || !(-9.223_372_036_854_776e18..=9.223_372_036_854_776e18).contains(&r) {
+            if !r.is_finite()
+                || !(-9.223_372_036_854_776e18..=9.223_372_036_854_776e18).contains(&r)
+            {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: "bigint out of range".into(),
                 }));
@@ -4694,7 +4684,8 @@ pub(crate) fn coerce_value(
         }
         (Value::Real(x), DataType::BigInt) => {
             let r = crate::eval::math::f64_round_half_even(f64::from(x));
-            if !r.is_finite() || !(-9.223_372_036_854_776e18..=9.223_372_036_854_776e18).contains(&r)
+            if !r.is_finite()
+                || !(-9.223_372_036_854_776e18..=9.223_372_036_854_776e18).contains(&r)
             {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: "bigint out of range".into(),
@@ -4736,11 +4727,12 @@ pub(crate) fn coerce_value(
                 // blanks is cut AT the limit (PG keeps 'abcd ' from
                 // 'abcd  ' in varchar(5) — not a full strip); anything
                 // else is 22001 with PG's phrasing.
-                let excess_all_blanks =
-                    s.chars().skip(max as usize).all(|c| c == ' ');
+                let excess_all_blanks = s.chars().skip(max as usize).all(|c| c == ' ');
                 if excess_all_blanks {
                     Some(Value::text(
-                        s.chars().take(max as usize).collect::<alloc::string::String>(),
+                        s.chars()
+                            .take(max as usize)
+                            .collect::<alloc::string::String>(),
                     ))
                 } else {
                     return Err(EngineError::Unsupported(alloc::format!(

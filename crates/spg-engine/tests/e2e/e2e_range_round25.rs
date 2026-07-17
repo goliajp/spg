@@ -35,8 +35,9 @@ fn misordered_bounds_rejected() {
             "{sql}"
         );
     }
-    assert!(err_of(&mut e, "SELECT '[1,2'::int4range")
-        .contains("malformed range literal: \"[1,2\""));
+    assert!(
+        err_of(&mut e, "SELECT '[1,2'::int4range").contains("malformed range literal: \"[1,2\"")
+    );
     // Equal bounds still collapse to empty (not an error).
     assert_eq!(row_of(&mut e, "SELECT int4range(3, 3)"), vec!["empty"]);
 }
@@ -80,7 +81,10 @@ fn tstzrange_offset_io() {
         vec!["[\"2024-01-01 10:00:00+00\",\"2024-01-02 00:00:00+00\")"]
     );
     assert_eq!(
-        row_of(&mut e, "SELECT tstzrange('2024-01-01 10:00+00', '2024-01-02+00')"),
+        row_of(
+            &mut e,
+            "SELECT tstzrange('2024-01-01 10:00+00', '2024-01-02+00')"
+        ),
         vec!["[\"2024-01-01 10:00:00+00\",\"2024-01-02 00:00:00+00\")"]
     );
     // tsrange stays offset-free.

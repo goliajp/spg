@@ -275,7 +275,12 @@ fn check_precision(scaled: i128, precision: u8, col_name: &str) -> Result<(), En
 /// v7.39 (read01 numeric.c) — overflow-honest sibling of `numeric_add`:
 /// `None` when the scale-aligned sum leaves i128, so the caller can promote
 /// to the bignum accumulator instead of saturating to a wrong value.
-pub(crate) fn numeric_add_checked(a: i128, a_scale: u8, b: i128, b_scale: u8) -> Option<(i128, u8)> {
+pub(crate) fn numeric_add_checked(
+    a: i128,
+    a_scale: u8,
+    b: i128,
+    b_scale: u8,
+) -> Option<(i128, u8)> {
     if a_scale == b_scale {
         a.checked_add(b).map(|s| (s, a_scale))
     } else if a_scale > b_scale {

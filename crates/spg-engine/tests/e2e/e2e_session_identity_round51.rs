@@ -17,7 +17,8 @@ fn err(e: &mut Engine, sql: &str) -> String {
 }
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn row(e: &mut Engine, sql: &str) -> Vec<String> {
@@ -36,7 +37,10 @@ fn embedded_defaults_to_admin() {
     let mut e = Engine::new();
     // No startup packet — the embedded engine keeps the Admin login.
     assert_eq!(
-        row(&mut e, "SELECT current_user, session_user, pg_get_userbyid(10)"),
+        row(
+            &mut e,
+            "SELECT current_user, session_user, pg_get_userbyid(10)"
+        ),
         vec!["admin", "admin", "admin"]
     );
 }

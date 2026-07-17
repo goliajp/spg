@@ -21,7 +21,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn joined(e: &mut Engine, sql: &str) -> String {
@@ -52,9 +53,15 @@ fn a_tg_variables_are_visible() {
          INSERT INTO log VALUES (TG_OP||'/'||TG_WHEN||'/'||TG_LEVEL||'/'||TG_NAME||'/'||\
          TG_TABLE_NAME||'/'||TG_NARGS::text); RETURN NEW; END; $$ LANGUAGE plpgsql",
     );
-    ok(&mut e, "CREATE TRIGGER tg1 BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()");
+    ok(
+        &mut e,
+        "CREATE TRIGGER tg1 BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
+    );
     ok(&mut e, "INSERT INTO t VALUES (1,10)");
-    assert_eq!(joined(&mut e, "SELECT msg FROM log"), "INSERT/BEFORE/ROW/tg1/t/0");
+    assert_eq!(
+        joined(&mut e, "SELECT msg FROM log"),
+        "INSERT/BEFORE/ROW/tg1/t/0"
+    );
 }
 
 #[test]
@@ -98,10 +105,16 @@ fn c_generated_column_recomputes_after_before_trigger() {
         "CREATE FUNCTION bt() RETURNS trigger AS $$ BEGIN NEW.v := NEW.v + 1; RETURN NEW; END; $$ \
          LANGUAGE plpgsql",
     );
-    ok(&mut e, "CREATE TRIGGER trg_bi BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION bt()");
+    ok(
+        &mut e,
+        "CREATE TRIGGER trg_bi BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION bt()",
+    );
     ok(&mut e, "INSERT INTO t (id,v) VALUES (1,100)");
     // trigger sets v to 101, THEN w = v*2 = 202. Not 200 (the pre-trigger 100*2).
-    assert_eq!(joined(&mut e, "SELECT v||'/'||w FROM t WHERE id=1"), "101/202");
+    assert_eq!(
+        joined(&mut e, "SELECT v||'/'||w FROM t WHERE id=1"),
+        "101/202"
+    );
 
     // Same for UPDATE.
     ok(
@@ -109,10 +122,16 @@ fn c_generated_column_recomputes_after_before_trigger() {
         "CREATE FUNCTION bu() RETURNS trigger AS $$ BEGIN NEW.v := NEW.v + 5; RETURN NEW; END; $$ \
          LANGUAGE plpgsql",
     );
-    ok(&mut e, "CREATE TRIGGER trg_bu BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION bu()");
+    ok(
+        &mut e,
+        "CREATE TRIGGER trg_bu BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION bu()",
+    );
     ok(&mut e, "UPDATE t SET v=200 WHERE id=1");
     // trigger sets v to 205, w = 410.
-    assert_eq!(joined(&mut e, "SELECT v||'/'||w FROM t WHERE id=1"), "205/410");
+    assert_eq!(
+        joined(&mut e, "SELECT v||'/'||w FROM t WHERE id=1"),
+        "205/410"
+    );
 }
 
 #[test]

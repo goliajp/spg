@@ -18,7 +18,10 @@ use std::time::Duration;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn local_spawn(db: &std::path::Path) -> (std::process::Child, common::ServerAddrs) {
-    common::ServerBuilder::new().arg_path(db).with_pgwire().spawn()
+    common::ServerBuilder::new()
+        .arg_path(db)
+        .with_pgwire()
+        .spawn()
 }
 
 fn unique_tmpdir(label: &str) -> PathBuf {
@@ -113,7 +116,10 @@ fn first_cell(s: &mut TcpStream, sql: &str) -> String {
 fn run_ok(s: &mut TcpStream, sql: &str) {
     send_query(s, sql);
     let msgs = read_until_ready(s);
-    assert!(msgs.iter().all(|m| m.ty != b'E'), "unexpected error for {sql}");
+    assert!(
+        msgs.iter().all(|m| m.ty != b'E'),
+        "unexpected error for {sql}"
+    );
 }
 
 fn open(addr: &str) -> TcpStream {
@@ -132,19 +138,40 @@ fn show_transaction_isolation_reports_live_level() {
     let _child = common::ChildGuard(raw);
     let mut s = open(addrs.pgwire.as_ref().unwrap());
 
-    assert_eq!(first_cell(&mut s, "SHOW transaction_isolation"), "read committed");
+    assert_eq!(
+        first_cell(&mut s, "SHOW transaction_isolation"),
+        "read committed"
+    );
 
     run_ok(&mut s, "BEGIN ISOLATION LEVEL REPEATABLE READ");
-    assert_eq!(first_cell(&mut s, "SHOW transaction_isolation"), "repeatable read");
+    assert_eq!(
+        first_cell(&mut s, "SHOW transaction_isolation"),
+        "repeatable read"
+    );
     run_ok(&mut s, "COMMIT");
     // Reverts to the default at transaction end.
-    assert_eq!(first_cell(&mut s, "SHOW transaction_isolation"), "read committed");
+    assert_eq!(
+        first_cell(&mut s, "SHOW transaction_isolation"),
+        "read committed"
+    );
 
     run_ok(&mut s, "BEGIN ISOLATION LEVEL SERIALIZABLE");
-    assert_eq!(first_cell(&mut s, "SHOW transaction_isolation"), "serializable");
+    assert_eq!(
+        first_cell(&mut s, "SHOW transaction_isolation"),
+        "serializable"
+    );
     // PG's multi-word spelling reports the live level too.
-    assert_eq!(first_cell(&mut s, "SHOW TRANSACTION ISOLATION LEVEL"), "serializable");
+    assert_eq!(
+        first_cell(&mut s, "SHOW TRANSACTION ISOLATION LEVEL"),
+        "serializable"
+    );
     run_ok(&mut s, "ROLLBACK");
-    assert_eq!(first_cell(&mut s, "SHOW transaction_isolation"), "read committed");
-    assert_eq!(first_cell(&mut s, "SHOW TRANSACTION ISOLATION LEVEL"), "read committed");
+    assert_eq!(
+        first_cell(&mut s, "SHOW transaction_isolation"),
+        "read committed"
+    );
+    assert_eq!(
+        first_cell(&mut s, "SHOW TRANSACTION ISOLATION LEVEL"),
+        "read committed"
+    );
 }

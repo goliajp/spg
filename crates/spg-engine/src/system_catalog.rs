@@ -949,10 +949,10 @@ pub(crate) fn synth_pg_stat_user_functions(
 pub(crate) const fn am_oid_of(kind: &spg_storage::IndexKind) -> i64 {
     use spg_storage::IndexKind as K;
     match kind {
-        K::Nsw(_) => 0,          // hnsw is an extension AM; no core oid
+        K::Nsw(_) => 0, // hnsw is an extension AM; no core oid
         K::Brin { .. } => 3580,
         K::Gin(_) | K::GinTrgm(_) | K::GinFulltext(_) | K::GinJsonb(_) => 2742,
-        _ => 403,                // btree
+        _ => 403, // btree
     }
 }
 
@@ -1551,9 +1551,7 @@ pub(crate) fn synth_pg_stat_database(
     // queries parse).
     // v7.39 (pg_stat knife A) — real xact counters + the host's live
     // backend count (embedded: no host slot -> 1, the calling session).
-    let commits = eng
-        .xact_commit
-        .load(core::sync::atomic::Ordering::Relaxed);
+    let commits = eng.xact_commit.load(core::sync::atomic::Ordering::Relaxed);
     let rollbacks = eng
         .xact_rollback
         .load(core::sync::atomic::Ordering::Relaxed);
@@ -1571,8 +1569,7 @@ pub(crate) fn synth_pg_stat_database(
                 tup_returned = tup_returned
                     .saturating_add(sc.seq_tup_read.load(Ordering::Relaxed))
                     .saturating_add(sc.idx_tup_fetch.load(Ordering::Relaxed));
-                tup_fetched =
-                    tup_fetched.saturating_add(sc.idx_tup_fetch.load(Ordering::Relaxed));
+                tup_fetched = tup_fetched.saturating_add(sc.idx_tup_fetch.load(Ordering::Relaxed));
             }
         }
     }
@@ -2173,15 +2170,14 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         let Some(t) = cat.get(&tname) else { continue };
         for idx in t.indices() {
             idx_oid += 1;
-            let relnatts =
-                i16::try_from(1 + idx.extra_column_positions.len()).unwrap_or(i16::MAX);
+            let relnatts = i16::try_from(1 + idx.extra_column_positions.len()).unwrap_or(i16::MAX);
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(idx_oid),
                 Value::text(idx.name.clone()),
-                Value::BigInt(2200), // relnamespace — public
-                Value::BigInt(0),    // reltype (indexes have none)
-                Value::BigInt(0),    // reloftype
-                Value::BigInt(10),   // relowner
+                Value::BigInt(2200),                 // relnamespace — public
+                Value::BigInt(0),                    // reltype (indexes have none)
+                Value::BigInt(0),                    // reloftype
+                Value::BigInt(10),                   // relowner
                 Value::BigInt(am_oid_of(&idx.kind)), // relam — the real AM
                 Value::BigInt(idx_oid),
                 Value::BigInt(0),
@@ -2224,8 +2220,8 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             Value::BigInt(0),  // relam — a sequence has no access method
             Value::BigInt(seq_oid),
             Value::BigInt(0),
-            Value::Int(1),      // relpages — a sequence is one page
-            Value::Float(1.0),  // reltuples — and one tuple
+            Value::Int(1),     // relpages — a sequence is one page
+            Value::Float(1.0), // reltuples — and one tuple
             Value::Int(0),
             Value::BigInt(0),
             Value::Bool(false), // relhasindex
@@ -2806,119 +2802,119 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
 /// regproc/regprocedure casts resolve names against the same table
 /// pg_proc synthesises.
 pub(crate) const PG_PROC_FUNCS: &[(i64, &str, &str, i32, i64)] = &[
-        // Scalar functions.
-        // PG ships eight length() overloads; mirror the full set so
-        // catalog joins see the same rows (1317 text, 1318 bpchar,
-        // 1530/1531 lseg/path -> float8, 1681 bit, 1713 length(bytea,
-        // name) [2 args], 2010 bytea, 3711 tsvector).
-        (1317, "length", "f", 1, 23),
-        (1318, "length", "f", 1, 23),
-        (1530, "length", "f", 1, 701),
-        (1531, "length", "f", 1, 701),
-        (1681, "length", "f", 1, 23),
-        (1713, "length", "f", 2, 23),
-        (2010, "length", "f", 1, 23),
-        (3711, "length", "f", 1, 23),
-        // v7.39 (pg_proc reconcile) — every row below carries PG18's
-        // real (oid, prokind, pronargs, prorettype); the old table was
-        // full of invented / transposed oids (found when the corpus
-        // campaign hit two wrong rows and a full differential audit
-        // showed the drift was systemic). VARIADIC functions have
-        // pronargs = 1 (or 2 with a leading fixed arg), like PG.
-        (870, "lower", "f", 1, 25),
-        (871, "upper", "f", 1, 25),
-        // v7.39 (read01 regproc.c) — the range overloads make
-        // lower/upper ambiguous for ::regproc, as in PG.
-        (3848, "lower", "f", 1, 2283),
-        (3849, "upper", "f", 1, 2283),
-        (936, "substring", "f", 3, 25),
-        (937, "substring", "f", 2, 25),
-        (885, "btrim", "f", 1, 25),
-        (884, "btrim", "f", 2, 25),
-        (881, "ltrim", "f", 1, 25),
-        (875, "ltrim", "f", 2, 25),
-        (882, "rtrim", "f", 1, 25),
-        (876, "rtrim", "f", 2, 25),
-        (1396, "abs", "f", 1, 20),
-        (1397, "abs", "f", 1, 23),
-        (1705, "abs", "f", 1, 1700),
-        (1342, "round", "f", 1, 701),
-        (1708, "round", "f", 1, 1700),
-        (1707, "round", "f", 2, 1700),
-        (2308, "ceil", "f", 1, 701),
-        (1711, "ceil", "f", 1, 1700),
-        (2320, "ceiling", "f", 1, 701),
-        (2167, "ceiling", "f", 1, 1700),
-        (2309, "floor", "f", 1, 701),
-        (1712, "floor", "f", 1, 1700),
-        (1344, "sqrt", "f", 1, 701),
-        (1730, "sqrt", "f", 1, 1700),
-        (1341, "ln", "f", 1, 701),
-        (1734, "ln", "f", 1, 1700),
-        (1347, "exp", "f", 1, 701),
-        (1732, "exp", "f", 1, 1700),
-        (1368, "power", "f", 2, 701),
-        (2169, "power", "f", 2, 1700),
-        (1598, "random", "f", 0, 701),
-        // Date / time. (current_date / current_timestamp /
-        // current_time are parser keywords in PG, not pg_proc rows.)
-        (1299, "now", "f", 0, 1184),
-        (2020, "date_trunc", "f", 2, 1114),
-        (2021, "date_part", "f", 2, 701),
-        (2059, "age", "f", 1, 1186),
-        (2058, "age", "f", 2, 1186),
-        (2049, "to_char", "f", 2, 25),
-        (1772, "to_char", "f", 2, 25),
-        // Session / introspection.
-        (861, "current_database", "f", 0, 19),
-        (745, "current_user", "f", 0, 19),
-        (746, "session_user", "f", 0, 19),
-        (1402, "current_schema", "f", 0, 19),
-        // String concat / format.
-        (3058, "concat", "f", 1, 25),
-        (3059, "concat_ws", "f", 2, 25),
-        (3539, "format", "f", 2, 25),
-        (3540, "format", "f", 1, 25),
-        // Type introspection.
-        (1619, "pg_typeof", "f", 1, 2206),
-        // JSON.
-        (3200, "json_build_object", "f", 1, 114),
-        (3273, "jsonb_build_object", "f", 1, 3802),
-        (3198, "json_build_array", "f", 1, 114),
-        (3271, "jsonb_build_array", "f", 1, 3802),
-        // UUID.
-        (3432, "gen_random_uuid", "f", 0, 2950),
-        // Aggregates.
-        // PG: 2147 = count(any) [1 arg], 2803 = count(*) [0 args].
-        (2147, "count", "a", 1, 20),
-        (2803, "count", "a", 0, 20),
-        (2116, "max", "a", 1, 23),
-        (2129, "max", "a", 1, 25),
-        (2130, "max", "a", 1, 1700),
-        (2132, "min", "a", 1, 23),
-        (2145, "min", "a", 1, 25),
-        (2146, "min", "a", 1, 1700),
-        (2108, "sum", "a", 1, 20),
-        (2114, "sum", "a", 1, 1700),
-        (2100, "avg", "a", 1, 1700),
-        (3538, "string_agg", "a", 2, 25),
-        (2335, "array_agg", "a", 1, 2277),
-        (2517, "bool_and", "a", 1, 16),
-        (2518, "bool_or", "a", 1, 16),
-        (2519, "every", "a", 1, 16),
-        // Window functions.
-        (3100, "row_number", "w", 0, 20),
-        (3101, "rank", "w", 0, 20),
-        (3102, "dense_rank", "w", 0, 20),
-        (3103, "percent_rank", "w", 0, 701),
-        (3104, "cume_dist", "w", 0, 701),
-        (3106, "lag", "w", 1, 2283),
-        (3107, "lag", "w", 2, 2283),
-        (3109, "lead", "w", 1, 2283),
-        (3110, "lead", "w", 2, 2283),
-        (3112, "first_value", "w", 1, 2283),
-        (3113, "last_value", "w", 1, 2283),
-        (3114, "nth_value", "w", 2, 2283),
+    // Scalar functions.
+    // PG ships eight length() overloads; mirror the full set so
+    // catalog joins see the same rows (1317 text, 1318 bpchar,
+    // 1530/1531 lseg/path -> float8, 1681 bit, 1713 length(bytea,
+    // name) [2 args], 2010 bytea, 3711 tsvector).
+    (1317, "length", "f", 1, 23),
+    (1318, "length", "f", 1, 23),
+    (1530, "length", "f", 1, 701),
+    (1531, "length", "f", 1, 701),
+    (1681, "length", "f", 1, 23),
+    (1713, "length", "f", 2, 23),
+    (2010, "length", "f", 1, 23),
+    (3711, "length", "f", 1, 23),
+    // v7.39 (pg_proc reconcile) — every row below carries PG18's
+    // real (oid, prokind, pronargs, prorettype); the old table was
+    // full of invented / transposed oids (found when the corpus
+    // campaign hit two wrong rows and a full differential audit
+    // showed the drift was systemic). VARIADIC functions have
+    // pronargs = 1 (or 2 with a leading fixed arg), like PG.
+    (870, "lower", "f", 1, 25),
+    (871, "upper", "f", 1, 25),
+    // v7.39 (read01 regproc.c) — the range overloads make
+    // lower/upper ambiguous for ::regproc, as in PG.
+    (3848, "lower", "f", 1, 2283),
+    (3849, "upper", "f", 1, 2283),
+    (936, "substring", "f", 3, 25),
+    (937, "substring", "f", 2, 25),
+    (885, "btrim", "f", 1, 25),
+    (884, "btrim", "f", 2, 25),
+    (881, "ltrim", "f", 1, 25),
+    (875, "ltrim", "f", 2, 25),
+    (882, "rtrim", "f", 1, 25),
+    (876, "rtrim", "f", 2, 25),
+    (1396, "abs", "f", 1, 20),
+    (1397, "abs", "f", 1, 23),
+    (1705, "abs", "f", 1, 1700),
+    (1342, "round", "f", 1, 701),
+    (1708, "round", "f", 1, 1700),
+    (1707, "round", "f", 2, 1700),
+    (2308, "ceil", "f", 1, 701),
+    (1711, "ceil", "f", 1, 1700),
+    (2320, "ceiling", "f", 1, 701),
+    (2167, "ceiling", "f", 1, 1700),
+    (2309, "floor", "f", 1, 701),
+    (1712, "floor", "f", 1, 1700),
+    (1344, "sqrt", "f", 1, 701),
+    (1730, "sqrt", "f", 1, 1700),
+    (1341, "ln", "f", 1, 701),
+    (1734, "ln", "f", 1, 1700),
+    (1347, "exp", "f", 1, 701),
+    (1732, "exp", "f", 1, 1700),
+    (1368, "power", "f", 2, 701),
+    (2169, "power", "f", 2, 1700),
+    (1598, "random", "f", 0, 701),
+    // Date / time. (current_date / current_timestamp /
+    // current_time are parser keywords in PG, not pg_proc rows.)
+    (1299, "now", "f", 0, 1184),
+    (2020, "date_trunc", "f", 2, 1114),
+    (2021, "date_part", "f", 2, 701),
+    (2059, "age", "f", 1, 1186),
+    (2058, "age", "f", 2, 1186),
+    (2049, "to_char", "f", 2, 25),
+    (1772, "to_char", "f", 2, 25),
+    // Session / introspection.
+    (861, "current_database", "f", 0, 19),
+    (745, "current_user", "f", 0, 19),
+    (746, "session_user", "f", 0, 19),
+    (1402, "current_schema", "f", 0, 19),
+    // String concat / format.
+    (3058, "concat", "f", 1, 25),
+    (3059, "concat_ws", "f", 2, 25),
+    (3539, "format", "f", 2, 25),
+    (3540, "format", "f", 1, 25),
+    // Type introspection.
+    (1619, "pg_typeof", "f", 1, 2206),
+    // JSON.
+    (3200, "json_build_object", "f", 1, 114),
+    (3273, "jsonb_build_object", "f", 1, 3802),
+    (3198, "json_build_array", "f", 1, 114),
+    (3271, "jsonb_build_array", "f", 1, 3802),
+    // UUID.
+    (3432, "gen_random_uuid", "f", 0, 2950),
+    // Aggregates.
+    // PG: 2147 = count(any) [1 arg], 2803 = count(*) [0 args].
+    (2147, "count", "a", 1, 20),
+    (2803, "count", "a", 0, 20),
+    (2116, "max", "a", 1, 23),
+    (2129, "max", "a", 1, 25),
+    (2130, "max", "a", 1, 1700),
+    (2132, "min", "a", 1, 23),
+    (2145, "min", "a", 1, 25),
+    (2146, "min", "a", 1, 1700),
+    (2108, "sum", "a", 1, 20),
+    (2114, "sum", "a", 1, 1700),
+    (2100, "avg", "a", 1, 1700),
+    (3538, "string_agg", "a", 2, 25),
+    (2335, "array_agg", "a", 1, 2277),
+    (2517, "bool_and", "a", 1, 16),
+    (2518, "bool_or", "a", 1, 16),
+    (2519, "every", "a", 1, 16),
+    // Window functions.
+    (3100, "row_number", "w", 0, 20),
+    (3101, "rank", "w", 0, 20),
+    (3102, "dense_rank", "w", 0, 20),
+    (3103, "percent_rank", "w", 0, 701),
+    (3104, "cume_dist", "w", 0, 701),
+    (3106, "lag", "w", 1, 2283),
+    (3107, "lag", "w", 2, 2283),
+    (3109, "lead", "w", 1, 2283),
+    (3110, "lead", "w", 2, 2283),
+    (3112, "first_value", "w", 1, 2283),
+    (3113, "last_value", "w", 1, 2283),
+    (3114, "nth_value", "w", 2, 2283),
 ];
 
 /// v7.17.0 Phase 3.P0-65 — synthesise `mysql.user`. MySQL admin
@@ -3776,7 +3772,9 @@ pub(crate) fn synth_pg_rules(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     for r in cat.rules() {
         let mut def = alloc::format!(
             "CREATE RULE {} AS ON {} TO public.{}",
-            r.name, r.event, r.table
+            r.name,
+            r.event,
+            r.table
         );
         if !r.when_condition.is_empty() {
             def.push_str(" WHERE ");
@@ -4215,8 +4213,7 @@ pub(crate) fn synth_pg_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
-        let has_indexes =
-            !t.indices().is_empty() || !t.schema().uniqueness_constraints.is_empty();
+        let has_indexes = !t.indices().is_empty() || !t.schema().uniqueness_constraints.is_empty();
         rows.push(Row::new(alloc::vec![
             Value::text("public"),
             Value::text(tname.clone()),
@@ -4266,29 +4263,29 @@ pub(crate) fn synth_info_role_table_grants(
         // An un-granted table reports only the owner's implicit set; once
         // relacl materialises, the ACL itself is the whole truth (its first
         // entry IS the owner's).
-        let acl: Vec<(alloc::string::String, u16, u16, alloc::string::String)> = if sc.acl.is_empty()
-        {
-            alloc::vec![(
-                owner.clone(),
-                spg_storage::priv_bits::ALL,
-                spg_storage::priv_bits::ALL,
-                owner.clone(),
-            )]
-        } else {
-            sc.acl
-                .iter()
-                .map(|a| {
-                    // The owner's own row is grantable throughout; a grantee's
-                    // is grantable only where WITH GRANT OPTION was given.
-                    let grantable = if a.grantee.eq_ignore_ascii_case(&owner) {
-                        a.privs
-                    } else {
-                        a.grantable
-                    };
-                    (a.grantee.clone(), a.privs, grantable, a.grantor.clone())
-                })
-                .collect()
-        };
+        let acl: Vec<(alloc::string::String, u16, u16, alloc::string::String)> =
+            if sc.acl.is_empty() {
+                alloc::vec![(
+                    owner.clone(),
+                    spg_storage::priv_bits::ALL,
+                    spg_storage::priv_bits::ALL,
+                    owner.clone(),
+                )]
+            } else {
+                sc.acl
+                    .iter()
+                    .map(|a| {
+                        // The owner's own row is grantable throughout; a grantee's
+                        // is grantable only where WITH GRANT OPTION was given.
+                        let grantable = if a.grantee.eq_ignore_ascii_case(&owner) {
+                            a.privs
+                        } else {
+                            a.grantable
+                        };
+                        (a.grantee.clone(), a.privs, grantable, a.grantor.clone())
+                    })
+                    .collect()
+            };
         for (who, privs, grantable, grantor) in acl {
             // information_schema is the SQL standard's view, so it lists only
             // the standard privileges — PG's non-standard MAINTAIN shows up in
@@ -4306,9 +4303,11 @@ pub(crate) fn synth_info_role_table_grants(
                     Value::text(alloc::string::String::from("public")),
                     Value::text(tname.clone()),
                     Value::text(alloc::string::String::from(word)),
-                    Value::text(alloc::string::String::from(
-                        if grantable & bit != 0 { "YES" } else { "NO" },
-                    )),
+                    Value::text(alloc::string::String::from(if grantable & bit != 0 {
+                        "YES"
+                    } else {
+                        "NO"
+                    },)),
                     // PG sets with_hierarchy YES only for SELECT.
                     Value::text(alloc::string::String::from(
                         if bit == spg_storage::priv_bits::SELECT {
@@ -4358,9 +4357,11 @@ pub(crate) fn synth_info_column_privileges(
                         Value::text(tname.clone()),
                         Value::text(col.name.clone()),
                         Value::text(alloc::string::String::from(crate::acl::priv_word(bit))),
-                        Value::text(alloc::string::String::from(
-                            if a.grantable & bit != 0 { "YES" } else { "NO" },
-                        )),
+                        Value::text(alloc::string::String::from(if a.grantable & bit != 0 {
+                            "YES"
+                        } else {
+                            "NO"
+                        },)),
                     ]));
                 }
             }
@@ -4460,7 +4461,8 @@ pub(crate) fn render_indexdef(
             .map_or_else(|| "?".into(), |c| c.name.clone())
     };
     let backs_unique_constraint = t.schema().uniqueness_constraints.iter().any(|uc| {
-        if uc.columns.len() != positions.len() || !positions.iter().all(|p| uc.columns.contains(p)) {
+        if uc.columns.len() != positions.len() || !positions.iter().all(|p| uc.columns.contains(p))
+        {
             return false;
         }
         let auto_name = if uc.is_primary_key {

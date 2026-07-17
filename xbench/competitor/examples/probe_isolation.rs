@@ -11,13 +11,11 @@ fn probe(level: &str) {
     e.execute("INSERT INTO t VALUES (1)").unwrap();
     let tx1 = e.alloc_tx_id();
     e.execute_in("BEGIN", tx1).unwrap();
-    if !level.is_empty() {
-        if let Err(err) =
-            e.execute_in(&format!("SET TRANSACTION ISOLATION LEVEL {level}"), tx1)
-        {
-            println!("{level:>16}: SET failed: {err:?}");
-            return;
-        }
+    if !level.is_empty()
+        && let Err(err) = e.execute_in(&format!("SET TRANSACTION ISOLATION LEVEL {level}"), tx1)
+    {
+        println!("{level:>16}: SET failed: {err:?}");
+        return;
     }
     // Establish tx1's snapshot with a first read.
     let count = |e: &mut Engine, tx| -> String {
@@ -28,7 +26,8 @@ fn probe(level: &str) {
     };
     let before = count(&mut e, tx1);
     // Concurrent autocommit insert (committed immediately).
-    e.execute_in("INSERT INTO t VALUES (2)", IMPLICIT_TX).unwrap();
+    e.execute_in("INSERT INTO t VALUES (2)", IMPLICIT_TX)
+        .unwrap();
     let after = count(&mut e, tx1);
     // Write-write: tx1 updates a row someone else updated after tx1's
     // snapshot — SER should abort at some point (here or commit).
@@ -37,8 +36,14 @@ fn probe(level: &str) {
     println!(
         "{:>16}: first-read={before} after-concurrent-commit={after} update={} commit={}",
         if level.is_empty() { "(default)" } else { level },
-        match upd { Ok(_) => "ok".to_string(), Err(e) => format!("ERR {e:?}") },
-        match commit { Ok(_) => "ok".to_string(), Err(e) => format!("ERR {e:?}") },
+        match upd {
+            Ok(_) => "ok".to_string(),
+            Err(e) => format!("ERR {e:?}"),
+        },
+        match commit {
+            Ok(_) => "ok".to_string(),
+            Err(e) => format!("ERR {e:?}"),
+        },
     );
 }
 

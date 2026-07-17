@@ -43,7 +43,10 @@ fn affected(r: QueryResult) -> usize {
 fn delete_is_blocked() {
     let mut e = Engine::new();
     setup(&mut e);
-    assert_eq!(affected(e.execute("DELETE FROM t WHERE id = 1").unwrap()), 0);
+    assert_eq!(
+        affected(e.execute("DELETE FROM t WHERE id = 1").unwrap()),
+        0
+    );
     assert_eq!(affected(e.execute("DELETE FROM t").unwrap()), 0);
     assert_eq!(pairs(&mut e), vec![(1, 10), (2, 20)]);
 }
@@ -52,7 +55,10 @@ fn delete_is_blocked() {
 fn update_is_blocked() {
     let mut e = Engine::new();
     setup(&mut e);
-    assert_eq!(affected(e.execute("UPDATE t SET v = 99 WHERE id = 2").unwrap()), 0);
+    assert_eq!(
+        affected(e.execute("UPDATE t SET v = 99 WHERE id = 2").unwrap()),
+        0
+    );
     assert_eq!(affected(e.execute("UPDATE t SET v = 0").unwrap()), 0);
     assert_eq!(pairs(&mut e), vec![(1, 10), (2, 20)]);
 }
@@ -61,8 +67,14 @@ fn update_is_blocked() {
 fn insert_is_blocked() {
     let mut e = Engine::new();
     setup(&mut e);
-    assert_eq!(affected(e.execute("INSERT INTO t VALUES (3, 30)").unwrap()), 0);
-    assert_eq!(affected(e.execute("INSERT INTO t VALUES (4, 40), (5, 50)").unwrap()), 0);
+    assert_eq!(
+        affected(e.execute("INSERT INTO t VALUES (3, 30)").unwrap()),
+        0
+    );
+    assert_eq!(
+        affected(e.execute("INSERT INTO t VALUES (4, 40), (5, 50)").unwrap()),
+        0
+    );
     assert_eq!(pairs(&mut e), vec![(1, 10), (2, 20)]);
 }
 
@@ -106,7 +118,10 @@ fn unsupported_rule_forms_are_rejected_not_swallowed() {
         Err(x) => format!("{x}"),
         Ok(_) => panic!("expected error"),
     };
-    assert!(m.contains("conditional (WHERE) DO INSTEAD <command> rules are not yet implemented"), "{m}");
+    assert!(
+        m.contains("conditional (WHERE) DO INSTEAD <command> rules are not yet implemented"),
+        "{m}"
+    );
     // Unconditional DO INSTEAD <command> is supported since round 142; the
     // conditional DO INSTEAD NOTHING form since round 141.
     // ON SELECT — use CREATE VIEW.
@@ -127,9 +142,15 @@ fn unsupported_rule_forms_are_rejected_not_swallowed() {
 fn drop_rule_reenables_dml() {
     let mut e = Engine::new();
     setup(&mut e);
-    assert_eq!(affected(e.execute("DELETE FROM t WHERE id = 1").unwrap()), 0);
+    assert_eq!(
+        affected(e.execute("DELETE FROM t WHERE id = 1").unwrap()),
+        0
+    );
     e.execute("DROP RULE r_del ON t").unwrap();
-    assert_eq!(affected(e.execute("DELETE FROM t WHERE id = 1").unwrap()), 1);
+    assert_eq!(
+        affected(e.execute("DELETE FROM t WHERE id = 1").unwrap()),
+        1
+    );
     assert_eq!(pairs(&mut e), vec![(2, 20)]);
     // IF EXISTS on a missing rule is a no-op; a bare drop of a missing rule errors.
     e.execute("DROP RULE IF EXISTS ghost ON t").unwrap();

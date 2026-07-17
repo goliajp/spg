@@ -39,8 +39,7 @@ fn errs(e: &mut Engine, sql: &str, want: &str) {
     assert!(m.contains(want), "{m}");
 }
 
-const DETAIL: &str =
-    "View columns that are not columns of their base relation are not updatable.";
+const DETAIL: &str = "View columns that are not columns of their base relation are not updatable.";
 
 fn setup(e: &mut Engine) {
     e.execute("CREATE TABLE t(id int, v int)").unwrap();
@@ -179,7 +178,10 @@ fn aliased_column_view_updatable() {
     setup(&mut e);
     e.execute("CREATE VIEW av AS SELECT id AS key, v FROM t")
         .unwrap();
-    assert_eq!(affected(&mut e, "INSERT INTO av (key, v) VALUES (7, 70)"), 1);
+    assert_eq!(
+        affected(&mut e, "INSERT INTO av (key, v) VALUES (7, 70)"),
+        1
+    );
     assert_eq!(affected(&mut e, "UPDATE av SET key = 9 WHERE key = 1"), 1);
     assert_eq!(affected(&mut e, "INSERT INTO av VALUES (3, 30)"), 1);
     assert_eq!(

@@ -33,10 +33,14 @@ fn err_of(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn jsonb_cast_rejects_invalid_tokens() {
     let mut e = Engine::new();
-    assert!(err_of(&mut e, "SELECT '{\"a\": NaN}'::jsonb")
-        .contains("invalid input syntax for type json"));
-    assert!(err_of(&mut e, "SELECT '{\"a\": Infinity}'::jsonb")
-        .contains("invalid input syntax for type json"));
+    assert!(
+        err_of(&mut e, "SELECT '{\"a\": NaN}'::jsonb")
+            .contains("invalid input syntax for type json")
+    );
+    assert!(
+        err_of(&mut e, "SELECT '{\"a\": Infinity}'::jsonb")
+            .contains("invalid input syntax for type json")
+    );
     // Valid jsonb still canonicalizes.
     assert_eq!(
         row_of(&mut e, "SELECT '  {  \"a\" : 1 }  '::jsonb"),
@@ -49,11 +53,17 @@ fn jsonb_object_keys_canonical_order() {
     let mut e = Engine::new();
     // jsonb keys sort by (length, then bytes); json keeps insertion order.
     assert_eq!(
-        col_of(&mut e, "SELECT jsonb_object_keys('{\"z\":1,\"a\":2,\"m\":3}')"),
+        col_of(
+            &mut e,
+            "SELECT jsonb_object_keys('{\"z\":1,\"a\":2,\"m\":3}')"
+        ),
         vec!["a", "m", "z"]
     );
     assert_eq!(
-        col_of(&mut e, "SELECT json_object_keys('{\"z\":1,\"a\":2,\"m\":3}')"),
+        col_of(
+            &mut e,
+            "SELECT json_object_keys('{\"z\":1,\"a\":2,\"m\":3}')"
+        ),
         vec!["z", "a", "m"]
     );
 }

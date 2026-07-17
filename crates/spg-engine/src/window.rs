@@ -620,17 +620,18 @@ pub(crate) fn compute_window_partition(
                     let found = if lower == "first_value" {
                         frame_idxs.iter().copied().find(|&j| !values[j].is_null())
                     } else {
-                        frame_idxs.iter().rev().copied().find(|&j| !values[j].is_null())
+                        frame_idxs
+                            .iter()
+                            .rev()
+                            .copied()
+                            .find(|&j| !values[j].is_null())
                     };
                     found.map(pick).unwrap_or(Value::Null)
                 } else {
                     match lower.as_str() {
                         "first_value" => pick(frame_idxs[0]),
                         "last_value" => pick(*frame_idxs.last().unwrap()),
-                        "nth_value" => frame_idxs
-                            .get(nth - 1)
-                            .copied()
-                            .map_or(Value::Null, pick),
+                        "nth_value" => frame_idxs.get(nth - 1).copied().map_or(Value::Null, pick),
                         _ => unreachable!(),
                     }
                 };

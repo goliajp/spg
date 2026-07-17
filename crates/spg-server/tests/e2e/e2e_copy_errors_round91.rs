@@ -21,7 +21,10 @@ use std::time::Duration;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn local_spawn(db: &std::path::Path) -> (std::process::Child, common::ServerAddrs) {
-    common::ServerBuilder::new().arg_path(db).with_pgwire().spawn()
+    common::ServerBuilder::new()
+        .arg_path(db)
+        .with_pgwire()
+        .spawn()
 }
 
 fn unique_tmpdir(label: &str) -> PathBuf {
@@ -166,14 +169,23 @@ fn null_option_decodes_the_token_to_null() {
     let mut s = open(addrs.pgwire.as_ref().unwrap());
 
     exec(&mut s, "CREATE TABLE t (id int, name text)");
-    send_query(&mut s, "COPY t FROM STDIN WITH (FORMAT csv, NULL 'NULLTOKEN')");
+    send_query(
+        &mut s,
+        "COPY t FROM STDIN WITH (FORMAT csv, NULL 'NULLTOKEN')",
+    );
     assert_eq!(read_message(&mut s).ty, b'G');
     send_msg(&mut s, b'd', b"1,NULLTOKEN\n");
     send_msg(&mut s, b'c', &[]);
     let _ = read_until_ready(&mut s);
 
     // The token decoded to NULL, not the literal "NULLTOKEN".
-    assert_eq!(scalar(&mut s, "SELECT coalesce(name, 'ISNULL') FROM t WHERE id = 1"), "ISNULL");
+    assert_eq!(
+        scalar(
+            &mut s,
+            "SELECT coalesce(name, 'ISNULL') FROM t WHERE id = 1"
+        ),
+        "ISNULL"
+    );
 }
 
 #[test]
@@ -226,5 +238,8 @@ fn well_formed_rows_still_load() {
     send_msg(&mut s, b'd', b"7\t8\n");
     send_msg(&mut s, b'c', &[]);
     let _ = read_until_ready(&mut s);
-    assert_eq!(scalar(&mut s, "SELECT coalesce(c::text,'NULL') FROM t WHERE a = 7"), "NULL");
+    assert_eq!(
+        scalar(&mut s, "SELECT coalesce(c::text,'NULL') FROM t WHERE a = 7"),
+        "NULL"
+    );
 }

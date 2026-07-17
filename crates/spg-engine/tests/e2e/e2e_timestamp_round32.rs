@@ -25,16 +25,27 @@ fn overflow_is_an_error_not_a_crash() {
     let mut e = Engine::new();
     // Both once aborted the process (debug multiply-overflow): a
     // beyond-window literal and a shifted-past-window instant.
-    assert!(!err_of(&mut e, "SELECT timestamp '294276-12-31 23:59:59' + interval '100 years'").is_empty());
-    assert!(err_of(
-        &mut e,
-        "SELECT timestamp '4714-01-01 00:00:00 BC' - interval '100 years'"
-    )
-    .contains("timestamp out of range"));
+    assert!(
+        !err_of(
+            &mut e,
+            "SELECT timestamp '294276-12-31 23:59:59' + interval '100 years'"
+        )
+        .is_empty()
+    );
+    assert!(
+        err_of(
+            &mut e,
+            "SELECT timestamp '4714-01-01 00:00:00 BC' - interval '100 years'"
+        )
+        .contains("timestamp out of range")
+    );
     // The date-infinity sentinel casts to the timestamp sentinel
     // (used to overflow in the multiply).
     assert_eq!(
-        row_of(&mut e, "SELECT '-infinity'::date::timestamp, 'infinity'::date"),
+        row_of(
+            &mut e,
+            "SELECT '-infinity'::date::timestamp, 'infinity'::date"
+        ),
         vec!["-infinity", "infinity"]
     );
 }
@@ -59,11 +70,13 @@ fn infinity_semantics() {
         ),
         vec!["infinity", "-infinity"]
     );
-    assert!(err_of(
-        &mut e,
-        "SELECT 'infinity'::timestamp - 'infinity'::timestamp"
-    )
-    .contains("interval out of range"));
+    assert!(
+        err_of(
+            &mut e,
+            "SELECT 'infinity'::timestamp - 'infinity'::timestamp"
+        )
+        .contains("interval out of range")
+    );
 }
 
 #[test]

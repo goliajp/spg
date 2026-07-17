@@ -28,7 +28,8 @@ fn cte_shadows_view() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE vt158(x int)").unwrap();
     e.execute("INSERT INTO vt158 VALUES (100),(200)").unwrap();
-    e.execute("CREATE VIEW vv158 AS SELECT x FROM vt158").unwrap();
+    e.execute("CREATE VIEW vv158 AS SELECT x FROM vt158")
+        .unwrap();
     e.execute("CREATE TABLE vo158(id int)").unwrap();
     // The CTE wins for the outer query.
     assert_eq!(
@@ -62,5 +63,8 @@ fn cte_shadows_view() {
         vec![3]
     );
     // The view itself is untouched.
-    assert_eq!(col(&mut e, "SELECT x FROM vv158 ORDER BY x"), vec![100, 200]);
+    assert_eq!(
+        col(&mut e, "SELECT x FROM vv158 ORDER BY x"),
+        vec![100, 200]
+    );
 }

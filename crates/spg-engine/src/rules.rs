@@ -35,19 +35,26 @@ fn rewrite_rule_pred_to_base(expr: &mut Expr, assignments: &[(String, Expr)]) {
         if let Some(q) = &c.qualifier {
             let lower = q.to_ascii_lowercase();
             if lower == "new" {
-                if let Some((_, aexpr)) =
-                    assignments.iter().find(|(col, _)| col.eq_ignore_ascii_case(&c.name))
+                if let Some((_, aexpr)) = assignments
+                    .iter()
+                    .find(|(col, _)| col.eq_ignore_ascii_case(&c.name))
                 {
                     // The SET expression is written over base columns (their OLD
                     // values at evaluation time), so it needs no further rewrite.
                     *expr = aexpr.clone();
                     return;
                 }
-                *expr = Expr::Column(ColumnName { qualifier: None, name: c.name.clone() });
+                *expr = Expr::Column(ColumnName {
+                    qualifier: None,
+                    name: c.name.clone(),
+                });
                 return;
             }
             if lower == "old" {
-                *expr = Expr::Column(ColumnName { qualifier: None, name: c.name.clone() });
+                *expr = Expr::Column(ColumnName {
+                    qualifier: None,
+                    name: c.name.clone(),
+                });
                 return;
             }
         }
@@ -103,7 +110,11 @@ fn rewrite_rule_pred_to_base(expr: &mut Expr, assignments: &[(String, Expr)]) {
                 rewrite_rule_pred_to_base(item, assignments);
             }
         }
-        Expr::Case { operand, branches, else_branch } => {
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
             if let Some(o) = operand {
                 rewrite_rule_pred_to_base(o, assignments);
             }
@@ -179,7 +190,10 @@ impl Engine {
             let keep = Expr::FunctionCall {
                 name: String::from("coalesce"),
                 args: alloc::vec![
-                    Expr::Unary { op: UnOp::Not, expr: Box::new(cond) },
+                    Expr::Unary {
+                        op: UnOp::Not,
+                        expr: Box::new(cond)
+                    },
                     Expr::Literal(Literal::Bool(true)),
                 ],
             };
@@ -198,7 +212,11 @@ impl Engine {
     /// v7.39 (round 141) — the conditional `DO INSTEAD NOTHING` rules for
     /// `(table, event)`: INSTEAD rules with a WHERE and no command body. Used to
     /// filter INSERT value tuples per row.
-    pub(crate) fn conditional_instead_nothing_rules(&self, table: &str, event: &str) -> Vec<RuleDef> {
+    pub(crate) fn conditional_instead_nothing_rules(
+        &self,
+        table: &str,
+        event: &str,
+    ) -> Vec<RuleDef> {
         self.snapshot_rules(table, event)
             .into_iter()
             .filter(|r| r.instead && r.commands.is_empty() && !r.when_condition.is_empty())
@@ -248,8 +266,8 @@ impl Engine {
                     continue;
                 }
                 for cmd_text in &rule.commands {
-                    let mut stmt = spg_sql::parser::parse_statement(cmd_text)
-                        .map_err(EngineError::Parse)?;
+                    let mut stmt =
+                        spg_sql::parser::parse_statement(cmd_text).map_err(EngineError::Parse)?;
                     triggers::substitute_trigger_context_in_statement(
                         &mut stmt,
                         new_row.as_ref(),

@@ -35,10 +35,16 @@ fn bytea_overlay_and_reverse() {
 #[test]
 fn bytea_index_range_wordings() {
     let mut e = Engine::new();
-    assert!(err_of(&mut e, "SELECT get_byte('\\x1234'::bytea, 9)")
-        .contains("index 9 out of valid range, 0..1"));
-    assert!(err_of(&mut e, "SELECT set_byte('\\x1234'::bytea, 9, 1)")
-        .contains("index 9 out of valid range, 0..1"));
-    assert!(err_of(&mut e, "SELECT get_bit('\\x12'::bytea, 99)")
-        .contains("index 99 out of valid range, 0..7"));
+    assert!(
+        err_of(&mut e, "SELECT get_byte('\\x1234'::bytea, 9)")
+            .contains("index 9 out of valid range, 0..1")
+    );
+    assert!(
+        err_of(&mut e, "SELECT set_byte('\\x1234'::bytea, 9, 1)")
+            .contains("index 9 out of valid range, 0..1")
+    );
+    assert!(
+        err_of(&mut e, "SELECT get_bit('\\x12'::bytea, 99)")
+            .contains("index 99 out of valid range, 0..7")
+    );
 }

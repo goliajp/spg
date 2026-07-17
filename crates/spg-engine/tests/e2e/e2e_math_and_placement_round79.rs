@@ -30,7 +30,10 @@
 use spg_engine::{Engine, QueryResult};
 
 fn r1(e: &mut Engine, sql: &str) -> String {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{sql}: {other:?}"),
     }
@@ -80,7 +83,13 @@ fn b_a_misplaced_aggregate_says_so() {
         "got {in_where:?}"
     );
     // HAVING is where an aggregate belongs, and still works.
-    assert_eq!(r1(&mut e, "SELECT count(*) FROM n GROUP BY v HAVING sum(v) > 1"), "1");
+    assert_eq!(
+        r1(
+            &mut e,
+            "SELECT count(*) FROM n GROUP BY v HAVING sum(v) > 1"
+        ),
+        "1"
+    );
 }
 
 #[test]
@@ -95,10 +104,15 @@ fn c_setseed_returns_void_not_null() {
 fn d_aggregate_filter_and_distinct_still_hold() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE a (g text, v int, t text)").unwrap();
-    e.execute("INSERT INTO a VALUES ('x',1,'p'),('x',2,'q'),('x',2,'p'),('y',3,'r'),('y',NULL,'s')")
-        .unwrap();
+    e.execute(
+        "INSERT INTO a VALUES ('x',1,'p'),('x',2,'q'),('x',2,'p'),('y',3,'r'),('y',NULL,'s')",
+    )
+    .unwrap();
     assert_eq!(
-        r1(&mut e, "SELECT count(DISTINCT v) FILTER (WHERE v > 1) FROM a"),
+        r1(
+            &mut e,
+            "SELECT count(DISTINCT v) FILTER (WHERE v > 1) FROM a"
+        ),
         "2"
     );
     assert_eq!(
@@ -108,8 +122,17 @@ fn d_aggregate_filter_and_distinct_still_hold() {
         ),
         "q,r,s"
     );
-    assert_eq!(r1(&mut e, "SELECT array_agg(DISTINCT v) FROM a"), "{1,2,3,NULL}");
+    assert_eq!(
+        r1(&mut e, "SELECT array_agg(DISTINCT v) FROM a"),
+        "{1,2,3,NULL}"
+    );
     // An empty FILTER makes count 0 but sum NULL — PG's distinction.
-    assert_eq!(r1(&mut e, "SELECT count(*) FILTER (WHERE v > 5) FROM a"), "0");
-    assert_eq!(r1(&mut e, "SELECT sum(v) FILTER (WHERE v > 5) IS NULL FROM a"), "true");
+    assert_eq!(
+        r1(&mut e, "SELECT count(*) FILTER (WHERE v > 5) FROM a"),
+        "0"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT sum(v) FILTER (WHERE v > 5) IS NULL FROM a"),
+        "true"
+    );
 }

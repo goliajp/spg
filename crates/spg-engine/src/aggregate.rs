@@ -311,12 +311,15 @@ fn classify_agg_name(name: &str) -> AggKind {
         "json_agg" | "jsonb_agg" | "json_arrayagg" | "json_agg_strict" | "jsonb_agg_strict" => {
             AggKind::JsonAgg
         }
-        "json_object_agg" | "jsonb_object_agg" | "json_objectagg"
-        | "json_object_agg_strict" | "jsonb_object_agg_strict"
-        | "json_object_agg_unique" | "jsonb_object_agg_unique"
-        | "json_object_agg_unique_strict" | "jsonb_object_agg_unique_strict" => {
-            AggKind::JsonObjectAgg
-        }
+        "json_object_agg"
+        | "jsonb_object_agg"
+        | "json_objectagg"
+        | "json_object_agg_strict"
+        | "jsonb_object_agg_strict"
+        | "json_object_agg_unique"
+        | "jsonb_object_agg_unique"
+        | "json_object_agg_unique_strict"
+        | "jsonb_object_agg_unique_strict" => AggKind::JsonObjectAgg,
         n if is_within_group_name(n) => AggKind::WithinGroup,
         n if is_regression_name(n) => AggKind::Regression,
         other => panic!("classify_agg_name: unknown aggregate {other}"),
@@ -711,8 +714,8 @@ pub(crate) fn run(
             if matches!(spec.kind, AggKind::Min | AggKind::Max)
                 && let Some(arg) = &spec.arg
             {
-                spec.enum_labels =
-                    crate::eval::expr_enum_labels(arg, schema_cols, catalog).map(<[String]>::to_vec);
+                spec.enum_labels = crate::eval::expr_enum_labels(arg, schema_cols, catalog)
+                    .map(<[String]>::to_vec);
             }
             if !spec.order_by.is_empty() {
                 spec.order_enum_labels = spec
@@ -741,16 +744,15 @@ pub(crate) fn run(
     )?;
 
     // (2) Build the synthetic per-group schema and finalise each group's row.
-    let synth_schema =
-        build_synth_schema(
-            rows,
-            &group_exprs,
-            &agg_specs,
-            schema_cols,
-            table_alias,
-            catalog,
-            engine,
-        )?;
+    let synth_schema = build_synth_schema(
+        rows,
+        &group_exprs,
+        &agg_specs,
+        schema_cols,
+        table_alias,
+        catalog,
+        engine,
+    )?;
     let synth_rows = finalize_synth_rows(
         &order,
         &agg_specs,
@@ -1127,7 +1129,13 @@ fn fill_states_from_fused(
 type SumBig = Option<alloc::boxed::Box<spg_storage::bignum::BigNumeric>>;
 
 /// Add an exact NUMERIC (mantissa × 10^-scale) into the sum tri-state.
-fn sum_add_exact(scaled: &mut i128, scale: &mut u8, big: &mut SumBig, add_scaled: i128, add_scale: u8) {
+fn sum_add_exact(
+    scaled: &mut i128,
+    scale: &mut u8,
+    big: &mut SumBig,
+    add_scaled: i128,
+    add_scale: u8,
+) {
     use spg_storage::bignum::BigNumeric;
     if let Some(b) = big {
         **b = b.add(&BigNumeric::from_i128(add_scaled, add_scale));
@@ -1600,9 +1608,7 @@ fn accumulate_groups(
     //   and one accumulate per row;
     // - remaining ops run in one tight pass, no update_state.
     // Finalize writes the same AggState fields as the single-spec path.
-    if single_anon_group
-        && let Some((spec_src, unique_ops)) = fused_layout(agg_specs, &arg_pos)
-    {
+    if single_anon_group && let Some((spec_src, unique_ops)) = fused_layout(agg_specs, &arg_pos) {
         let mut accs: Vec<FusedAcc> = (0..unique_ops.len()).map(|_| FusedAcc::default()).collect();
         // v7.39 (parallel-agg P1) — shard the row scan across the
         // host-injected executor when the input is large enough.
@@ -1610,25 +1616,24 @@ fn accumulate_groups(
         // returns its own Vec<FusedAcc>; the merge is field-wise
         // (see merge_fused). Errors inside a shard surface as the
         // shard result and re-raise after join.
-        let fused_scan = |range: core::ops::Range<usize>,
-                          accs: &mut Vec<FusedAcc>|
-         -> Result<(), EvalError> {
-            for row in &rows[range] {
-                for (si, op) in unique_ops.iter().enumerate() {
-                    match op {
-                        FusedOp::CountCol(p) => {
-                            if !matches!(row.get(*p), Some(Value::Null) | None) {
-                                accs[si].count += 1;
+        let fused_scan =
+            |range: core::ops::Range<usize>, accs: &mut Vec<FusedAcc>| -> Result<(), EvalError> {
+                for row in &rows[range] {
+                    for (si, op) in unique_ops.iter().enumerate() {
+                        match op {
+                            FusedOp::CountCol(p) => {
+                                if !matches!(row.get(*p), Some(Value::Null) | None) {
+                                    accs[si].count += 1;
+                                }
                             }
-                        }
-                        FusedOp::AccCol(p) => {
-                            fused_acc_cell(&mut accs[si], row.get(*p).unwrap_or(&Value::Null))?;
+                            FusedOp::AccCol(p) => {
+                                fused_acc_cell(&mut accs[si], row.get(*p).unwrap_or(&Value::Null))?;
+                            }
                         }
                     }
                 }
-            }
-            Ok(())
-        };
+                Ok(())
+            };
         if !unique_ops.is_empty() {
             let par = runner.filter(|_| rows.len() >= crate::PARALLEL_MIN_ROWS);
             if let Some(r) = par {
@@ -2031,13 +2036,7 @@ fn accumulate_groups(
                         scale,
                         kind,
                     } => {
-                        sum_add_exact(
-                            &mut num_scaled,
-                            &mut num_scale,
-                            &mut num_big,
-                            scaled,
-                            scale,
-                        );
+                        sum_add_exact(&mut num_scaled, &mut num_scale, &mut num_big, scaled, scale);
                         num_kind = fold_sum_kind(num_kind, kind);
                         use_numeric = true;
                         count += 1;
@@ -4165,9 +4164,7 @@ fn update_state(
                 });
                 if dup {
                     return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "duplicate JSON object key value: {kt:?}"
-                        ),
+                        detail: alloc::format!("duplicate JSON object key value: {kt:?}"),
                     });
                 }
             }
@@ -4264,11 +4261,9 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
                     // v7.39 (read01 numeric.c) — bignum avg = spilled sum /
                     // count at PG's division display scale.
                     use spg_storage::bignum::BigNumeric;
-                    let sum_tot =
-                        big.add(&BigNumeric::from_i128(i128::from(st.sum_int), 0));
+                    let sum_tot = big.add(&BigNumeric::from_i128(i128::from(st.sum_int), 0));
                     let cnt = BigNumeric::from_i128(i128::from(st.count), 0);
-                    let rscale =
-                        crate::numeric::division_display_scale_big(&sum_tot, &cnt);
+                    let rscale = crate::numeric::division_display_scale_big(&sum_tot, &cnt);
                     match sum_tot.div(&cnt, rscale) {
                         Some(q) => crate::eval::binop::bignum_to_value(q),
                         None => Value::Null,
@@ -4515,10 +4510,15 @@ fn finalize(name: &str, st: &AggState) -> Value<'static> {
         }
         // v7.32 (round-29) — json_object_agg: a JSON object built from
         // the parallel key (`items`) / value (`aux_items`) streams.
-        "json_object_agg" | "jsonb_object_agg" | "json_objectagg"
-        | "json_object_agg_strict" | "jsonb_object_agg_strict"
-        | "json_object_agg_unique" | "jsonb_object_agg_unique"
-        | "json_object_agg_unique_strict" | "jsonb_object_agg_unique_strict" => {
+        "json_object_agg"
+        | "jsonb_object_agg"
+        | "json_objectagg"
+        | "json_object_agg_strict"
+        | "jsonb_object_agg_strict"
+        | "json_object_agg_unique"
+        | "jsonb_object_agg_unique"
+        | "json_object_agg_unique_strict"
+        | "jsonb_object_agg_unique_strict" => {
             if st.items.is_empty() {
                 return Value::Null;
             }
@@ -4753,9 +4753,7 @@ fn finalize_ordered_set(
                     sorted.sort_by(tuple_cmp);
                     let mut distinct = 0usize;
                     for (k, &i) in sorted.iter().enumerate() {
-                        if k == 0
-                            || tuple_cmp(&sorted[k - 1], &i) != core::cmp::Ordering::Equal
-                        {
+                        if k == 0 || tuple_cmp(&sorted[k - 1], &i) != core::cmp::Ordering::Equal {
                             distinct += 1;
                         }
                     }
@@ -4817,10 +4815,7 @@ fn finalize_ordered_set(
             // v7.39 (read01 orderedsetaggs.c) — the INTERVAL overload
             // interpolates component-wise with PG's month→day→time
             // remainder spill (a month is 30 days, a day 86400 s).
-            if items
-                .iter()
-                .all(|v| matches!(v, Value::Interval { .. }))
-            {
+            if items.iter().all(|v| matches!(v, Value::Interval { .. })) {
                 let iv = |i: usize| -> (f64, f64, f64) {
                     match &items[i] {
                         Value::Interval {
@@ -4853,10 +4848,8 @@ fn finalize_ordered_set(
                     }
                 };
                 if let Some(fracs) = percentile_fraction_array(fraction) {
-                    let picked: Vec<Value> = fracs
-                        .iter()
-                        .map(|f| f.map_or(Value::Null, at))
-                        .collect();
+                    let picked: Vec<Value> =
+                        fracs.iter().map(|f| f.map_or(Value::Null, at)).collect();
                     return Ok(values_to_array(&picked));
                 }
                 let f = scalar_fraction.transpose()?.unwrap_or(0.0);
@@ -4880,9 +4873,7 @@ fn finalize_ordered_set(
                 nums[lo] + (nums[hi] - nums[lo]) * frac
             };
             if let Some(fracs) = percentile_fraction_array(fraction) {
-                return Ok(Value::FloatArray(
-                    fracs.iter().map(|f| f.map(at)).collect(),
-                ));
+                return Ok(Value::FloatArray(fracs.iter().map(|f| f.map(at)).collect()));
             }
             let f = scalar_fraction.transpose()?.unwrap_or(0.0);
             Value::Float(at(f))
@@ -5122,9 +5113,11 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             name: name.clone(),
             expr: alloc::boxed::Box::new(rewrite_expr(expr, group_exprs, aggs)),
         },
-        Expr::Variadic(expr) => {
-            Expr::Variadic(alloc::boxed::Box::new(rewrite_expr(expr, group_exprs, aggs)))
-        }
+        Expr::Variadic(expr) => Expr::Variadic(alloc::boxed::Box::new(rewrite_expr(
+            expr,
+            group_exprs,
+            aggs,
+        ))),
         Expr::AggregateOrdered {
             call,
             order_by,
@@ -5587,11 +5580,7 @@ fn fold_sum_kind(
 
 /// v7.39 (enum order knife) — min/max extreme comparison: member order when
 /// the spec's argument is enum-typed, the generic value order otherwise.
-fn extreme_cmp(
-    enum_labels: Option<&[String]>,
-    a: &Value,
-    b: &Value,
-) -> core::cmp::Ordering {
+fn extreme_cmp(enum_labels: Option<&[String]>, a: &Value, b: &Value) -> core::cmp::Ordering {
     if let Some(labels) = enum_labels
         && let Some(ord) = crate::eval::enum_ord_cmp(labels, a, b)
     {

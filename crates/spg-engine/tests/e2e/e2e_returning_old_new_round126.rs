@@ -38,7 +38,10 @@ fn update_returning_old_new() {
     setup(&mut e);
     // OLD.v=10, NEW.v=15, bare v=NEW=15, NEW.v-OLD.v=5.
     assert_eq!(
-        row1(&mut e, "UPDATE r SET v=v+5 WHERE id=1 RETURNING OLD.v, NEW.v, v, NEW.v-OLD.v AS d"),
+        row1(
+            &mut e,
+            "UPDATE r SET v=v+5 WHERE id=1 RETURNING OLD.v, NEW.v, v, NEW.v-OLD.v AS d"
+        ),
         vec!["10", "15", "15", "5"]
     );
 }
@@ -49,7 +52,10 @@ fn delete_returning_new_is_null() {
     setup(&mut e);
     // OLD.id=1, NEW.id=NULL (row gone), OLD.v=10.
     assert_eq!(
-        row1(&mut e, "DELETE FROM r WHERE id=1 RETURNING OLD.id, NEW.id, OLD.v"),
+        row1(
+            &mut e,
+            "DELETE FROM r WHERE id=1 RETURNING OLD.id, NEW.id, OLD.v"
+        ),
         vec!["1", "NULL", "10"]
     );
 }
@@ -60,7 +66,10 @@ fn insert_returning_old_is_null() {
     setup(&mut e);
     // OLD.v=NULL (no prior row), NEW.v=20.
     assert_eq!(
-        row1(&mut e, "INSERT INTO r VALUES(2,20) RETURNING OLD.v, NEW.v, id"),
+        row1(
+            &mut e,
+            "INSERT INTO r VALUES(2,20) RETURNING OLD.v, NEW.v, id"
+        ),
         vec!["NULL", "20", "2"]
     );
 }

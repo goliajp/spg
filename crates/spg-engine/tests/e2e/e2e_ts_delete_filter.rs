@@ -77,17 +77,11 @@ fn tsquery_phrase_joins() {
     // that renders as PG's canonical phrase form.
     let mut e = Engine::new();
     assert_eq!(
-        spg_engine::eval::value_to_text(&first(
-            &mut e,
-            "SELECT tsquery_phrase('fat', 'cat')"
-        )),
+        spg_engine::eval::value_to_text(&first(&mut e, "SELECT tsquery_phrase('fat', 'cat')")),
         "'fat' <-> 'cat'"
     );
     assert_eq!(
-        spg_engine::eval::value_to_text(&first(
-            &mut e,
-            "SELECT tsquery_phrase('fat', 'cat', 10)"
-        )),
+        spg_engine::eval::value_to_text(&first(&mut e, "SELECT tsquery_phrase('fat', 'cat', 10)")),
         "'fat' <10> 'cat'"
     );
 }

@@ -228,16 +228,34 @@ pub fn fire_row_trigger(
     // DECLARE block so an initialiser may reference them. PG names them
     // case-insensitively; the interpreter lowercases identifiers, so lowercase
     // keys are what a `TG_OP` reference resolves to.
-    locals.insert("tg_op".into(), Value::text::<alloc::string::String>(tg.op.into()));
+    locals.insert(
+        "tg_op".into(),
+        Value::text::<alloc::string::String>(tg.op.into()),
+    );
     locals.insert(
         "tg_when".into(),
         Value::text::<alloc::string::String>(if is_after { "AFTER" } else { "BEFORE" }.into()),
     );
-    locals.insert("tg_level".into(), Value::text::<alloc::string::String>(tg.level.into()));
-    locals.insert("tg_name".into(), Value::text::<alloc::string::String>(tg.name.into()));
-    locals.insert("tg_table_name".into(), Value::text::<alloc::string::String>(table_name.into()));
-    locals.insert("tg_table_schema".into(), Value::text::<alloc::string::String>("public".into()));
-    locals.insert("tg_relname".into(), Value::text::<alloc::string::String>(table_name.into()));
+    locals.insert(
+        "tg_level".into(),
+        Value::text::<alloc::string::String>(tg.level.into()),
+    );
+    locals.insert(
+        "tg_name".into(),
+        Value::text::<alloc::string::String>(tg.name.into()),
+    );
+    locals.insert(
+        "tg_table_name".into(),
+        Value::text::<alloc::string::String>(table_name.into()),
+    );
+    locals.insert(
+        "tg_table_schema".into(),
+        Value::text::<alloc::string::String>("public".into()),
+    );
+    locals.insert(
+        "tg_relname".into(),
+        Value::text::<alloc::string::String>(table_name.into()),
+    );
     locals.insert("tg_nargs".into(), Value::Int(0));
     init_locals_from_declarations(
         &block.declarations,
@@ -425,13 +443,15 @@ fn execute_stmts(
             // v7.39 (read01 round 66) — `RETURN NEXT <expr>`: append one row and
             // KEEP GOING. It is not a return.
             PlPgSqlStmt::ReturnNext(e) => {
-                let sink = ctx.set_sink.ok_or_else(|| TriggerError::UnsupportedConstruct {
-                    function: ctx.function.into(),
-                    // PG's wording.
-                    detail: alloc::string::String::from(
-                        "cannot use RETURN NEXT in a non-SETOF function",
-                    ),
-                })?;
+                let sink = ctx
+                    .set_sink
+                    .ok_or_else(|| TriggerError::UnsupportedConstruct {
+                        function: ctx.function.into(),
+                        // PG's wording.
+                        detail: alloc::string::String::from(
+                            "cannot use RETURN NEXT in a non-SETOF function",
+                        ),
+                    })?;
                 let v = eval_with_new_old_and_locals(
                     e,
                     current_new.as_ref(),
@@ -452,20 +472,22 @@ fn execute_stmts(
             // going. This used to desugar to a side-effect SELECT whose rows
             // were DISCARDED — the whole answer, thrown away.
             PlPgSqlStmt::ReturnQuery(query) => {
-                let sink = ctx.set_sink.ok_or_else(|| TriggerError::UnsupportedConstruct {
-                    function: ctx.function.into(),
-                    detail: alloc::string::String::from(
-                        "cannot use RETURN QUERY in a non-SETOF function",
-                    ),
-                })?;
-                let resolver = ctx.for_query_resolver.ok_or_else(|| {
-                    TriggerError::UnsupportedConstruct {
+                let sink = ctx
+                    .set_sink
+                    .ok_or_else(|| TriggerError::UnsupportedConstruct {
                         function: ctx.function.into(),
                         detail: alloc::string::String::from(
-                            "RETURN QUERY needs a query runner (this context has none)",
+                            "cannot use RETURN QUERY in a non-SETOF function",
                         ),
-                    }
-                })?;
+                    })?;
+                let resolver =
+                    ctx.for_query_resolver
+                        .ok_or_else(|| TriggerError::UnsupportedConstruct {
+                            function: ctx.function.into(),
+                            detail: alloc::string::String::from(
+                                "RETURN QUERY needs a query runner (this context has none)",
+                            ),
+                        })?;
                 let mut stmt = spg_sql::ast::Statement::Select((**query).clone());
                 substitute_trigger_context_in_statement(
                     &mut stmt,
@@ -794,7 +816,10 @@ fn execute_stmts(
                                 var.to_ascii_lowercase(),
                                 cname.to_ascii_lowercase()
                             ),
-                            row_values.get(i).cloned().unwrap_or(spg_storage::Value::Null),
+                            row_values
+                                .get(i)
+                                .cloned()
+                                .unwrap_or(spg_storage::Value::Null),
                         );
                     }
                     let first_cell = row_values
@@ -846,7 +871,10 @@ fn execute_stmts(
                                 var.to_ascii_lowercase(),
                                 cname.to_ascii_lowercase()
                             ),
-                            row_values.get(i).cloned().unwrap_or(spg_storage::Value::Null),
+                            row_values
+                                .get(i)
+                                .cloned()
+                                .unwrap_or(spg_storage::Value::Null),
                         );
                     }
                     let first_cell = row_values
@@ -866,20 +894,22 @@ fn execute_stmts(
             // runner the static form uses, and append the rows to the set. It
             // used to run and DISCARD them.
             PlPgSqlStmt::ReturnQueryExecute { sql } => {
-                let sink = ctx.set_sink.ok_or_else(|| TriggerError::UnsupportedConstruct {
-                    function: ctx.function.into(),
-                    detail: alloc::string::String::from(
-                        "cannot use RETURN QUERY in a non-SETOF function",
-                    ),
-                })?;
-                let resolver = ctx.for_query_resolver.ok_or_else(|| {
-                    TriggerError::UnsupportedConstruct {
+                let sink = ctx
+                    .set_sink
+                    .ok_or_else(|| TriggerError::UnsupportedConstruct {
                         function: ctx.function.into(),
                         detail: alloc::string::String::from(
-                            "RETURN QUERY EXECUTE needs a query runner (this context has none)",
+                            "cannot use RETURN QUERY in a non-SETOF function",
                         ),
-                    }
-                })?;
+                    })?;
+                let resolver =
+                    ctx.for_query_resolver
+                        .ok_or_else(|| TriggerError::UnsupportedConstruct {
+                            function: ctx.function.into(),
+                            detail: alloc::string::String::from(
+                                "RETURN QUERY EXECUTE needs a query runner (this context has none)",
+                            ),
+                        })?;
                 let sql_val = eval_with_new_old_and_locals(
                     sql,
                     current_new.as_ref(),
@@ -1920,7 +1950,11 @@ impl Engine {
         table: &str,
         event: &str,
         timing: &str,
-    ) -> Vec<(spg_storage::FunctionDef, alloc::string::String, alloc::string::String)> {
+    ) -> Vec<(
+        spg_storage::FunctionDef,
+        alloc::string::String,
+        alloc::string::String,
+    )> {
         let cat = self.active_catalog();
         cat.triggers()
             .iter()

@@ -13,11 +13,15 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn col(e: &mut Engine, sql: &str) -> Vec<String> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| spg_engine::eval::value_to_text(&r.values[0]))
@@ -40,7 +44,10 @@ fn dml_where_resolves_an_enum_cast() {
     // while the same predicate on a SELECT worked — the DML contexts were
     // built without the catalog.
     ok(&mut e, "UPDATE cx SET a = a + 10 WHERE m = 'happy'::mood");
-    assert_eq!(col(&mut e, "SELECT a FROM cx WHERE m = 'happy'::mood"), vec!["12"]);
+    assert_eq!(
+        col(&mut e, "SELECT a FROM cx WHERE m = 'happy'::mood"),
+        vec!["12"]
+    );
     ok(&mut e, "DELETE FROM cx WHERE m = 'ok'::mood");
     assert_eq!(col(&mut e, "SELECT count(*) FROM cx"), vec!["2"]);
 }
@@ -95,7 +102,10 @@ fn union_order_by_sorts_an_enum_by_member_order() {
     // enum identity (it lives outside the DataType lattice), so the combined
     // ORDER BY sorted the labels alphabetically — happy, ok, sad.
     assert_eq!(
-        col(&mut e, "SELECT m FROM cx UNION SELECT 'ok'::mood ORDER BY 1"),
+        col(
+            &mut e,
+            "SELECT m FROM cx UNION SELECT 'ok'::mood ORDER BY 1"
+        ),
         vec!["sad", "ok", "happy"]
     );
 }

@@ -42,17 +42,27 @@ fn b_invalid_numeric_and_bool_are_invalid_input_syntax() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (i int, b bigint, si smallint, f float8, r real, bo bool)")
         .unwrap();
-    assert!(err(&mut e, "INSERT INTO t(i) VALUES ('notint')")
-        .contains("invalid input syntax for type integer: \"notint\""));
+    assert!(
+        err(&mut e, "INSERT INTO t(i) VALUES ('notint')")
+            .contains("invalid input syntax for type integer: \"notint\"")
+    );
     // '3.5' is not an integer literal.
-    assert!(err(&mut e, "INSERT INTO t(i) VALUES ('3.5')")
-        .contains("invalid input syntax for type integer: \"3.5\""));
-    assert!(err(&mut e, "INSERT INTO t(b) VALUES ('xx')")
-        .contains("invalid input syntax for type bigint: \"xx\""));
-    assert!(err(&mut e, "INSERT INTO t(f) VALUES ('nope')")
-        .contains("invalid input syntax for type double precision: \"nope\""));
-    assert!(err(&mut e, "INSERT INTO t(bo) VALUES ('maybe')")
-        .contains("invalid input syntax for type boolean: \"maybe\""));
+    assert!(
+        err(&mut e, "INSERT INTO t(i) VALUES ('3.5')")
+            .contains("invalid input syntax for type integer: \"3.5\"")
+    );
+    assert!(
+        err(&mut e, "INSERT INTO t(b) VALUES ('xx')")
+            .contains("invalid input syntax for type bigint: \"xx\"")
+    );
+    assert!(
+        err(&mut e, "INSERT INTO t(f) VALUES ('nope')")
+            .contains("invalid input syntax for type double precision: \"nope\"")
+    );
+    assert!(
+        err(&mut e, "INSERT INTO t(bo) VALUES ('maybe')")
+            .contains("invalid input syntax for type boolean: \"maybe\"")
+    );
 }
 
 #[test]
@@ -60,13 +70,21 @@ fn c_date_out_of_range_vs_invalid_syntax() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (d date, ts timestamp)").unwrap();
     // Date-shaped but a field is out of range → 22008 wording.
-    assert!(err(&mut e, "INSERT INTO t(d) VALUES ('2020-13-99')")
-        .contains("date/time field value out of range: \"2020-13-99\""));
-    assert!(err(&mut e, "INSERT INTO t(d) VALUES ('2020-02-30')")
-        .contains("date/time field value out of range: \"2020-02-30\""));
+    assert!(
+        err(&mut e, "INSERT INTO t(d) VALUES ('2020-13-99')")
+            .contains("date/time field value out of range: \"2020-13-99\"")
+    );
+    assert!(
+        err(&mut e, "INSERT INTO t(d) VALUES ('2020-02-30')")
+            .contains("date/time field value out of range: \"2020-02-30\"")
+    );
     // Not date-shaped → invalid input syntax.
-    assert!(err(&mut e, "INSERT INTO t(d) VALUES ('notadate')")
-        .contains("invalid input syntax for type date: \"notadate\""));
-    assert!(err(&mut e, "INSERT INTO t(ts) VALUES ('garbage')")
-        .contains("invalid input syntax for type timestamp: \"garbage\""));
+    assert!(
+        err(&mut e, "INSERT INTO t(d) VALUES ('notadate')")
+            .contains("invalid input syntax for type date: \"notadate\"")
+    );
+    assert!(
+        err(&mut e, "INSERT INTO t(ts) VALUES ('garbage')")
+            .contains("invalid input syntax for type timestamp: \"garbage\"")
+    );
 }

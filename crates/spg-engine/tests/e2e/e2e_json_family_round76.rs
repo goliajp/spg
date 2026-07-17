@@ -32,7 +32,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn r1(e: &mut Engine, sql: &str) -> String {
@@ -76,12 +77,24 @@ fn a_table_function_column_alias_list() {
 #[test]
 fn b_every_array_encodes_as_a_json_array() {
     let mut e = Engine::new();
-    assert_eq!(r1(&mut e, "SELECT array_to_json(ARRAY[[1,2],[3,4]])"), "[[1,2],[3,4]]");
+    assert_eq!(
+        r1(&mut e, "SELECT array_to_json(ARRAY[[1,2],[3,4]])"),
+        "[[1,2],[3,4]]"
+    );
     assert_eq!(r1(&mut e, "SELECT to_jsonb(ARRAY[[1,2]])"), "[[1, 2]]");
     // The element types the old per-variant match never had an arm for.
-    assert_eq!(r1(&mut e, "SELECT to_jsonb(ARRAY[true,false])"), "[true, false]");
-    assert_eq!(r1(&mut e, "SELECT array_to_json(ARRAY[1.5::float8, 2.5])"), "[1.5,2.5]");
-    assert_eq!(r1(&mut e, "SELECT to_json(ARRAY['2020-01-01'::date])"), "[\"2020-01-01\"]");
+    assert_eq!(
+        r1(&mut e, "SELECT to_jsonb(ARRAY[true,false])"),
+        "[true, false]"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT array_to_json(ARRAY[1.5::float8, 2.5])"),
+        "[1.5,2.5]"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT to_json(ARRAY['2020-01-01'::date])"),
+        "[\"2020-01-01\"]"
+    );
 }
 
 #[test]
@@ -132,15 +145,24 @@ fn e_timestamptz_keeps_its_offset_through_the_compiled_vm() {
     ok(&mut e, "CREATE TABLE tz (x timestamptz)");
     ok(&mut e, "INSERT INTO tz VALUES ('2020-01-01')");
     // Plain projection always worked — the interpreter drives it.
-    assert_eq!(r1(&mut e, "SELECT x::text FROM tz"), "2020-01-01 00:00:00+00");
+    assert_eq!(
+        r1(&mut e, "SELECT x::text FROM tz"),
+        "2020-01-01 00:00:00+00"
+    );
     // Cast INSIDE an aggregate argument: compiled step VM.
     assert_eq!(
         r1(&mut e, "SELECT string_agg(x::text, ',') FROM tz"),
         "2020-01-01 00:00:00+00"
     );
-    assert_eq!(r1(&mut e, "SELECT max(x::text) FROM tz"), "2020-01-01 00:00:00+00");
+    assert_eq!(
+        r1(&mut e, "SELECT max(x::text) FROM tz"),
+        "2020-01-01 00:00:00+00"
+    );
     // Cast OVER an aggregate result: compiled too, over the synthetic schema.
-    assert_eq!(r1(&mut e, "SELECT min(x)::text FROM tz"), "2020-01-01 00:00:00+00");
+    assert_eq!(
+        r1(&mut e, "SELECT min(x)::text FROM tz"),
+        "2020-01-01 00:00:00+00"
+    );
 }
 
 #[test]

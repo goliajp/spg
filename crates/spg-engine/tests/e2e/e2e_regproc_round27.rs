@@ -32,16 +32,20 @@ fn regtype_canonical_and_existence() {
         ),
         vec!["integer", "integer", "integer[]", "integer[]", "integer"]
     );
-    assert!(err_of(&mut e, "SELECT 'nosuchtype'::regtype")
-        .contains("type \"nosuchtype\" does not exist"));
+    assert!(
+        err_of(&mut e, "SELECT 'nosuchtype'::regtype")
+            .contains("type \"nosuchtype\" does not exist")
+    );
 }
 
 #[test]
 fn regproc_family_casts() {
     let mut e = Engine::new();
     // lower is ambiguous (text + anyrange overloads, as in PG).
-    assert!(err_of(&mut e, "SELECT 'lower'::regproc")
-        .contains("more than one function named \"lower\""));
+    assert!(
+        err_of(&mut e, "SELECT 'lower'::regproc")
+            .contains("more than one function named \"lower\"")
+    );
     assert_eq!(
         row_of(
             &mut e,
@@ -50,14 +54,18 @@ fn regproc_family_casts() {
         ),
         vec!["lower(text)", "sum(integer)", "now()"]
     );
-    assert!(err_of(&mut e, "SELECT '+'::regoper")
-        .contains("more than one operator named +"));
+    assert!(err_of(&mut e, "SELECT '+'::regoper").contains("more than one operator named +"));
     assert_eq!(
-        row_of(&mut e, "SELECT 'english'::regconfig, 'simple'::regdictionary"),
+        row_of(
+            &mut e,
+            "SELECT 'english'::regconfig, 'simple'::regdictionary"
+        ),
         vec!["english", "simple"]
     );
-    assert!(err_of(&mut e, "SELECT 'klingon'::regconfig")
-        .contains("text search configuration \"klingon\" does not exist"));
+    assert!(
+        err_of(&mut e, "SELECT 'klingon'::regconfig")
+            .contains("text search configuration \"klingon\" does not exist")
+    );
 }
 
 #[test]

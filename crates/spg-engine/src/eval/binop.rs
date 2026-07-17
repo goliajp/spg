@@ -591,8 +591,7 @@ pub(super) fn apply_binary(
         && matches!(l, Value::Multirange { .. })
         && matches!(r, Value::Multirange { .. })
     {
-        let (Value::Multirange { kind, ranges: a }, Value::Multirange { ranges: b, .. }) =
-            (&l, &r)
+        let (Value::Multirange { kind, ranges: a }, Value::Multirange { ranges: b, .. }) = (&l, &r)
         else {
             unreachable!()
         };
@@ -743,8 +742,18 @@ pub(super) fn apply_binary(
             ))
         }
         BinOp::BitXor if matches!(l, Value::Line { .. }) && matches!(r, Value::Line { .. }) => {
-            let (Value::Line { a: a1, b: b1, c: c1 }, Value::Line { a: a2, b: b2, c: c2 }) =
-                (&l, &r)
+            let (
+                Value::Line {
+                    a: a1,
+                    b: b1,
+                    c: c1,
+                },
+                Value::Line {
+                    a: a2,
+                    b: b2,
+                    c: c2,
+                },
+            ) = (&l, &r)
             else {
                 unreachable!()
             };
@@ -798,9 +807,7 @@ pub(super) fn apply_binary(
         // v7.39 (read01 geo_ops.c part 2) — `point ?- point`: horizontally
         // aligned (equal y under the geometric epsilon).
         BinOp::GeomHoriz => match (&l, &r) {
-            (Value::Point(a), Value::Point(b)) => {
-                Ok(Value::Bool((a.y - b.y).abs() <= 1.0e-6))
-            }
+            (Value::Point(a), Value::Point(b)) => Ok(Value::Bool((a.y - b.y).abs() <= 1.0e-6)),
             _ => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
                     "operator ?- not supported for {:?} and {:?}",
@@ -834,8 +841,7 @@ pub(super) fn apply_binary(
             match (slope_of(&l), slope_of(&r)) {
                 (Some(m1), Some(m2)) => {
                     let res = if matches!(op, BinOp::GeomParallel) {
-                        (m1.is_infinite() && m2.is_infinite())
-                            || (m1 - m2).abs() <= EPS
+                        (m1.is_infinite() && m2.is_infinite()) || (m1 - m2).abs() <= EPS
                     } else if m1.is_infinite() {
                         m2.abs() <= EPS
                     } else if m2.is_infinite() {
@@ -848,7 +854,11 @@ pub(super) fn apply_binary(
                 _ => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "operator {} needs lseg or line operands, got {:?} and {:?}",
-                        if matches!(op, BinOp::GeomParallel) { "?||" } else { "?-|" },
+                        if matches!(op, BinOp::GeomParallel) {
+                            "?||"
+                        } else {
+                            "?-|"
+                        },
                         l.data_type(),
                         r.data_type()
                     ),
@@ -871,12 +881,21 @@ pub(super) fn apply_binary(
                     let b = hx(b1, b2);
                     Some(feq(a.0, b.0) && feq(a.1, b.1) && feq(a.2, b.2) && feq(a.3, b.3))
                 }
-                (Value::Circle { center: c1, radius: r1 }, Value::Circle { center: c2, radius: r2 }) => {
-                    Some(feq(c1.x, c2.x) && feq(c1.y, c2.y) && feq(*r1, *r2))
-                }
+                (
+                    Value::Circle {
+                        center: c1,
+                        radius: r1,
+                    },
+                    Value::Circle {
+                        center: c2,
+                        radius: r2,
+                    },
+                ) => Some(feq(c1.x, c2.x) && feq(c1.y, c2.y) && feq(*r1, *r2)),
                 (Value::Polygon(a), Value::Polygon(b)) => Some(
                     a.len() == b.len()
-                        && a.iter().zip(b.iter()).all(|(p, q)| feq(p.x, q.x) && feq(p.y, q.y)),
+                        && a.iter()
+                            .zip(b.iter())
+                            .all(|(p, q)| feq(p.x, q.x) && feq(p.y, q.y)),
                 ),
                 _ => None,
             };
@@ -926,7 +945,9 @@ pub(super) fn apply_binary(
             else {
                 unreachable!()
             };
-            Ok(Value::Bool(!multirange_intersection(*kind, a, b).is_empty()))
+            Ok(Value::Bool(
+                !multirange_intersection(*kind, a, b).is_empty(),
+            ))
         }
         BinOp::JsonContains if matches!(l, Value::Range { .. }) => {
             let Value::Range {
@@ -1160,7 +1181,11 @@ pub(super) fn apply_binary(
         BinOp::OverLeft | BinOp::OverRight => Err(EvalError::TypeMismatch {
             detail: format!(
                 "operator {} requires range operands",
-                if matches!(op, BinOp::OverLeft) { "&<" } else { "&>" }
+                if matches!(op, BinOp::OverLeft) {
+                    "&<"
+                } else {
+                    "&>"
+                }
             ),
         }),
         // range `<<` / `>>` — strictly left / right of. Claims the operator
@@ -2958,11 +2983,12 @@ fn as_f64(v: &Value<'_>) -> Result<f64, EvalError> {
         // v7.39 (read01 numeric.c) — a big NUMERIC in a mixed float op
         // approximates through its decimal text (same promotion as the
         // i128-mantissa arm above).
-        Value::NumericBig(b) => {
-            b.to_decimal_str().parse().map_err(|_| EvalError::TypeMismatch {
+        Value::NumericBig(b) => b
+            .to_decimal_str()
+            .parse()
+            .map_err(|_| EvalError::TypeMismatch {
                 detail: "value out of range: overflow".into(),
-            })
-        }
+            }),
         other => Err(EvalError::TypeMismatch {
             detail: format!("cannot convert {:?} to FLOAT", other.data_type()),
         }),
@@ -3562,10 +3588,7 @@ fn normalize_multirange(
 /// what `multirange` constructors must store — `int4multirange(int4range
 /// (1,5), int4range(4,8))` is `{[1,8)}`, not two spans.
 /// v7.39 (read01 multirangetypes.c) — span -> RangeParts view.
-fn span_parts(
-    kind: spg_storage::RangeKind,
-    s: &spg_storage::RangeSpan,
-) -> RangeParts<'_> {
+fn span_parts(kind: spg_storage::RangeKind, s: &spg_storage::RangeSpan) -> RangeParts<'_> {
     RangeParts::new(kind, &s.lower, &s.upper, s.lower_inc, s.upper_inc, s.empty)
 }
 
@@ -3594,7 +3617,11 @@ pub(crate) fn multirange_contains(
                 return Some(true);
             }
             let b = RangeParts::new(*rk, lower, upper, *lower_inc, *upper_inc, *empty);
-            Some(spans.iter().any(|s| range_contains_range(span_parts(kind, s), b)))
+            Some(
+                spans
+                    .iter()
+                    .any(|s| range_contains_range(span_parts(kind, s), b)),
+            )
         }
         Value::Multirange { kind: rk, ranges } => {
             if *rk != kind {
@@ -3608,7 +3635,15 @@ pub(crate) fn multirange_contains(
         }
         Value::Null => None,
         elem => Some(spans.iter().any(|s| {
-            range_contains_elem(kind, &s.lower, &s.upper, s.lower_inc, s.upper_inc, s.empty, elem)
+            range_contains_elem(
+                kind,
+                &s.lower,
+                &s.upper,
+                s.lower_inc,
+                s.upper_inc,
+                s.empty,
+                elem,
+            )
         })),
     }
 }
@@ -4375,9 +4410,7 @@ fn poly_edges(
 fn geo_pair_distance(l: &Value<'_>, r: &Value<'_>) -> Option<f64> {
     let one = |a: &Value<'_>, b: &Value<'_>| -> Option<f64> {
         match (a, b) {
-            (Value::Lseg(a1, a2), Value::Lseg(b1, b2)) => {
-                Some(lseg_lseg_distance(a1, a2, b1, b2))
-            }
+            (Value::Lseg(a1, a2), Value::Lseg(b1, b2)) => Some(lseg_lseg_distance(a1, a2, b1, b2)),
             (Value::PgBox(ur, ll), Value::Lseg(s1, s2)) => {
                 // Inside or crossing the box is distance 0; otherwise the
                 // minimum over the four box edges (PG box_closept_lseg).
@@ -4492,9 +4525,7 @@ fn geo_pt_on_object(container: &Value<'_>, p: &Value<'_>) -> Option<bool> {
     const EPS: f64 = 1.0e-6;
     let Value::Point(pt) = p else { return None };
     match container {
-        Value::Lseg(a, b) => {
-            Some((pt_dist(pt, a) + pt_dist(pt, b) - pt_dist(a, b)).abs() <= EPS)
-        }
+        Value::Lseg(a, b) => Some((pt_dist(pt, a) + pt_dist(pt, b) - pt_dist(a, b)).abs() <= EPS),
         Value::Path { points, closed } => {
             if points.is_empty() {
                 return Some(false);
@@ -5465,6 +5496,84 @@ fn or_3vl(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalEr
     }
 }
 
+/// v7.39 (read01 round 70) — for the three ARRAY operators (`@>`, `<@`, `&&`),
+/// read a bare TEXT literal on either side as an array of the OTHER side's
+/// type. PG's unknown-literal resolution, in the one place SPG needed it.
+///
+/// A text that does not parse as an array literal is left alone — it may well be
+/// the JSON or inet reading of the same operator, which the dispatch below still
+/// has to reach.
+fn coerce_array_literal_operands(
+    op: BinOp,
+    l: Value<'static>,
+    r: Value<'static>,
+) -> (Value<'static>, Value<'static>) {
+    // v7.39 (read01 round 71) — a RANGE beside a bare literal takes the same
+    // rule: `r && '[4,11)'` is a range, not an inet operand. Same family as the
+    // array case, found by the same sweep.
+    if matches!(op, BinOp::InetOverlap) {
+        if let (Value::Range { kind, .. }, Value::Text(_)) = (&l, &r) {
+            let k = *kind;
+            if let Ok(coerced) = crate::eval::cast::cast_value(
+                r.clone(),
+                spg_sql::ast::CastTarget::Named(range_type_name(k).into()),
+            ) {
+                return (l, coerced);
+            }
+        }
+        if let (Value::Text(_), Value::Range { kind, .. }) = (&l, &r) {
+            let k = *kind;
+            if let Ok(coerced) = crate::eval::cast::cast_value(
+                l.clone(),
+                spg_sql::ast::CastTarget::Named(range_type_name(k).into()),
+            ) {
+                return (coerced, r);
+            }
+        }
+    }
+    if !matches!(
+        op,
+        BinOp::JsonContains | BinOp::JsonContainedBy | BinOp::InetOverlap
+    ) {
+        return (l, r);
+    }
+    let as_array_like = |v: &Value<'_>| array_scalar_elems(v).is_some();
+    let cast_like = |text: Value<'static>, model: &Value<'_>| -> Option<Value<'static>> {
+        let target = match model {
+            Value::TextArray(_) => spg_sql::ast::CastTarget::TextArray,
+            Value::IntArray(_) => spg_sql::ast::CastTarget::IntArray,
+            Value::BigIntArray(_) => spg_sql::ast::CastTarget::BigIntArray,
+            _ => return None,
+        };
+        crate::eval::cast::cast_value(text, target).ok()
+    };
+    match (&l, &r) {
+        (_, Value::Text(_)) if as_array_like(&l) => match cast_like(r.clone(), &l) {
+            Some(coerced) => (l, coerced),
+            None => (l, r),
+        },
+        (Value::Text(_), _) if as_array_like(&r) => match cast_like(l.clone(), &r) {
+            Some(coerced) => (coerced, r),
+            None => (l, r),
+        },
+        _ => (l, r),
+    }
+}
+
+/// v7.39 (read01 round 71) — the SQL name of a range kind, for coercing a bare
+/// literal beside a range operand.
+fn range_type_name(kind: spg_storage::RangeKind) -> &'static str {
+    use spg_storage::RangeKind as K;
+    match kind {
+        K::Int4 => "int4range",
+        K::Int8 => "int8range",
+        K::Num => "numrange",
+        K::Ts => "tsrange",
+        K::TsTz => "tstzrange",
+        K::Date => "daterange",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5540,85 +5649,5 @@ mod tests {
             .unwrap();
         let expected = i64::from(d) * 86_400_000_000 + 3_600_000_000;
         assert_eq!(v, Value::Timestamp(expected));
-    }
-}
-
-
-/// v7.39 (read01 round 70) — for the three ARRAY operators (`@>`, `<@`, `&&`),
-/// read a bare TEXT literal on either side as an array of the OTHER side's
-/// type. PG's unknown-literal resolution, in the one place SPG needed it.
-///
-/// A text that does not parse as an array literal is left alone — it may well be
-/// the JSON or inet reading of the same operator, which the dispatch below still
-/// has to reach.
-fn coerce_array_literal_operands(
-    op: BinOp,
-    l: Value<'static>,
-    r: Value<'static>,
-) -> (Value<'static>, Value<'static>) {
-    // v7.39 (read01 round 71) — a RANGE beside a bare literal takes the same
-    // rule: `r && '[4,11)'` is a range, not an inet operand. Same family as the
-    // array case, found by the same sweep.
-    if matches!(op, BinOp::InetOverlap) {
-        if let (Value::Range { kind, .. }, Value::Text(_)) = (&l, &r) {
-            let k = *kind;
-            if let Ok(coerced) = crate::eval::cast::cast_value(
-                r.clone(),
-                spg_sql::ast::CastTarget::Named(range_type_name(k).into()),
-            ) {
-                return (l, coerced);
-            }
-        }
-        if let (Value::Text(_), Value::Range { kind, .. }) = (&l, &r) {
-            let k = *kind;
-            if let Ok(coerced) = crate::eval::cast::cast_value(
-                l.clone(),
-                spg_sql::ast::CastTarget::Named(range_type_name(k).into()),
-            ) {
-                return (coerced, r);
-            }
-        }
-    }
-    if !matches!(
-        op,
-        BinOp::JsonContains | BinOp::JsonContainedBy | BinOp::InetOverlap
-    ) {
-        return (l, r);
-    }
-    let as_array_like = |v: &Value<'_>| array_scalar_elems(v).is_some();
-    let cast_like = |text: Value<'static>, model: &Value<'_>| -> Option<Value<'static>> {
-        let target = match model {
-            Value::TextArray(_) => spg_sql::ast::CastTarget::TextArray,
-            Value::IntArray(_) => spg_sql::ast::CastTarget::IntArray,
-            Value::BigIntArray(_) => spg_sql::ast::CastTarget::BigIntArray,
-            _ => return None,
-        };
-        crate::eval::cast::cast_value(text, target).ok()
-    };
-    match (&l, &r) {
-        (_, Value::Text(_)) if as_array_like(&l) => match cast_like(r.clone(), &l) {
-            Some(coerced) => (l, coerced),
-            None => (l, r),
-        },
-        (Value::Text(_), _) if as_array_like(&r) => match cast_like(l.clone(), &r) {
-            Some(coerced) => (coerced, r),
-            None => (l, r),
-        },
-        _ => (l, r),
-    }
-}
-
-
-/// v7.39 (read01 round 71) — the SQL name of a range kind, for coercing a bare
-/// literal beside a range operand.
-fn range_type_name(kind: spg_storage::RangeKind) -> &'static str {
-    use spg_storage::RangeKind as K;
-    match kind {
-        K::Int4 => "int4range",
-        K::Int8 => "int8range",
-        K::Num => "numrange",
-        K::Ts => "tsrange",
-        K::TsTz => "tstzrange",
-        K::Date => "daterange",
     }
 }

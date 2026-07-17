@@ -19,21 +19,51 @@ fn scalar(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
 fn real_to_int_rounds_half_even() {
     let mut e = Engine::new();
     // Round half-to-even, matching PG: 2.5 → 2, 3.5 → 4, -2.5 → -2.
-    assert!(matches!(scalar(&mut e, "SELECT (1.9::real)::int"), spg_storage::Value::Int(2)));
-    assert!(matches!(scalar(&mut e, "SELECT (2.5::real)::int"), spg_storage::Value::Int(2)));
-    assert!(matches!(scalar(&mut e, "SELECT (3.5::real)::int"), spg_storage::Value::Int(4)));
-    assert!(matches!(scalar(&mut e, "SELECT (-2.5::real)::int"), spg_storage::Value::Int(-2)));
-    assert!(matches!(scalar(&mut e, "SELECT (0.4::real)::int"), spg_storage::Value::Int(0)));
-    assert!(matches!(scalar(&mut e, "SELECT (0.6::real)::int"), spg_storage::Value::Int(1)));
+    assert!(matches!(
+        scalar(&mut e, "SELECT (1.9::real)::int"),
+        spg_storage::Value::Int(2)
+    ));
+    assert!(matches!(
+        scalar(&mut e, "SELECT (2.5::real)::int"),
+        spg_storage::Value::Int(2)
+    ));
+    assert!(matches!(
+        scalar(&mut e, "SELECT (3.5::real)::int"),
+        spg_storage::Value::Int(4)
+    ));
+    assert!(matches!(
+        scalar(&mut e, "SELECT (-2.5::real)::int"),
+        spg_storage::Value::Int(-2)
+    ));
+    assert!(matches!(
+        scalar(&mut e, "SELECT (0.4::real)::int"),
+        spg_storage::Value::Int(0)
+    ));
+    assert!(matches!(
+        scalar(&mut e, "SELECT (0.6::real)::int"),
+        spg_storage::Value::Int(1)
+    ));
 }
 
 #[test]
 fn real_to_bigint_and_smallint() {
     let mut e = Engine::new();
-    assert!(matches!(scalar(&mut e, "SELECT (100::real)::bigint"), spg_storage::Value::BigInt(100)));
-    assert!(matches!(scalar(&mut e, "SELECT (100::real)::smallint"), spg_storage::Value::SmallInt(100)));
-    assert!(matches!(scalar(&mut e, "SELECT (-2.5::real)::smallint"), spg_storage::Value::SmallInt(-2)));
-    assert!(matches!(scalar(&mut e, "SELECT (32767.4::real)::smallint"), spg_storage::Value::SmallInt(32767)));
+    assert!(matches!(
+        scalar(&mut e, "SELECT (100::real)::bigint"),
+        spg_storage::Value::BigInt(100)
+    ));
+    assert!(matches!(
+        scalar(&mut e, "SELECT (100::real)::smallint"),
+        spg_storage::Value::SmallInt(100)
+    ));
+    assert!(matches!(
+        scalar(&mut e, "SELECT (-2.5::real)::smallint"),
+        spg_storage::Value::SmallInt(-2)
+    ));
+    assert!(matches!(
+        scalar(&mut e, "SELECT (32767.4::real)::smallint"),
+        spg_storage::Value::SmallInt(32767)
+    ));
 }
 
 #[test]

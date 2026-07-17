@@ -31,14 +31,38 @@ fn err(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn a_2d_literals_parse_for_the_variant_types() {
     let mut e = Engine::new();
-    assert_eq!(r1(&mut e, "SELECT ('{{1,2},{3,4}}'::int[])::text"), "{{1,2},{3,4}}");
-    assert_eq!(r1(&mut e, "SELECT ('{{1,2},{3,4}}'::bigint[])::text"), "{{1,2},{3,4}}");
-    assert_eq!(r1(&mut e, "SELECT ('{{a,b},{c,d}}'::text[])::text"), "{{a,b},{c,d}}");
-    assert_eq!(r1(&mut e, "SELECT ('{{t,f},{f,t}}'::bool[])::text"), "{{t,f},{f,t}}");
+    assert_eq!(
+        r1(&mut e, "SELECT ('{{1,2},{3,4}}'::int[])::text"),
+        "{{1,2},{3,4}}"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT ('{{1,2},{3,4}}'::bigint[])::text"),
+        "{{1,2},{3,4}}"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT ('{{a,b},{c,d}}'::text[])::text"),
+        "{{a,b},{c,d}}"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT ('{{t,f},{f,t}}'::bool[])::text"),
+        "{{t,f},{f,t}}"
+    );
     // Dimensions and subscripting work on the parsed 2-D value.
-    assert_eq!(r1(&mut e, "SELECT array_dims('{{1,2},{3,4}}'::int[])"), "[1:2][1:2]");
-    assert_eq!(r1(&mut e, "SELECT ('{{1,2},{3,4}}'::int[])[1][2]::text"), "2");
-    assert_eq!(r1(&mut e, "SELECT array_length('{{1,2,3},{4,5,6}}'::int[], 2)::text"), "3");
+    assert_eq!(
+        r1(&mut e, "SELECT array_dims('{{1,2},{3,4}}'::int[])"),
+        "[1:2][1:2]"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT ('{{1,2},{3,4}}'::int[])[1][2]::text"),
+        "2"
+    );
+    assert_eq!(
+        r1(
+            &mut e,
+            "SELECT array_length('{{1,2,3},{4,5,6}}'::int[], 2)::text"
+        ),
+        "3"
+    );
 }
 
 #[test]
@@ -58,7 +82,9 @@ fn b_1d_literals_unaffected() {
 #[test]
 fn c_array_element_and_literal_error_wording() {
     let mut e = Engine::new();
-    assert!(err(&mut e, "SELECT '{1,notint,3}'::int[]")
-        .contains("invalid input syntax for type integer: \"notint\""));
+    assert!(
+        err(&mut e, "SELECT '{1,notint,3}'::int[]")
+            .contains("invalid input syntax for type integer: \"notint\"")
+    );
     assert!(err(&mut e, "SELECT '{1,2'::int[]").contains("malformed array literal: \"{1,2\""));
 }

@@ -21,7 +21,10 @@ fn backend_pid_embedded_fallback() {
     let mut e = Engine::new();
     // No host slot in embedded runs: pid 1, stable across calls.
     assert_eq!(
-        row_of(&mut e, "SELECT pg_backend_pid(), pg_backend_pid() = pg_backend_pid()"),
+        row_of(
+            &mut e,
+            "SELECT pg_backend_pid(), pg_backend_pid() = pg_backend_pid()"
+        ),
         vec!["1", "true"]
     );
 }

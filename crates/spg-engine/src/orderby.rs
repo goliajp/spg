@@ -770,8 +770,9 @@ fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     match (a, b) {
         // v7.37.16 — NULL sentinels bracket every value (incl. NaN).
-        (OrderKey::NullBig, OrderKey::NullBig)
-        | (OrderKey::NullSmall, OrderKey::NullSmall) => Ordering::Equal,
+        (OrderKey::NullBig, OrderKey::NullBig) | (OrderKey::NullSmall, OrderKey::NullSmall) => {
+            Ordering::Equal
+        }
         (OrderKey::NullBig, _) => Ordering::Greater,
         (_, OrderKey::NullBig) => Ordering::Less,
         (OrderKey::NullSmall, _) => Ordering::Less,

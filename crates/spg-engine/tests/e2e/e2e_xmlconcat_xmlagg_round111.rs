@@ -21,18 +21,36 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn xmlconcat_over_xml_values() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT xmlconcat('<a/>'::xml, '<b/>'::xml)::text"), "<a/><b/>");
+    assert_eq!(
+        text(&mut e, "SELECT xmlconcat('<a/>'::xml, '<b/>'::xml)::text"),
+        "<a/><b/>"
+    );
     // NULL fragments are skipped.
-    assert_eq!(text(&mut e, "SELECT xmlconcat('<a/>'::xml, NULL, '<b/>'::xml)::text"), "<a/><b/>");
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT xmlconcat('<a/>'::xml, NULL, '<b/>'::xml)::text"
+        ),
+        "<a/><b/>"
+    );
     // All-NULL yields NULL.
-    assert_eq!(text(&mut e, "SELECT xmlconcat(NULL::xml, NULL::xml)::text"), "NULL");
+    assert_eq!(
+        text(&mut e, "SELECT xmlconcat(NULL::xml, NULL::xml)::text"),
+        "NULL"
+    );
     // The result is xml, so nesting it inlines the fragment (not escaped).
     assert_eq!(
-        text(&mut e, "SELECT xmlelement(name root, xmlconcat('<a/>'::xml, '<b/>'::xml))::text"),
+        text(
+            &mut e,
+            "SELECT xmlelement(name root, xmlconcat('<a/>'::xml, '<b/>'::xml))::text"
+        ),
         "<root><a/><b/></root>"
     );
     assert_eq!(
-        text(&mut e, "SELECT pg_typeof(xmlconcat('<a/>'::xml, '<b/>'::xml))::text"),
+        text(
+            &mut e,
+            "SELECT pg_typeof(xmlconcat('<a/>'::xml, '<b/>'::xml))::text"
+        ),
         "xml"
     );
 }
@@ -41,11 +59,17 @@ fn xmlconcat_over_xml_values() {
 fn xmlagg_over_xml_rows() {
     let mut e = Engine::new();
     assert_eq!(
-        text(&mut e, "SELECT xmlagg(x)::text FROM (VALUES('<a/>'::xml),('<b/>'::xml)) t(x)"),
+        text(
+            &mut e,
+            "SELECT xmlagg(x)::text FROM (VALUES('<a/>'::xml),('<b/>'::xml)) t(x)"
+        ),
         "<a/><b/>"
     );
     assert_eq!(
-        text(&mut e, "SELECT xmlagg(x ORDER BY id DESC)::text FROM (VALUES(1,'<a/>'::xml),(2,'<b/>'::xml)) t(id,x)"),
+        text(
+            &mut e,
+            "SELECT xmlagg(x ORDER BY id DESC)::text FROM (VALUES(1,'<a/>'::xml),(2,'<b/>'::xml)) t(id,x)"
+        ),
         "<b/><a/>"
     );
 }

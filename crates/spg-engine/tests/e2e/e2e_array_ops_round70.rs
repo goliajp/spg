@@ -21,7 +21,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn r1(e: &mut Engine, sql: &str) -> String {
@@ -45,12 +46,18 @@ fn seeded() -> Engine {
 fn contains_takes_a_string_literal_as_an_array() {
     let mut e = seeded();
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE tags @> '{b}'"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE tags @> '{b}'"
+        ),
         "1,2"
     );
     // The element-typed form was never broken — this is the control.
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE tags @> ARRAY['b']"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE tags @> ARRAY['b']"
+        ),
         "1,2"
     );
 }
@@ -59,12 +66,18 @@ fn contains_takes_a_string_literal_as_an_array() {
 fn contained_by_and_overlap_too() {
     let mut e = seeded();
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE tags <@ '{a,b,c}'"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE tags <@ '{a,b,c}'"
+        ),
         "1,2,3"
     );
     // `&&` used to reach the INET operator with an array on the left.
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE tags && '{a,c}'"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE tags && '{a,c}'"
+        ),
         "1,2,3"
     );
 }
@@ -73,11 +86,17 @@ fn contained_by_and_overlap_too() {
 fn an_int_array_column_coerces_the_same_way() {
     let mut e = seeded();
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE nums @> '{2}'"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE nums @> '{2}'"
+        ),
         "1,2"
     );
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE nums && '{3}'"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE nums && '{3}'"
+        ),
         "2,3"
     );
 }
@@ -93,7 +112,10 @@ fn the_json_reading_of_the_same_operator_still_works() {
         "INSERT INTO j VALUES (1,'{\"k\":1}'),(2,'{\"k\":2}')",
     );
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text, ',') FROM j WHERE doc @> '{\"k\":1}'"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text, ',') FROM j WHERE doc @> '{\"k\":1}'"
+        ),
         "1"
     );
 }
@@ -103,7 +125,10 @@ fn a_gin_index_does_not_change_the_answer() {
     let mut e = seeded();
     ok(&mut e, "CREATE INDEX i_gin ON t USING gin (tags)");
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE tags @> '{b}'"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE tags @> '{b}'"
+        ),
         "1,2"
     );
 }

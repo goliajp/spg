@@ -160,10 +160,8 @@ fn merge_returning_via_renamed_view() {
 fn inner_view_own_option_enforced_without_written_option() {
     let mut e = Engine::new();
     setup(&mut e);
-    e.execute(
-        "CREATE VIEW inner_v AS SELECT id, v FROM t WHERE v < 1000 WITH CHECK OPTION",
-    )
-    .unwrap();
+    e.execute("CREATE VIEW inner_v AS SELECT id, v FROM t WHERE v < 1000 WITH CHECK OPTION")
+        .unwrap();
     e.execute("CREATE VIEW outer_v AS SELECT id, v FROM inner_v")
         .unwrap();
     errs(

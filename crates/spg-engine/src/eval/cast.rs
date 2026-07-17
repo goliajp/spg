@@ -33,19 +33,41 @@ fn cast_reg_misc(kind: &str, s: &str) -> Result<Value<'static>, EvalError> {
     match kind {
         "regconfig" => {
             const CONFIGS: &[&str] = &[
-                "simple", "arabic", "armenian", "basque", "catalan", "danish", "dutch",
-                "english", "finnish", "french", "german", "greek", "hindi", "hungarian",
-                "indonesian", "irish", "italian", "lithuanian", "nepali", "norwegian",
-                "portuguese", "romanian", "russian", "serbian", "spanish", "swedish",
-                "tamil", "turkish", "yiddish",
+                "simple",
+                "arabic",
+                "armenian",
+                "basque",
+                "catalan",
+                "danish",
+                "dutch",
+                "english",
+                "finnish",
+                "french",
+                "german",
+                "greek",
+                "hindi",
+                "hungarian",
+                "indonesian",
+                "irish",
+                "italian",
+                "lithuanian",
+                "nepali",
+                "norwegian",
+                "portuguese",
+                "romanian",
+                "russian",
+                "serbian",
+                "spanish",
+                "swedish",
+                "tamil",
+                "turkish",
+                "yiddish",
             ];
             if CONFIGS.contains(&bare.as_str()) {
                 Ok(Value::text(bare))
             } else {
                 Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "text search configuration \"{s}\" does not exist"
-                    ),
+                    detail: alloc::format!("text search configuration \"{s}\" does not exist"),
                 })
             }
         }
@@ -54,9 +76,7 @@ fn cast_reg_misc(kind: &str, s: &str) -> Result<Value<'static>, EvalError> {
                 Ok(Value::text(bare))
             } else {
                 Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "text search dictionary \"{s}\" does not exist"
-                    ),
+                    detail: alloc::format!("text search dictionary \"{s}\" does not exist"),
                 })
             }
         }
@@ -80,16 +100,12 @@ fn cast_reg_misc(kind: &str, s: &str) -> Result<Value<'static>, EvalError> {
             // argument type, and re-render.
             let Some((fname, rest)) = bare.split_once('(') else {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "expected a left parenthesis in \"{s}\""
-                    ),
+                    detail: alloc::format!("expected a left parenthesis in \"{s}\""),
                 });
             };
             let Some(args_txt) = rest.strip_suffix(')') else {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "expected a right parenthesis in \"{s}\""
-                    ),
+                    detail: alloc::format!("expected a right parenthesis in \"{s}\""),
                 });
             };
             let fname = fname.trim().to_ascii_lowercase();
@@ -99,13 +115,11 @@ fn cast_reg_misc(kind: &str, s: &str) -> Result<Value<'static>, EvalError> {
                 args_txt
                     .split(',')
                     .map(|a| {
-                        crate::conversions::regtype_canonical_name(a.trim())
-                            .ok_or_else(|| EvalError::TypeMismatch {
-                                detail: alloc::format!(
-                                    "type \"{}\" does not exist",
-                                    a.trim()
-                                ),
-                            })
+                        crate::conversions::regtype_canonical_name(a.trim()).ok_or_else(|| {
+                            EvalError::TypeMismatch {
+                                detail: alloc::format!("type \"{}\" does not exist", a.trim()),
+                            }
+                        })
                     })
                     .collect::<Result<_, _>>()?
             };
@@ -125,10 +139,7 @@ fn cast_reg_misc(kind: &str, s: &str) -> Result<Value<'static>, EvalError> {
         // reports PG's ambiguity and anything else does not exist.
         _ => {
             let sym: String = bare.chars().filter(|c| !c.is_whitespace()).collect();
-            let core_op = !sym.is_empty()
-                && sym
-                    .chars()
-                    .all(|c| "+-*/<>=~!@#%^&|`?".contains(c));
+            let core_op = !sym.is_empty() && sym.chars().all(|c| "+-*/<>=~!@#%^&|`?".contains(c));
             if core_op {
                 Err(EvalError::TypeMismatch {
                     detail: alloc::format!("more than one operator named {sym}"),
@@ -427,17 +438,12 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                     Value::Text(s) => match crate::conversions::parse_bit_string_text(s) {
                         Some((nb, by)) => Ok(Value::bit_string(nb, by)),
                         None => Err(EvalError::TypeMismatch {
-                            detail: alloc::format!(
-                                "invalid input syntax for type bit: \"{s}\""
-                            ),
+                            detail: alloc::format!("invalid input syntax for type bit: \"{s}\""),
                         }),
                     },
                     Value::BitString { .. } => Ok(v),
                     other => Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "cannot cast {:?} to bit",
-                            other.data_type()
-                        ),
+                        detail: alloc::format!("cannot cast {:?} to bit", other.data_type()),
                     }),
                 };
             }
@@ -453,12 +459,12 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                             let bad = s.chars().find(|c| *c != '0' && *c != '1');
                             return Err(EvalError::TypeMismatch {
                                 detail: match bad {
-                                    Some(c) => alloc::format!(
-                                        "\"{c}\" is not a valid binary digit"
-                                    ),
-                                    None => alloc::format!(
-                                        "invalid input syntax for type bit: \"{s}\""
-                                    ),
+                                    Some(c) => {
+                                        alloc::format!("\"{c}\" is not a valid binary digit")
+                                    }
+                                    None => {
+                                        alloc::format!("invalid input syntax for type bit: \"{s}\"")
+                                    }
                                 },
                             });
                         }
@@ -538,8 +544,8 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
             {
                 let lower_name = name.to_ascii_lowercase();
                 match lower_name.as_str() {
-                    "regproc" | "regprocedure" | "regoper" | "regoperator"
-                    | "regconfig" | "regdictionary" => {
+                    "regproc" | "regprocedure" | "regoper" | "regoperator" | "regconfig"
+                    | "regdictionary" => {
                         let s = match &v {
                             Value::Null => return Ok(Value::Null),
                             Value::Text(s) => s.as_ref().trim().to_string(),
@@ -618,10 +624,7 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                     }
                     other => {
                         return Err(EvalError::TypeMismatch {
-                            detail: alloc::format!(
-                                "cannot cast {:?} to {name}",
-                                other.data_type()
-                            ),
+                            detail: alloc::format!("cannot cast {:?} to {name}", other.data_type()),
                         });
                     }
                 });
@@ -662,14 +665,9 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
             if name.eq_ignore_ascii_case("jsonpath") {
                 return match v {
                     Value::Null => Ok(Value::Null),
-                    Value::Text(s) => Ok(Value::text(
-                        crate::json::jsonpath_canonical(s.as_ref())?,
-                    )),
+                    Value::Text(s) => Ok(Value::text(crate::json::jsonpath_canonical(s.as_ref())?)),
                     other => Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "cannot cast {:?} to jsonpath",
-                            other.data_type()
-                        ),
+                        detail: alloc::format!("cannot cast {:?} to jsonpath", other.data_type()),
                     }),
                 };
             }
@@ -705,10 +703,9 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                     Value::Text(s) => Value::Text(s),
                     // v7.39 (read01 inet family) — inet/cidr ::text carries
                     // the mask even at full length (cast-path form).
-                    Value::Inet { family, bits, addr }
-                    | Value::Cidr { family, bits, addr } => Value::text(
-                        crate::conversions::format_inet_full(family, bits, &addr),
-                    ),
+                    Value::Inet { family, bits, addr } | Value::Cidr { family, bits, addr } => {
+                        Value::text(crate::conversions::format_inet_full(family, bits, &addr))
+                    }
                     other => Value::text(value_to_text(&other)),
                 },
                 (spg_storage::DataType::Varchar(n) | spg_storage::DataType::Char(n), v) => {
@@ -958,11 +955,7 @@ fn decode_int_array_external(s: &str) -> Result<Vec<Option<i32>>, EvalError> {
     let inner = trimmed
         .strip_prefix('{')
         .and_then(|x| x.strip_suffix('}'))
-        .or_else(|| {
-            trimmed
-                .strip_prefix('[')
-                .and_then(|x| x.strip_suffix(']'))
-        })
+        .or_else(|| trimmed.strip_prefix('[').and_then(|x| x.strip_suffix(']')))
         .ok_or_else(|| EvalError::TypeMismatch {
             detail: alloc::format!("malformed array literal: {s:?}"),
         })?;
@@ -991,11 +984,7 @@ fn decode_bigint_array_external(s: &str) -> Result<Vec<Option<i64>>, EvalError> 
     let inner = trimmed
         .strip_prefix('{')
         .and_then(|x| x.strip_suffix('}'))
-        .or_else(|| {
-            trimmed
-                .strip_prefix('[')
-                .and_then(|x| x.strip_suffix(']'))
-        })
+        .or_else(|| trimmed.strip_prefix('[').and_then(|x| x.strip_suffix(']')))
         .ok_or_else(|| EvalError::TypeMismatch {
             detail: alloc::format!("BIGmalformed array literal: {s:?}"),
         })?;
@@ -1028,11 +1017,7 @@ fn decode_text_array_external(s: &str) -> Result<Vec<Option<String>>, EvalError>
     let inner = trimmed
         .strip_prefix('{')
         .and_then(|x| x.strip_suffix('}'))
-        .or_else(|| {
-            trimmed
-                .strip_prefix('[')
-                .and_then(|x| x.strip_suffix(']'))
-        })
+        .or_else(|| trimmed.strip_prefix('[').and_then(|x| x.strip_suffix(']')))
         .ok_or_else(|| EvalError::TypeMismatch {
             detail: alloc::format!("TEXT[] literal {s:?} must be enclosed in '{{...}}'"),
         })?;
@@ -1198,9 +1183,7 @@ fn cast_to_timestamp(v: Value) -> Result<Value, EvalError> {
         // DATE → TIMESTAMP picks midnight on the date.
         // v7.39 (read01 timestamp.c) — sentinel-aware (the plain multiply
         // overflowed on ±infinity dates).
-        Value::Date(d) => Ok(Value::Timestamp(
-            crate::conversions::date_days_to_micros(d),
-        )),
+        Value::Date(d) => Ok(Value::Timestamp(crate::conversions::date_days_to_micros(d))),
         Value::Text(s) => {
             parse_timestamp_literal(&s)
                 .map(Value::Timestamp)
@@ -1279,9 +1262,9 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
         // round via the numeric arm above. String/array/object/boolean error.
         Value::Json(s) => match crate::conversions::jsonb_scalar_for_cast(&s, "integer")? {
             crate::conversions::JsonbScalar::Numeric(n) => cast_numeric_to_int(n),
-            crate::conversions::JsonbScalar::Bool(_) => {
-                Err(crate::conversions::jsonb_cast_type_error("boolean", "integer"))
-            }
+            crate::conversions::JsonbScalar::Bool(_) => Err(
+                crate::conversions::jsonb_cast_type_error("boolean", "integer"),
+            ),
             crate::conversions::JsonbScalar::Null => Ok(Value::Null),
         },
         other => Err(EvalError::TypeMismatch {
@@ -1342,9 +1325,9 @@ fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
         // v7.39 (read01 round 113) — jsonb → bigint.
         Value::Json(s) => match crate::conversions::jsonb_scalar_for_cast(&s, "bigint")? {
             crate::conversions::JsonbScalar::Numeric(n) => cast_numeric_to_bigint(n),
-            crate::conversions::JsonbScalar::Bool(_) => {
-                Err(crate::conversions::jsonb_cast_type_error("boolean", "bigint"))
-            }
+            crate::conversions::JsonbScalar::Bool(_) => Err(
+                crate::conversions::jsonb_cast_type_error("boolean", "bigint"),
+            ),
             crate::conversions::JsonbScalar::Null => Ok(Value::Null),
         },
         other => Err(EvalError::TypeMismatch {
@@ -1425,9 +1408,9 @@ fn cast_to_bool(v: Value) -> Result<Value, EvalError> {
         // true/false; a JSON number/string/array/object errors.
         Value::Json(s) => match crate::conversions::jsonb_scalar_for_cast(&s, "boolean")? {
             crate::conversions::JsonbScalar::Bool(b) => Ok(Value::Bool(b)),
-            crate::conversions::JsonbScalar::Numeric(_) => {
-                Err(crate::conversions::jsonb_cast_type_error("numeric", "boolean"))
-            }
+            crate::conversions::JsonbScalar::Numeric(_) => Err(
+                crate::conversions::jsonb_cast_type_error("numeric", "boolean"),
+            ),
             crate::conversions::JsonbScalar::Null => Ok(Value::Null),
         },
         other => Err(EvalError::TypeMismatch {

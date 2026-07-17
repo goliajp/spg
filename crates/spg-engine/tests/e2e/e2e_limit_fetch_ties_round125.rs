@@ -30,7 +30,8 @@ fn text(e: &mut Engine, sql: &str) -> String {
 
 fn setup(e: &mut Engine) {
     e.execute("CREATE TABLE l (id int, g int)").unwrap();
-    e.execute("INSERT INTO l VALUES (1,10),(2,10),(3,20),(4,20),(5,30)").unwrap();
+    e.execute("INSERT INTO l VALUES (1,10),(2,10),(3,20),(4,20),(5,30)")
+        .unwrap();
 }
 
 #[test]
@@ -38,11 +39,26 @@ fn fetch_first_with_ties_includes_boundary_peers() {
     let mut e = Engine::new();
     setup(&mut e);
     // The 1st row's g=10 group has two rows → WITH TIES returns both.
-    assert_eq!(count(&mut e, "SELECT count(*) FROM (SELECT id FROM l ORDER BY g FETCH FIRST 1 ROW WITH TIES) q"), 2);
-    // The 3rd row's g=20 group adds a 4th row.
-    assert_eq!(count(&mut e, "SELECT count(*) FROM (SELECT id FROM l ORDER BY g FETCH FIRST 3 ROWS WITH TIES) q"), 4);
     assert_eq!(
-        text(&mut e, "SELECT string_agg(g::text,'/') FROM (SELECT g FROM l ORDER BY g FETCH FIRST 3 ROWS WITH TIES) q"),
+        count(
+            &mut e,
+            "SELECT count(*) FROM (SELECT id FROM l ORDER BY g FETCH FIRST 1 ROW WITH TIES) q"
+        ),
+        2
+    );
+    // The 3rd row's g=20 group adds a 4th row.
+    assert_eq!(
+        count(
+            &mut e,
+            "SELECT count(*) FROM (SELECT id FROM l ORDER BY g FETCH FIRST 3 ROWS WITH TIES) q"
+        ),
+        4
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT string_agg(g::text,'/') FROM (SELECT g FROM l ORDER BY g FETCH FIRST 3 ROWS WITH TIES) q"
+        ),
         "10/10/20/20"
     );
 }
@@ -52,10 +68,25 @@ fn standard_limit_offset_fetch_forms() {
     let mut e = Engine::new();
     setup(&mut e);
     assert_eq!(
-        text(&mut e, "SELECT string_agg(id::text,'/') FROM (SELECT id FROM l ORDER BY g OFFSET 1 ROW FETCH NEXT 2 ROWS ONLY) q"),
+        text(
+            &mut e,
+            "SELECT string_agg(id::text,'/') FROM (SELECT id FROM l ORDER BY g OFFSET 1 ROW FETCH NEXT 2 ROWS ONLY) q"
+        ),
         "2/3"
     );
     // LIMIT NULL / LIMIT ALL = no limit.
-    assert_eq!(count(&mut e, "SELECT count(*) FROM (SELECT id FROM l ORDER BY g LIMIT NULL) q"), 5);
-    assert_eq!(count(&mut e, "SELECT count(*) FROM (SELECT id FROM l ORDER BY g LIMIT ALL) q"), 5);
+    assert_eq!(
+        count(
+            &mut e,
+            "SELECT count(*) FROM (SELECT id FROM l ORDER BY g LIMIT NULL) q"
+        ),
+        5
+    );
+    assert_eq!(
+        count(
+            &mut e,
+            "SELECT count(*) FROM (SELECT id FROM l ORDER BY g LIMIT ALL) q"
+        ),
+        5
+    );
 }

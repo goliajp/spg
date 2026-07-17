@@ -4,8 +4,8 @@
 //! batch-resolver path via the EXISTS_PULLUP_MULTICOL_DISABLE knob.
 
 use spg_engine::{
-    EXISTS_PULLUP_BAIL_MULTICOL_DISABLED, EXISTS_PULLUP_FIRE_COUNT,
-    EXISTS_PULLUP_MULTICOL_DISABLE, Engine, QueryResult,
+    EXISTS_PULLUP_BAIL_MULTICOL_DISABLED, EXISTS_PULLUP_FIRE_COUNT, EXISTS_PULLUP_MULTICOL_DISABLE,
+    Engine, QueryResult,
 };
 use spg_storage::Value;
 use std::sync::atomic::Ordering;

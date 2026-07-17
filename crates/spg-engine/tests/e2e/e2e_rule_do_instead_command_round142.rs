@@ -38,8 +38,10 @@ fn insert_redirect_multi_row_source_count_tag() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(id int, v int)").unwrap();
     e.execute("CREATE TABLE redir(id int, v int)").unwrap();
-    e.execute("CREATE RULE ri AS ON INSERT TO t DO INSTEAD INSERT INTO redir VALUES (NEW.id, NEW.v*10)")
-        .unwrap();
+    e.execute(
+        "CREATE RULE ri AS ON INSERT TO t DO INSTEAD INSERT INTO redir VALUES (NEW.id, NEW.v*10)",
+    )
+    .unwrap();
     // PG tags the source row count even though nothing lands in t.
     assert_eq!(affected(&mut e, "INSERT INTO t VALUES (1,10),(2,20)"), 2);
     assert_eq!(rows_i(&mut e, "SELECT count(*)::int FROM t"), vec![vec![0]]);
@@ -52,10 +54,13 @@ fn insert_redirect_multi_row_source_count_tag() {
 #[test]
 fn insert_redirect_new_sees_defaults() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE d(id int, v int DEFAULT 5)").unwrap();
-    e.execute("CREATE TABLE redir(id int, v int)").unwrap();
-    e.execute("CREATE RULE rd AS ON INSERT TO d DO INSTEAD INSERT INTO redir VALUES (NEW.id, NEW.v)")
+    e.execute("CREATE TABLE d(id int, v int DEFAULT 5)")
         .unwrap();
+    e.execute("CREATE TABLE redir(id int, v int)").unwrap();
+    e.execute(
+        "CREATE RULE rd AS ON INSERT TO d DO INSTEAD INSERT INTO redir VALUES (NEW.id, NEW.v)",
+    )
+    .unwrap();
     assert_eq!(affected(&mut e, "INSERT INTO d(id) VALUES (1)"), 1);
     assert_eq!(rows_i(&mut e, "SELECT id, v FROM redir"), vec![vec![1, 5]]);
     assert_eq!(rows_i(&mut e, "SELECT count(*)::int FROM d"), vec![vec![0]]);
@@ -85,10 +90,13 @@ fn update_instead_logs_old_and_new() {
 #[test]
 fn delete_soft_delete_same_table() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE s(id int, dead int DEFAULT 0)").unwrap();
-    e.execute("INSERT INTO s VALUES (1,0),(2,0)").unwrap();
-    e.execute("CREATE RULE rd AS ON DELETE TO s DO INSTEAD UPDATE s SET dead = 1 WHERE id = OLD.id")
+    e.execute("CREATE TABLE s(id int, dead int DEFAULT 0)")
         .unwrap();
+    e.execute("INSERT INTO s VALUES (1,0),(2,0)").unwrap();
+    e.execute(
+        "CREATE RULE rd AS ON DELETE TO s DO INSTEAD UPDATE s SET dead = 1 WHERE id = OLD.id",
+    )
+    .unwrap();
     assert_eq!(affected(&mut e, "DELETE FROM s WHERE id = 1"), 0);
     assert_eq!(
         rows_i(&mut e, "SELECT id, dead FROM s ORDER BY id"),

@@ -5,8 +5,8 @@
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let url = std::env::var("TPG_URL")
-        .unwrap_or_else(|_| "postgres://u:p@127.0.0.1:6033/app".into());
+    let url =
+        std::env::var("TPG_URL").unwrap_or_else(|_| "postgres://u:p@127.0.0.1:6033/app".into());
     let (client, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
     tokio::spawn(async move {
         if let Err(e) = conn.await {
@@ -15,7 +15,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     eprintln!("connected");
     client
-        .execute("CREATE TABLE tp (i INT, b BIGINT, t TEXT, f FLOAT, ok BOOLEAN)", &[])
+        .execute(
+            "CREATE TABLE tp (i INT, b BIGINT, t TEXT, f FLOAT, ok BOOLEAN)",
+            &[],
+        )
         .await?;
     eprintln!("create ok");
     client
@@ -30,7 +33,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let (i, b, t, f, ok): (i32, i64, String, f64, bool) =
         (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
-    assert_eq!((i, b, t.as_str(), f, ok), (7, 300000000000, "hi", 1.5, true));
+    assert_eq!(
+        (i, b, t.as_str(), f, ok),
+        (7, 300_000_000_000, "hi", 1.5, true)
+    );
     // Parameterised query exercises binary Bind params too.
     let row = client
         .query_one("SELECT i FROM tp WHERE i = $1", &[&7i32])

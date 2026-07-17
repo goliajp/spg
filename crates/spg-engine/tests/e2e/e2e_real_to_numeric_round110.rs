@@ -18,12 +18,27 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn real_to_numeric_constrained() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT (1.5::real)::numeric(10,4)::text"), "1.5000");
-    assert_eq!(text(&mut e, "SELECT (2.5::float4)::numeric(6,2)::text"), "2.50");
-    assert_eq!(text(&mut e, "SELECT (100.25::real)::numeric(8,2)::text"), "100.25");
-    assert_eq!(text(&mut e, "SELECT (-3.5::real)::numeric(5,1)::text"), "-3.5");
+    assert_eq!(
+        text(&mut e, "SELECT (1.5::real)::numeric(10,4)::text"),
+        "1.5000"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (2.5::float4)::numeric(6,2)::text"),
+        "2.50"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (100.25::real)::numeric(8,2)::text"),
+        "100.25"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT (-3.5::real)::numeric(5,1)::text"),
+        "-3.5"
+    );
     // Rounds to the declared scale.
-    assert_eq!(text(&mut e, "SELECT (123.456::real)::numeric(5,2)::text"), "123.46");
+    assert_eq!(
+        text(&mut e, "SELECT (123.456::real)::numeric(5,2)::text"),
+        "123.46"
+    );
 }
 
 #[test]
@@ -39,6 +54,9 @@ fn real_to_unconstrained_numeric_keeps_shortest_decimal() {
 fn float8_to_numeric_unchanged() {
     // Regression guard for the sibling arm.
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT (1.5::float8)::numeric(10,4)::text"), "1.5000");
+    assert_eq!(
+        text(&mut e, "SELECT (1.5::float8)::numeric(10,4)::text"),
+        "1.5000"
+    );
     assert_eq!(text(&mut e, "SELECT (0.1::float8)::numeric::text"), "0.1");
 }

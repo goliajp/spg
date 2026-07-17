@@ -30,7 +30,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn r1(e: &mut Engine, sql: &str) -> String {
@@ -43,11 +44,23 @@ fn r1(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn a_named_args_on_builtins_both_spellings() {
     let mut e = Engine::new();
-    assert_eq!(r1(&mut e, "SELECT make_interval(months := 2, days := 3)"), "2 mons 3 days");
-    assert_eq!(r1(&mut e, "SELECT make_interval(months => 2, days => 3)"), "2 mons 3 days");
+    assert_eq!(
+        r1(&mut e, "SELECT make_interval(months := 2, days := 3)"),
+        "2 mons 3 days"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT make_interval(months => 2, days => 3)"),
+        "2 mons 3 days"
+    );
     // Positional and named mixed; unfilled make_* slots default to zero.
-    assert_eq!(r1(&mut e, "SELECT make_date(2020, day := 17, month := 5)"), "2020-05-17");
-    assert_eq!(r1(&mut e, "SELECT make_interval(2, 0, 0, 3)"), "2 years 3 days");
+    assert_eq!(
+        r1(&mut e, "SELECT make_date(2020, day := 17, month := 5)"),
+        "2020-05-17"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT make_interval(2, 0, 0, 3)"),
+        "2 years 3 days"
+    );
 }
 
 #[test]
@@ -66,7 +79,10 @@ fn b_named_args_on_user_functions() {
     assert!(e.execute("SELECT addup(a := 1, zzz := 5)").is_err());
     // A function that declares no parameter names rejects the notation, as PG
     // does (it reports no matching candidate; SPG names the reason).
-    assert!(e.execute("SELECT lpad(string := 'x', length := 3)").is_err());
+    assert!(
+        e.execute("SELECT lpad(string := 'x', length := 3)")
+            .is_err()
+    );
 }
 
 #[test]
@@ -103,16 +119,25 @@ fn c_interval_unit_abbreviations() {
 fn d_timestamptz_survives_date_trunc_and_coalesce() {
     let mut e = Engine::new();
     assert_eq!(
-        r1(&mut e, "SELECT pg_typeof(date_trunc('day', '2020-05-17'::timestamptz))"),
+        r1(
+            &mut e,
+            "SELECT pg_typeof(date_trunc('day', '2020-05-17'::timestamptz))"
+        ),
         "timestamp with time zone"
     );
     assert_eq!(
-        r1(&mut e, "SELECT date_trunc('day', '2020-05-17 13:00'::timestamptz)::text"),
+        r1(
+            &mut e,
+            "SELECT date_trunc('day', '2020-05-17 13:00'::timestamptz)::text"
+        ),
         "2020-05-17 00:00:00+00"
     );
     // A plain timestamp still comes back plain.
     assert_eq!(
-        r1(&mut e, "SELECT date_trunc('day', '2020-05-17 13:00'::timestamp)::text"),
+        r1(
+            &mut e,
+            "SELECT date_trunc('day', '2020-05-17 13:00'::timestamp)::text"
+        ),
         "2020-05-17 00:00:00"
     );
     assert_eq!(
@@ -125,7 +150,10 @@ fn d_timestamptz_survives_date_trunc_and_coalesce() {
     );
     // An untyped NULL in the first slot must not erase the type of the rest.
     assert_eq!(
-        r1(&mut e, "SELECT coalesce(NULL, '2020-05-17 00:00:00'::timestamptz)::text"),
+        r1(
+            &mut e,
+            "SELECT coalesce(NULL, '2020-05-17 00:00:00'::timestamptz)::text"
+        ),
         "2020-05-17 00:00:00+00"
     );
 }

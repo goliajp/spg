@@ -23,18 +23,39 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn network_masks_partial_octet_prefixes() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT network(inet '192.168.1.130/25')::text"), "192.168.1.128/25");
-    assert_eq!(text(&mut e, "SELECT network(inet '192.168.1.200/26')::text"), "192.168.1.192/26");
-    assert_eq!(text(&mut e, "SELECT network(inet '10.5.6.7/12')::text"), "10.0.0.0/12");
-    assert_eq!(text(&mut e, "SELECT network(inet '172.16.5.4/20')::text"), "172.16.0.0/20");
+    assert_eq!(
+        text(&mut e, "SELECT network(inet '192.168.1.130/25')::text"),
+        "192.168.1.128/25"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT network(inet '192.168.1.200/26')::text"),
+        "192.168.1.192/26"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT network(inet '10.5.6.7/12')::text"),
+        "10.0.0.0/12"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT network(inet '172.16.5.4/20')::text"),
+        "172.16.0.0/20"
+    );
 }
 
 #[test]
 fn network_octet_aligned_and_full_still_work() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT network(inet '10.1.2.3/8')::text"), "10.0.0.0/8");
-    assert_eq!(text(&mut e, "SELECT network(inet '192.168.1.5/24')::text"), "192.168.1.0/24");
-    assert_eq!(text(&mut e, "SELECT network(inet '192.168.1.5')::text"), "192.168.1.5/32");
+    assert_eq!(
+        text(&mut e, "SELECT network(inet '10.1.2.3/8')::text"),
+        "10.0.0.0/8"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT network(inet '192.168.1.5/24')::text"),
+        "192.168.1.0/24"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT network(inet '192.168.1.5')::text"),
+        "192.168.1.5/32"
+    );
 }
 
 #[test]
@@ -42,6 +63,12 @@ fn netmask_hostmask_native_form_unchanged() {
     // Regression guard: PG's native (uncast) netmask/hostmask text omits /32,
     // which SPG's text form matches — don't regress that.
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT netmask(inet '192.168.1.130/25')"), "255.255.255.128");
-    assert_eq!(text(&mut e, "SELECT hostmask(inet '192.168.1.130/25')"), "0.0.0.127");
+    assert_eq!(
+        text(&mut e, "SELECT netmask(inet '192.168.1.130/25')"),
+        "255.255.255.128"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT hostmask(inet '192.168.1.130/25')"),
+        "0.0.0.127"
+    );
 }

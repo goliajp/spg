@@ -654,8 +654,7 @@ pub(crate) fn enforce_uniqueness_inserts(
                 // v7.39 (SQLSTATE fidelity) — PG's exact 23505 phrasing;
                 // ORMs regex the constraint name out of this message and
                 // the wire layer lifts it into the PG_DIAG fields.
-                let conname =
-                    crate::system_catalog::pg_unique_conname(table, uc, child_table);
+                let conname = crate::system_catalog::pg_unique_conname(table, uc, child_table);
                 let detail = unique_key_detail(
                     &uc.columns
                         .iter()
@@ -686,7 +685,10 @@ fn unique_key_detail(cols: &[String], key: &[Value<'_>]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    alloc::format!(" DETAIL: Key ({})=({vals}) already exists.", cols.join(", "))
+    alloc::format!(
+        " DETAIL: Key ({})=({vals}) already exists.",
+        cols.join(", ")
+    )
 }
 
 /// v7.39 (SQLSTATE fidelity) — PG's 23503 phrasing helper: the FK
@@ -851,9 +853,7 @@ pub(crate) fn check_existing_unique_violation(
         // v7.39 (read01 round 52) — NULLS NOT DISTINCT keeps NULL keys in the
         // check, so CREATE UNIQUE INDEX … NULLS NOT DISTINCT over two all-NULL
         // rows is rejected (PG: "could not create unique index").
-        if !idx.nulls_not_distinct
-            && key.iter().any(|v| matches!(v, spg_storage::Value::Null))
-        {
+        if !idx.nulls_not_distinct && key.iter().any(|v| matches!(v, spg_storage::Value::Null)) {
             continue;
         }
         if seen.iter().any(|other| *other == key) {
@@ -983,8 +983,7 @@ pub(crate) fn enforce_unique_index_inserts(
             let key = key_of(&prow.values)?;
             // v7.39 (read01 round 52) — NULLS NOT DISTINCT keeps NULL keys in
             // the uniqueness check (PG 15+); the default exempts them.
-            if !idx.nulls_not_distinct
-                && key.iter().any(|v| matches!(v, spg_storage::Value::Null))
+            if !idx.nulls_not_distinct && key.iter().any(|v| matches!(v, spg_storage::Value::Null))
             {
                 continue;
             }
@@ -995,8 +994,7 @@ pub(crate) fn enforce_unique_index_inserts(
                 continue;
             }
             let key = key_of(row_values)?;
-            if !idx.nulls_not_distinct
-                && key.iter().any(|v| matches!(v, spg_storage::Value::Null))
+            if !idx.nulls_not_distinct && key.iter().any(|v| matches!(v, spg_storage::Value::Null))
             {
                 continue;
             }
@@ -1371,11 +1369,8 @@ pub(crate) fn enforce_check_constraints(
             // PG: NULL passes (CHECK rejects on definite-false only).
             if matches!(v, spg_storage::Value::Bool(false)) {
                 // v7.39 (SQLSTATE fidelity) — PG's exact 23514 phrasing.
-                let names = crate::system_catalog::pg_check_connames(
-                    table,
-                    table_name,
-                    &schema.checks,
-                );
+                let names =
+                    crate::system_catalog::pg_check_connames(table, table_name, &schema.checks);
                 let conname = names
                     .get(*i)
                     .cloned()
@@ -1789,9 +1784,12 @@ pub(crate) enum FkChildAction {
 /// (and no trigger / RETURNING) will ever read them.
 pub(crate) fn any_fk_child_references(catalog: &Catalog, table_name: &str) -> bool {
     catalog.table_names().into_iter().any(|child_name| {
-        catalog
-            .get(&child_name)
-            .is_some_and(|c| c.schema().foreign_keys.iter().any(|fk| fk.parent_table == table_name))
+        catalog.get(&child_name).is_some_and(|c| {
+            c.schema()
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.parent_table == table_name)
+        })
     })
 }
 

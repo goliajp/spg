@@ -19,8 +19,14 @@ fn r1(e: &mut Engine, sql: &str) -> String {
 fn ts_lexize_stems_and_drops_stopwords() {
     let mut e = Engine::new();
     // english_stem: stem survivors, empty array for stopwords/empty.
-    assert_eq!(r1(&mut e, "SELECT ts_lexize('english_stem', 'jumping')"), "{jump}");
-    assert_eq!(r1(&mut e, "SELECT ts_lexize('english_stem', 'CATS')"), "{cat}");
+    assert_eq!(
+        r1(&mut e, "SELECT ts_lexize('english_stem', 'jumping')"),
+        "{jump}"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT ts_lexize('english_stem', 'CATS')"),
+        "{cat}"
+    );
     assert_eq!(r1(&mut e, "SELECT ts_lexize('english_stem', 'the')"), "{}");
     assert_eq!(r1(&mut e, "SELECT ts_lexize('english_stem', '')"), "{}");
     // simple: lowercase only, no stopword drop.
@@ -32,11 +38,17 @@ fn phraseto_tsquery_honours_stopword_gaps() {
     let mut e = Engine::new();
     // 'and' is dropped but advances position → <2>.
     assert_eq!(
-        r1(&mut e, "SELECT phraseto_tsquery('english', 'cats and dogs')"),
+        r1(
+            &mut e,
+            "SELECT phraseto_tsquery('english', 'cats and dogs')"
+        ),
         "'cat' <2> 'dog'"
     );
     assert_eq!(
-        r1(&mut e, "SELECT phraseto_tsquery('english', 'the quick and the brown fox')"),
+        r1(
+            &mut e,
+            "SELECT phraseto_tsquery('english', 'the quick and the brown fox')"
+        ),
         "'quick' <3> 'brown' <-> 'fox'"
     );
     // simple keeps every token adjacent.
@@ -51,12 +63,18 @@ fn tsvector_array_round_trip_values() {
     let mut e = Engine::new();
     // tsvector_to_array accepts a real tsvector value (not only text).
     assert_eq!(
-        r1(&mut e, "SELECT tsvector_to_array(to_tsvector('english','the quick brown fox'))"),
+        r1(
+            &mut e,
+            "SELECT tsvector_to_array(to_tsvector('english','the quick brown fox'))"
+        ),
         "{brown,fox,quick}"
     );
     // array_to_tsvector returns a real tsvector rendering with quotes.
     assert_eq!(
-        r1(&mut e, "SELECT array_to_tsvector(ARRAY['quick','brown','quick'])"),
+        r1(
+            &mut e,
+            "SELECT array_to_tsvector(ARRAY['quick','brown','quick'])"
+        ),
         "'brown' 'quick'"
     );
 }

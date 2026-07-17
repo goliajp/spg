@@ -13,7 +13,8 @@ use spg_engine::{Engine, QueryResult};
 fn setup(e: &mut Engine) {
     e.execute("CREATE TABLE base(id int, v int)").unwrap();
     // A non-auto-updatable view (has a computed column).
-    e.execute("CREATE VIEW jv AS SELECT id, v, v*2 AS dbl FROM base").unwrap();
+    e.execute("CREATE VIEW jv AS SELECT id, v, v*2 AS dbl FROM base")
+        .unwrap();
     e.execute(
         "CREATE FUNCTION jv_ins() RETURNS trigger AS $x$ BEGIN \
          INSERT INTO base(id,v) VALUES(NEW.id, NEW.v); RETURN NEW; END; $x$ LANGUAGE plpgsql",
@@ -43,7 +44,10 @@ fn instead_of_insert_fires_and_writes_base() {
     let mut e = Engine::new();
     setup(&mut e);
     // Multi-row INSERT through the non-updatable view fires the trigger per row.
-    match e.execute("INSERT INTO jv(id,v) VALUES(1,10),(2,20)").unwrap() {
+    match e
+        .execute("INSERT INTO jv(id,v) VALUES(1,10),(2,20)")
+        .unwrap()
+    {
         QueryResult::CommandOk { affected, .. } => assert_eq!(affected, 2),
         other => panic!("{other:?}"),
     }
@@ -72,9 +76,13 @@ fn instead_of_insert_positional() {
 fn instead_of_on_table_rejected() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(id int)").unwrap();
-    e.execute("CREATE FUNCTION f() RETURNS trigger AS $x$ BEGIN RETURN NEW; END; $x$ LANGUAGE plpgsql")
-        .unwrap();
-    let m = match e.execute("CREATE TRIGGER x INSTEAD OF INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()") {
+    e.execute(
+        "CREATE FUNCTION f() RETURNS trigger AS $x$ BEGIN RETURN NEW; END; $x$ LANGUAGE plpgsql",
+    )
+    .unwrap();
+    let m = match e
+        .execute("CREATE TRIGGER x INSTEAD OF INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()")
+    {
         Err(x) => format!("{x}"),
         Ok(_) => panic!("expected error"),
     };
@@ -86,9 +94,12 @@ fn instead_of_on_table_rejected() {
 fn statement_level_instead_of_rejected() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE base(id int, v int)").unwrap();
-    e.execute("CREATE VIEW jv AS SELECT id, v FROM base").unwrap();
-    e.execute("CREATE FUNCTION f() RETURNS trigger AS $x$ BEGIN RETURN NEW; END; $x$ LANGUAGE plpgsql")
+    e.execute("CREATE VIEW jv AS SELECT id, v FROM base")
         .unwrap();
+    e.execute(
+        "CREATE FUNCTION f() RETURNS trigger AS $x$ BEGIN RETURN NEW; END; $x$ LANGUAGE plpgsql",
+    )
+    .unwrap();
     // PG: INSTEAD OF triggers must be FOR EACH ROW.
     let m = match e
         .execute("CREATE TRIGGER x INSTEAD OF INSERT ON jv FOR EACH STATEMENT EXECUTE FUNCTION f()")
@@ -96,19 +107,26 @@ fn statement_level_instead_of_rejected() {
         Err(x) => format!("{x}"),
         Ok(_) => panic!("expected error"),
     };
-    assert!(m.contains("INSTEAD OF triggers must be FOR EACH ROW"), "{m}");
+    assert!(
+        m.contains("INSTEAD OF triggers must be FOR EACH ROW"),
+        "{m}"
+    );
 }
 
 #[test]
 fn before_on_view_rejected() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE base(id int, v int)").unwrap();
-    e.execute("CREATE VIEW jv AS SELECT id, v FROM base").unwrap();
-    e.execute("CREATE FUNCTION f() RETURNS trigger AS $x$ BEGIN RETURN NEW; END; $x$ LANGUAGE plpgsql")
+    e.execute("CREATE VIEW jv AS SELECT id, v FROM base")
         .unwrap();
-    let m = match e.execute("CREATE TRIGGER y BEFORE INSERT ON jv FOR EACH ROW EXECUTE FUNCTION f()") {
-        Err(x) => format!("{x}"),
-        Ok(_) => panic!("expected error"),
-    };
+    e.execute(
+        "CREATE FUNCTION f() RETURNS trigger AS $x$ BEGIN RETURN NEW; END; $x$ LANGUAGE plpgsql",
+    )
+    .unwrap();
+    let m =
+        match e.execute("CREATE TRIGGER y BEFORE INSERT ON jv FOR EACH ROW EXECUTE FUNCTION f()") {
+            Err(x) => format!("{x}"),
+            Ok(_) => panic!("expected error"),
+        };
     assert!(m.contains("\"jv\" is a view"), "{m}");
 }

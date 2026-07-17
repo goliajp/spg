@@ -1541,13 +1541,12 @@ fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
                                 while *i < chars.len() && chars[*i].is_ascii_digit() {
                                     *i += 1;
                                 }
-                                let off: usize = chars[s..*i]
-                                    .iter()
-                                    .collect::<String>()
-                                    .parse()
-                                    .map_err(|_| EvalError::TypeMismatch {
-                                        detail: "jsonpath: invalid `last - N` offset".into(),
-                                    })?;
+                                let off: usize =
+                                    chars[s..*i].iter().collect::<String>().parse().map_err(
+                                        |_| EvalError::TypeMismatch {
+                                            detail: "jsonpath: invalid `last - N` offset".into(),
+                                        },
+                                    )?;
                                 return Ok(IdxBound::FromLast(off));
                             }
                             return Ok(IdxBound::FromLast(0));
@@ -1946,16 +1945,9 @@ fn filter_matches(node: &JsonValue, pred: &FilterPred, vars: Option<&JsonValue>)
                 FilterOp::LikeRegex => {
                     // v7.39 (read01 jsonpath.c) — the `i` flag folds case
                     // (other flags round-trip but don't alter matching yet).
-                    if pred
-                        .regex_flags
-                        .as_deref()
-                        .is_some_and(|f| f.contains('i'))
-                    {
-                        crate::eval::regex_is_match(
-                            &rhs.to_lowercase(),
-                            &lhs.to_lowercase(),
-                        )
-                        .unwrap_or(false)
+                    if pred.regex_flags.as_deref().is_some_and(|f| f.contains('i')) {
+                        crate::eval::regex_is_match(&rhs.to_lowercase(), &lhs.to_lowercase())
+                            .unwrap_or(false)
                     } else {
                         crate::eval::regex_is_match(rhs, lhs).unwrap_or(false)
                     }
@@ -2021,9 +2013,7 @@ fn apply_jsonpath(
                 }
                 // v7.38 (read01, T8) — range / filter / methods.
                 (PathStep::Range(lo, hi), JsonValue::Array(items)) => {
-                    if let (Some(a), Some(b)) =
-                        (lo.resolve(items.len()), hi.resolve(items.len()))
-                    {
+                    if let (Some(a), Some(b)) = (lo.resolve(items.len()), hi.resolve(items.len())) {
                         for idx in a..=b {
                             if let Some(v) = items.get(idx) {
                                 next.push(v.clone());
@@ -2167,9 +2157,7 @@ pub fn path_predicate_vars(
         val,
         regex_flags,
     };
-    Ok(Some(
-        results.iter().any(|v| filter_matches(v, &pred, vars)),
-    ))
+    Ok(Some(results.iter().any(|v| filter_matches(v, &pred, vars))))
 }
 
 /// v7.17.0 Phase 3.9 — `jsonb_path_query(doc, path)` — returns the
@@ -2400,10 +2388,7 @@ pub fn jsonpath_canonical(input: &str) -> Result<String, EvalError> {
                 out.push_str(op);
                 fval(&p.val, out);
                 if let Some(f) = &p.regex_flags {
-                    let _ = core::fmt::Write::write_fmt(
-                        out,
-                        format_args!(" flag \"{f}\""),
-                    );
+                    let _ = core::fmt::Write::write_fmt(out, format_args!(" flag \"{f}\""));
                 }
             }
             FilterExpr::And(l, r) => {
@@ -2492,7 +2477,11 @@ fn encode_value_into(v: &Value, out: &mut String) {
             };
             write_json(&JsonValue::String(txt.into()), out);
         }
-        Value::Numeric { scaled, scale, kind } => {
+        Value::Numeric {
+            scaled,
+            scale,
+            kind,
+        } => {
             use spg_storage::NumericKind as NK;
             match kind {
                 NK::NaN => write_json(&JsonValue::String("NaN".into()), out),

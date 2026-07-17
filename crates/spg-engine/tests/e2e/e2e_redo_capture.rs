@@ -135,7 +135,11 @@ fn redo_carries_real_autocommit_writer_version() {
     let upd = e.take_redo();
     // Under the mvcc-inplace-on verification feature an UPDATE is
     // tombstone(old) + insert(new) — two changes, one shared version.
-    let expect_upd = if !cfg!(feature = "mvcc-inplace-off") { 2 } else { 1 };
+    let expect_upd = if !cfg!(feature = "mvcc-inplace-off") {
+        2
+    } else {
+        1
+    };
     assert_eq!(upd.len(), expect_upd);
     let v_upd = writer_version(&upd[0]);
     for c in &upd {

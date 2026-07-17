@@ -41,7 +41,10 @@ fn interval_input_forms() {
 fn array_fill_two_dimensional() {
     let mut e = Engine::new();
     assert_eq!(
-        row_of(&mut e, "SELECT array_fill(7, ARRAY[3]), array_fill(0, ARRAY[2,2])"),
+        row_of(
+            &mut e,
+            "SELECT array_fill(7, ARRAY[3]), array_fill(0, ARRAY[2,2])"
+        ),
         vec!["{7,7,7}", "{{0,0},{0,0}}"]
     );
 }

@@ -26,7 +26,10 @@ fn render(e: &mut Engine, sql: &str) -> String {
 fn date_trunc_over_date_is_timestamptz() {
     let mut e = Engine::new();
     assert_eq!(
-        render(&mut e, "SELECT date_trunc('quarter', date '2024-05-15')::text"),
+        render(
+            &mut e,
+            "SELECT date_trunc('quarter', date '2024-05-15')::text"
+        ),
         "2024-04-01 00:00:00+00"
     );
     assert_eq!(
@@ -34,7 +37,10 @@ fn date_trunc_over_date_is_timestamptz() {
         "2024-05-15 00:00:00+00"
     );
     assert_eq!(
-        render(&mut e, "SELECT pg_typeof(date_trunc('quarter', date '2024-05-15'))::text"),
+        render(
+            &mut e,
+            "SELECT pg_typeof(date_trunc('quarter', date '2024-05-15'))::text"
+        ),
         "timestamp with time zone"
     );
 }
@@ -44,11 +50,17 @@ fn date_trunc_over_timestamp_stays_timestamp() {
     let mut e = Engine::new();
     // Regression: a bare timestamp argument keeps the plain timestamp overload.
     assert_eq!(
-        render(&mut e, "SELECT date_trunc('month', timestamp '2024-05-15 12:00')::text"),
+        render(
+            &mut e,
+            "SELECT date_trunc('month', timestamp '2024-05-15 12:00')::text"
+        ),
         "2024-05-01 00:00:00"
     );
     assert_eq!(
-        render(&mut e, "SELECT pg_typeof(date_trunc('month', timestamp '2024-05-15 12:00'))::text"),
+        render(
+            &mut e,
+            "SELECT pg_typeof(date_trunc('month', timestamp '2024-05-15 12:00'))::text"
+        ),
         "timestamp without time zone"
     );
 }
@@ -59,11 +71,17 @@ fn date_bin_over_date_is_timestamptz() {
     // date_bin previously errored on a date argument; now it resolves to the
     // timestamptz overload like date_trunc.
     assert_eq!(
-        render(&mut e, "SELECT date_bin('1 day', date '2024-05-15', date '2024-01-01')::text"),
+        render(
+            &mut e,
+            "SELECT date_bin('1 day', date '2024-05-15', date '2024-01-01')::text"
+        ),
         "2024-05-15 00:00:00+00"
     );
     assert_eq!(
-        render(&mut e, "SELECT pg_typeof(date_bin('1 day', date '2024-05-15', date '2024-01-01'))::text"),
+        render(
+            &mut e,
+            "SELECT pg_typeof(date_bin('1 day', date '2024-05-15', date '2024-01-01'))::text"
+        ),
         "timestamp with time zone"
     );
 }

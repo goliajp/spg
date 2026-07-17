@@ -88,8 +88,5 @@ fn array_2d_construct_and_introspect() {
     assert_eq!(text(&mut e, "SELECT array_dims(ARRAY[1,2,3])"), "[1:3]");
     // pgvector literal `[...]` is unaffected by the ARRAY[[..]] nesting
     // change; the text form is pgvector's spaceless vector_out.
-    assert_eq!(
-        text(&mut e, "SELECT ('[1,2,3]'::vector)::text"),
-        "[1,2,3]"
-    );
+    assert_eq!(text(&mut e, "SELECT ('[1,2,3]'::vector)::text"), "[1,2,3]");
 }

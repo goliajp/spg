@@ -30,8 +30,14 @@ fn abs_covers_all_numeric_types() {
 #[test]
 fn abs_int2_overflow_errors_like_pg() {
     let mut e = Engine::new();
-    let err = e.execute("SELECT abs(-32768::int2)").unwrap_err().to_string();
-    assert!(err.contains("smallint out of range"), "unexpected error: {err}");
+    let err = e
+        .execute("SELECT abs(-32768::int2)")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("smallint out of range"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

@@ -20,10 +20,12 @@ fn text(e: &mut Engine, sql: &str) -> String {
 }
 
 fn setup(e: &mut Engine) {
-    e.execute("CREATE TABLE m (id int PRIMARY KEY, v int)").unwrap();
+    e.execute("CREATE TABLE m (id int PRIMARY KEY, v int)")
+        .unwrap();
     e.execute("INSERT INTO m VALUES (1,10),(2,20)").unwrap();
     e.execute("CREATE TABLE src (id int, v int)").unwrap();
-    e.execute("INSERT INTO src VALUES (2,88),(3,33),(4,44)").unwrap();
+    e.execute("INSERT INTO src VALUES (2,88),(3,33),(4,44)")
+        .unwrap();
 }
 
 const AGG: &str = "SELECT string_agg(id||':'||v, ',' ORDER BY id) FROM m";
@@ -59,10 +61,11 @@ fn merge_insert_too_many_values_errors() {
     let mut e = Engine::new();
     setup(&mut e);
     // No column list but more expressions than the table has columns.
-    assert!(e
-        .execute(
+    assert!(
+        e.execute(
             "MERGE INTO m USING src ON m.id=src.id \
              WHEN NOT MATCHED THEN INSERT VALUES(src.id, src.v, 99)",
         )
-        .is_err());
+        .is_err()
+    );
 }

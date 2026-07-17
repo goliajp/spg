@@ -32,9 +32,11 @@ fn base_rows(e: &mut Engine, sql: &str) -> Vec<Vec<String>> {
 fn insert_update_delete_through_renamed_view() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE rt(id int, x int)").unwrap();
-    e.execute("CREATE VIEW rv(a, b) AS SELECT id, x FROM rt").unwrap();
+    e.execute("CREATE VIEW rv(a, b) AS SELECT id, x FROM rt")
+        .unwrap();
     // INSERT with explicit renamed column list.
-    e.execute("INSERT INTO rv(a,b) VALUES(1,10),(2,20)").unwrap();
+    e.execute("INSERT INTO rv(a,b) VALUES(1,10),(2,20)")
+        .unwrap();
     // INSERT positional through the view.
     e.execute("INSERT INTO rv VALUES(3,30)").unwrap();
     // UPDATE via renamed columns: b→x, a→id.
@@ -58,20 +60,28 @@ fn reordered_renamed_view() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE rt(id int, x int)").unwrap();
     // View projects x first, id second, renamed (a,b): a→x, b→id.
-    e.execute("CREATE VIEW rv2(a, b) AS SELECT x, id FROM rt").unwrap();
+    e.execute("CREATE VIEW rv2(a, b) AS SELECT x, id FROM rt")
+        .unwrap();
     e.execute("INSERT INTO rv2(a,b) VALUES(7,8)").unwrap();
     // a=7 lands in x, b=8 lands in id.
-    assert_eq!(base_rows(&mut e, "SELECT id,x FROM rt"), vec![vec!["8", "7"]]);
+    assert_eq!(
+        base_rows(&mut e, "SELECT id,x FROM rt"),
+        vec![vec!["8", "7"]]
+    );
 }
 
 #[test]
 fn subset_renamed_view_insert() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE rt(id int, x int)").unwrap();
-    e.execute("CREATE VIEW rs(only_id) AS SELECT id FROM rt").unwrap();
+    e.execute("CREATE VIEW rs(only_id) AS SELECT id FROM rt")
+        .unwrap();
     // Only the mapped column is set; the rest defaults to NULL.
     e.execute("INSERT INTO rs(only_id) VALUES(42)").unwrap();
-    assert_eq!(base_rows(&mut e, "SELECT id,x FROM rt"), vec![vec!["42", "NULL"]]);
+    assert_eq!(
+        base_rows(&mut e, "SELECT id,x FROM rt"),
+        vec![vec!["42", "NULL"]]
+    );
 }
 
 #[test]
@@ -91,5 +101,8 @@ fn renamed_view_with_check_option() {
     );
     // A satisfying row lands.
     e.execute("INSERT INTO rc(a,b) VALUES(2,5)").unwrap();
-    assert_eq!(base_rows(&mut e, "SELECT id,x FROM rt"), vec![vec!["2", "5"]]);
+    assert_eq!(
+        base_rows(&mut e, "SELECT id,x FROM rt"),
+        vec![vec!["2", "5"]]
+    );
 }

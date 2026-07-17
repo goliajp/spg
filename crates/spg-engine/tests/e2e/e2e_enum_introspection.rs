@@ -8,9 +8,7 @@ use spg_engine::{Engine, QueryResult};
 
 fn text_of(e: &mut Engine, sql: &str) -> String {
     match e.execute(sql).unwrap() {
-        QueryResult::Rows { rows, .. } => {
-            spg_engine::eval::value_to_text(&rows[0].values[0])
-        }
+        QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{sql}: {other:?}"),
     }
 }
@@ -32,7 +30,10 @@ fn enum_first_last_range() {
     e.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
         .unwrap();
     assert_eq!(
-        row_of(&mut e, "SELECT enum_first(NULL::mood), enum_last(NULL::mood)"),
+        row_of(
+            &mut e,
+            "SELECT enum_first(NULL::mood), enum_last(NULL::mood)"
+        ),
         vec!["sad", "happy"]
     );
     assert_eq!(
@@ -70,12 +71,10 @@ fn enum_introspection_from_column_reference() {
     let mut e = Engine::new();
     e.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
         .unwrap();
-    e.execute("CREATE TABLE p (id INT NOT NULL, m mood)").unwrap();
+    e.execute("CREATE TABLE p (id INT NOT NULL, m mood)")
+        .unwrap();
     e.execute("INSERT INTO p VALUES (1, 'ok')").unwrap();
-    assert_eq!(
-        text_of(&mut e, "SELECT enum_last(m) FROM p"),
-        "happy"
-    );
+    assert_eq!(text_of(&mut e, "SELECT enum_last(m) FROM p"), "happy");
 }
 
 #[test]

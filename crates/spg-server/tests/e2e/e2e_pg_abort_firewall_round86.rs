@@ -25,7 +25,10 @@ use std::time::Duration;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn local_spawn(db: &std::path::Path) -> (std::process::Child, common::ServerAddrs) {
-    common::ServerBuilder::new().arg_path(db).with_pgwire().spawn()
+    common::ServerBuilder::new()
+        .arg_path(db)
+        .with_pgwire()
+        .spawn()
 }
 
 fn unique_tmpdir(label: &str) -> PathBuf {
@@ -167,7 +170,10 @@ fn statement_error_aborts_the_transaction() {
     let _child = common::ChildGuard(raw);
     let mut s = open(addrs.pgwire.as_ref().unwrap());
 
-    matches!(run(&mut s, "CREATE TABLE z (id int primary key, v int)"), Outcome::Tag(_));
+    matches!(
+        run(&mut s, "CREATE TABLE z (id int primary key, v int)"),
+        Outcome::Tag(_)
+    );
     matches!(run(&mut s, "INSERT INTO z VALUES (1, 10)"), Outcome::Tag(_));
 
     matches!(run(&mut s, "BEGIN"), Outcome::Tag(_));
@@ -179,21 +185,36 @@ fn statement_error_aborts_the_transaction() {
     // Every non-tx-control statement now rejects with 25P02, whichever wire path
     // it would have taken.
     assert_25p02(run(&mut s, "SELECT count(*) FROM z"), "SELECT (read path)");
-    assert_25p02(run(&mut s, "INSERT INTO z VALUES (2, 20)"), "INSERT (write path)");
-    assert_25p02(run(&mut s, "SHOW transaction_isolation"), "SHOW (short-circuit)");
-    assert_25p02(run(&mut s, "SET application_name = 'x'"), "SET (short-circuit)");
+    assert_25p02(
+        run(&mut s, "INSERT INTO z VALUES (2, 20)"),
+        "INSERT (write path)",
+    );
+    assert_25p02(
+        run(&mut s, "SHOW transaction_isolation"),
+        "SHOW (short-circuit)",
+    );
+    assert_25p02(
+        run(&mut s, "SET application_name = 'x'"),
+        "SET (short-circuit)",
+    );
 
     // COMMIT in an aborted tx rolls back and is tagged ROLLBACK.
     match run(&mut s, "COMMIT") {
         Outcome::Tag(t) => assert_eq!(t, "ROLLBACK"),
-        other => panic!("COMMIT-in-aborted: expected ROLLBACK tag, got {}", match other {
-            Outcome::Rows(n) => format!("{n} rows"),
-            Outcome::Error(c) => format!("error {c}"),
-            Outcome::Tag(_) => unreachable!(),
-        }),
+        other => panic!(
+            "COMMIT-in-aborted: expected ROLLBACK tag, got {}",
+            match other {
+                Outcome::Rows(n) => format!("{n} rows"),
+                Outcome::Error(c) => format!("error {c}"),
+                Outcome::Tag(_) => unreachable!(),
+            }
+        ),
     }
     // The aborted work did not apply; the transaction is over.
-    assert!(matches!(run(&mut s, "SELECT count(*) FROM z"), Outcome::Rows(1)));
+    assert!(matches!(
+        run(&mut s, "SELECT count(*) FROM z"),
+        Outcome::Rows(1)
+    ));
 }
 
 #[test]
@@ -204,12 +225,18 @@ fn rollback_recovers_and_missing_column_also_aborts() {
     let _child = common::ChildGuard(raw);
     let mut s = open(addrs.pgwire.as_ref().unwrap());
 
-    matches!(run(&mut s, "CREATE TABLE z (id int primary key)"), Outcome::Tag(_));
+    matches!(
+        run(&mut s, "CREATE TABLE z (id int primary key)"),
+        Outcome::Tag(_)
+    );
     matches!(run(&mut s, "INSERT INTO z VALUES (1)"), Outcome::Tag(_));
 
     matches!(run(&mut s, "BEGIN"), Outcome::Tag(_));
     // A missing-column SELECT is the error that aborts.
-    matches!(run(&mut s, "SELECT nonexistent_col FROM z"), Outcome::Error(_));
+    matches!(
+        run(&mut s, "SELECT nonexistent_col FROM z"),
+        Outcome::Error(_)
+    );
     assert_25p02(run(&mut s, "SELECT 1"), "SELECT after missing-col");
     // ROLLBACK ends the aborted block and recovers the session.
     match run(&mut s, "ROLLBACK") {
@@ -217,5 +244,8 @@ fn rollback_recovers_and_missing_column_also_aborts() {
         _ => panic!("ROLLBACK should tag ROLLBACK"),
     }
     // Session works again.
-    assert!(matches!(run(&mut s, "SELECT count(*) FROM z"), Outcome::Rows(1)));
+    assert!(matches!(
+        run(&mut s, "SELECT count(*) FROM z"),
+        Outcome::Rows(1)
+    ));
 }

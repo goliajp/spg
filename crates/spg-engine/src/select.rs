@@ -873,8 +873,7 @@ impl Engine {
             // own executor plumbing ("the top-level mutable entry"), which
             // means nothing to a client.
             return Err(EngineError::Unsupported(
-                "WITH clause containing a data-modifying statement must be at the top level"
-                    .into(),
+                "WITH clause containing a data-modifying statement must be at the top level".into(),
             ));
         }
         let catalog = self.materialise_ctes_readonly(&stmt.ctes, cancel)?;
@@ -2049,8 +2048,7 @@ impl Engine {
             // (`user_enum_type`), or `ORDER BY <enum col>` over a UNION sorts
             // by TEXT instead of member order — silently wrong rows, not an
             // error. (Same shape as the enum-order knife's GROUP BY fix.)
-            let synth_ctx =
-                EvalContext::new(&columns, None).with_catalog(self.active_catalog());
+            let synth_ctx = EvalContext::new(&columns, None).with_catalog(self.active_catalog());
             // v7.37.17 (17.6 siblings) — positional keys (ORDER BY 1)
             // survive to here when the head projects a Wildcard (the
             // group-tail wrapper shape): map them onto the Nth
@@ -3050,8 +3048,7 @@ impl Engine {
                     // NULL (or missing) argument → zero rows (PG).
                     return Ok((alloc::vec::Vec::new(), cols));
                 };
-                let entries =
-                    crate::partition_walks::tree_of(self.active_catalog(), name.as_ref());
+                let entries = crate::partition_walks::tree_of(self.active_catalog(), name.as_ref());
                 if entries.is_empty() && self.active_catalog().get(name.as_ref()).is_none() {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "relation \"{name}\" does not exist"
@@ -3072,11 +3069,8 @@ impl Engine {
                 Ok((rows, cols))
             }
             "pg_partition_ancestors" => {
-                let cols = alloc::vec![ColumnSchema::new(
-                    "relid".to_string(),
-                    DataType::Text,
-                    true
-                )];
+                let cols =
+                    alloc::vec![ColumnSchema::new("relid".to_string(), DataType::Text, true)];
                 let Some(Value::Text(name)) = &arg0 else {
                     return Ok((alloc::vec::Vec::new(), cols));
                 };
@@ -3152,14 +3146,11 @@ impl Engine {
         arg_values: &[Value<'static>],
         alias: Option<&str>,
     ) -> Result<(alloc::vec::Vec<Row<'static>>, alloc::vec::Vec<ColumnSchema>), EngineError> {
-
         let cat = self.active_catalog();
         let overloads = cat.functions_named(name);
         let def = overloads
             .iter()
-            .find(|f| {
-                spg_storage::function_arg_types(&f.args_repr).len() == arg_values.len()
-            })
+            .find(|f| spg_storage::function_arg_types(&f.args_repr).len() == arg_values.len())
             .ok_or_else(|| {
                 EngineError::Unsupported(alloc::format!(
                     "function {name} does not exist with {} argument(s)",
@@ -3574,12 +3565,12 @@ impl Engine {
                             // member order. Silently wrong rows, not an error.
                             let v = eval::eval_expr(&ob.expr, r, &scan_ctx)
                                 .map_err(EngineError::Eval)?;
-                            Ok(match crate::orderby::enum_order_ordinal(
-                                &ob.expr, &v, &scan_ctx,
-                            ) {
-                                Some(ord) => Value::Float(ord),
-                                None => v,
-                            })
+                            Ok(
+                                match crate::orderby::enum_order_ordinal(&ob.expr, &v, &scan_ctx) {
+                                    Some(ord) => Value::Float(ord),
+                                    None => v,
+                                },
+                            )
                         })
                         .collect();
                     Ok((i, keys?))
@@ -3663,10 +3654,10 @@ impl Engine {
                 let columns: Vec<ColumnSchema> = projection
                     .into_iter()
                     .map(|p| {
-                let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
-                c.user_enum_type = p.user_enum_type;
-                c
-            })
+                        let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
+                        c.user_enum_type = p.user_enum_type;
+                        c
+                    })
                     .collect();
                 return Ok(QueryResult::Rows {
                     columns,
@@ -3686,10 +3677,10 @@ impl Engine {
             let columns: Vec<ColumnSchema> = projection
                 .into_iter()
                 .map(|p| {
-                let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
-                c.user_enum_type = p.user_enum_type;
-                c
-            })
+                    let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
+                    c.user_enum_type = p.user_enum_type;
+                    c
+                })
                 .collect();
             // v7.39 (read01 round 80) — a FROM-less SELECT still has an ORDER BY,
             // an OFFSET and a LIMIT, and they apply to the rows the SRF expanded
@@ -4238,8 +4229,7 @@ impl Engine {
             // 'static bound — and the main thread only dereferences.
             let n = table.row_count();
             let par = self.parallel_runner.0.as_deref().filter(|_| {
-                n >= crate::PARALLEL_MIN_ROWS
-                    && (stmt.where_.is_none() || compiled_where.is_some())
+                n >= crate::PARALLEL_MIN_ROWS && (stmt.where_.is_none() || compiled_where.is_some())
             });
             if let Some(r) = par {
                 let n_shards = (n / crate::PARALLEL_MIN_ROWS).clamp(2, 8);
@@ -4250,8 +4240,7 @@ impl Engine {
                 let results = r.run_shards(n_shards, &|s| {
                     let lo = s * chunk;
                     let hi = ((s + 1) * chunk).min(n);
-                    let mut keep: alloc::vec::Vec<usize> =
-                        alloc::vec::Vec::with_capacity(hi - lo);
+                    let mut keep: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(hi - lo);
                     // EvalContext carries Cells (sampler / row counters)
                     // and is !Sync — each shard builds its own from the
                     // same Sync inputs. The compiled WHERE is gated to
@@ -5630,7 +5619,7 @@ fn norm_hash_value<H: core::hash::Hasher>(v: &Value<'static>, h: &mut H) {
             return;
         }
         const TWO63: f64 = 9_223_372_036_854_775_808.0;
-        if x >= -TWO63 && x < TWO63 {
+        if (-TWO63..TWO63).contains(&x) {
             #[allow(clippy::cast_possible_truncation)]
             let n = x as i64;
             #[allow(clippy::cast_precision_loss)]
@@ -6123,7 +6112,8 @@ pub(crate) fn build_projection(
                 let single_table = !table_alias.is_empty() && q == table_alias;
                 let mut matched = 0usize;
                 for col in schema_cols {
-                    let belongs = col.name.starts_with(&prefix) || (single_table && !col.name.contains('.'));
+                    let belongs =
+                        col.name.starts_with(&prefix) || (single_table && !col.name.contains('.'));
                     if !belongs {
                         continue;
                     }
@@ -6678,13 +6668,15 @@ pub(crate) fn generate_series_from_values(
                 .iter()
                 .any(|v| matches!(v, Value::Numeric { .. } | Value::NumericBig(_)))
                 && arg_values.iter().all(|v| {
-                    matches!(v, Value::Numeric { .. } | Value::NumericBig(_))
-                        || value_is_integer(v)
+                    matches!(v, Value::Numeric { .. } | Value::NumericBig(_)) || value_is_integer(v)
                 }) =>
         {
             use spg_storage::NumericKind as K;
             let words: [(&str, &str); 3] = [
-                ("start value cannot be NaN", "start value cannot be infinity"),
+                (
+                    "start value cannot be NaN",
+                    "start value cannot be infinity",
+                ),
                 ("stop value cannot be NaN", "stop value cannot be infinity"),
                 ("step size cannot be NaN", "step size cannot be infinity"),
             ];
@@ -6698,9 +6690,8 @@ pub(crate) fn generate_series_from_values(
                     }
                 }
             }
-            let big = |v: &Value<'_>| {
-                eval::binop::value_to_bignum(v).expect("finite numeric or integer")
-            };
+            let big =
+                |v: &Value<'_>| eval::binop::value_to_bignum(v).expect("finite numeric or integer");
             let start = big(&arg_values[0]);
             let stop = big(&arg_values[1]);
             let step = if arg_values.len() == 3 {
@@ -7876,11 +7867,7 @@ fn setof_column_shape_from(
             .split(',')
             .zip(got.iter())
             .map(|(decl, g)| {
-                let cname = decl
-                    .trim()
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or(g.name.as_str());
+                let cname = decl.split_whitespace().next().unwrap_or(g.name.as_str());
                 ColumnSchema::new(cname.to_string(), g.ty, true)
             })
             .collect();
@@ -8181,13 +8168,10 @@ impl Engine {
         let spg_sql::ast::Expr::FunctionCall { name, .. } = e else {
             return false;
         };
-        self.active_catalog()
-            .functions_named(name)
-            .iter()
-            .any(|f| {
-                let r = f.returns.trim().to_ascii_uppercase();
-                r.starts_with("SETOF") || r.starts_with("TABLE(")
-            })
+        self.active_catalog().functions_named(name).iter().any(|f| {
+            let r = f.returns.trim().to_ascii_uppercase();
+            r.starts_with("SETOF") || r.starts_with("TABLE(")
+        })
     }
 
     /// Does an SRF appear ANYWHERE in this expression (not only as its root)?
@@ -8318,13 +8302,7 @@ impl Engine {
             let raw = &declared["TABLE(".len()..declared.len() - 1];
             return Ok(raw
                 .split(',')
-                .map(|d| {
-                    d.trim()
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("col")
-                        .to_string()
-                })
+                .map(|d| d.split_whitespace().next().unwrap_or("col").to_string())
                 .collect());
         }
         Ok(alloc::vec![name.to_string()])
@@ -8372,7 +8350,10 @@ impl Engine {
                 // The parser lowered this one to `<array expr>`; its rows are the
                 // array's elements.
                 let arr = eval::eval_expr(&args[0], &dummy, &ctx).map_err(EngineError::Eval)?;
-                (array_value_to_elements(&arr)?, alloc::string::String::from("unnest"))
+                (
+                    array_value_to_elements(&arr)?,
+                    alloc::string::String::from("unnest"),
+                )
             } else {
                 let call = spg_sql::ast::Expr::FunctionCall {
                     name: name.clone(),

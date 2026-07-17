@@ -18,7 +18,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn err(e: &mut Engine, sql: &str) -> String {
@@ -56,18 +57,27 @@ fn seeded() -> Engine {
 #[test]
 fn privileges_flow_through_membership_to_an_inheriting_member() {
     let mut e = seeded();
-    assert_eq!(r1(&mut e, "SELECT has_table_privilege('ann','rt','SELECT')"), "false");
+    assert_eq!(
+        r1(&mut e, "SELECT has_table_privilege('ann','rt','SELECT')"),
+        "false"
+    );
     ok(&mut e, "GRANT devs TO ann");
     ok(&mut e, "GRANT SELECT ON rt TO devs");
     // ann INHERITs, so the group's grant is hers without any SET ROLE.
-    assert_eq!(r1(&mut e, "SELECT has_table_privilege('ann','rt','SELECT')"), "true");
+    assert_eq!(
+        r1(&mut e, "SELECT has_table_privilege('ann','rt','SELECT')"),
+        "true"
+    );
     ok(&mut e, "SET ROLE ann");
     assert_eq!(r1(&mut e, "SELECT count(*) FROM rt"), "1");
     ok(&mut e, "RESET ROLE");
     // Revoking the membership takes the privilege away again — inheritance is
     // resolved live, not snapshotted at GRANT time.
     ok(&mut e, "REVOKE devs FROM ann");
-    assert_eq!(r1(&mut e, "SELECT has_table_privilege('ann','rt','SELECT')"), "false");
+    assert_eq!(
+        r1(&mut e, "SELECT has_table_privilege('ann','rt','SELECT')"),
+        "false"
+    );
 }
 
 #[test]
@@ -76,7 +86,10 @@ fn a_noinherit_member_must_set_role_explicitly() {
     ok(&mut e, "GRANT devs TO carl");
     ok(&mut e, "GRANT SELECT ON rt TO devs");
     // carl is a member, but NOINHERIT: the privilege does not flow to him.
-    assert_eq!(r1(&mut e, "SELECT has_table_privilege('carl','rt','SELECT')"), "false");
+    assert_eq!(
+        r1(&mut e, "SELECT has_table_privilege('carl','rt','SELECT')"),
+        "false"
+    );
     ok(&mut e, "SET ROLE carl");
     assert_eq!(
         err(&mut e, "SELECT count(*) FROM rt"),
@@ -141,16 +154,28 @@ fn pg_has_role_and_column_privilege_stop_lying() {
     // MEMBER = can SET ROLE to it. USAGE = the privileges flow automatically,
     // which is the INHERIT question — so carl (NOINHERIT) is a member without
     // USAGE.
-    assert_eq!(r1(&mut e, "SELECT pg_has_role('ann','devs','MEMBER')"), "true");
-    assert_eq!(r1(&mut e, "SELECT pg_has_role('carl','devs','USAGE')"), "false");
-    // SPG has no column-level grants, so a column privilege IS the table's —
-    // and that is the truthful answer, not an unconditional `true`.
     assert_eq!(
-        r1(&mut e, "SELECT has_column_privilege('ann','rt','v','SELECT')"),
+        r1(&mut e, "SELECT pg_has_role('ann','devs','MEMBER')"),
         "true"
     );
     assert_eq!(
-        r1(&mut e, "SELECT has_column_privilege('carl','rt','v','SELECT')"),
+        r1(&mut e, "SELECT pg_has_role('carl','devs','USAGE')"),
+        "false"
+    );
+    // SPG has no column-level grants, so a column privilege IS the table's —
+    // and that is the truthful answer, not an unconditional `true`.
+    assert_eq!(
+        r1(
+            &mut e,
+            "SELECT has_column_privilege('ann','rt','v','SELECT')"
+        ),
+        "true"
+    );
+    assert_eq!(
+        r1(
+            &mut e,
+            "SELECT has_column_privilege('carl','rt','v','SELECT')"
+        ),
         "false"
     );
 }

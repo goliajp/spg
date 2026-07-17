@@ -133,6 +133,24 @@ for_kv_map              = "allow"
 semicolon_if_nothing_returned = "allow"
 useless_format          = "allow"
 explicit_iter_loop      = "allow"
+# v7.39 (round 161, clippy 1.97) — the toolchain bump surfaced a fresh
+# batch of complexity / style lints on long-standing code. Same policy
+# as above: signature-reshaping and cosmetic lints don't gate CI.
+too_many_arguments      = "allow"
+type_complexity         = "allow"
+struct_excessive_bools  = "allow"
+trivially_copy_pass_by_ref = "allow"
+needless_for_each       = "allow"
+field_reassign_with_default = "allow"
+match_wildcard_for_single_variants = "allow"
+redundant_locals        = "allow"
+# Same rationale as match_same_arms: adjacent same-valued branches in
+# the SQLSTATE mapping chain are semantically distinct cases.
+if_same_then_else       = "allow"
+# `Default::default()` is the only spelling when the concrete type
+# lives in a private module (e.g. spg-engine's eval::format::RenderStyle
+# reached through `Engine::render_style`).
+default_trait_access    = "allow"
 # Doc-style + stylistic carve-outs from newer clippy releases:
 doc_overindented_list_items = "allow"
 doc_lazy_continuation   = "allow"

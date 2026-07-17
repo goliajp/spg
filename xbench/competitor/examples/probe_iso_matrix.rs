@@ -14,9 +14,7 @@ fn main() {
     e.execute_in("UPDATE t SET x = 20 WHERE x = 1", IMPLICIT_TX)
         .unwrap();
     let dump = |e: &mut Engine, tag: &str, tx| {
-        if let Ok(QueryResult::Rows { rows, .. }) =
-            e.execute_in("SELECT x FROM t ORDER BY x", tx)
-        {
+        if let Ok(QueryResult::Rows { rows, .. }) = e.execute_in("SELECT x FROM t ORDER BY x", tx) {
             let xs: Vec<String> = rows.iter().map(|r| format!("{:?}", r.values[0])).collect();
             println!("{tag}: [{}]", xs.join(", "));
         }

@@ -59,25 +59,25 @@ impl Zone {
 
     /// Local type + designation ("JST", "EDT") at a UTC instant.
     pub fn type_and_abbr_at_utc(&self, utc_secs: i64) -> (LocalType, &str) {
-        if let Some(&last) = self.transitions.last() {
-            if utc_secs >= last {
-                // Inside or past the last explicit transition: the
-                // footer rule governs when present (slim tzdata), else
-                // the last explicit type extends forever.
-                if let Some(f) = &self.footer {
-                    return f.type_and_abbr_at_utc(utc_secs);
-                }
-                let i = self.transitions.len() - 1;
-                let ti = self.type_idx[i];
-                return (self.types[ti], &self.abbrs[ti]);
+        if let Some(&last) = self.transitions.last()
+            && utc_secs >= last
+        {
+            // Inside or past the last explicit transition: the
+            // footer rule governs when present (slim tzdata), else
+            // the last explicit type extends forever.
+            if let Some(f) = &self.footer {
+                return f.type_and_abbr_at_utc(utc_secs);
             }
+            let i = self.transitions.len() - 1;
+            let ti = self.type_idx[i];
+            return (self.types[ti], &self.abbrs[ti]);
         }
         match self.transitions.partition_point(|&t| t <= utc_secs) {
             0 => {
-                if self.transitions.is_empty() {
-                    if let Some(f) = &self.footer {
-                        return f.type_and_abbr_at_utc(utc_secs);
-                    }
+                if self.transitions.is_empty()
+                    && let Some(f) = &self.footer
+                {
+                    return f.type_and_abbr_at_utc(utc_secs);
                 }
                 (self.first, &self.first_abbr)
             }
@@ -260,14 +260,12 @@ pub fn parse_tzif(b: &[u8]) -> Option<Zone> {
     let mut zone = parse_block(b, block_at, &c2, 8)?;
     // Footer: '\n' TZstring '\n'
     let footer_at = block_at + data_block_len(&c2, 8);
-    if b.get(footer_at) == Some(&b'\n') {
-        if let Some(rest) = b.get(footer_at + 1..) {
-            if let Some(nl) = rest.iter().position(|&c| c == b'\n') {
-                if let Ok(tzs) = core::str::from_utf8(&rest[..nl]) {
-                    zone.footer = PosixTz::parse(tzs);
-                }
-            }
-        }
+    if b.get(footer_at) == Some(&b'\n')
+        && let Some(rest) = b.get(footer_at + 1..)
+        && let Some(nl) = rest.iter().position(|&c| c == b'\n')
+        && let Ok(tzs) = core::str::from_utf8(&rest[..nl])
+    {
+        zone.footer = PosixTz::parse(tzs);
     }
     Some(zone)
 }
@@ -393,11 +391,11 @@ fn take_name<'a>(rest: &mut &'a str) -> Option<&'a str> {
 fn take_offset(rest: &mut &str) -> Option<i64> {
     let mut chars = rest.char_indices().peekable();
     let mut neg = false;
-    if let Some(&(_, c)) = chars.peek() {
-        if c == '+' || c == '-' {
-            neg = c == '-';
-            chars.next();
-        }
+    if let Some(&(_, c)) = chars.peek()
+        && (c == '+' || c == '-')
+    {
+        neg = c == '-';
+        chars.next();
     }
     let mut fields = [0i64; 3];
     let mut fi = 0usize;
@@ -434,7 +432,11 @@ fn take_rule(s: &str) -> Option<(TzRule, &str)> {
         let r = r.strip_prefix('.')?;
         let (d, r) = take_num(r)?;
         rest = r;
-        TzRuleDay::MonthWeekDay(u8::try_from(m).ok()?, u8::try_from(w).ok()?, u8::try_from(d).ok()?)
+        TzRuleDay::MonthWeekDay(
+            u8::try_from(m).ok()?,
+            u8::try_from(w).ok()?,
+            u8::try_from(d).ok()?,
+        )
     } else if let Some(r) = rest.strip_prefix('J') {
         let (n, r) = take_num(r)?;
         rest = r;
@@ -456,9 +458,7 @@ fn take_rule(s: &str) -> Option<(TzRule, &str)> {
 }
 
 fn take_num(s: &str) -> Option<(u32, &str)> {
-    let n = s
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(s.len());
+    let n = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     if n == 0 {
         return None;
     }
@@ -523,7 +523,11 @@ fn days_in_month(y: i32, m: u32) -> u32 {
 }
 
 fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
-    let y_adj = if m <= 2 { i64::from(y) - 1 } else { i64::from(y) };
+    let y_adj = if m <= 2 {
+        i64::from(y) - 1
+    } else {
+        i64::from(y)
+    };
     let era = y_adj.div_euclid(400);
     let yoe = y_adj - era * 400;
     let doy = i64::from((153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1);
@@ -550,6 +554,7 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 /// Candidate zoneinfo roots, first that exists wins.
 const ZONEINFO_ROOTS: &[&str] = &["/usr/share/zoneinfo", "/usr/lib/zoneinfo", "/etc/zoneinfo"];
 
+#[derive(Debug)]
 pub struct TzDb {
     root: PathBuf,
     /// lowercase name -> canonical name ("asia/tokyo" -> "Asia/Tokyo").
@@ -581,16 +586,18 @@ impl TzDb {
     /// Canonical spelling of a zone name, case-insensitively
     /// (`asia/tokyo` -> `Asia/Tokyo`). `None` = unknown zone.
     pub fn canonical(&self, name: &str) -> Option<&str> {
-        self.names.get(&name.to_ascii_lowercase()).map(String::as_str)
+        self.names
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
     }
 
     /// Load (and cache) a zone by any-case name.
     pub fn zone(&self, name: &str) -> Option<Arc<Zone>> {
         let canon = self.canonical(name)?.to_string();
-        if let Ok(cache) = self.cache.lock() {
-            if let Some(z) = cache.get(&canon) {
-                return Some(Arc::clone(z));
-            }
+        if let Ok(cache) = self.cache.lock()
+            && let Some(z) = cache.get(&canon)
+        {
+            return Some(Arc::clone(z));
         }
         let bytes = std::fs::read(self.root.join(&canon)).ok()?;
         let zone = Arc::new(parse_tzif(&bytes)?);
@@ -616,8 +623,15 @@ fn collect_names(root: &Path, dir: &Path, out: &mut HashMap<String, String>) {
         // Auxiliary non-zone entries present in zoneinfo trees.
         if matches!(
             fname,
-            "posixrules" | "localtime" | "leapseconds" | "tzdata.zi" | "zone.tab"
-                | "zone1970.tab" | "iso3166.tab" | "leap-seconds.list" | "SECURITY"
+            "posixrules"
+                | "localtime"
+                | "leapseconds"
+                | "tzdata.zi"
+                | "zone.tab"
+                | "zone1970.tab"
+                | "iso3166.tab"
+                | "leap-seconds.list"
+                | "SECURITY"
                 | "+VERSION"
         ) {
             continue;
@@ -629,10 +643,10 @@ fn collect_names(root: &Path, dir: &Path, out: &mut HashMap<String, String>) {
         // A zone file starts with the TZif magic; probing every file
         // would be slow, so trust the tree structure and verify lazily
         // at load time (parse_tzif rejects non-TZif bytes).
-        if let Ok(rel) = path.strip_prefix(root) {
-            if let Some(rel) = rel.to_str() {
-                out.insert(rel.to_ascii_lowercase(), rel.to_string());
-            }
+        if let Ok(rel) = path.strip_prefix(root)
+            && let Some(rel) = rel.to_str()
+        {
+            out.insert(rel.to_ascii_lowercase(), rel.to_string());
         }
     }
 }

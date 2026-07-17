@@ -15,7 +15,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn err(e: &mut Engine, sql: &str) -> String {
@@ -62,7 +63,10 @@ fn setof_scalar_yields_one_column_named_after_the_alias() {
 fn returns_table_names_its_columns() {
     let mut e = seeded();
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text || v, ',') FROM rows_of(2)"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text || v, ',') FROM rows_of(2)"
+        ),
         "2b,3c"
     );
     assert_eq!(r1(&mut e, "SELECT count(*) FROM rows_of(1)"), "3");
@@ -71,7 +75,13 @@ fn returns_table_names_its_columns() {
 #[test]
 fn the_enclosing_query_may_filter_the_functions_rows() {
     let mut e = seeded();
-    assert_eq!(r1(&mut e, "SELECT string_agg(v, ',') FROM rows_of(2) WHERE id = 3"), "c");
+    assert_eq!(
+        r1(
+            &mut e,
+            "SELECT string_agg(v, ',') FROM rows_of(2) WHERE id = 3"
+        ),
+        "c"
+    );
 }
 
 #[test]
@@ -80,7 +90,10 @@ fn only_visible_rows_reach_the_caller() {
     let mut e = seeded();
     ok(&mut e, "DELETE FROM t WHERE id = 2");
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text || v, ',') FROM rows_of(1)"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text || v, ',') FROM rows_of(1)"
+        ),
         "1a,3c"
     );
     assert_eq!(

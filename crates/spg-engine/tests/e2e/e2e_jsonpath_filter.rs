@@ -140,11 +140,17 @@ fn jsonpath_filter_and_or() {
 fn jsonpath_last_subscript() {
     let mut e = Engine::new();
     assert_eq!(
-        text(&mut e, "SELECT jsonb_path_query_first('[1,2,3]', '$[last]')::text"),
+        text(
+            &mut e,
+            "SELECT jsonb_path_query_first('[1,2,3]', '$[last]')::text"
+        ),
         "3"
     );
     assert_eq!(
-        text(&mut e, "SELECT jsonb_path_query_first('[1,2,3]', '$[last - 1]')::text"),
+        text(
+            &mut e,
+            "SELECT jsonb_path_query_first('[1,2,3]', '$[last - 1]')::text"
+        ),
         "2"
     );
     assert_eq!(
@@ -160,15 +166,24 @@ fn jsonpath_last_subscript() {
 fn jsonpath_numeric_item_methods() {
     let mut e = Engine::new();
     assert_eq!(
-        text(&mut e, "SELECT jsonb_path_query_first('{\"n\":-5}', '$.n.abs()')::text"),
+        text(
+            &mut e,
+            "SELECT jsonb_path_query_first('{\"n\":-5}', '$.n.abs()')::text"
+        ),
         "5"
     );
     assert_eq!(
-        text(&mut e, "SELECT jsonb_path_query_first('{\"x\":4.7}', '$.x.floor()')::text"),
+        text(
+            &mut e,
+            "SELECT jsonb_path_query_first('{\"x\":4.7}', '$.x.floor()')::text"
+        ),
         "4"
     );
     assert_eq!(
-        text(&mut e, "SELECT jsonb_path_query_first('{\"x\":4.2}', '$.x.ceiling()')::text"),
+        text(
+            &mut e,
+            "SELECT jsonb_path_query_first('{\"x\":4.2}', '$.x.ceiling()')::text"
+        ),
         "5"
     );
     assert_eq!(
@@ -217,11 +232,17 @@ fn jsonpath_null_comparison_and_exists() {
         "null"
     );
     assert_eq!(
-        text(&mut e, "SELECT jsonb_path_query_first('{\"a\":1}', 'exists($.a)')::text"),
+        text(
+            &mut e,
+            "SELECT jsonb_path_query_first('{\"a\":1}', 'exists($.a)')::text"
+        ),
         "true"
     );
     assert_eq!(
-        text(&mut e, "SELECT jsonb_path_query_first('{\"a\":1}', 'exists($.b)')::text"),
+        text(
+            &mut e,
+            "SELECT jsonb_path_query_first('{\"a\":1}', 'exists($.b)')::text"
+        ),
         "false"
     );
 }

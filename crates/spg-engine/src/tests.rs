@@ -2630,7 +2630,8 @@ fn autovacuum_stays_quiet_below_threshold() {
     e.set_mvcc_inplace(true);
     e.execute("CREATE TABLE av (id INT NOT NULL)").unwrap();
     for i in 0..2000 {
-        e.execute(&alloc::format!("INSERT INTO av VALUES ({i})")).unwrap();
+        e.execute(&alloc::format!("INSERT INTO av VALUES ({i})"))
+            .unwrap();
     }
     // 500 dead < 1000 absolute floor — rows stay physically present.
     e.execute("DELETE FROM av WHERE id < 500").unwrap();

@@ -73,3 +73,6 @@ bigdecimal = ["dep:bigdecimal", "dep:num-bigint", "dep:num-traits"]
 # v7.17.0 Phase 3.P0-69 — Encode/Decode for `uuid::Uuid` against
 # SPG's `UUID` column.
 uuid       = ["dep:uuid"]
+
+[lints]
+workspace = true

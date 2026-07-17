@@ -34,7 +34,10 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows_of(e: &mut Engine, sql: &str) -> Vec<String> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| {
@@ -58,14 +61,26 @@ fn a_srf_nested_in_an_expression() {
     let mut e = Engine::new();
     assert_eq!(r1(&mut e, "SELECT upper(unnest(ARRAY['a','b']))"), "A,B");
     assert_eq!(r1(&mut e, "SELECT unnest(ARRAY[1,2]) + 10"), "11,12");
-    assert_eq!(r1(&mut e, "SELECT 'e:' || unnest(ARRAY['x','y'])"), "e:x,e:y");
+    assert_eq!(
+        r1(&mut e, "SELECT 'e:' || unnest(ARRAY['x','y'])"),
+        "e:x,e:y"
+    );
     assert_eq!(r1(&mut e, "SELECT generate_series(1,2) * 2"), "2,4");
     // The SRF keeps its real type through the lift: text[] here, jsonb below.
     assert_eq!(
-        r1(&mut e, "SELECT (regexp_matches('a1b2','([a-z])([0-9])','g'))::text"),
+        r1(
+            &mut e,
+            "SELECT (regexp_matches('a1b2','([a-z])([0-9])','g'))::text"
+        ),
         "{a,1},{b,2}"
     );
-    assert_eq!(r1(&mut e, "SELECT (jsonb_array_elements('[1,2]'::jsonb))::text"), "1,2");
+    assert_eq!(
+        r1(
+            &mut e,
+            "SELECT (jsonb_array_elements('[1,2]'::jsonb))::text"
+        ),
+        "1,2"
+    );
     // Bare SRF items still behave, and an empty set is zero rows.
     assert_eq!(r1(&mut e, "SELECT unnest(ARRAY[1,2])"), "1,2");
     assert_eq!(rows_of(&mut e, "SELECT unnest('{}'::int[])").len(), 0);
@@ -88,7 +103,10 @@ fn b_several_srfs_run_in_lockstep_after_nesting() {
 fn c_srf_in_a_conditional_is_an_error() {
     let mut e = Engine::new();
     // PG: "set-returning functions are not allowed in COALESCE".
-    assert!(e.execute("SELECT coalesce(unnest(ARRAY['a',NULL]),'-')").is_err());
+    assert!(
+        e.execute("SELECT coalesce(unnest(ARRAY['a',NULL]),'-')")
+            .is_err()
+    );
     assert!(
         e.execute("SELECT CASE WHEN true THEN unnest(ARRAY[1,2]) ELSE 0 END")
             .is_err()
@@ -98,14 +116,26 @@ fn c_srf_in_a_conditional_is_an_error() {
 #[test]
 fn d_scalar_function_from_item_has_the_scalar_as_its_row_type() {
     let mut e = Engine::new();
-    assert_eq!(r1(&mut e, "SELECT j::text FROM jsonb_array_elements('[1,2]'::jsonb) AS j"), "1,2");
     assert_eq!(
-        r1(&mut e, "SELECT m::text FROM regexp_matches('a1b2','([a-z])([0-9])','g') AS m"),
+        r1(
+            &mut e,
+            "SELECT j::text FROM jsonb_array_elements('[1,2]'::jsonb) AS j"
+        ),
+        "1,2"
+    );
+    assert_eq!(
+        r1(
+            &mut e,
+            "SELECT m::text FROM regexp_matches('a1b2','([a-z])([0-9])','g') AS m"
+        ),
         "{a,1},{b,2}"
     );
     // The declared column name still works alongside the collapse.
     assert_eq!(
-        r1(&mut e, "SELECT j.value::text FROM jsonb_array_elements('[1]'::jsonb) AS j"),
+        r1(
+            &mut e,
+            "SELECT j.value::text FROM jsonb_array_elements('[1]'::jsonb) AS j"
+        ),
         "1"
     );
     // A one-column SUBQUERY is not a function item — it stays a composite.
@@ -116,7 +146,10 @@ fn d_scalar_function_from_item_has_the_scalar_as_its_row_type() {
 fn e_regexp_matches_as_a_from_item() {
     let mut e = Engine::new();
     assert_eq!(
-        r1(&mut e, "SELECT m[1] || m[2] FROM regexp_matches('a1b2','([a-z])([0-9])','g') AS m"),
+        r1(
+            &mut e,
+            "SELECT m[1] || m[2] FROM regexp_matches('a1b2','([a-z])([0-9])','g') AS m"
+        ),
         "a1,b2"
     );
     assert_eq!(
@@ -127,7 +160,10 @@ fn e_regexp_matches_as_a_from_item() {
         ),
         "{a,1}|1,{b,2}|2"
     );
-    assert_eq!(rows_of(&mut e, "SELECT * FROM regexp_matches('zzz','([0-9])','g')").len(), 0);
+    assert_eq!(
+        rows_of(&mut e, "SELECT * FROM regexp_matches('zzz','([0-9])','g')").len(),
+        0
+    );
     // More column aliases than the item has columns is PG's error, reported here
     // rather than two layers down as "column not found".
     assert!(

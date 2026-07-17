@@ -32,7 +32,11 @@ fn unique_index_basic_blocks_dup() {
     ok(&mut eng, "CREATE UNIQUE INDEX uq_a ON t (a)");
     ok(&mut eng, "INSERT INTO t VALUES (1, 100)");
     ok(&mut eng, "INSERT INTO t VALUES (2, 200)");
-    err_contains(&mut eng, "INSERT INTO t VALUES (1, 999)", "unique constraint");
+    err_contains(
+        &mut eng,
+        "INSERT INTO t VALUES (1, 999)",
+        "unique constraint",
+    );
 }
 
 #[test]

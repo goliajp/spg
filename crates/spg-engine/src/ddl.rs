@@ -799,14 +799,9 @@ impl Engine {
         //    the views printed (`<table>_<col>_key` / `<table>_<col>_check`).
         // (Single-column UNIQUE indices that don't have a UC entry need to go
         // through `DROP INDEX <name>` instead — indices are a slice, not a Vec.)
-        let uc_hit = table
-            .schema()
-            .uniqueness_constraints
-            .iter()
-            .position(|uc| {
-                uc.name.is_none()
-                    && crate::system_catalog::pg_unique_conname(table, uc, tbl) == name
-            });
+        let uc_hit = table.schema().uniqueness_constraints.iter().position(|uc| {
+            uc.name.is_none() && crate::system_catalog::pg_unique_conname(table, uc, tbl) == name
+        });
         if let Some(idx) = uc_hit {
             table.schema_mut().uniqueness_constraints.remove(idx);
             return Ok(());
@@ -858,7 +853,8 @@ impl Engine {
                 // v7.39 (read01 round 46) — PG's IF NOT EXISTS skip NOTICE.
                 self.notice(alloc::format!(
                     "column {:?} of relation {:?} already exists, skipping",
-                    column.name, tbl
+                    column.name,
+                    tbl
                 ));
                 return Ok(());
             }
@@ -1127,10 +1123,13 @@ impl Engine {
                 }
             }
             spg_sql::ast::TableConstraint::Check { expr, .. } => {
-                table.schema_mut().checks.push(spg_storage::CheckConstraint {
-                    name: con_name.clone(),
-                    expr: alloc::format!("{expr}"),
-                });
+                table
+                    .schema_mut()
+                    .checks
+                    .push(spg_storage::CheckConstraint {
+                        name: con_name.clone(),
+                        expr: alloc::format!("{expr}"),
+                    });
             }
             spg_sql::ast::TableConstraint::Index { name, columns } => {
                 // v7.15.0 — ALTER TABLE ADD KEY (cols).
@@ -1391,14 +1390,10 @@ impl Engine {
             }
             "column" => {
                 let (tbl, col) = name.split_once('.').ok_or_else(|| {
-                    EngineError::Unsupported(alloc::format!(
-                        "column {name:?} does not exist"
-                    ))
+                    EngineError::Unsupported(alloc::format!("column {name:?} does not exist"))
                 })?;
                 let t = cat.get(tbl).ok_or_else(|| {
-                    EngineError::Unsupported(alloc::format!(
-                        "relation {tbl:?} does not exist"
-                    ))
+                    EngineError::Unsupported(alloc::format!("relation {tbl:?} does not exist"))
                 })?;
                 if !t
                     .schema()
@@ -1535,9 +1530,7 @@ impl Engine {
                 // v7.39 (read01 round 47) — PG wording (42703). PG omits
                 // the "of relation" qualifier on RENAME COLUMN (unlike the
                 // ALTER COLUMN family below) — match it exactly.
-                EngineError::Unsupported(alloc::format!(
-                    "column {old:?} does not exist"
-                ))
+                EngineError::Unsupported(alloc::format!("column {old:?} does not exist"))
             })?;
         // Reject same-name (case-insensitive) collision.
         if table
@@ -3186,7 +3179,11 @@ impl Engine {
                         .acl
                         .iter()
                         .any(|a| a.grantee.eq_ignore_ascii_case(name))
-                        || tb.schema().owner.as_deref().is_some_and(|o| o.eq_ignore_ascii_case(name))
+                        || tb
+                            .schema()
+                            .owner
+                            .as_deref()
+                            .is_some_and(|o| o.eq_ignore_ascii_case(name))
                 })
             })
             .collect();
@@ -3713,7 +3710,8 @@ impl Engine {
             if old.0 != new.0 {
                 return Err(EngineError::Unsupported(alloc::format!(
                     "cannot change name of view column \"{}\" to \"{}\"",
-                    old.0, new.0
+                    old.0,
+                    new.0
                 )));
             }
             if old.1 != new.1 {

@@ -34,21 +34,23 @@ fn geo_single_arg_constructors() {
         row_of(&mut e, "SELECT line(point '(0,0)', point '(1,1)')"),
         vec!["{1,-1,0}"]
     );
-    assert!(err_of(&mut e, "SELECT line(point '(1,1)', point '(1,1)')")
-        .contains("cannot create line from two identical points"));
+    assert!(
+        err_of(&mut e, "SELECT line(point '(1,1)', point '(1,1)')")
+            .contains("cannot create line from two identical points")
+    );
 }
 
 #[test]
 fn float_to_integer_coercion() {
     let mut e = Engine::new();
     assert_eq!(
-        row_of(&mut e, "SELECT int4(3.7::float8), int4(2.5::float8), int8(-2.5::float8)"),
+        row_of(
+            &mut e,
+            "SELECT int4(3.7::float8), int4(2.5::float8), int8(-2.5::float8)"
+        ),
         vec!["4", "2", "-2"]
     );
-    assert!(err_of(&mut e, "SELECT int4('inf'::float8)")
-        .contains("integer out of range"));
-    assert!(err_of(&mut e, "SELECT int4(1e20::float8)")
-        .contains("integer out of range"));
-    assert!(err_of(&mut e, "SELECT int2(1e6::float8)")
-        .contains("smallint out of range"));
+    assert!(err_of(&mut e, "SELECT int4('inf'::float8)").contains("integer out of range"));
+    assert!(err_of(&mut e, "SELECT int4(1e20::float8)").contains("integer out of range"));
+    assert!(err_of(&mut e, "SELECT int2(1e6::float8)").contains("smallint out of range"));
 }

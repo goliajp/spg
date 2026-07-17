@@ -24,10 +24,7 @@ fn main() {
     ] {
         match eng.execute(sql) {
             Ok(spg_engine::QueryResult::Rows { rows, .. }) => {
-                let cells: Vec<String> = rows
-                    .iter()
-                    .map(|r| format!("{:?}", r.values))
-                    .collect();
+                let cells: Vec<String> = rows.iter().map(|r| format!("{:?}", r.values)).collect();
                 println!("{sql}\n  -> {}", cells.join(" | "));
             }
             Ok(other) => println!("{sql}\n  -> {other:?}"),

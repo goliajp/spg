@@ -18,10 +18,22 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn epoch_from_date_is_scale_zero() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT extract(epoch from date '2024-01-01')::text"), "1704067200");
-    assert_eq!(text(&mut e, "SELECT extract(epoch from date '1970-01-01')::text"), "0");
-    assert_eq!(text(&mut e, "SELECT extract(epoch from date '1969-12-31')::text"), "-86400");
-    assert_eq!(text(&mut e, "SELECT date_part('epoch', date '2024-01-01')::text"), "1704067200");
+    assert_eq!(
+        text(&mut e, "SELECT extract(epoch from date '2024-01-01')::text"),
+        "1704067200"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT extract(epoch from date '1970-01-01')::text"),
+        "0"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT extract(epoch from date '1969-12-31')::text"),
+        "-86400"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT date_part('epoch', date '2024-01-01')::text"),
+        "1704067200"
+    );
 }
 
 #[test]
@@ -29,13 +41,25 @@ fn epoch_from_timestamp_time_interval_keep_scale_six() {
     // Regression guard: sub-second-capable types keep the microsecond scale.
     let mut e = Engine::new();
     assert_eq!(
-        text(&mut e, "SELECT extract(epoch from timestamp '2024-01-01 00:00:00')::text"),
+        text(
+            &mut e,
+            "SELECT extract(epoch from timestamp '2024-01-01 00:00:00')::text"
+        ),
         "1704067200.000000"
     );
     assert_eq!(
-        text(&mut e, "SELECT extract(epoch from timestamp '2024-01-01 00:00:00.5')::text"),
+        text(
+            &mut e,
+            "SELECT extract(epoch from timestamp '2024-01-01 00:00:00.5')::text"
+        ),
         "1704067200.500000"
     );
-    assert_eq!(text(&mut e, "SELECT extract(epoch from time '01:00:00')::text"), "3600.000000");
-    assert_eq!(text(&mut e, "SELECT extract(epoch from interval '1 day')::text"), "86400.000000");
+    assert_eq!(
+        text(&mut e, "SELECT extract(epoch from time '01:00:00')::text"),
+        "3600.000000"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT extract(epoch from interval '1 day')::text"),
+        "86400.000000"
+    );
 }

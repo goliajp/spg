@@ -101,6 +101,7 @@ mod e2e_chaos_logical;
 mod e2e_chaos_netsplit;
 #[allow(unsafe_code)]
 mod e2e_compression_metrics;
+mod e2e_copy_errors_round91;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -109,13 +110,7 @@ mod e2e_compression_metrics;
     clippy::uninlined_format_args
 )]
 mod e2e_copy_options;
-mod e2e_copy_errors_round91;
 mod e2e_copy_query_to_stdout_round94;
-mod e2e_error_position_round95;
-mod e2e_not_null_detail_round117;
-mod e2e_show_isolation_round118;
-mod e2e_gen_series_tstz_round119;
-mod e2e_returning_command_tag_round131;
 #[allow(clippy::doc_markdown, clippy::uninlined_format_args)]
 mod e2e_correlated;
 #[allow(clippy::doc_markdown, clippy::uninlined_format_args)]
@@ -129,6 +124,7 @@ mod e2e_cte;
     unused_variables
 )]
 mod e2e_disk_watermark;
+mod e2e_error_position_round95;
 #[allow(clippy::doc_markdown, clippy::uninlined_format_args)]
 mod e2e_explain;
 #[allow(
@@ -157,6 +153,7 @@ mod e2e_freezer;
     clippy::unreadable_literal
 )]
 mod e2e_fuzz;
+mod e2e_gen_series_tstz_round119;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -255,6 +252,7 @@ mod e2e_mysqlwire_ssl;
     clippy::uninlined_format_args
 )]
 mod e2e_mysqlwire_stmt;
+mod e2e_not_null_detail_round117;
 #[allow(
     clippy::doc_markdown,
     clippy::cast_possible_truncation,
@@ -266,6 +264,7 @@ mod e2e_observability;
 mod e2e_parallel_freezer;
 #[allow(unused_mut, unused_variables)]
 mod e2e_persistence;
+mod e2e_pg_abort_firewall_round86;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -328,6 +327,7 @@ mod e2e_pg_scram;
     unused_variables
 )]
 mod e2e_pg_session_vars;
+mod e2e_pg_tx_visibility_round84;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -359,7 +359,6 @@ mod e2e_pgbouncer_compat;
     unused_variables
 )]
 mod e2e_pgwire;
-mod e2e_query_cancel;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -396,6 +395,7 @@ mod e2e_publication_ddl;
 mod e2e_query;
 #[allow(unused_mut, unused_variables)]
 mod e2e_query_budget;
+mod e2e_query_cancel;
 #[allow(clippy::uninlined_format_args)]
 mod e2e_query_ns_budget;
 #[allow(unused_mut, unused_variables)]
@@ -428,8 +428,10 @@ mod e2e_replication_filter;
     unused_variables
 )]
 mod e2e_restore_drill;
+mod e2e_returning_command_tag_round131;
 #[allow(clippy::uninlined_format_args)]
 mod e2e_segment_forward;
+mod e2e_show_isolation_round118;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -488,8 +490,6 @@ mod e2e_timeouts;
 mod e2e_two_tier_server;
 #[allow(unused_mut, unused_variables)]
 mod e2e_tx;
-mod e2e_pg_tx_visibility_round84;
-mod e2e_pg_abort_firewall_round86;
 #[allow(clippy::doc_markdown, clippy::uninlined_format_args)]
 mod e2e_update_delete;
 mod e2e_vector;

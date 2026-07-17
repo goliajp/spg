@@ -71,10 +71,13 @@ fn pg_lsn_io_ordering_arithmetic() {
         ),
         vec!["1/0"]
     );
-    assert!(err_of(&mut e, "SELECT 'x/0'::pg_lsn")
-        .contains("invalid input syntax for type pg_lsn: \"x/0\""));
-    assert!(err_of(&mut e, "SELECT '0/16B3748'::pg_lsn - 100000000000")
-        .contains("pg_lsn out of range"));
+    assert!(
+        err_of(&mut e, "SELECT 'x/0'::pg_lsn")
+            .contains("invalid input syntax for type pg_lsn: \"x/0\"")
+    );
+    assert!(
+        err_of(&mut e, "SELECT '0/16B3748'::pg_lsn - 100000000000").contains("pg_lsn out of range")
+    );
 }
 
 #[test]
@@ -124,9 +127,14 @@ fn partition_tree_and_ancestors_srf() {
         Vec::<String>::new()
     );
     assert_eq!(
-        col_of(&mut e, "SELECT relid FROM pg_partition_ancestors('plain_t')"),
+        col_of(
+            &mut e,
+            "SELECT relid FROM pg_partition_ancestors('plain_t')"
+        ),
         Vec::<String>::new()
     );
-    assert!(err_of(&mut e, "SELECT relid FROM pg_partition_tree('nope')")
-        .contains("relation \"nope\" does not exist"));
+    assert!(
+        err_of(&mut e, "SELECT relid FROM pg_partition_tree('nope')")
+            .contains("relation \"nope\" does not exist")
+    );
 }

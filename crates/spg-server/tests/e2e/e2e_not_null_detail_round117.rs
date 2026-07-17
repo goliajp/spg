@@ -14,7 +14,10 @@ use std::time::Duration;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn local_spawn(db: &std::path::Path) -> (std::process::Child, common::ServerAddrs) {
-    common::ServerBuilder::new().arg_path(db).with_pgwire().spawn()
+    common::ServerBuilder::new()
+        .arg_path(db)
+        .with_pgwire()
+        .spawn()
 }
 
 fn unique_tmpdir(label: &str) -> PathBuf {
@@ -115,7 +118,10 @@ fn open(addr: &str) -> TcpStream {
 fn run_ok(s: &mut TcpStream, sql: &str) {
     send_query(s, sql);
     let msgs = read_until_ready(s);
-    assert!(msgs.iter().all(|m| m.ty != b'E'), "unexpected error for {sql}");
+    assert!(
+        msgs.iter().all(|m| m.ty != b'E'),
+        "unexpected error for {sql}"
+    );
 }
 
 #[test]
@@ -126,7 +132,10 @@ fn not_null_violation_splits_detail_field() {
     let _child = common::ChildGuard(raw);
     let mut s = open(addrs.pgwire.as_ref().unwrap());
 
-    run_ok(&mut s, "CREATE TABLE nn (a text, b int NOT NULL, c text DEFAULT 'x')");
+    run_ok(
+        &mut s,
+        "CREATE TABLE nn (a text, b int NOT NULL, c text DEFAULT 'x')",
+    );
 
     send_query(&mut s, "INSERT INTO nn (a) VALUES ('hi')");
     let msgs = read_until_ready(&mut s);

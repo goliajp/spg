@@ -28,7 +28,10 @@ fn text(e: &mut Engine, sql: &str) -> String {
 fn single_arg_age_uses_the_wall_clock() {
     let mut e = Engine::new().with_clock(fixed_today);
     // age(date) — relative to midnight today (2024-06-15).
-    assert_eq!(text(&mut e, "SELECT age(date '2024-03-15')::text"), "3 mons");
+    assert_eq!(
+        text(&mut e, "SELECT age(date '2024-03-15')::text"),
+        "3 mons"
+    );
     // age(timestamp) — keeps the sub-day remainder.
     assert_eq!(
         text(&mut e, "SELECT age(timestamp '2023-06-15 06:00')::text"),
@@ -53,6 +56,9 @@ fn no_clock_keeps_deterministic_2020_anchor() {
     // Without a clock the eval fallback still anchors at 2020-01-01, so the
     // embedded no-clock behaviour (and its tests) is unchanged.
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT age(date '2020-01-01')::text"), "00:00:00");
+    assert_eq!(
+        text(&mut e, "SELECT age(date '2020-01-01')::text"),
+        "00:00:00"
+    );
     assert_eq!(text(&mut e, "SELECT age(date '2019-12-01')::text"), "1 mon");
 }

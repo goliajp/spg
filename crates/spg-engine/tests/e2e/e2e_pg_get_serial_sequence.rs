@@ -24,7 +24,8 @@ fn pg_get_serial_sequence_bare_table() {
     // v7.39 (read01 ruleutils.c) — only serial/identity columns map to a
     // sequence; a plain column is NULL and a missing relation errors (PG).
     let mut e = Engine::new();
-    e.execute("CREATE TABLE users (id SERIAL, note TEXT)").unwrap();
+    e.execute("CREATE TABLE users (id SERIAL, note TEXT)")
+        .unwrap();
     assert_eq!(
         text(&first(
             &mut e,

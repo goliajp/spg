@@ -112,13 +112,10 @@ fn round18_numutils_oid_oracle_compat() {
         ),
         vec!["4294967295", "4294967295", "16384", "true"]
     );
-    let err = |e: &mut Engine, sql: &str| -> String {
-        format!("{}", e.execute(sql).unwrap_err())
-    };
+    let err = |e: &mut Engine, sql: &str| -> String { format!("{}", e.execute(sql).unwrap_err()) };
     assert!(err(&mut e, "SELECT 4294967296::oid").contains("OID out of range"));
     assert!(
-        err(&mut e, "SELECT 'abc'::oid")
-            .contains("invalid input syntax for type oid: \"abc\"")
+        err(&mut e, "SELECT 'abc'::oid").contains("invalid input syntax for type oid: \"abc\"")
     );
     assert!(err(&mut e, "SELECT chr(0)").contains("null character not permitted"));
     assert!(

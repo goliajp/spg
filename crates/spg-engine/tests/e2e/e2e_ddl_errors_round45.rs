@@ -13,7 +13,8 @@ fn err(e: &mut Engine, sql: &str) -> String {
 }
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 #[test]
@@ -49,8 +50,7 @@ fn ddl_object_error_wording_matches_pg() {
     );
     // missing table on DROP TABLE.
     assert!(
-        err(&mut e, "DROP TABLE nonexist_tbl")
-            .contains("table \"nonexist_tbl\" does not exist")
+        err(&mut e, "DROP TABLE nonexist_tbl").contains("table \"nonexist_tbl\" does not exist")
     );
 }
 
@@ -64,7 +64,9 @@ fn identity_generated_always_error_has_detail_hint() {
     ok(&mut e, "INSERT INTO idt(b) VALUES ('x')");
     let msg = err(&mut e, "INSERT INTO idt(a,b) VALUES (100,'z')");
     assert!(msg.contains("cannot insert a non-DEFAULT value into column \"a\""));
-    assert!(msg.contains("DETAIL: Column \"a\" is an identity column defined as GENERATED ALWAYS."));
+    assert!(
+        msg.contains("DETAIL: Column \"a\" is an identity column defined as GENERATED ALWAYS.")
+    );
     assert!(msg.contains("HINT:  Use OVERRIDING SYSTEM VALUE to override."));
 }
 
