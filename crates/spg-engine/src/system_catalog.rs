@@ -1400,7 +1400,10 @@ pub(crate) fn synth_pg_stat_user_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, V
 ///     estimates (live = row_count; dead = 0 until v7.37.15
 ///     vacuum daemon tracks them)
 ///   * last_vacuum / last_analyze (TIMESTAMPTZ, NULL)
-pub(crate) fn synth_pg_stat_user_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_stat_user_tables(
+    cat: &Catalog,
+    write_stats: &alloc::collections::BTreeMap<alloc::string::String, (u64, u64, u64)>,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("relid", DataType::BigInt, false),
         ColumnSchema::new("schemaname", DataType::Text, false),
@@ -1436,7 +1439,9 @@ pub(crate) fn synth_pg_stat_user_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Ve
         // instrumentation knife.
         let dead = i64::try_from(t.dead_rows()).unwrap_or(i64::MAX);
         let live_rows = (t.rows().len() as i64).saturating_sub(dead);
-        let (ins, upd, del) = t.write_stats();
+        // r192 — engine-side non-transactional counters (the on-table
+        // ones vanished in the RC rebase when bumped inside a tx).
+        let (ins, upd, del) = write_stats.get(&name).copied().unwrap_or((0, 0, 0));
         // v7.39 (pg_stat knife B) — scan counters (scan_visible +
         // index-seek instrumentation). This synth query itself walks
         // the catalog, not the user tables, so it doesn't self-count.

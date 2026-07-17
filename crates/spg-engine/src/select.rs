@@ -494,8 +494,13 @@ impl Engine {
                 // v7.37.22 (22.14) — pg_catalog.pg_stat_user_tables
                 // (per-table churn counters; live_tup = row count).
                 "__spg_pg_stat_user_tables" => {
-                    let (schema, rows) =
-                        crate::system_catalog::synth_pg_stat_user_tables(self.active_catalog());
+                    // r192 — DML counters come from the engine-side
+                    // non-transactional map, not the (tx-shadowed)
+                    // catalog tables.
+                    let (schema, rows) = crate::system_catalog::synth_pg_stat_user_tables(
+                        self.active_catalog(),
+                        &self.table_write_stats,
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.22 (22.15) — pg_catalog.pg_stat_user_indexes

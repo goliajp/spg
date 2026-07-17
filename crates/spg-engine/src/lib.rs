@@ -824,6 +824,15 @@ pub struct Engine {
     pub(crate) stat_tup_inserted: u64,
     pub(crate) stat_tup_updated: u64,
     pub(crate) stat_tup_deleted: u64,
+    /// v7.39 (round 192) — per-table DML counters for
+    /// pg_stat_user_tables (n_tup_ins / n_tup_upd / n_tup_del).
+    /// Engine-side and NON-transactional, like PG's stats collector:
+    /// a rolled-back INSERT still counts, and a tx's counts don't
+    /// ride the shadow catalog (the RC rebase rebuilt shadow tables
+    /// from the committed base, silently dropping any counter bumped
+    /// on the shadow — the r192 probe's tx-wrapped inserts read 0).
+    /// Keyed by table name; DROP TABLE clears, RENAME re-keys.
+    pub(crate) table_write_stats: alloc::collections::BTreeMap<String, (u64, u64, u64)>,
     /// v7.38 (read01 P3.19) — `SET LOCAL` undo log for the current
     /// transaction. Each entry is `(param_name, prior_value)` captured
     /// just before a `SET LOCAL` overwrote it (`None` = the param had no
@@ -1010,6 +1019,7 @@ impl Engine {
             tz_canon_fn: None,
             tz_abbrev_fn: None,
             stat_tup_inserted: 0,
+            table_write_stats: alloc::collections::BTreeMap::new(),
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
             local_guc_saves: Vec::new(),
@@ -1354,6 +1364,7 @@ impl Engine {
             tz_canon_fn: None,
             tz_abbrev_fn: None,
             stat_tup_inserted: 0,
+            table_write_stats: alloc::collections::BTreeMap::new(),
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
             local_guc_saves: Vec::new(),
@@ -1454,6 +1465,7 @@ impl Engine {
                     tz_canon_fn: None,
                     tz_abbrev_fn: None,
                     stat_tup_inserted: 0,
+                    table_write_stats: alloc::collections::BTreeMap::new(),
                     stat_tup_updated: 0,
                     stat_tup_deleted: 0,
                     local_guc_saves: Vec::new(),

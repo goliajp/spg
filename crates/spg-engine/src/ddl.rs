@@ -1507,6 +1507,12 @@ impl Engine {
         self.active_catalog_mut()
             .rename_table(&old, &new)
             .map_err(EngineError::Storage)?;
+        // r192 — carry the non-transactional DML counters to the new
+        // name (PG keeps stats across a rename). After the storage
+        // rename succeeded, so a failed rename leaves them keyed as-is.
+        if let Some(stats) = self.table_write_stats.remove(&old) {
+            self.table_write_stats.insert(new.clone(), stats);
+        }
         Ok(())
     }
 
@@ -2211,6 +2217,10 @@ impl Engine {
             }
             let dropped = self.active_catalog_mut().drop_table(&name);
             if dropped {
+                // r192 — drop the non-transactional DML counters so a
+                // later same-named table starts at zero (PG resets
+                // stats on DROP).
+                self.table_write_stats.remove(&name);
                 // v7.39 (read01 round 50) — purge the table's comments (and its
                 // columns') so a later table of the same name can't inherit them.
                 self.active_catalog_mut().drop_comments_for("table", &name);
