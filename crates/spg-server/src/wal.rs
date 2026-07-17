@@ -347,6 +347,22 @@ pub(crate) fn append_durability_marker(state: &ServerState) -> std::io::Result<u
 /// Takes a short engine **read** lock — callers must not hold the
 /// engine write lock (the dispatch loop captures this before taking
 /// it, same as `session_statement_timeout_ms`).
+/// v7.39 (round 190, D13) — client-path fsync with chaos injection.
+/// `SPG_FAIL_FSYNC_AT=K` makes the K-th call (1-based, process-wide)
+/// fail once with an injected EIO; unset costs one branch.
+fn client_fsync(state: &ServerState, f: &std::fs::File) -> std::io::Result<()> {
+    static FSYNC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if let Some(k) = state.chaos.fail_fsync_at {
+        let n = FSYNC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n == k {
+            return Err(std::io::Error::other(
+                "chaos: injected fsync failure (SPG_FAIL_FSYNC_AT)",
+            ));
+        }
+    }
+    f.sync_data()
+}
+
 pub(crate) fn session_sync_commit(state: &ServerState) -> bool {
     let session = state
         .engine
@@ -403,6 +419,12 @@ pub(crate) fn append_wal_v3_group(
             ));
         }
     }
+    // v7.39 (round 190, D13) — remember the pre-append length so a
+    // failed fsync can truncate its own bytes back off. Pre-r190 the
+    // in-memory rollback left the group's bytes in the file, the NEXT
+    // successful fsync made them durable, and replay resurrected the
+    // rolled-back statements (silent-wrong, r190 chaos pin).
+    let pre_append_len = f.metadata()?.len();
     f.write_all(&batched)?;
     // v5.4.2 — in async-commit mode the flusher thread is
     // responsible for `sync_data`; the client's CC may return
@@ -416,7 +438,15 @@ pub(crate) fn append_wal_v3_group(
     // `async_commit_dirty` so durability markers bound the loss
     // window (PG wal-writer semantics).
     if sync {
-        f.sync_data()?;
+        if let Err(e) = client_fsync(state, &f) {
+            // Best-effort byte rollback under the still-held wal
+            // mutex; if the truncate ALSO fails the file may retain
+            // un-fsynced garbage — recovery's torn-tail handling
+            // drops a partial tail, and a full D13 fsync-poison
+            // (PG PANIC semantics) stays a recorded residual.
+            let _ = f.set_len(pre_append_len);
+            return Err(e);
+        }
     } else {
         state
             .async_commit_dirty
@@ -839,6 +869,8 @@ pub(crate) fn append_wal(state: &ServerState, sql: &str, sync: bool) -> std::io:
             ));
         }
     }
+    // r190 (D13) — same failed-fsync byte rollback as the group path.
+    let pre_append_len = f.metadata()?.len();
     f.write_all(&entry)?;
     // v5.4.2 — async-commit mode opts out of the per-write
     // `sync_data`; durability rides on the flusher thread's
@@ -849,7 +881,10 @@ pub(crate) fn append_wal(state: &ServerState, sql: &str, sync: bool) -> std::io:
     // can't read it itself because the main-loop non-wrap caller
     // holds the engine write lock. Skipping arms the flusher.
     if sync {
-        f.sync_data()?;
+        if let Err(e) = client_fsync(state, &f) {
+            let _ = f.set_len(pre_append_len);
+            return Err(e);
+        }
     } else {
         state
             .async_commit_dirty

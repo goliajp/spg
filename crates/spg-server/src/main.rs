@@ -174,6 +174,15 @@ struct Limits {
 #[derive(Debug, Default, Clone, Copy)]
 struct ChaosKnobs {
     wal_quota_bytes: Option<u64>,
+    /// v7.39 (round 190, D13) — `SPG_FAIL_FSYNC_AT=K`: the K-th
+    /// client-path WAL `sync_data` (1-based, counted process-wide)
+    /// fails once with EIO. Exercises the fsync-failure rollback:
+    /// pre-r190 the group's already-appended bytes stayed in the WAL
+    /// file after the in-memory rollback, so the NEXT successful
+    /// fsync made them durable and replay resurrected the rolled-
+    /// back statements (silent-wrong; caught by the r190 chaos pin).
+    /// Test-only.
+    fail_fsync_at: Option<u64>,
     /// v4.34: when true, the dispatch-time preflight check that
     /// rejects oversize writes before any engine mutation is
     /// skipped. The append still fails inside `append_wal*`, which
@@ -1306,6 +1315,7 @@ fn run(
         disable_wal_preflight: env::var("SPG_DISABLE_WAL_PREFLIGHT")
             .ok()
             .is_some_and(|s| !s.is_empty() && s != "0"),
+        fail_fsync_at: parse_env_u64("SPG_FAIL_FSYNC_AT"),
     };
     let cold_preload = parse_cold_preload_env();
     let cold_preload_done = AtomicBool::new(cold_preload.is_empty());
