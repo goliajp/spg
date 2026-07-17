@@ -2387,10 +2387,59 @@ impl Parser {
             // rows into cold segments automatically. VACUUM is a
             // no-op — pg_dump maintenance scripts and Discourse's
             // periodic-maintenance path both emit it.
+            // v7.39 (round 169) — VACUUM is REAL now: with the in-place
+            // MVCC gate ON (v7.37.15 flip), tombstoned versions are
+            // actual bloat, so the pre-MVCC accept-and-ignore posture
+            // became a silent no-op on a customer's manual reclaim.
+            // Grammar: VACUUM [(opts)] [FULL] [FREEZE] [VERBOSE]
+            // [ANALYZE] [<table> [(cols)]] — option words are absorbed,
+            // ANALYZE is captured, the optional table name is captured.
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("vacuum") => {
                 self.advance();
+                // Parenthesised option list: absorb it.
+                if matches!(self.peek(), Token::LParen) {
+                    let mut depth = 0usize;
+                    loop {
+                        match self.advance() {
+                            Token::LParen => depth += 1,
+                            Token::RParen => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            Token::Eof => break,
+                            _ => {}
+                        }
+                    }
+                }
+                let mut analyze = false;
+                let mut table: Option<String> = None;
+                loop {
+                    match self.peek() {
+                        Token::Ident(w) | Token::QuotedIdent(w) => {
+                            let wl = w.to_ascii_lowercase();
+                            match wl.as_str() {
+                                "full" | "freeze" | "verbose" => {
+                                    self.advance();
+                                }
+                                "analyze" | "analyse" => {
+                                    analyze = true;
+                                    self.advance();
+                                }
+                                _ => {
+                                    table = Some(self.expect_ident_like()?);
+                                    break;
+                                }
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                // Optional trailing column list / anything else to the
+                // statement boundary (PG accepts per-column ANALYZE).
                 self.consume_until_statement_boundary();
-                Ok(Statement::Empty)
+                Ok(Statement::Vacuum { table, analyze })
             }
             // v7.37.17 (17.6 sibling) — CLUSTER [VERBOSE] <table>
             // [USING <index>] / CLUSTER (VERBOSE) <table> USING

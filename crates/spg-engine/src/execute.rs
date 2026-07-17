@@ -1100,6 +1100,25 @@ impl Engine {
             )),
             // v6.2.0 — ANALYZE recomputes per-column histograms.
             Statement::Analyze(target) => self.exec_analyze(target.as_deref()),
+            // v7.39 (round 169) — VACUUM does real work under the MVCC
+            // gate (tombstoned versions are actual bloat); the pre-MVCC
+            // parse-time no-op silently ignored a customer's manual
+            // reclaim. Gate-off stays a provable no-op inside vacuum.
+            Statement::Vacuum { table, analyze } => {
+                match &table {
+                    Some(t) => self.vacuum_one_table(t),
+                    None => {
+                        let _ = self.vacuum_pass(false);
+                    }
+                }
+                if analyze {
+                    self.exec_analyze(table.as_deref())?;
+                }
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
             // v7.37.17 (17.6 sibling) — TRUNCATE [TABLE] <t>[, ...]
             // [RESTART IDENTITY] [CASCADE]. Clears every row from
             // each named table. CASCADE currently accepts the syntax

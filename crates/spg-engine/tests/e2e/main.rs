@@ -122,6 +122,7 @@ mod e2e_cte_search;
 mod e2e_cte_shadows_table_round156;
 mod e2e_cte_shadows_table_write_round157;
 mod e2e_cte_shadows_view_round158;
+mod e2e_vacuum_statement_round169;
 mod e2e_cte_values_materialized;
 mod e2e_current_catalog_role;
 mod e2e_current_setting;

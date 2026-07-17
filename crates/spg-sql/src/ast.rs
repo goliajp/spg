@@ -109,6 +109,15 @@ pub enum Statement {
     /// source is a follow-up); BY SOURCE / BY TARGET and RETURNING
     /// are also follow-ups.
     Merge(MergeStatement),
+    /// v7.39 (round 169) — `VACUUM [(opts)] [FULL|FREEZE|VERBOSE|ANALYZE]
+    /// [<table>]`. Was a parse-time no-op from the pre-MVCC era; with the
+    /// in-place MVCC gate ON, tombstoned versions are REAL bloat and a
+    /// customer's manual VACUUM must actually reclaim. `analyze` mirrors
+    /// the `VACUUM ANALYZE` spelling.
+    Vacuum {
+        table: Option<String>,
+        analyze: bool,
+    },
     /// `BEGIN` / `START TRANSACTION` — with an optional explicit
     /// `ISOLATION LEVEL …` mode (`None` = use the session default). PG
     /// applies the level for the duration of this transaction only.
@@ -3546,6 +3555,9 @@ impl Statement {
             // the match exhaustiveness check and forces a
             // classification decision at add-site.
             Statement::Empty
+            // v7.39 (round 169) — VACUUM mutates storage (reclaims
+            // tombstoned versions): writer path.
+            | Statement::Vacuum { .. }
             | Statement::DropTable { .. }
             | Statement::DropIndex { .. }
             | Statement::CreateTable(_)
@@ -3845,6 +3857,16 @@ impl fmt::Display for Statement {
             Self::Update(s) => s.fmt(f),
             Self::Delete(s) => s.fmt(f),
             Self::Merge(s) => s.fmt(f),
+            Self::Vacuum { table, analyze } => {
+                f.write_str("VACUUM")?;
+                if *analyze {
+                    f.write_str(" ANALYZE")?;
+                }
+                if let Some(t) = table {
+                    write!(f, " {}", quote_ident(t))?;
+                }
+                Ok(())
+            }
             Self::Begin(None) => f.write_str("BEGIN"),
             Self::Begin(Some(level)) => write!(f, "BEGIN ISOLATION LEVEL {level}"),
             Self::Commit => f.write_str("COMMIT"),
