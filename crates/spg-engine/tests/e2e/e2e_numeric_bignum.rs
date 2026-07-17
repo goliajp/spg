@@ -199,7 +199,12 @@ fn numeric_bignum_order_by() {
     )
     .unwrap();
     // ASC: -888… < 5 < 123… < 999…
-    let order = match e.execute("SELECT x::text FROM bo ORDER BY x").unwrap() {
+    //
+    // v7.39 (round 185) — `ORDER BY x` now binds to the OUTPUT column
+    // `x::text` (implicit label), matching PG, which would make this a
+    // TEXT sort. Qualify as `bo.x` so the key stays the NUMERIC source
+    // column — this test pins the bignum value_cmp path.
+    let order = match e.execute("SELECT x::text FROM bo ORDER BY bo.x").unwrap() {
         QueryResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| match &r.values[0] {
@@ -215,6 +220,26 @@ fn numeric_bignum_order_by() {
         "-888888888888888888888888888888888888888888888,\
          5,\
          123456789012345678901234567890123456789012345,\
+         999999999999999999999999999999999999999999999"
+    );
+    // Unqualified `ORDER BY x` binds the output text — PG18 verified
+    // 2026-07-18: text order puts "123…" before "5".
+    let text_order = match e.execute("SELECT x::text FROM bo ORDER BY x").unwrap() {
+        QueryResult::Rows { rows, .. } => rows
+            .iter()
+            .map(|r| match &r.values[0] {
+                spg_storage::Value::Text(s) => s.to_string(),
+                v => format!("{v:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        _ => panic!("rows"),
+    };
+    assert_eq!(
+        text_order,
+        "-888888888888888888888888888888888888888888888,\
+         123456789012345678901234567890123456789012345,\
+         5,\
          999999999999999999999999999999999999999999999"
     );
     // max / min pick the exact extremes (value_cmp path).
