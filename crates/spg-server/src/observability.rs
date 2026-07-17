@@ -73,6 +73,12 @@ pub struct Metrics {
     /// the WAL volume needs attention. Exposed via
     /// `spg_flusher_errors_total`.
     pub flusher_errors: AtomicU64,
+    /// v7.39 (round 173): total tables the background autovacuum
+    /// worker has vacuumed. Stays at 0 while no table crosses the
+    /// dead-row threshold (or with `SPG_AUTOVACUUM=off`, which also
+    /// skips spawning the worker). Exposed via
+    /// `spg_autovacuum_tables_total`.
+    pub autovacuum_ticks: AtomicU64,
     /// v5.4.3: WAL byte offset confirmed durable by the most
     /// recent `durability_checkpoint` marker the flusher
     /// emitted. Updated by the flusher after `sync_data` returns
@@ -403,6 +409,14 @@ fn render_flusher(state: &crate::ServerState, out: &mut String) {
     out.push_str(&format!(
         "spg_flusher_errors_total {}\n",
         state.metrics.flusher_errors.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP spg_autovacuum_tables_total Tables vacuumed by the background autovacuum worker (v7.39 r173)\n",
+    );
+    out.push_str("# TYPE spg_autovacuum_tables_total counter\n");
+    out.push_str(&format!(
+        "spg_autovacuum_tables_total {}\n",
+        state.metrics.autovacuum_ticks.load(Ordering::Relaxed)
     ));
 }
 

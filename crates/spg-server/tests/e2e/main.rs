@@ -27,6 +27,7 @@ mod e2e_application_name;
     unused_variables
 )]
 mod e2e_async_commit;
+mod e2e_autovacuum_worker_round173;
 mod e2e_session_sync_commit_round172;
 #[allow(unused_mut, unused_variables)]
 mod e2e_audit;

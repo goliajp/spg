@@ -1104,6 +1104,57 @@ impl Engine {
         self.autovacuum = on;
     }
 
+    /// v7.39 (round 173) — turn the statement-exit **inline** vacuum
+    /// off. A host that flips this off MUST drive
+    /// [`Self::autovacuum_tick`] from a background worker, or dead
+    /// rows accumulate without bound (spg-server couples the two: the
+    /// flag only flips when the worker actually spawns).
+    pub fn set_autovacuum_inline(&mut self, on: bool) {
+        self.autovacuum_inline = on;
+    }
+
+    /// v7.39 (round 173) — one background-worker autovacuum pass: walk
+    /// every table, vacuum those over the PG-inspired threshold
+    /// (`dead >= 1000 && dead*4 >= live` — same rule as the inline
+    /// trigger). Returns how many tables were vacuumed. No-op while an
+    /// explicit transaction is open (its tombstones aren't committed;
+    /// the next tick picks the backlog up), when autovacuum is off, or
+    /// when the in-place gate is off (no tombstones exist).
+    pub fn autovacuum_tick(&mut self) -> usize {
+        if !self.autovacuum || !self.mvcc_inplace || self.in_transaction() {
+            return 0;
+        }
+        let candidates: Vec<String> = self
+            .active_catalog()
+            .table_names()
+            .into_iter()
+            .filter(|name| {
+                self.active_catalog().get(name).is_some_and(|t| {
+                    let dead = t.dead_rows();
+                    let live = (t.row_count() as u64).saturating_sub(dead);
+                    dead >= 1000 && dead * 4 >= live
+                })
+            })
+            .collect();
+        if candidates.is_empty() {
+            return 0;
+        }
+        let oldest_active = self.vacuum_oldest_active();
+        let now_us = self.clock.map(|f| f());
+        let mut vacuumed = 0;
+        for name in candidates {
+            if let Some(t) = self.active_catalog_mut().get_mut(&name) {
+                let _report = t.vacuum(oldest_active, false);
+                if let Some(us) = now_us {
+                    t.stamp_autovacuum(us);
+                }
+                crate::bump_counter!(AUTOVACUUM_FIRE_COUNT);
+                vacuumed += 1;
+            }
+        }
+        vacuumed
+    }
+
     /// v7.37.16 (autovacuum-lite, see .claude/state/autovacuum-design.md)
     /// — threshold check + single-table synchronous vacuum, called at the
     /// exit of an in-place DML statement. Fires only when: autovacuum is
@@ -1137,7 +1188,14 @@ impl Engine {
         // NB: `in_transaction()` (an EXPLICIT tx has a shadow catalog),
         // not `current_tx.is_some()` — the execute path pins an
         // IMPLICIT_TX marker for every autocommit statement too.
-        if !self.autovacuum || !self.mvcc_inplace || self.in_transaction() {
+        // v7.39 (round 173) — `autovacuum_inline` off means a
+        // background worker owns vacuum scheduling (autovacuum_tick);
+        // the statement path only keeps the dead-row meters current.
+        if !self.autovacuum
+            || !self.autovacuum_inline
+            || !self.mvcc_inplace
+            || self.in_transaction()
+        {
             return;
         }
         let Some(t) = self.active_catalog().get(table_name) else {
