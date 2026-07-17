@@ -2556,6 +2556,49 @@ fn sql_is_read_only(sql: &str) -> bool {
     )
 }
 
+/// v7.39 (round 180) — does this SQL text mutate data even though its
+/// head word looks read-shaped or its result is `Rows`? Two callers:
+///   * a DML with RETURNING answers `Rows` (not CommandOk), so the
+///     `modified_catalog` gate alone would skip its WAL record;
+///   * a writable CTE (`WITH … INSERT/UPDATE/DELETE/MERGE`) starts
+///     with `with`, which [`sql_is_read_only`] classifies as a read.
+/// Both were silent durability losses on the embedded autocommit and
+/// in-tx buffer paths (server twin fixed in r178). The WITH arm is a
+/// conservative substring probe — a false positive only adds a
+/// harmless replayed statement to the WAL.
+fn sql_is_dmlish(sql: &str) -> bool {
+    let head = sql
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == ';' || c == '(')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match head.as_str() {
+        "insert" | "update" | "delete" | "merge" => true,
+        "with" => {
+            let lower = sql.to_ascii_lowercase();
+            ["insert", "update", "delete", "merge"]
+                .iter()
+                .any(|kw| lower.contains(kw))
+        }
+        _ => false,
+    }
+}
+
+/// v7.39 (round 180) — should this statement's outcome reach the WAL
+/// on the autocommit path? CommandOk carries the engine's own
+/// `modified_catalog` verdict; a `Rows` outcome persists iff the SQL
+/// is DML-shaped (RETURNING).
+fn wal_worthy(result: &QueryResult, sql: &str) -> bool {
+    match result {
+        QueryResult::CommandOk {
+            modified_catalog, ..
+        } => *modified_catalog,
+        QueryResult::Rows { .. } => sql_is_dmlish(sql),
+        _ => false,
+    }
+}
+
 /// v7.37 Epic Du — is this a bare `CHECKPOINT` statement? The
 /// parser accepts `CHECKPOINT` as a top-level statement (a no-op
 /// at the engine layer — the no_std engine owns no WAL / snapshot),
@@ -3715,13 +3758,9 @@ impl Database {
             self.checkpoint()?;
             return Ok((result, None));
         }
-        let modified = matches!(
-            &result,
-            QueryResult::CommandOk {
-                modified_catalog: true,
-                ..
-            }
-        );
+        // r180 — RETURNING DML answers Rows; wal_worthy recognises it
+        // (the CommandOk-only gate silently dropped those records).
+        let modified = wal_worthy(&result, sql);
         let ticket = self.wal_after_ok(sql, modified)?;
         Ok((result, ticket))
     }
@@ -3804,11 +3843,17 @@ impl Database {
                 // unreachable.
             }
             None => {
+                // r180 — `sql_is_read_only` head-words `with` as a
+                // read, but a writable CTE (`WITH … INSERT/…`) is a
+                // mutation: it must reach the tx buffer / autocommit
+                // record or replay silently loses it.
+                let persistable =
+                    |sql: &str| !sql_is_read_only(sql) || sql_is_dmlish(sql);
                 if let Some(buf) = &mut self.tx_wal {
-                    if !sql_is_read_only(canonical) {
+                    if persistable(canonical) {
                         buf.statements.push(canonical.to_string());
                     }
-                } else if modified_catalog && !sql_is_read_only(canonical) {
+                } else if modified_catalog && persistable(canonical) {
                     let lsn = self.commit_lsn.fetch_add(1, Ordering::SeqCst) + 1;
                     // v7.34 (crash-recovery P0 #2) — hybrid log: when
                     // row-level redo is on and this statement produced row
@@ -4137,13 +4182,9 @@ impl Database {
         params: &[Value<'static>],
     ) -> Result<(QueryResult, Option<WalTicket>), EngineError> {
         let result = self.engine.execute_prepared(stmt.stmt.clone(), params)?;
-        let modified = matches!(
-            &result,
-            QueryResult::CommandOk {
-                modified_catalog: true,
-                ..
-            }
-        );
+        // r180 — same wal_worthy shape as execute_buffered: RETURNING
+        // DML answers Rows and must still persist.
+        let modified = wal_worthy(&result, &stmt.sql);
         // WAL persistence on the bind-final SQL. Build the
         // canonical Display form by re-printing the
         // placeholder-substituted statement (cheap — the AST
@@ -4155,7 +4196,8 @@ impl Database {
         let mut ticket = None;
         if self.persistence.is_some()
             && (modified
-                || (self.tx_wal.is_some() && !sql_is_read_only(&stmt.sql))
+                || (self.tx_wal.is_some()
+                    && (!sql_is_read_only(&stmt.sql) || sql_is_dmlish(&stmt.sql)))
                 || tx_control_kind(&stmt.sql).is_some())
         {
             let mut wal_stmt = stmt.stmt.clone();
