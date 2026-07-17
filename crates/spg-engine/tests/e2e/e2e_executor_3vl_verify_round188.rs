@@ -97,16 +97,14 @@ fn recursive_union_distinct_dedup_terminates() {
 #[test]
 fn correlated_subquery_no_cross_contamination() {
     let mut e = Engine::new();
-    // NOTE r188: the VALUE semantics are pinned; the count's TYPE in a
-    // correlated scalar subquery is `integer` here vs PG's `bigint` —
-    // recorded in the task-design as a separate open item, do not pin
-    // the wrong type.
-    let rows = cell_strings(
-        &mut e,
-        "SELECT a.x, (SELECT count(*) FROM (VALUES (1),(2)) b(y) WHERE b.y <= a.x) \
-         FROM (VALUES (1),(2)) a(x) ORDER BY a.x",
+    // r189 fixed the literal round-trip narrowing — the count is a
+    // real BigInt again, so the precise assertion holds.
+    assert_eq!(
+        cell_strings(
+            &mut e,
+            "SELECT a.x, (SELECT count(*) FROM (VALUES (1),(2)) b(y) WHERE b.y <= a.x) \
+             FROM (VALUES (1),(2)) a(x) ORDER BY a.x"
+        ),
+        ["Int(1)|BigInt(1)", "Int(2)|BigInt(2)"]
     );
-    assert_eq!(rows.len(), 2);
-    assert!(rows[0].ends_with("(1)") && rows[0].starts_with("Int(1)|"), "{rows:?}");
-    assert!(rows[1].ends_with("(2)") && rows[1].starts_with("Int(2)|"), "{rows:?}");
 }

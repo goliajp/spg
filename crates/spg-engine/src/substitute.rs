@@ -26,9 +26,26 @@ use crate::{EngineError, value_to_literal};
 pub(crate) fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
     let lit = match v {
         Value::Null => Literal::Null,
-        Value::SmallInt(n) => Literal::Integer(i64::from(n)),
+        // v7.39 (round 189) — a bare Literal::Integer re-types to INT
+        // when the value fits i32, so a BIGINT / SMALLINT subquery
+        // result silently narrowed through the literal round-trip
+        // (`pg_typeof((SELECT count(*) …))` came back `integer`; PG:
+        // `bigint`, and sqlx typed decodes break on the mismatch).
+        // Wrap in an explicit cast so the re-evaluated expression
+        // keeps the original type.
+        Value::SmallInt(n) => {
+            return Ok(Expr::Cast {
+                expr: alloc::boxed::Box::new(Expr::Literal(Literal::Integer(i64::from(n)))),
+                target: spg_sql::ast::CastTarget::Named("int2".into()),
+            });
+        }
         Value::Int(n) => Literal::Integer(i64::from(n)),
-        Value::BigInt(n) => Literal::Integer(n),
+        Value::BigInt(n) => {
+            return Ok(Expr::Cast {
+                expr: alloc::boxed::Box::new(Expr::Literal(Literal::Integer(n))),
+                target: spg_sql::ast::CastTarget::BigInt,
+            });
+        }
         Value::Float(x) => Literal::Float(x),
         // v7.38 (read01) — a scalar subquery returning NUMERIC (common now that
         // decimal literals are numeric) materialises back through Literal::Numeric.
@@ -108,9 +125,26 @@ pub(crate) fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
 pub(crate) fn value_to_literal_expr_permissive(v: Value) -> Result<Expr, EngineError> {
     let lit = match v {
         Value::Null => Literal::Null,
-        Value::SmallInt(n) => Literal::Integer(i64::from(n)),
+        // v7.39 (round 189) — a bare Literal::Integer re-types to INT
+        // when the value fits i32, so a BIGINT / SMALLINT subquery
+        // result silently narrowed through the literal round-trip
+        // (`pg_typeof((SELECT count(*) …))` came back `integer`; PG:
+        // `bigint`, and sqlx typed decodes break on the mismatch).
+        // Wrap in an explicit cast so the re-evaluated expression
+        // keeps the original type.
+        Value::SmallInt(n) => {
+            return Ok(Expr::Cast {
+                expr: alloc::boxed::Box::new(Expr::Literal(Literal::Integer(i64::from(n)))),
+                target: spg_sql::ast::CastTarget::Named("int2".into()),
+            });
+        }
         Value::Int(n) => Literal::Integer(i64::from(n)),
-        Value::BigInt(n) => Literal::Integer(n),
+        Value::BigInt(n) => {
+            return Ok(Expr::Cast {
+                expr: alloc::boxed::Box::new(Expr::Literal(Literal::Integer(n))),
+                target: spg_sql::ast::CastTarget::BigInt,
+            });
+        }
         Value::Float(x) => Literal::Float(x),
         Value::Text(s) | Value::Json(s) => Literal::String(s.into_owned()),
         Value::Bool(b) => Literal::Bool(b),
