@@ -39,12 +39,24 @@ pub(crate) fn select_refers_to(stmt: &SelectStatement, target: &str) -> bool {
 }
 
 pub(crate) fn from_refers_to(from: &FromClause, target: &str) -> bool {
-    if from.primary.name.eq_ignore_ascii_case(target) {
-        return true;
+    table_ref_refers_to(&from.primary, target)
+        || from.joins.iter().any(|j| table_ref_refers_to(&j.table, target))
+}
+
+/// v7.39 (round 186) — a derived / lateral subquery can carry the
+/// reference: PG allows a parenthesized recursive UNION peer
+/// (`… UNION ALL (SELECT … FROM t … ORDER BY … LIMIT 1)`), which SPG
+/// parses as `SELECT * FROM (inner) sub` — pre-r186 the name-only
+/// check missed the inner `t`, the peer was classified as a
+/// NON-recursive anchor term, and executing it outside the iteration
+/// loop failed with `relation "t" does not exist`. For a derived
+/// table only the inner select decides (its alias SHADOWS the outer
+/// name, so comparing the alias would over-match).
+fn table_ref_refers_to(t: &spg_sql::ast::TableRef, target: &str) -> bool {
+    if let Some(sub) = t.lateral_subquery.as_deref() {
+        return select_refers_to(sub, target);
     }
-    from.joins
-        .iter()
-        .any(|j| j.table.name.eq_ignore_ascii_case(target))
+    t.name.eq_ignore_ascii_case(target)
 }
 
 /// v7.28 (round-22) — collect every QUALIFIED column referenced
