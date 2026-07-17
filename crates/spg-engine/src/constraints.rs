@@ -590,6 +590,117 @@ fn substitute_excluded_refs(
 /// in the same batch has the same full-column tuple. NULL in
 /// any column lifts the row out of the check (SQL spec: NULL
 /// ≠ NULL for uniqueness). mailrs G1 + G6.
+
+/// v7.39 (round 166, write-path attack A1) — column types whose non-NULL
+/// values ALWAYS produce an `IndexKey` (`IndexKey::from_value` is total
+/// for them), so every live row is guaranteed to be present in a btree
+/// over that column. Types outside this list (Float / Numeric / arrays /
+/// …) may skip the index and MUST NOT be probed for uniqueness.
+fn indexkeyable_type(ty: &spg_storage::DataType) -> bool {
+    use spg_storage::DataType as D;
+    matches!(
+        ty,
+        D::SmallInt
+            | D::Int
+            | D::BigInt
+            | D::Text
+            | D::Varchar(_)
+            | D::Char(_)
+            | D::Bool
+            | D::Uuid
+            | D::Date
+            | D::Timestamp
+    )
+}
+
+/// v7.39 (round 166) — find a btree over `leading_pos` usable as a
+/// uniqueness PROBE index (candidate filter only — the caller re-checks
+/// candidates with the collated fold, so any plain btree on the leading
+/// column works, unique or not). Expression / partial indexes key on
+/// something other than the raw column and are skipped.
+fn probe_btree<'t>(
+    table: &'t spg_storage::Table,
+    leading_pos: usize,
+) -> Option<&'t spg_storage::Index> {
+    table.indices().iter().find(|i| {
+        matches!(i.kind, spg_storage::IndexKind::BTree(_))
+            && i.column_position == leading_pos
+            && i.expression.is_none()
+            && i.partial_predicate.is_none()
+    })
+}
+
+/// v7.39 (round 166) — can `uc` be enforced by probing a btree instead
+/// of folding the whole table into a HashSet (the r164/r165 write-path
+/// loss: O(table) per STATEMENT made every single-row write pay ~5-6ms
+/// on a 50k-row table)? Requirements, all mirroring the fold semantics:
+///  * a plain btree over the leading column exists (candidate source);
+///  * `NULLS NOT DISTINCT` is off (NULL keys never enter a btree);
+///  * no key column is case-insensitive collated (the btree keys raw
+///    values, so a collation-folded duplicate under a DIFFERENT raw
+///    key would be missed);
+///  * the leading column's type always produces an IndexKey (otherwise
+///    rows could be absent from the btree entirely).
+fn uc_probe_index<'t>(
+    table: &'t spg_storage::Table,
+    columns: &[usize],
+    nulls_not_distinct: bool,
+) -> Option<&'t spg_storage::Index> {
+    if nulls_not_distinct || columns.is_empty() {
+        return None;
+    }
+    let schema = table.schema();
+    let collation_ok = columns.iter().all(|&i| {
+        schema
+            .columns
+            .get(i)
+            .is_some_and(|c| !matches!(c.collation, spg_storage::Collation::CaseInsensitive))
+    });
+    if !collation_ok {
+        return None;
+    }
+    if !schema
+        .columns
+        .get(columns[0])
+        .is_some_and(|c| indexkeyable_type(&c.ty))
+    {
+        return None;
+    }
+    probe_btree(table, columns[0])
+}
+
+/// v7.39 (round 166) — probe `idx` for a live row whose collated key
+/// equals `key` (the fold of the row being written). Returns the row
+/// position of the first conflicting live row. `fold` recomputes the
+/// collated key of a candidate row so collation / bpchar semantics stay
+/// byte-identical with the HashSet path; tombstoned rows are skipped the
+/// same way; Cold locators are skipped because the fold path only ever
+/// scanned hot rows.
+fn probe_key_conflict(
+    table: &spg_storage::Table,
+    idx: &spg_storage::Index,
+    leading_val: &Value<'static>,
+    key: &[Value<'static>],
+    fold: &dyn Fn(&[Value<'static>]) -> Vec<Value<'static>>,
+) -> Option<usize> {
+    let ik = spg_storage::IndexKey::from_value(leading_val)?;
+    for loc in idx.lookup_eq(&ik) {
+        let spg_storage::RowLocator::Hot(ri) = loc else {
+            continue;
+        };
+        if table.headers().get(*ri).is_some_and(|h| h.is_deleted()) {
+            continue;
+        }
+        let Some(prow) = table.rows().get(*ri) else {
+            continue;
+        };
+        if fold(&prow.values) == key {
+            return Some(*ri);
+        }
+    }
+    None
+}
+
 pub(crate) fn enforce_uniqueness_inserts(
     catalog: &Catalog,
     child_table: &str,
@@ -624,6 +735,53 @@ pub(crate) fn enforce_uniqueness_inserts(
                 })
                 .collect()
         };
+        // v7.39 (round 166, attack A1) — btree probe instead of the
+        // per-statement O(table) fold when the constraint qualifies.
+        // The implicit PK/UNIQUE leading-column btree (create-table
+        // installs it) is maintained incrementally on every write, so
+        // a probe is O(log n) per row — this was the 6.3ms/row (94%)
+        // component of the r164 write losses.
+        if let Some(idx) = uc_probe_index(table, &uc.columns, uc.nulls_not_distinct) {
+            let mut batch_seen: hashbrown::HashSet<String> =
+                hashbrown::HashSet::with_capacity(rows.len());
+            let mut probe_ok = true;
+            for row_values in rows.iter() {
+                let key = fold_key(row_values);
+                if key.iter().any(|v| matches!(v, Value::Null)) && !uc.nulls_not_distinct {
+                    continue;
+                }
+                let leading = row_values
+                    .get(uc.columns[0])
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                if spg_storage::IndexKey::from_value(&leading).is_none() {
+                    // A value the btree can't key (shouldn't happen for
+                    // the whitelisted types) — fall back to the fold.
+                    probe_ok = false;
+                    break;
+                }
+                let dup_in_batch = !batch_seen.insert(aggregate::encode_key(&key));
+                if dup_in_batch
+                    || probe_key_conflict(table, idx, &leading, &key, &fold_key).is_some()
+                {
+                    let conname = crate::system_catalog::pg_unique_conname(table, uc, child_table);
+                    let detail = unique_key_detail(
+                        &uc.columns
+                            .iter()
+                            .map(|&i| table.schema().columns[i].name.clone())
+                            .collect::<Vec<_>>(),
+                        &key,
+                    );
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "duplicate key value violates unique constraint \"{conname}\" \
+                         on table \"{child_table}\"{detail}"
+                    )));
+                }
+            }
+            if probe_ok {
+                continue;
+            }
+        }
         let mut seen: hashbrown::HashSet<String> =
             hashbrown::HashSet::with_capacity(table.rows().len() + rows.len());
         for (row_idx, prow) in table.rows().iter().enumerate() {
@@ -962,6 +1120,65 @@ pub(crate) fn enforce_unique_index_inserts(
             })?;
             Ok(predicate_truthy(&v))
         };
+        // v7.39 (round 166, attack A2) — a plain (non-expression,
+        // non-partial) unique index IS its own probe btree: check each
+        // batch row via lookup_eq instead of folding the whole table.
+        // Same qualification rules as the constraint path (A1).
+        if idx.expression.is_none()
+            && idx.partial_predicate.is_none()
+            && !idx.nulls_not_distinct
+            && matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+        {
+            let positions = unique_key_positions(idx);
+            let schema_ok = positions.iter().all(|&i| {
+                schema.columns.get(i).is_some_and(|c| {
+                    !matches!(c.collation, spg_storage::Collation::CaseInsensitive)
+                })
+            }) && schema
+                .columns
+                .get(idx.column_position)
+                .is_some_and(|c| indexkeyable_type(&c.ty));
+            if schema_ok {
+                let fold = |values: &[spg_storage::Value<'static>]| -> Vec<spg_storage::Value<'static>> {
+                    positions
+                        .iter()
+                        .map(|&p| {
+                            let v = values.get(p).cloned().unwrap_or(spg_storage::Value::Null);
+                            collated_key_cell(&v, p, schema)
+                        })
+                        .collect()
+                };
+                let mut batch_seen: hashbrown::HashSet<String> =
+                    hashbrown::HashSet::with_capacity(rows.len());
+                let mut probe_ok = true;
+                for row_values in rows.iter() {
+                    let key = fold(row_values);
+                    if key.iter().any(|v| matches!(v, spg_storage::Value::Null)) {
+                        continue;
+                    }
+                    let leading = row_values
+                        .get(idx.column_position)
+                        .cloned()
+                        .unwrap_or(spg_storage::Value::Null);
+                    if spg_storage::IndexKey::from_value(&leading).is_none() {
+                        probe_ok = false;
+                        break;
+                    }
+                    if !batch_seen.insert(aggregate::encode_key(&key))
+                        || probe_key_conflict(table, idx, &leading, &key, &fold).is_some()
+                    {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "duplicate key value violates unique constraint \"{}\" \
+                             on table \"{table_name}\"",
+                            idx.name
+                        )));
+                    }
+                }
+                if probe_ok {
+                    continue;
+                }
+            }
+        }
         // v7.29 (mailrs round-23b) — set-based: one O(table) pass
         // (predicate evaluated once per existing row instead of once
         // per row PAIR), then probe per batch row. The previous
@@ -1043,6 +1260,70 @@ pub(crate) fn enforce_unique_index_inserts(
 /// (`SET x = CASE …`), and a shift (`SET x = x + 1` over adjacent keys)
 /// are all rejected exactly as PG rejects them, while a row whose key is
 /// unchanged, or reassigned to a genuinely free value, passes.
+
+/// v7.39 (round 166, attack A3) — probe-based twin of the UPDATE
+/// `replay` closure: instead of seeding a HashSet from the whole table,
+/// membership(k) is modelled as `(table \ removed) ∪ added` with the
+/// table part answered by a btree probe. Semantically identical to the
+/// fold replay (same key function, same ordering); returns Ok(false)
+/// when an unprobeable value forces the caller back onto the fold path.
+#[allow(clippy::too_many_lines)]
+fn probe_replay(
+    table: &spg_storage::Table,
+    idx: &spg_storage::Index,
+    columns: &[usize],
+    planned: &[(usize, Vec<Value<'static>>)],
+    schema: &spg_storage::TableSchema,
+    key_str: &KeyStrFn<'_>,
+    on_conflict: &dyn Fn(usize) -> EngineError,
+) -> Result<bool, EngineError> {
+    let fold = |values: &[Value<'static>]| -> Vec<Value<'static>> {
+        columns
+            .iter()
+            .map(|&i| {
+                let v = values.get(i).cloned().unwrap_or(Value::Null);
+                collated_key_cell(&v, i, schema)
+            })
+            .collect()
+    };
+    let mut added: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+    let mut removed: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+    for (pos, new_vals) in planned {
+        let old_key = match table.rows().get(*pos) {
+            Some(r) => key_str(&r.values)?,
+            None => None,
+        };
+        let new_key = key_str(new_vals)?;
+        if old_key == new_key {
+            continue;
+        }
+        if let Some(ok) = old_key {
+            if !added.remove(&ok) {
+                removed.insert(ok);
+            }
+        }
+        if let Some(nk) = new_key {
+            if added.contains(&nk) {
+                return Err(on_conflict(*pos));
+            }
+            if !removed.contains(&nk) {
+                let key_vec = fold(new_vals);
+                let leading = new_vals.get(columns[0]).cloned().unwrap_or(Value::Null);
+                if spg_storage::IndexKey::from_value(&leading).is_none() {
+                    return Ok(false);
+                }
+                if let Some(ri) = probe_key_conflict(table, idx, &leading, &key_vec, &fold)
+                    && ri != *pos
+                {
+                    return Err(on_conflict(*pos));
+                }
+            }
+            added.insert(nk);
+        }
+    }
+    Ok(true)
+}
+
 pub(crate) fn enforce_unique_updates(
     catalog: &Catalog,
     table_name: &str,
@@ -1135,6 +1416,12 @@ pub(crate) fn enforce_unique_updates(
                  on table \"{table_name}\""
             ))
         };
+        // v7.39 (round 166, attack A3) — probe path first.
+        if let Some(pidx) = uc_probe_index(table, &uc.columns, uc.nulls_not_distinct)
+            && probe_replay(table, pidx, &uc.columns, planned, schema, &key_str, &on_conflict)?
+        {
+            continue;
+        }
         replay(&key_str, &on_conflict)?;
     }
 
@@ -1217,6 +1504,33 @@ pub(crate) fn enforce_unique_updates(
                 idx.name
             ))
         };
+        // v7.39 (round 166, attack A3) — a plain unique index probes its
+        // own btree (expression / partial / NULLS-NOT-DISTINCT / collated
+        // shapes stay on the fold replay).
+        if !is_expr_or_partial
+            && !idx.nulls_not_distinct
+            && matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+            && key_positions.iter().all(|&i| {
+                schema.columns.get(i).is_some_and(|c| {
+                    !matches!(c.collation, spg_storage::Collation::CaseInsensitive)
+                })
+            })
+            && schema
+                .columns
+                .get(idx.column_position)
+                .is_some_and(|c| indexkeyable_type(&c.ty))
+            && probe_replay(
+                table,
+                idx,
+                &key_positions,
+                planned,
+                schema,
+                &key_str,
+                &on_conflict,
+            )?
+        {
+            continue;
+        }
         replay(&key_str, &on_conflict)?;
     }
     Ok(())
