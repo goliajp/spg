@@ -905,7 +905,17 @@ fn handle_pg_simple_query(
     // the wire response ROLLBACK, not COMMIT. Capture the pre-execute abort
     // state so the tag below can reflect the downgrade.
     let was_aborted = *tx_state == b'E';
-    let result = execute_with_role(state, sql, role, cancel, matches!(*tx_state, b'T' | b'E'));
+    // r178 — plain autocommit DML goes through the commit barrier
+    // (group fsync, already persisted by the leader); everything else
+    // keeps the inline execute + persist_wire_write flow.
+    let (result, queue_persisted) =
+        match try_queue_plain_dml(state, sql, role, *tx_state, settings) {
+            Some(r) => (r, true),
+            None => (
+                execute_with_role(state, sql, role, cancel, matches!(*tx_state, b'T' | b'E')),
+                false,
+            ),
+        };
     conn_state
         .wait_event
         .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -913,11 +923,15 @@ fn handle_pg_simple_query(
     // v7.33 (A1) — persist the write (WAL/snapshot + audit)
     // before acking it; a durability failure surfaces as a
     // query error, never a false CommandComplete.
-    let result = match persist_wire_write(state, sql, &result) {
-        Ok(()) => result,
-        Err(e) => Err(EngineError::Unsupported(format!(
-            "durability append failed: {e}"
-        ))),
+    let result = if queue_persisted {
+        result
+    } else {
+        match persist_wire_write(state, sql, &result) {
+            Ok(()) => result,
+            Err(e) => Err(EngineError::Unsupported(format!(
+                "durability append failed: {e}"
+            ))),
+        }
     };
     match result {
         Ok(QueryResult::Rows { columns, rows }) => {
@@ -1155,16 +1169,30 @@ fn handle_pg_simple_query_one_into_wbuf(
     conn_state
         .wait_event
         .store(1, std::sync::atomic::Ordering::Relaxed);
-    let result = execute_with_role(state, sql, role, cancel, matches!(*tx_state, b'T' | b'E'));
+    // r178 — same commit-barrier routing as the single-statement
+    // handler; per-statement of a multi-statement script each split
+    // statement is a candidate on its own.
+    let (result, queue_persisted) =
+        match try_queue_plain_dml(state, sql, role, *tx_state, settings) {
+            Some(r) => (r, true),
+            None => (
+                execute_with_role(state, sql, role, cancel, matches!(*tx_state, b'T' | b'E')),
+                false,
+            ),
+        };
     conn_state
         .wait_event
         .store(0, std::sync::atomic::Ordering::Relaxed);
     drain_notices(state, wbuf)?;
-    let result = match persist_wire_write(state, sql, &result) {
-        Ok(()) => result,
-        Err(e) => Err(EngineError::Unsupported(format!(
-            "durability append failed: {e}"
-        ))),
+    let result = if queue_persisted {
+        result
+    } else {
+        match persist_wire_write(state, sql, &result) {
+            Ok(()) => result,
+            Err(e) => Err(EngineError::Unsupported(format!(
+                "durability append failed: {e}"
+            ))),
+        }
     };
     match result {
         Ok(QueryResult::Rows { columns, rows }) => {
@@ -1784,6 +1812,87 @@ fn run_pg_session(
     }
 }
 
+/// v7.39 (round 178) — route a plain autocommit DML through the commit
+/// barrier so pgwire writes share the native wrap path's group fsync
+/// (concurrent writers coalesce into one `sync_data`). Returns `None`
+/// when the statement must take the classic inline path:
+///   * inside a transaction (r177 already made those fsync-free; the
+///     COMMIT is the durability point),
+///   * no WAL,
+///   * not a bare INSERT/UPDATE/DELETE/MERGE (DDL, SET, WITH-DML and
+///     multi-statement scripts keep the inline path),
+///   * RETURNING present (the leader treats a Rows result as a failed
+///     slot — see run_leader_commit_round step 2),
+///   * a session statement_timeout is set (it rides a deadline token
+///     the queue can't carry; the flag-based cancel still works).
+fn try_queue_plain_dml(
+    state: &Arc<ServerState>,
+    sql: &str,
+    role: Role,
+    tx_state: u8,
+    settings: &std::collections::HashMap<String, String>,
+) -> Option<Result<QueryResult, EngineError>> {
+    if tx_state != b'I' || state.wal.is_none() {
+        return None;
+    }
+    let verb = sql
+        .trim_start()
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(verb.as_str(), "insert" | "update" | "delete" | "merge") {
+        return None;
+    }
+    let b = sql.as_bytes();
+    if ci_contains(b, b"returning") {
+        return None;
+    }
+    // Multi-statement scripts must not reach execute_in as one text.
+    if sql.trim_end().trim_end_matches(';').contains(';') {
+        return None;
+    }
+    let timeout_set = settings
+        .get("statement_timeout")
+        .map(String::as_str)
+        .and_then(parse_timeout_ms)
+        .unwrap_or(0)
+        > 0;
+    if timeout_set {
+        return None;
+    }
+    // Role gate — the inline path's check lives in execute_with_role,
+    // which this route bypasses.
+    if !role.can_write() {
+        return Some(Err(EngineError::Unsupported(
+            "permission denied: write requires admin or readwrite role".into(),
+        )));
+    }
+    // The queue's cancel flag is per-task (the native watchdog owns
+    // it there). ConnState's session flag isn't Arc-shaped and no
+    // watchdog thread exists on this path (timeout sessions were
+    // excluded above); a CancelRequest racing a sub-ms queued DML
+    // completing is within PG's cancel contract. Pass a fresh flag.
+    let queue_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (result, wal_outcome) = crate::commit_queue_execute(state, sql.to_string(), &queue_flag);
+    if let Err(e) = wal_outcome {
+        return Some(Err(EngineError::Unsupported(format!(
+            "durability append failed: {e}"
+        ))));
+    }
+    // Audit parity with persist_wire_write (the WAL append itself
+    // already happened inside the leader's group).
+    if matches!(&result, Ok(QueryResult::CommandOk { .. }))
+        && state.audit_path.is_some()
+        && let Err(e) = crate::append_audit_pub(state, sql)
+    {
+        return Some(Err(EngineError::Unsupported(format!(
+            "audit append failed: {e}"
+        ))));
+    }
+    Some(result)
+}
+
 fn execute_with_role(
     state: &Arc<ServerState>,
     sql: &str,
@@ -1889,12 +1998,20 @@ pub(crate) fn persist_wire_write(
     sql: &str,
     result: &Result<QueryResult, EngineError>,
 ) -> std::io::Result<()> {
-    let Ok(QueryResult::CommandOk {
-        modified_catalog, ..
-    }) = result
-    else {
-        return Ok(()); // SELECT / error — nothing to persist
+    // v7.39 (round 178) — a DML with RETURNING answers `Rows`, not
+    // `CommandOk`. Pre-r178 this let-else dropped it ("SELECT —
+    // nothing to persist"), so `INSERT … RETURNING` over pgwire /
+    // mysql-wire NEVER reached the WAL: acked writes vanished on
+    // crash (caught by the r178 restart pin). Rows from a DML-shaped
+    // text persist like any write; Rows from a real read still skip.
+    let modified_catalog = match result {
+        Ok(QueryResult::CommandOk {
+            modified_catalog, ..
+        }) => *modified_catalog,
+        Ok(QueryResult::Rows { .. }) if crate::sql_is_dmlish(sql) => true,
+        _ => return Ok(()), // read / error — nothing to persist
     };
+    let modified_catalog = &modified_catalog;
     if state.wal.is_some() {
         // v7.37.15 (r172) — session synchronous_commit decides whether
         // this append fsyncs. Safe to read here: no engine lock is
@@ -3125,19 +3242,69 @@ fn handle_execute(
             .map_err(|e| proto(e.to_string()))?;
         return Ok(());
     }
-    let result = {
-        // execute_prepared takes &mut self for symmetry with the
-        // simple-query path, so both read and write hold the write
-        // lock for the duration (single-writer transactional state).
-        let mut eng = state
-            .engine
-            .write()
-            .map_err(|_| proto("Execute: engine lock poisoned".to_string()))?;
-        // Role gate — same shape as `execute_with_role`.
-        if needs_write && matches!(role, Role::ReadOnly) {
+    // r178 — plain autocommit DML (no RETURNING) goes through the
+    // commit barrier: the leader executes the bind-final SQL and the
+    // group shares one fsync with every concurrent writer (native
+    // wrap parity). Same exclusions as the simple-query route.
+    let plain_dml = {
+        use spg_sql::ast::Statement as S;
+        match &stmt.ast {
+            S::Insert(i) => i.returning.is_none(),
+            S::Update(u) => u.returning.is_none(),
+            S::Delete(d) => d.returning.is_none(),
+            S::Merge(m) => m.returning.is_none(),
+            _ => false,
+        }
+    };
+    let timeout_set = settings
+        .get("statement_timeout")
+        .map(String::as_str)
+        .and_then(parse_timeout_ms)
+        .unwrap_or(0)
+        > 0;
+    let (result, queue_persisted) = if *tx_state == b'I'
+        && state.wal.is_some()
+        && plain_dml
+        && !timeout_set
+    {
+        if matches!(role, Role::ReadOnly) {
             return Err(proto("permission denied: readonly role".to_string()));
         }
-        eng.execute_prepared_with_cancel(stmt.ast.clone(), &portal.params, cancel)
+        let mut bind_ast = stmt.ast.clone();
+        spg_engine::substitute_placeholders(&mut bind_ast, &portal.params)
+            .map_err(|e| proto(format!("Execute: bind-final render failed: {e}")))?;
+        let bind_sql = bind_ast.to_string();
+        // Fresh per-task flag — same reasoning as the simple-query
+        // route (no watchdog on this path; timeout sessions excluded).
+        let queue_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (result, wal_outcome) =
+            crate::commit_queue_execute(state, bind_sql.clone(), &queue_flag);
+        if let Err(e) = wal_outcome {
+            return Err(proto(format!("Execute: durability append failed: {e}")));
+        }
+        if matches!(&result, Ok(QueryResult::CommandOk { .. }))
+            && state.audit_path.is_some()
+            && let Err(e) = crate::append_audit_pub(state, &bind_sql)
+        {
+            return Err(proto(format!("Execute: audit append failed: {e}")));
+        }
+        (result, true)
+    } else {
+        let result = {
+            // execute_prepared takes &mut self for symmetry with the
+            // simple-query path, so both read and write hold the write
+            // lock for the duration (single-writer transactional state).
+            let mut eng = state
+                .engine
+                .write()
+                .map_err(|_| proto("Execute: engine lock poisoned".to_string()))?;
+            // Role gate — same shape as `execute_with_role`.
+            if needs_write && matches!(role, Role::ReadOnly) {
+                return Err(proto("permission denied: readonly role".to_string()));
+            }
+            eng.execute_prepared_with_cancel(stmt.ast.clone(), &portal.params, cancel)
+        };
+        (result, false)
     };
     // v7.33 (A1) — persist the write to the WAL (or the no-WAL snapshot)
     // BEFORE acking it. Pre-7.33 `handle_execute` persisted nothing, so
@@ -3145,7 +3312,16 @@ fn handle_execute(
     // bind-final SQL (placeholders substituted to literals — the same
     // walk execute_prepared just ran, so replay reproduces the effect)
     // and route it through the shared persister both pgwire paths use.
-    if needs_write && matches!(&result, Ok(QueryResult::CommandOk { .. })) {
+    // Queue-routed statements were already appended by the leader.
+    // r178 — RETURNING DML answers Rows; persist those too (the
+    // shared persister re-checks the statement shape itself).
+    if !queue_persisted
+        && needs_write
+        && matches!(
+            &result,
+            Ok(QueryResult::CommandOk { .. }) | Ok(QueryResult::Rows { .. })
+        )
+    {
         let mut bind_ast = stmt.ast.clone();
         spg_engine::substitute_placeholders(&mut bind_ast, &portal.params)
             .map_err(|e| proto(format!("Execute: bind-final render failed: {e}")))?;

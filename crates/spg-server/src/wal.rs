@@ -664,8 +664,19 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
                     tx_id,
                     spg_engine::CancelToken::from_flag(&task.cancel_flag),
                 );
-                let was_command_ok = matches!(exec_res, Ok(QueryResult::CommandOk { .. }));
-                if !was_command_ok {
+                // v7.39 (round 178) — a DML with RETURNING answers
+                // `Rows`, not `CommandOk`. Pre-r178 the leader treated
+                // ANY non-CommandOk as a failed slot and ROLLBACK-ed it
+                // while the dispatch thread still returned the rows to
+                // the client: a silent-wrong (acked write, data gone).
+                // Rows from a DML-shaped statement now commit + WAL
+                // like any other write; Rows from a non-DML text (a
+                // read that slipped past sql_is_read_only) keep the
+                // old rollback path, which is harmless for a read.
+                let commit_worthy = matches!(exec_res, Ok(QueryResult::CommandOk { .. }))
+                    || (matches!(exec_res, Ok(QueryResult::Rows { .. }))
+                        && crate::sql_is_dmlish(&task.sql));
+                if !commit_worthy {
                     // SQL itself failed (parse / type / cancel) —
                     // discard the slot via ROLLBACK in isolation
                     // so other tasks in the group aren't affected,
