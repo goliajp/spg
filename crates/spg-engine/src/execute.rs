@@ -420,6 +420,16 @@ impl Engine {
     }
 
     pub fn prepare_cached(&mut self, sql: &str) -> Result<Statement, ParseError> {
+        // v7.39 (round 200) — don't cache LARGE statements. A 24 KB
+        // multi-row VALUES INSERT paid a full AST deep-clone (~640 µs)
+        // just to enter the plan cache, where a unique bulk statement
+        // is never reused — and at that size a cache hit would only
+        // save the ~190 µs re-parse anyway. The threshold keeps every
+        // ORM-shaped statement (small, repeated) on the cached path.
+        const PLAN_CACHE_MAX_SQL_BYTES: usize = 4096;
+        if sql.len() > PLAN_CACHE_MAX_SQL_BYTES {
+            return self.prepare(sql);
+        }
         // v6.3.1 — version-aware lookup. If the cached plan was
         // prepared before the most recent ANALYZE, evict and replan.
         let current_version = self.statistics.version();
