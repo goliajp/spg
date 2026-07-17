@@ -392,6 +392,19 @@ impl Engine {
     /// engine-level cache must stay available for other sessions.
     /// Clone cost on a 5-table JOIN AST is well under the parse cost
     /// it replaces.
+    /// v7.39 (round 192) — bump the engine-side per-table DML
+    /// counters (pg_stat_user_tables n_tup_*). Non-transactional by
+    /// design, like PG's stats collector.
+    pub(crate) fn note_table_write(&mut self, table: &str, ins: u64, upd: u64, del: u64) {
+        let e = self
+            .table_write_stats
+            .entry(alloc::string::String::from(table))
+            .or_insert((0, 0, 0));
+        e.0 = e.0.saturating_add(ins);
+        e.1 = e.1.saturating_add(upd);
+        e.2 = e.2.saturating_add(del);
+    }
+
     pub fn prepare_cached(&mut self, sql: &str) -> Result<Statement, ParseError> {
         // v6.3.1 — version-aware lookup. If the cached plan was
         // prepared before the most recent ANALYZE, evict and replan.
@@ -967,9 +980,10 @@ impl Engine {
                 if let QueryResult::CommandOk { affected, .. } = &r {
                     self.stat_tup_inserted =
                         self.stat_tup_inserted.saturating_add(*affected as u64);
-                    if let Some(t) = self.active_catalog_mut().get_mut(&stat_table) {
-                        t.bump_write_stats(*affected as u64, 0, 0);
-                    }
+                    // r192 — engine-side, non-transactional (see
+                    // table_write_stats): in-tx bumps used to land on
+                    // the shadow table and vanish in the RC rebase.
+                    self.note_table_write(&stat_table, *affected as u64, 0, 0);
                 }
                 Ok(r)
             }
@@ -996,9 +1010,7 @@ impl Engine {
                 let r = self.exec_update_cancel(&s, cancel)?;
                 if let QueryResult::CommandOk { affected, .. } = &r {
                     self.stat_tup_updated = self.stat_tup_updated.saturating_add(*affected as u64);
-                    if let Some(t) = self.active_catalog_mut().get_mut(&s.table) {
-                        t.bump_write_stats(0, *affected as u64, 0);
-                    }
+                    self.note_table_write(&s.table, 0, *affected as u64, 0);
                 }
                 Ok(r)
             }
@@ -1013,9 +1025,7 @@ impl Engine {
                 let r = self.exec_delete_cancel(&s, cancel)?;
                 if let QueryResult::CommandOk { affected, .. } = &r {
                     self.stat_tup_deleted = self.stat_tup_deleted.saturating_add(*affected as u64);
-                    if let Some(t) = self.active_catalog_mut().get_mut(&s.table) {
-                        t.bump_write_stats(0, 0, *affected as u64);
-                    }
+                    self.note_table_write(&s.table, 0, 0, *affected as u64);
                 }
                 Ok(r)
             }
