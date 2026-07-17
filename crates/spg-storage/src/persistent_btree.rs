@@ -214,6 +214,108 @@ impl<K: Ord, V> PersistentBTreeMap<K, V> {
 
     /// In-order key-then-value iterator. Used by `PartialEq` and any caller
     /// that needs to walk the whole map (e.g. catalog deserialization).
+    /// v7.39 (round 170) — bulk-build from PRE-SORTED entries, bottom-up.
+    /// The per-row `insert_mut` path pays a path-copy allocation per
+    /// element (~300ns each), which made every `rebuild_indices` pass
+    /// O(n) allocations per index (the dominant cost of a VACUUM on an
+    /// indexed table). This builds leaves in ~ORDER-sized runs and
+    /// levels them up with the run separators as the internal entries —
+    /// zero path copies. Groups are cut evenly so no node is left
+    /// pathologically underfull for the later insert/remove rebalance.
+    ///
+    /// Debug builds assert the input is strictly sorted by `K`.
+    #[must_use]
+    pub fn from_sorted(entries: Vec<(K, V)>) -> Self
+    where
+        K: Ord + Clone,
+        V: Clone,
+    {
+        #[cfg(debug_assertions)]
+        for w in entries.windows(2) {
+            debug_assert!(w[0].0 < w[1].0, "from_sorted requires strictly sorted keys");
+        }
+        let len = entries.len();
+        if len <= MAX_ENTRIES {
+            return Self {
+                root: Arc::new(BNode::Leaf { entries }),
+                len,
+            };
+        }
+        // Level 0 — cut into leaf runs with one separator entry between
+        // consecutive leaves. Choose the number of leaves so every leaf
+        // gets between ceil(MAX_ENTRIES/2) and MAX_ENTRIES entries.
+        let mut nodes: Vec<Arc<BNode<K, V>>> = Vec::new();
+        let mut seps: Vec<(K, V)> = Vec::new();
+        {
+            // n items into g groups of ≤ MAX_ENTRIES with g-1 separators:
+            // g = ceil((n + 1) / (MAX_ENTRIES + 1)).
+            let g = (len + 1).div_ceil(MAX_ENTRIES + 1);
+            let mut it = entries.into_iter();
+            let mut remaining = len;
+            for gi in 0..g {
+                let groups_left = g - gi;
+                // Evenly split what's left (minus the separators still owed).
+                let seps_left = groups_left - 1;
+                let take = (remaining - seps_left).div_ceil(groups_left);
+                let leaf: Vec<(K, V)> = (&mut it).take(take).collect();
+                remaining -= leaf.len();
+                nodes.push(Arc::new(BNode::Leaf { entries: leaf }));
+                if gi + 1 < g {
+                    let sep = it.next().expect("separator exists");
+                    remaining -= 1;
+                    seps.push(sep);
+                }
+            }
+        }
+        // Level up until one root remains: group ≤ MAX_CHILDREN children
+        // with the intra-group separators as the internal entries; the
+        // inter-group separators bubble to the next level.
+        while nodes.len() > 1 {
+            let g = nodes.len().div_ceil(MAX_CHILDREN);
+            let per = nodes.len().div_ceil(g);
+            let mut up_nodes: Vec<Arc<BNode<K, V>>> = Vec::with_capacity(g);
+            let mut up_seps: Vec<(K, V)> = Vec::with_capacity(g - 1);
+            let mut node_it = nodes.into_iter();
+            let mut sep_it = seps.into_iter();
+            let mut children: Vec<Arc<BNode<K, V>>> = Vec::with_capacity(per);
+            let mut inner: Vec<(K, V)> = Vec::with_capacity(per - 1);
+            loop {
+                match node_it.next() {
+                    Some(n) => {
+                        if !children.is_empty() {
+                            // The separator BEFORE this child: intra-group
+                            // if the group isn't full, else it bubbles up.
+                            let sep = sep_it.next().expect("separator per boundary");
+                            if children.len() < per {
+                                inner.push(sep);
+                            } else {
+                                up_nodes.push(Arc::new(BNode::Internal {
+                                    entries: core::mem::take(&mut inner),
+                                    children: core::mem::take(&mut children),
+                                }));
+                                up_seps.push(sep);
+                            }
+                        }
+                        children.push(n);
+                    }
+                    None => {
+                        up_nodes.push(Arc::new(BNode::Internal {
+                            entries: inner,
+                            children,
+                        }));
+                        break;
+                    }
+                }
+            }
+            nodes = up_nodes;
+            seps = up_seps;
+        }
+        Self {
+            root: nodes.pop().expect("one root"),
+            len,
+        }
+    }
+
     pub fn iter(&self) -> Iter<'_, K, V> {
         let mut stack: Vec<(&Arc<BNode<K, V>>, usize)> = Vec::with_capacity(8);
         stack.push((&self.root, 0));
