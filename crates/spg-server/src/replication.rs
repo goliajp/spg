@@ -422,19 +422,40 @@ fn absorb_segment_chunk(
     segment_buffers: &mut std::collections::BTreeMap<u32, SegmentReceiveState>,
     chunk: &SegmentChunk<'_>,
     db_path: &Path,
+    state: &ServerState,
 ) -> std::io::Result<Option<Vec<u8>>> {
     // Look up or initialise the per-segment buffer. On the first
-    // chunk for a segment, check whether the segment file already
-    // exists on disk — if so, the follower owns that segment from
-    // a prior session and we can short-circuit the whole
+    // chunk for a segment, check whether the segment is already
+    // OWNED from a prior session — if so, short-circuit the whole
     // forwarding for it (segment-level resume).
+    //
+    // v7.39 (round 159) — "owned" means the file exists on disk AND
+    // the segment is registered (manifest-loaded / this-session
+    // committed, i.e. present in `cold_segment_paths`). A bare
+    // file-existence check turned a crash between the segment-file
+    // rename and the manifest refresh into PERMANENT data loss: the
+    // restarted follower had an orphan seg file its manifest never
+    // recorded, its rows pointed at an unregistered slot, and every
+    // re-send was dropped on the floor ("already present") — the
+    // r159 flake forensics (7 files on disk, "manifest loaded 6 cold
+    // segment(s)", the last segment's rows unreachable forever).
+    // Re-receiving overwrites the orphan atomically and re-registers
+    // it: the crash window self-heals.
     let entry = segment_buffers
         .entry(chunk.segment_id)
-        .or_insert_with(|| SegmentReceiveState {
-            bytes: Vec::new(),
-            expected_total: chunk.chunk_total,
-            next_seq: 0,
-            skip: cold_segment_file_already_present(db_path, chunk.segment_id),
+        .or_insert_with(|| {
+            let registered = state
+                .cold_segment_paths
+                .lock()
+                .map(|p| p.contains_key(&chunk.segment_id))
+                .unwrap_or(false);
+            SegmentReceiveState {
+                bytes: Vec::new(),
+                expected_total: chunk.chunk_total,
+                next_seq: 0,
+                skip: registered
+                    && cold_segment_file_already_present(db_path, chunk.segment_id),
+            }
         });
     if entry.skip {
         // Drop the chunk on the floor. After the last chunk in the
@@ -1379,7 +1400,7 @@ fn follow_once(
             FRAME_TYPE_SEGMENT_FILE_CHUNK => {
                 let chunk = decode_segment_chunk(&payload)?;
                 if let Some(committed_bytes) =
-                    absorb_segment_chunk(&mut segment_buffers, &chunk, db_path)?
+                    absorb_segment_chunk(&mut segment_buffers, &chunk, db_path, state)?
                 {
                     commit_received_segment(chunk.segment_id, committed_bytes, db_path, state)?;
                 }
