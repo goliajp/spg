@@ -210,6 +210,12 @@ struct CommitTask {
     sql: String,
     cancel_flag: Arc<AtomicBool>,
     ack: SyncSender<CommitResult>,
+    /// v7.37.15 (r172) — effective `synchronous_commit` captured at
+    /// dispatch time (session GUC, falling back to the env default).
+    /// The leader fsyncs a group iff any member wants sync; an
+    /// all-async group's append skips `sync_data` and the flusher
+    /// bounds the loss window.
+    sync_commit: bool,
 }
 
 /// v4.42 — shared commit-barrier state. The mutex serialises queue
@@ -342,6 +348,16 @@ pub(crate) struct ServerState {
     /// close. Surfaced through `spg_stat_activity` virtual table via
     /// the engine's registered activity provider.
     pub(crate) connections: RwLock<Vec<Arc<ConnState>>>,
+    /// v7.37.15 (r172) — latched true the first time a commit skips
+    /// its per-write fsync because the session GUC
+    /// `synchronous_commit = off` asked for async commit while the
+    /// process default is sync. The always-running flusher watches
+    /// this flag and starts emitting periodic durability markers +
+    /// fsync once set, bounding the async loss window the same way
+    /// `SPG_SYNCHRONOUS_COMMIT=off` mode does (PG wal-writer
+    /// semantics). Never cleared — like PG's wal writer, once async
+    /// commits exist the periodic flush keeps running.
+    pub(crate) async_commit_dirty: AtomicBool,
 }
 
 /// v6.5.2 — one row of `spg_stat_activity`'s per-connection state.
@@ -1275,6 +1291,7 @@ fn run(
         cluster_id,
         wal_level: AtomicU8::new(parse_wal_level_env()),
         connections: RwLock::new(Vec::new()),
+        async_commit_dirty: AtomicBool::new(false),
     });
     // v6.5.2 — register the global handle so the engine's
     // activity_provider callback can read the live registry. Safe
@@ -1346,18 +1363,16 @@ fn run(
         eprintln!("spg-server: freezer disabled via SPG_FREEZER_DISABLE");
     }
 
-    // v5.4.1: background flusher. Spawned only when async-commit
-    // mode is opted in via `SPG_SYNCHRONOUS_COMMIT=off` (default is
-    // synchronous — every WAL write already `sync_data`s, so the
-    // flusher would be redundant). In async mode the flusher emits
-    // a v5.4.0 `durability_checkpoint` WAL marker every
+    // v5.4.1: background flusher. In async-commit mode (env
+    // `SPG_SYNCHRONOUS_COMMIT=off`, or a session's SQL
+    // `SET synchronous_commit = off` after v7.37.15) it emits a
+    // v5.4.0 `durability_checkpoint` WAL marker every
     // `SPG_FLUSHER_INTERVAL_US` µs (default 200 µs) so crash
     // recovery can identify how much of the async-commit window
-    // had reached fsync at kill time.
-    if flusher::spawn(Arc::clone(&state)).is_none() {
-        // Default sync mode — silent. The opt-in async path logs
-        // its own "async-commit on" banner when it lands in v5.4.2.
-    }
+    // had reached fsync at kill time. Always spawned since
+    // v7.37.15, but dormant (no markers, no fsync) until async
+    // commits actually happen.
+    let _ = flusher::spawn(Arc::clone(&state));
 
     // v4.33 graceful shutdown: keep the blocking accept loop the
     // original code had (the per-connection timing is sensitive —
@@ -2423,6 +2438,13 @@ fn handle_query_op(
             .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
         engine_guard.session_statement_timeout_ms()
     };
+    // v7.37.15 (r172) — effective synchronous_commit, captured here
+    // (read lock, before the write paths below take theirs) for the
+    // same reason as `session_timeout_ms`. Both the wrap path (leader
+    // group fsync) and the non-wrap path (per-statement append) honour
+    // it, matching PG: `SET synchronous_commit = off` commits return
+    // before fsync, with the flusher bounding the loss window.
+    let sync_commit = session_sync_commit(state);
     let watchdog = spawn_query_watchdog(state, &cancel_flag, session_timeout_ms);
     // v4.42 — split the wrap path from the non-wrap path.
     //
@@ -2448,6 +2470,7 @@ fn handle_query_op(
             sql: sql.clone(),
             cancel_flag: Arc::clone(&cancel_flag),
             ack: ack_tx,
+            sync_commit,
         };
         let became_leader = enqueue_commit_task(state, task);
         if became_leader {
@@ -2486,7 +2509,10 @@ fn handle_query_op(
         alloc_budget::clear_query_budget();
         let was_command_ok = matches!(result, Ok(QueryResult::CommandOk { .. }));
         let wal_result = if was_command_ok && state.wal.is_some() {
-            append_wal(state, &sql)
+            // `sync_commit` was captured before this branch took the
+            // engine write lock — `append_wal` can't read the session
+            // GUC itself here without self-deadlocking on the RwLock.
+            append_wal(state, &sql, sync_commit)
         } else {
             Ok(())
         };

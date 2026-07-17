@@ -1896,7 +1896,10 @@ pub(crate) fn persist_wire_write(
         return Ok(()); // SELECT / error — nothing to persist
     };
     if state.wal.is_some() {
-        crate::append_wal(state, sql)?;
+        // v7.37.15 (r172) — session synchronous_commit decides whether
+        // this append fsyncs. Safe to read here: no engine lock is
+        // held (the no-WAL branch below takes engine.read() itself).
+        crate::append_wal(state, sql, crate::session_sync_commit(state))?;
     } else if *modified_catalog && state.db_path.is_some() {
         // No-WAL mode: capture the current committed state.
         let bytes = state
