@@ -22,6 +22,7 @@
 
 mod alloc_budget;
 mod backup;
+mod autovacuum;
 mod flusher;
 mod freezer;
 mod manifest;
@@ -1196,9 +1197,19 @@ fn run(
     }
     // v7.37.16 — autovacuum defaults ON; `SPG_AUTOVACUUM=0|false|off`
     // disables (operators running their own vacuum cadence).
-    if std::env::var("SPG_AUTOVACUUM")
-        .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
-    {
+    //
+    // v7.39 (round 173) — on the server, autovacuum runs in a
+    // background worker (PG's shape), never inside a client
+    // statement: the inline statement-exit trigger is switched off
+    // here and the worker (spawned after ServerState is built, same
+    // predicate) drives `autovacuum_tick` on its naptime cadence.
+    // The two must move together — inline-off without the worker
+    // would let dead rows grow without bound.
+    let autovacuum_enabled = !std::env::var("SPG_AUTOVACUUM")
+        .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"));
+    if autovacuum_enabled {
+        engine.set_autovacuum_inline(false);
+    } else {
         engine.set_autovacuum(false);
     }
     // v7.39 — parallel aggregation defaults ON on the server (the
@@ -1373,6 +1384,14 @@ fn run(
     // v7.37.15, but dormant (no markers, no fsync) until async
     // commits actually happen.
     let _ = flusher::spawn(Arc::clone(&state));
+
+    // v7.39 (round 173): background autovacuum worker — the other
+    // half of the inline-off flip above. Spawned under the same
+    // `SPG_AUTOVACUUM` predicate so there is never a state where
+    // neither the statement path nor a worker vacuums.
+    if autovacuum_enabled {
+        let _ = autovacuum::spawn(Arc::clone(&state));
+    }
 
     // v4.33 graceful shutdown: keep the blocking accept loop the
     // original code had (the per-connection timing is sensitive —

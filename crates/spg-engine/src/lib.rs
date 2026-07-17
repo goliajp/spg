@@ -669,6 +669,14 @@ pub struct Engine {
     /// exit (autovacuum-lite; see .claude/state/autovacuum-design.md).
     /// Default ON; hosts may disable via `SPG_AUTOVACUUM=0`.
     autovacuum: bool,
+    /// v7.39 (round 173) — whether the statement-exit trigger runs the
+    /// vacuum **inline**. Default ON (embedded: single-threaded host,
+    /// the statement path is the only place work can happen). A host
+    /// with a background autovacuum worker (spg-server) flips this off
+    /// and drives [`Self::autovacuum_tick`] from its own thread instead
+    /// — PG's shape, where autovacuum never runs inside a client
+    /// statement. Only meaningful while `autovacuum` itself is on.
+    autovacuum_inline: bool,
     /// v7.37.15 (Phase C) — TxId → writer version registry. When
     /// `exec_begin` opens an explicit transaction it allocates a
     /// fresh writer version (via [`Self::begin_writer_version`])
@@ -973,6 +981,7 @@ impl Engine {
             locks: crate::locks::LockTable::new(),
             mvcc_inplace: !cfg!(feature = "mvcc-inplace-off"),
             autovacuum: true,
+            autovacuum_inline: true,
             tx_writer_versions: BTreeMap::new(),
             stmt_writer_version: None,
             clock: None,
@@ -1316,6 +1325,7 @@ impl Engine {
             locks: crate::locks::LockTable::new(),
             mvcc_inplace: !cfg!(feature = "mvcc-inplace-off"),
             autovacuum: true,
+            autovacuum_inline: true,
             tx_writer_versions: BTreeMap::new(),
             stmt_writer_version: None,
             clock: None,
@@ -1415,6 +1425,7 @@ impl Engine {
                     locks: crate::locks::LockTable::new(),
                     mvcc_inplace: !cfg!(feature = "mvcc-inplace-off"),
                     autovacuum: true,
+                    autovacuum_inline: true,
                     tx_writer_versions: BTreeMap::new(),
                     stmt_writer_version: None,
                     clock: None,
