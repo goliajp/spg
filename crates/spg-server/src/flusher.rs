@@ -23,13 +23,19 @@
 //! and lifecycle integration all settle before the durability-
 //! semantics change in v5.4.2 ships.
 //!
-//! Cadence default: 200 µs per marker. Picked aggressively
-//! relative to PG's `wal_writer_delay = 200ms` so the durability
-//! window stays bounded at hundreds of microseconds even under
-//! 100K+ records/sec load — matching the v5.4 ship-gate target
-//! (single-client INSERT ≥ 200K r/s with async-commit on). The
-//! per-iteration `fsync` cost is the same whether we run it at
-//! 200 µs or 200 ms; the window is what changes.
+//! Cadence default (r176): 200 ms per marker — PG's
+//! `wal_writer_delay` default, the documented loss window for
+//! `synchronous_commit = off`. The original v5.4.1 default was
+//! 200 µs ("the fsync cost is the same at any cadence; only the
+//! window changes") — that reasoning missed the DUTY CYCLE: an
+//! fsync takes ~5-8 ms on APFS, so a 200 µs interval means the
+//! WAL file is being fsynced essentially 100% of the time, and
+//! every concurrent client `append_wal` write_all on the same
+//! file stalls behind the in-flight fsync (~1-3 ms per statement
+//! — the r175/r176 wire-panel tax, root-caused via the interval
+//! discriminator). At 200 ms the duty cycle drops to a few
+//! percent and the window matches what PG customers already
+//! accept for async commit.
 
 use std::env;
 use std::sync::Arc;
@@ -39,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use crate::{SHUTDOWN_FLAG, ServerState, append_durability_marker};
 
-pub(crate) const DEFAULT_INTERVAL_US: u64 = 200;
+pub(crate) const DEFAULT_INTERVAL_US: u64 = 200_000;
 /// Lower bound on the per-marker interval — sub-10 µs ticks
 /// would spin the WAL mutex faster than `sync_data` can return,
 /// burning CPU for no durability-window improvement.
@@ -120,6 +126,22 @@ fn run(state: &ServerState, config: FlusherConfig) {
             continue;
         }
         last_tick = Instant::now();
+        // r176 — idle gate: skip the marker + fsync when the WAL has
+        // not grown past the last marker. An idle (or currently
+        // sync-only) server must not burn a continuous fsync duty
+        // cycle: concurrent client appends on the same file stall
+        // behind an in-flight fsync, and the marker frames themselves
+        // grow the WAL for nothing.
+        let wal_len = state.wal.as_ref().and_then(|w| {
+            w.lock()
+                .ok()
+                .and_then(|f| f.metadata().ok().map(|m| m.len()))
+        });
+        if let Some(len) = wal_len
+            && len <= state.metrics.last_durable_wal_offset.load(Ordering::Relaxed)
+        {
+            continue;
+        }
         match append_durability_marker(state) {
             Ok(pre_marker_offset) => {
                 // v5.4.3 — update durability barrier metadata so
