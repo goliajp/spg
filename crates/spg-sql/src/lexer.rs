@@ -290,6 +290,15 @@ pub enum LexErrorKind {
     UnterminatedQuotedIdent,
     UnterminatedBlockComment,
     BadNumber(String),
+    /// v7.39 (round 184) — a numeric literal followed directly by an
+    /// identifier character (`12__34`, `123_`, `1.5_`, `123abc`). PG
+    /// rejects at scan time; pre-r184 SPG silently lexed the number
+    /// and let the tail become a column alias (`SELECT 12__34` → 12).
+    TrailingJunkAfterNumber(String),
+    /// v7.39 (round 184) — a radix prefix with no digits (`0x`, `0o`,
+    /// `0b`); pre-r184 the `0` lexed alone and the letter aliased.
+    /// Payload: (radix-name, literal-text).
+    InvalidRadixLiteral(&'static str, String),
     InvalidUnicodeEscape,
 }
 
@@ -314,6 +323,12 @@ impl fmt::Display for LexError {
             }
             LexErrorKind::BadNumber(s) => {
                 write!(f, "invalid number literal {s:?} at byte {}", self.pos)
+            }
+            LexErrorKind::TrailingJunkAfterNumber(s) => {
+                write!(f, "trailing junk after numeric literal at or near \"{s}\"")
+            }
+            LexErrorKind::InvalidRadixLiteral(radix, s) => {
+                write!(f, "invalid {radix} integer at or near \"{s}\"")
             }
             LexErrorKind::InvalidUnicodeEscape => {
                 write!(f, "invalid Unicode escape at byte {}", self.pos)
@@ -1541,36 +1556,71 @@ fn hex_digit_value(b: u8) -> Option<u32> {
 fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
     let bytes = s.as_bytes();
     let mut i = 0usize;
+    // v7.39 (round 184) — PG scan.l rejects a numeric literal that is
+    // followed directly by an identifier character: `12__34`, `123_`,
+    // `1.5_`, `123abc` are "trailing junk after numeric literal", not
+    // "number + alias". Pre-r184 the tail silently became a column
+    // alias (`SELECT 12__34` returned 12). The reported text spans the
+    // number plus its identifier-shaped tail, like PG's error cursor.
+    let junk_end = |from: usize| -> usize {
+        let mut j = from;
+        while j < bytes.len() && (bytes[j] == b'_' || bytes[j].is_ascii_alphanumeric()) {
+            j += 1;
+        }
+        j
+    };
+    let junk_check = |end: usize| -> Result<(), LexErrorKind> {
+        if end < bytes.len() && (bytes[end] == b'_' || bytes[end].is_ascii_alphabetic()) {
+            return Err(LexErrorKind::TrailingJunkAfterNumber(
+                s[..junk_end(end)].to_string(),
+            ));
+        }
+        Ok(())
+    };
     // v7.38 (read01) — PG 16+ non-decimal integer literals: `0x1F` (hex),
     // `0o17` (octal), `0b101` (binary), with optional `_` separators. Read the
     // radix digits, strip `_`, parse as i64 (NUMERIC on overflow).
     if bytes.len() >= 2 && bytes[0] == b'0' {
-        let radix = match bytes[1] {
-            b'x' | b'X' => Some(16u32),
-            b'o' | b'O' => Some(8),
-            b'b' | b'B' => Some(2),
-            _ => None,
+        let (radix, radix_name) = match bytes[1] {
+            b'x' | b'X' => (Some(16u32), "hexadecimal"),
+            b'o' | b'O' => (Some(8), "octal"),
+            b'b' | b'B' => (Some(2), "binary"),
+            _ => (None, ""),
         };
         if let Some(radix) = radix {
+            // PG's shape is `0x(_?digit)+`: every `_` must be followed
+            // by a radix digit (leading `_` allowed, trailing not).
             let mut j = 2;
-            let valid = |b: u8| -> bool { (b as char).is_digit(radix) || b == b'_' };
-            let start = j;
-            while j < bytes.len() && valid(bytes[j]) {
-                j += 1;
-            }
-            if j > start {
-                let digits: alloc::string::String = s[2..j].chars().filter(|c| *c != '_').collect();
-                if !digits.is_empty() {
-                    return match i64::from_str_radix(&digits, radix) {
-                        Ok(v) => Ok((Token::Integer(v), j)),
-                        // Over i64 → keep as decimal NUMERIC text.
-                        Err(_) => match u128::from_str_radix(&digits, radix) {
-                            Ok(v) => Ok((Token::Numeric(alloc::format!("{v}")), j)),
-                            Err(_) => Err(LexErrorKind::BadNumber(s[..j].to_string())),
-                        },
-                    };
+            loop {
+                let mut k = j;
+                if k < bytes.len() && bytes[k] == b'_' {
+                    k += 1;
+                }
+                if k < bytes.len() && (bytes[k] as char).is_digit(radix) {
+                    j = k + 1;
+                } else {
+                    break;
                 }
             }
+            let digits: alloc::string::String = s[2..j].chars().filter(|c| *c != '_').collect();
+            if digits.is_empty() {
+                // `0x` / `0x_` — a radix prefix with no digits. PG:
+                // "invalid hexadecimal integer"; pre-r184 the `0`
+                // lexed alone and the rest aliased.
+                return Err(LexErrorKind::InvalidRadixLiteral(
+                    radix_name,
+                    s[..junk_end(0)].to_string(),
+                ));
+            }
+            junk_check(j)?;
+            return match i64::from_str_radix(&digits, radix) {
+                Ok(v) => Ok((Token::Integer(v), j)),
+                // Over i64 → keep as decimal NUMERIC text.
+                Err(_) => match u128::from_str_radix(&digits, radix) {
+                    Ok(v) => Ok((Token::Numeric(alloc::format!("{v}")), j)),
+                    Err(_) => Err(LexErrorKind::BadNumber(s[..j].to_string())),
+                },
+            };
         }
     }
     // v7.38 (read01) — track the dot and exponent separately. PG: a dotted
@@ -1596,8 +1646,14 @@ fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
     if i < bytes.len() && bytes[i] == b'.' && !(i + 1 < bytes.len() && bytes[i + 1] == b'.') {
         has_dot = true;
         i += 1;
-        while i < bytes.len() && digit_or_sep(bytes, i) {
-            i += 1;
+        // r184 — a fraction may only START with a digit: `1._5` is
+        // trailing junk in PG (`_` is a separator BETWEEN digits),
+        // not 1.5. Leaving the `_` unconsumed routes it into the
+        // junk check below.
+        if i < bytes.len() && bytes[i].is_ascii_digit() {
+            while i < bytes.len() && digit_or_sep(bytes, i) {
+                i += 1;
+            }
         }
     }
     if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
@@ -1607,13 +1663,19 @@ fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
             i += 1;
         }
         let exp_start = i;
-        while i < bytes.len() && digit_or_sep(bytes, i) {
-            i += 1;
+        // r184 — same rule as the fraction: the exponent must start
+        // with a digit (`1e_5` is junk, not 1e5).
+        if i < bytes.len() && bytes[i].is_ascii_digit() {
+            while i < bytes.len() && digit_or_sep(bytes, i) {
+                i += 1;
+            }
         }
         if exp_start == i {
             return Err(LexErrorKind::BadNumber(s[..i].to_string()));
         }
     }
+    // r184 — reject an identifier-shaped tail glued to the number.
+    junk_check(i)?;
 
     // Strip the `_` separators for parsing / storage (source span keeps `i`).
     let owned;
