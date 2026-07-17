@@ -46,8 +46,14 @@ $$",
     e.execute_in("INSERT INTO main VALUES (2)", IMPLICIT_TX)
         .unwrap();
     // Next tx statement rebases; then commit.
-    println!("tr1 tx main: {}", q(&mut e, "SELECT id FROM main ORDER BY id", tx));
-    println!("tr2 tx log:  {}", q(&mut e, "SELECT id FROM log ORDER BY id", tx));
+    println!(
+        "tr1 tx main: {}",
+        q(&mut e, "SELECT id FROM main ORDER BY id", tx)
+    );
+    println!(
+        "tr2 tx log:  {}",
+        q(&mut e, "SELECT id FROM log ORDER BY id", tx)
+    );
     let commit = e.execute_in("COMMIT", tx);
     println!("tr3 commit: {commit:?}");
     println!(
@@ -69,11 +75,18 @@ fn returning_x_rebase() {
     e.execute_in("BEGIN", tx).unwrap();
     println!(
         "rt1 tx UPDATE..RETURNING (want 11): {}",
-        q(&mut e, "UPDATE t SET n = n + 1 WHERE id = 1 RETURNING n", tx)
+        q(
+            &mut e,
+            "UPDATE t SET n = n + 1 WHERE id = 1 RETURNING n",
+            tx
+        )
     );
     e.execute_in("UPDATE t SET n = n + 100 WHERE id = 2", IMPLICIT_TX)
         .unwrap();
-    println!("rt2 tx view: {}", q(&mut e, "SELECT id, n FROM t ORDER BY id", tx));
+    println!(
+        "rt2 tx view: {}",
+        q(&mut e, "SELECT id, n FROM t ORDER BY id", tx)
+    );
     let commit = e.execute_in("COMMIT", tx);
     println!("rt3 commit: {commit:?}");
     println!(
@@ -92,9 +105,11 @@ fn rr_savepoint_x_merge() {
     e.execute_in("BEGIN", tx).unwrap();
     e.execute_in("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", tx)
         .unwrap();
-    e.execute_in("UPDATE t SET n = 11 WHERE id = 1", tx).unwrap();
+    e.execute_in("UPDATE t SET n = 11 WHERE id = 1", tx)
+        .unwrap();
     e.execute_in("SAVEPOINT s1", tx).unwrap();
-    e.execute_in("UPDATE t SET n = 22 WHERE id = 2", tx).unwrap();
+    e.execute_in("UPDATE t SET n = 22 WHERE id = 2", tx)
+        .unwrap();
     e.execute_in("ROLLBACK TO SAVEPOINT s1", tx).unwrap();
     // Concurrent write to a third, untouched row.
     e.execute_in("UPDATE t SET n = 33 WHERE id = 3", IMPLICIT_TX)

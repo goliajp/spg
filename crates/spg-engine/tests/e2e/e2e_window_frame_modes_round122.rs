@@ -27,11 +27,21 @@ const PEERS: &str = "(VALUES(10,1),(10,2),(20,3),(20,4),(30,5)) t(g,v)";
 fn groups_frame_mode() {
     let mut e = Engine::new();
     assert_eq!(
-        agg(&mut e, &format!("SELECT sum(v) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) s FROM {PEERS} ORDER BY g")),
+        agg(
+            &mut e,
+            &format!(
+                "SELECT sum(v) OVER (ORDER BY g GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) s FROM {PEERS} ORDER BY g"
+            )
+        ),
         "10/10/15/15/12"
     );
     assert_eq!(
-        agg(&mut e, &format!("SELECT sum(v) OVER (ORDER BY g GROUPS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) s FROM {PEERS} ORDER BY g")),
+        agg(
+            &mut e,
+            &format!(
+                "SELECT sum(v) OVER (ORDER BY g GROUPS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) s FROM {PEERS} ORDER BY g"
+            )
+        ),
         "15/15/12/12/5"
     );
 }
@@ -40,19 +50,30 @@ fn groups_frame_mode() {
 fn range_offset_numeric_and_interval() {
     let mut e = Engine::new();
     assert_eq!(
-        agg(&mut e, &format!("SELECT sum(v) OVER (ORDER BY g RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) s FROM {PEERS} ORDER BY g")),
+        agg(
+            &mut e,
+            &format!(
+                "SELECT sum(v) OVER (ORDER BY g RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) s FROM {PEERS} ORDER BY g"
+            )
+        ),
         "3/3/7/7/5"
     );
     // Type-aware RANGE offset: date column with an INTERVAL bound.
     assert_eq!(
-        agg(&mut e, "SELECT sum(v) OVER (ORDER BY d RANGE BETWEEN INTERVAL '1 day' PRECEDING AND INTERVAL '1 day' FOLLOWING) s \
-                     FROM (VALUES(DATE '2024-01-01',1),(DATE '2024-01-01',2),(DATE '2024-01-02',3),(DATE '2024-01-05',4)) t(d,v) ORDER BY d"),
+        agg(
+            &mut e,
+            "SELECT sum(v) OVER (ORDER BY d RANGE BETWEEN INTERVAL '1 day' PRECEDING AND INTERVAL '1 day' FOLLOWING) s \
+                     FROM (VALUES(DATE '2024-01-01',1),(DATE '2024-01-01',2),(DATE '2024-01-02',3),(DATE '2024-01-05',4)) t(d,v) ORDER BY d"
+        ),
         "6/6/6/4"
     );
     // DESC order flips the offset direction.
     assert_eq!(
-        agg(&mut e, "SELECT sum(v) OVER (ORDER BY g DESC RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) s \
-                     FROM (VALUES(10,1),(15,2),(20,3)) t(g,v) ORDER BY g DESC"),
+        agg(
+            &mut e,
+            "SELECT sum(v) OVER (ORDER BY g DESC RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) s \
+                     FROM (VALUES(10,1),(15,2),(20,3)) t(g,v) ORDER BY g DESC"
+        ),
         "5/6/3"
     );
 }
@@ -62,14 +83,20 @@ fn empty_frame_aggregates() {
     let mut e = Engine::new();
     // Asymmetric future RANGE frame: the last row's frame is empty → sum NULL.
     assert_eq!(
-        agg(&mut e, "SELECT sum(v) OVER (ORDER BY g RANGE BETWEEN 5 FOLLOWING AND 10 FOLLOWING) s \
-                     FROM (VALUES(10,1),(15,2),(20,3),(30,4)) t(g,v) ORDER BY g"),
+        agg(
+            &mut e,
+            "SELECT sum(v) OVER (ORDER BY g RANGE BETWEEN 5 FOLLOWING AND 10 FOLLOWING) s \
+                     FROM (VALUES(10,1),(15,2),(20,3),(30,4)) t(g,v) ORDER BY g"
+        ),
         "5/3/4/NULL"
     );
     // Empty ROWS frame → count 0 (not NULL).
     assert_eq!(
-        agg(&mut e, "SELECT count(*) OVER (ORDER BY g ROWS BETWEEN 2 FOLLOWING AND 3 FOLLOWING) s \
-                     FROM (VALUES(1,1),(2,2),(3,3),(4,4)) t(g,v) ORDER BY g"),
+        agg(
+            &mut e,
+            "SELECT count(*) OVER (ORDER BY g ROWS BETWEEN 2 FOLLOWING AND 3 FOLLOWING) s \
+                     FROM (VALUES(1,1),(2,2),(3,3),(4,4)) t(g,v) ORDER BY g"
+        ),
         "2/1/0/0"
     );
 }

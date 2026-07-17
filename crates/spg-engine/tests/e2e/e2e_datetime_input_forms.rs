@@ -9,9 +9,7 @@ fn engine() -> Engine {
 
 fn text_of(e: &mut Engine, sql: &str) -> String {
     match e.execute(sql).unwrap() {
-        QueryResult::Rows { rows, .. } => {
-            spg_engine::eval::value_to_text(&rows[0].values[0])
-        }
+        QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{sql}: {other:?}"),
     }
 }

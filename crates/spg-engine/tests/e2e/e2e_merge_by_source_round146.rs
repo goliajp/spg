@@ -35,7 +35,8 @@ fn affected(e: &mut Engine, sql: &str) -> usize {
 fn setup(e: &mut Engine) {
     e.execute("CREATE TABLE mt(id int, v int)").unwrap();
     e.execute("CREATE TABLE ms(id int, v int)").unwrap();
-    e.execute("INSERT INTO mt VALUES (1,10),(2,20),(4,40)").unwrap();
+    e.execute("INSERT INTO mt VALUES (1,10),(2,20),(4,40)")
+        .unwrap();
     e.execute("INSERT INTO ms VALUES (1,100),(3,300)").unwrap();
 }
 
@@ -45,7 +46,10 @@ fn by_source_conditional_update() {
     setup(&mut e);
     // Unmatched-by-source rows are {2,4}; the AND keeps only v > 25 → row 4.
     assert_eq!(
-        affected(&mut e, "MERGE INTO mt USING ms ON mt.id = ms.id WHEN NOT MATCHED BY SOURCE AND mt.v > 25 THEN UPDATE SET v = -1"),
+        affected(
+            &mut e,
+            "MERGE INTO mt USING ms ON mt.id = ms.id WHEN NOT MATCHED BY SOURCE AND mt.v > 25 THEN UPDATE SET v = -1"
+        ),
         1
     );
     assert_eq!(
@@ -60,7 +64,10 @@ fn three_branch_combo_matches_pg() {
     setup(&mut e);
     // MATCHED updates id=1; BY SOURCE deletes {2,4}; BY TARGET inserts id=3.
     assert_eq!(
-        affected(&mut e, "MERGE INTO mt USING ms ON mt.id = ms.id WHEN MATCHED THEN UPDATE SET v = ms.v WHEN NOT MATCHED BY SOURCE THEN DELETE WHEN NOT MATCHED BY TARGET THEN INSERT VALUES (ms.id, ms.v)"),
+        affected(
+            &mut e,
+            "MERGE INTO mt USING ms ON mt.id = ms.id WHEN MATCHED THEN UPDATE SET v = ms.v WHEN NOT MATCHED BY SOURCE THEN DELETE WHEN NOT MATCHED BY TARGET THEN INSERT VALUES (ms.id, ms.v)"
+        ),
         4
     );
     assert_eq!(
@@ -69,7 +76,10 @@ fn three_branch_combo_matches_pg() {
     );
     // A second BY SOURCE pass finds nothing (every target row now matches).
     assert_eq!(
-        affected(&mut e, "MERGE INTO mt USING ms ON mt.id = ms.id WHEN NOT MATCHED BY SOURCE THEN DELETE"),
+        affected(
+            &mut e,
+            "MERGE INTO mt USING ms ON mt.id = ms.id WHEN NOT MATCHED BY SOURCE THEN DELETE"
+        ),
         0
     );
 }
@@ -97,7 +107,10 @@ fn source_column_ref_in_by_source_rejected() {
         Err(x) => format!("{x}"),
         Ok(_) => panic!("expected error"),
     };
-    assert!(m.contains("invalid reference to FROM-clause entry for table \"ms\""), "{m}");
+    assert!(
+        m.contains("invalid reference to FROM-clause entry for table \"ms\""),
+        "{m}"
+    );
 }
 
 #[test]
@@ -111,15 +124,24 @@ fn positions_survive_prior_mvcc_versions() {
     e.execute("UPDATE mt SET v = 11 WHERE id = 1").unwrap();
     // Now delete the unmatched-by-source rows {2,4}.
     assert_eq!(
-        affected(&mut e, "MERGE INTO mt USING ms ON mt.id = ms.id WHEN NOT MATCHED BY SOURCE THEN DELETE"),
+        affected(
+            &mut e,
+            "MERGE INTO mt USING ms ON mt.id = ms.id WHEN NOT MATCHED BY SOURCE THEN DELETE"
+        ),
         2
     );
-    assert_eq!(pairs(&mut e, "SELECT id, v FROM mt ORDER BY id"), vec![(1, 11)]);
+    assert_eq!(
+        pairs(&mut e, "SELECT id, v FROM mt ORDER BY id"),
+        vec![(1, 11)]
+    );
     // And a MATCHED update after further churn lands on the right row.
     e.execute("INSERT INTO mt VALUES (5,50)").unwrap();
     e.execute("UPDATE mt SET v = 12 WHERE id = 1").unwrap();
     assert_eq!(
-        affected(&mut e, "MERGE INTO mt USING ms ON mt.id = ms.id WHEN MATCHED THEN UPDATE SET v = ms.v"),
+        affected(
+            &mut e,
+            "MERGE INTO mt USING ms ON mt.id = ms.id WHEN MATCHED THEN UPDATE SET v = ms.v"
+        ),
         1
     );
     assert_eq!(

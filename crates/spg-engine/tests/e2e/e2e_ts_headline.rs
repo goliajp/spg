@@ -170,7 +170,10 @@ under the old wooden bridge every sunny morning";
              'MinWords=2, MaxFragments=2, MaxWords=6')"
         ),
     );
-    assert_eq!(got, "quick brown <b>fox</b> jumps over ... watches the <b>fox</b>");
+    assert_eq!(
+        got,
+        "quick brown <b>fox</b> jumps over ... watches the <b>fox</b>"
+    );
     // AND cover spans both terms; split into <= MaxWords fragments.
     let got = first_text(
         &mut e,
@@ -217,9 +220,7 @@ while the cat watches', to_tsquery('english','absentterm'), 'MinWords=4, MaxWord
 #[test]
 fn option_validation_matches_pg() {
     let mut e = Engine::new();
-    let err = |e: &mut Engine, sql: &str| -> String {
-        format!("{}", e.execute(sql).unwrap_err())
-    };
+    let err = |e: &mut Engine, sql: &str| -> String { format!("{}", e.execute(sql).unwrap_err()) };
     assert!(
         err(
             &mut e,
@@ -228,12 +229,18 @@ fn option_validation_matches_pg() {
         .contains("MinWords must be less than MaxWords")
     );
     assert!(
-        err(&mut e, "SELECT ts_headline('a b c', 'a'::tsquery, 'MinWords=0')")
-            .contains("MinWords must be positive")
+        err(
+            &mut e,
+            "SELECT ts_headline('a b c', 'a'::tsquery, 'MinWords=0')"
+        )
+        .contains("MinWords must be positive")
     );
     assert!(
-        err(&mut e, "SELECT ts_headline('a b c', 'a'::tsquery, 'ShortWord=-1')")
-            .contains("ShortWord must be >= 0")
+        err(
+            &mut e,
+            "SELECT ts_headline('a b c', 'a'::tsquery, 'ShortWord=-1')"
+        )
+        .contains("ShortWord must be >= 0")
     );
     assert!(
         err(
@@ -243,16 +250,25 @@ fn option_validation_matches_pg() {
         .contains("MaxFragments must be >= 0")
     );
     assert!(
-        err(&mut e, "SELECT ts_headline('a b c', 'a'::tsquery, 'Bogus=1')")
-            .contains("unrecognized headline parameter: \"Bogus\"")
+        err(
+            &mut e,
+            "SELECT ts_headline('a b c', 'a'::tsquery, 'Bogus=1')"
+        )
+        .contains("unrecognized headline parameter: \"Bogus\"")
     );
     assert!(
-        err(&mut e, "SELECT ts_headline('a b c', 'a'::tsquery, 'MaxWords=zzz')")
-            .contains("invalid input syntax for type integer: \"zzz\"")
+        err(
+            &mut e,
+            "SELECT ts_headline('a b c', 'a'::tsquery, 'MaxWords=zzz')"
+        )
+        .contains("invalid input syntax for type integer: \"zzz\"")
     );
     assert!(
-        err(&mut e, "SELECT ts_headline('a b c', 'a'::tsquery, 'StartSel=')")
-            .contains("invalid parameter list format: \"StartSel=\"")
+        err(
+            &mut e,
+            "SELECT ts_headline('a b c', 'a'::tsquery, 'StartSel=')"
+        )
+        .contains("invalid parameter list format: \"StartSel=\"")
     );
     // Fragment mode validates the same set.
     assert!(
@@ -265,9 +281,7 @@ fn option_validation_matches_pg() {
     // Valid options still work; HighlightAll reads 1/on/t/true/y/yes as
     // true and anything else as false without erroring (PG).
     let ok = |e: &mut Engine, sql: &str| match e.execute(sql).unwrap() {
-        QueryResult::Rows { rows, .. } => {
-            spg_engine::eval::value_to_text(&rows[0].values[0])
-        }
+        QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{other:?}"),
     };
     assert_eq!(

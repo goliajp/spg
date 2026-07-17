@@ -1261,9 +1261,7 @@ pub enum PlPgSqlStmt {
     ReturnQuery(Box<SelectStatement>),
     /// v7.39 (read01 round 68) — `RETURN QUERY EXECUTE <sql expr>`: the dynamic
     /// twin. Its rows go to the set too; it used to run and discard them.
-    ReturnQueryExecute {
-        sql: Expr,
-    },
+    ReturnQueryExecute { sql: Expr },
     /// v7.12.6 — `IF cond THEN body [ELSIF cond THEN body]*
     /// [ELSE body] END IF;`. Branches are tried in order; first
     /// truthy condition wins; the optional ELSE runs when no
@@ -2691,7 +2689,10 @@ pub enum SelectItem {
     /// of the table / alias `qualifier` (or, in a RETURNING list, the `OLD` /
     /// `NEW` pseudo-relation).
     QualifiedWildcard(String),
-    Expr { expr: Expr, alias: Option<String> },
+    Expr {
+        expr: Expr,
+        alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4255,7 +4256,11 @@ impl fmt::Display for Statement {
                 if let Some(w) = &r.when_condition {
                     write!(f, " WHERE {w}")?;
                 }
-                f.write_str(if r.instead { " DO INSTEAD " } else { " DO ALSO " })?;
+                f.write_str(if r.instead {
+                    " DO INSTEAD "
+                } else {
+                    " DO ALSO "
+                })?;
                 if r.commands.is_empty() {
                     f.write_str("NOTHING")?;
                 } else if r.commands.len() == 1 {
@@ -4548,7 +4553,7 @@ impl fmt::Display for PlPgSqlBlock {
         if !self.exception_handlers.is_empty() {
             f.write_str("EXCEPTION\n")?;
             for h in &self.exception_handlers {
-                write!(f, "  WHEN {} THEN\n", h.conditions.join(" OR "))?;
+                writeln!(f, "  WHEN {} THEN", h.conditions.join(" OR "))?;
                 for stmt in &h.body {
                     writeln!(f, "    {stmt};")?;
                 }

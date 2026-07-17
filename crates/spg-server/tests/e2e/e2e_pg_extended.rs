@@ -313,10 +313,7 @@ fn execute_max_rows_suspends_and_resumes_portal() {
             b'D' => rows += 1,
             b's' => suspends += 1,
             b'C' => completes += 1,
-            b'E' => panic!(
-                "unexpected error: {}",
-                String::from_utf8_lossy(&m.body)
-            ),
+            b'E' => panic!("unexpected error: {}", String::from_utf8_lossy(&m.body)),
             b'Z' => break,
             _ => {}
         }

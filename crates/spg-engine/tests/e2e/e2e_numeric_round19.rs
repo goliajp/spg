@@ -71,20 +71,28 @@ fn power_log_sqrt_domain_errors() {
         err_of(&mut e, "SELECT power(0::numeric, '-inf'::numeric)")
             .contains("zero raised to a negative power is undefined")
     );
-    assert!(err_of(&mut e, "SELECT 0::numeric ^ (-0.5)")
-        .contains("zero raised to a negative power is undefined"));
-    assert!(err_of(&mut e, "SELECT (-8)::numeric ^ (1::numeric/3)")
-        .contains("a negative number raised to a non-integer power yields a complex result"));
-    assert!(err_of(&mut e, "SELECT ln(0::numeric)")
-        .contains("cannot take logarithm of zero"));
-    assert!(err_of(&mut e, "SELECT ln(-1::numeric)")
-        .contains("cannot take logarithm of a negative number"));
-    assert!(err_of(&mut e, "SELECT log(0::numeric)")
-        .contains("cannot take logarithm of zero"));
-    assert!(err_of(&mut e, "SELECT sqrt(-1::numeric)")
-        .contains("cannot take square root of a negative number"));
-    assert!(err_of(&mut e, "SELECT '-NaN'::numeric")
-        .contains("invalid input syntax for type numeric: \"-NaN\""));
+    assert!(
+        err_of(&mut e, "SELECT 0::numeric ^ (-0.5)")
+            .contains("zero raised to a negative power is undefined")
+    );
+    assert!(
+        err_of(&mut e, "SELECT (-8)::numeric ^ (1::numeric/3)")
+            .contains("a negative number raised to a non-integer power yields a complex result")
+    );
+    assert!(err_of(&mut e, "SELECT ln(0::numeric)").contains("cannot take logarithm of zero"));
+    assert!(
+        err_of(&mut e, "SELECT ln(-1::numeric)")
+            .contains("cannot take logarithm of a negative number")
+    );
+    assert!(err_of(&mut e, "SELECT log(0::numeric)").contains("cannot take logarithm of zero"));
+    assert!(
+        err_of(&mut e, "SELECT sqrt(-1::numeric)")
+            .contains("cannot take square root of a negative number")
+    );
+    assert!(
+        err_of(&mut e, "SELECT '-NaN'::numeric")
+            .contains("invalid input syntax for type numeric: \"-NaN\"")
+    );
 }
 
 #[test]
@@ -99,7 +107,10 @@ fn numeric_gcd_lcm_overload() {
         vec!["4.0", "12.0", "0.75", "NaN", "0.0"]
     );
     assert_eq!(
-        row_of(&mut e, "SELECT gcd(12, 8.0), lcm(330.3, 462), gcd(0::numeric, 0::numeric)"),
+        row_of(
+            &mut e,
+            "SELECT gcd(12, 8.0), lcm(330.3, 462), gcd(0::numeric, 0::numeric)"
+        ),
         vec!["4.0", "508662.0", "0"]
     );
 }
@@ -119,12 +130,20 @@ fn generate_series_numeric() {
         col_of(&mut e, "SELECT generate_series(4, 3, -1.1)"),
         vec!["4"]
     );
-    assert!(err_of(&mut e, "SELECT generate_series('NaN'::numeric, 4)")
-        .contains("start value cannot be NaN"));
-    assert!(err_of(&mut e, "SELECT generate_series(1, 'inf'::numeric)")
-        .contains("stop value cannot be infinity"));
-    assert!(err_of(&mut e, "SELECT generate_series(1::numeric, 4, 0.0)")
-        .contains("step size cannot equal zero"));
-    assert!(err_of(&mut e, "SELECT generate_series(1.0, 2.0, 'NaN'::numeric)")
-        .contains("step size cannot be NaN"));
+    assert!(
+        err_of(&mut e, "SELECT generate_series('NaN'::numeric, 4)")
+            .contains("start value cannot be NaN")
+    );
+    assert!(
+        err_of(&mut e, "SELECT generate_series(1, 'inf'::numeric)")
+            .contains("stop value cannot be infinity")
+    );
+    assert!(
+        err_of(&mut e, "SELECT generate_series(1::numeric, 4, 0.0)")
+            .contains("step size cannot equal zero")
+    );
+    assert!(
+        err_of(&mut e, "SELECT generate_series(1.0, 2.0, 'NaN'::numeric)")
+            .contains("step size cannot be NaN")
+    );
 }

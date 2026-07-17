@@ -31,7 +31,10 @@
 use spg_engine::{Engine, QueryResult};
 
 fn rows_of(e: &mut Engine, sql: &str) -> Vec<String> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| {
@@ -64,7 +67,10 @@ fn a_positional_order_by_over_an_srf() {
         "A,B,a,b"
     );
     assert_eq!(
-        joined(&mut e, "SELECT unnest(ARRAY['B','a','A','b']) x ORDER BY 1 DESC"),
+        joined(
+            &mut e,
+            "SELECT unnest(ARRAY['B','a','A','b']) x ORDER BY 1 DESC"
+        ),
         "b,a,B,A"
     );
     // FROM-less, SRF nested in an expression: this path had no ORDER BY at all.
@@ -74,7 +80,10 @@ fn a_positional_order_by_over_an_srf() {
     );
     // …and it had no LIMIT/OFFSET either.
     assert_eq!(
-        joined(&mut e, "SELECT upper(unnest(ARRAY['c','a','b'])) x ORDER BY 1 LIMIT 2"),
+        joined(
+            &mut e,
+            "SELECT upper(unnest(ARRAY['c','a','b'])) x ORDER BY 1 LIMIT 2"
+        ),
         "A,B"
     );
     // Naming the column still works, and agrees.
@@ -88,14 +97,21 @@ fn a_positional_order_by_over_an_srf() {
 fn b_positional_order_by_on_ordinary_shapes() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (a int, b text)").unwrap();
-    e.execute("INSERT INTO t VALUES (3,'x'),(1,'z'),(2,'y')").unwrap();
+    e.execute("INSERT INTO t VALUES (3,'x'),(1,'z'),(2,'y')")
+        .unwrap();
     assert_eq!(joined(&mut e, "SELECT a FROM t ORDER BY 1"), "1,2,3");
     assert_eq!(joined(&mut e, "SELECT a FROM t ORDER BY 1 DESC"), "3,2,1");
     // A wildcard projection: `1` is the first output column, `a`.
     assert_eq!(joined(&mut e, "SELECT * FROM t ORDER BY 1"), "1|z,2|y,3|x");
     // Projection order decides, not table order.
-    assert_eq!(joined(&mut e, "SELECT b, a FROM t ORDER BY 1"), "x|3,y|2,z|1");
-    assert_eq!(joined(&mut e, "SELECT a, b FROM t ORDER BY 2"), "3|x,2|y,1|z");
+    assert_eq!(
+        joined(&mut e, "SELECT b, a FROM t ORDER BY 1"),
+        "x|3,y|2,z|1"
+    );
+    assert_eq!(
+        joined(&mut e, "SELECT a, b FROM t ORDER BY 2"),
+        "3|x,2|y,1|z"
+    );
     // Inside an aggregate, ORDER BY 1 is the CONSTANT 1, not a position (PG).
     assert_eq!(
         joined(&mut e, "SELECT string_agg(a::text, ',' ORDER BY 1) FROM t"),
@@ -112,18 +128,25 @@ fn c_set_operations_still_hold() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE s1 (a int)").unwrap();
     e.execute("CREATE TABLE s2 (a int)").unwrap();
-    e.execute("INSERT INTO s1 VALUES (1),(2),(2),(NULL)").unwrap();
+    e.execute("INSERT INTO s1 VALUES (1),(2),(2),(NULL)")
+        .unwrap();
     e.execute("INSERT INTO s2 VALUES (2),(4)").unwrap();
     assert_eq!(
         joined(&mut e, "SELECT a FROM s1 UNION SELECT a FROM s2 ORDER BY 1"),
         "1,2,4,NULL"
     );
     assert_eq!(
-        joined(&mut e, "SELECT a FROM s1 INTERSECT SELECT a FROM s2 ORDER BY 1"),
+        joined(
+            &mut e,
+            "SELECT a FROM s1 INTERSECT SELECT a FROM s2 ORDER BY 1"
+        ),
         "2"
     );
     assert_eq!(
-        joined(&mut e, "SELECT a FROM s1 EXCEPT SELECT a FROM s2 ORDER BY 1 NULLS LAST"),
+        joined(
+            &mut e,
+            "SELECT a FROM s1 EXCEPT SELECT a FROM s2 ORDER BY 1 NULLS LAST"
+        ),
         "1,NULL"
     );
     // NULL is its own peer in a set operation (not "unknown").

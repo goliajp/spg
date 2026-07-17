@@ -41,8 +41,13 @@ fn insert_omitted_not_null_has_detail() {
     setup(&mut e);
     // Omitted no-default column b lands as NULL; the default column c shows 'x'.
     let m = err(&mut e, "INSERT INTO nn (a) VALUES ('hi')");
-    assert!(m.contains("null value in column \"b\" of relation \"nn\" violates not-null constraint"));
-    assert!(m.contains("DETAIL: Failing row contains (hi, null, x)."), "got: {m}");
+    assert!(
+        m.contains("null value in column \"b\" of relation \"nn\" violates not-null constraint")
+    );
+    assert!(
+        m.contains("DETAIL: Failing row contains (hi, null, x)."),
+        "got: {m}"
+    );
 }
 
 #[test]
@@ -51,7 +56,10 @@ fn insert_explicit_null_has_detail_with_comma() {
     setup(&mut e);
     // A comma inside a text cell is shown verbatim (PG does not quote it).
     let m = err(&mut e, "INSERT INTO nn VALUES ('p,q', NULL, 'z')");
-    assert!(m.contains("DETAIL: Failing row contains (p,q, null, z)."), "got: {m}");
+    assert!(
+        m.contains("DETAIL: Failing row contains (p,q, null, z)."),
+        "got: {m}"
+    );
 }
 
 #[test]
@@ -60,17 +68,26 @@ fn update_to_null_has_detail() {
     setup(&mut e);
     e.execute("INSERT INTO nn (a, b) VALUES ('ok', 5)").unwrap();
     let m = err(&mut e, "UPDATE nn SET b = NULL");
-    assert!(m.contains("null value in column \"b\" of relation \"nn\" violates not-null constraint"));
-    assert!(m.contains("DETAIL: Failing row contains (ok, null, x)."), "got: {m}");
+    assert!(
+        m.contains("null value in column \"b\" of relation \"nn\" violates not-null constraint")
+    );
+    assert!(
+        m.contains("DETAIL: Failing row contains (ok, null, x)."),
+        "got: {m}"
+    );
 }
 
 #[test]
 fn multi_row_insert_not_null_is_atomic() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE ta (id int, v int NOT NULL)").unwrap();
+    e.execute("CREATE TABLE ta (id int, v int NOT NULL)")
+        .unwrap();
     // Row 2 violates NOT NULL; the whole statement must roll back (PG: 0 rows),
     // not leave row 1 behind. The DETAIL names the failing row.
     let m = err(&mut e, "INSERT INTO ta VALUES (1, 10), (2, NULL), (3, 30)");
-    assert!(m.contains("DETAIL: Failing row contains (2, null)."), "got: {m}");
+    assert!(
+        m.contains("DETAIL: Failing row contains (2, null)."),
+        "got: {m}"
+    );
     assert_eq!(scalar_i64(&mut e, "SELECT count(*) FROM ta"), 0);
 }

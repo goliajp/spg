@@ -84,10 +84,7 @@ const SHAPES: &[(&str, &str)] = &[
          31,33,35,37,39,41,43,45,47,49,51,53,55,57,59,61,63,65,67,69,71,73,75,77,79,\
          81,83,85,87,89,91,93,95,97,99)",
     ),
-    (
-        "distinct_proj",
-        "SELECT DISTINCT g FROM h ORDER BY g",
-    ),
+    ("distinct_proj", "SELECT DISTINCT g FROM h ORDER BY g"),
     // ---- loss-hunt round 3 (v7.37.16): TEXT-heavy / correlated
     // subquery / 500k scale. `ht` = 50k rows with a TEXT tag column
     // (1000 uniques); `h5` = 500k-row copy of the h shape.
@@ -99,10 +96,7 @@ const SHAPES: &[(&str, &str)] = &[
         "like_filter",
         "SELECT count(*) FROM ht WHERE s LIKE '%_05%'",
     ),
-    (
-        "text_distinct",
-        "SELECT count(DISTINCT s) FROM ht",
-    ),
+    ("text_distinct", "SELECT count(DISTINCT s) FROM ht"),
     (
         "corr_subq",
         "SELECT count(*) FROM d WHERE g < (SELECT avg(h.v) FROM h WHERE h.g = d.g)",

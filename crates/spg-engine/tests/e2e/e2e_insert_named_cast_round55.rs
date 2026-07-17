@@ -11,11 +11,15 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn col(e: &mut Engine, sql: &str) -> Vec<String> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         QueryResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| spg_engine::eval::value_to_text(&r.values[0]))
@@ -38,7 +42,10 @@ fn insert_values_resolve_a_domain_cast() {
         vec!["1"]
     );
     // The domain's CHECK still fires on a cast value.
-    assert!(e.execute("INSERT INTO dm VALUES (-1::posint, 'bad')").is_err());
+    assert!(
+        e.execute("INSERT INTO dm VALUES (-1::posint, 'bad')")
+            .is_err()
+    );
 }
 
 #[test]
@@ -53,7 +60,10 @@ fn insert_values_resolve_an_enum_cast() {
         vec!["1"]
     );
     ok(&mut e, "UPDATE dm SET t = 'z' WHERE m = 'sad'::mood");
-    assert_eq!(col(&mut e, "SELECT t FROM dm WHERE m = 'sad'::mood"), vec!["z"]);
+    assert_eq!(
+        col(&mut e, "SELECT t FROM dm WHERE m = 'sad'::mood"),
+        vec!["z"]
+    );
 }
 
 #[test]

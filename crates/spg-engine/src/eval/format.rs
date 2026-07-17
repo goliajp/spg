@@ -15,7 +15,6 @@ use alloc::vec::Vec;
 
 use super::{MONTH_ABBR, MONTH_FULL, civil_from_days};
 
-
 // ---- v7.39 (GUC knife 3) — render styles ----
 //
 // PG's DateStyle / IntervalStyle / extra_float_digits GUCs change the
@@ -485,8 +484,8 @@ fn format_g(x: f64, prec: usize) -> String {
     let mant = &sci[..epos];
     if exp_val >= -4 && (exp_val as i64) < prec as i64 {
         // Fixed-point with prec-1-exp decimals, from the rounded value.
-        let decimals = usize::try_from(i64::try_from(prec).unwrap_or(1) - 1 - i64::from(exp_val))
-            .unwrap_or(0);
+        let decimals =
+            usize::try_from(i64::try_from(prec).unwrap_or(1) - 1 - i64::from(exp_val)).unwrap_or(0);
         let rounded: f64 = sci.parse().unwrap_or(x);
         let fixed = format!("{rounded:.decimals$}");
         if fixed.contains('.') {

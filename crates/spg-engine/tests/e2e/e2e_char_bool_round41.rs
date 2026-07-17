@@ -30,7 +30,10 @@ fn char1_ascii_and_bit_length() {
     let mut e = Engine::new();
     // ascii of a "char" is its byte value; bit_length of a single byte is 8.
     assert_eq!(
-        row_of(&mut e, "SELECT ascii('z'::\"char\"), bit_length('z'::\"char\")"),
+        row_of(
+            &mut e,
+            "SELECT ascii('z'::\"char\"), bit_length('z'::\"char\")"
+        ),
         vec!["122", "8"]
     );
 }

@@ -71,7 +71,10 @@ fn single_entry_and_srfs_without_an_array_form() {
     // channel, which RUNS each function and zips the rows themselves — so it
     // works, and so does a user set-returning function (see
     // e2e_rows_from_round74).
-    let got = rows(&mut e, "SELECT * FROM ROWS FROM (generate_series(1, 3)) AS t(v)");
+    let got = rows(
+        &mut e,
+        "SELECT * FROM ROWS FROM (generate_series(1, 3)) AS t(v)",
+    );
     assert_eq!(got.len(), 3);
     assert_eq!(as_i64(&got[2][0]), 3);
 }

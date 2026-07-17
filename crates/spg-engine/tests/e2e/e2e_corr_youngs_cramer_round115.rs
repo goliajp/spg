@@ -25,17 +25,26 @@ fn text(e: &mut Engine, sql: &str) -> String {
 fn corr_matches_pg_to_last_ulp() {
     let mut e = Engine::new();
     assert_eq!(
-        text(&mut e, "SELECT corr(y, x)::text FROM (VALUES(1,1),(2,2),(3,4)) t(x,y)"),
+        text(
+            &mut e,
+            "SELECT corr(y, x)::text FROM (VALUES(1,1),(2,2),(3,4)) t(x,y)"
+        ),
         "0.9819805060619659"
     );
     // A messier, decimal dataset (naive accumulation drifted here too).
     assert_eq!(
-        text(&mut e, "SELECT corr(y,x)::text FROM (VALUES(1,2.5),(2,3.7),(3,1.1),(4,9.9),(5,4.2)) t(x,y)"),
+        text(
+            &mut e,
+            "SELECT corr(y,x)::text FROM (VALUES(1,2.5),(2,3.7),(3,1.1),(4,9.9),(5,4.2)) t(x,y)"
+        ),
         "0.4515060623032481"
     );
     // Self-correlation is exactly 1 (regression guard).
     assert_eq!(
-        text(&mut e, "SELECT corr(x, x)::text FROM (VALUES(1),(2),(3)) t(x)"),
+        text(
+            &mut e,
+            "SELECT corr(x, x)::text FROM (VALUES(1),(2),(3)) t(x)"
+        ),
         "1"
     );
 }
@@ -44,22 +53,43 @@ fn corr_matches_pg_to_last_ulp() {
 fn covar_and_regr_family_match_pg() {
     let mut e = Engine::new();
     let rows = "(VALUES(1,1),(2,3),(3,5),(4,6)) t(x,y)";
-    assert_eq!(text(&mut e, &format!("SELECT covar_pop(y,x)::text FROM {rows}")), "2.125");
+    assert_eq!(
+        text(&mut e, &format!("SELECT covar_pop(y,x)::text FROM {rows}")),
+        "2.125"
+    );
     assert_eq!(
         text(&mut e, &format!("SELECT regr_slope(y,x)::text FROM {rows}")),
         "1.7"
     );
     assert_eq!(
-        text(&mut e, &format!("SELECT regr_intercept(y,x)::text FROM {rows}")),
+        text(
+            &mut e,
+            &format!("SELECT regr_intercept(y,x)::text FROM {rows}")
+        ),
         "-0.5"
     );
     assert_eq!(
         text(&mut e, &format!("SELECT regr_r2(y,x)::text FROM {rows}")),
         "0.9796610169491525"
     );
-    assert_eq!(text(&mut e, &format!("SELECT regr_sxx(y,x)::text FROM {rows}")), "5");
-    assert_eq!(text(&mut e, &format!("SELECT regr_syy(y,x)::text FROM {rows}")), "14.75");
-    assert_eq!(text(&mut e, &format!("SELECT regr_sxy(y,x)::text FROM {rows}")), "8.5");
-    assert_eq!(text(&mut e, &format!("SELECT regr_avgx(y,x)::text FROM {rows}")), "2.5");
-    assert_eq!(text(&mut e, &format!("SELECT regr_avgy(y,x)::text FROM {rows}")), "3.75");
+    assert_eq!(
+        text(&mut e, &format!("SELECT regr_sxx(y,x)::text FROM {rows}")),
+        "5"
+    );
+    assert_eq!(
+        text(&mut e, &format!("SELECT regr_syy(y,x)::text FROM {rows}")),
+        "14.75"
+    );
+    assert_eq!(
+        text(&mut e, &format!("SELECT regr_sxy(y,x)::text FROM {rows}")),
+        "8.5"
+    );
+    assert_eq!(
+        text(&mut e, &format!("SELECT regr_avgx(y,x)::text FROM {rows}")),
+        "2.5"
+    );
+    assert_eq!(
+        text(&mut e, &format!("SELECT regr_avgy(y,x)::text FROM {rows}")),
+        "3.75"
+    );
 }

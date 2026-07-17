@@ -34,7 +34,10 @@ use std::time::Duration;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn local_spawn(db: &std::path::Path) -> (std::process::Child, common::ServerAddrs) {
-    common::ServerBuilder::new().arg_path(db).with_pgwire().spawn()
+    common::ServerBuilder::new()
+        .arg_path(db)
+        .with_pgwire()
+        .spawn()
 }
 
 fn unique_tmpdir(label: &str) -> PathBuf {
@@ -169,18 +172,33 @@ fn select_sees_the_transactions_own_writes() {
     query_one(&mut s, "BEGIN");
     // Own uncommitted INSERT is visible to a later SELECT in the same tx.
     query_one(&mut s, "INSERT INTO t VALUES (3, 30)");
-    assert_eq!(query_one(&mut s, "SELECT count(*) FROM t"), Some("3".to_string()));
+    assert_eq!(
+        query_one(&mut s, "SELECT count(*) FROM t"),
+        Some("3".to_string())
+    );
     // Own uncommitted UPDATE of a pre-existing row is visible.
     query_one(&mut s, "UPDATE t SET v = 999 WHERE id = 1");
-    assert_eq!(query_one(&mut s, "SELECT v FROM t WHERE id = 1"), Some("999".to_string()));
+    assert_eq!(
+        query_one(&mut s, "SELECT v FROM t WHERE id = 1"),
+        Some("999".to_string())
+    );
     // Own uncommitted DELETE is visible.
     query_one(&mut s, "DELETE FROM t WHERE id = 2");
-    assert_eq!(query_one(&mut s, "SELECT count(*) FROM t WHERE id = 2"), Some("0".to_string()));
+    assert_eq!(
+        query_one(&mut s, "SELECT count(*) FROM t WHERE id = 2"),
+        Some("0".to_string())
+    );
 
     // ROLLBACK restores the committed state.
     query_one(&mut s, "ROLLBACK");
-    assert_eq!(query_one(&mut s, "SELECT count(*) FROM t"), Some("2".to_string()));
-    assert_eq!(query_one(&mut s, "SELECT v FROM t WHERE id = 1"), Some("10".to_string()));
+    assert_eq!(
+        query_one(&mut s, "SELECT count(*) FROM t"),
+        Some("2".to_string())
+    );
+    assert_eq!(
+        query_one(&mut s, "SELECT v FROM t WHERE id = 1"),
+        Some("10".to_string())
+    );
 }
 
 #[test]
@@ -202,7 +220,10 @@ fn autocommit_read_does_not_see_another_connections_uncommitted_write() {
     query_one(&mut a, "BEGIN");
     query_one(&mut a, "UPDATE t SET v = 222 WHERE id = 1");
     // B is autocommit; it must see the committed 10, not A's uncommitted 222.
-    assert_eq!(query_one(&mut b, "SELECT v FROM t WHERE id = 1"), Some("10".to_string()));
+    assert_eq!(
+        query_one(&mut b, "SELECT v FROM t WHERE id = 1"),
+        Some("10".to_string())
+    );
     // …and it must not see A's uncommitted INSERT either.
     query_one(&mut a, "INSERT INTO t VALUES (9, 90)");
     assert_eq!(
@@ -211,7 +232,10 @@ fn autocommit_read_does_not_see_another_connections_uncommitted_write() {
     );
     query_one(&mut a, "COMMIT");
     // After A commits, B sees both.
-    assert_eq!(query_one(&mut b, "SELECT v FROM t WHERE id = 1"), Some("222".to_string()));
+    assert_eq!(
+        query_one(&mut b, "SELECT v FROM t WHERE id = 1"),
+        Some("222".to_string())
+    );
     assert_eq!(
         query_one(&mut b, "SELECT count(*) FROM t WHERE id = 9"),
         Some("1".to_string())

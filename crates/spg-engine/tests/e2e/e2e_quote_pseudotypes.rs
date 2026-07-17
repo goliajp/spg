@@ -24,7 +24,15 @@ fn quote_family_locked() {
             "SELECT quote_ident('foo'), quote_ident('Foo'), quote_ident('foo\"bar'), \
              quote_ident('select'), quote_ident('1abc'), quote_ident('_ok'), quote_ident('')"
         ),
-        vec!["foo", "\"Foo\"", "\"foo\"\"bar\"", "\"select\"", "\"1abc\"", "_ok", "\"\""]
+        vec![
+            "foo",
+            "\"Foo\"",
+            "\"foo\"\"bar\"",
+            "\"select\"",
+            "\"1abc\"",
+            "_ok",
+            "\"\""
+        ]
     );
     assert_eq!(
         row_of(

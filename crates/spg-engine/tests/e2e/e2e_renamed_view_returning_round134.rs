@@ -8,7 +8,8 @@ use spg_engine::{Engine, QueryResult};
 
 fn setup(e: &mut Engine) {
     e.execute("CREATE TABLE rt(id int, x int)").unwrap();
-    e.execute("CREATE VIEW rv(a, b) AS SELECT id, x FROM rt").unwrap();
+    e.execute("CREATE VIEW rv(a, b) AS SELECT id, x FROM rt")
+        .unwrap();
 }
 
 fn run(e: &mut Engine, sql: &str) -> (Vec<String>, Vec<Vec<String>>) {
@@ -36,7 +37,10 @@ fn insert_returning_view_columns() {
     let mut e = Engine::new();
     setup(&mut e);
     // RETURNING a, b, b+1 AS bp — a→id, b→x for eval; names stay a/b/bp.
-    let (cols, rows) = run(&mut e, "INSERT INTO rv(a,b) VALUES(1,10) RETURNING a, b, b+1 AS bp");
+    let (cols, rows) = run(
+        &mut e,
+        "INSERT INTO rv(a,b) VALUES(1,10) RETURNING a, b, b+1 AS bp",
+    );
     assert_eq!(cols, vec!["a", "b", "bp"]);
     assert_eq!(rows, vec![vec!["1", "10", "11"]]);
 }

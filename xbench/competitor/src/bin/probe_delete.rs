@@ -56,7 +56,10 @@ fn main() {
         ("del_1row_50k_2idx", "DELETE FROM h WHERE id = 25000"),
         ("del_0row_50k_2idx", "DELETE FROM h WHERE id = -1"),
         ("del_500_50k_2idx", "DELETE FROM h WHERE g = 50"),
-        ("del_10k_50k_2idx", "DELETE FROM h WHERE v BETWEEN 20000 AND 40000"),
+        (
+            "del_10k_50k_2idx",
+            "DELETE FROM h WHERE v BETWEEN 20000 AND 40000",
+        ),
     ] {
         println!("| {:<20} | {:>7.3} |", name, timed(&mut e, sql, 7));
     }
@@ -133,11 +136,8 @@ fn main() {
         }
         // restore the 500 rows so each run deletes the same set
         for i in (1..=50_000i64).filter(|i| i % 100 == 50) {
-            ea.execute(&format!(
-                "INSERT INTO h VALUES ({i}, 50, {})",
-                val_for(i)
-            ))
-            .unwrap();
+            ea.execute(&format!("INSERT INTO h VALUES ({i}, 50, {})", val_for(i)))
+                .unwrap();
         }
     }
     println!("| {:<20} | {:>7.3} |", "del_500_autocommit", best);

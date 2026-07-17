@@ -106,7 +106,10 @@ fn e_update_committed_row_and_insert_new() {
     ok(&mut e, "UPDATE t SET v = 11 WHERE id = 1");
     ok(&mut e, "INSERT INTO t VALUES (3, 30)");
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text || '=' || v::text, ',' ORDER BY id) FROM t"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text || '=' || v::text, ',' ORDER BY id) FROM t"
+        ),
         "1=11,3=30"
     );
     ok(&mut e, "COMMIT");

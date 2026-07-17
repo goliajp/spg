@@ -16,7 +16,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn err(e: &mut Engine, sql: &str) -> String {
@@ -65,11 +66,7 @@ fn a_column_grant_lands_in_attacl_and_leaves_relacl_alone() {
             "SELECT attname||'='||coalesce(attacl,'NULL') FROM pg_attribute \
              WHERE attrelid='ct'::regclass AND attnum>0 ORDER BY attnum"
         ),
-        [
-            "id={dan=r/admin}",
-            "secret=NULL",
-            "pub={dan=r/admin}"
-        ]
+        ["id={dan=r/admin}", "secret=NULL", "pub={dan=r/admin}"]
     );
     // Revoking takes the column's entry away again — back to NULL.
     ok(&mut e, "REVOKE SELECT (pub) ON ct FROM dan");
@@ -88,18 +85,30 @@ fn the_privilege_probes_tell_the_truth_about_columns() {
     let mut e = seeded();
     // A column privilege is the table's OR the column's own.
     assert_eq!(
-        r1(&mut e, "SELECT has_column_privilege('dan','ct','pub','SELECT')"),
+        r1(
+            &mut e,
+            "SELECT has_column_privilege('dan','ct','pub','SELECT')"
+        ),
         "true"
     );
     assert_eq!(
-        r1(&mut e, "SELECT has_column_privilege('dan','ct','secret','SELECT')"),
+        r1(
+            &mut e,
+            "SELECT has_column_privilege('dan','ct','secret','SELECT')"
+        ),
         "false"
     );
     // The table-wide question stays false — a column grant does not confer it.
-    assert_eq!(r1(&mut e, "SELECT has_table_privilege('dan','ct','SELECT')"), "false");
+    assert_eq!(
+        r1(&mut e, "SELECT has_table_privilege('dan','ct','SELECT')"),
+        "false"
+    );
     // …but "can this role touch the table at all?" is true.
     assert_eq!(
-        r1(&mut e, "SELECT has_any_column_privilege('dan','ct','SELECT')"),
+        r1(
+            &mut e,
+            "SELECT has_any_column_privilege('dan','ct','SELECT')"
+        ),
         "true"
     );
 }

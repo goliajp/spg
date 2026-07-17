@@ -26,7 +26,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn r1(e: &mut Engine, sql: &str) -> String {
@@ -38,7 +39,10 @@ fn r1(e: &mut Engine, sql: &str) -> String {
 
 fn seeded() -> Engine {
     let mut e = Engine::new();
-    ok(&mut e, "CREATE TABLE t (id int, b bool, d date, n numeric, v text)");
+    ok(
+        &mut e,
+        "CREATE TABLE t (id int, b bool, d date, n numeric, v text)",
+    );
     ok(
         &mut e,
         "INSERT INTO t VALUES (1,true,'2024-01-01',1.5,'a'),(2,false,'2024-02-01',2.5,'b')",
@@ -49,11 +53,26 @@ fn seeded() -> Engine {
 #[test]
 fn array_agg_keeps_the_element_type() {
     let mut e = seeded();
-    assert_eq!(r1(&mut e, "SELECT pg_typeof(array_agg(b)) FROM t"), "boolean[]");
-    assert_eq!(r1(&mut e, "SELECT pg_typeof(array_agg(d)) FROM t"), "date[]");
-    assert_eq!(r1(&mut e, "SELECT pg_typeof(array_agg(n)) FROM t"), "numeric[]");
-    assert_eq!(r1(&mut e, "SELECT pg_typeof(array_agg(v)) FROM t"), "text[]");
-    assert_eq!(r1(&mut e, "SELECT pg_typeof(array_agg(id)) FROM t"), "integer[]");
+    assert_eq!(
+        r1(&mut e, "SELECT pg_typeof(array_agg(b)) FROM t"),
+        "boolean[]"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT pg_typeof(array_agg(d)) FROM t"),
+        "date[]"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT pg_typeof(array_agg(n)) FROM t"),
+        "numeric[]"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT pg_typeof(array_agg(v)) FROM t"),
+        "text[]"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT pg_typeof(array_agg(id)) FROM t"),
+        "integer[]"
+    );
 }
 
 #[test]
@@ -68,7 +87,10 @@ fn an_aggregated_array_reaches_the_array_functions() {
         "t"
     );
     assert_eq!(
-        r1(&mut e, "SELECT array_to_string(array_agg(b ORDER BY id),'|') FROM t"),
+        r1(
+            &mut e,
+            "SELECT array_to_string(array_agg(b ORDER BY id),'|') FROM t"
+        ),
         "t|f"
     );
 }
@@ -78,9 +100,18 @@ fn a_two_dimensional_bool_array_is_still_two_dimensional() {
     // The round-72 regression: this collapsed into a 1-D text[] and `[1][2]`
     // errored with "subscript target must be an array".
     let mut e = Engine::new();
-    assert_eq!(r1(&mut e, "SELECT (ARRAY[ARRAY[true,false]])[1][2]::text"), "false");
-    assert_eq!(r1(&mut e, "SELECT pg_typeof(ARRAY[ARRAY[1,2],ARRAY[3,4]])"), "integer[]");
-    assert_eq!(r1(&mut e, "SELECT (ARRAY[ARRAY[1,2],ARRAY[3,4]])[2][1]::text"), "3");
+    assert_eq!(
+        r1(&mut e, "SELECT (ARRAY[ARRAY[true,false]])[1][2]::text"),
+        "false"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT pg_typeof(ARRAY[ARRAY[1,2],ARRAY[3,4]])"),
+        "integer[]"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT (ARRAY[ARRAY[1,2],ARRAY[3,4]])[2][1]::text"),
+        "3"
+    );
 }
 
 #[test]

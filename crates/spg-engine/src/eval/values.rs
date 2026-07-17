@@ -324,8 +324,12 @@ pub fn value_to_text_styled(v: &Value, style: &crate::eval::RenderStyle) -> Stri
         Value::FloatArray(items) => crate::eval::format_float_array_styled(items, style),
         Value::NumericArray(items) => crate::eval::format_numeric_array(items),
         Value::DateArray(items) => crate::eval::format_date_array_styled(items, style),
-        Value::TimestampArray(items) => crate::eval::format_timestamp_array_styled(items, false, style),
-        Value::TimestamptzArray(items) => crate::eval::format_timestamp_array_styled(items, true, style),
+        Value::TimestampArray(items) => {
+            crate::eval::format_timestamp_array_styled(items, false, style)
+        }
+        Value::TimestamptzArray(items) => {
+            crate::eval::format_timestamp_array_styled(items, true, style)
+        }
         Value::UuidArray(items) => crate::eval::format_uuid_array(items),
         Value::JsonArray(items) | Value::JsonbArray(items) => crate::eval::format_text_array(items),
         Value::BytesArray(items) => crate::eval::format_bytea_array(items),
@@ -479,7 +483,6 @@ pub(super) fn array_element_at(v: &Value, pos: usize) -> Option<Value<'static>> 
     }
 }
 
-
 /// v7.39 (read01 round 72) — rebuild an array of the SAME variant as `model`
 /// from a list of element values. The mirror of `array_element_at`, and the
 /// piece that was missing: without it, every array function that BUILDS a result
@@ -488,10 +491,7 @@ pub(super) fn array_element_at(v: &Value, pos: usize) -> Option<Value<'static>> 
 ///
 /// A value that does not fit the model's element type is a caller error, and the
 /// caller phrases it; here it becomes `None`.
-pub(super) fn array_rebuild(
-    model: &Value<'_>,
-    elems: &[Value<'static>],
-) -> Option<Value<'static>> {
+pub(super) fn array_rebuild(model: &Value<'_>, elems: &[Value<'static>]) -> Option<Value<'static>> {
     macro_rules! build {
         ($variant:ident, $conv:expr) => {{
             let mut out = alloc::vec::Vec::with_capacity(elems.len());
@@ -587,7 +587,6 @@ pub(super) fn array_rebuild(
         _ => None,
     }
 }
-
 
 /// v7.39 (read01 round 73) — build an array Value from a list of element values,
 /// choosing the element type PG would choose. ONE place, used by the `ARRAY[…]`
@@ -735,7 +734,6 @@ pub(crate) fn homogeneous_typed_array(vals: &[Value<'static>]) -> Option<Value<'
         _ => None,
     }
 }
-
 
 /// v7.39 (read01 round 75) — build a 2-D array from rows that are themselves
 /// arrays. `None` when the list is not all-arrays (the caller then treats it as

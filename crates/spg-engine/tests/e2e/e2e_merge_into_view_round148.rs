@@ -41,7 +41,10 @@ fn simple_view_update_and_insert() {
     setup(&mut e);
     e.execute("CREATE VIEW v1 AS SELECT id, v FROM t").unwrap();
     assert_eq!(
-        affected(&mut e, "MERGE INTO v1 USING s ON v1.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)"),
+        affected(
+            &mut e,
+            "MERGE INTO v1 USING s ON v1.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)"
+        ),
         2
     );
     assert_eq!(
@@ -56,9 +59,13 @@ fn where_view_narrows_matched_set() {
     setup(&mut e);
     e.execute("INSERT INTO t VALUES (3,500)").unwrap();
     // View hides (3,500); s matches ids {1,3} but only id=1 is visible.
-    e.execute("CREATE VIEW v2 AS SELECT id, v FROM t WHERE v < 150").unwrap();
+    e.execute("CREATE VIEW v2 AS SELECT id, v FROM t WHERE v < 150")
+        .unwrap();
     assert_eq!(
-        affected(&mut e, "MERGE INTO v2 USING s ON v2.id = s.id WHEN MATCHED THEN UPDATE SET v = 999"),
+        affected(
+            &mut e,
+            "MERGE INTO v2 USING s ON v2.id = s.id WHEN MATCHED THEN UPDATE SET v = 999"
+        ),
         1
     );
     assert_eq!(
@@ -71,14 +78,19 @@ fn where_view_narrows_matched_set() {
 fn where_view_narrows_by_source_set() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(id int, v int)").unwrap();
-    e.execute("INSERT INTO t VALUES (1,10),(2,20),(3,500)").unwrap();
+    e.execute("INSERT INTO t VALUES (1,10),(2,20),(3,500)")
+        .unwrap();
     e.execute("CREATE TABLE s(id int, v int)").unwrap();
     e.execute("INSERT INTO s VALUES (1,100)").unwrap();
-    e.execute("CREATE VIEW vw AS SELECT id, v FROM t WHERE v < 150").unwrap();
+    e.execute("CREATE VIEW vw AS SELECT id, v FROM t WHERE v < 150")
+        .unwrap();
     // Visible = {1,2}; id=1 matches → BY SOURCE deletes only id=2. The
     // out-of-view (3,500) is untouched even though no source row matches it.
     assert_eq!(
-        affected(&mut e, "MERGE INTO vw USING s ON vw.id = s.id WHEN NOT MATCHED BY SOURCE THEN DELETE"),
+        affected(
+            &mut e,
+            "MERGE INTO vw USING s ON vw.id = s.id WHEN NOT MATCHED BY SOURCE THEN DELETE"
+        ),
         1
     );
     assert_eq!(
@@ -91,10 +103,14 @@ fn where_view_narrows_by_source_set() {
 fn renamed_columns_view() {
     let mut e = Engine::new();
     setup(&mut e);
-    e.execute("CREATE VIEW v3(a, b) AS SELECT id, v FROM t").unwrap();
+    e.execute("CREATE VIEW v3(a, b) AS SELECT id, v FROM t")
+        .unwrap();
     // Qualified refs in ON / condition and the bare SET column all remap.
     assert_eq!(
-        affected(&mut e, "MERGE INTO v3 USING s ON v3.a = s.id WHEN MATCHED AND v3.b = 10 THEN UPDATE SET b = 7"),
+        affected(
+            &mut e,
+            "MERGE INTO v3 USING s ON v3.a = s.id WHEN MATCHED AND v3.b = 10 THEN UPDATE SET b = 7"
+        ),
         1
     );
     assert_eq!(
@@ -103,7 +119,10 @@ fn renamed_columns_view() {
     );
     // Positional INSERT follows the view's column order (a=id, b=v).
     assert_eq!(
-        affected(&mut e, "MERGE INTO v3 USING s ON v3.a = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)"),
+        affected(
+            &mut e,
+            "MERGE INTO v3 USING s ON v3.a = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)"
+        ),
         1
     );
     assert_eq!(
@@ -121,12 +140,17 @@ fn non_updatable_view_still_errors() {
     // round154 and e2e_view_auto_updatable.
     let mut e = Engine::new();
     setup(&mut e);
-    e.execute("CREATE VIEW v4 AS SELECT id, v, v*2 AS d FROM t").unwrap();
+    e.execute("CREATE VIEW v4 AS SELECT id, v, v*2 AS d FROM t")
+        .unwrap();
     assert_eq!(
-        affected(&mut e, "MERGE INTO v4 USING s ON v4.id = s.id WHEN MATCHED THEN UPDATE SET v = 1"),
+        affected(
+            &mut e,
+            "MERGE INTO v4 USING s ON v4.id = s.id WHEN MATCHED THEN UPDATE SET v = 1"
+        ),
         1
     );
-    assert!(e
-        .execute("MERGE INTO v4 USING s ON v4.id = s.id WHEN MATCHED THEN UPDATE SET d = 1")
-        .is_err());
+    assert!(
+        e.execute("MERGE INTO v4 USING s ON v4.id = s.id WHEN MATCHED THEN UPDATE SET d = 1")
+            .is_err()
+    );
 }

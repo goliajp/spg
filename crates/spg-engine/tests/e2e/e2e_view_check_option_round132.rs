@@ -120,9 +120,8 @@ fn information_schema_check_option() {
     // PG: bare WITH CHECK OPTION → CASCADED, WITH LOCAL → LOCAL, none → NONE.
     let want = [("vv", "CASCADED"), ("vl", "LOCAL"), ("vn", "NONE")];
     for (name, opt) in want {
-        let sql = format!(
-            "SELECT check_option FROM information_schema.views WHERE table_name='{name}'"
-        );
+        let sql =
+            format!("SELECT check_option FROM information_schema.views WHERE table_name='{name}'");
         match e.execute(&sql).unwrap() {
             QueryResult::Rows { rows, .. } => {
                 assert_eq!(

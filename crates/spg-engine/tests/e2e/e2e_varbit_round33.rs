@@ -25,7 +25,10 @@ fn err_of(e: &mut Engine, sql: &str) -> String {
 fn bit_cast_pads_right_or_truncates() {
     let mut e = Engine::new();
     assert_eq!(
-        row_of(&mut e, "SELECT B'10'::bit(4), B'1010'::bit(2), '101'::bit(4)"),
+        row_of(
+            &mut e,
+            "SELECT B'10'::bit(4), B'1010'::bit(2), '101'::bit(4)"
+        ),
         vec!["1000", "10", "1010"]
     );
 }
@@ -41,10 +44,10 @@ fn bit_length_overlay_and_wordings() {
         ),
         vec!["101001", "4", "1", "4", "1110"]
     );
-    assert!(err_of(&mut e, "SELECT B'1' & B'10'")
-        .contains("cannot AND bit strings of different sizes"));
-    assert!(err_of(&mut e, "SELECT 'abc'::bit(4)")
-        .contains("\"a\" is not a valid binary digit"));
+    assert!(
+        err_of(&mut e, "SELECT B'1' & B'10'").contains("cannot AND bit strings of different sizes")
+    );
+    assert!(err_of(&mut e, "SELECT 'abc'::bit(4)").contains("\"a\" is not a valid binary digit"));
 }
 
 #[test]
@@ -60,10 +63,7 @@ fn varchar_prefix_and_name_cast() {
     );
     // ::name truncates to 63 bytes.
     assert_eq!(
-        row_of(
-            &mut e,
-            "SELECT length(repeat('x', 100)::name)"
-        ),
+        row_of(&mut e, "SELECT length(repeat('x', 100)::name)"),
         vec!["63"]
     );
 }

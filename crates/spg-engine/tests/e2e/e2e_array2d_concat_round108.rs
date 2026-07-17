@@ -19,32 +19,68 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn concat_operator_appends_matrix_rows() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT (ARRAY[[1,2]] || ARRAY[[3,4]])::text"), "{{1,2},{3,4}}");
+    assert_eq!(
+        text(&mut e, "SELECT (ARRAY[[1,2]] || ARRAY[[3,4]])::text"),
+        "{{1,2},{3,4}}"
+    );
     assert_eq!(
         text(&mut e, "SELECT (ARRAY[[1,2],[3,4]] || ARRAY[[5,6]])::text"),
         "{{1,2},{3,4},{5,6}}"
     );
-    assert_eq!(text(&mut e, "SELECT (ARRAY[['a','b']] || ARRAY[['c','d']])::text"), "{{a,b},{c,d}}");
-    assert_eq!(text(&mut e, "SELECT (ARRAY[[true,false]] || ARRAY[[false,true]])::text"), "{{t,f},{f,t}}");
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT (ARRAY[['a','b']] || ARRAY[['c','d']])::text"
+        ),
+        "{{a,b},{c,d}}"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT (ARRAY[[true,false]] || ARRAY[[false,true]])::text"
+        ),
+        "{{t,f},{f,t}}"
+    );
 }
 
 #[test]
 fn array_cat_appends_matrix_rows() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT array_cat(ARRAY[[1,2]], ARRAY[[3,4]])::text"), "{{1,2},{3,4}}");
-    assert_eq!(text(&mut e, "SELECT array_cat(ARRAY[[1::bigint,2]], ARRAY[[3::bigint,4]])::text"), "{{1,2},{3,4}}");
+    assert_eq!(
+        text(&mut e, "SELECT array_cat(ARRAY[[1,2]], ARRAY[[3,4]])::text"),
+        "{{1,2},{3,4}}"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT array_cat(ARRAY[[1::bigint,2]], ARRAY[[3::bigint,4]])::text"
+        ),
+        "{{1,2},{3,4}}"
+    );
 }
 
 #[test]
 fn concat_keeps_the_array_type_and_dims() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT pg_typeof(ARRAY[[1,2]] || ARRAY[[3,4]])::text"), "integer[]");
-    assert_eq!(text(&mut e, "SELECT array_dims(ARRAY[[1,2]] || ARRAY[[3,4]])"), "[1:2][1:2]");
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT pg_typeof(ARRAY[[1,2]] || ARRAY[[3,4]])::text"
+        ),
+        "integer[]"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT array_dims(ARRAY[[1,2]] || ARRAY[[3,4]])"),
+        "[1:2][1:2]"
+    );
 }
 
 #[test]
 fn one_dimensional_concat_unaffected() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT (ARRAY[1,2] || ARRAY[3,4])::text"), "{1,2,3,4}");
+    assert_eq!(
+        text(&mut e, "SELECT (ARRAY[1,2] || ARRAY[3,4])::text"),
+        "{1,2,3,4}"
+    );
     assert_eq!(text(&mut e, "SELECT (ARRAY[1,2] || 3)::text"), "{1,2,3}");
 }

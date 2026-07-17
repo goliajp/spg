@@ -49,7 +49,7 @@ pub(crate) fn deserialize_table(
             auto_increment,
             user_enum_type: None,
             user_composite_type: None,
-                acl: alloc::vec::Vec::new(),
+            acl: alloc::vec::Vec::new(),
             user_domain_type: None,
             on_update_runtime: None,
             collation: Collation::Binary,

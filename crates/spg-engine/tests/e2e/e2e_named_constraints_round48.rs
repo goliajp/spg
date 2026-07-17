@@ -13,7 +13,8 @@ fn err(e: &mut Engine, sql: &str) -> String {
 }
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 #[test]
@@ -25,7 +26,10 @@ fn named_constraints_round_trip() {
     ok(&mut e, "ALTER TABLE nc1 DROP CONSTRAINT c_pos");
     ok(&mut e, "ALTER TABLE nc1 ADD CONSTRAINT u_b UNIQUE (b)");
     ok(&mut e, "ALTER TABLE nc1 DROP CONSTRAINT u_b");
-    ok(&mut e, "ALTER TABLE nc1 ADD CONSTRAINT pk_a PRIMARY KEY (a)");
+    ok(
+        &mut e,
+        "ALTER TABLE nc1 ADD CONSTRAINT pk_a PRIMARY KEY (a)",
+    );
     ok(&mut e, "ALTER TABLE nc1 DROP CONSTRAINT pk_a");
 }
 
@@ -50,7 +54,10 @@ fn rename_constraint() {
     let mut e = Engine::new();
     ok(&mut e, "CREATE TABLE nc3(a int, b int)");
     ok(&mut e, "ALTER TABLE nc3 ADD CONSTRAINT c_pos CHECK (a > 0)");
-    ok(&mut e, "ALTER TABLE nc3 RENAME CONSTRAINT c_pos TO c_positive");
+    ok(
+        &mut e,
+        "ALTER TABLE nc3 RENAME CONSTRAINT c_pos TO c_positive",
+    );
     // The old name is gone, the new one drops.
     ok(&mut e, "ALTER TABLE nc3 DROP CONSTRAINT c_positive");
     // PG says "for table" here (DROP CONSTRAINT says "of relation").

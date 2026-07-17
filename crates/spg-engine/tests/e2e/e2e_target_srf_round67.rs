@@ -21,7 +21,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn r1(e: &mut Engine, sql: &str) -> String {
@@ -68,7 +69,10 @@ fn two_srfs_run_in_lockstep_and_the_shorter_pads_with_nulls() {
 fn a_user_setof_function_expands_in_the_target_list() {
     let mut e = seeded();
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(x::text, ',') FROM (SELECT odds() AS x) s"),
+        r1(
+            &mut e,
+            "SELECT string_agg(x::text, ',') FROM (SELECT odds() AS x) s"
+        ),
         "1,3"
     );
 }
@@ -104,7 +108,10 @@ fn the_functions_rows_obey_visibility() {
     let mut e = seeded();
     ok(&mut e, "DELETE FROM t WHERE id = 3");
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(x::text, ',') FROM (SELECT odds() AS x) s"),
+        r1(
+            &mut e,
+            "SELECT string_agg(x::text, ',') FROM (SELECT odds() AS x) s"
+        ),
         "1"
     );
 }

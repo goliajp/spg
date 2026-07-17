@@ -4,7 +4,6 @@
 
 use spg_engine::{Engine, QueryResult};
 
-
 #[test]
 fn alter_type_to_text_rewrites_existing_rows() {
     let mut e = Engine::new();
@@ -12,9 +11,7 @@ fn alter_type_to_text_rewrites_existing_rows() {
     e.execute("INSERT INTO att VALUES (5),(42)").unwrap();
     e.execute("ALTER TABLE att ALTER COLUMN a TYPE TEXT")
         .expect("INT -> TEXT is an automatic assignment cast in PG");
-    let QueryResult::Rows { rows, .. } =
-        e.execute("SELECT a FROM att ORDER BY a").unwrap()
-    else {
+    let QueryResult::Rows { rows, .. } = e.execute("SELECT a FROM att ORDER BY a").unwrap() else {
         panic!("rows")
     };
     let got: Vec<_> = rows.iter().map(|r| r.values[0].clone()).collect();
@@ -37,10 +34,7 @@ fn alter_type_narrowing_without_using_refuses_with_pg_phrasing() {
         .execute("ALTER TABLE att2 ALTER COLUMN t TYPE INT")
         .unwrap_err()
         .to_string();
-    assert!(
-        err.contains("cannot be cast automatically"),
-        "got: {err}"
-    );
+    assert!(err.contains("cannot be cast automatically"), "got: {err}");
     // USING makes the conversion explicit and succeeds for castable data.
     e.execute("UPDATE att2 SET t = '7'").unwrap();
     e.execute("ALTER TABLE att2 ALTER COLUMN t TYPE INT USING t::integer")

@@ -16,7 +16,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn err(e: &mut Engine, sql: &str) -> String {
@@ -41,16 +42,25 @@ fn seeded() -> Engine {
 fn the_public_schema_grants_usage_but_not_create() {
     let mut e = seeded();
     assert_eq!(
-        r1(&mut e, "SELECT has_schema_privilege('eve','public','USAGE')"),
+        r1(
+            &mut e,
+            "SELECT has_schema_privilege('eve','public','USAGE')"
+        ),
         "true"
     );
     assert_eq!(
-        r1(&mut e, "SELECT has_schema_privilege('eve','public','CREATE')"),
+        r1(
+            &mut e,
+            "SELECT has_schema_privilege('eve','public','CREATE')"
+        ),
         "false"
     );
     // nspacl is never NULL — PG prints the default it ships with.
     assert_eq!(
-        r1(&mut e, "SELECT nspacl FROM pg_namespace WHERE nspname='public'"),
+        r1(
+            &mut e,
+            "SELECT nspacl FROM pg_namespace WHERE nspname='public'"
+        ),
         "{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}"
     );
 }
@@ -67,7 +77,10 @@ fn creating_a_table_needs_create_on_the_schema() {
     ok(&mut e, "GRANT CREATE ON SCHEMA public TO eve");
     // The grant must not silently take PUBLIC's implicit USAGE away.
     assert_eq!(
-        r1(&mut e, "SELECT has_schema_privilege('eve','public','USAGE')"),
+        r1(
+            &mut e,
+            "SELECT has_schema_privilege('eve','public','USAGE')"
+        ),
         "true"
     );
     ok(&mut e, "SET ROLE eve");
@@ -126,11 +139,17 @@ fn nextval_needs_usage_and_setval_needs_update() {
 fn the_database_grants_connect_but_not_create() {
     let mut e = seeded();
     assert_eq!(
-        r1(&mut e, "SELECT has_database_privilege('eve','app','CONNECT')"),
+        r1(
+            &mut e,
+            "SELECT has_database_privilege('eve','app','CONNECT')"
+        ),
         "true"
     );
     assert_eq!(
-        r1(&mut e, "SELECT has_database_privilege('eve','app','CREATE')"),
+        r1(
+            &mut e,
+            "SELECT has_database_privilege('eve','app','CREATE')"
+        ),
         "false"
     );
 }

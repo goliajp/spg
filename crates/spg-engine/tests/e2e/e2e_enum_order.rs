@@ -10,9 +10,7 @@ use spg_engine::{Engine, QueryResult};
 
 fn text_of(e: &mut Engine, sql: &str) -> String {
     match e.execute(sql).unwrap() {
-        QueryResult::Rows { rows, .. } => {
-            spg_engine::eval::value_to_text(&rows[0].values[0])
-        }
+        QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{sql}: {other:?}"),
     }
 }
@@ -28,13 +26,13 @@ fn col_of(e: &mut Engine, sql: &str) -> Vec<String> {
 }
 
 fn setup(e: &mut Engine) {
-    e.execute("CREATE TYPE mood AS ENUM ('sad','ok','happy')").unwrap();
-    e.execute("ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok'").unwrap();
+    e.execute("CREATE TYPE mood AS ENUM ('sad','ok','happy')")
+        .unwrap();
+    e.execute("ALTER TYPE mood ADD VALUE 'meh' BEFORE 'ok'")
+        .unwrap();
     e.execute("CREATE TABLE em (id INT, m mood)").unwrap();
-    e.execute(
-        "INSERT INTO em VALUES (1,'happy'),(2,'sad'),(3,'meh'),(4,'ok'),(5,NULL),(6,'meh')",
-    )
-    .unwrap();
+    e.execute("INSERT INTO em VALUES (1,'happy'),(2,'sad'),(3,'meh'),(4,'ok'),(5,NULL),(6,'meh')")
+        .unwrap();
 }
 
 #[test]
@@ -70,10 +68,7 @@ fn comparisons_use_member_order() {
 fn min_max_and_greatest_least() {
     let mut e = Engine::new();
     setup(&mut e);
-    assert_eq!(
-        col_of(&mut e, "SELECT min(m) FROM em"),
-        vec!["sad"]
-    );
+    assert_eq!(col_of(&mut e, "SELECT min(m) FROM em"), vec!["sad"]);
     assert_eq!(col_of(&mut e, "SELECT max(m) FROM em"), vec!["happy"]);
     assert_eq!(
         text_of(&mut e, "SELECT min(m) FROM em WHERE m > 'sad'"),
@@ -148,7 +143,10 @@ fn index_backed_scans_stay_member_ordered() {
         vec!["meh", "meh", "ok"]
     );
     assert_eq!(
-        text_of(&mut e, "SELECT count(*) FROM em WHERE m >= 'meh' AND m <= 'ok'"),
+        text_of(
+            &mut e,
+            "SELECT count(*) FROM em WHERE m >= 'meh' AND m <= 'ok'"
+        ),
         "3"
     );
     // Equality seeks stay on the index (labels are exact).

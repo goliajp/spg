@@ -96,7 +96,7 @@ pub(crate) fn classify_stmt_for_tx(stmt: &spg_sql::ast::Statement) -> TxStmtClas
         | S::ShowCreateTable { .. }
         | S::ShowIndexes { .. }
         | S::ShowStatus
-        | S::ShowVariables { .. }
+        | S::ShowVariables
         | S::ShowProcesslist
         | S::ShowColumns { .. }
         | S::ShowUsers
@@ -178,7 +178,10 @@ impl Engine {
         let mut wsets: Vec<(String, spg_storage::TxWriteSet)> = Vec::new();
         let mut pairs: alloc::collections::BTreeMap<
             String,
-            Vec<(spg_storage::row_header::RowId, spg_storage::row_header::RowId)>,
+            Vec<(
+                spg_storage::row_header::RowId,
+                spg_storage::row_header::RowId,
+            )>,
         > = alloc::collections::BTreeMap::new();
         for tname in &state.touched_tables {
             if let Some(old_t) = state.catalog.get(tname) {
@@ -263,9 +266,8 @@ impl Engine {
                 // update's new {6,99} as inserts, and the check saw two rows with
                 // key 6 and failed the NEXT statement with a spurious duplicate
                 // key — losing the row.
-                let own_cycle_set: alloc::collections::BTreeSet<
-                    spg_storage::row_header::RowId,
-                > = own_cycle.iter().copied().collect();
+                let own_cycle_set: alloc::collections::BTreeSet<spg_storage::row_header::RowId> =
+                    own_cycle.iter().copied().collect();
                 let inserted_rows: Vec<Vec<spg_storage::Value<'static>>> = ws
                     .inserted
                     .iter()
@@ -301,10 +303,7 @@ impl Engine {
                 tombstoned: own_cycle,
             };
             let leftover = new_t.replay_tx_writeset(&phase2, v);
-            debug_assert!(
-                leftover.is_empty(),
-                "insert replay must be clean"
-            );
+            debug_assert!(leftover.is_empty(), "insert replay must be clean");
         }
         if let Some(st) = self.tx_catalogs.get_mut(&tx_id) {
             st.catalog = fresh;
@@ -319,7 +318,10 @@ impl Engine {
     pub(crate) fn record_update_pairs(
         &mut self,
         table: &str,
-        new_pairs: Vec<(spg_storage::row_header::RowId, spg_storage::row_header::RowId)>,
+        new_pairs: Vec<(
+            spg_storage::row_header::RowId,
+            spg_storage::row_header::RowId,
+        )>,
     ) {
         if new_pairs.is_empty() {
             return;
@@ -503,9 +505,8 @@ impl Engine {
                 // the tx's own old versions are already dead (an
                 // UPDATE's new version must not false-conflict with
                 // its own old version), then land the inserts.
-                let own_inserted: alloc::collections::BTreeSet<
-                    spg_storage::row_header::RowId,
-                > = ws.inserted.iter().map(|(rid, _)| *rid).collect();
+                let own_inserted: alloc::collections::BTreeSet<spg_storage::row_header::RowId> =
+                    ws.inserted.iter().map(|(rid, _)| *rid).collect();
                 let hard: Vec<spg_storage::row_header::RowId> = new_t
                     .tombstone_conflicts(&ws.tombstoned, v)
                     .into_iter()
@@ -534,9 +535,8 @@ impl Engine {
                 // phantoms from the uniqueness pre-check (see the RC-rebase site
                 // above): an INSERT-then-UPDATE of the same key in one tx staged
                 // both versions as inserts and false-tripped a duplicate key.
-                let own_cycle_set: alloc::collections::BTreeSet<
-                    spg_storage::row_header::RowId,
-                > = own_cycle.iter().copied().collect();
+                let own_cycle_set: alloc::collections::BTreeSet<spg_storage::row_header::RowId> =
+                    own_cycle.iter().copied().collect();
                 let inserted_rows: Vec<Vec<spg_storage::Value<'static>>> = ws
                     .inserted
                     .iter()

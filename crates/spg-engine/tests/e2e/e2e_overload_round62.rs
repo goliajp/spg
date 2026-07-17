@@ -16,7 +16,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn err(e: &mut Engine, sql: &str) -> String {
@@ -49,7 +50,10 @@ fn two_overloads_coexist_and_the_right_one_runs() {
     assert_eq!(r1(&mut e, "SELECT f(1)"), "int:1");
     assert_eq!(r1(&mut e, "SELECT f('hi')"), "text:hi");
     // Both are in pg_proc, sharing one name.
-    assert_eq!(r1(&mut e, "SELECT count(*) FROM pg_proc WHERE proname='f'"), "2");
+    assert_eq!(
+        r1(&mut e, "SELECT count(*) FROM pg_proc WHERE proname='f'"),
+        "2"
+    );
 }
 
 #[test]
@@ -67,7 +71,10 @@ fn a_type_alias_names_the_same_function() {
         "CREATE OR REPLACE FUNCTION f(x integer) RETURNS text AS $$ SELECT 'replaced' $$ LANGUAGE sql",
     );
     assert_eq!(r1(&mut e, "SELECT f(1)"), "replaced");
-    assert_eq!(r1(&mut e, "SELECT count(*) FROM pg_proc WHERE proname='f'"), "2");
+    assert_eq!(
+        r1(&mut e, "SELECT count(*) FROM pg_proc WHERE proname='f'"),
+        "2"
+    );
 }
 
 #[test]
@@ -76,11 +83,17 @@ fn each_overload_carries_its_own_acl() {
     ok(&mut e, "CREATE ROLE fred LOGIN PASSWORD 'x'");
     ok(&mut e, "REVOKE EXECUTE ON FUNCTION f(int) FROM PUBLIC");
     assert_eq!(
-        r1(&mut e, "SELECT has_function_privilege('fred','f(int)','EXECUTE')"),
+        r1(
+            &mut e,
+            "SELECT has_function_privilege('fred','f(int)','EXECUTE')"
+        ),
         "false"
     );
     assert_eq!(
-        r1(&mut e, "SELECT has_function_privilege('fred','f(text)','EXECUTE')"),
+        r1(
+            &mut e,
+            "SELECT has_function_privilege('fred','f(text)','EXECUTE')"
+        ),
         "true"
     );
     ok(&mut e, "SET ROLE fred");
@@ -100,10 +113,16 @@ fn dropping_needs_a_signature_when_the_name_is_ambiguous() {
     ok(&mut e, "DROP FUNCTION f(int)");
     // The int one is gone; the text one still answers.
     assert_eq!(r1(&mut e, "SELECT f('hi')"), "text:hi");
-    assert_eq!(r1(&mut e, "SELECT count(*) FROM pg_proc WHERE proname='f'"), "1");
+    assert_eq!(
+        r1(&mut e, "SELECT count(*) FROM pg_proc WHERE proname='f'"),
+        "1"
+    );
     // …and now that the name IS unambiguous, a bare DROP works.
     ok(&mut e, "DROP FUNCTION f");
-    assert_eq!(r1(&mut e, "SELECT count(*) FROM pg_proc WHERE proname='f'"), "0");
+    assert_eq!(
+        r1(&mut e, "SELECT count(*) FROM pg_proc WHERE proname='f'"),
+        "0"
+    );
 }
 
 #[test]

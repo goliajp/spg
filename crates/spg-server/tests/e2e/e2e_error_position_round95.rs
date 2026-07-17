@@ -18,7 +18,10 @@ use std::time::Duration;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn local_spawn(db: &std::path::Path) -> (std::process::Child, common::ServerAddrs) {
-    common::ServerBuilder::new().arg_path(db).with_pgwire().spawn()
+    common::ServerBuilder::new()
+        .arg_path(db)
+        .with_pgwire()
+        .spawn()
 }
 
 fn unique_tmpdir(label: &str) -> PathBuf {
@@ -120,7 +123,10 @@ fn open(addr: &str) -> TcpStream {
 fn err_pos(s: &mut TcpStream, sql: &str) -> (Option<String>, Option<String>) {
     send_query(s, sql);
     let msgs = read_until_ready(s);
-    let e = msgs.iter().find(|m| m.ty == b'E').unwrap_or_else(|| panic!("no error for {sql}"));
+    let e = msgs
+        .iter()
+        .find(|m| m.ty == b'E')
+        .unwrap_or_else(|| panic!("no error for {sql}"));
     (field(&e.body, b'C'), field(&e.body, b'P'))
 }
 
@@ -159,5 +165,8 @@ fn valid_statement_has_no_error() {
 
     send_query(&mut s, "SELECT 1");
     let msgs = read_until_ready(&mut s);
-    assert!(msgs.iter().all(|m| m.ty != b'E'), "unexpected error for SELECT 1");
+    assert!(
+        msgs.iter().all(|m| m.ty != b'E'),
+        "unexpected error for SELECT 1"
+    );
 }

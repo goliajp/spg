@@ -236,10 +236,7 @@ impl Engine {
     /// value: 'utc' -> 'UTC'; fixed offsets / abbreviations keep their
     /// spelling; IANA names resolve through the host tzdb to their
     /// canonical case. Unknown -> PG's invalid-parameter error.
-    pub(crate) fn canonicalize_timezone(
-        &self,
-        value: &str,
-    ) -> Result<String, crate::EngineError> {
+    pub(crate) fn canonicalize_timezone(&self, value: &str) -> Result<String, crate::EngineError> {
         let v = value.trim();
         if v.eq_ignore_ascii_case("utc") || v.eq_ignore_ascii_case("gmt") {
             return Ok(v.to_ascii_uppercase());

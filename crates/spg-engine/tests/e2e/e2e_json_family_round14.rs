@@ -35,10 +35,7 @@ fn to_json_nonfinite_and_timestamptz() {
             "SELECT to_json(TIMESTAMPTZ '2024-03-09 14:05:06+00'), \
              to_json(TIMESTAMP '2024-03-09 14:05:06')"
         ),
-        vec![
-            "\"2024-03-09T14:05:06+00:00\"",
-            "\"2024-03-09T14:05:06\""
-        ]
+        vec!["\"2024-03-09T14:05:06+00:00\"", "\"2024-03-09T14:05:06\""]
     );
 }
 
@@ -133,9 +130,7 @@ fn strip_nulls_two_arg_and_record_families() {
 #[test]
 fn jsonfuncs_error_wordings() {
     let mut e = Engine::new();
-    let err = |e: &mut Engine, sql: &str| -> String {
-        format!("{}", e.execute(sql).unwrap_err())
-    };
+    let err = |e: &mut Engine, sql: &str| -> String { format!("{}", e.execute(sql).unwrap_err()) };
     assert!(
         err(&mut e, "SELECT json_array_length('{\"a\":1}'::json)")
             .contains("cannot get array length of a non-array")

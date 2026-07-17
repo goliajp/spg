@@ -1897,8 +1897,7 @@ impl Engine {
                             let cols: Vec<ColumnSchema> = raw
                                 .split(',')
                                 .map(|decl| {
-                                    let cname =
-                                        decl.trim().split_whitespace().next().unwrap_or("col");
+                                    let cname = decl.split_whitespace().next().unwrap_or("col");
                                     ColumnSchema::new(cname.to_string(), DataType::Text, true)
                                 })
                                 .collect();
@@ -1909,11 +1908,7 @@ impl Engine {
                             .alias
                             .clone()
                             .unwrap_or_else(|| fn_name.clone());
-                        return Ok(alloc::vec![ColumnSchema::new(
-                            cname,
-                            DataType::Text,
-                            true
-                        )]);
+                        return Ok(alloc::vec![ColumnSchema::new(cname, DataType::Text, true)]);
                     }
                 }
                 let mut out: Vec<ColumnSchema> = Vec::new();

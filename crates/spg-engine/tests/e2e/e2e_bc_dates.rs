@@ -8,9 +8,7 @@ use spg_engine::{Engine, QueryResult};
 
 fn text_of(e: &mut Engine, sql: &str) -> String {
     match e.execute(sql).unwrap() {
-        QueryResult::Rows { rows, .. } => {
-            spg_engine::eval::value_to_text(&rows[0].values[0])
-        }
+        QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{sql}: {other:?}"),
     }
 }
@@ -18,7 +16,10 @@ fn text_of(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn bc_dates_round_trip_and_compute() {
     let mut e = Engine::new();
-    assert_eq!(text_of(&mut e, "SELECT DATE '0044-03-15 BC'"), "0044-03-15 BC");
+    assert_eq!(
+        text_of(&mut e, "SELECT DATE '0044-03-15 BC'"),
+        "0044-03-15 BC"
+    );
     assert_eq!(
         text_of(&mut e, "SELECT DATE '0044-03-15 BC' + 10"),
         "0044-03-25 BC"
@@ -51,5 +52,8 @@ fn bc_dates_round_trip_and_compute() {
     );
     // Styled output keeps the era suffix.
     e.execute("SET datestyle = 'German'").unwrap();
-    assert_eq!(text_of(&mut e, "SELECT (DATE '0044-03-15 BC')::text"), "15.03.0044 BC");
+    assert_eq!(
+        text_of(&mut e, "SELECT (DATE '0044-03-15 BC')::text"),
+        "15.03.0044 BC"
+    );
 }

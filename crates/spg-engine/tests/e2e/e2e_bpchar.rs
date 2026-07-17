@@ -84,7 +84,10 @@ fn bpchar_text_functions_see_stripped_form() {
     let mut e = Engine::new();
     assert_eq!(one(&mut e, "SELECT upper('ab'::char(5))"), "AB");
     assert_eq!(one(&mut e, "SELECT length(upper('ab'::char(5)))"), "2");
-    assert_eq!(one(&mut e, "SELECT substring('ab'::char(5) from 1 for 4)"), "ab");
+    assert_eq!(
+        one(&mut e, "SELECT substring('ab'::char(5) from 1 for 4)"),
+        "ab"
+    );
     assert_eq!(one(&mut e, "SELECT position(' ' in 'ab'::char(5))"), "0");
     // concat keeps the padded form (PG output function).
     assert_eq!(one(&mut e, "SELECT concat('ab'::char(5), 'x')"), "ab   x");
@@ -123,9 +126,7 @@ fn bpchar_order_by_sorts_stripped() {
     e.execute("CREATE TABLE c (a CHAR(5), tag INT)").unwrap();
     e.execute("INSERT INTO c VALUES ('b', 1), ('a', 2), ('ab', 3)")
         .unwrap();
-    let QueryResult::Rows { rows, .. } =
-        e.execute("SELECT tag FROM c ORDER BY a").unwrap()
-    else {
+    let QueryResult::Rows { rows, .. } = e.execute("SELECT tag FROM c ORDER BY a").unwrap() else {
         panic!("rows")
     };
     let got: Vec<_> = rows.iter().map(|r| r.values[0].clone()).collect();
@@ -152,7 +153,10 @@ fn bpchar_format_keeps_pad_quote_literal_strips() {
     let mut e = Engine::new();
     // format renders via the output function (padded) —
     // differential-verified vs PG18.
-    assert_eq!(one(&mut e, "SELECT format('<%s>', 'ab'::char(5))"), "<ab   >");
+    assert_eq!(
+        one(&mut e, "SELECT format('<%s>', 'ab'::char(5))"),
+        "<ab   >"
+    );
     assert_eq!(one(&mut e, "SELECT quote_literal('ab'::char(5))"), "'ab'");
     assert_eq!(one(&mut e, "SELECT replace('ab'::char(5), 'b', 'X')"), "aX");
 }

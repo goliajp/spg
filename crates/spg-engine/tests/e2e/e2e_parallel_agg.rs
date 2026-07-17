@@ -35,7 +35,8 @@ fn build_pair() -> (Engine, Engine) {
             .unwrap();
         e.execute("CREATE TABLE tg (g INT NOT NULL, v INT NOT NULL)")
             .unwrap();
-        e.execute("CREATE TABLE tgn (gn INT, v INT NOT NULL)").unwrap();
+        e.execute("CREATE TABLE tgn (gn INT, v INT NOT NULL)")
+            .unwrap();
         // 150 batches x 1000 rows.
         for b in 0..150 {
             let mut sql = String::from("INSERT INTO t VALUES ");

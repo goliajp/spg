@@ -23,14 +23,20 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn variadic_array_spreads_into_the_call() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT concat(VARIADIC ARRAY['a','b','c'])"), "abc");
+    assert_eq!(
+        text(&mut e, "SELECT concat(VARIADIC ARRAY['a','b','c'])"),
+        "abc"
+    );
     assert_eq!(text(&mut e, "SELECT concat(VARIADIC ARRAY[1,2,3])"), "123");
     assert_eq!(
         text(&mut e, "SELECT concat_ws('-', VARIADIC ARRAY[1,2,3])"),
         "1-2-3"
     );
     assert_eq!(
-        text(&mut e, "SELECT format('%s/%s/%s', VARIADIC ARRAY['x','y','z'])"),
+        text(
+            &mut e,
+            "SELECT format('%s/%s/%s', VARIADIC ARRAY['x','y','z'])"
+        ),
         "x/y/z"
     );
 }

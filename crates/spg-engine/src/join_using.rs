@@ -465,9 +465,7 @@ fn expand_wildcards(
                 spliced = true;
             }
             SelectItem::Wildcard => {}
-            other @ (SelectItem::Expr { .. } | SelectItem::QualifiedWildcard(_)) => {
-                out.push(other)
-            }
+            other @ (SelectItem::Expr { .. } | SelectItem::QualifiedWildcard(_)) => out.push(other),
         }
     }
     *items = out;

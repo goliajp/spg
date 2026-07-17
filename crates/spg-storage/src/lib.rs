@@ -1666,7 +1666,8 @@ pub mod priv_bits {
     pub const EXECUTE: u16 = 1 << 12; // X
     /// Every TABLE privilege — what `GRANT ALL ON <table>` grants and what a
     /// table's owner holds.
-    pub const ALL: u16 = INSERT | SELECT | UPDATE | DELETE | TRUNCATE | REFERENCES | TRIGGER | MAINTAIN;
+    pub const ALL: u16 =
+        INSERT | SELECT | UPDATE | DELETE | TRUNCATE | REFERENCES | TRIGGER | MAINTAIN;
     /// `GRANT ALL ON SEQUENCE` — PG renders a sequence owner's default as `rwU`.
     pub const ALL_SEQUENCE: u16 = SELECT | UPDATE | USAGE;
     /// `GRANT ALL ON SCHEMA` — `UC`.
@@ -3562,7 +3563,10 @@ pub fn function_signature_key(name: &str, args_repr: &str) -> String {
 /// bare type with no name (`"(INT)"`).
 #[must_use]
 pub fn function_arg_types(args_repr: &str) -> Vec<String> {
-    let inner = args_repr.trim().trim_start_matches('(').trim_end_matches(')');
+    let inner = args_repr
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
     if inner.trim().is_empty() {
         return Vec::new();
     }
@@ -3591,7 +3595,10 @@ pub fn function_arg_types(args_repr: &str) -> Vec<String> {
 /// a bare type with no name).
 #[must_use]
 pub fn function_arg_names(args_repr: &str) -> Vec<String> {
-    let inner = args_repr.trim().trim_start_matches('(').trim_end_matches(')');
+    let inner = args_repr
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
     if inner.trim().is_empty() {
         return Vec::new();
     }
@@ -4373,9 +4380,7 @@ impl Catalog {
             )));
         }
         let at = def.labels.iter().position(|l| l == old).ok_or_else(|| {
-            StorageError::Corrupt(format!(
-                "{old:?} is not an existing enum label"
-            ))
+            StorageError::Corrupt(format!("{old:?} is not an existing enum label"))
         })?;
         def.labels[at] = new.to_string();
         Ok(())
@@ -4727,8 +4732,7 @@ impl Catalog {
     /// v7.39 (round 139) — drop a RULE by `(name, table)`.
     pub fn drop_rule(&mut self, name: &str, table: &str) -> bool {
         let before = self.rules.len();
-        self.rules
-            .retain(|r| !(r.name == name && r.table == table));
+        self.rules.retain(|r| !(r.name == name && r.table == table));
         before != self.rules.len()
     }
 
@@ -6418,7 +6422,10 @@ impl fmt::Display for StorageError {
                 // v7.39 (SQLSTATE fidelity) — PG's 23502 phrasing (the
                 // relation-qualified long form is added by engine call
                 // sites that know the table name).
-                write!(f, "null value in column \"{column}\" violates not-null constraint")
+                write!(
+                    f,
+                    "null value in column \"{column}\" violates not-null constraint"
+                )
             }
             // v7.39 (read01 round 47) — an index is a relation to PG (42P07).
             Self::DuplicateIndex { name } => write!(f, "relation \"{name}\" already exists"),
@@ -7470,8 +7477,7 @@ impl Catalog {
             }
             write_u16(
                 &mut out,
-                u16::try_from(comp_bindings.len())
-                    .expect("≤ 65k composite-typed columns/table"),
+                u16::try_from(comp_bindings.len()).expect("≤ 65k composite-typed columns/table"),
             );
             for (pos, n) in comp_bindings {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
@@ -7783,7 +7789,10 @@ impl Catalog {
         // reader stops cleanly before it. Layout: [u32 count] then per rule
         // [str name][str table][str event][u8 instead][str when]
         // [u16 cmd_count]([str cmd] × cmd_count).
-        write_u32(&mut out, u32::try_from(self.rules.len()).expect("≤ 4G rules"));
+        write_u32(
+            &mut out,
+            u32::try_from(self.rules.len()).expect("≤ 4G rules"),
+        );
         for r in &self.rules {
             write_str(&mut out, &r.name);
             write_str(&mut out, &r.table);

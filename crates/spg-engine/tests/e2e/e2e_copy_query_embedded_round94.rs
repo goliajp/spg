@@ -26,7 +26,8 @@ fn copy_lines(e: &mut Engine, sql: &str) -> Vec<String> {
 fn seed() -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TABLE cq (a int, b text)").unwrap();
-    e.execute("INSERT INTO cq VALUES (1,'x'),(2,'y'),(3,NULL)").unwrap();
+    e.execute("INSERT INTO cq VALUES (1,'x'),(2,'y'),(3,NULL)")
+        .unwrap();
     e
 }
 
@@ -34,10 +35,16 @@ fn seed() -> Engine {
 fn embedded_query_text() {
     let mut e = seed();
     assert_eq!(
-        copy_lines(&mut e, "COPY (SELECT a, b FROM cq WHERE a <> 2 ORDER BY a) TO STDOUT"),
+        copy_lines(
+            &mut e,
+            "COPY (SELECT a, b FROM cq WHERE a <> 2 ORDER BY a) TO STDOUT"
+        ),
         ["1\tx", "3\t\\N"]
     );
-    assert_eq!(copy_lines(&mut e, "COPY (SELECT count(*) FROM cq) TO STDOUT"), ["3"]);
+    assert_eq!(
+        copy_lines(&mut e, "COPY (SELECT count(*) FROM cq) TO STDOUT"),
+        ["3"]
+    );
 }
 
 #[test]

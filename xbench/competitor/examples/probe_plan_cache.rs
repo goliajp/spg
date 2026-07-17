@@ -18,7 +18,8 @@ fn main() {
     e.execute("CREATE TABLE t (a INT)").unwrap();
     e.execute("INSERT INTO t VALUES (1)").unwrap();
     println!("s1 pre : {}", run(&mut e, "SELECT * FROM t"));
-    e.execute("ALTER TABLE t ADD COLUMN b INT DEFAULT 7").unwrap();
+    e.execute("ALTER TABLE t ADD COLUMN b INT DEFAULT 7")
+        .unwrap();
     println!("s1 post: {}", run(&mut e, "SELECT * FROM t"));
 
     // 2. DROP + recreate with different schema, same SQL.
@@ -37,7 +38,10 @@ fn main() {
     e.execute("INSERT INTO t VALUES (5)").unwrap();
     println!("s3 pre : {}", run(&mut e, "SELECT a FROM t WHERE a = 5"));
     e.execute("ALTER TABLE t RENAME COLUMN a TO z").unwrap();
-    println!("s3 post (must ERR): {}", run(&mut e, "SELECT a FROM t WHERE a = 5"));
+    println!(
+        "s3 post (must ERR): {}",
+        run(&mut e, "SELECT a FROM t WHERE a = 5")
+    );
 
     // 4. RENAME TABLE.
     let mut e = Engine::new();
@@ -51,7 +55,13 @@ fn main() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (a INT)").unwrap();
     e.execute("INSERT INTO t VALUES (5)").unwrap();
-    println!("s5 pre : {}", run(&mut e, "SELECT count(*) FROM t WHERE a > 3"));
+    println!(
+        "s5 pre : {}",
+        run(&mut e, "SELECT count(*) FROM t WHERE a > 3")
+    );
     e.execute("ALTER TABLE t ALTER COLUMN a TYPE TEXT").unwrap();
-    println!("s5 post: {}", run(&mut e, "SELECT count(*) FROM t WHERE a > 3"));
+    println!(
+        "s5 post: {}",
+        run(&mut e, "SELECT count(*) FROM t WHERE a > 3")
+    );
 }

@@ -35,7 +35,10 @@ fn r1(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn a_homogeneous_literal_keeps_its_type() {
     let mut e = Engine::new();
-    assert_eq!(r1(&mut e, "SELECT pg_typeof(ARRAY[true,false])"), "boolean[]");
+    assert_eq!(
+        r1(&mut e, "SELECT pg_typeof(ARRAY[true,false])"),
+        "boolean[]"
+    );
     assert_eq!(
         r1(&mut e, "SELECT pg_typeof(ARRAY['2024-01-01'::date])"),
         "date[]"
@@ -52,15 +55,24 @@ fn a_homogeneous_literal_keeps_its_type() {
 fn array_remove_works_on_every_element_type() {
     let mut e = Engine::new();
     assert_eq!(
-        r1(&mut e, "SELECT array_to_string(array_remove(ARRAY['a','b','a'],'a'),'|')"),
+        r1(
+            &mut e,
+            "SELECT array_to_string(array_remove(ARRAY['a','b','a'],'a'),'|')"
+        ),
         "b"
     );
     assert_eq!(
-        r1(&mut e, "SELECT array_to_string(array_remove(ARRAY[true,false,true],false),'|')"),
+        r1(
+            &mut e,
+            "SELECT array_to_string(array_remove(ARRAY[true,false,true],false),'|')"
+        ),
         "t|t"
     );
     assert_eq!(
-        r1(&mut e, "SELECT array_to_string(array_remove(ARRAY[1.5,2.5],1.5),'|')"),
+        r1(
+            &mut e,
+            "SELECT array_to_string(array_remove(ARRAY[1.5,2.5],1.5),'|')"
+        ),
         "2.5"
     );
     assert_eq!(
@@ -76,15 +88,24 @@ fn array_remove_works_on_every_element_type() {
 fn array_replace_works_on_every_element_type() {
     let mut e = Engine::new();
     assert_eq!(
-        r1(&mut e, "SELECT array_to_string(array_replace(ARRAY['a','b','a'],'a','z'),'|')"),
+        r1(
+            &mut e,
+            "SELECT array_to_string(array_replace(ARRAY['a','b','a'],'a','z'),'|')"
+        ),
         "z|b|z"
     );
     assert_eq!(
-        r1(&mut e, "SELECT array_to_string(array_replace(ARRAY[true,false],false,true),'|')"),
+        r1(
+            &mut e,
+            "SELECT array_to_string(array_replace(ARRAY[true,false],false,true),'|')"
+        ),
         "t|t"
     );
     assert_eq!(
-        r1(&mut e, "SELECT array_to_string(array_replace(ARRAY[1,2,1],1,9),'|')"),
+        r1(
+            &mut e,
+            "SELECT array_to_string(array_replace(ARRAY[1,2,1],1,9),'|')"
+        ),
         "9|2|9"
     );
 }
@@ -93,11 +114,17 @@ fn array_replace_works_on_every_element_type() {
 fn a_bool_element_renders_as_t_inside_an_array() {
     // The ARRAY rendering, not the scalar one — `t`, not `true`.
     let mut e = Engine::new();
-    assert_eq!(r1(&mut e, "SELECT array_to_string(ARRAY[true,false],'|')"), "t|f");
+    assert_eq!(
+        r1(&mut e, "SELECT array_to_string(ARRAY[true,false],'|')"),
+        "t|f"
+    );
 }
 
 #[test]
 fn array_to_string_handles_a_numeric_array() {
     let mut e = Engine::new();
-    assert_eq!(r1(&mut e, "SELECT array_to_string(ARRAY[1.5,2.5],'|')"), "1.5|2.5");
+    assert_eq!(
+        r1(&mut e, "SELECT array_to_string(ARRAY[1.5,2.5],'|')"),
+        "1.5|2.5"
+    );
 }

@@ -11,7 +11,10 @@ use spg_engine::{Engine, QueryResult};
 
 fn tri(e: &mut Engine, sql: &str) -> String {
     let wrapped = format!("SELECT coalesce(({sql})::text, 'NULL')");
-    match e.execute(&wrapped).unwrap_or_else(|x| panic!("{wrapped}: {x:?}")) {
+    match e
+        .execute(&wrapped)
+        .unwrap_or_else(|x| panic!("{wrapped}: {x:?}"))
+    {
         QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{wrapped}: {other:?}"),
     }
@@ -57,6 +60,9 @@ fn scalar_subquery_cardinality() {
 fn exists_counts_null_rows() {
     let mut e = Engine::new();
     setup(&mut e);
-    assert_eq!(tri(&mut e, "EXISTS(SELECT 1 FROM s WHERE x IS NULL)"), "true");
+    assert_eq!(
+        tri(&mut e, "EXISTS(SELECT 1 FROM s WHERE x IS NULL)"),
+        "true"
+    );
     assert_eq!(tri(&mut e, "NOT EXISTS(SELECT 1 FROM s WHERE x=9)"), "true");
 }

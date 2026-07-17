@@ -30,10 +30,7 @@ fn is_binds_looser_than_every_operator() {
     );
     // ... but tighter than NOT / AND / OR.
     assert_eq!(
-        row_of(
-            &mut e,
-            "SELECT NOT 1 IS NULL, true AND false IS NULL"
-        ),
+        row_of(&mut e, "SELECT NOT 1 IS NULL, true AND false IS NULL"),
         vec!["true", "false"]
     );
     // IS chains left-to-right: (1 IS NULL) = false, then false IS NULL.

@@ -16,7 +16,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn err(e: &mut Engine, sql: &str) -> String {
@@ -106,7 +107,10 @@ fn execute_is_granted_to_public_by_default() {
     ok(&mut e, "CREATE ROLE fred LOGIN PASSWORD 'x'");
     // PG's default is not "nobody may call it" — proacl stays NULL to say so.
     assert_eq!(
-        r1(&mut e, "SELECT has_function_privilege('fred','f1(int)','EXECUTE')"),
+        r1(
+            &mut e,
+            "SELECT has_function_privilege('fred','f1(int)','EXECUTE')"
+        ),
         "true"
     );
     assert_eq!(
@@ -131,7 +135,10 @@ fn revoking_execute_from_public_actually_stops_the_call() {
         "{admin=X/admin}"
     );
     assert_eq!(
-        r1(&mut e, "SELECT has_function_privilege('fred','f1(int)','EXECUTE')"),
+        r1(
+            &mut e,
+            "SELECT has_function_privilege('fred','f1(int)','EXECUTE')"
+        ),
         "false"
     );
     ok(&mut e, "SET ROLE fred");
@@ -153,7 +160,10 @@ fn grant_on_all_tables_in_schema_expands() {
     let mut e = seeded();
     ok(&mut e, "CREATE ROLE fred LOGIN PASSWORD 'x'");
     ok(&mut e, "CREATE TABLE t2 (a int)");
-    ok(&mut e, "GRANT SELECT ON ALL TABLES IN SCHEMA public TO fred");
+    ok(
+        &mut e,
+        "GRANT SELECT ON ALL TABLES IN SCHEMA public TO fred",
+    );
     assert_eq!(
         r1(&mut e, "SELECT has_table_privilege('fred','t','SELECT')"),
         "true"
@@ -162,7 +172,10 @@ fn grant_on_all_tables_in_schema_expands() {
         r1(&mut e, "SELECT has_table_privilege('fred','t2','SELECT')"),
         "true"
     );
-    ok(&mut e, "REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM fred");
+    ok(
+        &mut e,
+        "REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM fred",
+    );
     assert_eq!(
         r1(&mut e, "SELECT has_table_privilege('fred','t','SELECT')"),
         "false"

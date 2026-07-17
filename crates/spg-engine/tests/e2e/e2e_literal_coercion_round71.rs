@@ -20,7 +20,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn r1(e: &mut Engine, sql: &str) -> String {
@@ -50,12 +51,18 @@ fn a_range_beside_a_literal_is_a_range() {
     let mut e = seeded();
     // Used to reach the INET operator: "requires INET/CIDR/TEXT operands".
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE r && '[4,11)'"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE r && '[4,11)'"
+        ),
         "1,2"
     );
     // The containment reading of the same operator is untouched.
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE r @> 3"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE r @> 3"
+        ),
         "1"
     );
 }
@@ -64,7 +71,10 @@ fn a_range_beside_a_literal_is_a_range() {
 fn a_tsvector_matches_a_bare_literal_query() {
     let mut e = seeded();
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE ts @@ 'a'"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text, ',' ORDER BY id) FROM t WHERE ts @@ 'a'"
+        ),
         "1"
     );
     // The literal goes through the tsquery INPUT function, not to_tsquery: no
@@ -74,7 +84,10 @@ fn a_tsvector_matches_a_bare_literal_query() {
         "0"
     );
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text, ',') FROM t WHERE ts @@ 'c & d'"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text, ',') FROM t WHERE ts @@ 'c & d'"
+        ),
         "2"
     );
 }
@@ -83,12 +96,18 @@ fn a_tsvector_matches_a_bare_literal_query() {
 fn array_remove_handles_text_arrays() {
     let mut e = seeded();
     assert_eq!(
-        r1(&mut e, "SELECT array_to_string(array_remove(tags,'a'),'|') FROM t WHERE id=1"),
+        r1(
+            &mut e,
+            "SELECT array_to_string(array_remove(tags,'a'),'|') FROM t WHERE id=1"
+        ),
         "b"
     );
     // The int arrays it always handled still work.
     assert_eq!(
-        r1(&mut e, "SELECT array_to_string(array_remove(ARRAY[1,2,3], 2), '|')"),
+        r1(
+            &mut e,
+            "SELECT array_to_string(array_remove(ARRAY[1,2,3], 2), '|')"
+        ),
         "1|3"
     );
 }
@@ -97,7 +116,10 @@ fn array_remove_handles_text_arrays() {
 fn the_inet_reading_of_the_same_operators_survives() {
     let mut e = seeded();
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text, ',') FROM t WHERE ip << '192.168.0.0/16'"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text, ',') FROM t WHERE ip << '192.168.0.0/16'"
+        ),
         "2"
     );
 }

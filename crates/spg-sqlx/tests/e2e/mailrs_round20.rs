@@ -5,6 +5,9 @@
 //! column-not-found error from round-20 B in one test.
 //! Note: `.claude/notes/mailrs-embed-round20-column-typeinfo-and-ea.md`.
 
+// Rust 2024 makes env::set_var unsafe; these tests toggle the inline
+// budget knob process-wide, which is safe under the single-test flow.
+#![allow(unsafe_code)]
 use spg_sqlx::{SpgPool, SpgPoolExt};
 
 const SEARCH_SQL: &str = include_str!("mailrs_round20_search.sql");

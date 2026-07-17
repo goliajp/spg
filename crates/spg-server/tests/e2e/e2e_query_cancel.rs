@@ -137,10 +137,7 @@ fn cancel_request_interrupts_running_statement() {
             b'E' => {
                 let text = String::from_utf8_lossy(&m.body).to_string();
                 assert!(text.contains("57014"), "sqlstate in {text:?}");
-                assert!(
-                    text.contains("user request"),
-                    "PG cancel text in {text:?}"
-                );
+                assert!(text.contains("user request"), "PG cancel text in {text:?}");
                 got_error = true;
             }
             b'Z' => break,

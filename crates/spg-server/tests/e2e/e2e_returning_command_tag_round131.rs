@@ -103,7 +103,10 @@ fn unique_tmpdir(label: &str) -> PathBuf {
 }
 
 fn local_spawn(db: &std::path::Path) -> (std::process::Child, common::ServerAddrs) {
-    common::ServerBuilder::new().arg_path(db).with_pgwire().spawn()
+    common::ServerBuilder::new()
+        .arg_path(db)
+        .with_pgwire()
+        .spawn()
 }
 
 #[test]

@@ -27,7 +27,8 @@ fn big(v: &spg_storage::Value<'_>) -> i64 {
 #[test]
 fn stat_user_tables_reports_real_write_and_dead_counters() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE stt(id INT PRIMARY KEY, v TEXT)").unwrap();
+    e.execute("CREATE TABLE stt(id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     e.execute("INSERT INTO stt SELECT g, 'x' FROM generate_series(1,100) g")
         .unwrap();
     e.execute("UPDATE stt SET v='y' WHERE id <= 30").unwrap();
@@ -54,10 +55,7 @@ fn stat_user_tables_reports_real_write_and_dead_counters() {
 fn stat_database_counts_implicit_and_explicit_xacts() {
     let mut e = Engine::new();
     let read = |e: &mut Engine| -> (i64, i64) {
-        let r = one_row(
-            e,
-            "SELECT xact_commit, xact_rollback FROM pg_stat_database",
-        );
+        let r = one_row(e, "SELECT xact_commit, xact_rollback FROM pg_stat_database");
         (big(&r[0]), big(&r[1]))
     };
     let (c0, r0) = read(&mut e);
@@ -89,13 +87,15 @@ fn stat_database_counts_implicit_and_explicit_xacts() {
 #[test]
 fn stat_user_tables_reports_scan_counters() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE sct(id INT PRIMARY KEY, v TEXT)").unwrap();
+    e.execute("CREATE TABLE sct(id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     e.execute("INSERT INTO sct SELECT g, 'x' FROM generate_series(1,100) g")
         .unwrap();
     // A full-table aggregate and a non-indexed filter are sequential
     // scans; an equality probe on the PK is an index scan.
     e.execute("SELECT count(*) FROM sct").unwrap();
-    e.execute("SELECT v FROM sct WHERE v = 'x' LIMIT 1").unwrap();
+    e.execute("SELECT v FROM sct WHERE v = 'x' LIMIT 1")
+        .unwrap();
     e.execute("SELECT v FROM sct WHERE id = 7").unwrap();
     let r = one_row(
         &mut e,
@@ -132,20 +132,22 @@ fn stat_user_tables_reports_analyze_stamp_and_db_tup_counters() {
          FROM pg_stat_user_tables WHERE relname = 'mst'",
     );
     assert_eq!(r[0], spg_storage::Value::Bool(true), "analyze stamped");
-    assert_eq!(r[1], spg_storage::Value::Bool(true), "manual vacuum stays NULL");
+    assert_eq!(
+        r[1],
+        spg_storage::Value::Bool(true),
+        "manual vacuum stays NULL"
+    );
     // tup_returned aggregates scan reads; a full scan of 50 rows moves it.
     e.execute("SELECT count(*) FROM mst").unwrap();
-    let r = one_row(
-        &mut e,
-        "SELECT tup_returned >= 50 FROM pg_stat_database",
-    );
+    let r = one_row(&mut e, "SELECT tup_returned >= 50 FROM pg_stat_database");
     assert_eq!(r[0], spg_storage::Value::Bool(true), "tup_returned moved");
 }
 
 #[test]
 fn stat_database_blks_ratio_moves_with_tiers() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE bt(id INT PRIMARY KEY, v TEXT)").unwrap();
+    e.execute("CREATE TABLE bt(id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     e.execute("INSERT INTO bt SELECT g, 'x' FROM generate_series(1,50) g")
         .unwrap();
     e.execute("SELECT count(*) FROM bt").unwrap();

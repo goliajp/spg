@@ -38,7 +38,8 @@ fn headers(e: &mut Engine, sql: &str) -> Vec<String> {
 #[test]
 fn action_target_old_new() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE mt(id int primary key, v int)").unwrap();
+    e.execute("CREATE TABLE mt(id int primary key, v int)")
+        .unwrap();
     e.execute("INSERT INTO mt VALUES(1,10),(2,20)").unwrap();
     e.execute("CREATE TABLE ms(id int, v int)").unwrap();
     e.execute("INSERT INTO ms VALUES(1,100),(3,300)").unwrap();
@@ -61,7 +62,8 @@ fn action_target_old_new() {
 #[test]
 fn old_star_new_star() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE mt(id int primary key, v int)").unwrap();
+    e.execute("CREATE TABLE mt(id int primary key, v int)")
+        .unwrap();
     e.execute("INSERT INTO mt VALUES(1,10)").unwrap();
     e.execute("CREATE TABLE ms(id int, v int)").unwrap();
     e.execute("INSERT INTO ms VALUES(1,100)").unwrap();
@@ -80,7 +82,8 @@ fn old_star_new_star() {
 #[test]
 fn delete_action_and_bare_star_ordering() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE mt(id int primary key, tv int)").unwrap();
+    e.execute("CREATE TABLE mt(id int primary key, tv int)")
+        .unwrap();
     e.execute("INSERT INTO mt VALUES(9,90)").unwrap();
     e.execute("CREATE TABLE ms(sid int, sv int)").unwrap();
     e.execute("INSERT INTO ms VALUES(9,7)").unwrap();
@@ -99,7 +102,8 @@ fn delete_action_and_bare_star_ordering() {
 #[test]
 fn returning_column_names() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE mt(id int primary key, v int)").unwrap();
+    e.execute("CREATE TABLE mt(id int primary key, v int)")
+        .unwrap();
     e.execute("INSERT INTO mt VALUES(1,10)").unwrap();
     e.execute("CREATE TABLE ms(id int, v int)").unwrap();
     e.execute("INSERT INTO ms VALUES(1,100)").unwrap();
@@ -118,15 +122,14 @@ fn returning_column_names() {
 #[test]
 fn merge_without_returning_still_commandok() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE mt(id int primary key, v int)").unwrap();
+    e.execute("CREATE TABLE mt(id int primary key, v int)")
+        .unwrap();
     e.execute("INSERT INTO mt VALUES(1,10)").unwrap();
     e.execute("CREATE TABLE ms(id int, v int)").unwrap();
     e.execute("INSERT INTO ms VALUES(1,100)").unwrap();
     // Regression: no RETURNING → CommandOk, not Rows.
     match e
-        .execute(
-            "MERGE INTO mt t USING ms s ON t.id=s.id WHEN MATCHED THEN UPDATE SET v=s.v",
-        )
+        .execute("MERGE INTO mt t USING ms s ON t.id=s.id WHEN MATCHED THEN UPDATE SET v=s.v")
         .unwrap()
     {
         QueryResult::CommandOk { affected, .. } => assert_eq!(affected, 1),

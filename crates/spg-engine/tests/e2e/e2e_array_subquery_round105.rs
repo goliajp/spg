@@ -20,10 +20,16 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn array_subquery_collects_rows_in_order() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT (ARRAY(SELECT generate_series(1,3)))::text"), "{1,2,3}");
+    assert_eq!(
+        text(&mut e, "SELECT (ARRAY(SELECT generate_series(1,3)))::text"),
+        "{1,2,3}"
+    );
     // Lowercase spelling + a descending series preserves order.
     assert_eq!(
-        text(&mut e, "SELECT (array(SELECT x FROM generate_series(3,1,-1) x))::text"),
+        text(
+            &mut e,
+            "SELECT (array(SELECT x FROM generate_series(3,1,-1) x))::text"
+        ),
         "{3,2,1}"
     );
 }
@@ -32,11 +38,17 @@ fn array_subquery_collects_rows_in_order() {
 fn array_subquery_honors_where_order_limit() {
     let mut e = Engine::new();
     assert_eq!(
-        text(&mut e, "SELECT (ARRAY(SELECT x FROM generate_series(1,5) x WHERE x%2=1 ORDER BY x DESC))::text"),
+        text(
+            &mut e,
+            "SELECT (ARRAY(SELECT x FROM generate_series(1,5) x WHERE x%2=1 ORDER BY x DESC))::text"
+        ),
         "{5,3,1}"
     );
     assert_eq!(
-        text(&mut e, "SELECT (ARRAY(SELECT x FROM generate_series(1,5) x ORDER BY x DESC LIMIT 3))::text"),
+        text(
+            &mut e,
+            "SELECT (ARRAY(SELECT x FROM generate_series(1,5) x ORDER BY x DESC LIMIT 3))::text"
+        ),
         "{5,4,3}"
     );
 }
@@ -45,11 +57,17 @@ fn array_subquery_honors_where_order_limit() {
 fn array_subquery_union_and_with() {
     let mut e = Engine::new();
     assert_eq!(
-        text(&mut e, "SELECT (ARRAY(SELECT 'a' UNION SELECT 'b' ORDER BY 1))::text"),
+        text(
+            &mut e,
+            "SELECT (ARRAY(SELECT 'a' UNION SELECT 'b' ORDER BY 1))::text"
+        ),
         "{a,b}"
     );
     assert_eq!(
-        text(&mut e, "SELECT (ARRAY(WITH t AS (SELECT 5 AS n) SELECT n FROM t))::text"),
+        text(
+            &mut e,
+            "SELECT (ARRAY(WITH t AS (SELECT 5 AS n) SELECT n FROM t))::text"
+        ),
         "{5}"
     );
 }
@@ -59,5 +77,8 @@ fn array_literal_constructor_unaffected() {
     // Regression guard: ARRAY[...] (the literal form) must still parse.
     let mut e = Engine::new();
     assert_eq!(text(&mut e, "SELECT ARRAY[1,2,3]::text"), "{1,2,3}");
-    assert_eq!(text(&mut e, "SELECT ARRAY[[1,2],[3,4]]::text"), "{{1,2},{3,4}}");
+    assert_eq!(
+        text(&mut e, "SELECT ARRAY[[1,2],[3,4]]::text"),
+        "{{1,2},{3,4}}"
+    );
 }

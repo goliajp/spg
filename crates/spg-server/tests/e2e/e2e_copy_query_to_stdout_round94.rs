@@ -20,7 +20,10 @@ use std::time::Duration;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn local_spawn(db: &std::path::Path) -> (std::process::Child, common::ServerAddrs) {
-    common::ServerBuilder::new().arg_path(db).with_pgwire().spawn()
+    common::ServerBuilder::new()
+        .arg_path(db)
+        .with_pgwire()
+        .spawn()
 }
 
 fn unique_tmpdir(label: &str) -> PathBuf {
@@ -114,7 +117,10 @@ fn copy_out(s: &mut TcpStream, sql: &str) -> String {
     // A COPY OUT must open with CopyOutResponse ('H') and close with
     // CopyDone ('c'); assert both so a regression to a normal result set
     // (RowDescription/DataRow) is caught, not silently string-matched.
-    assert!(msgs.iter().any(|m| m.ty == b'H'), "no CopyOutResponse for {sql}");
+    assert!(
+        msgs.iter().any(|m| m.ty == b'H'),
+        "no CopyOutResponse for {sql}"
+    );
     assert!(msgs.iter().any(|m| m.ty == b'c'), "no CopyDone for {sql}");
     let mut out = Vec::new();
     for m in &msgs {
@@ -141,11 +147,17 @@ fn query_form_text_and_null() {
 
     // Plain text: tab-separated, `\N` for NULL, filtered + ordered.
     assert_eq!(
-        copy_out(&mut s, "COPY (SELECT a, b FROM cq WHERE a <> 2 ORDER BY a) TO STDOUT"),
+        copy_out(
+            &mut s,
+            "COPY (SELECT a, b FROM cq WHERE a <> 2 ORDER BY a) TO STDOUT"
+        ),
         "1\tx\n3\t\\N\n"
     );
     // An aggregate query is a valid COPY source.
-    assert_eq!(copy_out(&mut s, "COPY (SELECT count(*) FROM cq) TO STDOUT"), "3\n");
+    assert_eq!(
+        copy_out(&mut s, "COPY (SELECT count(*) FROM cq) TO STDOUT"),
+        "3\n"
+    );
 }
 
 #[test]
@@ -202,7 +214,10 @@ fn table_form_now_honours_options() {
     let mut s = open(addrs.pgwire.as_ref().unwrap());
     seed(&mut s);
 
-    assert_eq!(copy_out(&mut s, "COPY cq TO STDOUT"), "1\tx\n2\ty\n3\t\\N\n");
+    assert_eq!(
+        copy_out(&mut s, "COPY cq TO STDOUT"),
+        "1\tx\n2\ty\n3\t\\N\n"
+    );
     assert_eq!(
         copy_out(&mut s, "COPY cq TO STDOUT WITH (FORMAT csv, HEADER)"),
         "a,b\n1,x\n2,y\n3,\n"

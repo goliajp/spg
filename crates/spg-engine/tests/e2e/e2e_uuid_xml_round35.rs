@@ -46,8 +46,13 @@ fn uuid_io_and_extract() {
         ),
         vec!["4", "7"]
     );
-    assert!(err_of(&mut e, "SELECT 'zzze8400-e29b-41d4-a716-446655440000'::uuid")
-        .contains("invalid input syntax for type uuid"));
+    assert!(
+        err_of(
+            &mut e,
+            "SELECT 'zzze8400-e29b-41d4-a716-446655440000'::uuid"
+        )
+        .contains("invalid input syntax for type uuid")
+    );
 }
 
 #[test]

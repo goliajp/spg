@@ -8,7 +8,8 @@ fn main() {
     eng.execute("CREATE TABLE fx (x DOUBLE PRECISION)").unwrap();
     eng.execute("INSERT INTO fx VALUES ('NaN'::float8),(1.0),('NaN'),(2.0),('-0'::float8),(0.0)")
         .unwrap();
-    eng.execute("CREATE TABLE fn2 (x DOUBLE PRECISION)").unwrap();
+    eng.execute("CREATE TABLE fn2 (x DOUBLE PRECISION)")
+        .unwrap();
     eng.execute("INSERT INTO fn2 VALUES (1.0),('NaN'::float8),(NULL),(2.0)")
         .unwrap();
     for sql in [

@@ -62,8 +62,10 @@ fn replace_start_n_shape() {
         row_of(&mut e, "SELECT regexp_replace('abcabc', 'b', 'X', 'g')"),
         vec!["aXcaXc"]
     );
-    assert!(err_of(&mut e, "SELECT regexp_replace('abc', 'b', 'X', 0, 1)")
-        .contains("invalid value for parameter \"start\": 0"));
+    assert!(
+        err_of(&mut e, "SELECT regexp_replace('abc', 'b', 'X', 0, 1)")
+            .contains("invalid value for parameter \"start\": 0")
+    );
 }
 
 #[test]
@@ -77,8 +79,12 @@ fn instr_subexpr_and_wordings() {
         ),
         vec!["5", "3"]
     );
-    assert!(err_of(&mut e, "SELECT regexp_instr('abcdef', 'c', 0)")
-        .contains("invalid value for parameter \"start\": 0"));
-    assert!(err_of(&mut e, "SELECT 'abc' ~ '('")
-        .contains("invalid regular expression: parentheses () not balanced"));
+    assert!(
+        err_of(&mut e, "SELECT regexp_instr('abcdef', 'c', 0)")
+            .contains("invalid value for parameter \"start\": 0")
+    );
+    assert!(
+        err_of(&mut e, "SELECT 'abc' ~ '('")
+            .contains("invalid regular expression: parentheses () not balanced")
+    );
 }

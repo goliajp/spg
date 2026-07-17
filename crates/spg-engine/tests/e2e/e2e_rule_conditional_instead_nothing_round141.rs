@@ -40,7 +40,8 @@ fn affected(e: &mut Engine, sql: &str) -> usize {
 fn delete_conditional_over_old() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE d(id int, v int)").unwrap();
-    e.execute("INSERT INTO d VALUES (1,10),(2,20),(3,30)").unwrap();
+    e.execute("INSERT INTO d VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     e.execute("CREATE RULE rd AS ON DELETE TO d WHERE OLD.v > 15 DO INSTEAD NOTHING")
         .unwrap();
     // Only id=1 (v=10, not > 15) is deleted; 2 and 3 are blocked.
@@ -55,7 +56,8 @@ fn delete_conditional_over_old() {
 fn update_conditional_new_post_image_partial() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u(id int, v int)").unwrap();
-    e.execute("INSERT INTO u VALUES (1,10),(2,20),(3,30)").unwrap();
+    e.execute("INSERT INTO u VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     e.execute("CREATE RULE ru AS ON UPDATE TO u WHERE NEW.v < 0 DO INSTEAD NOTHING")
         .unwrap();
     // v-25: 10->-15 (blocked), 20->-5 (blocked), 30->5 (ok). UPDATE 1.
@@ -70,7 +72,8 @@ fn update_conditional_new_post_image_partial() {
 fn update_conditional_new_all_pass() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u(id int, v int)").unwrap();
-    e.execute("INSERT INTO u VALUES (1,-5),(2,7),(3,-1)").unwrap();
+    e.execute("INSERT INTO u VALUES (1,-5),(2,7),(3,-1)")
+        .unwrap();
     e.execute("CREATE RULE ru AS ON UPDATE TO u WHERE NEW.v < 0 DO INSTEAD NOTHING")
         .unwrap();
     // v+100: all post-images positive → nothing blocked → all 3 updated.
@@ -102,7 +105,10 @@ fn insert_conditional_multi_row() {
     e.execute("CREATE RULE ri AS ON INSERT TO ins WHERE NEW.v > 15 DO INSTEAD NOTHING")
         .unwrap();
     // Only v <= 15 rows survive.
-    assert_eq!(affected(&mut e, "INSERT INTO ins VALUES (1,10),(2,20),(3,30)"), 1);
+    assert_eq!(
+        affected(&mut e, "INSERT INTO ins VALUES (1,10),(2,20),(3,30)"),
+        1
+    );
     assert_eq!(
         pairs(&mut e, "SELECT id, v FROM ins ORDER BY id"),
         vec![(1, Some(10))]
@@ -123,7 +129,10 @@ fn conditional_null_means_rule_does_not_apply() {
     e.execute("CREATE TABLE ins(id int, v int)").unwrap();
     e.execute("CREATE RULE ri AS ON INSERT TO ins WHERE NEW.v < 0 DO INSTEAD NOTHING")
         .unwrap();
-    assert_eq!(affected(&mut e, "INSERT INTO ins VALUES (1, NULL), (2, -3), (3, 8)"), 2);
+    assert_eq!(
+        affected(&mut e, "INSERT INTO ins VALUES (1, NULL), (2, -3), (3, 8)"),
+        2
+    );
     assert_eq!(
         pairs(&mut e, "SELECT id, v FROM ins ORDER BY id"),
         vec![(1, None), (3, Some(8))]

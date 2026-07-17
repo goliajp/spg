@@ -95,11 +95,8 @@ fn validate_known_guc(name: &str, value: &str) -> Result<(), EngineError> {
         // v7.39 (GUC knife 3) — the render GUCs reject invalid values
         // with PG's own texts (canonical-caps parameter names).
         "datestyle" => {
-            if crate::session::parse_datestyle_parts(
-                value,
-                crate::eval::RenderStyle::default(),
-            )
-            .is_none()
+            if crate::session::parse_datestyle_parts(value, crate::eval::RenderStyle::default())
+                .is_none()
             {
                 return Err(EngineError::Unsupported(alloc::format!(
                     "invalid value for parameter \"DateStyle\": \"{value}\""
@@ -113,18 +110,16 @@ fn validate_known_guc(name: &str, value: &str) -> Result<(), EngineError> {
                 )));
             }
         }
-        "extra_float_digits" => {
-            match value.trim().parse::<i64>() {
-                Ok(n) if (-15..=3).contains(&n) => {}
-                Ok(n) => {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "{n} is outside the valid range for parameter \
+        "extra_float_digits" => match value.trim().parse::<i64>() {
+            Ok(n) if (-15..=3).contains(&n) => {}
+            Ok(n) => {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "{n} is outside the valid range for parameter \
                          \"extra_float_digits\" (-15 .. 3)"
-                    )));
-                }
-                Err(_) => return Err(bad()),
+                )));
             }
-        }
+            Err(_) => return Err(bad()),
+        },
         _ => {}
     }
     Ok(())
@@ -868,9 +863,7 @@ impl Engine {
             // rebasing fails THIS statement with 40001 (the tx aborts
             // via the standard failed-statement path below, like PG's
             // in-statement 23505 after the lock wait).
-            if let Err(e) = self.maybe_rc_rebase() {
-                return Err(e);
-            }
+            self.maybe_rc_rebase()?;
         }
         let result = self.dispatch_stmt_inner(stmt, cancel);
         if result.is_ok() {
@@ -1035,7 +1028,13 @@ impl Engine {
                 columns,
                 query,
                 options,
-            } => self.exec_copy_to(&table, columns.as_deref(), query.as_deref(), &options, cancel),
+            } => self.exec_copy_to(
+                &table,
+                columns.as_deref(),
+                query.as_deref(),
+                &options,
+                cancel,
+            ),
             Statement::Begin(isolation) => self.exec_begin(isolation),
             Statement::Commit => self.exec_commit(),
             Statement::Rollback => self.exec_rollback(),
@@ -1166,8 +1165,7 @@ impl Engine {
                         let local = local;
                         if local {
                             if self.in_transaction() {
-                                let prior =
-                                    self.session_param("timezone").map(String::from);
+                                let prior = self.session_param("timezone").map(String::from);
                                 self.local_guc_saves.push(("timezone".into(), prior));
                                 self.set_session_param(
                                     "timezone".into(),
@@ -1225,8 +1223,7 @@ impl Engine {
                         .is_some_and(|st| st.stmts_run > 0)
                 {
                     return Err(EngineError::Unsupported(
-                        "SET TRANSACTION ISOLATION LEVEL must be called before any query"
-                            .into(),
+                        "SET TRANSACTION ISOLATION LEVEL must be called before any query".into(),
                     ));
                 }
                 self.current_isolation_level = isolation;
@@ -1627,10 +1624,8 @@ impl Engine {
         };
         let mut out_rows: alloc::vec::Vec<spg_storage::Row<'static>> = alloc::vec::Vec::new();
         if options.header {
-            let names: alloc::vec::Vec<Option<alloc::string::String>> = result_cols
-                .iter()
-                .map(|c| Some(c.name.clone()))
-                .collect();
+            let names: alloc::vec::Vec<Option<alloc::string::String>> =
+                result_cols.iter().map(|c| Some(c.name.clone())).collect();
             out_rows.push(spg_storage::Row::new(alloc::vec![Value::text(
                 encode_cells(&names)
             )]));

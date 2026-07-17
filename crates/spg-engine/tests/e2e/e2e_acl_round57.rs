@@ -15,7 +15,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn err(e: &mut Engine, sql: &str) -> String {
@@ -83,12 +84,24 @@ fn relacl_is_null_until_the_first_grant_then_materialises() {
 #[test]
 fn has_table_privilege_answers_from_the_acl() {
     let mut e = seeded();
-    assert_eq!(r1(&mut e, "SELECT has_table_privilege('bob','ac','SELECT')"), "false");
+    assert_eq!(
+        r1(&mut e, "SELECT has_table_privilege('bob','ac','SELECT')"),
+        "false"
+    );
     ok(&mut e, "GRANT SELECT ON ac TO bob");
-    assert_eq!(r1(&mut e, "SELECT has_table_privilege('bob','ac','SELECT')"), "true");
-    assert_eq!(r1(&mut e, "SELECT has_table_privilege('bob','ac','INSERT')"), "false");
+    assert_eq!(
+        r1(&mut e, "SELECT has_table_privilege('bob','ac','SELECT')"),
+        "true"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT has_table_privilege('bob','ac','INSERT')"),
+        "false"
+    );
     // The owner holds everything implicitly, ACL or no ACL.
-    assert_eq!(r1(&mut e, "SELECT has_table_privilege('admin','ac','DELETE')"), "true");
+    assert_eq!(
+        r1(&mut e, "SELECT has_table_privilege('admin','ac','DELETE')"),
+        "true"
+    );
 }
 
 #[test]

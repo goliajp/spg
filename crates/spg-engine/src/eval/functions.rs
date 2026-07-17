@@ -83,20 +83,15 @@ fn check_log_domain(v: &spg_storage::bignum::BigNumeric) -> Result<(), EvalError
 /// returns None so the caller's integer path (or its error) still applies.
 fn numeric_gcd_lcm(x: &Value<'_>, y: &Value<'_>, want_lcm: bool) -> Option<Value<'static>> {
     use spg_storage::bignum::BigNumeric;
-    let numericish =
-        |v: &Value<'_>| matches!(v, Value::Numeric { .. } | Value::NumericBig(_));
-    let intish = |v: &Value<'_>| {
-        matches!(v, Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_))
-    };
+    let numericish = |v: &Value<'_>| matches!(v, Value::Numeric { .. } | Value::NumericBig(_));
+    let intish = |v: &Value<'_>| matches!(v, Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_));
     if !(numericish(x) || numericish(y))
         || !(numericish(x) || intish(x))
         || !(numericish(y) || intish(y))
     {
         return None;
     }
-    let special = |v: &Value<'_>| {
-        matches!(v, Value::Numeric { kind, .. } if *kind != spg_storage::NumericKind::Finite)
-    };
+    let special = |v: &Value<'_>| matches!(v, Value::Numeric { kind, .. } if *kind != spg_storage::NumericKind::Finite);
     if special(x) || special(y) {
         return Some(Value::numeric_special(spg_storage::NumericKind::NaN));
     }
@@ -140,9 +135,7 @@ fn numeric_gcd_lcm(x: &Value<'_>, y: &Value<'_>, want_lcm: bool) -> Option<Value
 /// WHERE parentheses, as PG's pretty mode does. Shapes beyond a plain
 /// single-table SELECT fall back to the stored single-line body.
 fn pg_viewdef_render(body: &str, pretty: bool) -> String {
-    let Ok(spg_sql::ast::Statement::Select(stmt)) =
-        spg_sql::parser::parse_statement(body)
-    else {
+    let Ok(spg_sql::ast::Statement::Select(stmt)) = spg_sql::parser::parse_statement(body) else {
         return body.to_string();
     };
     // Narrow shape: no CTEs / unions / grouping / ordering / limits.
@@ -166,11 +159,7 @@ fn pg_viewdef_render(body: &str, pretty: bool) -> String {
         return body.to_string();
     }
     let mut out = String::from(" SELECT ");
-    let items: Vec<String> = stmt
-        .items
-        .iter()
-        .map(|i| alloc::format!("{i}"))
-        .collect();
+    let items: Vec<String> = stmt.items.iter().map(|i| alloc::format!("{i}")).collect();
     out.push_str(&items.join(",\n    "));
     out.push_str("\n   FROM ");
     out.push_str(&from.primary.name);
@@ -183,10 +172,7 @@ fn pg_viewdef_render(body: &str, pretty: bool) -> String {
     if let Some(w) = &stmt.where_ {
         out.push_str("\n  WHERE ");
         let mut pred = alloc::format!("{w}");
-        if pretty
-            && pred.starts_with('(')
-            && pred.ends_with(')')
-        {
+        if pretty && pred.starts_with('(') && pred.ends_with(')') {
             // Drop ONE redundant outer layer when it wraps the whole
             // predicate (balanced check).
             let inner = &pred[1..pred.len() - 1];
@@ -343,9 +329,7 @@ fn apply_function_dispatch(
     // before dispatch so every text builtin (upper / substring / position /
     // length / …) accepts CHAR(n) without a per-function arm. The padded
     // whitelist keeps the stored form where PG does.
-    if args.iter().any(|a| matches!(a, Value::BpChar(_)))
-        && !BPCHAR_PADDED_FNS.contains(&name)
-    {
+    if args.iter().any(|a| matches!(a, Value::BpChar(_))) && !BPCHAR_PADDED_FNS.contains(&name) {
         let stripped: alloc::vec::Vec<Value<'_>> = args
             .iter()
             .map(|a| match a {
@@ -11135,7 +11119,7 @@ fn apply_function_dispatch(
             // whole string is field 1 (or -1); other fields are ''.
             if delim.is_empty() {
                 return Ok(Value::text(if n == 1 || n == -1 {
-                    s.to_string()
+                    s.clone()
                 } else {
                     String::new()
                 }));
@@ -16777,11 +16761,7 @@ fn call_user_function<'v>(
             })
             .collect();
         return Err(EvalError::TypeMismatch {
-            detail: format!(
-                "function {}({}) does not exist",
-                def.name,
-                sig.join(", ")
-            ),
+            detail: format!("function {}({}) does not exist", def.name, sig.join(", ")),
         });
     }
     // The arguments become the columns of a synthetic one-row table, so the
@@ -16911,10 +16891,14 @@ fn user_fn_body_expr(def: &spg_storage::FunctionDef) -> Result<Expr, EvalError> 
             return Err(unsupported("a LANGUAGE sql body must be a SELECT"));
         };
         if s.items.len() != 1 {
-            return Err(unsupported("a LANGUAGE sql body must select exactly one value"));
+            return Err(unsupported(
+                "a LANGUAGE sql body must select exactly one value",
+            ));
         }
         let spg_sql::ast::SelectItem::Expr { expr, .. } = &s.items[0] else {
-            return Err(unsupported("a LANGUAGE sql body must select a value, not `*`"));
+            return Err(unsupported(
+                "a LANGUAGE sql body must select a value, not `*`",
+            ));
         };
         return Ok(expr.clone());
     }
@@ -17179,10 +17163,7 @@ fn roman_numeral_to_int(input: &str) -> Option<i32> {
             ('I', 'V') | ('I', 'X') | ('X', 'L') | ('X', 'C') | ('C', 'D') | ('C', 'M')
         )
     }
-    let chars: alloc::vec::Vec<char> = input
-        .chars()
-        .map(|c| c.to_ascii_uppercase())
-        .collect();
+    let chars: alloc::vec::Vec<char> = input.chars().map(|c| c.to_ascii_uppercase()).collect();
     if chars.is_empty() || chars.len() > 15 || chars.iter().any(|&c| val(c) == 0) {
         return None;
     }
@@ -17438,9 +17419,14 @@ fn parse_by_format(input: &str, fmt: &str) -> Result<(i32, u32, u32, u32, u32, u
                 .ok_or_else(|| alloc::format!("expected minute digits at position {ii}"))?;
             minute = v as u32;
             fi += 2;
-        } else if starts_with_ci(&fmt_bytes, fi, "SSSSS") || starts_with_ci(&fmt_bytes, fi, "SSSS") {
+        } else if starts_with_ci(&fmt_bytes, fi, "SSSSS") || starts_with_ci(&fmt_bytes, fi, "SSSS")
+        {
             // Seconds past midnight (0..86399).
-            let width = if starts_with_ci(&fmt_bytes, fi, "SSSSS") { 5 } else { 4 };
+            let width = if starts_with_ci(&fmt_bytes, fi, "SSSSS") {
+                5
+            } else {
+                4
+            };
             let v = take_digits(&in_bytes, &mut ii, 5)
                 .ok_or_else(|| alloc::format!("expected seconds digits at position {ii}"))?;
             let v = v as u32;

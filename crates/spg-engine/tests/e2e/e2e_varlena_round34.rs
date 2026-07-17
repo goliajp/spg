@@ -31,8 +31,10 @@ fn split_part_contract() {
         ),
         vec!["a,b,c", "a,b,c", ""]
     );
-    assert!(err_of(&mut e, "SELECT split_part('a,b,c', ',', 0)")
-        .contains("field position must not be zero"));
+    assert!(
+        err_of(&mut e, "SELECT split_part('a,b,c', ',', 0)")
+            .contains("field position must not be zero")
+    );
 }
 
 #[test]

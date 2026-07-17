@@ -38,9 +38,10 @@ fn scientific_literals_are_numeric() {
         ),
         vec!["numeric", "numeric", "numeric", "numeric"]
     );
-    assert_eq!(row_of(&mut e, "SELECT 1e5::int, 1e5 + 1"), vec![
-        "100000", "100001"
-    ]);
+    assert_eq!(
+        row_of(&mut e, "SELECT 1e5::int, 1e5 + 1"),
+        vec!["100000", "100001"]
+    );
 }
 
 #[test]
@@ -80,8 +81,7 @@ fn big_literals_expand_exactly() {
     // Beyond PG's numeric format: dedicated error.
     assert!(err_of(&mut e, "SELECT 1e131072").contains("value overflows numeric format"));
     assert!(
-        err_of(&mut e, "SELECT '1e131072'::numeric")
-            .contains("value overflows numeric format")
+        err_of(&mut e, "SELECT '1e131072'::numeric").contains("value overflows numeric format")
     );
 }
 

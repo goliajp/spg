@@ -22,12 +22,12 @@ use crate::ast::{
     CreateFunctionStatement, CreateIndexStatement, CreatePublicationStatement,
     CreateSubscriptionStatement, CreateTableStatement, CreateTriggerStatement, Expr, ExtractField,
     FkAction, ForeignKeyConstraint, FrameBound, FrameExclusion, FrameKind, FromClause, FromJoin,
-    FunctionArg, FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, IndexMethod,
-    GrantObject, GrantPriv, GrantStatement, InsertStatement, IsolationLevel, JoinKind, Literal, NullTreatment,
-    OrderBy, Overriding,
-    PlPgSqlBlock, PlPgSqlDeclare, PlPgSqlStmt, PublicationScope, RaiseLevel, RangeKindAst,
-    ReturnTarget, SelectItem, SelectStatement, Statement, TableRef, TriggerEvent, TriggerForEach,
-    TriggerTiming, UnOp, UnionKind, VecEncoding, WindowFrame,
+    FunctionArg, FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, GrantObject,
+    GrantPriv, GrantStatement, IndexMethod, InsertStatement, IsolationLevel, JoinKind, Literal,
+    NullTreatment, OrderBy, Overriding, PlPgSqlBlock, PlPgSqlDeclare, PlPgSqlStmt,
+    PublicationScope, RaiseLevel, RangeKindAst, ReturnTarget, SelectItem, SelectStatement,
+    Statement, TableRef, TriggerEvent, TriggerForEach, TriggerTiming, UnOp, UnionKind, VecEncoding,
+    WindowFrame,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -357,7 +357,7 @@ fn numeric_token_to_literal(s: String) -> Result<Literal, String> {
                 Some((unscaled, scale)) => Ok(Literal::Numeric { unscaled, scale }),
                 None if plain
                     .split_once('.')
-                    .is_none_or(|(_, f)| f.len() <= u8::MAX as usize) =>
+                    .is_none_or(|(_, f)| u8::try_from(f.len()).is_ok()) =>
                 {
                     Ok(Literal::NumericBig(plain))
                 }
@@ -6083,6 +6083,9 @@ impl Parser {
         let mut login: Option<bool> = None;
         let mut inherit: Option<bool> = None;
         let mut superuser: Option<bool> = None;
+        // Not a `while let`: the pattern would borrow `self` across the
+        // body, which calls `self.advance()` / `self.expect_*` (&mut).
+        #[allow(clippy::while_let_loop)]
         loop {
             let (Token::Ident(w) | Token::QuotedIdent(w)) = self.peek() else {
                 break;
@@ -9413,8 +9416,8 @@ impl Parser {
                             lateral_subquery: Some(Box::new(head)),
                             jsonb_each_text_arg: None,
                             table_fn_call: None,
-        rows_from: None,
-        scalar_fn_item: false,
+                            rows_from: None,
+                            scalar_fn_item: false,
                         },
                         joins: Vec::new(),
                     }),
@@ -9517,10 +9520,12 @@ impl Parser {
         // is exactly what the function's own row shape already is. Anywhere else
         // (per outer row, or beside other items) it would need a real record-typed
         // projection, so it says so rather than answering something else.
-        if let [SelectItem::Expr {
-            expr: Expr::FunctionCall { name, args },
-            ..
-        }] = items.as_slice()
+        if let [
+            SelectItem::Expr {
+                expr: Expr::FunctionCall { name, args },
+                ..
+            },
+        ] = items.as_slice()
             && name == "__record_expand"
         {
             let Some(Expr::FunctionCall {
@@ -9674,8 +9679,8 @@ impl Parser {
                             lateral_subquery: None,
                             jsonb_each_text_arg: None,
                             table_fn_call: None,
-        rows_from: None,
-        scalar_fn_item: false,
+                            rows_from: None,
+                            scalar_fn_item: false,
                         },
                         colname,
                     ));
@@ -13664,8 +13669,8 @@ impl Parser {
                         lateral_subquery: None,
                         jsonb_each_text_arg: Some((each_fn, Box::new(arg))),
                         table_fn_call: None,
-        rows_from: None,
-        scalar_fn_item: false,
+                        rows_from: None,
+                        scalar_fn_item: false,
                     },
                     joins: Vec::new(),
                 }),
@@ -13690,8 +13695,8 @@ impl Parser {
                 lateral_subquery: Some(Box::new(inner_select)),
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
-        rows_from: None,
-        scalar_fn_item: false,
+                rows_from: None,
+                scalar_fn_item: false,
             });
         }
         // v7.37.43-T4.5 — bare `CROSS JOIN jsonb_each_text(t.col)`
@@ -13744,8 +13749,8 @@ impl Parser {
                 lateral_subquery: Some(Box::new(head)),
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
-        rows_from: None,
-        scalar_fn_item: false,
+                rows_from: None,
+                scalar_fn_item: false,
             });
         }
         // v7.37.17 (17.6 siblings) — plain derived table:
@@ -13802,8 +13807,8 @@ impl Parser {
                 lateral_subquery: Some(Box::new(inner)),
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
-        rows_from: None,
-        scalar_fn_item: false,
+                rows_from: None,
+                scalar_fn_item: false,
             });
         }
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("lateral"))
@@ -13843,8 +13848,8 @@ impl Parser {
                 lateral_subquery: Some(Box::new(inner)),
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
-        rows_from: None,
-        scalar_fn_item: false,
+                rows_from: None,
+                scalar_fn_item: false,
             });
         }
         // v7.37.43-T4.5 — `jsonb_each_text(<expr>)` set-returning
@@ -13886,8 +13891,8 @@ impl Parser {
                 lateral_subquery: None,
                 jsonb_each_text_arg: Some((each_fn, Box::new(arg))),
                 table_fn_call: None,
-        rows_from: None,
-        scalar_fn_item: false,
+                rows_from: None,
+                scalar_fn_item: false,
             });
         }
         // `jsonb_to_recordset(J) AS t(a int, b text)` / `jsonb_to_record`
@@ -13980,10 +13985,10 @@ impl Parser {
                 lateral_subquery: Some(Box::new(inner)),
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
-        rows_from: None,
-        // regexp_matches returns text[], a base type: `SELECT m FROM
-        // regexp_matches(…) AS m` is the array, not a composite wrapping it.
-        scalar_fn_item: true,
+                rows_from: None,
+                // regexp_matches returns text[], a base type: `SELECT m FROM
+                // regexp_matches(…) AS m` is the array, not a composite wrapping it.
+                scalar_fn_item: true,
             });
         }
         // v7.37.17 (17.6 siblings) — `jsonb_array_elements[_text](<expr>)`
@@ -14077,11 +14082,11 @@ impl Parser {
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
-        rows_from: None,
-        // Each of these returns a BASE type (jsonb / text / int), so the item's
-        // row type is that scalar: `SELECT j FROM jsonb_array_elements('[1]') j`
-        // is `1`, not `(1)`. WITH ORDINALITY makes it a real two-column item.
-        scalar_fn_item: !with_ordinality,
+                rows_from: None,
+                // Each of these returns a BASE type (jsonb / text / int), so the item's
+                // row type is that scalar: `SELECT j FROM jsonb_array_elements('[1]') j`
+                // is `1`, not `(1)`. WITH ORDINALITY makes it a real two-column item.
+                scalar_fn_item: !with_ordinality,
             };
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
@@ -14247,8 +14252,8 @@ impl Parser {
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
-        rows_from: None,
-        scalar_fn_item: false,
+                rows_from: None,
+                scalar_fn_item: false,
             };
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
@@ -14303,8 +14308,8 @@ impl Parser {
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
-        rows_from: None,
-        scalar_fn_item: false,
+                rows_from: None,
+                scalar_fn_item: false,
             };
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
@@ -14399,8 +14404,8 @@ impl Parser {
                 lateral_subquery: None,
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
-        rows_from: None,
-        scalar_fn_item: false,
+                rows_from: None,
+                scalar_fn_item: false,
             };
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
@@ -14558,8 +14563,8 @@ impl Parser {
             lateral_subquery: None,
             jsonb_each_text_arg: None,
             table_fn_call: None,
-        rows_from: None,
-        scalar_fn_item: false,
+            rows_from: None,
+            scalar_fn_item: false,
         })
     }
 
@@ -14667,8 +14672,8 @@ impl Parser {
             lateral_subquery: Some(Box::new(inner)),
             jsonb_each_text_arg: None,
             table_fn_call: None,
-        rows_from: None,
-        scalar_fn_item: false,
+            rows_from: None,
+            scalar_fn_item: false,
         }
     }
 
@@ -14798,8 +14803,8 @@ impl Parser {
                     lateral_subquery: None,
                     jsonb_each_text_arg: None,
                     table_fn_call: None,
-        rows_from: None,
-        scalar_fn_item: false,
+                    rows_from: None,
+                    scalar_fn_item: false,
                 },
                 joins: Vec::new(),
             }),
@@ -14967,8 +14972,8 @@ impl Parser {
                     lateral_subquery: None,
                     jsonb_each_text_arg: None,
                     table_fn_call: None,
-        rows_from: None,
-        scalar_fn_item: false,
+                    rows_from: None,
+                    scalar_fn_item: false,
                 },
                 joins: Vec::new(),
             })
@@ -15002,8 +15007,8 @@ impl Parser {
             lateral_subquery: Some(Box::new(inner)),
             jsonb_each_text_arg: None,
             table_fn_call: None,
-        rows_from: None,
-        scalar_fn_item: false,
+            rows_from: None,
+            scalar_fn_item: false,
         })
     }
 
@@ -15569,7 +15574,6 @@ impl Parser {
         Ok(Some(out))
     }
 
-
     /// v7.39 (IS-precedence knife) — the LOW-precedence postfix
     /// predicates, moved out of the tight postfix-cast loop: PG binds
     /// `IS [NOT] NULL/TRUE/FALSE/UNKNOWN/DISTINCT FROM/JSON/NORMALIZED`
@@ -15615,111 +15619,68 @@ impl Parser {
         // IS family: rung 3 (NOT parses at 3, so `NOT x IS NULL` still
         // groups as NOT (x IS NULL); AND/OR at 1-2 stay outside).
         if min_prec <= 3 {
-        if matches!(self.peek(), Token::Is) {
-            self.advance();
-            let negated = if matches!(self.peek(), Token::Not) {
+            if matches!(self.peek(), Token::Is) {
                 self.advance();
-                true
-            } else {
-                false
-            };
-            // v7.9.27b — `IS [NOT] DISTINCT FROM <rhs>`.
-            // mailrs pg_dump.
-            if matches!(self.peek(), Token::Distinct) {
-                self.advance();
-                if !matches!(self.peek(), Token::From) {
-                    return Err(self.err(format!(
-                        "expected FROM after IS{} DISTINCT, got {:?}",
-                        if negated { " NOT" } else { "" },
-                        self.peek()
-                    )));
+                let negated = if matches!(self.peek(), Token::Not) {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                // v7.9.27b — `IS [NOT] DISTINCT FROM <rhs>`.
+                // mailrs pg_dump.
+                if matches!(self.peek(), Token::Distinct) {
+                    self.advance();
+                    if !matches!(self.peek(), Token::From) {
+                        return Err(self.err(format!(
+                            "expected FROM after IS{} DISTINCT, got {:?}",
+                            if negated { " NOT" } else { "" },
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    // Right-hand side: parse at the same precedence
+                    // tier as comparison so `x IS DISTINCT FROM a + b`
+                    // groups as `x IS DISTINCT FROM (a + b)`.
+                    let rhs = self.parse_expr(4)?;
+                    let op = if negated {
+                        BinOp::IsNotDistinctFrom
+                    } else {
+                        BinOp::IsDistinctFrom
+                    };
+                    expr = Expr::Binary {
+                        op,
+                        lhs: Box::new(expr),
+                        rhs: Box::new(rhs),
+                    };
+                    {
+                        return Ok(Some(expr));
+                    }
                 }
-                self.advance();
-                // Right-hand side: parse at the same precedence
-                // tier as comparison so `x IS DISTINCT FROM a + b`
-                // groups as `x IS DISTINCT FROM (a + b)`.
-                let rhs = self.parse_expr(4)?;
-                let op = if negated {
-                    BinOp::IsNotDistinctFrom
-                } else {
-                    BinOp::IsDistinctFrom
-                };
-                expr = Expr::Binary {
-                    op,
-                    lhs: Box::new(expr),
-                    rhs: Box::new(rhs),
-                };
-                { return Ok(Some(expr)); }
-            }
-            // v7.37.17 (17.6 siblings) — SQL:2016 / PG 16
-            // `IS [NOT] JSON [VALUE|OBJECT|ARRAY|SCALAR]`.
-            // Lowers onto pg_is_json(x, kind); NOT wraps the
-            // call in a logical negation.
-            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                // v7.37.17 (17.6 siblings) — SQL:2016 / PG 16
+                // `IS [NOT] JSON [VALUE|OBJECT|ARRAY|SCALAR]`.
+                // Lowers onto pg_is_json(x, kind); NOT wraps the
+                // call in a logical negation.
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
                 if s.eq_ignore_ascii_case("json"))
-            {
-                self.advance(); // JSON
-                let kind = match self.peek() {
-                    Token::Ident(s) | Token::QuotedIdent(s)
-                        if matches!(
-                            s.to_ascii_lowercase().as_str(),
-                            "value" | "object" | "array" | "scalar"
-                        ) =>
-                    {
-                        let k = s.to_ascii_lowercase();
-                        self.advance();
-                        k
-                    }
-                    _ => "value".to_string(),
-                };
-                let call = Expr::FunctionCall {
-                    name: "pg_is_json".to_string(),
-                    args: alloc::vec![expr, Expr::Literal(Literal::String(kind)),],
-                };
-                expr = if negated {
-                    Expr::Unary {
-                        op: UnOp::Not,
-                        expr: Box::new(call),
-                    }
-                } else {
-                    call
-                };
-                { return Ok(Some(expr)); }
-            }
-            // v7.38 (read01 sweep) — SQL:2016 `x IS [NOT] [form]
-            // NORMALIZED` (form ∈ NFC/NFD/NFKC/NFKD, default NFC).
-            // Lowers onto is_normalized(x [, 'FORM']); NOT negates.
-            {
-                let form_kw = match self.peek() {
-                    Token::Ident(s) | Token::QuotedIdent(s)
-                        if matches!(
-                            s.to_ascii_uppercase().as_str(),
-                            "NFC" | "NFD" | "NFKC" | "NFKD"
-                        ) && matches!(
-                            self.tokens.get(self.pos + 1),
-                            Some(Token::Ident(n) | Token::QuotedIdent(n))
-                                if n.eq_ignore_ascii_case("normalized")
-                        ) =>
-                    {
-                        Some(s.to_ascii_uppercase())
-                    }
-                    _ => None,
-                };
-                let bare_normalized = form_kw.is_none()
-                    && matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
-                        if s.eq_ignore_ascii_case("normalized"));
-                if form_kw.is_some() || bare_normalized {
-                    if form_kw.is_some() {
-                        self.advance(); // form keyword
-                    }
-                    self.advance(); // NORMALIZED
-                    let mut args = alloc::vec![expr];
-                    if let Some(f) = form_kw {
-                        args.push(Expr::Literal(Literal::String(f)));
-                    }
+                {
+                    self.advance(); // JSON
+                    let kind = match self.peek() {
+                        Token::Ident(s) | Token::QuotedIdent(s)
+                            if matches!(
+                                s.to_ascii_lowercase().as_str(),
+                                "value" | "object" | "array" | "scalar"
+                            ) =>
+                        {
+                            let k = s.to_ascii_lowercase();
+                            self.advance();
+                            k
+                        }
+                        _ => "value".to_string(),
+                    };
                     let call = Expr::FunctionCall {
-                        name: "is_normalized".to_string(),
-                        args,
+                        name: "pg_is_json".to_string(),
+                        args: alloc::vec![expr, Expr::Literal(Literal::String(kind)),],
                     };
                     expr = if negated {
                         Expr::Unary {
@@ -15729,163 +15690,232 @@ impl Parser {
                     } else {
                         call
                     };
-                    { return Ok(Some(expr)); }
+                    {
+                        return Ok(Some(expr));
+                    }
                 }
-            }
-            // `x IS [NOT] TRUE | FALSE | UNKNOWN` — the
-            // three-valued boolean tests. IS TRUE/FALSE never
-            // return NULL, so they lower to CASE forms whose
-            // ELSE catches the NULL branch; IS UNKNOWN on a
-            // boolean is exactly IS NULL.
-            if matches!(self.peek(), Token::True | Token::False)
-                || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("unknown"))
-            {
-                let tok = self.advance();
-                let test = match tok {
-                    Token::True => Some(true),
-                    Token::False => Some(false),
-                    _ => None, // UNKNOWN
-                };
-                let lowered = match test {
-                    // IS TRUE: CASE WHEN x THEN t ELSE f END —
-                    // NULL and false both land in ELSE.
-                    Some(true) => Expr::Case {
-                        operand: None,
-                        branches: alloc::vec![(expr, Expr::Literal(Literal::Bool(!negated)),)],
-                        else_branch: Some(Box::new(Expr::Literal(Literal::Bool(negated)))),
-                    },
-                    // IS FALSE: CASE WHEN NOT x THEN t ELSE f
-                    // END — NOT NULL is NULL, so NULL lands in
-                    // ELSE alongside true.
-                    Some(false) => Expr::Case {
-                        operand: None,
-                        branches: alloc::vec![(
+                // v7.38 (read01 sweep) — SQL:2016 `x IS [NOT] [form]
+                // NORMALIZED` (form ∈ NFC/NFD/NFKC/NFKD, default NFC).
+                // Lowers onto is_normalized(x [, 'FORM']); NOT negates.
+                {
+                    let form_kw = match self.peek() {
+                        Token::Ident(s) | Token::QuotedIdent(s)
+                            if matches!(
+                                s.to_ascii_uppercase().as_str(),
+                                "NFC" | "NFD" | "NFKC" | "NFKD"
+                            ) && matches!(
+                                self.tokens.get(self.pos + 1),
+                                Some(Token::Ident(n) | Token::QuotedIdent(n))
+                                    if n.eq_ignore_ascii_case("normalized")
+                            ) =>
+                        {
+                            Some(s.to_ascii_uppercase())
+                        }
+                        _ => None,
+                    };
+                    let bare_normalized = form_kw.is_none()
+                        && matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("normalized"));
+                    if form_kw.is_some() || bare_normalized {
+                        if form_kw.is_some() {
+                            self.advance(); // form keyword
+                        }
+                        self.advance(); // NORMALIZED
+                        let mut args = alloc::vec![expr];
+                        if let Some(f) = form_kw {
+                            args.push(Expr::Literal(Literal::String(f)));
+                        }
+                        let call = Expr::FunctionCall {
+                            name: "is_normalized".to_string(),
+                            args,
+                        };
+                        expr = if negated {
                             Expr::Unary {
                                 op: UnOp::Not,
-                                expr: Box::new(expr),
-                            },
-                            Expr::Literal(Literal::Bool(!negated)),
-                        )],
-                        else_branch: Some(Box::new(Expr::Literal(Literal::Bool(negated)))),
-                    },
-                    None => Expr::IsNull {
-                        expr: Box::new(expr),
-                        negated,
-                    },
-                };
-                expr = lowered;
-                { return Ok(Some(expr)); }
-            }
-            if !matches!(self.peek(), Token::Null) {
-                return Err(self.err(format!(
+                                expr: Box::new(call),
+                            }
+                        } else {
+                            call
+                        };
+                        {
+                            return Ok(Some(expr));
+                        }
+                    }
+                }
+                // `x IS [NOT] TRUE | FALSE | UNKNOWN` — the
+                // three-valued boolean tests. IS TRUE/FALSE never
+                // return NULL, so they lower to CASE forms whose
+                // ELSE catches the NULL branch; IS UNKNOWN on a
+                // boolean is exactly IS NULL.
+                if matches!(self.peek(), Token::True | Token::False)
+                    || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("unknown"))
+                {
+                    let tok = self.advance();
+                    let test = match tok {
+                        Token::True => Some(true),
+                        Token::False => Some(false),
+                        _ => None, // UNKNOWN
+                    };
+                    let lowered = match test {
+                        // IS TRUE: CASE WHEN x THEN t ELSE f END —
+                        // NULL and false both land in ELSE.
+                        Some(true) => Expr::Case {
+                            operand: None,
+                            branches: alloc::vec![(expr, Expr::Literal(Literal::Bool(!negated)),)],
+                            else_branch: Some(Box::new(Expr::Literal(Literal::Bool(negated)))),
+                        },
+                        // IS FALSE: CASE WHEN NOT x THEN t ELSE f
+                        // END — NOT NULL is NULL, so NULL lands in
+                        // ELSE alongside true.
+                        Some(false) => Expr::Case {
+                            operand: None,
+                            branches: alloc::vec![(
+                                Expr::Unary {
+                                    op: UnOp::Not,
+                                    expr: Box::new(expr),
+                                },
+                                Expr::Literal(Literal::Bool(!negated)),
+                            )],
+                            else_branch: Some(Box::new(Expr::Literal(Literal::Bool(negated)))),
+                        },
+                        None => Expr::IsNull {
+                            expr: Box::new(expr),
+                            negated,
+                        },
+                    };
+                    expr = lowered;
+                    {
+                        return Ok(Some(expr));
+                    }
+                }
+                if !matches!(self.peek(), Token::Null) {
+                    return Err(self.err(format!(
                     "expected NULL, DISTINCT, JSON, TRUE, FALSE or UNKNOWN after IS{}, got {:?}",
                     if negated { " NOT" } else { "" },
                     self.peek()
                 )));
+                }
+                self.advance();
+                expr = Expr::IsNull {
+                    expr: Box::new(expr),
+                    negated,
+                };
+                {
+                    return Ok(Some(expr));
+                }
             }
-            self.advance();
-            expr = Expr::IsNull {
-                expr: Box::new(expr),
-                negated,
-            };
-            { return Ok(Some(expr)); }
-        }
         }
         // BETWEEN / IN / LIKE / ILIKE / SIMILAR: comparison rung.
         if min_prec <= 4 {
-        // `x [NOT] BETWEEN a AND b`, `x [NOT] IN (...)`, `x [NOT] LIKE p`.
-        // Look one token ahead so a stray `NOT` not followed by any of
-        // these flows through to the early return below untouched.
-        let negated = if matches!(self.peek(), Token::Not) {
-            let next = self.tokens.get(self.pos + 1);
-            matches!(next, Some(Token::Between | Token::In | Token::Like))
-                || matches!(next, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("ilike")
+            // `x [NOT] BETWEEN a AND b`, `x [NOT] IN (...)`, `x [NOT] LIKE p`.
+            // Look one token ahead so a stray `NOT` not followed by any of
+            // these flows through to the early return below untouched.
+            let negated = if matches!(self.peek(), Token::Not) {
+                let next = self.tokens.get(self.pos + 1);
+                matches!(next, Some(Token::Between | Token::In | Token::Like))
+                    || matches!(next, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("ilike")
                     || s.eq_ignore_ascii_case("similar"))
-        } else {
-            false
-        };
-        if negated {
-            self.advance();
-        }
-        if matches!(self.peek(), Token::Between) {
-            expr = self.parse_between_tail(expr, negated)?;
-            { return Ok(Some(expr)); }
-        }
-        if matches!(self.peek(), Token::In) {
-            if self.suppress_in_tail && !negated {
-                // POSITION(sub IN str) — IN belongs to the
-                // enclosing function syntax; stop here.
-                { return Ok(None); }
-            }
-            expr = self.parse_in_tail(expr, negated)?;
-            { return Ok(Some(expr)); }
-        }
-        // v7.39 (read01 regexp.c) — `x [NOT] SIMILAR TO p [ESCAPE e]`
-        // lowers onto the internal __similar_to(expr, pat[, esc]) call
-        // (the SQL→regex transform runs inside, in the backtracking-
-        // friendly shape SPG's matcher needs).
-        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("similar"))
-            && matches!(self.tokens.get(self.pos + 1), Some(Token::To))
-        {
-            self.advance(); // SIMILAR
-            self.advance(); // TO
-            let pattern = self.parse_expr(5)?;
-            let mut args = alloc::vec![expr, pattern];
-            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("escape")) {
+            } else {
+                false
+            };
+            if negated {
                 self.advance();
-                args.push(self.parse_expr(5)?);
             }
-            let call = Expr::FunctionCall {
-                name: "__similar_to".to_string(),
-                args,
-            };
-            expr = maybe_not(call, negated);
-            { return Ok(Some(expr)); }
-        }
-        if matches!(self.peek(), Token::Like) {
-            self.advance();
-            // `x [NOT] LIKE ANY/ALL (ARRAY[...])` — quantified LIKE.
-            if let Some(q) = self.try_like_any_all(&expr, negated, false)? {
-                expr = q;
-                { return Ok(Some(expr)); }
+            if matches!(self.peek(), Token::Between) {
+                expr = self.parse_between_tail(expr, negated)?;
+                {
+                    return Ok(Some(expr));
+                }
             }
-            // Pattern at the same precedence as other comparison RHSes —
-            // 5 leaves AND/OR alone so `a LIKE 'x%' AND b` parses right.
-            let mut pattern = self.parse_expr(5)?;
-            // `ESCAPE 'c'` — rewrite a literal pattern to the
-            // default backslash escape at parse time. Custom
-            // escapes on non-literal patterns would need
-            // matcher support; error honestly.
-            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("escape")) {
+            if matches!(self.peek(), Token::In) {
+                if self.suppress_in_tail && !negated {
+                    // POSITION(sub IN str) — IN belongs to the
+                    // enclosing function syntax; stop here.
+                    {
+                        return Ok(None);
+                    }
+                }
+                expr = self.parse_in_tail(expr, negated)?;
+                {
+                    return Ok(Some(expr));
+                }
+            }
+            // v7.39 (read01 regexp.c) — `x [NOT] SIMILAR TO p [ESCAPE e]`
+            // lowers onto the internal __similar_to(expr, pat[, esc]) call
+            // (the SQL→regex transform runs inside, in the backtracking-
+            // friendly shape SPG's matcher needs).
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("similar"))
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::To))
+            {
+                self.advance(); // SIMILAR
+                self.advance(); // TO
+                let pattern = self.parse_expr(5)?;
+                let mut args = alloc::vec![expr, pattern];
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("escape")) {
+                    self.advance();
+                    args.push(self.parse_expr(5)?);
+                }
+                let call = Expr::FunctionCall {
+                    name: "__similar_to".to_string(),
+                    args,
+                };
+                expr = maybe_not(call, negated);
+                {
+                    return Ok(Some(expr));
+                }
+            }
+            if matches!(self.peek(), Token::Like) {
                 self.advance();
-                let esc = self.parse_expr(5)?;
-                pattern = Self::rewrite_like_escape(pattern, esc).map_err(|m| self.err(m))?;
+                // `x [NOT] LIKE ANY/ALL (ARRAY[...])` — quantified LIKE.
+                if let Some(q) = self.try_like_any_all(&expr, negated, false)? {
+                    expr = q;
+                    {
+                        return Ok(Some(expr));
+                    }
+                }
+                // Pattern at the same precedence as other comparison RHSes —
+                // 5 leaves AND/OR alone so `a LIKE 'x%' AND b` parses right.
+                let mut pattern = self.parse_expr(5)?;
+                // `ESCAPE 'c'` — rewrite a literal pattern to the
+                // default backslash escape at parse time. Custom
+                // escapes on non-literal patterns would need
+                // matcher support; error honestly.
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("escape")) {
+                    self.advance();
+                    let esc = self.parse_expr(5)?;
+                    pattern = Self::rewrite_like_escape(pattern, esc).map_err(|m| self.err(m))?;
+                }
+                expr = Expr::Like {
+                    expr: Box::new(expr),
+                    pattern: Box::new(pattern),
+                    negated,
+                    case_insensitive: false,
+                };
+                {
+                    return Ok(Some(expr));
+                }
             }
-            expr = Expr::Like {
-                expr: Box::new(expr),
-                pattern: Box::new(pattern),
-                negated,
-                case_insensitive: false,
-            };
-            { return Ok(Some(expr)); }
-        }
-        // v7.25 (round-17) — ILIKE: case-insensitive LIKE. The
-        // keyword reaches us as a plain identifier.
-        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("ilike")) {
-            self.advance();
-            if let Some(q) = self.try_like_any_all(&expr, negated, true)? {
-                expr = q;
-                { return Ok(Some(expr)); }
+            // v7.25 (round-17) — ILIKE: case-insensitive LIKE. The
+            // keyword reaches us as a plain identifier.
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("ilike")) {
+                self.advance();
+                if let Some(q) = self.try_like_any_all(&expr, negated, true)? {
+                    expr = q;
+                    {
+                        return Ok(Some(expr));
+                    }
+                }
+                let pattern = self.parse_expr(5)?;
+                expr = Expr::Like {
+                    expr: Box::new(expr),
+                    pattern: Box::new(pattern),
+                    negated,
+                    case_insensitive: true,
+                };
+                {
+                    return Ok(Some(expr));
+                }
             }
-            let pattern = self.parse_expr(5)?;
-            expr = Expr::Like {
-                expr: Box::new(expr),
-                pattern: Box::new(pattern),
-                negated,
-                case_insensitive: true,
-            };
-            { return Ok(Some(expr)); }
-        }
         }
         let _ = expr;
         Ok(None)
@@ -16197,9 +16227,8 @@ impl Parser {
         let wrapper = alloc::format!(
             "SELECT array_agg(\"__spg_arr_c\") FROM ({sub}) AS \"__spg_arr_t\"(\"__spg_arr_c\")"
         );
-        let stmt = parse_statement(&wrapper).map_err(|e| {
-            self.err(alloc::format!("ARRAY(subquery): {}", e.message))
-        })?;
+        let stmt = parse_statement(&wrapper)
+            .map_err(|e| self.err(alloc::format!("ARRAY(subquery): {}", e.message)))?;
         let Statement::Select(sel) = stmt else {
             return Err(self.err("ARRAY(subquery) did not desugar to a SELECT".into()));
         };
@@ -17361,10 +17390,12 @@ impl Parser {
             // under INTERSECT / EXCEPT (or with no set-op at all) is PG's
             // "does not have the form" error — SPG used to compute a value.
             if body.unions.is_empty()
-                || body
-                    .unions
-                    .iter()
-                    .any(|(k, _)| !matches!(k, crate::ast::UnionKind::Distinct | crate::ast::UnionKind::All))
+                || body.unions.iter().any(|(k, _)| {
+                    !matches!(
+                        k,
+                        crate::ast::UnionKind::Distinct | crate::ast::UnionKind::All
+                    )
+                })
             {
                 return Err(self.err(alloc::format!(
                     "recursive query \"{}\" does not have the form non-recursive-term \
@@ -17388,8 +17419,8 @@ impl Parser {
             // join (LEFT: right side; RIGHT: everything before it; FULL: both).
             if let Some(from) = &u.from {
                 for (i, j) in from.joins.iter().enumerate() {
-                    let left_has_self =
-                        is_self(&from.primary) || from.joins[..i].iter().any(|pj| is_self(&pj.table));
+                    let left_has_self = is_self(&from.primary)
+                        || from.joins[..i].iter().any(|pj| is_self(&pj.table));
                     let violated = match j.kind {
                         crate::ast::JoinKind::Left => is_self(&j.table),
                         crate::ast::JoinKind::Right => left_has_self,
@@ -18488,7 +18519,7 @@ impl Parser {
         };
         let (months, days, micros) = match qualifier {
             Some(q) => interpret_qualified_interval(&text, q),
-            None => parse_interval_text(&text).map(|(m, d, u)| (m, d, u)),
+            None => parse_interval_text(&text),
         }
         .ok_or_else(|| ParseError {
             message: format!(
@@ -20116,7 +20147,11 @@ fn interpret_qualified_interval(
         #[allow(clippy::cast_possible_truncation)]
         let secs_micros = {
             let m = val * 1_000_000.0;
-            if m >= 0.0 { (m + 0.5) as i64 } else { (m - 0.5) as i64 }
+            if m >= 0.0 {
+                (m + 0.5) as i64
+            } else {
+                (m - 0.5) as i64
+            }
         };
         return Some(match f1 {
             IntervalField::Year => (i32::try_from(whole).ok()?.checked_mul(12)?, 0, 0),
@@ -20429,6 +20464,241 @@ fn parse_plpgsql_body(body: &str) -> Result<PlPgSqlBlock, ParseError> {
     })?;
     let mut parser = Parser::new(tokens);
     parser.parse_plpgsql_block()
+}
+
+/// v7.39 (GUC) — the textual body of a SET value, for list joining.
+fn set_value_text(v: &crate::ast::SetValue) -> alloc::string::String {
+    match v {
+        crate::ast::SetValue::String(s)
+        | crate::ast::SetValue::Ident(s)
+        | crate::ast::SetValue::Number(s) => s.clone(),
+        crate::ast::SetValue::Default => "DEFAULT".into(),
+    }
+}
+
+/// v7.39 (round 145, parse_cte.c / parse_agg.c) — true when an expression
+/// contains an aggregate call at ITS OWN query level (recursion stops at
+/// sublink boundaries — a sublink's aggregates belong to the sublink).
+/// Backs the "aggregate functions are not allowed in a recursive query's
+/// recursive term" well-formedness check.
+fn expr_has_toplevel_aggregate(e: &Expr) -> bool {
+    const AGG_NAMES: &[&str] = &[
+        "count",
+        "sum",
+        "min",
+        "max",
+        "avg",
+        "string_agg",
+        "array_agg",
+        "bool_and",
+        "bool_or",
+        "every",
+        "any_value",
+        "json_agg",
+        "jsonb_agg",
+        "json_object_agg",
+        "jsonb_object_agg",
+        "bit_and",
+        "bit_or",
+        "bit_xor",
+        "var_pop",
+        "var_samp",
+        "variance",
+        "stddev",
+        "stddev_pop",
+        "stddev_samp",
+        "range_agg",
+        "range_intersect_agg",
+        "percentile_cont",
+        "percentile_disc",
+        "mode",
+        "corr",
+        "covar_pop",
+        "covar_samp",
+    ];
+    match e {
+        Expr::AggregateOrdered { .. } => true,
+        Expr::FunctionCall { name, args } => {
+            AGG_NAMES.contains(&name.to_ascii_lowercase().as_str())
+                || args.iter().any(expr_has_toplevel_aggregate)
+        }
+        Expr::NamedArg { expr, .. }
+        | Expr::Variadic(expr)
+        | Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. }
+        | Expr::Extract { source: expr, .. } => expr_has_toplevel_aggregate(expr),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_has_toplevel_aggregate(lhs) || expr_has_toplevel_aggregate(rhs)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_has_toplevel_aggregate(expr) || expr_has_toplevel_aggregate(pattern)
+        }
+        Expr::Array(items) => items.iter().any(expr_has_toplevel_aggregate),
+        Expr::InList { expr, list, .. } => {
+            expr_has_toplevel_aggregate(expr) || list.iter().any(expr_has_toplevel_aggregate)
+        }
+        Expr::ArraySubscript { target, index } => {
+            expr_has_toplevel_aggregate(target) || expr_has_toplevel_aggregate(index)
+        }
+        Expr::ArraySlice { target, lo, hi } => {
+            expr_has_toplevel_aggregate(target)
+                || lo.as_deref().is_some_and(expr_has_toplevel_aggregate)
+                || hi.as_deref().is_some_and(expr_has_toplevel_aggregate)
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            expr_has_toplevel_aggregate(expr) || expr_has_toplevel_aggregate(array)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            operand.as_deref().is_some_and(expr_has_toplevel_aggregate)
+                || branches
+                    .iter()
+                    .any(|(w, t)| expr_has_toplevel_aggregate(w) || expr_has_toplevel_aggregate(t))
+                || else_branch
+                    .as_deref()
+                    .is_some_and(expr_has_toplevel_aggregate)
+        }
+        // The outer-level operands of a sublink can aggregate; the sublink's
+        // own body cannot leak its aggregates up here.
+        Expr::InSubquery { expr, .. } => expr_has_toplevel_aggregate(expr),
+        Expr::RowInSubquery { row, .. } | Expr::RowCmpSubquery { row, .. } => {
+            row.iter().any(expr_has_toplevel_aggregate)
+        }
+        _ => false,
+    }
+}
+
+/// v7.39 (round 145, parse_cte.c) — true when any sublink expression
+/// (EXISTS / IN / scalar subquery) inside this SELECT term references the
+/// named table anywhere in its subtree. A plain FROM derived table is NOT a
+/// sublink and is legal in a recursive term, so it is not walked here.
+fn select_has_self_ref_in_sublink(s: &crate::ast::SelectStatement, name: &str) -> bool {
+    let mut exprs: Vec<&Expr> = Vec::new();
+    for it in &s.items {
+        if let crate::ast::SelectItem::Expr { expr, .. } = it {
+            exprs.push(expr);
+        }
+    }
+    if let Some(w) = &s.where_ {
+        exprs.push(w);
+    }
+    if let Some(h) = &s.having {
+        exprs.push(h);
+    }
+    if let Some(g) = &s.group_by {
+        exprs.extend(g.iter());
+    }
+    if let Some(from) = &s.from {
+        for j in &from.joins {
+            if let Some(on) = &j.on {
+                exprs.push(on);
+            }
+        }
+    }
+    exprs.into_iter().any(|e| expr_sublink_mentions(e, name))
+}
+
+/// Does this expression contain a sublink whose subquery mentions `name`?
+fn expr_sublink_mentions(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::ScalarSubquery(sub) => select_mentions_table(sub, name),
+        Expr::Exists { subquery, .. } => select_mentions_table(subquery, name),
+        Expr::InSubquery { expr, subquery, .. } => {
+            expr_sublink_mentions(expr, name) || select_mentions_table(subquery, name)
+        }
+        Expr::RowInSubquery { row, subquery, .. } => {
+            row.iter().any(|x| expr_sublink_mentions(x, name))
+                || select_mentions_table(subquery, name)
+        }
+        Expr::RowCmpSubquery { row, subquery, .. } => {
+            row.iter().any(|x| expr_sublink_mentions(x, name))
+                || select_mentions_table(subquery, name)
+        }
+        Expr::NamedArg { expr, .. }
+        | Expr::Variadic(expr)
+        | Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::FieldAccess { base: expr, .. }
+        | Expr::Extract { source: expr, .. } => expr_sublink_mentions(expr, name),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_sublink_mentions(lhs, name) || expr_sublink_mentions(rhs, name)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_sublink_mentions(expr, name) || expr_sublink_mentions(pattern, name)
+        }
+        Expr::FunctionCall { args, .. } | Expr::Array(args) => {
+            args.iter().any(|x| expr_sublink_mentions(x, name))
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_sublink_mentions(expr, name) || list.iter().any(|x| expr_sublink_mentions(x, name))
+        }
+        Expr::ArraySubscript { target, index } => {
+            expr_sublink_mentions(target, name) || expr_sublink_mentions(index, name)
+        }
+        Expr::ArraySlice { target, lo, hi } => {
+            expr_sublink_mentions(target, name)
+                || lo
+                    .as_deref()
+                    .is_some_and(|x| expr_sublink_mentions(x, name))
+                || hi
+                    .as_deref()
+                    .is_some_and(|x| expr_sublink_mentions(x, name))
+        }
+        Expr::AnyAll { expr, array, .. } => {
+            expr_sublink_mentions(expr, name) || expr_sublink_mentions(array, name)
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|x| expr_sublink_mentions(x, name))
+                || branches
+                    .iter()
+                    .any(|(w, t)| expr_sublink_mentions(w, name) || expr_sublink_mentions(t, name))
+                || else_branch
+                    .as_deref()
+                    .is_some_and(|x| expr_sublink_mentions(x, name))
+        }
+        _ => false,
+    }
+}
+
+/// Does this SELECT (in full — FROM tables, derived tables, its own
+/// sublinks, and union arms) mention the named table?
+fn select_mentions_table(s: &crate::ast::SelectStatement, name: &str) -> bool {
+    if let Some(from) = &s.from {
+        if from.primary.name.eq_ignore_ascii_case(name) {
+            return true;
+        }
+        if let Some(sub) = &from.primary.lateral_subquery
+            && select_mentions_table(sub, name)
+        {
+            return true;
+        }
+        for j in &from.joins {
+            if j.table.name.eq_ignore_ascii_case(name) {
+                return true;
+            }
+            if let Some(sub) = &j.table.lateral_subquery
+                && select_mentions_table(sub, name)
+            {
+                return true;
+            }
+        }
+    }
+    if select_has_self_ref_in_sublink(s, name) {
+        return true;
+    }
+    s.unions.iter().any(|(_, u)| select_mentions_table(u, name))
 }
 
 #[cfg(test)]
@@ -21959,205 +22229,4 @@ $$";
             assert_eq!(s, again, "round-trip mismatch for {sql:?}");
         }
     }
-}
-
-/// v7.39 (GUC) — the textual body of a SET value, for list joining.
-fn set_value_text(v: &crate::ast::SetValue) -> alloc::string::String {
-    match v {
-        crate::ast::SetValue::String(s)
-        | crate::ast::SetValue::Ident(s)
-        | crate::ast::SetValue::Number(s) => s.clone(),
-        crate::ast::SetValue::Default => "DEFAULT".into(),
-    }
-}
-
-/// v7.39 (round 145, parse_cte.c / parse_agg.c) — true when an expression
-/// contains an aggregate call at ITS OWN query level (recursion stops at
-/// sublink boundaries — a sublink's aggregates belong to the sublink).
-/// Backs the "aggregate functions are not allowed in a recursive query's
-/// recursive term" well-formedness check.
-fn expr_has_toplevel_aggregate(e: &Expr) -> bool {
-    const AGG_NAMES: &[&str] = &[
-        "count", "sum", "min", "max", "avg", "string_agg", "array_agg", "bool_and", "bool_or",
-        "every", "any_value", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg",
-        "bit_and", "bit_or", "bit_xor", "var_pop", "var_samp", "variance", "stddev", "stddev_pop",
-        "stddev_samp", "range_agg", "range_intersect_agg", "percentile_cont", "percentile_disc",
-        "mode", "corr", "covar_pop", "covar_samp",
-    ];
-    match e {
-        Expr::AggregateOrdered { .. } => true,
-        Expr::FunctionCall { name, args } => {
-            AGG_NAMES.contains(&name.to_ascii_lowercase().as_str())
-                || args.iter().any(expr_has_toplevel_aggregate)
-        }
-        Expr::NamedArg { expr, .. }
-        | Expr::Variadic(expr)
-        | Expr::Unary { expr, .. }
-        | Expr::Cast { expr, .. }
-        | Expr::IsNull { expr, .. }
-        | Expr::FieldAccess { base: expr, .. }
-        | Expr::Extract { source: expr, .. } => expr_has_toplevel_aggregate(expr),
-        Expr::Binary { lhs, rhs, .. } => {
-            expr_has_toplevel_aggregate(lhs) || expr_has_toplevel_aggregate(rhs)
-        }
-        Expr::Like { expr, pattern, .. } => {
-            expr_has_toplevel_aggregate(expr) || expr_has_toplevel_aggregate(pattern)
-        }
-        Expr::Array(items) => items.iter().any(expr_has_toplevel_aggregate),
-        Expr::InList { expr, list, .. } => {
-            expr_has_toplevel_aggregate(expr) || list.iter().any(expr_has_toplevel_aggregate)
-        }
-        Expr::ArraySubscript { target, index } => {
-            expr_has_toplevel_aggregate(target) || expr_has_toplevel_aggregate(index)
-        }
-        Expr::ArraySlice { target, lo, hi } => {
-            expr_has_toplevel_aggregate(target)
-                || lo.as_deref().is_some_and(expr_has_toplevel_aggregate)
-                || hi.as_deref().is_some_and(expr_has_toplevel_aggregate)
-        }
-        Expr::AnyAll { expr, array, .. } => {
-            expr_has_toplevel_aggregate(expr) || expr_has_toplevel_aggregate(array)
-        }
-        Expr::Case {
-            operand,
-            branches,
-            else_branch,
-        } => {
-            operand.as_deref().is_some_and(expr_has_toplevel_aggregate)
-                || branches.iter().any(|(w, t)| {
-                    expr_has_toplevel_aggregate(w) || expr_has_toplevel_aggregate(t)
-                })
-                || else_branch.as_deref().is_some_and(expr_has_toplevel_aggregate)
-        }
-        // The outer-level operands of a sublink can aggregate; the sublink's
-        // own body cannot leak its aggregates up here.
-        Expr::InSubquery { expr, .. } => expr_has_toplevel_aggregate(expr),
-        Expr::RowInSubquery { row, .. } | Expr::RowCmpSubquery { row, .. } => {
-            row.iter().any(expr_has_toplevel_aggregate)
-        }
-        _ => false,
-    }
-}
-
-/// v7.39 (round 145, parse_cte.c) — true when any sublink expression
-/// (EXISTS / IN / scalar subquery) inside this SELECT term references the
-/// named table anywhere in its subtree. A plain FROM derived table is NOT a
-/// sublink and is legal in a recursive term, so it is not walked here.
-fn select_has_self_ref_in_sublink(s: &crate::ast::SelectStatement, name: &str) -> bool {
-    let mut exprs: Vec<&Expr> = Vec::new();
-    for it in &s.items {
-        if let crate::ast::SelectItem::Expr { expr, .. } = it {
-            exprs.push(expr);
-        }
-    }
-    if let Some(w) = &s.where_ {
-        exprs.push(w);
-    }
-    if let Some(h) = &s.having {
-        exprs.push(h);
-    }
-    if let Some(g) = &s.group_by {
-        exprs.extend(g.iter());
-    }
-    if let Some(from) = &s.from {
-        for j in &from.joins {
-            if let Some(on) = &j.on {
-                exprs.push(on);
-            }
-        }
-    }
-    exprs.into_iter().any(|e| expr_sublink_mentions(e, name))
-}
-
-/// Does this expression contain a sublink whose subquery mentions `name`?
-fn expr_sublink_mentions(e: &Expr, name: &str) -> bool {
-    match e {
-        Expr::ScalarSubquery(sub) => select_mentions_table(sub, name),
-        Expr::Exists { subquery, .. } => select_mentions_table(subquery, name),
-        Expr::InSubquery { expr, subquery, .. } => {
-            expr_sublink_mentions(expr, name) || select_mentions_table(subquery, name)
-        }
-        Expr::RowInSubquery { row, subquery, .. } => {
-            row.iter().any(|x| expr_sublink_mentions(x, name))
-                || select_mentions_table(subquery, name)
-        }
-        Expr::RowCmpSubquery { row, subquery, .. } => {
-            row.iter().any(|x| expr_sublink_mentions(x, name))
-                || select_mentions_table(subquery, name)
-        }
-        Expr::NamedArg { expr, .. }
-        | Expr::Variadic(expr)
-        | Expr::Unary { expr, .. }
-        | Expr::Cast { expr, .. }
-        | Expr::IsNull { expr, .. }
-        | Expr::FieldAccess { base: expr, .. }
-        | Expr::Extract { source: expr, .. } => expr_sublink_mentions(expr, name),
-        Expr::Binary { lhs, rhs, .. } => {
-            expr_sublink_mentions(lhs, name) || expr_sublink_mentions(rhs, name)
-        }
-        Expr::Like { expr, pattern, .. } => {
-            expr_sublink_mentions(expr, name) || expr_sublink_mentions(pattern, name)
-        }
-        Expr::FunctionCall { args, .. } | Expr::Array(args) => {
-            args.iter().any(|x| expr_sublink_mentions(x, name))
-        }
-        Expr::InList { expr, list, .. } => {
-            expr_sublink_mentions(expr, name)
-                || list.iter().any(|x| expr_sublink_mentions(x, name))
-        }
-        Expr::ArraySubscript { target, index } => {
-            expr_sublink_mentions(target, name) || expr_sublink_mentions(index, name)
-        }
-        Expr::ArraySlice { target, lo, hi } => {
-            expr_sublink_mentions(target, name)
-                || lo.as_deref().is_some_and(|x| expr_sublink_mentions(x, name))
-                || hi.as_deref().is_some_and(|x| expr_sublink_mentions(x, name))
-        }
-        Expr::AnyAll { expr, array, .. } => {
-            expr_sublink_mentions(expr, name) || expr_sublink_mentions(array, name)
-        }
-        Expr::Case {
-            operand,
-            branches,
-            else_branch,
-        } => {
-            operand.as_deref().is_some_and(|x| expr_sublink_mentions(x, name))
-                || branches.iter().any(|(w, t)| {
-                    expr_sublink_mentions(w, name) || expr_sublink_mentions(t, name)
-                })
-                || else_branch
-                    .as_deref()
-                    .is_some_and(|x| expr_sublink_mentions(x, name))
-        }
-        _ => false,
-    }
-}
-
-/// Does this SELECT (in full — FROM tables, derived tables, its own
-/// sublinks, and union arms) mention the named table?
-fn select_mentions_table(s: &crate::ast::SelectStatement, name: &str) -> bool {
-    if let Some(from) = &s.from {
-        if from.primary.name.eq_ignore_ascii_case(name) {
-            return true;
-        }
-        if let Some(sub) = &from.primary.lateral_subquery
-            && select_mentions_table(sub, name)
-        {
-            return true;
-        }
-        for j in &from.joins {
-            if j.table.name.eq_ignore_ascii_case(name) {
-                return true;
-            }
-            if let Some(sub) = &j.table.lateral_subquery
-                && select_mentions_table(sub, name)
-            {
-                return true;
-            }
-        }
-    }
-    if select_has_self_ref_in_sublink(s, name) {
-        return true;
-    }
-    s.unions.iter().any(|(_, u)| select_mentions_table(u, name))
 }

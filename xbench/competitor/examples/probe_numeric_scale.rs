@@ -20,7 +20,13 @@ fn main() {
     one(&mut e, "SELECT power(2, 8)");
     one(&mut e, "SELECT power(2.0, 8)");
     one(&mut e, "SELECT sign(1.5)");
-    one(&mut e, "SELECT EXTRACT(SECOND FROM '2024-03-15 14:30:45.123456'::TIMESTAMP)");
-    one(&mut e, "SELECT TO_CHAR('2024-03-15'::DATE, 'Month DD, YYYY')");
+    one(
+        &mut e,
+        "SELECT EXTRACT(SECOND FROM '2024-03-15 14:30:45.123456'::TIMESTAMP)",
+    );
+    one(
+        &mut e,
+        "SELECT TO_CHAR('2024-03-15'::DATE, 'Month DD, YYYY')",
+    );
     one(&mut e, "SELECT pg_typeof(power(2, 8))");
 }

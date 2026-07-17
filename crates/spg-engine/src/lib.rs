@@ -34,6 +34,7 @@ macro_rules! bump_counter {
     }};
 }
 
+mod acl;
 pub mod aggregate;
 pub(crate) mod amcheck;
 mod bytebudget;
@@ -69,7 +70,6 @@ pub mod publications;
 pub mod query_stats;
 mod readonly;
 pub mod reorder;
-mod acl;
 mod rls;
 mod rules;
 pub mod scalarsq_streaming;
@@ -485,8 +485,13 @@ struct TxState {
     /// row was updated/deleted by a concurrently-committed tx), the
     /// paired insert must be dropped too — otherwise the row
     /// DUPLICATES (caught by the E4 isolation matrix).
-    update_pairs:
-        alloc::collections::BTreeMap<String, Vec<(spg_storage::row_header::RowId, spg_storage::row_header::RowId)>>,
+    update_pairs: alloc::collections::BTreeMap<
+        String,
+        Vec<(
+            spg_storage::row_header::RowId,
+            spg_storage::row_header::RowId,
+        )>,
+    >,
 }
 
 /// v7.11.0 — frozen read-only view of the engine's committed state.
@@ -1409,7 +1414,7 @@ impl Engine {
                     aborted_versions: BTreeSet::new(),
                     locks: crate::locks::LockTable::new(),
                     mvcc_inplace: !cfg!(feature = "mvcc-inplace-off"),
-            autovacuum: true,
+                    autovacuum: true,
                     tx_writer_versions: BTreeMap::new(),
                     stmt_writer_version: None,
                     clock: None,
@@ -1430,22 +1435,22 @@ impl Engine {
                     session_params: BTreeMap::new(),
                     pending_notices: Vec::new(),
                     xact_commit: core::sync::atomic::AtomicU64::new(0),
-            xact_rollback: core::sync::atomic::AtomicU64::new(0),
-            backend_count_fn: None,
-            backend_pid_fn: None,
-            tz_offset_fn: None,
-            tz_localize_fn: None,
-            tz_canon_fn: None,
-            tz_abbrev_fn: None,
-            stat_tup_inserted: 0,
+                    xact_rollback: core::sync::atomic::AtomicU64::new(0),
+                    backend_count_fn: None,
+                    backend_pid_fn: None,
+                    tz_offset_fn: None,
+                    tz_localize_fn: None,
+                    tz_canon_fn: None,
+                    tz_abbrev_fn: None,
+                    stat_tup_inserted: 0,
                     stat_tup_updated: 0,
                     stat_tup_deleted: 0,
                     local_guc_saves: Vec::new(),
-            render_style: crate::eval::RenderStyle::default(),
+                    render_style: crate::eval::RenderStyle::default(),
                     savepoint_guc_marks: Vec::new(),
                     tx_aborted: false,
                     trigger_recursion_depth: 0,
-            rule_rewrite_active: false,
+                    rule_rewrite_active: false,
                     foreign_key_checks: true,
                     meta_views_materialised: false,
                     pending_foreign_keys: Vec::new(),

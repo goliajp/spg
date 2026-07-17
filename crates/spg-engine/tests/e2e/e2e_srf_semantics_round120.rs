@@ -34,10 +34,28 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn strict_srf_null_arg_is_empty_set() {
     let mut e = Engine::new();
-    assert_eq!(count(&mut e, "SELECT count(*) FROM (SELECT generate_series(1, NULL::int) g) s"), 0);
-    assert_eq!(count(&mut e, "SELECT count(*) FROM (SELECT unnest(NULL::int[]) g) s"), 0);
+    assert_eq!(
+        count(
+            &mut e,
+            "SELECT count(*) FROM (SELECT generate_series(1, NULL::int) g) s"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &mut e,
+            "SELECT count(*) FROM (SELECT unnest(NULL::int[]) g) s"
+        ),
+        0
+    );
     // Empty range → no rows.
-    assert_eq!(count(&mut e, "SELECT count(*) FROM (SELECT generate_series(5, 1) g) s"), 0);
+    assert_eq!(
+        count(
+            &mut e,
+            "SELECT count(*) FROM (SELECT generate_series(5, 1) g) s"
+        ),
+        0
+    );
 }
 
 #[test]
@@ -45,19 +63,31 @@ fn target_list_srfs_run_in_lockstep() {
     let mut e = Engine::new();
     // Shorter SRF is NULL-padded to the longer one's length.
     assert_eq!(
-        text(&mut e, "SELECT string_agg(a||','||coalesce(b::text,'X'), '/') \
-                      FROM (SELECT generate_series(1,3) a, generate_series(1,2) b) s"),
+        text(
+            &mut e,
+            "SELECT string_agg(a||','||coalesce(b::text,'X'), '/') \
+                      FROM (SELECT generate_series(1,3) a, generate_series(1,2) b) s"
+        ),
         "1,1/2,2/3,X"
     );
     // An empty sibling does not shorten the output.
-    assert_eq!(count(&mut e, "SELECT count(*) FROM (SELECT generate_series(1,3) a, generate_series(1,0) b) s"), 3);
+    assert_eq!(
+        count(
+            &mut e,
+            "SELECT count(*) FROM (SELECT generate_series(1,3) a, generate_series(1,0) b) s"
+        ),
+        3
+    );
 }
 
 #[test]
 fn scalar_column_repeats_per_srf_row() {
     let mut e = Engine::new();
     assert_eq!(
-        text(&mut e, "SELECT string_agg(x||','||g, '/') FROM (SELECT 9 x, generate_series(1,2) g) s"),
+        text(
+            &mut e,
+            "SELECT string_agg(x||','||g, '/') FROM (SELECT 9 x, generate_series(1,2) g) s"
+        ),
         "9,1/9,2"
     );
 }
@@ -65,12 +95,27 @@ fn scalar_column_repeats_per_srf_row() {
 #[test]
 fn with_ordinality_over_empty_is_empty() {
     let mut e = Engine::new();
-    assert_eq!(count(&mut e, "SELECT count(*) FROM (SELECT * FROM generate_series(1,0) WITH ORDINALITY) s"), 0);
-    assert_eq!(count(&mut e, "SELECT count(*) FROM (SELECT * FROM unnest(ARRAY[]::int[]) WITH ORDINALITY) s"), 0);
+    assert_eq!(
+        count(
+            &mut e,
+            "SELECT count(*) FROM (SELECT * FROM generate_series(1,0) WITH ORDINALITY) s"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &mut e,
+            "SELECT count(*) FROM (SELECT * FROM unnest(ARRAY[]::int[]) WITH ORDINALITY) s"
+        ),
+        0
+    );
     // Ordinality counts from 1 in output order.
     assert_eq!(
-        text(&mut e, "SELECT string_agg(v||':'||n, '/') \
-                      FROM (SELECT * FROM unnest(ARRAY['a','b']) WITH ORDINALITY AS t(v,n)) s"),
+        text(
+            &mut e,
+            "SELECT string_agg(v||':'||n, '/') \
+                      FROM (SELECT * FROM unnest(ARRAY['a','b']) WITH ORDINALITY AS t(v,n)) s"
+        ),
         "a:1/b:2"
     );
 }

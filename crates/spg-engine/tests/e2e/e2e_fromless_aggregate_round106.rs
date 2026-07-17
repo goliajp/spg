@@ -30,12 +30,21 @@ fn common_aggregates_over_the_implicit_row() {
     let mut e = Engine::new();
     assert_eq!(text(&mut e, "SELECT count(*)"), "1");
     assert_eq!(
-        text(&mut e, "SELECT sum(5), max(3), min(7), avg(4)::text, (array_agg(5))::text"),
+        text(
+            &mut e,
+            "SELECT sum(5), max(3), min(7), avg(4)::text, (array_agg(5))::text"
+        ),
         "5|3|7|4.0000000000000000|{5}"
     );
-    assert_eq!(text(&mut e, "SELECT string_agg('x', ','), count(1), count(NULL)"), "x|1|0");
+    assert_eq!(
+        text(&mut e, "SELECT string_agg('x', ','), count(1), count(NULL)"),
+        "x|1|0"
+    );
     // (embedded value_to_text renders bool as true/false; the wire form is t/f)
-    assert_eq!(text(&mut e, "SELECT bool_and(true), bool_or(false)"), "true|false");
+    assert_eq!(
+        text(&mut e, "SELECT bool_and(true), bool_or(false)"),
+        "true|false"
+    );
 }
 
 #[test]
@@ -51,7 +60,10 @@ fn where_filters_the_implicit_row() {
 fn filter_having_and_ordered_agg() {
     let mut e = Engine::new();
     assert_eq!(
-        text(&mut e, "SELECT count(*) FILTER (WHERE false), count(*) FILTER (WHERE true)"),
+        text(
+            &mut e,
+            "SELECT count(*) FILTER (WHERE false), count(*) FILTER (WHERE true)"
+        ),
         "0|1"
     );
     assert_eq!(text(&mut e, "SELECT count(*) HAVING count(*) > 0"), "1");
@@ -62,7 +74,10 @@ fn filter_having_and_ordered_agg() {
 fn non_aggregate_constant_select_unaffected() {
     // Regression guard: a plain constant SELECT still evaluates as scalars.
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT 1 + 1, 'x', coalesce(NULL, 3)"), "2|x|3");
+    assert_eq!(
+        text(&mut e, "SELECT 1 + 1, 'x', coalesce(NULL, 3)"),
+        "2|x|3"
+    );
     // A non-aggregate `SELECT … WHERE false` still returns zero rows.
     match e.execute("SELECT 1 WHERE false").unwrap() {
         QueryResult::Rows { rows, .. } => assert!(rows.is_empty()),

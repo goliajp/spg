@@ -103,18 +103,13 @@ fn int2_overflow_errors_like_pg() {
 #[test]
 fn overflow_and_error_surfaces_match_pg() {
     let mut e = Engine::new();
-    let err = |e: &mut Engine, sql: &str| -> String {
-        format!("{}", e.execute(sql).unwrap_err())
-    };
+    let err = |e: &mut Engine, sql: &str| -> String { format!("{}", e.execute(sql).unwrap_err()) };
     assert!(err(&mut e, "SELECT 2147483647::int + 1").contains("integer out of range"));
     assert!(err(&mut e, "SELECT 32767::smallint + 1::smallint").contains("smallint out of range"));
-    assert!(
-        err(&mut e, "SELECT 9223372036854775807::bigint + 1").contains("bigint out of range")
-    );
+    assert!(err(&mut e, "SELECT 9223372036854775807::bigint + 1").contains("bigint out of range"));
     assert!(err(&mut e, "SELECT (-2147483648)::int / (-1)").contains("integer out of range"));
     assert!(
-        err(&mut e, "SELECT (-9223372036854775808)::bigint / (-1)")
-            .contains("bigint out of range")
+        err(&mut e, "SELECT (-9223372036854775808)::bigint / (-1)").contains("bigint out of range")
     );
     assert!(err(&mut e, "SELECT abs((-2147483648)::int)").contains("integer out of range"));
     // INT_MIN % -1 is 0, not an overflow (PG).

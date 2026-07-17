@@ -20,7 +20,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn err(e: &mut Engine, sql: &str) -> String {
@@ -55,7 +56,10 @@ fn seeded() -> Engine {
 fn return_next_accumulates_a_row_at_a_time() {
     let mut e = seeded();
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(x::text, ',') FROM pl_next(3) AS x"),
+        r1(
+            &mut e,
+            "SELECT string_agg(x::text, ',') FROM pl_next(3) AS x"
+        ),
         "10,20,30"
     );
     // Zero iterations = the empty set, not an error.
@@ -66,7 +70,10 @@ fn return_next_accumulates_a_row_at_a_time() {
 fn return_query_appends_the_querys_rows() {
     let mut e = seeded();
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(x::text, ',') FROM pl_query(2) AS x"),
+        r1(
+            &mut e,
+            "SELECT string_agg(x::text, ',') FROM pl_query(2) AS x"
+        ),
         "2,3"
     );
     assert_eq!(r1(&mut e, "SELECT count(*) FROM pl_query(1)"), "3");
@@ -78,7 +85,10 @@ fn return_query_sees_only_visible_rows() {
     let mut e = seeded();
     ok(&mut e, "DELETE FROM t WHERE id = 2");
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(x::text, ',') FROM pl_query(1) AS x"),
+        r1(
+            &mut e,
+            "SELECT string_agg(x::text, ',') FROM pl_query(1) AS x"
+        ),
         "1,3"
     );
 }
@@ -92,7 +102,10 @@ fn a_plpgsql_returns_table_names_its_columns() {
          BEGIN RETURN QUERY SELECT t.id, t.v FROM t WHERE t.id >= k ORDER BY t.id; END; $$ LANGUAGE plpgsql",
     );
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(id::text || v, ',') FROM pl_table(2)"),
+        r1(
+            &mut e,
+            "SELECT string_agg(id::text || v, ',') FROM pl_table(2)"
+        ),
         "2b,3c"
     );
 }

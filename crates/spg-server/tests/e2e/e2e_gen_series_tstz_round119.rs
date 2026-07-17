@@ -17,7 +17,10 @@ const OID_TIMESTAMPTZ: i32 = 1184;
 const OID_TIMESTAMP: i32 = 1114;
 
 fn local_spawn(db: &std::path::Path) -> (std::process::Child, common::ServerAddrs) {
-    common::ServerBuilder::new().arg_path(db).with_pgwire().spawn()
+    common::ServerBuilder::new()
+        .arg_path(db)
+        .with_pgwire()
+        .spawn()
 }
 
 fn unique_tmpdir(label: &str) -> PathBuf {
@@ -138,7 +141,11 @@ fn top_level_generate_series_over_date_is_timestamptz() {
     );
     let msgs = read_until_ready(&mut s);
     let t = msgs.iter().find(|m| m.ty == b'T').expect("RowDescription");
-    assert_eq!(first_col_oid(&t.body), OID_TIMESTAMPTZ, "date bounds → timestamptz");
+    assert_eq!(
+        first_col_oid(&t.body),
+        OID_TIMESTAMPTZ,
+        "date bounds → timestamptz"
+    );
     assert_eq!(
         cells(&msgs),
         vec!["2024-01-01 00:00:00+00", "2024-01-02 00:00:00+00"]
@@ -159,7 +166,11 @@ fn top_level_generate_series_over_timestamp_stays_timestamp() {
     );
     let msgs = read_until_ready(&mut s);
     let t = msgs.iter().find(|m| m.ty == b'T').expect("RowDescription");
-    assert_eq!(first_col_oid(&t.body), OID_TIMESTAMP, "timestamp bounds stay timestamp");
+    assert_eq!(
+        first_col_oid(&t.body),
+        OID_TIMESTAMP,
+        "timestamp bounds stay timestamp"
+    );
     assert_eq!(
         cells(&msgs),
         vec!["2024-01-01 00:00:00", "2024-01-02 00:00:00"]

@@ -52,8 +52,14 @@ fn positive_and_float_paths_unchanged() {
     // 1-arg round stays double precision with banker's rounding.
     let mut e = Engine::new();
     assert_eq!(text(&mut e, "SELECT round(1234.5678, 2)::text"), "1234.57");
-    assert_eq!(text(&mut e, "SELECT pg_typeof(round(1.5, 2))::text"), "numeric");
-    assert_eq!(text(&mut e, "SELECT round(1.255::numeric, 2)::text"), "1.26");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(round(1.5, 2))::text"),
+        "numeric"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT round(1.255::numeric, 2)::text"),
+        "1.26"
+    );
     assert_eq!(
         text(&mut e, "SELECT pg_typeof(round(2.5::float8))::text"),
         "double precision"

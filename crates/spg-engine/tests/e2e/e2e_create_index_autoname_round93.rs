@@ -18,9 +18,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn index_names(e: &mut Engine, table: &str) -> Vec<String> {
-    let sql = format!(
-        "SELECT indexname FROM pg_indexes WHERE tablename='{table}' ORDER BY indexname"
-    );
+    let sql =
+        format!("SELECT indexname FROM pg_indexes WHERE tablename='{table}' ORDER BY indexname");
     match e.execute(&sql).unwrap() {
         QueryResult::Rows { rows, .. } => rows
             .iter()
@@ -35,18 +34,18 @@ fn unnamed_index_gets_pg_style_generated_names() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE zz (a int, b int, c int)").unwrap();
     for s in [
-        "CREATE INDEX ON zz (a)",              // zz_a_idx
-        "CREATE INDEX ON zz (a)",              // collision -> zz_a_idx1
-        "CREATE INDEX ON zz (a)",              // zz_a_idx2
-        "CREATE UNIQUE INDEX ON zz (b)",       // unique doesn't change the name -> zz_b_idx
-        "CREATE INDEX ON zz (a) INCLUDE (b)",  // INCLUDE cols are in the name -> zz_a_b_idx
-        "CREATE INDEX ON zz (a) WHERE b > 0",  // partial predicate not in name -> zz_a_idx3
-        "CREATE INDEX ON zz (c)",              // zz_c_idx
-        "CREATE INDEX ON zz (b, a)",           // multi-col -> zz_b_a_idx
-        "CREATE INDEX ON zz ((a + b))",        // non-function expr -> zz_expr_idx
-        "CREATE INDEX ON zz (lower(c::text))", // function name -> zz_lower_idx (cast descended)
+        "CREATE INDEX ON zz (a)",                 // zz_a_idx
+        "CREATE INDEX ON zz (a)",                 // collision -> zz_a_idx1
+        "CREATE INDEX ON zz (a)",                 // zz_a_idx2
+        "CREATE UNIQUE INDEX ON zz (b)",          // unique doesn't change the name -> zz_b_idx
+        "CREATE INDEX ON zz (a) INCLUDE (b)",     // INCLUDE cols are in the name -> zz_a_b_idx
+        "CREATE INDEX ON zz (a) WHERE b > 0",     // partial predicate not in name -> zz_a_idx3
+        "CREATE INDEX ON zz (c)",                 // zz_c_idx
+        "CREATE INDEX ON zz (b, a)",              // multi-col -> zz_b_a_idx
+        "CREATE INDEX ON zz ((a + b))",           // non-function expr -> zz_expr_idx
+        "CREATE INDEX ON zz (lower(c::text))",    // function name -> zz_lower_idx (cast descended)
         "CREATE INDEX ON zz (upper(c::text), a)", // func + col -> zz_upper_a_idx
-        "CREATE INDEX ON zz (abs(a))",         // zz_abs_idx
+        "CREATE INDEX ON zz (abs(a))",            // zz_abs_idx
     ] {
         e.execute(s).unwrap_or_else(|x| panic!("{s}: {x:?}"));
     }

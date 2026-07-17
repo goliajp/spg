@@ -27,7 +27,8 @@ fn drop_constraint_unique_via_synth_name() {
     // name the catalog shows: PG's `<table>_<cols…>_key`. (The old
     // `<table>_uniq<idx>` this pinned was never printed by any view — DROP
     // and pg_constraint had simply disagreed; oracle-verified as t_a_b_key.)
-    e.execute("ALTER TABLE t DROP CONSTRAINT t_a_b_key").unwrap();
+    e.execute("ALTER TABLE t DROP CONSTRAINT t_a_b_key")
+        .unwrap();
     e.execute("INSERT INTO t VALUES (1, 1)").unwrap();
     e.execute("INSERT INTO t VALUES (1, 1)").unwrap();
 }
@@ -39,7 +40,8 @@ fn drop_constraint_check_via_synth_name() {
         .unwrap();
     // v7.39 (read01 round 48) — same fix: PG's `<table>_<col>_check` is what
     // pg_constraint prints and what DROP now accepts (oracle-verified).
-    e.execute("ALTER TABLE t DROP CONSTRAINT t_status_check").unwrap();
+    e.execute("ALTER TABLE t DROP CONSTRAINT t_status_check")
+        .unwrap();
     // The CHECK is gone, so a previously-rejected value lands.
     e.execute("INSERT INTO t VALUES (1, 'z')").unwrap();
 }

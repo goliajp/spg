@@ -434,15 +434,15 @@ impl Table {
         v: u64,
     ) -> alloc::vec::Vec<crate::row_header::RowId> {
         rids.iter()
-            .filter(|rid| {
-                match (0..self.rowids.len()).find(|&i| self.rowids.get(i) == Some(rid)) {
+            .filter(
+                |rid| match (0..self.rowids.len()).find(|&i| self.rowids.get(i) == Some(rid)) {
                     Some(i) => self
                         .headers
                         .get(i)
                         .is_some_and(|h| h.xmax != crate::row_header::XMAX_ALIVE && h.xmax != v),
                     None => true,
-                }
-            })
+                },
+            )
             .copied()
             .collect()
     }

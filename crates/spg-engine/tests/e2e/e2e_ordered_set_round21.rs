@@ -60,16 +60,20 @@ fn interval_order_by_is_span_ordered() {
 #[test]
 fn percentile_fraction_contract() {
     let mut e = Engine::new();
-    assert!(err_of(
-        &mut e,
-        "SELECT percentile_cont(1.5) WITHIN GROUP (ORDER BY x) FROM (VALUES (1),(2)) t(x)"
-    )
-    .contains("percentile value 1.5 is not between 0 and 1"));
-    assert!(err_of(
-        &mut e,
-        "SELECT percentile_cont(-0.1) WITHIN GROUP (ORDER BY x) FROM (VALUES (1),(2)) t(x)"
-    )
-    .contains("percentile value -0.1 is not between 0 and 1"));
+    assert!(
+        err_of(
+            &mut e,
+            "SELECT percentile_cont(1.5) WITHIN GROUP (ORDER BY x) FROM (VALUES (1),(2)) t(x)"
+        )
+        .contains("percentile value 1.5 is not between 0 and 1")
+    );
+    assert!(
+        err_of(
+            &mut e,
+            "SELECT percentile_cont(-0.1) WITHIN GROUP (ORDER BY x) FROM (VALUES (1),(2)) t(x)"
+        )
+        .contains("percentile value -0.1 is not between 0 and 1")
+    );
     // NULL fraction → NULL result.
     assert_eq!(
         row_of(
@@ -124,12 +128,14 @@ fn hypothetical_set_multi_key() {
         vec!["3"]
     );
     // Direct-argument count must match the ordering-column count.
-    assert!(err_of(
-        &mut e,
-        "SELECT rank(2, 3) WITHIN GROUP (ORDER BY a) FROM (VALUES (1)) t(a)"
-    )
-    .contains(
-        "the number of hypothetical direct arguments (here 2) must match \
+    assert!(
+        err_of(
+            &mut e,
+            "SELECT rank(2, 3) WITHIN GROUP (ORDER BY a) FROM (VALUES (1)) t(a)"
+        )
+        .contains(
+            "the number of hypothetical direct arguments (here 2) must match \
          the number of ordering columns (here 1)"
-    ));
+        )
+    );
 }

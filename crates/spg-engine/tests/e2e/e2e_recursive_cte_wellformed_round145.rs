@@ -53,15 +53,24 @@ fn non_union_set_op_with_self_ref_rejected() {
     // to swallow these too, concatenating the arms like UNION ALL (INTERSECT
     // gave 2, EXCEPT gave 2, UNION-distinct gave 2).
     assert_eq!(
-        count(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 INTERSECT SELECT 1) SELECT count(*) FROM r"),
+        count(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 INTERSECT SELECT 1) SELECT count(*) FROM r"
+        ),
         1
     );
     assert_eq!(
-        count(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 EXCEPT SELECT 1) SELECT count(*) FROM r"),
+        count(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 EXCEPT SELECT 1) SELECT count(*) FROM r"
+        ),
         0
     );
     assert_eq!(
-        count(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT 1) SELECT count(*) FROM r"),
+        count(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT 1) SELECT count(*) FROM r"
+        ),
         1
     );
 }
@@ -78,12 +87,18 @@ fn outer_join_nullable_side_self_ref_rejected() {
     );
     // Self-ref on the non-nullable side (left of LEFT JOIN) is legal — PG runs it.
     assert_eq!(
-        count(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT r.n+1 FROM r LEFT JOIN ot ON r.n = ot.id WHERE r.n < 3) SELECT count(*) FROM r"),
+        count(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT r.n+1 FROM r LEFT JOIN ot ON r.n = ot.id WHERE r.n < 3) SELECT count(*) FROM r"
+        ),
         3
     );
     // INNER JOIN with a self-ref is legal.
     assert_eq!(
-        count(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT r.n+1 FROM r JOIN ot ON r.n = ot.id) SELECT count(*) FROM r"),
+        count(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT r.n+1 FROM r JOIN ot ON r.n = ot.id) SELECT count(*) FROM r"
+        ),
         2
     );
 }
@@ -99,11 +114,17 @@ fn aggregate_in_recursive_term_rejected() {
     );
     // GROUP BY / DISTINCT without aggregates stay legal (PG runs both).
     assert_eq!(
-        count(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<3 GROUP BY n) SELECT count(*) FROM r"),
+        count(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<3 GROUP BY n) SELECT count(*) FROM r"
+        ),
         3
     );
     assert_eq!(
-        count(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT DISTINCT n+1 FROM r WHERE n<3) SELECT count(*) FROM r"),
+        count(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT DISTINCT n+1 FROM r WHERE n<3) SELECT count(*) FROM r"
+        ),
         3
     );
 }

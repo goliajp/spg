@@ -21,7 +21,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn r1(e: &mut Engine, sql: &str) -> String {
@@ -34,12 +35,21 @@ fn r1(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn a_bool_matrix_reports_and_renders_like_pg() {
     let mut e = Engine::new();
-    assert_eq!(r1(&mut e, "SELECT pg_typeof(ARRAY[ARRAY[true,false]])"), "boolean[]");
+    assert_eq!(
+        r1(&mut e, "SELECT pg_typeof(ARRAY[ARRAY[true,false]])"),
+        "boolean[]"
+    );
     // `t` / `f` INSIDE the array…
-    assert_eq!(r1(&mut e, "SELECT (ARRAY[ARRAY[true,false]])::text"), "{{t,f}}");
+    assert_eq!(
+        r1(&mut e, "SELECT (ARRAY[ARRAY[true,false]])::text"),
+        "{{t,f}}"
+    );
     // …and `false` when a cell is pulled out as a scalar. The pair of these is
     // what a text-backed 2-D could never satisfy at once.
-    assert_eq!(r1(&mut e, "SELECT (ARRAY[ARRAY[true,false]])[1][2]::text"), "false");
+    assert_eq!(
+        r1(&mut e, "SELECT (ARRAY[ARRAY[true,false]])[1][2]::text"),
+        "false"
+    );
 }
 
 #[test]
@@ -47,14 +57,29 @@ fn the_other_element_types_are_untouched() {
     // They render the same in an array and out of it, so they stay on the
     // text-backed 2-D — no variant, no storage change.
     let mut e = Engine::new();
-    assert_eq!(r1(&mut e, "SELECT (ARRAY[ARRAY[1,2],ARRAY[3,4]])::text"), "{{1,2},{3,4}}");
-    assert_eq!(r1(&mut e, "SELECT (ARRAY[ARRAY['a','b']])::text"), "{{a,b}}");
+    assert_eq!(
+        r1(&mut e, "SELECT (ARRAY[ARRAY[1,2],ARRAY[3,4]])::text"),
+        "{{1,2},{3,4}}"
+    );
+    assert_eq!(
+        r1(&mut e, "SELECT (ARRAY[ARRAY['a','b']])::text"),
+        "{{a,b}}"
+    );
     assert_eq!(
         r1(&mut e, "SELECT (ARRAY[ARRAY['2024-01-01'::date]])::text"),
         "{{2024-01-01}}"
     );
-    assert_eq!(r1(&mut e, "SELECT array_dims(ARRAY[ARRAY[true,false]])"), "[1:1][1:2]");
-    assert_eq!(r1(&mut e, "SELECT array_length(ARRAY[ARRAY[1,2],ARRAY[3,4]],2)::text"), "2");
+    assert_eq!(
+        r1(&mut e, "SELECT array_dims(ARRAY[ARRAY[true,false]])"),
+        "[1:1][1:2]"
+    );
+    assert_eq!(
+        r1(
+            &mut e,
+            "SELECT array_length(ARRAY[ARRAY[1,2],ARRAY[3,4]],2)::text"
+        ),
+        "2"
+    );
 }
 
 #[test]
@@ -62,7 +87,10 @@ fn a_bool_matrix_survives_a_snapshot() {
     // The new codec tag, round-tripped through a real snapshot.
     let mut e = Engine::new();
     ok(&mut e, "CREATE TABLE m (id int, g bool[][])");
-    ok(&mut e, "INSERT INTO m VALUES (1, ARRAY[ARRAY[true,false],ARRAY[false,true]])");
+    ok(
+        &mut e,
+        "INSERT INTO m VALUES (1, ARRAY[ARRAY[true,false],ARRAY[false,true]])",
+    );
     let bytes = e.snapshot();
     let cat = spg_storage::Catalog::deserialize(&bytes).unwrap();
     let t = cat.get("m").unwrap();

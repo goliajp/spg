@@ -90,7 +90,10 @@ fn compose_view_maps(a: &[(String, String)], b: &[(String, String)]) -> Vec<(Str
         b.iter().map(|(k, v)| (k, v)).collect();
     a.iter()
         .map(|(outer, mid)| {
-            let base = bm.get(mid).map(|s| (*s).clone()).unwrap_or_else(|| mid.clone());
+            let base = bm
+                .get(mid)
+                .map(|s| (*s).clone())
+                .unwrap_or_else(|| mid.clone());
             (outer.clone(), base)
         })
         .collect()
@@ -139,12 +142,10 @@ fn view_redirect_to_simple_base(
     // view auto-updatable). The view-side name is the rename-list entry
     // when present, else the item alias, else the column's own name.
     // `*` projects the primary's columns in declaration order.
-    let mut out_cols: Vec<(String, Option<String>, Option<spg_sql::ast::Expr>)> =
-        Vec::new(); // (view-side name, base col, computed expr)
+    let mut out_cols: Vec<(String, Option<String>, Option<spg_sql::ast::Expr>)> = Vec::new(); // (view-side name, base col, computed expr)
     for item in &select.items {
         match item {
-            spg_sql::ast::SelectItem::Wildcard
-            | spg_sql::ast::SelectItem::QualifiedWildcard(_) => {
+            spg_sql::ast::SelectItem::Wildcard | spg_sql::ast::SelectItem::QualifiedWildcard(_) => {
                 // Leaf: resolve the primary's output columns (a base
                 // table's schema). Over a nested view the wildcard is the
                 // identity pass-through (no per-column info needed) —
@@ -174,9 +175,7 @@ fn view_redirect_to_simple_base(
                     {
                         return None;
                     }
-                    let name = alias
-                        .clone()
-                        .unwrap_or_else(|| String::from("?column?"));
+                    let name = alias.clone().unwrap_or_else(|| String::from("?column?"));
                     out_cols.push((name, None, Some(other.clone())));
                 }
             },
@@ -187,7 +186,7 @@ fn view_redirect_to_simple_base(
         if rename_cols.len() != out_cols.len() {
             return None;
         }
-        for (slot, name) in out_cols.iter_mut().zip(rename_cols.into_iter()) {
+        for (slot, name) in out_cols.iter_mut().zip(rename_cols) {
             slot.0 = name;
         }
     }
@@ -209,8 +208,7 @@ fn view_redirect_to_simple_base(
         .iter()
         .filter_map(|(n, b, _)| b.clone().map(|b| (n.clone(), b)))
         .collect();
-    let identity =
-        computed.is_empty() && all_simple.iter().all(|(v, b)| v.eq_ignore_ascii_case(b));
+    let identity = computed.is_empty() && all_simple.iter().all(|(v, b)| v.eq_ignore_ascii_case(b));
     let this_map: Vec<(String, String)> = if identity { Vec::new() } else { all_simple };
     let view_cols: Vec<(String, Option<String>)> = if computed.is_empty() {
         Vec::new()
@@ -226,7 +224,11 @@ fn view_redirect_to_simple_base(
     if catalog.get(&primary_name).is_some() {
         let mut chain = Vec::new();
         if let Some(w) = &this_where {
-            chain.push((alloc::string::String::from(view_name), w.clone(), this_check));
+            chain.push((
+                alloc::string::String::from(view_name),
+                w.clone(),
+                this_check,
+            ));
         }
         return Some(ViewRedirect {
             base: primary_name,
@@ -258,7 +260,11 @@ fn view_redirect_to_simple_base(
         });
         let mut chain = Vec::new();
         if let Some(w) = &this_where_at_base {
-            chain.push((alloc::string::String::from(view_name), w.clone(), this_check));
+            chain.push((
+                alloc::string::String::from(view_name),
+                w.clone(),
+                this_check,
+            ));
         }
         chain.extend(inner.check_chain);
         if inner.computed.is_empty() {
@@ -293,12 +299,10 @@ fn view_redirect_to_simple_base(
                 let inner_ref = inner_ref.as_ref()?; // all-simple here
                 if let Some(c) = inner.computed.iter().find(|c| c.name == *inner_ref) {
                     composed.push((name.clone(), None, Some(c)));
-                } else if let Some(base) = inner_by_name.get(inner_ref.as_str()) {
+                } else {
+                    let base = inner_by_name.get(inner_ref.as_str())?;
                     // A simple inner column — its base name is right there.
                     composed.push((name.clone(), (*base).clone(), None));
-                } else {
-                    // Not a column of the inner view; bail to the honest error.
-                    return None;
                 }
             }
         }
@@ -475,9 +479,9 @@ fn rewrite_view_returning_items(
     use spg_sql::ast::{Expr, SelectItem};
     let map: alloc::collections::BTreeMap<String, String> = col_map.iter().cloned().collect();
     let cmap: alloc::collections::BTreeMap<String, Expr> = computed
-                    .iter()
-                    .map(|c| (c.name.clone(), c.def.clone()))
-                    .collect();
+        .iter()
+        .map(|c| (c.name.clone(), c.def.clone()))
+        .collect();
     let mut out: Vec<SelectItem> = Vec::new();
     for it in items {
         match it {
@@ -571,13 +575,13 @@ use crate::eval::{EvalContext, EvalError};
 use crate::{
     CancelToken, Engine, EngineError, QueryResult, any_column_changed, apply_fk_child_step,
     apply_on_conflict_assignments, build_projection, canonicalize_set_value, check_unsigned_range,
-    coerce_value,
-    enforce_check_constraints, enforce_enum_label, enforce_fk_inserts, enforce_not_null,
-    enforce_unique_index_inserts, enforce_unique_updates, enforce_uniqueness_inserts, eval,
-    eval_runtime_default_free, expr_has_subquery, literal_expr_to_value, literal_expr_to_value_in,
-    lookup_row_position_by_keys, on_conflict_keys_exist, plan_fk_parent_deletions,
-    plan_fk_parent_updates, resolve_column_default_free, resolve_on_conflict_columns, triggers,
-    try_index_seek_positions, try_pk_predicate, value_to_literal_expr_permissive,
+    coerce_value, enforce_check_constraints, enforce_enum_label, enforce_fk_inserts,
+    enforce_not_null, enforce_unique_index_inserts, enforce_unique_updates,
+    enforce_uniqueness_inserts, eval, eval_runtime_default_free, expr_has_subquery,
+    literal_expr_to_value, literal_expr_to_value_in, lookup_row_position_by_keys,
+    on_conflict_keys_exist, plan_fk_parent_deletions, plan_fk_parent_updates,
+    resolve_column_default_free, resolve_on_conflict_columns, triggers, try_index_seek_positions,
+    try_pk_predicate, value_to_literal_expr_permissive,
 };
 
 /// Pre-borrow snapshots gathered by `prepare_insert_snapshots` for the
@@ -685,7 +689,9 @@ impl Engine {
             if stmt.returning.is_some() {
                 return Err(crate::rules::rule_returning_error("UPDATE", &stmt.table));
             }
-            Some(spg_sql::ast::Expr::Literal(spg_sql::ast::Literal::Bool(false)))
+            Some(spg_sql::ast::Expr::Literal(spg_sql::ast::Literal::Bool(
+                false,
+            )))
         } else {
             self.conditional_block_predicate(&stmt.table, "UPDATE", &stmt.assignments)?
         };
@@ -769,8 +775,7 @@ impl Engine {
             if !col_map.is_empty() || !computed.is_empty() {
                 let map: alloc::collections::BTreeMap<String, String> =
                     col_map.iter().cloned().collect();
-                let cmap: alloc::collections::BTreeMap<String, Expr> =
-                    computed
+                let cmap: alloc::collections::BTreeMap<String, Expr> = computed
                     .iter()
                     .map(|c| (c.name.clone(), c.def.clone()))
                     .collect();
@@ -1258,7 +1263,11 @@ impl Engine {
                     &[],
                     trigger_session_cfg.as_deref(),
                     false,
-                    &triggers::TgMeta { op: "UPDATE", name: tgname, level: "ROW" },
+                    &triggers::TgMeta {
+                        op: "UPDATE",
+                        name: tgname,
+                        level: "ROW",
+                    },
                 )
                 .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
                 deferred_embedded.extend(deferred);
@@ -1326,7 +1335,10 @@ impl Engine {
                     .map_err(EngineError::Storage)?;
                 if let (Some(o), Some(n)) = (
                     old_rid,
-                    table.rowids().get(table.rowids().len().wrapping_sub(1)).copied(),
+                    table
+                        .rowids()
+                        .get(table.rowids().len().wrapping_sub(1))
+                        .copied(),
                 ) {
                     update_rid_pairs.push((o, n));
                 }
@@ -1357,7 +1369,11 @@ impl Engine {
                     &[],
                     trigger_session_cfg.as_deref(),
                     true,
-                    &triggers::TgMeta { op: "UPDATE", name: tgname, level: "ROW" },
+                    &triggers::TgMeta {
+                        op: "UPDATE",
+                        name: tgname,
+                        level: "ROW",
+                    },
                 )
                 .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
                 deferred_embedded.extend(deferred);
@@ -1453,8 +1469,8 @@ impl Engine {
             if !vr.col_map.is_empty() || !vr.computed.is_empty() {
                 let map: alloc::collections::BTreeMap<String, String> =
                     vr.col_map.iter().cloned().collect();
-                let cmap: alloc::collections::BTreeMap<String, Expr> =
-                    vr.computed
+                let cmap: alloc::collections::BTreeMap<String, Expr> = vr
+                    .computed
                     .iter()
                     .map(|c| (c.name.clone(), c.def.clone()))
                     .collect();
@@ -1471,9 +1487,7 @@ impl Engine {
                             for (col, e) in assignments {
                                 // v7.39 (round 154) — a computed view column
                                 // is never a write target.
-                                if let Some(cc) =
-                                    vr.computed.iter().find(|cc| cc.name == *col)
-                                {
+                                if let Some(cc) = vr.computed.iter().find(|cc| cc.name == *col) {
                                     return Err(view_computed_col_write_err(
                                         "merge into",
                                         &cc.origin_col,
@@ -1494,8 +1508,7 @@ impl Engine {
                                 // the order comes from `view_cols`; a tuple
                                 // value landing on a computed slot errors.
                                 if vr.computed.is_empty() {
-                                    *columns =
-                                        vr.col_map.iter().map(|(_, b)| b.clone()).collect();
+                                    *columns = vr.col_map.iter().map(|(_, b)| b.clone()).collect();
                                 } else {
                                     let n = values.len();
                                     let mut cols: Vec<String> = Vec::with_capacity(n);
@@ -1520,9 +1533,7 @@ impl Engine {
                                 }
                             } else {
                                 for c in columns.iter_mut() {
-                                    if let Some(cc) =
-                                        vr.computed.iter().find(|cc| cc.name == *c)
-                                    {
+                                    if let Some(cc) = vr.computed.iter().find(|cc| cc.name == *c) {
                                         return Err(view_computed_col_write_err(
                                             "merge into",
                                             &cc.origin_col,
@@ -1555,22 +1566,19 @@ impl Engine {
                     for it in items.iter() {
                         if let spg_sql::ast::SelectItem::Expr { expr, .. } = it {
                             let mut bad = false;
-                            crate::expr_analysis::rewrite_nodes_mut(
-                                &mut expr.clone(),
-                                &mut |n| {
-                                    if let Expr::Column(c) = n {
-                                        if c.qualifier.as_deref().is_some_and(|q| {
-                                            q.eq_ignore_ascii_case("old")
-                                                || q.eq_ignore_ascii_case("new")
-                                        }) && vr.computed.iter().any(|cc| cc.name == c.name)
-                                        {
-                                            bad = true;
-                                        }
-                                        return true;
+                            crate::expr_analysis::rewrite_nodes_mut(&mut expr.clone(), &mut |n| {
+                                if let Expr::Column(c) = n {
+                                    if c.qualifier.as_deref().is_some_and(|q| {
+                                        q.eq_ignore_ascii_case("old")
+                                            || q.eq_ignore_ascii_case("new")
+                                    }) && vr.computed.iter().any(|cc| cc.name == c.name)
+                                    {
+                                        bad = true;
                                     }
-                                    false
-                                },
-                            );
+                                    return true;
+                                }
+                                false
+                            });
                             if bad {
                                 return Err(EngineError::Unsupported(alloc::format!(
                                     "OLD/NEW references to computed view column of view \"{}\" in MERGE RETURNING are not supported",
@@ -1589,51 +1597,48 @@ impl Engine {
                     };
                     let mut out: alloc::vec::Vec<spg_sql::ast::SelectItem> =
                         alloc::vec::Vec::with_capacity(items.len());
-                    let push_view_cols =
-                        |out: &mut alloc::vec::Vec<spg_sql::ast::SelectItem>| {
-                            // Round 154 — `view_cols` carries the order when
-                            // computed columns exist; a computed column
-                            // projects its (target-qualified) expression.
-                            if vr.view_cols.is_empty() {
-                                for (view_col, base_col) in &vr.col_map {
-                                    out.push(spg_sql::ast::SelectItem::Expr {
-                                        expr: Expr::Column(spg_sql::ast::ColumnName {
-                                            qualifier: Some(alias.clone()),
-                                            name: base_col.clone(),
-                                        }),
-                                        alias: Some(view_col.clone()),
-                                    });
-                                }
-                            } else {
-                                for (view_col, base_col) in &vr.view_cols {
-                                    let expr = match base_col {
-                                        Some(b) => Expr::Column(spg_sql::ast::ColumnName {
-                                            qualifier: Some(alias.clone()),
-                                            name: b.clone(),
-                                        }),
-                                        None => {
-                                            let mut e = Expr::Column(
-                                                spg_sql::ast::ColumnName {
-                                                    qualifier: None,
-                                                    name: view_col.clone(),
-                                                },
-                                            );
-                                            rewrite_view_refs_to_base(
-                                                &mut e,
-                                                &map,
-                                                &cmap,
-                                                Some(&alias),
-                                            );
-                                            e
-                                        }
-                                    };
-                                    out.push(spg_sql::ast::SelectItem::Expr {
-                                        expr,
-                                        alias: Some(view_col.clone()),
-                                    });
-                                }
+                    let push_view_cols = |out: &mut alloc::vec::Vec<spg_sql::ast::SelectItem>| {
+                        // Round 154 — `view_cols` carries the order when
+                        // computed columns exist; a computed column
+                        // projects its (target-qualified) expression.
+                        if vr.view_cols.is_empty() {
+                            for (view_col, base_col) in &vr.col_map {
+                                out.push(spg_sql::ast::SelectItem::Expr {
+                                    expr: Expr::Column(spg_sql::ast::ColumnName {
+                                        qualifier: Some(alias.clone()),
+                                        name: base_col.clone(),
+                                    }),
+                                    alias: Some(view_col.clone()),
+                                });
                             }
-                        };
+                        } else {
+                            for (view_col, base_col) in &vr.view_cols {
+                                let expr = match base_col {
+                                    Some(b) => Expr::Column(spg_sql::ast::ColumnName {
+                                        qualifier: Some(alias.clone()),
+                                        name: b.clone(),
+                                    }),
+                                    None => {
+                                        let mut e = Expr::Column(spg_sql::ast::ColumnName {
+                                            qualifier: None,
+                                            name: view_col.clone(),
+                                        });
+                                        rewrite_view_refs_to_base(
+                                            &mut e,
+                                            &map,
+                                            &cmap,
+                                            Some(&alias),
+                                        );
+                                        e
+                                    }
+                                };
+                                out.push(spg_sql::ast::SelectItem::Expr {
+                                    expr,
+                                    alias: Some(view_col.clone()),
+                                });
+                            }
+                        }
+                    };
                     for it in items.iter() {
                         match it {
                             spg_sql::ast::SelectItem::QualifiedWildcard(q)
@@ -1647,10 +1652,8 @@ impl Engine {
                             // source columns first, then the view's columns
                             // under their VIEW names.
                             spg_sql::ast::SelectItem::Wildcard => {
-                                let src = s
-                                    .source_alias
-                                    .clone()
-                                    .unwrap_or_else(|| s.source.clone());
+                                let src =
+                                    s.source_alias.clone().unwrap_or_else(|| s.source.clone());
                                 out.push(spg_sql::ast::SelectItem::QualifiedWildcard(src));
                                 push_view_cols(&mut out);
                             }
@@ -1659,8 +1662,7 @@ impl Engine {
                                     a.clone()
                                 } else if let Expr::Column(c) = expr
                                     && is_target_q(&c.qualifier)
-                                    && (map.contains_key(&c.name)
-                                        || cmap.contains_key(&c.name))
+                                    && (map.contains_key(&c.name) || cmap.contains_key(&c.name))
                                 {
                                     Some(c.name.clone())
                                 } else {
@@ -1676,12 +1678,11 @@ impl Engine {
                                                 // Substitute the computed
                                                 // column's expression,
                                                 // target-qualified.
-                                                let mut sub = Expr::Column(
-                                                    spg_sql::ast::ColumnName {
+                                                let mut sub =
+                                                    Expr::Column(spg_sql::ast::ColumnName {
                                                         qualifier: None,
                                                         name: c.name.clone(),
-                                                    },
-                                                );
+                                                    });
                                                 rewrite_view_refs_to_base(
                                                     &mut sub,
                                                     &map,
@@ -2034,14 +2035,13 @@ impl Engine {
                         }
                     } else {
                         for (col, expr) in columns.iter().zip(values.iter()) {
-                            let pos = target_cols
-                                .iter()
-                                .position(|c| c.name == *col)
-                                .ok_or_else(|| {
+                            let pos = target_cols.iter().position(|c| c.name == *col).ok_or_else(
+                                || {
                                     EngineError::Eval(EvalError::ColumnNotFound {
                                         name: col.clone(),
                                     })
-                                })?;
+                                },
+                            )?;
                             let raw = eval::eval_expr(expr, &synth_row, &source_only_ctx)?;
                             let coerced = coerce_value(
                                 raw,
@@ -2106,7 +2106,9 @@ impl Engine {
                     if !matches!(c.matched, spg_sql::ast::MergeMatched::NotMatchedBySource) {
                         return false;
                     }
-                    let Some(cond) = &c.condition else { return true };
+                    let Some(cond) = &c.condition else {
+                        return true;
+                    };
                     matches!(
                         eval::eval_expr(cond, &eval_row, &combined_ctx),
                         Ok(Value::Bool(true))
@@ -2135,17 +2137,20 @@ impl Engine {
                     spg_sql::ast::MergeAction::Update { assignments } => {
                         let mut new_values = t_row.values.clone();
                         for (col, expr) in assignments {
-                            let pos = target_cols
-                                .iter()
-                                .position(|c| c.name == *col)
-                                .ok_or_else(|| {
+                            let pos = target_cols.iter().position(|c| c.name == *col).ok_or_else(
+                                || {
                                     EngineError::Eval(EvalError::ColumnNotFound {
                                         name: col.clone(),
                                     })
-                                })?;
+                                },
+                            )?;
                             let raw = eval::eval_expr(expr, &eval_row, &combined_ctx)?;
-                            let coerced =
-                                coerce_value(raw, target_cols[pos].ty, &target_cols[pos].name, pos)?;
+                            let coerced = coerce_value(
+                                raw,
+                                target_cols[pos].ty,
+                                &target_cols[pos].name,
+                                pos,
+                            )?;
                             new_values[pos] = coerced;
                         }
                         if want_returning {
@@ -2286,10 +2291,18 @@ impl Engine {
             syn.push(ColumnSchema::new(c.name.clone(), c.ty, true));
         }
         for c in target_cols {
-            syn.push(ColumnSchema::new(alloc::format!("__ret_old_{}", c.name), c.ty, true));
+            syn.push(ColumnSchema::new(
+                alloc::format!("__ret_old_{}", c.name),
+                c.ty,
+                true,
+            ));
         }
         for c in target_cols {
-            syn.push(ColumnSchema::new(alloc::format!("__ret_new_{}", c.name), c.ty, true));
+            syn.push(ColumnSchema::new(
+                alloc::format!("__ret_new_{}", c.name),
+                c.ty,
+                true,
+            ));
         }
         syn.push(ColumnSchema::new(
             alloc::string::String::from("__merge_action"),
@@ -2299,8 +2312,7 @@ impl Engine {
 
         // Expand + rewrite the projection into flat (output_name, ty, expr)
         // triples against the synthetic schema.
-        let expanded =
-            expand_merge_returning_items(items, target_alias, source_alias, target_cols);
+        let expanded = expand_merge_returning_items(items, target_alias, source_alias, target_cols);
         let projection = build_projection(&expanded, &syn, "")?;
         let columns: Vec<ColumnSchema> = projection
             .iter()
@@ -2365,7 +2377,9 @@ impl Engine {
             if stmt.returning.is_some() {
                 return Err(crate::rules::rule_returning_error("DELETE", &stmt.table));
             }
-            Some(spg_sql::ast::Expr::Literal(spg_sql::ast::Literal::Bool(false)))
+            Some(spg_sql::ast::Expr::Literal(spg_sql::ast::Literal::Bool(
+                false,
+            )))
         } else {
             self.conditional_block_predicate(&stmt.table, "DELETE", &[])?
         };
@@ -2412,8 +2426,8 @@ impl Engine {
             if !vr.col_map.is_empty() || !vr.computed.is_empty() {
                 let map: alloc::collections::BTreeMap<String, String> =
                     vr.col_map.iter().cloned().collect();
-                let cmap: alloc::collections::BTreeMap<String, Expr> =
-                    vr.computed
+                let cmap: alloc::collections::BTreeMap<String, Expr> = vr
+                    .computed
                     .iter()
                     .map(|c| (c.name.clone(), c.def.clone()))
                     .collect();
@@ -2724,7 +2738,11 @@ impl Engine {
                         &[],
                         trigger_session_cfg.as_deref(),
                         false,
-                        &triggers::TgMeta { op: "DELETE", name: tgname, level: "ROW" },
+                        &triggers::TgMeta {
+                            op: "DELETE",
+                            name: tgname,
+                            level: "ROW",
+                        },
                     )
                     .map_err(|e| {
                         EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
@@ -2828,7 +2846,11 @@ impl Engine {
                         &[],
                         trigger_session_cfg.as_deref(),
                         true,
-                        &triggers::TgMeta { op: "DELETE", name: tgname, level: "ROW" },
+                        &triggers::TgMeta {
+                            op: "DELETE",
+                            name: tgname,
+                            level: "ROW",
+                        },
                     )
                     .map_err(|e| {
                         EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
@@ -2981,7 +3003,11 @@ impl Engine {
     fn exec_insert_view_instead_of(
         &mut self,
         stmt: &spg_sql::ast::InsertStatement,
-        triggers_list: Vec<(spg_storage::FunctionDef, alloc::string::String, alloc::string::String)>,
+        triggers_list: Vec<(
+            spg_storage::FunctionDef,
+            alloc::string::String,
+            alloc::string::String,
+        )>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let view_def = self
@@ -3181,7 +3207,8 @@ impl Engine {
                     let pos = columns.iter().position(|c| &c.name == col).ok_or_else(|| {
                         EngineError::Eval(EvalError::ColumnNotFound { name: col.clone() })
                     })?;
-                    new_vals[pos] = self.eval_expr_with_correlated(expr, old, &ctx, cancel, None)?;
+                    new_vals[pos] =
+                        self.eval_expr_with_correlated(expr, old, &ctx, cancel, None)?;
                 }
                 pairs.push((Some(Row::new(new_vals)), Some(old.clone())));
             }
@@ -3235,7 +3262,8 @@ impl Engine {
                     let pos = columns.iter().position(|c| &c.name == col).ok_or_else(|| {
                         EngineError::Eval(EvalError::ColumnNotFound { name: col.clone() })
                     })?;
-                    new_vals[pos] = self.eval_expr_with_correlated(expr, old, &ctx, cancel, None)?;
+                    new_vals[pos] =
+                        self.eval_expr_with_correlated(expr, old, &ctx, cancel, None)?;
                 }
                 pairs.push((Some(Row::new(new_vals)), Some(old.clone())));
             }
@@ -3255,11 +3283,14 @@ impl Engine {
     fn exec_update_view_instead_of(
         &mut self,
         stmt: &spg_sql::ast::UpdateStatement,
-        triggers_list: Vec<(spg_storage::FunctionDef, alloc::string::String, alloc::string::String)>,
+        triggers_list: Vec<(
+            spg_storage::FunctionDef,
+            alloc::string::String,
+            alloc::string::String,
+        )>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
-        let (columns, old_rows) =
-            self.scan_relation_rows(&stmt.table, &stmt.where_, cancel)?;
+        let (columns, old_rows) = self.scan_relation_rows(&stmt.table, &stmt.where_, cancel)?;
         let trigger_cfg: Option<String> = self
             .session_params
             .get("default_text_search_config")
@@ -3332,11 +3363,14 @@ impl Engine {
     fn exec_delete_view_instead_of(
         &mut self,
         stmt: &spg_sql::ast::DeleteStatement,
-        triggers_list: Vec<(spg_storage::FunctionDef, alloc::string::String, alloc::string::String)>,
+        triggers_list: Vec<(
+            spg_storage::FunctionDef,
+            alloc::string::String,
+            alloc::string::String,
+        )>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
-        let (columns, old_rows) =
-            self.scan_relation_rows(&stmt.table, &stmt.where_, cancel)?;
+        let (columns, old_rows) = self.scan_relation_rows(&stmt.table, &stmt.where_, cancel)?;
         let trigger_cfg: Option<String> = self
             .session_params
             .get("default_text_search_config")
@@ -3401,10 +3435,7 @@ impl Engine {
             .map_err(|e| enrich_not_null(e, &table))
     }
 
-    fn exec_insert_inner(
-        &mut self,
-        mut stmt: InsertStatement,
-    ) -> Result<QueryResult, EngineError> {
+    fn exec_insert_inner(&mut self, mut stmt: InsertStatement) -> Result<QueryResult, EngineError> {
         // v7.37.43-T4.4 — writable CTE outer body: materialise every
         // leading WITH clause first (running any modifying CTE
         // bodies against the active catalog so their writes land
@@ -3515,8 +3546,7 @@ impl Engine {
                         }
                     }
                     None if computed.is_empty() => {
-                        stmt.columns =
-                            Some(col_map.iter().map(|(_, b)| b.clone()).collect());
+                        stmt.columns = Some(col_map.iter().map(|(_, b)| b.clone()).collect());
                     }
                     None => {
                         let n = stmt.rows.iter().map(Vec::len).max().unwrap_or(0);
@@ -3783,18 +3813,18 @@ impl Engine {
         // a fresh mutable borrow, then apply queued ON CONFLICT updates.
         let (returning_rows, deferred_embedded, affected, oc_pairs, oc_old_images) =
             insert_parsed_rows(
-            table,
-            xmin_for_stmt,
-            inplace_for_stmt,
-            all_values,
-            pending_updates,
-            &before_insert_triggers,
-            &after_insert_triggers,
-            &column_meta,
-            &stmt.table,
-            trigger_session_cfg.as_deref(),
-            stmt.returning.is_some() || !also_ins.is_empty(),
-        )?;
+                table,
+                xmin_for_stmt,
+                inplace_for_stmt,
+                all_values,
+                pending_updates,
+                &before_insert_triggers,
+                &after_insert_triggers,
+                &column_meta,
+                &stmt.table,
+                trigger_session_cfg.as_deref(),
+                stmt.returning.is_some() || !also_ins.is_empty(),
+            )?;
         let _ = skipped_count;
         // v7.12.7 — drop the table mut borrow and drain any
         // trigger-emitted embedded SQL queued during this INSERT.
@@ -4813,7 +4843,9 @@ impl Engine {
                         _ => vals.extend(default_rows[i].iter().cloned()),
                     },
                     SelectItem::Expr { expr, .. } => {
-                        vals.push(self.eval_expr_with_correlated(expr, &syn_row, &ctx, cancel, None)?);
+                        vals.push(
+                            self.eval_expr_with_correlated(expr, &syn_row, &ctx, cancel, None)?,
+                        );
                     }
                 }
             }
@@ -4848,9 +4880,9 @@ fn rewrite_returning_old_new(expr: &mut Expr) -> bool {
             let a = rewrite_returning_old_new(lhs);
             rewrite_returning_old_new(rhs) || a
         }
-        Expr::Unary { expr, .. }
-        | Expr::Cast { expr, .. }
-        | Expr::IsNull { expr, .. } => rewrite_returning_old_new(expr),
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            rewrite_returning_old_new(expr)
+        }
         Expr::FunctionCall { args, .. } => {
             let mut found = false;
             for a in args {
@@ -4955,7 +4987,11 @@ fn expand_merge_returning_items(
             SelectItem::QualifiedWildcard(q) => {
                 let ql = q.to_ascii_lowercase();
                 if ql == "old" || ql == "new" {
-                    let prefix = if ql == "old" { "__ret_old_" } else { "__ret_new_" };
+                    let prefix = if ql == "old" {
+                        "__ret_old_"
+                    } else {
+                        "__ret_new_"
+                    };
                     for c in target_cols {
                         out.push(SelectItem::Expr {
                             expr: Expr::Column(spg_sql::ast::ColumnName {
@@ -5040,7 +5076,8 @@ fn build_tuple_pos(
                         // ("column \"x\" does not exist") dropped the relation.
                         EngineError::Unsupported(alloc::format!(
                             "column \"{}\" of relation \"{}\" does not exist",
-                            name, table_name
+                            name,
+                            table_name
                         ))
                     })?;
                 if map[idx].is_some() {
@@ -5427,8 +5464,16 @@ fn insert_parsed_rows(
     inplace: bool,
     all_values: Vec<Vec<Value<'static>>>,
     pending_updates: Vec<(usize, Vec<Value<'static>>, Vec<Value<'static>>)>,
-    before_insert_triggers: &[(spg_storage::FunctionDef, alloc::string::String, alloc::string::String)],
-    after_insert_triggers: &[(spg_storage::FunctionDef, alloc::string::String, alloc::string::String)],
+    before_insert_triggers: &[(
+        spg_storage::FunctionDef,
+        alloc::string::String,
+        alloc::string::String,
+    )],
+    after_insert_triggers: &[(
+        spg_storage::FunctionDef,
+        alloc::string::String,
+        alloc::string::String,
+    )],
     column_meta: &[ColumnSchema],
     table_name: &str,
     trigger_session_cfg: Option<&str>,
@@ -5488,7 +5533,11 @@ fn insert_parsed_rows(
                 &[],
                 trigger_session_cfg,
                 false,
-                &triggers::TgMeta { op: "INSERT", name: tgname, level: "ROW" },
+                &triggers::TgMeta {
+                    op: "INSERT",
+                    name: tgname,
+                    level: "ROW",
+                },
             )
             .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
             deferred_embedded.extend(deferred);
@@ -5539,7 +5588,11 @@ fn insert_parsed_rows(
                 &[],
                 trigger_session_cfg,
                 true,
-                &triggers::TgMeta { op: "INSERT", name: tgname, level: "ROW" },
+                &triggers::TgMeta {
+                    op: "INSERT",
+                    name: tgname,
+                    level: "ROW",
+                },
             )
             .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
             deferred_embedded.extend(deferred);
@@ -5576,7 +5629,13 @@ fn insert_parsed_rows(
         }
         affected += 1;
     }
-    Ok((returning_rows, deferred_embedded, affected, oc_pairs, old_images))
+    Ok((
+        returning_rows,
+        deferred_embedded,
+        affected,
+        oc_pairs,
+        old_images,
+    ))
 }
 
 /// v7.39 (SQLSTATE fidelity) — PG's full 23502 message needs the
@@ -5812,8 +5871,7 @@ fn rename_rel_in_expr(e: &mut spg_sql::ast::Expr, old: &str, new: &str) {
             rename_rel_in_select(subquery, old, new);
             true
         }
-        Expr::RowInSubquery { row, subquery, .. }
-        | Expr::RowCmpSubquery { row, subquery, .. } => {
+        Expr::RowInSubquery { row, subquery, .. } | Expr::RowCmpSubquery { row, subquery, .. } => {
             for x in row {
                 rename_rel_in_expr(x, old, new);
             }

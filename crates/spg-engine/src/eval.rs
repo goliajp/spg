@@ -65,11 +65,10 @@ pub use format::{
 pub use format::{
     DateOrder, DateStyleKind, IntervalStyleKind, RenderStyle, format_date_array_styled,
     format_date_styled, format_float_array_styled, format_float_styled,
-    parse_date_literal_ordered, parse_timestamp_literal_ordered,
-    parse_timestamp_literal_tz_ordered,
     format_interval_array_styled, format_interval_styled, format_real_styled,
     format_timestamp_array_styled, format_timestamp_styled, format_timestamptz_styled,
-    format_timestamptz_tz,
+    format_timestamptz_tz, parse_date_literal_ordered, parse_timestamp_literal_ordered,
+    parse_timestamp_literal_tz_ordered,
 };
 use functions::apply_function;
 use inet::{inet_host, inet_masklen, inet_network, inet_op_bool_result};
@@ -636,15 +635,11 @@ fn apply_composite_cast(
         }
         Value::Text(s) => {
             let raw = parse_record_text(s.as_ref()).ok_or_else(|| EvalError::TypeMismatch {
-                detail: alloc::format!(
-                    "malformed record literal: \"{s}\""
-                ),
+                detail: alloc::format!("malformed record literal: \"{s}\""),
             })?;
             if raw.len() != comp.fields.len() {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "malformed record literal: \"{s}\""
-                    ),
+                    detail: alloc::format!("malformed record literal: \"{s}\""),
                 });
             }
             let mut out: alloc::vec::Vec<(alloc::string::String, Value<'static>)> =
@@ -652,15 +647,10 @@ fn apply_composite_cast(
             for ((fname, fty), field_text) in comp.fields.iter().zip(raw) {
                 let val = match field_text {
                     None => Value::Null,
-                    Some(t) => crate::conversions::coerce_value(
-                        Value::text(t),
-                        *fty,
-                        fname,
-                        0,
-                    )
-                    .map_err(|e| EvalError::TypeMismatch {
-                        detail: alloc::format!("{e}"),
-                    })?,
+                    Some(t) => crate::conversions::coerce_value(Value::text(t), *fty, fname, 0)
+                        .map_err(|e| EvalError::TypeMismatch {
+                            detail: alloc::format!("{e}"),
+                        })?,
                 };
                 out.push((fname.clone(), val));
             }
@@ -1033,7 +1023,6 @@ fn eval_matrix_subscript(
     }
 }
 
-
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
 /// (stack-depth guard budget); body unchanged.
 #[inline(never)]
@@ -1083,9 +1072,7 @@ fn eval_cast_arm(
         };
         if let (Some(oid), Some(cat)) = (oid_in, ctx.catalog) {
             if oid >= 16384 {
-                if let Some(name) =
-                    cat.table_names().into_iter().nth((oid - 16384) as usize)
-                {
+                if let Some(name) = cat.table_names().into_iter().nth((oid - 16384) as usize) {
                     return Ok(Value::RegClass(oid, name.into()));
                 }
             }
@@ -1161,17 +1148,15 @@ fn eval_cast_arm(
     if ctx.render_style.date_order != format::DateOrder::Mdy {
         match (&target, &v) {
             (CastTarget::Date, Value::Text(s)) => {
-                if let Some(d) =
-                    format::parse_date_literal_ordered(s, ctx.render_style.date_order)
+                if let Some(d) = format::parse_date_literal_ordered(s, ctx.render_style.date_order)
                 {
                     return Ok(Value::Date(d));
                 }
             }
             (CastTarget::Timestamp, Value::Text(s)) => {
-                if let Some(t) = format::parse_timestamp_literal_ordered(
-                    s,
-                    ctx.render_style.date_order,
-                ) {
+                if let Some(t) =
+                    format::parse_timestamp_literal_ordered(s, ctx.render_style.date_order)
+                {
                     return Ok(Value::Timestamp(t));
                 }
             }
@@ -1203,16 +1188,13 @@ fn eval_cast_arm(
                 && !tail.eq_ignore_ascii_case("ad");
             if tail_is_zoneish
                 && format::parse_timestamp_literal_tz_ordered(txt, order).is_none()
-                && let Some((wall, false)) =
-                    format::parse_timestamp_literal_tz_ordered(head, order)
+                && let Some((wall, false)) = format::parse_timestamp_literal_tz_ordered(head, order)
                 && let Some(utc) = ctx.zone_local_to_utc(tail, wall)
             {
                 return Ok(Value::Timestamp(utc));
             }
         }
-        if let Some((wall, had_tz)) =
-            format::parse_timestamp_literal_tz_ordered(txt, order)
-        {
+        if let Some((wall, had_tz)) = format::parse_timestamp_literal_tz_ordered(txt, order) {
             if had_tz {
                 return Ok(Value::Timestamp(wall));
             }
@@ -1249,7 +1231,10 @@ fn eval_cast_arm(
                 micros,
             } => {
                 return Ok(Value::text(format::format_interval_styled(
-                    *months, *days, *micros, &ctx.render_style,
+                    *months,
+                    *days,
+                    *micros,
+                    &ctx.render_style,
                 )));
             }
             Value::Float(x) => {
@@ -1269,7 +1254,6 @@ fn eval_cast_arm(
     }
     cast_value(v, target.clone())
 }
-
 
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
 /// (stack-depth guard budget); body unchanged.
@@ -1297,18 +1281,16 @@ fn eval_array_arm(
     // int/bigint arrays render into the text 2-D form below (SPG has no bool 2-D
     // storage variant — a recorded residual), but they stay 2-D.
     let all_arrays = !materialised.is_empty()
-        && materialised
-            .iter()
-            .all(|v| {
-                values::array_len(v).is_some()
-                    && !matches!(
-                        v,
-                        Value::TextArray2D(_)
-                            | Value::IntArray2D(_)
-                            | Value::BigIntArray2D(_)
-                            | Value::BoolArray2D(_)
-                    )
-            });
+        && materialised.iter().all(|v| {
+            values::array_len(v).is_some()
+                && !matches!(
+                    v,
+                    Value::TextArray2D(_)
+                        | Value::IntArray2D(_)
+                        | Value::BigIntArray2D(_)
+                        | Value::BoolArray2D(_)
+                )
+        });
     if all_arrays {
         let row_len = values::array_len(&materialised[0]).unwrap_or(0);
         let same_len = materialised
@@ -1509,7 +1491,6 @@ fn eval_array_arm(
     Ok(Value::IntArray(out))
 }
 
-
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
 /// (stack-depth guard budget); body unchanged.
 #[inline(never)]
@@ -1577,9 +1558,7 @@ fn declared_param_names(fname: &str, ctx: &EvalContext<'_>) -> Option<alloc::vec
     let builtin: &[&str] = match lower.as_str() {
         "make_date" => &["year", "month", "day"],
         "make_time" => &["hour", "min", "sec"],
-        "make_timestamp" | "make_timestamptz" => {
-            &["year", "month", "mday", "hour", "min", "sec"]
-        }
+        "make_timestamp" | "make_timestamptz" => &["year", "month", "mday", "hour", "min", "sec"],
         "make_interval" => &["years", "months", "weeks", "days", "hours", "mins", "secs"],
         _ => &[],
     };
@@ -1622,9 +1601,7 @@ fn resolve_named_args(
                     .iter()
                     .position(|p| p.eq_ignore_ascii_case(name))
                     .ok_or_else(|| EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "{fname}(...) has no argument named \"{name}\""
-                        ),
+                        detail: alloc::format!("{fname}(...) has no argument named \"{name}\""),
                     })?;
                 (i, (**expr).clone())
             }
@@ -1863,10 +1840,7 @@ fn eval_function_call_positional(
         }
         let (sign, omag) = if off < 0 { ('-', -off) } else { ('+', off) };
         let (oh, om) = (omag / 3_600_000_000, (omag / 60_000_000) % 60);
-        let _ = core::fmt::Write::write_fmt(
-            &mut txt,
-            format_args!("{sign}{oh:02}:{om:02}"),
-        );
+        let _ = core::fmt::Write::write_fmt(&mut txt, format_args!("{sign}{oh:02}:{om:02}"));
         return Ok(Value::json(alloc::format!("\"{txt}\"")));
     }
     // v7.39 (enum order knife) — greatest/least over enum-typed arguments
@@ -1899,7 +1873,6 @@ fn eval_function_call_positional(
     apply_function(name, &evaluated, ctx)
 }
 
-
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
 /// (stack-depth guard budget); body unchanged.
 #[inline(never)]
@@ -1924,14 +1897,10 @@ fn eval_any_all_arm(
             // The LHS's element type, or TEXT when the LHS is an
             // untyped NULL (PG's unknown → text default).
             let arr_ty = match lhs.data_type() {
-                Some(spg_storage::DataType::SmallInt) => {
-                    spg_storage::DataType::SmallIntArray
-                }
+                Some(spg_storage::DataType::SmallInt) => spg_storage::DataType::SmallIntArray,
                 Some(spg_storage::DataType::Int) => spg_storage::DataType::IntArray,
                 Some(spg_storage::DataType::BigInt) => spg_storage::DataType::BigIntArray,
-                Some(spg_storage::DataType::Numeric { .. }) => {
-                    spg_storage::DataType::NumericArray
-                }
+                Some(spg_storage::DataType::Numeric { .. }) => spg_storage::DataType::NumericArray,
                 Some(spg_storage::DataType::Float) => spg_storage::DataType::FloatArray,
                 Some(spg_storage::DataType::Bool) => spg_storage::DataType::BoolArray,
                 Some(spg_storage::DataType::Date) => spg_storage::DataType::DateArray,
@@ -2014,7 +1983,6 @@ fn eval_any_all_arm(
     Ok(result)
 }
 
-
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
 /// (stack-depth guard budget); body unchanged.
 #[inline(never)]
@@ -2075,7 +2043,6 @@ fn eval_case_arm(
     }
 }
 
-
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
 /// (stack-depth guard budget); body unchanged.
 #[inline(never)]
@@ -2133,7 +2100,6 @@ fn eval_array_slice_arm(
     }
 }
 
-
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
 /// (stack-depth guard budget); body unchanged.
 #[inline(never)]
@@ -2186,7 +2152,6 @@ fn eval_in_list_arm(
     })
 }
 
-
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
 /// (stack-depth guard budget); body unchanged.
 #[inline(never)]
@@ -2222,7 +2187,6 @@ fn eval_like_arm(
     Ok(Value::Bool(if negated { !m } else { m }))
 }
 
-
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
 /// (stack-depth guard budget); body unchanged.
 #[inline(never)]
@@ -2255,7 +2219,6 @@ fn eval_extract_arm(
     }
     extract_field(*field, &v)
 }
-
 
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
 /// (stack-depth guard budget); body unchanged.
@@ -2297,7 +2260,6 @@ fn eval_array_subscript_arm(
     Ok(cur)
 }
 
-
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
 /// (stack-depth guard budget); body unchanged.
 #[inline(never)]
@@ -2322,13 +2284,10 @@ fn eval_field_access_arm(
                 name: field.to_string(),
             }),
         _ => Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "field access `.{field}` requires a composite (record) value"
-            ),
+            detail: alloc::format!("field access `.{field}` requires a composite (record) value"),
         }),
     }
 }
-
 
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
 /// (stack-depth guard budget); body unchanged.
@@ -2391,9 +2350,7 @@ pub fn eval_expr(
         // parameter names give it a slot. Anywhere else it is a syntax error,
         // and saying so beats silently evaluating it as if the name were absent.
         Expr::NamedArg { name, .. } => Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "named argument \"{name}\" is only valid in a function call"
-            ),
+            detail: alloc::format!("named argument \"{name}\" is only valid in a function call"),
         }),
         Expr::Literal(l) => Ok(literal_to_value(l)),
         Expr::Column(c) => resolve_column(c, row, ctx),
@@ -2434,8 +2391,7 @@ pub fn eval_expr(
                 // Text and the catalog has enum types at all.
                 if matches!(lc.as_ref(), Value::Text(_))
                     && matches!(rc.as_ref(), Value::Text(_))
-                    && let Some(r) =
-                        enum_compare_hook(*op, lhs, rhs, lc.as_ref(), rc.as_ref(), ctx)
+                    && let Some(r) = enum_compare_hook(*op, lhs, rhs, lc.as_ref(), rc.as_ref(), ctx)
                 {
                     return r;
                 }
@@ -3012,6 +2968,442 @@ pub(crate) fn literal_to_value(l: &Literal) -> Value<'static> {
     }
 }
 
+impl crate::Engine {
+    /// v7.39 (read01 round 63) — run a user function whose body has its own
+    /// FROM. The arguments are substituted into the body as literals and the
+    /// SELECT goes through the REAL executor, so it sees exactly the rows a
+    /// hand-written query would: the row-header visibility filter applies, and
+    /// under in-place MVCC a dead row stays dead.
+    ///
+    /// PG returns the FIRST row of a scalar SQL function's body (and NULL when
+    /// it returns none).
+    pub(crate) fn run_user_fn_query(
+        &self,
+        def: &spg_storage::FunctionDef,
+        stmt: &spg_sql::ast::SelectStatement,
+        arg_names: &[alloc::string::String],
+        args: &spg_storage::Row<'static>,
+        fn_depth: u16,
+    ) -> Result<Value<'static>, EvalError> {
+        const MAX_QUERY_FN_DEPTH: u16 = 8;
+        if fn_depth >= MAX_QUERY_FN_DEPTH {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "function {:?}: a body with its own FROM may nest at most {MAX_QUERY_FN_DEPTH} deep",
+                    def.name
+                ),
+            });
+        }
+        // Bind the arguments — the same helper the set-returning path uses, so
+        // both resolve an argument identically (a COLUMN of the body's own FROM
+        // shadows a same-named argument, as in PG).
+        let owned: alloc::vec::Vec<Value<'static>> =
+            args.values.iter().map(|v| v.clone().into_owned()).collect();
+        let bound =
+            bind_user_fn_args(self.active_catalog(), stmt, arg_names, &owned).map_err(|e| {
+                EvalError::TypeMismatch {
+                    detail: alloc::format!("function {:?}: {e}", def.name),
+                }
+            })?;
+
+        let out = self
+            .exec_select_cancel(&bound, crate::CancelToken::none())
+            .map_err(|e| EvalError::TypeMismatch {
+                detail: alloc::format!("function {:?}: {e}", def.name),
+            })?;
+        let crate::QueryResult::Rows { rows, .. } = out else {
+            return Ok(Value::Null);
+        };
+        let Some(first) = rows.first() else {
+            // No row: PG's scalar SQL function returns NULL.
+            return Ok(Value::Null);
+        };
+        let v = first.values.first().cloned().unwrap_or(Value::Null);
+        let declared = def.returns.trim();
+        if declared.eq_ignore_ascii_case("VOID") {
+            return Ok(Value::Null);
+        }
+        crate::eval::cast::cast_value(
+            v.into_owned(),
+            spg_sql::ast::CastTarget::Named(alloc::string::String::from(declared)),
+        )
+        .or_else(|_| Ok(Value::Null))
+    }
+}
+
+/// v7.39 (read01 round 65) — bind a call's arguments into a function body's
+/// SELECT, as literals. Shared by the scalar path (round 63) and the
+/// set-returning one, so both resolve an argument the same way — including the
+/// rule that a COLUMN of the body's own FROM shadows a same-named argument.
+pub(crate) fn bind_user_fn_args(
+    cat: &spg_storage::Catalog,
+    stmt: &spg_sql::ast::SelectStatement,
+    arg_names: &[alloc::string::String],
+    args: &[Value<'static>],
+) -> Result<spg_sql::ast::SelectStatement, EvalError> {
+    let mut bound = stmt.clone();
+    let mut binds: alloc::collections::BTreeMap<alloc::string::String, spg_sql::ast::Expr> =
+        alloc::collections::BTreeMap::new();
+    for (i, name) in arg_names.iter().enumerate() {
+        if name.is_empty() {
+            continue;
+        }
+        let shadowed = body_from_tables(stmt).iter().any(|t| {
+            cat.get(t).is_some_and(|tb| {
+                tb.schema()
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(name))
+            })
+        });
+        if shadowed {
+            continue;
+        }
+        let v = args.get(i).cloned().unwrap_or(Value::Null);
+        let lit =
+            crate::substitute::value_to_literal_expr(v).map_err(|e| EvalError::TypeMismatch {
+                detail: alloc::format!("argument {name} cannot be bound into the body: {e}"),
+            })?;
+        binds.insert(name.to_ascii_lowercase(), lit);
+    }
+    substitute_arg_refs_in_select(&mut bound, &binds);
+    Ok(bound)
+}
+
+/// The base tables a function body's FROM names — used to decide whether an
+/// argument name is shadowed by a column of the same name.
+fn body_from_tables(
+    stmt: &spg_sql::ast::SelectStatement,
+) -> alloc::vec::Vec<alloc::string::String> {
+    let mut out = alloc::vec::Vec::new();
+    if let Some(from) = &stmt.from {
+        out.push(from.primary.name.clone());
+        for j in &from.joins {
+            out.push(j.table.name.clone());
+        }
+    }
+    out
+}
+
+/// Replace every bare reference to an argument name with its literal value.
+fn substitute_arg_refs_in_select(
+    stmt: &mut spg_sql::ast::SelectStatement,
+    binds: &alloc::collections::BTreeMap<alloc::string::String, spg_sql::ast::Expr>,
+) {
+    use spg_sql::ast::{Expr, SelectItem};
+    fn walk(e: &mut Expr, binds: &alloc::collections::BTreeMap<alloc::string::String, Expr>) {
+        match e {
+            Expr::Column(c) => {
+                if c.qualifier.is_none()
+                    && let Some(lit) = binds.get(&c.name.to_ascii_lowercase())
+                {
+                    *e = lit.clone();
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                walk(lhs, binds);
+                walk(rhs, binds);
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => walk(expr, binds),
+            Expr::FunctionCall { args, .. } => args.iter_mut().for_each(|a| walk(a, binds)),
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                if let Some(o) = operand {
+                    walk(o, binds);
+                }
+                for (c, v) in branches.iter_mut() {
+                    walk(c, binds);
+                    walk(v, binds);
+                }
+                if let Some(x) = else_branch {
+                    walk(x, binds);
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                walk(expr, binds);
+                list.iter_mut().for_each(|it| walk(it, binds));
+            }
+            Expr::AnyAll { expr, array, .. } => {
+                walk(expr, binds);
+                walk(array, binds);
+            }
+            Expr::Array(items) => items.iter_mut().for_each(|it| walk(it, binds)),
+            Expr::ArraySubscript { target, index } => {
+                walk(target, binds);
+                walk(index, binds);
+            }
+            _ => {}
+        }
+    }
+    for item in &mut stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            walk(expr, binds);
+        }
+    }
+    if let Some(w) = &mut stmt.where_ {
+        walk(w, binds);
+    }
+    if let Some(h) = &mut stmt.having {
+        walk(h, binds);
+    }
+    if let Some(gs) = &mut stmt.group_by {
+        gs.iter_mut().for_each(|g| walk(g, binds));
+    }
+    for o in &mut stmt.order_by {
+        walk(&mut o.expr, binds);
+    }
+    if let Some(from) = &mut stmt.from {
+        for j in &mut from.joins {
+            if let Some(on) = &mut j.on {
+                walk(on, binds);
+            }
+        }
+    }
+    // v7.39 (read01 round 69) — the UNION peers. A body like
+    // `SELECT k UNION ALL SELECT k * 10` has its second half in `unions`, and
+    // leaving it unsubstituted made the argument look like a missing column.
+    for (_, peer) in &mut stmt.unions {
+        substitute_arg_refs_in_select(peer, binds);
+    }
+    for cte in &mut stmt.ctes {
+        if let Some(s) = cte.body.as_select_mut() {
+            substitute_arg_refs_in_select(s, binds);
+        }
+    }
+}
+
+impl crate::Engine {
+    /// v7.39 (read01 round 64) — call a plpgsql function as a scalar. The body
+    /// runs on the interpreter the DO block and triggers already use, with the
+    /// arguments bound as locals; its `SELECT … INTO` and `FOR … IN SELECT`
+    /// resolvers go through the READ path, so what the body sees is what a
+    /// hand-written query would see (visibility filter and all).
+    ///
+    /// A body that writes is refused — the call arrives through expression
+    /// evaluation, which holds the engine immutably. Refusing is the honest
+    /// answer; silently dropping the write would be the worst one.
+    pub(crate) fn call_plpgsql_scalar_fn(
+        &self,
+        def: &spg_storage::FunctionDef,
+        arg_names: &[alloc::string::String],
+        args: &spg_storage::Row<'static>,
+    ) -> Result<Value<'static>, EvalError> {
+        let block =
+            spg_sql::parse_function_body(def.body.trim()).map_err(|e| EvalError::TypeMismatch {
+                detail: alloc::format!("function {:?} body does not parse: {e}", def.name),
+            })?;
+        let mut locals: alloc::collections::BTreeMap<alloc::string::String, Value<'static>> =
+            alloc::collections::BTreeMap::new();
+        for (i, n) in arg_names.iter().enumerate() {
+            if n.is_empty() {
+                continue;
+            }
+            locals.insert(
+                n.to_ascii_lowercase(),
+                args.values.get(i).cloned().unwrap_or(Value::Null),
+            );
+        }
+        let dts = self
+            .session_param("default_text_search_config")
+            .map(alloc::string::String::from);
+
+        let select_into = |stmt: &spg_sql::ast::Statement| -> Result<
+            Value<'static>,
+            crate::triggers::TriggerError,
+        > {
+            let spg_sql::ast::Statement::Select(s) = stmt else {
+                return Err(crate::triggers::TriggerError::EvalFailed {
+                    function: def.name.clone(),
+                    cause: EvalError::TypeMismatch {
+                        detail: "SELECT … INTO body must be a SELECT".into(),
+                    },
+                });
+            };
+            let r = self
+                .exec_select_cancel(s, crate::CancelToken::none())
+                .map_err(|e| crate::triggers::TriggerError::EvalFailed {
+                    function: def.name.clone(),
+                    cause: EvalError::TypeMismatch {
+                        detail: alloc::format!("SELECT … INTO failed: {e}"),
+                    },
+                })?;
+            match r {
+                crate::QueryResult::Rows { rows, .. } => Ok(rows
+                    .into_iter()
+                    .next()
+                    .and_then(|row| row.values.into_iter().next())
+                    .unwrap_or(Value::Null)),
+                _ => Ok(Value::Null),
+            }
+        };
+        let for_query = |stmt: &spg_sql::ast::Statement| -> Result<
+            (
+                alloc::vec::Vec<alloc::string::String>,
+                alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>,
+            ),
+            crate::triggers::TriggerError,
+        > {
+            let spg_sql::ast::Statement::Select(s) = stmt else {
+                return Err(crate::triggers::TriggerError::EvalFailed {
+                    function: def.name.clone(),
+                    cause: EvalError::TypeMismatch {
+                        detail: "FOR … IN body must be a SELECT".into(),
+                    },
+                });
+            };
+            let r = self
+                .exec_select_cancel(s, crate::CancelToken::none())
+                .map_err(|e| crate::triggers::TriggerError::EvalFailed {
+                    function: def.name.clone(),
+                    cause: EvalError::TypeMismatch {
+                        detail: alloc::format!("FOR … IN SELECT failed: {e}"),
+                    },
+                })?;
+            match r {
+                crate::QueryResult::Rows { columns, rows } => Ok((
+                    columns.iter().map(|c| c.name.clone()).collect(),
+                    rows.into_iter().map(|row| row.values).collect(),
+                )),
+                _ => Ok((alloc::vec::Vec::new(), alloc::vec::Vec::new())),
+            }
+        };
+
+        let out = crate::triggers::call_plpgsql_scalar(
+            &def.name,
+            &block,
+            locals,
+            dts.as_deref(),
+            Some(&select_into),
+            Some(&for_query),
+            // A scalar call has no set to build; RETURN NEXT / RETURN QUERY are
+            // errors here, as in PG.
+            None,
+        )
+        .map_err(|e| EvalError::TypeMismatch {
+            detail: alloc::format!("{e}"),
+        })?;
+        let declared = def.returns.trim();
+        let Some(v) = out else {
+            if declared.eq_ignore_ascii_case("VOID") {
+                return Ok(Value::Null);
+            }
+            // PG: a non-void function that falls out of the bottom.
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "control reached end of function {:?} without RETURN",
+                    def.name
+                ),
+            });
+        };
+        if declared.eq_ignore_ascii_case("VOID") {
+            return Ok(Value::Null);
+        }
+        crate::eval::cast::cast_value(
+            v.into_owned(),
+            spg_sql::ast::CastTarget::Named(alloc::string::String::from(declared)),
+        )
+        .or_else(|_| Ok(Value::Null))
+    }
+}
+
+impl crate::Engine {
+    /// v7.39 (read01 round 66) — run a `RETURNS SETOF` plpgsql function and
+    /// collect the rows `RETURN NEXT` / `RETURN QUERY` appended. Same
+    /// interpreter, same read-path resolvers as the scalar call — the only
+    /// difference is that a SINK is provided, which is what makes those two
+    /// statements legal.
+    pub(crate) fn call_plpgsql_setof_fn(
+        &self,
+        def: &spg_storage::FunctionDef,
+        arg_names: &[alloc::string::String],
+        args: &[Value<'static>],
+    ) -> Result<alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>, EvalError> {
+        let block =
+            spg_sql::parse_function_body(def.body.trim()).map_err(|e| EvalError::TypeMismatch {
+                detail: alloc::format!("function {:?} body does not parse: {e}", def.name),
+            })?;
+        let mut locals: alloc::collections::BTreeMap<alloc::string::String, Value<'static>> =
+            alloc::collections::BTreeMap::new();
+        for (i, n) in arg_names.iter().enumerate() {
+            if n.is_empty() {
+                continue;
+            }
+            locals.insert(
+                n.to_ascii_lowercase(),
+                args.get(i).cloned().unwrap_or(Value::Null),
+            );
+        }
+        let dts = self
+            .session_param("default_text_search_config")
+            .map(alloc::string::String::from);
+        let run_select = |stmt: &spg_sql::ast::Statement,
+                          what: &str|
+         -> Result<crate::QueryResult, crate::triggers::TriggerError> {
+            let spg_sql::ast::Statement::Select(s) = stmt else {
+                return Err(crate::triggers::TriggerError::EvalFailed {
+                    function: def.name.clone(),
+                    cause: EvalError::TypeMismatch {
+                        detail: alloc::format!("{what} body must be a SELECT"),
+                    },
+                });
+            };
+            self.exec_select_cancel(s, crate::CancelToken::none())
+                .map_err(|e| crate::triggers::TriggerError::EvalFailed {
+                    function: def.name.clone(),
+                    cause: EvalError::TypeMismatch {
+                        detail: alloc::format!("{what} failed: {e}"),
+                    },
+                })
+        };
+        let select_into = |stmt: &spg_sql::ast::Statement| -> Result<
+            Value<'static>,
+            crate::triggers::TriggerError,
+        > {
+            match run_select(stmt, "SELECT … INTO")? {
+                crate::QueryResult::Rows { rows, .. } => Ok(rows
+                    .into_iter()
+                    .next()
+                    .and_then(|r| r.values.into_iter().next())
+                    .unwrap_or(Value::Null)),
+                _ => Ok(Value::Null),
+            }
+        };
+        let for_query = |stmt: &spg_sql::ast::Statement| -> Result<
+            (
+                alloc::vec::Vec<alloc::string::String>,
+                alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>,
+            ),
+            crate::triggers::TriggerError,
+        > {
+            match run_select(stmt, "FOR … IN / RETURN QUERY")? {
+                crate::QueryResult::Rows { columns, rows } => Ok((
+                    columns.iter().map(|c| c.name.clone()).collect(),
+                    rows.into_iter().map(|r| r.values).collect(),
+                )),
+                _ => Ok((alloc::vec::Vec::new(), alloc::vec::Vec::new())),
+            }
+        };
+        let sink: core::cell::RefCell<alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>> =
+            core::cell::RefCell::new(alloc::vec::Vec::new());
+        crate::triggers::call_plpgsql_scalar(
+            &def.name,
+            &block,
+            locals,
+            dts.as_deref(),
+            Some(&select_into),
+            Some(&for_query),
+            Some(&sink),
+        )
+        .map_err(|e| EvalError::TypeMismatch {
+            detail: alloc::format!("{e}"),
+        })?;
+        Ok(sink.into_inner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3362,444 +3754,3 @@ mod tests {
         );
     }
 }
-
-impl crate::Engine {
-    /// v7.39 (read01 round 63) — run a user function whose body has its own
-    /// FROM. The arguments are substituted into the body as literals and the
-    /// SELECT goes through the REAL executor, so it sees exactly the rows a
-    /// hand-written query would: the row-header visibility filter applies, and
-    /// under in-place MVCC a dead row stays dead.
-    ///
-    /// PG returns the FIRST row of a scalar SQL function's body (and NULL when
-    /// it returns none).
-    pub(crate) fn run_user_fn_query(
-        &self,
-        def: &spg_storage::FunctionDef,
-        stmt: &spg_sql::ast::SelectStatement,
-        arg_names: &[alloc::string::String],
-        args: &spg_storage::Row<'static>,
-        fn_depth: u16,
-    ) -> Result<Value<'static>, EvalError> {
-        const MAX_QUERY_FN_DEPTH: u16 = 8;
-        if fn_depth >= MAX_QUERY_FN_DEPTH {
-            return Err(EvalError::TypeMismatch {
-                detail: alloc::format!(
-                    "function {:?}: a body with its own FROM may nest at most {MAX_QUERY_FN_DEPTH} deep",
-                    def.name
-                ),
-            });
-        }
-        // Bind the arguments — the same helper the set-returning path uses, so
-        // both resolve an argument identically (a COLUMN of the body's own FROM
-        // shadows a same-named argument, as in PG).
-        let owned: alloc::vec::Vec<Value<'static>> = args
-            .values
-            .iter()
-            .map(|v| v.clone().into_owned())
-            .collect();
-        let bound = bind_user_fn_args(self.active_catalog(), stmt, arg_names, &owned)
-            .map_err(|e| EvalError::TypeMismatch {
-                detail: alloc::format!("function {:?}: {e}", def.name),
-            })?;
-
-        let out = self
-            .exec_select_cancel(&bound, crate::CancelToken::none())
-            .map_err(|e| EvalError::TypeMismatch {
-                detail: alloc::format!("function {:?}: {e}", def.name),
-            })?;
-        let crate::QueryResult::Rows { rows, .. } = out else {
-            return Ok(Value::Null);
-        };
-        let Some(first) = rows.first() else {
-            // No row: PG's scalar SQL function returns NULL.
-            return Ok(Value::Null);
-        };
-        let v = first.values.first().cloned().unwrap_or(Value::Null);
-        let declared = def.returns.trim();
-        if declared.eq_ignore_ascii_case("VOID") {
-            return Ok(Value::Null);
-        }
-        crate::eval::cast::cast_value(
-            v.into_owned(),
-            spg_sql::ast::CastTarget::Named(alloc::string::String::from(declared)),
-        )
-        .or_else(|_| Ok(Value::Null))
-    }
-}
-
-/// v7.39 (read01 round 65) — bind a call's arguments into a function body's
-/// SELECT, as literals. Shared by the scalar path (round 63) and the
-/// set-returning one, so both resolve an argument the same way — including the
-/// rule that a COLUMN of the body's own FROM shadows a same-named argument.
-pub(crate) fn bind_user_fn_args(
-    cat: &spg_storage::Catalog,
-    stmt: &spg_sql::ast::SelectStatement,
-    arg_names: &[alloc::string::String],
-    args: &[Value<'static>],
-) -> Result<spg_sql::ast::SelectStatement, EvalError> {
-    let mut bound = stmt.clone();
-    let mut binds: alloc::collections::BTreeMap<alloc::string::String, spg_sql::ast::Expr> =
-        alloc::collections::BTreeMap::new();
-    for (i, name) in arg_names.iter().enumerate() {
-        if name.is_empty() {
-            continue;
-        }
-        let shadowed = body_from_tables(stmt).iter().any(|t| {
-            cat.get(t).is_some_and(|tb| {
-                tb.schema()
-                    .columns
-                    .iter()
-                    .any(|c| c.name.eq_ignore_ascii_case(name))
-            })
-        });
-        if shadowed {
-            continue;
-        }
-        let v = args.get(i).cloned().unwrap_or(Value::Null);
-        let lit = crate::substitute::value_to_literal_expr(v).map_err(|e| {
-            EvalError::TypeMismatch {
-                detail: alloc::format!("argument {name} cannot be bound into the body: {e}"),
-            }
-        })?;
-        binds.insert(name.to_ascii_lowercase(), lit);
-    }
-    substitute_arg_refs_in_select(&mut bound, &binds);
-    Ok(bound)
-}
-
-/// The base tables a function body's FROM names — used to decide whether an
-/// argument name is shadowed by a column of the same name.
-fn body_from_tables(stmt: &spg_sql::ast::SelectStatement) -> alloc::vec::Vec<alloc::string::String> {
-    let mut out = alloc::vec::Vec::new();
-    if let Some(from) = &stmt.from {
-        out.push(from.primary.name.clone());
-        for j in &from.joins {
-            out.push(j.table.name.clone());
-        }
-    }
-    out
-}
-
-/// Replace every bare reference to an argument name with its literal value.
-fn substitute_arg_refs_in_select(
-    stmt: &mut spg_sql::ast::SelectStatement,
-    binds: &alloc::collections::BTreeMap<alloc::string::String, spg_sql::ast::Expr>,
-) {
-    use spg_sql::ast::{Expr, SelectItem};
-    fn walk(e: &mut Expr, binds: &alloc::collections::BTreeMap<alloc::string::String, Expr>) {
-        match e {
-            Expr::Column(c) => {
-                if c.qualifier.is_none()
-                    && let Some(lit) = binds.get(&c.name.to_ascii_lowercase())
-                {
-                    *e = lit.clone();
-                }
-            }
-            Expr::Binary { lhs, rhs, .. } => {
-                walk(lhs, binds);
-                walk(rhs, binds);
-            }
-            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => walk(expr, binds),
-            Expr::FunctionCall { args, .. } => args.iter_mut().for_each(|a| walk(a, binds)),
-            Expr::Case {
-                operand,
-                branches,
-                else_branch,
-            } => {
-                if let Some(o) = operand {
-                    walk(o, binds);
-                }
-                for (c, v) in branches.iter_mut() {
-                    walk(c, binds);
-                    walk(v, binds);
-                }
-                if let Some(x) = else_branch {
-                    walk(x, binds);
-                }
-            }
-            Expr::InList { expr, list, .. } => {
-                walk(expr, binds);
-                list.iter_mut().for_each(|it| walk(it, binds));
-            }
-            Expr::AnyAll { expr, array, .. } => {
-                walk(expr, binds);
-                walk(array, binds);
-            }
-            Expr::Array(items) => items.iter_mut().for_each(|it| walk(it, binds)),
-            Expr::ArraySubscript { target, index } => {
-                walk(target, binds);
-                walk(index, binds);
-            }
-            _ => {}
-        }
-    }
-    for item in &mut stmt.items {
-        if let SelectItem::Expr { expr, .. } = item {
-            walk(expr, binds);
-        }
-    }
-    if let Some(w) = &mut stmt.where_ {
-        walk(w, binds);
-    }
-    if let Some(h) = &mut stmt.having {
-        walk(h, binds);
-    }
-    if let Some(gs) = &mut stmt.group_by {
-        gs.iter_mut().for_each(|g| walk(g, binds));
-    }
-    for o in &mut stmt.order_by {
-        walk(&mut o.expr, binds);
-    }
-    if let Some(from) = &mut stmt.from {
-        for j in &mut from.joins {
-            if let Some(on) = &mut j.on {
-                walk(on, binds);
-            }
-        }
-    }
-    // v7.39 (read01 round 69) — the UNION peers. A body like
-    // `SELECT k UNION ALL SELECT k * 10` has its second half in `unions`, and
-    // leaving it unsubstituted made the argument look like a missing column.
-    for (_, peer) in &mut stmt.unions {
-        substitute_arg_refs_in_select(peer, binds);
-    }
-    for cte in &mut stmt.ctes {
-        if let Some(s) = cte.body.as_select_mut() {
-            substitute_arg_refs_in_select(s, binds);
-        }
-    }
-}
-
-impl crate::Engine {
-    /// v7.39 (read01 round 64) — call a plpgsql function as a scalar. The body
-    /// runs on the interpreter the DO block and triggers already use, with the
-    /// arguments bound as locals; its `SELECT … INTO` and `FOR … IN SELECT`
-    /// resolvers go through the READ path, so what the body sees is what a
-    /// hand-written query would see (visibility filter and all).
-    ///
-    /// A body that writes is refused — the call arrives through expression
-    /// evaluation, which holds the engine immutably. Refusing is the honest
-    /// answer; silently dropping the write would be the worst one.
-    pub(crate) fn call_plpgsql_scalar_fn(
-        &self,
-        def: &spg_storage::FunctionDef,
-        arg_names: &[alloc::string::String],
-        args: &spg_storage::Row<'static>,
-    ) -> Result<Value<'static>, EvalError> {
-        let block = spg_sql::parse_function_body(def.body.trim()).map_err(|e| {
-            EvalError::TypeMismatch {
-                detail: alloc::format!("function {:?} body does not parse: {e}", def.name),
-            }
-        })?;
-        let mut locals: alloc::collections::BTreeMap<alloc::string::String, Value<'static>> =
-            alloc::collections::BTreeMap::new();
-        for (i, n) in arg_names.iter().enumerate() {
-            if n.is_empty() {
-                continue;
-            }
-            locals.insert(
-                n.to_ascii_lowercase(),
-                args.values.get(i).cloned().unwrap_or(Value::Null),
-            );
-        }
-        let dts = self
-            .session_param("default_text_search_config")
-            .map(alloc::string::String::from);
-
-        let select_into = |stmt: &spg_sql::ast::Statement| -> Result<
-            Value<'static>,
-            crate::triggers::TriggerError,
-        > {
-            let spg_sql::ast::Statement::Select(s) = stmt else {
-                return Err(crate::triggers::TriggerError::EvalFailed {
-                    function: def.name.clone(),
-                    cause: EvalError::TypeMismatch {
-                        detail: "SELECT … INTO body must be a SELECT".into(),
-                    },
-                });
-            };
-            let r = self
-                .exec_select_cancel(s, crate::CancelToken::none())
-                .map_err(|e| crate::triggers::TriggerError::EvalFailed {
-                    function: def.name.clone(),
-                    cause: EvalError::TypeMismatch {
-                        detail: alloc::format!("SELECT … INTO failed: {e}"),
-                    },
-                })?;
-            match r {
-                crate::QueryResult::Rows { rows, .. } => Ok(rows
-                    .into_iter()
-                    .next()
-                    .and_then(|row| row.values.into_iter().next())
-                    .unwrap_or(Value::Null)),
-                _ => Ok(Value::Null),
-            }
-        };
-        let for_query = |stmt: &spg_sql::ast::Statement| -> Result<
-            (
-                alloc::vec::Vec<alloc::string::String>,
-                alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>,
-            ),
-            crate::triggers::TriggerError,
-        > {
-            let spg_sql::ast::Statement::Select(s) = stmt else {
-                return Err(crate::triggers::TriggerError::EvalFailed {
-                    function: def.name.clone(),
-                    cause: EvalError::TypeMismatch {
-                        detail: "FOR … IN body must be a SELECT".into(),
-                    },
-                });
-            };
-            let r = self
-                .exec_select_cancel(s, crate::CancelToken::none())
-                .map_err(|e| crate::triggers::TriggerError::EvalFailed {
-                    function: def.name.clone(),
-                    cause: EvalError::TypeMismatch {
-                        detail: alloc::format!("FOR … IN SELECT failed: {e}"),
-                    },
-                })?;
-            match r {
-                crate::QueryResult::Rows { columns, rows } => Ok((
-                    columns.iter().map(|c| c.name.clone()).collect(),
-                    rows.into_iter().map(|row| row.values).collect(),
-                )),
-                _ => Ok((alloc::vec::Vec::new(), alloc::vec::Vec::new())),
-            }
-        };
-
-        let out = crate::triggers::call_plpgsql_scalar(
-            &def.name,
-            &block,
-            locals,
-            dts.as_deref(),
-            Some(&select_into),
-            Some(&for_query),
-            // A scalar call has no set to build; RETURN NEXT / RETURN QUERY are
-            // errors here, as in PG.
-            None,
-        )
-        .map_err(|e| EvalError::TypeMismatch {
-            detail: alloc::format!("{e}"),
-        })?;
-        let declared = def.returns.trim();
-        let Some(v) = out else {
-            if declared.eq_ignore_ascii_case("VOID") {
-                return Ok(Value::Null);
-            }
-            // PG: a non-void function that falls out of the bottom.
-            return Err(EvalError::TypeMismatch {
-                detail: alloc::format!(
-                    "control reached end of function {:?} without RETURN",
-                    def.name
-                ),
-            });
-        };
-        if declared.eq_ignore_ascii_case("VOID") {
-            return Ok(Value::Null);
-        }
-        crate::eval::cast::cast_value(
-            v.into_owned(),
-            spg_sql::ast::CastTarget::Named(alloc::string::String::from(declared)),
-        )
-        .or_else(|_| Ok(Value::Null))
-    }
-}
-
-impl crate::Engine {
-    /// v7.39 (read01 round 66) — run a `RETURNS SETOF` plpgsql function and
-    /// collect the rows `RETURN NEXT` / `RETURN QUERY` appended. Same
-    /// interpreter, same read-path resolvers as the scalar call — the only
-    /// difference is that a SINK is provided, which is what makes those two
-    /// statements legal.
-    pub(crate) fn call_plpgsql_setof_fn(
-        &self,
-        def: &spg_storage::FunctionDef,
-        arg_names: &[alloc::string::String],
-        args: &[Value<'static>],
-    ) -> Result<alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>, EvalError> {
-        let block = spg_sql::parse_function_body(def.body.trim()).map_err(|e| {
-            EvalError::TypeMismatch {
-                detail: alloc::format!("function {:?} body does not parse: {e}", def.name),
-            }
-        })?;
-        let mut locals: alloc::collections::BTreeMap<alloc::string::String, Value<'static>> =
-            alloc::collections::BTreeMap::new();
-        for (i, n) in arg_names.iter().enumerate() {
-            if n.is_empty() {
-                continue;
-            }
-            locals.insert(
-                n.to_ascii_lowercase(),
-                args.get(i).cloned().unwrap_or(Value::Null),
-            );
-        }
-        let dts = self
-            .session_param("default_text_search_config")
-            .map(alloc::string::String::from);
-        let run_select = |stmt: &spg_sql::ast::Statement,
-                          what: &str|
-         -> Result<crate::QueryResult, crate::triggers::TriggerError> {
-            let spg_sql::ast::Statement::Select(s) = stmt else {
-                return Err(crate::triggers::TriggerError::EvalFailed {
-                    function: def.name.clone(),
-                    cause: EvalError::TypeMismatch {
-                        detail: alloc::format!("{what} body must be a SELECT"),
-                    },
-                });
-            };
-            self.exec_select_cancel(s, crate::CancelToken::none()).map_err(|e| {
-                crate::triggers::TriggerError::EvalFailed {
-                    function: def.name.clone(),
-                    cause: EvalError::TypeMismatch {
-                        detail: alloc::format!("{what} failed: {e}"),
-                    },
-                }
-            })
-        };
-        let select_into = |stmt: &spg_sql::ast::Statement| -> Result<
-            Value<'static>,
-            crate::triggers::TriggerError,
-        > {
-            match run_select(stmt, "SELECT … INTO")? {
-                crate::QueryResult::Rows { rows, .. } => Ok(rows
-                    .into_iter()
-                    .next()
-                    .and_then(|r| r.values.into_iter().next())
-                    .unwrap_or(Value::Null)),
-                _ => Ok(Value::Null),
-            }
-        };
-        let for_query = |stmt: &spg_sql::ast::Statement| -> Result<
-            (
-                alloc::vec::Vec<alloc::string::String>,
-                alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>,
-            ),
-            crate::triggers::TriggerError,
-        > {
-            match run_select(stmt, "FOR … IN / RETURN QUERY")? {
-                crate::QueryResult::Rows { columns, rows } => Ok((
-                    columns.iter().map(|c| c.name.clone()).collect(),
-                    rows.into_iter().map(|r| r.values).collect(),
-                )),
-                _ => Ok((alloc::vec::Vec::new(), alloc::vec::Vec::new())),
-            }
-        };
-        let sink: core::cell::RefCell<alloc::vec::Vec<alloc::vec::Vec<Value<'static>>>> =
-            core::cell::RefCell::new(alloc::vec::Vec::new());
-        crate::triggers::call_plpgsql_scalar(
-            &def.name,
-            &block,
-            locals,
-            dts.as_deref(),
-            Some(&select_into),
-            Some(&for_query),
-            Some(&sink),
-        )
-        .map_err(|e| EvalError::TypeMismatch {
-            detail: alloc::format!("{e}"),
-        })?;
-        Ok(sink.into_inner())
-    }
-}
-
-

@@ -65,7 +65,9 @@ fn composite_fk_insert_check_against_committed_parent() {
     ]);
     eng.execute("INSERT INTO c VALUES (1, 10)").unwrap();
     let r = eng.execute("INSERT INTO c VALUES (1, 99)");
-    assert!(matches!(r, Err(EngineError::Unsupported(ref s)) if s.to_lowercase().contains("foreign key")));
+    assert!(
+        matches!(r, Err(EngineError::Unsupported(ref s)) if s.to_lowercase().contains("foreign key"))
+    );
 }
 
 #[test]

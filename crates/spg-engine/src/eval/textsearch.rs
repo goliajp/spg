@@ -91,7 +91,10 @@ fn parse_rank_args(name: &str, args: &[Value<'_>]) -> Result<RankArgs, EvalError
         let vals = parsed.map_err(|_| EvalError::TypeMismatch {
             detail: format!("{name}(): invalid weight array literal {s:?}"),
         })?;
-        weights = parse_weight_array(name, &Value::FloatArray(vals.into_iter().map(Some).collect()))?;
+        weights = parse_weight_array(
+            name,
+            &Value::FloatArray(vals.into_iter().map(Some).collect()),
+        )?;
         rest = &rest[1..];
     }
     // A trailing integer is the normalization flag.
@@ -183,8 +186,12 @@ pub(super) fn ts_match(l: Value, r: Value) -> Result<Value<'static>, EvalError> 
         // TSQUERY (an unknown literal takes the other operand's type), which is
         // how the operator is actually written. Same family as the array and
         // range coercions.
-        (Value::TsVector(v), Value::Text(q)) => (v, crate::eval::decode_tsquery_external(q.as_ref())?),
-        (Value::Text(q), Value::TsVector(v)) => (v, crate::eval::decode_tsquery_external(q.as_ref())?),
+        (Value::TsVector(v), Value::Text(q)) => {
+            (v, crate::eval::decode_tsquery_external(q.as_ref())?)
+        }
+        (Value::Text(q), Value::TsVector(v)) => {
+            (v, crate::eval::decode_tsquery_external(q.as_ref())?)
+        }
         (l, r) => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
@@ -976,19 +983,13 @@ pub(super) fn fts_ts_headline(
             }
             let Some((k, v)) = pair.split_once('=') else {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid parameter list format: {:?}",
-                        pair.trim()
-                    ),
+                    detail: alloc::format!("invalid parameter list format: {:?}", pair.trim()),
                 });
             };
             let v = v.trim().trim_matches('"');
             if v.is_empty() {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid parameter list format: {:?}",
-                        pair.trim()
-                    ),
+                    detail: alloc::format!("invalid parameter list format: {:?}", pair.trim()),
                 });
             }
             match k.trim().to_ascii_lowercase().as_str() {
@@ -1009,10 +1010,7 @@ pub(super) fn fts_ts_headline(
                 }
                 _ => {
                     return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "unrecognized headline parameter: {:?}",
-                            k.trim()
-                        ),
+                        detail: alloc::format!("unrecognized headline parameter: {:?}", k.trim()),
                     });
                 }
             }
@@ -1393,10 +1391,7 @@ pub(super) fn fts_ts_headline(
             .map(|c| (c.st, c.en))
             .collect();
         chosen.sort_unstable();
-        let parts: Vec<String> = chosen
-            .iter()
-            .map(|&(st, en)| render(st, en + 1))
-            .collect();
+        let parts: Vec<String> = chosen.iter().map(|&(st, en)| render(st, en + 1)).collect();
         return Ok(Value::text(parts.join(&frag_delim)));
     }
     // Window mode: the cover is the smallest span holding every

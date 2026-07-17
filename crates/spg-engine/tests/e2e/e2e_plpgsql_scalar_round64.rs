@@ -23,7 +23,8 @@
 use spg_engine::{Engine, QueryResult};
 
 fn ok(e: &mut Engine, sql: &str) {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
 fn err(e: &mut Engine, sql: &str) -> String {
@@ -71,7 +72,10 @@ fn declare_and_if_elsif_else() {
     assert_eq!(r1(&mut e, "SELECT grade(10)"), "C");
     // …and per-row, inside an aggregate.
     assert_eq!(
-        r1(&mut e, "SELECT string_agg(grade(id*30), ',' ORDER BY id) FROM t"),
+        r1(
+            &mut e,
+            "SELECT string_agg(grade(id*30), ',' ORDER BY id) FROM t"
+        ),
         "C,C,A"
     );
 }

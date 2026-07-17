@@ -18,10 +18,12 @@
 use spg_engine::{Engine, QueryResult};
 
 fn setup(e: &mut Engine) {
-    e.execute("CREATE TABLE emp (id int, name text, sal int)").unwrap();
+    e.execute("CREATE TABLE emp (id int, name text, sal int)")
+        .unwrap();
     e.execute("INSERT INTO emp VALUES (1,'a',100),(2,'b',90),(3,'c',80)")
         .unwrap();
-    e.execute("CREATE VIEW v AS SELECT id, name, sal FROM emp").unwrap();
+    e.execute("CREATE VIEW v AS SELECT id, name, sal FROM emp")
+        .unwrap();
 }
 
 fn err(e: &mut Engine, sql: &str) -> String {
@@ -53,7 +55,10 @@ fn a_replace_view_may_only_append_columns() {
     // Same names, retype the body expression: allowed (sal stays integer here).
     e.execute("CREATE OR REPLACE VIEW v AS SELECT id, name, sal*2 sal FROM emp")
         .unwrap();
-    assert_eq!(joined(&mut e, "SELECT sal FROM v ORDER BY sal"), "160,180,200");
+    assert_eq!(
+        joined(&mut e, "SELECT sal FROM v ORDER BY sal"),
+        "160,180,200"
+    );
     // Append a column at the end: allowed.
     e.execute("CREATE OR REPLACE VIEW v AS SELECT id, name, sal*2 sal, 1 extra FROM emp")
         .unwrap();
@@ -70,8 +75,11 @@ fn a_replace_view_may_only_append_columns() {
     );
     // Drop a column: rejected.
     assert!(
-        err(&mut e, "CREATE OR REPLACE VIEW v AS SELECT id, name FROM emp")
-            .contains("cannot drop columns from view"),
+        err(
+            &mut e,
+            "CREATE OR REPLACE VIEW v AS SELECT id, name FROM emp"
+        )
+        .contains("cannot drop columns from view"),
     );
     // Change a column's type: rejected.
     assert!(
@@ -83,8 +91,11 @@ fn a_replace_view_may_only_append_columns() {
     );
     // Reorder (which reads as a rename at the first differing position): rejected.
     assert!(
-        err(&mut e, "CREATE OR REPLACE VIEW v AS SELECT name, id, sal*2 sal, 1 extra FROM emp")
-            .contains("cannot change name of view column"),
+        err(
+            &mut e,
+            "CREATE OR REPLACE VIEW v AS SELECT name, id, sal*2 sal, 1 extra FROM emp"
+        )
+        .contains("cannot change name of view column"),
     );
     // After all the rejected attempts the view is still its last GOOD shape.
     assert_eq!(joined(&mut e, "SELECT extra FROM v LIMIT 1"), "1");
@@ -100,7 +111,8 @@ fn b_missing_column_uses_pg_wording() {
 #[test]
 fn c_recursive_and_chained_ctes_still_hold() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE emp (id int, mgr int, name text)").unwrap();
+    e.execute("CREATE TABLE emp (id int, mgr int, name text)")
+        .unwrap();
     e.execute("INSERT INTO emp VALUES (1,NULL,'a'),(2,1,'b'),(3,1,'c'),(4,2,'d')")
         .unwrap();
     // Depth-tagged hierarchy walk.

@@ -26,7 +26,10 @@ fn rows_i(e: &mut Engine, sql: &str) -> Vec<Vec<i32>> {
 }
 
 fn aud_rows(e: &mut Engine) -> Vec<(i32, String, i32)> {
-    match e.execute("SELECT id, op, v FROM aud ORDER BY id, op").unwrap() {
+    match e
+        .execute("SELECT id, op, v FROM aud ORDER BY id, op")
+        .unwrap()
+    {
         QueryResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| match (&r.values[0], &r.values[1], &r.values[2]) {
@@ -44,13 +47,20 @@ fn aud_rows(e: &mut Engine) -> Vec<(i32, String, i32)> {
 
 fn setup(e: &mut Engine) {
     e.execute("CREATE TABLE t(id int, v int)").unwrap();
-    e.execute("CREATE TABLE aud(id int, op text, v int)").unwrap();
-    e.execute("CREATE RULE r_ins AS ON INSERT TO t DO ALSO INSERT INTO aud VALUES (NEW.id, 'I', NEW.v)")
+    e.execute("CREATE TABLE aud(id int, op text, v int)")
         .unwrap();
-    e.execute("CREATE RULE r_upd AS ON UPDATE TO t DO ALSO INSERT INTO aud VALUES (OLD.id, 'U', NEW.v)")
-        .unwrap();
-    e.execute("CREATE RULE r_del AS ON DELETE TO t DO ALSO INSERT INTO aud VALUES (OLD.id, 'D', OLD.v)")
-        .unwrap();
+    e.execute(
+        "CREATE RULE r_ins AS ON INSERT TO t DO ALSO INSERT INTO aud VALUES (NEW.id, 'I', NEW.v)",
+    )
+    .unwrap();
+    e.execute(
+        "CREATE RULE r_upd AS ON UPDATE TO t DO ALSO INSERT INTO aud VALUES (OLD.id, 'U', NEW.v)",
+    )
+    .unwrap();
+    e.execute(
+        "CREATE RULE r_del AS ON DELETE TO t DO ALSO INSERT INTO aud VALUES (OLD.id, 'D', OLD.v)",
+    )
+    .unwrap();
 }
 
 #[test]
@@ -61,7 +71,10 @@ fn combined_audit_matches_pg() {
     e.execute("UPDATE t SET v = 99 WHERE id = 1").unwrap();
     e.execute("DELETE FROM t WHERE id = 2").unwrap();
     // The base table reflects the real writes.
-    assert_eq!(rows_i(&mut e, "SELECT id, v FROM t ORDER BY id"), vec![vec![1, 99]]);
+    assert_eq!(
+        rows_i(&mut e, "SELECT id, v FROM t ORDER BY id"),
+        vec![vec![1, 99]]
+    );
     // The audit trail is the per-row rule side effects, in PG's order.
     assert_eq!(
         aud_rows(&mut e),
@@ -78,7 +91,8 @@ fn combined_audit_matches_pg() {
 fn insert_new_reflects_default_post_image() {
     // NEW in a DO ALSO INSERT sees the DEFAULT-filled column, not the raw VALUES.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE d(id int, v int DEFAULT 5)").unwrap();
+    e.execute("CREATE TABLE d(id int, v int DEFAULT 5)")
+        .unwrap();
     e.execute("CREATE TABLE daud(id int, v int)").unwrap();
     e.execute("CREATE RULE rd AS ON INSERT TO d DO ALSO INSERT INTO daud VALUES (NEW.id, NEW.v)")
         .unwrap();
@@ -93,7 +107,8 @@ fn conditional_where_filters_per_row() {
     e.execute("CREATE TABLE aud(id int, v int)").unwrap();
     e.execute("CREATE RULE r AS ON INSERT TO t WHERE NEW.v > 15 DO ALSO INSERT INTO aud VALUES (NEW.id, NEW.v)")
         .unwrap();
-    e.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
+    e.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     assert_eq!(
         rows_i(&mut e, "SELECT id, v FROM aud ORDER BY id"),
         vec![vec![2, 20], vec![3, 30]]
@@ -138,5 +153,8 @@ fn conditional_do_instead_command_rejected() {
         Err(x) => format!("{x}"),
         Ok(_) => panic!("expected error"),
     };
-    assert!(m.contains("conditional (WHERE) DO INSTEAD <command> rules are not yet implemented"), "{m}");
+    assert!(
+        m.contains("conditional (WHERE) DO INSTEAD <command> rules are not yet implemented"),
+        "{m}"
+    );
 }

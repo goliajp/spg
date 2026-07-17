@@ -33,8 +33,10 @@ fn dump(e: &mut Engine) -> Vec<i32> {
 fn nested_view_insert_update_delete() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(x int)").unwrap();
-    e.execute("CREATE VIEW v1 AS SELECT * FROM t WHERE x > 0").unwrap();
-    e.execute("CREATE VIEW v2 AS SELECT * FROM v1 WHERE x < 100").unwrap();
+    e.execute("CREATE VIEW v1 AS SELECT * FROM t WHERE x > 0")
+        .unwrap();
+    e.execute("CREATE VIEW v2 AS SELECT * FROM v1 WHERE x < 100")
+        .unwrap();
     // INSERT/UPDATE/DELETE through the two-level view chain reach the base table.
     e.execute("INSERT INTO v2 VALUES(60)").unwrap();
     assert_eq!(dump(&mut e), vec![60]);
@@ -44,7 +46,8 @@ fn nested_view_insert_update_delete() {
     assert_eq!(dump(&mut e), Vec::<i32>::new());
     // The composed WHERE restricts visibility: a base row outside the chain's
     // predicates is invisible through v2.
-    e.execute("INSERT INTO t VALUES(5),(150),(-3),(50)").unwrap();
+    e.execute("INSERT INTO t VALUES(5),(150),(-3),(50)")
+        .unwrap();
     match e.execute("SELECT x FROM v2 ORDER BY x").unwrap() {
         QueryResult::Rows { rows, .. } => {
             let xs: Vec<i32> = rows
@@ -64,7 +67,8 @@ fn nested_view_insert_update_delete() {
 fn cascaded_checks_both_levels_and_names_failing_view() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(x int)").unwrap();
-    e.execute("CREATE VIEW v1 AS SELECT * FROM t WHERE x > 0").unwrap();
+    e.execute("CREATE VIEW v1 AS SELECT * FROM t WHERE x > 0")
+        .unwrap();
     e.execute("CREATE VIEW v2c AS SELECT * FROM v1 WHERE x < 100 WITH CASCADED CHECK OPTION")
         .unwrap();
     // Violates the underlying v1 (x>0) → error names v1.
@@ -86,7 +90,8 @@ fn cascaded_checks_both_levels_and_names_failing_view() {
 fn local_does_not_cascade_to_uncheck_underlying() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(x int)").unwrap();
-    e.execute("CREATE VIEW v1 AS SELECT * FROM t WHERE x > 0").unwrap();
+    e.execute("CREATE VIEW v1 AS SELECT * FROM t WHERE x > 0")
+        .unwrap();
     e.execute("CREATE VIEW v2l AS SELECT * FROM v1 WHERE x < 100 WITH LOCAL CHECK OPTION")
         .unwrap();
     // LOCAL only checks v2l's own qual (x<100). v1 has no check option, so its

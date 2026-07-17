@@ -18,9 +18,7 @@ fn engine() -> Engine {
 
 fn text_of(e: &mut Engine, sql: &str) -> String {
     match e.execute(sql).unwrap() {
-        QueryResult::Rows { rows, .. } => {
-            spg_engine::eval::value_to_text(&rows[0].values[0])
-        }
+        QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{sql}: {other:?}"),
     }
 }
@@ -45,11 +43,17 @@ fn tstz_cast_renders_per_value_dst_offsets() {
     e.execute("SET timezone = 'America/New_York'").unwrap();
     // One session, two instants, two offsets (winter -05, summer -04).
     assert_eq!(
-        text_of(&mut e, "SELECT (TIMESTAMPTZ '2024-01-15 12:00:00+00')::text"),
+        text_of(
+            &mut e,
+            "SELECT (TIMESTAMPTZ '2024-01-15 12:00:00+00')::text"
+        ),
         "2024-01-15 07:00:00-05"
     );
     assert_eq!(
-        text_of(&mut e, "SELECT (TIMESTAMPTZ '2024-07-15 12:00:00+00')::text"),
+        text_of(
+            &mut e,
+            "SELECT (TIMESTAMPTZ '2024-07-15 12:00:00+00')::text"
+        ),
         "2024-07-15 08:00:00-04"
     );
 }
@@ -64,7 +68,10 @@ fn offsetless_tstz_literal_reads_session_wall_clock() {
     );
     // Trailing zone name localises there instead.
     assert_eq!(
-        text_of(&mut e, "SELECT (TIMESTAMPTZ '2024-07-15 12:00 Asia/Tokyo')::text"),
+        text_of(
+            &mut e,
+            "SELECT (TIMESTAMPTZ '2024-07-15 12:00 Asia/Tokyo')::text"
+        ),
         "2024-07-14 23:00:00-04"
     );
 }

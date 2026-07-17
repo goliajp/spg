@@ -2022,20 +2022,14 @@ pub(super) fn regexp_replace(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
             }),
         }
     }
-    let is_int = |v: &Value<'_>| {
-        matches!(v, Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_))
-    };
+    let is_int = |v: &Value<'_>| matches!(v, Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_));
     let (start_1based, nth, flags): (i64, Option<i64>, String) = match args.len() {
         3 => (1, None, String::new()),
         4 if is_int(&args[3]) => match int_arg(&args[3])? {
             None => return Ok(Value::Null),
             Some(st) => (st, None, String::new()),
         },
-        4 => (
-            1,
-            None,
-            text_arg(&args[3])?.unwrap_or_default(),
-        ),
+        4 => (1, None, text_arg(&args[3])?.unwrap_or_default()),
         5 => match (int_arg(&args[3])?, int_arg(&args[4])?) {
             (Some(st), Some(n)) => (st, Some(n), String::new()),
             _ => return Ok(Value::Null),

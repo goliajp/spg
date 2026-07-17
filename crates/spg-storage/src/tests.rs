@@ -962,8 +962,7 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         + EMPTY_COMPOSITE_APPENDIX
         + EMPTY_OWNER_ACL_APPENDIX
         + EMPTY_COLUMN_ACL_APPENDIX;
-    let mut v52 =
-        Vec::with_capacity(v53.len() - appendix.len() - trailing_v53plus - tail_v60plus);
+    let mut v52 = Vec::with_capacity(v53.len() - appendix.len() - trailing_v53plus - tail_v60plus);
     v52.extend_from_slice(&v53[..start - trailing_v53plus]);
     v52.extend_from_slice(&v53[start + appendix.len() + tail_v60plus..]);
     // Set the version byte to 52 — the format before the MVCC appendix (v53)
@@ -1054,7 +1053,10 @@ fn v68_overloads_are_separate_functions_with_separate_acls() {
         .function_by_key(&crate::function_signature_key("f", "(x integer)"))
         .expect("integer folds to int");
     assert_eq!(by_alias.body, "SELECT 'int'");
-    assert_eq!(by_alias.acl[0].grantee, "bob", "each overload keeps its OWN acl");
+    assert_eq!(
+        by_alias.acl[0].grantee, "bob",
+        "each overload keeps its OWN acl"
+    );
     let text_one = restored
         .function_by_key(&crate::function_signature_key("f", "(TEXT)"))
         .expect("bare type, no arg name");

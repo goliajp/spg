@@ -56,10 +56,14 @@ impl Runner {
         // v7.37.16 — two-way `SPG_MVCC_INPLACE` override (default is
         // now ON; `=0` runs the corpus on the legacy path).
         match std::env::var("SPG_MVCC_INPLACE").ok().as_deref() {
-            Some(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") => {
+            Some(v)
+                if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") =>
+            {
                 engine.set_mvcc_inplace(false);
             }
-            Some(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on") => {
+            Some(v)
+                if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on") =>
+            {
                 engine.set_mvcc_inplace(true);
             }
             _ => {}

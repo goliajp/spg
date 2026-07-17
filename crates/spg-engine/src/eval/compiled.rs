@@ -240,9 +240,7 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             // (compile-time check, zero cost when the catalog has no
             // enum types).
             if cmp
-                && ctx
-                    .catalog
-                    .is_some_and(|cat| !cat.enum_types().is_empty())
+                && ctx.catalog.is_some_and(|cat| !cat.enum_types().is_empty())
                 && (crate::eval::expr_enum_labels(lhs, ctx.columns, ctx.catalog).is_some()
                     || crate::eval::expr_enum_labels(rhs, ctx.columns, ctx.catalog).is_some())
             {

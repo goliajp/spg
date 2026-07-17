@@ -77,7 +77,7 @@ fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> 
                 let name = alias.clone().unwrap_or(desc.name);
                 out.push(ColumnSchema {
                     user_composite_type: None,
-                acl: alloc::vec::Vec::new(),
+                    acl: alloc::vec::Vec::new(),
                     name,
                     ty: desc.ty,
                     nullable: desc.nullable,
@@ -562,11 +562,10 @@ fn function_return_shape(
         // plain timestamp. Only a bare `timestamp` stays timestamp.
         "date_trunc" | "date_bin" => {
             let src = args.get(1)?;
-            let ty = describe_expr(src, schema_cols)
-                .map_or(DataType::Timestamp, |s| match s.ty {
-                    DataType::Timestamptz | DataType::Date => DataType::Timestamptz,
-                    _ => DataType::Timestamp,
-                });
+            let ty = describe_expr(src, schema_cols).map_or(DataType::Timestamp, |s| match s.ty {
+                DataType::Timestamptz | DataType::Date => DataType::Timestamptz,
+                _ => DataType::Timestamp,
+            });
             (ty, true)
         }
         "from_unixtime" => {
@@ -785,9 +784,7 @@ fn infer_placeholder_oids(stmt: &Statement, catalog: &Catalog, oids: &mut [u32])
             let schema = t.schema().columns.clone();
             for (col, e) in &u.assignments {
                 if let Expr::Placeholder(n) = e
-                    && let Some(c) = schema
-                        .iter()
-                        .find(|c| c.name.eq_ignore_ascii_case(col))
+                    && let Some(c) = schema.iter().find(|c| c.name.eq_ignore_ascii_case(col))
                 {
                     mark(*n, Some(wire_oid_for(c.ty)));
                 }

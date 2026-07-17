@@ -459,23 +459,26 @@ fn handle_pg_simple_query(
     {
         let t = sql.trim();
         let b = t.as_bytes();
-        let restore_app_name =
-            |settings: &mut std::collections::HashMap<String, String>| {
-                if !conn_state.startup_app_name.is_empty() {
-                    settings.insert(
-                        "application_name".to_string(),
-                        conn_state.startup_app_name.clone(),
-                    );
-                }
-                if let Ok(mut g) = conn_state.application_name.write() {
-                    g.clone_from(&conn_state.startup_app_name);
-                }
-            };
+        let restore_app_name = |settings: &mut std::collections::HashMap<String, String>| {
+            if !conn_state.startup_app_name.is_empty() {
+                settings.insert(
+                    "application_name".to_string(),
+                    conn_state.startup_app_name.clone(),
+                );
+            }
+            if let Ok(mut g) = conn_state.application_name.write() {
+                g.clone_from(&conn_state.startup_app_name);
+            }
+        };
         if ci_eq(b, b"reset all") {
             settings.clear();
             restore_app_name(settings);
         } else if ci_starts_with(b, b"reset ") {
-            let name = t[6..].trim().trim_end_matches(';').trim().to_ascii_lowercase();
+            let name = t[6..]
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .to_ascii_lowercase();
             settings.remove(&name);
             if name == "application_name" {
                 restore_app_name(settings);
@@ -520,7 +523,13 @@ fn handle_pg_simple_query(
         match copy {
             CopyIntent::From(table, cols, opts) => {
                 handle_copy_from_stdin(
-                    stream, state, role, &table, cols.as_deref(), &opts, tx_state,
+                    stream,
+                    state,
+                    role,
+                    &table,
+                    cols.as_deref(),
+                    &opts,
+                    tx_state,
                 )?;
             }
             CopyIntent::To(table, opts) => {
@@ -700,8 +709,15 @@ fn handle_pg_simple_query(
                         first_row_size = Some(wbuf.len() - before);
                         return r.map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()));
                     }
-                    encode_data_row_from_refs(wbuf, &cols_storage, values, &wire_arena, &wire_style, &wire_tz)
-                        .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
+                    encode_data_row_from_refs(
+                        wbuf,
+                        &cols_storage,
+                        values,
+                        &wire_arena,
+                        &wire_style,
+                        &wire_tz,
+                    )
+                    .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
                 }
             }
         };
@@ -780,8 +796,15 @@ fn handle_pg_simple_query(
                         header_written = true;
                     }
                     let before = wbuf.len();
-                    encode_data_row_from_values(wbuf, &cols_storage, values, &arena, &wire_style, &wire_tz)
-                        .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
+                    encode_data_row_from_values(
+                        wbuf,
+                        &cols_storage,
+                        values,
+                        &arena,
+                        &wire_style,
+                        &wire_tz,
+                    )
+                    .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
                     if first_row_size.is_none() {
                         first_row_size = Some(wbuf.len() - before);
                     }
@@ -814,8 +837,15 @@ fn handle_pg_simple_query(
                         wrote_header = true;
                         for row in &rows {
                             let before = wbuf.len();
-                            encode_data_row(wbuf, &cols_storage, row, &wire_arena, &wire_style, &wire_tz)
-                                .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
+                            encode_data_row(
+                                wbuf,
+                                &cols_storage,
+                                row,
+                                &wire_arena,
+                                &wire_style,
+                                &wire_tz,
+                            )
+                            .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
                             if first_row_size.is_none() {
                                 first_row_size = Some(wbuf.len() - before);
                             }
@@ -1055,23 +1085,26 @@ fn handle_pg_simple_query_one_into_wbuf(
     {
         let t = sql.trim();
         let b = t.as_bytes();
-        let restore_app_name =
-            |settings: &mut std::collections::HashMap<String, String>| {
-                if !conn_state.startup_app_name.is_empty() {
-                    settings.insert(
-                        "application_name".to_string(),
-                        conn_state.startup_app_name.clone(),
-                    );
-                }
-                if let Ok(mut g) = conn_state.application_name.write() {
-                    g.clone_from(&conn_state.startup_app_name);
-                }
-            };
+        let restore_app_name = |settings: &mut std::collections::HashMap<String, String>| {
+            if !conn_state.startup_app_name.is_empty() {
+                settings.insert(
+                    "application_name".to_string(),
+                    conn_state.startup_app_name.clone(),
+                );
+            }
+            if let Ok(mut g) = conn_state.application_name.write() {
+                g.clone_from(&conn_state.startup_app_name);
+            }
+        };
         if ci_eq(b, b"reset all") {
             settings.clear();
             restore_app_name(settings);
         } else if ci_starts_with(b, b"reset ") {
-            let name = t[6..].trim().trim_end_matches(';').trim().to_ascii_lowercase();
+            let name = t[6..]
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .to_ascii_lowercase();
             settings.remove(&name);
             if name == "application_name" {
                 restore_app_name(settings);
@@ -1351,7 +1384,9 @@ fn run_pg_session(
         .find_map(|(k, v)| (k == "database").then(|| v.clone()))
     {
         if !db.is_empty()
-            && db.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            && db
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         {
             if let Ok(mut e) = state.engine.write() {
                 let _ = e.execute(&format!("SET spg.database = '{db}'"));
@@ -1946,10 +1981,7 @@ fn command_tag(sql: &str, affected: usize) -> String {
                 Some(w) if w.eq_ignore_ascii_case("materialized") && first != "CREATE" => {
                     format!("{first} MATERIALIZED VIEW")
                 }
-                Some(w) => match OBJECTS
-                    .iter()
-                    .find(|o| w.eq_ignore_ascii_case(o))
-                {
+                Some(w) => match OBJECTS.iter().find(|o| w.eq_ignore_ascii_case(o)) {
                     Some(o) => format!("{first} {o}"),
                     None => first.to_string(),
                 },
@@ -2215,7 +2247,6 @@ fn sql_has_clock_function(b: &[u8]) -> bool {
     }
     false
 }
-
 
 enum CannedResponse {
     Rows {
@@ -2964,8 +2995,15 @@ fn handle_execute(
                 )
                 .map_err(|e| proto(e.to_string()))?;
             } else {
-                encode_data_row(stream, &susp.columns, row, &row_arena, &wire_style, &wire_tz)
-                    .map_err(|e| proto(e.to_string()))?;
+                encode_data_row(
+                    stream,
+                    &susp.columns,
+                    row,
+                    &row_arena,
+                    &wire_style,
+                    &wire_tz,
+                )
+                .map_err(|e| proto(e.to_string()))?;
             }
         }
         susp.cursor = end;
@@ -3047,10 +3085,15 @@ fn handle_execute(
                     let _ = &cached_row_desc;
                     Ok(())
                 }
-                spg_engine::StreamItem::Row(values) => {
-                    encode_data_row_from_refs(stream, &cols_storage, values, &ext_arena, &wire_style, &wire_tz)
-                        .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
-                }
+                spg_engine::StreamItem::Row(values) => encode_data_row_from_refs(
+                    stream,
+                    &cols_storage,
+                    values,
+                    &ext_arena,
+                    &wire_style,
+                    &wire_tz,
+                )
+                .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string())),
             });
         drop(eng);
         let row_count = match stream_emit_result {
@@ -3990,10 +4033,7 @@ mod engine_error_sqlstate_tests {
             code("durability append failed: No such file or directory (os error 2)"),
             "58P01"
         );
-        assert_eq!(
-            code("durability append failed: broken pipe"),
-            "58030"
-        );
+        assert_eq!(code("durability append failed: broken pipe"), "58030");
         // v7.39 (read01 round 45, commands/) — DDL object errors.
         assert_eq!(
             code("multiple primary keys for table \"t3\" are not allowed"),
@@ -4249,7 +4289,9 @@ fn parse_copy_query_intent(trimmed: &str, rest: &str, lparen: usize) -> Option<C
     // Inner query, taken from the ORIGINAL-case SQL (offsets map through the
     // shared `copy ` prefix length).
     let prefix = trimmed.len() - rest.len();
-    let query = trimmed[prefix + lparen + 1..prefix + close].trim().to_string();
+    let query = trimmed[prefix + lparen + 1..prefix + close]
+        .trim()
+        .to_string();
     if query.is_empty() {
         return None;
     }
@@ -4492,9 +4534,16 @@ fn handle_copy_from_stdin(
             }
         }
         // Process whatever full lines we have.
-        if let Err(msg) =
-            process_copy_chunk(state, table, column_list, &expected_names, &mut buf, &mut inserted, &mut skipped, opts)
-        {
+        if let Err(msg) = process_copy_chunk(
+            state,
+            table,
+            column_list,
+            &expected_names,
+            &mut buf,
+            &mut inserted,
+            &mut skipped,
+            opts,
+        ) {
             let code = if msg.contains("missing data for column")
                 || msg.contains("extra data after last expected column")
             {
@@ -4508,8 +4557,16 @@ fn handle_copy_from_stdin(
         }
     }
     // Final drain.
-    if let Err(msg) = process_copy_chunk(state, table, column_list, &expected_names, &mut buf, &mut inserted, &mut skipped, opts)
-    {
+    if let Err(msg) = process_copy_chunk(
+        state,
+        table,
+        column_list,
+        &expected_names,
+        &mut buf,
+        &mut inserted,
+        &mut skipped,
+        opts,
+    ) {
         let code = if msg.contains("missing data for column")
             || msg.contains("extra data after last expected column")
         {
@@ -4883,7 +4940,13 @@ fn handle_copy_to_stdout(
     // does not cross the COPY boundary); bulk-export paths get
     // `CancelToken::none()`. SPG_QUERY_TIMEOUT_MS / server-wide cap
     // still applies via the server-state watchdog.
-    let result = execute_with_role(state, sql, role, CancelToken::none(), matches!(*tx_state, b'T' | b'E'));
+    let result = execute_with_role(
+        state,
+        sql,
+        role,
+        CancelToken::none(),
+        matches!(*tx_state, b'T' | b'E'),
+    );
     let (columns, rows) = match result {
         Ok(QueryResult::Rows { columns, rows }) => (columns, rows),
         Ok(QueryResult::CommandOk { .. }) => {
@@ -4924,10 +4987,13 @@ fn handle_copy_to_stdout(
         .csv_delimiter
         .unwrap_or(if is_csv { ',' } else { '\t' });
     let quote = opts.csv_quote.unwrap_or('"');
-    let null_str = opts
-        .null_string
-        .clone()
-        .unwrap_or_else(|| if is_csv { String::new() } else { "\\N".to_string() });
+    let null_str = opts.null_string.clone().unwrap_or_else(|| {
+        if is_csv {
+            String::new()
+        } else {
+            "\\N".to_string()
+        }
+    });
     let encode_line = |cells: &[Option<String>]| -> String {
         if is_csv {
             spg_engine::copy::encode_copy_csv_cells(cells, delimiter, quote, &null_str)
@@ -4935,14 +5001,14 @@ fn handle_copy_to_stdout(
             spg_engine::copy::encode_copy_text_cells_opts(cells, delimiter, &null_str)
         }
     };
-    let mut send_line = |stream: &mut dyn ReadWrite, cells: &[Option<String>]| -> std::io::Result<()> {
-        let mut line = encode_line(cells);
-        line.push('\n');
-        send_msg(stream, b'd', line.as_bytes())
-    };
+    let mut send_line =
+        |stream: &mut dyn ReadWrite, cells: &[Option<String>]| -> std::io::Result<()> {
+            let mut line = encode_line(cells);
+            line.push('\n');
+            send_msg(stream, b'd', line.as_bytes())
+        };
     if opts.header {
-        let names: Vec<Option<String>> =
-            columns.iter().map(|c| Some(c.name.clone())).collect();
+        let names: Vec<Option<String>> = columns.iter().map(|c| Some(c.name.clone())).collect();
         send_line(stream, &names)?;
     }
     for row in &rows {
@@ -4999,7 +5065,12 @@ fn copy_cell_raw(
         Value::Timestamp(t) => {
             if matches!(ty, Some(DataType::Timestamptz)) {
                 let abbr = tz.abbrev_at(*t);
-                spg_engine::eval::format_timestamptz_tz(*t, style, tz.offset_at(*t), abbr.as_deref())
+                spg_engine::eval::format_timestamptz_tz(
+                    *t,
+                    style,
+                    tz.offset_at(*t),
+                    abbr.as_deref(),
+                )
             } else {
                 spg_engine::eval::format_timestamp_styled(*t, style)
             }
@@ -5576,7 +5647,11 @@ fn send_notice(stream: &mut dyn Write, msg: &str) -> std::io::Result<()> {
     body.push(0);
     body.push(0);
     stream.write_all(b"N")?;
-    stream.write_all(&u32::try_from(body.len() + 4).unwrap_or(u32::MAX).to_be_bytes())?;
+    stream.write_all(
+        &u32::try_from(body.len() + 4)
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    )?;
     stream.write_all(&body)
 }
 
@@ -5759,11 +5834,7 @@ const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 /// format: `[i32 len][payload]`, NULL = len -1. Types without a
 /// binary encoder yet return an error (an honest protocol failure
 /// beats bytes the client will mis-decode).
-fn encode_binary_cell(
-    out: &mut Vec<u8>,
-    v: &Value,
-    ty: DataType,
-) -> Result<(), String> {
+fn encode_binary_cell(out: &mut Vec<u8>, v: &Value, ty: DataType) -> Result<(), String> {
     let mut put = |payload: &[u8]| {
         out.extend_from_slice(&(payload.len() as i32).to_be_bytes());
         out.extend_from_slice(payload);
@@ -5851,11 +5922,7 @@ fn encode_binary_cell(
 
 /// v7.39 — encode a 1-D array in PG's binary array format. `enc`
 /// writes one element's payload; NULL elements get len -1.
-fn binary_array<T>(
-    items: &[Option<T>],
-    elem_oid: u32,
-    enc: impl Fn(&T, &mut Vec<u8>),
-) -> Vec<u8> {
+fn binary_array<T>(items: &[Option<T>], elem_oid: u32, enc: impl Fn(&T, &mut Vec<u8>)) -> Vec<u8> {
     let has_null = items.iter().any(Option::is_none);
     let mut buf = Vec::with_capacity(20 + items.len() * 8);
     buf.extend_from_slice(&1i32.to_be_bytes()); // ndim
@@ -6531,9 +6598,7 @@ fn value_to_pg_text<'a>(
         Value::BpChar(s) => into_arena(s.as_ref()),
         // v7.39 (FTS) — canonical tsvector/tsquery text (they fell
         // through to the Debug placeholder).
-        Value::TsVector(lexs) => {
-            into_arena(&spg_engine::eval::format_tsvector(lexs))
-        }
+        Value::TsVector(lexs) => into_arena(&spg_engine::eval::format_tsvector(lexs)),
         Value::TsQuery(ast) => into_arena(&spg_engine::eval::format_tsquery(ast)),
         // v7.15.0 — TIMESTAMPTZ vs plain TIMESTAMP at render
         // time. mailrs round-8 acceptance: SELECT on TIMESTAMPTZ
@@ -6666,23 +6731,17 @@ fn value_to_pg_text<'a>(
         Value::IntArray(items) => into_arena(&spg_engine::eval::format_int_array(items)),
         Value::BigIntArray(items) => into_arena(&spg_engine::eval::format_bigint_array(items)),
         Value::BoolArray(items) => into_arena(&spg_engine::eval::format_bool_array(items)),
-        Value::SmallIntArray(items) => {
-            into_arena(&spg_engine::eval::format_smallint_array(items))
-        }
+        Value::SmallIntArray(items) => into_arena(&spg_engine::eval::format_smallint_array(items)),
         Value::FloatArray(items) => {
             into_arena(&spg_engine::eval::format_float_array_styled(items, style))
         }
-        Value::NumericArray(items) => {
-            into_arena(&spg_engine::eval::format_numeric_array(items))
-        }
+        Value::NumericArray(items) => into_arena(&spg_engine::eval::format_numeric_array(items)),
         Value::DateArray(items) => {
             into_arena(&spg_engine::eval::format_date_array_styled(items, style))
         }
-        Value::TimestampArray(items) => {
-            into_arena(&spg_engine::eval::format_timestamp_array_styled(
-                items, false, style,
-            ))
-        }
+        Value::TimestampArray(items) => into_arena(
+            &spg_engine::eval::format_timestamp_array_styled(items, false, style),
+        ),
         Value::TimestamptzArray(items) => {
             // Element-wise per-value offsets (see the scalar arm).
             let mut out = String::from("{");
@@ -6707,9 +6766,9 @@ fn value_to_pg_text<'a>(
             into_arena(&out)
         }
         Value::UuidArray(items) => into_arena(&spg_engine::eval::format_uuid_array(items)),
-        Value::IntervalArray(items) => {
-            into_arena(&spg_engine::eval::format_interval_array_styled(items, style))
-        }
+        Value::IntervalArray(items) => into_arena(&spg_engine::eval::format_interval_array_styled(
+            items, style,
+        )),
         // v7.39 — every remaining variant renders its canonical PG
         // text via the engine's shared formatter (the old Debug
         // fallback leaked `Inet { .. }` / `Point(..)` / `BitString
@@ -6837,9 +6896,15 @@ mod tests {
             command_tag("CREATE OR REPLACE VIEW v AS SELECT 1", 0),
             "CREATE VIEW"
         );
-        assert_eq!(command_tag("CREATE TEMP TABLE t (id INT)", 0), "CREATE TABLE");
+        assert_eq!(
+            command_tag("CREATE TEMP TABLE t (id INT)", 0),
+            "CREATE TABLE"
+        );
         assert_eq!(command_tag("DROP TABLE IF EXISTS t", 0), "DROP TABLE");
-        assert_eq!(command_tag("ALTER TABLE t ADD COLUMN x INT", 0), "ALTER TABLE");
+        assert_eq!(
+            command_tag("ALTER TABLE t ADD COLUMN x INT", 0),
+            "ALTER TABLE"
+        );
         assert_eq!(command_tag("TRUNCATE t", 0), "TRUNCATE TABLE");
         assert_eq!(command_tag("CREATE USER u", 0), "CREATE ROLE");
         assert_eq!(
@@ -7077,7 +7142,8 @@ mod tests {
     #[test]
     fn parse_copy_query_to_stdout() {
         // v7.39 (read01 round 94) — the parenthesised query form.
-        let sql = "COPY (SELECT a, b FROM t WHERE a > 1 ORDER BY a) TO STDOUT WITH (FORMAT csv, HEADER)";
+        let sql =
+            "COPY (SELECT a, b FROM t WHERE a > 1 ORDER BY a) TO STDOUT WITH (FORMAT csv, HEADER)";
         match parse_copy_intent(sql) {
             Some(CopyIntent::ToQuery(query, opts)) => {
                 assert_eq!(query, "SELECT a, b FROM t WHERE a > 1 ORDER BY a");

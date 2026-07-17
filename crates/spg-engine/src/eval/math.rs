@@ -198,7 +198,7 @@ pub(crate) fn f64_exp(x: f64) -> f64 {
 }
 
 pub(crate) fn f64_ln(x: f64) -> f64 {
-    if x <= 0.0 && x != 0.0 {
+    if x < 0.0 {
         return f64::NAN;
     }
     plat::ln(x)

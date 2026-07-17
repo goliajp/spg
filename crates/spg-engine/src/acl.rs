@@ -176,10 +176,7 @@ pub(crate) fn render_nspacl(cat: &spg_storage::Catalog) -> String {
     if let Some(rendered) = render_acl_list(cat.schema_acl()) {
         return rendered;
     }
-    alloc::format!(
-        "{{{o}=UC/{o},=U/{o}}}",
-        o = SCHEMA_OWNER_ROLE
-    )
+    alloc::format!("{{{o}=UC/{o},=U/{o}}}", o = SCHEMA_OWNER_ROLE)
 }
 
 /// v7.39 (read01 round 59) — the privileges `roles` hold on ONE column: its own
@@ -274,7 +271,10 @@ impl Engine {
         let Some(t) = self.active_catalog().get(table) else {
             return Ok(());
         };
-        if self.table_owner(t.schema()).eq_ignore_ascii_case(self.current_role()) {
+        if self
+            .table_owner(t.schema())
+            .eq_ignore_ascii_case(self.current_role())
+        {
             Ok(())
         } else {
             Err(EngineError::Unsupported(alloc::format!(
@@ -478,7 +478,10 @@ impl Engine {
                 continue;
             };
             for g in grantees {
-                let at = col.acl.iter().position(|a| a.grantee.eq_ignore_ascii_case(g));
+                let at = col
+                    .acl
+                    .iter()
+                    .position(|a| a.grantee.eq_ignore_ascii_case(g));
                 if grant {
                     match at {
                         Some(i) => {
@@ -567,20 +570,15 @@ impl Engine {
         self.acl_require_owner(table)?;
         let grantor = self.current_role().to_string();
         let owner = {
-            let t = self
-                .active_catalog()
-                .get(table)
-                .ok_or_else(|| EngineError::Unsupported(alloc::format!(
-                    "relation \"{table}\" does not exist"
-                )))?;
+            let t = self.active_catalog().get(table).ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!("relation \"{table}\" does not exist"))
+            })?;
             self.table_owner(t.schema()).to_string()
         };
         let cat = self.active_catalog_mut();
-        let t = cat
-            .get_mut(table)
-            .ok_or_else(|| EngineError::Unsupported(alloc::format!(
-                "relation \"{table}\" does not exist"
-            )))?;
+        let t = cat.get_mut(table).ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!("relation \"{table}\" does not exist"))
+        })?;
         let acl = &mut t.schema_mut().acl;
         // PG materialises the whole list — owner's default entry first — the
         // moment the first GRANT lands. A REVOKE against a never-granted table
@@ -972,7 +970,6 @@ impl Engine {
     }
 }
 
-
 impl Engine {
     /// v7.39 (read01 round 59) — the column-aware SELECT gate for ONE table.
     ///
@@ -986,9 +983,8 @@ impl Engine {
         if self.acl_holds(table, priv_bits::SELECT) {
             return Ok(());
         }
-        let denied = || {
-            EngineError::Unsupported(alloc::format!("permission denied for table {table}"))
-        };
+        let denied =
+            || EngineError::Unsupported(alloc::format!("permission denied for table {table}"));
         let Some(t) = self.active_catalog().get(table) else {
             return Ok(());
         };
@@ -1082,7 +1078,9 @@ impl Engine {
         let cat = self.active_catalog();
         // This level's base tables, and the aliases that name them.
         let mut bases: alloc::vec::Vec<(String, Option<String>)> = alloc::vec::Vec::new();
-        let mut note = |t: &TableRef, into: &mut alloc::collections::BTreeMap<String, ColRead>, this: &Self| {
+        let mut note = |t: &TableRef,
+                        into: &mut alloc::collections::BTreeMap<String, ColRead>,
+                        this: &Self| {
             if let Some(sub) = &t.lateral_subquery {
                 this.collect_select_reads(sub, into);
                 return None;
@@ -1115,27 +1113,34 @@ impl Engine {
                     .any(|c| c.name.eq_ignore_ascii_case(col))
             })
         };
-        let mut add_col = |c: &ColumnName, into: &mut alloc::collections::BTreeMap<String, ColRead>| {
-            match &c.qualifier {
-                Some(q) => {
-                    // The qualifier is a table name or an alias of one.
-                    let target = bases.iter().find(|(t, a)| {
-                        a.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(q))
-                            || t.eq_ignore_ascii_case(q)
-                    });
-                    if let Some((t, _)) = target {
-                        into.entry(t.clone()).or_default().cols.insert(c.name.clone());
+        let mut add_col =
+            |c: &ColumnName, into: &mut alloc::collections::BTreeMap<String, ColRead>| {
+                match &c.qualifier {
+                    Some(q) => {
+                        // The qualifier is a table name or an alias of one.
+                        let target = bases.iter().find(|(t, a)| {
+                            a.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(q))
+                                || t.eq_ignore_ascii_case(q)
+                        });
+                        if let Some((t, _)) = target {
+                            into.entry(t.clone())
+                                .or_default()
+                                .cols
+                                .insert(c.name.clone());
+                        }
                     }
-                }
-                None => {
-                    for (t, _) in &bases {
-                        if owns(t, &c.name) {
-                            into.entry(t.clone()).or_default().cols.insert(c.name.clone());
+                    None => {
+                        for (t, _) in &bases {
+                            if owns(t, &c.name) {
+                                into.entry(t.clone())
+                                    .or_default()
+                                    .cols
+                                    .insert(c.name.clone());
+                            }
                         }
                     }
                 }
-            }
-        };
+            };
         // `SELECT *` reaches every column of every base table at this level.
         if stmt.items.iter().any(|i| matches!(i, SelectItem::Wildcard)) {
             for (t, _) in &bases {
@@ -1517,7 +1522,10 @@ impl Engine {
 /// v7.39 (read01 round 61) — how many arguments a stored function declares,
 /// out of its `args_repr` (`"(x INT, y TEXT)"`).
 pub(crate) fn function_arg_count(args_repr: &str) -> usize {
-    let inner = args_repr.trim().trim_start_matches('(').trim_end_matches(')');
+    let inner = args_repr
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
     if inner.trim().is_empty() {
         0
     } else {

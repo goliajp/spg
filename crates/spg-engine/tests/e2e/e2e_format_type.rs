@@ -189,8 +189,14 @@ fn array_oids_bit_family_and_typmod_given_specials() {
         "character varying(16)[]"
     );
     // bit family: typmod is the raw bit count (no varlena offset).
-    assert_eq!(text(&first(&mut e, "SELECT format_type(1560, 4)")), "bit(4)");
-    assert_eq!(text(&first(&mut e, "SELECT format_type(1560, NULL)")), "bit");
+    assert_eq!(
+        text(&first(&mut e, "SELECT format_type(1560, 4)")),
+        "bit(4)"
+    );
+    assert_eq!(
+        text(&first(&mut e, "SELECT format_type(1560, NULL)")),
+        "bit"
+    );
     assert_eq!(
         text(&first(&mut e, "SELECT format_type(1562, 8)")),
         "bit varying(8)"

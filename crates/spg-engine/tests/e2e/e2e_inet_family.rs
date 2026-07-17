@@ -176,8 +176,17 @@ fn abbrev_inet_vs_cidr_and_same_family_values() {
 fn cidr_abbreviated_input_and_validation() {
     let mut e = Engine::new();
     assert_eq!(
-        row(&mut e, "SELECT cidr '10/8', cidr '10.5/16', cidr '10.5.3/24', cidr '128.1', cidr '192.5.5.240/28'"),
-        vec!["10.0.0.0/8", "10.5.0.0/16", "10.5.3.0/24", "128.1.0.0/16", "192.5.5.240/28"]
+        row(
+            &mut e,
+            "SELECT cidr '10/8', cidr '10.5/16', cidr '10.5.3/24', cidr '128.1', cidr '192.5.5.240/28'"
+        ),
+        vec![
+            "10.0.0.0/8",
+            "10.5.0.0/16",
+            "10.5.3.0/24",
+            "128.1.0.0/16",
+            "192.5.5.240/28"
+        ]
     );
     // Host bits right of the mask are rejected (PG's dedicated error).
     let err = e.execute("SELECT cidr '10.1.2.3/8'").unwrap_err();

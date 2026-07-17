@@ -7,7 +7,8 @@
 use spg_engine::Engine;
 
 fn notices_of(e: &mut Engine, sql: &str) -> Vec<String> {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     e.take_notices()
 }
 

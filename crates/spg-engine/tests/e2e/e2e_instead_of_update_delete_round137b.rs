@@ -8,8 +8,10 @@ use spg_engine::{Engine, QueryResult};
 
 fn setup(e: &mut Engine) {
     e.execute("CREATE TABLE base(id int, v int)").unwrap();
-    e.execute("INSERT INTO base VALUES(1,10),(2,20),(3,30)").unwrap();
-    e.execute("CREATE VIEW jv AS SELECT id, v, v*2 AS dbl FROM base").unwrap();
+    e.execute("INSERT INTO base VALUES(1,10),(2,20),(3,30)")
+        .unwrap();
+    e.execute("CREATE VIEW jv AS SELECT id, v, v*2 AS dbl FROM base")
+        .unwrap();
     e.execute(
         "CREATE FUNCTION jv_upd() RETURNS trigger AS $x$ BEGIN \
          UPDATE base SET v=NEW.v WHERE id=OLD.id; RETURN NEW; END; $x$ LANGUAGE plpgsql",

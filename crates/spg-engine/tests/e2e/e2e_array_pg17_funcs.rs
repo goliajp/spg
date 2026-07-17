@@ -6,9 +6,7 @@ use spg_engine::{Engine, QueryResult};
 
 fn text_of(e: &mut Engine, sql: &str) -> String {
     match e.execute(sql).unwrap() {
-        QueryResult::Rows { rows, .. } => {
-            spg_engine::eval::value_to_text(&rows[0].values[0])
-        }
+        QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{sql}: {other:?}"),
     }
 }
@@ -16,7 +14,10 @@ fn text_of(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn array_sort_reverse_match_pg() {
     let mut e = Engine::new();
-    assert_eq!(text_of(&mut e, "SELECT array_sort(ARRAY[3,1,2])"), "{1,2,3}");
+    assert_eq!(
+        text_of(&mut e, "SELECT array_sort(ARRAY[3,1,2])"),
+        "{1,2,3}"
+    );
     // NULLS last ascending, first descending (PG's sort convention).
     assert_eq!(
         text_of(&mut e, "SELECT array_sort(ARRAY[3,1,NULL,2])"),
@@ -30,7 +31,10 @@ fn array_sort_reverse_match_pg() {
         text_of(&mut e, "SELECT array_sort(ARRAY['b','a'], false, true)"),
         "{a,b}"
     );
-    assert_eq!(text_of(&mut e, "SELECT array_reverse(ARRAY[1,2,3])"), "{3,2,1}");
+    assert_eq!(
+        text_of(&mut e, "SELECT array_reverse(ARRAY[1,2,3])"),
+        "{3,2,1}"
+    );
     assert_eq!(text_of(&mut e, "SELECT array_reverse(ARRAY['x'])"), "{x}");
 }
 
@@ -50,9 +54,8 @@ fn array_sample_and_multidim_search_error_shapes() {
         .execute("SELECT array_position(ARRAY[[1,2]], 1)")
         .unwrap_err();
     assert!(
-        format!("{err}").contains(
-            "searching for elements in multidimensional arrays is not supported"
-        ),
+        format!("{err}")
+            .contains("searching for elements in multidimensional arrays is not supported"),
         "got {err}"
     );
 }

@@ -293,7 +293,11 @@ fn update_promotes_cold_row_to_hot_tier() {
     // Under the mvcc-inplace-on verification feature the UPDATE
     // additionally keeps the tombstoned pre-update version in the
     // hot tier (physical 2, visible 1) until vacuum.
-    let expect_hot = if !cfg!(feature = "mvcc-inplace-off") { 2 } else { 1 };
+    let expect_hot = if !cfg!(feature = "mvcc-inplace-off") {
+        2
+    } else {
+        1
+    };
     assert_eq!(
         engine.catalog().get("users").unwrap().row_count(),
         expect_hot,
@@ -350,7 +354,11 @@ fn update_on_hot_pk_still_works_after_promote_hook_added() {
     assert_eq!(select_name_by_id(&mut engine, 1).as_deref(), Some("ALICE"));
     // (Physical count: mvcc-inplace-on keeps the tombstoned old
     // version until vacuum; the VISIBLE count above is the contract.)
-    let expect_hot = if !cfg!(feature = "mvcc-inplace-off") { 2 } else { 1 };
+    let expect_hot = if !cfg!(feature = "mvcc-inplace-off") {
+        2
+    } else {
+        1
+    };
     assert_eq!(
         engine.catalog().get("users").unwrap().row_count(),
         expect_hot,

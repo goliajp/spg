@@ -21,7 +21,8 @@ fn text(e: &mut Engine, sql: &str) -> String {
 
 fn setup(e: &mut Engine) {
     e.execute("CREATE TABLE t (a text, b int, v int)").unwrap();
-    e.execute("INSERT INTO t VALUES ('x',1,10),('x',2,20),('y',1,30)").unwrap();
+    e.execute("INSERT INTO t VALUES ('x',1,10),('x',2,20),('y',1,30)")
+        .unwrap();
 }
 
 #[test]
@@ -29,13 +30,19 @@ fn rollup_and_cube() {
     let mut e = Engine::new();
     setup(&mut e);
     assert_eq!(
-        text(&mut e, "SELECT string_agg(coalesce(a,'*')||'/'||coalesce(b::text,'*')||'/'||s, ',') \
-                      FROM (SELECT a,b,sum(v) s FROM t GROUP BY ROLLUP(a,b) ORDER BY a NULLS LAST, b NULLS LAST) q"),
+        text(
+            &mut e,
+            "SELECT string_agg(coalesce(a,'*')||'/'||coalesce(b::text,'*')||'/'||s, ',') \
+                      FROM (SELECT a,b,sum(v) s FROM t GROUP BY ROLLUP(a,b) ORDER BY a NULLS LAST, b NULLS LAST) q"
+        ),
         "x/1/10,x/2/20,x/*/30,y/1/30,y/*/30,*/*/60"
     );
     assert_eq!(
-        text(&mut e, "SELECT string_agg(coalesce(a,'*')||'/'||coalesce(b::text,'*')||'/'||s, ',') \
-                      FROM (SELECT a,b,sum(v) s FROM t GROUP BY CUBE(a,b) ORDER BY a NULLS LAST, b NULLS LAST) q"),
+        text(
+            &mut e,
+            "SELECT string_agg(coalesce(a,'*')||'/'||coalesce(b::text,'*')||'/'||s, ',') \
+                      FROM (SELECT a,b,sum(v) s FROM t GROUP BY CUBE(a,b) ORDER BY a NULLS LAST, b NULLS LAST) q"
+        ),
         "x/1/10,x/2/20,x/*/30,y/1/30,y/*/30,*/1/40,*/2/20,*/*/60"
     );
 }
@@ -46,8 +53,11 @@ fn grouping_function_bitmask_single_arg() {
     setup(&mut e);
     // GROUPING(a): 0 when a is grouped, 1 when a is aggregated (the total row).
     assert_eq!(
-        text(&mut e, "SELECT string_agg(g::text||':'||coalesce(a,'*')||':'||s, ',') \
-                      FROM (SELECT GROUPING(a) g, a, sum(v) s FROM t GROUP BY GROUPING SETS ((a),()) ORDER BY a NULLS LAST) q"),
+        text(
+            &mut e,
+            "SELECT string_agg(g::text||':'||coalesce(a,'*')||':'||s, ',') \
+                      FROM (SELECT GROUPING(a) g, a, sum(v) s FROM t GROUP BY GROUPING SETS ((a),()) ORDER BY a NULLS LAST) q"
+        ),
         "0:x:30,0:y:30,1:*:60"
     );
 }
@@ -58,8 +68,11 @@ fn grouping_function_bitmask_multi_arg() {
     setup(&mut e);
     // GROUPING(a,b): (a,b)→0, (a)→1 (b dropped), (b)→2 (a dropped), ()→3.
     assert_eq!(
-        text(&mut e, "SELECT string_agg(g::text||':'||coalesce(a,'*')||coalesce(b::text,'*')||':'||s, ',') \
-                      FROM (SELECT GROUPING(a,b) g, a, b, sum(v) s FROM t GROUP BY GROUPING SETS ((a,b),(a),(b),()) ORDER BY a NULLS LAST, b NULLS LAST) q"),
+        text(
+            &mut e,
+            "SELECT string_agg(g::text||':'||coalesce(a,'*')||coalesce(b::text,'*')||':'||s, ',') \
+                      FROM (SELECT GROUPING(a,b) g, a, b, sum(v) s FROM t GROUP BY GROUPING SETS ((a,b),(a),(b),()) ORDER BY a NULLS LAST, b NULLS LAST) q"
+        ),
         "0:x1:10,0:x2:20,1:x*:30,0:y1:30,1:y*:30,2:*1:40,2:*2:20,3:**:60"
     );
 }

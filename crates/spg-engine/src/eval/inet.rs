@@ -75,7 +75,11 @@ pub(super) fn inet_network(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
         return Ok(Value::text(s));
     };
     let mask = mask.min(32);
-    let masked = if mask == 0 { 0 } else { addr & (u32::MAX << (32 - mask)) };
+    let masked = if mask == 0 {
+        0
+    } else {
+        addr & (u32::MAX << (32 - mask))
+    };
     Ok(Value::text(alloc::format!(
         "{}.{}.{}.{}/{mask}",
         (masked >> 24) & 0xFF,

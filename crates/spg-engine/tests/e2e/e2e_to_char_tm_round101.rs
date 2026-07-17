@@ -19,12 +19,27 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn tm_emits_name_at_natural_width() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT to_char(date '2024-01-01','TMDay')"), "Monday");
-    assert_eq!(text(&mut e, "SELECT to_char(date '2024-01-01','TMDy')"), "Mon");
-    assert_eq!(text(&mut e, "SELECT to_char(date '2024-03-05','TMMonth')"), "March");
-    assert_eq!(text(&mut e, "SELECT to_char(date '2024-03-05','TMMon')"), "Mar");
     assert_eq!(
-        text(&mut e, "SELECT to_char(date '2024-03-05','TMDay, TMMonth DD')"),
+        text(&mut e, "SELECT to_char(date '2024-01-01','TMDay')"),
+        "Monday"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT to_char(date '2024-01-01','TMDy')"),
+        "Mon"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT to_char(date '2024-03-05','TMMonth')"),
+        "March"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT to_char(date '2024-03-05','TMMon')"),
+        "Mar"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT to_char(date '2024-03-05','TMDay, TMMonth DD')"
+        ),
         "Tuesday, March 05"
     );
 }
@@ -35,9 +50,15 @@ fn non_tm_still_blank_pads_and_numeric_unaffected() {
     // longest member (9), and TM on a name field doesn't strip a following
     // numeric field's zero pad.
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT to_char(date '2024-03-05','Day')"), "Tuesday  ");
     assert_eq!(
-        text(&mut e, "SELECT to_char(timestamp '2024-03-05 14:00','TMDay HH24')"),
+        text(&mut e, "SELECT to_char(date '2024-03-05','Day')"),
+        "Tuesday  "
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT to_char(timestamp '2024-03-05 14:00','TMDay HH24')"
+        ),
         "Tuesday 14"
     );
 }
