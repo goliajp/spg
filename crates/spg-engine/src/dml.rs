@@ -44,6 +44,17 @@ struct ViewRedirect {
     /// Outermost-view-col → base-table-col map (composed across the chain).
     /// Empty when no level renames columns (the common path).
     col_map: Vec<(String, String)>,
+    /// v7.39 (round 154) — computed (expression) view columns, leaf level
+    /// only: `(view_col, defining expr over base columns)`. PG keeps such
+    /// a view auto-updatable; a write TARGETING one of these errors
+    /// ("View columns that are not columns of their base relation are
+    /// not updatable"), reads of them rewrite to the expression.
+    computed: Vec<(String, spg_sql::ast::Expr)>,
+    /// v7.39 (round 154) — the view's full output column order,
+    /// `(view_col, Some(base_col) = simple | None = computed)`. Filled
+    /// only when `computed` is non-empty (positional writes can no
+    /// longer be derived from `col_map` alone then).
+    view_cols: Vec<(String, Option<String>)>,
     /// Per-level `(view_name, qual_at_base, check_option)`, outermost first, for
     /// WITH CHECK OPTION enforcement (only WHERE-bearing levels appear).
     check_chain: Vec<(String, spg_sql::ast::Expr, u8)>,
@@ -104,43 +115,86 @@ fn view_redirect_to_simple_base(
         return None;
     }
     let primary_name = from.primary.name.clone();
-    // Validate the projection is a bare-column / wildcard list, and (only when
-    // renamed) build this level's view-col → primary-col map. `*` projects the
-    // primary's columns in declaration order.
-    let mut primary_cols: Vec<String> = Vec::new();
-    let mut need_primary_cols = !rename_cols.is_empty();
+    let is_leaf = catalog.get(&primary_name).is_some();
+    // Build the view's output columns in order: each is either a simple
+    // primary column (writable) or — leaf level only, v7.39 round 154 —
+    // a computed expression (readable, not a write target; PG keeps the
+    // view auto-updatable). The view-side name is the rename-list entry
+    // when present, else the item alias, else the column's own name.
+    // `*` projects the primary's columns in declaration order.
+    let mut out_cols: Vec<(String, Option<String>, Option<spg_sql::ast::Expr>)> =
+        Vec::new(); // (view-side name, base col, computed expr)
     for item in &select.items {
         match item {
             spg_sql::ast::SelectItem::Wildcard
             | spg_sql::ast::SelectItem::QualifiedWildcard(_) => {
-                if need_primary_cols {
-                    // Renamed wildcard view: resolve the primary's output columns
-                    // (a base table's schema). Renamed-over-nested-view is a rare
-                    // case we don't compose column-wise — bail rather than guess.
+                // Leaf: resolve the primary's output columns (a base
+                // table's schema). Over a nested view the wildcard is the
+                // identity pass-through (no per-column info needed) —
+                // renamed-wildcard-over-nested-view bails at the rename
+                // length check below, as before.
+                if is_leaf {
                     let base = catalog.get(&primary_name)?;
                     for c in &base.schema().columns {
-                        primary_cols.push(c.name.clone());
+                        out_cols.push((c.name.clone(), Some(c.name.clone()), None));
                     }
-                    need_primary_cols = false;
                 }
             }
-            spg_sql::ast::SelectItem::Expr { expr, .. } => match expr {
+            spg_sql::ast::SelectItem::Expr { expr, alias } => match expr {
                 spg_sql::ast::Expr::Column(c) => {
-                    if need_primary_cols {
-                        primary_cols.push(c.name.clone());
-                    }
+                    let name = alias.clone().unwrap_or_else(|| c.name.clone());
+                    out_cols.push((name, Some(c.name.clone()), None));
                 }
-                _ => return None,
+                other => {
+                    // v7.39 (round 154) — a computed column keeps the view
+                    // auto-updatable ONLY for plain expressions at the leaf
+                    // level: an aggregate (`SELECT max(v) …`) makes the
+                    // whole view non-updatable in PG, and window / SRF /
+                    // subquery shapes stay conservatively rejected too.
+                    if !is_leaf
+                        || crate::aggregate::contains_aggregate(other)
+                        || expr_mentions_subquery_or_window(other)
+                    {
+                        return None;
+                    }
+                    let name = alias
+                        .clone()
+                        .unwrap_or_else(|| String::from("?column?"));
+                    out_cols.push((name, None, Some(other.clone())));
+                }
             },
         }
     }
-    let this_map: Vec<(String, String)> = if rename_cols.is_empty() {
-        Vec::new()
-    } else {
-        if rename_cols.len() != primary_cols.len() {
+    // A rename list overrides every view-side name positionally.
+    if !rename_cols.is_empty() {
+        if rename_cols.len() != out_cols.len() {
             return None;
         }
-        rename_cols.into_iter().zip(primary_cols).collect()
+        for (slot, name) in out_cols.iter_mut().zip(rename_cols.into_iter()) {
+            slot.0 = name;
+        }
+    }
+    let computed: Vec<(String, spg_sql::ast::Expr)> = out_cols
+        .iter()
+        .filter_map(|(n, _, e)| e.clone().map(|e| (n.clone(), e)))
+        .collect();
+    // The simple view→base pairs. `col_map` stays EMPTY on the pure
+    // identity shape (no rename, no alias, no computed column) so the
+    // established fast path — no rewriting at all — is byte-identical.
+    let all_simple: Vec<(String, String)> = out_cols
+        .iter()
+        .filter_map(|(n, b, _)| b.clone().map(|b| (n.clone(), b)))
+        .collect();
+    let identity =
+        computed.is_empty() && all_simple.iter().all(|(v, b)| v.eq_ignore_ascii_case(b));
+    let this_map: Vec<(String, String)> = if identity { Vec::new() } else { all_simple };
+    let view_cols: Vec<(String, Option<String>)> = if computed.is_empty() {
+        Vec::new()
+    } else {
+        out_cols
+            .iter()
+            .map(|(n, b, _)| (n.clone(), b.clone()))
+            .collect()
     };
     let this_where = select.where_;
 
@@ -154,12 +208,21 @@ fn view_redirect_to_simple_base(
             base: primary_name,
             where_at_base: this_where,
             col_map: this_map,
+            computed,
+            view_cols,
             check_chain: chain,
         });
     }
     // Nested: the primary is itself an auto-updatable view — recurse and compose.
     if catalog.views().contains_key(&primary_name) {
         let inner = view_redirect_to_simple_base(catalog, &primary_name)?;
+        // v7.39 (round 154) — computed columns are supported at the LEAF
+        // level only; composing a rename/projection over a computed
+        // inner view is a recorded residual (PG allows it) — bail to
+        // the honest error rather than mis-compose.
+        if !inner.computed.is_empty() {
+            return None;
+        }
         // This view's WHERE references the inner view's columns; translate them
         // to base columns through the inner map.
         let this_where_at_base = this_where.map(|mut w| {
@@ -179,10 +242,93 @@ fn view_redirect_to_simple_base(
             base: inner.base,
             where_at_base: and_optional_predicates(this_where_at_base, inner.where_at_base),
             col_map: compose_view_maps(&this_map, &inner.col_map),
+            computed: Vec::new(),
+            view_cols: Vec::new(),
             check_chain: chain,
         });
     }
     None
+}
+
+/// v7.39 (round 154) — shapes that make a view non-auto-updatable even
+/// as a "computed column": subqueries and window functions (aggregates
+/// are checked separately via `contains_aggregate`).
+fn expr_mentions_subquery_or_window(e: &spg_sql::ast::Expr) -> bool {
+    if crate::subquery::expr_has_subquery(e) {
+        return true;
+    }
+    let mut found = false;
+    let mut probe = e.clone();
+    crate::expr_analysis::rewrite_nodes_mut(&mut probe, &mut |n| {
+        if matches!(n, spg_sql::ast::Expr::WindowFunction { .. }) {
+            found = true;
+        }
+        false
+    });
+    found
+}
+
+/// v7.39 (round 154) — PG's error for a write that targets a computed
+/// (expression) view column; the view stays auto-updatable otherwise.
+/// `verb` is "insert into" / "update" / "merge into" (PG varies it by
+/// statement kind).
+fn view_computed_col_write_err(verb: &str, col: &str, view: &str) -> EngineError {
+    EngineError::Unsupported(alloc::format!(
+        "cannot {verb} column \"{col}\" of view \"{view}\" \
+         DETAIL: View columns that are not columns of their base relation are not updatable."
+    ))
+}
+
+/// v7.39 (round 154) — the round-133 ref rewriter extended for computed
+/// view columns: a simple column renames to its base column, a computed
+/// column substitutes its defining expression. `target_alias` selects
+/// the context: `Some(alias)` (MERGE) rewrites only bare / alias-
+/// qualified refs — source-alias refs must survive — and stamps the
+/// alias onto every rewritten ref (the combined-row context resolves
+/// target columns through it); `None` (single-table UPDATE / DELETE /
+/// INSERT context) rewrites every ref and leaves them bare.
+fn rewrite_view_refs_to_base(
+    expr: &mut spg_sql::ast::Expr,
+    map: &alloc::collections::BTreeMap<String, String>,
+    computed: &alloc::collections::BTreeMap<String, spg_sql::ast::Expr>,
+    target_alias: Option<&str>,
+) {
+    use spg_sql::ast::Expr;
+    crate::expr_analysis::rewrite_nodes_mut(expr, &mut |n| {
+        if let Expr::Column(c) = n {
+            let eligible = match target_alias {
+                None => true,
+                Some(a) => {
+                    c.qualifier.is_none()
+                        || c.qualifier
+                            .as_deref()
+                            .is_some_and(|q| q.eq_ignore_ascii_case(a))
+                }
+            };
+            if eligible {
+                if let Some(base) = map.get(&c.name) {
+                    c.name = base.clone();
+                    c.qualifier = target_alias.map(Into::into);
+                } else if let Some(def) = computed.get(&c.name) {
+                    let mut sub = def.clone();
+                    if let Some(q) = target_alias {
+                        crate::expr_analysis::rewrite_nodes_mut(&mut sub, &mut |m| {
+                            if let Expr::Column(mc) = m {
+                                if mc.qualifier.is_none() {
+                                    mc.qualifier = Some(q.into());
+                                }
+                                return true;
+                            }
+                            false
+                        });
+                    }
+                    *n = sub;
+                }
+            }
+            return true;
+        }
+        false
+    });
 }
 
 /// v7.39 (round 133) — rewrite an auto-updatable view's column references in a
@@ -240,22 +386,47 @@ fn rewrite_view_col_refs(
 fn rewrite_view_returning_items(
     items: &[spg_sql::ast::SelectItem],
     col_map: &[(String, String)],
+    computed: &[(String, spg_sql::ast::Expr)],
+    view_cols: &[(String, Option<String>)],
 ) -> Vec<spg_sql::ast::SelectItem> {
     use spg_sql::ast::{Expr, SelectItem};
     let map: alloc::collections::BTreeMap<String, String> = col_map.iter().cloned().collect();
+    let cmap: alloc::collections::BTreeMap<String, Expr> = computed.iter().cloned().collect();
     let mut out: Vec<SelectItem> = Vec::new();
     for it in items {
         match it {
-            // `RETURNING *` / `v.*` → the view's columns (base value, view name).
+            // `RETURNING *` / `v.*` → the view's columns (base value, view
+            // name). v7.39 (round 154) — a computed column projects its
+            // defining expression (evaluated on the post-write row, as PG);
+            // `view_cols` carries the declaration order when one exists.
             SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
-                for (view_col, base_col) in col_map {
-                    out.push(SelectItem::Expr {
-                        expr: Expr::Column(spg_sql::ast::ColumnName {
-                            qualifier: None,
-                            name: base_col.clone(),
-                        }),
-                        alias: Some(view_col.clone()),
-                    });
+                if view_cols.is_empty() {
+                    for (view_col, base_col) in col_map {
+                        out.push(SelectItem::Expr {
+                            expr: Expr::Column(spg_sql::ast::ColumnName {
+                                qualifier: None,
+                                name: base_col.clone(),
+                            }),
+                            alias: Some(view_col.clone()),
+                        });
+                    }
+                } else {
+                    for (view_col, base_col) in view_cols {
+                        let expr = match base_col {
+                            Some(b) => Expr::Column(spg_sql::ast::ColumnName {
+                                qualifier: None,
+                                name: b.clone(),
+                            }),
+                            None => cmap
+                                .get(view_col)
+                                .cloned()
+                                .expect("view_cols and computed come from the same projection"),
+                        };
+                        out.push(SelectItem::Expr {
+                            expr,
+                            alias: Some(view_col.clone()),
+                        });
+                    }
                 }
             }
             SelectItem::Expr { expr, alias } => {
@@ -264,14 +435,14 @@ fn rewrite_view_returning_items(
                 let out_alias = if alias.is_some() {
                     alias.clone()
                 } else if let Expr::Column(c) = expr
-                    && map.contains_key(&c.name)
+                    && (map.contains_key(&c.name) || cmap.contains_key(&c.name))
                 {
                     Some(c.name.clone())
                 } else {
                     alias.clone()
                 };
                 let mut e = expr.clone();
-                rewrite_view_col_refs(&mut e, &map);
+                rewrite_view_refs_to_base(&mut e, &map, &cmap, None);
                 out.push(SelectItem::Expr {
                     expr: e,
                     alias: out_alias,
@@ -469,8 +640,17 @@ impl Engine {
                 base,
                 where_at_base,
                 col_map,
+                computed,
+                view_cols,
                 check_chain,
             } = vr;
+            // v7.39 (round 154) — a computed view column is never a write
+            // target (PG: the view stays updatable, the column doesn't).
+            for (target, _) in &stmt.assignments {
+                if computed.iter().any(|(n, _)| n == target) {
+                    return Err(view_computed_col_write_err("update", target, &stmt.table));
+                }
+            }
             // v7.39 (round 132/136) — WITH CHECK OPTION: the updated row must
             // still satisfy the view chain's quals. The written (outermost)
             // view's own option drives the cascade.
@@ -494,22 +674,27 @@ impl Engine {
             let mut rewritten = stmt.clone();
             // v7.39 (round 133) — a column-renamed view: rewrite SET targets and
             // WHERE / assignment expressions from view columns to base columns
-            // before AND-ing the (base-column) view WHERE.
-            if !col_map.is_empty() {
+            // before AND-ing the (base-column) view WHERE. Round 154 — a
+            // computed column READ substitutes its defining expression.
+            if !col_map.is_empty() || !computed.is_empty() {
                 let map: alloc::collections::BTreeMap<String, String> =
                     col_map.iter().cloned().collect();
+                let cmap: alloc::collections::BTreeMap<String, Expr> =
+                    computed.iter().cloned().collect();
                 for (target, e) in &mut rewritten.assignments {
                     if let Some(b) = map.get(target) {
                         *target = b.clone();
                     }
-                    rewrite_view_col_refs(e, &map);
+                    rewrite_view_refs_to_base(e, &map, &cmap, None);
                 }
                 if let Some(w) = &mut rewritten.where_ {
-                    rewrite_view_col_refs(w, &map);
+                    rewrite_view_refs_to_base(w, &map, &cmap, None);
                 }
                 // v7.39 (round 134) — rewrite RETURNING view cols → base cols.
                 if let Some(ret) = &rewritten.returning {
-                    rewritten.returning = Some(rewrite_view_returning_items(ret, &col_map));
+                    rewritten.returning = Some(rewrite_view_returning_items(
+                        ret, &col_map, &computed, &view_cols,
+                    ));
                 }
             }
             rewritten.table = base;
@@ -1172,23 +1357,13 @@ impl Engine {
             // target's alias while the storage target becomes the base table.
             s.target_alias = Some(alias.clone());
             s.target = vr.base.clone();
-            if !vr.col_map.is_empty() {
+            if !vr.col_map.is_empty() || !vr.computed.is_empty() {
                 let map: alloc::collections::BTreeMap<String, String> =
                     vr.col_map.iter().cloned().collect();
+                let cmap: alloc::collections::BTreeMap<String, Expr> =
+                    vr.computed.iter().cloned().collect();
                 let rw = |e: &mut Expr| {
-                    crate::expr_analysis::rewrite_nodes_mut(e, &mut |n| {
-                        if let Expr::Column(c) = n {
-                            if c.qualifier
-                                .as_deref()
-                                .is_some_and(|q| q.eq_ignore_ascii_case(&alias))
-                                && let Some(b) = map.get(&c.name)
-                            {
-                                c.name = b.clone();
-                            }
-                            return true;
-                        }
-                        false
-                    });
+                    rewrite_view_refs_to_base(e, &map, &cmap, Some(&alias));
                 };
                 rw(&mut s.on);
                 for cl in &mut s.clauses {
@@ -1198,6 +1373,15 @@ impl Engine {
                     match &mut cl.action {
                         spg_sql::ast::MergeAction::Update { assignments } => {
                             for (col, e) in assignments {
+                                // v7.39 (round 154) — a computed view column
+                                // is never a write target.
+                                if cmap.contains_key(col.as_str()) {
+                                    return Err(view_computed_col_write_err(
+                                        "merge into",
+                                        col,
+                                        &stmt.target,
+                                    ));
+                                }
                                 if let Some(b) = map.get(col) {
                                     *col = b.clone();
                                 }
@@ -1208,9 +1392,38 @@ impl Engine {
                             if columns.is_empty() {
                                 // Positional tuples follow the VIEW's column
                                 // order; make that explicit as base columns.
-                                *columns = vr.col_map.iter().map(|(_, b)| b.clone()).collect();
+                                // Round 154 — with computed columns present
+                                // the order comes from `view_cols`; a tuple
+                                // value landing on a computed slot errors.
+                                if vr.computed.is_empty() {
+                                    *columns =
+                                        vr.col_map.iter().map(|(_, b)| b.clone()).collect();
+                                } else {
+                                    let n = values.len();
+                                    let mut cols: Vec<String> = Vec::with_capacity(n);
+                                    for (view_col, base_col) in vr.view_cols.iter().take(n) {
+                                        match base_col {
+                                            Some(b) => cols.push(b.clone()),
+                                            None => {
+                                                return Err(view_computed_col_write_err(
+                                                    "merge into",
+                                                    view_col,
+                                                    &stmt.target,
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    *columns = cols;
+                                }
                             } else {
                                 for c in columns.iter_mut() {
+                                    if cmap.contains_key(c.as_str()) {
+                                        return Err(view_computed_col_write_err(
+                                            "merge into",
+                                            c,
+                                            &stmt.target,
+                                        ));
+                                    }
                                     if let Some(b) = map.get(c) {
                                         *c = b.clone();
                                     }
@@ -1229,6 +1442,38 @@ impl Engine {
                 // Qualifier-aware: bare refs and refs qualified by the
                 // view alias / OLD / NEW remap; source-alias refs don't.
                 if let Some(items) = &mut s.returning {
+                    // Round 154 — an OLD./NEW.-qualified reference to a
+                    // COMPUTED view column would need the expression
+                    // evaluated on the pre-/post-image specifically; the
+                    // substitution below is post-image only. Honest error
+                    // instead of a silently-wrong value.
+                    for it in items.iter() {
+                        if let spg_sql::ast::SelectItem::Expr { expr, .. } = it {
+                            let mut bad = false;
+                            crate::expr_analysis::rewrite_nodes_mut(
+                                &mut expr.clone(),
+                                &mut |n| {
+                                    if let Expr::Column(c) = n {
+                                        if c.qualifier.as_deref().is_some_and(|q| {
+                                            q.eq_ignore_ascii_case("old")
+                                                || q.eq_ignore_ascii_case("new")
+                                        }) && vr.computed.iter().any(|(m, _)| *m == c.name)
+                                        {
+                                            bad = true;
+                                        }
+                                        return true;
+                                    }
+                                    false
+                                },
+                            );
+                            if bad {
+                                return Err(EngineError::Unsupported(alloc::format!(
+                                    "OLD/NEW references to computed view column of view \"{}\" in MERGE RETURNING are not supported",
+                                    stmt.target
+                                )));
+                            }
+                        }
+                    }
                     let is_target_q = |q: &Option<String>| match q.as_deref() {
                         None => true,
                         Some(x) => {
@@ -1241,14 +1486,47 @@ impl Engine {
                         alloc::vec::Vec::with_capacity(items.len());
                     let push_view_cols =
                         |out: &mut alloc::vec::Vec<spg_sql::ast::SelectItem>| {
-                            for (view_col, base_col) in &vr.col_map {
-                                out.push(spg_sql::ast::SelectItem::Expr {
-                                    expr: Expr::Column(spg_sql::ast::ColumnName {
-                                        qualifier: Some(alias.clone()),
-                                        name: base_col.clone(),
-                                    }),
-                                    alias: Some(view_col.clone()),
-                                });
+                            // Round 154 — `view_cols` carries the order when
+                            // computed columns exist; a computed column
+                            // projects its (target-qualified) expression.
+                            if vr.view_cols.is_empty() {
+                                for (view_col, base_col) in &vr.col_map {
+                                    out.push(spg_sql::ast::SelectItem::Expr {
+                                        expr: Expr::Column(spg_sql::ast::ColumnName {
+                                            qualifier: Some(alias.clone()),
+                                            name: base_col.clone(),
+                                        }),
+                                        alias: Some(view_col.clone()),
+                                    });
+                                }
+                            } else {
+                                for (view_col, base_col) in &vr.view_cols {
+                                    let expr = match base_col {
+                                        Some(b) => Expr::Column(spg_sql::ast::ColumnName {
+                                            qualifier: Some(alias.clone()),
+                                            name: b.clone(),
+                                        }),
+                                        None => {
+                                            let mut e = Expr::Column(
+                                                spg_sql::ast::ColumnName {
+                                                    qualifier: None,
+                                                    name: view_col.clone(),
+                                                },
+                                            );
+                                            rewrite_view_refs_to_base(
+                                                &mut e,
+                                                &map,
+                                                &cmap,
+                                                Some(&alias),
+                                            );
+                                            e
+                                        }
+                                    };
+                                    out.push(spg_sql::ast::SelectItem::Expr {
+                                        expr,
+                                        alias: Some(view_col.clone()),
+                                    });
+                                }
                             }
                         };
                     for it in items.iter() {
@@ -1276,7 +1554,8 @@ impl Engine {
                                     a.clone()
                                 } else if let Expr::Column(c) = expr
                                     && is_target_q(&c.qualifier)
-                                    && map.contains_key(&c.name)
+                                    && (map.contains_key(&c.name)
+                                        || cmap.contains_key(&c.name))
                                 {
                                     Some(c.name.clone())
                                 } else {
@@ -1285,10 +1564,27 @@ impl Engine {
                                 let mut e = expr.clone();
                                 crate::expr_analysis::rewrite_nodes_mut(&mut e, &mut |n| {
                                     if let Expr::Column(c) = n {
-                                        if is_target_q(&c.qualifier)
-                                            && let Some(b) = map.get(&c.name)
-                                        {
-                                            c.name = b.clone();
+                                        if is_target_q(&c.qualifier) {
+                                            if let Some(b) = map.get(&c.name) {
+                                                c.name = b.clone();
+                                            } else if cmap.contains_key(&c.name) {
+                                                // Substitute the computed
+                                                // column's expression,
+                                                // target-qualified.
+                                                let mut sub = Expr::Column(
+                                                    spg_sql::ast::ColumnName {
+                                                        qualifier: None,
+                                                        name: c.name.clone(),
+                                                    },
+                                                );
+                                                rewrite_view_refs_to_base(
+                                                    &mut sub,
+                                                    &map,
+                                                    &cmap,
+                                                    Some(&alias),
+                                                );
+                                                *n = sub;
+                                            }
                                         }
                                         return true;
                                     }
@@ -2006,16 +2302,24 @@ impl Engine {
             // levels AND-ed) still restricts which base rows are visible.
             let mut rewritten = stmt.clone();
             // v7.39 (round 133) — column-renamed view: rewrite the WHERE's view
-            // columns to base columns before AND-ing the view WHERE.
-            if !vr.col_map.is_empty() {
+            // columns to base columns before AND-ing the view WHERE. Round 154
+            // — a computed column READ substitutes its defining expression.
+            if !vr.col_map.is_empty() || !vr.computed.is_empty() {
                 let map: alloc::collections::BTreeMap<String, String> =
                     vr.col_map.iter().cloned().collect();
+                let cmap: alloc::collections::BTreeMap<String, Expr> =
+                    vr.computed.iter().cloned().collect();
                 if let Some(w) = &mut rewritten.where_ {
-                    rewrite_view_col_refs(w, &map);
+                    rewrite_view_refs_to_base(w, &map, &cmap, None);
                 }
                 // v7.39 (round 134) — rewrite RETURNING view cols → base cols.
                 if let Some(ret) = &rewritten.returning {
-                    rewritten.returning = Some(rewrite_view_returning_items(ret, &vr.col_map));
+                    rewritten.returning = Some(rewrite_view_returning_items(
+                        ret,
+                        &vr.col_map,
+                        &vr.computed,
+                        &vr.view_cols,
+                    ));
                 }
             }
             rewritten.table = vr.base;
@@ -3053,8 +3357,23 @@ impl Engine {
                 base,
                 where_at_base: _,
                 col_map,
+                computed,
+                view_cols,
                 check_chain,
             } = vr;
+            // v7.39 (round 154) — a computed view column is never a write
+            // target (PG: "cannot insert into column … of view …").
+            if let Some(cols) = &stmt.columns {
+                for c in cols {
+                    if computed.iter().any(|(n, _)| n == c) {
+                        return Err(view_computed_col_write_err(
+                            "insert into",
+                            c,
+                            &stmt.table,
+                        ));
+                    }
+                }
+            }
             let written_opt = self
                 .active_catalog()
                 .views()
@@ -3072,7 +3391,11 @@ impl Engine {
             // column list to base columns. An explicit `(a, b)` list maps each
             // name; a positional insert becomes an explicit base-column list in
             // view-column order (so a subset / reordered view lands correctly).
-            if !col_map.is_empty() {
+            // Round 154 — with computed columns present the order comes from
+            // `view_cols`: the first N view columns cover N positional values
+            // (PG takes a short tuple, probe P12) and hitting a computed slot
+            // errors.
+            if !col_map.is_empty() || !computed.is_empty() {
                 let map: alloc::collections::BTreeMap<String, String> =
                     col_map.iter().cloned().collect();
                 match &mut stmt.columns {
@@ -3083,14 +3406,33 @@ impl Engine {
                             }
                         }
                     }
-                    None => {
+                    None if computed.is_empty() => {
                         stmt.columns =
                             Some(col_map.iter().map(|(_, b)| b.clone()).collect());
+                    }
+                    None => {
+                        let n = stmt.rows.iter().map(Vec::len).max().unwrap_or(0);
+                        let mut cols: Vec<String> = Vec::with_capacity(n);
+                        for (view_col, base_col) in view_cols.iter().take(n) {
+                            match base_col {
+                                Some(b) => cols.push(b.clone()),
+                                None => {
+                                    return Err(view_computed_col_write_err(
+                                        "insert into",
+                                        view_col,
+                                        &stmt.table,
+                                    ));
+                                }
+                            }
+                        }
+                        stmt.columns = Some(cols);
                     }
                 }
                 // v7.39 (round 134) — rewrite RETURNING view cols → base cols.
                 if let Some(ret) = &stmt.returning {
-                    stmt.returning = Some(rewrite_view_returning_items(ret, &col_map));
+                    stmt.returning = Some(rewrite_view_returning_items(
+                        ret, &col_map, &computed, &view_cols,
+                    ));
                 }
             }
             stmt.table = base;

@@ -114,13 +114,19 @@ fn renamed_columns_view() {
 
 #[test]
 fn non_updatable_view_still_errors() {
-    // A computed-column view is not auto-updatable in SPG's redirect; the
-    // merge errs honestly. (PG 17 can update the simple columns of such a
-    // view — a recorded residual, not silent-wrong.)
+    // v7.39 (round 154) — the r148 residual is closed: a computed-column
+    // view IS partially updatable (PG 17); merging into its SIMPLE columns
+    // works, targeting the computed column errors. An aggregate view stays
+    // non-updatable (honest error), pinned in e2e_computed_col_view_dml_
+    // round154 and e2e_view_auto_updatable.
     let mut e = Engine::new();
     setup(&mut e);
     e.execute("CREATE VIEW v4 AS SELECT id, v, v*2 AS d FROM t").unwrap();
+    assert_eq!(
+        affected(&mut e, "MERGE INTO v4 USING s ON v4.id = s.id WHEN MATCHED THEN UPDATE SET v = 1"),
+        1
+    );
     assert!(e
-        .execute("MERGE INTO v4 USING s ON v4.id = s.id WHEN MATCHED THEN UPDATE SET v = 1")
+        .execute("MERGE INTO v4 USING s ON v4.id = s.id WHEN MATCHED THEN UPDATE SET d = 1")
         .is_err());
 }
