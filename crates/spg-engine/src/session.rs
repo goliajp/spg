@@ -179,6 +179,22 @@ impl Engine {
                 Some(ms) => render_pg_duration_ms(ms),
                 None => normalised,
             }
+        } else if matches!(
+            // v7.39 (round 204) — memory GUCs canonicalize to the
+            // largest binary unit at store time, so `SET work_mem =
+            // '65536'` and `= '64MB'` both SHOW `64MB`, matching PG.
+            key.as_str(),
+            "work_mem"
+                | "maintenance_work_mem"
+                | "shared_buffers"
+                | "temp_buffers"
+                | "effective_cache_size"
+                | "wal_buffers"
+        ) {
+            match parse_pg_mem_kb(&normalised) {
+                Some(kb) => render_pg_mem_kb(kb),
+                None => normalised,
+            }
         } else {
             normalised
         };
@@ -302,6 +318,7 @@ impl Engine {
         }
         self.session_params.get(&lower).map(String::as_str)
     }
+
 
     /// v7.39 (read01 round 46) — raise a PG-style NOTICE for the statement
     /// now executing. The text is PG's exact wording minus the "NOTICE:  "
@@ -520,6 +537,51 @@ fn render_pg_duration_ms(ms: u64) -> String {
         format!("{}s", ms / 1_000)
     } else {
         format!("{ms}ms")
+    }
+}
+
+/// v7.39 (round 204) — parse a PG memory-size GUC value to a count of
+/// KILOBYTES (work_mem's base unit). Accepts a bare integer (already
+/// kB) or a `<n><unit>` with unit B/kB/MB/GB/TB. `None` on malformed
+/// input so the caller keeps the raw string.
+pub(crate) fn parse_pg_mem_kb(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let lowered = s.to_ascii_lowercase();
+    let (num_part, mult_kb): (&str, u64) = if let Some(p) = lowered.strip_suffix("tb") {
+        (p, 1024 * 1024 * 1024)
+    } else if let Some(p) = lowered.strip_suffix("gb") {
+        (p, 1024 * 1024)
+    } else if let Some(p) = lowered.strip_suffix("mb") {
+        (p, 1024)
+    } else if let Some(p) = lowered.strip_suffix("kb") {
+        (p, 1)
+    } else if let Some(p) = lowered.strip_suffix('b') {
+        // bytes → kB only when a whole multiple of 1024.
+        let n: u64 = p.trim().parse().ok()?;
+        return if n % 1024 == 0 { Some(n / 1024) } else { None };
+    } else {
+        (lowered.as_str(), 1)
+    };
+    let n: u64 = num_part.trim().parse().ok()?;
+    n.checked_mul(mult_kb)
+}
+
+/// v7.39 (round 204) — render a kB count the way PG's SHOW does: the
+/// largest binary unit that divides it evenly.
+fn render_pg_mem_kb(kb: u64) -> String {
+    use alloc::format;
+    if kb == 0 {
+        return String::from("0");
+    }
+    if kb % (1024 * 1024) == 0 {
+        format!("{}GB", kb / (1024 * 1024))
+    } else if kb % 1024 == 0 {
+        format!("{}MB", kb / 1024)
+    } else {
+        format!("{kb}kB")
     }
 }
 

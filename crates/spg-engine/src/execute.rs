@@ -104,6 +104,19 @@ fn validate_known_guc(name: &str, value: &str) -> Result<(), EngineError> {
                 return Err(bad());
             }
         }
+        // v7.39 (round 204) — enum GUCs reject an out-of-domain value
+        // like PG (`SET client_min_messages = bogus` errors). PG's
+        // message quotes the value with a trailing hint listing the
+        // valid set; we match the leading, stable clause.
+        "client_min_messages" => {
+            if !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "debug5" | "debug4" | "debug3" | "debug2" | "debug1" | "log" | "notice"
+                    | "warning" | "error" | "fatal" | "panic"
+            ) {
+                return Err(bad());
+            }
+        }
         // v7.39 (GUC knife 3) — the render GUCs reject invalid values
         // with PG's own texts (canonical-caps parameter names).
         "datestyle" => {
