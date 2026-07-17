@@ -120,9 +120,11 @@ fn correlated_not_exists_on_readonly_and_join_paths() {
          WHERE ac.message_id = m.id) FROM messages m ORDER BY m.id",
     );
     assert_eq!(r.len(), 3);
-    // COUNT(*) in a scalar subquery surfaces as Int on this path.
-    assert_eq!(r[0][1], Value::Int(1));
-    assert_eq!(r[1][1], Value::Int(0));
+    // v7.39 (round 189) — COUNT(*) in a scalar subquery is BIGINT
+    // (PG's type); the old Int here pinned the literal-round-trip
+    // narrowing this round fixed.
+    assert_eq!(r[0][1], Value::BigInt(1));
+    assert_eq!(r[1][1], Value::BigInt(0));
 }
 
 /// Round-16 collateral #1 — multi-row VALUES drew the SAME serial id

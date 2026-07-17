@@ -3340,19 +3340,19 @@ impl ScalarPkProbeFastPath {
             Some(Value::BigInt(n)) => *n,
             Some(Value::Int(n)) => i64::from(*n),
             Some(Value::SmallInt(n)) => i64::from(*n),
-            Some(Value::Null) | None => return Value::Int(0),
-            _ => return Value::Int(0),
+            Some(Value::Null) | None => return Value::BigInt(0),
+            _ => return Value::BigInt(0),
         };
         SCALARSQ_PK_PROBE_PLAN_OUTER_INT.store(outer_int, core::sync::atomic::Ordering::Relaxed);
         SCALARSQ_PK_PROBE_PLAN_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // The actual seek lives in `Engine::probe_with_pk_fast_path` —
         // we can't carry an engine borrow here without a lifetime
-        // round-trip. Returning Int(0) as a placeholder would break
+        // round-trip. Returning BigInt(0) as a placeholder would break
         // semantics; instead the run-loop calls
         // `engine.probe_with_pk_fast_path(&self, row)` directly so
         // the plan's `probe()` method is used only in tests where
         // the table data isn't load-bearing.
-        Value::Int(0)
+        Value::BigInt(0)
     }
 }
 
@@ -3364,8 +3364,8 @@ pub static SCALARSQ_PK_PROBE_PLAN_OUTER_INT: core::sync::atomic::AtomicI64 =
 
 /// v7.37.x (docker-fair SCALARSQ attack) — direct PK probe for the
 /// `(SELECT COUNT(*) FROM T WHERE T.pk = outer.col)` correlated
-/// scalar subquery shape. Returns `Some(Int(0))` if the probe misses
-/// or `Some(Int(1))` if it hits; `None` when the shape doesn't match
+/// scalar subquery shape. Returns `Some(BigInt(0))` if the probe misses
+/// or `Some(BigInt(1))` if it hits; `None` when the shape doesn't match
 /// (caller falls back to per-row exec). Bypasses parse / resolve /
 /// plan / aggregate; the SCALARSQ docker-fair bench drops from
 /// per-row ~3 µs to per-row ~100 ns.
@@ -3382,8 +3382,8 @@ impl Engine {
             Some(Value::BigInt(n)) => *n,
             Some(Value::Int(n)) => i64::from(*n),
             Some(Value::SmallInt(n)) => i64::from(*n),
-            Some(Value::Null) | None => return Value::Int(0),
-            _ => return Value::Int(0),
+            Some(Value::Null) | None => return Value::BigInt(0),
+            _ => return Value::BigInt(0),
         };
         // v7.37.42 attack 1 — bypass per-row `BTreeMap<String,usize>::get`
         // by going through the cached positional index. The prepare-time
@@ -3391,17 +3391,17 @@ impl Engine {
         // the executor sees (same engine read guard), so the cached
         // index remains valid for the query's duration.
         let Some(inner_table) = self.active_catalog().tables_at(plan.table_idx) else {
-            return Value::Int(0);
+            return Value::BigInt(0);
         };
         let Some(idx) = inner_table.index_on(plan.inner_pos) else {
-            return Value::Int(0);
+            return Value::BigInt(0);
         };
         let Some(key) = spg_storage::IndexKey::from_value(&Value::BigInt(outer_int)) else {
-            return Value::Int(0);
+            return Value::BigInt(0);
         };
         let hit = !idx.lookup_eq(&key).is_empty();
         SCALARSQ_PK_PROBE_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        Value::Int(i32::from(hit))
+        Value::BigInt(i64::from(hit))
     }
 
     /// Analyse a scalar subquery against the OUTER scan schema; return
@@ -3631,7 +3631,7 @@ impl Engine {
             Value::BigInt(n) => n,
             Value::Int(n) => i64::from(n),
             Value::SmallInt(n) => i64::from(n),
-            Value::Null => return Ok(Some(Value::Int(0))),
+            Value::Null => return Ok(Some(Value::BigInt(0))),
             _ => return Ok(None),
         };
         let Some(idx) = inner_table.index_on(inner_pos) else {
@@ -3642,7 +3642,7 @@ impl Engine {
         };
         SCALARSQ_PK_PROBE_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let hit = !idx.lookup_eq(&key).is_empty();
-        Ok(Some(Value::Int(i32::from(hit))))
+        Ok(Some(Value::BigInt(i64::from(hit))))
     }
 }
 
@@ -3674,7 +3674,9 @@ fn scalar_subquery_empty_default(inner: &SelectStatement) -> Value<'static> {
         }
     }
     if is_count(expr) {
-        Value::Int(0)
+        // v7.39 (round 189) — count is BIGINT; the Int(0) default
+        // leaked an integer-typed zero on the empty-set path.
+        Value::BigInt(0)
     } else {
         Value::Null
     }
