@@ -321,6 +321,20 @@ impl Engine {
             };
             ctr.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
+        // r196 — a statement that did NOT run inside its own open tx
+        // slot (autocommit, or a COMMIT/ROLLBACK that just closed its
+        // slot) may have moved the committed base; bump the epoch so
+        // OTHER open txs know their next RC rebase is real. The test
+        // must be per-statement (`tx_catalogs` membership of THIS
+        // call's tx_id), not the global `in_transaction()` — a
+        // concurrent autocommit while some tx is open is exactly the
+        // case the rebase exists for (the first cut used the global
+        // check and 10 isolation pins caught the missed bumps).
+        // Deliberately over-approximate (reads bump too — an extra
+        // rebase is only slower, never wrong).
+        if !self.tx_catalogs.contains_key(&tx_id) {
+            self.commit_epoch = self.commit_epoch.wrapping_add(1);
+        }
         if self.redo_capture {
             let mut drained = self.active_catalog_mut().drain_redo();
             if result.is_ok() {
