@@ -335,7 +335,35 @@ pub(crate) fn append_durability_marker(state: &ServerState) -> std::io::Result<u
 /// the whole group or rolls back every member — same fan-out
 /// invariant `chaos_disk_full_multi_client_group_rollback_all_writers`
 /// pins.
-pub(crate) fn append_wal_v3_group(state: &ServerState, entries: &[Vec<u8>]) -> std::io::Result<()> {
+/// v7.37.15 (r172) — effective `synchronous_commit` for the current
+/// session. PG semantics: the session GUC (set via SQL
+/// `SET synchronous_commit = off`) decides whether this commit waits
+/// for fsync; `SPG_SYNCHRONOUS_COMMIT` stays the process default when
+/// no session value is set. The engine's session_params store is
+/// process-wide on the server (single shared engine — the same shape
+/// `statement_timeout` already has), so a SET on one connection
+/// applies server-wide until RESET.
+///
+/// Takes a short engine **read** lock — callers must not hold the
+/// engine write lock (the dispatch loop captures this before taking
+/// it, same as `session_statement_timeout_ms`).
+pub(crate) fn session_sync_commit(state: &ServerState) -> bool {
+    let session = state
+        .engine
+        .read()
+        .ok()
+        .and_then(|e| e.session_param("synchronous_commit").map(str::to_string));
+    match session {
+        Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "off" | "false" | "0"),
+        None => !synchronous_commit_disabled(),
+    }
+}
+
+pub(crate) fn append_wal_v3_group(
+    state: &ServerState,
+    entries: &[Vec<u8>],
+    sync: bool,
+) -> std::io::Result<()> {
     let Some(wal) = state.wal.as_ref() else {
         return Ok(());
     };
@@ -380,8 +408,19 @@ pub(crate) fn append_wal_v3_group(state: &ServerState, entries: &[Vec<u8>]) -> s
     // responsible for `sync_data`; the client's CC may return
     // before the bytes reach disk. v4.42 group-commit semantics
     // are preserved exactly in sync mode (the default).
-    if !synchronous_commit_disabled() {
+    //
+    // v7.37.15 (r172) — `sync` is resolved by the caller from the
+    // session GUC + env default (`session_sync_commit`), so SQL
+    // `SET synchronous_commit = off` skips the fsync exactly like
+    // the env knob. Skipping arms the flusher via
+    // `async_commit_dirty` so durability markers bound the loss
+    // window (PG wal-writer semantics).
+    if sync {
         f.sync_data()?;
+    } else {
+        state
+            .async_commit_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
     }
     // v6.10.6 — best-effort WAL tee. When `SPG_WAL_TEE_PATH` is
     // set, append the same group bytes to the tee path so an
@@ -689,8 +728,14 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
         }
 
         // ----- 3. Batched fsync barrier -----
+        // v7.37.15 (r172) — a group syncs iff any member's session
+        // wants synchronous_commit. An all-async group appends
+        // without fsync (the flusher bounds the loss window); a
+        // mixed group's single fsync covers the async members for
+        // free, same as PG's group flush.
         let entries: Vec<Vec<u8>> = prepared.iter().map(|p| p.wal_bytes.clone()).collect();
-        let wal_outcome: std::io::Result<()> = append_wal_v3_group(state, &entries);
+        let want_sync = prepared.iter().any(|p| p.task.sync_commit);
+        let wal_outcome: std::io::Result<()> = append_wal_v3_group(state, &entries, want_sync);
 
         // ----- 4. Fsync-fail rollback -----
         if wal_outcome.is_err()
@@ -741,7 +786,7 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
     }
 }
 
-pub(crate) fn append_wal(state: &ServerState, sql: &str) -> std::io::Result<()> {
+pub(crate) fn append_wal(state: &ServerState, sql: &str, sync: bool) -> std::io::Result<()> {
     let Some(wal) = state.wal.as_ref() else {
         return Ok(());
     };
@@ -787,8 +832,17 @@ pub(crate) fn append_wal(state: &ServerState, sql: &str) -> std::io::Result<()> 
     // v5.4.2 — async-commit mode opts out of the per-write
     // `sync_data`; durability rides on the flusher thread's
     // periodic `durability_checkpoint` markers instead.
-    if !synchronous_commit_disabled() {
+    //
+    // v7.37.15 (r172) — `sync` is caller-resolved from the session
+    // GUC + env default (`session_sync_commit`); this function
+    // can't read it itself because the main-loop non-wrap caller
+    // holds the engine write lock. Skipping arms the flusher.
+    if sync {
         f.sync_data()?;
+    } else {
+        state
+            .async_commit_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
     }
     Ok(())
 }

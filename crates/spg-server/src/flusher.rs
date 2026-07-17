@@ -78,15 +78,17 @@ impl FlusherConfig {
     }
 }
 
-/// Spawn the background flusher iff async-commit mode is opted
-/// in via `SPG_SYNCHRONOUS_COMMIT=off`. Returns `None` in sync
-/// mode (the default) — no flusher needed because the write path
-/// already syncs every record.
+/// Spawn the background flusher. Before v7.37.15 this only spawned
+/// when async-commit mode was opted in via
+/// `SPG_SYNCHRONOUS_COMMIT=off`; now it always spawns (like PG's
+/// wal writer) but stays **dormant** — no markers, no fsync, one
+/// atomic load per 50 ms — until either the env opts into async
+/// mode or a session's `SET synchronous_commit = off` commit
+/// latches `async_commit_dirty`. Sync-mode servers that never see
+/// an async commit keep their exact pre-7.37.15 WAL byte stream
+/// (zero marker frames).
 pub(crate) fn spawn(state: Arc<ServerState>) -> Option<JoinHandle<()>> {
     let config = FlusherConfig::from_env();
-    if !config.async_mode {
-        return None;
-    }
     let handle = thread::Builder::new()
         .name("spg-flusher".into())
         .spawn(move || run(&state, config))
@@ -99,6 +101,14 @@ fn run(state: &ServerState, config: FlusherConfig) {
     loop {
         if SHUTDOWN_FLAG.load(Ordering::Acquire) {
             break;
+        }
+        // v7.37.15 (r172) — dormant until async commits exist. The
+        // dirty latch is set by the WAL append path the first time a
+        // session-GUC async commit skips its fsync; it is never
+        // cleared (PG's wal writer also never stops).
+        if !config.async_mode && !state.async_commit_dirty.load(Ordering::Acquire) {
+            thread::sleep(SHUTDOWN_POLL_CAP);
+            continue;
         }
         let elapsed = last_tick.elapsed();
         if elapsed < config.interval {
