@@ -131,6 +131,7 @@ mod e2e_executor_3vl_verify_round188;
 mod e2e_scalar_subquery_type_round189;
 mod e2e_table_write_stats_round192;
 mod e2e_numeric_overflow_message_round193;
+mod e2e_rls_role_membership_round202;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;

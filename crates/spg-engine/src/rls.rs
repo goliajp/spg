@@ -66,6 +66,7 @@ impl Engine {
         Ok(Some(build_policy_predicate(
             table.schema(),
             self.current_role(),
+            &self.users.memberships_of_transitive(self.current_role()),
             PolicyCmd::Select,
             QualKind::Using,
         )))
@@ -116,6 +117,7 @@ impl Engine {
         Some(build_policy_predicate(
             t.schema(),
             self.current_role(),
+            &self.users.memberships_of_transitive(self.current_role()),
             cmd,
             QualKind::Using,
         ))
@@ -142,7 +144,13 @@ impl Engine {
             return Ok(());
         }
         let pred =
-            build_policy_predicate(t.schema(), self.current_role(), cmd, QualKind::WithCheck);
+            build_policy_predicate(
+            t.schema(),
+            self.current_role(),
+            &self.users.memberships_of_transitive(self.current_role()),
+            cmd,
+            QualKind::WithCheck,
+        );
         let ctx = eval::EvalContext::new(columns, None);
         for values in rows {
             let tmp = Row {
@@ -169,6 +177,7 @@ impl Engine {
 fn build_policy_predicate(
     schema: &TableSchema,
     role: &str,
+    member_of: &alloc::collections::BTreeSet<alloc::string::String>,
     target_cmd: PolicyCmd,
     kind: QualKind,
 ) -> Expr {
@@ -179,7 +188,15 @@ fn build_policy_predicate(
             continue;
         }
         // roles empty = PUBLIC (applies to everyone).
-        if !(p.roles.is_empty() || p.roles.iter().any(|r| r.eq_ignore_ascii_case(role))) {
+        // v7.39 (round 202) — a policy `TO grp` also applies to
+        // transitive MEMBERS of grp (PG role inheritance; the r202
+        // differential showed SPG default-denying a member where PG
+        // granted visibility through the group).
+        if !(p.roles.is_empty()
+            || p.roles.iter().any(|r| {
+                r.eq_ignore_ascii_case(role) || member_of.contains(&r.to_ascii_lowercase())
+            }))
+        {
             continue;
         }
         let src = match kind {
