@@ -2399,7 +2399,26 @@ impl Table {
             GinFulltext,
             GinJsonb,
         }
-        let descriptors: Vec<(String, usize, RebuildKind)> = self
+        // v7.39 (round 170) — the descriptor must carry the FULL index
+        // metadata: the rebuild used to reconstruct via bare
+        // `Index::new_btree(name, pos)`, silently DROPPING is_unique /
+        // extra_column_positions / partial_predicate / expression /
+        // included_columns / nulls_not_distinct — so the first VACUUM
+        // (or any delete-path rebuild) turned every UNIQUE INDEX into a
+        // plain one and stopped enforcing it (probe-reproduced:
+        // duplicate keys inserted silently after VACUUM).
+        struct RebuildDesc {
+            name: String,
+            column_position: usize,
+            kind: RebuildKind,
+            is_unique: bool,
+            extra_column_positions: Vec<usize>,
+            partial_predicate: Option<String>,
+            expression: Option<String>,
+            included_columns: Vec<usize>,
+            nulls_not_distinct: bool,
+        }
+        let descriptors: Vec<RebuildDesc> = self
             .indices
             .iter()
             .map(|idx| {
@@ -2412,11 +2431,33 @@ impl Table {
                     IndexKind::GinFulltext(_) => RebuildKind::GinFulltext,
                     IndexKind::GinJsonb(_) => RebuildKind::GinJsonb,
                 };
-                (idx.name.clone(), idx.column_position, kind)
+                RebuildDesc {
+                    name: idx.name.clone(),
+                    column_position: idx.column_position,
+                    kind,
+                    is_unique: idx.is_unique,
+                    extra_column_positions: idx.extra_column_positions.clone(),
+                    partial_predicate: idx.partial_predicate.clone(),
+                    expression: idx.expression.clone(),
+                    included_columns: idx.included_columns.clone(),
+                    nulls_not_distinct: idx.nulls_not_distinct,
+                }
             })
             .collect();
         self.indices.clear();
-        for (name, column_position, rebuild_kind) in descriptors {
+        for desc in descriptors {
+            let RebuildDesc {
+                name,
+                column_position,
+                kind: rebuild_kind,
+                is_unique,
+                extra_column_positions,
+                partial_predicate,
+                expression,
+                included_columns,
+                nulls_not_distinct,
+            } = desc;
+            let pre_len = self.indices.len();
             match rebuild_kind {
                 RebuildKind::Nsw(m) => {
                     let idx = Index::new_nsw(name, column_position, m);
@@ -2434,16 +2475,28 @@ impl Table {
                         .push(Index::new_brin(name, column_position, column_type));
                 }
                 RebuildKind::BTree => {
+                    // v7.39 (round 170) — bulk build: collect + sort +
+                    // group + from_sorted. The per-row insert_mut paid a
+                    // path-copy allocation per row per index (~15ms per
+                    // index on a 50k-row VACUUM, the dominant cost).
                     let mut idx = Index::new_btree(name, column_position);
-                    if let IndexKind::BTree(map) = &mut idx.kind {
-                        for (i, row) in self.rows.iter().enumerate() {
-                            if let Some(key) = IndexKey::from_value(&row.values[column_position]) {
-                                let mut entries = map.get(&key).cloned().unwrap_or_default();
-                                entries.push(RowLocator::Hot(i));
-                                map.insert_mut(key, entries);
-                            }
+                    let mut pairs: Vec<(IndexKey, usize)> = Vec::with_capacity(self.rows.len());
+                    for (i, row) in self.rows.iter().enumerate() {
+                        if let Some(key) = IndexKey::from_value(&row.values[column_position]) {
+                            pairs.push((key, i));
                         }
                     }
+                    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                    let mut grouped: Vec<(IndexKey, Vec<RowLocator>)> = Vec::new();
+                    for (key, i) in pairs {
+                        match grouped.last_mut() {
+                            Some((k, locs)) if *k == key => locs.push(RowLocator::Hot(i)),
+                            _ => grouped.push((key, alloc::vec![RowLocator::Hot(i)])),
+                        }
+                    }
+                    idx.kind = IndexKind::BTree(
+                        crate::persistent_btree::PersistentBTreeMap::from_sorted(grouped),
+                    );
                     self.indices.push(idx);
                 }
                 RebuildKind::Gin => {
@@ -2514,6 +2567,16 @@ impl Table {
                     }
                     self.indices.push(idx);
                 }
+            }
+            // v7.39 (round 170) — restore the captured metadata onto
+            // whatever this arm pushed (see RebuildDesc above).
+            if let Some(idx) = self.indices.get_mut(pre_len) {
+                idx.is_unique = is_unique;
+                idx.extra_column_positions = extra_column_positions;
+                idx.partial_predicate = partial_predicate;
+                idx.expression = expression;
+                idx.included_columns = included_columns;
+                idx.nulls_not_distinct = nulls_not_distinct;
             }
         }
 
