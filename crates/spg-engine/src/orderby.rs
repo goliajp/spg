@@ -618,6 +618,20 @@ pub(crate) fn expand_group_by_all(s: &mut SelectStatement) {
     }
 }
 
+/// v7.39 (round 185) — the implicit output label PG gives a
+/// projection with no AS: a cast keeps its inner expression's label,
+/// a function call is named after the function, a bare column keeps
+/// its name. Anything else (PG's `?column?` family) returns None so
+/// it never accidentally matches an ORDER BY identifier.
+fn implicit_output_label(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Cast { expr, .. } => implicit_output_label(expr),
+        Expr::FunctionCall { name, .. } => Some(name.as_str()),
+        Expr::Column(c) => Some(c.name.as_str()),
+        _ => None,
+    }
+}
+
 pub(crate) fn resolve_order_by_position(s: &mut SelectStatement) {
     // v6.4.0 — iterate every ORDER BY key. Position references
     // (`ORDER BY 2`) bind to the 1-based projection index;
@@ -680,15 +694,43 @@ pub(crate) fn resolve_order_by_position(s: &mut SelectStatement) {
                 if has_unions {
                     continue;
                 }
+                // Local copy: the arms below assign `order.expr`,
+                // which invalidates the `c` borrow.
+                let target = c.name.clone();
+                let mut bound = false;
                 for item in &s.items {
                     if let SelectItem::Expr {
                         expr,
                         alias: Some(a),
                     } = item
-                        && a == &c.name
+                        && a == &target
                     {
                         order.expr = expr.clone();
+                        bound = true;
                         break;
+                    }
+                }
+                // v7.39 (round 185) — PG binds `ORDER BY <name>` to the
+                // OUTPUT column even when its label is implicit: a cast
+                // keeps the inner column's name (`SELECT x::text …
+                // ORDER BY x` sorts the TEXT), a function call is named
+                // after the function. Pre-r185 only explicit aliases
+                // matched, so the sort silently used the SOURCE column
+                // (int order instead of text order — live-PG18
+                // differential 2026-07-18). A bare column projection is
+                // skipped (substitution would be identity), and SRF
+                // expressions keep the name path (round-80 reasoning:
+                // copying a set into the key breaks the sort).
+                if !bound {
+                    for item in &s.items {
+                        if let SelectItem::Expr { expr, alias: None } = item
+                            && !matches!(expr, Expr::Column(_))
+                            && implicit_output_label(expr) == Some(target.as_str())
+                            && !crate::select::expr_contains_builtin_srf(expr)
+                        {
+                            order.expr = expr.clone();
+                            break;
+                        }
                     }
                 }
             }

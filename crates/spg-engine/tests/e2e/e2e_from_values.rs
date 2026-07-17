@@ -122,10 +122,15 @@ fn real_orders_and_dedups_like_pg() {
             other => panic!("expected text, got {other:?}"),
         })
         .collect();
+    // v7.39 (round 185) — corrected against live PG18: `ORDER BY x`
+    // binds to the OUTPUT column `x::text` (implicit label "x"), so
+    // the sort is TEXT order ("-0" < "-Infinity" bytewise), not the
+    // float total order the original expectation assumed. Verified
+    // 2026-07-18: PG returns -0,-Infinity,0,1.5,Infinity,NaN.
     assert_eq!(
         texts,
-        ["-Infinity", "-0", "0", "1.5", "Infinity", "NaN"],
-        "PG float4 total order"
+        ["-0", "-Infinity", "0", "1.5", "Infinity", "NaN"],
+        "PG output-column text order"
     );
     let got = rows(
         &mut e,
