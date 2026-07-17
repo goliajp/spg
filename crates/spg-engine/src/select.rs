@@ -903,22 +903,20 @@ impl Engine {
         cancel.check()?;
         let mut catalog = self.active_catalog().clone();
         for cte in ctes {
-            if catalog.get(&cte.name).is_some() {
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "CTE name {:?} shadows an existing table; rename the CTE",
-                    cte.name
-                )));
-            }
             let body_select = cte.body.as_select().ok_or_else(|| {
                 EngineError::Unsupported(alloc::format!(
                     "data-modifying CTE not supported on this SELECT entry"
                 ))
             })?;
-            // v7.39 (round 145) — RECURSIVE routes to the iterating
-            // materialiser only when the body actually references itself. A
-            // non-self-referencing CTE under WITH RECURSIVE is an ordinary
-            // CTE; the iterator concatenates union arms and would lose
-            // INTERSECT / EXCEPT / UNION-distinct set-op semantics.
+            // v7.39 (round 156) — a CTE may SHADOW a same-named real table
+            // (PG scoping: the WITH name wins for the outer query and later
+            // CTEs, while THIS body still sees the real table — a
+            // non-recursive body's self-name is the table, probe P2). This
+            // materialiser works on a CLONE, so the shadow is simply: run
+            // the body against the untouched clone, then drop the real
+            // table from the clone before installing the CTE's temp. A
+            // RECURSIVE self-reference is the CTE itself (P6), so there the
+            // drop happens before the iterating materialiser runs.
             let (columns, rows) = if cte.recursive && select_refers_to(body_select, &cte.name) {
                 let synthetic = spg_sql::ast::Cte {
                     name: cte.name.clone(),
@@ -928,6 +926,9 @@ impl Engine {
                     search: None,
                     cycle: None,
                 };
+                if catalog.get(&cte.name).is_some() {
+                    let _ = catalog.drop_table(&cte.name);
+                }
                 self.materialise_recursive_cte(&synthetic, &catalog, cancel)?
             } else {
                 let mut cte_engine = Engine::restore(catalog.clone());
@@ -962,6 +963,11 @@ impl Engine {
                 }
             }
             let schema = TableSchema::new(cte.name.clone(), columns);
+            // v7.39 (round 156) — the body ran against the untouched clone;
+            // from here on the CTE name resolves to the temp (PG scoping).
+            if catalog.get(&cte.name).is_some() {
+                let _ = catalog.drop_table(&cte.name);
+            }
             catalog.create_table(schema).map_err(EngineError::Storage)?;
             let table = catalog
                 .get_mut(&cte.name)
