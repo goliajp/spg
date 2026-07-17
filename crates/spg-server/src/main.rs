@@ -231,6 +231,42 @@ struct CommitQueueState {
     leader_active: bool,
 }
 
+/// v7.39 (round 178) — run one auto-commit write through the commit
+/// barrier: enqueue, drive the leader if this caller won the baton,
+/// wait for the ack. Shared by the native-wire wrap path (v4.42) and
+/// the pgwire plain-DML path (r178) so both fan into the same group
+/// fsync. `sync_commit` is resolved here from the session GUC —
+/// callers must NOT hold the engine lock.
+pub(crate) fn commit_queue_execute(
+    state: &ServerState,
+    sql: String,
+    cancel_flag: &Arc<AtomicBool>,
+) -> (Result<QueryResult, EngineError>, std::io::Result<()>) {
+    let (ack_tx, ack_rx) = mpsc::sync_channel::<CommitResult>(1);
+    let task = CommitTask {
+        sql,
+        cancel_flag: Arc::clone(cancel_flag),
+        ack: ack_tx,
+        sync_commit: session_sync_commit(state),
+    };
+    let became_leader = enqueue_commit_task(state, task);
+    if became_leader {
+        run_leader_commit_round(state);
+    }
+    match ack_rx.recv() {
+        Ok(CommitResult {
+            result,
+            wal_outcome,
+        }) => (result, wal_outcome),
+        Err(_) => (
+            Err(EngineError::Unsupported(
+                "commit barrier: ack channel closed before result arrived".into(),
+            )),
+            Ok(()),
+        ),
+    }
+}
+
 pub(crate) struct ServerState {
     /// v4.0: `RwLock` instead of `Mutex` so read-only statements
     /// (SELECT / SHOW outside an active TX) can run in parallel
@@ -1946,6 +1982,31 @@ fn sql_is_user_mgmt(sql: &str) -> bool {
 /// client's own TX before its body runs. Over-broad matches just
 /// disable the wrap for that one statement (no correctness impact —
 /// the original v4.30 preflight still gates the chaos path).
+/// v7.39 (round 178) — does this SQL text mutate data? Used by the
+/// durability paths to decide whether a `QueryResult::Rows` outcome
+/// is a DML-with-RETURNING (must be WAL-appended + committed) or a
+/// plain read (nothing to persist). The WITH arm is a conservative
+/// substring probe: a false positive only appends a harmless
+/// replayed statement to the WAL.
+pub(crate) fn sql_is_dmlish(sql: &str) -> bool {
+    let verb = sql
+        .trim_start()
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match verb.as_str() {
+        "insert" | "update" | "delete" | "merge" => true,
+        "with" => {
+            let lower = sql.to_ascii_lowercase();
+            ["insert", "update", "delete", "merge"]
+                .iter()
+                .any(|kw| lower.contains(kw))
+        }
+        _ => false,
+    }
+}
+
 fn sql_is_tx_control(sql: &str) -> bool {
     let lower = sql.trim_start().to_ascii_lowercase();
     let first_word = lower
@@ -2484,23 +2545,9 @@ fn handle_query_op(
     // (auto-commit framing assumes there's no client TX
     // in flight, which this branch contradicts).
     let (result, wal_result, snapshot) = if needs_wrap {
-        let (ack_tx, ack_rx) = mpsc::sync_channel::<CommitResult>(1);
-        let task = CommitTask {
-            sql: sql.clone(),
-            cancel_flag: Arc::clone(&cancel_flag),
-            ack: ack_tx,
-            sync_commit,
-        };
-        let became_leader = enqueue_commit_task(state, task);
-        if became_leader {
-            run_leader_commit_round(state);
-        }
-        let CommitResult {
-            result,
-            wal_outcome,
-        } = ack_rx.recv().map_err(|_| {
-            std::io::Error::other("commit barrier: ack channel closed before result arrived")
-        })?;
+        // r178 — shared helper (also used by the pgwire plain-DML
+        // path); resolves sync_commit from the session GUC itself.
+        let (result, wal_outcome) = commit_queue_execute(state, sql.clone(), &cancel_flag);
         // Wrap path always has WAL on (see `needs_wrap`
         // gate above), so the wal-off snapshot branch is
         // unreachable here. Auto-commit wraps never leave
@@ -2526,7 +2573,11 @@ fn handle_query_op(
         let result =
             engine.execute_with_cancel(&sql, spg_engine::CancelToken::from_flag(&cancel_flag));
         alloc_budget::clear_query_budget();
-        let was_command_ok = matches!(result, Ok(QueryResult::CommandOk { .. }));
+        // r178 — RETURNING DML answers Rows, not CommandOk; inside an
+        // explicit tx those must reach the WAL too (the pre-r178 gate
+        // silently dropped them from replay).
+        let was_command_ok = matches!(result, Ok(QueryResult::CommandOk { .. }))
+            || (matches!(result, Ok(QueryResult::Rows { .. })) && sql_is_dmlish(&sql));
         let wal_result = if was_command_ok && state.wal.is_some() {
             // `sync_commit` was captured before this branch took the
             // engine write lock — `append_wal` can't read the session
