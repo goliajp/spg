@@ -251,6 +251,14 @@ pub(crate) fn synth_information_schema_columns(
         ColumnSchema::new("numeric_scale", DataType::Int, true),
         ColumnSchema::new("udt_name", DataType::Text, false),
         ColumnSchema::new("is_identity", DataType::Text, false),
+        // v7.39 (round 208) — generated-column columns (PG spec):
+        // is_generated = ALWAYS for a generated column, else NEVER;
+        // generation_expression = its source text (NULL otherwise).
+        // Reflection tools (SQLAlchemy, Alembic) and pg_dump read
+        // these; a query naming them previously errored (column
+        // absent) — GENERATED VIRTUAL / STORED were invisible.
+        ColumnSchema::new("is_generated", DataType::Text, false),
+        ColumnSchema::new("generation_expression", DataType::Text, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
@@ -320,6 +328,15 @@ pub(crate) fn synth_information_schema_columns(
                 num_scale,
                 Value::text::<&str>(udt),
                 Value::text::<&str>(if col.auto_increment { "YES" } else { "NO" }),
+                Value::text::<&str>(if col.generated_stored_expr.is_some() {
+                    "ALWAYS"
+                } else {
+                    "NEVER"
+                }),
+                match &col.generated_stored_expr {
+                    Some(src) => Value::text(src.clone()),
+                    None => Value::Null,
+                },
             ]));
         }
     }
