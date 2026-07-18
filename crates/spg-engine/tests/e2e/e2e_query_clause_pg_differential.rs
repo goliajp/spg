@@ -46,10 +46,12 @@
 //! localized clause fix; asserted against SPG's current behaviour to lock
 //! it):
 //!   * `ORDER BY 5` where position 5 is not in the select list: PG errors;
-//!     SPG leaves the constant literal as the key, so the term ties every
-//!     row and is silently dropped (table order). Fixing it needs
-//!     `resolve_order_by_position` to become fallible (Result threaded
-//!     through ~5 infallible pre-pass call sites + union recursion).
+//!     SPG left the constant literal as the key, so the term tied every
+//!     row and was silently dropped (table order). FIXED in round 232 —
+//!     the bound is checked up front (`check_order_by_positions`) rather
+//!     than by threading a Result through the positional resolver, so PG's
+//!     "ORDER BY position 5 is not in select list" now comes back. The
+//!     case below asserts the error.
 //!   * `GROUP BY true` (bare non-integer constant): PG rejects it (only a
 //!     bare integer literal is legal there, as a positional ref); SPG
 //!     accepts it as a single-group key. A constant-VALUED *expression*
@@ -219,12 +221,16 @@ fn order_by_nulls_default_and_keys() {
     // back in table order). REPORTED divergence (SPG laxer) — the fix
     // needs `resolve_order_by_position` to become fallible, which threads
     // a Result through several currently-infallible pre-pass call sites,
-    // so it is out of scope for this localized clause fix. Asserted
-    // against SPG's current behaviour to lock it.
-    ck(
-        &mut e,
-        "SELECT a FROM t ORDER BY 5",
-        "3|1|<NULL>|1|2|3|<NULL>",
+    // v7.39 (round 232) — was locked as a known divergence (SPG answered
+    // in table order); PG rejects the out-of-range position and so does SPG
+    // now.
+    let got = e
+        .execute("SELECT a FROM t ORDER BY 5")
+        .expect_err("out-of-range ORDER BY position must be rejected")
+        .to_string();
+    assert!(
+        got.contains("ORDER BY position 5 is not in select list"),
+        "{got}"
     );
 }
 

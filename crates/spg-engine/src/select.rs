@@ -1943,6 +1943,9 @@ impl Engine {
         // DISTINCT and any inner ORDER BY are dropped by parser rule —
         // the wrapper SelectStatement carries them), execute, then chain
         // peers with left-associative dedup semantics.
+        // v7.39 (round 232) — the wrapper's ORDER BY addresses the head's
+        // output columns; a position past their count is PG's 42P10.
+        crate::orderby::check_order_by_positions(stmt_ref)?;
         let mut head = stmt_ref.clone();
         head.unions = Vec::new();
         head.order_by = Vec::new();
@@ -1972,10 +1975,10 @@ impl Engine {
                 unreachable!("bare SELECT cannot return CommandOk")
             };
             if peer_cols.len() != columns.len() {
+                // v7.39 (round 232) — PG's wording, which clients match on.
                 return Err(EngineError::Unsupported(alloc::format!(
-                    "UNION arity mismatch: head has {} columns, peer has {}",
-                    columns.len(),
-                    peer_cols.len()
+                    "each {} query must have the same number of columns",
+                    set_op_name(*kind)
                 )));
             }
             // v7.37 D.26 — a UNION result column is nullable when ANY branch is
@@ -2621,6 +2624,10 @@ impl Engine {
         // on the window path: `HAVING row_number() OVER () = 1` has no
         // window in its projection at all.
         crate::window::reject_window_in_row_clauses(stmt)?;
+        // v7.39 (round 232) — the ORDER BY legality rules (positional
+        // bounds, DISTINCT, DISTINCT ON). Same placement as the window
+        // check: before anything scans.
+        crate::orderby::check_order_by_legality(stmt)?;
         // v7.37.16 — resolve `USING` column-merge + `NATURAL JOIN` into an
         // equivalent statement the regular executor handles (merged join
         // columns collapse to a single unqualified output column; NATURAL
@@ -8726,5 +8733,16 @@ impl Engine {
                 .collect();
         }
         Ok((rows, cols))
+    }
+}
+
+/// v7.39 (round 232) — PG names the offending set operation in its
+/// arity / type-mismatch messages ("each UNION query must have the same
+/// number of columns"). `UNION ALL` is still spelled UNION there.
+fn set_op_name(kind: UnionKind) -> &'static str {
+    match kind {
+        UnionKind::All | UnionKind::Distinct => "UNION",
+        UnionKind::Intersect | UnionKind::IntersectAll => "INTERSECT",
+        UnionKind::Except | UnionKind::ExceptAll => "EXCEPT",
     }
 }

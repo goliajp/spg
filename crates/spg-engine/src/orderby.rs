@@ -1121,6 +1121,119 @@ pub(crate) fn apply_offset_and_limit_tagged(
     }
 }
 
+/// v7.39 (round 232) — the ORDER BY legality rules PG enforces before it
+/// sorts anything. SPG accepted all three of these and silently answered
+/// something; PG rejects each by name (42P10 INVALID_COLUMN_REFERENCE),
+/// which is what a client branches on.
+///
+/// * a positional key must name an existing output column;
+/// * under SELECT DISTINCT the sort keys must be output columns, because
+///   the de-duplication happens before the sort and a key that isn't in
+///   the result has no defined value to sort by;
+/// * under DISTINCT ON the leading sort keys must come from the
+///   DISTINCT ON list, since which row survives per group is decided by
+///   that ordering.
+///
+/// Wording and rules measured off live PG18.4 (r232 probe).
+pub(crate) fn check_order_by_legality(
+    stmt: &spg_sql::ast::SelectStatement,
+) -> Result<(), crate::EngineError> {
+    use spg_sql::ast::{Expr, Literal, SelectItem};
+    let err = |m: alloc::string::String| Err(crate::EngineError::Unsupported(m));
+    if stmt.order_by.is_empty() {
+        return Ok(());
+    }
+    // A wildcard makes the output width unknown here (it expands against
+    // the scanned schema), so the positional bound is only checked when
+    // every item is explicit.
+    check_order_by_positions(stmt)?;
+    // Does this sort key name one of the output columns?
+    let is_output_column = |e: &Expr| -> bool {
+        if matches!(e, Expr::Literal(Literal::Integer(_))) {
+            return true; // positional; bounds already checked
+        }
+        stmt.items.iter().any(|item| match item {
+            SelectItem::Expr { expr, alias } => {
+                expr == e
+                    || match (alias, e) {
+                        (Some(a), Expr::Column(c)) => {
+                            c.qualifier.is_none() && c.name.eq_ignore_ascii_case(a)
+                        }
+                        _ => false,
+                    }
+            }
+            // A wildcard puts every scanned column in the output, so any
+            // plain column reference is satisfied by it.
+            _ => matches!(e, Expr::Column(_)),
+        })
+    };
+    if !stmt.distinct_on.is_empty() {
+        // Probed rule (PG18.4): scan the sort keys left to right; until
+        // every DISTINCT ON expression has been matched, each key must be
+        // one of them. Once they are all accounted for the remaining keys
+        // are free — `DISTINCT ON (a) … ORDER BY a, b` is fine while
+        // `ORDER BY b, a` is not, and running out of sort keys early
+        // (`DISTINCT ON (a, b) … ORDER BY a`) is fine too.
+        let mut matched = alloc::vec![false; stmt.distinct_on.len()];
+        for ob in &stmt.order_by {
+            if matched.iter().all(|m| *m) {
+                break;
+            }
+            match stmt.distinct_on.iter().position(|d| d == &ob.expr) {
+                Some(i) => matched[i] = true,
+                None => {
+                    return err(
+                        "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+                            .into(),
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
+    if stmt.distinct {
+        for ob in &stmt.order_by {
+            if !is_output_column(&ob.expr) {
+                return err(
+                    "for SELECT DISTINCT, ORDER BY expressions must appear in select list".into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v7.39 (round 232) — the positional half of [`check_order_by_legality`],
+/// split out because a set-operation wrapper carries its own ORDER BY over
+/// the head's output columns but not the head's DISTINCT, so only this part
+/// applies there.
+pub(crate) fn check_order_by_positions(
+    stmt: &spg_sql::ast::SelectStatement,
+) -> Result<(), crate::EngineError> {
+    use spg_sql::ast::{Expr, Literal, SelectItem};
+    // A wildcard makes the output width unknown here (it expands against
+    // the scanned schema), so the bound is only checked when every item is
+    // explicit.
+    let Some(width) = stmt
+        .items
+        .iter()
+        .all(|i| matches!(i, SelectItem::Expr { .. }))
+        .then(|| stmt.items.len())
+    else {
+        return Ok(());
+    };
+    for ob in &stmt.order_by {
+        if let Expr::Literal(Literal::Integer(n)) = &ob.expr
+            && (*n < 1 || *n as usize > width as i64 as usize)
+        {
+            return Err(crate::EngineError::Unsupported(alloc::format!(
+                "ORDER BY position {n} is not in select list"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod value_cmp_mixed_numeric_tests {
     //! v7.37.16 Slice A — direct coverage of the mixed NUMERIC↔int/float
