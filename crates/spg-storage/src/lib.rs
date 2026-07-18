@@ -3285,6 +3285,68 @@ impl Clone for ScanStats {
     }
 }
 
+/// v7.39 (round 215) — the lower-bound sort key for a range value, used by
+/// the range-exclusion index. The bound as an `i128` (unbounded lower =
+/// `i128::MIN`, sorting first) plus an inclusivity rank (inclusive lower
+/// sorts before exclusive at the same value, `[3` before `(3`). Returns
+/// `None` for range kinds whose bound isn't an integer scalar (numrange's
+/// numeric/bignum), for empty ranges, and for non-range values — the caller
+/// then keeps the O(n) scan rather than risk an unsound order. Int4/Int8/
+/// Date/Ts/TsTz all reduce here (tstzrange bounds are `Value::Timestamp`).
+/// Maintenance (index build) and query (overlap probe) MUST agree on this
+/// key, so both sides call exactly this function.
+#[must_use]
+pub fn range_excl_index_key(v: &Value<'_>) -> Option<(i128, u8)> {
+    let Value::Range {
+        lower,
+        lower_inc,
+        empty,
+        ..
+    } = v
+    else {
+        return None;
+    };
+    if *empty {
+        return None;
+    }
+    let key = match lower {
+        None => i128::MIN,
+        Some(b) => match b.as_ref() {
+            Value::SmallInt(n) => i128::from(*n),
+            Value::Int(n) => i128::from(*n),
+            Value::BigInt(n) => i128::from(*n),
+            Value::Date(n) => i128::from(*n),
+            Value::Timestamp(n) => i128::from(*n),
+            _ => return None,
+        },
+    };
+    Some((key, u8::from(!*lower_inc)))
+}
+
+/// v7.39 (round 215) — a per-table range-exclusion index: an incrementally
+/// maintained map from a range column's lower-bound key
+/// ([`range_excl_index_key`]) to the physical row locators carrying that
+/// bound. Lets EXCLUDE enforcement find the few candidate rows a new range
+/// might overlap in O(log n) instead of scanning every row (measured O(N²),
+/// r213). Because the stored ranges under a valid `EXCLUDE (col WITH &&)`
+/// are pairwise disjoint, a candidate overlaps only its predecessor or the
+/// successors whose lower bound precedes its upper — a handful of probes.
+///
+/// NOT persisted: rebuilt from the (persisted) exclusion constraints + rows
+/// on catalog load, exactly like BRIN re-derives. Backed by a
+/// `PersistentBTreeMap` so `Table::clone` (the per-write snapshot) stays
+/// O(1). Locators to tombstoned rows are left in place and filtered by the
+/// consumer via `is_deleted()` at query time — the established index pattern.
+#[derive(Debug, Clone)]
+pub struct ExclRangeIndex {
+    /// The constrained range column's position in the table.
+    pub column_position: usize,
+    /// Lower-bound key → row locators. A key maps to a `Vec` because a
+    /// tombstoned-then-reinserted bound can transiently collide; live rows
+    /// under the constraint are disjoint so each key has one live locator.
+    pub map: PersistentBTreeMap<(i128, u8), Vec<RowLocator>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Table {
     schema: TableSchema,
@@ -3395,6 +3457,13 @@ pub struct Table {
     /// SQL text. Transient: never serialized; a `Catalog::clone` between
     /// enable and drain copies it (cheap — empty in the steady state).
     redo_log: Option<Vec<RowChange>>,
+    /// v7.39 (round 215) — per-`EXCLUDE`-constraint range-overlap indexes,
+    /// one per single-`&&` constraint on an integer-keyable range column.
+    /// Maintained incrementally on insert / update / rebuild (mirroring the
+    /// BTree secondary indexes); NOT serialized — rebuilt from the schema's
+    /// exclusion constraints on load. Empty for tables with no EXCLUDE
+    /// constraint (the common case), so `Table::clone` pays nothing.
+    excl_indexes: Vec<ExclRangeIndex>,
 }
 
 /// Catalog: insertion-ordered `Vec<Table>` for stable iter / serialize,

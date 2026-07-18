@@ -13,9 +13,56 @@ use spg_sql::ast::{
     Literal, PartitionKindAst, PartitionOfBoundsAst, Statement, VecEncoding as SqlVecEncoding,
 };
 use spg_storage::{
-    ColumnSchema, DataType, PartitionKind, PartitionRole, StorageError, TableSchema, Value,
-    VecEncoding,
+    ColumnSchema, DataType, ExclusionConstraint, PartitionKind, PartitionRole, RangeKind,
+    StorageError, TableSchema, Value, VecEncoding,
 };
+
+/// v7.39 (round 215) — the column an EXCLUDE constraint's range-overlap index
+/// should key on: the `&&` element sitting on an integer-keyable range column
+/// (int4/int8/date/ts/tstz range — the kinds `range_excl_index_key` reduces to
+/// an `i128`). `None` when no element qualifies (numrange, or a non-`&&`
+/// operator only), in which case the constraint keeps the O(n) enforcement.
+fn excl_index_column(schema: &TableSchema, ex: &ExclusionConstraint) -> Option<usize> {
+    for (pos, op) in &ex.elements {
+        if op == "&&"
+            && let Some(col) = schema.columns.get(*pos)
+            && matches!(
+                col.ty,
+                DataType::Range(
+                    RangeKind::Int4
+                        | RangeKind::Int8
+                        | RangeKind::Date
+                        | RangeKind::Ts
+                        | RangeKind::TsTz
+                )
+            )
+        {
+            return Some(*pos);
+        }
+    }
+    None
+}
+
+/// v7.39 (round 215) — rebuild the range-exclusion indexes for every table in
+/// a freshly-deserialized catalog. The indexes aren't persisted (like BRIN,
+/// they re-derive), so a catalog load must re-emit them from the persisted
+/// exclusion constraints + rows before the first EXCLUDE enforcement runs.
+pub(crate) fn rebuild_all_excl_indexes(cat: &mut spg_storage::Catalog) {
+    for name in cat.table_names() {
+        let Some(table) = cat.get_mut(&name) else {
+            continue;
+        };
+        let cols: Vec<usize> = table
+            .schema()
+            .exclusion_constraints
+            .iter()
+            .filter_map(|ex| excl_index_column(table.schema(), ex))
+            .collect();
+        for c in cols {
+            table.ensure_excl_range_index(c);
+        }
+    }
+}
 
 use crate::{
     CancelToken, ClockFn, Engine, EngineError, QueryResult, check_existing_unique_violation,
@@ -40,6 +87,11 @@ impl Engine {
         for target in s.targets {
             self.exec_alter_table_subaction(&table_name, target)?;
         }
+        // v7.39 (round 215) — (re)build range-exclusion indexes after any
+        // ALTER: ADD EXCLUDE installs a new one; DROP COLUMN cleared them (it
+        // shifts positions), so this restores them from the constraints'
+        // updated column positions. Idempotent for the untouched case.
+        self.install_excl_range_indexes(&table_name);
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: !self.in_transaction(),
@@ -2419,6 +2471,7 @@ impl Engine {
         }
         self.active_catalog_mut().create_table(schema)?;
         self.install_implicit_indexes(&table_name, &inline_pk_columns, &stmt.table_constraints)?;
+        self.install_excl_range_indexes(&table_name);
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: !self.in_transaction(),
@@ -2974,6 +3027,28 @@ impl Engine {
 
     /// Install the implicit BTree / fulltext-GIN indexes a freshly-created
     /// table needs: one per inline PRIMARY KEY column, plus one per
+    /// v7.39 (round 215) — build a range-overlap index for every EXCLUDE
+    /// constraint whose `&&` element sits on an integer-keyable range column
+    /// (int4/int8/date/ts/tstz range). Turns the O(n) enforcement scan into an
+    /// O(log n) predecessor+successor probe. Idempotent — safe to call again
+    /// after ALTER or on catalog load. Constraints the index can't cover
+    /// (numrange, `@>`/`<@`/geometry operators) simply get no index and keep
+    /// the correct O(n) scan.
+    pub(crate) fn install_excl_range_indexes(&mut self, table_name: &str) {
+        let Some(table) = self.active_catalog_mut().get_mut(table_name) else {
+            return;
+        };
+        let cols: Vec<usize> = table
+            .schema()
+            .exclusion_constraints
+            .iter()
+            .filter_map(|ex| excl_index_column(table.schema(), ex))
+            .collect();
+        for c in cols {
+            table.ensure_excl_range_index(c);
+        }
+    }
+
     /// table-level PRIMARY KEY / UNIQUE / KEY / FULLTEXT constraint.
     fn install_implicit_indexes(
         &mut self,

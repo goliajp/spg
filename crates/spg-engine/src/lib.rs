@@ -1425,7 +1425,8 @@ impl Engine {
                 subscriptions: sub_bytes,
                 statistics: stats_bytes,
             } => {
-                let catalog = Catalog::deserialize(catalog_bytes).map_err(EngineError::Storage)?;
+                let mut catalog = Catalog::deserialize(catalog_bytes).map_err(EngineError::Storage)?;
+                crate::ddl::rebuild_all_excl_indexes(&mut catalog);
                 let users = users::deserialize_users(user_bytes)
                     .map_err(|e| EngineError::Unsupported(alloc::format!("users restore: {e}")))?;
                 let publications = match pub_bytes {
@@ -1517,7 +1518,8 @@ impl Engine {
                 ))))
             }
             EnvelopeParse::Bare => {
-                let catalog = Catalog::deserialize(buf).map_err(EngineError::Storage)?;
+                let mut catalog = Catalog::deserialize(buf).map_err(EngineError::Storage)?;
+                crate::ddl::rebuild_all_excl_indexes(&mut catalog);
                 Ok(Self::restore(catalog))
             }
         }

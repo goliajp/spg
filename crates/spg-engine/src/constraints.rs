@@ -845,6 +845,129 @@ fn exclude_op_binop(op: &str) -> Option<spg_sql::ast::BinOp> {
     })
 }
 
+/// v7.39 (round 210/215) — do two DISTINCT rows conflict under `ex`? True iff
+/// EVERY element's operator holds (`new op old`). A NULL in any element column
+/// exempts the row (returns false). Shared by the O(n) scan and the O(log n)
+/// index probe so both decide identically.
+fn excl_rows_conflict(
+    ex: &spg_storage::ExclusionConstraint,
+    newr: &[Value<'static>],
+    oldr: &[Value<'static>],
+) -> Result<bool, EngineError> {
+    for (pos, op) in &ex.elements {
+        let a = newr.get(*pos).cloned().unwrap_or(Value::Null);
+        let b = oldr.get(*pos).cloned().unwrap_or(Value::Null);
+        if matches!(a, Value::Null) || matches!(b, Value::Null) {
+            return Ok(false);
+        }
+        let binop = exclude_op_binop(op).ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!("unsupported EXCLUDE operator {op:?}"))
+        })?;
+        // `&&` / `@>` / range / geo operators need owned semantics (the by-ref
+        // path only answers comparisons); `a`/`b` are already owned clones.
+        match eval::apply_binary(binop, a, b)? {
+            Value::Bool(true) => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// v7.39 (round 215) — outcome of probing the range-exclusion index for one
+/// candidate against the existing committed rows.
+enum ExclProbe {
+    /// A live existing row conflicts; carries its values for the DETAIL.
+    Conflict(Vec<Value<'static>>),
+    /// No existing row overlaps — the candidate is definitively clear (skip
+    /// the O(n) scan).
+    NoOverlap,
+    /// The index couldn't decide (unkeyable candidate, or a probe key whose
+    /// only locators are tombstoned under gate-on MVCC) — the caller runs the
+    /// exact O(n) scan, which is always correct.
+    Inconclusive,
+}
+
+/// One map-key probe result.
+enum KeyProbe {
+    Conflict(Vec<Value<'static>>),
+    /// The key has ≥1 live locator, none of which conflict.
+    LiveClear,
+    /// The key exists but every locator is tombstoned.
+    AllDead,
+    /// No such key.
+    Absent,
+}
+
+/// v7.39 (round 215) — O(log n) overlap probe for one candidate against the
+/// range-exclusion index on `index_col`. Under a valid `EXCLUDE (col WITH &&)`
+/// the stored ranges are pairwise disjoint, so a candidate can overlap only
+/// its predecessor (the range whose lower sits just below) or the FIRST
+/// successor (the smallest lower ≥ the candidate's): if the first LIVE
+/// successor doesn't overlap, its lower is ≥ the candidate's upper and no
+/// later one can either. Two `predecessor`/`range` probes, each O(log n). A
+/// probe key whose only locators are tombstoned (gate-on) is inconclusive —
+/// the real live neighbour may be further out, so fall back to the O(n) scan.
+fn excl_probe_existing(
+    table: &spg_storage::Table,
+    ex: &spg_storage::ExclusionConstraint,
+    index_col: usize,
+    newr: &[Value<'static>],
+) -> Result<ExclProbe, EngineError> {
+    let Some(map) = table.excl_range_index(index_col) else {
+        return Ok(ExclProbe::Inconclusive);
+    };
+    let cand = newr.get(index_col).cloned().unwrap_or(Value::Null);
+    if matches!(cand, Value::Null) {
+        return Ok(ExclProbe::NoOverlap); // NULL range never conflicts (exempt)
+    }
+    let Some(cand_key) = spg_storage::range_excl_index_key(&cand) else {
+        return Ok(ExclProbe::Inconclusive); // unkeyable range → O(n)
+    };
+    let probe_entry = |entry: Option<(&(i128, u8), &Vec<spg_storage::RowLocator>)>|
+     -> Result<KeyProbe, EngineError> {
+        let Some((_, locs)) = entry else {
+            return Ok(KeyProbe::Absent);
+        };
+        let mut saw_live = false;
+        for loc in locs {
+            if locator_is_tombstoned(table, loc) {
+                continue;
+            }
+            let spg_storage::RowLocator::Hot(ri) = loc else {
+                continue; // cold-tier rows aren't in the hot scan either (parity)
+            };
+            let Some(prow) = table.rows().get(*ri) else {
+                continue;
+            };
+            saw_live = true;
+            if excl_rows_conflict(ex, newr, &prow.values)? {
+                return Ok(KeyProbe::Conflict(prow.values.clone()));
+            }
+        }
+        Ok(if saw_live {
+            KeyProbe::LiveClear
+        } else {
+            KeyProbe::AllDead
+        })
+    };
+    let pred = probe_entry(map.predecessor(&cand_key))?;
+    if let KeyProbe::Conflict(old) = pred {
+        return Ok(ExclProbe::Conflict(old));
+    }
+    let succ = probe_entry(
+        map.range(core::ops::Bound::Included(&cand_key), core::ops::Bound::Unbounded)
+            .next(),
+    )?;
+    if let KeyProbe::Conflict(old) = succ {
+        return Ok(ExclProbe::Conflict(old));
+    }
+    if matches!(pred, KeyProbe::AllDead) || matches!(succ, KeyProbe::AllDead) {
+        Ok(ExclProbe::Inconclusive)
+    } else {
+        Ok(ExclProbe::NoOverlap)
+    }
+}
+
 /// v7.39 (round 210) — enforce `EXCLUDE` constraints for a batch of incoming
 /// rows. An exclusion constraint forbids two DISTINCT rows r,s from
 /// satisfying `(r.c1 op1 s.c1) AND (r.c2 op2 s.c2) AND …` for every element.
@@ -869,41 +992,39 @@ pub(crate) fn enforce_exclusion_inserts(
             name: child_table.into(),
         })
     })?;
-    // `new op existing` holds for every element (row NOT exempt on either
-    // side). Returns Ok(false) when any column is NULL (exempt) or any
-    // operator evaluates non-true.
-    let conflicts = |ex: &spg_storage::ExclusionConstraint,
-                     newr: &[Value<'static>],
-                     oldr: &[Value<'static>]|
-     -> Result<bool, EngineError> {
-        for (pos, op) in &ex.elements {
-            let a = newr.get(*pos).cloned().unwrap_or(Value::Null);
-            let b = oldr.get(*pos).cloned().unwrap_or(Value::Null);
-            if matches!(a, Value::Null) || matches!(b, Value::Null) {
-                return Ok(false);
-            }
-            let binop = exclude_op_binop(op).ok_or_else(|| {
-                EngineError::Unsupported(alloc::format!(
-                    "unsupported EXCLUDE operator {op:?}"
-                ))
-            })?;
-            // `&&` / `@>` / range / geo operators need owned semantics
-            // (the by-ref path only answers comparisons); `a`/`b` are
-            // already owned clones here.
-            match eval::apply_binary(binop, a, b)? {
-                Value::Bool(true) => {}
-                _ => return Ok(false),
-            }
-        }
-        Ok(true)
-    };
+    let conflicts = excl_rows_conflict;
     for ex in constraints {
-        // Existing live rows.
-        for (row_idx, prow) in table.rows().iter().enumerate() {
-            if table.headers().get(row_idx).is_some_and(|h| h.is_deleted()) {
+        // v7.39 (round 215) — the `&&` element with a range-overlap index, if
+        // one was built (single-`&&` / multi-col `=`+`&&` on an integer-keyable
+        // range column). Lets each candidate probe O(log n) instead of scanning
+        // every existing row (measured O(N²), r213).
+        let idx_col = ex
+            .elements
+            .iter()
+            .find(|(pos, op)| op == "&&" && table.excl_range_index(*pos).is_some())
+            .map(|(pos, _)| *pos);
+        // Each candidate vs the existing committed rows: index probe when
+        // possible, exact O(n) scan otherwise.
+        for newr in rows.iter() {
+            let mut proved_clear = false;
+            if let Some(col) = idx_col {
+                match excl_probe_existing(table, ex, col, newr)? {
+                    ExclProbe::Conflict(old) => {
+                        return Err(exclusion_violation(table, ex, child_table, newr, &old));
+                    }
+                    ExclProbe::NoOverlap => proved_clear = true,
+                    ExclProbe::Inconclusive => {} // fall through to the O(n) scan
+                }
+            }
+            if proved_clear {
                 continue;
             }
-            for newr in rows.iter() {
+            // O(n) fallback (no index, unkeyable candidate, or an all-dead
+            // probe key under gate-on tombstones — always correct).
+            for (row_idx, prow) in table.rows().iter().enumerate() {
+                if table.headers().get(row_idx).is_some_and(|h| h.is_deleted()) {
+                    continue;
+                }
                 if conflicts(ex, newr, &prow.values)? {
                     return Err(exclusion_violation(table, ex, child_table, newr, &prow.values));
                 }
