@@ -432,6 +432,73 @@ fn pg_cond(e: &Expr) -> String {
     }
 }
 
+
+/// v7.39 (round 226, Phase 2) — split a WHERE into the conjunct the index
+/// actually serves (rendered as `Index Cond:`) and the residual conjuncts
+/// (rendered as `Filter:`), matching PG's two-line Index Scan shape. The
+/// split MIRRORS `try_index_seek`'s own decision: it walks the top-level
+/// AND chain in the same order (LHS first, then RHS) and takes the FIRST
+/// branch the seek accepts — so the plan reports the predicate SPG's
+/// executor really pushed into the index, not a guess.
+fn split_index_cond<'a>(
+    engine: &Engine,
+    name: &str,
+    alias: &str,
+    where_: &'a Expr,
+) -> (Option<&'a Expr>, Vec<&'a Expr>) {
+    // Flatten the top-level AND chain, preserving source order.
+    fn flatten<'b>(e: &'b Expr, out: &mut Vec<&'b Expr>) {
+        if let Expr::Binary {
+            lhs,
+            op: spg_sql::ast::BinOp::And,
+            rhs,
+        } = e
+        {
+            flatten(lhs, out);
+            flatten(rhs, out);
+        } else {
+            out.push(e);
+        }
+    }
+    let mut conjuncts: Vec<&Expr> = Vec::new();
+    flatten(where_, &mut conjuncts);
+    let Some(table) = engine.active_catalog().get(name) else {
+        return (None, conjuncts);
+    };
+    let cols = &table.schema().columns;
+    let snap = engine.current_snapshot();
+    // Whole-predicate seek that is NOT decomposable (a two-sided range like
+    // BETWEEN) stays one Index Cond.
+    if conjuncts.len() == 1 {
+        return (Some(where_), Vec::new());
+    }
+    for (i, c) in conjuncts.iter().enumerate() {
+        if try_index_seek(c, cols, engine.active_catalog(), table, alias, &snap).is_some() {
+            let residual: Vec<&Expr> = conjuncts
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, e)| *e)
+                .collect();
+            return (Some(conjuncts[i]), residual);
+        }
+    }
+    (None, conjuncts)
+}
+
+/// Render a conjunct list the way PG prints a multi-branch Filter:
+/// `((a) AND (b))`, single conjunct as `(a)`.
+fn pg_conjuncts(list: &[&Expr]) -> String {
+    match list.len() {
+        0 => String::new(),
+        1 => pg_cond(list[0]),
+        _ => {
+            let parts: Vec<String> = list.iter().map(|e| pg_cond(e)).collect();
+            alloc::format!("({})", parts.join(" AND "))
+        }
+    }
+}
+
 /// v7.39 (round 224) — build the scan node for one table reference:
 /// `Index Scan using <idx> on <t>` when the executor's own index-seek
 /// heuristic fires (the WHERE lands in `Index Cond:`), else
@@ -531,8 +598,19 @@ fn scan_node(
         let mut n = PlanNode::new(alloc::format!(
             "Index Scan using {idx_name} on {name}{alias_sfx}"
         ));
+        // v7.39 (round 226) — PG splits the predicate: the indexed conjunct
+        // goes to Index Cond, everything else to a Filter line beneath it.
         if let Some(w) = where_ {
-            n.attrs.push(alloc::format!("Index Cond: {}", pg_cond(w)));
+            let a = alias.unwrap_or(name);
+            let (cond, residual) = split_index_cond(engine, name, a, w);
+            match cond {
+                Some(c) => n.attrs.push(alloc::format!("Index Cond: {}", pg_cond(c))),
+                None => n.attrs.push(alloc::format!("Index Cond: {}", pg_cond(w))),
+            }
+            if !residual.is_empty() {
+                n.attrs
+                    .push(alloc::format!("Filter: {}", pg_conjuncts(&residual)));
+            }
         }
         let rows = est_scan_rows(table_rows, where_, true);
         // Index descent + per-row fetch (SPG's own constants, PG's format).
@@ -560,6 +638,97 @@ fn child_cost(n: &PlanNode) -> (f64, f64, u64, u64) {
         .first()
         .and_then(|c| c.cost)
         .unwrap_or((0.0, 0.0, 1, 8))
+}
+
+
+/// v7.39 (round 226, Phase 2) — render the plan tree as PG's FORMAT JSON:
+/// a one-element array holding `{"Plan": {…}}`, each node an object with
+/// "Node Type" first, structural keys, cost keys (omitted under COSTS
+/// OFF), the node's attribute lines as their own keys, and children under
+/// "Plans". Key names and nesting measured off live PG18.4 (r226 probe).
+fn render_json_plan(node: &PlanNode, with_costs: bool) -> String {
+    fn obj(node: &PlanNode, with_costs: bool, parent_rel: Option<&str>) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        // "Node Type" + the structural keys PG derives from the node head.
+        let head = node.head.as_str();
+        let (node_type, rel, idx) = if let Some(rest) = head.strip_prefix("Seq Scan on ") {
+            ("Seq Scan", Some(rest.split_whitespace().next().unwrap_or(rest)), None)
+        } else if let Some(rest) = head.strip_prefix("Index Scan using ") {
+            let (i, r) = rest.split_once(" on ").unwrap_or((rest, ""));
+            ("Index Scan", Some(r.split_whitespace().next().unwrap_or(r)), Some(i))
+        } else if let Some(rest) = head.strip_prefix("CTE Scan on ") {
+            ("CTE Scan", Some(rest.split_whitespace().next().unwrap_or(rest)), None)
+        } else if let Some(rest) = head.strip_prefix("Insert on ") {
+            ("Insert", Some(rest), None)
+        } else if let Some(rest) = head.strip_prefix("Update on ") {
+            ("Update", Some(rest), None)
+        } else if let Some(rest) = head.strip_prefix("Delete on ") {
+            ("Delete", Some(rest), None)
+        } else if head.starts_with("CTE ") {
+            ("CTE", None, None)
+        } else {
+            (head, None, None)
+        };
+        parts.push(alloc::format!("\"Node Type\": {}", json_string_lit(node_type)));
+        if let Some(pr) = parent_rel {
+            parts.push(alloc::format!("\"Parent Relationship\": {}", json_string_lit(pr)));
+        }
+        // PG's HashAggregate is Node Type "Aggregate" + Strategy "Hashed".
+        if node_type == "HashAggregate" {
+            parts.clear();
+            parts.push(alloc::format!("\"Node Type\": {}", json_string_lit("Aggregate")));
+            if let Some(pr) = parent_rel {
+                parts.push(alloc::format!("\"Parent Relationship\": {}", json_string_lit(pr)));
+            }
+            parts.push(alloc::format!("\"Strategy\": {}", json_string_lit("Hashed")));
+        } else if node_type == "Aggregate" {
+            parts.push(alloc::format!("\"Strategy\": {}", json_string_lit("Plain")));
+        }
+        parts.push(String::from("\"Parallel Aware\": false"));
+        if let Some(i) = idx {
+            parts.push(alloc::format!("\"Index Name\": {}", json_string_lit(i)));
+        }
+        if let Some(r) = rel {
+            parts.push(alloc::format!("\"Relation Name\": {}", json_string_lit(r)));
+            parts.push(alloc::format!("\"Alias\": {}", json_string_lit(r)));
+        }
+        if with_costs && let Some((cs, ct, rows, width)) = node.cost {
+            parts.push(alloc::format!("\"Startup Cost\": {cs:.2}"));
+            parts.push(alloc::format!("\"Total Cost\": {ct:.2}"));
+            parts.push(alloc::format!("\"Plan Rows\": {rows}"));
+            parts.push(alloc::format!("\"Plan Width\": {width}"));
+        }
+        parts.push(String::from("\"Disabled\": false"));
+        // Attribute lines become their own keys ("Filter", "Index Cond",
+        // "Sort Key", "Group Key", "Hash Cond", "Join Filter"). PG renders
+        // the key-list forms (Sort/Group Key) as JSON arrays.
+        for a in &node.attrs {
+            let Some((k, v)) = a.split_once(": ") else {
+                continue;
+            };
+            if k == "Sort Key" || k == "Group Key" {
+                let items: Vec<String> = v.split(", ").map(json_string_lit).collect();
+                parts.push(alloc::format!("\"{k}\": [{}]", items.join(", ")));
+            } else {
+                parts.push(alloc::format!("\"{k}\": {}", json_string_lit(v)));
+            }
+        }
+        if !node.children.is_empty() {
+            let kids: Vec<String> = node
+                .children
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    // PG labels the first child Outer, the second Inner.
+                    let rel = if i == 0 { "Outer" } else { "Inner" };
+                    obj(c, with_costs, Some(rel))
+                })
+                .collect();
+            parts.push(alloc::format!("\"Plans\": [{}]", kids.join(", ")));
+        }
+        alloc::format!("{{{}}}", parts.join(", "))
+    }
+    alloc::format!("[{{\"Plan\": {}}}]", obj(node, with_costs, None))
 }
 
 /// v7.39 (round 224) — build the PG-shaped plan tree for a SELECT.
@@ -871,12 +1040,17 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let mut lines = Vec::<String>::new();
+        // v7.39 (round 226) — keep the tree so FORMAT JSON can render PG's
+        // nested node objects instead of a per-line fallback.
+        let mut plan_tree: Option<PlanNode>;
         // v7.39 (round 225) — the body may be DML; PG explains it as a
         // `<Verb> on <table>` root over the source plan. `sel` is Some only
         // for a SELECT body — the suggest / analyze branches below need it.
         let sel: Option<&SelectStatement> = match &*e.inner {
             spg_sql::ast::Statement::Select(s) => {
-                explain_select_costed(s, self, !e.costs_off, &mut lines);
+                let tree = build_plan_tree(s, self);
+                render_costed(&tree, !e.costs_off, &mut lines);
+                plan_tree = Some(tree);
                 Some(s)
             }
             spg_sql::ast::Statement::Insert(i) => {
@@ -893,6 +1067,7 @@ impl Engine {
                 root.cost = child.cost.map(|(_, ct, cr, _)| (0.0, ct, cr, 0));
                 root.children.push(child);
                 render_costed(&root, !e.costs_off, &mut lines);
+                plan_tree = Some(root);
                 None
             }
             spg_sql::ast::Statement::Update(u) => {
@@ -901,6 +1076,7 @@ impl Engine {
                 root.cost = child.cost.map(|(cs, ct, cr, _)| (cs, ct, cr, 0));
                 root.children.push(child);
                 render_costed(&root, !e.costs_off, &mut lines);
+                plan_tree = Some(root);
                 None
             }
             spg_sql::ast::Statement::Delete(d) => {
@@ -909,9 +1085,12 @@ impl Engine {
                 root.cost = child.cost.map(|(cs, ct, cr, _)| (cs, ct, cr, 0));
                 root.children.push(child);
                 render_costed(&root, !e.costs_off, &mut lines);
+                plan_tree = Some(root);
                 None
             }
             other => {
+                plan_tree = None;
+                let _ = &plan_tree;
                 return Err(EngineError::Unsupported(alloc::format!(
                     "EXPLAIN body must be SELECT / INSERT / UPDATE / DELETE, got {other:?}"
                 )));
@@ -1067,16 +1246,25 @@ impl Engine {
                 // bodies see the same content; tools doing a
                 // strict PG-tree schema match should still call
                 // out to the engine via the text shape.
-                let mut body = alloc::string::String::from("[");
-                for (i, l) in lines.iter().enumerate() {
-                    if i > 0 {
-                        body.push_str(", ");
+                // v7.39 (round 226) — PG's nested node objects, rendered
+                // from the real plan tree. The per-line fallback stays for
+                // shapes that produced no tree (SUGGEST / ANALYZE extras).
+                let body = match &plan_tree {
+                    Some(tree) => render_json_plan(tree, !e.costs_off),
+                    None => {
+                        let mut b = alloc::string::String::from("[");
+                        for (i, l) in lines.iter().enumerate() {
+                            if i > 0 {
+                                b.push_str(", ");
+                            }
+                            b.push_str("{\"Plan Line\": ");
+                            b.push_str(&json_string_lit(l));
+                            b.push('}');
+                        }
+                        b.push(']');
+                        b
                     }
-                    body.push_str("{\"Plan Line\": ");
-                    body.push_str(&json_string_lit(l));
-                    body.push('}');
-                }
-                body.push(']');
+                };
                 alloc::vec![Row::new(alloc::vec![Value::text(body)])]
             }
             spg_sql::ast::ExplainFormat::Xml => {
