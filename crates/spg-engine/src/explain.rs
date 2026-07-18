@@ -340,6 +340,13 @@ struct PlanNode {
     attrs: Vec<String>,
     children: Vec<PlanNode>,
     no_arrow: bool,
+    /// v7.39 (round 225, Phase 1) — `(startup, total, rows, width)` for the
+    /// PG-format cost annotation `(cost=A..B rows=N width=W)`. The FORMAT
+    /// is PG's; the NUMBERS are SPG's own estimates (real table row counts
+    /// + fixed per-type widths + simple selectivity guesses — SPG has no
+    /// PG statistics and its cost model is its own). `None` = no
+    /// annotation (COSTS OFF, or a label pseudo-node).
+    cost: Option<(f64, f64, u64, u64)>,
 }
 
 impl PlanNode {
@@ -349,6 +356,46 @@ impl PlanNode {
             attrs: Vec::new(),
             children: Vec::new(),
             no_arrow: false,
+            cost: None,
+        }
+    }
+}
+
+/// Fixed per-type width estimate (bytes) for the `width=` figure. PG reads
+/// pg_statistic averages; SPG uses declared-type widths (text-ish = 32).
+fn est_width(cols: &[ColumnSchema]) -> u64 {
+    cols.iter()
+        .map(|c| match c.ty {
+            DataType::SmallInt => 2,
+            DataType::Int | DataType::Date | DataType::Float => 4,
+            DataType::BigInt | DataType::Timestamp | DataType::Timestamptz | DataType::Money => 8,
+            DataType::Bool => 1,
+            DataType::Uuid => 16,
+            _ => 32,
+        })
+        .sum()
+}
+
+/// Row-count estimate for a scan: no predicate = the real live count;
+/// an equality lands 1 (unique-ish assumption on the seek path) or n/10;
+/// anything else n/3 (PG's default_selectivity flavour).
+fn est_scan_rows(n: u64, where_: Option<&Expr>, eq_seek: bool) -> u64 {
+    match where_ {
+        None => n,
+        Some(_) if eq_seek => 1,
+        Some(w) => {
+            let frac = if matches!(
+                w,
+                Expr::Binary {
+                    op: spg_sql::ast::BinOp::Eq,
+                    ..
+                }
+            ) {
+                10
+            } else {
+                3
+            };
+            (n / frac).max(1)
         }
     }
 }
@@ -456,6 +503,16 @@ fn scan_node(
         )
         .map(|_| ())
     });
+    let table_rows = engine
+        .active_catalog()
+        .get(name)
+        .map(|t| t.rows().len() as u64)
+        .unwrap_or(0);
+    let width = engine
+        .active_catalog()
+        .get(name)
+        .map(|t| est_width(&t.schema().columns))
+        .unwrap_or(8);
     if seek.is_some() {
         // Name the index the way create-table synthesises it: the first
         // BTree index on the seek column. Approximation: report the
@@ -477,14 +534,32 @@ fn scan_node(
         if let Some(w) = where_ {
             n.attrs.push(alloc::format!("Index Cond: {}", pg_cond(w)));
         }
+        let rows = est_scan_rows(table_rows, where_, true);
+        // Index descent + per-row fetch (SPG's own constants, PG's format).
+        n.cost = Some((0.15, 0.15 + 8.0 + rows as f64 * 0.01, rows, width));
         n
     } else {
         let mut n = PlanNode::new(alloc::format!("Seq Scan on {name}{alias_sfx}"));
+        let filtered = where_.is_some();
         if let Some(w) = where_ {
             n.attrs.push(alloc::format!("Filter: {}", pg_cond(w)));
         }
+        let rows = est_scan_rows(table_rows, where_, false);
+        let total = 1.0
+            + table_rows as f64 * 0.01
+            + if filtered { table_rows as f64 * 0.0025 } else { 0.0 };
+        n.cost = Some((0.0, total, rows, width));
         n
     }
+}
+
+/// Cost roll-ups for the wrapper nodes: derived from the child's total +
+/// a per-row CPU term. SPG's own model in PG's clothes.
+fn child_cost(n: &PlanNode) -> (f64, f64, u64, u64) {
+    n.children
+        .first()
+        .and_then(|c| c.cost)
+        .unwrap_or((0.0, 0.0, 1, 8))
 }
 
 /// v7.39 (round 224) — build the PG-shaped plan tree for a SELECT.
@@ -504,11 +579,26 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
         for (_kind, peer) in &stmt.unions {
             root.children.push(build_plan_tree(peer, engine));
         }
+        let mut total = 0.0f64;
+        let mut rows = 0u64;
+        let mut width = 8u64;
+        for c in &root.children {
+            if let Some((_, ct, cr, cw)) = c.cost {
+                total += ct;
+                rows += cr;
+                width = width.max(cw);
+            }
+        }
+        root.cost = Some((0.0, total + rows as f64 * 0.0025, rows, width));
         return root;
     }
     // Base: FROM-less SELECT is PG's Result node.
     let mut node = match &stmt.from {
-        None => PlanNode::new(String::from("Result")),
+        None => {
+            let mut r = PlanNode::new(String::from("Result"));
+            r.cost = Some((0.0, 0.01, 1, 4));
+            r
+        }
         Some(from) => {
             let mut left = scan_node(
                 engine,
@@ -547,7 +637,18 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
                         jn.attrs.push(alloc::format!("Hash Cond: {}", pg_cond(on)));
                     }
                     let mut hash = PlanNode::new(String::from("Hash"));
+                    let (_, rt, rr, rw) = right.cost.unwrap_or((0.0, 0.0, 1, 8));
+                    hash.cost = Some((rt, rt + rr as f64 * 0.01, rr, rw));
                     hash.children.push(right);
+                    let (_, lt, lr, lw) = left.cost.unwrap_or((0.0, 0.0, 1, 8));
+                    let (hs, ht, hr, hw) = hash.cost.unwrap_or((0.0, 0.0, 1, 8));
+                    let _ = hs;
+                    jn.cost = Some((
+                        ht,
+                        ht + lt + (lr + hr) as f64 * 0.01,
+                        lr.max(hr),
+                        lw + hw,
+                    ));
                     jn.children.push(left);
                     jn.children.push(hash);
                     jn
@@ -556,6 +657,9 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
                     if let Some(on) = &j.on {
                         jn.attrs.push(alloc::format!("Join Filter: {}", pg_cond(on)));
                     }
+                    let (_, lt, lr, lw) = left.cost.unwrap_or((0.0, 0.0, 1, 8));
+                    let (_, rt, rr, rw) = right.cost.unwrap_or((0.0, 0.0, 1, 8));
+                    jn.cost = Some((0.0, lt + lr as f64 * rt.max(0.01), lr * rr.max(1), lw + rw));
                     jn.children.push(left);
                     jn.children.push(right);
                     jn
@@ -577,6 +681,8 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
     if select_has_window(stmt) {
         let mut w = PlanNode::new(String::from("WindowAgg"));
         w.children.push(node);
+        let (cs, ct, cr, cw) = child_cost(&w);
+        w.cost = Some((cs, ct + cr as f64 * 0.01, cr, cw + 8));
         node = w;
     }
     if aggregate::uses_aggregate(stmt) || stmt.group_by.is_some() {
@@ -592,6 +698,13 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
             agg.attrs.push(alloc::format!("Filter: {}", pg_cond(h)));
         }
         agg.children.push(node);
+        let (_, ct, cr, cw) = child_cost(&agg);
+        let out_rows = if stmt.group_by.is_some() {
+            (cr / 10).max(1)
+        } else {
+            1
+        };
+        agg.cost = Some((ct, ct + cr as f64 * 0.0025, out_rows, cw.min(16)));
         node = agg;
     } else if stmt.distinct {
         // PG plans SELECT DISTINCT as a HashAggregate over the select list.
@@ -607,6 +720,8 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
             .collect();
         d.attrs.push(alloc::format!("Group Key: {}", keys.join(", ")));
         d.children.push(node);
+        let (_, ct, cr, cw) = child_cost(&d);
+        d.cost = Some((ct, ct + cr as f64 * 0.0025, (cr / 10).max(1), cw));
         node = d;
     }
     if !stmt.order_by.is_empty() {
@@ -624,11 +739,22 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
             .collect();
         s.attrs.push(alloc::format!("Sort Key: {}", keys.join(", ")));
         s.children.push(node);
+        let (_, ct, cr, cw) = child_cost(&s);
+        // Sort pays its work up front: startup ≈ total (PG shape).
+        let sort_cost = ct + cr as f64 * 0.02;
+        s.cost = Some((sort_cost, sort_cost + cr as f64 * 0.01, cr, cw));
         node = s;
     }
     if stmt.limit.is_some() || stmt.offset.is_some() {
         let mut l = PlanNode::new(String::from("Limit"));
         l.children.push(node);
+        let (cs, ct, cr, cw) = child_cost(&l);
+        // A literal LIMIT n caps the estimate; expression limits keep it.
+        let lim = match &stmt.limit {
+            Some(spg_sql::ast::LimitExpr::Literal(n)) => u64::from(*n).min(cr),
+            _ => cr,
+        };
+        l.cost = Some((cs, ct, lim, cw));
         node = l;
     }
     // Materialized CTE blocks hang as named (`no_arrow`) sub-plans on the
@@ -687,6 +813,50 @@ pub(crate) fn explain_select(
     render_pg_tree(&tree, depth, out);
 }
 
+/// v7.39 (round 225, Phase 1) — costed variant: bare `EXPLAIN` shows PG's
+/// `(cost=A..B rows=N width=W)` suffix on every plan node (format PG's,
+/// numbers SPG's own estimates); `COSTS OFF` routes to the bare renderer.
+pub(crate) fn explain_select_costed(
+    stmt: &SelectStatement,
+    engine: &Engine,
+    with_costs: bool,
+    out: &mut Vec<String>,
+) {
+    let tree = build_plan_tree(stmt, engine);
+    render_costed(&tree, with_costs, out);
+}
+
+/// Render with or without the cost suffix (one shared walk).
+fn render_costed(tree: &PlanNode, with_costs: bool, out: &mut Vec<String>) {
+    if !with_costs {
+        render_pg_tree(tree, 0, out);
+        return;
+    }
+    fn walk(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
+        let mut head = if depth == 0 {
+            node.head.clone()
+        } else if node.no_arrow {
+            alloc::format!("{}{}", " ".repeat(6 * depth - 4), node.head)
+        } else {
+            alloc::format!("{}->  {}", " ".repeat(6 * depth - 6 + 2), node.head)
+        };
+        if let Some((cs, ct, rows, width)) = node.cost {
+            head.push_str(&alloc::format!(
+                "  (cost={cs:.2}..{ct:.2} rows={rows} width={width})"
+            ));
+        }
+        out.push(head);
+        let attr_pad = " ".repeat(6 * depth + 2);
+        for a in &node.attrs {
+            out.push(alloc::format!("{attr_pad}{a}"));
+        }
+        for c in &node.children {
+            walk(c, depth + 1, out);
+        }
+    }
+    walk(tree, 0, out);
+}
+
 impl Engine {
     /// v4.26: `EXPLAIN [ANALYZE] <select>`. Returns a single-column
     /// `QUERY PLAN` text table — first line names the top operator
@@ -701,7 +871,52 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let mut lines = Vec::<String>::new();
-        explain_select(&e.inner, self, 0, &mut lines);
+        // v7.39 (round 225) — the body may be DML; PG explains it as a
+        // `<Verb> on <table>` root over the source plan. `sel` is Some only
+        // for a SELECT body — the suggest / analyze branches below need it.
+        let sel: Option<&SelectStatement> = match &*e.inner {
+            spg_sql::ast::Statement::Select(s) => {
+                explain_select_costed(s, self, !e.costs_off, &mut lines);
+                Some(s)
+            }
+            spg_sql::ast::Statement::Insert(i) => {
+                let mut root = PlanNode::new(alloc::format!("Insert on {}", i.table));
+                // INSERT … SELECT plans the source; plain VALUES is Result.
+                let child = match &i.select_source {
+                    Some(src) => build_plan_tree(src, self),
+                    None => {
+                        let mut r = PlanNode::new(String::from("Result"));
+                        r.cost = Some((0.0, 0.01, i.rows.len().max(1) as u64, 8));
+                        r
+                    }
+                };
+                root.cost = child.cost.map(|(_, ct, cr, _)| (0.0, ct, cr, 0));
+                root.children.push(child);
+                render_costed(&root, !e.costs_off, &mut lines);
+                None
+            }
+            spg_sql::ast::Statement::Update(u) => {
+                let mut root = PlanNode::new(alloc::format!("Update on {}", u.table));
+                let child = scan_node(self, &u.table, None, u.where_.as_ref(), &[]);
+                root.cost = child.cost.map(|(cs, ct, cr, _)| (cs, ct, cr, 0));
+                root.children.push(child);
+                render_costed(&root, !e.costs_off, &mut lines);
+                None
+            }
+            spg_sql::ast::Statement::Delete(d) => {
+                let mut root = PlanNode::new(alloc::format!("Delete on {}", d.table));
+                let child = scan_node(self, &d.table, None, d.where_.as_ref(), &[]);
+                root.cost = child.cost.map(|(cs, ct, cr, _)| (cs, ct, cr, 0));
+                root.children.push(child);
+                render_costed(&root, !e.costs_off, &mut lines);
+                None
+            }
+            other => {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "EXPLAIN body must be SELECT / INSERT / UPDATE / DELETE, got {other:?}"
+                )));
+            }
+        };
         if e.suggest {
             // v6.8.3 — index advisor. Walks the SELECT's FROM
             // tables + WHERE column refs; for each (table, column)
@@ -711,9 +926,11 @@ impl Engine {
             // matching the v6.8.3 design intent of "tell the
             // operator where indexes are missing", not "give the
             // mathematically optimal index set".
-            let suggestions = build_index_suggestions(&e.inner, self);
-            for s in suggestions {
-                lines.push(s);
+            if let Some(sel) = sel {
+                let suggestions = build_index_suggestions(sel, self);
+                for s in suggestions {
+                    lines.push(s);
+                }
             }
         } else if e.analyze {
             // v6.2.4 — EXPLAIN ANALYZE annotates each operator line
@@ -732,8 +949,15 @@ impl Engine {
             //     stats. v6.2.5 fills in via inline executor
             //     instrumentation.
             // Total elapsed lands on a trailing `Total: …` line.
+            // v7.39 (round 225) — ANALYZE executes; SPG supports it for
+            // SELECT bodies only (a DML ANALYZE would have to really write).
+            let Some(sel) = sel else {
+                return Err(EngineError::Unsupported(String::from(
+                    "EXPLAIN ANALYZE on INSERT/UPDATE/DELETE is not supported (it would execute the write); use plain EXPLAIN",
+                )));
+            };
             let started = self.clock.map(|f| f());
-            let exec = self.exec_select_cancel(&e.inner, cancel)?;
+            let exec = self.exec_select_cancel(sel, cancel)?;
             let elapsed_micros = match (self.clock, started) {
                 (Some(f), Some(s)) => Some(f().saturating_sub(s)),
                 _ => None,

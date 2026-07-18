@@ -201,8 +201,11 @@ pub fn collect_source_tables(stmt: &Statement) -> Vec<String> {
                 collect_expr(w, &mut out);
             }
         }
+        // v7.39 (round 225) — the body is a whole Statement (SELECT or DML).
         Statement::Explain(inner) => {
-            collect_from_select(&inner.inner, &mut out);
+            if let Statement::Select(sel) = &*inner.inner {
+                collect_from_select(sel, &mut out);
+            }
         }
         _ => {}
     }

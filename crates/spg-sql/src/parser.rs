@@ -1583,20 +1583,38 @@ impl Parser {
                 }
                 // v7.39 (round 224) — the body may open with WITH (CTEs);
                 // route through the same CTE-then-SELECT path the top-level
-                // WITH statement uses.
-                let inner = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("with"))
-                {
-                    self.advance();
-                    self.parse_with_cte_then_select()?
-                } else {
-                    self.parse_select_stmt()?
+                // WITH statement uses. v7.39 (round 225) — DML bodies parse
+                // too (PG explains INSERT / UPDATE / DELETE).
+                let inner = match self.peek().clone() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("with") => {
+                        self.advance();
+                        self.parse_with_cte_then_select()?
+                    }
+                    Token::Insert => self.parse_insert_stmt(false)?,
+                    Token::Ident(s) if s.eq_ignore_ascii_case("update") => {
+                        self.advance();
+                        self.parse_update_after_keyword()?
+                    }
+                    Token::Ident(s) if s.eq_ignore_ascii_case("delete") => {
+                        self.advance();
+                        self.parse_delete_after_keyword()?
+                    }
+                    _ => self.parse_select_stmt()?,
                 };
-                let Statement::Select(s) = inner else {
-                    return Err(self.err(format!("EXPLAIN body must be a SELECT, got {inner:?}")));
-                };
+                if !matches!(
+                    inner,
+                    Statement::Select(_)
+                        | Statement::Insert(_)
+                        | Statement::Update(_)
+                        | Statement::Delete(_)
+                ) {
+                    return Err(self.err(format!(
+                        "EXPLAIN body must be SELECT / INSERT / UPDATE / DELETE, got {inner:?}"
+                    )));
+                }
                 Ok(Statement::Explain(crate::ast::ExplainStatement {
                     analyze,
-                    inner: Box::new(s),
+                    inner: Box::new(inner),
                     suggest,
                     costs_off,
                     buffers,
