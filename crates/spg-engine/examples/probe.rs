@@ -24,7 +24,21 @@ fn render(v: &Value) -> String {
 fn main() {
     let path = std::env::args().nth(1).expect("usage: probe <sql-file>");
     let sql = std::fs::read_to_string(&path).expect("read sql file");
-    let mut e = Engine::new();
+    fn wall_clock_micros() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0)
+    }
+    let mut e = Engine::new().with_clock(wall_clock_micros);
+    // v7.39 (round 221) — named-timezone lookups, same wiring as
+    // spg-embedded / spg-server, so tz differentials probe the real path.
+    e.set_tz_fns(
+        spg_tzif::tz_offset_at,
+        spg_tzif::tz_local_to_utc,
+        spg_tzif::tz_canonical,
+        spg_tzif::tz_abbrev_at,
+    );
     for stmt in sql.split(';') {
         let stmt = stmt.trim();
         if stmt.is_empty() {
