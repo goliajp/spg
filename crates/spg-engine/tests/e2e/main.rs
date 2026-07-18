@@ -142,6 +142,7 @@ mod e2e_exclude_catalog_round211;
 mod e2e_exclude_multicol_round212;
 mod e2e_exclude_batch_fastpath_round214;
 mod e2e_exclude_index_mvcc_round215;
+mod e2e_exclude_update_index_round216;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;
