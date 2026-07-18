@@ -31,15 +31,23 @@ fn every_operator_reports_stats() {
     let r = e.execute("EXPLAIN ANALYZE SELECT * FROM t").unwrap();
     let lines = rows_of(&r);
     assert!(!lines.is_empty(), "EXPLAIN ANALYZE must emit ≥ 1 line");
-    // Every operator line carries either `(rows=N)`, `(rows=—)`,
-    // or `(rows_scanned…)`. The trailing Total line carries
-    // `Total: rows=…`.
-    for line in &lines {
-        let ok = line.contains("(rows=")
-            || line.contains("(hot_rows")
-            || line.starts_with("Total: rows=");
-        assert!(ok, "no stats annotation on line: {line:?}");
-    }
+    // v7.39 (round 227) — PG-shaped ANALYZE: node lines carry an
+    // `(actual … rows=N.NN loops=1)` block (or none, where SPG cannot
+    // genuinely derive the count); the trailing line is PG's
+    // `Execution Time:`. Attribute lines carry no stats.
+    assert!(
+        lines[0].contains("(actual ") && lines[0].contains("loops=1"),
+        "top node carries the measured block: {:?}",
+        lines[0]
+    );
+    // This engine has no clock, so the measured block carries rows only
+    // and the `Execution Time:` summary is (correctly) absent — SPG does
+    // not invent a timing it never took.
+    assert!(
+        !lines[0].contains("actual time="),
+        "no clock ⇒ no per-node time: {:?}",
+        lines[0]
+    );
 }
 
 #[test]
@@ -52,18 +60,18 @@ fn top_level_rows_match_result_count() {
     let r = e.execute("EXPLAIN ANALYZE SELECT * FROM t").unwrap();
     let lines = rows_of(&r);
     let top = &lines[0];
-    // v7.39 (round 224) — a single-node plan's top line IS the scan line;
-    // it carries the scan annotation (hot_rows), and the result count
-    // rides the trailing Total line.
+    // v7.39 (round 227) — PG shape: the top node reports the real result
+    // count in the measured block.
     assert!(
-        top.contains("hot_rows=7"),
-        "top scan reports hot_rows; got {top:?}"
+        top.contains("rows=7.00 loops=1"),
+        "top reports actual result rows; got {top:?}"
     );
-    let total = lines
-        .iter()
-        .find(|l| l.starts_with("Total: rows="))
-        .unwrap();
-    assert!(total.contains("rows=7"));
+    // No clock injected on this engine, so PG's `Execution Time:` summary
+    // (which needs a real measurement) is correctly absent.
+    assert!(
+        !lines.iter().any(|l| l.starts_with("Execution Time: ")),
+        "no clock ⇒ no fabricated timing line: {lines:?}"
+    );
 }
 
 #[test]
@@ -77,15 +85,20 @@ fn scan_reports_catalog_row_count() {
         .execute("EXPLAIN ANALYZE SELECT * FROM big WHERE id < 10")
         .unwrap();
     let lines = rows_of(&r);
-    // v7.39 (round 224) — the PG-shaped scan line ("Seq Scan on big")
-    // reports `(hot_rows=40)` — every catalog row was a candidate.
+    // v7.39 (round 227) — PG shape: the filtered top-level Seq Scan
+    // reports its OUTPUT rows plus `Rows Removed by Filter` (40 scanned
+    // − 10 emitted = 30), both genuinely derived.
     let from_line = lines
         .iter()
         .find(|l| l.contains("Seq Scan on big"))
         .expect("scan line present");
     assert!(
-        from_line.contains("hot_rows=40"),
-        "From line reports hot_rows; got {from_line:?}"
+        from_line.contains("rows=10.00 loops=1"),
+        "scan reports actual output rows; got {from_line:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("Rows Removed by Filter: 30")),
+        "PG's removed-rows line: {lines:?}"
     );
 }
 
@@ -142,25 +155,30 @@ fn scan_omits_cold_marker_when_no_cold_segments() {
         .iter()
         .find(|l| l.contains("Seq Scan on warm"))
         .unwrap();
+    // v7.39 (round 227) — PG shape: actual rows on the scan; the old
+    // SPG-vocabulary cold-tier marker is gone from the node line.
     assert!(
-        from.contains("hot_rows=1"),
-        "From line shows hot_rows=1; got {from:?}"
+        from.contains("rows=1.00 loops=1"),
+        "scan line shows actual rows; got {from:?}"
     );
     assert!(
         !from.contains("cold_tier"),
-        "no cold marker without cold segments; got {from:?}"
+        "no cold marker on the PG-shaped node line; got {from:?}"
     );
 }
 
 #[test]
-fn trailing_total_line_has_elapsed_when_clock_is_set() {
-    // Engine without a clock injected → elapsed is omitted. With
-    // a clock, the Total line should include `elapsed=…us`.
+fn execution_time_line_present_when_clock_is_set() {
+    // v7.39 (round 227) — PG's `Execution Time:` replaced SPG's
+    // `Total: … elapsed=…us`. It needs an injected clock to measure.
     let mut e = Engine::new().with_clock(|| 1_000_000);
     e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
     e.execute("INSERT INTO t VALUES (1)").unwrap();
     let r = e.execute("EXPLAIN ANALYZE SELECT * FROM t").unwrap();
     let lines = rows_of(&r);
-    let total = lines.iter().find(|l| l.starts_with("Total: ")).unwrap();
-    assert!(total.contains("elapsed="), "got: {total:?}");
+    let total = lines
+        .iter()
+        .find(|l| l.starts_with("Execution Time: "))
+        .expect("Execution Time line present");
+    assert!(total.ends_with(" ms"), "PG unit suffix: {total:?}");
 }

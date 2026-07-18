@@ -1094,6 +1094,11 @@ pub struct ExplainStatement {
     /// write-side queries (INSERT/UPDATE/DELETE wrapped in EXPLAIN
     /// ANALYZE) report against the engine WAL counter delta.
     pub wal: bool,
+    /// v7.39 (round 227) — `EXPLAIN (SUMMARY OFF)` suppresses the trailing
+    /// `Planning Time:` / `Execution Time:` lines. PG defaults SUMMARY on
+    /// for ANALYZE and off otherwise; SPG emits them for ANALYZE unless
+    /// this is set.
+    pub summary_off: bool,
     /// v7.37.23 (23.5) — `EXPLAIN (FORMAT text|json|xml|yaml)`.
     /// PG's standard format selector. Default is text. JSON / XML
     /// / YAML emit a single-row TEXT result whose body wraps the

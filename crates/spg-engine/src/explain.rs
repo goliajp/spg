@@ -3,7 +3,6 @@
 //! indexes. Split out of `lib.rs` (v7.32 engine modularisation).
 
 use alloc::string::String;
-use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use spg_sql::ast::{Expr, SelectItem, SelectStatement};
@@ -242,93 +241,6 @@ pub(crate) fn collect_column_refs(expr: &Expr, out: &mut Vec<spg_sql::ast::Colum
     }
 }
 
-/// v6.2.4 — walk every line of the rendered plan tree and append
-/// per-operator stats. Lines that name a known operator get `(rows=N)`
-/// (the top-level operator's actual_rows equals the final result row
-/// count; scans report their catalog row count as rows-considered).
-/// Other lines — Filter / Join / GroupBy / OrderBy — are marked `(—)`
-/// so the surface is complete-by-construction.
-pub(crate) fn annotate_explain_lines(lines: &mut [String], total_rows: usize, engine: &Engine) {
-    let catalog = engine.active_catalog();
-    let cold_ids = catalog.cold_segment_ids_global();
-    let any_cold = !cold_ids.is_empty();
-    let cold_ids_repr = if any_cold {
-        let mut s = alloc::string::String::from("[");
-        for (i, id) in cold_ids.iter().enumerate() {
-            if i > 0 {
-                s.push(',');
-            }
-            s.push_str(&alloc::format!("{id}"));
-        }
-        s.push(']');
-        s
-    } else {
-        alloc::string::String::new()
-    };
-    for (idx, line) in lines.iter_mut().enumerate() {
-        let trimmed = line.trim_start();
-        let is_top_level = idx == 0;
-        // v7.39 (round 224) — under the PG-shaped tree a single-node plan's
-        // top line IS the scan line; give it the scan annotation (hot_rows
-        // is the useful figure) alongside the result count.
-        let top_is_scan = is_top_level
-            && (trimmed.starts_with("Seq Scan on ") || trimmed.starts_with("Index Scan using "));
-        if is_top_level && !top_is_scan {
-            line.push_str(&alloc::format!(" (rows={total_rows})"));
-            continue;
-        }
-        // v7.39 (round 224) — the PG-shaped tree renamed the scan lines:
-        // `Seq Scan on <t>` (was `From: <t> [full scan]`) and
-        // `Index Scan using <idx> on <t>` (was `[index seek]`).
-        let scan = trimmed
-            .strip_prefix("->  ")
-            .unwrap_or(trimmed);
-        if let Some(rest) = scan
-            .strip_prefix("Seq Scan on ")
-            .map(|r| (r, "full scan"))
-            .or_else(|| {
-                scan.split_once(" on ")
-                    .filter(|_| scan.starts_with("Index Scan using "))
-                    .map(|(_, r)| (r, "index seek"))
-            })
-        {
-            let (name, scan_kind) = rest;
-            let bare = name.split_whitespace().next().unwrap_or(name);
-            let hot = catalog.get(bare).map(|t| t.rows().len());
-            // v6.2.7 — `cold_segments=[id0,id1,…]` enumerates every
-            // cold-tier segment the scan COULD have walked. v6.2.x
-            // can tighten to per-table by walking the table's
-            // BTree-index cold locators.
-            let annot = match (hot, scan_kind) {
-                (Some(h), "full scan") => {
-                    let mut s = alloc::format!(" (hot_rows={h}");
-                    if any_cold {
-                        s.push_str(&alloc::format!(
-                            ", cold_tier=present, cold_segments={cold_ids_repr}"
-                        ));
-                    }
-                    s.push(')');
-                    s
-                }
-                (Some(h), "index seek") => {
-                    let mut s = alloc::format!(" (hot_rows≤{h}");
-                    if any_cold {
-                        s.push_str(&alloc::format!(
-                            ", cold_tier=present, cold_segments={cold_ids_repr}"
-                        ));
-                    }
-                    s.push(')');
-                    s
-                }
-                _ => " (rows=—)".to_string(),
-            };
-            line.push_str(&annot);
-            continue;
-        }
-        // Filter / GroupBy / Having / OrderBy / Limit / Join etc.
-        line.push_str(" (rows=—)");
-    }
-}
 
 /// v7.39 (round 224, EXPLAIN epic Phase 0) — one node of the PG-shaped
 /// plan tree. `head` is the node line ("Seq Scan on t1", "Sort"), `attrs`
@@ -347,6 +259,14 @@ struct PlanNode {
     /// PG statistics and its cost model is its own). `None` = no
     /// annotation (COSTS OFF, or a label pseudo-node).
     cost: Option<(f64, f64, u64, u64)>,
+    /// v7.39 (round 227, Phase 3) — EXPLAIN ANALYZE's measured block:
+    /// `(time_ms, rows)`. `time_ms` is `Some` ONLY where SPG genuinely
+    /// measured it (the top node, whose elapsed IS the query elapsed);
+    /// inner nodes carry rows-only because SPG has no per-node timer and
+    /// will not fabricate one. `None` = SPG could not derive this node's
+    /// actual row count from a real counter, so no block is emitted
+    /// rather than a guess. Loops is always 1 (SPG re-executes nothing).
+    actual: Option<(Option<f64>, u64)>,
 }
 
 impl PlanNode {
@@ -357,6 +277,7 @@ impl PlanNode {
             children: Vec::new(),
             no_arrow: false,
             cost: None,
+            actual: None,
         }
     }
 }
@@ -640,6 +561,104 @@ fn child_cost(n: &PlanNode) -> (f64, f64, u64, u64) {
         .unwrap_or((0.0, 0.0, 1, 8))
 }
 
+
+
+/// v7.39 (round 227, Phase 3) — fill the tree's ANALYZE blocks from
+/// GENUINELY MEASURED numbers only. The top node takes the real elapsed
+/// (its elapsed IS the query's) plus the real result-row count; leaf scan
+/// nodes take the per-table scan-counter delta the executor really bumped
+/// (`idx_tup_fetch` for an Index Scan, `seq_tup_read` for a Seq Scan).
+/// Any node whose actual row count SPG cannot derive from a real counter
+/// is left un-annotated rather than given a fabricated figure — SPG has
+/// no per-node timer and this renderer will not invent one. Documented
+/// divergence from PG, which instruments every node.
+fn fill_actuals(
+    node: &mut PlanNode,
+    is_top: bool,
+    engine: &Engine,
+    result_rows: u64,
+    elapsed_ms: Option<f64>,
+    deltas: &alloc::collections::BTreeMap<String, u64>,
+) {
+    /// The table a scan node reads, if the head names one.
+    fn scan_table(head: &str) -> Option<(&str, bool)> {
+        if let Some(r) = head.strip_prefix("Seq Scan on ") {
+            Some((r.split_whitespace().next().unwrap_or(r), true))
+        } else if let Some(r) = head.strip_prefix("CTE Scan on ") {
+            Some((r.split_whitespace().next().unwrap_or(r), false))
+        } else if let Some(r) = head
+            .strip_prefix("Index Scan using ")
+            .and_then(|r| r.split_once(" on ").map(|(_, t)| t))
+        {
+            Some((r.split_whitespace().next().unwrap_or(r), false))
+        } else {
+            None
+        }
+    }
+    let head = node.head.clone();
+    let filtered = node.attrs.iter().any(|a| a.starts_with("Filter: "));
+    let live_rows = |t: &str| -> Option<u64> {
+        engine
+            .active_catalog()
+            .get(t)
+            .map(|tb| (tb.rows().len() as u64).saturating_sub(tb.dead_rows()))
+    };
+    if is_top {
+        node.actual = Some((elapsed_ms, result_rows));
+        // When the top node IS a Seq Scan carrying the filter, both numbers
+        // are genuine: a sequential scan reads every live row (catalog
+        // count), and the result is what survived.
+        if node.children.is_empty()
+            && filtered
+            && let Some((t, is_seq)) = scan_table(&head)
+            && is_seq
+            && let Some(read) = live_rows(t)
+            && read >= result_rows
+        {
+            node.attrs.push(alloc::format!(
+                "Rows Removed by Filter: {}",
+                read - result_rows
+            ));
+        }
+    } else if let Some((table, is_seq)) = scan_table(&head) {
+        // PG's `actual rows` on a scan is its OUTPUT (post-filter) count.
+        // An unfiltered sequential scan emits every live row — genuinely
+        // the catalog count. A filtered one's output is not derivable
+        // without per-node instrumentation, so it is left un-annotated
+        // rather than labelled with a number that means something else.
+        // Index scans report the executor's real fetch counter when the
+        // path bumped it.
+        if !filtered {
+            if is_seq {
+                if let Some(n) = live_rows(table) {
+                    node.actual = Some((None, n));
+                }
+            } else if let Some(&n) = deltas.get(table) {
+                node.actual = Some((None, n));
+            }
+        }
+    }
+    for c in &mut node.children {
+        fill_actuals(c, false, engine, result_rows, elapsed_ms, deltas);
+    }
+}
+
+/// Snapshot every table's (seq_tup_read + idx_tup_fetch) so a before/after
+/// pair yields the rows each scan really touched during the ANALYZE run.
+fn scan_counter_snapshot(engine: &Engine) -> alloc::collections::BTreeMap<String, u64> {
+    use core::sync::atomic::Ordering;
+    let cat = engine.active_catalog();
+    let mut out = alloc::collections::BTreeMap::new();
+    for name in cat.table_names() {
+        if let Some(t) = cat.get(&name) {
+            let st = t.scan_stats();
+            let v = st.seq_tup_read.load(Ordering::Relaxed)
+                + st.idx_tup_fetch.load(Ordering::Relaxed);
+            out.insert(name, v);
+        }
+    }
+    out
+}
 
 /// v7.39 (round 226, Phase 2) — render the plan tree as PG's FORMAT JSON:
 /// a one-element array holding `{"Plan": {…}}`, each node an object with
@@ -997,11 +1016,10 @@ pub(crate) fn explain_select_costed(
 
 /// Render with or without the cost suffix (one shared walk).
 fn render_costed(tree: &PlanNode, with_costs: bool, out: &mut Vec<String>) {
-    if !with_costs {
-        render_pg_tree(tree, 0, out);
-        return;
-    }
-    fn walk(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
+    // v7.39 (round 227) — one walk handles both: the cost suffix is gated
+    // per-node, the ANALYZE `(actual …)` block always renders when present
+    // (COSTS OFF must not swallow the measured block).
+    fn walk(node: &PlanNode, depth: usize, out: &mut Vec<String>, with_costs: bool) {
         let mut head = if depth == 0 {
             node.head.clone()
         } else if node.no_arrow {
@@ -1009,10 +1027,19 @@ fn render_costed(tree: &PlanNode, with_costs: bool, out: &mut Vec<String>) {
         } else {
             alloc::format!("{}->  {}", " ".repeat(6 * depth - 6 + 2), node.head)
         };
-        if let Some((cs, ct, rows, width)) = node.cost {
+        if with_costs && let Some((cs, ct, rows, width)) = node.cost {
             head.push_str(&alloc::format!(
                 "  (cost={cs:.2}..{ct:.2} rows={rows} width={width})"
             ));
+        }
+        // v7.39 (round 227) — PG's measured block follows the estimate.
+        if let Some((t, rows)) = node.actual {
+            match t {
+                Some(ms) => head.push_str(&alloc::format!(
+                    " (actual time=0.000..{ms:.3} rows={rows}.00 loops=1)"
+                )),
+                None => head.push_str(&alloc::format!(" (actual rows={rows}.00 loops=1)")),
+            }
         }
         out.push(head);
         let attr_pad = " ".repeat(6 * depth + 2);
@@ -1020,10 +1047,10 @@ fn render_costed(tree: &PlanNode, with_costs: bool, out: &mut Vec<String>) {
             out.push(alloc::format!("{attr_pad}{a}"));
         }
         for c in &node.children {
-            walk(c, depth + 1, out);
+            walk(c, depth + 1, out, with_costs);
         }
     }
-    walk(tree, 0, out);
+    walk(tree, 0, out, with_costs);
 }
 
 impl Engine {
@@ -1135,33 +1162,55 @@ impl Engine {
                     "EXPLAIN ANALYZE on INSERT/UPDATE/DELETE is not supported (it would execute the write); use plain EXPLAIN",
                 )));
             };
+            // v7.39 (round 227, Phase 3) — PG-shaped ANALYZE. Snapshot the
+            // real per-table scan counters around the execution so leaf
+            // scans report rows the executor genuinely touched.
+            let before = scan_counter_snapshot(self);
             let started = self.clock.map(|f| f());
             let exec = self.exec_select_cancel(sel, cancel)?;
             let elapsed_micros = match (self.clock, started) {
                 (Some(f), Some(s)) => Some(f().saturating_sub(s)),
                 _ => None,
             };
+            let after = scan_counter_snapshot(self);
+            let mut deltas: alloc::collections::BTreeMap<String, u64> =
+                alloc::collections::BTreeMap::new();
+            for (k, v) in &after {
+                let d = v.saturating_sub(before.get(k).copied().unwrap_or(0));
+                if d > 0 {
+                    deltas.insert(k.clone(), d);
+                }
+            }
             let row_count = if let QueryResult::Rows { rows, .. } = &exec {
                 rows.len()
             } else {
                 0
             };
-            annotate_explain_lines(&mut lines, row_count, self);
-            let mut total = alloc::format!("Total: rows={row_count}");
-            // Two independent gates suppress the wall-clock
-            // `elapsed=…us` annotation:
-            // - v7.37.7 C.1: `EXPLAIN (COSTS OFF)` (per-statement SQL
-            //   option; PG-standard).
-            // - v7.38 元机制 D: `SPG_TEST_EXPLAIN_NO_COSTS=1`
-            //   (per-session env var; SPG-specific test-mode GUC).
-            // Either gate active → skip the annotation. Both default
-            // off in production builds.
-            if !e.costs_off
-                && !e.timing_off
+            // Re-render the tree with the measured blocks attached. Timing
+            // rides the top node only (see fill_actuals); TIMING OFF and
+            // the test-mode GUC suppress it entirely.
+            let show_time = !e.timing_off && !self.env_cfg().explain_no_costs;
+            let elapsed_ms = if show_time {
+                elapsed_micros.map(|us| us as f64 / 1000.0)
+            } else {
+                None
+            };
+            if let Some(tree) = &mut plan_tree {
+                fill_actuals(tree, true, self, row_count as u64, elapsed_ms, &deltas);
+                lines.clear();
+                render_costed(tree, !e.costs_off, &mut lines);
+            }
+            // PG's trailing summary (suppressed by SUMMARY OFF). Only
+            // `Execution Time:` is emitted: SPG's planning is not separately
+            // instrumented (it happens inside the same execute call), so a
+            // `Planning Time:` line would have to be invented — omitted
+            // rather than faked. Documented divergence.
+            if !e.summary_off
                 && !self.env_cfg().explain_no_costs
                 && let Some(us) = elapsed_micros
             {
-                total.push_str(&alloc::format!(" elapsed={us}us"));
+                let ms = us as f64 / 1000.0;
+                lines.push(alloc::format!("Execution Time: {ms:.3} ms"));
             }
             // v7.37.22 (22.7) — BUFFERS adds a hot/cold row
             // breakdown after Total. SPG's hot-tier row count is
@@ -1197,7 +1246,6 @@ impl Engine {
                     "Buffers: hot_rows={hot_rows} cold_rows={cold_rows} cache_hit_ratio={ratio}"
                 ));
             }
-            lines.push(total);
         }
         // v7.37.22 (22.7) — SETTINGS appends GUCs that diverge from
         // default. Independent of ANALYZE — `EXPLAIN (SETTINGS) S`
