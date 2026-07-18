@@ -133,18 +133,24 @@ fn explain_combined_options_compose() {
 // v7.37.23 (23.5) — EXPLAIN (FORMAT json / xml / yaml).
 
 #[test]
-fn explain_format_json_wraps_plan_in_array_of_lines() {
+fn explain_format_json_emits_pg_plan_object() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT)").unwrap();
     let plan = plan_text(&mut e, "EXPLAIN (FORMAT json) SELECT * FROM t");
     let plan = plan.trim_end();
     assert!(plan.starts_with('['), "JSON must open with [: {plan}");
     assert!(plan.ends_with(']'), "JSON must close with ]: {plan}");
+    // v7.39 (round 226) — PG's nested node objects replaced the old
+    // per-line `{"Plan Line": …}` fallback.
+    assert!(plan.contains("\"Plan\""), "PG Plan wrapper missing: {plan}");
     assert!(
-        plan.contains("\"Plan Line\""),
-        "JSON object key missing: {plan}"
+        plan.contains("\"Node Type\": \"Seq Scan\""),
+        "PG Node Type missing: {plan}"
     );
-    assert!(plan.contains("Seq Scan on t"), "plan body missing: {plan}");
+    assert!(
+        plan.contains("\"Relation Name\": \"t\""),
+        "relation name missing: {plan}"
+    );
 }
 
 #[test]
