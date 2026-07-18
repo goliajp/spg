@@ -4037,6 +4037,24 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // message also carries `constraint "t_pkey"` and a DETAIL ending in
         // "already exists.", so key on PG's distinctive "for relation" /
         // "for table" qualifier, which only the DDL form has.
+        // v7.39 (read01 round 229) — window-clause errors are PG's 42P20
+        // WINDOWING_ERROR. Classified before the generic object patterns:
+        // the copy / redefinition wordings also carry `window "w1"`, which
+        // the 42704 "does not exist" arm below would otherwise steal — only
+        // the genuinely-missing-name case belongs there.
+        } else if msg.contains("window functions are not allowed in ")
+            || msg.starts_with("frame start cannot be")
+            || msg.starts_with("frame end cannot be")
+            || msg.starts_with("frame starting from ")
+            || msg.contains("cannot override PARTITION BY clause of window ")
+            || msg.contains("cannot override ORDER BY clause of window ")
+            || msg.contains("because it has a frame clause")
+            || msg.contains("RANGE with offset PRECEDING/FOLLOWING requires")
+            || (msg.contains("window \"") && msg.contains("\" is already defined"))
+        {
+            "42P20"
+        } else if msg.contains("window \"") && msg.contains("\" does not exist") {
+            "42704"
         } else if msg.contains("constraint \"")
             && (msg.contains("\" for relation \"") || msg.contains("\" for table \""))
             && msg.contains("already exists")

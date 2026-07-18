@@ -10317,8 +10317,36 @@ impl Parser {
                     )));
                 }
                 self.advance();
+                // v7.39 (round 229) — PG rejects a redefinition outright.
+                if window_defs.iter().any(|(n, _)| n.eq_ignore_ascii_case(&wname)) {
+                    return Err(self.err(alloc::format!("window \"{wname}\" is already defined")));
+                }
                 let def = self.parse_over_clause()?;
-                window_defs.push((wname, def));
+                // A definition may itself copy an earlier one
+                // (`WINDOW w1 AS (PARTITION BY g), w2 AS (w1 ORDER BY v)`),
+                // so resolve it against the defs already in scope. Same
+                // copy rules as an `OVER (w1 …)` in the select list.
+                let mut probe = Expr::WindowFunction {
+                    name: String::new(),
+                    args: Vec::new(),
+                    partition_by: def.0,
+                    order_by: def.1,
+                    frame: def.2,
+                    null_treatment: crate::ast::NullTreatment::Respect,
+                    filter: None,
+                };
+                Self::substitute_named_windows(&mut probe, &window_defs)
+                    .map_err(|m| self.err(m))?;
+                let Expr::WindowFunction {
+                    partition_by,
+                    order_by,
+                    frame,
+                    ..
+                } = probe
+                else {
+                    unreachable!("probe is a WindowFunction")
+                };
+                window_defs.push((wname, (partition_by, order_by, frame)));
                 if matches!(self.peek(), Token::Comma) {
                     self.advance();
                     continue;
@@ -15219,7 +15247,10 @@ impl Parser {
         match e {
             Expr::WindowFunction { partition_by, .. } => matches!(
                 partition_by.as_slice(),
-                [Expr::Column(c)] if c.qualifier.as_deref() == Some("__named_window__")
+                [Expr::Column(c)] if matches!(
+                    c.qualifier.as_deref(),
+                    Some("__named_window__") | Some("__named_window_ref__")
+                )
             ),
             Expr::Binary { lhs, rhs, .. } => {
                 Self::expr_has_named_window(lhs) || Self::expr_has_named_window(rhs)
@@ -15264,20 +15295,46 @@ impl Parser {
                 frame,
                 ..
             } => {
+                // `is_copy` distinguishes `OVER (w1 …)` (a refinable copy)
+                // from the bare `OVER w1` (a plain reference).
                 let named = match partition_by.as_slice() {
-                    [Expr::Column(c)] if c.qualifier.as_deref() == Some("__named_window__") => {
-                        Some(c.name.clone())
-                    }
+                    [Expr::Column(c)] => match c.qualifier.as_deref() {
+                        Some("__named_window__") => Some((c.name.clone(), false)),
+                        Some("__named_window_ref__") => Some((c.name.clone(), true)),
+                        _ => None,
+                    },
                     _ => None,
                 };
-                if let Some(wname) = named {
+                if let Some((wname, is_copy)) = named {
                     let Some((_, def)) = defs.iter().find(|(n, _)| n.eq_ignore_ascii_case(&wname))
                     else {
                         return Err(alloc::format!("window {wname:?} does not exist"));
                     };
+                    if !is_copy {
+                        *partition_by = def.0.clone();
+                        *order_by = def.1.clone();
+                        *frame = def.2.clone();
+                        return Ok(());
+                    }
+                    // v7.39 (round 229) — PG's copy rules, probed against
+                    // 18.4: a copy inherits the partitioning, may supply an
+                    // ordering only when the base has none, and may not copy
+                    // a base that already carries a frame (its own frame
+                    // would be ambiguous with the inherited one).
+                    if !def.1.is_empty() && !order_by.is_empty() {
+                        return Err(alloc::format!(
+                            "cannot override ORDER BY clause of window \"{wname}\""
+                        ));
+                    }
+                    if def.2.is_some() {
+                        return Err(alloc::format!(
+                            "cannot copy window \"{wname}\" because it has a frame clause"
+                        ));
+                    }
                     *partition_by = def.0.clone();
-                    *order_by = def.1.clone();
-                    *frame = def.2.clone();
+                    if order_by.is_empty() {
+                        *order_by = def.1.clone();
+                    }
                 }
                 Ok(())
             }
@@ -19594,6 +19651,24 @@ impl Parser {
         self.advance();
         let mut partition_by = Vec::new();
         let mut order_by = Vec::new();
+        // v7.39 (round 229) — `OVER (w1 …)`: a *copy* of an existing named
+        // window, refined in place. PG's rules (probed against 18.4) differ
+        // from the bare `OVER w1` form, so the reference rides out under its
+        // own marker and `substitute_named_windows` applies them. The base
+        // name is any leading identifier that isn't a window-spec keyword.
+        let base_window = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if !s.eq_ignore_ascii_case("partition")
+                    && !s.eq_ignore_ascii_case("rows")
+                    && !s.eq_ignore_ascii_case("range")
+                    && !s.eq_ignore_ascii_case("groups") =>
+            {
+                let n = s.clone();
+                self.advance();
+                Some(n)
+            }
+            _ => None,
+        };
         // PARTITION BY ?
         // v7.37.6-B promoted PARTITION to a reserved keyword
         // (Token::Partition); pre-7.37.6-B catalogs lexed it as
@@ -19677,6 +19752,19 @@ impl Parser {
             )));
         }
         self.advance();
+        if let Some(base) = base_window {
+            // A copy may refine but never override the base's partitioning
+            // (PG rejects it outright, before looking the name up).
+            if !partition_by.is_empty() {
+                return Err(self.err(alloc::format!(
+                    "cannot override PARTITION BY clause of window \"{base}\""
+                )));
+            }
+            partition_by = alloc::vec![Expr::Column(crate::ast::ColumnName {
+                qualifier: Some("__named_window_ref__".to_string()),
+                name: base,
+            })];
+        }
         Ok((partition_by, order_by, frame))
     }
 

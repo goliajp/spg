@@ -153,6 +153,7 @@ mod e2e_explain_costs_dml_round225;
 mod e2e_explain_split_json_round226;
 mod e2e_explain_analyze_pg_round227;
 mod e2e_explain_xml_yaml_round228;
+mod e2e_window_named_errors_round229;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;
