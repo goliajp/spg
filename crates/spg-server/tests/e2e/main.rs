@@ -146,6 +146,7 @@ mod e2e_fsync_fail_round190;
 mod e2e_file_access_sqlstate_round191;
 mod e2e_exclude_wire_round217;
 mod e2e_cursor_wire_round219;
+mod e2e_notify_wire_round222;
 #[allow(
     clippy::cast_possible_truncation,
     clippy::doc_markdown,

@@ -2453,20 +2453,55 @@ impl Parser {
                 self.consume_until_statement_boundary();
                 Ok(Statement::Empty)
             }
-            // v7.37.17 (17.6 sibling) — LISTEN / NOTIFY / UNLISTEN.
-            // PG's async notification channels. SPG has no LISTEN/
-            // NOTIFY delivery machinery yet; accept the syntax so
-            // pg_dump / migration scripts that reference channels
-            // don't fail at parse. Notifications get dropped on
-            // the floor at execute time (Statement::Empty).
-            Token::Ident(s) | Token::QuotedIdent(s)
-                if s.eq_ignore_ascii_case("listen")
-                    || s.eq_ignore_ascii_case("notify")
-                    || s.eq_ignore_ascii_case("unlisten") =>
-            {
+            // v7.39 (round 222) — LISTEN / NOTIFY / UNLISTEN with real
+            // delivery (was accept-and-drop since v7.37.17). NOTIFY takes an
+            // optional string payload; UNLISTEN takes a channel or `*`.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("listen") => {
                 self.advance();
-                self.consume_until_statement_boundary();
-                Ok(Statement::Empty)
+                let ch = match self.advance() {
+                    Token::Ident(c) | Token::QuotedIdent(c) => c,
+                    other => {
+                        return Err(self.err(format!(
+                            "expected channel name after LISTEN, got {other:?}"
+                        )));
+                    }
+                };
+                Ok(Statement::Listen(ch))
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("notify") => {
+                self.advance();
+                let channel = match self.advance() {
+                    Token::Ident(c) | Token::QuotedIdent(c) => c,
+                    other => {
+                        return Err(self.err(format!(
+                            "expected channel name after NOTIFY, got {other:?}"
+                        )));
+                    }
+                };
+                let payload = if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    match self.advance() {
+                        Token::String(p) => Some(p),
+                        other => {
+                            return Err(self.err(format!(
+                                "expected string payload after NOTIFY <channel>, got {other:?}"
+                            )));
+                        }
+                    }
+                } else {
+                    None
+                };
+                Ok(Statement::Notify { channel, payload })
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("unlisten") => {
+                self.advance();
+                match self.advance() {
+                    Token::Star => Ok(Statement::Unlisten(None)),
+                    Token::Ident(c) | Token::QuotedIdent(c) => Ok(Statement::Unlisten(Some(c))),
+                    other => Err(self.err(format!(
+                        "expected channel name or * after UNLISTEN, got {other:?}"
+                    ))),
+                }
             }
             // v7.37.17 (17.6 sibling) — LOCK [TABLE] [ONLY] <table>
             // [IN <mode> MODE] [NOWAIT]. SPG's engine holds a

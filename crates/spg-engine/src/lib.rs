@@ -42,6 +42,7 @@ mod cancel;
 mod clock;
 mod constraints;
 mod cursor;
+mod notify;
 mod conversions;
 pub mod copy;
 mod ddl;
@@ -810,6 +811,18 @@ pub struct Engine {
     /// Session-scoped in PG; SPG stores them engine-wide (the same
     /// process-level session-state architecture wall as `session_params`).
     pub(crate) cursors: BTreeMap<String, cursor::OpenCursor>,
+    /// v7.39 (round 222) — channels this session LISTENs on. Engine-wide
+    /// (the same process-level session-state architecture wall as
+    /// `session_params`). Never serialized.
+    pub(crate) listen_channels: BTreeSet<String>,
+    /// v7.39 (round 222) — NOTIFYs raised inside the current transaction,
+    /// held until COMMIT (PG: transactional delivery, deduplicated within
+    /// the tx); dropped at ROLLBACK.
+    pub(crate) tx_pending_notifies: Vec<(String, String)>,
+    /// v7.39 (round 222) — committed notifications on LISTENed channels,
+    /// awaiting a drain by the wire layer ('A' NotificationResponse) or an
+    /// embedded caller ([`Engine::take_notifications`]).
+    pub(crate) delivered_notifies: Vec<(String, String)>,
     /// v7.39 (read01 round 46) — NOTICEs raised by the statement now
     /// executing. PG emits a NoticeResponse whenever an `IF EXISTS` /
     /// `IF NOT EXISTS` clause makes it skip work ("table \"t\" does not
@@ -1041,6 +1054,9 @@ impl Engine {
             slow_query_logger: None,
             session_params: BTreeMap::new(),
             cursors: BTreeMap::new(),
+            listen_channels: BTreeSet::new(),
+            tx_pending_notifies: Vec::new(),
+            delivered_notifies: Vec::new(),
             pending_notices: Vec::new(),
             xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
@@ -1388,6 +1404,9 @@ impl Engine {
             slow_query_logger: None,
             session_params: BTreeMap::new(),
             cursors: BTreeMap::new(),
+            listen_channels: BTreeSet::new(),
+            tx_pending_notifies: Vec::new(),
+            delivered_notifies: Vec::new(),
             pending_notices: Vec::new(),
             xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
@@ -1492,6 +1511,9 @@ impl Engine {
                     slow_query_logger: None,
                     session_params: BTreeMap::new(),
                     cursors: BTreeMap::new(),
+                    listen_channels: BTreeSet::new(),
+                    tx_pending_notifies: Vec::new(),
+                    delivered_notifies: Vec::new(),
                     pending_notices: Vec::new(),
                     xact_commit: core::sync::atomic::AtomicU64::new(0),
                     xact_rollback: core::sync::atomic::AtomicU64::new(0),
