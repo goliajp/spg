@@ -1191,11 +1191,16 @@ impl Engine {
                 method,
                 elements,
             } => {
-                // v7.39 (round 210) — ALTER TABLE ADD EXCLUDE. Resolve
+                // v7.39 (round 210/211) — ALTER TABLE ADD EXCLUDE. Resolve
                 // element columns to positions and synthesise PG's
-                // `<table>_<leading-col>_excl` name when unnamed.
+                // `<table>_<col…>_excl` name (ALL element columns joined by
+                // `_`, e.g. `book_room_during_excl`) when unnamed.
                 let mut els = Vec::with_capacity(elements.len());
-                let leading = elements[0].0.clone();
+                let cols_joined = elements
+                    .iter()
+                    .map(|(c, _)| c.clone())
+                    .collect::<Vec<_>>()
+                    .join("_");
                 for (col, op) in elements {
                     let pos = table
                         .schema()
@@ -1210,7 +1215,7 @@ impl Engine {
                     els.push((pos, op));
                 }
                 let ex_name =
-                    name.unwrap_or_else(|| alloc::format!("{tbl}_{leading}_excl"));
+                    name.unwrap_or_else(|| alloc::format!("{tbl}_{cols_joined}_excl"));
                 table
                     .schema_mut()
                     .exclusion_constraints
@@ -2886,10 +2891,17 @@ impl Engine {
                             })?;
                         els.push((pos, op.clone()));
                     }
-                    let leading = &elements[0].0;
+                    // v7.39 (round 211) — PG auto-names an unnamed EXCLUDE
+                    // `<table>_<col…>_excl`, joining ALL element columns
+                    // (e.g. `book_room_during_excl`), not just the leading one.
+                    let cols_joined = elements
+                        .iter()
+                        .map(|(c, _)| c.clone())
+                        .collect::<Vec<_>>()
+                        .join("_");
                     let con_name = name
                         .clone()
-                        .unwrap_or_else(|| alloc::format!("{table_name}_{leading}_excl"));
+                        .unwrap_or_else(|| alloc::format!("{table_name}_{cols_joined}_excl"));
                     excl_storage.push(spg_storage::ExclusionConstraint {
                         name: con_name,
                         method: method.clone(),
