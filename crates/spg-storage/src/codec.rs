@@ -485,6 +485,32 @@ pub(crate) fn deserialize_table(
             }
         }
     }
+    // v7.39 (round 210) — EXCLUDE-constraint appendix (FILE_VERSION 72+).
+    if version >= 72 {
+        let n = cur.read_u16()? as usize;
+        let mut excls = alloc::vec::Vec::with_capacity(n);
+        for _ in 0..n {
+            let name = cur.read_str()?;
+            let method = if cur.read_u8()? == 1 {
+                Some(cur.read_str()?)
+            } else {
+                None
+            };
+            let elem_count = cur.read_u16()? as usize;
+            let mut elements = alloc::vec::Vec::with_capacity(elem_count);
+            for _ in 0..elem_count {
+                let pos = cur.read_u16()? as usize;
+                let op = cur.read_str()?;
+                elements.push((pos, op));
+            }
+            excls.push(crate::ExclusionConstraint {
+                name,
+                method,
+                elements,
+            });
+        }
+        t.schema_mut().exclusion_constraints = excls;
+    }
     let _ = table_name;
     Ok(())
 }

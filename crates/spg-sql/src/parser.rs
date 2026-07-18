@@ -580,6 +580,7 @@ enum NamedTableConstraintKind {
     Check,
     Unique,
     PrimaryKey,
+    Exclude,
 }
 
 impl Parser {
@@ -10211,6 +10212,9 @@ impl Parser {
             // a column.
             if self.peek_table_level_pk_start() {
                 table_constraints.push(self.parse_table_level_primary_key()?);
+            } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("exclude")) {
+                // v7.39 (round 210) — bare `EXCLUDE [USING m] (col WITH op, …)`.
+                table_constraints.push(self.parse_table_level_exclude()?);
             } else if self.peek_table_level_unique_start() {
                 table_constraints.push(self.parse_table_level_unique()?);
             } else if self.peek_table_level_check_start() {
@@ -10240,11 +10244,13 @@ impl Parser {
                     NamedTableConstraintKind::Check => self.parse_table_level_check()?,
                     NamedTableConstraintKind::Unique => self.parse_table_level_unique()?,
                     NamedTableConstraintKind::PrimaryKey => self.parse_table_level_primary_key()?,
+                    NamedTableConstraintKind::Exclude => self.parse_table_level_exclude()?,
                 };
                 match &mut tc {
                     crate::ast::TableConstraint::Check { name, .. }
                     | crate::ast::TableConstraint::Unique { name, .. }
-                    | crate::ast::TableConstraint::PrimaryKey { name, .. } => {
+                    | crate::ast::TableConstraint::PrimaryKey { name, .. }
+                    | crate::ast::TableConstraint::Exclude { name, .. } => {
                         *name = Some(con_name);
                     }
                     _ => {}
@@ -10999,6 +11005,84 @@ impl Parser {
     /// v7.13.0 — table-level `CHECK (<expr>)` constraint
     /// (mailrs round-5 G3). Consumes `CHECK` then a parenthesised
     /// expression.
+    /// v7.39 (round 210) — `EXCLUDE [USING <method>] ( <col> WITH <op>
+    /// [, <col> WITH <op>]* ) [WHERE (...)]`. The operator is read as a
+    /// standalone token spelling (`&&`, `=`, `@>`, `<@`, `&<`, `&>`).
+    fn parse_table_level_exclude(
+        &mut self,
+    ) -> Result<crate::ast::TableConstraint, ParseError> {
+        self.advance(); // EXCLUDE
+        // Optional `USING <method>`.
+        let mut method = None;
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using")) {
+            self.advance();
+            method = Some(match self.advance() {
+                Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
+                other => {
+                    return Err(
+                        self.err(alloc::format!("expected index method after USING, got {other:?}"))
+                    );
+                }
+            });
+        }
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(alloc::format!(
+                "expected '(' after EXCLUDE, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let mut elements: Vec<(String, String)> = Vec::new();
+        loop {
+            let col = match self.advance() {
+                Token::Ident(s) | Token::QuotedIdent(s) => s,
+                other => {
+                    return Err(
+                        self.err(alloc::format!("expected column name in EXCLUDE, got {other:?}"))
+                    );
+                }
+            };
+            if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("with")) {
+                return Err(self.err(alloc::format!(
+                    "expected WITH after EXCLUDE column, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let op = match self.advance() {
+                Token::InetOverlap => String::from("&&"),
+                Token::Eq => String::from("="),
+                Token::JsonContains => String::from("@>"),
+                Token::JsonContainedBy => String::from("<@"),
+                Token::OverLeft => String::from("&<"),
+                Token::OverRight => String::from("&>"),
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "unsupported EXCLUDE operator {other:?} (SPG supports &&, =, @>, <@, &<, &>)"
+                    )));
+                }
+            };
+            elements.push((col, op));
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(alloc::format!(
+                "expected ')' to close EXCLUDE, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        Ok(crate::ast::TableConstraint::Exclude {
+            name: None,
+            method,
+            elements,
+        })
+    }
+
     fn parse_table_level_check(&mut self) -> Result<crate::ast::TableConstraint, ParseError> {
         self.advance(); // CHECK
         if !matches!(self.peek(), Token::LParen) {
@@ -11043,6 +11127,9 @@ impl Parser {
             }
             Some(Token::Ident(s)) if s.eq_ignore_ascii_case("primary") => {
                 Some(NamedTableConstraintKind::PrimaryKey)
+            }
+            Some(Token::Ident(s)) if s.eq_ignore_ascii_case("exclude") => {
+                Some(NamedTableConstraintKind::Exclude)
             }
             _ => None,
         }

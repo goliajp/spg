@@ -41,9 +41,9 @@ pub(crate) mod values;
 
 pub use crate::conversions::format_money_array;
 pub(crate) use binop::{
-    add_interval_to_micros, and_3vl, apply_binary_by_ref, apply_binary_interval,
+    add_interval_to_micros, and_3vl, apply_binary, apply_binary_by_ref, apply_binary_interval,
 };
-use binop::{apply_binary, apply_unary, compare, pow10_i128};
+use binop::{apply_unary, compare, pow10_i128};
 pub use cast::{cast_to_vector, cast_value, parse_vector_text};
 pub(crate) use compiled::{
     CompiledExpr, compile_column_pos, compile_expr, eval_compiled, eval_compiled_ref,

@@ -1191,6 +1191,19 @@ impl Engine {
                 }
             }
             enforce_unique_updates(self.active_catalog(), &stmt.table, &planned, &changed_cols)?;
+            // v7.39 (round 210) — EXCLUDE constraints on the post-update rows;
+            // each updated row's pre-image is excluded from the scan.
+            let exclusions = self
+                .active_catalog()
+                .get(&stmt.table)
+                .map(|t| t.schema().exclusion_constraints.clone())
+                .unwrap_or_default();
+            crate::constraints::enforce_exclusion_updates(
+                self.active_catalog(),
+                &stmt.table,
+                &exclusions,
+                &planned,
+            )?;
         }
         // v7.6.6 — Stage 2b: inbound FK check. For every row that
         // changed value in a column that *some other table* uses as
@@ -3682,6 +3695,9 @@ impl Engine {
         // `table` here since stage 1 was the last use. The
         // parent-table lookup runs before any row is committed.
         let uniqueness = table.schema().uniqueness_constraints.clone();
+        // v7.39 (round 210) — EXCLUDE constraints run alongside uniqueness on
+        // the post-ON-CONFLICT row set.
+        let exclusions = table.schema().exclusion_constraints.clone();
         let _ = table;
         // v7.37.7(sentori Epic 3 P1)— stored generated-column
         // evaluation runs AFTER ordinary INSERT values are coerced
@@ -3787,6 +3803,12 @@ impl Engine {
         // reroute), so what remains must be genuinely unique.
         enforce_uniqueness_inserts(self.active_catalog(), &stmt.table, &uniqueness, &all_values)?;
         enforce_unique_index_inserts(self.active_catalog(), &stmt.table, &all_values)?;
+        crate::constraints::enforce_exclusion_inserts(
+            self.active_catalog(),
+            &stmt.table,
+            &exclusions,
+            &all_values,
+        )?;
         // v7.39 (round 140) — DO ALSO INSERT rules: capture the post-image rows
         // (RETURNING is forced on so defaults / sequences are reflected) and run
         // each rule's command per inserted row after the write completes.

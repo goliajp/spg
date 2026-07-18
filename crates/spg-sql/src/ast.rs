@@ -1714,6 +1714,18 @@ pub enum TableConstraint {
     /// predicate against each INSERT/UPDATE candidate row; a
     /// false / NULL result rejects the mutation.
     Check { name: Option<String>, expr: Expr },
+    /// v7.39 (round 210) — `EXCLUDE [USING <method>] (<col> WITH <op>
+    /// [, …])`: no two rows may satisfy `(r.c1 op1 s.c1) AND …` for
+    /// every element (the booking/scheduling non-overlap constraint,
+    /// `EXCLUDE USING gist (during WITH &&)`). `method` is the index
+    /// AM name (gist/spgist/btree — informational in Phase 0; the O(n)
+    /// enforcement doesn't build the index yet). Each element pairs a
+    /// column name with an operator spelling (`&&`, `=`, `@>`, …).
+    Exclude {
+        name: Option<String>,
+        method: Option<String>,
+        elements: Vec<(String, String)>,
+    },
     /// v7.15.0 — MySQL `KEY name (cols)` / `INDEX name (cols)`
     /// non-unique secondary-index declaration inline in CREATE
     /// TABLE. Engine builds a BTree index on the leading column
@@ -5256,6 +5268,27 @@ impl fmt::Display for TableConstraint {
                         f.write_str(", ")?;
                     }
                     f.write_str(&quote_ident(c))?;
+                }
+                f.write_str(")")
+            }
+            Self::Exclude {
+                name,
+                method,
+                elements,
+            } => {
+                if let Some(n) = name {
+                    write!(f, "CONSTRAINT {} ", quote_ident(n))?;
+                }
+                f.write_str("EXCLUDE ")?;
+                if let Some(m) = method {
+                    write!(f, "USING {m} ")?;
+                }
+                f.write_str("(")?;
+                for (i, (col, op)) in elements.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{} WITH {op}", quote_ident(col))?;
                 }
                 f.write_str(")")
             }

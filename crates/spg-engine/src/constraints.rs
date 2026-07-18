@@ -830,6 +830,214 @@ pub(crate) fn enforce_uniqueness_inserts(
     Ok(())
 }
 
+/// v7.39 (round 210) — map an EXCLUDE element's stored operator spelling to
+/// its `BinOp`. Only the operators the parser accepts land here.
+fn exclude_op_binop(op: &str) -> Option<spg_sql::ast::BinOp> {
+    use spg_sql::ast::BinOp;
+    Some(match op {
+        "&&" => BinOp::InetOverlap,
+        "=" => BinOp::Eq,
+        "@>" => BinOp::JsonContains,
+        "<@" => BinOp::JsonContainedBy,
+        "&<" => BinOp::OverLeft,
+        "&>" => BinOp::OverRight,
+        _ => return None,
+    })
+}
+
+/// v7.39 (round 210) — enforce `EXCLUDE` constraints for a batch of incoming
+/// rows. An exclusion constraint forbids two DISTINCT rows r,s from
+/// satisfying `(r.c1 op1 s.c1) AND (r.c2 op2 s.c2) AND …` for every element.
+/// A NULL in any element column exempts the row (PG / UNIQUE NULL semantics).
+///
+/// Enforcement is a full live-row scan re-evaluating each element's operator
+/// (an equality index can't answer overlap; a real GiST index that does is a
+/// later perf phase), plus an intra-batch pairwise check so two overlapping
+/// rows inserted in one statement collide too. PG's exact 23P01 message +
+/// the auto-/user-named constraint.
+pub(crate) fn enforce_exclusion_inserts(
+    catalog: &Catalog,
+    child_table: &str,
+    constraints: &[spg_storage::ExclusionConstraint],
+    rows: &[Vec<Value<'static>>],
+) -> Result<(), EngineError> {
+    if constraints.is_empty() {
+        return Ok(());
+    }
+    let table = catalog.get(child_table).ok_or_else(|| {
+        EngineError::Storage(StorageError::TableNotFound {
+            name: child_table.into(),
+        })
+    })?;
+    // `new op existing` holds for every element (row NOT exempt on either
+    // side). Returns Ok(false) when any column is NULL (exempt) or any
+    // operator evaluates non-true.
+    let conflicts = |ex: &spg_storage::ExclusionConstraint,
+                     newr: &[Value<'static>],
+                     oldr: &[Value<'static>]|
+     -> Result<bool, EngineError> {
+        for (pos, op) in &ex.elements {
+            let a = newr.get(*pos).cloned().unwrap_or(Value::Null);
+            let b = oldr.get(*pos).cloned().unwrap_or(Value::Null);
+            if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                return Ok(false);
+            }
+            let binop = exclude_op_binop(op).ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "unsupported EXCLUDE operator {op:?}"
+                ))
+            })?;
+            // `&&` / `@>` / range / geo operators need owned semantics
+            // (the by-ref path only answers comparisons); `a`/`b` are
+            // already owned clones here.
+            match eval::apply_binary(binop, a, b)? {
+                Value::Bool(true) => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    };
+    for ex in constraints {
+        // Existing live rows.
+        for (row_idx, prow) in table.rows().iter().enumerate() {
+            if table.headers().get(row_idx).is_some_and(|h| h.is_deleted()) {
+                continue;
+            }
+            for newr in rows.iter() {
+                if conflicts(ex, newr, &prow.values)? {
+                    return Err(exclusion_violation(table, ex, child_table, newr, &prow.values));
+                }
+            }
+        }
+        // Intra-batch: two incoming rows that overlap each other.
+        for i in 0..rows.len() {
+            for j in (i + 1)..rows.len() {
+                if conflicts(ex, &rows[j], &rows[i])? {
+                    return Err(exclusion_violation(table, ex, child_table, &rows[j], &rows[i]));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v7.39 (round 210) — enforce `EXCLUDE` constraints for an UPDATE. Each
+/// planned `(row_pos, new_values)` is checked against every live row EXCEPT
+/// the rows being updated in this same statement (their pre-images leave the
+/// set — otherwise a no-op UPDATE would collide with itself), plus pairwise
+/// among the planned new rows.
+pub(crate) fn enforce_exclusion_updates(
+    catalog: &Catalog,
+    table_name: &str,
+    constraints: &[spg_storage::ExclusionConstraint],
+    planned: &[(usize, Vec<Value<'static>>)],
+) -> Result<(), EngineError> {
+    if constraints.is_empty() || planned.is_empty() {
+        return Ok(());
+    }
+    let table = catalog.get(table_name).ok_or_else(|| {
+        EngineError::Storage(StorageError::TableNotFound {
+            name: table_name.into(),
+        })
+    })?;
+    let updated: hashbrown::HashSet<usize> = planned.iter().map(|(p, _)| *p).collect();
+    let conflicts = |ex: &spg_storage::ExclusionConstraint,
+                     newr: &[Value<'static>],
+                     oldr: &[Value<'static>]|
+     -> Result<bool, EngineError> {
+        for (pos, op) in &ex.elements {
+            let a = newr.get(*pos).cloned().unwrap_or(Value::Null);
+            let b = oldr.get(*pos).cloned().unwrap_or(Value::Null);
+            if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                return Ok(false);
+            }
+            let binop = exclude_op_binop(op).ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!("unsupported EXCLUDE operator {op:?}"))
+            })?;
+            // `&&` / `@>` / range / geo operators need owned semantics
+            // (the by-ref path only answers comparisons); `a`/`b` are
+            // already owned clones here.
+            match eval::apply_binary(binop, a, b)? {
+                Value::Bool(true) => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    };
+    for ex in constraints {
+        for (row_idx, prow) in table.rows().iter().enumerate() {
+            if table.headers().get(row_idx).is_some_and(|h| h.is_deleted()) {
+                continue;
+            }
+            if updated.contains(&row_idx) {
+                continue;
+            }
+            for (_pos, newr) in planned {
+                if conflicts(ex, newr, &prow.values)? {
+                    return Err(exclusion_violation(table, ex, table_name, newr, &prow.values));
+                }
+            }
+        }
+        for i in 0..planned.len() {
+            for j in (i + 1)..planned.len() {
+                if conflicts(ex, &planned[j].1, &planned[i].1)? {
+                    return Err(exclusion_violation(
+                        table,
+                        ex,
+                        table_name,
+                        &planned[j].1,
+                        &planned[i].1,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v7.39 (round 210) — PG's 23P01 exclusion-violation error + DETAIL. PG:
+/// `conflicting key value violates exclusion constraint "<name>"` with
+/// `DETAIL: Key (during)=([3,7)) conflicts with existing key (during)=([1,5)).`
+/// The ` on table "…"` suffix mirrors the uniqueness path; the pgwire layer
+/// strips it (PG's message has none) and lifts the name into PG_DIAG `n`.
+fn exclusion_violation(
+    table: &spg_storage::Table,
+    ex: &spg_storage::ExclusionConstraint,
+    child_table: &str,
+    newr: &[Value<'static>],
+    oldr: &[Value<'static>],
+) -> EngineError {
+    let render = |vals: &[Value<'static>]| -> (String, String) {
+        let cols = ex
+            .elements
+            .iter()
+            .map(|(p, _)| table.schema().columns[*p].name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rendered = ex
+            .elements
+            .iter()
+            .map(|(p, _)| {
+                let v = vals.get(*p).cloned().unwrap_or(Value::Null);
+                match v {
+                    Value::Text(s) => s.to_string(),
+                    other => crate::eval::value_to_text(&other),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        (cols, rendered)
+    };
+    let (cols, new_vals) = render(newr);
+    let (_, old_vals) = render(oldr);
+    EngineError::Unsupported(alloc::format!(
+        "conflicting key value violates exclusion constraint \"{}\" \
+         on table \"{child_table}\" DETAIL: Key ({cols})=({new_vals}) \
+         conflicts with existing key ({cols})=({old_vals}).",
+        ex.name
+    ))
+}
+
 /// v7.39 (SQLSTATE fidelity) — PG's 23505 DETAIL body:
 /// ` DETAIL: Key (a, b)=(1, x) already exists.` Appended to the main
 /// message (the engine error is a single string; psql-style separate

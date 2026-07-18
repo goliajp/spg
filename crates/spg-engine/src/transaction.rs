@@ -301,6 +301,17 @@ impl Engine {
                     ) {
                         return Err(EngineError::SerializationFailure(alloc::format!("{e}")));
                     }
+                    // v7.39 (round 210) — EXCLUDE constraints re-validate at
+                    // commit against the fresh snapshot, same as uniqueness.
+                    let excls = t_ro.schema().exclusion_constraints.clone();
+                    if let Err(e) = crate::constraints::enforce_exclusion_inserts(
+                        &fresh,
+                        tname,
+                        &excls,
+                        &inserted_rows,
+                    ) {
+                        return Err(EngineError::SerializationFailure(alloc::format!("{e}")));
+                    }
                 }
             }
             let Some(new_t) = fresh.get_mut(tname) else {
@@ -572,6 +583,18 @@ impl Engine {
                     if let Err(e) = crate::constraints::enforce_unique_index_inserts(
                         &fresh,
                         tname,
+                        &inserted_rows,
+                    ) {
+                        conflict = Some(alloc::format!("{e}"));
+                        break 'merge;
+                    }
+                    // v7.39 (round 210) — EXCLUDE constraints re-validate at
+                    // commit against the fresh snapshot, same as uniqueness.
+                    let excls = t_ro.schema().exclusion_constraints.clone();
+                    if let Err(e) = crate::constraints::enforce_exclusion_inserts(
+                        &fresh,
+                        tname,
+                        &excls,
                         &inserted_rows,
                     ) {
                         conflict = Some(alloc::format!("{e}"));
