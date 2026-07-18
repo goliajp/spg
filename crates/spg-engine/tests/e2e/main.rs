@@ -138,6 +138,7 @@ mod e2e_json_table_format_round206;
 mod e2e_json_table_nested_round207;
 mod e2e_infoschema_generated_round208;
 mod e2e_exclude_constraint_round210;
+mod e2e_exclude_catalog_round211;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;

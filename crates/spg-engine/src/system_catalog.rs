@@ -3589,6 +3589,38 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text(String::new()),
             ]));
         }
+        // v7.39 (round 210, EXCLUDE Phase 1) — exclusion constraints
+        // (contype 'x'). PG's conkey is the constrained columns' attnums
+        // (1-based); the operator list rides pg_get_constraintdef, not
+        // pg_constraint's columns. conindid points at the backing index
+        // (PG creates a real GiST index); SPG has no real index yet
+        // (Phase 3), so 0 like the uniqueness rows above.
+        for ex in t.schema().exclusion_constraints.iter() {
+            let positions: Vec<usize> = ex.elements.iter().map(|(p, _)| *p).collect();
+            let conkey_display = conkey_vec(&positions);
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(next_con_oid()),
+                Value::text(ex.name.clone()),
+                Value::BigInt(2200),
+                Value::text("x"),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::BigInt(conrelid),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::text(" "),
+                Value::text(" "),
+                Value::text(" "),
+                Value::Bool(true),
+                Value::Int(0),
+                Value::Bool(true),
+                Value::text(conkey_display),
+                Value::text(String::new()),
+            ]));
+        }
         // v7.37 U6 — NOT NULL constraints (contype 'n', PG 18). PG
         // materialises one row per NOT NULL column, named
         // `<table>_<col>_not_null`, including columns made NOT NULL

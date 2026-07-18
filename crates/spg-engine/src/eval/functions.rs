@@ -13803,6 +13803,22 @@ fn apply_function_dispatch(
                     };
                     return Ok(Value::text(alloc::format!("CHECK ({body})")));
                 }
+                // v7.39 (round 210, EXCLUDE Phase 1) — exclusion constraints.
+                // PG deparses `EXCLUDE USING <am> (<col> WITH <op>[, …])`
+                // (defaulting the access method to gist when none was named).
+                for ex in t.schema().exclusion_constraints.iter() {
+                    if ex.name != bare {
+                        continue;
+                    }
+                    let am = ex.method.as_deref().unwrap_or("gist");
+                    let elems = ex
+                        .elements
+                        .iter()
+                        .map(|(p, op)| alloc::format!("{} WITH {op}", col_name_at(*p)))
+                        .collect::<alloc::vec::Vec<_>>()
+                        .join(", ");
+                    return Ok(Value::text(alloc::format!("EXCLUDE USING {am} ({elems})")));
+                }
                 // NOT NULL constraints (PG 18) — `{t}_{col}_not_null` for
                 // every NOT NULL column (incl. implicit-from-PK).
                 let pk_cols: alloc::collections::BTreeSet<usize> = t
