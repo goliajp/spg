@@ -777,6 +777,7 @@ impl Engine {
             table_fn_call: None,
             scalar_fn_item: false,
             rows_from: None,
+            json_table: None,
         };
         let where_ = combine_with_and_owned(inner_preds);
         let pk_col_name = ColumnName {
