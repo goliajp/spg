@@ -83,6 +83,16 @@ impl JsonValue {
         self.as_text()
     }
 
+    /// v7.39 (round 206) — the PG-canonical jsonb TEXT of this value
+    /// (spaces after `,` and `:`, strings quoted): a FORMAT JSON
+    /// column returns this, matching PG's `[1, 2, 3]` / `{"x": 1}` /
+    /// `"hi"` output.
+    pub(crate) fn canonical_json_text(&self) -> String {
+        let mut out = String::new();
+        write_json_canonical(self, &mut out);
+        out
+    }
+
     /// v7.39 (round 205) — true for a JSON null (distinct from "no
     /// match": the caller checks emptiness of the match set first).
     pub(crate) fn is_json_null(&self) -> bool {
