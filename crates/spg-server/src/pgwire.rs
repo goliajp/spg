@@ -4106,6 +4106,10 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("could not create unique index")
         {
             "23505"
+        // v7.39 (round 210) — EXCLUDE constraint violation (PG 23P01
+        // exclusion_violation).
+        } else if msg.contains("violates exclusion constraint") {
+            "23P01"
         } else if msg.contains("violates foreign key constraint")
             || msg.contains("FOREIGN KEY violation")
         {
@@ -4218,6 +4222,15 @@ mod engine_error_sqlstate_tests {
         assert_eq!(
             code("FOREIGN KEY violation: no parent row in \"t\" where id = Int(9)"),
             "23503"
+        );
+        // v7.39 (round 210) — EXCLUDE violation maps to PG's 23P01.
+        assert_eq!(
+            code(
+                "conflicting key value violates exclusion constraint \"ov_during_excl\" \
+                 on table \"ov\" DETAIL: Key (during)=([3,7)) conflicts with existing \
+                 key (during)=([1,5))."
+            ),
+            "23P01"
         );
         assert_eq!(
             code("CHECK constraint violation on \"t\" (row #0): \"(y > 0)\""),
@@ -5969,7 +5982,9 @@ fn send_error_pos(
     // the PG_DIAG `t` field (extracted from `main` below, which keeps
     // the suffix). ORMs regex the PG message shape exactly.
     let main_msg: &str = match (sqlstate, main_msg.find(" on table \"")) {
-        ("23505", Some(cut)) => &main_msg[..cut],
+        // v7.39 (round 210) — 23P01 EXCLUDE carries the same engine-side
+        // ` on table "…"` suffix; PG's exclusion message has none either.
+        ("23505" | "23P01", Some(cut)) => &main_msg[..cut],
         _ => main_msg,
     };
     body.push(b'M');
@@ -5992,6 +6007,7 @@ fn send_error_pos(
     if let Some(con) = quoted_after("violates unique constraint ")
         .or_else(|| quoted_after("violates foreign key constraint "))
         .or_else(|| quoted_after("violates check constraint "))
+        .or_else(|| quoted_after("violates exclusion constraint "))
     {
         body.push(b'n');
         body.extend_from_slice(con.as_bytes());

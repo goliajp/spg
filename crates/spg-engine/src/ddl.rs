@@ -1186,6 +1186,40 @@ impl Engine {
                     let _ = table.add_gin_fulltext_index(idx_name, col);
                 }
             }
+            spg_sql::ast::TableConstraint::Exclude {
+                name,
+                method,
+                elements,
+            } => {
+                // v7.39 (round 210) — ALTER TABLE ADD EXCLUDE. Resolve
+                // element columns to positions and synthesise PG's
+                // `<table>_<leading-col>_excl` name when unnamed.
+                let mut els = Vec::with_capacity(elements.len());
+                let leading = elements[0].0.clone();
+                for (col, op) in elements {
+                    let pos = table
+                        .schema()
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(&col))
+                        .ok_or_else(|| {
+                            EngineError::Unsupported(alloc::format!(
+                                "ALTER TABLE ADD EXCLUDE: column {col:?} not found on {tbl:?}"
+                            ))
+                        })?;
+                    els.push((pos, op));
+                }
+                let ex_name =
+                    name.unwrap_or_else(|| alloc::format!("{tbl}_{leading}_excl"));
+                table
+                    .schema_mut()
+                    .exclusion_constraints
+                    .push(spg_storage::ExclusionConstraint {
+                        name: ex_name,
+                        method,
+                        elements: els,
+                    });
+            }
         }
         Ok(())
     }
@@ -2811,6 +2845,10 @@ impl Engine {
         // v7.39 (read01 round 48) — the AST has carried `name` all along;
         // the schema now keeps it instead of dropping it on the floor.
         let mut check_exprs: Vec<spg_storage::CheckConstraint> = Vec::new();
+        // v7.39 (round 210) — EXCLUDE constraints translate column names to
+        // positions and synthesise PG's `<table>_<leading-col>_excl` name
+        // when the user left it unnamed.
+        let mut excl_storage: Vec<spg_storage::ExclusionConstraint> = Vec::new();
         for tc in table_constraints {
             let (is_pk, names, nnd, con_name) = match tc {
                 spg_sql::ast::TableConstraint::PrimaryKey { name, columns } => {
@@ -2827,6 +2865,35 @@ impl Engine {
                     check_exprs.push(spg_storage::CheckConstraint {
                         name: name.clone(),
                         expr: alloc::format!("{expr}"),
+                    });
+                    continue;
+                }
+                spg_sql::ast::TableConstraint::Exclude {
+                    name,
+                    method,
+                    elements,
+                } => {
+                    let mut els = Vec::with_capacity(elements.len());
+                    for (col, op) in elements {
+                        let pos = schema
+                            .columns
+                            .iter()
+                            .position(|c| c.name == *col)
+                            .ok_or_else(|| {
+                                EngineError::Unsupported(alloc::format!(
+                                    "EXCLUDE constraint references unknown column {col:?}"
+                                ))
+                            })?;
+                        els.push((pos, op.clone()));
+                    }
+                    let leading = &elements[0].0;
+                    let con_name = name
+                        .clone()
+                        .unwrap_or_else(|| alloc::format!("{table_name}_{leading}_excl"));
+                    excl_storage.push(spg_storage::ExclusionConstraint {
+                        name: con_name,
+                        method: method.clone(),
+                        elements: els,
                     });
                     continue;
                 }
@@ -2889,6 +2956,7 @@ impl Engine {
         }
         schema.uniqueness_constraints = uc_storage.clone();
         schema.checks = check_exprs;
+        schema.exclusion_constraints = excl_storage;
         Ok(schema)
     }
 
@@ -2959,6 +3027,10 @@ impl Engine {
                 spg_sql::ast::TableConstraint::Check { .. } => continue,
                 // Handled by the early-branch above.
                 spg_sql::ast::TableConstraint::FulltextIndex { .. } => continue,
+                // v7.39 (round 210) — EXCLUDE builds no implicit index in
+                // Phase 0 (O(n)-scan enforcement); a real GiST index is a
+                // later perf phase.
+                spg_sql::ast::TableConstraint::Exclude { .. } => continue,
             };
             let leading = &names[0];
             // Skip if a same-column BTree already exists (e.g.

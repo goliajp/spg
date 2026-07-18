@@ -1583,6 +1583,12 @@ pub struct TableSchema {
     /// by the leading column. Persisted in catalog FILE_VERSION
     /// 15+. Older catalogs (≤ 14) deserialise with an empty vec.
     pub uniqueness_constraints: Vec<UniquenessConstraint>,
+    /// v7.39 (round 210) — `EXCLUDE` constraints declared at the table level.
+    /// Enforced on INSERT/UPDATE by a full live-row scan re-checking each
+    /// element's operator (no equality index can answer overlap). Persisted
+    /// in catalog FILE_VERSION 72+; older catalogs deserialise with an empty
+    /// vec.
+    pub exclusion_constraints: Vec<ExclusionConstraint>,
     /// v7.13.0 — `CHECK (<expr>)` predicates declared on this
     /// table. Both column-level inline `CHECK (…)` and
     /// table-level `CHECK (…)` fold into this list. Each entry
@@ -1821,6 +1827,30 @@ pub struct UniquenessConstraint {
     /// first and falls back to the synthesised one, so catalogs written
     /// before this field (< FILE_VERSION 60) keep working unchanged.
     pub name: Option<String>,
+}
+
+/// v7.39 (round 210) — an `EXCLUDE` constraint. Forbids two distinct live
+/// rows from satisfying, for EVERY element, `new.col <op> existing.col`
+/// (e.g. `EXCLUDE USING gist (during WITH &&)` = no two `during` ranges
+/// overlap). Unlike a uniqueness constraint the operator is not equality,
+/// so enforcement is a full live-row scan re-checking the operator (a real
+/// GiST index that answers overlap in O(log n) is a later perf phase). A
+/// NULL in any element column exempts the row (matching PG / UNIQUE NULL
+/// semantics). Persisted in catalog FILE_VERSION 72+.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExclusionConstraint {
+    /// The constraint's SQL name. PG auto-names an unnamed EXCLUDE
+    /// `<table>_<leading-col>_excl`; the engine synthesises that at CREATE
+    /// TABLE time so this is always populated.
+    pub name: String,
+    /// Access method spelled after `USING` (`gist`, `spgist`, …), lower-cased.
+    /// `None` = no `USING` clause. Purely cosmetic for enforcement; it round-
+    /// trips into `pg_get_constraintdef`.
+    pub method: Option<String>,
+    /// One `(column-position, operator-spelling)` pair per element, in
+    /// declaration order. The operator spelling is the wire token (`&&`,
+    /// `=`, `@>`, `<@`, `&<`, `&>`) evaluated against each existing row.
+    pub elements: Vec<(usize, String)>,
 }
 
 /// v7.6.1 — Storage-layer mirror of `spg_sql::ast::ForeignKeyConstraint`.
@@ -6497,6 +6527,7 @@ impl TableSchema {
             hot_tier_bytes: None,
             foreign_keys: Vec::new(),
             uniqueness_constraints: Vec::new(),
+            exclusion_constraints: Vec::new(),
             checks: Vec::new(),
             partition_role: None,
             policies: Vec::new(),
@@ -6797,7 +6828,12 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// image so a corrupted `base.spg` is caught on load instead of silently
 /// deserialising garbage. Older images (v8..=53) carry no trailer and load
 /// unchanged.
-const FILE_VERSION: u8 = 71;
+/// v7.39 (round 210) — v72 appends a per-table EXCLUDE-constraint appendix
+/// (sparse: only tables carrying an EXCLUDE write it) at the very end of the
+/// per-table block, after the column-ACL appendix. A v71 reader stops before
+/// it and its tables read back with no exclusion constraints, which is what
+/// they were.
+const FILE_VERSION: u8 = 72;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7531,6 +7567,35 @@ impl Catalog {
                     write_u16(&mut out, a.privs);
                     write_u16(&mut out, a.grantable);
                     write_str(&mut out, &a.grantor);
+                }
+            }
+            // v7.39 (round 210) — EXCLUDE-constraint appendix (FILE_VERSION
+            // 72+), at the very end of the per-table block so a v71 reader
+            // stops before it and its tables read back with no exclusion
+            // constraints. Layout: [u16 excl_count] then per constraint
+            // [str name] [u8 has_method](+str) [u16 elem_count] then per
+            // element [u16 col_pos][str op].
+            write_u16(
+                &mut out,
+                u16::try_from(t.schema.exclusion_constraints.len())
+                    .expect("≤ 65k exclusion constraints/table"),
+            );
+            for ex in &t.schema.exclusion_constraints {
+                write_str(&mut out, &ex.name);
+                match &ex.method {
+                    Some(m) => {
+                        out.push(1);
+                        write_str(&mut out, m);
+                    }
+                    None => out.push(0),
+                }
+                write_u16(
+                    &mut out,
+                    u16::try_from(ex.elements.len()).expect("≤ 65k elements/exclusion"),
+                );
+                for (pos, op) in &ex.elements {
+                    write_u16(&mut out, u16::try_from(*pos).expect("≤ 65k columns/table"));
+                    write_str(&mut out, op);
                 }
             }
         }

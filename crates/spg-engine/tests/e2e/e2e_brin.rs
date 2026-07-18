@@ -92,6 +92,7 @@ fn brin_summaries_get_emitted_at_freeze_when_brin_index_exists() {
         hot_tier_bytes: None,
         foreign_keys: Vec::new(),
         uniqueness_constraints: Vec::new(),
+        exclusion_constraints: Vec::new(),
         checks: Vec::new(),
         partition_role: None,
         policies: Vec::new(),

@@ -253,7 +253,7 @@ fn or_3vl_by_ref(l: &Value<'_>, r: &Value<'_>) -> Value<'static> {
     }
 }
 
-pub(super) fn apply_binary(
+pub(crate) fn apply_binary(
     op: BinOp,
     l: Value<'static>,
     r: Value<'static>,
