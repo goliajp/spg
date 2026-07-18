@@ -1881,6 +1881,18 @@ impl Engine {
                 // function DECLARES: `RETURNS TABLE(id int, v text)` names its
                 // columns, and a `SETOF <scalar>` is one column named after the
                 // call's alias.
+                // v7.39 (round 205, JSON_TABLE) — a wrapped correlated
+                // JSON_TABLE (`SELECT * FROM JSON_TABLE(t.col, …)`):
+                // its column shape is STATIC (COLUMNS list), so infer
+                // it directly without evaluating the doc (which still
+                // references the outer column at schema time).
+                if let Some(from) = &inner.from
+                    && from.joins.is_empty()
+                    && matches!(inner.items.as_slice(), [SelectItem::Wildcard])
+                    && let Some(jt) = from.primary.json_table.as_deref()
+                {
+                    return Ok(crate::select::json_table_schema_pub(&jt.columns));
+                }
                 if let Some(from) = &inner.from
                     && from.joins.is_empty()
                     && matches!(inner.items.as_slice(), [SelectItem::Wildcard])
@@ -3024,6 +3036,16 @@ fn substitute_outer_in_table_ref(
     }
     if let Some(inner) = t.lateral_subquery.as_deref_mut() {
         substitute_outer_in_select(inner, outer_row, outer_schema);
+    }
+    // v7.39 (round 205, JSON_TABLE) — the document expr (and PASSING
+    // values) are evaluated with no inner scope, so their unqualified
+    // / outer-qualified column refs are outer refs (implicit LATERAL:
+    // `t, JSON_TABLE(t.arr, …)`).
+    if let Some(jt) = t.json_table.as_deref_mut() {
+        substitute_outer_in_expr(&mut jt.doc, outer_row, outer_schema, true);
+        for (_, e) in jt.passing.iter_mut() {
+            substitute_outer_in_expr(e, outer_row, outer_schema, true);
+        }
     }
 }
 

@@ -9474,6 +9474,7 @@ impl Parser {
                             jsonb_each_text_arg: None,
                             table_fn_call: None,
                             rows_from: None,
+                            json_table: None,
                             scalar_fn_item: false,
                         },
                         joins: Vec::new(),
@@ -9615,6 +9616,7 @@ impl Parser {
                     inner_args.clone(),
                 ))),
                 rows_from: None,
+                json_table: None,
                 scalar_fn_item: false,
             };
             items = alloc::vec![SelectItem::Wildcard];
@@ -9737,6 +9739,7 @@ impl Parser {
                             jsonb_each_text_arg: None,
                             table_fn_call: None,
                             rows_from: None,
+                            json_table: None,
                             scalar_fn_item: false,
                         },
                         colname,
@@ -13727,6 +13730,7 @@ impl Parser {
                         jsonb_each_text_arg: Some((each_fn, Box::new(arg))),
                         table_fn_call: None,
                         rows_from: None,
+                        json_table: None,
                         scalar_fn_item: false,
                     },
                     joins: Vec::new(),
@@ -13753,6 +13757,7 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
                 rows_from: None,
+                json_table: None,
                 scalar_fn_item: false,
             });
         }
@@ -13807,6 +13812,7 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
                 rows_from: None,
+                json_table: None,
                 scalar_fn_item: false,
             });
         }
@@ -13865,6 +13871,7 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
                 rows_from: None,
+                json_table: None,
                 scalar_fn_item: false,
             });
         }
@@ -13906,6 +13913,7 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
                 rows_from: None,
+                json_table: None,
                 scalar_fn_item: false,
             });
         }
@@ -13949,6 +13957,7 @@ impl Parser {
                 jsonb_each_text_arg: Some((each_fn, Box::new(arg))),
                 table_fn_call: None,
                 rows_from: None,
+                json_table: None,
                 scalar_fn_item: false,
             });
         }
@@ -14043,6 +14052,7 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
                 rows_from: None,
+                json_table: None,
                 // regexp_matches returns text[], a base type: `SELECT m FROM
                 // regexp_matches(…) AS m` is the array, not a composite wrapping it.
                 scalar_fn_item: true,
@@ -14140,6 +14150,7 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
                 rows_from: None,
+                json_table: None,
                 // Each of these returns a BASE type (jsonb / text / int), so the item's
                 // row type is that scalar: `SELECT j FROM jsonb_array_elements('[1]') j`
                 // is `1`, not `(1)`. WITH ORDINALITY makes it a real two-column item.
@@ -14281,6 +14292,7 @@ impl Parser {
                     jsonb_each_text_arg: None,
                     table_fn_call: None,
                     rows_from: Some(generic),
+                    json_table: None,
                     scalar_fn_item: false,
                 };
                 return Ok(if correlated {
@@ -14310,6 +14322,7 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
                 rows_from: None,
+                json_table: None,
                 scalar_fn_item: false,
             };
             return Ok(if correlated {
@@ -14366,8 +14379,29 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
                 rows_from: None,
+                json_table: None,
                 scalar_fn_item: false,
             };
+            return Ok(if correlated {
+                Self::wrap_correlated_srf(tref)
+            } else {
+                tref
+            });
+        }
+        // v7.39 (round 205, JSON_TABLE epic) — `JSON_TABLE(doc, '$path'
+        // COLUMNS (...))` has bespoke syntax (a COLUMNS clause the
+        // generic table-fn arg parser can't read), so it is intercepted
+        // here BEFORE the generic dispatch. The doc expr may reference
+        // outer columns (implicit LATERAL) — same correlated-wrap rule.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("json_table"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            let tref = self.parse_json_table_ref()?;
+            let correlated = tref
+                .json_table
+                .as_deref()
+                .is_some_and(|jt| Self::expr_has_any_column(&jt.doc));
             return Ok(if correlated {
                 Self::wrap_correlated_srf(tref)
             } else {
@@ -14462,6 +14496,7 @@ impl Parser {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
                 rows_from: None,
+                json_table: None,
                 scalar_fn_item: false,
             };
             return Ok(if correlated {
@@ -14621,6 +14656,7 @@ impl Parser {
             jsonb_each_text_arg: None,
             table_fn_call: None,
             rows_from: None,
+            json_table: None,
             scalar_fn_item: false,
         })
     }
@@ -14730,6 +14766,7 @@ impl Parser {
             jsonb_each_text_arg: None,
             table_fn_call: None,
             rows_from: None,
+            json_table: None,
             scalar_fn_item: false,
         }
     }
@@ -14861,6 +14898,7 @@ impl Parser {
                     jsonb_each_text_arg: None,
                     table_fn_call: None,
                     rows_from: None,
+                    json_table: None,
                     scalar_fn_item: false,
                 },
                 joins: Vec::new(),
@@ -14944,6 +14982,7 @@ impl Parser {
                     jsonb_each_text_arg: None,
                     table_fn_call: Some(Box::new((fn_name, alloc::vec![base_expr, arg]))),
                     rows_from: None,
+                    json_table: None,
                     scalar_fn_item: false,
                 });
             }
@@ -15030,6 +15069,7 @@ impl Parser {
                     jsonb_each_text_arg: None,
                     table_fn_call: None,
                     rows_from: None,
+                    json_table: None,
                     scalar_fn_item: false,
                 },
                 joins: Vec::new(),
@@ -15065,6 +15105,7 @@ impl Parser {
             jsonb_each_text_arg: None,
             table_fn_call: None,
             rows_from: None,
+            json_table: None,
             scalar_fn_item: false,
         })
     }
@@ -15132,7 +15173,258 @@ impl Parser {
             jsonb_each_text_arg: None,
             table_fn_call: Some(Box::new((fn_name, args))),
             rows_from: None,
+            json_table: None,
             scalar_fn_item: false,
+        })
+    }
+
+    /// v7.39 (round 205, JSON_TABLE) — parse
+    /// `JSON_TABLE(<doc>, '<row_path>' [PASSING …] COLUMNS (<coldefs>))
+    /// [AS <alias>]`. The COLUMNS list is a recursive tree (NESTED
+    /// PATH nests another COLUMNS). Out-of-line (FROM recursion chain).
+    #[inline(never)]
+    fn parse_json_table_ref(&mut self) -> Result<TableRef, ParseError> {
+        self.advance(); // json_table
+        self.advance(); // (
+        let doc = Box::new(self.parse_expr(0)?);
+        self.expect_comma_json_table()?;
+        let row_path = self.parse_json_string_literal("JSON_TABLE row path")?;
+        // Optional `PASSING <expr> AS <name> [, …]`.
+        let mut passing: Vec<(String, Expr)> = Vec::new();
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("passing")) {
+            self.advance();
+            loop {
+                let e = self.parse_expr(0)?;
+                if !matches!(self.peek(), Token::As) {
+                    return Err(self.err("expected AS after JSON_TABLE PASSING value".into()));
+                }
+                self.advance();
+                let vname = match self.advance() {
+                    Token::Ident(s) | Token::QuotedIdent(s) => s,
+                    other => {
+                        return Err(
+                            self.err(alloc::format!("expected PASSING variable name, got {other:?}"))
+                        );
+                    }
+                };
+                passing.push((vname, e));
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("columns")) {
+            return Err(self.err("expected COLUMNS in JSON_TABLE".into()));
+        }
+        self.advance();
+        let columns = self.parse_json_table_columns()?;
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(alloc::format!(
+                "expected ')' to close JSON_TABLE, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let alias_ident = self.parse_optional_alias();
+        let name = alias_ident.clone().unwrap_or_else(|| String::from("json_table"));
+        Ok(TableRef {
+            name,
+            alias: alias_ident,
+            as_of_segment: None,
+            unnest_expr: None,
+            unnest_column_aliases: Vec::new(),
+            with_ordinality: false,
+            generate_series_args: None,
+            lateral_subquery: None,
+            jsonb_each_text_arg: None,
+            table_fn_call: None,
+            rows_from: None,
+            json_table: Some(Box::new(crate::ast::JsonTable {
+                doc,
+                row_path,
+                columns,
+                passing,
+            })),
+            scalar_fn_item: false,
+        })
+    }
+
+    fn expect_comma_json_table(&mut self) -> Result<(), ParseError> {
+        if !matches!(self.peek(), Token::Comma) {
+            return Err(self.err(alloc::format!(
+                "expected ',' after JSON_TABLE document, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        Ok(())
+    }
+
+    fn parse_json_string_literal(&mut self, what: &str) -> Result<String, ParseError> {
+        match self.advance() {
+            Token::String(s) => Ok(s),
+            other => Err(self.err(alloc::format!("expected {what} string literal, got {other:?}"))),
+        }
+    }
+
+    /// v7.39 (round 205) — `( <coldef> [, <coldef>]* )`.
+    #[inline(never)]
+    fn parse_json_table_columns(
+        &mut self,
+    ) -> Result<alloc::vec::Vec<crate::ast::JsonTableColumn>, ParseError> {
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err("expected '(' after COLUMNS".into()));
+        }
+        self.advance();
+        let mut cols = Vec::new();
+        loop {
+            cols.push(self.parse_json_table_one_column()?);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(alloc::format!(
+                "expected ')' after JSON_TABLE COLUMNS, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        Ok(cols)
+    }
+
+    fn parse_json_table_one_column(&mut self) -> Result<crate::ast::JsonTableColumn, ParseError> {
+        use crate::ast::{JsonTableColumn, JsonTableOnBehavior};
+        // NESTED [PATH] '<p>' COLUMNS (...)
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("nested")) {
+            self.advance();
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("path")) {
+                self.advance();
+            }
+            let path = self.parse_json_string_literal("NESTED PATH")?;
+            if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("columns")) {
+                return Err(self.err("expected COLUMNS after NESTED PATH".into()));
+            }
+            self.advance();
+            let columns = self.parse_json_table_columns()?;
+            return Ok(JsonTableColumn::Nested { path, columns });
+        }
+        // <name> ...
+        let name = match self.advance() {
+            Token::Ident(s) | Token::QuotedIdent(s) => s,
+            other => {
+                return Err(self.err(alloc::format!("expected column name, got {other:?}")));
+            }
+        };
+        // <name> FOR ORDINALITY
+        if matches!(self.peek(), Token::For) {
+            self.advance();
+            if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("ordinality")) {
+                return Err(self.err("expected ORDINALITY after FOR".into()));
+            }
+            self.advance();
+            return Ok(JsonTableColumn::Ordinality { name });
+        }
+        // <name> <type> [FORMAT JSON] {PATH '<p>' | EXISTS [PATH '<p>']} [WITH WRAPPER] [ON …]
+        let ty = self.parse_column_type_name()?;
+        let mut format_json = false;
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("format")) {
+            self.advance();
+            if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("json")) {
+                return Err(self.err("expected JSON after FORMAT".into()));
+            }
+            self.advance();
+        }
+        let mut exists = false;
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("exists")) {
+            self.advance();
+            exists = true;
+        }
+        let mut path = alloc::format!("$.{name}");
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("path")) {
+            self.advance();
+            path = self.parse_json_string_literal("column PATH")?;
+        }
+        if !exists
+            && matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("format"))
+        {
+            // `FORMAT JSON` after PATH (alternate placement).
+            self.advance();
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("json")) {
+                self.advance();
+            }
+            format_json = true;
+        }
+        let mut wrapper = false;
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("with")) {
+            self.advance();
+            // optional CONDITIONAL/UNCONDITIONAL
+            if matches!(self.peek(), Token::Ident(s)
+                if s.eq_ignore_ascii_case("unconditional")
+                    || s.eq_ignore_ascii_case("conditional"))
+            {
+                self.advance();
+            }
+            if !matches!(self.peek(), Token::Ident(s)
+                if s.eq_ignore_ascii_case("wrapper") || s.eq_ignore_ascii_case("array"))
+            {
+                return Err(self.err("expected WRAPPER after WITH".into()));
+            }
+            self.advance();
+            // optional `ARRAY` after `WRAPPER`, or `WRAPPER` after `ARRAY`
+            if matches!(self.peek(), Token::Ident(s)
+                if s.eq_ignore_ascii_case("wrapper") || s.eq_ignore_ascii_case("array"))
+            {
+                self.advance();
+            }
+            wrapper = true;
+        }
+        // ON EMPTY / ON ERROR clauses (two, in any order).
+        let mut on_empty = JsonTableOnBehavior::Null;
+        let mut on_error = JsonTableOnBehavior::Null;
+        for _ in 0..2 {
+            let behavior = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("error"))
+            {
+                self.advance();
+                Some(JsonTableOnBehavior::Error)
+            } else if matches!(self.peek(), Token::Null) {
+                self.advance();
+                Some(JsonTableOnBehavior::Null)
+            } else if matches!(self.peek(), Token::Default) {
+                self.advance();
+                Some(JsonTableOnBehavior::Default(Box::new(self.parse_expr(0)?)))
+            } else {
+                None
+            };
+            let Some(behavior) = behavior else { break };
+            // `ON {EMPTY|ERROR}`
+            if !matches!(self.peek(), Token::On) {
+                return Err(self.err("expected ON after JSON_TABLE column behavior".into()));
+            }
+            self.advance();
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("empty")) {
+                self.advance();
+                on_empty = behavior;
+            } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("error")) {
+                self.advance();
+                on_error = behavior;
+            } else {
+                return Err(self.err("expected EMPTY or ERROR after ON".into()));
+            }
+        }
+        Ok(JsonTableColumn::Regular {
+            name,
+            ty,
+            path,
+            exists,
+            format_json,
+            wrapper,
+            on_empty,
+            on_error,
         })
     }
 
