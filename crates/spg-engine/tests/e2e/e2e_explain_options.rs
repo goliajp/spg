@@ -144,7 +144,7 @@ fn explain_format_json_wraps_plan_in_array_of_lines() {
         plan.contains("\"Plan Line\""),
         "JSON object key missing: {plan}"
     );
-    assert!(plan.contains("TableScan"), "plan body missing: {plan}");
+    assert!(plan.contains("Seq Scan on t"), "plan body missing: {plan}");
 }
 
 #[test]
@@ -177,9 +177,11 @@ fn explain_format_yaml_emits_list_items() {
 fn explain_format_text_default_unchanged() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT)").unwrap();
-    let plan = plan_text(&mut e, "EXPLAIN (FORMAT text) SELECT * FROM t");
+    // v7.39 (round 224) — a filtered query so the PG-shaped plan has a
+    // Filter attr line (a bare scan is one line).
+    let plan = plan_text(&mut e, "EXPLAIN (FORMAT text) SELECT * FROM t WHERE id = 1 ORDER BY id");
     assert!(
-        plan.contains("TableScan"),
+        plan.contains("Seq Scan on t"),
         "TEXT format body broken: {plan}"
     );
     // TEXT format emits one row per line; JSON would be a single

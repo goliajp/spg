@@ -43,13 +43,16 @@ fn explain_lists_kept_children_for_list_eq_predicate() {
         .unwrap();
 
     let plan = explain_text(&mut e, "EXPLAIN SELECT * FROM cust WHERE region = 'jp'");
+    // v7.39 (round 224) — PG-shaped plan: a partition parent renders as
+    // Append over the surviving children.
+    assert!(plan.contains("Append"), "missing Append: {plan}");
     assert!(
-        plan.contains("[partition parent]"),
-        "missing partition-parent marker: {plan}"
+        plan.contains("Seq Scan on cust_apac"),
+        "expected kept child cust_apac, got: {plan}"
     );
     assert!(
-        plan.contains("kept=[cust_apac]"),
-        "expected kept=[cust_apac], got: {plan}"
+        !plan.contains("cust_emea") && !plan.contains("cust_default"),
+        "pruned children must not appear: {plan}"
     );
 }
 
@@ -67,8 +70,8 @@ fn explain_lists_default_only_when_no_concrete_match() {
     // survives.
     let plan = explain_text(&mut e, "EXPLAIN SELECT * FROM cust WHERE region = 'us'");
     assert!(
-        plan.contains("kept=[cust_default]"),
-        "expected kept=[cust_default]: {plan}"
+        plan.contains("Seq Scan on cust_default"),
+        "expected kept child cust_default: {plan}"
     );
     assert!(
         !plan.contains("cust_apac"),
@@ -122,8 +125,8 @@ fn explain_range_keeps_overlapping_children() {
          WHERE received_at >= '2026-07-01 00:00:00+00'",
     );
     assert!(
-        plan.contains("kept=[events_2026_07]"),
-        "expected kept=[events_2026_07], got: {plan}"
+        plan.contains("Seq Scan on events_2026_07"),
+        "expected kept child events_2026_07, got: {plan}"
     );
     assert!(
         !plan.contains("events_2026_06"),
@@ -230,7 +233,8 @@ fn explain_hash_keeps_only_residue_class_child() {
     let owner = owner.expect("some bucket owns id=42");
 
     let plan = explain_text(&mut e, "EXPLAIN SELECT * FROM oh WHERE id = 42");
-    let kept_marker = format!("kept=[oh_{owner}]");
+    // v7.39 (round 224) — PG-shaped: the kept child appears as its own scan.
+    let kept_marker = format!("Seq Scan on oh_{owner}");
     assert!(
         plan.contains(&kept_marker),
         "expected {kept_marker}, got: {plan}"
