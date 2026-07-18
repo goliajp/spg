@@ -27,6 +27,24 @@ fn bench(n: usize) -> f64 {
     start.elapsed().as_secs_f64()
 }
 
+/// Single multi-row INSERT of N non-overlapping ranges — exercises the
+/// intra-batch pairwise check (O(N^2) today) with an empty existing table.
+fn bench_batch(n: usize) -> f64 {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE bk (during int4range, EXCLUDE USING gist (during WITH &&))")
+        .unwrap();
+    let mut sql = String::from("INSERT INTO bk VALUES ");
+    for i in 0..n {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&format!("('[{},{})')", 2 * i, 2 * i + 1));
+    }
+    let start = Instant::now();
+    e.execute(&sql).unwrap();
+    start.elapsed().as_secs_f64()
+}
+
 fn main() {
     println!("{:>8}  {:>10}  {:>12}  {:>8}", "N", "total_s", "us/insert", "ratio");
     let mut prev: Option<(usize, f64)> = None;
@@ -38,4 +56,14 @@ fn main() {
         prev = Some((n, t));
     }
     println!("\nO(N^2) ⇒ ratio ~4.0 (each N-doubling), O(N log N) ⇒ ratio ~2.1");
+
+    println!("\n-- single multi-row INSERT (intra-batch pairwise) --");
+    println!("{:>8}  {:>10}  {:>8}", "N", "total_s", "ratio");
+    let mut prev: Option<f64> = None;
+    for &n in &[1000usize, 2000, 4000, 8000] {
+        let t = bench_batch(n);
+        let ratio = prev.map(|pt| t / pt).unwrap_or(0.0);
+        println!("{n:>8}  {t:>10.4}  {ratio:>8.2}");
+        prev = Some(t);
+    }
 }
