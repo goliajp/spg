@@ -51,7 +51,44 @@ pub enum JsonValue {
     Object(Vec<(String, JsonValue)>),
 }
 
+/// v7.39 (round 205, JSON_TABLE) — parse a document string into a
+/// JsonValue tree. Thin pub(crate) wrapper so the executor's
+/// JSON_TABLE arm can hold the parsed root across row iteration.
+pub(crate) fn parse_doc(src: &str) -> Result<JsonValue, EvalError> {
+    parse(src).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("invalid JSON for JSON_TABLE: {e}"),
+    })
+}
+
+/// v7.39 (round 205, JSON_TABLE) — evaluate a jsonpath string over a
+/// pre-parsed JsonValue root, returning the ordered match set. The
+/// JSON_TABLE executor drives this for the row pattern (once per doc)
+/// and each column path (once per row item). `vars` carries PASSING
+/// variables the same way the jsonb_path_* functions do.
+pub(crate) fn json_table_path(
+    root: &JsonValue,
+    path: &str,
+    vars: Option<&JsonValue>,
+) -> Result<Vec<JsonValue>, EvalError> {
+    let steps = parse_jsonpath(path)?;
+    Ok(apply_jsonpath(root, &steps, vars))
+}
+
 impl JsonValue {
+    /// v7.39 (round 205) — the scalar text of a JSON value for column
+    /// coercion: a json string yields its inner text (so
+    /// `"2024-01-15"` coerces to a DATE by its content), numbers/bools
+    /// their literal, containers their json text.
+    pub(crate) fn scalar_text(&self) -> String {
+        self.as_text()
+    }
+
+    /// v7.39 (round 205) — true for a JSON null (distinct from "no
+    /// match": the caller checks emptiness of the match set first).
+    pub(crate) fn is_json_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
     fn as_text(&self) -> String {
         match self {
             Self::Null => "null".into(),

@@ -2751,6 +2751,18 @@ impl Engine {
                 .unwrap_or_else(|| from.primary.name.clone());
             return self.exec_select_over_rows(stmt, rows, schema_cols, &alias, cancel);
         }
+        // v7.39 (round 205, JSON_TABLE) — `FROM JSON_TABLE(doc, '$p'
+        // COLUMNS (...))`. Materialise the row stream + schema by
+        // walking the row path, then run the regular pipeline over it.
+        if let Some(jt) = &from.primary.json_table {
+            let (rows, schema_cols) = self.json_table_rows(jt, None)?;
+            let alias = from
+                .primary
+                .alias
+                .clone()
+                .unwrap_or_else(|| from.primary.name.clone());
+            return self.exec_select_over_rows(stmt, rows, schema_cols, &alias, cancel);
+        }
         if from.primary.table_fn_call.is_some() {
             let (rows, mut schema_cols) = self.table_fn_rows(&from.primary)?;
             // v7.39 (read01 round 68) — WITH ORDINALITY appends a BIGINT counter
@@ -2954,6 +2966,229 @@ impl Engine {
     /// synthetic two-column TEXT table, then routes through the
     /// regular projection / WHERE / ORDER BY pipeline.
     /// v7.39 (read01 partitionfuncs.c) — materialise a FROM-position
+    /// v7.39 (round 205, JSON_TABLE) — materialise a JSON_TABLE FROM
+    /// item into (rows, schema). `outer_doc` is `Some` only when this
+    /// is a NESTED level being expanded against a parent row item's
+    /// already-parsed sub-document; the top-level call parses the doc
+    /// expr itself. Row/column paths reuse the existing jsonpath
+    /// evaluator (`json::json_table_path`); coercion reuses
+    /// `coerce_value` on the JSON scalar text, so a json string
+    /// coerces to DATE by its content, matching PG.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn json_table_rows(
+        &self,
+        jt: &spg_sql::ast::JsonTable,
+        outer_doc: Option<&crate::json::JsonValue>,
+    ) -> Result<(alloc::vec::Vec<Row<'static>>, alloc::vec::Vec<ColumnSchema>), EngineError> {
+        // Column schema is static (independent of data): flatten the
+        // COLUMNS tree in declaration order (NESTED contributes its
+        // children inline, the PG output shape).
+        let schema = json_table_schema(&jt.columns);
+
+        // PASSING variables → a single JsonValue object the jsonpath
+        // engine reads `$name` from.
+        let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+        let ctx = EvalContext::new(&empty_schema, None);
+        let dummy = Row::new(alloc::vec::Vec::new());
+        let vars: Option<crate::json::JsonValue> = if jt.passing.is_empty() {
+            None
+        } else {
+            let mut entries = alloc::vec::Vec::new();
+            for (name, e) in &jt.passing {
+                let v = eval::eval_expr(e, &dummy, &ctx).map_err(EngineError::Eval)?;
+                entries.push((name.clone(), value_to_json_value(&v)));
+            }
+            Some(crate::json::JsonValue::Object(entries))
+        };
+
+        // The document root: a NESTED level gets it from the parent;
+        // the top level parses its doc expr.
+        let root_owned;
+        let root: &crate::json::JsonValue = match outer_doc {
+            Some(d) => d,
+            None => {
+                let doc_val = eval::eval_expr(&jt.doc, &dummy, &ctx).map_err(EngineError::Eval)?;
+                let src = match &doc_val {
+                    Value::Null => return Ok((alloc::vec::Vec::new(), schema)),
+                    Value::Json(s) | Value::Text(s) => s.as_ref().to_string(),
+                    other => {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "JSON_TABLE document must be json/text, got {:?}",
+                            other.data_type()
+                        )));
+                    }
+                };
+                root_owned = crate::json::parse_doc(&src).map_err(EngineError::Eval)?;
+                &root_owned
+            }
+        };
+
+        let items = crate::json::json_table_path(root, &jt.row_path, vars.as_ref())
+            .map_err(EngineError::Eval)?;
+        let mut rows: alloc::vec::Vec<Row<'static>> = alloc::vec::Vec::new();
+        for (idx, item) in items.iter().enumerate() {
+            self.json_table_emit_item(jt, item, idx, vars.as_ref(), &mut rows)?;
+        }
+        Ok((rows, schema))
+    }
+
+    /// v7.39 (round 205) — emit the row(s) for one row-pattern item.
+    /// Regular columns produce one value each; a NESTED column expands
+    /// as an outer join (each nested match → one row sharing the
+    /// parent cells; no nested match → one row with the nested cells
+    /// NULL). Sibling NESTED at one level cross by concatenation of
+    /// their independent expansions (PG's UNION-of-outer shape).
+    fn json_table_emit_item(
+        &self,
+        jt: &spg_sql::ast::JsonTable,
+        item: &crate::json::JsonValue,
+        ordinality: usize,
+        vars: Option<&crate::json::JsonValue>,
+        out: &mut alloc::vec::Vec<Row<'static>>,
+    ) -> Result<(), EngineError> {
+        use spg_sql::ast::JsonTableColumn as C;
+        // Parent cells (regular + ordinality), left-to-right; NESTED
+        // columns contribute a run of child cells appended after.
+        let mut parent_cells: alloc::vec::Vec<Value<'static>> = alloc::vec::Vec::new();
+        let mut nested_runs: alloc::vec::Vec<alloc::vec::Vec<Row<'static>>> =
+            alloc::vec::Vec::new();
+        let mut nested_widths: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        for col in &jt.columns {
+            match col {
+                C::Ordinality { .. } => {
+                    parent_cells.push(Value::BigInt(ordinality as i64 + 1));
+                }
+                C::Regular { .. } => {
+                    parent_cells.push(self.json_table_column_value(col, item, vars)?);
+                }
+                C::Nested { path, columns } => {
+                    // Recurse: a nested JSON_TABLE over `item` filtered
+                    // by `path`, with the same PASSING vars.
+                    let sub = spg_sql::ast::JsonTable {
+                        doc: jt.doc.clone(), // unused (outer_doc provided)
+                        row_path: path.clone(),
+                        columns: columns.clone(),
+                        passing: alloc::vec::Vec::new(),
+                    };
+                    let (nrows, nschema) = self.json_table_rows(&sub, Some(item))?;
+                    nested_widths.push(nschema.len());
+                    nested_runs.push(nrows);
+                }
+            }
+        }
+        if nested_runs.is_empty() {
+            out.push(Row::new(parent_cells));
+            return Ok(());
+        }
+        // Outer-join expansion per sibling NESTED, then concatenate the
+        // sibling runs so the parent row appears once per (sibling,
+        // nested-match) — PG expands each sibling independently.
+        for (run, width) in nested_runs.iter().zip(nested_widths.iter()) {
+            if run.is_empty() {
+                // No nested match → one row, this sibling's cells NULL,
+                // other siblings' cells NULL too.
+                let mut cells = parent_cells.clone();
+                for w in &nested_widths {
+                    for _ in 0..*w {
+                        cells.push(Value::Null);
+                    }
+                }
+                out.push(Row::new(cells));
+                continue;
+            }
+            for nrow in run {
+                let mut cells = parent_cells.clone();
+                for (w, sibling_run) in nested_widths.iter().zip(nested_runs.iter()) {
+                    if core::ptr::eq(sibling_run, run) {
+                        cells.extend(nrow.values.iter().cloned());
+                    } else {
+                        let _ = width;
+                        for _ in 0..*w {
+                            cells.push(Value::Null);
+                        }
+                    }
+                }
+                out.push(Row::new(cells));
+            }
+        }
+        Ok(())
+    }
+
+    /// v7.39 (round 205) — evaluate one Regular column against a row
+    /// item: EXISTS → bool; else path → at most one value, coerced to
+    /// the declared type with ON EMPTY / ON ERROR / DEFAULT behaviour.
+    fn json_table_column_value(
+        &self,
+        col: &spg_sql::ast::JsonTableColumn,
+        item: &crate::json::JsonValue,
+        vars: Option<&crate::json::JsonValue>,
+    ) -> Result<Value<'static>, EngineError> {
+        use spg_sql::ast::{JsonTableColumn as C, JsonTableOnBehavior as B};
+        let C::Regular {
+            name,
+            ty,
+            path,
+            exists,
+            format_json,
+            wrapper,
+            on_empty,
+            on_error,
+        } = col
+        else {
+            unreachable!("caller guards Regular");
+        };
+        let matches =
+            crate::json::json_table_path(item, path, vars).map_err(EngineError::Eval)?;
+        if *exists {
+            return Ok(Value::Bool(!matches.is_empty()));
+        }
+        let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+        let ctx = EvalContext::new(&empty_schema, None);
+        let dummy = Row::new(alloc::vec::Vec::new());
+        let default_of = |b: &B| -> Result<Option<Value<'static>>, EngineError> {
+            match b {
+                B::Null => Ok(Some(Value::Null)),
+                B::Error => Ok(None),
+                B::Default(e) => Ok(Some(
+                    eval::eval_expr(e, &dummy, &ctx).map_err(EngineError::Eval)?,
+                )),
+            }
+        };
+        // Empty match set → ON EMPTY.
+        if matches.is_empty() {
+            return match default_of(on_empty)? {
+                Some(v) => coerce_json_table_default(v, *ty, name),
+                None => Err(EngineError::Unsupported(alloc::format!(
+                    "no SQL/JSON item found for JSON_TABLE column {name:?}"
+                ))),
+            };
+        }
+        let first = &matches[0];
+        // FORMAT JSON: return the raw json (array-wrapped WITH WRAPPER).
+        if *format_json {
+            let text = if *wrapper {
+                crate::json::JsonValue::Array(matches.clone()).to_json_text()
+            } else {
+                first.to_json_text()
+            };
+            return Ok(Value::Json(alloc::borrow::Cow::Owned(text)));
+        }
+        if first.is_json_null() {
+            return Ok(Value::Null);
+        }
+        // Coerce the scalar text to the declared type; on failure → ON
+        // ERROR (default NULL, DEFAULT expr, or raise).
+        let dt = crate::conversions::column_type_to_data_type(ty.clone());
+        let scalar = Value::Text(alloc::borrow::Cow::Owned(first.scalar_text()));
+        match crate::conversions::coerce_value(scalar, dt, name, 0) {
+            Ok(v) => Ok(v),
+            Err(e) => match default_of(on_error)? {
+                Some(v) => coerce_json_table_default(v, *ty, name),
+                None => Err(e),
+            },
+        }
+    }
+
     /// table function into (rows, default schema). Dispatch by name.
     pub(crate) fn table_fn_rows(
         &self,
@@ -5474,6 +5709,7 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
         jsonb_each_text_arg: None,
         table_fn_call: None,
         rows_from: None,
+        json_table: None,
         scalar_fn_item: false,
     };
     // Outer window query over the derived rows: aggregates → __aggN column refs.
@@ -8315,6 +8551,71 @@ impl Engine {
 }
 
 /// A bare `TableRef` with a name — the FROM item a lowered record expansion adds.
+/// v7.39 (round 205, JSON_TABLE) — the static output schema of a
+/// COLUMNS list (data-independent), NESTED children inlined in
+/// declaration order (PG's flattened output shape).
+/// v7.39 (round 205) — pub(crate) shim so join.rs infers a wrapped
+/// correlated JSON_TABLE's static schema without evaluating its doc.
+pub(crate) fn json_table_schema_pub(
+    cols: &[spg_sql::ast::JsonTableColumn],
+) -> alloc::vec::Vec<ColumnSchema> {
+    json_table_schema(cols)
+}
+
+fn json_table_schema(cols: &[spg_sql::ast::JsonTableColumn]) -> alloc::vec::Vec<ColumnSchema> {
+    use spg_sql::ast::JsonTableColumn as C;
+    let mut out = alloc::vec::Vec::new();
+    for c in cols {
+        match c {
+            C::Ordinality { name } => {
+                out.push(ColumnSchema::new(name.clone(), DataType::BigInt, false));
+            }
+            C::Regular {
+                name, ty, exists, ..
+            } => {
+                let dt = if *exists {
+                    DataType::Bool
+                } else {
+                    crate::conversions::column_type_to_data_type(ty.clone())
+                };
+                out.push(ColumnSchema::new(name.clone(), dt, true));
+            }
+            C::Nested { columns, .. } => out.extend(json_table_schema(columns)),
+        }
+    }
+    out
+}
+
+/// v7.39 (round 205) — coerce a DEFAULT / literal value to a
+/// JSON_TABLE column's declared type (the DEFAULT expr may be a
+/// string literal like `'none'` that must land as the column type).
+fn coerce_json_table_default(
+    v: Value<'static>,
+    ty: spg_sql::ast::ColumnTypeName,
+    name: &str,
+) -> Result<Value<'static>, EngineError> {
+    if v.is_null() {
+        return Ok(Value::Null);
+    }
+    let dt = crate::conversions::column_type_to_data_type(ty);
+    crate::conversions::coerce_value(v, dt, name, 0)
+}
+
+/// v7.39 (round 205) — a runtime Value → JsonValue for PASSING vars.
+fn value_to_json_value(v: &Value<'_>) -> crate::json::JsonValue {
+    use crate::json::JsonValue as J;
+    match v {
+        Value::Null => J::Null,
+        Value::Bool(b) => J::Bool(*b),
+        Value::SmallInt(n) => J::Number(f64::from(*n)),
+        Value::Int(n) => J::Number(f64::from(*n)),
+        Value::BigInt(n) => J::Number(*n as f64),
+        Value::Float(x) => J::Number(*x),
+        Value::Json(s) => crate::json::parse_doc(s).unwrap_or(J::Null),
+        other => J::String(crate::eval::value_to_text(other)),
+    }
+}
+
 fn bare_table_ref_named(name: &str) -> TableRef {
     TableRef {
         name: name.to_string(),
@@ -8328,6 +8629,7 @@ fn bare_table_ref_named(name: &str) -> TableRef {
         jsonb_each_text_arg: None,
         table_fn_call: None,
         rows_from: None,
+        json_table: None,
         scalar_fn_item: false,
     }
 }

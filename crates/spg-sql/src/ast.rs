@@ -2794,6 +2794,71 @@ pub struct TableRef {
     /// its own lowering; this channel carries the ones that have no array form
     /// (`generate_series`, a user `RETURNS SETOF` function).
     pub rows_from: Option<Vec<(String, Vec<Expr>)>>,
+    /// v7.39 (round 205, JSON_TABLE epic) — a `JSON_TABLE(doc, '$path'
+    /// COLUMNS (...))` FROM item. The doc expr may reference left-side
+    /// tables (implicit LATERAL, like every SRF channel). Executed by
+    /// walking the row path over the parsed doc, then each column's
+    /// path per row-item; NESTED expands as a per-parent outer join.
+    pub json_table: Option<Box<JsonTable>>,
+}
+
+/// v7.39 (round 205) — a `JSON_TABLE` FROM item.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonTable {
+    /// The document expression (jsonb/json/text). May reference outer
+    /// columns → implicit LATERAL.
+    pub doc: Box<Expr>,
+    /// The row-pattern jsonpath (the 2nd JSON_TABLE argument); each
+    /// match is one row's context item.
+    pub row_path: String,
+    /// The COLUMNS list (regular columns, FOR ORDINALITY, NESTED).
+    pub columns: Vec<JsonTableColumn>,
+    /// `PASSING <expr> AS <name>` variables, folded into jsonpath `$name`.
+    pub passing: Vec<(String, Expr)>,
+}
+
+/// v7.39 (round 205) — one entry in a JSON_TABLE (or NESTED) COLUMNS list.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsonTableColumn {
+    /// `<name> FOR ORDINALITY` — 1-based counter within this level.
+    Ordinality { name: String },
+    /// `<name> <type> [FORMAT JSON] PATH '<p>' [WITH WRAPPER]
+    /// [{DEFAULT <e>|ERROR|NULL} ON EMPTY] [... ON ERROR]`, or
+    /// `<name> <type> EXISTS [PATH '<p>']`.
+    Regular {
+        name: String,
+        ty: ColumnTypeName,
+        /// The column jsonpath; defaults to `$.<name>` when `PATH` omitted.
+        path: String,
+        /// `EXISTS [PATH …]` — the column is a boolean "did the path match".
+        exists: bool,
+        /// `FORMAT JSON` — return the raw jsonb value (not a coerced scalar).
+        format_json: bool,
+        /// `WITH [UNCONDITIONAL] WRAPPER` — wrap the result in a json array.
+        wrapper: bool,
+        /// Behaviour when the path matches nothing (default NULL).
+        on_empty: JsonTableOnBehavior,
+        /// Behaviour when coercion fails (default NULL).
+        on_error: JsonTableOnBehavior,
+    },
+    /// `NESTED PATH '<p>' COLUMNS (...)` — a child level joined per parent
+    /// row like a LEFT JOIN (a parent with no nested match still emits one
+    /// row, nested cols NULL).
+    Nested {
+        path: String,
+        columns: Vec<JsonTableColumn>,
+    },
+}
+
+/// v7.39 (round 205) — a JSON_TABLE column's ON EMPTY / ON ERROR clause.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsonTableOnBehavior {
+    /// Default: the column value is NULL.
+    Null,
+    /// `ERROR ON {EMPTY|ERROR}` — raise PG's error.
+    Error,
+    /// `DEFAULT <expr> ON {EMPTY|ERROR}` — the given value.
+    Default(Box<Expr>),
 }
 
 /// FROM clause shape. v1.10 accepts a primary table plus a flat list of
@@ -5707,6 +5772,63 @@ impl fmt::Display for FromClause {
     }
 }
 
+/// v7.39 (round 205) — render a JSON_TABLE COLUMNS list (recursive
+/// for NESTED). Kept close to the parser's grammar so it re-parses.
+fn fmt_json_table_columns(
+    f: &mut fmt::Formatter<'_>,
+    cols: &[JsonTableColumn],
+) -> fmt::Result {
+    for (i, c) in cols.iter().enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        match c {
+            JsonTableColumn::Ordinality { name } => {
+                write!(f, "{} FOR ORDINALITY", quote_ident(name))?;
+            }
+            JsonTableColumn::Nested { path, columns } => {
+                write!(f, "NESTED PATH '{path}' COLUMNS (")?;
+                fmt_json_table_columns(f, columns)?;
+                f.write_str(")")?;
+            }
+            JsonTableColumn::Regular {
+                name,
+                ty,
+                path,
+                exists,
+                format_json,
+                wrapper,
+                on_empty,
+                on_error,
+            } => {
+                write!(f, "{} {ty}", quote_ident(name))?;
+                if *format_json {
+                    f.write_str(" FORMAT JSON")?;
+                }
+                if *exists {
+                    write!(f, " EXISTS PATH '{path}'")?;
+                } else {
+                    write!(f, " PATH '{path}'")?;
+                }
+                if *wrapper {
+                    f.write_str(" WITH WRAPPER")?;
+                }
+                if let JsonTableOnBehavior::Error = on_empty {
+                    f.write_str(" ERROR ON EMPTY")?;
+                } else if let JsonTableOnBehavior::Default(e) = on_empty {
+                    write!(f, " DEFAULT {e} ON EMPTY")?;
+                }
+                if let JsonTableOnBehavior::Error = on_error {
+                    f.write_str(" ERROR ON ERROR")?;
+                } else if let JsonTableOnBehavior::Default(e) = on_error {
+                    write!(f, " DEFAULT {e} ON ERROR")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl fmt::Display for TableRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // v7.30.1 (mailrs round-24 class audit) — the dynamic
@@ -5714,6 +5836,27 @@ impl fmt::Display for TableRef {
         // (synthetic) name turned LATERAL / unnest() /
         // generate_series() into references to nonexistent tables
         // on re-parse.
+        // v7.39 (round 205) — JSON_TABLE round-trips through Display
+        // (view bodies, WAL replay of `INSERT … SELECT FROM JSON_TABLE`).
+        if let Some(jt) = &self.json_table {
+            write!(f, "JSON_TABLE({}, '{}'", jt.doc, jt.row_path)?;
+            if !jt.passing.is_empty() {
+                f.write_str(" PASSING ")?;
+                for (i, (n, e)) in jt.passing.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{e} AS {}", quote_ident(n))?;
+                }
+            }
+            f.write_str(" COLUMNS (")?;
+            fmt_json_table_columns(f, &jt.columns)?;
+            f.write_str(")")?;
+            if let Some(a) = &self.alias {
+                write!(f, " AS {}", quote_ident(a))?;
+            }
+            return Ok(());
+        }
         if let Some(inner) = &self.lateral_subquery {
             write!(f, "LATERAL ({inner})")?;
             if let Some(a) = &self.alias {
@@ -6417,6 +6560,7 @@ mod tests {
                     jsonb_each_text_arg: None,
                     table_fn_call: None,
                     rows_from: None,
+                    json_table: None,
                     scalar_fn_item: false,
                 },
                 joins: vec![],
