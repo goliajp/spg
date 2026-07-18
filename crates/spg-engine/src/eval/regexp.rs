@@ -471,7 +471,24 @@ fn re_parse_atom(
                         capturing = false;
                         *p += 2;
                     }
-                    _ => {}
+                    // v7.39 (round 223) — any other `(?x` form here is NOT
+                    // part of PG's ARE syntax (leading `(?flags)` options are
+                    // consumed before parsing; PCRE named groups `(?P<n>` /
+                    // `(?<n>` and atomic `(?>` don't exist in ARE).
+                    // Previously the `?` fell through as a LITERAL inside a
+                    // plain capturing group, so `(?<first>h)` silently
+                    // matched nothing — a silent-wrong for callers expecting
+                    // either PCRE behaviour or PG's error. Match PG's two
+                    // messages: a letter reads as a (bad) embedded option;
+                    // anything else is a `?` with no quantifier operand.
+                    c => {
+                        let msg = if c.is_ascii_alphabetic() {
+                            "invalid regular expression: invalid embedded option"
+                        } else {
+                            "invalid regular expression: quantifier operand invalid"
+                        };
+                        return Err(EvalError::TypeMismatch { detail: msg.into() });
+                    }
                 }
             }
             // v7.38 (read01) — reserve this group's number BEFORE parsing the
