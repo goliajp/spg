@@ -7530,6 +7530,20 @@ impl Engine {
     /// children the planner would scan (same algorithm as
     /// [`Self::build_partition_parent_union_body`] but without the
     /// SQL re-parse).
+    /// v7.39 (round 224) — the kept-children prune keyed off a bare WHERE
+    /// expression (the PG-shaped EXPLAIN's scan builder has no full
+    /// SelectStatement in hand). Wraps the original by synthesising a
+    /// minimal statement carrying just the predicate.
+    pub(crate) fn explain_partition_kept_children_by_where(
+        &self,
+        parent_name: &str,
+        where_: Option<&spg_sql::ast::Expr>,
+    ) -> Option<Vec<alloc::string::String>> {
+        let mut synth = SelectStatement::default();
+        synth.where_ = where_.cloned();
+        self.explain_partition_kept_children(parent_name, &synth)
+    }
+
     pub(crate) fn explain_partition_kept_children(
         &self,
         parent_name: &str,

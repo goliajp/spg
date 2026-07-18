@@ -1581,7 +1581,16 @@ impl Parser {
                     self.advance();
                     analyze = true;
                 }
-                let inner = self.parse_select_stmt()?;
+                // v7.39 (round 224) — the body may open with WITH (CTEs);
+                // route through the same CTE-then-SELECT path the top-level
+                // WITH statement uses.
+                let inner = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("with"))
+                {
+                    self.advance();
+                    self.parse_with_cte_then_select()?
+                } else {
+                    self.parse_select_stmt()?
+                };
                 let Statement::Select(s) = inner else {
                     return Err(self.err(format!("EXPLAIN body must be a SELECT, got {inner:?}")));
                 };

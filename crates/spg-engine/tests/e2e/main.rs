@@ -148,6 +148,7 @@ mod e2e_identity_domain_round220;
 mod e2e_timezone_round221;
 mod e2e_listen_notify_round222;
 mod e2e_regex_are_round223;
+mod e2e_explain_pg_shape_round224;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;

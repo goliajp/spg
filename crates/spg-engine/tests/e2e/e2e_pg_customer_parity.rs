@@ -191,9 +191,10 @@ fn multi_column_index_picker_recurses_into_and() {
         &mut e,
         "SELECT id FROM m WHERE id = 1 AND created_at > '2025-01-01'::TIMESTAMP",
     );
+    // v7.39 (round 224) — PG-shaped: an index pick renders as Index Scan.
     assert!(
-        text.contains("[index seek]"),
-        "EXPLAIN expected [index seek] but got:\n{text}"
+        text.contains("Index Scan using"),
+        "EXPLAIN expected an Index Scan but got:\n{text}"
     );
 }
 
@@ -210,7 +211,7 @@ fn pk_index_picker_used_with_and_predicate() {
         "SELECT body FROM foo WHERE id = 1 AND body LIKE '%a%'",
     );
     assert!(
-        text.contains("[index seek]"),
+        text.contains("Index Scan using foo_pkey"),
         "PK index should be picked under AND-composite WHERE; got:\n{text}"
     );
 }

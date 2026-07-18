@@ -25,18 +25,22 @@ fn explain_returns_query_plan_lines() {
         !plan.is_empty(),
         "EXPLAIN must produce at least one QUERY PLAN line"
     );
-    // First line names the top operator — for this shape it should
-    // mention a JOIN or a scan over messages.
+    // v7.39 (round 224) — PG-shaped tree: this ORDER BY + LIMIT query
+    // roots at a Limit node; the join/scan appear beneath it.
     let head = &plan[0];
     assert!(
-        head.contains("messages") || head.contains("Join") || head.contains("Scan"),
-        "expected top line to name messages / Join / Scan, got: {head}"
+        head.contains("Limit"),
+        "expected the PG-shaped root (Limit), got: {head}"
     );
-    // Some line mentions ORDER BY or LIMIT 200 (planner walker
-    // path captures the LIMIT).
+    assert!(
+        plan.iter().any(|l| l.contains("messages")),
+        "some line names the messages scan: {plan:?}"
+    );
+    // v7.39 (round 224) — PG-shaped tree: the LIMIT surfaces as a
+    // `Limit` node and the ORDER BY as `Sort Key:`.
     let has_limit_or_order = plan
         .iter()
-        .any(|l| l.contains("Limit") || l.contains("OrderBy"));
+        .any(|l| l.contains("Limit") || l.contains("Sort Key"));
     assert!(
         has_limit_or_order,
         "expected OrderBy or Limit mention in plan, got: {plan:?}"

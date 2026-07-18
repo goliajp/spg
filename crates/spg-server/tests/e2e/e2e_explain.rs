@@ -78,11 +78,10 @@ fn explain_simple_table_scan_reports_full_scan() {
 
     let lines = explain_lines(&mut s, "EXPLAIN SELECT * FROM t");
     let blob = lines.join("\n");
-    assert!(blob.contains("TableScan"), "missing TableScan: {blob}");
-    assert!(blob.contains("From: t"), "missing From: t: {blob}");
+    // v7.39 (round 224) — PG-shaped plan text.
     assert!(
-        blob.contains("full scan"),
-        "expected full scan note: {blob}"
+        blob.contains("Seq Scan on t"),
+        "missing Seq Scan on t: {blob}"
     );
 }
 
@@ -102,8 +101,8 @@ fn explain_picks_up_index_seek() {
     let lines = explain_lines(&mut s, "EXPLAIN SELECT v FROM t WHERE id = 5");
     let blob = lines.join("\n");
     assert!(
-        blob.contains("index seek"),
-        "expected index seek note: {blob}"
+        blob.contains("Index Scan using"),
+        "expected an Index Scan node: {blob}"
     );
 }
 
@@ -125,9 +124,14 @@ fn explain_shows_aggregate_and_grouping() {
         "EXPLAIN SELECT region, sum(amt) FROM sales GROUP BY region HAVING sum(amt) > 5",
     );
     let blob = lines.join("\n");
-    assert!(blob.contains("Aggregate"), "missing Aggregate: {blob}");
-    assert!(blob.contains("GroupBy"), "missing GroupBy: {blob}");
-    assert!(blob.contains("Having"), "missing Having: {blob}");
+    // v7.39 (round 224) — PG-shaped: GROUP BY renders as HashAggregate
+    // with a Group Key line; HAVING folds into the aggregate's Filter.
+    assert!(
+        blob.contains("HashAggregate"),
+        "missing HashAggregate: {blob}"
+    );
+    assert!(blob.contains("Group Key: region"), "missing Group Key: {blob}");
+    assert!(blob.contains("Filter:"), "missing HAVING filter: {blob}");
 }
 
 #[test]

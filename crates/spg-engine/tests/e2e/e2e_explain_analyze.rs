@@ -52,9 +52,12 @@ fn top_level_rows_match_result_count() {
     let r = e.execute("EXPLAIN ANALYZE SELECT * FROM t").unwrap();
     let lines = rows_of(&r);
     let top = &lines[0];
+    // v7.39 (round 224) — a single-node plan's top line IS the scan line;
+    // it carries the scan annotation (hot_rows), and the result count
+    // rides the trailing Total line.
     assert!(
-        top.contains("(rows=7)"),
-        "top reports result rows; got {top:?}"
+        top.contains("hot_rows=7"),
+        "top scan reports hot_rows; got {top:?}"
     );
     let total = lines
         .iter()
@@ -74,12 +77,12 @@ fn scan_reports_catalog_row_count() {
         .execute("EXPLAIN ANALYZE SELECT * FROM big WHERE id < 10")
         .unwrap();
     let lines = rows_of(&r);
-    // The "From: big [full scan]" line should report
-    // `(hot_rows=40)` — every catalog row was a candidate.
+    // v7.39 (round 224) — the PG-shaped scan line ("Seq Scan on big")
+    // reports `(hot_rows=40)` — every catalog row was a candidate.
     let from_line = lines
         .iter()
-        .find(|l| l.contains("From: big"))
-        .expect("From line present");
+        .find(|l| l.contains("Seq Scan on big"))
+        .expect("scan line present");
     assert!(
         from_line.contains("hot_rows=40"),
         "From line reports hot_rows; got {from_line:?}"
@@ -91,14 +94,16 @@ fn no_unknown_operator_in_top_level() {
     // Walk a handful of representative SQL shapes; assert the
     // top-level operator is one of the known labels (not "unknown"
     // or empty).
-    let known: [&str; 7] = [
-        "TableScan",
+    // v7.39 (round 224) — PG-shaped node vocabulary.
+    let known: [&str; 8] = [
+        "Seq",
+        "Index",
         "Result",
         "Aggregate",
-        "Distinct",
+        "HashAggregate",
         "WindowAgg",
-        "UnionScan",
-        "CTEScan",
+        "Append",
+        "CTE",
     ];
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
@@ -133,7 +138,10 @@ fn scan_omits_cold_marker_when_no_cold_segments() {
     e.execute("INSERT INTO warm VALUES (1)").unwrap();
     let r = e.execute("EXPLAIN ANALYZE SELECT * FROM warm").unwrap();
     let lines = rows_of(&r);
-    let from = lines.iter().find(|l| l.contains("From: warm")).unwrap();
+    let from = lines
+        .iter()
+        .find(|l| l.contains("Seq Scan on warm"))
+        .unwrap();
     assert!(
         from.contains("hot_rows=1"),
         "From line shows hot_rows=1; got {from:?}"

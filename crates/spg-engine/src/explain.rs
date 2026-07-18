@@ -6,7 +6,7 @@ use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
-use spg_sql::ast::{Expr, SelectItem, SelectStatement, UnionKind};
+use spg_sql::ast::{Expr, SelectItem, SelectStatement};
 
 use crate::index_access::try_index_seek;
 use spg_storage::{ColumnSchema, DataType, Row, Value};
@@ -268,15 +268,31 @@ pub(crate) fn annotate_explain_lines(lines: &mut [String], total_rows: usize, en
     for (idx, line) in lines.iter_mut().enumerate() {
         let trimmed = line.trim_start();
         let is_top_level = idx == 0;
-        if is_top_level {
+        // v7.39 (round 224) — under the PG-shaped tree a single-node plan's
+        // top line IS the scan line; give it the scan annotation (hot_rows
+        // is the useful figure) alongside the result count.
+        let top_is_scan = is_top_level
+            && (trimmed.starts_with("Seq Scan on ") || trimmed.starts_with("Index Scan using "));
+        if is_top_level && !top_is_scan {
             line.push_str(&alloc::format!(" (rows={total_rows})"));
             continue;
         }
-        if let Some(rest) = trimmed.strip_prefix("From: ") {
-            let (name, scan_kind) = match rest.split_once(" [") {
-                Some((n, k)) => (n.trim(), k.trim_end_matches(']')),
-                None => (rest.trim(), ""),
-            };
+        // v7.39 (round 224) — the PG-shaped tree renamed the scan lines:
+        // `Seq Scan on <t>` (was `From: <t> [full scan]`) and
+        // `Index Scan using <idx> on <t>` (was `[index seek]`).
+        let scan = trimmed
+            .strip_prefix("->  ")
+            .unwrap_or(trimmed);
+        if let Some(rest) = scan
+            .strip_prefix("Seq Scan on ")
+            .map(|r| (r, "full scan"))
+            .or_else(|| {
+                scan.split_once(" on ")
+                    .filter(|_| scan.starts_with("Index Scan using "))
+                    .map(|(_, r)| (r, "index seek"))
+            })
+        {
+            let (name, scan_kind) = rest;
             let bare = name.split_whitespace().next().unwrap_or(name);
             let hot = catalog.get(bare).map(|t| t.rows().len());
             // v6.2.7 — `cold_segments=[id0,id1,…]` enumerates every
@@ -314,200 +330,361 @@ pub(crate) fn annotate_explain_lines(lines: &mut [String], total_rows: usize, en
     }
 }
 
-/// v4.26: render a human-readable plan tree for `EXPLAIN <select>`.
-/// Lines are pushed into `out`; `depth` controls indentation. We
-/// describe the rewritten SELECT — what the executor *would* do —
-/// using the engine handle to spot indexed lookups and table shapes.
-#[allow(clippy::too_many_lines, clippy::format_push_string)]
+/// v7.39 (round 224, EXPLAIN epic Phase 0) — one node of the PG-shaped
+/// plan tree. `head` is the node line ("Seq Scan on t1", "Sort"), `attrs`
+/// the property lines beneath it ("Sort Key: v", "Filter: (id = 5)"),
+/// `children` the `->`-prefixed sub-plans. `no_arrow` marks named
+/// sub-plan labels (PG's `CTE <name>` blocks render without `->  `).
+struct PlanNode {
+    head: String,
+    attrs: Vec<String>,
+    children: Vec<PlanNode>,
+    no_arrow: bool,
+}
+
+impl PlanNode {
+    fn new(head: String) -> Self {
+        Self {
+            head,
+            attrs: Vec::new(),
+            children: Vec::new(),
+            no_arrow: false,
+        }
+    }
+}
+
+/// PG's text renderer: a node's text starts at column 6*depth; its `->  `
+/// arrow occupies the 4 columns before that; attribute lines indent 2 past
+/// the node text. (Measured off live PG18.4 output, r224 probe.)
+fn render_pg_tree(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
+    let head = if depth == 0 {
+        node.head.clone()
+    } else if node.no_arrow {
+        alloc::format!("{}{}", " ".repeat(6 * depth - 4), node.head)
+    } else {
+        alloc::format!("{}->  {}", " ".repeat(6 * depth - 6 + 2), node.head)
+    };
+    out.push(head);
+    let attr_pad = " ".repeat(6 * depth + 2);
+    for a in &node.attrs {
+        out.push(alloc::format!("{attr_pad}{a}"));
+    }
+    for c in &node.children {
+        render_pg_tree(c, depth + 1, out);
+    }
+}
+
+/// Render an expression the way PG's deparser does at the plan level —
+/// wrapped in one set of parentheses unless it already is.
+fn pg_cond(e: &Expr) -> String {
+    let s = alloc::format!("{e}");
+    if s.starts_with('(') && s.ends_with(')') {
+        s
+    } else {
+        alloc::format!("({s})")
+    }
+}
+
+/// v7.39 (round 224) — build the scan node for one table reference:
+/// `Index Scan using <idx> on <t>` when the executor's own index-seek
+/// heuristic fires (the WHERE lands in `Index Cond:`), else
+/// `Seq Scan on <t>` with the WHERE in `Filter:`. `where_` is attached
+/// only when `attach_where` (the caller owns predicate placement for
+/// joins). The plan shown is SPG's REAL access decision expressed in
+/// PG's vocabulary — node names/indentation match PG so tools parse it;
+/// the planner choices are SPG's own.
+fn scan_node(
+    engine: &Engine,
+    name: &str,
+    alias: Option<&str>,
+    where_: Option<&Expr>,
+    cte_names: &[String],
+) -> PlanNode {
+    let alias_sfx = match alias {
+        Some(a) if a != name => alloc::format!(" {a}"),
+        _ => String::new(),
+    };
+    // A FROM item naming a CTE renders as PG's materialized-CTE scan.
+    if cte_names.iter().any(|c| c == name) {
+        let mut n = PlanNode::new(alloc::format!("CTE Scan on {name}{alias_sfx}"));
+        if let Some(w) = where_ {
+            n.attrs.push(alloc::format!("Filter: {}", pg_cond(w)));
+        }
+        return n;
+    }
+    // A partition parent renders as PG's Append over the surviving
+    // children (the engine's prune pass decides which stay — the same
+    // kept-set the pre-r224 format printed as `kept=[…]`).
+    if crate::partition::is_partition_parent(engine.active_catalog(), name) {
+        let mut app = PlanNode::new(String::from("Append"));
+        let kept = where_
+            .and_then(|_| {
+                engine.explain_partition_kept_children_by_where(name, where_)
+            })
+            .or_else(|| engine.explain_partition_kept_children_by_where(name, None));
+        if let Some(children) = kept {
+            for c in &children {
+                let mut sc = PlanNode::new(alloc::format!("Seq Scan on {c}"));
+                if let Some(w) = where_ {
+                    sc.attrs.push(alloc::format!("Filter: {}", pg_cond(w)));
+                }
+                app.children.push(sc);
+            }
+        }
+        if app.children.is_empty() {
+            // Every child pruned (or prune unavailable): PG shows a
+            // one-child Append over the parent relation name.
+            let mut sc = PlanNode::new(alloc::format!("Seq Scan on {name}{alias_sfx}"));
+            if let Some(w) = where_ {
+                sc.attrs.push(alloc::format!("Filter: {}", pg_cond(w)));
+            }
+            app.children.push(sc);
+        }
+        return app;
+    }
+    let seek = where_.and_then(|w| {
+        let table = engine.active_catalog().get(name)?;
+        let cols = &table.schema().columns;
+        let a = alias.unwrap_or(name);
+        try_index_seek(
+            w,
+            cols,
+            engine.active_catalog(),
+            table,
+            a,
+            &engine.current_snapshot(),
+        )
+        .map(|_| ())
+    });
+    if seek.is_some() {
+        // Name the index the way create-table synthesises it: the first
+        // BTree index on the seek column. Approximation: report the
+        // table's first BTree index name (single-index tables — the
+        // common case — are exact).
+        let idx_name = engine
+            .active_catalog()
+            .get(name)
+            .and_then(|t| {
+                t.indices()
+                    .iter()
+                    .find(|i| matches!(i.kind, spg_storage::IndexKind::BTree(_)))
+                    .map(|i| i.name.clone())
+            })
+            .unwrap_or_else(|| alloc::format!("{name}_idx"));
+        let mut n = PlanNode::new(alloc::format!(
+            "Index Scan using {idx_name} on {name}{alias_sfx}"
+        ));
+        if let Some(w) = where_ {
+            n.attrs.push(alloc::format!("Index Cond: {}", pg_cond(w)));
+        }
+        n
+    } else {
+        let mut n = PlanNode::new(alloc::format!("Seq Scan on {name}{alias_sfx}"));
+        if let Some(w) = where_ {
+            n.attrs.push(alloc::format!("Filter: {}", pg_cond(w)));
+        }
+        n
+    }
+}
+
+/// v7.39 (round 224) — build the PG-shaped plan tree for a SELECT.
+/// Wrapping order (inner to outer): scan/join -> Aggregate/WindowAgg ->
+/// Sort -> Limit, matching PG's text plans. UNION peers become Append;
+/// materialized CTEs hang a `CTE <name>` labelled block under the root.
+fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
+    let cte_names: Vec<String> = stmt.ctes.iter().map(|c| c.name.clone()).collect();
+    // UNION family: every branch under one Append (PG uses Append for
+    // UNION ALL and wraps distinct set-ops further; Phase 0 renders the
+    // branch structure for all of them).
+    if !stmt.unions.is_empty() {
+        let mut root = PlanNode::new(String::from("Append"));
+        let mut first = stmt.clone();
+        first.unions = Vec::new();
+        root.children.push(build_plan_tree(&first, engine));
+        for (_kind, peer) in &stmt.unions {
+            root.children.push(build_plan_tree(peer, engine));
+        }
+        return root;
+    }
+    // Base: FROM-less SELECT is PG's Result node.
+    let mut node = match &stmt.from {
+        None => PlanNode::new(String::from("Result")),
+        Some(from) => {
+            let mut left = scan_node(
+                engine,
+                &from.primary.name,
+                from.primary.alias.as_deref(),
+                stmt.where_.as_ref(),
+                &cte_names,
+            );
+            // Fold joins left-deep: equality ON -> Hash Join (right side
+            // wrapped in a Hash node, like PG); anything else ->
+            // Nested Loop with a Join Filter.
+            for j in &from.joins {
+                let right = scan_node(
+                    engine,
+                    &j.table.name,
+                    j.table.alias.as_deref(),
+                    None,
+                    &cte_names,
+                );
+                let (verb, hashable) = match j.kind {
+                    spg_sql::ast::JoinKind::Inner => ("", true),
+                    spg_sql::ast::JoinKind::Left => (" Left", true),
+                    spg_sql::ast::JoinKind::Right => (" Right", true),
+                    spg_sql::ast::JoinKind::FullOuter => (" Full", true),
+                    spg_sql::ast::JoinKind::Cross => ("", false),
+                };
+                let is_eq_join = j
+                    .on
+                    .as_ref()
+                    .is_some_and(|on| matches!(on, Expr::Binary { op, .. } if matches!(op, spg_sql::ast::BinOp::Eq)));
+                let mut jn = if is_eq_join && hashable {
+                    let mut jn = PlanNode::new(alloc::format!("Hash Join{verb}"));
+                    // PG spells it "Hash Left Join", verb before "Join".
+                    jn.head = alloc::format!("Hash{verb} Join");
+                    if let Some(on) = &j.on {
+                        jn.attrs.push(alloc::format!("Hash Cond: {}", pg_cond(on)));
+                    }
+                    let mut hash = PlanNode::new(String::from("Hash"));
+                    hash.children.push(right);
+                    jn.children.push(left);
+                    jn.children.push(hash);
+                    jn
+                } else {
+                    let mut jn = PlanNode::new(alloc::format!("Nested Loop{verb}"));
+                    if let Some(on) = &j.on {
+                        jn.attrs.push(alloc::format!("Join Filter: {}", pg_cond(on)));
+                    }
+                    jn.children.push(left);
+                    jn.children.push(right);
+                    jn
+                };
+                if expr_has_subquery(stmt.where_.as_ref().unwrap_or(&Expr::Literal(
+                    spg_sql::ast::Literal::Null,
+                ))) {
+                    // Subquery filters stay on the scan node (attached
+                    // above); nothing extra here — placeholder branch kept
+                    // for the Phase 1 predicate-split work.
+                    let _ = &mut jn;
+                }
+                left = jn;
+            }
+            left
+        }
+    };
+    // Aggregate / window / distinct wrappers.
+    if select_has_window(stmt) {
+        let mut w = PlanNode::new(String::from("WindowAgg"));
+        w.children.push(node);
+        node = w;
+    }
+    if aggregate::uses_aggregate(stmt) || stmt.group_by.is_some() {
+        let mut agg = if let Some(gs) = &stmt.group_by {
+            let mut a = PlanNode::new(String::from("HashAggregate"));
+            let keys: Vec<String> = gs.iter().map(|g| alloc::format!("{g}")).collect();
+            a.attrs.push(alloc::format!("Group Key: {}", keys.join(", ")));
+            a
+        } else {
+            PlanNode::new(String::from("Aggregate"))
+        };
+        if let Some(h) = &stmt.having {
+            agg.attrs.push(alloc::format!("Filter: {}", pg_cond(h)));
+        }
+        agg.children.push(node);
+        node = agg;
+    } else if stmt.distinct {
+        // PG plans SELECT DISTINCT as a HashAggregate over the select list.
+        let mut d = PlanNode::new(String::from("HashAggregate"));
+        let keys: Vec<String> = stmt
+            .items
+            .iter()
+            .map(|it| match it {
+                SelectItem::Wildcard => String::from("*"),
+                SelectItem::Expr { expr, .. } => alloc::format!("{expr}"),
+                other => alloc::format!("{other:?}"),
+            })
+            .collect();
+        d.attrs.push(alloc::format!("Group Key: {}", keys.join(", ")));
+        d.children.push(node);
+        node = d;
+    }
+    if !stmt.order_by.is_empty() {
+        let mut s = PlanNode::new(String::from("Sort"));
+        let keys: Vec<String> = stmt
+            .order_by
+            .iter()
+            .map(|o| {
+                if o.desc {
+                    alloc::format!("{} DESC", o.expr)
+                } else {
+                    alloc::format!("{}", o.expr)
+                }
+            })
+            .collect();
+        s.attrs.push(alloc::format!("Sort Key: {}", keys.join(", ")));
+        s.children.push(node);
+        node = s;
+    }
+    if stmt.limit.is_some() || stmt.offset.is_some() {
+        let mut l = PlanNode::new(String::from("Limit"));
+        l.children.push(node);
+        node = l;
+    }
+    // Materialized CTE blocks hang as named (`no_arrow`) sub-plans on the
+    // root, matching PG's `CTE <name>` label + arrowed body.
+    for cte in &stmt.ctes {
+        let label = if cte.recursive {
+            alloc::format!("CTE {} (recursive)", cte.name)
+        } else {
+            alloc::format!("CTE {}", cte.name)
+        };
+        let mut block = PlanNode::new(label);
+        block.no_arrow = true;
+        match &cte.body {
+            spg_sql::ast::CteBody::Select(s) => {
+                block.children.push(build_plan_tree(s, engine));
+            }
+            spg_sql::ast::CteBody::Insert(s) => {
+                block
+                    .children
+                    .push(PlanNode::new(alloc::format!("Insert on {}", s.table)));
+            }
+            spg_sql::ast::CteBody::Update(s) => {
+                block
+                    .children
+                    .push(PlanNode::new(alloc::format!("Update on {}", s.table)));
+            }
+            spg_sql::ast::CteBody::Delete(s) => {
+                block
+                    .children
+                    .push(PlanNode::new(alloc::format!("Delete on {}", s.table)));
+            }
+            spg_sql::ast::CteBody::Merge(s) => {
+                block
+                    .children
+                    .push(PlanNode::new(alloc::format!("Merge on {}", s.target)));
+            }
+        }
+        node.children.insert(0, block);
+    }
+    node
+}
+
+/// v4.26 → v7.39 (round 224) — render the plan for `EXPLAIN <select>` in
+/// PG's text-tree shape (node vocabulary + `->` indentation measured off
+/// live PG18.4), so tools that parse PG plans (pgAdmin, explain
+/// visualisers, ORM analyzers) read SPG plans unchanged. The tree shows
+/// SPG's REAL execution decisions (its own index-seek heuristic, its own
+/// join strategy) — the shape is PG's, the choices are SPG's.
 pub(crate) fn explain_select(
     stmt: &SelectStatement,
     engine: &Engine,
     depth: usize,
     out: &mut Vec<String>,
 ) {
-    let pad = "  ".repeat(depth);
-    // 1) Top-level operator label.
-    let top = if !stmt.ctes.is_empty() {
-        if stmt.ctes.iter().any(|c| c.recursive) {
-            "CTEScan (WITH RECURSIVE)"
-        } else {
-            "CTEScan (WITH)"
-        }
-    } else if !stmt.unions.is_empty() {
-        "UnionScan"
-    } else if select_has_window(stmt) {
-        "WindowAgg"
-    } else if aggregate::uses_aggregate(stmt) {
-        "Aggregate"
-    } else if stmt.distinct {
-        "Distinct"
-    } else if stmt.from.is_some() {
-        "TableScan"
-    } else {
-        "Result"
-    };
-    out.push(alloc::format!("{pad}{top}"));
-    let child = "  ".repeat(depth + 1);
-    // 2) CTE bodies.
-    for cte in &stmt.ctes {
-        let head = if cte.recursive {
-            alloc::format!("{child}CTE (recursive): {}", cte.name)
-        } else {
-            alloc::format!("{child}CTE: {}", cte.name)
-        };
-        out.push(head);
-        // v7.37.43-T4.4 — modifying CTE bodies appear as a stub
-        // node; the dispatch logic in the engine routes them
-        // through dml.rs paths, not the recursive select planner.
-        match &cte.body {
-            spg_sql::ast::CteBody::Select(s) => explain_select(s, engine, depth + 2, out),
-            spg_sql::ast::CteBody::Insert(s) => {
-                out.push(alloc::format!(
-                    "{}ModifyingCTE (INSERT {})",
-                    "  ".repeat(depth + 2),
-                    s.table
-                ));
-            }
-            spg_sql::ast::CteBody::Merge(s) => {
-                out.push(alloc::format!(
-                    "{}ModifyingCTE (MERGE {})",
-                    "  ".repeat(depth + 2),
-                    s.target
-                ));
-            }
-            spg_sql::ast::CteBody::Update(s) => {
-                out.push(alloc::format!(
-                    "{}ModifyingCTE (UPDATE {})",
-                    "  ".repeat(depth + 2),
-                    s.table
-                ));
-            }
-            spg_sql::ast::CteBody::Delete(s) => {
-                out.push(alloc::format!(
-                    "{}ModifyingCTE (DELETE {})",
-                    "  ".repeat(depth + 2),
-                    s.table
-                ));
-            }
-        }
-    }
-    // 3) FROM details — primary table + joins, index hits.
-    if let Some(from) = &stmt.from {
-        let mut tag = alloc::format!("{child}From: {}", from.primary.name);
-        if let Some(alias) = &from.primary.alias {
-            tag.push_str(&alloc::format!(" AS {alias}"));
-        }
-        // v7.37.16 (16.10 [PG+]) — when the primary table is a
-        // partition parent, ask the planner which children survive
-        // the WHERE-clause prune pass and append that as an EXPLAIN
-        // annotation. PG only shows "Partitions removed: N"; we
-        // emit the kept children's actual names (which dashboards
-        // and dogfood-replay flagged as the missing piece).
-        if crate::partition::is_partition_parent(engine.active_catalog(), &from.primary.name) {
-            tag.push_str(" [partition parent]");
-            if let Some(kept) = engine.explain_partition_kept_children(&from.primary.name, stmt) {
-                tag.push_str(&alloc::format!(" kept=[{}]", kept.join(", ")));
-            }
-            out.push(tag);
-        } else {
-            // Try to detect an index-seek opportunity on WHERE against
-            // the primary table — same heuristic the executor uses.
-            if let Some(w) = &stmt.where_
-                && let Some(table) = engine.active_catalog().get(&from.primary.name)
-            {
-                let alias = from.primary.alias.as_deref().unwrap_or(&from.primary.name);
-                let cols = &table.schema().columns;
-                if try_index_seek(
-                    w,
-                    cols,
-                    engine.active_catalog(),
-                    table,
-                    alias,
-                    &engine.current_snapshot(),
-                )
-                .is_some()
-                {
-                    tag.push_str(" [index seek]");
-                } else {
-                    tag.push_str(" [full scan]");
-                }
-            } else {
-                tag.push_str(" [full scan]");
-            }
-            out.push(tag);
-        }
-        for j in &from.joins {
-            let kind = match j.kind {
-                spg_sql::ast::JoinKind::Inner => "INNER JOIN",
-                spg_sql::ast::JoinKind::Left => "LEFT JOIN",
-                spg_sql::ast::JoinKind::Cross => "CROSS JOIN",
-                spg_sql::ast::JoinKind::Right => "RIGHT JOIN",
-                spg_sql::ast::JoinKind::FullOuter => "FULL OUTER JOIN",
-            };
-            let mut s = alloc::format!("{child}{kind}: {}", j.table.name);
-            if let Some(alias) = &j.table.alias {
-                s.push_str(&alloc::format!(" AS {alias}"));
-            }
-            if j.on.is_some() {
-                s.push_str(" (ON …)");
-            }
-            out.push(s);
-        }
-    }
-    // 4) WHERE / GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET.
-    if let Some(w) = &stmt.where_ {
-        let mut s = alloc::format!("{child}Filter: {w}");
-        if expr_has_subquery(w) {
-            s.push_str(" [subquery]");
-        }
-        out.push(s);
-    }
-    if let Some(gs) = &stmt.group_by {
-        let mut parts = Vec::new();
-        for g in gs {
-            parts.push(alloc::format!("{g}"));
-        }
-        out.push(alloc::format!("{child}GroupBy: {}", parts.join(", ")));
-    }
-    if let Some(h) = &stmt.having {
-        out.push(alloc::format!("{child}Having: {h}"));
-    }
-    for o in &stmt.order_by {
-        let dir = if o.desc { "DESC" } else { "ASC" };
-        out.push(alloc::format!("{child}OrderBy: {} {dir}", o.expr));
-    }
-    if let Some(lim) = stmt.limit {
-        out.push(alloc::format!("{child}Limit: {lim}"));
-    }
-    if let Some(off) = stmt.offset {
-        out.push(alloc::format!("{child}Offset: {off}"));
-    }
-    // 5) Projection — collapse Wildcard or render N items.
-    if stmt
-        .items
-        .iter()
-        .any(|it| matches!(it, SelectItem::Wildcard))
-    {
-        out.push(alloc::format!("{child}Project: *"));
-    } else {
-        out.push(alloc::format!(
-            "{child}Project: {} item(s)",
-            stmt.items.len()
-        ));
-    }
-    // 6) Recurse into UNION peers.
-    for (kind, peer) in &stmt.unions {
-        let label = match kind {
-            UnionKind::All => "UNION ALL",
-            UnionKind::Distinct => "UNION",
-            UnionKind::Intersect => "INTERSECT",
-            UnionKind::IntersectAll => "INTERSECT ALL",
-            UnionKind::Except => "EXCEPT",
-            UnionKind::ExceptAll => "EXCEPT ALL",
-        };
-        out.push(alloc::format!("{child}{label}"));
-        explain_select(peer, engine, depth + 2, out);
-    }
+    let tree = build_plan_tree(stmt, engine);
+    render_pg_tree(&tree, depth, out);
 }
 
 impl Engine {
