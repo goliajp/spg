@@ -2063,6 +2063,22 @@ fn command_tag(sql: &str, affected: usize) -> String {
         "BEGIN" => "BEGIN".to_string(),
         "COMMIT" => "COMMIT".to_string(),
         "ROLLBACK" => "ROLLBACK".to_string(),
+        // v7.39 (round 219) — cursor command tags. MOVE reports the moved
+        // count; CLOSE ALL tags `CLOSE CURSOR ALL` (PG's spelling).
+        "DECLARE" => "DECLARE CURSOR".to_string(),
+        "MOVE" => format!("MOVE {affected}"),
+        "CLOSE" => {
+            let second = sql
+                .trim_start()
+                .split_ascii_whitespace()
+                .nth(1)
+                .unwrap_or("");
+            if second.eq_ignore_ascii_case("all") {
+                "CLOSE CURSOR ALL".to_string()
+            } else {
+                "CLOSE CURSOR".to_string()
+            }
+        }
         // v7.38 (read01 P3.27) — the first word does not name the command
         // for a data-modifying CTE (`WITH … INSERT/UPDATE/DELETE`) or a
         // MERGE, so PG tags them by the real top-level statement. Parse to
@@ -3460,6 +3476,8 @@ fn command_tag_for_rows_sql(sql: &str, n: usize) -> String {
         "UPDATE" => format!("UPDATE {n}"),
         "DELETE" => format!("DELETE {n}"),
         "MERGE" => format!("MERGE {n}"),
+        // v7.39 (round 219) — a cursor FETCH tags with its row count.
+        "FETCH" => format!("FETCH {n}"),
         "WITH" => spg_sql::parser::parse_statement(sql)
             .map(|s| command_tag_for_rows_ast(&s, n))
             .unwrap_or_else(|_| format!("SELECT {n}")),
