@@ -797,6 +797,7 @@ fn generic_aggregate_window(
     };
     let arg1 = if args.is_empty() { Vec::new() } else { eval_arg(0)? };
     let arg2 = if args.len() > 1 { Some(eval_arg(1)?) } else { None };
+    let name = crate::aggregate::canonical_agg_name(name);
     let kind = crate::aggregate::classify_agg_name(name);
     let eff = effective_frame(frame, ordered)?;
     let exclude = frame_exclusion(frame)?;

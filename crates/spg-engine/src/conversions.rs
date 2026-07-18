@@ -3977,7 +3977,15 @@ pub(crate) fn coerce_value(
         // `{[a,b),[c,d),...}` comma-separated ranges; each
         // subrange parses with the parent kind.
         (Value::Text(s), DataType::Multirange(kind)) => match parse_multirange_str(&s, kind) {
-            Some(ranges) => Some(Value::Multirange { kind, ranges }),
+            // v7.39 (round 231) — a multirange is normalized whatever built
+            // it. The constructor function already sorted / merged / dropped
+            // empties; the text cast kept the literal's spans verbatim, so
+            // `'{[1,3),[3,5)}'::int4multirange` printed back two adjacent
+            // spans where PG prints the merged `{[1,5)}`.
+            Some(ranges) => Some(Value::Multirange {
+                kind,
+                ranges: crate::eval::binop::normalize_multirange_spans(kind, &ranges),
+            }),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
