@@ -165,7 +165,13 @@ fn explain_format_xml_wraps_plan_in_explain_element() {
         "XML must open with <explain: {plan}"
     );
     assert!(plan.ends_with("</explain>"), "XML must close: {plan}");
-    assert!(plan.contains("<line>"), "line element missing: {plan}");
+    // v7.39 (round 228) — the body is the real node tree, not the old
+    // `<line>` wrapper: PG's <Query>/<Plan>/<Node-Type> elements.
+    assert!(plan.contains("<Query>"), "query element missing: {plan}");
+    assert!(
+        plan.contains("<Node-Type>Seq Scan</Node-Type>"),
+        "node element missing: {plan}"
+    );
 }
 
 #[test]
@@ -177,7 +183,15 @@ fn explain_format_yaml_emits_list_items() {
         plan.starts_with("- Plan:"),
         "YAML must start with `- Plan:`: {plan}"
     );
-    assert!(plan.contains("  - "), "no nested list item: {plan}");
+    // v7.39 (round 228) — PG's node mapping, not the old per-line list.
+    assert!(
+        plan.contains("Node Type: \"Seq Scan\""),
+        "node mapping missing: {plan}"
+    );
+    assert!(
+        plan.contains("Relation Name: \"t\""),
+        "relation key missing: {plan}"
+    );
 }
 
 #[test]

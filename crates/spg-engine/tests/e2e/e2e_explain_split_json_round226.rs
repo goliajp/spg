@@ -84,7 +84,8 @@ fn format_json_emits_pg_node_objects() {
     );
     assert_eq!(out.len(), 1, "JSON is one row");
     let j = &out[0];
-    assert!(j.starts_with("[{\"Plan\": {"), "PG array/Plan wrapper: {j}");
+    // v7.39 (round 228) — PG pretty-prints the array/Plan wrapper.
+    assert!(j.starts_with("[\n  {\n    \"Plan\": {"), "PG array/Plan wrapper: {j}");
     assert!(j.contains("\"Node Type\": \"Index Scan\""), "{j}");
     assert!(j.contains("\"Index Name\": \"p1_pkey\""), "{j}");
     assert!(j.contains("\"Relation Name\": \"p1\""), "{j}");

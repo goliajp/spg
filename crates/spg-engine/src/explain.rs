@@ -660,94 +660,241 @@ fn scan_counter_snapshot(engine: &Engine) -> alloc::collections::BTreeMap<String
     out
 }
 
-/// v7.39 (round 226, Phase 2) — render the plan tree as PG's FORMAT JSON:
-/// a one-element array holding `{"Plan": {…}}`, each node an object with
-/// "Node Type" first, structural keys, cost keys (omitted under COSTS
-/// OFF), the node's attribute lines as their own keys, and children under
-/// "Plans". Key names and nesting measured off live PG18.4 (r226 probe).
-fn render_json_plan(node: &PlanNode, with_costs: bool) -> String {
-    fn obj(node: &PlanNode, with_costs: bool, parent_rel: Option<&str>) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        // "Node Type" + the structural keys PG derives from the node head.
-        let head = node.head.as_str();
-        let (node_type, rel, idx) = if let Some(rest) = head.strip_prefix("Seq Scan on ") {
-            ("Seq Scan", Some(rest.split_whitespace().next().unwrap_or(rest)), None)
-        } else if let Some(rest) = head.strip_prefix("Index Scan using ") {
-            let (i, r) = rest.split_once(" on ").unwrap_or((rest, ""));
-            ("Index Scan", Some(r.split_whitespace().next().unwrap_or(r)), Some(i))
-        } else if let Some(rest) = head.strip_prefix("CTE Scan on ") {
-            ("CTE Scan", Some(rest.split_whitespace().next().unwrap_or(rest)), None)
-        } else if let Some(rest) = head.strip_prefix("Insert on ") {
-            ("Insert", Some(rest), None)
-        } else if let Some(rest) = head.strip_prefix("Update on ") {
-            ("Update", Some(rest), None)
-        } else if let Some(rest) = head.strip_prefix("Delete on ") {
-            ("Delete", Some(rest), None)
-        } else if head.starts_with("CTE ") {
-            ("CTE", None, None)
-        } else {
-            (head, None, None)
+/// One rendered property of a plan node, format-neutral: the structured
+/// forms below are what differ between JSON / XML / YAML, so the property
+/// list is built once (`node_props`) and each renderer spells it its own
+/// way. (v7.39 round 228 — was JSON-only in r226.)
+enum Prop {
+    /// A quoted scalar in JSON/YAML, bare text in XML.
+    Str(String),
+    /// A bare token (`false`, a number) — unquoted in every format.
+    Bare(String),
+    /// A sequence: JSON `[…]`, XML `<Item>…</Item>`, YAML `- …` lines.
+    List(Vec<String>),
+}
+
+/// v7.39 (round 226 Phase 2 / round 228) — the PG property list for one
+/// plan node: "Node Type" first, structural keys, cost keys (omitted under
+/// COSTS OFF), ANALYZE actuals when measured, then the node's attribute
+/// lines as their own keys. Key names, order, and the Aggregate
+/// Strategy / Partial Mode / Scan Direction spellings are measured off
+/// live PG18.4 (r226 + r228 probes).
+fn node_props(node: &PlanNode, with_costs: bool, parent_rel: Option<&str>) -> Vec<(String, Prop)> {
+    let mut p: Vec<(String, Prop)> = Vec::new();
+    let mut push = |k: &str, v: Prop| p.push((String::from(k), v));
+    // "Node Type" + the structural keys PG derives from the node head.
+    let head = node.head.as_str();
+    let (node_type, rel, idx) = if let Some(rest) = head.strip_prefix("Seq Scan on ") {
+        ("Seq Scan", Some(rest.split_whitespace().next().unwrap_or(rest)), None)
+    } else if let Some(rest) = head.strip_prefix("Index Scan using ") {
+        let (i, r) = rest.split_once(" on ").unwrap_or((rest, ""));
+        ("Index Scan", Some(r.split_whitespace().next().unwrap_or(r)), Some(i))
+    } else if let Some(rest) = head.strip_prefix("CTE Scan on ") {
+        ("CTE Scan", Some(rest.split_whitespace().next().unwrap_or(rest)), None)
+    } else if let Some(rest) = head.strip_prefix("Insert on ") {
+        ("Insert", Some(rest), None)
+    } else if let Some(rest) = head.strip_prefix("Update on ") {
+        ("Update", Some(rest), None)
+    } else if let Some(rest) = head.strip_prefix("Delete on ") {
+        ("Delete", Some(rest), None)
+    } else if head.starts_with("CTE ") {
+        ("CTE", None, None)
+    } else {
+        (head, None, None)
+    };
+    // PG's HashAggregate is Node Type "Aggregate" + Strategy "Hashed",
+    // and every Aggregate carries a Partial Mode.
+    let is_agg = node_type == "HashAggregate" || node_type == "Aggregate";
+    push(
+        "Node Type",
+        Prop::Str(String::from(if is_agg { "Aggregate" } else { node_type })),
+    );
+    if let Some(pr) = parent_rel {
+        push("Parent Relationship", Prop::Str(String::from(pr)));
+    }
+    if is_agg {
+        let strategy = if node_type == "HashAggregate" { "Hashed" } else { "Plain" };
+        push("Strategy", Prop::Str(String::from(strategy)));
+        push("Partial Mode", Prop::Str(String::from("Simple")));
+    }
+    push("Parallel Aware", Prop::Bare(String::from("false")));
+    push("Async Capable", Prop::Bare(String::from("false")));
+    if let Some(i) = idx {
+        // SPG's index access is always a forward descent (r228: PG spells
+        // the same thing "Forward").
+        push("Scan Direction", Prop::Str(String::from("Forward")));
+        push("Index Name", Prop::Str(String::from(i)));
+    }
+    if let Some(r) = rel {
+        push("Relation Name", Prop::Str(String::from(r)));
+        push("Alias", Prop::Str(String::from(r)));
+    }
+    if with_costs && let Some((cs, ct, rows, width)) = node.cost {
+        push("Startup Cost", Prop::Bare(alloc::format!("{cs:.2}")));
+        push("Total Cost", Prop::Bare(alloc::format!("{ct:.2}")));
+        push("Plan Rows", Prop::Bare(alloc::format!("{rows}")));
+        push("Plan Width", Prop::Bare(alloc::format!("{width}")));
+    }
+    // ANALYZE actuals — only the genuinely measured ones (r227): a time
+    // key appears only where SPG really took a reading.
+    if let Some((time, rows)) = &node.actual {
+        if let Some(ms) = time {
+            push("Actual Startup Time", Prop::Bare(String::from("0.000")));
+            push("Actual Total Time", Prop::Bare(alloc::format!("{ms:.3}")));
+        }
+        push("Actual Rows", Prop::Bare(alloc::format!("{rows}.00")));
+        push("Actual Loops", Prop::Bare(String::from("1")));
+    }
+    push("Disabled", Prop::Bare(String::from("false")));
+    // Attribute lines become their own keys ("Filter", "Index Cond",
+    // "Sort Key", "Group Key", "Hash Cond", "Join Filter"). PG renders
+    // the key-list forms (Sort/Group Key) as sequences.
+    for a in &node.attrs {
+        let Some((k, v)) = a.split_once(": ") else {
+            continue;
         };
-        parts.push(alloc::format!("\"Node Type\": {}", json_string_lit(node_type)));
-        if let Some(pr) = parent_rel {
-            parts.push(alloc::format!("\"Parent Relationship\": {}", json_string_lit(pr)));
+        if k == "Sort Key" || k == "Group Key" {
+            push(k, Prop::List(v.split(", ").map(String::from).collect()));
+        } else if k == "Rows Removed by Filter" {
+            push(k, Prop::Bare(String::from(v)));
+        } else {
+            push(k, Prop::Str(String::from(v)));
         }
-        // PG's HashAggregate is Node Type "Aggregate" + Strategy "Hashed".
-        if node_type == "HashAggregate" {
-            parts.clear();
-            parts.push(alloc::format!("\"Node Type\": {}", json_string_lit("Aggregate")));
-            if let Some(pr) = parent_rel {
-                parts.push(alloc::format!("\"Parent Relationship\": {}", json_string_lit(pr)));
+    }
+    p
+}
+
+/// PG labels a node's first child Outer and the second Inner.
+fn child_rel(i: usize) -> &'static str {
+    if i == 0 { "Outer" } else { "Inner" }
+}
+
+/// v7.39 (round 226 / round 228) — PG's FORMAT JSON: a one-element array
+/// holding `{"Plan": {…}}`, pretty-printed two spaces per level exactly as
+/// PG does, children nested under "Plans".
+fn render_json_plan(node: &PlanNode, with_costs: bool) -> String {
+    fn obj(node: &PlanNode, with_costs: bool, parent_rel: Option<&str>, ind: usize, out: &mut String) {
+        let pad = " ".repeat(ind);
+        let inner = " ".repeat(ind + 2);
+        out.push_str("{\n");
+        let props = node_props(node, with_costs, parent_rel);
+        let last = props.len().saturating_sub(1);
+        for (i, (k, v)) in props.iter().enumerate() {
+            out.push_str(&inner);
+            out.push_str(&json_string_lit(k));
+            out.push_str(": ");
+            match v {
+                Prop::Str(s) => out.push_str(&json_string_lit(s)),
+                Prop::Bare(s) => out.push_str(s),
+                Prop::List(items) => {
+                    let its: Vec<String> = items.iter().map(|s| json_string_lit(s)).collect();
+                    out.push_str(&alloc::format!("[{}]", its.join(", ")));
+                }
             }
-            parts.push(alloc::format!("\"Strategy\": {}", json_string_lit("Hashed")));
-        } else if node_type == "Aggregate" {
-            parts.push(alloc::format!("\"Strategy\": {}", json_string_lit("Plain")));
+            if i != last || !node.children.is_empty() {
+                out.push(',');
+            }
+            out.push('\n');
         }
-        parts.push(String::from("\"Parallel Aware\": false"));
-        if let Some(i) = idx {
-            parts.push(alloc::format!("\"Index Name\": {}", json_string_lit(i)));
+        if !node.children.is_empty() {
+            out.push_str(&inner);
+            out.push_str("\"Plans\": [\n");
+            for (i, c) in node.children.iter().enumerate() {
+                out.push_str(&" ".repeat(ind + 4));
+                obj(c, with_costs, Some(child_rel(i)), ind + 4, out);
+                if i + 1 != node.children.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str(&inner);
+            out.push_str("]\n");
         }
-        if let Some(r) = rel {
-            parts.push(alloc::format!("\"Relation Name\": {}", json_string_lit(r)));
-            parts.push(alloc::format!("\"Alias\": {}", json_string_lit(r)));
-        }
-        if with_costs && let Some((cs, ct, rows, width)) = node.cost {
-            parts.push(alloc::format!("\"Startup Cost\": {cs:.2}"));
-            parts.push(alloc::format!("\"Total Cost\": {ct:.2}"));
-            parts.push(alloc::format!("\"Plan Rows\": {rows}"));
-            parts.push(alloc::format!("\"Plan Width\": {width}"));
-        }
-        parts.push(String::from("\"Disabled\": false"));
-        // Attribute lines become their own keys ("Filter", "Index Cond",
-        // "Sort Key", "Group Key", "Hash Cond", "Join Filter"). PG renders
-        // the key-list forms (Sort/Group Key) as JSON arrays.
-        for a in &node.attrs {
-            let Some((k, v)) = a.split_once(": ") else {
-                continue;
-            };
-            if k == "Sort Key" || k == "Group Key" {
-                let items: Vec<String> = v.split(", ").map(json_string_lit).collect();
-                parts.push(alloc::format!("\"{k}\": [{}]", items.join(", ")));
-            } else {
-                parts.push(alloc::format!("\"{k}\": {}", json_string_lit(v)));
+        out.push_str(&pad);
+        out.push('}');
+    }
+    let mut out = String::from("[\n  {\n    \"Plan\": ");
+    obj(node, with_costs, None, 4, &mut out);
+    out.push_str("\n  }\n]");
+    out
+}
+
+/// v7.39 (round 228) — PG's FORMAT XML: the `<explain>` envelope with the
+/// PG namespace, one `<Query>`, and the node tree with hyphenated element
+/// names (`Node-Type`, `Relation-Name`) and `<Item>` sequences.
+fn render_xml_plan(node: &PlanNode, with_costs: bool) -> String {
+    fn elem(node: &PlanNode, with_costs: bool, parent_rel: Option<&str>, ind: usize, out: &mut String) {
+        let pad = " ".repeat(ind);
+        let inner = " ".repeat(ind + 2);
+        out.push_str(&alloc::format!("{pad}<Plan>\n"));
+        for (k, v) in node_props(node, with_costs, parent_rel) {
+            let tag = k.replace(' ', "-");
+            match v {
+                Prop::Str(s) => {
+                    out.push_str(&alloc::format!("{inner}<{tag}>{}</{tag}>\n", xml_escape(&s)));
+                }
+                Prop::Bare(s) => out.push_str(&alloc::format!("{inner}<{tag}>{s}</{tag}>\n")),
+                Prop::List(items) => {
+                    out.push_str(&alloc::format!("{inner}<{tag}>\n"));
+                    for it in items {
+                        out.push_str(&alloc::format!(
+                            "{inner}  <Item>{}</Item>\n",
+                            xml_escape(&it)
+                        ));
+                    }
+                    out.push_str(&alloc::format!("{inner}</{tag}>\n"));
+                }
             }
         }
         if !node.children.is_empty() {
-            let kids: Vec<String> = node
-                .children
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    // PG labels the first child Outer, the second Inner.
-                    let rel = if i == 0 { "Outer" } else { "Inner" };
-                    obj(c, with_costs, Some(rel))
-                })
-                .collect();
-            parts.push(alloc::format!("\"Plans\": [{}]", kids.join(", ")));
+            out.push_str(&alloc::format!("{inner}<Plans>\n"));
+            for (i, c) in node.children.iter().enumerate() {
+                elem(c, with_costs, Some(child_rel(i)), ind + 4, out);
+            }
+            out.push_str(&alloc::format!("{inner}</Plans>\n"));
         }
-        alloc::format!("{{{}}}", parts.join(", "))
+        out.push_str(&alloc::format!("{pad}</Plan>\n"));
     }
-    alloc::format!("[{{\"Plan\": {}}}]", obj(node, with_costs, None))
+    let mut out =
+        String::from("<explain xmlns=\"http://www.postgresql.org/2009/explain\">\n  <Query>\n");
+    elem(node, with_costs, None, 4, &mut out);
+    out.push_str("  </Query>\n</explain>");
+    out
+}
+
+/// v7.39 (round 228) — PG's FORMAT YAML: a one-element sequence whose
+/// `Plan:` mapping holds the node properties, children as a nested `Plans:`
+/// sequence. PG emits a trailing space after the container keys; matched.
+fn render_yaml_plan(node: &PlanNode, with_costs: bool) -> String {
+    fn map(node: &PlanNode, with_costs: bool, parent_rel: Option<&str>, ind: usize, out: &mut String) {
+        let pad = " ".repeat(ind);
+        for (i, (k, v)) in node_props(node, with_costs, parent_rel).iter().enumerate() {
+            // The first property carries the sequence dash from the caller.
+            if i > 0 {
+                out.push_str(&pad);
+            }
+            match v {
+                Prop::Str(s) => out.push_str(&alloc::format!("{k}: {}\n", yaml_scalar(s))),
+                Prop::Bare(s) => out.push_str(&alloc::format!("{k}: {s}\n")),
+                Prop::List(items) => {
+                    out.push_str(&alloc::format!("{k}: \n"));
+                    for it in items {
+                        out.push_str(&alloc::format!("{pad}  - {}\n", yaml_scalar(it)));
+                    }
+                }
+            }
+        }
+        if !node.children.is_empty() {
+            out.push_str(&alloc::format!("{pad}Plans: \n"));
+            for (i, c) in node.children.iter().enumerate() {
+                out.push_str(&alloc::format!("{pad}  - "));
+                map(c, with_costs, Some(child_rel(i)), ind + 4, out);
+            }
+        }
+    }
+    let mut out = String::from("- Plan: \n    ");
+    map(node, with_costs, None, 4, &mut out);
+    out
 }
 
 /// v7.39 (round 224) — build the PG-shaped plan tree for a SELECT.
@@ -1315,25 +1462,40 @@ impl Engine {
                 };
                 alloc::vec![Row::new(alloc::vec![Value::text(body)])]
             }
+            // v7.39 (round 228) — XML / YAML render the same node tree the
+            // JSON path does. The per-line fallback stays for shapes that
+            // produced no tree (SUGGEST / ANALYZE extras).
             spg_sql::ast::ExplainFormat::Xml => {
-                let mut body = alloc::string::String::from(
-                    "<explain xmlns=\"http://www.postgresql.org/2009/explain\">",
-                );
-                for l in &lines {
-                    body.push_str("<line>");
-                    body.push_str(&xml_escape(l));
-                    body.push_str("</line>");
-                }
-                body.push_str("</explain>");
+                let body = match &plan_tree {
+                    Some(tree) => render_xml_plan(tree, !e.costs_off),
+                    None => {
+                        let mut b = alloc::string::String::from(
+                            "<explain xmlns=\"http://www.postgresql.org/2009/explain\">",
+                        );
+                        for l in &lines {
+                            b.push_str("<line>");
+                            b.push_str(&xml_escape(l));
+                            b.push_str("</line>");
+                        }
+                        b.push_str("</explain>");
+                        b
+                    }
+                };
                 alloc::vec![Row::new(alloc::vec![Value::text(body)])]
             }
             spg_sql::ast::ExplainFormat::Yaml => {
-                let mut body = alloc::string::String::from("- Plan:\n");
-                for l in &lines {
-                    body.push_str("  - ");
-                    body.push_str(&yaml_scalar(l));
-                    body.push('\n');
-                }
+                let body = match &plan_tree {
+                    Some(tree) => render_yaml_plan(tree, !e.costs_off),
+                    None => {
+                        let mut b = alloc::string::String::from("- Plan:\n");
+                        for l in &lines {
+                            b.push_str("  - ");
+                            b.push_str(&yaml_scalar(l));
+                            b.push('\n');
+                        }
+                        b
+                    }
+                };
                 alloc::vec![Row::new(alloc::vec![Value::text(body)])]
             }
         };
