@@ -148,6 +148,25 @@ impl Engine {
             T::AlterColumnDropDefault { column } => self.alter_column_drop_default(tbl, column),
             T::AlterColumnSetNotNull { column } => self.alter_column_set_not_null(tbl, column),
             T::AlterColumnDropNotNull { column } => self.alter_column_drop_not_null(tbl, column),
+            // v7.39 (round 220) — RESTART [WITH n]: record the next-value
+            // floor on the identity column (max+1 alloc takes the max).
+            T::AlterColumnRestart { column, with } => {
+                let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+                })?;
+                let Some(col) = table
+                    .schema_mut()
+                    .columns
+                    .iter_mut()
+                    .find(|c| c.name.eq_ignore_ascii_case(&column))
+                else {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "column \"{column}\" of relation \"{tbl}\" does not exist"
+                    )));
+                };
+                col.auto_restart = Some(with.unwrap_or(1));
+                Ok(())
+            }
             T::AlterColumnDropExpression { column, if_exists } => {
                 self.alter_column_drop_expression(tbl, column, if_exists)
             }

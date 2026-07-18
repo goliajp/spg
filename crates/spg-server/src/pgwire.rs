@@ -4128,6 +4128,10 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // exclusion_violation).
         } else if msg.contains("violates exclusion constraint") {
             "23P01"
+        // v7.39 (round 220) — a CYCLE-less sequence past its bound
+        // (PG 2200H sequence_generator_limit_exceeded).
+        } else if msg.contains("nextval: reached") {
+            "2200H"
         } else if msg.contains("violates foreign key constraint")
             || msg.contains("FOREIGN KEY violation")
         {

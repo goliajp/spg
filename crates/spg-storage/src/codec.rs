@@ -59,6 +59,7 @@ pub(crate) fn deserialize_table(
             generated_stored_expr: None,
             identity_always: false,
             default_text: None,
+            auto_restart: None,
             scalar_row_source: false,
         });
     }
@@ -510,6 +511,17 @@ pub(crate) fn deserialize_table(
             });
         }
         t.schema_mut().exclusion_constraints = excls;
+    }
+    // v7.39 (round 220) — identity-RESTART appendix (FILE_VERSION 73+).
+    if version >= 73 {
+        let n = cur.read_u16()? as usize;
+        for _ in 0..n {
+            let pos = cur.read_u16()? as usize;
+            let floor = cur.read_i64()?;
+            if let Some(col) = t.schema_mut().columns.get_mut(pos) {
+                col.auto_restart = Some(floor);
+            }
+        }
     }
     let _ = table_name;
     Ok(())

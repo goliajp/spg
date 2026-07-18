@@ -779,6 +779,7 @@ fn handle_com_stmt_prepare(
                 generated_stored_expr: None,
                 identity_always: false,
                 default_text: None,
+                auto_restart: None,
                 scalar_row_source: false,
             };
             let buf = encode_column_def_41(&placeholder);

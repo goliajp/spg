@@ -8297,6 +8297,38 @@ impl Parser {
                             }
                         ]);
                     }
+                    // v7.39 (round 220) — `RESTART [WITH n]` on an identity
+                    // column: floor the next allocated value at n (bare
+                    // RESTART = restart from the start value, 1).
+                    Token::Ident(s) if s.eq_ignore_ascii_case("restart") => {
+                        self.advance();
+                        let with = if matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("with"))
+                        {
+                            self.advance();
+                            let neg = if matches!(self.peek(), Token::Minus) {
+                                self.advance();
+                                true
+                            } else {
+                                false
+                            };
+                            match self.advance() {
+                                Token::Integer(v) => Some(if neg { -v } else { v }),
+                                other => {
+                                    return Err(self.err(alloc::format!(
+                                        "expected integer after RESTART WITH, got {other:?}"
+                                    )));
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        return Ok(alloc::vec![
+                            crate::ast::AlterTableTarget::AlterColumnRestart {
+                                column: col_name,
+                                with,
+                            }
+                        ]);
+                    }
                     other => {
                         return Err(self.err(alloc::format!(
                             "expected TYPE / SET / DROP / ADD after ALTER COLUMN <name>, got {other:?}"

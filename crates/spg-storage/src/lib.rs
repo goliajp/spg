@@ -1438,6 +1438,14 @@ pub struct ColumnSchema {
     /// `None` for a column with no explicit default. Persisted in catalog
     /// FILE_VERSION 58+; older catalogs deserialise with None.
     pub default_text: Option<String>,
+    /// v7.39 (round 220) — `ALTER TABLE … ALTER COLUMN … RESTART [WITH n]`
+    /// on an identity column. SPG's identity allocation is a max+1 scan;
+    /// this floor lifts the next allocated value to at least `n`
+    /// (`max(max+1, n)`) — exactly what a dump-restore RESTART needs, and
+    /// safer than PG for a backward RESTART (no duplicate-key landmine).
+    /// Persisted in the FILE_VERSION 73+ sparse appendix; older catalogs
+    /// deserialise with None.
+    pub auto_restart: Option<i64>,
     /// v7.39 (read01 round 78) — this column is the ONLY column of a FROM item
     /// that calls a function returning a BASE type, so the item's row type IS
     /// this column: a whole-row reference collapses to the value
@@ -4292,10 +4300,13 @@ impl Catalog {
                     if seq.cycle {
                         seq.min_value
                     } else {
-                        return Err(StorageError::Corrupt(format!(
-                            "sequence {name:?} reached MAXVALUE ({})",
-                            seq.max_value
-                        )));
+                        // v7.39 (round 220) — PG's 2200H wording, not a
+                        // Corrupt-classed error.
+                        return Err(StorageError::SequenceExhausted {
+                            name: name.into(),
+                            limit: seq.max_value,
+                            is_max: true,
+                        });
                     }
                 } else {
                     next
@@ -4304,10 +4315,11 @@ impl Catalog {
                 if seq.cycle {
                     seq.max_value
                 } else {
-                    return Err(StorageError::Corrupt(format!(
-                        "sequence {name:?} reached MINVALUE ({})",
-                        seq.min_value
-                    )));
+                    return Err(StorageError::SequenceExhausted {
+                        name: name.into(),
+                        limit: seq.min_value,
+                        is_max: false,
+                    });
                 }
             } else {
                 next
@@ -6492,6 +6504,14 @@ pub enum StorageError {
     /// kind / column type (e.g. ALTER INDEX REBUILD on a `BTree`
     /// index, or REBUILD WITH (encoding=…) on a non-vector column).
     Unsupported(String),
+    /// v7.39 (round 220) — a CYCLE-less sequence ran past its bound.
+    /// PG's 2200H phrasing: `nextval: reached maximum value of
+    /// sequence "s" (n)` (`is_max: false` = the MINVALUE direction).
+    SequenceExhausted {
+        name: String,
+        limit: i64,
+        is_max: bool,
+    },
 }
 
 impl fmt::Display for StorageError {
@@ -6532,6 +6552,12 @@ impl fmt::Display for StorageError {
             Self::Corrupt(detail) => write!(f, "corrupt on-disk format: {detail}"),
             Self::IndexNotFound { name } => write!(f, "index \"{name}\" does not exist"),
             Self::Unsupported(detail) => write!(f, "unsupported: {detail}"),
+            // v7.39 (round 220) — PG's exact 2200H wording.
+            Self::SequenceExhausted { name, limit, is_max } => write!(
+                f,
+                "nextval: reached {} value of sequence \"{name}\" ({limit})",
+                if *is_max { "maximum" } else { "minimum" }
+            ),
         }
     }
 }
@@ -6557,6 +6583,7 @@ impl ColumnSchema {
             generated_stored_expr: None,
             identity_always: false,
             default_text: None,
+            auto_restart: None,
             scalar_row_source: false,
         }
     }
@@ -6902,7 +6929,12 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// per-table block, after the column-ACL appendix. A v71 reader stops before
 /// it and its tables read back with no exclusion constraints, which is what
 /// they were.
-const FILE_VERSION: u8 = 72;
+/// v7.39 (round 220) — v73 appends a per-table identity-RESTART appendix
+/// (sparse: [u16 count] then per entry [u16 col_pos][i64 LE floor]) after
+/// the EXCLUDE appendix. A v72 reader stops before it; its columns read
+/// back with no RESTART floor, losing only an un-consumed
+/// `ALTER … RESTART WITH` across a restart.
+const FILE_VERSION: u8 = 73;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7666,6 +7698,23 @@ impl Catalog {
                     write_u16(&mut out, u16::try_from(*pos).expect("≤ 65k columns/table"));
                     write_str(&mut out, op);
                 }
+            }
+            // v7.39 (round 220) — identity-RESTART appendix (FILE_VERSION
+            // 73+), sparse: only columns carrying a RESTART floor land here.
+            let restarts: Vec<(usize, i64)> = t
+                .schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.auto_restart.map(|n| (i, n)))
+                .collect();
+            write_u16(
+                &mut out,
+                u16::try_from(restarts.len()).expect("≤ 65k restart columns/table"),
+            );
+            for (pos, n) in restarts {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                out.extend_from_slice(&n.to_le_bytes());
             }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
