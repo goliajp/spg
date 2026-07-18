@@ -148,13 +148,16 @@ fn explain_analyze_attaches_actual_rows() {
 
     let lines = explain_lines(&mut s, "EXPLAIN ANALYZE SELECT * FROM t WHERE id > 4");
     let blob = lines.join("\n");
-    // v6.2.4 changed the EXPLAIN ANALYZE annotation shape: per-op
-    // `(rows=N)` inline on each operator line plus a `Total:` line
-    // at the bottom carrying total rows + elapsed micros. Drop the
-    // legacy "Actual:" probe; assert on the new shape instead.
+    // v7.39 (round 227) — PG-shaped ANALYZE: the measured block on the
+    // node (`rows=3.00 loops=1`) plus PG's `Execution Time:` summary,
+    // replacing SPG's old `Total: rows=… elapsed=…us` line.
     assert!(
-        blob.contains("Total:") && blob.contains("rows=3"),
-        "expected Total: + rows=3 on a `id > 4` filter over 7 rows; got: {blob}"
+        blob.contains("rows=3.00 loops=1"),
+        "expected the measured block with 3 rows on `id > 4` over 7 rows; got: {blob}"
+    );
+    assert!(
+        blob.contains("Execution Time: "),
+        "expected PG's Execution Time summary; got: {blob}"
     );
 }
 

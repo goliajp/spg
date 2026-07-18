@@ -1394,6 +1394,7 @@ impl Parser {
                 let mut timing_off = false;
                 let mut settings = false;
                 let mut wal = false;
+                let mut summary_off = false;
                 let mut format = crate::ast::ExplainFormat::Text;
                 // v6.8.3 + v7.37.7 — `EXPLAIN (option [, option…])`
                 // syntax accepts SUGGEST + COSTS ON|OFF. Multiple
@@ -1516,9 +1517,32 @@ impl Parser {
                             settings = true;
                         } else if opt.eq_ignore_ascii_case("wal") {
                             wal = true;
+                        } else if opt.eq_ignore_ascii_case("summary") {
+                            // v7.39 (round 227) — `SUMMARY [ON|OFF]` really
+                            // gates the trailing Planning/Execution Time
+                            // lines now (was accept-and-no-op).
+                            let value = match self.peek().clone() {
+                                Token::On => {
+                                    self.advance();
+                                    true
+                                }
+                                Token::Ident(v) | Token::QuotedIdent(v)
+                                    if v.eq_ignore_ascii_case("off") =>
+                                {
+                                    self.advance();
+                                    false
+                                }
+                                Token::Ident(v) | Token::QuotedIdent(v)
+                                    if v.eq_ignore_ascii_case("true") =>
+                                {
+                                    self.advance();
+                                    true
+                                }
+                                _ => true,
+                            };
+                            summary_off = !value;
                         } else if opt.eq_ignore_ascii_case("verbose")
                             || opt.eq_ignore_ascii_case("format")
-                            || opt.eq_ignore_ascii_case("summary")
                         {
                             // v7.37.22 — accept-but-no-op the remaining
                             // PG options so EXPLAIN-using clients
@@ -1621,6 +1645,7 @@ impl Parser {
                     timing_off,
                     settings,
                     wal,
+                    summary_off,
                     format,
                 }))
             }

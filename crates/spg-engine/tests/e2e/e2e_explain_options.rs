@@ -89,8 +89,9 @@ fn explain_timing_off_strips_elapsed() {
     // clock guards whether elapsed actually lands. (The
     // clock-bound branch is covered by e2e_explain_analyze.)
     let plan_on = plan_text(&mut e, "EXPLAIN (ANALYZE, TIMING ON) SELECT * FROM t");
+    // v7.39 (round 227) — PG shape: the node carries the measured block.
     assert!(
-        plan_on.contains("Total: rows="),
+        plan_on.contains("loops=1"),
         "TIMING ON plan body broken: {plan_on}"
     );
 }

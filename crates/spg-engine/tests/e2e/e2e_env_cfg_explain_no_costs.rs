@@ -42,16 +42,13 @@ fn explain_lines(engine: &mut Engine) -> Vec<String> {
 
 #[test]
 fn explain_no_costs_strips_elapsed_from_total_line() {
-    // GUC off (production): Total line carries `elapsed=…us`.
+    // v7.39 (round 227) — PG shape: production EXPLAIN ANALYZE emits
+    // `Execution Time: … ms` (replaced SPG's `Total: … elapsed=…us`).
     let mut on = Engine::new().with_clock(fake_clock);
     let on_lines = explain_lines(&mut on);
-    let total_on = on_lines
-        .iter()
-        .find(|l| l.starts_with("Total: rows="))
-        .expect("Total line present");
     assert!(
-        total_on.contains("elapsed="),
-        "production EXPLAIN must include elapsed; got {total_on:?}"
+        on_lines.iter().any(|l| l.starts_with("Execution Time: ")),
+        "production EXPLAIN must include Execution Time; got {on_lines:?}"
     );
 
     // GUC on: same query, Total line has no elapsed annotation.
@@ -59,13 +56,9 @@ fn explain_no_costs_strips_elapsed_from_total_line() {
         .with_clock(fake_clock)
         .with_env_cfg(EnvConfig::builder().explain_no_costs(true).build());
     let off_lines = explain_lines(&mut off);
-    let total_off = off_lines
-        .iter()
-        .find(|l| l.starts_with("Total: rows="))
-        .expect("Total line present");
     assert!(
-        !total_off.contains("elapsed="),
-        "EXPLAIN_NO_COSTS must strip elapsed; got {total_off:?}"
+        !off_lines.iter().any(|l| l.starts_with("Execution Time: ")),
+        "EXPLAIN_NO_COSTS must strip the timing summary; got {off_lines:?}"
     );
 }
 
