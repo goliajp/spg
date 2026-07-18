@@ -127,6 +127,18 @@ pub enum Statement {
     },
     /// v7.39 (round 218) — `CLOSE <name>` / `CLOSE ALL` (`None` = ALL).
     CloseCursor { name: Option<String> },
+    /// v7.39 (round 222) — `LISTEN <channel>`: subscribe this session to
+    /// async notifications on the channel.
+    Listen(String),
+    /// v7.39 (round 222) — `NOTIFY <channel> [, '<payload>']`. Delivered at
+    /// COMMIT (PG semantics: transactional, deduplicated within the tx);
+    /// immediately under autocommit.
+    Notify {
+        channel: String,
+        payload: Option<String>,
+    },
+    /// v7.39 (round 222) — `UNLISTEN <channel>` / `UNLISTEN *` (`None` = *).
+    Unlisten(Option<String>),
     /// `COPY table [(cols)] TO STDOUT` — the engine renders the
     /// visible rows in COPY text format (tab-separated, `\N`
     /// nulls, backslash escapes) as a single-text-column result
@@ -3772,7 +3784,12 @@ impl Statement {
             | Statement::DeclareCursor { .. }
             | Statement::FetchCursor { .. }
             | Statement::MoveCursor { .. }
-            | Statement::CloseCursor { .. } => false,
+            | Statement::CloseCursor { .. }
+            // v7.39 (round 222) — LISTEN/NOTIFY mutate session channel
+            // state / the notification queue: writer path.
+            | Statement::Listen(_)
+            | Statement::Notify { .. }
+            | Statement::Unlisten(_) => false,
         }
     }
 }
@@ -3955,6 +3972,18 @@ impl fmt::Display for Statement {
             Self::CloseCursor { name } => match name {
                 Some(n) => write!(f, "CLOSE {}", quote_ident(n)),
                 None => f.write_str("CLOSE ALL"),
+            },
+            Self::Listen(ch) => write!(f, "LISTEN {}", quote_ident(ch)),
+            Self::Notify { channel, payload } => {
+                write!(f, "NOTIFY {}", quote_ident(channel))?;
+                if let Some(p) = payload {
+                    write!(f, ", '{}'", p.replace('\'', "''"))?;
+                }
+                Ok(())
+            }
+            Self::Unlisten(ch) => match ch {
+                Some(c) => write!(f, "UNLISTEN {}", quote_ident(c)),
+                None => f.write_str("UNLISTEN *"),
             },
             Self::CopyTo {
                 table,

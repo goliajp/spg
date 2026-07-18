@@ -372,6 +372,25 @@ fn handle_pg_simple_query(
                 && let Ok(s) = core::str::from_utf8(rest_trim)
                 && let Ok(n) = s.parse::<i64>()
             {
+                // v7.39 (round 222) — flush pending LISTEN/NOTIFY deliveries
+                // even on the liveness fast path: psycopg2 / libpq poll
+                // loops issue exactly `SELECT 1` expecting queued
+                // notifications to arrive with it. One uncontended Mutex
+                // lock (normally-empty Vec) — no engine lock touched.
+                let mine: Vec<(String, String)> = conn_state
+                    .notify_queue
+                    .lock()
+                    .map(|mut q| core::mem::take(&mut *q))
+                    .unwrap_or_default();
+                for (channel, payload) in &mine {
+                    let mut body = Vec::with_capacity(channel.len() + payload.len() + 8);
+                    body.extend_from_slice(&conn_state.pid.to_be_bytes());
+                    body.extend_from_slice(channel.as_bytes());
+                    body.push(0);
+                    body.extend_from_slice(payload.as_bytes());
+                    body.push(0);
+                    send_msg(wbuf, b'A', &body)?;
+                }
                 encode_select_int_response(wbuf, n, *tx_state)?;
                 stream.write_all(wbuf)?;
                 wbuf.clear();
@@ -869,6 +888,10 @@ fn handle_pg_simple_query(
             .store(0, std::sync::atomic::Ordering::Relaxed);
         match stream_result {
             Ok(n) => {
+                // v7.39 (round 222) — the streaming fast path also flushes
+                // pending LISTEN/NOTIFY deliveries (the engine read lock is
+                // dropped above, so the drain's write lock is safe).
+                drain_notifications(state, wbuf, conn_state)?;
                 send_command_complete_select_count(wbuf, n)?;
                 send_ready_for_query(wbuf, *tx_state)?;
                 stream.write_all(wbuf)?;
@@ -920,6 +943,7 @@ fn handle_pg_simple_query(
         .wait_event
         .store(0, std::sync::atomic::Ordering::Relaxed);
     drain_notices(state, wbuf)?;
+    drain_notifications(state, wbuf, conn_state)?;
     // v7.33 (A1) — persist the write (WAL/snapshot + audit)
     // before acking it; a durability failure surfaces as a
     // query error, never a false CommandComplete.
@@ -1184,6 +1208,7 @@ fn handle_pg_simple_query_one_into_wbuf(
         .wait_event
         .store(0, std::sync::atomic::Ordering::Relaxed);
     drain_notices(state, wbuf)?;
+    drain_notifications(state, wbuf, conn_state)?;
     let result = if queue_persisted {
         result
     } else {
@@ -1443,6 +1468,7 @@ fn run_pg_session(
         startup_app_name: startup_app_name.clone(),
         cancel_secret: new_cancel_secret(),
         cancel_flag: std::sync::atomic::AtomicBool::new(false),
+        notify_queue: std::sync::Mutex::new(Vec::new()),
     });
 
     // v7.39 (read01 pgstatfuncs.c) — stamp this connection's pid into the
@@ -5881,6 +5907,48 @@ fn drain_notices(state: &ServerState, wbuf: &mut Vec<u8>) -> std::io::Result<()>
     };
     for n in &notices {
         send_notice(wbuf, n)?;
+    }
+    Ok(())
+}
+
+/// v7.39 (round 222) — LISTEN/NOTIFY wire delivery. Two phases at every
+/// statement boundary: (1) drain the engine's committed-notification queue
+/// and BROADCAST each entry to every registered connection's per-conn
+/// queue — whichever connection reaches a boundary first performs the
+/// broadcast, so a NOTIFY from connection B reaches connection A's queue
+/// even before A runs anything; (2) flush THIS connection's queue as 'A'
+/// NotificationResponse messages ([i32 pid][cstr channel][cstr payload]).
+/// libpq / psycopg2 pick them up on their next interaction.
+fn drain_notifications(
+    state: &ServerState,
+    wbuf: &mut Vec<u8>,
+    conn_state: &crate::ConnState,
+) -> std::io::Result<()> {
+    let notifies = match state.engine.write() {
+        Ok(mut e) => e.take_notifications(),
+        Err(_) => return Ok(()),
+    };
+    if !notifies.is_empty()
+        && let Ok(conns) = state.connections.read()
+    {
+        for c in conns.iter() {
+            if let Ok(mut q) = c.notify_queue.lock() {
+                q.extend(notifies.iter().cloned());
+            }
+        }
+    }
+    let mine: Vec<(String, String)> = match conn_state.notify_queue.lock() {
+        Ok(mut q) => core::mem::take(&mut *q),
+        Err(_) => Vec::new(),
+    };
+    for (channel, payload) in &mine {
+        let mut body = Vec::with_capacity(channel.len() + payload.len() + 8);
+        body.extend_from_slice(&conn_state.pid.to_be_bytes());
+        body.extend_from_slice(channel.as_bytes());
+        body.push(0);
+        body.extend_from_slice(payload.as_bytes());
+        body.push(0);
+        send_msg(wbuf, b'A', &body)?;
     }
     Ok(())
 }

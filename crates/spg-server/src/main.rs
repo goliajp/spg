@@ -437,6 +437,13 @@ pub(crate) struct ConnState {
     /// CancelToken. Reset when the next statement starts (PG: a
     /// between-statements cancel is a no-op).
     pub(crate) cancel_flag: AtomicBool,
+    /// v7.39 (round 222) — LISTEN/NOTIFY per-connection delivery queue.
+    /// Whichever connection reaches a statement boundary first drains the
+    /// engine's committed-notification queue and BROADCASTS to every
+    /// registered connection's queue (including its own); each connection
+    /// then flushes its own queue as 'A' NotificationResponse messages at
+    /// its next statement boundary.
+    pub(crate) notify_queue: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 impl ConnState {

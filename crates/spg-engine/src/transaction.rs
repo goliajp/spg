@@ -715,6 +715,8 @@ impl Engine {
         // v7.39 (round 218) — cursor lifecycle: non-HOLD cursors close at
         // COMMIT; WITH HOLD ones become held (survive later rollbacks).
         self.cursors_on_commit();
+        // v7.39 (round 222) — release the tx's pending NOTIFYs to delivery.
+        self.notifies_on_commit();
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: true,
@@ -754,6 +756,8 @@ impl Engine {
         // v7.39 (round 218) — cursor lifecycle: everything not already held
         // by an earlier COMMIT closes with the aborted transaction.
         self.cursors_on_rollback();
+        // v7.39 (round 222) — the aborted tx's NOTIFYs vanish.
+        self.notifies_on_rollback();
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
