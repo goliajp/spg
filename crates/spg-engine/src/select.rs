@@ -3080,29 +3080,22 @@ impl Engine {
             out.push(Row::new(parent_cells));
             return Ok(());
         }
-        // Outer-join expansion per sibling NESTED, then concatenate the
-        // sibling runs so the parent row appears once per (sibling,
-        // nested-match) — PG expands each sibling independently.
-        for (run, width) in nested_runs.iter().zip(nested_widths.iter()) {
-            if run.is_empty() {
-                // No nested match → one row, this sibling's cells NULL,
-                // other siblings' cells NULL too.
-                let mut cells = parent_cells.clone();
-                for w in &nested_widths {
-                    for _ in 0..*w {
-                        cells.push(Value::Null);
-                    }
-                }
-                out.push(Row::new(cells));
-                continue;
-            }
+        // PG sibling-NESTED semantics: each sibling expands
+        // INDEPENDENTLY and the results CONCATENATE — a row from
+        // sibling s fills only s's cells, every other sibling's cells
+        // NULL. An empty sibling contributes ZERO rows (not a NULL
+        // row). Only when EVERY sibling is empty does the parent still
+        // emit one all-NULL row (the outer-join guarantee that a parent
+        // item is never dropped). Verified vs PG18 (r207): a=1,b=2 → 3
+        // rows; a=1,b=[] → 1 row; all-empty → 1 NULL row.
+        let before = out.len();
+        for (s_idx, run) in nested_runs.iter().enumerate() {
             for nrow in run {
                 let mut cells = parent_cells.clone();
-                for (w, sibling_run) in nested_widths.iter().zip(nested_runs.iter()) {
-                    if core::ptr::eq(sibling_run, run) {
+                for (o_idx, w) in nested_widths.iter().enumerate() {
+                    if o_idx == s_idx {
                         cells.extend(nrow.values.iter().cloned());
                     } else {
-                        let _ = width;
                         for _ in 0..*w {
                             cells.push(Value::Null);
                         }
@@ -3110,6 +3103,16 @@ impl Engine {
                 }
                 out.push(Row::new(cells));
             }
+        }
+        if out.len() == before {
+            // Every sibling empty → one all-NULL nested row.
+            let mut cells = parent_cells.clone();
+            for w in &nested_widths {
+                for _ in 0..*w {
+                    cells.push(Value::Null);
+                }
+            }
+            out.push(Row::new(cells));
         }
         Ok(())
     }
