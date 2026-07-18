@@ -134,6 +134,7 @@ mod e2e_numeric_overflow_message_round193;
 mod e2e_rls_role_membership_round202;
 mod e2e_guc_canonicalize_round204;
 mod e2e_json_table_round205;
+mod e2e_json_table_format_round206;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;

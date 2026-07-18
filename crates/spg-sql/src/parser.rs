@@ -15338,6 +15338,7 @@ impl Parser {
                 return Err(self.err("expected JSON after FORMAT".into()));
             }
             self.advance();
+            format_json = true;
         }
         let mut exists = false;
         if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("exists")) {

@@ -3164,12 +3164,14 @@ impl Engine {
             };
         }
         let first = &matches[0];
-        // FORMAT JSON: return the raw json (array-wrapped WITH WRAPPER).
+        // FORMAT JSON: return the PG-canonical json representation.
+        // WITH WRAPPER wraps the whole match SET in an array (even a
+        // single scalar → `[5]`); without it, the single match's json.
         if *format_json {
             let text = if *wrapper {
-                crate::json::JsonValue::Array(matches.clone()).to_json_text()
+                crate::json::JsonValue::Array(matches.clone()).canonical_json_text()
             } else {
-                first.to_json_text()
+                first.canonical_json_text()
             };
             return Ok(Value::Json(alloc::borrow::Cow::Owned(text)));
         }
