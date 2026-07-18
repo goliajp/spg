@@ -1003,6 +1003,11 @@ pub enum AlterTableTarget {
     AlterColumnSetNotNull { column: String },
     /// v7.37.18 (18.2) — `ALTER TABLE … ALTER COLUMN col DROP NOT NULL`.
     AlterColumnDropNotNull { column: String },
+    /// v7.39 (round 220) — `ALTER TABLE … ALTER COLUMN col RESTART
+    /// [WITH n]` on an identity column (`None` = bare RESTART, from the
+    /// column's start value = 1). Engine records a next-value floor over
+    /// SPG's max+1 identity allocation.
+    AlterColumnRestart { column: String, with: Option<i64> },
     /// v7.38 (read01 U10) — `ALTER TABLE … ALTER COLUMN col DROP
     /// EXPRESSION` turns a stored generated column into a plain column
     /// (its generation expression is removed; existing values are kept).
@@ -5270,6 +5275,13 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
         }
         AlterTableTarget::AlterColumnDropNotNull { column } => {
             write!(f, "ALTER COLUMN {} DROP NOT NULL", quote_ident(column))
+        }
+        AlterTableTarget::AlterColumnRestart { column, with } => {
+            write!(f, "ALTER COLUMN {} RESTART", quote_ident(column))?;
+            if let Some(n) = with {
+                write!(f, " WITH {n}")?;
+            }
+            Ok(())
         }
         AlterTableTarget::AlterColumnDropExpression { column, if_exists } => {
             write!(

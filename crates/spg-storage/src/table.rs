@@ -748,7 +748,19 @@ impl Table {
                 _ => {}
             }
         }
-        Some(max.map_or(1, |m| m + 1))
+        // v7.39 (round 220) — `ALTER … ALTER COLUMN … RESTART [WITH n]`
+        // lifts the next allocated value to at least n (a floor over the
+        // max+1 scan). A dump-restore RESTART lands exactly on n; a
+        // backward RESTART is safely ignored (no duplicate-key landmine,
+        // unlike PG).
+        let base = max.map_or(1, |m| m + 1);
+        let floor = self
+            .schema
+            .columns
+            .get(col_pos)
+            .and_then(|c| c.auto_restart)
+            .unwrap_or(i64::MIN);
+        Some(base.max(floor))
     }
 
     /// Return the first index defined over `column_position`, if any.

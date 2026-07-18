@@ -2036,6 +2036,19 @@ pub(crate) fn enforce_not_null(
     for row in rows {
         for (val, col) in row.iter().zip(cols) {
             if val.is_null() && !col.nullable {
+                // v7.39 (round 220) — a NOT NULL that comes from the
+                // column's DOMAIN reports PG's domain wording, not the
+                // column-level 23502 form.
+                if let Some(dname) = &col.user_domain_type
+                    && catalog
+                        .domain_types()
+                        .get(dname)
+                        .is_some_and(|d| !d.nullable)
+                {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "domain {dname} does not allow null values"
+                    )));
+                }
                 return Err(EngineError::Unsupported(alloc::format!(
                     "null value in column \"{}\" of relation \"{table_name}\" \
                      violates not-null constraint DETAIL: Failing row contains ({}).",
@@ -2066,7 +2079,7 @@ pub(crate) fn enforce_check_constraints(
     // v7.17.0 Phase 1.5 — domain-level CHECKs are enforced in
     // parallel with table-level CHECKs. Collect both lists up
     // front; if neither exists we early-out.
-    let mut domain_checks_per_col: alloc::vec::Vec<(usize, alloc::vec::Vec<Expr>)> =
+    let mut domain_checks_per_col: alloc::vec::Vec<(usize, String, alloc::vec::Vec<Expr>)> =
         alloc::vec::Vec::new();
     for (idx, col) in schema.columns.iter().enumerate() {
         let Some(dname) = &col.user_domain_type else {
@@ -2087,7 +2100,7 @@ pub(crate) fn enforce_check_constraints(
             parsed_for_col.push(expr);
         }
         if !parsed_for_col.is_empty() {
-            domain_checks_per_col.push((idx, parsed_for_col));
+            domain_checks_per_col.push((idx, dname.clone(), parsed_for_col));
         }
     }
     if schema.checks.is_empty() && domain_checks_per_col.is_empty() {
@@ -2135,7 +2148,7 @@ pub(crate) fn enforce_check_constraints(
         // substitute the per-row cell into the eval context by
         // synthesising a single-column row of just that value
         // under a temporary `value` column schema.
-        for (col_idx, checks) in &domain_checks_per_col {
+        for (col_idx, dname, checks) in &domain_checks_per_col {
             let cell = row_values
                 .get(*col_idx)
                 .cloned()
@@ -2157,9 +2170,11 @@ pub(crate) fn enforce_check_constraints(
                     ))
                 })?;
                 if matches!(v, spg_storage::Value::Bool(false)) {
+                    // v7.39 (round 220) — PG's exact 23514 domain phrasing
+                    // (constraint auto-name `<domain>_check`), matching the
+                    // cast path's wording.
                     return Err(EngineError::Unsupported(alloc::format!(
-                        "DOMAIN CHECK violation on column {:?} (row #{batch_idx})",
-                        schema.columns[*col_idx].name
+                        "value for domain {dname} violates check constraint \"{dname}_check\""
                     )));
                 }
             }

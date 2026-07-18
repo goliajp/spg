@@ -94,6 +94,7 @@ fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> 
                     generated_stored_expr: None,
                     identity_always: false,
                     default_text: None,
+                    auto_restart: None,
                     scalar_row_source: false,
                 });
             }
