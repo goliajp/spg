@@ -912,6 +912,7 @@ fn excl_probe_existing(
     ex: &spg_storage::ExclusionConstraint,
     index_col: usize,
     newr: &[Value<'static>],
+    exclude: Option<&hashbrown::HashSet<usize>>,
 ) -> Result<ExclProbe, EngineError> {
     let Some(map) = table.excl_range_index(index_col) else {
         return Ok(ExclProbe::Inconclusive);
@@ -936,6 +937,12 @@ fn excl_probe_existing(
             let spg_storage::RowLocator::Hot(ri) = loc else {
                 continue; // cold-tier rows aren't in the hot scan either (parity)
             };
+            // v7.39 (round 216) — UPDATE excludes each updated row's own
+            // pre-image (it is being replaced): skip it like a tombstone, so
+            // an all-excluded probe key is inconclusive → the O(n) fallback.
+            if exclude.is_some_and(|s| s.contains(ri)) {
+                continue;
+            }
             let Some(prow) = table.rows().get(*ri) else {
                 continue;
             };
@@ -1008,7 +1015,7 @@ pub(crate) fn enforce_exclusion_inserts(
         for newr in rows.iter() {
             let mut proved_clear = false;
             if let Some(col) = idx_col {
-                match excl_probe_existing(table, ex, col, newr)? {
+                match excl_probe_existing(table, ex, col, newr, None)? {
                     ExclProbe::Conflict(old) => {
                         return Err(exclusion_violation(table, ex, child_table, newr, &old));
                     }
@@ -1161,38 +1168,37 @@ pub(crate) fn enforce_exclusion_updates(
         })
     })?;
     let updated: hashbrown::HashSet<usize> = planned.iter().map(|(p, _)| *p).collect();
-    let conflicts = |ex: &spg_storage::ExclusionConstraint,
-                     newr: &[Value<'static>],
-                     oldr: &[Value<'static>]|
-     -> Result<bool, EngineError> {
-        for (pos, op) in &ex.elements {
-            let a = newr.get(*pos).cloned().unwrap_or(Value::Null);
-            let b = oldr.get(*pos).cloned().unwrap_or(Value::Null);
-            if matches!(a, Value::Null) || matches!(b, Value::Null) {
-                return Ok(false);
-            }
-            let binop = exclude_op_binop(op).ok_or_else(|| {
-                EngineError::Unsupported(alloc::format!("unsupported EXCLUDE operator {op:?}"))
-            })?;
-            // `&&` / `@>` / range / geo operators need owned semantics
-            // (the by-ref path only answers comparisons); `a`/`b` are
-            // already owned clones here.
-            match eval::apply_binary(binop, a, b)? {
-                Value::Bool(true) => {}
-                _ => return Ok(false),
-            }
-        }
-        Ok(true)
-    };
+    let conflicts = excl_rows_conflict;
     for ex in constraints {
-        for (row_idx, prow) in table.rows().iter().enumerate() {
-            if table.headers().get(row_idx).is_some_and(|h| h.is_deleted()) {
+        // v7.39 (round 216) — the indexed `&&` element, if any: each planned
+        // new row probes O(log n) (excluding the rows being updated, whose
+        // pre-images are replaced) instead of scanning every existing row.
+        let idx_col = ex
+            .elements
+            .iter()
+            .find(|(pos, op)| op == "&&" && table.excl_range_index(*pos).is_some())
+            .map(|(pos, _)| *pos);
+        for (_pos, newr) in planned {
+            let mut proved_clear = false;
+            if let Some(col) = idx_col {
+                match excl_probe_existing(table, ex, col, newr, Some(&updated))? {
+                    ExclProbe::Conflict(old) => {
+                        return Err(exclusion_violation(table, ex, table_name, newr, &old));
+                    }
+                    ExclProbe::NoOverlap => proved_clear = true,
+                    ExclProbe::Inconclusive => {}
+                }
+            }
+            if proved_clear {
                 continue;
             }
-            if updated.contains(&row_idx) {
-                continue;
-            }
-            for (_pos, newr) in planned {
+            for (row_idx, prow) in table.rows().iter().enumerate() {
+                if table.headers().get(row_idx).is_some_and(|h| h.is_deleted()) {
+                    continue;
+                }
+                if updated.contains(&row_idx) {
+                    continue;
+                }
                 if conflicts(ex, newr, &prow.values)? {
                     return Err(exclusion_violation(table, ex, table_name, newr, &prow.values));
                 }

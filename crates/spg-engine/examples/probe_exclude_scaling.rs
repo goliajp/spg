@@ -45,6 +45,39 @@ fn bench_batch(n: usize) -> f64 {
     start.elapsed().as_secs_f64()
 }
 
+/// Build N non-overlapping rows, then UPDATE each to a fresh non-overlapping
+/// range (single-row UPDATEs) — exercises the existing-row scan on the UPDATE
+/// path. O(n)/update → O(N^2); the index makes each O(log n) → O(N log N).
+fn bench_update(n: usize) -> f64 {
+    let mut e = Engine::new();
+    // id PRIMARY KEY so the `WHERE id = i` lookup is O(log n) and doesn't
+    // itself contribute an O(n) scan that would mask the EXCLUDE cost.
+    e.execute(
+        "CREATE TABLE bk (id int PRIMARY KEY, during int4range, \
+         EXCLUDE USING gist (during WITH &&))",
+    )
+    .unwrap();
+    for i in 0..n {
+        e.execute(&format!(
+            "INSERT INTO bk VALUES ({i}, '[{},{})')",
+            2 * i,
+            2 * i + 1
+        ))
+        .unwrap();
+    }
+    let base = 2 * n + 10;
+    let start = Instant::now();
+    for i in 0..n {
+        let lo = base + 2 * i;
+        e.execute(&format!(
+            "UPDATE bk SET during = '[{lo},{})' WHERE id = {i}",
+            lo + 1
+        ))
+        .unwrap();
+    }
+    start.elapsed().as_secs_f64()
+}
+
 fn main() {
     println!("{:>8}  {:>10}  {:>12}  {:>8}", "N", "total_s", "us/insert", "ratio");
     let mut prev: Option<(usize, f64)> = None;
@@ -62,6 +95,16 @@ fn main() {
     let mut prev: Option<f64> = None;
     for &n in &[1000usize, 2000, 4000, 8000] {
         let t = bench_batch(n);
+        let ratio = prev.map(|pt| t / pt).unwrap_or(0.0);
+        println!("{n:>8}  {t:>10.4}  {ratio:>8.2}");
+        prev = Some(t);
+    }
+
+    println!("\n-- single-row UPDATE stream (existing-row scan) --");
+    println!("{:>8}  {:>10}  {:>8}", "N", "total_s", "ratio");
+    let mut prev: Option<f64> = None;
+    for &n in &[1000usize, 2000, 4000, 8000] {
+        let t = bench_update(n);
         let ratio = prev.map(|pt| t / pt).unwrap_or(0.0);
         println!("{n:>8}  {t:>10.4}  {ratio:>8.2}");
         prev = Some(t);
