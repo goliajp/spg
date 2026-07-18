@@ -2616,6 +2616,11 @@ impl Engine {
         // error and SPG mirrors the surface so the same DDL/app
         // path behaves identically on cutover.
         check_with_ties_requires_order_by(stmt)?;
+        // v7.39 (round 229) — WHERE / HAVING run before the window pass, so
+        // PG rejects window calls there outright. Checked here rather than
+        // on the window path: `HAVING row_number() OVER () = 1` has no
+        // window in its projection at all.
+        crate::window::reject_window_in_row_clauses(stmt)?;
         // v7.37.16 — resolve `USING` column-merge + `NATURAL JOIN` into an
         // equivalent statement the regular executor handles (merged join
         // columns collapse to a single unqualified output column; NATURAL

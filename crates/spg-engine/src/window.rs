@@ -30,6 +30,25 @@ pub(crate) fn select_has_window(stmt: &SelectStatement) -> bool {
     false
 }
 
+/// v7.39 (round 229) — PG forbids window functions in WHERE and HAVING:
+/// both are evaluated before the window pass, so a window call there has
+/// no defined value. SPG used to let one through to row eval, where it hit
+/// an internal "engine rewrite bug" message; this reports PG's wording
+/// (42P20) at the front of execution instead.
+pub(crate) fn reject_window_in_row_clauses(stmt: &SelectStatement) -> Result<(), EngineError> {
+    if stmt.where_.as_ref().is_some_and(expr_has_window) {
+        return Err(EngineError::Unsupported(
+            "window functions are not allowed in WHERE".into(),
+        ));
+    }
+    if stmt.having.as_ref().is_some_and(expr_has_window) {
+        return Err(EngineError::Unsupported(
+            "window functions are not allowed in HAVING".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn expr_has_window(e: &Expr) -> bool {
     match e {
         Expr::NamedArg { expr, .. } => expr_has_window(expr),
@@ -789,15 +808,39 @@ fn effective_frame(
         }
         Some(fr) => {
             let end = fr.end.clone().unwrap_or(FrameBound::CurrentRow);
-            // Reject start > end (a few impossible combinations).
-            if matches!(fr.start, FrameBound::UnboundedFollowing)
-                || matches!(end, FrameBound::UnboundedPreceding)
+            // v7.39 (round 229) — reject the frames whose start is after
+            // their end. PG names each case; before this round SPG rejected
+            // only the two unbounded ones (with its own wording) and let the
+            // rest through, silently producing an all-NULL column for a
+            // frame that can never contain a row. Wording and the case split
+            // are PG18.4's (r229 probe).
+            let starts_preceding = matches!(
+                end,
+                FrameBound::OffsetPreceding(_) | FrameBound::IntervalPreceding { .. }
+            );
+            if matches!(fr.start, FrameBound::UnboundedFollowing) {
+                return Err(EngineError::Unsupported(
+                    "frame start cannot be UNBOUNDED FOLLOWING".into(),
+                ));
+            }
+            if matches!(end, FrameBound::UnboundedPreceding) {
+                return Err(EngineError::Unsupported(
+                    "frame end cannot be UNBOUNDED PRECEDING".into(),
+                ));
+            }
+            if matches!(fr.start, FrameBound::CurrentRow) && starts_preceding {
+                return Err(EngineError::Unsupported(
+                    "frame starting from current row cannot have preceding rows".into(),
+                ));
+            }
+            if matches!(
+                fr.start,
+                FrameBound::OffsetFollowing(_) | FrameBound::IntervalFollowing { .. }
+            ) && (starts_preceding || matches!(end, FrameBound::CurrentRow))
             {
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "invalid frame: start={:?} end={:?}",
-                    fr.start,
-                    end
-                )));
+                return Err(EngineError::Unsupported(
+                    "frame starting from following row cannot have preceding rows".into(),
+                ));
             }
             // RANGE and GROUPS offset bounds are both supported now (see
             // frame_bounds_for_row → range_offset_bounds / groups_offset_bounds).
@@ -975,10 +1018,22 @@ fn range_offset_bounds(
     ) {
         return range_offset_bounds_interval(start, end, i, slice);
     }
+    // v7.39 (round 229) — PG splits this into two messages: a key-count
+    // complaint and a per-type one. Match both (probed against 18.4).
     let unsupported = || {
-        EngineError::Unsupported(
-            "RANGE offset frame requires a single numeric ORDER BY column".into(),
-        )
+        let key = &slice[i].1;
+        if key.len() != 1 {
+            return EngineError::Unsupported(
+                "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column".into(),
+            );
+        }
+        let ty = match key[0].0.data_type() {
+            Some(t) => crate::system_catalog::pg_data_type_text(t),
+            None => alloc::string::String::from("unknown"),
+        };
+        EngineError::Unsupported(alloc::format!(
+            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {ty}"
+        ))
     };
     let (v, asc) = range_order_key_f64(&slice[i].1).ok_or_else(unsupported)?;
     // The value a bound resolves to, given the ordering direction. PRECEDING is
