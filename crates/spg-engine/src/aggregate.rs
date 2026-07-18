@@ -287,6 +287,21 @@ pub(crate) enum AggKind {
 /// Hot path (`update_state_kind`) only sees the enum; the canonical
 /// string still travels with the spec so `finalize` and errors can
 /// quote it.
+/// v7.39 (round 231) — the spelling `classify_agg_name` / `update_state` /
+/// `finalize` expect. PG's `every` is a standard-SQL alias for `bool_and`
+/// and every accumulator keys off the latter. The GROUP BY builder folded
+/// it at two of its own call sites; the window path (round 230) reached
+/// `classify_agg_name` without folding and hit its panic arm, so
+/// `every(x) OVER (…)` aborted the query. One entry point now, and
+/// `every_aggregate_name_classifies` keeps the two name lists in step.
+pub(crate) fn canonical_agg_name(name: &str) -> &str {
+    if name.eq_ignore_ascii_case("every") {
+        "bool_and"
+    } else {
+        name
+    }
+}
+
 pub(crate) fn classify_agg_name(name: &str) -> AggKind {
     match name {
         "count_star" => AggKind::CountStar,
@@ -4301,7 +4316,20 @@ pub(crate) fn finalize(name: &str, st: &AggState) -> Value<'static> {
         "min" | "max" | "any_value" => st.extreme.clone().unwrap_or(Value::Null),
         // PG: range_agg over an empty group is NULL; all-empty
         // ranges finalize to the empty multirange {}.
-        "range_agg" | "range_intersect_agg" => st.extreme.clone().unwrap_or(Value::Null),
+        // v7.39 (round 231) — range_agg collects its inputs verbatim while
+        // accumulating; PG's result is a *normalized* multirange, so the
+        // spans are sorted, merged where they overlap or abut, and emptied
+        // ones dropped exactly once, here. Without this
+        // `range_agg` over `[1,3),[5,9),[2,6)` answered all three spans
+        // where PG answers the single `{[1,9)}` they cover.
+        "range_agg" => match st.extreme.clone() {
+            Some(Value::Multirange { kind, ranges }) => Value::Multirange {
+                kind,
+                ranges: crate::eval::binop::normalize_multirange_spans(kind, &ranges),
+            },
+            other => other.unwrap_or(Value::Null),
+        },
+        "range_intersect_agg" => st.extreme.clone().unwrap_or(Value::Null),
         // v7.17.0 — string_agg: join all collected text items with
         // the captured separator. Empty / all-NULL group → NULL
         // (PG semantics).
@@ -5870,5 +5898,35 @@ mod value_cmp_mixed_numeric_tests {
             Ordering::Greater
         );
         assert_eq!(value_cmp(&Value::Float(1.0), &num(25, 1)), Ordering::Less);
+    }
+
+    /// v7.39 (round 231) — `is_aggregate_name` admits a name and
+    /// `classify_agg_name` panics on anything it doesn't know, so the two
+    /// lists drifting apart turns into a SQL-reachable abort. That is how
+    /// `every(x) OVER (…)` crashed the query in round 230. Walk the whole
+    /// admitted set and classify each one.
+    #[test]
+    fn every_aggregate_name_classifies() {
+        const NAMES: &[&str] = &[
+            "count", "count_star", "sum", "min", "max", "avg", "any_value",
+            "range_agg", "range_intersect_agg", "string_agg", "group_concat",
+            "xmlagg", "array_agg", "bool_and", "bool_or", "every", "stddev",
+            "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop",
+            "bit_and", "bit_or", "bit_xor", "json_agg", "jsonb_agg",
+            "json_object_agg", "jsonb_object_agg",
+        ];
+        for n in NAMES {
+            assert!(super::is_aggregate_name(n), "{n} should be an aggregate name");
+            // Panics if the classifier doesn't know it.
+            let _ = super::classify_agg_name(super::canonical_agg_name(n));
+        }
+        // Anything `is_aggregate_name` admits must classify, so a name added
+        // to one list and not the other fails here rather than at runtime.
+        for n in NAMES {
+            assert!(
+                super::is_aggregate_name(&n.to_ascii_uppercase()),
+                "{n} should be case-insensitive"
+            );
+        }
     }
 }

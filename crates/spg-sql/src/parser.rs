@@ -20598,6 +20598,7 @@ impl Parser {
                         .into(),
                 ));
             }
+            let within_group_seen = !within_group_order.is_empty();
             let agg_order_by = if within_group_order.is_empty() {
                 agg_order_by
             } else {
@@ -20626,9 +20627,16 @@ impl Parser {
                     );
                 }
                 if !agg_order_by.is_empty() {
-                    return Err(self.err(
-                        "aggregate ORDER BY is not implemented for window functions".to_string(),
-                    ));
+                    // PG separates the two shapes that land here: a
+                    // WITHIN GROUP call is an ordered-set aggregate and gets
+                    // its own message naming the aggregate; a plain
+                    // `agg(x ORDER BY y)` gets the generic one.
+                    let msg = if within_group_seen {
+                        alloc::format!("OVER is not supported for ordered-set aggregate {first}")
+                    } else {
+                        "aggregate ORDER BY is not implemented for window functions".to_string()
+                    };
+                    return Err(self.err(msg));
                 }
                 let (partition_by, order_by, frame) = self.parse_over_clause()?;
                 return Ok(Expr::WindowFunction {
