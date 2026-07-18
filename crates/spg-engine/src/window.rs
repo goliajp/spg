@@ -750,10 +750,87 @@ pub(crate) fn compute_window_partition(
             }
             Ok(())
         }
+        // v7.39 (round 230) — every *aggregate* is usable as a window
+        // function in PG, not just the handful with a bespoke arm above.
+        // Rather than grow that list one accumulator at a time, drive the
+        // aggregate module's own state machine over each row's frame:
+        // string_agg / array_agg / bool_and / bool_or / stddev / variance /
+        // bit_and / json_agg / range_agg and the rest all arrive for free,
+        // with the same NULL handling and result typing they have in a
+        // GROUP BY.
+        other if crate::aggregate::is_aggregate_name(other) => {
+            generic_aggregate_window(other, args, ordered, frame, &filter_pass, slice, filtered_rows, ctx, out_vals)
+        }
+        // Neither a window function nor an aggregate: PG resolves the call
+        // like any other and reports the missing function (42883).
         other => Err(EngineError::Unsupported(alloc::format!(
-            "window function {other:?} not supported (v4.21: row_number/rank/dense_rank/sum/avg/count/min/max/lag/lead/first_value/last_value/nth_value/ntile/percent_rank/cume_dist)"
+            "function {other}() does not exist"
         ))),
     }
+}
+
+/// v7.39 (round 230) — an arbitrary aggregate evaluated over each row's
+/// window frame. Mirrors the bespoke sum/avg/min/max path's frame walk
+/// (bounds, EXCLUDE, FILTER) but accumulates through `aggregate`'s own
+/// `AggState`, so the value and its type are whatever the same aggregate
+/// would produce over that row set in a GROUP BY.
+#[allow(clippy::too_many_arguments)]
+fn generic_aggregate_window(
+    name: &str,
+    args: &[Expr],
+    ordered: bool,
+    frame: Option<&WindowFrame>,
+    filter_pass: &[bool],
+    slice: &[(Vec<Value<'static>>, Vec<(Value, bool, Option<bool>)>, usize)],
+    filtered_rows: &[&Row<'static>],
+    ctx: &EvalContext<'_>,
+    out_vals: &mut [Value],
+) -> Result<(), EngineError> {
+    // Pre-evaluate the argument(s) once per row: the frame walk below
+    // revisits the same rows for every output row.
+    let eval_arg = |n: usize| -> Result<Vec<Value<'static>>, EngineError> {
+        slice
+            .iter()
+            .map(|(_, _, idx)| eval::eval_expr(&args[n], filtered_rows[*idx], ctx))
+            .collect::<Result<_, _>>()
+            .map_err(EngineError::Eval)
+    };
+    let arg1 = if args.is_empty() { Vec::new() } else { eval_arg(0)? };
+    let arg2 = if args.len() > 1 { Some(eval_arg(1)?) } else { None };
+    let kind = crate::aggregate::classify_agg_name(name);
+    let eff = effective_frame(frame, ordered)?;
+    let exclude = frame_exclusion(frame)?;
+    for i in 0..slice.len() {
+        let (lo, hi) = frame_bounds_for_row(&eff, i, slice)?;
+        let (peer_start, peer_end) =
+            if matches!(exclude, FrameExclusion::Group | FrameExclusion::Ties) {
+                (peer_group_start(slice, i), peer_group_end(slice, i))
+            } else {
+                (0, 0)
+            };
+        let mut st = crate::aggregate::AggState::default();
+        if lo <= hi {
+            for j in lo..=hi {
+                if frame_row_excluded(exclude, j, i, peer_start, peer_end) || !filter_pass[j] {
+                    continue;
+                }
+                let v = arg1.get(j).unwrap_or(&Value::Null);
+                crate::aggregate::update_state(
+                    &mut st,
+                    kind,
+                    name,
+                    v,
+                    arg2.as_ref().and_then(|a| a.get(j)),
+                    None,
+                    None,
+                )
+                .map_err(EngineError::Eval)?;
+            }
+        }
+        let (_, _, idx) = &slice[i];
+        out_vals[*idx] = crate::aggregate::finalize(name, &st);
+    }
+    Ok(())
 }
 
 /// v4.20: resolve the user-provided frame down to a normalised

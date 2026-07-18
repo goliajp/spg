@@ -3869,6 +3869,37 @@ fn strip_error_class(msg: &str) -> String {
 /// offsets in practice. Only syntax errors carry a position today; semantic
 /// errors (column-not-found, type mismatch) would need analyzer/eval plumbing
 /// and are deferred.
+/// v7.39 (read01 round 230) — SQLSTATE for the window-clause errors, or
+/// `None` when the message isn't one. PG answers every window-clause
+/// complaint with 42P20 WINDOWING_ERROR and reserves 42704
+/// UNDEFINED_OBJECT for a genuinely missing window name — a split worth
+/// keeping straight, since the copy and redefinition wordings also carry
+/// `window "w1"`. Matches on substrings because the engine's `Unsupported`
+/// Display prefixes the message.
+fn window_sqlstate(msg: &str) -> Option<&'static str> {
+    if msg.contains("window functions are not allowed in ")
+        || msg.contains("frame start cannot be ")
+        || msg.contains("frame end cannot be ")
+        || msg.contains("frame starting from ")
+        || msg.contains("cannot override PARTITION BY clause of window ")
+        || msg.contains("cannot override ORDER BY clause of window ")
+        || msg.contains("because it has a frame clause")
+        || msg.contains("RANGE with offset PRECEDING/FOLLOWING ")
+        || (msg.contains("window \"") && msg.contains("\" is already defined"))
+    {
+        return Some("42P20");
+    }
+    if msg.contains("window \"") && msg.contains("\" does not exist") {
+        return Some("42704");
+    }
+    // v7.39 (round 230) — PG implements neither modifier for a windowed
+    // call and reports the gap as 0A000 FEATURE_NOT_SUPPORTED.
+    if msg.contains("is not implemented for window functions") {
+        return Some("0A000");
+    }
+    None
+}
+
 fn parse_error_position(e: &EngineError, sql: &str) -> Option<usize> {
     match e {
         EngineError::Parse(pe) => spg_sql::parser::syntax_error_position(sql, false, pe.token_pos),
@@ -3897,6 +3928,15 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
     // conflict is PG's 40001 SERIALIZATION_FAILURE (clients retry).
     if let EngineError::SerializationFailure(_) = e {
         return ("40001", e.to_string());
+    }
+    // v7.39 (read01 round 230) — window-clause errors carry PG's own class
+    // and must be classified BEFORE the two variant-level short-circuits
+    // below: the named-window complaints are raised by the parser (which
+    // would otherwise blanket them as 42601) and the frame ones arrive as
+    // `Unsupported` (whose Display prefixes "unsupported: ", so the message
+    // arms further down only ever see a substring).
+    if let Some(code) = window_sqlstate(&e.to_string()) {
+        return (code, e.to_string());
     }
     // v7.39 (read01 round 95) — a parse failure is PG's 42601 SYNTAX_ERROR
     // (was the generic 42000). The character position rides the separate `P`
@@ -4037,24 +4077,6 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // message also carries `constraint "t_pkey"` and a DETAIL ending in
         // "already exists.", so key on PG's distinctive "for relation" /
         // "for table" qualifier, which only the DDL form has.
-        // v7.39 (read01 round 229) — window-clause errors are PG's 42P20
-        // WINDOWING_ERROR. Classified before the generic object patterns:
-        // the copy / redefinition wordings also carry `window "w1"`, which
-        // the 42704 "does not exist" arm below would otherwise steal — only
-        // the genuinely-missing-name case belongs there.
-        } else if msg.contains("window functions are not allowed in ")
-            || msg.starts_with("frame start cannot be")
-            || msg.starts_with("frame end cannot be")
-            || msg.starts_with("frame starting from ")
-            || msg.contains("cannot override PARTITION BY clause of window ")
-            || msg.contains("cannot override ORDER BY clause of window ")
-            || msg.contains("because it has a frame clause")
-            || msg.contains("RANGE with offset PRECEDING/FOLLOWING requires")
-            || (msg.contains("window \"") && msg.contains("\" is already defined"))
-        {
-            "42P20"
-        } else if msg.contains("window \"") && msg.contains("\" does not exist") {
-            "42704"
         } else if msg.contains("constraint \"")
             && (msg.contains("\" for relation \"") || msg.contains("\" for table \""))
             && msg.contains("already exists")
