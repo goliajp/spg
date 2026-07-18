@@ -145,6 +145,7 @@ mod e2e_exclude_index_mvcc_round215;
 mod e2e_exclude_update_index_round216;
 mod e2e_cursor_round218;
 mod e2e_identity_domain_round220;
+mod e2e_timezone_round221;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;

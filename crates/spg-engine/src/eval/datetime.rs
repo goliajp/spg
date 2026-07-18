@@ -691,7 +691,40 @@ pub(super) fn from_unixtime(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
 /// requested calendar boundary (year / month / day / hour / minute /
 /// second). Returns the truncated `TIMESTAMP`. NULL on either side
 /// propagates to NULL.
-pub(super) fn date_trunc(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+pub(super) fn date_trunc(
+    args: &[Value<'_>],
+    ctx: &super::EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    // v7.39 (round 221) — PG 12+ `date_trunc(unit, tstz, zone)`: truncate in
+    // the ZONE's local calendar, return the UTC instant of that local
+    // boundary (DST-correct via the tzdb's reverse lookup).
+    if args.len() == 3 {
+        if args.iter().any(|a| matches!(a, Value::Null)) {
+            return Ok(Value::Null);
+        }
+        let Value::Text(zone) = &args[2] else {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "date_trunc() zone must be text, got {:?}",
+                    args[2].data_type()
+                ),
+            });
+        };
+        let z = zone.trim();
+        let ts = text_or_temporal_micros(&args[1], "date_trunc")?;
+        let off = ctx.zone_offset_at(z, ts).ok_or_else(|| EvalError::TypeMismatch {
+            detail: format!("date_trunc({z:?}): time zone not recognized"),
+        })?;
+        let local = Value::Timestamp(ts + off);
+        let truncated = date_trunc(&[args[0].clone(), local], ctx)?;
+        let Value::Timestamp(tl) = truncated else {
+            return Ok(truncated);
+        };
+        // Local boundary back to UTC (reverse lookup handles a boundary
+        // that lands on the other side of a DST transition).
+        let utc = ctx.zone_local_to_utc(z, tl).unwrap_or(tl - off);
+        return Ok(Value::Timestamp(utc));
+    }
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
             detail: format!("date_trunc() takes 2 args, got {}", args.len()),
@@ -1378,10 +1411,14 @@ pub(super) fn get_format_mysql(args: &[Value<'_>]) -> Result<Value<'static>, Eva
 /// input is treated as UTC-stored micros and the result is the
 /// zone-local naive timestamp (the dominant timestamptz →
 /// timestamp display direction; SPG's single timestamp
-/// representation cannot distinguish the reverse). Named zones
-/// error honestly — SPG carries no tzdata, and a silent no-op
-/// would misrender every non-UTC display.
-pub(super) fn timezone_pg(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+/// representation cannot distinguish the reverse). v7.39 (round
+/// 221) — named IANA zones (`Asia/Tokyo`) resolve through the
+/// host tzdb (`ctx.zone_offset_at`, DST-correct per instant);
+/// only a host with no zoneinfo still errors honestly.
+pub(super) fn timezone_pg(
+    args: &[Value<'_>],
+    ctx: &super::EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
             detail: format!("timezone() takes 2 args, got {}", args.len()),
@@ -1389,6 +1426,12 @@ pub(super) fn timezone_pg(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
         return Ok(Value::Null);
+    }
+    // v7.39 (round 221) — `timetz AT TIME ZONE zone`: re-anchor the
+    // time-of-day to the target zone's offset, preserving the instant
+    // (PG: `12:00:00+05` AT TIME ZONE 'UTC' → `07:00:00+00`).
+    if let Value::TimeTz { .. } = &args[1] {
+        return timetz_at_zone(args, ctx);
     }
     let Value::Text(zone) = &args[0] else {
         return Err(EvalError::TypeMismatch {
@@ -1417,16 +1460,68 @@ pub(super) fn timezone_pg(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
     } else if let Some(applied) = tz_abbrev_offset(z) {
         applied
     } else {
-        return Err(EvalError::TypeMismatch {
-            detail: format!(
-                "timezone({z:?}): named IANA zones with DST rules need tzdata \
-                 SPG does not carry; use UTC, a fixed abbreviation (EST/PST/JST/\
-                 CET/…), or an explicit '+HH:MM' offset"
-            ),
-        });
+        // v7.39 (round 221) — a named IANA zone resolves through the host
+        // tzdb, DST-correct at the input instant. The instant is needed
+        // first, so this branch reads it early (same call as below —
+        // text_or_temporal_micros is pure).
+        let ts = text_or_temporal_micros(&args[1], "timezone")?;
+        let Some(off) = ctx.zone_offset_at(z, ts) else {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "timezone({z:?}): time zone not recognized (no tzdata entry \
+                     on this host); use UTC, a fixed abbreviation (EST/PST/JST/\
+                     CET/…), or an explicit '+HH:MM' offset"
+                ),
+            });
+        };
+        return Ok(Value::Timestamp(ts + off));
     };
     let ts = text_or_temporal_micros(&args[1], "timezone")?;
     Ok(Value::Timestamp(ts + offset))
+}
+
+/// v7.39 (round 221) — `timezone(zone, timetz)`: keep the instant, swap the
+/// carried offset (PG's timetz AT TIME ZONE). The wall-clock moves by the
+/// offset delta; the result is a `timetz` at the target offset.
+fn timetz_at_zone(
+    args: &[Value<'_>],
+    ctx: &super::EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let Value::Text(zone) = &args[0] else {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "timezone() zone must be text, got {:?}",
+                args[0].data_type()
+            ),
+        });
+    };
+    let Value::TimeTz { us, offset_secs } = &args[1] else {
+        unreachable!("caller matched TimeTz");
+    };
+    let z = zone.trim();
+    // Resolve the target offset. A DST-varying named zone needs an instant;
+    // timetz carries none, so PG uses the current date — mirror via the
+    // session clock when available, else epoch (fixed zones unaffected).
+    let now = ctx.clock.map_or(0, |c| c());
+    let target_secs = if z.eq_ignore_ascii_case("utc") || z.eq_ignore_ascii_case("gmt") {
+        0
+    } else if let Some(off) = parse_tz_offset(z) {
+        (off / 1_000_000) as i32
+    } else if let Some(off) = tz_abbrev_offset(z).or_else(|| ctx.zone_offset_at(z, now)) {
+        (off / 1_000_000) as i32
+    } else {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("timezone({z:?}): time zone not recognized"),
+        });
+    };
+    // Same instant, new offset: shift wall-clock by the delta, wrap to 24h.
+    const DAY: i64 = 86_400_000_000;
+    let delta_us = (i64::from(target_secs) - i64::from(*offset_secs)) * 1_000_000;
+    let new_us = (us + delta_us).rem_euclid(DAY);
+    Ok(Value::TimeTz {
+        us: new_us,
+        offset_secs: target_secs,
+    })
 }
 
 /// v7.38 (T-tstz Phase 2) — the micro-offset a fixed time-zone spelling adds to

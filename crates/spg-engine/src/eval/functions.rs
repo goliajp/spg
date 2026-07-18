@@ -5716,7 +5716,7 @@ fn apply_function_dispatch(
                 args.iter().filter_map(Value::data_type).collect();
             Ok(super::widen_to_common(result, &types))
         }
-        "date_trunc" => date_trunc(args),
+        "date_trunc" => date_trunc(args, ctx),
         // v7.37.17 (17.6 siblings) — PG 14+ date_bin(stride, ts, origin)
         // "bins" ts to the nearest lower multiple of stride from
         // origin. Real implementation: compute integer micros
@@ -6697,6 +6697,15 @@ fn apply_function_dispatch(
             Ok(Value::Time(us))
         }
         "make_timestamp" | "make_timestamptz" => {
+            // v7.39 (round 221) — make_timestamptz takes an optional 7th
+            // arg: the zone the wall-clock fields are IN (result = that
+            // local time converted to UTC).
+            let tz_arg = if name == "make_timestamptz" && args.len() == 7 {
+                Some(args[6].clone())
+            } else {
+                None
+            };
+            let args = if tz_arg.is_some() { &args[..6] } else { args };
             if args.len() != 6 {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
@@ -6771,6 +6780,25 @@ fn apply_function_dispatch(
                 + h * 3_600_000_000
                 + mi * 60_000_000
                 + (s * 1_000_000.0) as i64;
+            // v7.39 (round 221) — the 7-arg form: `us` is local wall-clock
+            // in `tz`; convert to the UTC instant (DST-correct reverse
+            // lookup; fixed offsets resolve statically).
+            if let Some(tzv) = tz_arg {
+                let Value::Text(z) = &tzv else {
+                    return Err(EvalError::TypeMismatch {
+                        detail: "make_timestamptz(): timezone must be text".into(),
+                    });
+                };
+                let z = z.trim();
+                let utc = ctx.zone_local_to_utc(z, us).ok_or_else(|| {
+                    EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "make_timestamptz({z:?}): time zone not recognized"
+                        ),
+                    }
+                })?;
+                return Ok(Value::Timestamp(utc));
+            }
             Ok(Value::Timestamp(us))
         }
         "make_interval" => {
@@ -8356,7 +8384,7 @@ fn apply_function_dispatch(
         "get_format" => super::datetime::get_format_mysql(args),
         "convert_tz" => super::datetime::convert_tz_mysql(args),
         // PG timezone(zone, ts) — the function form of AT TIME ZONE.
-        "timezone" => super::datetime::timezone_pg(args),
+        "timezone" => super::datetime::timezone_pg(args, ctx),
         "unix_timestamp" => unix_timestamp_of(args),
         "from_unixtime" => from_unixtime(args),
         // v7.17.0 Phase 3.8 — PG `format(fmt, args…)` sprintf-style.

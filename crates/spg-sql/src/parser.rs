@@ -17134,6 +17134,37 @@ impl Parser {
                     target,
                 })
             }
+            // v7.39 (round 221) — the SQL-standard long spellings:
+            // `TIME [WITHOUT|WITH] TIME ZONE '…'` / `TIMESTAMP [WITHOUT|WITH]
+            // TIME ZONE '…'`. Consume the modifier and lower to the same
+            // typed-literal cast (`timetz` / `timestamptz` for WITH).
+            Token::Ident(s)
+                if (s.eq_ignore_ascii_case("time") || s.eq_ignore_ascii_case("timestamp"))
+                    && matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("with")
+                        || w.eq_ignore_ascii_case("without"))
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(t)) if t.eq_ignore_ascii_case("time"))
+                    && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(z)) if z.eq_ignore_ascii_case("zone"))
+                    && matches!(self.tokens.get(self.pos + 3), Some(Token::String(_))) =>
+            {
+                let with_tz = matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("with"));
+                self.advance(); // WITH / WITHOUT
+                self.advance(); // TIME
+                self.advance(); // ZONE
+                let Token::String(lit) = self.advance() else {
+                    unreachable!("guard checked a string token");
+                };
+                let base = s.to_ascii_lowercase();
+                let target = match (base.as_str(), with_tz) {
+                    ("time", true) => CastTarget::Named(alloc::string::String::from("timetz")),
+                    ("time", false) => CastTarget::Named(alloc::string::String::from("time")),
+                    (_, true) => CastTarget::Timestamptz,
+                    (_, false) => CastTarget::Timestamp,
+                };
+                Ok(Expr::Cast {
+                    expr: Box::new(Expr::Literal(Literal::String(lit))),
+                    target,
+                })
+            }
             // v7.39 (read01 round 105) — `ARRAY(<subquery>)` constructor:
             // gathers the subquery's single-column rows (in its row order)
             // into an array. Desugared to `array_agg` over the subquery as a
