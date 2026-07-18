@@ -323,6 +323,7 @@ fn bare_table_ref(name: String) -> TableRef {
         table_fn_call: None,
         scalar_fn_item: false,
         rows_from: None,
+        json_table: None,
     }
 }
 

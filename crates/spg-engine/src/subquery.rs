@@ -2099,6 +2099,7 @@ impl Engine {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
                 rows_from: None,
+                json_table: None,
                 scalar_fn_item: false,
             },
             on: Some(Expr::Binary {
@@ -2379,6 +2380,7 @@ impl Engine {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
                 rows_from: None,
+                json_table: None,
                 scalar_fn_item: false,
             },
             on: Some(on),
@@ -2912,6 +2914,7 @@ impl Engine {
                 jsonb_each_text_arg: None,
                 table_fn_call: None,
                 rows_from: None,
+                json_table: None,
                 scalar_fn_item: false,
             },
             on: Some(on),
