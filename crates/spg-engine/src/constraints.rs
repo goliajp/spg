@@ -910,15 +910,114 @@ pub(crate) fn enforce_exclusion_inserts(
             }
         }
         // Intra-batch: two incoming rows that overlap each other.
-        for i in 0..rows.len() {
-            for j in (i + 1)..rows.len() {
-                if conflicts(ex, &rows[j], &rows[i])? {
-                    return Err(exclusion_violation(table, ex, child_table, &rows[j], &rows[i]));
+        // v7.39 (round 214) — the naive pairwise scan is O(N²); a single
+        // multi-row INSERT / COPY of a booking table hits it hard (measured
+        // O(N²), r213). For the common single-`&&` form the sorted-adjacency
+        // test proves disjointness in O(N log N): sort the candidates by
+        // range lower bound and check only adjacent pairs (a non-adjacent
+        // overlap always implies an adjacent one). When that PROVES no
+        // overlap the O(N²) loop is skipped entirely. When it can't (an
+        // overlap exists, or a candidate is a kind the fast key doesn't
+        // cover), fall through to the exact loop so the error stays
+        // byte-identical to PG. This touches no cross-statement state, so it
+        // is MVCC-trivially correct — the per-write existing-row scan above
+        // (single-row INSERT streams) still needs the persistent index.
+        if !(ex.elements.len() == 1
+            && ex.elements[0].1 == "&&"
+            && intra_batch_proven_disjoint(ex.elements[0].0, rows)?)
+        {
+            for i in 0..rows.len() {
+                for j in (i + 1)..rows.len() {
+                    if conflicts(ex, &rows[j], &rows[i])? {
+                        return Err(exclusion_violation(
+                            table, ex, child_table, &rows[j], &rows[i],
+                        ));
+                    }
                 }
             }
         }
     }
     Ok(())
+}
+
+/// v7.39 (round 214) — extract a range's lower-bound sort key: the bound as
+/// an `i128` (unbounded = i128::MIN, sorting first) plus an inclusivity rank
+/// (inclusive lower sorts before exclusive at the same value, `[3` before
+/// `(3`). Returns `None` for range kinds whose bound isn't an integer scalar
+/// (numrange's numeric/bignum) — the caller then forces the exact O(N²) loop
+/// rather than risk an unsound order. Int4/Int8/Date/Ts/TsTz all reduce here.
+fn range_lower_sort_key(v: &Value<'_>) -> Option<(i128, u8)> {
+    let Value::Range {
+        lower,
+        lower_inc,
+        empty,
+        ..
+    } = v
+    else {
+        return None;
+    };
+    if *empty {
+        return None;
+    }
+    let key = match lower {
+        None => i128::MIN,
+        Some(b) => match b.as_ref() {
+            Value::SmallInt(n) => i128::from(*n),
+            Value::Int(n) => i128::from(*n),
+            Value::BigInt(n) => i128::from(*n),
+            // daterange (days since epoch) + ts/tstzrange (micros since epoch)
+            // — both totally ordered as their raw integer.
+            Value::Date(n) => i128::from(*n),
+            Value::Timestamp(n) => i128::from(*n),
+            _ => return None,
+        },
+    };
+    Some((key, u8::from(!*lower_inc)))
+}
+
+/// v7.39 (round 214) — PROVE (soundly) that no two candidate rows' ranges at
+/// `pos` overlap, in O(N log N). Returns `true` only when disjointness is
+/// certain; returns `false` if an overlap exists OR any candidate can't be
+/// keyed (non-range, empty handled as exempt, numrange, short row) — in which
+/// case the caller runs the exact pairwise loop. NULL and empty ranges never
+/// conflict, so they leave the candidate set. The authoritative overlap
+/// decision on each adjacent pair delegates to `&&` (`apply_binary`), so the
+/// only thing the fast path relies on is the sort order being correct — which
+/// the integer key guarantees for the kinds it accepts.
+fn intra_batch_proven_disjoint(
+    pos: usize,
+    rows: &[Vec<Value<'static>>],
+) -> Result<bool, EngineError> {
+    let mut keyed: Vec<((i128, u8), usize)> = Vec::with_capacity(rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        match r.get(pos) {
+            None => return Ok(false), // short row — let the exact loop handle it
+            Some(Value::Null) => continue, // NULL exempts the row
+            Some(v @ Value::Range { empty, .. }) => {
+                if *empty {
+                    continue; // empty range never overlaps
+                }
+                match range_lower_sort_key(v) {
+                    Some(k) => keyed.push((k, i)),
+                    None => return Ok(false), // unkeyable range kind → exact loop
+                }
+            }
+            Some(_) => return Ok(false), // not a range → exact loop
+        }
+    }
+    if keyed.len() < 2 {
+        return Ok(true); // 0 or 1 candidate ranges can't overlap each other
+    }
+    keyed.sort_by_key(|k| k.0);
+    for w in keyed.windows(2) {
+        let a = rows[w[0].1][pos].clone();
+        let b = rows[w[1].1][pos].clone();
+        // overlap → let the exact loop produce PG's byte-identical error
+        if let Value::Bool(true) = eval::apply_binary(spg_sql::ast::BinOp::InetOverlap, a, b)? {
+            return Ok(false);
+        }
+    }
+    Ok(true) // adjacency proved the whole set disjoint
 }
 
 /// v7.39 (round 210) — enforce `EXCLUDE` constraints for an UPDATE. Each
