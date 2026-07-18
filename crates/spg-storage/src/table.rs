@@ -30,6 +30,7 @@ impl Table {
             cold_row_count: 0,
             cold_row_count_stale: false,
             redo_log: None,
+            excl_indexes: Vec::new(),
         }
     }
 
@@ -945,6 +946,12 @@ impl Table {
                 IndexKind::Nsw(_) | IndexKind::Brin { .. } => {}
             }
         }
+        // v7.39 (round 215) — maintain the range-exclusion indexes for the
+        // freshly-inserted row (before the move; `new_row_idx` is the slot it
+        // will occupy). Mirrors the BTree maintenance above.
+        if !self.excl_indexes.is_empty() {
+            self.excl_indexes_on_insert(&row, new_row_idx);
+        }
         // v5.2.1: maintain incremental hot-tier byte counter. Computed
         // before the move so we don't need to borrow `row` after push.
         self.hot_bytes = self
@@ -1042,6 +1049,79 @@ impl Table {
         }
         self.indices.push(idx);
         Ok(())
+    }
+
+    /// v7.39 (round 215) — ensure a range-exclusion index exists on
+    /// `column_position`, building it from the current rows. Idempotent: a
+    /// second call for the same column is a no-op. Called at CREATE TABLE /
+    /// ALTER ADD EXCLUDE and on catalog load (rebuild-from-constraints).
+    /// Tombstoned rows are indexed too (they are filtered by the consumer via
+    /// `is_deleted()` at query time — the established index pattern).
+    pub fn ensure_excl_range_index(&mut self, column_position: usize) {
+        if self
+            .excl_indexes
+            .iter()
+            .any(|e| e.column_position == column_position)
+        {
+            return;
+        }
+        let mut map: crate::PersistentBTreeMap<(i128, u8), Vec<RowLocator>> =
+            crate::PersistentBTreeMap::new();
+        for (i, row) in self.rows.iter().enumerate() {
+            if let Some(v) = row.values.get(column_position)
+                && let Some(key) = crate::range_excl_index_key(v)
+            {
+                let mut entries = map.get(&key).cloned().unwrap_or_default();
+                entries.push(RowLocator::Hot(i));
+                map.insert_mut(key, entries);
+            }
+        }
+        self.excl_indexes.push(crate::ExclRangeIndex {
+            column_position,
+            map,
+        });
+    }
+
+    /// v7.39 (round 215) — the range-exclusion index on `column_position`, if
+    /// one was built. The EXCLUDE enforcement path probes its
+    /// [`predecessor`](crate::PersistentBTreeMap::predecessor) + successors to
+    /// find candidate overlaps in O(log n).
+    #[must_use]
+    pub fn excl_range_index(
+        &self,
+        column_position: usize,
+    ) -> Option<&crate::PersistentBTreeMap<(i128, u8), Vec<RowLocator>>> {
+        self.excl_indexes
+            .iter()
+            .find(|e| e.column_position == column_position)
+            .map(|e| &e.map)
+    }
+
+    /// v7.39 (round 215) — add a freshly-appended row at `row_idx` to every
+    /// range-exclusion index. Called from `insert` after the row is pushed,
+    /// mirroring the BTree secondary-index maintenance.
+    fn excl_indexes_on_insert(&mut self, row: &Row<'static>, row_idx: usize) {
+        for ex in &mut self.excl_indexes {
+            if let Some(v) = row.values.get(ex.column_position)
+                && let Some(key) = crate::range_excl_index_key(v)
+            {
+                let mut entries = ex.map.get(&key).cloned().unwrap_or_default();
+                entries.push(RowLocator::Hot(row_idx));
+                ex.map.insert_mut(key, entries);
+            }
+        }
+    }
+
+    /// v7.39 (round 215) — rebuild every range-exclusion index from the
+    /// current rows (called from `rebuild_indices`, i.e. after a physical
+    /// compaction/delete that shifted slots). Preserves which columns are
+    /// indexed; re-emits all `Hot` locators.
+    fn rebuild_excl_indexes(&mut self) {
+        let cols: Vec<usize> = self.excl_indexes.iter().map(|e| e.column_position).collect();
+        self.excl_indexes.clear();
+        for c in cols {
+            self.ensure_excl_range_index(c);
+        }
     }
 
     /// Build a new NSW (HNSW-flavoured) index over the named column.
@@ -1690,6 +1770,13 @@ impl Table {
     /// needed.
     pub fn drop_column(&mut self, col_pos: usize) {
         debug_assert!(col_pos < self.schema.columns.len());
+        // v7.39 (round 215) — dropping a column shifts every later column's
+        // position, which would leave a range-exclusion index pointing at the
+        // wrong column. Drop the indexes rather than risk a silent-wrong
+        // probe; enforce falls back to the correct O(n) scan until they are
+        // rebuilt (`ensure_excl_range_index` from the constraint's updated
+        // column position).
+        self.excl_indexes.clear();
         // Strip the column from the schema.
         self.schema.columns.remove(col_pos);
         // Rewrite every row to omit the cell at col_pos.
@@ -2228,6 +2315,29 @@ impl Table {
                 }
             }
         }
+        // v7.39 (round 215) — capture the range-exclusion key move BEFORE the
+        // in-place `set` consumes `new_row`. A `FullRebuild` (a GIN/NSW/BRIN
+        // column changed) rebuilds the excl indexes too via `rebuild_indices`,
+        // so only apply the incremental move on the pure-BTreeMove path.
+        let excl_has_full = fixes.iter().any(|f| matches!(f, IdxFix::FullRebuild));
+        let excl_moves: Vec<(usize, Option<(i128, u8)>, Option<(i128, u8)>)> =
+            if self.excl_indexes.is_empty() || excl_has_full {
+                Vec::new()
+            } else {
+                self.excl_indexes
+                    .iter()
+                    .filter_map(|e| {
+                        let c = e.column_position;
+                        let old_k = old_row.values.get(c).and_then(crate::range_excl_index_key);
+                        let new_k = new_row.values.get(c).and_then(crate::range_excl_index_key);
+                        if old_k == new_k {
+                            None // range bound unchanged — no index touch
+                        } else {
+                            Some((c, old_k, new_k))
+                        }
+                    })
+                    .collect()
+            };
         self.rows = self
             .rows
             .set(position, new_row)
@@ -2296,6 +2406,31 @@ impl Table {
                         map.insert_mut(k, entries);
                     }
                 }
+            }
+        }
+        // v7.39 (round 215) — apply the range-exclusion key moves captured
+        // above (skipped when a FullRebuild already re-emitted every excl
+        // index). Same shape as the BTreeMove: drop Hot(position) from the
+        // old key, append it to the new key.
+        for (col, old_k, new_k) in excl_moves {
+            let Some(ex) = self
+                .excl_indexes
+                .iter_mut()
+                .find(|e| e.column_position == col)
+            else {
+                continue;
+            };
+            if let Some(k) = old_k
+                && let Some(locs) = ex.map.get(&k)
+            {
+                let mut locs = locs.clone();
+                locs.retain(|l| *l != RowLocator::Hot(position));
+                ex.map.insert_mut(k, locs);
+            }
+            if let Some(k) = new_k {
+                let mut entries = ex.map.get(&k).cloned().unwrap_or_default();
+                entries.push(RowLocator::Hot(position));
+                ex.map.insert_mut(k, entries);
             }
         }
         Ok(())
@@ -2593,6 +2728,12 @@ impl Table {
         // v7.12.3 — same for GIN posting-list cold locators.
         for (idx_name, locators) in preserved_gin_cold {
             let _ = self.register_gin_cold_locators(&idx_name, locators);
+        }
+        // v7.39 (round 215) — the range-exclusion indexes address rows by the
+        // same physical slot, so a compaction that shifted slots invalidates
+        // their Hot locators too. Re-emit them from the (post-compaction) rows.
+        if !self.excl_indexes.is_empty() {
+            self.rebuild_excl_indexes();
         }
     }
 
