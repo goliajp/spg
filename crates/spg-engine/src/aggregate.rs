@@ -251,7 +251,7 @@ pub fn is_within_group_name(name: &str) -> bool {
 /// construction sites (window+ORDER, plain, `first_ordered`
 /// `array_agg`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum AggKind {
+pub(crate) enum AggKind {
     CountStar,
     Count,
     Sum,
@@ -287,7 +287,7 @@ enum AggKind {
 /// Hot path (`update_state_kind`) only sees the enum; the canonical
 /// string still travels with the spec so `finalize` and errors can
 /// quote it.
-fn classify_agg_name(name: &str) -> AggKind {
+pub(crate) fn classify_agg_name(name: &str) -> AggKind {
     match name {
         "count_star" => AggKind::CountStar,
         "count" => AggKind::Count,
@@ -335,7 +335,7 @@ fn classify_agg_name(name: &str) -> AggKind {
 /// which gate each fast path reads.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default, Clone)]
-struct AggState {
+pub(crate) struct AggState {
     count: i64,
     sum_int: i64,
     sum_float: f64,
@@ -3743,7 +3743,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
     }
 }
 
-fn update_state(
+pub(crate) fn update_state(
     st: &mut AggState,
     kind: AggKind,
     name: &str,
@@ -4177,7 +4177,7 @@ fn update_state(
 }
 
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-fn finalize(name: &str, st: &AggState) -> Value<'static> {
+pub(crate) fn finalize(name: &str, st: &AggState) -> Value<'static> {
     match name {
         "count" | "count_star" => Value::BigInt(st.count),
         "sum" => {

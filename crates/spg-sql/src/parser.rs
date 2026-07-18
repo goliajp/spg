@@ -20616,6 +20616,20 @@ impl Parser {
                 && s.eq_ignore_ascii_case("over")
             {
                 self.advance();
+                // v7.39 (round 230) — PG implements neither modifier for a
+                // windowed call and says so (0A000). Both used to be parsed
+                // and then silently dropped here, so `count(DISTINCT v)
+                // OVER (…)` quietly answered the non-distinct count.
+                if agg_distinct {
+                    return Err(
+                        self.err("DISTINCT is not implemented for window functions".to_string())
+                    );
+                }
+                if !agg_order_by.is_empty() {
+                    return Err(self.err(
+                        "aggregate ORDER BY is not implemented for window functions".to_string(),
+                    ));
+                }
                 let (partition_by, order_by, frame) = self.parse_over_clause()?;
                 return Ok(Expr::WindowFunction {
                     name: first,
