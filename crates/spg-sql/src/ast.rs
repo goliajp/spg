@@ -1054,7 +1054,10 @@ pub enum TriggerSelector {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExplainStatement {
     pub analyze: bool,
-    pub inner: Box<SelectStatement>,
+    /// v7.39 (round 225) — widened from SelectStatement so EXPLAIN
+    /// INSERT/UPDATE/DELETE parses (PG explains DML); the engine renders
+    /// `Insert on / Update on / Delete on` trees for them.
+    pub inner: Box<Statement>,
     /// v6.8.3 — `EXPLAIN (SUGGEST) <SELECT>` enables the index
     /// advisor pass: after the regular plan tree, the engine
     /// emits one suggestion line per column referenced in the

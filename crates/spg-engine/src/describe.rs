@@ -841,7 +841,12 @@ fn walk_statement(stmt: &Statement, f: &mut impl FnMut(&Expr)) {
                 walk_expr(w, f);
             }
         }
-        Statement::Explain(inner) => walk_select(&inner.inner, f),
+        // v7.39 (round 225) — the body is a whole Statement (SELECT or DML).
+        Statement::Explain(inner) => {
+            if let Statement::Select(sel) = &*inner.inner {
+                walk_select(sel, f);
+            }
+        }
         _ => {}
     }
 }

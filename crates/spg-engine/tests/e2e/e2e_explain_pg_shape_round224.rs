@@ -35,18 +35,18 @@ fn seeded() -> Engine {
 #[test]
 fn scan_shapes() {
     let mut e = seeded();
-    assert_eq!(plan(&mut e, "EXPLAIN SELECT * FROM t1"), vec!["Seq Scan on t1"]);
+    assert_eq!(plan(&mut e, "EXPLAIN (COSTS OFF) SELECT * FROM t1"), vec!["Seq Scan on t1"]);
     // SPG's real decision: the PK index serves id=5 (PG's small-table
     // planner would seq-scan — the SHAPE grammar is what's aligned).
     assert_eq!(
-        plan(&mut e, "EXPLAIN SELECT * FROM t1 WHERE id = 5"),
+        plan(&mut e, "EXPLAIN (COSTS OFF) SELECT * FROM t1 WHERE id = 5"),
         vec!["Index Scan using t1_pkey on t1", "  Index Cond: (id = 5)"]
     );
     assert_eq!(
-        plan(&mut e, "EXPLAIN SELECT * FROM t1 WHERE v = 10"),
+        plan(&mut e, "EXPLAIN (COSTS OFF) SELECT * FROM t1 WHERE v = 10"),
         vec!["Seq Scan on t1", "  Filter: (v = 10)"]
     );
-    assert_eq!(plan(&mut e, "EXPLAIN SELECT 1"), vec!["Result"]);
+    assert_eq!(plan(&mut e, "EXPLAIN (COSTS OFF) SELECT 1"), vec!["Result"]);
 }
 
 #[test]
@@ -57,7 +57,7 @@ fn sort_limit_nesting_matches_pg_indentation() {
     //              Sort Key: v
     //              ->  Seq Scan on t1
     assert_eq!(
-        plan(&mut e, "EXPLAIN SELECT * FROM t1 ORDER BY v LIMIT 3"),
+        plan(&mut e, "EXPLAIN (COSTS OFF) SELECT * FROM t1 ORDER BY v LIMIT 3"),
         vec![
             "Limit",
             "  ->  Sort",
@@ -71,11 +71,11 @@ fn sort_limit_nesting_matches_pg_indentation() {
 fn aggregate_shapes() {
     let mut e = seeded();
     assert_eq!(
-        plan(&mut e, "EXPLAIN SELECT count(*) FROM t1"),
+        plan(&mut e, "EXPLAIN (COSTS OFF) SELECT count(*) FROM t1"),
         vec!["Aggregate", "  ->  Seq Scan on t1"]
     );
     assert_eq!(
-        plan(&mut e, "EXPLAIN SELECT v, count(*) FROM t1 GROUP BY v"),
+        plan(&mut e, "EXPLAIN (COSTS OFF) SELECT v, count(*) FROM t1 GROUP BY v"),
         vec![
             "HashAggregate",
             "  Group Key: v",
@@ -84,7 +84,7 @@ fn aggregate_shapes() {
     );
     // DISTINCT plans as a HashAggregate over the select list (PG shape).
     assert_eq!(
-        plan(&mut e, "EXPLAIN SELECT DISTINCT v FROM t1"),
+        plan(&mut e, "EXPLAIN (COSTS OFF) SELECT DISTINCT v FROM t1"),
         vec![
             "HashAggregate",
             "  Group Key: v",
@@ -99,7 +99,7 @@ fn hash_join_shape() {
     assert_eq!(
         plan(
             &mut e,
-            "EXPLAIN SELECT * FROM t1 JOIN t2 ON t2.t1_id = t1.id"
+            "EXPLAIN (COSTS OFF) SELECT * FROM t1 JOIN t2 ON t2.t1_id = t1.id"
         ),
         vec![
             "Hash Join",
@@ -117,7 +117,7 @@ fn append_and_window_shapes() {
     assert_eq!(
         plan(
             &mut e,
-            "EXPLAIN SELECT * FROM t1 UNION ALL SELECT * FROM t1"
+            "EXPLAIN (COSTS OFF) SELECT * FROM t1 UNION ALL SELECT * FROM t1"
         ),
         vec![
             "Append",
@@ -126,7 +126,7 @@ fn append_and_window_shapes() {
         ]
     );
     assert_eq!(
-        plan(&mut e, "EXPLAIN SELECT sum(v) OVER (ORDER BY id) FROM t1"),
+        plan(&mut e, "EXPLAIN (COSTS OFF) SELECT sum(v) OVER (ORDER BY id) FROM t1"),
         vec!["WindowAgg", "  ->  Seq Scan on t1"]
     );
 }
@@ -139,7 +139,7 @@ fn cte_block_shape() {
     assert_eq!(
         plan(
             &mut e,
-            "EXPLAIN WITH w AS (SELECT * FROM t1) SELECT * FROM w WHERE id = 1"
+            "EXPLAIN (COSTS OFF) WITH w AS (SELECT * FROM t1) SELECT * FROM w WHERE id = 1"
         ),
         vec![
             "CTE Scan on w",

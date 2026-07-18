@@ -463,7 +463,9 @@ pub fn substitute_placeholders(
                 substitute_expr(w, params)?;
             }
         }
-        Statement::Explain(e) => substitute_select(&mut e.inner, params)?,
+        // v7.39 (round 225) — the EXPLAIN body is a whole Statement now
+        // (SELECT or DML); recurse through the generic walker.
+        Statement::Explain(e) => substitute_placeholders(&mut e.inner, params)?,
         // v7.39 (round 149) — prepared MERGE: `$N` may appear in the ON
         // condition, WHEN filters, action exprs, and RETURNING.
         Statement::Merge(m) => walk_merge_exprs_mut(m, &mut |e| substitute_expr(e, params))?,
