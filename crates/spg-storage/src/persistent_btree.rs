@@ -212,6 +212,39 @@ impl<K: Ord, V> PersistentBTreeMap<K, V> {
         }
     }
 
+    /// v7.39 (round 215) — the entry with the largest key STRICTLY less than
+    /// `key` (the in-order predecessor of `key`), or `None` when every key is
+    /// ≥ `key`. `O(log₈ N)`: descend once toward `key`; at each internal node
+    /// the entries left of the descent slot are all < `key`, and the rightmost
+    /// of them is the best candidate at that level — but the child we descend
+    /// into holds keys strictly between it and `key`, so a deeper hit always
+    /// overrides. The building block for the range-exclusion overlap probe
+    /// (find the existing range whose lower bound sits just below a candidate).
+    pub fn predecessor(&self, key: &K) -> Option<(&K, &V)> {
+        let mut node: &Arc<BNode<K, V>> = &self.root;
+        let mut best: Option<(&K, &V)> = None;
+        loop {
+            match &**node {
+                BNode::Leaf { entries } => {
+                    let i = entries.partition_point(|e| &e.0 < key);
+                    if i > 0 {
+                        let (k, v) = &entries[i - 1];
+                        best = Some((k, v));
+                    }
+                    return best;
+                }
+                BNode::Internal { entries, children } => {
+                    let i = entries.partition_point(|e| &e.0 < key);
+                    if i > 0 {
+                        let (k, v) = &entries[i - 1];
+                        best = Some((k, v));
+                    }
+                    node = &children[i];
+                }
+            }
+        }
+    }
+
     /// In-order key-then-value iterator. Used by `PartialEq` and any caller
     /// that needs to walk the whole map (e.g. catalog deserialization).
     /// v7.39 (round 170) — bulk-build from PRE-SORTED entries, bottom-up.
@@ -964,6 +997,33 @@ mod tests {
                     got, want,
                     "range drift n={n_inserts} lo={lo_raw:?} hi={hi_raw:?}"
                 );
+            }
+        }
+    }
+
+    /// Fuzz `predecessor` against a `BTreeMap` oracle (largest key < probe)
+    /// across leaf-only, shallow, and deep trees.
+    #[test]
+    fn fuzz_predecessor_against_btreemap() {
+        let mut rng = Splitmix::new(0x9E37_79B9_7F4A_7C15_u64);
+        const KEY_RANGE: i64 = 512;
+        for &n_inserts in &[0usize, 5, 40, 300, 2000] {
+            let mut pb: PersistentBTreeMap<i64, i64> = PersistentBTreeMap::new();
+            let mut oracle: BTreeMap<i64, i64> = BTreeMap::new();
+            for _ in 0..n_inserts {
+                let key = (rng.next() as i64).rem_euclid(KEY_RANGE);
+                let val = rng.next() as i64;
+                pb = pb.insert(key, val).0;
+                oracle.insert(key, val);
+            }
+            for _ in 0..2000 {
+                let probe = (rng.next() as i64).rem_euclid(KEY_RANGE + 40) - 20;
+                let got = pb.predecessor(&probe).map(|(k, v)| (*k, *v));
+                let want = oracle
+                    .range(..probe)
+                    .next_back()
+                    .map(|(k, v)| (*k, *v));
+                assert_eq!(got, want, "predecessor drift n={n_inserts} probe={probe}");
             }
         }
     }
