@@ -980,6 +980,18 @@ impl Engine {
         self.acl_check_statement(&stmt)?;
         let result = match stmt {
             Statement::CreateTable(s) => self.exec_create_table(s),
+            // v7.39 (round 218) — server-side cursors.
+            Statement::DeclareCursor {
+                name,
+                scroll,
+                hold,
+                query,
+            } => self.exec_declare_cursor(name, scroll, hold, *query),
+            Statement::FetchCursor { name, direction } => {
+                self.exec_fetch_cursor(&name, direction)
+            }
+            Statement::MoveCursor { name, direction } => self.exec_move_cursor(&name, direction),
+            Statement::CloseCursor { name } => self.exec_close_cursor(name.as_deref()),
             // v7.9.15 — CREATE EXTENSION is a no-op on SPG. Returns
             // CommandOk with affected=0; modified_catalog=false so
             // the WAL doesn't grow a useless entry. mailrs F3.

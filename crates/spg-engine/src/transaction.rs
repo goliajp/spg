@@ -712,6 +712,9 @@ impl Engine {
         // v7.39 (pg_stat knife A) — one committed transaction.
         self.xact_commit
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // v7.39 (round 218) — cursor lifecycle: non-HOLD cursors close at
+        // COMMIT; WITH HOLD ones become held (survive later rollbacks).
+        self.cursors_on_commit();
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: true,
@@ -748,6 +751,9 @@ impl Engine {
         // COMMIT inside an aborted tx dispatches here too, like PG).
         self.xact_rollback
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // v7.39 (round 218) — cursor lifecycle: everything not already held
+        // by an earlier COMMIT closes with the aborted transaction.
+        self.cursors_on_rollback();
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,

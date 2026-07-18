@@ -35,6 +35,44 @@ pub struct CopyOptions {
     pub quote: Option<char>,
 }
 
+/// v7.39 (round 218) — FETCH / MOVE cursor direction. PG grammar: single-row
+/// forms (NEXT / PRIOR / FIRST / LAST / ABSOLUTE n / RELATIVE n) return at
+/// most one row; multi-row forms (bare n / ALL / FORWARD [n|ALL] /
+/// BACKWARD [n|ALL]) stream a run. A negative bare/FORWARD count means
+/// BACKWARD (normalized at execution).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorDirection {
+    Next,
+    Prior,
+    First,
+    Last,
+    Absolute(i64),
+    Relative(i64),
+    /// Bare `FETCH n` / `FORWARD n` (negative = backward n).
+    Count(i64),
+    /// `ALL` / `FORWARD ALL`.
+    All,
+    Backward(i64),
+    BackwardAll,
+}
+
+impl fmt::Display for CursorDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Next => f.write_str("NEXT"),
+            Self::Prior => f.write_str("PRIOR"),
+            Self::First => f.write_str("FIRST"),
+            Self::Last => f.write_str("LAST"),
+            Self::Absolute(n) => write!(f, "ABSOLUTE {n}"),
+            Self::Relative(n) => write!(f, "RELATIVE {n}"),
+            Self::Count(n) => write!(f, "FORWARD {n}"),
+            Self::All => f.write_str("ALL"),
+            Self::Backward(n) => write!(f, "BACKWARD {n}"),
+            Self::BackwardAll => f.write_str("BACKWARD ALL"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Statement::Select dominates; Boxing would touch every match site
 pub enum Statement {
@@ -61,6 +99,34 @@ pub enum Statement {
     /// pg_dump / mysqldump preambles (`SET NAMES utf8mb4`
     /// wrapped in conditional comments, etc.) load cleanly.
     Empty,
+    /// v7.39 (round 218) — `DECLARE <name> [BINARY] [INSENSITIVE]
+    /// [[NO] SCROLL] CURSOR [{WITH|WITHOUT} HOLD] FOR <select>`. The
+    /// canonical driver path for streaming large result sets (psycopg2
+    /// named cursors, JDBC setFetchSize).
+    DeclareCursor {
+        name: String,
+        /// `None` = neither keyword (PG default: backward allowed when the
+        /// plan supports it — always, for SPG's materialized cursors);
+        /// `Some(true)` = SCROLL; `Some(false)` = NO SCROLL (backward
+        /// fetch errors 55000).
+        scroll: Option<bool>,
+        /// `WITH HOLD` — survives the creating transaction's COMMIT.
+        hold: bool,
+        query: Box<Statement>,
+    },
+    /// v7.39 (round 218) — `FETCH [<direction>] [FROM|IN] <name>`.
+    FetchCursor {
+        name: String,
+        direction: CursorDirection,
+    },
+    /// v7.39 (round 218) — `MOVE [<direction>] [FROM|IN] <name>`: FETCH
+    /// without returning rows; the command tag carries the move count.
+    MoveCursor {
+        name: String,
+        direction: CursorDirection,
+    },
+    /// v7.39 (round 218) — `CLOSE <name>` / `CLOSE ALL` (`None` = ALL).
+    CloseCursor { name: Option<String> },
     /// `COPY table [(cols)] TO STDOUT` — the engine renders the
     /// visible rows in COPY text format (tab-separated, `\N`
     /// nulls, backslash escapes) as a single-text-column result
@@ -3695,7 +3761,13 @@ impl Statement {
             | Statement::CreateDomain(_)
             | Statement::DropDomain { .. }
             | Statement::CreateSchema { .. }
-            | Statement::DropSchema { .. } => false,
+            | Statement::DropSchema { .. }
+            // v7.39 (round 218) — cursors mutate per-session cursor state
+            // (open/position/close) on the writer engine: writer path.
+            | Statement::DeclareCursor { .. }
+            | Statement::FetchCursor { .. }
+            | Statement::MoveCursor { .. }
+            | Statement::CloseCursor { .. } => false,
         }
     }
 }
@@ -3851,6 +3923,34 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => Ok(()),
+            Self::DeclareCursor {
+                name,
+                scroll,
+                hold,
+                query,
+            } => {
+                write!(f, "DECLARE {} ", quote_ident(name))?;
+                match scroll {
+                    Some(true) => f.write_str("SCROLL ")?,
+                    Some(false) => f.write_str("NO SCROLL ")?,
+                    None => {}
+                }
+                f.write_str("CURSOR ")?;
+                if *hold {
+                    f.write_str("WITH HOLD ")?;
+                }
+                write!(f, "FOR {query}")
+            }
+            Self::FetchCursor { name, direction } => {
+                write!(f, "FETCH {direction} FROM {}", quote_ident(name))
+            }
+            Self::MoveCursor { name, direction } => {
+                write!(f, "MOVE {direction} FROM {}", quote_ident(name))
+            }
+            Self::CloseCursor { name } => match name {
+                Some(n) => write!(f, "CLOSE {}", quote_ident(n)),
+                None => f.write_str("CLOSE ALL"),
+            },
             Self::CopyTo {
                 table,
                 columns,

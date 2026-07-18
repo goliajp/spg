@@ -2874,11 +2874,225 @@ impl Parser {
                     }
                 }
             }
+            // v7.39 (round 218) — server-side cursors.
+            Token::Ident(s) if s.eq_ignore_ascii_case("declare") => self.parse_declare_cursor(),
+            Token::Ident(s) if s.eq_ignore_ascii_case("fetch") => self.parse_fetch_or_move(false),
+            Token::Ident(s) if s.eq_ignore_ascii_case("move") => self.parse_fetch_or_move(true),
+            Token::Ident(s) if s.eq_ignore_ascii_case("close") => {
+                self.advance();
+                match self.peek().clone() {
+                    Token::All => {
+                        self.advance();
+                        Ok(Statement::CloseCursor { name: None })
+                    }
+                    Token::Ident(s) if s.eq_ignore_ascii_case("all") => {
+                        self.advance();
+                        Ok(Statement::CloseCursor { name: None })
+                    }
+                    Token::Ident(n) | Token::QuotedIdent(n) => {
+                        self.advance();
+                        Ok(Statement::CloseCursor { name: Some(n) })
+                    }
+                    other => Err(self.err(format!(
+                        "expected cursor name or ALL after CLOSE, got {other:?}"
+                    ))),
+                }
+            }
             other => Err(self.err(format!(
                 "expected SELECT / CREATE / DROP / INSERT / UPDATE / DELETE / ALTER / BEGIN / COMMIT / \
                  ROLLBACK / SAVEPOINT / RELEASE / SHOW at start of statement, got {other:?}"
             ))),
         }
+    }
+
+    /// v7.39 (round 218) — `DECLARE <name> [BINARY] [INSENSITIVE] [ASENSITIVE]
+    /// [[NO] SCROLL] CURSOR [{WITH|WITHOUT} HOLD] FOR <select>`. BINARY /
+    /// (IN|A)SENSITIVE are accepted and ignored (SPG cursors materialize at
+    /// DECLARE, which is INSENSITIVE — PG's only actual behaviour too).
+    fn parse_declare_cursor(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // DECLARE
+        let name = match self.advance() {
+            Token::Ident(n) | Token::QuotedIdent(n) => n,
+            other => {
+                return Err(self.err(format!("expected cursor name after DECLARE, got {other:?}")));
+            }
+        };
+        let mut scroll: Option<bool> = None;
+        loop {
+            match self.peek() {
+                Token::Ident(s) if s.eq_ignore_ascii_case("binary")
+                    || s.eq_ignore_ascii_case("insensitive")
+                    || s.eq_ignore_ascii_case("asensitive") =>
+                {
+                    self.advance();
+                }
+                Token::Ident(s) if s.eq_ignore_ascii_case("scroll") => {
+                    self.advance();
+                    scroll = Some(true);
+                }
+                Token::Not | Token::Ident(_)
+                    if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("no")) =>
+                {
+                    self.advance(); // NO
+                    if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("scroll")) {
+                        return Err(self.err(format!(
+                            "expected SCROLL after NO in DECLARE, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    scroll = Some(false);
+                }
+                _ => break,
+            }
+        }
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("cursor")) {
+            return Err(self.err(format!(
+                "expected CURSOR in DECLARE, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let mut hold = false;
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("with")) {
+            self.advance();
+            if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("hold")) {
+                return Err(self.err(format!(
+                    "expected HOLD after WITH in DECLARE, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            hold = true;
+        } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("without")) {
+            self.advance();
+            if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("hold")) {
+                return Err(self.err(format!(
+                    "expected HOLD after WITHOUT in DECLARE, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+        }
+        if !matches!(self.peek(), Token::For) {
+            return Err(self.err(format!(
+                "expected FOR before the cursor query, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let query = self.parse_one_statement()?;
+        Ok(Statement::DeclareCursor {
+            name,
+            scroll,
+            hold,
+            query: alloc::boxed::Box::new(query),
+        })
+    }
+
+    /// v7.39 (round 218) — `FETCH`/`MOVE` `[<direction>] [FROM|IN] <name>`.
+    /// Direction: NEXT | PRIOR | FIRST | LAST | ABSOLUTE n | RELATIVE n | n |
+    /// ALL | FORWARD [n|ALL] | BACKWARD [n|ALL]; bare `FETCH <name>` = NEXT.
+    fn parse_fetch_or_move(&mut self, is_move: bool) -> Result<Statement, ParseError> {
+        use crate::ast::CursorDirection as D;
+        self.advance(); // FETCH / MOVE
+        let mut signed_count = |this: &mut Self| -> Result<i64, ParseError> {
+            let neg = if matches!(this.peek(), Token::Minus) {
+                this.advance();
+                true
+            } else {
+                false
+            };
+            match this.advance() {
+                Token::Integer(v) => Ok(if neg { -v } else { v }),
+                other => Err(this.err(format!("expected count, got {other:?}"))),
+            }
+        };
+        let direction = match self.peek().clone() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("next") => {
+                self.advance();
+                D::Next
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("prior") => {
+                self.advance();
+                D::Prior
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("first") => {
+                self.advance();
+                D::First
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("last") => {
+                self.advance();
+                D::Last
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("absolute") => {
+                self.advance();
+                D::Absolute(signed_count(self)?)
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("relative") => {
+                self.advance();
+                D::Relative(signed_count(self)?)
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("forward") => {
+                self.advance();
+                match self.peek().clone() {
+                    Token::All => {
+                        self.advance();
+                        D::All
+                    }
+                    Token::Ident(s) if s.eq_ignore_ascii_case("all") => {
+                        self.advance();
+                        D::All
+                    }
+                    Token::Integer(_) | Token::Minus => D::Count(signed_count(self)?),
+                    _ => D::Next, // bare FORWARD = FORWARD 1
+                }
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("backward") => {
+                self.advance();
+                match self.peek().clone() {
+                    Token::All => {
+                        self.advance();
+                        D::BackwardAll
+                    }
+                    Token::Ident(s) if s.eq_ignore_ascii_case("all") => {
+                        self.advance();
+                        D::BackwardAll
+                    }
+                    Token::Integer(_) | Token::Minus => D::Backward(signed_count(self)?),
+                    _ => D::Backward(1), // bare BACKWARD = BACKWARD 1
+                }
+            }
+            Token::All => {
+                self.advance();
+                D::All
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("all") => {
+                self.advance();
+                D::All
+            }
+            Token::Integer(_) | Token::Minus => D::Count(signed_count(self)?),
+            // Bare `FETCH <name>` — direction defaults to NEXT.
+            _ => D::Next,
+        };
+        // Optional FROM / IN.
+        if matches!(self.peek(), Token::From)
+            || matches!(self.peek(), Token::In)
+            || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("in"))
+        {
+            self.advance();
+        }
+        let name = match self.advance() {
+            Token::Ident(n) | Token::QuotedIdent(n) => n,
+            other => {
+                return Err(self.err(format!("expected cursor name, got {other:?}")));
+            }
+        };
+        Ok(if is_move {
+            Statement::MoveCursor { name, direction }
+        } else {
+            Statement::FetchCursor { name, direction }
+        })
     }
 
     fn parse_create_stmt(&mut self) -> Result<Statement, ParseError> {

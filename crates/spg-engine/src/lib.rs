@@ -41,6 +41,7 @@ mod bytebudget;
 mod cancel;
 mod clock;
 mod constraints;
+mod cursor;
 mod conversions;
 pub mod copy;
 mod ddl;
@@ -800,6 +801,15 @@ pub struct Engine {
     /// All other names are accepted + recorded so PG-dump output
     /// loads, but have no behavioural effect.
     pub(crate) session_params: BTreeMap<String, String>,
+    /// v7.39 (round 218) — open server-side cursors (DECLARE … CURSOR),
+    /// keyed by name. Materialized at DECLARE (INSENSITIVE semantics —
+    /// PG's only actual behaviour too); FETCH / MOVE walk the stored rows.
+    /// Lifecycle: created only inside a transaction; COMMIT closes
+    /// non-HOLD cursors and marks WITH HOLD ones held; ROLLBACK closes
+    /// everything not already held by an earlier commit. Never serialized.
+    /// Session-scoped in PG; SPG stores them engine-wide (the same
+    /// process-level session-state architecture wall as `session_params`).
+    pub(crate) cursors: BTreeMap<String, cursor::OpenCursor>,
     /// v7.39 (read01 round 46) — NOTICEs raised by the statement now
     /// executing. PG emits a NoticeResponse whenever an `IF EXISTS` /
     /// `IF NOT EXISTS` clause makes it skip work ("table \"t\" does not
@@ -1030,6 +1040,7 @@ impl Engine {
             slow_query_threshold_us: None,
             slow_query_logger: None,
             session_params: BTreeMap::new(),
+            cursors: BTreeMap::new(),
             pending_notices: Vec::new(),
             xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
@@ -1376,6 +1387,7 @@ impl Engine {
             slow_query_threshold_us: None,
             slow_query_logger: None,
             session_params: BTreeMap::new(),
+            cursors: BTreeMap::new(),
             pending_notices: Vec::new(),
             xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
@@ -1479,6 +1491,7 @@ impl Engine {
                     slow_query_threshold_us: None,
                     slow_query_logger: None,
                     session_params: BTreeMap::new(),
+                    cursors: BTreeMap::new(),
                     pending_notices: Vec::new(),
                     xact_commit: core::sync::atomic::AtomicU64::new(0),
                     xact_rollback: core::sync::atomic::AtomicU64::new(0),
