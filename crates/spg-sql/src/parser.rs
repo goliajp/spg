@@ -7783,6 +7783,21 @@ impl Parser {
                             )
                         ]);
                     }
+                    // v7.39 (round 211) — ADD CONSTRAINT <name> EXCLUDE
+                    // [USING <am>] (<col> WITH <op>[, …]). pg_dump emits
+                    // exclusion constraints via this ALTER form.
+                    if matches!(&kind, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("exclude"))
+                    {
+                        self.advance(); // CONSTRAINT
+                        let con_name = self.expect_ident_like()?;
+                        let mut ex = self.parse_table_level_exclude()?;
+                        if let crate::ast::TableConstraint::Exclude { name, .. } = &mut ex {
+                            *name = Some(con_name);
+                        }
+                        return Ok(alloc::vec![
+                            crate::ast::AlterTableTarget::AddTableConstraint(ex)
+                        ]);
+                    }
                     // Unknown kind — fall through to FK path which
                     // produces a descriptive parse error.
                 }
@@ -7816,6 +7831,13 @@ impl Parser {
                         let uc = self.parse_table_level_unique()?;
                         return Ok(alloc::vec![
                             crate::ast::AlterTableTarget::AddTableConstraint(uc)
+                        ]);
+                    }
+                    // v7.39 (round 211) — bare ADD EXCLUDE (no CONSTRAINT prefix).
+                    Token::Ident(s) if s.eq_ignore_ascii_case("exclude") => {
+                        let ex = self.parse_table_level_exclude()?;
+                        return Ok(alloc::vec![
+                            crate::ast::AlterTableTarget::AddTableConstraint(ex)
                         ]);
                     }
                     _ => {}
