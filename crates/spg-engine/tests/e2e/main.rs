@@ -168,6 +168,7 @@ mod e2e_on_conflict_round240;
 mod e2e_update_from_alias_round241;
 mod e2e_grouping_elements_round242;
 mod e2e_tochar_templates_round243;
+mod e2e_sequence_functions_round244;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;

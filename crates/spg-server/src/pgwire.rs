@@ -3959,6 +3959,18 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         if msg.contains("arguments to GROUPING must be grouping expressions") {
             return ("42803", msg);
         }
+        // v7.39 (round 244) — sequence-range errors: a setval outside the
+        // range is 22003 NUMERIC_VALUE_OUT_OF_RANGE, the CREATE SEQUENCE
+        // option refusals 22023.
+        if msg.contains("is out of bounds for sequence") {
+            return ("22003", msg);
+        }
+        if msg.contains("cannot be less than MINVALUE")
+            || msg.contains("cannot be greater than MAXVALUE")
+            || msg.contains("INCREMENT must not be zero")
+        {
+            return ("22023", msg);
+        }
         if msg.contains("ON CONFLICT DO UPDATE requires inference specification") {
             return ("42601", msg);
         }
