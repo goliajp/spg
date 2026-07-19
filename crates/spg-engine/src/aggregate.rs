@@ -444,6 +444,15 @@ pub(crate) struct AggState {
     /// v7.38 (read01, T4.4) — true once a BIGINT input is seen, so
     /// bit_and/or/xor finalize as bigint vs integer (PG input-typed).
     bit_wide: bool,
+    /// v7.39 (round 254/255) — EVERY row fed to a WITHIN GROUP
+    /// aggregate, NULLs included. `items` (and `count`) hold only the
+    /// non-NULL values, which is right for `percentile_*` / `mode` —
+    /// but PG's hypothetical-set fractions divide by the full input
+    /// size: with one extra NULL row, `percent_rank(3)` moves from 2/6
+    /// to 2/7 (probed live). rank / dense_rank are unaffected either
+    /// way, since they only count values sorting before the
+    /// hypothetical row.
+    within_group_rows: usize,
     /// v7.32 (round-29) — two-argument regression family
     /// (`covar_*` / `corr` / `regr_*`), PG arg order `f(Y, X)`. Only
     /// rows where BOTH inputs are non-NULL contribute (`count` is the
@@ -717,7 +726,7 @@ pub(crate) fn run(
     // `array_agg()` or `string_agg(x)`) surfaces as a SQL error
     // rather than silently coercing to a degenerate aggregate.
     validate_agg_arities(stmt, &agg_specs)?;
-    validate_within_group(&agg_specs)?;
+    validate_within_group(&agg_specs, schema_cols)?;
 
     // v7.39 (enum order knife) — resolve enum member-order metadata once
     // per query: min/max extremes and ordered-collection sort keys over
@@ -915,7 +924,59 @@ pub(crate) fn run(
 /// GROUP (ordered-set / hypothetical-set) aggregates up front, so a
 /// malformed call surfaces as a SQL error rather than a silently
 /// degenerate aggregate.
-fn validate_within_group(agg_specs: &[AggSpec]) -> Result<(), EvalError> {
+/// v7.39 (round 255) — PG's name for an expression's type in an
+/// ordered-set signature error. Only a CAST / COLUMN is trusted (the
+/// round-237 lesson: `describe_expr` reports a binary operator as its
+/// left operand's type); an untyped literal is PG's own `unknown`, and
+/// anything else falls back to `unknown` rather than guessing.
+fn ordered_set_arg_type_name(e: &Expr, columns: &[ColumnSchema]) -> String {
+    if matches!(
+        e,
+        Expr::Literal(spg_sql::ast::Literal::String(_)) | Expr::Literal(spg_sql::ast::Literal::Null)
+    ) {
+        return String::from("unknown");
+    }
+    match e {
+        Expr::Cast { .. } | Expr::Column(_) | Expr::Literal(_) => {
+            crate::describe::describe_expr(e, columns)
+                .map_or_else(|| String::from("unknown"), |s| {
+                    crate::conversions::pg_type_name_for_error(s.ty)
+                })
+        }
+        _ => String::from("unknown"),
+    }
+}
+
+/// v7.39 (round 255) — PG resolves an ordered-set / hypothetical-set
+/// call as ONE function whose signature is `(direct args…, WITHIN GROUP
+/// args…)`; anything that does not match a declared overload is a plain
+/// `function f(…) does not exist` (42883), not a bespoke message. Probed
+/// live: `percentile_cont(numeric, text)`, `rank(integer, integer,
+/// text)`, `mode(integer, integer)`.
+fn ordered_set_signature_error(
+    name: &str,
+    spec: &AggSpec,
+    columns: &[ColumnSchema],
+) -> EvalError {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(d) = &spec.direct_arg {
+        parts.push(ordered_set_arg_type_name(d, columns));
+    }
+    for d in &spec.direct_args_extra {
+        parts.push(ordered_set_arg_type_name(d, columns));
+    }
+    for o in &spec.order_by {
+        parts.push(ordered_set_arg_type_name(&o.expr, columns));
+    }
+    EvalError::TypeMismatch {
+        detail: format!("function {name}({}) does not exist", parts.join(", ")),
+    }
+}
+
+fn validate_within_group(
+    agg_specs: &[AggSpec],
+    columns: &[ColumnSchema],
+) -> Result<(), EvalError> {
     // v7.32 (round-29) — WITHIN GROUP aggregates require the clause (PG
     // raises a hard error otherwise rather than silently degrading), and
     // SPG supports the single-sort-key form only.
@@ -934,39 +995,56 @@ fn validate_within_group(agg_specs: &[AggSpec]) -> Result<(), EvalError> {
                     detail: format!("{}() requires a direct argument", spec.name),
                 });
             }
+            // …and mode() takes NONE: `mode(1)` used to be accepted with
+            // the argument silently dropped.
+            if spec.name == "mode" && spec.direct_arg.is_some() {
+                return Err(ordered_set_signature_error(&spec.name, spec, columns));
+            }
             // v7.39 (read01 orderedsetaggs.c) — the hypothetical-set
             // family supports the multi-key form: one direct argument
             // per sort key (PG resolves a mismatch as a missing
             // function overload; its HINT carries the real rule).
-            if spec.order_by.len() > 1 {
-                let hypothetical = matches!(
-                    spec.name.as_str(),
-                    "rank" | "dense_rank" | "percent_rank" | "cume_dist"
-                );
-                if !hypothetical {
-                    return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "{}() with multiple WITHIN GROUP sort keys is not supported yet",
-                            spec.name
-                        ),
-                    });
-                }
-            }
-            if matches!(
+            let hypothetical = matches!(
                 spec.name.as_str(),
                 "rank" | "dense_rank" | "percent_rank" | "cume_dist"
-            ) {
-                let n_direct = 1 + spec.direct_args_extra.len();
-                if n_direct != spec.order_by.len() {
-                    return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "the number of hypothetical direct arguments (here {}) must \
-                             match the number of ordering columns (here {})",
-                            n_direct,
-                            spec.order_by.len()
-                        ),
-                    });
+            );
+            // Only the hypothetical-set family takes a multi-key sort
+            // spec, and then it needs exactly one direct argument per
+            // key. PG reports every mismatch as a missing overload.
+            if hypothetical {
+                if 1 + spec.direct_args_extra.len() != spec.order_by.len() {
+                    return Err(ordered_set_signature_error(&spec.name, spec, columns));
                 }
+            } else if spec.order_by.len() > 1 || !spec.direct_args_extra.is_empty() {
+                // `percentile_cont(0.5, 0.6)` and `mode(1)` used to be
+                // silently accepted (the extra arguments were dropped and
+                // the aggregate answered anyway).
+                return Err(ordered_set_signature_error(&spec.name, spec, columns));
+            }
+            // v7.39 (round 255) — `percentile_cont` interpolates, so PG
+            // declares it only over the numeric tower and interval
+            // (probed: text / date / timestamp / bool are refused, while
+            // `percentile_disc` and `mode` take any sortable type). SPG
+            // answered NULL for the refused types. Judged from the
+            // STATICALLY known type only — an unknown one is let through
+            // (round 237: refusing a legal query is worse than missing an
+            // illegal one).
+            if spec.name == "percentile_cont"
+                && let Some(o) = spec.order_by.first()
+                && matches!(o.expr, Expr::Cast { .. } | Expr::Column(_))
+                && let Some(sch) = crate::describe::describe_expr(&o.expr, columns)
+                && !matches!(
+                    sch.ty,
+                    spg_storage::DataType::SmallInt
+                        | spg_storage::DataType::Int
+                        | spg_storage::DataType::BigInt
+                        | spg_storage::DataType::Float
+                        | spg_storage::DataType::Real
+                        | spg_storage::DataType::Numeric { .. }
+                        | spg_storage::DataType::Interval
+                )
+            {
+                return Err(ordered_set_signature_error(&spec.name, spec, columns));
             }
         }
     }
@@ -4101,6 +4179,9 @@ pub(crate) fn update_state(
         // PG) into `items`, sorted at finalize by the parallel
         // `item_keys`.
         AggKind::WithinGroup => {
+            // Counted before the NULL skip: the hypothetical-set
+            // fractions divide by the full input size (PG).
+            st.within_group_rows += 1;
             if is_null {
                 return Ok(());
             }
@@ -4763,7 +4844,9 @@ fn finalize_ordered_set(
                     core::cmp::Ordering::Greater => {}
                 }
             }
-            let nn = n as f64;
+            // PG divides by the FULL input size (NULL rows included);
+            // `n` counts only the non-NULL values `items` holds.
+            let nn = st.within_group_rows.max(n) as f64;
             match name {
                 "rank" => Value::BigInt((before.len() + 1) as i64),
                 "dense_rank" => {
