@@ -4975,8 +4975,10 @@ fn apply_function_dispatch(
         // empty multirange {}. No overlap coalescing — matches the
         // existing Multirange contract (the engine trusts the
         // caller, mirroring PG's _construct_array pattern).
+        // v7.39 (round 256) — PG also has the polymorphic `multirange(range)`
+        // spelling, which takes its kind from the argument.
         "int4multirange" | "int8multirange" | "nummultirange" | "datemultirange"
-        | "tsmultirange" | "tstzmultirange" => {
+        | "tsmultirange" | "tstzmultirange" | "multirange" => {
             use spg_storage::RangeKind as K;
             let kind = match name {
                 "int4multirange" => K::Int4,
@@ -4984,6 +4986,14 @@ fn apply_function_dispatch(
                 "nummultirange" => K::Num,
                 "datemultirange" => K::Date,
                 "tsmultirange" => K::Ts,
+                "multirange" => match args.first() {
+                    Some(Value::Range { kind, .. } | Value::Multirange { kind, .. }) => *kind,
+                    _ => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: String::from("multirange() takes exactly one range argument"),
+                        });
+                    }
+                },
                 _ => K::TsTz,
             };
             let mut ranges: alloc::vec::Vec<spg_storage::RangeSpan> = alloc::vec::Vec::new();
