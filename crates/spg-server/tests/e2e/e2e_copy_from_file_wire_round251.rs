@@ -332,3 +332,68 @@ fn non_admin_role_gets_pgs_42501() {
     assert_eq!(tag.as_deref(), Some("COPY 1"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// v7.39 (round 252) — the write direction: `COPY … TO '<file>'` over
+/// the pgwire. The server renders via the engine and writes the file;
+/// non-admin roles get PG's 42501 (pg_write_server_files analog); a
+/// missing directory is 58P01 with the COPY TO HINT.
+#[test]
+fn copy_to_file_over_the_wire_writes_and_gates() {
+    let dir = unique_dir("tofile");
+    let out = dir.join("out.txt");
+    let (raw, addrs) = common::ServerBuilder::new()
+        .arg_path(&dir.join("d.spgdb"))
+        .with_pgwire()
+        .spawn();
+    let _guard = common::ChildGuard(raw);
+    let mut s = pg_connect(addrs.pgwire.as_ref().unwrap());
+    assert_eq!(exec(&mut s, "CREATE TABLE ct (id int, name text)").1, None);
+    assert_eq!(exec(&mut s, "INSERT INTO ct VALUES (1,'a'),(2,NULL)").1, None);
+    let (tag, err) = exec(&mut s, &format!("COPY ct TO '{}'", out.display()));
+    assert_eq!(err, None);
+    assert_eq!(tag.as_deref(), Some("COPY 2"));
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "1\ta\n2\t\\N\n");
+    // Query form.
+    let (tag, err) = exec(
+        &mut s,
+        &format!(
+            "COPY (SELECT id FROM ct ORDER BY id) TO '{}' WITH (FORMAT csv)",
+            out.display()
+        ),
+    );
+    assert_eq!(err, None);
+    assert_eq!(tag.as_deref(), Some("COPY 2"));
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "1\n2\n");
+    // Missing directory: 58P01 + PG wording.
+    let (_, err) = exec(&mut s, "COPY ct TO '/definitely/not/here/o.txt'");
+    let (code, msg) = err.expect("missing dir must fail");
+    assert_eq!(code, "58P01", "{msg}");
+    assert!(msg.contains("for writing:"), "{msg}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn non_admin_role_gets_42501_on_copy_to_file() {
+    let dir = unique_dir("torole");
+    let (raw, addrs) = common::ServerBuilder::new()
+        .arg_path(&dir.join("d.spgdb"))
+        .with_pgwire()
+        .env("SPG_ADMIN_PASSWORD", "admin-pw")
+        .spawn();
+    let _guard = common::ChildGuard(raw);
+    let addr = addrs.pgwire.as_ref().unwrap();
+    {
+        let mut s = scram_login(addr, "admin", "admin-pw");
+        assert_eq!(exec(&mut s, "CREATE TABLE ct (id int)").1, None);
+        assert_eq!(
+            exec(&mut s, "CREATE USER 'bi2' WITH PASSWORD 'bi-pw' ROLE 'readwrite'").1,
+            None
+        );
+    }
+    let mut s = scram_login(addr, "bi2", "bi-pw");
+    let (_, err) = exec(&mut s, &format!("COPY ct TO '{}'", dir.join("x.txt").display()));
+    let (code, msg) = err.expect("non-admin COPY TO file must fail");
+    assert_eq!(code, "42501", "{msg}");
+    assert!(msg.contains("permission denied to COPY to a file"), "{msg}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

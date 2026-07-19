@@ -1118,6 +1118,13 @@ impl Engine {
                 &options,
                 cancel,
             ),
+            // v7.39 (round 252) — the engine is no_std: the HOST renders
+            // via `copy_to_buffer` and writes the file itself.
+            Statement::CopyToFile { path, .. } => Err(EngineError::Unsupported(
+                alloc::format!(
+                    "COPY TO file: the host must render via copy_to_buffer and write {path:?}"
+                ),
+            )),
             Statement::Begin(isolation) => self.exec_begin(isolation),
             Statement::Commit => self.exec_commit(),
             Statement::Rollback => self.exec_rollback(),
@@ -1691,6 +1698,39 @@ impl Engine {
             affected,
             modified_catalog: false,
         })
+    }
+
+    /// v7.39 (round 252) — render a `COPY … TO '<file>'` payload for the
+    /// HOST to write (the engine is no_std and performs no I/O). Returns
+    /// the encoded bytes (one line per record, trailing newline) and the
+    /// DATA row count for the `COPY n` tag — the HEADER line, when
+    /// present, is part of the payload but not of the count.
+    ///
+    /// # Errors
+    /// Same surface as `COPY … TO STDOUT` (missing relation / column,
+    /// CSV-mode option refusals).
+    pub fn copy_to_buffer(
+        &mut self,
+        table: &str,
+        columns: Option<&[alloc::string::String]>,
+        query: Option<&Statement>,
+        options: &spg_sql::ast::CopyOptions,
+    ) -> Result<(alloc::string::String, usize), EngineError> {
+        let result = self.exec_copy_to(table, columns, query, options, CancelToken::none())?;
+        let QueryResult::Rows { rows, .. } = result else {
+            return Err(EngineError::Unsupported(
+                "COPY TO rendered a non-row result".into(),
+            ));
+        };
+        let mut payload = alloc::string::String::new();
+        for row in &rows {
+            if let Some(Value::Text(line)) = row.values.first() {
+                payload.push_str(line);
+            }
+            payload.push('\n');
+        }
+        let data_rows = rows.len().saturating_sub(usize::from(options.header));
+        Ok((payload, data_rows))
     }
 
     /// `COPY table [(cols)] TO STDOUT` — render the visible rows

@@ -1732,6 +1732,17 @@ impl Parser {
                     )));
                 }
                 self.advance();
+                if matches!(self.peek(), Token::String(_)) {
+                    let Token::String(path) = self.advance() else { unreachable!() };
+                    let options = self.parse_copy_to_options()?;
+                    return Ok(Statement::CopyToFile {
+                        table,
+                        columns,
+                        query: None,
+                        path,
+                        options,
+                    });
+                }
                 if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("stdout")) {
                     return Err(self.err(format!(
                         "COPY TO supports STDOUT only (no file endpoints), got {:?}",
@@ -1771,9 +1782,20 @@ impl Parser {
                     )));
                 }
                 self.advance();
+                if matches!(self.peek(), Token::String(_)) {
+                    let Token::String(path) = self.advance() else { unreachable!() };
+                    let options = self.parse_copy_to_options()?;
+                    return Ok(Statement::CopyToFile {
+                        table: String::new(),
+                        columns: None,
+                        query: Some(alloc::boxed::Box::new(query)),
+                        path,
+                        options,
+                    });
+                }
                 if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("stdout")) {
                     return Err(self.err(format!(
-                        "COPY TO supports STDOUT only (no file endpoints), got {:?}",
+                        "COPY (query): TO supports STDOUT only, got {:?}",
                         self.peek()
                     )));
                 }

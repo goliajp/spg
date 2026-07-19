@@ -554,6 +554,9 @@ fn handle_pg_simple_query(
             CopyIntent::FromFile(spec) => {
                 handle_copy_from_file(stream, state, role, &spec, tx_state)?;
             }
+            CopyIntent::ToFile(spec) => {
+                handle_copy_to_file(stream, state, role, &spec)?;
+            }
             CopyIntent::To(table, opts) => {
                 let sql = format!("SELECT * FROM {table}");
                 handle_copy_to_stdout(stream, state, role, &sql, &opts, tx_state)?;
@@ -4521,6 +4524,10 @@ enum CopyIntent {
     // (spg_engine::copy::parse_copy_from_file), not the hand parser, so
     // the r247 option grammar (one-byte checks, mode refusals) applies.
     FromFile(spg_engine::copy::CopyFromFileSpec),
+    // v7.39 (round 252) — `COPY … TO '<file>'`: the SERVER renders via
+    // the engine and writes the file (PG semantics, pg_write_server_files
+    // analog: admin only).
+    ToFile(spg_engine::copy::CopyToFileSpec),
 }
 
 /// v6.4.7 — `COPY FROM STDIN WITH (...)` option parser. PG-style
@@ -4668,9 +4675,13 @@ fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
         return None;
     }
     let endpoint = &rest[ep_start..i];
-    // v7.39 (round 251) — a quoted endpoint after FROM is the file form.
+    // v7.39 (round 251/252) — a quoted endpoint is the file form; the
+    // engine's SQL parser owns the grammar.
     if dir == "from" && endpoint.starts_with('\'') {
         return spg_engine::copy::parse_copy_from_file(trimmed).map(CopyIntent::FromFile);
+    }
+    if dir == "to" && endpoint.starts_with('\'') {
+        return spg_engine::copy::parse_copy_to_file(trimmed).map(CopyIntent::ToFile);
     }
     match (dir, endpoint) {
         ("from", "stdin") => {
@@ -4735,6 +4746,11 @@ fn parse_copy_query_intent(trimmed: &str, rest: &str, lparen: usize) -> Option<C
     }
     // `stdout` may be trailed by `;` or a `WITH (...)` clause.
     let ep = it.next().unwrap_or("");
+    // v7.39 (round 252) — a quoted endpoint is the file form; the
+    // engine's SQL parser owns the grammar (options included).
+    if ep.starts_with('\'') {
+        return spg_engine::copy::parse_copy_to_file(trimmed).map(CopyIntent::ToFile);
+    }
     if ep.trim_end_matches(';') != "stdout" {
         return None;
     }
@@ -4861,6 +4877,79 @@ fn drain_copy_in_frames(stream: &mut dyn ReadWrite) -> std::io::Result<()> {
             return Ok(());
         }
     }
+}
+
+/// v7.39 (round 252) — `COPY … TO '<file>'`: the server process writes
+/// the file (PG semantics; probed live 2026-07-19). Non-admin roles get
+/// PG's 42501; an OS permission failure is ALSO 42501 (PG's class for
+/// it, probed), while a missing directory is 58P01 — both with the
+/// psql \copy HINT. Read-only: no WAL involvement.
+fn handle_copy_to_file(
+    stream: &mut dyn ReadWrite,
+    state: &Arc<ServerState>,
+    role: Role,
+    spec: &spg_engine::copy::CopyToFileSpec,
+) -> std::io::Result<()> {
+    if role != Role::Admin {
+        send_error(
+            stream,
+            "42501",
+            "permission denied to COPY to a file DETAIL: Only roles with privileges of the \
+             \"pg_write_server_files\" role may COPY to a file.\nHINT:  Anyone can COPY to \
+             stdout or from stdin. psql's \\copy command also works for anyone.",
+        )?;
+        return Ok(());
+    }
+    let rendered = state
+        .engine
+        .write()
+        .map_err(|_| std::io::Error::other("engine rwlock poisoned"))
+        .map(|mut e| {
+            e.copy_to_buffer(
+                &spec.table,
+                spec.columns.as_deref(),
+                spec.query.as_deref(),
+                &spec.options,
+            )
+        })?;
+    let (payload, n) = match rendered {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("{e}");
+            let code = if msg.contains("relation") && msg.contains("does not exist") {
+                "42P01"
+            } else if msg.contains("does not exist") || msg.contains("column") {
+                "42703"
+            } else {
+                "0A000"
+            };
+            send_error(stream, code, &msg)?;
+            return Ok(());
+        }
+    };
+    if let Err(e) = std::fs::write(&spec.path, payload) {
+        let os = e.to_string();
+        let os = os.split(" (os error").next().unwrap_or(&os).to_string();
+        // PG: an EACCES open is 42501; anything else here is 58P01.
+        let code = if e.kind() == std::io::ErrorKind::PermissionDenied {
+            "42501"
+        } else {
+            "58P01"
+        };
+        send_error(
+            stream,
+            code,
+            &format!(
+                "could not open file \"{path}\" for writing: {os}\nHINT:  COPY TO instructs \
+                 the PostgreSQL server process to write a file. You may want a client-side \
+                 facility such as psql's \\copy.",
+                path = spec.path
+            ),
+        )?;
+        return Ok(());
+    }
+    send_command_complete(stream, &format!("COPY {n}"))?;
+    Ok(())
 }
 
 /// v7.39 (round 251) — `COPY t [(cols)] FROM '<file>'`: the server
@@ -7896,6 +7985,17 @@ mod tests {
                 assert!(opts.format_json);
             }
             other => panic!("expected From(t) with format_json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_to_file_intent() {
+        match parse_copy_intent("COPY ct TO '/tmp/spg-r252/x.txt'") {
+            Some(CopyIntent::ToFile(spec)) => {
+                assert_eq!(spec.table, "ct");
+                assert_eq!(spec.path, "/tmp/spg-r252/x.txt");
+            }
+            other => panic!("expected ToFile, got {other:?}"),
         }
     }
 

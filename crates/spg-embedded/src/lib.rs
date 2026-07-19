@@ -3683,6 +3683,30 @@ impl Database {
         // per-row INSERTs through the normal execute path (each row gets
         // its WAL record; the wrapping transaction makes the whole COPY
         // one atomic, one-fsync commit — and PG's all-or-nothing COPY).
+        // v7.39 (round 252) — `COPY … TO '<file>'`: the engine renders the
+        // payload (read-only), the HOST writes the file.
+        if sql_head_is_copy(sql)
+            && let Some(spec) = spg_engine::copy::parse_copy_to_file(sql)
+        {
+            let (payload, n) = self.engine.copy_to_buffer(
+                &spec.table,
+                spec.columns.as_deref(),
+                spec.query.as_deref(),
+                &spec.options,
+            )?;
+            std::fs::write(&spec.path, payload).map_err(|e| {
+                let os = e.to_string();
+                let os = os.split(" (os error").next().unwrap_or(&os).to_string();
+                EngineError::Unsupported(format!(
+                    "could not open file \"{path}\" for writing: {os}",
+                    path = spec.path
+                ))
+            })?;
+            return Ok(QueryResult::CommandOk {
+                affected: n,
+                modified_catalog: false,
+            });
+        }
         if sql_head_is_copy(sql)
             && let Some(spec) = spg_engine::copy::parse_copy_from_file(sql)
         {
