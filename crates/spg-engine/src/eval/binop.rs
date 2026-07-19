@@ -96,8 +96,12 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
                 micros: micros.checked_neg().ok_or_else(overflow)?,
             })
         }
+        // v7.39 (round 238) — PG's wording: "operator does not exist: - text".
         (UnOp::Neg, other) => Err(EvalError::TypeMismatch {
-            detail: format!("unary - applied to {:?}", other.data_type()),
+            detail: format!(
+                "operator does not exist: - {}",
+                super::strings::pg_typeof_name(&other)
+            ),
         }),
         // v7.38 (read01) — PG `~ int2` is int2, not int4.
         (UnOp::BitNot, Value::SmallInt(n)) => Ok(Value::SmallInt(!n)),
@@ -195,15 +199,19 @@ pub(crate) fn apply_binary_by_ref(
     // 3VL And/Or/IS [NOT] DISTINCT FROM — NULL handling without
     // moving operands. These mirror the owning path's pre-checks.
     if let BinOp::IsNotDistinctFrom = op {
+        require_comparable(BinOp::Eq, l, r)?;
         return Ok(Some(Value::Bool(values_not_distinct(l, r))));
     }
     if let BinOp::IsDistinctFrom = op {
+        require_comparable(BinOp::Eq, l, r)?;
         return Ok(Some(Value::Bool(!values_not_distinct(l, r))));
     }
     if let BinOp::And = op {
+        require_boolean_argument("AND", l, r)?;
         return Ok(Some(and_3vl_by_ref(l, r)));
     }
     if let BinOp::Or = op {
+        require_boolean_argument("OR", l, r)?;
         return Ok(Some(or_3vl_by_ref(l, r)));
     }
     // Any NULL operand → NULL for the remaining ops.
@@ -276,9 +284,11 @@ pub(crate) fn apply_binary(
     // v7.9.27b — IS [NOT] DISTINCT FROM. NULL-safe equality:
     // `NULL IS NOT DISTINCT FROM NULL` → true. mailrs pg_dump.
     if let BinOp::IsNotDistinctFrom = op {
+        require_comparable(BinOp::Eq, &l, &r)?;
         return Ok(Value::Bool(values_not_distinct(&l, &r)));
     }
     if let BinOp::IsDistinctFrom = op {
+        require_comparable(BinOp::Eq, &l, &r)?;
         return Ok(Value::Bool(!values_not_distinct(&l, &r)));
     }
     // v7.38 (read01) — PG's array `||` treats a NULL array operand as an empty
@@ -2816,11 +2826,15 @@ fn arith(
                 op_name,
             )?))
         }
+        // v7.39 (round 238) — PG's wording: "operator does not exist:
+        // integer + text". SPG printed `+ applied to non-numeric:
+        // Some(Int) vs Some(Text)` — a Rust Debug dump of an internal enum,
+        // and nothing a driver can match on.
         (a, b) => Err(EvalError::TypeMismatch {
             detail: format!(
-                "{op_name} applied to non-numeric: {:?} vs {:?}",
-                a.data_type(),
-                b.data_type()
+                "operator does not exist: {} {op_name} {}",
+                super::strings::pg_typeof_name(&a),
+                super::strings::pg_typeof_name(&b)
             ),
         }),
     }
@@ -4940,6 +4954,27 @@ fn inet_bitwise(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Result<Value<'static
 /// dump in a user-facing error, and nothing a driver could match on. The
 /// SQLSTATE (42883) already keyed off PG's phrasing, so the wire class was
 /// right while the text was not.
+/// v7.39 (round 238) — the operator-resolution gate `=` already applies,
+/// reusable by the constructs that compare WITHOUT going through `compare`:
+/// `IS DISTINCT FROM`, `NULLIF` and `IN`. All three answered happily across
+/// types PG has no operator for — `1 IS DISTINCT FROM 'a'::text` was `true`,
+/// `nullif(1, 'a'::text)` was `1`, `1 IN (1, 'a'::text)` was `true` — so a
+/// predicate that PG rejects outright silently decided a row's fate.
+pub(super) fn require_comparable(
+    op: BinOp,
+    a: &Value<'_>,
+    b: &Value<'_>,
+) -> Result<(), EvalError> {
+    if a.is_null() || b.is_null() {
+        return Ok(());
+    }
+    // `compare` is the authority: if it can answer, the pair is comparable.
+    match compare(op, a, b) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn no_such_operator(op: BinOp, a: &Value<'_>, b: &Value<'_>) -> EvalError {
     // `pg_typeof_name` is the FULL value→type-name table (the one pg_typeof
     // itself answers from); `pg_typeof_name_for_datatype` covers only the
@@ -5475,32 +5510,52 @@ pub(super) fn compare(
     Ok(Value::Bool(result))
 }
 
+/// v7.39 (round 238) — both arguments of a boolean connective must be
+/// boolean, checked BEFORE the short-circuit. PG type-checks its arguments
+/// up front, so `1 OR true` and `false AND 1` are refused; SPG decided the
+/// answer from the other side first and let a non-boolean operand through.
+fn require_boolean_argument(kw: &str, l: &Value<'_>, r: &Value<'_>) -> Result<(), EvalError> {
+    for v in [l, r] {
+        if !matches!(v, Value::Bool(_) | Value::Null) {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "argument of {kw} must be type boolean, not type {}",
+                    super::strings::pg_typeof_name(v)
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 // SQL three-valued AND / OR.
 pub(crate) fn and_3vl(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
+    require_boolean_argument("AND", &l, &r)?;
     match (l, r) {
         (Value::Bool(false), _) | (_, Value::Bool(false)) => Ok(Value::Bool(false)),
         (Value::Bool(true), Value::Bool(true)) => Ok(Value::Bool(true)),
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        // v7.39 (round 238) — PG names the offending side's type:
+        // "argument of AND must be type boolean, not type integer".
         (a, b) => Err(EvalError::TypeMismatch {
             detail: format!(
-                "AND on non-boolean: {:?} and {:?}",
-                a.data_type(),
-                b.data_type()
+                "argument of AND must be type boolean, not type {}",
+                super::strings::pg_typeof_name(if matches!(a, Value::Bool(_)) { &b } else { &a })
             ),
         }),
     }
 }
 
 fn or_3vl(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
+    require_boolean_argument("OR", &l, &r)?;
     match (l, r) {
         (Value::Bool(true), _) | (_, Value::Bool(true)) => Ok(Value::Bool(true)),
         (Value::Bool(false), Value::Bool(false)) => Ok(Value::Bool(false)),
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (a, b) => Err(EvalError::TypeMismatch {
             detail: format!(
-                "OR on non-boolean: {:?} and {:?}",
-                a.data_type(),
-                b.data_type()
+                "argument of OR must be type boolean, not type {}",
+                super::strings::pg_typeof_name(if matches!(a, Value::Bool(_)) { &b } else { &a })
             ),
         }),
     }

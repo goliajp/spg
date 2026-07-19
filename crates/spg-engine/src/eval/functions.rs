@@ -10563,6 +10563,14 @@ fn apply_function_dispatch(
                 (Value::Null, _) => Ok(Value::Null),
                 (a, Value::Null) => Ok(a.clone().into_owned()),
                 (a, b) => {
+                    // v7.39 (round 238) — NULLIF is `=` under the hood, so it
+                    // inherits `=`'s operator resolution: PG refuses
+                    // `nullif(1, 'a'::text)` rather than answering 1.
+                    super::binop::require_comparable(
+                        spg_sql::ast::BinOp::Eq,
+                        a,
+                        b,
+                    )?;
                     // Use value_cmp (already defined as Ord-like
                     // function in lib.rs) — but it's not accessible
                     // here. Fall back to direct equality.
