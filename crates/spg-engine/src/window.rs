@@ -341,7 +341,7 @@ pub(crate) fn compute_window_partition(
                 // Numeric frame (was deferred → NULL). Only written when a
                 // Numeric cell appears; the f64 path stays untouched.
                 let mut num_scaled: i128 = 0;
-                let mut num_scale: u8 = 0;
+                let mut num_scale: u16 = 0;
                 let mut use_numeric = false;
                 // v7.38 (read01 sweep) — sum() over integer inputs returns
                 // BIGINT (PG), not double. Accumulate integers exactly and only

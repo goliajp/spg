@@ -2756,7 +2756,7 @@ fn encode_value_into(v: &Value, out: &mut String) {
     }
 }
 
-fn render_numeric(scaled: i128, scale: u8) -> String {
+fn render_numeric(scaled: i128, scale: u16) -> String {
     let neg = scaled < 0;
     let mag_str = alloc::format!("{}", scaled.unsigned_abs());
     let s = scale as usize;

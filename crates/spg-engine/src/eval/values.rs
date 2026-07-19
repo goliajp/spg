@@ -469,7 +469,7 @@ pub(super) fn array_element_at(v: &Value, pos: usize) -> Option<Value<'static>> 
         Value::BoolArray(items) => nth!(items, |b| Value::Bool(*b)),
         Value::FloatArray(items) => nth!(items, |f| Value::Float(*f)),
         Value::NumericArray(items) => {
-            nth!(items, |t: &(i128, u8)| Value::Numeric {
+            nth!(items, |t: &(i128, u16)| Value::Numeric {
                 scaled: t.0,
                 scale: t.1,
                 kind: spg_storage::NumericKind::Finite
@@ -554,7 +554,7 @@ pub(super) fn array_rebuild(model: &Value<'_>, elems: &[Value<'static>]) -> Opti
         }),
         Value::NumericArray(_) => build!(NumericArray, |e: &Value<'_>| match e {
             Value::Numeric { scaled, scale, .. } => Some((*scaled, *scale)),
-            other => as_i64(other).map(|n| (i128::from(n), 0u8)),
+            other => as_i64(other).map(|n| (i128::from(n), 0u16)),
         }),
         Value::DateArray(_) => build!(DateArray, |e: &Value<'_>| match e {
             Value::Date(d) => Some(*d),
@@ -670,7 +670,7 @@ pub(crate) fn build_array_from_values(vals: &[Value<'static>]) -> Value<'static>
                         .map(|v| match v {
                             Value::Null => None,
                             Value::Numeric { scaled, scale, .. } => Some((*scaled, *scale)),
-                            other => as_i64(other).map(|n| (i128::from(n), 0u8)),
+                            other => as_i64(other).map(|n| (i128::from(n), 0u16)),
                         })
                         .collect(),
                 );

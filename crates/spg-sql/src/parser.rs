@@ -375,19 +375,24 @@ fn numeric_token_to_literal(s: String) -> Result<Literal, String> {
     }
 }
 
-fn parse_decimal_literal(s: &str) -> Option<(i128, u8)> {
+fn parse_decimal_literal(s: &str) -> Option<(i128, u16)> {
     let (int_part, frac_part) = match s.split_once('.') {
         Some((i, f)) => (i, f),
         None => (s, ""),
     };
-    if frac_part.len() > u8::MAX as usize {
+    // v7.39 (round 271) — was u8::MAX. A literal with 256 decimal
+    // places fell out of the numeric path here, which is why
+    // `pg_typeof(1e-256)` answered double precision and a plain
+    // 256-place decimal aborted the query in the big-decimal converter.
+    if frac_part.len() > u16::MAX as usize {
         return None;
     }
     let mut digits = String::with_capacity(int_part.len() + frac_part.len());
     digits.push_str(int_part);
     digits.push_str(frac_part);
     let mantissa: i128 = digits.parse().ok()?;
-    Some((mantissa, frac_part.len() as u8))
+    #[allow(clippy::cast_possible_truncation)]
+    Some((mantissa, frac_part.len() as u16))
 }
 
 /// `jsonb_to_record` / `jsonb_to_recordset` (+ `json_` variants) — the
@@ -13984,7 +13989,7 @@ impl Parser {
     /// `NUMERIC` may appear without parameters, with one (precision
     /// only, scale=0), or with both. Returns `(precision, scale)` with
     /// 0 = unspecified for the bare form.
-    fn parse_optional_numeric_params(&mut self) -> Result<(u8, u8), ParseError> {
+    fn parse_optional_numeric_params(&mut self) -> Result<(u8, u16), ParseError> {
         if !matches!(self.peek(), Token::LParen) {
             // Bare `NUMERIC` — PG treats this as "unlimited precision";
             // we surface it as precision=0 to mean "unconstrained" so
@@ -14007,7 +14012,7 @@ impl Parser {
             self.advance();
             match self.advance() {
                 Token::Integer(n) if (0..=i64::from(precision)).contains(&n) => {
-                    u8::try_from(n).expect("range-checked")
+                    u16::try_from(n).expect("range-checked")
                 }
                 other => {
                     return Err(ParseError {

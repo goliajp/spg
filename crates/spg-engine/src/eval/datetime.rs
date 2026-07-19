@@ -46,7 +46,7 @@ pub(super) fn extract_field(
     if let Value::TimeTz { us, offset_secs } = *v {
         let secs = us / 1_000_000;
         let frac = us % 1_000_000;
-        let num = |scaled: i128, scale: u8| {
+        let num = |scaled: i128, scale: u16| {
             Ok(Value::Numeric {
                 scaled,
                 scale,
@@ -166,7 +166,7 @@ pub(super) fn extract_field(
     if let Value::Time(micros) = *v {
         let secs = micros / 1_000_000;
         let frac = micros % 1_000_000;
-        let num = |scaled: i128, scale: u8| {
+        let num = |scaled: i128, scale: u16| {
             Ok(Value::Numeric {
                 scaled,
                 scale,

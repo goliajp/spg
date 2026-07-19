@@ -257,7 +257,7 @@ fn jdn_to_ymd(jdn: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
-pub(crate) fn format_numeric(scaled: i128, scale: u8) -> String {
+pub(crate) fn format_numeric(scaled: i128, scale: u16) -> String {
     if scale == 0 {
         return alloc::format!("{scaled}");
     }

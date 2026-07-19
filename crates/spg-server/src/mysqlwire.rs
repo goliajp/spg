@@ -1357,7 +1357,10 @@ fn encode_column_def_41(c: &ColumnSchema) -> Vec<u8> {
     // decimals: 0x1f = "no fixed decimal point" for floats.
     let decimals: u8 = match c.ty {
         DataType::Float => 0x1f,
-        DataType::Numeric { scale, .. } => scale,
+        // v7.39 (round 271) — the protocol's decimals byte is a u8;
+        // a scale past it saturates rather than truncating to a wrong
+        // small number.
+        DataType::Numeric { scale, .. } => u8::try_from(scale).unwrap_or(0x1f),
         _ => 0x00,
     };
     buf.push(decimals);

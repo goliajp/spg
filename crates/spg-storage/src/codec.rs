@@ -960,7 +960,11 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         DataType::Int => out.push(1),
         DataType::BigInt => out.push(2),
         DataType::Float => out.push(3),
-        DataType::Real => out.push(66),
+        // v7.39 (round 271) — tag 68. Real used to write 66, which
+        // PgLsn also writes and which the reader maps to PgLsn, so a
+        // persisted REAL column came back as pg_lsn. The collision was
+        // unreachable until round 269 made REAL a column type.
+        DataType::Real => out.push(68),
         DataType::Text => out.push(4),
         DataType::Bool => out.push(5),
         DataType::Vector { dim, encoding } => match encoding {
@@ -997,9 +1001,18 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
             out.extend_from_slice(&size.to_le_bytes());
         }
         DataType::Numeric { precision, scale } => {
-            out.push(10);
-            out.push(precision);
-            out.push(scale);
+            // v7.39 (round 271) — tag 10 keeps its one-byte scale so
+            // every catalog already on disk reads back unchanged; tag 69
+            // carries the u16 scale a value can now have.
+            if let Ok(narrow) = u8::try_from(scale) {
+                out.push(10);
+                out.push(precision);
+                out.push(narrow);
+            } else {
+                out.push(69);
+                out.push(precision);
+                out.extend_from_slice(&scale.to_le_bytes());
+            }
         }
         DataType::Date => out.push(11),
         DataType::Timestamp => out.push(12),
@@ -1133,8 +1146,17 @@ impl Cursor<'_> {
             9 => Ok(DataType::Char(self.read_u32()?)),
             10 => {
                 let precision = self.read_u8()?;
-                let scale = self.read_u8()?;
+                let scale = u16::from(self.read_u8()?);
                 Ok(DataType::Numeric { precision, scale })
+            }
+            69 => {
+                let precision = self.read_u8()?;
+                let lo = self.read_u8()?;
+                let hi = self.read_u8()?;
+                Ok(DataType::Numeric {
+                    precision,
+                    scale: u16::from_le_bytes([lo, hi]),
+                })
             }
             11 => Ok(DataType::Date),
             12 => Ok(DataType::Timestamp),
@@ -1241,6 +1263,7 @@ impl Cursor<'_> {
             64 => Ok(DataType::Char1),
             65 => Ok(DataType::MoneyArray),
             66 => Ok(DataType::PgLsn),
+            68 => Ok(DataType::Real),
             other => Err(StorageError::Corrupt(format!(
                 "unknown data type tag: {other}"
             ))),
@@ -1730,9 +1753,20 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
             // insert, so the two already agree there).
             match kind {
                 crate::NumericKind::Finite => {
-                    out.push(0);
-                    out.extend_from_slice(&scaled.to_le_bytes());
-                    out.push(*scale);
+                    // v7.39 (round 271) — scale widened to u16. A scale
+                    // that still fits a byte keeps form 0 byte-for-byte,
+                    // so nothing already on disk changes shape; only the
+                    // scales that could not previously EXIST take the new
+                    // form 4. No migration, no version fence.
+                    if let Ok(narrow) = u8::try_from(*scale) {
+                        out.push(0);
+                        out.extend_from_slice(&scaled.to_le_bytes());
+                        out.push(narrow);
+                    } else {
+                        out.push(4);
+                        out.extend_from_slice(&scaled.to_le_bytes());
+                        out.extend_from_slice(&scale.to_le_bytes());
+                    }
                 }
                 crate::NumericKind::NaN => out.push(1),
                 crate::NumericKind::PosInf => out.push(2),
@@ -1887,9 +1921,17 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
                 match item {
                     None => out.push(1),
                     Some((scaled, scale)) => {
-                        out.push(0);
-                        out.extend_from_slice(&scaled.to_le_bytes());
-                        out.push(*scale);
+                        // v7.39 (round 271) — element flag 0 keeps the
+                        // one-byte scale; flag 2 carries the u16 one.
+                        if let Ok(narrow) = u8::try_from(*scale) {
+                            out.push(0);
+                            out.extend_from_slice(&scaled.to_le_bytes());
+                            out.push(narrow);
+                        } else {
+                            out.push(2);
+                            out.extend_from_slice(&scaled.to_le_bytes());
+                            out.extend_from_slice(&scale.to_le_bytes());
+                        }
                     }
                 }
             }
@@ -2309,9 +2351,20 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
             // v7.38 (read01, T6.P4) — form byte after the tag (FILE_VERSION 56+).
             match kind {
                 crate::NumericKind::Finite => {
-                    out.push(0);
-                    out.extend_from_slice(&scaled.to_le_bytes());
-                    out.push(*scale);
+                    // v7.39 (round 271) — scale widened to u16. A scale
+                    // that still fits a byte keeps form 0 byte-for-byte,
+                    // so nothing already on disk changes shape; only the
+                    // scales that could not previously EXIST take the new
+                    // form 4. No migration, no version fence.
+                    if let Ok(narrow) = u8::try_from(*scale) {
+                        out.push(0);
+                        out.extend_from_slice(&scaled.to_le_bytes());
+                        out.push(narrow);
+                    } else {
+                        out.push(4);
+                        out.extend_from_slice(&scaled.to_le_bytes());
+                        out.extend_from_slice(&scale.to_le_bytes());
+                    }
                 }
                 crate::NumericKind::NaN => out.push(1),
                 crate::NumericKind::PosInf => out.push(2),
@@ -2322,9 +2375,16 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
         // tag 33, then [neg u8][scale u8][nlimbs u16 LE][limb u32 LE]…
         Value::NumericBig(b) => {
             let (neg, limbs, scale) = b.parts();
-            out.push(33);
+            // v7.39 (round 271) — tag 33 keeps its one-byte scale; tag 34
+            // is the same layout with a u16 scale, written only when the
+            // value needs it.
+            out.push(if scale > 255 { 34 } else { 33 });
             out.push(u8::from(neg));
-            out.push(scale);
+            if let Ok(narrow) = u8::try_from(scale) {
+                out.push(narrow);
+            } else {
+                out.extend_from_slice(&scale.to_le_bytes());
+            }
             out.extend_from_slice(&(limbs.len() as u16).to_le_bytes());
             for &l in limbs {
                 out.extend_from_slice(&l.to_le_bytes());
@@ -3295,10 +3355,22 @@ impl<'a> Cursor<'a> {
                         0 => {
                             let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
                             let scaled = i128::from_le_bytes(arr);
-                            let scale = self.read_u8()?;
+                            let scale = u16::from(self.read_u8()?);
                             Ok(Value::Numeric {
                                 scaled,
                                 scale,
+                                kind: crate::NumericKind::Finite,
+                            })
+                        }
+                        // v7.39 (round 271) — wide-scale finite form.
+                        4 => {
+                            let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
+                            let scaled = i128::from_le_bytes(arr);
+                            let lo = self.read_u8()?;
+                            let hi = self.read_u8()?;
+                            Ok(Value::Numeric {
+                                scaled,
+                                scale: u16::from_le_bytes([lo, hi]),
                                 kind: crate::NumericKind::Finite,
                             })
                         }
@@ -3312,7 +3384,8 @@ impl<'a> Cursor<'a> {
                 } else {
                     let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
                     let scaled = i128::from_le_bytes(arr);
-                    let scale = self.read_u8()?;
+                    // Pre-form-byte layout; its scale was always a byte.
+                    let scale = u16::from(self.read_u8()?);
                     Ok(Value::Numeric {
                         scaled,
                         scale,
@@ -3481,14 +3554,21 @@ impl<'a> Cursor<'a> {
             }
             DataType::NumericArray => {
                 let count = self.read_u16()? as usize;
-                let mut items: Vec<Option<(i128, u8)>> = Vec::with_capacity(count);
+                let mut items: Vec<Option<(i128, u16)>> = Vec::with_capacity(count);
                 for _ in 0..count {
                     match self.read_u8()? {
                         0 => {
                             let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
                             let scaled = i128::from_le_bytes(arr);
-                            let scale = self.read_u8()?;
+                            let scale = u16::from(self.read_u8()?);
                             items.push(Some((scaled, scale)));
+                        }
+                        2 => {
+                            let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
+                            let scaled = i128::from_le_bytes(arr);
+                            let lo = self.read_u8()?;
+                            let hi = self.read_u8()?;
+                            items.push(Some((scaled, u16::from_le_bytes([lo, hi]))));
                         }
                         1 => items.push(None),
                         other => {
@@ -4015,9 +4095,16 @@ impl<'a> Cursor<'a> {
             3 => Ok(Value::Float(self.read_f64()?)),
             32 => Ok(Value::Real(self.read_f32()?)),
             // v7.38 (read01, T3.C3) — arbitrary-precision NUMERIC (form 2).
-            33 => {
+            33 | 34 => {
                 let neg = self.read_u8()? != 0;
-                let scale = self.read_u8()?;
+                // v7.39 (round 271) — tag 34 is tag 33 with a u16 scale.
+                let scale = if tag == 34 {
+                    let lo = self.read_u8()?;
+                    let hi = self.read_u8()?;
+                    u16::from_le_bytes([lo, hi])
+                } else {
+                    u16::from(self.read_u8()?)
+                };
                 let nlimbs = self.read_u16()? as usize;
                 let mut limbs = alloc::vec::Vec::with_capacity(nlimbs);
                 for _ in 0..nlimbs {
@@ -4049,10 +4136,22 @@ impl<'a> Cursor<'a> {
                         0 => {
                             let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
                             let scaled = i128::from_le_bytes(arr);
-                            let scale = self.read_u8()?;
+                            let scale = u16::from(self.read_u8()?);
                             Ok(Value::Numeric {
                                 scaled,
                                 scale,
+                                kind: crate::NumericKind::Finite,
+                            })
+                        }
+                        // v7.39 (round 271) — wide-scale finite form.
+                        4 => {
+                            let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
+                            let scaled = i128::from_le_bytes(arr);
+                            let lo = self.read_u8()?;
+                            let hi = self.read_u8()?;
+                            Ok(Value::Numeric {
+                                scaled,
+                                scale: u16::from_le_bytes([lo, hi]),
                                 kind: crate::NumericKind::Finite,
                             })
                         }
@@ -4066,7 +4165,8 @@ impl<'a> Cursor<'a> {
                 } else {
                     let arr: [u8; 16] = self.take(16)?.try_into().expect("checked");
                     let scaled = i128::from_le_bytes(arr);
-                    let scale = self.read_u8()?;
+                    // Pre-form-byte layout; its scale was always a byte.
+                    let scale = u16::from(self.read_u8()?);
                     Ok(Value::Numeric {
                         scaled,
                         scale,

@@ -850,13 +850,11 @@ fn numeric_value_for_to_char(v: &Value) -> Option<f64> {
         Value::BigInt(n) => Some(*n as f64),
         Value::Float(x) => Some(*x),
         #[allow(clippy::cast_precision_loss)]
-        Value::Numeric { scaled, scale, .. } => {
-            let mut div = 1.0_f64;
-            for _ in 0..*scale {
-                div *= 10.0;
-            }
-            Some((*scaled as f64) / div)
-        }
+        Value::Numeric { scaled, scale, .. } => Some(
+            crate::eval::format_numeric(*scaled, *scale)
+                .parse()
+                .unwrap_or(f64::NAN),
+        ),
         _ => None,
     }
 }
@@ -1177,7 +1175,7 @@ fn check_eeee_format(fmt: &str) -> Result<(), EvalError> {
 // from integer arithmetic instead of the lossy f64 `n`. `n` is still used by
 // the RN / EEEE / V paths (roman / scientific / V-scale), which are inherently
 // float-shaped, and as the fallback when the exact form overflows i128.
-fn to_char_numeric(n: f64, exact: Option<(i128, u8)>, fmt: &str) -> String {
+fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
     let fill_mode = fmt.len() >= 2 && fmt[..2].eq_ignore_ascii_case("FM");
     let pat = if fill_mode { &fmt[2..] } else { fmt };
     // v7.39 (round 243) — characters with no meaning in a number picture

@@ -3084,8 +3084,9 @@ fn decode_binary_numeric(bytes: &[u8]) -> Result<spg_storage::Value<'static>, St
     }
     let _ = total_digits_after_weight; // diagnostic-only
     let final_value = if sign == 0x4000 { -unscaled } else { unscaled };
-    // dscale fits in u8; precision is best-effort (38 = i128 max).
-    let scale = u8::try_from(dscale).map_err(|_| "NUMERIC dscale too large".to_string())?;
+    // v7.39 (round 271) — dscale is a u16 on the wire and now in the
+    // value too, so it no longer has to fit a byte.
+    let scale = dscale;
     Ok(spg_storage::Value::Numeric {
         scaled: final_value,
         scale,
@@ -6792,14 +6793,14 @@ fn binary_array<T>(items: &[Option<T>], elem_oid: u32, enc: impl Fn(&T, &mut Vec
 
 /// Parse a plain decimal string into (scaled i128, scale) — the big
 /// numeric bridge for the binary encoder.
-fn decimal_str_to_scaled(s: &str) -> Option<(i128, u8)> {
+fn decimal_str_to_scaled(s: &str) -> Option<(i128, u16)> {
     let (int_part, frac_part) = match s.split_once('.') {
         Some((i, f)) => (i, f),
         None => (s, ""),
     };
     let digits: String = format!("{int_part}{frac_part}");
     let scaled: i128 = digits.parse().ok()?;
-    Some((scaled, u8::try_from(frac_part.len()).ok()?))
+    Some((scaled, u16::try_from(frac_part.len()).ok()?))
 }
 
 /// v7.39 — PG `numeric` binary send format: base-10000 digit groups
@@ -6807,7 +6808,7 @@ fn decimal_str_to_scaled(s: &str) -> Option<(i128, u8)> {
 /// display scale. Matches numeric_send in behaviour for finite
 /// values (SPG's Numeric kind NaN/Inf never reach the wire — they
 /// format as text through float paths).
-fn numeric_binary(scaled: i128, scale: u8) -> Vec<u8> {
+fn numeric_binary(scaled: i128, scale: u16) -> Vec<u8> {
     let neg = scaled < 0;
     let mut abs = scaled.unsigned_abs();
     // Left-pad the fractional side to a whole number of 4-digit
@@ -6853,7 +6854,7 @@ fn numeric_binary(scaled: i128, scale: u8) -> Vec<u8> {
     buf.extend_from_slice(&(digits.len() as i16).to_be_bytes());
     buf.extend_from_slice(&(weight as i16).to_be_bytes());
     buf.extend_from_slice(&(if neg { 0x4000u16 } else { 0 }).to_be_bytes());
-    buf.extend_from_slice(&u16::from(scale).to_be_bytes());
+    buf.extend_from_slice(&scale.to_be_bytes());
     for d in &digits {
         buf.extend_from_slice(&d.to_be_bytes());
     }
@@ -7668,7 +7669,7 @@ fn secs_to_ymdhms(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     (y, m, d, hh, mm, ss)
 }
 
-fn format_numeric_kind(kind: spg_storage::NumericKind, scaled: i128, scale: u8) -> String {
+fn format_numeric_kind(kind: spg_storage::NumericKind, scaled: i128, scale: u16) -> String {
     use spg_storage::NumericKind;
     match kind {
         NumericKind::Finite => format_numeric(scaled, scale),
@@ -7678,7 +7679,7 @@ fn format_numeric_kind(kind: spg_storage::NumericKind, scaled: i128, scale: u8) 
     }
 }
 
-fn format_numeric(scaled: i128, scale: u8) -> String {
+fn format_numeric(scaled: i128, scale: u16) -> String {
     if scale == 0 {
         return scaled.to_string();
     }
