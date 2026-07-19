@@ -735,7 +735,11 @@ pub(crate) fn run(
         && !cat.enum_types().is_empty()
     {
         for spec in &mut agg_specs {
-            if matches!(spec.kind, AggKind::Min | AggKind::Max)
+            // v7.39 (round 258) — min/max have always needed the argument's
+            // enum labels; a DISTINCT aggregate now does too, because its
+            // dedup sort must follow MEMBER order (round 257 added the sort
+            // and, deriving labels only here, sorted enum columns by text).
+            if (matches!(spec.kind, AggKind::Min | AggKind::Max) || spec.distinct)
                 && let Some(arg) = &spec.arg
             {
                 spec.enum_labels = crate::eval::expr_enum_labels(arg, schema_cols, catalog)
@@ -3190,8 +3194,22 @@ fn finalize_synth_rows(
                     // explicit ORDER BY takes the branch above instead, and
                     // the scalar aggregates (count / sum / …) are
                     // order-insensitive, so this only moves the collections.
+                    // v7.39 (round 258) — an ENUM input sorts by MEMBER
+                    // ORDER, not by its text (`{sad,ok,happy}`, not
+                    // `{happy,ok,sad}`); `spec.enum_labels` already
+                    // carries the aggregate argument's labels for exactly
+                    // this. Round 257 shipped this sort with the generic
+                    // value comparison and regressed enum columns.
+                    let labels = agg_specs[i].enum_labels.as_deref();
                     let mut sorted = st.clone();
                     sorted.items.sort_by(|a, b| {
+                        if let Some(labels) = labels
+                            && !matches!(a, Value::Null)
+                            && !matches!(b, Value::Null)
+                            && let Some(ord) = crate::eval::enum_ord_cmp(labels, a, b)
+                        {
+                            return ord;
+                        }
                         crate::order_by_value_cmp(false, Some(false), a, b)
                     });
                     st_sorted = sorted;

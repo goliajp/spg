@@ -10,13 +10,24 @@
 
 use spg_embedded::Database;
 
-fn tmp() -> std::path::PathBuf {
+/// v7.39 (round 258) — the four tests in this file run in PARALLEL and
+/// each removes its directory at the end, so the name has to be unique
+/// per TEST, not merely per instant: `SystemTime::now()` is not
+/// nanosecond-distinct on macOS, two tests could land on the same
+/// directory, and one's cleanup deleted the other's fixture files. Seen
+/// as a flake in `a_bad_row_leaves_nothing_even_across_reopen` ("could
+/// not open file … bad.csv"). A per-test tag plus a counter removes the
+/// collision entirely.
+fn tmp(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
     let p = std::env::temp_dir().join(format!(
-        "spg-copy-from-{}",
+        "spg-copy-from-{tag}-{}-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&p).unwrap();
     p
@@ -34,7 +45,7 @@ fn count(db: &mut Database, sql: &str) -> i64 {
 
 #[test]
 fn copy_from_file_lands_and_survives_reopen() {
-    let dir = tmp();
+    let dir = tmp("lands-reopen");
     let path = dir.join("d.db");
     let csv = dir.join("in.csv");
     std::fs::write(&csv, "id,name,v\n1,a,10\n2,\"b,comma\",\n3,c,30\n").unwrap();
@@ -68,7 +79,7 @@ fn copy_from_file_lands_and_survives_reopen() {
 
 #[test]
 fn a_bad_row_leaves_nothing_even_across_reopen() {
-    let dir = tmp();
+    let dir = tmp("bad-row");
     let path = dir.join("d.db");
     let csv = dir.join("bad.csv");
     std::fs::write(&csv, "1,a,10\n2,b,notanint\n").unwrap();
@@ -121,7 +132,7 @@ fn missing_file_and_missing_relation_take_pgs_wordings() {
 
 #[test]
 fn text_format_and_explicit_columns_work_on_the_file_endpoint() {
-    let dir = tmp();
+    let dir = tmp("text-cols");
     let txt = dir.join("in.txt");
     std::fs::write(&txt, "1\tx\n2\t\\N\n").unwrap();
     let mut db = Database::open_in_memory();
@@ -154,7 +165,7 @@ fn text_format_and_explicit_columns_work_on_the_file_endpoint() {
 /// Payloads probed byte-identical to PG's written files.
 #[test]
 fn copy_to_file_writes_pg_identical_bytes() {
-    let dir = tmp();
+    let dir = tmp("copy-to");
     let out = dir.join("out.csv");
     let mut db = Database::open_in_memory();
     db.execute("CREATE TABLE ct (id int, name text)").unwrap();
