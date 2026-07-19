@@ -20,6 +20,10 @@ fn n(e: &mut Engine, sql: &str) -> i64 {
         spg_storage::Value::Numeric { scaled, scale, .. } => {
             (scaled / 10i128.pow(u32::from(scale))) as i64
         }
+        // v7.39 (round 253) — date_part returns double precision (PG);
+        // these assertions are whole numbers, so truncate.
+        #[allow(clippy::cast_possible_truncation)]
+        spg_storage::Value::Float(v) => v as i64,
         ref other => panic!("{sql}: expected integer, got {other:?}"),
     }
 }
@@ -102,13 +106,19 @@ fn subsecond_timezone_and_date_part() {
         ),
         45_500
     );
-    // SPG sessions run UTC.
-    assert_eq!(
-        n(
-            &mut e,
-            "SELECT extract(TIMEZONE FROM TIMESTAMP '2024-01-01 00:00:00')"
-        ),
-        0
+    // v7.39 (round 253) — this pin used to lock the pre-r253 leniency
+    // (TIMEZONE of a plain timestamp answered 0); PG rejects it (0A000,
+    // probed live), and SPG now does too when the declared type is
+    // statically timestamp. The tstz form still reports the session
+    // offset (see the tz-epic pins).
+    let got = format!(
+        "{}",
+        e.execute("SELECT extract(TIMEZONE FROM TIMESTAMP '2024-01-01 00:00:00')")
+            .unwrap_err()
+    );
+    assert!(
+        got.contains("unit \"timezone\" not supported for type timestamp without time zone"),
+        "{got}"
     );
     // date_part shares the field table.
     assert_eq!(n(&mut e, "SELECT date_part('dow', DATE '2024-01-01')"), 1);

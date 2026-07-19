@@ -40,6 +40,8 @@ fn scalar(e: &mut Engine, sql: &str) -> String {
             days,
             micros,
         } => f::format_interval(*months, *days, *micros),
+        // v7.39 (round 253) — EXTRACT returns numeric (PG 14+).
+        Value::Numeric { .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{sql}: unexpected {other:?}"),
     }
 }

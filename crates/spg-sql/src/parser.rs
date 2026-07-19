@@ -19776,14 +19776,10 @@ impl Parser {
             "timezone" => ExtractField::Timezone,
             "timezone_hour" => ExtractField::TimezoneHour,
             "timezone_minute" => ExtractField::TimezoneMinute,
-            other => {
-                return Err(self.err(format!(
-                    "unknown EXTRACT field {other:?}; \
-                     supported: YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, MICROSECOND, \
-                     MILLISECOND, EPOCH, DOW, ISODOW, DOY, WEEK, ISOYEAR, QUARTER, \
-                     DECADE, CENTURY, MILLENNIUM, JULIAN, TIMEZONE[_HOUR|_MINUTE]"
-                )));
-            }
+            // v7.39 (round 253) — PG resolves EXTRACT fields at runtime and
+            // reports an unknown one with the source type (22023); carry the
+            // raw name so eval can word it.
+            other => ExtractField::Other(alloc::string::String::from(other)),
         };
         if !matches!(self.peek(), Token::From) {
             return Err(self.err(format!(
