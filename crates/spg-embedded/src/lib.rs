@@ -6123,14 +6123,26 @@ mod tests {
     //           per WAL record
     // ─────────────────────────────────────────────────────────────
 
+    /// v7.39 (round 262) — 14 tests in this module run in PARALLEL and
+    /// six of them remove their directory at the end, so the name has to
+    /// be unique per CALL, not merely per instant: `SystemTime::now()`
+    /// is not nanosecond-distinct on macOS, two tests could land on the
+    /// same directory, and one's cleanup deleted the other's database
+    /// mid-run (seen as `seed checkpoint: … No such file or directory`).
+    /// The repo's server e2e helpers already add an atomic serial for
+    /// exactly this; round 258 fixed the same shape in the round-249
+    /// test file.
     fn tmpdir() -> std::path::PathBuf {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
         let base = std::env::temp_dir().join(format!(
-            "spg-v7375-lockhang-{}-{}",
+            "spg-v7375-lockhang-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&base).unwrap();
         base

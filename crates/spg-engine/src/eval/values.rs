@@ -346,8 +346,16 @@ pub fn value_to_text_styled(v: &Value, style: &crate::eval::RenderStyle) -> Stri
         // v7.37.5 δ — multirange canonical PG text.
         Value::Multirange { ranges, .. } => crate::conversions::format_multirange(ranges),
         // v7.37.5 ζ-A — network/MAC/bit/XML/char1.
-        Value::Inet { family, bits, addr } | Value::Cidr { family, bits, addr } => {
+        Value::Inet { family, bits, addr } => {
             crate::conversions::format_inet(*family, *bits, addr)
+        }
+        // v7.39 (round 262) — a CIDR ALWAYS shows its mask length, where
+        // an inet omits a full-width one: `'192.168.1.5'::inet::cidr` is
+        // `192.168.1.5/32` and `'::1'::inet::cidr` is `::1/128` (probed).
+        // Both variants shared the inet renderer, so a full-width cidr
+        // printed without its `/32`.
+        Value::Cidr { family, bits, addr } => {
+            crate::conversions::format_inet_full(*family, *bits, addr)
         }
         Value::Macaddr(b) => crate::conversions::format_macaddr(b),
         Value::Macaddr8(b) => crate::conversions::format_macaddr8(b),

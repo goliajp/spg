@@ -3821,13 +3821,42 @@ pub(crate) fn coerce_value(
         (Value::Text(s), DataType::Inet) => match parse_inet_text(&s) {
             Some((family, bits, addr)) => Some(Value::Inet { family, bits, addr }),
             None => {
+                // v7.39 (round 262) — PG's wording: the lowercase type
+                // name and no column suffix (the cidr arm below already
+                // had it right).
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for INET: {s:?} (column `{col_name}`)"
-                    ),
+                    detail: alloc::format!("invalid input syntax for type inet: {s:?}"),
                 }));
             }
         },
+        // v7.39 (round 262) — the inet <-> cidr casts, probed live:
+        // `inet::cidr` keeps the mask length (defaulting to the family's
+        // full width) and ZEROES the host bits, so `192.168.1.5/24`
+        // becomes `192.168.1.0/24`; `cidr::inet` passes through
+        // unchanged. Neither existed, so both raised a storage type
+        // mismatch on perfectly ordinary SQL.
+        (Value::Inet { family, bits, addr }, DataType::Cidr) => {
+            let full = if family == 6 { 128 } else { 32 };
+            let bits = if bits > full { full } else { bits };
+            let mut masked = addr;
+            for i in 0..16usize {
+                let bit_start = i * 8;
+                if bit_start >= usize::from(bits) {
+                    masked[i] = 0;
+                } else if bit_start + 8 > usize::from(bits) {
+                    let keep = usize::from(bits) - bit_start;
+                    masked[i] &= 0xffu8 << (8 - keep);
+                }
+            }
+            Some(Value::Cidr {
+                family,
+                bits,
+                addr: masked,
+            })
+        }
+        (Value::Cidr { family, bits, addr }, DataType::Inet) => {
+            Some(Value::Inet { family, bits, addr })
+        }
         (Value::Text(s), DataType::Cidr) => match parse_cidr_text(&s) {
             Ok(Some((family, bits, addr))) => Some(Value::Cidr { family, bits, addr }),
             Err(()) => {

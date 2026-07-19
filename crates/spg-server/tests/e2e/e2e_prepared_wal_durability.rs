@@ -24,7 +24,18 @@ fn unique_tmpdir() -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let p = std::env::temp_dir().join(format!("spg-prepared-wal-{}-{nanos}", std::process::id()));
+    // v7.39 (round 262) — an atomic serial as well as the timestamp: the
+    // tests here run in parallel and each removes its directory, and
+    // `SystemTime::now()` is not nanosecond-distinct on macOS, so two
+    // could otherwise share a directory and one's cleanup would delete
+    // the other's database mid-run.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let p = std::env::temp_dir().join(format!(
+        "spg-prepared-wal-{}-{nanos}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&p).unwrap();
     p
 }
