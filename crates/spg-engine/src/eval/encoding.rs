@@ -56,7 +56,7 @@ pub(super) fn encode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
         "escape" => escape_encode(bytes),
         other => {
             return Err(EvalError::TypeMismatch {
-                detail: format!("encode(): unknown format `{other}`"),
+                detail: format!("unrecognized encoding: \"{other}\""),
             });
         }
     };
@@ -99,7 +99,7 @@ pub(super) fn decode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
         "escape" => escape_decode(text)?,
         other => {
             return Err(EvalError::TypeMismatch {
-                detail: format!("decode(): unknown format `{other}`"),
+                detail: format!("unrecognized encoding: \"{other}\""),
             });
         }
     };
@@ -150,13 +150,13 @@ fn escape_decode(text: &str) -> Result<Vec<u8>, EvalError> {
             let v = d(bytes[i + 1]) * 64 + d(bytes[i + 2]) * 8 + d(bytes[i + 3]);
             // \777 = 511 > 255; PG rejects an out-of-range octal escape.
             let byte = u8::try_from(v).map_err(|_| EvalError::TypeMismatch {
-                detail: "decode(escape): octal escape out of range".into(),
+                detail: "invalid input syntax for type bytea".into(),
             })?;
             out.push(byte);
             i += 4;
         } else {
             return Err(EvalError::TypeMismatch {
-                detail: "decode(escape): invalid escape sequence".into(),
+                detail: "invalid input syntax for type bytea".into(),
             });
         }
     }
@@ -339,25 +339,62 @@ fn b64_decode(text: &str, alpha: &[u8; 64]) -> Result<Vec<u8>, EvalError> {
     let mut out = Vec::with_capacity(text.len() * 3 / 4);
     let mut buf: u32 = 0;
     let mut bits: u32 = 0;
+    // v7.39 (round 261) — PG validates the sequence rather than decoding
+    // whatever it can (probed live). Whitespace is skipped anywhere; any
+    // other non-alphabet byte is `invalid symbol`; `=` may only appear as
+    // the final one or two characters of a 4-character group, and the
+    // total number of significant characters must be a multiple of 4.
+    // SPG stopped at the first `=` and decoded the rest of whatever it
+    // had, so `SGVsbG8` (unpadded), `SG`, `S` and `SGVsbG8==` all
+    // silently produced a value, and a leading `=` produced empty.
+    let mut ndigits: usize = 0;
+    let mut pad: usize = 0;
     for c in text.bytes() {
-        if c == b'=' {
-            break;
-        }
-        if c == b'\n' || c == b'\r' || c == b' ' {
+        if c == b'\n' || c == b'\r' || c == b' ' || c == b'\t' {
             continue;
+        }
+        if c == b'=' {
+            // `=` may only close a group that has at least two data
+            // characters. A THIRD `=` is a length problem, not a
+            // placement one — PG reports `invalid base64 end sequence`
+            // for `SGVsbG8==` (9 significant characters), so let the
+            // multiple-of-4 check below own that case.
+            if ndigits % 4 < 2 && pad == 0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: String::from("unexpected \"=\" while decoding base64 sequence"),
+                });
+            }
+            pad += 1;
+            ndigits += 1;
+            continue;
+        }
+        if pad > 0 {
+            // A data character after padding restarts a group PG refuses.
+            return Err(EvalError::TypeMismatch {
+                detail: String::from("unexpected \"=\" while decoding base64 sequence"),
+            });
         }
         let v = lookup[c as usize];
         if v == 255 {
             return Err(EvalError::TypeMismatch {
-                detail: format!("decode(base64): invalid char {:?}", c as char),
+                detail: format!(
+                    "invalid symbol \"{}\" found while decoding base64 sequence",
+                    c as char
+                ),
             });
         }
+        ndigits += 1;
         buf = (buf << 6) | v as u32;
         bits += 6;
         if bits >= 8 {
             bits -= 8;
             out.push(((buf >> bits) & 0xff) as u8);
         }
+    }
+    if ndigits % 4 != 0 {
+        return Err(EvalError::TypeMismatch {
+            detail: String::from("invalid base64 end sequence"),
+        });
     }
     Ok(out)
 }
@@ -429,30 +466,38 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(text: &str) -> Result<Vec<u8>, EvalError> {
-    let trimmed = text.trim();
-    if trimmed.len() % 2 != 0 {
-        return Err(EvalError::TypeMismatch {
-            detail: "decode(hex): input length must be even".into(),
-        });
-    }
-    let mut out = Vec::with_capacity(trimmed.len() / 2);
+    // v7.39 (round 261) — PG skips whitespace ANYWHERE (probed:
+    // `decode('41 42','hex')` is `\x4142`), where SPG only trimmed the
+    // ends and rejected an interior space. The digit and odd-length
+    // errors take PG's wordings.
+    let mut out = Vec::with_capacity(text.len() / 2);
     let mut hi: u8 = 0;
-    for (i, c) in trimmed.bytes().enumerate() {
+    let mut n: usize = 0;
+    for c in text.bytes() {
+        if c == b' ' || c == b'\n' || c == b'\r' || c == b'\t' {
+            continue;
+        }
         let v = match c {
             b'0'..=b'9' => c - b'0',
             b'a'..=b'f' => c - b'a' + 10,
             b'A'..=b'F' => c - b'A' + 10,
             _ => {
                 return Err(EvalError::TypeMismatch {
-                    detail: format!("decode(hex): invalid char {:?}", c as char),
+                    detail: format!("invalid hexadecimal digit: \"{}\"", c as char),
                 });
             }
         };
-        if i % 2 == 0 {
+        if n % 2 == 0 {
             hi = v;
         } else {
             out.push((hi << 4) | v);
         }
+        n += 1;
+    }
+    if n % 2 != 0 {
+        return Err(EvalError::TypeMismatch {
+            detail: String::from("invalid hexadecimal data: odd number of digits"),
+        });
     }
     Ok(out)
 }
