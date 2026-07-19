@@ -551,6 +551,9 @@ fn handle_pg_simple_query(
                     tx_state,
                 )?;
             }
+            CopyIntent::FromFile(spec) => {
+                handle_copy_from_file(stream, state, role, &spec, tx_state)?;
+            }
             CopyIntent::To(table, opts) => {
                 let sql = format!("SELECT * FROM {table}");
                 handle_copy_to_stdout(stream, state, role, &sql, &opts, tx_state)?;
@@ -4513,6 +4516,11 @@ enum CopyIntent {
     // inner SQL is run and its result set streamed in COPY format.
     To(String, CopyOptions),
     ToQuery(String, CopyOptions),
+    // v7.39 (round 251) — `COPY t FROM '<file>'`: the SERVER process
+    // reads the file, PG semantics. Parsed by the engine's SQL parser
+    // (spg_engine::copy::parse_copy_from_file), not the hand parser, so
+    // the r247 option grammar (one-byte checks, mode refusals) applies.
+    FromFile(spg_engine::copy::CopyFromFileSpec),
 }
 
 /// v6.4.7 — `COPY FROM STDIN WITH (...)` option parser. PG-style
@@ -4660,6 +4668,10 @@ fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
         return None;
     }
     let endpoint = &rest[ep_start..i];
+    // v7.39 (round 251) — a quoted endpoint after FROM is the file form.
+    if dir == "from" && endpoint.starts_with('\'') {
+        return spg_engine::copy::parse_copy_from_file(trimmed).map(CopyIntent::FromFile);
+    }
     match (dir, endpoint) {
         ("from", "stdin") => {
             // v7.39 (read01 round 91) — parse options from the ORIGINAL-case
@@ -4849,6 +4861,151 @@ fn drain_copy_in_frames(stream: &mut dyn ReadWrite) -> std::io::Result<()> {
             return Ok(());
         }
     }
+}
+
+/// v7.39 (round 251) — `COPY t [(cols)] FROM '<file>'`: the server
+/// process reads the file (PG semantics; probed live 2026-07-19).
+/// Non-admin roles get PG's 42501 refusal; a missing file is PG's
+/// 58P01 with the psql \copy HINT. The rows drive the same
+/// BEGIN / per-row INSERT+WAL / COMMIT-or-ROLLBACK sequence as the
+/// round-250 STDIN path, so the COPY is atomic and durable (one fsync
+/// at COMMIT, crash mid-COPY replays to the end-of-WAL auto-rollback).
+fn handle_copy_from_file(
+    stream: &mut dyn ReadWrite,
+    state: &Arc<ServerState>,
+    role: Role,
+    spec: &spg_engine::copy::CopyFromFileSpec,
+    tx_state: &mut u8,
+) -> std::io::Result<()> {
+    if role != Role::Admin {
+        // PG: only superuser / pg_read_server_files may read server
+        // files; SPG's admin is the superuser analog.
+        send_error(
+            stream,
+            "42501",
+            "permission denied to COPY from a file DETAIL: Only roles with privileges of the \
+             \"pg_read_server_files\" role may COPY from a file.\nHINT:  Anyone can COPY to \
+             stdout or from stdin. psql's \\copy command also works for anyone.",
+        )?;
+        return Ok(());
+    }
+    // PG's pre-file check order: relation / column existence /
+    // duplicate column, all before the file is opened (probed r249).
+    let target = match state
+        .engine
+        .read()
+        .map_err(|_| std::io::Error::other("engine rwlock poisoned"))
+        .map(|e| e.copy_target_columns(&spec.table, spec.columns.as_deref()))
+    {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => {
+            let msg = format!("{e}");
+            let code = if msg.contains("does not exist") && msg.contains("relation") && !msg.contains("column") {
+                "42P01"
+            } else if msg.contains("specified more than once") {
+                "42701"
+            } else {
+                "42703"
+            };
+            send_error(stream, code, &msg)?;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    let data = match std::fs::read_to_string(&spec.path) {
+        Ok(d) => d,
+        Err(e) => {
+            // PG's wording, without std's " (os error N)" suffix.
+            let os = e.to_string();
+            let os = os.split(" (os error").next().unwrap_or(&os);
+            send_error(
+                stream,
+                "58P01",
+                &format!(
+                    "could not open file \"{path}\" for reading: {os}\nHINT:  COPY FROM \
+                     instructs the PostgreSQL server process to read a file. You may want a \
+                     client-side facility such as psql's \\copy.",
+                    path = spec.path
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    let inserts = match spg_engine::copy::copy_buffer_inserts(
+        &spec.table,
+        spec.columns.as_deref(),
+        &target,
+        &spec.options,
+        &data,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            let msg = format!("{e}");
+            let code = if msg.contains("missing data for column")
+                || msg.contains("extra data after last expected column")
+            {
+                "22P04"
+            } else {
+                "22P02"
+            };
+            send_error(stream, code, &msg)?;
+            return Ok(());
+        }
+    };
+    // Same transaction + WAL discipline as the STDIN path (round 250).
+    let wrap = !state.engine.read().is_ok_and(|e| e.in_transaction());
+    let run = |state: &Arc<ServerState>, sql: &str| -> Result<(), String> {
+        state
+            .engine
+            .write()
+            .map_err(|_| "engine rwlock poisoned".to_string())
+            .and_then(|mut e| e.execute(sql).map(|_| ()).map_err(|err| format!("{err}")))
+    };
+    if wrap {
+        if let Err(e) = run(state, "BEGIN") {
+            send_error(stream, "XX000", &format!("COPY: {e}"))?;
+            return Ok(());
+        }
+        if let Err(e) = crate::append_wal(state, "BEGIN", false) {
+            let _ = run(state, "ROLLBACK");
+            send_error(stream, "53100", &format!("{e}"))?;
+            return Ok(());
+        }
+    }
+    let mut inserted: u64 = 0;
+    for insert in &inserts {
+        let step = run(state, insert)
+            .and_then(|()| crate::append_wal(state, insert, false).map_err(|e| format!("{e}")));
+        match step {
+            Ok(()) => inserted += 1,
+            Err(msg) => {
+                if wrap {
+                    let _ = run(state, "ROLLBACK");
+                    let _ = crate::append_wal(state, "ROLLBACK", false);
+                }
+                send_error(stream, "22P02", &msg)?;
+                return Ok(());
+            }
+        }
+    }
+    if wrap {
+        if let Err(e) = run(state, "COMMIT") {
+            let _ = crate::append_wal(state, "ROLLBACK", false);
+            send_error(stream, "XX000", &format!("COPY: {e}"))?;
+            return Ok(());
+        }
+        if let Err(e) = crate::append_wal(state, "COMMIT", crate::session_sync_commit(state)) {
+            send_error(stream, "53100", &format!("{e}"))?;
+            return Ok(());
+        }
+    }
+    send_command_complete(stream, &format!("COPY {inserted}"))?;
+    *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
+        b'T'
+    } else {
+        b'I'
+    };
+    Ok(())
 }
 
 fn handle_copy_from_stdin(
@@ -7745,8 +7902,16 @@ mod tests {
     #[test]
     fn parse_non_copy_returns_none() {
         assert!(parse_copy_intent("SELECT 1").is_none());
-        // File-based COPY: pgwire intentionally doesn't handle.
-        assert!(parse_copy_intent("COPY t FROM '/etc/passwd'").is_none());
+        // v7.39 (round 251) — file-based COPY is now a real intent: the
+        // SERVER reads the file (PG semantics; admin-gated in the
+        // handler, 42501 for everyone else).
+        match parse_copy_intent("COPY t FROM '/etc/passwd'") {
+            Some(CopyIntent::FromFile(spec)) => {
+                assert_eq!(spec.table, "t");
+                assert_eq!(spec.path, "/etc/passwd");
+            }
+            other => panic!("expected FromFile, got {other:?}"),
+        }
     }
 
     #[test]
