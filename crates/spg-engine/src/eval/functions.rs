@@ -4122,14 +4122,43 @@ fn apply_function_dispatch(
         // NULL if not found. PG NULL semantics: NULL array → NULL;
         // NULL val never matches (returns NULL if absent).
         "array_position" => {
-            if args.len() != 2 {
+            // v7.39 (round 257) — PG also has the three-argument form,
+            // `array_position(arr, elem, start)`, which begins the scan at
+            // subscript `start` (probed: a start past the end answers
+            // NULL, and a NULL start is an error).
+            if !(2..=3).contains(&args.len()) {
                 return Err(EvalError::TypeMismatch {
-                    detail: format!("array_position() takes 2 args, got {}", args.len()),
+                    detail: format!("array_position() takes 2 or 3 args, got {}", args.len()),
                 });
             }
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
             }
+            let start_at: usize = match args.get(2) {
+                None => 0,
+                Some(Value::Null) => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: String::from("initial position must not be null"),
+                    });
+                }
+                Some(v) => {
+                    let n = match v {
+                        Value::Int(n) => i64::from(*n),
+                        Value::SmallInt(n) => i64::from(*n),
+                        Value::BigInt(n) => *n,
+                        other => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: format!(
+                                    "array_position() start must be an integer, got {:?}",
+                                    other.data_type()
+                                ),
+                            });
+                        }
+                    };
+                    // Subscripts are 1-based; anything below 1 starts at the front.
+                    usize::try_from(n.max(1) - 1).unwrap_or(usize::MAX)
+                }
+            };
             // PG refuses multidimensional search with its own text
             // (no good way to report a position).
             if matches!(
@@ -4155,7 +4184,7 @@ fn apply_function_dispatch(
             // `array_position(ARRAY[1,NULL,2], NULL)` → 2), reusing the
             // scalar `=` dispatch so cross-width numerics / date / uuid /
             // bytea / interval / money / jsonb all match consistently.
-            for i in 0..len {
+            for i in start_at..len {
                 let elem = array_element_at(&args[0], i).unwrap_or(Value::Null);
                 if array_search_match(&elem, &args[1])? {
                     return Ok(Value::Int(i32::try_from(i + 1).unwrap_or(i32::MAX)));
@@ -4538,6 +4567,73 @@ fn apply_function_dispatch(
         // → {3}); a NULL element is appended as a NULL item. Both
         // NULL → NULL (PG can't resolve the polymorphic type either).
         // v7.37 D.53 — `UPDATE t SET arr[i] = v` desugars (in the parser) to
+        // v7.39 (round 257) — `SET arr[lo:hi] = src`, desugared to
+        // `arr = __array_assign_slice(arr, lo, hi, src)` (a NULL `hi` is
+        // the open form `arr[lo:]`, which runs to the end). PG's rules,
+        // all probed live: the slice is replaced in place; a source
+        // shorter than the slice is an ERROR ("source array too small");
+        // a longer one is truncated to the slice; a slice past the end
+        // extends the array, NULL-padding the hole; and a NULL array
+        // becomes a fresh array. Implemented as repeated single-element
+        // assignment so every array variant's own logic is reused rather
+        // than duplicated here.
+        "__array_assign_slice" => {
+            if args.len() != 4 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "__array_assign_slice() takes 4 args, got {}",
+                        args.len()
+                    ),
+                });
+            }
+            let bound = |v: &Value<'_>| -> Result<Option<i64>, EvalError> {
+                match v {
+                    Value::Null => Ok(None),
+                    Value::SmallInt(n) => Ok(Some(i64::from(*n))),
+                    Value::Int(n) => Ok(Some(i64::from(*n))),
+                    Value::BigInt(n) => Ok(Some(*n)),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "array subscript must be integer, got {:?}",
+                            other.data_type()
+                        ),
+                    }),
+                }
+            };
+            let lo = bound(&args[1])?.unwrap_or(1).max(1);
+            let src = &args[3];
+            let Some(src_len) = array_len(src) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "slice assignment needs an array source, got {:?}",
+                        src.data_type()
+                    ),
+                });
+            };
+            // An absent upper bound runs to the end of the SOURCE, which
+            // is what PG's `arr[2:] = ARRAY[9,9]` does (probed: `{1,2,3}`
+            // becomes `{1,9,9}`).
+            let hi = match bound(&args[2])? {
+                Some(h) => h,
+                None => lo + i64::try_from(src_len).unwrap_or(0) - 1,
+            };
+            if hi < lo {
+                return Ok(args[0].clone().into_owned());
+            }
+            let want = usize::try_from(hi - lo + 1).unwrap_or(0);
+            if src_len < want {
+                return Err(EvalError::TypeMismatch {
+                    detail: String::from("source array too small"),
+                });
+            }
+            let mut acc = args[0].clone().into_owned();
+            for k in 0..want {
+                let elem = array_element_at(src, k).unwrap_or(Value::Null);
+                let idx = Value::BigInt(lo + i64::try_from(k).unwrap_or(0));
+                acc = apply_function_dispatch("__array_assign", &[acc, idx, elem], ctx)?;
+            }
+            Ok(acc)
+        }
         // `arr = __array_assign(arr, i, v)`. PG assigns to the i-th (1-based)
         // element, NULL-padding the array when i exceeds its current length.
         "__array_assign" => {

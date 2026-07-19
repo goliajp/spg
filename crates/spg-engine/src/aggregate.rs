@@ -3180,6 +3180,22 @@ fn finalize_synth_rows(
                     sorted.items = idx.iter().map(|&j| st.items[j].clone()).collect();
                     st_sorted = sorted;
                     &st_sorted
+                } else if agg_specs[i].distinct && st.items.len() > 1 {
+                    // v7.39 (round 257) — PG dedups a DISTINCT aggregate by
+                    // SORTING its input, so the collection aggregates emit
+                    // their values in sort order (probed across array_agg /
+                    // string_agg / json_agg, ints and text, NULLs last):
+                    // `array_agg(DISTINCT x)` over 2,1,2 is `{1,2}`, where
+                    // SPG kept first-seen order and answered `{2,1}`. An
+                    // explicit ORDER BY takes the branch above instead, and
+                    // the scalar aggregates (count / sum / …) are
+                    // order-insensitive, so this only moves the collections.
+                    let mut sorted = st.clone();
+                    sorted.items.sort_by(|a, b| {
+                        crate::order_by_value_cmp(false, Some(false), a, b)
+                    });
+                    st_sorted = sorted;
+                    &st_sorted
                 } else {
                     st
                 };

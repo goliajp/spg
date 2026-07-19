@@ -7013,6 +7013,19 @@ impl Parser {
             if matches!(self.peek(), Token::LBracket) {
                 self.advance();
                 let index = self.parse_expr(0)?;
+                // v7.39 (round 257) — the SLICE target `SET arr[lo:hi] = src`
+                // (and the open `arr[lo:]`), lowered to
+                // `__array_assign_slice`. Only the single-subscript form
+                // parsed before, so a slice assignment was a syntax error.
+                let mut slice_hi: Option<Option<Expr>> = None;
+                if matches!(self.peek(), Token::Colon) {
+                    self.advance();
+                    slice_hi = Some(if matches!(self.peek(), Token::RBracket) {
+                        None
+                    } else {
+                        Some(self.parse_expr(0)?)
+                    });
+                }
                 if !matches!(self.peek(), Token::RBracket) {
                     return Err(self.err(format!(
                         "expected `]` after array subscript in UPDATE SET, got {:?}",
@@ -7039,9 +7052,20 @@ impl Parser {
                         name: col.clone(),
                     }),
                 };
-                let assigned = Expr::FunctionCall {
-                    name: "__array_assign".to_string(),
-                    args: alloc::vec![base, index, value],
+                let assigned = match slice_hi {
+                    None => Expr::FunctionCall {
+                        name: "__array_assign".to_string(),
+                        args: alloc::vec![base, index, value],
+                    },
+                    Some(hi) => Expr::FunctionCall {
+                        name: "__array_assign_slice".to_string(),
+                        args: alloc::vec![
+                            base,
+                            index,
+                            hi.unwrap_or(Expr::Literal(crate::ast::Literal::Null)),
+                            value,
+                        ],
+                    },
                 };
                 match existing {
                     Some(i) => assignments[i].1 = assigned,
