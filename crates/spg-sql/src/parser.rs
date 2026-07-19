@@ -4273,6 +4273,127 @@ impl Parser {
 
     /// v7.17.0 — body of `ALTER SEQUENCE`. The `ALTER` keyword has
     /// already been consumed; this is reached after `SEQUENCE`.
+    /// v7.39 (round 260) — `ALTER DOMAIN name <action>`.
+    fn parse_alter_domain_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        use crate::ast::AlterDomainAction as A;
+        let name = self.expect_ident_like()?;
+        // DROP / SET / ADD lex as reserved keyword tokens, not idents.
+        let kw = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
+            Token::Drop => alloc::string::String::from("drop"),
+            Token::Default => alloc::string::String::from("default"),
+            other => {
+                return Err(self.err(alloc::format!(
+                    "expected an ALTER DOMAIN action, got {other:?}"
+                )));
+            }
+        };
+        let action = match kw.as_str() {
+            "add" => {
+                self.advance();
+                let cname = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("constraint"))
+                {
+                    self.advance();
+                    Some(self.expect_ident_like()?)
+                } else {
+                    None
+                };
+                if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("check")) {
+                    return Err(self.err(alloc::format!(
+                        "ALTER DOMAIN ADD supports CHECK only, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err(self.err("expected '(' after CHECK".into()));
+                }
+                self.advance();
+                let check = self.parse_expr(0)?;
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err("expected ')' after CHECK expression".into()));
+                }
+                self.advance();
+                A::AddConstraint { name: cname, check }
+            }
+            "drop" => {
+                self.advance();
+                match self.peek() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("constraint") => {
+                        self.advance();
+                        let if_exists = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if"))
+                        {
+                            self.advance();
+                            if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("exists"))
+                            {
+                                return Err(self.err("expected EXISTS after IF".into()));
+                            }
+                            self.advance();
+                            true
+                        } else {
+                            false
+                        };
+                        let cn = self.expect_ident_like()?;
+                        A::DropConstraint { name: cn, if_exists }
+                    }
+                    Token::Default => {
+                        self.advance();
+                        A::DropDefault
+                    }
+                    Token::Not => {
+                        self.advance();
+                        if !matches!(self.peek(), Token::Null) {
+                            return Err(self.err("expected NULL after NOT".into()));
+                        }
+                        self.advance();
+                        A::DropNotNull
+                    }
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "ALTER DOMAIN DROP expects CONSTRAINT / DEFAULT / NOT NULL, got {other:?}"
+                        )));
+                    }
+                }
+            }
+            "set" => {
+                self.advance();
+                match self.peek() {
+                    Token::Default => {
+                        self.advance();
+                        A::SetDefault(self.parse_expr(0)?)
+                    }
+                    Token::Not => {
+                        self.advance();
+                        if !matches!(self.peek(), Token::Null) {
+                            return Err(self.err("expected NULL after NOT".into()));
+                        }
+                        self.advance();
+                        A::SetNotNull
+                    }
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "ALTER DOMAIN SET expects DEFAULT / NOT NULL, got {other:?}"
+                        )));
+                    }
+                }
+            }
+            "rename" => {
+                self.advance();
+                if !matches!(self.peek(), Token::To) {
+                    return Err(self.err("expected TO after RENAME".into()));
+                }
+                self.advance();
+                A::RenameTo(self.expect_ident_like()?)
+            }
+            other => {
+                return Err(self.err(alloc::format!(
+                    "unsupported ALTER DOMAIN action {other:?}"
+                )));
+            }
+        };
+        Ok(Statement::AlterDomain { name, action })
+    }
+
     fn parse_alter_sequence_after_keyword(&mut self) -> Result<Statement, ParseError> {
         let if_exists = self.parse_if_exists();
         let name = self.expect_ident_like()?;
@@ -7843,12 +7964,20 @@ impl Parser {
             // ROLE / ALTER SCHEMA / ALTER OWNER / ALTER DEFAULT
             // PRIVILEGES — accept as no-op so pg_dump's tail loads.
             // v7.17.0 NOTE: ALTER SEQUENCE moved out (above).
+            // v7.39 (round 260) — ALTER DOMAIN is REAL now, so it leaves the
+            // pg_dump no-op list below: every form used to report success
+            // and change nothing, which is worse than refusing outright
+            // (a migration dropping a constraint kept rejecting data).
+            // NOTE: the enclosing `match self.advance()` already consumed
+            // the DOMAIN keyword, so the name is next.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("domain") => {
+                return self.parse_alter_domain_after_keyword();
+            }
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(
                     s.to_ascii_lowercase().as_str(),
                     "view"
                         | "function"
-                        | "domain"
                         | "database"
                         | "role"
                         | "schema"

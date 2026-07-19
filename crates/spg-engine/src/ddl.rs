@@ -4075,6 +4075,186 @@ impl Engine {
             modified_catalog: !self.in_transaction(),
         })
     }
+    /// v7.39 (round 260) — `ALTER DOMAIN`. Every form used to be
+    /// swallowed by the parser's pg_dump no-op arm: success reported,
+    /// nothing changed. Constraint names and the error wordings are PG's,
+    /// probed live.
+    pub(crate) fn exec_alter_domain(
+        &mut self,
+        name: &str,
+        action: spg_sql::ast::AlterDomainAction,
+    ) -> Result<QueryResult, EngineError> {
+        use spg_sql::ast::AlterDomainAction as A;
+        let not_found = || {
+            EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
+                "type {name:?} does not exist"
+            )))
+        };
+        if !self.active_catalog().domain_types().contains_key(name) {
+            return Err(not_found());
+        }
+        match action {
+            A::AddConstraint { name: cname, check } => {
+                let dom = self
+                    .active_catalog()
+                    .domain_types()
+                    .get(name)
+                    .ok_or_else(not_found)?;
+                // PG's auto-name for an unnamed ALTER-added check follows
+                // the same `<domain>_check{n}` sequence as CREATE DOMAIN.
+                let cname = match cname {
+                    Some(c) => c,
+                    None => {
+                        let mut i = dom.checks.len();
+                        loop {
+                            let cand = if i == 0 {
+                                alloc::format!("{name}_check")
+                            } else {
+                                alloc::format!("{name}_check{i}")
+                            };
+                            if !dom.checks.iter().any(|c| c.name == cand) {
+                                break cand;
+                            }
+                            i += 1;
+                        }
+                    }
+                };
+                if dom.checks.iter().any(|c| c.name == cname) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "constraint \"{cname}\" for domain \"{name}\" already exists"
+                    )));
+                }
+                let expr = alloc::format!("{check}");
+                let mut def = dom.clone();
+                def.checks.push(spg_storage::DomainCheck { name: cname, expr });
+                self.replace_domain(name, def)?;
+            }
+            A::DropConstraint {
+                name: cname,
+                if_exists,
+            } => {
+                let mut def = self
+                    .active_catalog()
+                    .domain_types()
+                    .get(name)
+                    .ok_or_else(not_found)?
+                    .clone();
+                let before = def.checks.len();
+                def.checks.retain(|c| c.name != cname);
+                if def.checks.len() == before {
+                    if if_exists {
+                        return Ok(QueryResult::CommandOk {
+                            affected: 0,
+                            modified_catalog: false,
+                        });
+                    }
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "constraint \"{cname}\" of domain \"{name}\" does not exist"
+                    )));
+                }
+                self.replace_domain(name, def)?;
+            }
+            A::SetDefault(e) => {
+                let mut def = self
+                    .active_catalog()
+                    .domain_types()
+                    .get(name)
+                    .ok_or_else(not_found)?
+                    .clone();
+                def.default = Some(alloc::format!("{e}"));
+                self.replace_domain(name, def)?;
+            }
+            A::DropDefault => {
+                let mut def = self
+                    .active_catalog()
+                    .domain_types()
+                    .get(name)
+                    .ok_or_else(not_found)?
+                    .clone();
+                def.default = None;
+                self.replace_domain(name, def)?;
+            }
+            A::SetNotNull | A::DropNotNull => {
+                // v7.39 (round 260) — SET NOT NULL must reject when an
+                // existing column of this domain already holds NULLs (PG:
+                // `column "v" of table "adt" contains null values`).
+                if matches!(action, A::SetNotNull) {
+                    let snap = self.current_snapshot();
+                    let cat = self.active_catalog();
+                    let mut offender: Option<(alloc::string::String, alloc::string::String)> = None;
+                    'outer: for tname in cat.table_names() {
+                        let Some(table) = cat.get(&tname) else { continue };
+                        let cols = table.schema().columns.clone();
+                        let idxs: alloc::vec::Vec<usize> = cols
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.user_domain_type.as_deref() == Some(name))
+                            .map(|(i, _)| i)
+                            .collect();
+                        if idxs.is_empty() {
+                            continue;
+                        }
+                        for (_, row) in table.scan_visible(&snap) {
+                            for &i in &idxs {
+                                if row.values.get(i).is_none_or(spg_storage::Value::is_null) {
+                                    offender = Some((tname.clone(), cols[i].name.clone()));
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                    if let Some((t, c)) = offender {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "column \"{c}\" of table \"{t}\" contains null values"
+                        )));
+                    }
+                }
+                let mut def = self
+                    .active_catalog()
+                    .domain_types()
+                    .get(name)
+                    .ok_or_else(not_found)?
+                    .clone();
+                def.nullable = matches!(action, A::DropNotNull);
+                self.replace_domain(name, def)?;
+            }
+            A::RenameTo(new_name) => {
+                if self.active_catalog().domain_types().contains_key(&new_name) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "type {new_name:?} already exists"
+                    )));
+                }
+                let mut def = self
+                    .active_catalog()
+                    .domain_types()
+                    .get(name)
+                    .ok_or_else(not_found)?
+                    .clone();
+                def.name = new_name.clone();
+                self.active_catalog_mut().drop_domain_type(name);
+                self.active_catalog_mut()
+                    .create_domain_type(def)
+                    .map_err(EngineError::Storage)?;
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: !self.in_transaction(),
+        })
+    }
+
+    /// v7.39 (round 260) — swap a domain definition in place.
+    fn replace_domain(
+        &mut self,
+        name: &str,
+        def: spg_storage::DomainDef,
+    ) -> Result<(), EngineError> {
+        self.active_catalog_mut().drop_domain_type(name);
+        self.active_catalog_mut()
+            .create_domain_type(def)
+            .map_err(EngineError::Storage)
+    }
+
 
     /// v7.17.0 Phase 1.5 — `CREATE DOMAIN name AS base [DEFAULT
     /// expr] [NOT NULL] [CHECK (expr)]*` engine path. Stores the
@@ -4118,10 +4298,20 @@ impl Engine {
             }
         }
         let default = s.default.as_ref().map(|e| alloc::format!("{e}"));
+        // v7.39 (round 260) — PG names an unnamed domain CHECK
+        // `<domain>_check`, then `_check1`, `_check2`, … (probed).
         let checks = s
             .checks
             .iter()
-            .map(|e| alloc::format!("{e}"))
+            .enumerate()
+            .map(|(i, e)| spg_storage::DomainCheck {
+                name: if i == 0 {
+                    alloc::format!("{}_check", s.name)
+                } else {
+                    alloc::format!("{}_check{i}", s.name)
+                },
+                expr: alloc::format!("{e}"),
+            })
             .collect::<Vec<_>>();
         let def = spg_storage::DomainDef {
             name: s.name.clone(),

@@ -574,6 +574,15 @@ pub enum Statement {
     /// validated identifier types (email, positive_int, …) keep
     /// their guarantees.
     CreateDomain(CreateDomainStatement),
+    /// v7.39 (round 260) — `ALTER DOMAIN name <action>`. Every form was
+    /// previously swallowed by the catch-all DDL arm: the statement
+    /// reported success and did nothing, so a migration that dropped a
+    /// constraint kept rejecting the data it had just been told to
+    /// accept.
+    AlterDomain {
+        name: String,
+        action: AlterDomainAction,
+    },
     /// v7.17.0 Phase 1.5 — `DROP DOMAIN [IF EXISTS] name
     /// [, name…] [CASCADE | RESTRICT]`. Removes the matching
     /// domain from the catalog.
@@ -602,6 +611,18 @@ pub enum Statement {
         names: Vec<String>,
         if_exists: bool,
     },
+}
+
+/// v7.39 (round 260) — the `ALTER DOMAIN` actions SPG implements.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterDomainAction {
+    AddConstraint { name: Option<String>, check: Expr },
+    DropConstraint { name: String, if_exists: bool },
+    SetDefault(Expr),
+    DropDefault,
+    SetNotNull,
+    DropNotNull,
+    RenameTo(String),
 }
 
 /// v7.17.0 Phase 1.5 — `CREATE DOMAIN` AST.
@@ -3864,7 +3885,8 @@ impl Statement {
             | Statement::Listen(_)
             | Statement::Notify { .. }
             | Statement::Unlisten(_)
-            | Statement::CopyFromFile { .. } => false,
+            | Statement::CopyFromFile { .. }
+            | Statement::AlterDomain { .. } => false,
         }
     }
 }
@@ -4164,6 +4186,27 @@ impl fmt::Display for Statement {
                     write!(f, " WITH ({})", parts.join(", "))?;
                 }
                 Ok(())
+            }
+            Self::AlterDomain { name, action } => {
+                write!(f, "ALTER DOMAIN {name} ")?;
+                match action {
+                    AlterDomainAction::AddConstraint { name: cn, check } => match cn {
+                        Some(cn) => write!(f, "ADD CONSTRAINT {cn} CHECK ({check})"),
+                        None => write!(f, "ADD CHECK ({check})"),
+                    },
+                    AlterDomainAction::DropConstraint { name: cn, if_exists } => {
+                        if *if_exists {
+                            write!(f, "DROP CONSTRAINT IF EXISTS {cn}")
+                        } else {
+                            write!(f, "DROP CONSTRAINT {cn}")
+                        }
+                    }
+                    AlterDomainAction::SetDefault(e) => write!(f, "SET DEFAULT {e}"),
+                    AlterDomainAction::DropDefault => f.write_str("DROP DEFAULT"),
+                    AlterDomainAction::SetNotNull => f.write_str("SET NOT NULL"),
+                    AlterDomainAction::DropNotNull => f.write_str("DROP NOT NULL"),
+                    AlterDomainAction::RenameTo(n) => write!(f, "RENAME TO {n}"),
+                }
             }
             Self::Truncate {
                 tables,

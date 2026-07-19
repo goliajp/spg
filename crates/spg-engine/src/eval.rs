@@ -597,8 +597,10 @@ fn apply_domain_checks_of(
     target: &str,
 ) -> Result<(), EvalError> {
     let name = target;
-    let owner = dom.name.as_str();
-    for src in &dom.checks {
+    for chk in &dom.checks {
+        let src = &chk.expr;
+        // v7.39 (round 260) — report the constraint that failed by NAME.
+        let owner = chk.name.as_str();
         let expr = spg_sql::parser::parse_expression(src).map_err(|e| EvalError::TypeMismatch {
             detail: alloc::format!("domain {name} CHECK ({src:?}) failed to re-parse: {e:?}"),
         })?;
@@ -616,7 +618,7 @@ fn apply_domain_checks_of(
         if matches!(r, Value::Bool(false)) {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "value for domain {name} violates check constraint \"{owner}_check\""
+                    "value for domain {name} violates check constraint \"{owner}\""
                 ),
             });
         }
