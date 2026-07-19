@@ -67,7 +67,36 @@ fn main() {
         spg_tzif::tz_canonical,
         spg_tzif::tz_abbrev_at,
     );
-    for stmt in sql.split(';') {
+    // v7.39 (round 247) — quote-aware statement splitting: a `;` inside a
+    // string literal (`DELIMITER ';'`) is not a statement boundary. The
+    // plain split shredded any statement carrying one.
+    let mut stmts: Vec<String> = Vec::new();
+    {
+        let mut cur = String::new();
+        let mut in_str = false;
+        let mut chars = sql.chars().peekable();
+        while let Some(c) = chars.next() {
+            if in_str {
+                cur.push(c);
+                if c == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        cur.push(chars.next().unwrap());
+                    } else {
+                        in_str = false;
+                    }
+                }
+            } else if c == '\'' {
+                in_str = true;
+                cur.push(c);
+            } else if c == ';' {
+                stmts.push(core::mem::take(&mut cur));
+            } else {
+                cur.push(c);
+            }
+        }
+        stmts.push(cur);
+    }
+    for stmt in &stmts {
         let stmt = stmt.trim();
         if stmt.is_empty() {
             continue;

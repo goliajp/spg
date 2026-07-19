@@ -4272,6 +4272,9 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("must not use data-modifying statements in WITH")
             // v7.39 (round 154) — writes targeting a computed view column.
             || msg.contains("View columns that are not columns of their base relation")
+            // v7.39 (round 247) — the COPY option refusals share the class.
+            || msg.contains("requires CSV mode")
+            || msg.contains("must be a single one-byte character")
         {
             "0A000"
         } else if msg.contains("duplicate key value violates unique constraint")

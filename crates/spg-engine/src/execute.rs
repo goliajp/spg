@@ -1554,6 +1554,52 @@ impl Engine {
 }
 
 impl Engine {
+    /// v7.39 (round 247) — resolve the CSV-only extras. QUOTE / ESCAPE /
+    /// FORCE_QUOTE outside CSV mode are PG's 0A000 refusals (SPG used to
+    /// ignore a text-mode QUOTE silently); the returned mask marks the
+    /// force-quoted columns of `column_names`.
+    fn resolve_copy_csv_extras(
+        options: &spg_sql::ast::CopyOptions,
+        is_csv: bool,
+        quote: char,
+        column_names: &[alloc::string::String],
+    ) -> Result<(char, Option<alloc::vec::Vec<bool>>), EngineError> {
+        if !is_csv {
+            if options.quote.is_some() {
+                return Err(EngineError::Unsupported("COPY QUOTE requires CSV mode".into()));
+            }
+            if options.escape.is_some() {
+                return Err(EngineError::Unsupported("COPY ESCAPE requires CSV mode".into()));
+            }
+            if options.force_quote.is_some() {
+                return Err(EngineError::Unsupported(
+                    "COPY FORCE_QUOTE requires CSV mode".into(),
+                ));
+            }
+        }
+        let escape = options.escape.unwrap_or(quote);
+        let force = match &options.force_quote {
+            None => None,
+            Some(cols) if cols.is_empty() => Some(alloc::vec![true; column_names.len()]),
+            Some(cols) => {
+                let mut mask = alloc::vec![false; column_names.len()];
+                for c in cols {
+                    let pos = column_names
+                        .iter()
+                        .position(|n| n.eq_ignore_ascii_case(c))
+                        .ok_or_else(|| {
+                            EngineError::Unsupported(alloc::format!(
+                                "column \"{c}\" does not exist"
+                            ))
+                        })?;
+                    mask[pos] = true;
+                }
+                Some(mask)
+            }
+        };
+        Ok((escape, force))
+    }
+
     /// `COPY table [(cols)] TO STDOUT` — render the visible rows
     /// in COPY text format (tab-separated, `\N` nulls, backslash
     /// escapes) as a single-text-column result set. Embedded
@@ -1605,9 +1651,23 @@ impl Engine {
             .null_str
             .clone()
             .unwrap_or_else(|| alloc::string::String::from(if is_csv { "" } else { "\\N" }));
+        // v7.39 (round 247) — the FORCE_QUOTE mask follows the emitted
+        // column order (the projection), not the table order.
+        let out_names: alloc::vec::Vec<alloc::string::String> = positions
+            .iter()
+            .filter_map(|&p| schema_cols.get(p).map(|c| c.name.clone()))
+            .collect();
+        let (escape, force_mask) = Self::resolve_copy_csv_extras(options, is_csv, quote, &out_names)?;
         let encode_cells = |cells: &[Option<alloc::string::String>]| -> alloc::string::String {
             if is_csv {
-                crate::copy::encode_copy_csv_cells(cells, delimiter, quote, &null_str)
+                crate::copy::encode_copy_csv_cells_opts(
+                    cells,
+                    delimiter,
+                    quote,
+                    escape,
+                    force_mask.as_deref(),
+                    &null_str,
+                )
             } else {
                 crate::copy::encode_copy_text_cells_opts(cells, delimiter, &null_str)
             }
@@ -1699,9 +1759,19 @@ impl Engine {
             .null_str
             .clone()
             .unwrap_or_else(|| alloc::string::String::from(if is_csv { "" } else { "\\N" }));
+        let out_names: alloc::vec::Vec<alloc::string::String> =
+            result_cols.iter().map(|c| c.name.clone()).collect();
+        let (escape, force_mask) = Self::resolve_copy_csv_extras(options, is_csv, quote, &out_names)?;
         let encode_cells = |cells: &[Option<alloc::string::String>]| -> alloc::string::String {
             if is_csv {
-                crate::copy::encode_copy_csv_cells(cells, delimiter, quote, &null_str)
+                crate::copy::encode_copy_csv_cells_opts(
+                    cells,
+                    delimiter,
+                    quote,
+                    escape,
+                    force_mask.as_deref(),
+                    &null_str,
+                )
             } else {
                 crate::copy::encode_copy_text_cells_opts(cells, delimiter, &null_str)
             }
