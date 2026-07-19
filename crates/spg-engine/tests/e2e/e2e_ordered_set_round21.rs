@@ -128,14 +128,16 @@ fn hypothetical_set_multi_key() {
         vec!["3"]
     );
     // Direct-argument count must match the ordering-column count.
+    // v7.39 (round 255) — this pin locked SPG's own wording; PG resolves
+    // the mismatch as a missing overload whose signature is the direct
+    // arguments followed by the WITHIN GROUP ones (probed live on this
+    // exact query: `function rank(integer, integer, integer) does not
+    // exist`).
     assert!(
         err_of(
             &mut e,
             "SELECT rank(2, 3) WITHIN GROUP (ORDER BY a) FROM (VALUES (1)) t(a)"
         )
-        .contains(
-            "the number of hypothetical direct arguments (here 2) must match \
-         the number of ordering columns (here 1)"
-        )
+        .contains("function rank(integer, integer, integer) does not exist")
     );
 }
