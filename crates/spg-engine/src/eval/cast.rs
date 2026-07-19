@@ -185,8 +185,15 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
             Value::RegClass(_, name) => name.to_string(),
             _ => value_to_text(&v),
         })),
-        CastTarget::Int => cast_numeric_to_int(v),
-        CastTarget::BigInt => cast_numeric_to_bigint(v),
+        // v7.39 (round 254) — the integer targets refuse a NUMERIC special
+        // outright (PG: `cannot convert NaN to integer`); without this the
+        // arms below read the special's canonical mantissa and answered 0.
+        // The float / numeric targets pass it through instead — handled in
+        // their own arms, which now consult `kind`.
+        CastTarget::Int => cast_numeric_special_reject(&v, "integer")
+            .unwrap_or_else(|| cast_numeric_to_int(v)),
+        CastTarget::BigInt => cast_numeric_special_reject(&v, "bigint")
+            .unwrap_or_else(|| cast_numeric_to_bigint(v)),
         CastTarget::Float => cast_numeric_to_float(v),
         CastTarget::Bool => cast_to_bool(v),
         CastTarget::Date => cast_to_date(v),
@@ -1200,6 +1207,28 @@ fn cast_to_timestamp(v: Value) -> Result<Value, EvalError> {
     }
 }
 
+/// v7.39 (round 254) — PG refuses to cast a NUMERIC special into any
+/// integer type: `cannot convert NaN to integer` / `cannot convert
+/// infinity to bigint` (an infinity is named without its sign, probed
+/// live). Returns `None` for an ordinary value so the caller runs its
+/// normal conversion.
+fn cast_numeric_special_reject(v: &Value, target: &str) -> Option<Result<Value<'static>, EvalError>> {
+    let Value::Numeric { kind, .. } = v else {
+        return None;
+    };
+    if *kind == spg_storage::NumericKind::Finite {
+        return None;
+    }
+    let what = if *kind == spg_storage::NumericKind::NaN {
+        "NaN"
+    } else {
+        "infinity"
+    };
+    Some(Err(EvalError::TypeMismatch {
+        detail: alloc::format!("cannot convert {what} to {target}"),
+    }))
+}
+
 fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
     match v {
         Value::Int(n) => Ok(Value::Int(n)),
@@ -1346,6 +1375,14 @@ fn cast_numeric_to_float(v: Value) -> Result<Value, EvalError> {
         // `Value::Numeric` (from `::numeric`, a numeric column, or
         // numeric arithmetic) must convert to f64, not error.
         #[allow(clippy::cast_precision_loss)]
+        // v7.39 (round 254) — a special crosses to its IEEE twin.
+        Value::Numeric { kind, .. } if kind != spg_storage::NumericKind::Finite => {
+            Ok(Value::Float(match kind {
+                spg_storage::NumericKind::NaN => f64::NAN,
+                spg_storage::NumericKind::PosInf => f64::INFINITY,
+                _ => f64::NEG_INFINITY,
+            }))
+        }
         Value::Numeric { scaled, scale, .. } => Ok(Value::Float(
             (scaled as f64) / f64_powi(10.0, i32::from(scale)),
         )),
