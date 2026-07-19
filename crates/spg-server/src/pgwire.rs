@@ -4111,6 +4111,22 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // v7.39 (read01 round 49) — ALTER TYPE ADD VALUE / RENAME VALUE.
         } else if msg.contains("enum label \"") && msg.contains("already exists") {
             "42710"
+        // v7.39 (read01 round 235) — jsonpath strict-mode refusals each
+        // carry their own SQLSTATE in PG's SQL/JSON classes, not one
+        // shared code: a missing key / non-object accessor is 2203A
+        // SQL_JSON_MEMBER_NOT_FOUND, an out-of-range subscript 22033
+        // INVALID_SQL_JSON_SUBSCRIPT, a wildcard on a non-array 22039
+        // SQL_JSON_ARRAY_NOT_FOUND.
+        } else if msg.contains("JSON object does not contain key")
+            || msg.contains("jsonpath member accessor can only be applied")
+        {
+            "2203A"
+        } else if msg.contains("jsonpath array subscript is out of bounds") {
+            "22033"
+        } else if msg.contains("jsonpath wildcard array accessor can only be applied")
+            || msg.contains("jsonpath array accessor can only be applied")
+        {
+            "22039"
         } else if msg.contains("is not an existing enum label")
             // v7.39 (read01 round 234) — the jsonb modification family's
             // refusals are PG's 22023 INVALID_PARAMETER_VALUE too.

@@ -159,6 +159,7 @@ mod e2e_agg_normalize_round231;
 mod e2e_orderby_legality_round232;
 mod e2e_setop_types_round233;
 mod e2e_jsonb_modify_round234;
+mod e2e_jsonpath_modes_round235;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;

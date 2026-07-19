@@ -1121,10 +1121,14 @@ pub(crate) fn apply_binary(
             if matches!(l, Value::Null) || matches!(r, Value::Null) {
                 Ok(Value::Null)
             } else {
-                match crate::json::path_query(&l, &r)? {
-                    Value::TextArray(items) => Ok(Value::Bool(!items.is_empty())),
-                    Value::Null => Ok(Value::Null),
-                    _ => Ok(Value::Bool(true)),
+                // v7.39 (round 235) — `@?` SUPPRESSES a strict-mode
+                // refusal and answers NULL, where jsonb_path_exists()
+                // raises it. Probed against PG18.4.
+                match crate::json::path_query(&l, &r) {
+                    Err(_) => Ok(Value::Null),
+                    Ok(Value::TextArray(items)) => Ok(Value::Bool(!items.is_empty())),
+                    Ok(Value::Null) => Ok(Value::Null),
+                    Ok(_) => Ok(Value::Bool(true)),
                 }
             }
         }
@@ -1148,16 +1152,22 @@ pub(crate) fn apply_binary(
             if matches!(r, Value::Null) {
                 return Ok(Value::Null);
             }
-            match crate::json::path_predicate(&l, &r)? {
+            // v7.39 (round 235) — `@@` suppresses a strict-mode refusal
+            // too (same PG rule as `@?`).
+            match match crate::json::path_predicate(&l, &r) {
+                Err(_) => return Ok(Value::Null),
+                Ok(v) => v,
+            } {
                 Some(b) => Ok(Value::Bool(b)),
-                None => match crate::json::path_query(&l, &r)? {
-                    Value::TextArray(items) => Ok(Value::Bool(match items.first() {
+                None => match crate::json::path_query(&l, &r) {
+                    Err(_) => Ok(Value::Null),
+                    Ok(Value::TextArray(items)) => Ok(Value::Bool(match items.first() {
                         Some(Some(s)) if s == "false" => false,
                         Some(_) => true,
                         None => false,
                     })),
-                    Value::Null => Ok(Value::Null),
-                    _ => Ok(Value::Bool(true)),
+                    Ok(Value::Null) => Ok(Value::Null),
+                    Ok(_) => Ok(Value::Bool(true)),
                 },
             }
         }

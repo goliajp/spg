@@ -70,8 +70,8 @@ pub(crate) fn json_table_path(
     path: &str,
     vars: Option<&JsonValue>,
 ) -> Result<Vec<JsonValue>, EvalError> {
-    let steps = parse_jsonpath(path)?;
-    Ok(apply_jsonpath(root, &steps, vars))
+    let (strict, steps) = parse_jsonpath_mode(path)?;
+    apply_jsonpath_mode(root, &steps, vars, strict)
 }
 
 impl JsonValue {
@@ -1465,15 +1465,19 @@ enum FilterVal {
     Var(String),
 }
 
-fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
-    // v7.39 (read01 jsonpath) — an optional leading `strict`/`lax` mode
-    // word precedes the `$` (PG's jsonpath grammar). SPG evaluates lax
-    // semantics; the mode word is accepted and stripped.
-    let p = p
-        .trim_start()
-        .strip_prefix("strict")
-        .or_else(|| p.trim_start().strip_prefix("lax"))
-        .map_or(p.trim_start(), str::trim_start);
+/// v7.39 (round 235) — parse a jsonpath, returning its MODE alongside the
+/// steps. Before this round the leading `strict` / `lax` word was stripped
+/// and thrown away, so every path evaluated with (incomplete) lax
+/// semantics and `strict` was silently a no-op.
+fn parse_jsonpath_mode(p: &str) -> Result<(bool, Vec<PathStep>), EvalError> {
+    let trimmed = p.trim_start();
+    let (strict, p) = if let Some(rest) = trimmed.strip_prefix("strict") {
+        (true, rest.trim_start())
+    } else if let Some(rest) = trimmed.strip_prefix("lax") {
+        (false, rest.trim_start())
+    } else {
+        (false, trimmed)
+    };
     let chars: Vec<char> = p.chars().collect();
     let mut i = 0;
     if i >= chars.len() || chars[i] != '$' {
@@ -1659,7 +1663,12 @@ fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
             }
         }
     }
-    Ok(steps)
+    Ok((strict, steps))
+}
+
+/// Lax-mode convenience for the callers that only need the steps.
+fn parse_jsonpath(p: &str) -> Result<Vec<PathStep>, EvalError> {
+    parse_jsonpath_mode(p).map(|(_, steps)| steps)
 }
 
 fn jp_skip_ws(chars: &[char], i: &mut usize) {
@@ -2033,13 +2042,120 @@ fn filter_expr_matches(node: &JsonValue, expr: &FilterExpr, vars: Option<&JsonVa
     }
 }
 
+/// Lax evaluation, for the callers that never carried a mode.
 fn apply_jsonpath(
     root: &JsonValue,
     steps: &[PathStep],
     vars: Option<&JsonValue>,
 ) -> Vec<JsonValue> {
+    apply_jsonpath_mode(root, steps, vars, false).unwrap_or_default()
+}
+
+/// v7.39 (round 235) — jsonpath evaluation with PG's two modes.
+///
+/// LAX (the default) is forgiving in two specific ways SPG did not
+/// implement: a member accessor auto-UNWRAPS an array and applies to each
+/// element (`lax $.a` over `[{"a":1}]` yields 1), and an array accessor
+/// auto-WRAPS a non-array into a one-element array (`lax $[*]` over `1`
+/// yields 1, and over `{"a":1}` yields the object). Both used to return
+/// nothing.
+///
+/// STRICT reports what lax quietly skips. Wording probed off PG18.4:
+/// a missing object key, an out-of-bounds subscript, a wildcard on a
+/// non-array, a member accessor on a non-object. Filters never error in
+/// either mode — a predicate that matches nothing is simply empty.
+fn apply_jsonpath_mode(
+    root: &JsonValue,
+    steps: &[PathStep],
+    vars: Option<&JsonValue>,
+    strict: bool,
+) -> Result<Vec<JsonValue>, EvalError> {
+    let err = |m: alloc::string::String| Err(EvalError::TypeMismatch { detail: m });
     let mut cur: Vec<JsonValue> = alloc::vec![root.clone()];
     for step in steps {
+        // LAX auto-unwrap / auto-wrap, applied to the inputs of this step.
+        if !strict {
+            match step {
+                // A member accessor looks inside an array's elements.
+                PathStep::Field(_) => {
+                    let mut flat: Vec<JsonValue> = Vec::new();
+                    for node in cur {
+                        match node {
+                            JsonValue::Array(items) => flat.extend(items),
+                            other => flat.push(other),
+                        }
+                    }
+                    cur = flat;
+                }
+                // An array accessor treats a non-array as a single element.
+                PathStep::Wildcard | PathStep::Index(_) | PathStep::Range(..) => {
+                    cur = cur
+                        .into_iter()
+                        .map(|n| match n {
+                            arr @ JsonValue::Array(_) => arr,
+                            other => JsonValue::Array(alloc::vec![other]),
+                        })
+                        .collect();
+                }
+                _ => {}
+            }
+        } else {
+            // STRICT refuses the shapes lax would have adapted.
+            for node in &cur {
+                match step {
+                    PathStep::Field(k) => match node {
+                        JsonValue::Object(entries) => {
+                            if !entries.iter().any(|(name, _)| name == k) {
+                                return err(alloc::format!(
+                                    "JSON object does not contain key \"{k}\""
+                                ));
+                            }
+                        }
+                        _ => {
+                            return err(
+                                "jsonpath member accessor can only be applied to an object".into(),
+                            );
+                        }
+                    },
+                    PathStep::Wildcard => {
+                        if !matches!(node, JsonValue::Array(_)) {
+                            return err(
+                                "jsonpath wildcard array accessor can only be applied to an array"
+                                    .into(),
+                            );
+                        }
+                    }
+                    PathStep::Index(idx) => match node {
+                        JsonValue::Array(items) => {
+                            if idx.resolve(items.len()).is_none_or(|p| p >= items.len()) {
+                                return err("jsonpath array subscript is out of bounds".into());
+                            }
+                        }
+                        _ => {
+                            return err(
+                                "jsonpath array accessor can only be applied to an array".into(),
+                            );
+                        }
+                    },
+                    PathStep::Range(lo, hi) => match node {
+                        JsonValue::Array(items) => {
+                            let n = items.len();
+                            if lo.resolve(n).is_none_or(|p| p >= n)
+                                || hi.resolve(n).is_none_or(|p| p >= n)
+                            {
+                                return err("jsonpath array subscript is out of bounds".into());
+                            }
+                        }
+                        _ => {
+                            return err(
+                                "jsonpath array accessor can only be applied to an array".into(),
+                            );
+                        }
+                    },
+                    _ => {}
+                }
+            }
+        }
         let mut next: Vec<JsonValue> = Vec::new();
         for node in &cur {
             match (step, node) {
@@ -2127,10 +2243,10 @@ fn apply_jsonpath(
         }
         cur = next;
         if cur.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
     }
-    cur
+    Ok(cur)
 }
 
 /// v7.38 (read01, T8) — evaluate a top-level jsonpath boolean predicate like
@@ -2160,11 +2276,13 @@ pub fn path_predicate_vars(
         .and_then(|r| r.strip_prefix('('))
         .and_then(|r| r.strip_suffix(')'))
     {
-        let steps = parse_jsonpath(inner.trim())?;
+        let (strict, steps) = parse_jsonpath_mode(inner.trim())?;
         let root = parse(src).map_err(|e| EvalError::TypeMismatch {
             detail: alloc::format!("{e}"),
         })?;
-        return Ok(Some(!apply_jsonpath(&root, &steps, vars).is_empty()));
+        return Ok(Some(
+            !apply_jsonpath_mode(&root, &steps, vars, strict)?.is_empty(),
+        ));
     }
     let chars: Vec<char> = ptext.chars().collect();
     // Find a top-level comparison operator — depth 0, outside quotes, so a `>`
@@ -2192,12 +2310,14 @@ pub fn path_predicate_vars(
     }
     let Some(pos) = op_at else { return Ok(None) };
     let left: String = chars[..pos].iter().collect();
-    let steps = parse_jsonpath(left.trim())?;
+    let (strict, steps) = parse_jsonpath_mode(left.trim())?;
     let (op, val, regex_flags, _) = parse_cmp_and_literal(&chars, pos)?;
     let root = parse(src).map_err(|e| EvalError::TypeMismatch {
         detail: alloc::format!("{e}"),
     })?;
-    let results = apply_jsonpath(&root, &steps, vars);
+    // v7.39 (round 235) — a strict refusal travels out of the predicate
+    // too; the `@@` / jsonb_path_match callers turn it into NULL.
+    let results = apply_jsonpath_mode(&root, &steps, vars, strict)?;
     let pred = FilterPred {
         path: Vec::new(),
         op,
@@ -2268,8 +2388,10 @@ pub fn path_query_vars(
             if hit { "true" } else { "false" }.into()
         )]));
     }
-    let steps = parse_jsonpath(path_text)?;
-    let matches = apply_jsonpath(&root, &steps, vars);
+    // v7.39 (round 235) — the query family propagates a strict-mode
+    // refusal; only path_match / `@?` / `@@` suppress it (see below).
+    let (strict, steps) = parse_jsonpath_mode(path_text)?;
+    let matches = apply_jsonpath_mode(&root, &steps, vars, strict)?;
     let arr: Vec<Option<String>> = matches
         .into_iter()
         .map(|v| Some(json_canonical_string(&v)))

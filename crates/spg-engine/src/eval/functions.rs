@@ -12535,14 +12535,20 @@ fn apply_function_dispatch(
             };
             // v7.38 (read01, T8) — a top-level predicate (`$.a > 3`) evaluates
             // to a real boolean; other paths fall back to any-match.
-            if let Some(b) =
-                crate::json::path_predicate_vars(&args[0], &args[1], vars.as_ref())?
+            let pred = match crate::json::path_predicate_vars(&args[0], &args[1], vars.as_ref())
             {
+                Err(_) => return Ok(Value::Null),
+                Ok(v) => v,
+            };
+            if let Some(b) = pred {
                 return Ok(Value::Bool(b));
             }
-            let q = crate::json::path_query_vars(&args[0], &args[1], vars.as_ref())?;
-            match q {
-                Value::TextArray(items) => {
+            // v7.39 (round 235) — jsonb_path_match SUPPRESSES a
+            // strict-mode refusal and answers NULL (PG18.4 probe), unlike
+            // jsonb_path_exists / _query, which raise it.
+            match crate::json::path_query_vars(&args[0], &args[1], vars.as_ref()) {
+                Err(_) => Ok(Value::Null),
+                Ok(Value::TextArray(items)) => {
                     // If the first match is a boolean literal, use it;
                     // otherwise treat any-match as true.
                     match items.first() {
@@ -12552,8 +12558,8 @@ fn apply_function_dispatch(
                         None => Ok(Value::Bool(false)),
                     }
                 }
-                Value::Null => Ok(Value::Null),
-                _ => Ok(Value::Bool(true)),
+                Ok(Value::Null) => Ok(Value::Null),
+                Ok(_) => Ok(Value::Bool(true)),
             }
         }
         // v7.39 (jsonpath depth) — the jsonb_path_* family takes
