@@ -4248,6 +4248,8 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("string is not a valid identifier")
             // v7.39 (read01 round 51) — has_table_privilege's privilege word.
             || msg.contains("unrecognized privilege type")
+            // v7.39 (round 253) — an unknown EXTRACT/date_part field name.
+            || (msg.contains("unit \"") && msg.contains("\" not recognized for type"))
         {
             "22023"
         // v7.39 (ts_headline validation) — a malformed key=value list is
@@ -4281,6 +4283,8 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             // v7.39 (round 247) — the COPY option refusals share the class.
             || msg.contains("requires CSV mode")
             || msg.contains("must be a single one-byte character")
+            // v7.39 (round 253) — EXTRACT field/type validity (PG 0A000).
+            || (msg.contains("unit \"") && msg.contains("\" not supported for type"))
         {
             "0A000"
         } else if msg.contains("duplicate key value violates unique constraint")

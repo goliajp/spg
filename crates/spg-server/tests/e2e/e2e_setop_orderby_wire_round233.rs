@@ -309,3 +309,41 @@ fn sequence_range_errors_carry_pgs_classes() {
         assert!(msg.contains(want), "{sql} → {msg}");
     }
 }
+
+/// v7.39 (round 253) — the EXTRACT field-validity errors over the wire:
+/// PG's 0A000 for a field the source type does not support, 22023 for a
+/// field name that does not exist at all.
+#[test]
+fn extract_field_errors_carry_pgs_classes() {
+    let (raw, mut s) = {
+        let (raw, addrs) = common::ServerBuilder::new()
+            .arg_path(&unique_db())
+            .with_pgwire()
+            .spawn();
+        let s = pg_connect(addrs.pgwire.as_ref().unwrap());
+        (raw, s)
+    };
+    let _guard = common::ChildGuard(raw);
+    for (sql, code, want) in [
+        (
+            "SELECT extract(hour FROM date '2024-03-15')",
+            "0A000",
+            "unit \"hour\" not supported for type date",
+        ),
+        (
+            "SELECT extract(dow FROM interval '3 days')",
+            "0A000",
+            "unit \"dow\" not supported for type interval",
+        ),
+        (
+            "SELECT extract(nosuch FROM timestamp '2024-03-15 00:00:00')",
+            "22023",
+            "unit \"nosuch\" not recognized for type timestamp without time zone",
+        ),
+    ] {
+        let (got_code, msg) =
+            exec_error(&mut s, sql).unwrap_or_else(|| panic!("no error for {sql}"));
+        assert_eq!(got_code, code, "{sql} → {msg}");
+        assert!(msg.contains(want), "{sql} → {msg}");
+    }
+}

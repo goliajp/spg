@@ -18,12 +18,58 @@ use super::{EvalError, MONTH_ABBR, MONTH_FULL, civil_from_days, days_from_civil}
 /// of a `DATE` or `TIMESTAMP`. Returns NULL on a NULL source, errors
 /// when the source isn't a calendar type.
 pub(super) fn extract_field(
-    field: spg_sql::ast::ExtractField,
+    field: &spg_sql::ast::ExtractField,
     v: &Value,
+    src_name: &str,
 ) -> Result<Value<'static>, EvalError> {
     use spg_sql::ast::ExtractField as F;
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
+    }
+    // v7.39 (round 253) — PG resolves field names at runtime: an unknown
+    // one is 22023 with the source type in the message.
+    if let F::Other(name) = field {
+        return Err(EvalError::TypeMismatch {
+            detail: format!("unit \"{name}\" not recognized for type {src_name}"),
+        });
+    }
+    // Integral results are NUMERIC (PG 14+ EXTRACT returns numeric;
+    // date_part demotes to double precision at its own boundary).
+    let num0 = |n: i64| Value::Numeric {
+        scaled: i128::from(n),
+        scale: 0,
+        kind: spg_storage::NumericKind::Finite,
+    };
+    // v7.39 (round 253) — EXTRACT from TIMETZ (probed live): the
+    // time-of-day fields read the LOCAL clock, epoch subtracts the
+    // offset, and the timezone fields report the signed offset parts.
+    if let Value::TimeTz { us, offset_secs } = *v {
+        let secs = us / 1_000_000;
+        let frac = us % 1_000_000;
+        let num = |scaled: i128, scale: u8| {
+            Ok(Value::Numeric {
+                scaled,
+                scale,
+                kind: spg_storage::NumericKind::Finite,
+            })
+        };
+        return match field {
+            F::Hour => num(i128::from(secs / 3600), 0),
+            F::Minute => num(i128::from((secs / 60) % 60), 0),
+            F::Second => num(i128::from(secs % 60) * 1_000_000 + i128::from(frac), 6),
+            F::Millisecond => num(i128::from(secs % 60) * 1_000_000 + i128::from(frac), 3),
+            F::Microsecond => num(i128::from(secs % 60) * 1_000_000 + i128::from(frac), 0),
+            F::Epoch => num(i128::from(us) - i128::from(offset_secs) * 1_000_000, 6),
+            F::Timezone => num(i128::from(offset_secs), 0),
+            F::TimezoneHour => num(i128::from(offset_secs / 3600), 0),
+            F::TimezoneMinute => num(i128::from((offset_secs / 60) % 60), 0),
+            other => Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "unit \"{}\" not supported for type {src_name}",
+                    format!("{other}").to_lowercase()
+                ),
+            }),
+        };
     }
     // INTERVAL has its own decomposition — `YEAR` / `MONTH` come from
     // the months part, the rest from the microseconds part. PG matches
@@ -92,21 +138,27 @@ pub(super) fn extract_field(
             F::Century => i64::from(years) / 100,
             F::Millennium => i64::from(years) / 1000,
             F::Millisecond => (secs_total % 60) * 1_000 + frac / 1_000,
+            // v7.39 (round 253) — probed live: WEEK on an interval is
+            // days/7 (truncating toward zero: 13d -> 1, -8d -> -1).
+            F::Week => i64::from(days) / 7,
             F::Dow
             | F::Isodow
             | F::Doy
-            | F::Week
             | F::Isoyear
             | F::Julian
             | F::Timezone
             | F::TimezoneHour
             | F::TimezoneMinute => {
                 return Err(EvalError::TypeMismatch {
-                    detail: format!("EXTRACT field {field} is not supported for INTERVAL"),
+                    detail: format!(
+                        "unit \"{}\" not supported for type {src_name}",
+                        format!("{field}").to_lowercase()
+                    ),
                 });
             }
+            F::Other(_) => unreachable!("handled above"),
         };
-        return Ok(Value::BigInt(result));
+        return Ok(num0(result));
     }
     // v7.38 (read01) — EXTRACT from TIME. `Value::Time` is micros within the
     // day; only the time-of-day fields apply, and PG returns them all as
@@ -130,11 +182,33 @@ pub(super) fn extract_field(
             F::Epoch => num(i128::from(secs) * 1_000_000 + i128::from(frac), 6),
             other => Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "unit \"{}\" not supported for type time without time zone",
+                    "unit \"{}\" not supported for type {src_name}",
                     alloc::format!("{other}").to_lowercase()
                 ),
             }),
         };
+    }
+    // v7.39 (round 253) — a DATE has no time-of-day: PG rejects those
+    // fields (0A000) where SPG silently answered 0.
+    if matches!(*v, Value::Date(_))
+        && matches!(
+            field,
+            F::Hour
+                | F::Minute
+                | F::Second
+                | F::Millisecond
+                | F::Microsecond
+                | F::Timezone
+                | F::TimezoneHour
+                | F::TimezoneMinute
+        )
+    {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "unit \"{}\" not supported for type {src_name}",
+                format!("{field}").to_lowercase()
+            ),
+        });
     }
     let (days, day_micros) = match *v {
         Value::Date(d) => (d, 0_i64),
@@ -230,14 +304,46 @@ pub(super) fn extract_field(
         F::Decade => i64::from(y).div_euclid(10),
         F::Century => era_bucket(y, 100),
         F::Millennium => era_bucket(y, 1000),
-        // JD of 1970-01-01 is 2440588 (integer-day convention;
-        // truncated for timestamps — the BigInt shape of this file).
-        F::Julian => i64::from(days) + 2_440_588,
+        // JD of 1970-01-01 is 2440588. A DATE is the integer day; a
+        // TIMESTAMP carries the day fraction — PG renders it as the
+        // numeric division's scale-20 form (`2460385.50000000000000000000`).
+        F::Julian => {
+            if matches!(*v, Value::Timestamp(_)) {
+                let jd = i128::from(days) + 2_440_588;
+                let scaled =
+                    jd * 10_i128.pow(20) + i128::from(day_micros) * 10_i128.pow(20) / 86_400_000_000;
+                return Ok(Value::Numeric {
+                    scaled,
+                    scale: 20,
+                    kind: spg_storage::NumericKind::Finite,
+                });
+            }
+            i64::from(days) + 2_440_588
+        }
         F::Millisecond => ss * 1_000 + frac / 1_000,
-        // SPG sessions run UTC — the offset is honestly zero.
+        // SPG sessions run UTC — the offset is honestly zero. The
+        // statically-typed `timestamp` rejection lives at the eval arm
+        // (the tstz/timestamp split needs the expression's declared
+        // type, which a Value alone cannot carry).
         F::Timezone | F::TimezoneHour | F::TimezoneMinute => 0,
+        F::Other(_) => unreachable!("handled above"),
     };
-    Ok(Value::BigInt(result))
+    Ok(num0(result))
+}
+
+/// v7.39 (round 253) — the PG type name for EXTRACT error messages,
+/// from the VALUE's variant. `timestamptz` shares `Value::Timestamp`,
+/// so the function form can only say "timestamp without time zone";
+/// the EXTRACT arm upgrades the name from the expression's declared
+/// type when it is statically known.
+pub(super) fn value_src_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Date(_) => "date",
+        Value::Time(_) => "time without time zone",
+        Value::TimeTz { .. } => "time with time zone",
+        Value::Interval { .. } => "interval",
+        _ => "timestamp without time zone",
+    }
 }
 
 /// PG counts centuries/millennia from year 1 with no year 0:
@@ -332,22 +438,13 @@ pub(super) fn date_part(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
         "timezone" => F::Timezone,
         "timezone_hour" => F::TimezoneHour,
         "timezone_minute" => F::TimezoneMinute,
-        other => {
-            return Err(EvalError::TypeMismatch {
-                detail: format!(
-                    "unknown date_part field {other:?}; \
-                     supported: year, month, day, hour, minute, second, microsecond, \
-                     millisecond, epoch, dow, isodow, doy, week, isoyear, quarter, \
-                     decade, century, millennium, julian, timezone[_hour|_minute]"
-                ),
-            });
-        }
+        other => F::Other(String::from(other)),
     };
     // v7.38 (read01) — date_part() returns `double precision`, whereas EXTRACT
     // returns `numeric` (PG 14+). extract_field builds the numeric form; demote
     // it to f64 so `date_part('epoch', …)` renders like PG's double (no trailing
     // `.000000`) and pg_typeof reports double precision.
-    Ok(match extract_field(field, &args[1])? {
+    Ok(match extract_field(&field, &args[1], value_src_type_name(&args[1]))? {
         Value::Numeric { scaled, scale, .. } =>
         {
             #[allow(clippy::cast_precision_loss)]

@@ -2090,8 +2090,12 @@ pub(crate) fn parse_timetz_str(s: &str) -> Option<(i64, i32)> {
     let us = parse_time_str(time_part)?;
     let sign: i32 = if offset_part.starts_with('+') { 1 } else { -1 };
     let offset_body = &offset_part[1..];
+    // v7.39 (round 253) — PG accepts the compact offset spellings too
+    // (probed live): `+0230` = 02:30, `+023` = 00:23.
     let (hh_str, mm_str) = match offset_body.split_once(':') {
         Some((h, m)) => (h, m),
+        None if offset_body.len() == 4 => offset_body.split_at(2),
+        None if offset_body.len() == 3 => offset_body.split_at(1),
         None => (offset_body, "0"),
     };
     let hh: i32 = hh_str.parse().ok()?;

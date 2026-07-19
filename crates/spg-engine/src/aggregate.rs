@@ -5206,7 +5206,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             case_insensitive: *case_insensitive,
         },
         Expr::Extract { field, source } => Expr::Extract {
-            field: *field,
+            field: field.clone(),
             source: Box::new(rewrite_expr(source, group_exprs, aggs)),
         },
         // v7.25.2 (round-19 A) — subquery nodes: rewrite group-key

@@ -3394,7 +3394,7 @@ impl fmt::Display for FrameBound {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtractField {
     Year,
     Month,
@@ -3434,6 +3434,12 @@ pub enum ExtractField {
     TimezoneHour,
     /// Minute component of the UTC offset — 0.
     TimezoneMinute,
+    /// v7.39 (round 253) — a field name the parser does not know. PG
+    /// resolves EXTRACT fields at RUNTIME and reports them with the
+    /// source type (`unit "nosuch" not recognized for type timestamp
+    /// without time zone`, 22023), so the parser carries the raw name
+    /// instead of rejecting.
+    Other(String),
 }
 
 impl fmt::Display for ExtractField {
@@ -3461,6 +3467,7 @@ impl fmt::Display for ExtractField {
             Self::Timezone => "TIMEZONE",
             Self::TimezoneHour => "TIMEZONE_HOUR",
             Self::TimezoneMinute => "TIMEZONE_MINUTE",
+            Self::Other(name) => return f.write_str(name),
         })
     }
 }

@@ -2280,9 +2280,44 @@ fn eval_extract_arm(
             spg_sql::ast::ExtractField::TimezoneHour => off_secs / 3600,
             _ => (off_secs / 60) % 60,
         };
-        return Ok(Value::BigInt(n));
+        // v7.39 (round 253) — numeric, like every other EXTRACT result.
+        return Ok(Value::Numeric {
+            scaled: i128::from(n),
+            scale: 0,
+            kind: spg_storage::NumericKind::Finite,
+        });
     }
-    extract_field(*field, &v)
+    // v7.39 (round 253) — the source's PG type name for error wording,
+    // upgraded from the declared type when statically known (a tstz
+    // VALUE is indistinguishable from a timestamp). Only a cast /
+    // column is trusted (the r237 lesson: describe_expr reports a
+    // binary operator as its left operand's type).
+    let static_declared = matches!(source, Expr::Cast { .. } | Expr::Column(_))
+        .then(|| crate::describe::describe_expr(source, ctx.columns))
+        .flatten()
+        .map(|sch| sch.ty);
+    let src_name = match static_declared {
+        Some(spg_storage::DataType::Timestamptz) => "timestamp with time zone",
+        _ => datetime::value_src_type_name(&v),
+    };
+    // PG rejects the timezone family on a plain timestamp (0A000);
+    // only reject when the declared type is STATICALLY timestamp — a
+    // dynamic value stays lenient (the pre-r253 zero answer).
+    if matches!(
+        field,
+        spg_sql::ast::ExtractField::Timezone
+            | spg_sql::ast::ExtractField::TimezoneHour
+            | spg_sql::ast::ExtractField::TimezoneMinute
+    ) && matches!(static_declared, Some(spg_storage::DataType::Timestamp))
+    {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "unit \"{}\" not supported for type timestamp without time zone",
+                alloc::format!("{field}").to_lowercase()
+            ),
+        });
+    }
+    extract_field(field, &v, src_name)
 }
 
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
