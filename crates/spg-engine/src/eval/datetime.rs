@@ -440,11 +440,48 @@ pub(super) fn date_part(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
         "timezone_minute" => F::TimezoneMinute,
         other => F::Other(String::from(other)),
     };
+    // v7.39 (round 275) — date_part() and EXTRACT do NOT share a
+    // field/type matrix, and SPG was wrong in BOTH directions because it
+    // borrowed EXTRACT's. Measured on PG 18.4:
+    //   date_part('hour', DATE)      → 0        EXTRACT(hour FROM DATE) → error
+    //   date_part('timezone', DATE)  → error naming TIMESTAMP, not date
+    //   date_part('timezone', TIME)  → error naming TIME
+    // The error naming *timestamp* for a DATE argument is the tell: the
+    // function form promotes a date to timestamp-at-midnight first, and
+    // everything follows from that one promotion. A TIME is not promoted.
+    let promoted;
+    let mut from_date = false;
+    let (arg, src_name) = match &args[1] {
+        Value::Date(d) => {
+            promoted = Value::Timestamp(i64::from(*d) * 86_400_000_000);
+            from_date = true;
+            (&promoted, "timestamp without time zone")
+        }
+        other => (other, value_src_type_name(other)),
+    };
+    // The timezone fields are rejected on the promoted value, because a
+    // timestamp carries no zone to report.
+    //
+    // Only for a value we KNOW came from a date. SPG stores timestamptz
+    // in the same `Value::Timestamp`, so a bare Timestamp here may be
+    // either type and `date_part('timezone', <timestamptz>)` legitimately
+    // answers 0. Telling the two apart needs the argument's STATIC
+    // declared type, which EXTRACT has (eval.rs:2448) and this call path
+    // does not — the function dispatch receives values, not expressions.
+    // That plumbing is its own round; recorded in the phase-2 ledger.
+    if matches!(field, F::Timezone | F::TimezoneHour | F::TimezoneMinute) && from_date {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "unit \"{}\" not supported for type timestamp without time zone",
+                format!("{field}").to_lowercase()
+            ),
+        });
+    }
     // v7.38 (read01) — date_part() returns `double precision`, whereas EXTRACT
     // returns `numeric` (PG 14+). extract_field builds the numeric form; demote
     // it to f64 so `date_part('epoch', …)` renders like PG's double (no trailing
     // `.000000`) and pg_typeof reports double precision.
-    Ok(match extract_field(&field, &args[1], value_src_type_name(&args[1]))? {
+    Ok(match extract_field(&field, arg, src_name)? {
         Value::Numeric { scaled, scale, .. } =>
         {
             #[allow(clippy::cast_precision_loss)]

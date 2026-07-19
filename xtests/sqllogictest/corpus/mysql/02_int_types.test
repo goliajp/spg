@@ -2,6 +2,12 @@
 # the closest SPG type; UNSIGNED is parsed and dropped (no semantic
 # effect — SPG holds the value in the signed twin).
 
+# v7.39 (round 274) — declare the session's dialect the way a mysqldump
+# preamble does. PG's REAL is 4-byte and MySQL's REAL is a synonym for
+# DOUBLE, so this file's expectations only hold in a MySQL session.
+statement ok
+SET sql_mode = 'STRICT_TRANS_TABLES'
+
 statement ok
 CREATE TABLE mixed (
   tiny_v TINYINT NOT NULL,
