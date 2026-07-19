@@ -3117,9 +3117,42 @@ fn invalid_input_syntax(ty: &str, value: &str) -> EngineError {
 /// v7.39 (round 269) — PG quotes the offending source when it has one:
 /// `"1e40" is out of range for type real`.
 fn real_out_of_range(value: &str) -> EngineError {
+    float_out_of_range(value, "real")
+}
+
+/// v7.39 (round 270) — the same for either float width.
+fn float_out_of_range(value: &str, ty: &str) -> EngineError {
     EngineError::Eval(EvalError::TypeMismatch {
-        detail: alloc::format!("\"{value}\" is out of range for type real"),
+        detail: alloc::format!("\"{value}\" is out of range for type {ty}"),
     })
+}
+
+/// v7.39 (round 270) — a float text that `parse_float8` rejected is
+/// either not a number at all or a number outside the type's range, and
+/// PG words the two differently. `parse_float8` already distinguishes
+/// them internally (it returns None for a numeric-looking infinity or a
+/// nonzero mantissa that underflowed to zero); this recovers which.
+fn float_text_error(s: &str, ty: &str) -> EngineError {
+    let t = s.trim();
+    let body = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let numeric_looking = body
+        .bytes()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit() || c == b'.');
+    if numeric_looking && t.parse::<f64>().is_ok() {
+        float_out_of_range(t, ty)
+    } else {
+        invalid_input_syntax(ty, s)
+    }
+}
+
+/// Whether a float text names a nonzero value: a mantissa carrying any
+/// digit other than 0. Underflowing such a source to zero is an error
+/// in PG, while `'0'` really is zero.
+fn float_text_is_nonzero(t: &str) -> bool {
+    let body = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let mantissa = body.split(['e', 'E']).next().unwrap_or(body);
+    mantissa.bytes().any(|c| c.is_ascii_digit() && c != b'0')
 }
 
 /// Whether a float text literally spells an infinity, which PG accepts
@@ -3611,8 +3644,11 @@ pub(crate) fn coerce_value(
             parse_pg_int(&s).ok_or_else(|| invalid_input_syntax("bigint", &s))?,
         )),
         (Value::Text(s), DataType::Float) => {
+            // v7.39 (round 270) — a numeric-looking text outside the
+            // double range is "out of range", not "invalid input
+            // syntax"; PG quotes the source either way.
             Some(Value::Float(parse_float8(&s).ok_or_else(|| {
-                invalid_input_syntax("double precision", &s)
+                float_text_error(&s, "double precision")
             })?))
         }
         // v7.38 (read01, T-float4) — coerce to REAL narrows to f32.
@@ -3627,6 +3663,12 @@ pub(crate) fn coerce_value(
             if narrowed.is_infinite() && x.is_finite() {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: "value out of range: overflow".into(),
+                }));
+            }
+            // v7.39 (round 270) — PG names the other end separately.
+            if narrowed == 0.0 && x != 0.0 {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: "value out of range: underflow".into(),
                 }));
             }
             Some(Value::Real(narrowed))
@@ -3647,7 +3689,15 @@ pub(crate) fn coerce_value(
                 for _ in 0..scale {
                     div *= 10.0;
                 }
-                (scaled as f64 / div) as f32
+                let x = (scaled as f64 / div) as f32;
+                // v7.39 (round 270) — same underflow rule at real's
+                // (much nearer) bottom end.
+                if x == 0.0 && scaled != 0 {
+                    return Err(real_out_of_range(&crate::eval::format_numeric(
+                        scaled, scale,
+                    )));
+                }
+                x
             }
         })),
         (Value::Real(x), DataType::Float) => Some(Value::Float(f64::from(x))),
@@ -3664,6 +3714,11 @@ pub(crate) fn coerce_value(
                 .ok()
                 .ok_or_else(|| invalid_input_syntax("real", &s))?;
             if x.is_infinite() && !text_is_explicit_infinity(t) {
+                return Err(real_out_of_range(t));
+            }
+            // v7.39 (round 270) — the other end: a nonzero source that
+            // underflows to zero is an error too, not a silent 0.
+            if x == 0.0 && float_text_is_nonzero(t) {
                 return Err(real_out_of_range(t));
             }
             Some(Value::Real(x))
@@ -4853,7 +4908,17 @@ pub(crate) fn coerce_value(
             for _ in 0..scale {
                 div *= 10.0;
             }
-            Some(Value::Float((scaled as f64) / div))
+            let x = (scaled as f64) / div;
+            // v7.39 (round 270) — a nonzero NUMERIC that underflows the
+            // double range is an error in PG, quoting the decimal
+            // expansion. It used to arrive as a silent zero.
+            if x == 0.0 && scaled != 0 {
+                return Err(float_out_of_range(
+                    &crate::eval::format_numeric(scaled, scale),
+                    "double precision",
+                ));
+            }
+            Some(Value::Float(x))
         }
         // v7.39 (read01 numeric.c) — a big NUMERIC (`3.14e100` literal) casts
         // to float8 through its decimal text; a value beyond the double range
@@ -4867,21 +4932,21 @@ pub(crate) fn coerce_value(
             let x: f32 = text
                 .parse()
                 .map_err(|_| real_out_of_range(&text))?;
-            if !x.is_finite() {
+            if !x.is_finite() || (x == 0.0 && float_text_is_nonzero(&text)) {
                 return Err(real_out_of_range(&text));
             }
             Some(Value::Real(x))
         }
         (Value::NumericBig(b), DataType::Float) => {
-            let x: f64 = b.to_decimal_str().parse().map_err(|_| {
-                EngineError::Eval(EvalError::TypeMismatch {
-                    detail: "value out of range: overflow".into(),
-                })
-            })?;
-            if !x.is_finite() {
-                return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: "value out of range: overflow".into(),
-                }));
+            // v7.39 (round 270) — PG quotes the decimal expansion here
+            // rather than saying "value out of range: overflow", which
+            // it reserves for narrowing a double.
+            let text = b.to_decimal_str();
+            let x: f64 = text
+                .parse()
+                .map_err(|_| float_out_of_range(&text, "double precision"))?;
+            if !x.is_finite() || (x == 0.0 && float_text_is_nonzero(&text)) {
+                return Err(float_out_of_range(&text, "double precision"));
             }
             Some(Value::Float(x))
         }
