@@ -339,6 +339,15 @@ fn apply_function_dispatch(
             .collect();
         return apply_function_dispatch(name, &stripped, ctx);
     }
+    // v7.39 (round 254) — NUMERIC specials (NaN / ±Infinity) reach the
+    // scalar math family through one shared table instead of each arm
+    // rebuilding its result with `kind: Finite` (which silently
+    // collapsed a special to the canonical mantissa 0). Runs before the
+    // coercion pass below: a special is already typed, so there is
+    // nothing to resolve.
+    if let Some(result) = crate::numeric::special_math(name, args) {
+        return result;
+    }
     // v7.38 (read01 sweep) — PG resolves an unknown-type string literal in a
     // numeric function's argument to numeric (`abs('-7')`, `sqrt('16')`,
     // `round('3.567', 2)`). For the single-numeric-first-argument math
@@ -9958,6 +9967,17 @@ fn apply_function_dispatch(
                     }
                 }
             }
+            // v7.39 (round 254) — PG refuses a zero base with a negative
+            // exponent for EVERY type in the tower (probed: int, bigint,
+            // smallint, float8 and the `^` operator all raise). This check
+            // used to sit below the integer-exponent fast path, so only the
+            // NUMERIC overload above reached it and `power(0, -1)` answered
+            // Infinity instead of erroring.
+            if x == 0.0 && y < 0.0 {
+                return Err(EvalError::TypeMismatch {
+                    detail: "zero raised to a negative power is undefined".into(),
+                });
+            }
             // Integer-exponent fast path.
             let y_int = y as i32;
             if (y_int as f64) == y && y.abs() < 1024.0 {
@@ -9971,11 +9991,6 @@ fn apply_function_dispatch(
                 return Err(EvalError::TypeMismatch {
                     detail: "a negative number raised to a non-integer power yields a complex result"
                         .into(),
-                });
-            }
-            if x == 0.0 && y < 0.0 {
-                return Err(EvalError::TypeMismatch {
-                    detail: "zero raised to a negative power is undefined".into(),
                 });
             }
             if x == 0.0 {
@@ -9997,22 +10012,33 @@ fn apply_function_dispatch(
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
+            // v7.39 (round 254) — PG declares only `div(numeric, numeric)`,
+            // so every overload answers NUMERIC (the rendered digits are
+            // identical; `pg_typeof(div(9,4))` was the visible divergence).
+            // The zero-divisor message is PG's bare "division by zero" —
+            // the `div(): ` prefix was an internal leak.
+            let num = |n: i128| {
+                Ok(Value::Numeric {
+                    scaled: n,
+                    scale: 0,
+                    kind: spg_storage::NumericKind::Finite,
+                })
+            };
+            let div_zero = || EvalError::TypeMismatch {
+                detail: alloc::string::String::from("division by zero"),
+            };
             match (&args[0], &args[1]) {
                 (Value::Int(a), Value::Int(b)) => {
                     if *b == 0 {
-                        return Err(EvalError::TypeMismatch {
-                            detail: "div(): division by zero".into(),
-                        });
+                        return Err(div_zero());
                     }
-                    Ok(Value::Int(a.wrapping_div(*b)))
+                    num(i128::from(a.wrapping_div(*b)))
                 }
                 (Value::BigInt(a), Value::BigInt(b)) => {
                     if *b == 0 {
-                        return Err(EvalError::TypeMismatch {
-                            detail: "div(): division by zero".into(),
-                        });
+                        return Err(div_zero());
                     }
-                    Ok(Value::BigInt(a.wrapping_div(*b)))
+                    num(i128::from(a.wrapping_div(*b)))
                 }
                 (a, b) => {
                     // Widen mixed numeric to f64, truncate.
@@ -10023,11 +10049,10 @@ fn apply_function_dispatch(
                         detail: "div() needs numeric args".into(),
                     })?;
                     if y == 0.0 {
-                        return Err(EvalError::TypeMismatch {
-                            detail: "div(): division by zero".into(),
-                        });
+                        return Err(div_zero());
                     }
-                    Ok(Value::BigInt((x / y) as i64))
+                    #[allow(clippy::cast_possible_truncation)]
+                    num((x / y) as i128)
                 }
             }
         }
@@ -10090,7 +10115,7 @@ fn apply_function_dispatch(
                     if let (Some(ya), Some(xa)) = (ya, xa) {
                         if xa == 0 {
                             return Err(EvalError::TypeMismatch {
-                                detail: "mod(): division by zero".into(),
+                                detail: "division by zero".into(),
                             });
                         }
                         return Ok(Value::Numeric {
@@ -10118,7 +10143,7 @@ fn apply_function_dispatch(
                 if let (Some(a), Some(b)) = (as_f(&args[0]), as_f(&args[1])) {
                     if b == 0.0 {
                         return Err(EvalError::TypeMismatch {
-                            detail: "mod(): division by zero".into(),
+                            detail: "division by zero".into(),
                         });
                     }
                     return Ok(Value::Float(a % b));
@@ -10138,7 +10163,7 @@ fn apply_function_dispatch(
             let x = to_i64(&args[1])?;
             if x == 0 {
                 return Err(EvalError::TypeMismatch {
-                    detail: "mod(): division by zero".into(),
+                    detail: "division by zero".into(),
                 });
             }
             // Rust's `%` operator on signed integers follows the
@@ -16700,8 +16725,21 @@ fn apply_function_dispatch(
                 }
                 return call_user_function(def, args, ctx);
             }
+            // v7.39 (round 254) — PG names the call SIGNATURE, not just the
+            // function: `function nosuchfn(integer) does not exist` (42883).
+            // An argument whose type SPG cannot name (an untyped literal)
+            // reports PG's `unknown`, the same placeholder PG uses.
+            let sig: alloc::vec::Vec<alloc::string::String> = args
+                .iter()
+                .map(|a| {
+                    a.data_type().map_or_else(
+                        || alloc::string::String::from("unknown"),
+                        crate::conversions::pg_type_name_for_error,
+                    )
+                })
+                .collect();
             Err(EvalError::TypeMismatch {
-                detail: format!("unknown function `{other}`"),
+                detail: format!("function {other}({}) does not exist", sig.join(", ")),
             })
         }
     }

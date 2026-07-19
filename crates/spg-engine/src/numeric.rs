@@ -95,6 +95,104 @@ pub(crate) fn parse_numeric_special(s: &str) -> Option<spg_storage::NumericKind>
     }
 }
 
+/// v7.39 (round 254) — PG's NUMERIC special-value table for the scalar
+/// math family, probed cell by cell against live PG18.4 (2026-07-19).
+///
+/// The `NumericKind` infrastructure has existed since v7.38 (comparison,
+/// min/max and `power` honour it), but every other math function and the
+/// numeric casts rebuilt their result with `kind: Finite`, so a NaN or
+/// ±Infinity argument collapsed to the canonical mantissa `0` and the
+/// answer was silently wrong (`abs('-Infinity')` = 0, not Infinity).
+///
+/// Returns `None` when the call has no special argument or the name is
+/// not in the table (the ordinary finite path then runs unchanged).
+///
+/// # Errors
+/// The cells where PG itself raises: sqrt / ln / log of -Infinity, and
+/// width_bucket with a NaN operand or bound.
+pub(crate) fn special_math(
+    name: &str,
+    args: &[Value<'_>],
+) -> Option<Result<Value<'static>, crate::eval::EvalError>> {
+    use spg_storage::NumericKind as K;
+    let kind_of = |v: &Value<'_>| match v {
+        Value::Numeric { kind, .. } if *kind != K::Finite => Some(*kind),
+        _ => None,
+    };
+    // Only NUMERIC specials take this path; the float8 family follows
+    // IEEE semantics through Rust's own f64 arithmetic.
+    if !args.iter().any(|a| kind_of(a).is_some()) {
+        return None;
+    }
+    let special = |k: K| {
+        Ok(Value::Numeric {
+            scaled: 0,
+            scale: 0,
+            kind: k,
+        })
+    };
+    let finite = |n: i128| {
+        Ok(Value::Numeric {
+            scaled: n,
+            scale: 0,
+            kind: K::Finite,
+        })
+    };
+    let neg_err = |what: &str| {
+        Err(crate::eval::EvalError::TypeMismatch {
+            detail: alloc::format!("cannot take {what} of a negative number"),
+        })
+    };
+    let a0 = kind_of(&args[0]);
+    let a1 = args.get(1).and_then(kind_of);
+    Some(match (name, a0) {
+        // abs folds -Infinity onto +Infinity; NaN stays NaN.
+        ("abs", Some(K::NegInf)) => special(K::PosInf),
+        ("abs", Some(k)) => special(k),
+        // The rounding family passes every special through unchanged —
+        // including the two-argument spellings (`round(x, n)` /
+        // `trunc(x, n)`), where the scale argument is simply ignored.
+        ("trunc" | "truncate" | "round" | "ceil" | "ceiling" | "floor" | "trim_scale", Some(k)) => {
+            special(k)
+        }
+        // sign reports the direction of an infinity, NaN of a NaN.
+        ("sign", Some(K::PosInf)) => finite(1),
+        ("sign", Some(K::NegInf)) => finite(-1),
+        ("sign", Some(K::NaN)) => special(K::NaN),
+        // scale / min_scale of a special is NULL (PG has no scale to report).
+        ("scale" | "min_scale", Some(_)) => Ok(Value::Null),
+        ("sqrt", Some(K::NegInf)) => neg_err("square root"),
+        ("sqrt", Some(k)) => special(k),
+        ("ln", Some(K::NegInf)) => neg_err("logarithm"),
+        ("ln", Some(k)) => special(k),
+        ("exp", Some(K::NegInf)) => finite(0),
+        ("exp", Some(k)) => special(k),
+        // log's one-argument form is base 10; the two-argument form is
+        // log(base, x) — probed: log(2, Inf) = Infinity, log(Inf, 2) = 0.
+        ("log", Some(K::NegInf)) if args.len() == 1 => neg_err("logarithm"),
+        ("log", Some(k)) if args.len() == 1 => special(k),
+        ("log", Some(K::PosInf)) => finite(0),
+        ("log", _) if a1 == Some(K::PosInf) => special(K::PosInf),
+        ("log", _) if a1 == Some(K::NaN) || a0 == Some(K::NaN) => special(K::NaN),
+        // div truncates toward zero: an infinite dividend stays infinite,
+        // an infinite divisor gives 0, NaN anywhere gives NaN.
+        ("div", Some(K::NaN)) => special(K::NaN),
+        ("div", Some(k)) if a1.is_none() => special(k),
+        ("div", _) if a1 == Some(K::NaN) => special(K::NaN),
+        ("div", _) => finite(0),
+        // mod is NaN whenever either side is special (probed: even
+        // mod(Infinity, 2) is NaN, not Infinity).
+        ("mod", _) => special(K::NaN),
+        // width_bucket refuses a NaN operand or bound outright.
+        ("width_bucket", _) => Err(crate::eval::EvalError::TypeMismatch {
+            detail: alloc::string::String::from(
+                "operand, lower bound, and upper bound cannot be NaN",
+            ),
+        }),
+        _ => return None,
+    })
+}
+
 /// v7.38 (read01) — PG 16+ accepts `_` as a digit-group separator in numeric /
 /// integer *input* (`'1_000'::numeric`), but only between two digits — not
 /// leading, trailing, doubled, or adjacent to a sign / point / exponent.

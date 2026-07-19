@@ -19,21 +19,24 @@ fn as_float(v: &spg_storage::Value<'_>) -> f64 {
     }
 }
 
+/// v7.39 (round 254) — this pin locked SPG's pre-r254 integer result
+/// shape; PG declares only `div(numeric, numeric)` and reports NUMERIC
+/// for every argument type (probed live: `pg_typeof(div(9,4))` =
+/// numeric). The digits are unchanged — only the type tag moved.
 #[test]
 fn div_truncated_quotient() {
     let mut e = Engine::new();
-    match first(&mut e, "SELECT div(9, 4)") {
-        spg_storage::Value::Int(2) => {}
-        other => panic!("got {other:?}"),
-    }
-    match first(&mut e, "SELECT div(-9, 4)") {
-        spg_storage::Value::Int(-2) => {}
-        other => panic!("got {other:?}"),
-    }
-    match first(&mut e, "SELECT div(100::bigint, 7::bigint)") {
-        spg_storage::Value::BigInt(14) => {}
-        other => panic!("got {other:?}"),
-    }
+    let quotient = |e: &mut Engine, sql: &str| match first(e, sql) {
+        spg_storage::Value::Numeric {
+            scaled,
+            scale: 0,
+            kind: spg_storage::NumericKind::Finite,
+        } => scaled,
+        other => panic!("{sql}: expected a scale-0 numeric, got {other:?}"),
+    };
+    assert_eq!(quotient(&mut e, "SELECT div(9, 4)"), 2);
+    assert_eq!(quotient(&mut e, "SELECT div(-9, 4)"), -2);
+    assert_eq!(quotient(&mut e, "SELECT div(100::bigint, 7::bigint)"), 14);
 }
 
 #[test]

@@ -3243,6 +3243,79 @@ pub(crate) fn coerce_value(
     // "internal error" instead of comparing by oid. Fall through to the
     // coercion table, which handles the shapes it knows and errors cleanly
     // on the rest.
+    // v7.39 (round 254) — a NUMERIC special (NaN / ±Infinity) crossing a
+    // cast: every arm below rebuilds its result from `scaled`/`scale`
+    // with `kind: Finite`, which silently turned a special into 0
+    // (`'Infinity'::numeric::float8` = 0). PG's table, probed live:
+    // float8 / real pass the special through; the integer targets refuse
+    // it; an unconstrained numeric keeps it, and a typmod'd numeric takes
+    // NaN but overflows on an infinity.
+    if let Value::Numeric { kind, .. } = v
+        && kind != spg_storage::NumericKind::Finite
+    {
+        use spg_storage::NumericKind as K;
+        let as_f64 = match kind {
+            K::NaN => f64::NAN,
+            K::PosInf => f64::INFINITY,
+            K::NegInf => f64::NEG_INFINITY,
+            K::Finite => unreachable!("checked above"),
+        };
+        // PG names any infinity "infinity" here, sign included.
+        let what = if kind == K::NaN { "NaN" } else { "infinity" };
+        let int_err = |target: &str| {
+            Err(EngineError::Eval(EvalError::TypeMismatch {
+                detail: alloc::format!("cannot convert {what} to {target}"),
+            }))
+        };
+        match expected {
+            DataType::Float => return Ok(Value::Float(as_f64)),
+            #[allow(clippy::cast_possible_truncation)]
+            DataType::Real => return Ok(Value::Real(as_f64 as f32)),
+            DataType::Int => return int_err("integer"),
+            DataType::BigInt => return int_err("bigint"),
+            DataType::SmallInt => return int_err("smallint"),
+            DataType::Numeric { precision, scale } => {
+                // Unconstrained numeric (the 0/0 sentinel) keeps the
+                // special; a declared precision overflows on an infinity
+                // but still accepts NaN (PG: NaN has no magnitude).
+                if precision != 0 && kind != K::NaN {
+                    return Err(EngineError::Eval(EvalError::TypeMismatch {
+                        detail: alloc::string::String::from("numeric field overflow"),
+                    }));
+                }
+                let _ = scale;
+                return Ok(v);
+            }
+            _ => {}
+        }
+    }
+    // v7.39 (round 254) — the reverse direction: an IEEE special arriving
+    // from float8 / real becomes the NUMERIC special (PG accepts it since
+    // 14); the finite path below cannot represent one.
+    if let DataType::Numeric { precision, .. } = expected {
+        let f = match v {
+            Value::Float(f) if !f.is_finite() => Some(f),
+            #[allow(clippy::cast_lossless)]
+            Value::Real(f) if !f.is_finite() => Some(f as f64),
+            _ => None,
+        };
+        if let Some(f) = f {
+            use spg_storage::NumericKind as K;
+            if f.is_nan() {
+                return Ok(Value::numeric_special(K::NaN));
+            }
+            if precision != 0 {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::string::String::from("numeric field overflow"),
+                }));
+            }
+            return Ok(Value::numeric_special(if f > 0.0 {
+                K::PosInf
+            } else {
+                K::NegInf
+            }));
+        }
+    }
     let Some(actual) = v.data_type() else {
         return coerce_untyped_value(v, expected, col_name, position);
     };

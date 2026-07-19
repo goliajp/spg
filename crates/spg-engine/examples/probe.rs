@@ -20,19 +20,10 @@ fn render(v: &Value) -> String {
         // `Json("{\"a\": 1}")` and drowned real diffs in escaping noise.
         Value::Json(s) => s.to_string(),
         // v7.39 (round 237) — NUMERIC prints its decimal text.
-        Value::Numeric { scaled, scale, .. } => {
-            let neg = *scaled < 0;
-            let digits = scaled.unsigned_abs().to_string();
-            let sc = *scale as usize;
-            let body = if sc == 0 {
-                digits
-            } else {
-                let padded = format!("{digits:0>width$}", width = sc + 1);
-                let split = padded.len() - sc;
-                format!("{}.{}", &padded[..split], &padded[split..])
-            };
-            if neg { format!("-{body}") } else { body }
-        }
+        // v7.39 (round 254) — via the engine's own renderer: this arm used
+        // to ignore `kind`, so every NaN / ±Infinity numeric printed as its
+        // canonical 0 and the sweep read 12 phantom diffs against PG.
+        Value::Numeric { .. } => spg_engine::eval::value_to_text(v),
         // v7.39 (round 236) — arrays print PG's `{a,b}` external form.
         // Without this every array-returning probe row came back as
         // `IntArray([Some(1), Some(2)])` and buried the real diffs.
