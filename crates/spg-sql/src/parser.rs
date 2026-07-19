@@ -21529,7 +21529,31 @@ pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
             }
         }
     }
-    let mut parts: Vec<&str> = s.split_whitespace().collect();
+    // v7.39 (round 243) — PG accepts the number and unit run together
+    // (`'15h 2m 12s'`); split each token at the digit→letter boundary so
+    // the `<n> <unit>` pair loop below sees them as two.
+    let raw_parts: Vec<&str> = s.split_whitespace().collect();
+    let mut parts: Vec<&str> = Vec::with_capacity(raw_parts.len());
+    for p in raw_parts {
+        let boundary = p
+            .char_indices()
+            .find(|(i, c)| {
+                *i > 0
+                    && c.is_ascii_alphabetic()
+                    && p[..*i]
+                        .chars()
+                        .all(|d| d.is_ascii_digit() || matches!(d, '.' | '-' | '+'))
+                    && p[..*i].chars().any(|d| d.is_ascii_digit())
+            })
+            .map(|(i, _)| i);
+        match boundary {
+            Some(i) => {
+                parts.push(&p[..i]);
+                parts.push(&p[i..]);
+            }
+            None => parts.push(p),
+        }
+    }
     // A bare clock-time token `HH:MM[:SS[.ffffff]]` carries the time-of-day
     // part (PG: `3 days 14:30:45`, or `14:30:45` alone). Extract it; whatever
     // remains is the `<n> <unit>` pair form handled below.
