@@ -4221,6 +4221,23 @@ fn expr_may_use_in_set(e: &Expr) -> bool {
     }
 }
 
+
+/// v7.39 (round 275) — is this cast target one of the integer widths
+/// whose values all live in the same `InListSet::Int`?
+fn cast_target_is_integer(target: &spg_sql::ast::CastTarget) -> bool {
+    use spg_sql::ast::CastTarget;
+    match target {
+        CastTarget::BigInt | CastTarget::Int => true,
+        CastTarget::Named(n) => {
+            matches!(
+                n.to_ascii_lowercase().as_str(),
+                "int2" | "int4" | "int8" | "smallint" | "integer" | "int" | "bigint"
+            )
+        }
+        _ => false,
+    }
+}
+
 /// Analyse an `IN` list for set eligibility: every element a literal,
 /// all of one family (integer or string, NULLs tracked separately).
 pub(crate) fn build_in_list_set(list: &[Expr]) -> Option<memoize::InListSetEntry> {
@@ -4228,8 +4245,27 @@ pub(crate) fn build_in_list_set(list: &[Expr]) -> Option<memoize::InListSetEntry
     let mut ints: hashbrown::HashSet<i64> = hashbrown::HashSet::with_capacity(list.len());
     let mut texts: hashbrown::HashSet<String> = hashbrown::HashSet::with_capacity(list.len());
     for item in list {
-        let Expr::Literal(lit) = item else {
-            return None;
+        // v7.39 (round 275) — see through the integer cast round 189
+        // wraps a materialised BIGINT / SMALLINT subquery result in.
+        // Before that round every element was a bare literal; after it
+        // the elements of a pulled-up NOT EXISTS list are
+        // `Expr::Cast { Literal::Integer, ::int8 }`, and requiring a
+        // bare literal here silently dropped the whole set — the
+        // membership probe fell back to an O(N x M) linear scan and the
+        // mailrs content_worker shape went from 9 ms to 321 s.
+        //
+        // The set is keyed by VALUE, not by width: the probe side
+        // already matches SmallInt / Int / BigInt against
+        // `InListSet::Int`, so the cast carries nothing the set needs.
+        let lit = match item {
+            Expr::Literal(lit) => lit,
+            Expr::Cast { expr, target } if cast_target_is_integer(target) => {
+                match expr.as_ref() {
+                    Expr::Literal(inner) => inner,
+                    _ => return None,
+                }
+            }
+            _ => return None,
         };
         match lit {
             Literal::Null => has_null = true,
