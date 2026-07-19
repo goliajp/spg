@@ -2164,6 +2164,13 @@ fn eval_in_list_arm(
     row: &Row<'static>,
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.39 (round 238) — PG resolves the whole list's type BEFORE comparing
+    // anything, so `1 IN (1, 'a'::text)` is refused. SPG compared item by
+    // item and broke on the first match, so the offending element was never
+    // reached and the predicate quietly answered true. Checked statically,
+    // like round 237: evaluating the rest of the list to inspect it would
+    // change when side effects fire.
+    require_in_list_comparable(expr, list, ctx)?;
     let needle = eval_expr(expr, row, ctx)?;
     let needle_null = matches!(needle, Value::Null);
     let mut saw_null = needle_null && !list.is_empty();
@@ -3467,6 +3474,55 @@ fn unify_array_elements(
     materialised: &mut [Value<'static>],
 ) -> Result<(), EvalError> {
     unify_construct_values("ARRAY", items, materialised)
+}
+
+/// v7.39 (round 238) — an `IN (...)` list must be comparable with its
+/// needle. Reports the operator the way PG does
+/// ("operator does not exist: integer = text"), and — like round 237 —
+/// judges only the operands whose type is genuinely known.
+fn require_in_list_comparable(
+    needle: &Expr,
+    list: &[Expr],
+    ctx: &EvalContext<'_>,
+) -> Result<(), EvalError> {
+    let known_ty = |e: &Expr| {
+        matches!(e, Expr::Cast { .. } | Expr::Literal(_) | Expr::Column(_))
+            .then(|| crate::describe::describe_expr(e, ctx.columns).map(|s| s.ty))
+            .flatten()
+    };
+    // An untyped literal adopts the needle's type, so it never conflicts.
+    let untyped = |e: &Expr| {
+        matches!(
+            e,
+            Expr::Literal(spg_sql::ast::Literal::String(_))
+                | Expr::Literal(spg_sql::ast::Literal::Null)
+        )
+    };
+    // The needle can be untyped too (`NULL IN (1,2)`): SPG has no `Unknown`
+    // DataType, so a bare NULL describes as TEXT and would look like a text
+    // needle conflicting with integer list items.
+    if untyped(needle) {
+        return Ok(());
+    }
+    let Some(nt) = known_ty(needle) else {
+        return Ok(());
+    };
+    for item in list {
+        if untyped(item) {
+            continue;
+        }
+        let Some(it) = known_ty(item) else { continue };
+        if !crate::conversions::types_unify(nt, it) {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "operator does not exist: {} = {}",
+                    crate::conversions::pg_type_name_for_error(nt),
+                    crate::conversions::pg_type_name_for_error(it),
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// v7.39 (round 237) — STATIC branch-type resolution for the constructs
