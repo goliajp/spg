@@ -3942,6 +3942,20 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         {
             return ("42P10", msg);
         }
+        // v7.39 (round 240) — the other two ON CONFLICT refusals: touching
+        // the same row twice in one command is 21000 CARDINALITY_VIOLATION,
+        // and DO UPDATE without a conflict target is 42601.
+        if msg.contains("cannot affect row a second time") {
+            return ("21000", msg);
+        }
+        // v7.39 (round 241) — a qualifier naming no table in scope is PG's
+        // 42P01 UNDEFINED_TABLE, same class as a missing relation.
+        if msg.contains("missing FROM-clause entry for table") {
+            return ("42P01", msg);
+        }
+        if msg.contains("ON CONFLICT DO UPDATE requires inference specification") {
+            return ("42601", msg);
+        }
         if msg.contains("query must have the same number of columns") {
             return ("42601", msg);
         }

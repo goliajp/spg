@@ -500,8 +500,12 @@ impl core::fmt::Display for EvalError {
             // matched none of the wire layer's `does not exist` patterns, so a
             // missing column reached the client as the generic error class.
             Self::ColumnNotFound { name } => write!(f, "column \"{name}\" does not exist"),
+            // v7.39 (round 241) — PG's wording (and 42P01 trigger): a
+            // qualifier that names no table in scope is "missing
+            // FROM-clause entry for table \"x\"". The old "unknown table
+            // qualifier" matched nothing a driver branches on.
             Self::UnknownQualifier { qualifier } => {
-                write!(f, "unknown table qualifier: {qualifier}")
+                write!(f, "missing FROM-clause entry for table \"{qualifier}\"")
             }
             Self::DivisionByZero => f.write_str("division by zero"),
             Self::TypeMismatch { detail } => write!(f, "type mismatch: {detail}"),
