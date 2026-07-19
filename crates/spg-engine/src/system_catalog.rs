@@ -403,6 +403,19 @@ pub(crate) fn synth_information_schema_tables(
         ColumnSchema::new("table_schema", DataType::Text, false),
         ColumnSchema::new("table_name", DataType::Text, false),
         ColumnSchema::new("table_type", DataType::Text, false),
+        // v7.39 (round 266) — the SQL-standard tail of the view. PG
+        // leaves every one of these NULL for an ordinary table and
+        // answers YES/NO for the two flags, so the columns exist to be
+        // *read*: reflection tools select them by name and previously
+        // got "column does not exist" instead of PG's NULL.
+        ColumnSchema::new("self_referencing_column_name", DataType::Text, true),
+        ColumnSchema::new("reference_generation", DataType::Text, true),
+        ColumnSchema::new("user_defined_type_catalog", DataType::Text, true),
+        ColumnSchema::new("user_defined_type_schema", DataType::Text, true),
+        ColumnSchema::new("user_defined_type_name", DataType::Text, true),
+        ColumnSchema::new("is_insertable_into", DataType::Text, false),
+        ColumnSchema::new("is_typed", DataType::Text, false),
+        ColumnSchema::new("commit_action", DataType::Text, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
@@ -411,6 +424,14 @@ pub(crate) fn synth_information_schema_tables(
             Value::text("public"),
             Value::text(tname.clone()),
             Value::text("BASE TABLE"),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::text("YES"),
+            Value::text("NO"),
+            Value::Null,
         ]));
     }
     (schema, rows)
@@ -3111,6 +3132,27 @@ pub(crate) fn synth_info_constraint_column_usage(
                 }
             }
         }
+        // v7.39 (round 266) — CHECK rows, one per column the expression
+        // mentions (PG explodes a multi-column CHECK across its
+        // columns), and the NOT NULL pseudo-constraints. The column
+        // extraction is the same one that names a CHECK, so the name
+        // here and in check_constraints cannot drift apart.
+        let check_names = pg_check_connames(t, &tname, &t.schema().checks);
+        for (ci, chk) in t.schema().checks.iter().enumerate() {
+            for col in referenced_columns(t, &chk.expr) {
+                push(&tname, col, check_names[ci].clone());
+            }
+        }
+        for col in cols.iter() {
+            if col.nullable {
+                continue;
+            }
+            push(
+                &tname,
+                col.name.clone(),
+                alloc::format!("{tname}_{}_not_null", col.name),
+            );
+        }
     }
     (schema, rows)
 }
@@ -3175,6 +3217,22 @@ pub(crate) fn synth_info_check_constraints(
                 Value::text(clause.expr.clone()),
             ]));
         }
+        // v7.39 (round 266) — PG 18 models each NOT NULL column as a
+        // real CHECK constraint, so it surfaces here too with the
+        // clause it would have been written as. table_constraints
+        // already listed these rows; check_constraints did not, which
+        // left the two views disagreeing about the same constraint.
+        for col in t.schema().columns.iter() {
+            if col.nullable {
+                continue;
+            }
+            rows.push(Row::new(alloc::vec![
+                Value::text("spg"),
+                Value::text("public"),
+                Value::text(alloc::format!("{tname}_{}_not_null", col.name)),
+                Value::text(alloc::format!("{} IS NOT NULL", col.name)),
+            ]));
+        }
     }
     (schema, rows)
 }
@@ -3225,6 +3283,10 @@ pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, 
         ColumnSchema::new("ordinal_position", DataType::Int, false),
         ColumnSchema::new("referenced_table_name", DataType::Text, false),
         ColumnSchema::new("referenced_column_name", DataType::Text, false),
+        // v7.39 (round 266) — where this column sits in the parent key
+        // the FK points at. NULL on PK/UNIQUE rows, which is how a
+        // reflection tool tells an FK row apart from a key row.
+        ColumnSchema::new("position_in_unique_constraint", DataType::Int, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
@@ -3252,6 +3314,25 @@ pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, 
                     .unwrap_or_else(|| alloc::format!("col{parent}"));
                 #[allow(clippy::cast_possible_wrap)]
                 let ordinal = (i + 1) as i32;
+                // Where the referenced column sits inside the PARENT's
+                // key, which is not necessarily where it sits in this
+                // FK's own column list when the two are written in a
+                // different order.
+                let in_unique = cat
+                    .get(&fk.parent_table)
+                    .and_then(|pt| {
+                        pt.schema()
+                            .uniqueness_constraints
+                            .iter()
+                            .find(|uc| {
+                                uc.columns.len() == fk.parent_columns.len()
+                                    && fk.parent_columns.iter().all(|pc| uc.columns.contains(pc))
+                            })
+                            .and_then(|uc| uc.columns.iter().position(|&c| c == parent))
+                    })
+                    .unwrap_or(i);
+                #[allow(clippy::cast_possible_wrap)]
+                let in_unique = (in_unique + 1) as i32;
                 rows.push(Row::new(alloc::vec![
                     Value::text(conname.clone()),
                     Value::text(tname.clone()),
@@ -3259,6 +3340,7 @@ pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, 
                     Value::Int(ordinal),
                     Value::text(fk.parent_table.clone()),
                     Value::text(parent_name),
+                    Value::Int(in_unique),
                 ]));
             }
         }
@@ -3275,6 +3357,7 @@ pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, 
                     Value::Int(ordinal),
                     Value::text(String::new()),
                     Value::text(String::new()),
+                    Value::Null,
                 ]));
             }
         }
@@ -3297,6 +3380,18 @@ pub(crate) fn synth_info_referential_constraints(
         ColumnSchema::new("unique_constraint_name", DataType::Text, true),
         ColumnSchema::new("update_rule", DataType::Text, false),
         ColumnSchema::new("delete_rule", DataType::Text, false),
+        // v7.39 (round 266) — the four SQL-standard qualifiers plus
+        // match_option. The view was built from the MySQL-flavoured
+        // column set (table_name / referenced_table_name above), so the
+        // PG names a reflection tool actually selects were absent.
+        // match_option reports the FK's stored MATCH type, which is the
+        // one the enforcement path in constraints.rs honours — PG spells
+        // the default `NONE`, not `SIMPLE`.
+        ColumnSchema::new("constraint_catalog", DataType::Text, false),
+        ColumnSchema::new("constraint_schema", DataType::Text, false),
+        ColumnSchema::new("unique_constraint_catalog", DataType::Text, true),
+        ColumnSchema::new("unique_constraint_schema", DataType::Text, true),
+        ColumnSchema::new("match_option", DataType::Text, false),
     ];
     fn rule_name(a: spg_storage::FkAction) -> &'static str {
         match a {
@@ -3330,6 +3425,16 @@ pub(crate) fn synth_info_referential_constraints(
                         .map(|uc| pg_unique_conname(pt, uc, &fk.parent_table))
                 })
                 .map_or(Value::Null, Value::text);
+            // The parent-side qualifiers exist only when the parent key
+            // was actually located, so they track unique_constraint_name.
+            let has_unique = !matches!(unique_name, Value::Null);
+            let qualifier = |text: &'static str| {
+                if has_unique {
+                    Value::text(text)
+                } else {
+                    Value::Null
+                }
+            };
             rows.push(Row::new(alloc::vec![
                 Value::text(conname),
                 Value::text(tname.clone()),
@@ -3337,6 +3442,14 @@ pub(crate) fn synth_info_referential_constraints(
                 unique_name,
                 Value::text::<String>(rule_name(fk.on_update).into()),
                 Value::text::<String>(rule_name(fk.on_delete).into()),
+                Value::text("spg"),
+                Value::text("public"),
+                qualifier("spg"),
+                qualifier("public"),
+                Value::text::<&str>(match fk.match_type {
+                    spg_storage::MatchType::Simple => "NONE",
+                    spg_storage::MatchType::Full => "FULL",
+                }),
             ]));
         }
     }
