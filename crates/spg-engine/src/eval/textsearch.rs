@@ -429,7 +429,7 @@ pub fn format_tsquery(ast: &TsQueryAst) -> String {
             out.push_str("( ");
         }
         match ast {
-            TsQueryAst::Term { word, .. } => {
+            TsQueryAst::Term { word, weight_mask } => {
                 out.push('\'');
                 for c in word.chars() {
                     if c == '\'' {
@@ -438,6 +438,19 @@ pub fn format_tsquery(ast: &TsQueryAst) -> String {
                     out.push(c);
                 }
                 out.push('\'');
+                // v7.39 (round 245) — the modifiers print back: `:*` for a
+                // prefix query, then the weight letters (PG's order).
+                if *weight_mask != 0 {
+                    out.push(':');
+                    if weight_mask & 0x10 != 0 {
+                        out.push('*');
+                    }
+                    for (bit, ch) in [(3u8, 'A'), (2, 'B'), (1, 'C'), (0, 'D')] {
+                        if weight_mask & (1 << bit) != 0 {
+                            out.push(ch);
+                        }
+                    }
+                }
             }
             TsQueryAst::And(a, b) => {
                 go(a, own_prec, out);
@@ -770,10 +783,10 @@ impl<'a> TsQueryParser<'a> {
                 }
                 // Optional `:WEIGHT_MASK` (digit-mask) — v7.12.0
                 // accepts but always stores 0 (any).
-                self.skip_weight_suffix();
+                let weight_mask = self.skip_weight_suffix();
                 Ok(TsQueryAst::Term {
                     word: w,
-                    weight_mask: 0,
+                    weight_mask,
                 })
             }
             Some(b) if b.is_ascii_alphanumeric() || b == b'_' => {
@@ -791,10 +804,10 @@ impl<'a> TsQueryParser<'a> {
                         detail: "tsquery literal: non-UTF-8 lexeme".into(),
                     })?
                     .to_string();
-                self.skip_weight_suffix();
+                let weight_mask = self.skip_weight_suffix();
                 Ok(TsQueryAst::Term {
                     word: w,
-                    weight_mask: 0,
+                    weight_mask,
                 })
             }
             Some(b) => Err(EvalError::TypeMismatch {
@@ -809,22 +822,29 @@ impl<'a> TsQueryParser<'a> {
             }),
         }
     }
-    fn skip_weight_suffix(&mut self) {
+    /// v7.39 (round 245) — the `:` suffix now RETURNS its content as a
+    /// mask instead of discarding it: bit 4 for the `*` prefix flag,
+    /// A/B/C/D as PG's weight bits. Digits (the legacy digit-mask form)
+    /// are still skipped.
+    fn skip_weight_suffix(&mut self) -> u8 {
         if self.peek() != Some(b':') {
-            return;
+            return 0;
         }
         self.pos += 1;
+        let mut mask: u8 = 0;
         while let Some(b) = self.peek() {
-            if matches!(
-                b,
-                b'A' | b'B' | b'C' | b'D' | b'a' | b'b' | b'c' | b'd' | b'*'
-            ) || b.is_ascii_digit()
-            {
-                self.pos += 1;
-            } else {
-                break;
+            match b {
+                b'A' | b'a' => mask |= 1 << 3,
+                b'B' | b'b' => mask |= 1 << 2,
+                b'C' | b'c' => mask |= 1 << 1,
+                b'D' | b'd' => mask |= 1,
+                b'*' => mask |= 0x10,
+                _ if b.is_ascii_digit() => {}
+                _ => break,
             }
+            self.pos += 1;
         }
+        mask
     }
 }
 

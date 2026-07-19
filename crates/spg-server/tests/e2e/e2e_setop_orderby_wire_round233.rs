@@ -272,3 +272,40 @@ fn grouping_error_carries_42803() {
         "{msg}"
     );
 }
+
+/// v7.39 (round 245) — round 244's sequence-range errors over the wire.
+#[test]
+fn sequence_range_errors_carry_pgs_classes() {
+    let (raw, mut s) = {
+        let (raw, addrs) = common::ServerBuilder::new()
+            .arg_path(&unique_db())
+            .with_pgwire()
+            .spawn();
+        let s = pg_connect(addrs.pgwire.as_ref().unwrap());
+        (raw, s)
+    };
+    let _guard = common::ChildGuard(raw);
+    assert_eq!(exec_error(&mut s, "CREATE SEQUENCE wsq MAXVALUE 6"), None);
+    for (sql, code, want) in [
+        (
+            "SELECT setval('wsq', 99)",
+            "22003",
+            "is out of bounds for sequence",
+        ),
+        (
+            "CREATE SEQUENCE wbad MINVALUE 5 START 3",
+            "22023",
+            "START value (3) cannot be less than MINVALUE (5)",
+        ),
+        (
+            "SELECT nextval('wnope')",
+            "42P01",
+            "relation \"wnope\" does not exist",
+        ),
+    ] {
+        let (got_code, msg) =
+            exec_error(&mut s, sql).unwrap_or_else(|| panic!("no error for {sql}"));
+        assert_eq!(got_code, code, "{sql} → {msg}");
+        assert!(msg.contains(want), "{sql} → {msg}");
+    }
+}

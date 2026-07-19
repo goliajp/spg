@@ -691,6 +691,19 @@ pub(crate) fn apply_binary(
         BinOp::Mul => arith(l, r, i64::checked_mul, |a, b| a * b, "*"),
         BinOp::Div => div_op(l, r),
         BinOp::Mod => mod_op(l, r),
+        // v7.39 (round 245) — `tsquery <-> tsquery` is PG's phrase
+        // concatenation (tsquery_phrase, distance 1), a different operator
+        // from the vector distance that shares the spelling.
+        BinOp::L2Distance if matches!(l, Value::TsQuery(_)) && matches!(r, Value::TsQuery(_)) => {
+            let (Value::TsQuery(a), Value::TsQuery(b)) = (&l, &r) else {
+                unreachable!()
+            };
+            Ok(Value::TsQuery(spg_storage::TsQueryAst::Phrase {
+                left: alloc::boxed::Box::new(a.clone()),
+                right: alloc::boxed::Box::new(b.clone()),
+                distance: 1,
+            }))
+        }
         BinOp::L2Distance => l2_distance(l, r),
         BinOp::InnerProduct => inner_product(l, r),
         BinOp::CosineDistance => cosine_distance(l, r),

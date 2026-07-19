@@ -204,7 +204,55 @@ pub fn websearch_to_tsquery(config: TsConfig, text: &str) -> TsQueryAst {
 pub fn to_tsquery(config: TsConfig, text: &str) -> Result<TsQueryAst, EvalError> {
     let mut ast = crate::eval::decode_tsquery_external(text)?;
     stem_tsquery_in_place(&mut ast, config);
+    // v7.39 (round 245) — the english config drops stopwords from a QUERY
+    // too, collapsing the tree around them: PG's
+    // `to_tsquery('english','!(a & b)')` is `!'b'` because `a` is a
+    // stopword. SPG kept the stopword term, so the query demanded a
+    // lexeme no vector ever contains. A tree that is ALL stopwords is
+    // left as parsed (PG returns an empty tsquery there — an empty-tree
+    // representation SPG doesn't have; recorded residual).
+    if matches!(config, TsConfig::English)
+        && let Some(pruned) = prune_stopword_terms(&ast)
+    {
+        ast = pruned;
+    }
     Ok(ast)
+}
+
+fn prune_stopword_terms(ast: &TsQueryAst) -> Option<TsQueryAst> {
+    match ast {
+        TsQueryAst::Term { word, .. } => {
+            if is_english_stopword(word) {
+                None
+            } else {
+                Some(ast.clone())
+            }
+        }
+        TsQueryAst::And(a, b) => match (prune_stopword_terms(a), prune_stopword_terms(b)) {
+            (Some(x), Some(y)) => Some(TsQueryAst::And(alloc::boxed::Box::new(x), alloc::boxed::Box::new(y))),
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        },
+        TsQueryAst::Or(a, b) => match (prune_stopword_terms(a), prune_stopword_terms(b)) {
+            (Some(x), Some(y)) => Some(TsQueryAst::Or(alloc::boxed::Box::new(x), alloc::boxed::Box::new(y))),
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        },
+        TsQueryAst::Not(x) => prune_stopword_terms(x).map(|p| TsQueryAst::Not(alloc::boxed::Box::new(p))),
+        TsQueryAst::Phrase {
+            left,
+            right,
+            distance,
+        } => match (prune_stopword_terms(left), prune_stopword_terms(right)) {
+            (Some(x), Some(y)) => Some(TsQueryAst::Phrase {
+                left: alloc::boxed::Box::new(x),
+                right: alloc::boxed::Box::new(y),
+                distance: *distance,
+            }),
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        },
+    }
 }
 
 fn stem_tsquery_in_place(ast: &mut TsQueryAst, config: TsConfig) {
@@ -365,7 +413,7 @@ fn fold_phrase_positioned(lexs: &[(String, u16)]) -> TsQueryAst {
 #[must_use]
 pub fn ts_query_matches(vec: &[TsLexeme], query: &TsQueryAst) -> bool {
     match query {
-        TsQueryAst::Term { word, .. } => contains_lexeme(vec, word),
+        TsQueryAst::Term { word, weight_mask } => term_matches(vec, word, *weight_mask),
         TsQueryAst::And(a, b) => ts_query_matches(vec, a) && ts_query_matches(vec, b),
         TsQueryAst::Or(a, b) => ts_query_matches(vec, a) || ts_query_matches(vec, b),
         TsQueryAst::Not(x) => !ts_query_matches(vec, x),
@@ -379,6 +427,22 @@ pub fn ts_query_matches(vec: &[TsLexeme], query: &TsQueryAst) -> bool {
 
 fn contains_lexeme(vec: &[TsLexeme], word: &str) -> bool {
     vec.binary_search_by(|l| l.word.as_str().cmp(word)).is_ok()
+}
+
+/// v7.39 (round 245) — Term matching with the two mask-carried modifiers:
+/// bit 4 is the PREFIX flag (`fox:*` — any lexeme starting with the word
+/// matches) and the low four bits the accepted-weight set (`0` = any).
+fn term_matches(vec: &[TsLexeme], word: &str, mask: u8) -> bool {
+    let prefix = mask & 0x10 != 0;
+    let weights = mask & 0x0f;
+    let weight_ok = |l: &TsLexeme| weights == 0 || weights & (1 << l.weight) != 0;
+    if prefix {
+        return vec.iter().any(|l| l.word.starts_with(word) && weight_ok(l));
+    }
+    match vec.binary_search_by(|l| l.word.as_str().cmp(word)) {
+        Ok(idx) => weight_ok(&vec[idx]),
+        Err(_) => false,
+    }
 }
 
 /// Phrase positions of a sub-AST. For atomic terms returns the
@@ -940,7 +1004,43 @@ pub fn is_english_stopword(word: &str) -> bool {
 /// v7.12.1 — Porter v1 stem. Lowercased ASCII input gives a
 /// stemmed form; non-ASCII characters bypass the algorithm
 /// (returned verbatim).
+/// v7.39 (round 245) — Snowball's exceptional forms: a handful of words
+/// whose stem the algorithm gets wrong are mapped directly (skies→sky and
+/// friends), and a few short words are left untouched. PG's english
+/// config is the Snowball stemmer, so these are observable in every
+/// to_tsvector/to_tsquery differential.
+fn stem_exception(word: &str) -> Option<&'static str> {
+    Some(match word {
+        "skis" => "ski",
+        "skies" => "sky",
+        "dying" => "die",
+        "lying" => "lie",
+        "tying" => "tie",
+        "idly" => "idl",
+        "gently" => "gentl",
+        "ugly" => "ugli",
+        "early" => "earli",
+        "only" => "onli",
+        "singly" => "singl",
+        "sky" | "news" | "howe" | "atlas" | "cosmos" | "bias" | "andes" => {
+            return Some(match word {
+                "sky" => "sky",
+                "news" => "news",
+                "howe" => "howe",
+                "atlas" => "atlas",
+                "cosmos" => "cosmos",
+                "bias" => "bias",
+                _ => "andes",
+            });
+        }
+        _ => return None,
+    })
+}
+
 pub fn porter_stem(word: &str) -> String {
+    if let Some(fixed) = stem_exception(word) {
+        return String::from(fixed);
+    }
     if !word.is_ascii() {
         return word.to_string();
     }
@@ -1007,7 +1107,15 @@ fn step1a(b: &mut Vec<u8>) {
     if ends_with(b, b"sses") {
         replace_suffix(b, 4, b"ss");
     } else if ends_with(b, b"ies") {
-        replace_suffix(b, 3, b"i");
+        // v7.39 (round 245) — Snowball's refinement of Porter's rule:
+        // `ies` becomes `ie` when only one letter precedes it (dies→die,
+        // ties→tie) and `i` otherwise (cries→cri, flies→fli). The
+        // unconditional `i` gave PG-divergent stems for the short words.
+        if b.len() - 3 <= 1 {
+            replace_suffix(b, 3, b"ie");
+        } else {
+            replace_suffix(b, 3, b"i");
+        }
     } else if ends_with(b, b"ss") {
         // No change.
     } else if ends_with(b, b"s") {
@@ -1169,7 +1277,8 @@ mod tests {
     fn porter_simple_cases() {
         assert_eq!(porter_stem("caresses"), "caress");
         assert_eq!(porter_stem("ponies"), "poni");
-        assert_eq!(porter_stem("ties"), "ti");
+        // v7.39 (round 245) — Snowball's short-word rule (and PG): tie.
+        assert_eq!(porter_stem("ties"), "tie");
         assert_eq!(porter_stem("cats"), "cat");
         assert_eq!(porter_stem("running"), "run");
         assert_eq!(porter_stem("happy"), "happi");
