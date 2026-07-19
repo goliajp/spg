@@ -75,8 +75,15 @@ impl Engine {
             let empty_schema: Vec<ColumnSchema> = Vec::new();
             let ctx = EvalContext::new(&empty_schema, None);
             let dummy_row = Row::new(Vec::new());
+            // v7.39 (round 236) — a multidimensional array unnests into its
+            // elements in row-major order (PG); flatten before the per-variant
+            // match, which only knows the 1-D forms.
+            let unnest_src = {
+                let v = eval::eval_expr(expr, &dummy_row, &ctx).map_err(EngineError::Eval)?;
+                crate::eval::values::flatten_2d(&v).unwrap_or(v)
+            };
             let (elem_dtype, rows) =
-                match eval::eval_expr(expr, &dummy_row, &ctx).map_err(EngineError::Eval)? {
+                match unnest_src {
                     Value::Null => (DataType::Text, Vec::new()),
                     Value::TextArray(items) => (
                         DataType::Text,

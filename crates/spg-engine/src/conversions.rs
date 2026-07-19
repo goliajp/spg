@@ -4835,3 +4835,70 @@ pub(crate) fn big_literal_to_value(s: &str) -> Value<'static> {
         None => Value::NumericBig(alloc::boxed::Box::new(b)),
     }
 }
+
+/// v7.39 (round 233 / round 236) — do two types share a PG type category,
+/// so a set operation, an ARRAY constructor, a VALUES list, CASE, COALESCE
+/// or GREATEST/LEAST can resolve them to one result type? Same type
+/// always does; otherwise PG unifies within the numeric, string and
+/// date/time families and refuses across them (probed against 18.4:
+/// int ∪ bigint → bigint, text ∪ varchar → text, date ∪ timestamp →
+/// timestamp, but int ∪ boolean, int ∪ text and text ∪ date are all
+/// refused).
+pub(crate) fn types_unify(a: DataType, b: DataType) -> bool {
+    fn category(t: DataType) -> Option<u8> {
+        Some(match t {
+            DataType::SmallInt
+            | DataType::Int
+            | DataType::BigInt
+            | DataType::Numeric { .. }
+            | DataType::Real
+            | DataType::Float => 1,
+            DataType::Text | DataType::Varchar(_) | DataType::Char(_) => 2,
+            DataType::Date | DataType::Timestamp | DataType::Timestamptz => 3,
+            _ => return None,
+        })
+    }
+    if a == b {
+        return true;
+    }
+    match (category(a), category(b)) {
+        (Some(x), Some(y)) => x == y,
+        // Outside the families a set operation needs the exact same type;
+        // `a == b` above already covered that.
+        _ => false,
+    }
+}
+
+/// v7.39 (round 236) — the type name PG puts in a "types X and Y cannot be
+/// matched" message. `pg_data_type_text` answers for
+/// `information_schema.columns.data_type`, where every array is the
+/// pseudo-name `ARRAY`; an error message names the real thing
+/// (`integer[]`).
+pub(crate) fn pg_type_name_for_error(t: DataType) -> alloc::string::String {
+    use spg_storage::DataType as D;
+    let elem = match t {
+        D::TextArray => Some(D::Text),
+        D::IntArray => Some(D::Int),
+        D::BigIntArray => Some(D::BigInt),
+        D::SmallIntArray => Some(D::SmallInt),
+        D::FloatArray => Some(D::Float),
+        D::NumericArray => Some(D::Numeric {
+            precision: 0,
+            scale: 0,
+        }),
+        D::BoolArray => Some(D::Bool),
+        D::DateArray => Some(D::Date),
+        D::TimestampArray => Some(D::Timestamp),
+        D::TimestamptzArray => Some(D::Timestamptz),
+        D::IntervalArray => Some(D::Interval),
+        D::UuidArray => Some(D::Uuid),
+        D::JsonArray | D::JsonbArray => Some(D::Jsonb),
+        D::BytesArray => Some(D::Bytes),
+        D::MoneyArray => Some(D::Money),
+        _ => None,
+    };
+    match elem {
+        Some(e) => alloc::format!("{}[]", crate::system_catalog::pg_data_type_text(e)),
+        None => crate::system_catalog::pg_data_type_text(t),
+    }
+}

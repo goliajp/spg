@@ -1383,6 +1383,23 @@ fn eval_array_arm(
     if let Some(v) = values::homogeneous_typed_array(&materialised) {
         return Ok(v);
     }
+    // v7.39 (round 236) — PG resolves an ARRAY constructor's elements to ONE
+    // element type and refuses the constructor when they have no common one:
+    // `ARRAY[1, 'a'::text]` is "ARRAY types integer and text cannot be
+    // matched". SPG degraded to `text[]` instead, so `ARRAY[1, true]` came
+    // back as `{1,t}` — a column of rendered strings that then behaved like
+    // text everywhere downstream. Same rule (and the same untyped-literal
+    // subtlety) as the set-operation resolution in round 233: a bare string
+    // literal is PG's `unknown` and takes the other elements' type, so it is
+    // identified from the SYNTAX, not from the value's runtime type.
+    unify_array_elements(items, &mut materialised)?;
+    // Coercing the untyped elements can make the array homogeneous
+    // (`ARRAY[true,'t']` becomes two booleans), so re-try the typed-array
+    // path before falling into the numeric/text ladder below — otherwise
+    // the now-uniform boolean array would still degrade to text[].
+    if let Some(v) = values::homogeneous_typed_array(&materialised) {
+        return Ok(v);
+    }
     let mut has_text = false;
     let mut has_float = false;
     let mut has_numeric = false;
@@ -3402,6 +3419,70 @@ impl crate::Engine {
         })?;
         Ok(sink.into_inner())
     }
+}
+
+/// v7.39 (round 236) — resolve an ARRAY constructor's element types the way
+/// PG does. Typed elements must share a type category; a bare string or NULL
+/// literal is untyped and converts to whatever the typed elements resolved
+/// to, reporting the value (not a type mismatch) when it will not convert.
+fn unify_array_elements(
+    items: &[Expr],
+    materialised: &mut [Value<'static>],
+) -> Result<(), EvalError> {
+    use spg_storage::DataType;
+    let untyped = |e: &Expr| {
+        matches!(
+            e,
+            Expr::Literal(spg_sql::ast::Literal::String(_))
+                | Expr::Literal(spg_sql::ast::Literal::Null)
+        )
+    };
+    // The type the typed elements agree on, if any.
+    let mut resolved: Option<DataType> = None;
+    for (i, v) in materialised.iter().enumerate() {
+        if items.get(i).is_some_and(untyped) {
+            continue;
+        }
+        let Some(ty) = v.data_type() else { continue };
+        match resolved {
+            None => resolved = Some(ty),
+            Some(prev) if crate::conversions::types_unify(prev, ty) => {
+                // Keep the wider of the two so the coercion below targets it.
+                if matches!(prev, DataType::Int | DataType::SmallInt) {
+                    resolved = Some(ty);
+                }
+            }
+            Some(prev) => {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "ARRAY types {} and {} cannot be matched",
+                        crate::conversions::pg_type_name_for_error(prev),
+                        crate::conversions::pg_type_name_for_error(ty),
+                    ),
+                });
+            }
+        }
+    }
+    // Untyped literals adopt that type; a failure names the value, as PG does.
+    let Some(target) = resolved else {
+        return Ok(());
+    };
+    if matches!(target, DataType::Text) {
+        return Ok(());
+    }
+    for (i, v) in materialised.iter_mut().enumerate() {
+        if !items.get(i).is_some_and(untyped) || matches!(v, Value::Null) {
+            continue;
+        }
+        *v = crate::conversions::coerce_value(v.clone(), target, "", i)
+            .map_err(|e| match e {
+                crate::EngineError::Eval(ev) => ev,
+                other => EvalError::TypeMismatch {
+                    detail: alloc::format!("{other}"),
+                },
+            })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

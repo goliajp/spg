@@ -2005,12 +2005,12 @@ impl Engine {
                 match (hu, pu) {
                     // Both sides carry a real type: they must share a category.
                     (false, false) => {
-                        if !types_unify(ht, pt) {
+                        if !crate::conversions::types_unify(ht, pt) {
                             return Err(EngineError::Unsupported(alloc::format!(
                                 "{} types {} and {} cannot be matched",
                                 set_op_name(*kind),
-                                crate::system_catalog::pg_data_type_text(ht),
-                                crate::system_catalog::pg_data_type_text(pt),
+                                crate::conversions::pg_type_name_for_error(ht),
+                                crate::conversions::pg_type_name_for_error(pt),
                             )));
                         }
                     }
@@ -2184,8 +2184,14 @@ impl Engine {
             if let Some(m) = multi {
                 m
             } else {
+                // v7.39 (round 236) — flatten a multidimensional array into
+                // its row-major elements (PG) before the 1-D-only match.
+                let unnest_src = {
+                    let v = eval::eval_expr(expr, &dummy_row, &ctx).map_err(EngineError::Eval)?;
+                    crate::eval::values::flatten_2d(&v).unwrap_or(v)
+                };
                 let (elem_dtype, rows): (DataType, alloc::vec::Vec<Row<'static>>) =
-                    match eval::eval_expr(expr, &dummy_row, &ctx).map_err(EngineError::Eval)? {
+                    match unnest_src {
                         Value::Null => (DataType::Text, alloc::vec::Vec::new()),
                         Value::TextArray(items) => {
                             let rows = items
@@ -7401,6 +7407,13 @@ fn top_level_srf_output(
 /// = (no rows)`). Non-array values fall through to a type-mismatch
 /// error.
 pub(crate) fn array_value_to_elements(v: &Value) -> Result<Vec<Value<'static>>, EngineError> {
+    // v7.39 (round 236) — PG unnests a multidimensional array into its
+    // elements in row-major order (`unnest(ARRAY[[1,2],[3,4]])` is four
+    // rows). SPG stores 2-D arrays as their own variants, which fell
+    // through to the type-mismatch arm below.
+    if let Some(flat) = crate::eval::values::flatten_2d(v) {
+        return array_value_to_elements(&flat);
+    }
     match v {
         Value::Null => Ok(Vec::new()),
         Value::TextArray(items) => Ok(items
@@ -8812,37 +8825,6 @@ fn branch_unknown_mask(stmt: &SelectStatement) -> Vec<bool> {
         .collect()
 }
 
-/// v7.39 (round 233) — do two branch column types share a PG type category,
-/// so the set operation can resolve them to one result type? Same type
-/// always does; otherwise PG unifies within the numeric, string and
-/// date/time families and refuses across them (probed against 18.4:
-/// int ∪ bigint → bigint, text ∪ varchar → text, date ∪ timestamp →
-/// timestamp, but int ∪ boolean, int ∪ text and text ∪ date are all
-/// refused).
-fn types_unify(a: DataType, b: DataType) -> bool {
-    fn category(t: DataType) -> Option<u8> {
-        Some(match t {
-            DataType::SmallInt
-            | DataType::Int
-            | DataType::BigInt
-            | DataType::Numeric { .. }
-            | DataType::Real
-            | DataType::Float => 1,
-            DataType::Text | DataType::Varchar(_) | DataType::Char(_) => 2,
-            DataType::Date | DataType::Timestamp | DataType::Timestamptz => 3,
-            _ => return None,
-        })
-    }
-    if a == b {
-        return true;
-    }
-    match (category(a), category(b)) {
-        (Some(x), Some(y)) => x == y,
-        // Outside the families a set operation needs the exact same type;
-        // `a == b` above already covered that.
-        _ => false,
-    }
-}
 
 /// v7.39 (round 233) — retype one branch column's cells, reporting the
 /// conversion failure the way PG does rather than leaving the column

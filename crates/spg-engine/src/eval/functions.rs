@@ -12968,7 +12968,11 @@ fn apply_function_dispatch(
             // variant too, so a NumericArray (or any newer element type) fell
             // into "first arg must be array" — the same arm-gap round 71 found
             // in array_remove, in the function next door.
-            let Some(len) = array_len(&args[0]) else {
+            // v7.39 (round 236) — a multidimensional array contributes its
+            // elements in row-major order (PG), so flatten before measuring.
+            let flat = super::values::flatten_2d(&args[0]);
+            let arr0 = flat.as_ref().unwrap_or(&args[0]);
+            let Some(len) = array_len(arr0) else {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "array_to_string(): first arg must be array, got {:?}",
@@ -12979,7 +12983,7 @@ fn apply_function_dispatch(
             let mut pieces: alloc::vec::Vec<alloc::string::String> =
                 alloc::vec::Vec::with_capacity(len);
             for i in 0..len {
-                match array_element_at(&args[0], i).unwrap_or(Value::Null) {
+                match array_element_at(arr0, i).unwrap_or(Value::Null) {
                     // PG drops NULL elements unless a null_string is given.
                     Value::Null => {
                         if let Some(ns) = &null_replacement {
