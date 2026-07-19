@@ -33,7 +33,9 @@ fn widened_columns_present() {
          FROM information_schema.columns WHERE table_name = 'wc' ORDER BY ordinal_position",
     );
     assert_eq!(got.len(), 3);
-    // id: serial → nextval default + identity YES + int8 udt.
+    // id: serial → nextval default + int8 udt. v7.39 (round 248) — a
+    // SERIAL is NOT identity in PG (is_identity keys off GENERATED … AS
+    // IDENTITY); the old YES here locked the divergence.
     assert_eq!(text(&got[0][0]), "id");
     assert!(
         text(&got[0][1]).contains("nextval"),
@@ -41,7 +43,7 @@ fn widened_columns_present() {
         got[0][1]
     );
     assert_eq!(text(&got[0][3]), "int8");
-    assert_eq!(text(&got[0][4]), "YES");
+    assert_eq!(text(&got[0][4]), "NO");
     // n: literal default 7, precision 32, int4.
     assert_eq!(text(&got[1][0]), "n");
     assert_eq!(text(&got[1][1]), "7");
