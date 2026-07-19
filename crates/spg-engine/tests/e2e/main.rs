@@ -185,6 +185,7 @@ mod e2e_domain_round259;
 mod e2e_alter_domain_round260;
 mod e2e_bytea_round261;
 mod e2e_inet_cidr_round262;
+mod e2e_composite_round263;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;

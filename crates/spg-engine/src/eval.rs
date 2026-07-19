@@ -662,6 +662,15 @@ pub(crate) fn regclass_name_to_oid(cat: &spg_storage::Catalog, bare: &str) -> Op
     })
 }
 
+/// v7.39 (round 263) — crate-visible wrapper so the write path can
+/// relabel + coerce a value into a composite column's declared type.
+pub(crate) fn apply_composite_cast_pub(
+    v: Value<'static>,
+    comp: &spg_storage::CompositeDef,
+) -> Result<Value<'static>, EvalError> {
+    apply_composite_cast(v, comp)
+}
+
 fn apply_composite_cast(
     v: Value<'static>,
     comp: &spg_storage::CompositeDef,
@@ -670,21 +679,29 @@ fn apply_composite_cast(
         Value::Null => Ok(Value::Null),
         Value::Composite(fields) => {
             if fields.len() != comp.fields.len() {
+                // PG reports the SHAPE mismatch as a plain cast refusal.
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "cannot cast a {}-field row to composite type \"{}\"",
-                        fields.len(),
-                        comp.name
-                    ),
+                    detail: alloc::format!("cannot cast type record to {}", comp.name),
                 });
             }
-            Ok(Value::Composite(
-                comp.fields
-                    .iter()
-                    .zip(fields)
-                    .map(|((name, _), (_, val))| (name.clone(), val))
-                    .collect(),
-            ))
+            // v7.39 (round 263) — relabel AND coerce: this branch only
+            // renamed the fields, so `ROW('x','notanint')::addr` kept the
+            // text in an int field and PG's input error never fired.
+            let mut out: alloc::vec::Vec<(alloc::string::String, Value<'static>)> =
+                alloc::vec::Vec::with_capacity(comp.fields.len());
+            for ((name, fty), (_, val)) in comp.fields.iter().zip(fields) {
+                let coerced = if matches!(val, Value::Null) {
+                    val
+                } else {
+                    crate::conversions::coerce_value(val, *fty, name, 0).map_err(|e| {
+                        EvalError::TypeMismatch {
+                            detail: alloc::format!("{e}"),
+                        }
+                    })?
+                };
+                out.push((name.clone(), coerced));
+            }
+            Ok(Value::Composite(out))
         }
         Value::Text(s) => {
             let raw = parse_record_text(s.as_ref()).ok_or_else(|| EvalError::TypeMismatch {
@@ -1623,7 +1640,11 @@ fn eval_function_call_arm(
             expr_enum_type_name(e, ctx.columns)
                 .filter(|n| {
                     ctx.catalog.is_some_and(|cat| {
-                        cat.enum_types().contains_key(*n) || cat.domain_types().contains_key(*n)
+                        cat.enum_types().contains_key(*n)
+                            || cat.domain_types().contains_key(*n)
+                            // v7.39 (round 263) — composites too: a cast to
+                            // one reported the generic `record`.
+                            || cat.composite_types().contains_key(*n)
                     })
                 })
                 .map(alloc::string::String::from)

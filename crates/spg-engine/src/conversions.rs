@@ -3201,6 +3201,47 @@ pub(crate) fn jsonb_scalar_for_cast(s: &str, target: &str) -> Result<JsonbScalar
         Err(_) => Err(jsonb_cast_type_error("value", target)),
     }
 }
+/// v7.39 (round 263) — normalise a value being written into a COMPOSITE
+/// column before the generic coercion runs.
+///
+/// A composite column stores JSON keyed by FIELD NAME, and the field
+/// names are PG-observable (`row_to_json(col)` keys by them, probed).
+/// Two inputs reached the column without ever being labelled by the
+/// target type:
+///   * `ROW('elm', 999)` carries the constructor's placeholder names
+///     `f1`/`f2`, so the stored object had the wrong keys and the read
+///     side — which looks fields up BY NAME — rebuilt an all-NULL
+///     record: silent data loss, `(elm,999)` came back as `(,)`.
+///   * a record TEXT literal (`'("oak ave",111)'`) was stored verbatim,
+///     which is not JSON at all, so the read side's parse failed and
+///     field access errored.
+/// Relabelling through the declared type also COERCES each field to its
+/// declared type, which is what refuses `ROW('x','notanint')::addr`.
+/// Returns the value untouched for a non-composite column.
+pub(crate) fn normalize_composite_for_column(
+    v: Value<'static>,
+    col: &ColumnSchema,
+    catalog: Option<&spg_storage::Catalog>,
+) -> Result<Value<'static>, EngineError> {
+    let Some(tname) = col.user_composite_type.as_deref() else {
+        return Ok(v);
+    };
+    if matches!(v, Value::Null) {
+        return Ok(v);
+    }
+    // No catalog in scope degrades to the previous behaviour rather than
+    // erroring, matching how the read-side rehydration handles it.
+    let Some(def) = catalog.and_then(|c| c.composite_types().get(tname)) else {
+        return Ok(v);
+    };
+    // An already-labelled Composite still goes through so its fields get
+    // coerced; a Json value is already in storage form.
+    if matches!(v, Value::Json(_)) {
+        return Ok(v);
+    }
+    crate::eval::apply_composite_cast_pub(v, def).map_err(EngineError::Eval)
+}
+
 
 /// Coerce a `jsonb` value to a scalar numeric/bool `expected`. Returns `None`
 /// when `expected` is not one of those targets (so the caller falls through to
