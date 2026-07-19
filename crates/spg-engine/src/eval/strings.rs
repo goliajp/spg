@@ -1002,6 +1002,21 @@ fn to_char_v_scale(n: f64, before: &str, after: &str, fill_mode: bool) -> String
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     let scaled = libm::round(n.abs() * libm::pow(10.0, vdigits as f64)) as i128;
     let neg = n < 0.0 && scaled != 0;
+    // v7.39 (round 243) — a value wider than the slots OVERFLOWS: every
+    // digit slot renders `#` and the pattern's literal characters (spaces
+    // in `V99 999`) stay put, exactly as the plain path already did. SPG
+    // used to print the scaled number full-width.
+    let digits = alloc::format!("{scaled}").len();
+    if digits > total_slots {
+        let mut out = String::new();
+        if !fill_mode {
+            out.push(' ');
+        }
+        for c in before.chars().chain(after.chars()) {
+            out.push(if matches!(c, '9' | '0') { '#' } else { c });
+        }
+        return out;
+    }
     let core = if neg {
         alloc::format!("-{scaled}")
     } else {
@@ -1156,6 +1171,52 @@ fn check_eeee_format(fmt: &str) -> Result<(), EvalError> {
 fn to_char_numeric(n: f64, exact: Option<(i128, u8)>, fmt: &str) -> String {
     let fill_mode = fmt.len() >= 2 && fmt[..2].eq_ignore_ascii_case("FM");
     let pat = if fill_mode { &fmt[2..] } else { fmt };
+    // v7.39 (round 243) — characters with no meaning in a number picture
+    // print AS THEMSELVES in PG (`XYZ999` → `XYZ 123`); SPG dropped them.
+    // Peel a leading / trailing run of letters outside the template
+    // alphabet and re-attach it around the rendered body. (Literals in the
+    // MIDDLE of the picture remain a recorded residual.)
+    let template_letter = |c: char| {
+        matches!(
+            c.to_ascii_uppercase(),
+            'S' | 'L' | 'D' | 'G' | 'V' | 'E' | 'R' | 'N' | 'T' | 'H' | 'P' | 'M' | 'I' | 'F'
+        )
+    };
+    let lit_prefix_len = pat
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic() && !template_letter(*c))
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let lit_suffix_len = pat
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphabetic() && !template_letter(*c))
+        .map(char::len_utf8)
+        .sum::<usize>();
+    if lit_prefix_len > 0 || lit_suffix_len > 0 {
+        let prefix = &pat[..lit_prefix_len];
+        let suffix = &pat[pat.len() - lit_suffix_len..];
+        let inner = &pat[lit_prefix_len..pat.len() - lit_suffix_len];
+        let inner_fmt = if fill_mode {
+            alloc::format!("FM{inner}")
+        } else {
+            String::from(inner)
+        };
+        return alloc::format!("{prefix}{}{suffix}", to_char_numeric(n, exact, &inner_fmt));
+    }
+    // v7.39 (round 243) — a LEADING `PL` is its own column: `+` for a
+    // non-negative value, a space otherwise, ahead of the normally
+    // rendered body (PG: `PL9999.9` → `+ 1234.5` / ` -1234.5`).
+    if pat.len() >= 2 && pat[..2].eq_ignore_ascii_case("PL") && !pat[2..].is_empty() {
+        let rest = &pat[2..];
+        let rest_fmt = if fill_mode {
+            alloc::format!("FM{rest}")
+        } else {
+            String::from(rest)
+        };
+        let col = if n < 0.0 { " " } else { "+" };
+        return alloc::format!("{col}{}", to_char_numeric(n, exact, &rest_fmt));
+    }
     // `RN` / `rn`: Roman numerals (handled before the digit-slot machinery).
     if pat.eq_ignore_ascii_case("RN") {
         return to_char_roman(n, fill_mode);

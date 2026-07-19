@@ -257,3 +257,18 @@ fn row_count_clause_errors_carry_pgs_sqlstates() {
         assert!(msg.contains(want), "{sql} → {msg}");
     }
 }
+
+/// v7.39 (round 243) — round 242's grouping error over the wire (42803
+/// GROUPING_ERROR, parser-raised so classified ahead of the Parse→42601
+/// short-circuit).
+#[test]
+fn grouping_error_carries_42803() {
+    let (raw, mut s) = seeded();
+    let _guard = common::ChildGuard(raw);
+    let (code, msg) = exec_error(&mut s, "SELECT grouping(a) FROM t").unwrap();
+    assert_eq!(code, "42803", "{msg}");
+    assert!(
+        msg.contains("arguments to GROUPING must be grouping expressions"),
+        "{msg}"
+    );
+}
