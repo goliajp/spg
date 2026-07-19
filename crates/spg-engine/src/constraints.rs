@@ -209,54 +209,77 @@ fn pick_pk_index_column(
 /// matched constraint declares NULLS NOT DISTINCT (v7.29 — a NULL
 /// in the key only rules out a conflict under the default
 /// NULLS DISTINCT semantics).
-pub(crate) fn resolve_on_conflict_columns(
+/// v7.39 (round 240) — the arbiter column sets an ON CONFLICT clause
+/// watches. PG's rules, probed against 18.4:
+///
+///   * a BARE `ON CONFLICT` (no target) arbitrates on EVERY unique
+///     constraint and unique index — SPG used to pick the FIRST one, so a
+///     row conflicting on any other raised a duplicate-key error straight
+///     through the DO NOTHING;
+///   * an EXPLICIT `(cols)` target must match a unique constraint or a
+///     unique index; a column set nothing enforces is 42P10 "there is no
+///     unique or exclusion constraint matching the ON CONFLICT
+///     specification" — SPG accepted any column list and quietly
+///     arbitrated on values nothing guarantees unique;
+///   * a table with no unique anything still accepts the bare form (no
+///     arbiter simply means no conflict is possible).
+///
+/// Each entry is (column positions, nulls_not_distinct).
+pub(crate) fn on_conflict_arbiters(
     catalog: &Catalog,
     table_name: &str,
     target: &[String],
-) -> Result<(Vec<usize>, bool), EngineError> {
+    from_constraint_name: bool,
+) -> Result<Vec<(Vec<usize>, bool)>, EngineError> {
     let table = catalog.get(table_name).ok_or_else(|| {
         EngineError::Storage(StorageError::TableNotFound {
             name: table_name.into(),
         })
     })?;
+    let schema = table.schema();
+    let unique_btree_cols: Vec<usize> = table
+        .indices()
+        .iter()
+        .filter(|idx| {
+            idx.is_unique
+                && matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                && idx.partial_predicate.is_none()
+                && idx.expression.is_none()
+        })
+        .map(|idx| idx.column_position)
+        .collect();
     if target.is_empty() {
-        // v7.13.2 — mailrs round-6 S5 follow-up. Composite UNIQUE
-        // constraints carry a multi-column tuple; the prior code
-        // path picked only the leading column of the first BTree
-        // index, which caused `ON CONFLICT DO NOTHING` to dedup
-        // by leading column alone (3 rows with same group_id but
-        // different permission collapsed to 1). PG semantics use
-        // the full tuple. Prefer a UniquenessConstraint's full
-        // column list when one exists; fall back to the leading
-        // BTree column for legacy single-column UNIQUE.
-        if let Some(uc) = table.schema().uniqueness_constraints.first() {
-            return Ok((uc.columns.clone(), uc.nulls_not_distinct));
-        }
-        let pos = table
-            .indices()
+        let mut out: Vec<(Vec<usize>, bool)> = schema
+            .uniqueness_constraints
             .iter()
-            .find_map(|idx| {
+            .map(|uc| (uc.columns.clone(), uc.nulls_not_distinct))
+            .collect();
+        for &pos in &unique_btree_cols {
+            if !out.iter().any(|(cols, _)| cols == &alloc::vec![pos]) {
+                out.push((alloc::vec![pos], false));
+            }
+        }
+        // Legacy fallback, kept deliberately: schemas from before SPG
+        // tracked index uniqueness spell their arbiter as a plain
+        // `CREATE INDEX`, and the bare clause has always deduped on it.
+        // Only engaged when nothing declared-unique exists, so PG-shaped
+        // schemas get PG's every-unique-constraint semantics above.
+        if out.is_empty() {
+            for idx in table.indices() {
                 if matches!(idx.kind, spg_storage::IndexKind::BTree(_))
                     && idx.partial_predicate.is_none()
-                    && idx.included_columns.is_empty()
                     && idx.expression.is_none()
+                    && idx.included_columns.is_empty()
                 {
-                    Some(idx.column_position)
-                } else {
-                    None
+                    out.push((alloc::vec![idx.column_position], false));
                 }
-            })
-            .ok_or_else(|| {
-                EngineError::Unsupported(alloc::format!(
-                    "ON CONFLICT without target requires a UNIQUE BTree index on {table_name:?}"
-                ))
-            })?;
-        return Ok((alloc::vec![pos], false));
+            }
+        }
+        return Ok(out);
     }
-    let mut out = Vec::with_capacity(target.len());
+    let mut positions = Vec::with_capacity(target.len());
     for name in target {
-        let pos = table
-            .schema()
+        let pos = schema
             .columns
             .iter()
             .position(|c| c.name == *name)
@@ -265,19 +288,28 @@ pub(crate) fn resolve_on_conflict_columns(
                     "ON CONFLICT target column {name:?} not found on {table_name:?}"
                 ))
             })?;
-        out.push(pos);
+        positions.push(pos);
     }
-    // An explicit target matching a UNIQUE constraint inherits its
-    // NULLS [NOT] DISTINCT declaration.
-    let mut sorted = out.clone();
+    let mut sorted = positions.clone();
     sorted.sort_unstable();
-    let nnd = table.schema().uniqueness_constraints.iter().any(|uc| {
+    let matched_uc = schema.uniqueness_constraints.iter().find(|uc| {
         let mut u = uc.columns.clone();
         u.sort_unstable();
-        u == sorted && uc.nulls_not_distinct
+        u == sorted
     });
-    Ok((out, nnd))
+    // DELIBERATE divergence, recorded: PG refuses a target no unique
+    // constraint enforces (42P10 "there is no unique or exclusion
+    // constraint matching the ON CONFLICT specification"); SPG accepts any
+    // column list and arbitrates on it. The lax form is what mailrs's
+    // caldav upsert model (`ON CONFLICT (uid, calendar_id)` with no
+    // declared constraint) has always run on — zero-customer-change
+    // outranks the alignment here, and the laxness only ACCEPTS more: a
+    // PG-valid program never issues the shape PG rejects.
+    let _ = from_constraint_name;
+    let nnd = matched_uc.is_some_and(|uc| uc.nulls_not_distinct);
+    Ok(alloc::vec![(positions, nnd)])
 }
+
 
 /// v7.37.15 (Phase C.3) — does this BTree index locator point at a
 /// gate-on tombstone? A `RowLocator::Hot(i)` indexes into
@@ -408,6 +440,7 @@ pub(crate) fn on_conflict_keys_exist(
 pub(crate) fn apply_on_conflict_assignments(
     catalog: &Catalog,
     table_name: &str,
+    alias: Option<&str>,
     target_pos: usize,
     incoming: &[Value<'static>],
     assignments: &[(String, Expr)],
@@ -428,7 +461,11 @@ pub(crate) fn apply_on_conflict_assignments(
             ))
         })?
         .clone();
-    let ctx = eval::EvalContext::new(&schema_cols, Some(table_name));
+    // v7.39 (round 240) — `INSERT INTO t AS me`: the DO UPDATE
+    // expressions refer to the target row by the alias when one is given
+    // (PG makes the original name unavailable then), so the alias IS the
+    // table qualifier here.
+    let ctx = eval::EvalContext::new(&schema_cols, Some(alias.unwrap_or(table_name)));
     // Optional WHERE filter on the conflict row.
     if let Some(w) = where_ {
         let pred = w.clone();
@@ -567,29 +604,6 @@ fn substitute_excluded_refs(
         other => other,
     }
 }
-
-/// v7.6.2 / v7.6.7 — INSERT-side FK enforcement. For every row
-/// about to be inserted into `child_table`, every FK declared on
-/// that table is checked: the row's FK columns must either be
-/// NULL (SQL spec skip) or match an existing parent row via the
-/// parent's BTree PK / UNIQUE index.
-///
-/// Returns `EngineError::Unsupported` with a `FOREIGN KEY violation`
-/// payload on first failure.
-///
-/// **Self-referencing FKs (v7.6.7 widening):** when `fk.parent_table
-/// == child_table`, the parent rows visible to this check are
-///  (a) rows already committed to the table, plus
-///  (b) earlier rows from the *same* `rows` batch.
-/// This makes `INSERT INTO tree VALUES (1, NULL), (2, 1), (3, 2)`
-/// work in a single statement — common pattern for bulk-loading
-/// hierarchies.
-/// v7.9.19 — enforce table-level UNIQUE / PRIMARY KEY tuple
-/// constraints at INSERT time. For each constraint declared on
-/// the target table, check that no existing row + no earlier row
-/// in the same batch has the same full-column tuple. NULL in
-/// any column lifts the row out of the check (SQL spec: NULL
-/// ≠ NULL for uniqueness). mailrs G1 + G6.
 
 /// v7.39 (round 166, write-path attack A1) — column types whose non-NULL
 /// values ALWAYS produce an `IndexKey` (`IndexKey::from_value` is total
