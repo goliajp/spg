@@ -3945,6 +3945,11 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         if msg.contains("query must have the same number of columns") {
             return ("42601", msg);
         }
+        // v7.39 (round 233) — two set-operation branch columns with no
+        // common type are PG's 42804 DATATYPE_MISMATCH.
+        if msg.contains(" types ") && msg.contains(" cannot be matched") {
+            return ("42804", msg);
+        }
     }
     // v7.39 (read01 round 230) — window-clause errors carry PG's own class
     // and must be classified BEFORE the two variant-level short-circuits

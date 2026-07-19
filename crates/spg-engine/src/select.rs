@@ -1946,6 +1946,7 @@ impl Engine {
         // v7.39 (round 232) — the wrapper's ORDER BY addresses the head's
         // output columns; a position past their count is PG's 42P10.
         crate::orderby::check_order_by_positions(stmt_ref)?;
+        let mut head_unknown = branch_unknown_mask(stmt_ref);
         let mut head = stmt_ref.clone();
         head.unions = Vec::new();
         head.order_by = Vec::new();
@@ -1969,7 +1970,7 @@ impl Engine {
             };
             let QueryResult::Rows {
                 columns: peer_cols,
-                rows: peer_rows,
+                rows: mut peer_rows,
             } = peer_result
             else {
                 unreachable!("bare SELECT cannot return CommandOk")
@@ -1980,6 +1981,52 @@ impl Engine {
                     "each {} query must have the same number of columns",
                     set_op_name(*kind)
                 )));
+            }
+            // v7.39 (round 232+233) — PG resolves each result column to one
+            // type before it merges anything, and refuses the query when the
+            // two branches have no common type. SPG's unifier
+            // (`unify_union_columns`) is value-driven and deliberately
+            // conservative — "a column where any cell fails to coerce is left
+            // exactly as it was" — so a mismatch produced a column holding
+            // BOTH types (`SELECT a, b FROM t UNION SELECT b, a FROM t` came
+            // back with integers and text interleaved) instead of an error.
+            //
+            // The check has to read the branch ASTs, not just their schemas:
+            // SPG has no `Unknown` DataType, so a bare `'a'` literal describes
+            // as TEXT and is indistinguishable from a real text column by
+            // schema alone — yet PG treats the two completely differently
+            // (`SELECT 1 UNION SELECT 'a'` is an input-syntax error on the
+            // literal, `SELECT 1 UNION SELECT 'a'::text` is a type mismatch).
+            let peer_unknown = branch_unknown_mask(peer);
+            for i in 0..columns.len() {
+                let hu = head_unknown.get(i).copied().unwrap_or(false);
+                let pu = peer_unknown.get(i).copied().unwrap_or(false);
+                let (ht, pt) = (columns[i].ty, peer_cols[i].ty);
+                match (hu, pu) {
+                    // Both sides carry a real type: they must share a category.
+                    (false, false) => {
+                        if !types_unify(ht, pt) {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "{} types {} and {} cannot be matched",
+                                set_op_name(*kind),
+                                crate::system_catalog::pg_data_type_text(ht),
+                                crate::system_catalog::pg_data_type_text(pt),
+                            )));
+                        }
+                    }
+                    // One side is an untyped literal: it takes the other's
+                    // type, and failing to convert is the error PG reports.
+                    (true, false) => {
+                        coerce_branch_column(&mut rows, i, pt, &columns[i].name)?;
+                        columns[i].ty = pt;
+                        head_unknown[i] = false;
+                    }
+                    (false, true) => {
+                        coerce_branch_column(&mut peer_rows, i, ht, &columns[i].name)?;
+                    }
+                    // Both untyped — nothing to resolve against yet.
+                    (true, true) => {}
+                }
             }
             // v7.37 D.26 — a UNION result column is nullable when ANY branch is
             // nullable (PG semantics). Previously the result kept only the head's
@@ -8745,4 +8792,75 @@ fn set_op_name(kind: UnionKind) -> &'static str {
         UnionKind::Intersect | UnionKind::IntersectAll => "INTERSECT",
         UnionKind::Except | UnionKind::ExceptAll => "EXCEPT",
     }
+}
+
+/// v7.39 (round 233) — which output columns of a branch are PG's `unknown`
+/// type: a bare string or NULL literal that no context has typed yet. SPG
+/// has no `Unknown` DataType (both describe as TEXT), so the witness has to
+/// be the syntax. A wildcard or a non-literal expression is never unknown.
+fn branch_unknown_mask(stmt: &SelectStatement) -> Vec<bool> {
+    stmt.items
+        .iter()
+        .map(|item| match item {
+            SelectItem::Expr { expr, .. } => matches!(
+                expr,
+                Expr::Literal(spg_sql::ast::Literal::String(_))
+                    | Expr::Literal(spg_sql::ast::Literal::Null)
+            ),
+            _ => false,
+        })
+        .collect()
+}
+
+/// v7.39 (round 233) — do two branch column types share a PG type category,
+/// so the set operation can resolve them to one result type? Same type
+/// always does; otherwise PG unifies within the numeric, string and
+/// date/time families and refuses across them (probed against 18.4:
+/// int ∪ bigint → bigint, text ∪ varchar → text, date ∪ timestamp →
+/// timestamp, but int ∪ boolean, int ∪ text and text ∪ date are all
+/// refused).
+fn types_unify(a: DataType, b: DataType) -> bool {
+    fn category(t: DataType) -> Option<u8> {
+        Some(match t {
+            DataType::SmallInt
+            | DataType::Int
+            | DataType::BigInt
+            | DataType::Numeric { .. }
+            | DataType::Real
+            | DataType::Float => 1,
+            DataType::Text | DataType::Varchar(_) | DataType::Char(_) => 2,
+            DataType::Date | DataType::Timestamp | DataType::Timestamptz => 3,
+            _ => return None,
+        })
+    }
+    if a == b {
+        return true;
+    }
+    match (category(a), category(b)) {
+        (Some(x), Some(y)) => x == y,
+        // Outside the families a set operation needs the exact same type;
+        // `a == b` above already covered that.
+        _ => false,
+    }
+}
+
+/// v7.39 (round 233) — retype one branch column's cells, reporting the
+/// conversion failure the way PG does rather than leaving the column
+/// half-converted. Used when the other branch typed an untyped literal.
+fn coerce_branch_column(
+    rows: &mut [Row<'static>],
+    col_idx: usize,
+    target: DataType,
+    col_name: &str,
+) -> Result<(), EngineError> {
+    for row in rows.iter_mut() {
+        let Some(slot) = row.values.get_mut(col_idx) else {
+            continue;
+        };
+        if matches!(slot, Value::Null) {
+            continue;
+        }
+        *slot = crate::conversions::coerce_value(slot.clone(), target, col_name, col_idx)?;
+    }
+    Ok(())
 }
