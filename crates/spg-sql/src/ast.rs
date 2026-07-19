@@ -609,9 +609,15 @@ pub enum Statement {
 pub struct CreateDomainStatement {
     pub name: String,
     /// Base type for the domain (one of the built-in
-    /// `ColumnTypeName` variants). User-defined enum / domain
-    /// bases are deferred to Phase 1.5b.
+    /// `ColumnTypeName` variants).
     pub base_type: ColumnTypeName,
+    /// v7.39 (round 259) — `CREATE DOMAIN child AS parent …` where
+    /// `parent` is itself a DOMAIN. The parser already captured the
+    /// unknown type name; it just was not carried here, so the parent's
+    /// CHECK constraints were invisible and a value violating them was
+    /// silently accepted. `base_type` still holds the ultimate scalar
+    /// type, which is what the storage tier stores.
+    pub base_domain: Option<String>,
     /// Optional `DEFAULT <expr>`. Resolved at engine-side
     /// CREATE TABLE time when a column is bound to this domain.
     pub default: Option<Expr>,

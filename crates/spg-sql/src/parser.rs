@@ -3856,7 +3856,10 @@ impl Parser {
         if matches!(self.peek(), Token::As) {
             self.advance();
         }
-        let base_type = self.parse_column_type_name()?;
+        // v7.39 (round 259) — keep the raw type NAME when the base is not
+        // a builtin: it is how `CREATE DOMAIN child AS parent` records its
+        // parent domain.
+        let (base_type, _, _, base_user_ref, _, _, _, _) = self.parse_type_with_implied_flags()?;
         let mut default: Option<Expr> = None;
         let mut not_null = false;
         let mut checks: Vec<Expr> = Vec::new();
@@ -3918,6 +3921,7 @@ impl Parser {
         Ok(Statement::CreateDomain(crate::ast::CreateDomainStatement {
             name,
             base_type,
+            base_domain: base_user_ref,
             default,
             not_null,
             checks,

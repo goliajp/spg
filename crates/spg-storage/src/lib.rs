@@ -3973,6 +3973,15 @@ pub struct DomainDef {
     pub nullable: bool,
     pub default: Option<String>,
     pub checks: Vec<String>,
+    /// v7.39 (round 258/259) — when this domain was declared over ANOTHER
+    /// domain (`CREATE DOMAIN child AS parent CHECK (…)`), the parent's
+    /// name. `base_type` is the ultimate scalar type either way, so
+    /// without this the parent's constraints were invisible and a value
+    /// violating them was silently accepted. PG checks the whole chain,
+    /// base-first, and an `ALTER DOMAIN` on the parent takes effect for
+    /// the child immediately (probed) — so the chain is walked at check
+    /// time rather than copied at CREATE time. Catalog FILE_VERSION 74+.
+    pub base_domain: Option<String>,
 }
 
 /// v7.17.0 Phase 1.4 — catalogued user-defined ENUM type. The
@@ -6935,7 +6944,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 73;
+const FILE_VERSION: u8 = 74;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7871,6 +7880,14 @@ impl Catalog {
             for c in &d.checks {
                 write_str(&mut out, c);
             }
+            // v7.39 (round 259) — the parent domain (FILE_VERSION 74+).
+            match &d.base_domain {
+                None => out.push(0),
+                Some(s) => {
+                    out.push(1);
+                    write_str(&mut out, s);
+                }
+            }
         }
         // v7.17.0 Phase 1.6 — user-schemas registry
         // (FILE_VERSION 31+). Built-ins are hardcoded in
@@ -8241,6 +8258,22 @@ impl Catalog {
                 for _ in 0..check_count {
                     checks.push(cur.read_str()?);
                 }
+                // v7.39 (round 259) — the parent domain. Absent before
+                // FILE_VERSION 74; an older catalog reads as a domain over
+                // a scalar, which is what it was.
+                let base_domain = if version >= 74 {
+                    match cur.read_u8()? {
+                        0 => None,
+                        1 => Some(cur.read_str()?),
+                        other => {
+                            return Err(StorageError::Corrupt(alloc::format!(
+                                "domain base_domain tag {other}"
+                            )));
+                        }
+                    }
+                } else {
+                    None
+                };
                 cat.domain_types.insert(
                     name.clone(),
                     DomainDef {
@@ -8249,6 +8282,7 @@ impl Catalog {
                         nullable,
                         default,
                         checks,
+                        base_domain,
                     },
                 );
             }

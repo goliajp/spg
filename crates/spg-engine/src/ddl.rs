@@ -2837,10 +2837,41 @@ impl Engine {
                 continue;
             }
             if let Some(dom) = cat.domain_types().get(&name) {
-                col.ty = dom.base_type;
+                let base_type = dom.base_type;
+                let dom_default = dom.default.clone();
+                col.ty = base_type;
                 col.user_domain_type = Some(name);
                 if !dom.nullable {
                     col.nullable = false;
+                }
+                // v7.39 (round 259) — two DEFAULT problems on a domain
+                // column, both because the column was typed Text (the
+                // parser's placeholder for an unknown type name) while its
+                // DEFAULT was being resolved, and only re-typed here:
+                //   * a COLUMN-level default failed to coerce and the
+                //     whole CREATE TABLE errored ("type mismatch") — a
+                //     hard failure on valid SQL;
+                //   * the DOMAIN's own default was never adopted, so an
+                //     omitted column landed NULL where PG gives the
+                //     domain default (probed: 42, and a column default
+                //     of 7 overrides it).
+                if let Some(d) = col.default.take() {
+                    col.default =
+                        Some(crate::conversions::coerce_value(d, base_type, &col.name, 0)?);
+                } else if let Some(src) = dom_default {
+                    let expr = spg_sql::parser::parse_expression(&src).map_err(|e| {
+                        EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
+                            "domain default {src:?} failed to re-parse: {e:?}"
+                        )))
+                    })?;
+                    let empty: alloc::vec::Vec<spg_storage::ColumnSchema> =
+                        alloc::vec::Vec::new();
+                    let ctx = crate::eval::EvalContext::new(&empty, None);
+                    let row = spg_storage::Row { values: alloc::vec::Vec::new() };
+                    let v = crate::eval::eval_expr(&expr, &row, &ctx)
+                        .map_err(EngineError::Eval)?;
+                    col.default =
+                        Some(crate::conversions::coerce_value(v, base_type, &col.name, 0)?);
                 }
                 continue;
             }
@@ -4068,7 +4099,24 @@ impl Engine {
                 alloc::format!("domain {:?} would shadow an existing object", s.name),
             )));
         }
-        let base_type = column_type_to_data_type(s.base_type);
+        // v7.39 (round 259) — `CREATE DOMAIN child AS parent`: the parent
+        // supplies the ultimate scalar type (the parser typed the unknown
+        // name as Text), and its NAME is recorded so the check walk can
+        // reach the parent's constraints — which an ALTER on the parent
+        // must keep affecting, so the chain is walked at check time rather
+        // than copied here (probed against PG).
+        let mut base_domain: Option<alloc::string::String> = None;
+        let mut base_type = column_type_to_data_type(s.base_type);
+        if let Some(parent) = &s.base_domain {
+            if let Some(pd) = cat.domain_types().get(parent) {
+                base_type = pd.base_type;
+                base_domain = Some(parent.clone());
+            } else if !cat.enum_types().contains_key(parent) {
+                return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                    alloc::format!("type {parent:?} does not exist"),
+                )));
+            }
+        }
         let default = s.default.as_ref().map(|e| alloc::format!("{e}"));
         let checks = s
             .checks
@@ -4081,6 +4129,7 @@ impl Engine {
             nullable: !s.not_null,
             default,
             checks,
+            base_domain,
         };
         self.active_catalog_mut()
             .create_domain_type(def)
@@ -4855,7 +4904,17 @@ fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
             schema = schema.with_runtime_default(display);
         } else {
             let raw = literal_expr_to_value(default_expr)?;
-            let coerced = coerce_value(raw, ty, &c.name, 0)?;
+            // v7.39 (round 259) — a column whose type is a user type is
+            // still typed with the parser's Text placeholder here; the
+            // real type only arrives when the domain binding is resolved
+            // (exec_create_table). Coercing now made `w wd DEFAULT 7`
+            // fail outright — a hard error on valid SQL — so the domain
+            // case keeps the raw value and is coerced there instead.
+            let coerced = if schema.user_enum_type.is_some() {
+                raw
+            } else {
+                coerce_value(raw, ty, &c.name, 0)?
+            };
             schema = schema.with_default(coerced);
         }
     }

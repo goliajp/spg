@@ -542,15 +542,62 @@ fn apply_domain_constraints<'a>(
     v: Value<'a>,
     dom: &spg_storage::DomainDef,
     name: &str,
+    cat: &spg_storage::Catalog,
 ) -> Result<Value<'a>, EvalError> {
     if matches!(v, Value::Null) {
-        if dom.nullable {
-            return Ok(v);
+        // A NOT NULL anywhere in the chain rejects a NULL.
+        let mut cur = Some(dom);
+        while let Some(d) = cur {
+            if !d.nullable {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("domain {name} does not allow null values"),
+                });
+            }
+            cur = d
+                .base_domain
+                .as_ref()
+                .and_then(|p| cat.domain_types().get(p.as_str()));
         }
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("domain {name} does not allow null values"),
-        });
+        return Ok(v);
     }
+    // v7.39 (round 259) — walk the domain chain BASE-FIRST (probed: a
+    // value violating both a parent's and the child's constraint reports
+    // the PARENT's). The message names the domain being cast TO, but the
+    // constraint that actually failed — `value for domain pchild violates
+    // check constraint "pbase_check"`.
+    let mut chain: alloc::vec::Vec<&spg_storage::DomainDef> = alloc::vec![dom];
+    let mut cur = dom;
+    while let Some(parent) = cur
+        .base_domain
+        .as_ref()
+        .and_then(|p| cat.domain_types().get(p.as_str()))
+    {
+        // A cycle cannot be created through CREATE DOMAIN (the parent must
+        // already exist), but stop defensively rather than loop forever.
+        if chain.iter().any(|d| core::ptr::eq(*d, parent)) {
+            break;
+        }
+        chain.push(parent);
+        cur = parent;
+    }
+    chain.reverse();
+    for owner in chain {
+        apply_domain_checks_of(&v, owner, name)?;
+    }
+    Ok(v)
+}
+
+/// v7.39 (round 259) — run ONE domain's own CHECK list against `v`. The
+/// error names `target` (the domain the value is being cast to) and
+/// `owner` (whose constraint failed); for a single-level domain they are
+/// the same, which is the pre-259 wording.
+fn apply_domain_checks_of(
+    v: &Value<'_>,
+    dom: &spg_storage::DomainDef,
+    target: &str,
+) -> Result<(), EvalError> {
+    let name = target;
+    let owner = dom.name.as_str();
     for src in &dom.checks {
         let expr = spg_sql::parser::parse_expression(src).map_err(|e| EvalError::TypeMismatch {
             detail: alloc::format!("domain {name} CHECK ({src:?}) failed to re-parse: {e:?}"),
@@ -569,12 +616,12 @@ fn apply_domain_constraints<'a>(
         if matches!(r, Value::Bool(false)) {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "value for domain {name} violates check constraint \"{name}_check\""
+                    "value for domain {name} violates check constraint \"{owner}_check\""
                 ),
             });
         }
     }
-    Ok(v)
+    Ok(())
 }
 
 /// v7.38 (read01 P6.67) — validate a value cast to a user ENUM: a text label
@@ -795,7 +842,16 @@ fn expr_enum_type_name<'e>(e: &'e Expr, columns: &'e [ColumnSchema]) -> Option<&
         Expr::Column(c) => columns
             .iter()
             .find(|col| col.name == c.name)
-            .and_then(|col| col.user_enum_type.as_deref()),
+            // v7.39 (round 259) — a DOMAIN column carries its name in its
+            // own field; both are "the user type this column is declared
+            // as", which is what the callers (enum-order comparison,
+            // pg_typeof) want. Callers gate on the catalog, so a name that
+            // is one kind never resolves as the other.
+            .and_then(|col| {
+                col.user_enum_type
+                    .as_deref()
+                    .or(col.user_domain_type.as_deref())
+            }),
         _ => None,
     }
 }
@@ -1055,7 +1111,7 @@ fn eval_cast_arm(
         && let Some(cat) = ctx.catalog
     {
         if let Some(dom) = cat.domain_types().get(name.as_str()) {
-            return apply_domain_constraints(v, dom, name);
+            return apply_domain_constraints(v, dom, name, cat);
         }
         // v7.38 (read01 P6.67) — `'label'::<user enum>` validates the
         // label against the enum's members (a non-member errors like
@@ -1556,14 +1612,21 @@ fn eval_function_call_arm(
         // pre-filter for `expr_enum_labels`, which does the catalog
         // lookup — so using it alone hijacked every `x::float8` /
         // `x::int2` and reported SPG's internal spelling instead of PG's.
-        let is_enum = |e: &Expr| {
+        // v7.39 (round 259) — domains report their own name too; like an
+        // enum, a domain value travels as its BASE type's value, so the
+        // name has to come from the expression. Both lookups are gated on
+        // the catalog: `expr_enum_type_name` returns ANY named cast's
+        // target verbatim, so an ungated use hijacks `x::float8`.
+        let is_user_type = |e: &Expr| {
             expr_enum_type_name(e, ctx.columns)
                 .filter(|n| {
-                    ctx.catalog
-                        .is_some_and(|cat| cat.enum_types().contains_key(*n))
+                    ctx.catalog.is_some_and(|cat| {
+                        cat.enum_types().contains_key(*n) || cat.domain_types().contains_key(*n)
+                    })
                 })
                 .map(alloc::string::String::from)
         };
+        let is_enum = is_user_type;
         if let Some(en) = is_enum(arg) {
             return Ok(Value::text(en));
         }
