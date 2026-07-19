@@ -850,3 +850,19 @@ pub(crate) fn build_2d_from_rows(rows: &[Value<'static>]) -> Option<Value<'stati
             .collect(),
     ))
 }
+
+/// v7.39 (round 236) — PG's array functions treat a multidimensional array
+/// as its elements in row-major order: `array_to_string(ARRAY[[1,2],[3,4]],
+/// ',')` is `1,2,3,4` and `unnest` of it yields four rows. SPG stores 2-D
+/// arrays as their own variants, and the generic `array_len` /
+/// element-access helpers only knew the 1-D ones, so both functions
+/// rejected the value outright. Flattening here keeps every caller generic.
+pub(crate) fn flatten_2d(v: &Value<'_>) -> Option<Value<'static>> {
+    Some(match v {
+        Value::IntArray2D(rows) => Value::IntArray(rows.iter().flatten().copied().collect()),
+        Value::BigIntArray2D(rows) => Value::BigIntArray(rows.iter().flatten().copied().collect()),
+        Value::BoolArray2D(rows) => Value::BoolArray(rows.iter().flatten().copied().collect()),
+        Value::TextArray2D(rows) => Value::TextArray(rows.iter().flatten().cloned().collect()),
+        _ => return None,
+    })
+}

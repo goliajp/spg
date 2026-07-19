@@ -19,6 +19,14 @@ fn render(v: &Value) -> String {
         // does. Without this every json-returning probe row came back as
         // `Json("{\"a\": 1}")` and drowned real diffs in escaping noise.
         Value::Json(s) => s.to_string(),
+        // v7.39 (round 236) — arrays print PG's `{a,b}` external form.
+        // Without this every array-returning probe row came back as
+        // `IntArray([Some(1), Some(2)])` and buried the real diffs.
+        Value::IntArray(items) => arr_text(items.iter().map(|v| v.map(|n| n.to_string()))),
+        Value::BigIntArray(items) => arr_text(items.iter().map(|v| v.map(|n| n.to_string()))),
+        Value::TextArray(items) => {
+            arr_text(items.iter().map(|v| v.as_ref().map(ToString::to_string)))
+        }
         // Non-scalar / float / numeric values keep the Debug form; wrap the
         // column in ::text in the probe SQL when an exact value diff is needed.
         other => format!("{other:?}"),
@@ -62,4 +70,21 @@ fn main() {
             Err(err) => println!("ERROR: {err}"),
         }
     }
+}
+
+/// PG's array external form: `{a,b,NULL}`, quoting members that need it.
+fn arr_text(items: impl Iterator<Item = Option<String>>) -> String {
+    let body: Vec<String> = items
+        .map(|v| match v {
+            None => "NULL".to_string(),
+            Some(s) => {
+                if s.is_empty() || s.contains([',', '{', '}', '"', ' ']) {
+                    format!("\"{}\"", s.replace('"', "\\\""))
+                } else {
+                    s
+                }
+            }
+        })
+        .collect();
+    format!("{{{}}}", body.join(","))
 }

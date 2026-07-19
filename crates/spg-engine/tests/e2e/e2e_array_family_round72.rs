@@ -47,8 +47,18 @@ fn a_homogeneous_literal_keeps_its_type() {
     assert_eq!(r1(&mut e, "SELECT pg_typeof(ARRAY[1,2])"), "integer[]");
     assert_eq!(r1(&mut e, "SELECT pg_typeof(ARRAY[1,2.5])"), "numeric[]");
     assert_eq!(r1(&mut e, "SELECT pg_typeof(ARRAY['a','b'])"), "text[]");
-    // A MIX still falls back to text[], as it always did.
-    assert_eq!(r1(&mut e, "SELECT pg_typeof(ARRAY[true,'x'])"), "text[]");
+    // v7.39 (round 236) — a MIX used to fall back to text[]; PG resolves
+    // the untyped `'x'` against the boolean elements and reports that it
+    // will not convert. `'t'` does convert, and the array stays boolean[].
+    let got = e
+        .execute("SELECT pg_typeof(ARRAY[true,'x'])")
+        .expect_err("an unconvertible untyped element must be rejected")
+        .to_string();
+    assert!(
+        got.contains("invalid input syntax for type boolean: \"x\""),
+        "{got}"
+    );
+    assert_eq!(r1(&mut e, "SELECT pg_typeof(ARRAY[true,'t'])"), "boolean[]");
 }
 
 #[test]
