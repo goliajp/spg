@@ -22,10 +22,6 @@
 //!   * v7.38 (T4): avg(int/bigint) now returns NUMERIC like PG
 //!     (`26.0000000000000000`). stddev/variance/corr still return FLOAT
 //!     (PG NUMERIC) — a remaining T4 residual; values are equal.
-//!   * array_agg(DISTINCT x) / string_agg(DISTINCT x): PG sorts the
-//!     distinct set (dedup is sort-based); SPG keeps first-seen order.
-//!     SQL leaves DISTINCT-without-ORDER-BY order UNSPECIFIED, so
-//!     SPG's order is a valid implementation.
 //!   * json_object_agg: PG inserts spaces (`{ "a" : 10 }`); SPG is
 //!     compact (`{"a": 10}`). Same value.
 //!
@@ -198,17 +194,22 @@ fn distinct() {
         "SELECT avg(DISTINCT x) FROM t",
         "25.0000000000000000",
     );
-    // SEMANTIC: PG sorts distinct set -> {10,20,30,40,NULL} / bar,baz,foo.
-    // SPG keeps first-seen order (valid: DISTINCT order is unspecified).
+    // v7.39 (round 257) — PG dedups a DISTINCT aggregate by SORTING its
+    // input, so the collection aggregates emit sorted values (NULLs
+    // last). These two used to lock SPG's first-seen order as an
+    // accepted divergence on the grounds that SQL leaves the order
+    // unspecified — but a program ported from PG sees the difference,
+    // and the alignment target is PG's observable behaviour. Values
+    // probed on this exact seed.
     check(
         &mut e,
         "SELECT array_agg(DISTINCT x) FROM t",
-        "{10,20,NULL,30,40}",
+        "{10,20,30,40,NULL}",
     );
     check(
         &mut e,
         "SELECT string_agg(DISTINCT s, ',') FROM t",
-        "foo,bar,baz",
+        "bar,baz,foo",
     );
 }
 
