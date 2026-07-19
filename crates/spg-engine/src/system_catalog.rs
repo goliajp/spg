@@ -419,6 +419,14 @@ pub(crate) fn synth_information_schema_tables(
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
+        // v7.39 (round 267) — a materialized view is backed by a real
+        // table in SPG, but PG omits materialized views from this view
+        // entirely (they are not in the SQL standard), and reporting one
+        // as a BASE TABLE would have a migration tool try to recreate it
+        // as a table.
+        if cat.materialized_views().contains_key(&tname) {
+            continue;
+        }
         rows.push(Row::new(alloc::vec![
             Value::text("spg"),
             Value::text("public"),
@@ -430,6 +438,27 @@ pub(crate) fn synth_information_schema_tables(
             Value::Null,
             Value::Null,
             Value::text("YES"),
+            Value::text("NO"),
+            Value::Null,
+        ]));
+    }
+    // v7.39 (round 267) — views. The view was table-only, so every
+    // reflection tool saw a database with no views in it. table_type is
+    // VIEW and is_insertable_into follows the same auto-updatability
+    // judgement the write path uses.
+    for (name, _) in cat.views() {
+        let insertable = crate::dml::view_is_auto_updatable(cat, name);
+        rows.push(Row::new(alloc::vec![
+            Value::text("spg"),
+            Value::text("public"),
+            Value::text(name.clone()),
+            Value::text("VIEW"),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::text::<&str>(if insertable { "YES" } else { "NO" }),
             Value::text("NO"),
             Value::Null,
         ]));
@@ -522,8 +551,24 @@ pub(crate) fn synth_information_schema_views(
                     2 => "CASCADED",
                     _ => "NONE",
                 }),
-                Value::text("NO"), // is_updatable — view-update lands in 19.13
-                Value::text("NO"), // is_insertable_into
+                // v7.39 (round 267) — the same auto-updatability
+                // judgement the write path uses. These read NO for every
+                // view until this round, while INSERT/UPDATE/DELETE
+                // through a simple view had worked since 19.13: the
+                // catalog was telling every reflection tool the engine
+                // could not do something it does.
+                Value::text::<&str>(if crate::dml::view_is_auto_updatable(cat, &v.name) {
+                    "YES"
+                } else {
+                    "NO"
+                }),
+                Value::text::<&str>(if crate::dml::view_is_auto_updatable(cat, &v.name) {
+                    "YES"
+                } else {
+                    "NO"
+                }),
+                // SPG has no INSTEAD OF-trigger-driven updatability to
+                // report separately; PG answers NO for a plain view too.
                 Value::text("NO"),
                 Value::text("NO"),
                 Value::text("NO"),

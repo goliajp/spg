@@ -189,6 +189,7 @@ mod e2e_composite_round263;
 mod e2e_nested_composite_round264;
 mod e2e_copy_options_round265;
 mod e2e_info_constraints_round266;
+mod e2e_view_updatable_round267;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;

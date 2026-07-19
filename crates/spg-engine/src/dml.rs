@@ -99,40 +99,170 @@ fn compose_view_maps(a: &[(String, String)], b: &[(String, String)]) -> Vec<(Str
         .collect()
 }
 
+/// v7.39 (round 267) — why a view is not auto-updatable. PG reports a
+/// specific DETAIL per reason, and when several apply it names exactly
+/// one: measured precedence on PG 18.4 is set-op > DISTINCT > GROUP BY
+/// > WITH > LIMIT/OFFSET > not-a-single-table, which is the order the
+/// checks below run in.
+///
+/// `Unsupported` is the honest odd one out: the shape may well be
+/// auto-updatable in PG, but SPG's redirect cannot express it yet. It
+/// must not borrow a PG DETAIL it does not mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewNotUpdatable {
+    SetOp,
+    Distinct,
+    GroupBy,
+    With,
+    LimitOffset,
+    NotSingleTable,
+    Unsupported,
+}
+
+impl ViewNotUpdatable {
+    /// PG's DETAIL line, verbatim from PG 18.4.
+    fn detail(self) -> &'static str {
+        match self {
+            Self::SetOp => {
+                "Views containing UNION, INTERSECT, or EXCEPT are not automatically updatable."
+            }
+            Self::Distinct => "Views containing DISTINCT are not automatically updatable.",
+            Self::GroupBy => "Views containing GROUP BY are not automatically updatable.",
+            Self::With => "Views containing WITH are not automatically updatable.",
+            Self::LimitOffset => {
+                "Views containing LIMIT or OFFSET are not automatically updatable."
+            }
+            Self::NotSingleTable => {
+                "Views that do not select from a single table or view are not automatically \
+                 updatable."
+            }
+            Self::Unsupported => "This view shape is not auto-updatable in SPG.",
+        }
+    }
+}
+
+/// The verb-dependent halves of PG's non-updatable-view error.
+struct WriteVerb {
+    /// "insert into" / "update" / "delete from", as it appears after
+    /// "cannot " in the primary message.
+    cannot: &'static str,
+    /// "inserting into" / "updating" / "deleting from", for the HINT.
+    gerund: &'static str,
+    /// "INSERT" / "UPDATE" / "DELETE", for the trigger and rule names.
+    keyword: &'static str,
+}
+
+const INSERT_VERB: WriteVerb = WriteVerb {
+    cannot: "insert into",
+    gerund: "inserting into",
+    keyword: "INSERT",
+};
+const UPDATE_VERB: WriteVerb = WriteVerb {
+    cannot: "update",
+    gerund: "updating",
+    keyword: "UPDATE",
+};
+const DELETE_VERB: WriteVerb = WriteVerb {
+    cannot: "delete from",
+    gerund: "deleting from",
+    keyword: "DELETE",
+};
+
+/// Build PG's full "cannot <verb> view" error for a non-updatable view.
+/// MERGE names itself in the HINT and offers only the trigger, not the
+/// rule — measured on PG 18.4.
+fn view_not_updatable_error(
+    view_name: &str,
+    verb: &WriteVerb,
+    reason: ViewNotUpdatable,
+    via_merge: bool,
+) -> EngineError {
+    let hint = if via_merge {
+        alloc::format!(
+            "To enable {} the view using MERGE, provide an INSTEAD OF {} trigger.",
+            verb.gerund,
+            verb.keyword,
+        )
+    } else {
+        alloc::format!(
+            "To enable {} the view, provide an INSTEAD OF {} trigger or an unconditional ON {} \
+             DO INSTEAD rule.",
+            verb.gerund,
+            verb.keyword,
+            verb.keyword,
+        )
+    };
+    EngineError::Unsupported(alloc::format!(
+        "cannot {} view \"{}\" DETAIL: {} HINT: {}",
+        verb.cannot,
+        view_name,
+        reason.detail(),
+        hint,
+    ))
+}
+
+/// v7.39 (round 267) — the single auto-updatability judgement. The write
+/// paths and `information_schema` both go through it, so the catalog
+/// cannot advertise an updatability the engine does not honour (before
+/// this round it advertised NO for every view while happily writing
+/// through the simple ones).
+pub(crate) fn view_is_auto_updatable(catalog: &spg_storage::Catalog, view_name: &str) -> bool {
+    view_redirect_checked(catalog, view_name).is_ok()
+}
+
 fn view_redirect_to_simple_base(
     catalog: &spg_storage::Catalog,
     view_name: &str,
 ) -> Option<ViewRedirect> {
-    let view = catalog.views().get(view_name)?;
+    view_redirect_checked(catalog, view_name).ok()
+}
+
+fn view_redirect_checked(
+    catalog: &spg_storage::Catalog,
+    view_name: &str,
+) -> Result<ViewRedirect, ViewNotUpdatable> {
+    let view = catalog
+        .views()
+        .get(view_name)
+        .ok_or(ViewNotUpdatable::Unsupported)?;
     let this_check = view.check_option;
     // v7.39 (round 133) — a column-rename list maps the view's column names back
     // to the primary's columns.
     let rename_cols = view.columns.clone();
-    let stmt = spg_sql::parser::parse_statement(&view.body).ok()?;
+    let stmt = spg_sql::parser::parse_statement(&view.body)
+        .map_err(|_| ViewNotUpdatable::Unsupported)?;
     let select = match stmt {
         spg_sql::ast::Statement::Select(s) => s,
-        _ => return None,
+        _ => return Err(ViewNotUpdatable::Unsupported),
     };
-    // simple-query shape: every reject clause must be empty / None. A WHERE is
-    // allowed (PG-auto-updatable).
-    if !select.ctes.is_empty()
-        || select.distinct
-        || select.group_by.is_some()
-        || select.group_by_all
-        || select.having.is_some()
-        || !select.unions.is_empty()
-        || !select.order_by.is_empty()
-        || select.limit.is_some()
-        || select.offset.is_some()
-    {
-        return None;
+    // Simple-query shape. A WHERE is allowed, and so is ORDER BY — PG
+    // auto-updates `SELECT a FROM t ORDER BY a` (measured on 18.4), and
+    // ordering is meaningless to a write anyway. SPG rejected it until
+    // round 267, which made an INSERT PG accepts fail here.
+    //
+    // The order of these checks is PG's reporting precedence, measured
+    // by building views that break two rules at once.
+    if !select.unions.is_empty() {
+        return Err(ViewNotUpdatable::SetOp);
     }
-    let from = select.from.as_ref()?;
+    if select.distinct {
+        return Err(ViewNotUpdatable::Distinct);
+    }
+    if select.group_by.is_some() || select.group_by_all || select.having.is_some() {
+        return Err(ViewNotUpdatable::GroupBy);
+    }
+    if !select.ctes.is_empty() {
+        return Err(ViewNotUpdatable::With);
+    }
+    if select.limit.is_some() || select.offset.is_some() {
+        return Err(ViewNotUpdatable::LimitOffset);
+    }
+    let from = select.from.as_ref().ok_or(ViewNotUpdatable::NotSingleTable)?;
     if !from.joins.is_empty() {
-        return None;
+        return Err(ViewNotUpdatable::NotSingleTable);
     }
     if from.primary.unnest_expr.is_some() || from.primary.as_of_segment.is_some() {
-        return None;
+        return Err(ViewNotUpdatable::NotSingleTable);
     }
     let primary_name = from.primary.name.clone();
     let is_leaf = catalog.get(&primary_name).is_some();
@@ -152,7 +282,7 @@ fn view_redirect_to_simple_base(
                 // renamed-wildcard-over-nested-view bails at the rename
                 // length check below, as before.
                 if is_leaf {
-                    let base = catalog.get(&primary_name)?;
+                    let base = catalog.get(&primary_name).ok_or(ViewNotUpdatable::Unsupported)?;
                     for c in &base.schema().columns {
                         out_cols.push((c.name.clone(), Some(c.name.clone()), None));
                     }
@@ -173,7 +303,7 @@ fn view_redirect_to_simple_base(
                         || crate::aggregate::contains_aggregate(other)
                         || expr_mentions_subquery_or_window(other)
                     {
-                        return None;
+                        return Err(ViewNotUpdatable::Unsupported);
                     }
                     let name = alias.clone().unwrap_or_else(|| String::from("?column?"));
                     out_cols.push((name, None, Some(other.clone())));
@@ -184,7 +314,7 @@ fn view_redirect_to_simple_base(
     // A rename list overrides every view-side name positionally.
     if !rename_cols.is_empty() {
         if rename_cols.len() != out_cols.len() {
-            return None;
+            return Err(ViewNotUpdatable::Unsupported);
         }
         for (slot, name) in out_cols.iter_mut().zip(rename_cols) {
             slot.0 = name;
@@ -230,7 +360,7 @@ fn view_redirect_to_simple_base(
                 this_check,
             ));
         }
-        return Some(ViewRedirect {
+        return Ok(ViewRedirect {
             base: primary_name,
             where_at_base: this_where,
             col_map: this_map,
@@ -241,7 +371,7 @@ fn view_redirect_to_simple_base(
     }
     // Nested: the primary is itself an auto-updatable view — recurse and compose.
     if catalog.views().contains_key(&primary_name) {
-        let inner = view_redirect_to_simple_base(catalog, &primary_name)?;
+        let inner = view_redirect_checked(catalog, &primary_name)?;
         let inner_map: alloc::collections::BTreeMap<String, String> =
             inner.col_map.iter().cloned().collect();
         let inner_cmap: alloc::collections::BTreeMap<String, spg_sql::ast::Expr> = inner
@@ -268,7 +398,7 @@ fn view_redirect_to_simple_base(
         }
         chain.extend(inner.check_chain);
         if inner.computed.is_empty() {
-            return Some(ViewRedirect {
+            return Ok(ViewRedirect {
                 base: inner.base,
                 where_at_base: and_optional_predicates(this_where_at_base, inner.where_at_base),
                 col_map: compose_view_maps(&this_map, &inner.col_map),
@@ -296,11 +426,11 @@ fn view_redirect_to_simple_base(
             }
         } else {
             for (name, inner_ref, _) in &out_cols {
-                let inner_ref = inner_ref.as_ref()?; // all-simple here
+                let inner_ref = inner_ref.as_ref().ok_or(ViewNotUpdatable::Unsupported)?; // all-simple here
                 if let Some(c) = inner.computed.iter().find(|c| c.name == *inner_ref) {
                     composed.push((name.clone(), None, Some(c)));
                 } else {
-                    let base = inner_by_name.get(inner_ref.as_str())?;
+                    let base = inner_by_name.get(inner_ref.as_str()).ok_or(ViewNotUpdatable::Unsupported)?;
                     // A simple inner column — its base name is right there.
                     composed.push((name.clone(), (*base).clone(), None));
                 }
@@ -325,7 +455,7 @@ fn view_redirect_to_simple_base(
             .iter()
             .map(|(n, b, _)| (n.clone(), b.clone()))
             .collect();
-        return Some(ViewRedirect {
+        return Ok(ViewRedirect {
             base: inner.base,
             where_at_base: and_optional_predicates(this_where_at_base, inner.where_at_base),
             col_map,
@@ -334,7 +464,7 @@ fn view_redirect_to_simple_base(
             check_chain: chain,
         });
     }
-    None
+    Err(ViewNotUpdatable::Unsupported)
 }
 
 /// v7.39 (round 154) — shapes that make a view non-auto-updatable even
@@ -727,6 +857,16 @@ impl Engine {
         // v7.37.19 (19.13) — auto-updatable view redirect. v7.38 (P6.46) — a
         // view WHERE is AND-ed onto the caller's so only rows visible through
         // the view are updated.
+        // v7.39 (round 267) — the view exists but is not auto-updatable.
+        // Without this the write fell through to the base-table lookup and
+        // reported `relation "<view>" does not exist`, which is not merely
+        // the wrong wording — it denies the existence of an object the
+        // catalog plainly has.
+        if let Err(reason) = view_redirect_checked(self.active_catalog(), &stmt.table) {
+            if self.active_catalog().views().contains_key(&stmt.table) {
+                return Err(view_not_updatable_error(&stmt.table, &UPDATE_VERB, reason, false));
+            }
+        }
         if let Some(vr) = view_redirect_to_simple_base(self.active_catalog(), &stmt.table) {
             let ViewRedirect {
                 base,
@@ -1478,6 +1618,24 @@ impl Engine {
         // to the base table: column names map view → base (qualified by the
         // view's alias), the view's WHERE narrows which target rows the merge
         // can see, and a positional INSERT follows the VIEW's column order.
+        // v7.39 (round 267) — as above; MERGE reports the verb of its
+        // FIRST WHEN clause (measured on PG 18.4) and names MERGE in the
+        // HINT instead of offering a rewrite rule.
+        if let Err(reason) = view_redirect_checked(self.active_catalog(), &stmt.target) {
+            if self.active_catalog().views().contains_key(&stmt.target) {
+                let verb = stmt
+                    .clauses
+                    .iter()
+                    .find_map(|c| match c.action {
+                        spg_sql::ast::MergeAction::Insert { .. } => Some(&INSERT_VERB),
+                        spg_sql::ast::MergeAction::Update { .. } => Some(&UPDATE_VERB),
+                        spg_sql::ast::MergeAction::Delete => Some(&DELETE_VERB),
+                        _ => None,
+                    })
+                    .unwrap_or(&INSERT_VERB);
+                return Err(view_not_updatable_error(&stmt.target, verb, reason, true));
+            }
+        }
         if let Some(vr) = view_redirect_to_simple_base(self.active_catalog(), &stmt.target) {
             let mut s = stmt.clone();
             let alias = s.target_alias.clone().unwrap_or_else(|| s.target.clone());
@@ -2434,6 +2592,16 @@ impl Engine {
         // v7.37.19 (19.13) — auto-updatable view redirect. v7.38 (P6.46) — a
         // view WHERE is AND-ed onto the caller's so only rows visible through
         // the view are deleted.
+        // v7.39 (round 267) — the view exists but is not auto-updatable.
+        // Without this the write fell through to the base-table lookup and
+        // reported `relation "<view>" does not exist`, which is not merely
+        // the wrong wording — it denies the existence of an object the
+        // catalog plainly has.
+        if let Err(reason) = view_redirect_checked(self.active_catalog(), &stmt.table) {
+            if self.active_catalog().views().contains_key(&stmt.table) {
+                return Err(view_not_updatable_error(&stmt.table, &DELETE_VERB, reason, false));
+            }
+        }
         if let Some(vr) = view_redirect_to_simple_base(self.active_catalog(), &stmt.table) {
             // DELETE removes rows; there is no post-image to check, so
             // WITH CHECK OPTION does not apply. The composed WHERE (all nested
@@ -3511,6 +3679,16 @@ impl Engine {
         // the view's WHERE. Captured here (view name = the pre-redirect table),
         // enforced below once the full base rows are assembled.
         let mut view_check: Option<ViewCheck> = None;
+        // v7.39 (round 267) — the view exists but is not auto-updatable.
+        // Without this the write fell through to the base-table lookup and
+        // reported `relation "<view>" does not exist`, which is not merely
+        // the wrong wording — it denies the existence of an object the
+        // catalog plainly has.
+        if let Err(reason) = view_redirect_checked(self.active_catalog(), &stmt.table) {
+            if self.active_catalog().views().contains_key(&stmt.table) {
+                return Err(view_not_updatable_error(&stmt.table, &INSERT_VERB, reason, false));
+            }
+        }
         if let Some(vr) = view_redirect_to_simple_base(self.active_catalog(), &stmt.table) {
             let ViewRedirect {
                 base,
