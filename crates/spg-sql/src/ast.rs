@@ -2176,6 +2176,12 @@ pub enum ColumnTypeName {
     Int,
     BigInt,
     Float,
+    /// v7.39 (round 269) — `REAL` / `FLOAT4` / `FLOAT(1..24)`: 32-bit
+    /// IEEE. It used to map to [`Self::Float`] on the theory that a
+    /// wider float is harmless, but the width is observable: a `real`
+    /// column holding 0.1 stored the f64 0.1, so `r = 0.1::real`
+    /// answered false where PG answers true.
+    Real,
     Text,
     /// `VARCHAR(N)` — TEXT capped at N Unicode characters.
     Varchar(u32),
@@ -2353,6 +2359,7 @@ impl fmt::Display for ColumnTypeName {
             Self::Int => f.write_str("INT"),
             Self::BigInt => f.write_str("BIGINT"),
             Self::Float => f.write_str("FLOAT"),
+            Self::Real => f.write_str("REAL"),
             Self::Text => f.write_str("TEXT"),
             Self::Varchar(n) => write!(f, "VARCHAR({n})"),
             Self::Char(n) => write!(f, "CHAR({n})"),

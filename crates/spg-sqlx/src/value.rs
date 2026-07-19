@@ -113,6 +113,12 @@ pub fn engine_value_kind(v: &EngineValue) -> Kind {
         EngineValue::Text(_) => Kind::Text,
         EngineValue::Bytes(_) => Kind::Bytes,
         EngineValue::Float(_) => Kind::Float,
+        // v7.39 (round 269) — REAL rides the same Kind as FLOAT so
+        // f32 / f64 stay `compatible` with a real column; the width
+        // difference lives in Decode, not in the kind. Without this it
+        // fell to the non-exhaustive catch-all and reported Kind::Null,
+        // which fails every type check.
+        EngineValue::Real(_) => Kind::Float,
         EngineValue::Date(_) => Kind::Date,
         EngineValue::Timestamp(_) => Kind::Timestamp,
         EngineValue::Json(_) => Kind::Json,

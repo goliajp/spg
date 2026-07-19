@@ -2366,6 +2366,7 @@ pub(crate) const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Int => DataType::Int,
         ColumnTypeName::BigInt => DataType::BigInt,
         ColumnTypeName::Float => DataType::Float,
+        ColumnTypeName::Real => DataType::Real,
         ColumnTypeName::Text => DataType::Text,
         ColumnTypeName::Varchar(n) => DataType::Varchar(n),
         ColumnTypeName::Char(n) => DataType::Char(n),
@@ -3113,6 +3114,21 @@ fn invalid_input_syntax(ty: &str, value: &str) -> EngineError {
     })
 }
 
+/// v7.39 (round 269) — PG quotes the offending source when it has one:
+/// `"1e40" is out of range for type real`.
+fn real_out_of_range(value: &str) -> EngineError {
+    EngineError::Eval(EvalError::TypeMismatch {
+        detail: alloc::format!("\"{value}\" is out of range for type real"),
+    })
+}
+
+/// Whether a float text literally spells an infinity, which PG accepts
+/// as a value rather than treating as an overflow.
+fn text_is_explicit_infinity(t: &str) -> bool {
+    let t = t.trim_start_matches(['+', '-']);
+    t.eq_ignore_ascii_case("inf") || t.eq_ignore_ascii_case("infinity")
+}
+
 /// v7.39 (read01 round 90) — PG splits a failed date/time text into two states:
 /// a date-shaped string whose fields are out of range (month 13, day 30) is
 /// 22008 `date/time field value out of range: "X"`; anything not date-shaped is
@@ -3603,7 +3619,18 @@ pub(crate) fn coerce_value(
         (Value::Int(n), DataType::Real) => Some(Value::Real(n as f32)),
         (Value::SmallInt(n), DataType::Real) => Some(Value::Real(f32::from(n))),
         (Value::BigInt(n), DataType::Real) => Some(Value::Real(n as f32)),
-        (Value::Float(x), DataType::Real) => Some(Value::Real(x as f32)),
+        (Value::Float(x), DataType::Real) => {
+            // v7.39 (round 269) — narrowing a finite f64 past the f32
+            // range overflows; PG words this one "value out of range:
+            // overflow" (it has no source text to quote).
+            let narrowed = x as f32;
+            if narrowed.is_infinite() && x.is_finite() {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: "value out of range: overflow".into(),
+                }));
+            }
+            Some(Value::Real(narrowed))
+        }
         (
             Value::Numeric {
                 scaled,
@@ -3624,12 +3651,23 @@ pub(crate) fn coerce_value(
             }
         })),
         (Value::Real(x), DataType::Float) => Some(Value::Float(f64::from(x))),
-        (Value::Text(s), DataType::Real) => Some(Value::Real(
-            s.trim()
+        // v7.39 (round 269) — overflowing the f32 range is an ERROR, not
+        // an infinity. `parse::<f32>()` reports "1e40" as inf and this
+        // used to hand that back, so a value PG rejects arrived as
+        // Infinity and every later comparison against it was wrong. An
+        // explicitly written infinity still passes; the test is whether
+        // the SOURCE said infinity, not whether the result is one.
+        (Value::Text(s), DataType::Real) => {
+            let t = s.trim();
+            let x = t
                 .parse::<f32>()
                 .ok()
-                .ok_or_else(|| invalid_input_syntax("real", &s))?,
-        )),
+                .ok_or_else(|| invalid_input_syntax("real", &s))?;
+            if x.is_infinite() && !text_is_explicit_infinity(t) {
+                return Err(real_out_of_range(t));
+            }
+            Some(Value::Real(x))
+        }
         // PG boolin accepts any unambiguous prefix of true/false/yes/no,
         // plus on/off/1/0, case-insensitively with surrounding whitespace
         // trimmed. `o` alone is ambiguous (on vs off) → error.
@@ -4820,6 +4858,20 @@ pub(crate) fn coerce_value(
         // v7.39 (read01 numeric.c) — a big NUMERIC (`3.14e100` literal) casts
         // to float8 through its decimal text; a value beyond the double range
         // errors like PG ("value out of range: overflow").
+        // v7.39 (round 269) — the same route to real. Without this arm a
+        // NUMERIC literal past the i128 range (1.8e38 and up) never
+        // reached a real cast at all and surfaced an internal
+        // "expected REAL, got NUMERIC(0)" storage mismatch.
+        (Value::NumericBig(b), DataType::Real) => {
+            let text = b.to_decimal_str();
+            let x: f32 = text
+                .parse()
+                .map_err(|_| real_out_of_range(&text))?;
+            if !x.is_finite() {
+                return Err(real_out_of_range(&text));
+            }
+            Some(Value::Real(x))
+        }
         (Value::NumericBig(b), DataType::Float) => {
             let x: f64 = b.to_decimal_str().parse().map_err(|_| {
                 EngineError::Eval(EvalError::TypeMismatch {

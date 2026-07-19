@@ -13040,20 +13040,45 @@ impl Parser {
                 self.consume_optional_paren_size();
                 ColumnTypeName::BigInt
             }
-            // DOUBLE / REAL are 64-bit IEEE — same as our FLOAT.
             // v7.13.0 — `DOUBLE PRECISION` (PG canonical spelling)
             // (mailrs round-5 G6). Consume the optional `PRECISION`
             // tail when the type keyword was `double` / `DOUBLE`.
+            //
+            // v7.39 (round 269) — REAL is 32-bit, not "the same as our
+            // FLOAT". `FLOAT(p)` picks the width the way PG does:
+            // p in 1..=24 is real, 25..=53 is double precision, and
+            // anything else is an error.
             "float" | "double" | "real" => {
                 if ty_ident.eq_ignore_ascii_case("double")
                     && matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("precision"))
                 {
                     self.advance();
                 }
-                ColumnTypeName::Float
+                if ty_ident.eq_ignore_ascii_case("real") {
+                    ColumnTypeName::Real
+                } else if ty_ident.eq_ignore_ascii_case("float")
+                    && matches!(self.peek(), Token::LParen)
+                {
+                    // PG words the two bounds differently, and
+                    // parse_paren_size already rejects a zero.
+                    let p = self.parse_paren_size("FLOAT")?;
+                    if p > 53 {
+                        return Err(self.err(String::from(
+                            "precision for type float must be less than 54 bits",
+                        )));
+                    }
+                    if p <= 24 {
+                        ColumnTypeName::Real
+                    } else {
+                        ColumnTypeName::Float
+                    }
+                } else {
+                    ColumnTypeName::Float
+                }
             }
             // v7.13.0 — `FLOAT8` (PG short form) maps the same as FLOAT.
-            "float4" | "float8" => ColumnTypeName::Float,
+            "float4" => ColumnTypeName::Real,
+            "float8" => ColumnTypeName::Float,
             "text" => ColumnTypeName::Text,
             "bool" | "boolean" => ColumnTypeName::Bool,
             "varchar" => ColumnTypeName::Varchar(self.parse_paren_size("VARCHAR")?),
@@ -22018,7 +22043,9 @@ fn map_type_ident_to_column_type_name(ident: &str) -> Option<ColumnTypeName> {
         "smallint" | "tinyint" => ColumnTypeName::SmallInt,
         "int" | "integer" | "mediumint" => ColumnTypeName::Int,
         "bigint" => ColumnTypeName::BigInt,
-        "float" | "double" | "real" => ColumnTypeName::Float,
+        "float" | "double" => ColumnTypeName::Float,
+        // v7.39 (round 269) — real is 32-bit.
+        "real" | "float4" => ColumnTypeName::Real,
         "text" => ColumnTypeName::Text,
         "bool" | "boolean" => ColumnTypeName::Bool,
         "date" => ColumnTypeName::Date,

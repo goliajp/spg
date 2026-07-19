@@ -356,6 +356,10 @@ pub(crate) struct AggState {
     sum_float: f64,
     extreme: Option<Value<'static>>,
     use_float: bool,
+    /// v7.39 (round 269) — a non-REAL float has flowed into
+    /// `sum_float`. `sum(real)` stays real in PG; it only widens to
+    /// double precision once something wider joins the accumulation.
+    float_not_real: bool,
     /// v7.37.16 — exact NUMERIC accumulator for `sum(numeric)` /
     /// `avg(numeric)`. Only touched when a `Value::Numeric` flows
     /// through the sum/avg path (`use_numeric` gates it); the
@@ -1067,6 +1071,7 @@ struct FusedAcc {
     sum_int: i64,
     sum_float: f64,
     use_float: bool,
+    float_not_real: bool,
     num_scaled: i128,
     num_kind: spg_storage::NumericKind,
     num_scale: u8,
@@ -1160,6 +1165,7 @@ fn merge_fused(a: &mut FusedAcc, b: &FusedAcc) {
     a.sum_int += b.sum_int;
     a.sum_float += b.sum_float;
     a.use_float |= b.use_float;
+    a.float_not_real |= b.float_not_real;
     if b.use_numeric {
         // v7.39 (read01 numeric.c) — fold the shard's bignum spill first,
         // then its i128 lane (zero if the shard promoted).
@@ -1203,6 +1209,7 @@ fn fill_states_from_fused(
                 state.sum_int = a.sum_int;
                 state.sum_float = a.sum_float;
                 state.use_float = a.use_float;
+                state.float_not_real = a.float_not_real;
                 state.sum_num_scaled = a.num_scaled;
                 state.sum_num_kind = a.num_kind;
                 state.sum_num_scale = a.num_scale;
@@ -1303,6 +1310,7 @@ fn fused_acc_cell(a: &mut FusedAcc, v: &Value<'_>) -> Result<(), EvalError> {
         Value::Float(x) => {
             a.sum_float += *x;
             a.use_float = true;
+            a.float_not_real = true;
             a.count += 1;
         }
         Value::Real(x) => {
@@ -1958,6 +1966,7 @@ fn accumulate_groups(
         let mut sum_int: i64 = 0;
         let mut sum_float: f64 = 0.0;
         let mut use_float = false;
+        let mut float_not_real = false;
         // v7.37.16 — exact NUMERIC accumulator, only written when a
         // Numeric cell appears. The int/float branches above are
         // untouched (byte-identical), so the common int/float sum pays
@@ -2007,6 +2016,7 @@ fn accumulate_groups(
                     Value::Float(x) => {
                         sum_float += *x;
                         use_float = true;
+                        float_not_real = true;
                         count += 1;
                     }
                     Value::Real(x) => {
@@ -2121,6 +2131,7 @@ fn accumulate_groups(
                     Value::Float(x) => {
                         sum_float += x;
                         use_float = true;
+                        float_not_real = true;
                         count += 1;
                     }
                     Value::Real(x) => {
@@ -2174,6 +2185,7 @@ fn accumulate_groups(
         state.sum_int = sum_int;
         state.sum_float = sum_float;
         state.use_float = use_float;
+        state.float_not_real = float_not_real;
         state.sum_num_scaled = num_scaled;
         state.sum_num_kind = num_kind;
         state.sum_num_scale = num_scale;
@@ -3915,6 +3927,7 @@ pub(crate) fn update_state(
                 Value::Float(x) => {
                     st.use_float = true;
                     st.sum_float += *x;
+                    st.float_not_real = true;
                 }
                 Value::Real(x) => {
                     st.use_float = true;
@@ -4347,7 +4360,17 @@ pub(crate) fn finalize(name: &str, st: &AggState) -> Value<'static> {
                     }
                 }
             } else if st.use_float {
-                Value::Float(st.sum_float + (st.sum_int as f64))
+                let total = st.sum_float + (st.sum_int as f64);
+                // v7.39 (round 269) — sum over REAL input stays real in
+                // PG; it widens only when something wider joined the
+                // accumulation. avg is deliberately not the same:
+                // avg(real) IS double precision (measured on 18.4).
+                if st.float_not_real {
+                    Value::Float(total)
+                } else {
+                    #[allow(clippy::cast_possible_truncation)]
+                    Value::Real(total as f32)
+                }
             } else {
                 Value::BigInt(st.sum_int)
             }

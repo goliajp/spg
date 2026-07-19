@@ -36,6 +36,8 @@ impl<'r> Decode<'r, Spg> for f64 {
     fn decode(value: SpgValueRef<'r>) -> Result<Self, BoxDynError> {
         match value.engine() {
             EngineValue::Float(x) => Ok(*x),
+            // v7.39 (round 269) — widening a REAL into f64 is lossless.
+            EngineValue::Real(x) => Ok(f64::from(*x)),
             other => Err(format!("cannot decode {other:?} as f64 / FLOAT").into()),
         }
     }
@@ -66,6 +68,11 @@ impl<'r> Decode<'r, Spg> for f32 {
         match value.engine() {
             #[allow(clippy::cast_possible_truncation)]
             EngineValue::Float(x) => Ok(*x as f32),
+            // v7.39 (round 269) — a REAL column is now genuinely 32-bit
+            // and yields Value::Real. Decoding it as f32 is the most
+            // natural pairing a customer can write, and it is exactly
+            // the one that had no arm here.
+            EngineValue::Real(x) => Ok(*x),
             other => Err(format!("cannot decode {other:?} as f32 / FLOAT").into()),
         }
     }

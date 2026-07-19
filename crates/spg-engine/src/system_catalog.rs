@@ -248,6 +248,11 @@ pub(crate) fn synth_information_schema_columns(
         ColumnSchema::new("column_default", DataType::Text, true),
         ColumnSchema::new("character_maximum_length", DataType::Int, true),
         ColumnSchema::new("numeric_precision", DataType::Int, true),
+        // v7.39 (round 269) — the radix the precision is expressed in:
+        // 2 for the binary-precision types (the integers and the two
+        // floats), 10 for numeric, NULL for everything non-numeric.
+        // JDBC getColumns reads it alongside the precision.
+        ColumnSchema::new("numeric_precision_radix", DataType::Int, true),
         ColumnSchema::new("numeric_scale", DataType::Int, true),
         ColumnSchema::new("udt_name", DataType::Text, false),
         ColumnSchema::new("is_identity", DataType::Text, false),
@@ -326,6 +331,8 @@ fn info_column_row(
             DataType::Int => (Value::Int(32), Value::Int(0)),
             DataType::BigInt => (Value::Int(64), Value::Int(0)),
             DataType::Float => (Value::Int(53), Value::Null),
+            // v7.39 (round 269) — real carries 24 bits of mantissa.
+            DataType::Real => (Value::Int(24), Value::Null),
             DataType::Numeric { precision, scale } => (
                 Value::Int(i32::from(precision)),
                 Value::Int(i32::from(scale)),
@@ -406,7 +413,14 @@ fn info_column_row(
                 }
                 _ => Value::Null,
             },
-            num_prec,
+            num_prec.clone(),
+            // NUMERIC states its precision in decimal digits; every
+            // other numeric type states it in bits.
+            match col.ty {
+                DataType::Numeric { .. } => Value::Int(10),
+                _ if matches!(num_prec, Value::Null) => Value::Null,
+                _ => Value::Int(2),
+            },
             num_scale,
             Value::text::<&str>(udt),
             // v7.39 (round 248) — a SERIAL column is NOT identity in PG
