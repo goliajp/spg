@@ -146,6 +146,7 @@ mod e2e_fsync_fail_round190;
 mod e2e_file_access_sqlstate_round191;
 mod e2e_exclude_wire_round217;
 mod e2e_window_sqlstate_wire_round230;
+mod e2e_copy_from_wire_round250;
 mod e2e_setop_orderby_wire_round233;
 mod e2e_cursor_wire_round219;
 mod e2e_notify_wire_round222;

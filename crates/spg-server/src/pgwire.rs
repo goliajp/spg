@@ -4913,6 +4913,52 @@ fn handle_copy_from_stdin(
     }
     send_msg(stream, b'G', &body)?;
 
+    // v7.39 (round 250) — COPY is ONE command: wrap the per-row INSERTs
+    // in a transaction (engine AND WAL) unless the client already opened
+    // one. Pre-r250 the rows went through `engine.execute` alone — never
+    // WAL-appended (acknowledged rows vanished on kill -9: the r178/r180
+    // lesson, wire-COPY spelling) and never rolled back on a bad row
+    // (PG's COPY is all-or-nothing). A crash mid-COPY now replays
+    // BEGIN + rows with no COMMIT, which the end-of-WAL auto-rollback
+    // discards — exactly what the client observed (no success).
+    // `ON_ERROR SET_NULL` (an SPG extension) is explicitly per-row:
+    // a bad row must not poison the rest, but an error inside an engine
+    // transaction aborts it (PG semantics) — so that mode keeps the
+    // pre-r250 per-row autocommit shape (rows WAL-append per row, one
+    // fsync at CommandComplete).
+    let wrap = !opts.on_error_set_null
+        && !state.engine.read().is_ok_and(|e| e.in_transaction());
+    if wrap {
+        if let Err(e) = state
+            .engine
+            .write()
+            .map_err(|_| std::io::Error::other("engine rwlock poisoned"))
+            .and_then(|mut e| {
+                e.execute("BEGIN")
+                    .map(|_| ())
+                    .map_err(|err| std::io::Error::other(format!("{err}")))
+            })
+        {
+            send_error(stream, "XX000", &format!("COPY: {e}"))?;
+            drain_copy_in_frames(stream)?;
+            return Ok(());
+        }
+        if let Err(e) = crate::append_wal(state, "BEGIN", false) {
+            let _ = state.engine.write().map(|mut en| en.execute("ROLLBACK"));
+            send_error(stream, "53100", &format!("{e}"))?;
+            drain_copy_in_frames(stream)?;
+            return Ok(());
+        }
+    }
+    // Roll the wrapping transaction back (engine + WAL) on any error
+    // below, so the failed COPY leaves nothing — including on replay.
+    let rollback_wrap = |state: &Arc<ServerState>| {
+        if wrap {
+            let _ = state.engine.write().map(|mut e| e.execute("ROLLBACK"));
+            let _ = crate::append_wal(state, "ROLLBACK", false);
+        }
+    };
+
     // Stream loop: keep reading frames; each CopyData ('d') frame
     // may carry partial / multiple / no rows. Buffer bytes, split
     // on \n. CopyDone ('c') ends the input.
@@ -4969,6 +5015,7 @@ fn handle_copy_from_stdin(
             } else {
                 "22P02"
             };
+            rollback_wrap(state);
             send_error(stream, code, &msg)?;
             drain_copy_in_frames(stream)?;
             return Ok(());
@@ -4992,8 +5039,43 @@ fn handle_copy_from_stdin(
         } else {
             "22P02"
         };
+        rollback_wrap(state);
         send_error(stream, code, &msg)?;
         return Ok(());
+    }
+    // v7.39 (round 250) — the COMMIT is the durability point: one fsync
+    // covers every row (session synchronous_commit honoured, like the
+    // normal statement path).
+    if !wrap && crate::session_sync_commit(state) {
+        // Unwrapped path (ON_ERROR SET_NULL / client transaction): the
+        // client-tx case fsyncs at its COMMIT; SET_NULL anchors here.
+        if opts.on_error_set_null
+            && inserted > 0
+            && let Err(e) = crate::wal_fsync_now(state)
+        {
+            send_error(stream, "53100", &format!("{e}"))?;
+            return Ok(());
+        }
+    }
+    if wrap {
+        if let Err(e) = state
+            .engine
+            .write()
+            .map_err(|_| std::io::Error::other("engine rwlock poisoned"))
+            .and_then(|mut e| {
+                e.execute("COMMIT")
+                    .map(|_| ())
+                    .map_err(|err| std::io::Error::other(format!("{err}")))
+            })
+        {
+            let _ = crate::append_wal(state, "ROLLBACK", false);
+            send_error(stream, "XX000", &format!("COPY: {e}"))?;
+            return Ok(());
+        }
+        if let Err(e) = crate::append_wal(state, "COMMIT", crate::session_sync_commit(state)) {
+            send_error(stream, "53100", &format!("{e}"))?;
+            return Ok(());
+        }
     }
     send_command_complete(stream, &format!("COPY {inserted}"))?;
     *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
@@ -5055,19 +5137,26 @@ fn process_copy_chunk(
                 return Err(msg);
             }
             let sql = spg_engine::copy::build_copy_insert(table, column_list, &values);
-            let mut engine = state
-                .engine
-                .write()
-                .map_err(|_| "engine rwlock poisoned".to_string())?;
-            match engine.execute(&sql) {
-                Ok(_) => *inserted += 1,
-                Err(e) => {
-                    if opts.on_error_set_null {
-                        continue;
+            {
+                let mut engine = state
+                    .engine
+                    .write()
+                    .map_err(|_| "engine rwlock poisoned".to_string())?;
+                match engine.execute(&sql) {
+                    Ok(_) => *inserted += 1,
+                    Err(e) => {
+                        if opts.on_error_set_null {
+                            continue;
+                        }
+                        // Bare engine error — PG reports the cell error
+                        // itself, not an internal wrapper.
+                        return Err(format!("{e}"));
                     }
-                    return Err(format!("COPY row INSERT failed: {e}"));
                 }
             }
+            // v7.39 (round 250) — the row is in the wrapping transaction;
+            // its WAL record must be too (no fsync — COMMIT covers).
+            crate::append_wal(state, &sql, false).map_err(|e| format!("{e}"))?;
         }
         return Ok(());
     }
@@ -5116,20 +5205,26 @@ fn process_copy_chunk(
             }
             spg_engine::copy::build_copy_insert(table, column_list, &values)
         };
-        let mut engine = state
-            .engine
-            .write()
-            .map_err(|_| "engine rwlock poisoned".to_string())?;
-        match engine.execute(&sql) {
-            Ok(_) => *inserted += 1,
-            Err(e) => {
-                if opts.on_error_set_null {
-                    // Best-effort: skip the row but keep going.
-                    continue;
+        {
+            let mut engine = state
+                .engine
+                .write()
+                .map_err(|_| "engine rwlock poisoned".to_string())?;
+            match engine.execute(&sql) {
+                Ok(_) => *inserted += 1,
+                Err(e) => {
+                    if opts.on_error_set_null {
+                        // Best-effort: skip the row but keep going.
+                        continue;
+                    }
+                    // Bare engine error — PG reports the cell error
+                    // itself, not an internal wrapper.
+                    return Err(format!("{e}"));
                 }
-                return Err(format!("COPY row INSERT failed: {e}"));
             }
         }
+        // v7.39 (round 250) — WAL record inside the wrapping transaction.
+        crate::append_wal(state, &sql, false).map_err(|e| format!("{e}"))?;
     }
     Ok(())
 }
