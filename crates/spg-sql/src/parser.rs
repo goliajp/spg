@@ -9103,7 +9103,8 @@ impl Parser {
                     "TEXT" => opts.format = CopyFormat::Text,
                     other => {
                         return Err(self.err(alloc::format!(
-                            "COPY FORMAT {other} is not supported (use text or csv)"
+                            "COPY format \"{}\" not recognized",
+                            other.to_ascii_lowercase()
                         )));
                     }
                 }
@@ -9206,11 +9207,62 @@ impl Parser {
                     }
                 });
             }
+            // v7.39 (round 265) — the two CSV FROM-side column lists. Same
+            // grammar as FORCE_QUOTE; PG accepts `*` for FORCE_NOT_NULL /
+            // FORCE_NULL too.
+            "FORCE_NOT_NULL" | "FORCE_NULL" => {
+                let cols = self.parse_copy_column_list(&kw)?;
+                if kw == "FORCE_NOT_NULL" {
+                    opts.force_not_null = Some(cols);
+                } else {
+                    opts.force_null = Some(cols);
+                }
+            }
             other => {
-                return Err(self.err(alloc::format!("unsupported COPY option {other:?}")));
+                // PG's wording, lowercased option name.
+                return Err(self.err(alloc::format!(
+                    "option \"{}\" not recognized",
+                    other.to_ascii_lowercase()
+                )));
             }
         }
         Ok(())
+    }
+
+    /// v7.39 (round 265) — `( col, … )` or `*` after a COPY column-list
+    /// option (FORCE_QUOTE / FORCE_NOT_NULL / FORCE_NULL). An empty vec
+    /// is the `*` spelling.
+    fn parse_copy_column_list(&mut self, kw: &str) -> Result<Vec<String>, ParseError> {
+        if matches!(self.peek(), Token::Star) {
+            self.advance();
+            return Ok(Vec::new());
+        }
+        if !matches!(self.peek(), Token::LParen) {
+            return Err(self.err(alloc::format!(
+                "expected '(' or '*' after {kw}, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let mut cols = Vec::new();
+        loop {
+            cols.push(self.expect_ident_like()?);
+            match self.peek() {
+                Token::Comma => {
+                    self.advance();
+                }
+                Token::RParen => {
+                    self.advance();
+                    break;
+                }
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "expected ',' or ')' in {kw} list, got {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(cols)
     }
 
     fn parse_partition_bounds_tail(

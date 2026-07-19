@@ -41,6 +41,14 @@ pub struct CopyOptions {
     /// columns whose non-NULL cells always quote. `Some(vec![])` is the
     /// `*` spelling (every column).
     pub force_quote: Option<Vec<String>>,
+    /// v7.39 (round 265) — CSV `FORCE_NOT_NULL (col, …)`: for these
+    /// columns an UNQUOTED empty field reads as the empty string rather
+    /// than NULL (probed). COPY FROM only.
+    pub force_not_null: Option<Vec<String>>,
+    /// v7.39 (round 265) — CSV `FORCE_NULL (col, …)`: for these columns
+    /// a QUOTED empty field (`""`) also reads as NULL (probed). COPY
+    /// FROM only.
+    pub force_null: Option<Vec<String>>,
 }
 
 /// v7.39 (round 218) — FETCH / MOVE cursor direction. PG grammar: single-row
