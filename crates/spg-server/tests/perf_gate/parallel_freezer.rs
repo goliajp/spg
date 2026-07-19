@@ -69,6 +69,13 @@ fn wide_users_schema() -> TableSchema {
         policies: Vec::new(),
         row_security: false,
         force_row_security: false,
+        // v7.39 (round 275) — fields this branch added to TableSchema
+        // (exclusion constraints, table ACL, owner). This literal was
+        // never updated because the gates category, which is the only
+        // thing that builds this test, had never run on the branch.
+        exclusion_constraints: Vec::new(),
+        acl: Vec::new(),
+        owner: None,
     }
 }
 
