@@ -1662,6 +1662,25 @@ fn eval_function_call_positional(
     row: &Row<'static>,
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.39 (round 237) — COALESCE / GREATEST / LEAST resolve their
+    // arguments to one type the way CASE and ARRAY do. Checked statically:
+    // an argument may have side effects (`COALESCE(nextval('s'), 1)`), so
+    // its declared type is read rather than its value.
+    if matches!(args.len(), 2..) {
+        let construct = if name.eq_ignore_ascii_case("coalesce") {
+            Some("COALESCE")
+        } else if name.eq_ignore_ascii_case("greatest") {
+            Some("GREATEST")
+        } else if name.eq_ignore_ascii_case("least") {
+            Some("LEAST")
+        } else {
+            None
+        };
+        if let Some(construct) = construct {
+            let refs: Vec<&Expr> = args.iter().collect();
+            unify_branch_types_static(construct, &refs, ctx)?;
+        }
+    }
     // v7.39 (read01 utils/adt, enum.c) — the enum introspection
     // v7.39 (read01 utils/adt, enum.c) — the enum introspection
     // family needs the ARGUMENT'S STATIC TYPE (the value is
@@ -2010,6 +2029,24 @@ fn eval_case_arm(
     row: &Row<'static>,
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.39 (round 237) — PG resolves the RESULT branches to one type and
+    // refuses the CASE when they have no common one, before running
+    // anything. SPG returned whichever branch fired, so
+    // `CASE WHEN true THEN 1 ELSE 'a'::text END` answered `1` and the same
+    // expression answered text on another row.
+    {
+        // PG resolves the ELSE branch FIRST and then the WHEN results, and
+        // its message names the running type before the conflicting one —
+        // which is why `THEN 1 ELSE 'a'::text` reports "text and integer"
+        // while a two-WHEN `THEN 1 ... THEN true` reports "integer and
+        // boolean". Probed against 18.4; the order is observable.
+        let mut results: Vec<&Expr> = Vec::with_capacity(branches.len() + 1);
+        if let Some(e) = else_branch {
+            results.push(e);
+        }
+        results.extend(branches.iter().map(|(_, r)| r));
+        unify_branch_types_static("CASE", &results, ctx)?;
+    }
     let operand_value = match operand {
         Some(o) => Some(eval_expr(o, row, ctx)?),
         None => None,
@@ -3429,6 +3466,103 @@ fn unify_array_elements(
     items: &[Expr],
     materialised: &mut [Value<'static>],
 ) -> Result<(), EvalError> {
+    unify_construct_values("ARRAY", items, materialised)
+}
+
+/// v7.39 (round 237) — STATIC branch-type resolution for the constructs
+/// whose branches must not all be evaluated: CASE runs only the branch it
+/// takes, and a COALESCE / GREATEST argument may have side effects
+/// (`COALESCE(nextval('s'), 1)`), so the check reads each branch's declared
+/// type instead of its value. Same rule and wording as the value-driven
+/// ARRAY path below; an untyped literal is converted here (a literal has no
+/// side effects) so a value that will not convert is reported as PG does.
+pub(crate) fn unify_branch_types_static(
+    construct: &str,
+    branches: &[&Expr],
+    ctx: &EvalContext<'_>,
+) -> Result<(), EvalError> {
+    use spg_storage::DataType;
+    let untyped = |e: &Expr| {
+        matches!(
+            e,
+            Expr::Literal(spg_sql::ast::Literal::String(_))
+                | Expr::Literal(spg_sql::ast::Literal::Null)
+        )
+    };
+    let mut resolved: Option<DataType> = None;
+    for e in branches {
+        if untyped(e) {
+            continue;
+        }
+        // Only branches whose type is GENUINELY known take part. A general
+        // `describe_expr` is a best-effort hint for wire type tags, not a
+        // type checker: it reports a binary operator as its left operand's
+        // type, so `payload->'a'` (jsonb in PG) came back as text and this
+        // check refused a working `COALESCE(payload->'a', '{}'::jsonb)`.
+        // Refusing a valid query is worse than missing an invalid one, so
+        // the check confines itself to an explicit cast, a typed literal and
+        // a plain column reference.
+        let known = matches!(
+            e,
+            Expr::Cast { .. } | Expr::Literal(_) | Expr::Column(_)
+        );
+        if !known {
+            continue;
+        }
+        let Some(ty) = crate::describe::describe_expr(e, ctx.columns).map(|s| s.ty) else {
+            continue;
+        };
+        match resolved {
+            None => resolved = Some(ty),
+            Some(prev) if crate::conversions::types_unify(prev, ty) => {
+                if matches!(prev, DataType::Int | DataType::SmallInt) {
+                    resolved = Some(ty);
+                }
+            }
+            Some(prev) => {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "{construct} types {} and {} cannot be matched",
+                        crate::conversions::pg_type_name_for_error(prev),
+                        crate::conversions::pg_type_name_for_error(ty),
+                    ),
+                });
+            }
+        }
+    }
+    let Some(target) = resolved else {
+        return Ok(());
+    };
+    if matches!(target, DataType::Text) {
+        return Ok(());
+    }
+    for e in branches {
+        if !untyped(e) {
+            continue;
+        }
+        if let Expr::Literal(spg_sql::ast::Literal::String(lit)) = e {
+            crate::conversions::coerce_value(Value::text(lit.clone()), target, "", 0).map_err(
+                |err| match err {
+                    crate::EngineError::Eval(ev) => ev,
+                    other => EvalError::TypeMismatch {
+                        detail: alloc::format!("{other}"),
+                    },
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// v7.39 (round 237) — the same resolution for every construct that builds
+/// one value out of several branches: ARRAY, CASE, COALESCE, GREATEST and
+/// LEAST. PG names the construct in the message ("CASE types text and
+/// integer cannot be matched"), which is why the caller passes it in.
+pub(crate) fn unify_construct_values(
+    construct: &str,
+    items: &[Expr],
+    materialised: &mut [Value<'static>],
+) -> Result<(), EvalError> {
     use spg_storage::DataType;
     let untyped = |e: &Expr| {
         matches!(
@@ -3455,7 +3589,7 @@ fn unify_array_elements(
             Some(prev) => {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "ARRAY types {} and {} cannot be matched",
+                        "{construct} types {} and {} cannot be matched",
                         crate::conversions::pg_type_name_for_error(prev),
                         crate::conversions::pg_type_name_for_error(ty),
                     ),

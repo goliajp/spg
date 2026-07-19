@@ -19,6 +19,20 @@ fn render(v: &Value) -> String {
         // does. Without this every json-returning probe row came back as
         // `Json("{\"a\": 1}")` and drowned real diffs in escaping noise.
         Value::Json(s) => s.to_string(),
+        // v7.39 (round 237) — NUMERIC prints its decimal text.
+        Value::Numeric { scaled, scale, .. } => {
+            let neg = *scaled < 0;
+            let digits = scaled.unsigned_abs().to_string();
+            let sc = *scale as usize;
+            let body = if sc == 0 {
+                digits
+            } else {
+                let padded = format!("{digits:0>width$}", width = sc + 1);
+                let split = padded.len() - sc;
+                format!("{}.{}", &padded[..split], &padded[split..])
+            };
+            if neg { format!("-{body}") } else { body }
+        }
         // v7.39 (round 236) — arrays print PG's `{a,b}` external form.
         // Without this every array-returning probe row came back as
         // `IntArray([Some(1), Some(2)])` and buried the real diffs.
