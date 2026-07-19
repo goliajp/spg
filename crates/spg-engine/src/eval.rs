@@ -667,13 +667,46 @@ pub(crate) fn regclass_name_to_oid(cat: &spg_storage::Catalog, bare: &str) -> Op
 pub(crate) fn apply_composite_cast_pub(
     v: Value<'static>,
     comp: &spg_storage::CompositeDef,
+    cat: Option<&spg_storage::Catalog>,
 ) -> Result<Value<'static>, EvalError> {
-    apply_composite_cast(v, comp)
+    apply_composite_cast_in(v, comp, cat)
+}
+
+/// v7.39 (round 264) — resolve one field's value, recursing when the
+/// field is itself a COMPOSITE. Without this a nested field kept the
+/// inner record's TEXT rendering, so `(x).inner.street` errored and
+/// `row_to_json` nested a string rather than an object.
+fn coerce_composite_field(
+    val: Value<'static>,
+    fname: &str,
+    fty: spg_storage::DataType,
+    user_ty: Option<&str>,
+    cat: Option<&spg_storage::Catalog>,
+) -> Result<Value<'static>, EvalError> {
+    if matches!(val, Value::Null) {
+        return Ok(val);
+    }
+    if let Some(tn) = user_ty
+        && let Some(inner) = cat.and_then(|c| c.composite_types().get(tn))
+    {
+        return apply_composite_cast_in(val, inner, cat);
+    }
+    crate::conversions::coerce_value(val, fty, fname, 0).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("{e}"),
+    })
 }
 
 fn apply_composite_cast(
     v: Value<'static>,
     comp: &spg_storage::CompositeDef,
+) -> Result<Value<'static>, EvalError> {
+    apply_composite_cast_in(v, comp, None)
+}
+
+fn apply_composite_cast_in(
+    v: Value<'static>,
+    comp: &spg_storage::CompositeDef,
+    cat: Option<&spg_storage::Catalog>,
 ) -> Result<Value<'static>, EvalError> {
     match v {
         Value::Null => Ok(Value::Null),
@@ -689,16 +722,9 @@ fn apply_composite_cast(
             // text in an int field and PG's input error never fired.
             let mut out: alloc::vec::Vec<(alloc::string::String, Value<'static>)> =
                 alloc::vec::Vec::with_capacity(comp.fields.len());
-            for ((name, fty), (_, val)) in comp.fields.iter().zip(fields) {
-                let coerced = if matches!(val, Value::Null) {
-                    val
-                } else {
-                    crate::conversions::coerce_value(val, *fty, name, 0).map_err(|e| {
-                        EvalError::TypeMismatch {
-                            detail: alloc::format!("{e}"),
-                        }
-                    })?
-                };
+            for (i, ((name, fty), (_, val))) in comp.fields.iter().zip(fields).enumerate() {
+                let ut = comp.field_user_types.get(i).and_then(Option::as_deref);
+                let coerced = coerce_composite_field(val, name, *fty, ut, cat)?;
                 out.push((name.clone(), coerced));
             }
             Ok(Value::Composite(out))
@@ -714,13 +740,11 @@ fn apply_composite_cast(
             }
             let mut out: alloc::vec::Vec<(alloc::string::String, Value<'static>)> =
                 alloc::vec::Vec::with_capacity(raw.len());
-            for ((fname, fty), field_text) in comp.fields.iter().zip(raw) {
+            for (i, ((fname, fty), field_text)) in comp.fields.iter().zip(raw).enumerate() {
+                let ut = comp.field_user_types.get(i).and_then(Option::as_deref);
                 let val = match field_text {
                     None => Value::Null,
-                    Some(t) => crate::conversions::coerce_value(Value::text(t), *fty, fname, 0)
-                        .map_err(|e| EvalError::TypeMismatch {
-                            detail: alloc::format!("{e}"),
-                        })?,
+                    Some(t) => coerce_composite_field(Value::text(t), fname, *fty, ut, cat)?,
                 };
                 out.push((fname.clone(), val));
             }
@@ -1142,7 +1166,9 @@ fn eval_cast_arm(
         // record text form against the type's field list; a ROW value
         // re-labels its fields.
         if let Some(comp) = cat.composite_types().get(name.as_str()) {
-            return apply_composite_cast(v, comp);
+            // v7.39 (round 264) — pass the catalog so a NESTED composite
+            // field resolves into a record rather than staying text.
+            return apply_composite_cast_in(v, comp, ctx.catalog);
         }
     }
     // v7.38 (read01, T22) — a numeric OID cast to regclass reverse-looks

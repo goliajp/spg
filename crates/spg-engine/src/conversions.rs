@@ -3239,7 +3239,7 @@ pub(crate) fn normalize_composite_for_column(
     if matches!(v, Value::Json(_)) {
         return Ok(v);
     }
-    crate::eval::apply_composite_cast_pub(v, def).map_err(EngineError::Eval)
+    crate::eval::apply_composite_cast_pub(v, def, catalog).map_err(EngineError::Eval)
 }
 
 

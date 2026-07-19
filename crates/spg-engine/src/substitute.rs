@@ -107,6 +107,21 @@ pub(crate) fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
                     .collect(),
             ));
         }
+        // v7.39 (round 264) — a COMPOSITE-returning scalar subquery
+        // (`(SELECT ROW('a',1)::addr)`) materialises back through a ROW
+        // constructor of its field literals, so the outer query rebuilds
+        // the same record. Field ACCESS on it then works for free, since
+        // the outer expression is an ordinary ROW.
+        Value::Composite(fields) => {
+            let mut args = alloc::vec::Vec::with_capacity(fields.len());
+            for (_, v) in fields {
+                args.push(value_to_literal_expr(v)?);
+            }
+            return Ok(Expr::FunctionCall {
+                name: alloc::string::String::from("row"),
+                args,
+            });
+        }
         other => {
             return Err(EngineError::Unsupported(alloc::format!(
                 "subquery result type {:?} not yet materialisable; cast to text or integer in the inner SELECT",
