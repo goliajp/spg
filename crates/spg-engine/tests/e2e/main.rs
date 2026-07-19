@@ -164,6 +164,8 @@ mod e2e_array_ctor_types_round236;
 mod e2e_case_coalesce_types_round237;
 mod e2e_operator_resolution_round238;
 mod e2e_limit_rowcount_round239;
+mod e2e_on_conflict_round240;
+mod e2e_update_from_alias_round241;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;

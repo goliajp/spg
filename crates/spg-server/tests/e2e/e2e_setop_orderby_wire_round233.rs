@@ -225,3 +225,35 @@ fn json_refusals_carry_pgs_sqlstates() {
         assert!(msg.contains(want), "{sql} → {msg}");
     }
 }
+
+/// v7.39 (round 240) — the round 239 row-count clause errors over the
+/// wire. They are raised by the parser, so without the pre-classification
+/// they would all have fallen into the Parse→42601 short-circuit; PG uses
+/// 2201W / 2201X / 22P02 here.
+#[test]
+fn row_count_clause_errors_carry_pgs_sqlstates() {
+    let (raw, mut s) = {
+        let (raw, addrs) = common::ServerBuilder::new()
+            .arg_path(&unique_db())
+            .with_pgwire()
+            .spawn();
+        let s = pg_connect(addrs.pgwire.as_ref().unwrap());
+        (raw, s)
+    };
+    let _guard = common::ChildGuard(raw);
+    for (sql, code, want) in [
+        ("SELECT 1 LIMIT -1", "2201W", "LIMIT must not be negative"),
+        ("SELECT 1 FETCH FIRST -1 ROWS ONLY", "2201W", "LIMIT must not be negative"),
+        ("SELECT 1 OFFSET -1", "2201X", "OFFSET must not be negative"),
+        (
+            "SELECT 1 LIMIT 'a'",
+            "22P02",
+            "invalid input syntax for type bigint: \"a\"",
+        ),
+    ] {
+        let (got_code, msg) =
+            exec_error(&mut s, sql).unwrap_or_else(|| panic!("no error for {sql}"));
+        assert_eq!(got_code, code, "{sql} → {msg}");
+        assert!(msg.contains(want), "{sql} → {msg}");
+    }
+}

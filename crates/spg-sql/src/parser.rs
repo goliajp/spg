@@ -6762,10 +6762,116 @@ impl Parser {
         }))
     }
 
+}
+fn wrap_from_leaves(
+    e: &mut Expr,
+    names: &[String],
+    make: &dyn Fn(Expr) -> Expr,
+    refs: &dyn Fn(&Expr) -> bool,
+) {
+    if let Expr::Column(c) = e {
+        if c.qualifier
+            .as_deref()
+            .is_some_and(|q| names.iter().any(|n| n.eq_ignore_ascii_case(q)))
+        {
+            let taken = core::mem::replace(e, Expr::Literal(Literal::Null));
+            *e = make(taken);
+        }
+        return;
+    }
+    match e {
+        Expr::Binary { lhs, rhs, .. } => {
+            wrap_from_leaves(lhs, names, make, refs);
+            wrap_from_leaves(rhs, names, make, refs);
+        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. } => wrap_from_leaves(expr, names, make, refs),
+        Expr::FunctionCall { args, .. } => {
+            for a in args.iter_mut() {
+                wrap_from_leaves(a, names, make, refs);
+            }
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            if let Some(o) = operand.as_deref_mut() {
+                wrap_from_leaves(o, names, make, refs);
+            }
+            for (w, t) in branches.iter_mut() {
+                wrap_from_leaves(w, names, make, refs);
+                wrap_from_leaves(t, names, make, refs);
+            }
+            if let Some(el) = else_branch.as_deref_mut() {
+                wrap_from_leaves(el, names, make, refs);
+            }
+        }
+        // Compound variants the walk doesn't decompose: keep the
+        // pre-D.30 behavior — wrap the whole sub-expr if it touches
+        // a source table, so nothing regresses.
+        other => {
+            if refs(other) {
+                let taken = core::mem::replace(other, Expr::Literal(Literal::Null));
+                *other = make(taken);
+            }
+        }
+    }
+}
+
+/// v7.39 (round 241) — does this expression reference any of the FROM /
+/// USING table names (shared by the UPDATE…FROM and DELETE…USING
+/// lowerings)?
+fn expr_refs_tables(e: &Expr, names: &[String]) -> bool {
+    match e {
+        Expr::Column(c) => c
+            .qualifier
+            .as_deref()
+            .is_some_and(|q| names.iter().any(|n| n.eq_ignore_ascii_case(q))),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_refs_tables(lhs, names) || expr_refs_tables(rhs, names)
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => expr_refs_tables(expr, names),
+        Expr::FunctionCall { args, .. } => args.iter().any(|a| expr_refs_tables(a, names)),
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            operand.as_deref().is_some_and(|o| expr_refs_tables(o, names))
+                || branches
+                    .iter()
+                    .any(|(w, t)| expr_refs_tables(w, names) || expr_refs_tables(t, names))
+                || else_branch
+                    .as_deref()
+                    .is_some_and(|el| expr_refs_tables(el, names))
+        }
+        _ => false,
+    }
+}
+
+impl Parser {
     /// v4.4 `UPDATE <table> SET col = expr [, col = expr]* [WHERE cond]`.
     /// Caller already consumed the leading `UPDATE` ident.
     fn parse_update_after_keyword(&mut self) -> Result<Statement, ParseError> {
         let table = self.expect_ident_like()?;
+        // v7.39 (round 241) — `UPDATE t [AS] alias SET …`. PG allows the
+        // bare spelling; a bare identifier that is the SET keyword itself
+        // is the clause, not an alias.
+        let alias = if matches!(self.peek(), Token::As) {
+            self.advance();
+            Some(self.expect_ident_like()?)
+        } else {
+            match self.peek() {
+                Token::Ident(s) | Token::QuotedIdent(s) if !s.eq_ignore_ascii_case("set") => {
+                    let a = s.clone();
+                    self.advance();
+                    Some(a)
+                }
+                _ => None,
+            }
+        };
         self.expect_keyword_ident("set")?;
         let mut assignments = Vec::new();
         loop {
@@ -6955,6 +7061,7 @@ impl Parser {
         } else {
             None
         };
+        let mut returning = self.parse_optional_returning()?;
         let (assignments, where_) = if let Some(fc) = from_clause {
             let names: Vec<String> = core::iter::once(&fc.primary)
                 .chain(fc.joins.iter().map(|j| &j.table))
@@ -7017,62 +7124,6 @@ impl Parser {
             // context — where they belong — fixes it; only the source columns
             // (`u.bonus`) become subqueries. A whole-expr fallback covers
             // compound variants the leaf-walk doesn't decompose.
-            fn wrap_from_leaves(
-                e: &mut Expr,
-                names: &[String],
-                make: &dyn Fn(Expr) -> Expr,
-                refs: &dyn Fn(&Expr) -> bool,
-            ) {
-                if let Expr::Column(c) = e {
-                    if c.qualifier
-                        .as_deref()
-                        .is_some_and(|q| names.iter().any(|n| n.eq_ignore_ascii_case(q)))
-                    {
-                        let taken = core::mem::replace(e, Expr::Literal(Literal::Null));
-                        *e = make(taken);
-                    }
-                    return;
-                }
-                match e {
-                    Expr::Binary { lhs, rhs, .. } => {
-                        wrap_from_leaves(lhs, names, make, refs);
-                        wrap_from_leaves(rhs, names, make, refs);
-                    }
-                    Expr::Unary { expr, .. }
-                    | Expr::Cast { expr, .. }
-                    | Expr::IsNull { expr, .. } => wrap_from_leaves(expr, names, make, refs),
-                    Expr::FunctionCall { args, .. } => {
-                        for a in args.iter_mut() {
-                            wrap_from_leaves(a, names, make, refs);
-                        }
-                    }
-                    Expr::Case {
-                        operand,
-                        branches,
-                        else_branch,
-                    } => {
-                        if let Some(o) = operand.as_deref_mut() {
-                            wrap_from_leaves(o, names, make, refs);
-                        }
-                        for (w, t) in branches.iter_mut() {
-                            wrap_from_leaves(w, names, make, refs);
-                            wrap_from_leaves(t, names, make, refs);
-                        }
-                        if let Some(el) = else_branch.as_deref_mut() {
-                            wrap_from_leaves(el, names, make, refs);
-                        }
-                    }
-                    // Compound variants the walk doesn't decompose: keep the
-                    // pre-D.30 behavior — wrap the whole sub-expr if it touches
-                    // a source table, so nothing regresses.
-                    other => {
-                        if refs(other) {
-                            let taken = core::mem::replace(other, Expr::Literal(Literal::Null));
-                            *other = make(taken);
-                        }
-                    }
-                }
-            }
             let make_subq = |inner: Expr| {
                 Expr::ScalarSubquery(Box::new(sub_select(alloc::vec![SelectItem::Expr {
                     expr: inner,
@@ -7093,14 +7144,27 @@ impl Parser {
                 }])),
                 negated: false,
             };
+            // v7.39 (round 241) — RETURNING may reference the FROM-list
+            // tables too (`RETURNING emp.id, dept.name`); the same
+            // leaf-to-correlated-subquery lowering the assignments get.
+            // Without it the qualifier died at eval with "unknown table
+            // qualifier". (RETURNING was parsed before this block — the
+            // lowering is a pure AST transformation.)
+            if let Some(items) = returning.as_mut() {
+                for item in items.iter_mut() {
+                    if let SelectItem::Expr { expr, .. } = item {
+                        wrap_from_leaves(expr, &names, &make_subq, &refs_list);
+                    }
+                }
+            }
             (assignments, Some(exists))
         } else {
             (assignments, where_)
         };
-        let returning = self.parse_optional_returning()?;
         Ok(Statement::Update(crate::ast::UpdateStatement {
             ctes: Vec::new(),
             table,
+            alias,
             assignments,
             where_,
             returning,
@@ -7115,6 +7179,25 @@ impl Parser {
         }
         self.advance();
         let table = self.expect_ident_like()?;
+        // v7.39 (round 241) — `DELETE FROM t [AS] alias …`. The bare
+        // spelling must not swallow the clause keywords that can follow
+        // the target.
+        let alias = if matches!(self.peek(), Token::As) {
+            self.advance();
+            Some(self.expect_ident_like()?)
+        } else {
+            match self.peek() {
+                Token::Ident(s) | Token::QuotedIdent(s)
+                    if !s.eq_ignore_ascii_case("using")
+                        && !s.eq_ignore_ascii_case("returning") =>
+                {
+                    let a = s.clone();
+                    self.advance();
+                    Some(a)
+                }
+                _ => None,
+            }
+        };
         // `DELETE FROM t USING src [, …] WHERE cond` — PG's joined
         // delete. Same lowering as UPDATE … FROM: the WHERE
         // becomes EXISTS(SELECT 1 FROM src WHERE cond), driven per
@@ -7132,7 +7215,51 @@ impl Parser {
         } else {
             None
         };
+        let mut returning = self.parse_optional_returning()?;
         let where_ = if let Some(fc) = using_clause {
+            // v7.39 (round 241) — same RETURNING lowering as UPDATE…FROM:
+            // a USING-table reference in RETURNING becomes a correlated
+            // scalar subquery over the USING list.
+            let names: Vec<String> = core::iter::once(&fc.primary)
+                .chain(fc.joins.iter().map(|j| &j.table))
+                .flat_map(|t| {
+                    t.alias
+                        .clone()
+                        .into_iter()
+                        .chain(core::iter::once(t.name.clone()))
+                })
+                .collect();
+            let sub_where = where_.clone();
+            let sub_fc = fc.clone();
+            let make_subq = move |leaf: Expr| -> Expr {
+                Expr::ScalarSubquery(Box::new(SelectStatement {
+                    ctes: Vec::new(),
+                    distinct: false,
+                    distinct_on: Vec::new(),
+                    items: alloc::vec![SelectItem::Expr {
+                        expr: leaf,
+                        alias: None,
+                    }],
+                    from: Some(sub_fc.clone()),
+                    where_: sub_where.clone(),
+                    group_by: None,
+                    group_by_all: false,
+                    having: None,
+                    unions: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                    limit_with_ties: false,
+                }))
+            };
+            let refs = |e: &Expr| expr_refs_tables(e, &names);
+            if let Some(items) = returning.as_mut() {
+                for item in items.iter_mut() {
+                    if let SelectItem::Expr { expr, .. } = item {
+                        wrap_from_leaves(expr, &names, &make_subq, &refs);
+                    }
+                }
+            }
             Some(Expr::Exists {
                 subquery: Box::new(SelectStatement {
                     ctes: Vec::new(),
@@ -7158,10 +7285,10 @@ impl Parser {
         } else {
             where_
         };
-        let returning = self.parse_optional_returning()?;
         Ok(Statement::Delete(crate::ast::DeleteStatement {
             ctes: Vec::new(),
             table,
+            alias,
             where_,
             returning,
         }))
@@ -13571,6 +13698,16 @@ impl Parser {
         }
         self.advance();
         let table = self.expect_ident_like()?;
+        // v7.39 (round 240) — `INSERT INTO t AS alias`: PG's insert_target
+        // grammar requires the AS keyword here (a bare identifier would be
+        // ambiguous with a column list). The alias is what the ON CONFLICT
+        // DO UPDATE expressions refer to the target row by.
+        let alias = if matches!(self.peek(), Token::As) {
+            self.advance();
+            Some(self.expect_ident_like()?)
+        } else {
+            None
+        };
         // Optional column list — `INSERT INTO t (a, b) VALUES ...`.
         // v7.39 (round 151) — a SELECT or WITH right after the paren is
         // a parenthesized query source instead (PG select_with_parens:
@@ -13605,6 +13742,7 @@ impl Parser {
                 return Ok(Statement::Insert(InsertStatement {
                     ctes: Vec::new(),
                     table,
+                    alias: alias.clone(),
                     columns: None,
                     rows: Vec::new(),
                     select_source: Some(Box::new(select_stmt)),
@@ -13686,6 +13824,7 @@ impl Parser {
             return Ok(Statement::Insert(InsertStatement {
                 ctes: Vec::new(),
                 table,
+                alias: alias.clone(),
                 columns: Some(Vec::new()),
                 rows: alloc::vec![Vec::new()],
                 select_source: None,
@@ -13718,6 +13857,7 @@ impl Parser {
             return Ok(Statement::Insert(InsertStatement {
                 ctes: Vec::new(),
                 table,
+                alias: alias.clone(),
                 columns,
                 rows: Vec::new(),
                 select_source: Some(Box::new(select_stmt)),
@@ -13834,7 +13974,9 @@ impl Parser {
             }
             Some(crate::ast::OnConflictClause {
                 target_columns: Vec::new(),
+                index_where: None,
                 constraint_name: None,
+                mysql_lowered: true,
                 action: crate::ast::OnConflictAction::Update {
                     assignments,
                     where_: None,
@@ -13848,7 +13990,9 @@ impl Parser {
         } else if replace {
             Some(crate::ast::OnConflictClause {
                 target_columns: Vec::new(),
+                index_where: None,
                 constraint_name: None,
+                mysql_lowered: true,
                 action: crate::ast::OnConflictAction::Update {
                     assignments: Vec::new(),
                     where_: None,
@@ -13861,6 +14005,7 @@ impl Parser {
         Ok(Statement::Insert(InsertStatement {
             ctes: Vec::new(),
             table,
+            alias,
             columns,
             rows,
             select_source: None,
@@ -13979,6 +14124,17 @@ impl Parser {
                 }
             }
         }
+        // v7.39 (round 240) — optional index predicate after the target
+        // list: `ON CONFLICT (col) WHERE pred DO …`. PG uses it to infer a
+        // PARTIAL unique index; SPG's arbiters are full indexes, which
+        // satisfy any predicate, so it is parsed and carried but not
+        // consulted (recorded residual: partial-unique-index arbiters).
+        let index_where = if !target_columns.is_empty() && matches!(self.peek(), Token::Where) {
+            self.advance();
+            Some(self.parse_expr(0)?)
+        } else {
+            None
+        };
         // Required `DO`.
         match self.advance() {
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("do") => {}
@@ -14004,7 +14160,9 @@ impl Parser {
         };
         Ok(Some(crate::ast::OnConflictClause {
             target_columns,
+            index_where,
             constraint_name,
+            mysql_lowered: false,
             action,
         }))
     }

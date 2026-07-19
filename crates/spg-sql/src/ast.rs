@@ -2380,6 +2380,10 @@ pub struct UpdateStatement {
     /// level UPDATE. Empty for a plain UPDATE.
     pub ctes: Vec<Cte>,
     pub table: String,
+    /// v7.39 (round 241) — `UPDATE t [AS] alias SET …`: the name the
+    /// statement's expressions refer to the target row by. PG allows the
+    /// bare spelling here (unlike INSERT, which requires AS).
+    pub alias: Option<String>,
     pub assignments: Vec<(String, Expr)>,
     pub where_: Option<Expr>,
     /// v7.9.4 — `RETURNING <projection>`. None = no RETURNING
@@ -2397,6 +2401,9 @@ pub struct DeleteStatement {
     /// level DELETE. Empty for a plain DELETE.
     pub ctes: Vec<Cte>,
     pub table: String,
+    /// v7.39 (round 241) — `DELETE FROM t [AS] alias USING …`: the name
+    /// the WHERE / RETURNING expressions refer to the target row by.
+    pub alias: Option<String>,
     pub where_: Option<Expr>,
     /// v7.9.4 — `RETURNING <projection>`.
     pub returning: Option<Vec<SelectItem>>,
@@ -2481,6 +2488,10 @@ pub struct InsertStatement {
     /// outer INSERT runs, sharing the same transaction.
     pub ctes: Vec<Cte>,
     pub table: String,
+    /// v7.39 (round 240) — `INSERT INTO t AS alias`: the alias the ON
+    /// CONFLICT DO UPDATE expressions (and RETURNING) refer to the target
+    /// row by. PG requires the AS keyword in this position.
+    pub alias: Option<String>,
     /// Optional column list — `INSERT INTO t (a, b) VALUES (...)`. When
     /// `None`, every tuple is positional and must match the table arity.
     /// When `Some`, the engine maps each tuple slot to the named column and
@@ -2533,13 +2544,24 @@ pub struct OnConflictClause {
     /// Local columns that identify the conflict (must match a
     /// UNIQUE / PRIMARY KEY index on the target table). Empty
     /// list means the user wrote `ON CONFLICT DO …` without a
-    /// target — engine picks the table's first BTree index by
-    /// convention.
+    /// target — the engine arbitrates on every unique constraint
+    /// (round 240).
     pub target_columns: Vec<String>,
+    /// v7.39 (round 240) — the index predicate after the target list
+    /// (`ON CONFLICT (col) WHERE pred DO …`). PG uses it to infer a
+    /// PARTIAL unique index; SPG's conflict arbiters are full indexes,
+    /// which satisfy any predicate, so it is parsed and carried but not
+    /// consulted (recorded residual: partial-unique-index arbiters).
+    pub index_where: Option<Expr>,
     /// v7.37.17 (17.6 siblings) — `ON CONFLICT ON CONSTRAINT
     /// <name>`: the pg_dump conflict-target form. The engine
     /// resolves the name to the constraint's columns.
     pub constraint_name: Option<String>,
+    /// v7.39 (round 240) — true when this clause was LOWERED from MySQL's
+    /// `ON DUPLICATE KEY UPDATE` / `REPLACE INTO`, whose bare-target DO
+    /// UPDATE is legal (MySQL watches every unique key); PG's own bare
+    /// `ON CONFLICT DO UPDATE` is refused (42601).
+    pub mysql_lowered: bool,
     /// The action on conflict.
     pub action: OnConflictAction,
 }
@@ -5628,6 +5650,9 @@ impl fmt::Display for OnConflictClause {
                 f.write_str(&quote_ident(c))?;
             }
             f.write_str(")")?;
+        }
+        if let Some(w) = &self.index_where {
+            write!(f, " WHERE {w}")?;
         }
         match &self.action {
             OnConflictAction::Nothing => f.write_str(" DO NOTHING"),

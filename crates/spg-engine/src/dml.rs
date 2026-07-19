@@ -580,7 +580,7 @@ use crate::{
     enforce_uniqueness_inserts, eval, eval_runtime_default_free, expr_has_subquery,
     literal_expr_to_value, literal_expr_to_value_in, lookup_row_position_by_keys,
     on_conflict_keys_exist, plan_fk_parent_deletions, plan_fk_parent_updates,
-    resolve_column_default_free, resolve_on_conflict_columns, triggers, try_index_seek_positions,
+    resolve_column_default_free, triggers, try_index_seek_positions,
     try_pk_predicate, value_to_literal_expr_permissive,
 };
 
@@ -925,7 +925,7 @@ impl Engine {
                     if let Some(t) = self.active_catalog().get(&stmt.table)
                         && t.count_cold_locators() > 0
                     {
-                        let ctx = eval::EvalContext::new(&schema_cols, Some(stmt.table.as_str()));
+                        let ctx = eval::EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())));
                         for (key, row) in
                             crate::constraints::iter_cold_rows_with_pk_key(self.active_catalog(), t)
                         {
@@ -1011,7 +1011,7 @@ impl Engine {
         // `::mood`" — the same SELECT worked. Catalog::clone is a structural
         // Arc bump, so this is cheap and sidesteps the &mut self borrow.
         let cat_for_ctx = self.active_catalog().clone();
-        let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()))
+        let ctx = EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())))
             .with_default_text_search_config(ts_cfg.as_deref())
             .with_catalog(&cat_for_ctx);
         // Walk candidate rows, evaluate WHERE then SET
@@ -1415,6 +1415,7 @@ impl Engine {
             let new_for_returning = updated_for_returning.clone();
             return self.build_returning_rows_old_new(
                 &stmt.table,
+                stmt.alias.as_deref(),
                 items,
                 updated_for_returning,
                 Some(old_for_returning),
@@ -2547,7 +2548,7 @@ impl Engine {
                     if let Some(t) = self.active_catalog().get(&stmt.table)
                         && t.count_cold_locators() > 0
                     {
-                        let ctx = eval::EvalContext::new(&schema_cols, Some(stmt.table.as_str()));
+                        let ctx = eval::EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())));
                         for (key, row) in
                             crate::constraints::iter_cold_rows_with_pk_key(self.active_catalog(), t)
                         {
@@ -2608,7 +2609,7 @@ impl Engine {
             let schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
             // v7.39 (read01 round 54) — carry the catalog (see above).
             let cat_for_ctx = self.active_catalog().clone();
-            let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()))
+            let ctx = EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())))
                 .with_default_text_search_config(ts_cfg.as_deref())
                 .with_catalog(&cat_for_ctx);
             // v7.37.16 (gate-on inventory) — visibility gate, same as
@@ -2660,7 +2661,7 @@ impl Engine {
                 })
             })?;
         let schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
-        let ctx = EvalContext::new(&schema_cols, Some(stmt.table.as_str()))
+        let ctx = EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())))
             .with_default_text_search_config(ts_cfg.as_deref())
             .with_catalog(&cat_for_ctx);
         let mut positions: Vec<usize> = Vec::new();
@@ -2895,6 +2896,7 @@ impl Engine {
             let old_for_returning = to_delete_rows.clone();
             return self.build_returning_rows_old_new(
                 &stmt.table,
+                stmt.alias.as_deref(),
                 items,
                 to_delete_rows,
                 Some(old_for_returning),
@@ -3627,6 +3629,7 @@ impl Engine {
             let recurse = InsertStatement {
                 ctes: Vec::new(),
                 table: stmt.table,
+                alias: stmt.alias,
                 columns: stmt.columns,
                 rows: materialised,
                 select_source: None,
@@ -3790,7 +3793,12 @@ impl Engine {
         let (pending_updates, skipped_count) = match &stmt.on_conflict {
             Some(clause) => {
                 let (kept, pending, skipped) =
-                    self.resolve_insert_on_conflict(&stmt.table, clause, all_values)?;
+                    self.resolve_insert_on_conflict(
+                        &stmt.table,
+                        stmt.alias.as_deref(),
+                        clause,
+                        all_values,
+                    )?;
                 all_values = kept;
                 (pending, skipped)
             }
@@ -3878,6 +3886,7 @@ impl Engine {
             let new_for_returning = returning_rows.clone();
             return self.build_returning_rows_old_new(
                 &stmt.table,
+                stmt.alias.as_deref(),
                 items,
                 returning_rows,
                 Some(oc_old_images),
@@ -3906,6 +3915,7 @@ impl Engine {
     fn resolve_insert_on_conflict(
         &self,
         table_name: &str,
+        alias: Option<&str>,
         clause: &spg_sql::ast::OnConflictClause,
         all_values: Vec<Vec<Value<'static>>>,
     ) -> Result<
@@ -3960,33 +3970,78 @@ impl Engine {
         } else {
             named_columns.as_slice()
         };
-        let (conflict_cols, conflict_nnd) =
-            resolve_on_conflict_columns(self.active_catalog(), table_name, target_cols)?;
+        // v7.39 (round 240) — DO UPDATE has one row to find, so PG requires
+        // an explicit conflict target for it (42601).
+        if target_cols.is_empty()
+            && !clause.mysql_lowered
+            && matches!(clause.action, spg_sql::ast::OnConflictAction::Update { .. })
+        {
+            return Err(EngineError::Unsupported(
+                "ON CONFLICT DO UPDATE requires inference specification or constraint name".into(),
+            ));
+        }
+        // The arbiter column sets this clause watches: exactly one for an
+        // explicit target (validated against the table's unique
+        // constraints), every unique constraint and index for the bare
+        // form — which used to pick ONE, so a DO NOTHING let a conflict on
+        // any other constraint escalate to a duplicate-key error.
+        let arbiters = crate::constraints::on_conflict_arbiters(
+            self.active_catalog(),
+            table_name,
+            target_cols,
+            clause.constraint_name.is_some(),
+        )?;
         let mut kept: Vec<Vec<Value<'static>>> = Vec::with_capacity(all_values.len());
-        let mut seen_keys: Vec<Vec<Value<'static>>> = Vec::new();
+        // Per-arbiter batch-local keys (a bare clause tracks several sets).
+        let mut seen_keys: Vec<Vec<Vec<Value<'static>>>> = alloc::vec![Vec::new(); arbiters.len()];
         for values in all_values {
+            // SQL spec: NULL in any conflict column means "no conflict
+            // possible" (NULL ≠ NULL for uniqueness) — UNLESS the
+            // constraint says NULLS NOT DISTINCT (v7.29; mailrs
+            // migrate-013 replays its seed row ('super', NULL) under
+            // exactly that declaration).
+            let mut collides_with_table = false;
+            let mut collides_with_batch = false;
+            // Which arbiter hit — the DO UPDATE row lookup keys off it (a
+            // MySQL-lowered bare clause can have several).
+            let mut hit_arbiter = 0usize;
+            for (ai, (cols, nnd)) in arbiters.iter().enumerate() {
+                let kt: Vec<&Value> = cols.iter().map(|&c| &values[c]).collect();
+                let has_null = !nnd && kt.iter().any(|v| matches!(v, Value::Null));
+                if has_null {
+                    continue;
+                }
+                if on_conflict_keys_exist(self.active_catalog(), table_name, cols, &kt) {
+                    if !collides_with_table && !collides_with_batch {
+                        hit_arbiter = ai;
+                    }
+                    collides_with_table = true;
+                }
+                let kt_owned: Vec<Value<'static>> = kt.iter().map(|v| (*v).clone()).collect();
+                if seen_keys[ai].iter().any(|k| k == &kt_owned) {
+                    if !collides_with_table && !collides_with_batch {
+                        hit_arbiter = ai;
+                    }
+                    collides_with_batch = true;
+                }
+            }
+            let conflict_cols = &arbiters
+                .get(hit_arbiter)
+                .map(|(c, _)| c.clone())
+                .unwrap_or_default();
             let key_tuple: Vec<&Value> = conflict_cols.iter().map(|&c| &values[c]).collect();
-            // SQL spec: NULL in any conflict column means "no
-            // conflict possible" (NULL ≠ NULL for uniqueness) —
-            // UNLESS the constraint says NULLS NOT DISTINCT
-            // (v7.29; mailrs migrate-013 replays its seed row
-            // ('super', NULL) under exactly that declaration).
-            let has_null_key = !conflict_nnd && key_tuple.iter().any(|v| matches!(v, Value::Null));
-            let collides_with_table = !has_null_key
-                && on_conflict_keys_exist(
-                    self.active_catalog(),
-                    table_name,
-                    &conflict_cols,
-                    &key_tuple,
-                );
             let key_tuple_owned: Vec<Value<'static>> =
                 key_tuple.iter().map(|v| (*v).clone()).collect();
-            let collides_with_batch =
-                !has_null_key && seen_keys.iter().any(|k| k == &key_tuple_owned);
             let collides = collides_with_table || collides_with_batch;
             match (&clause.action, collides) {
                 (_, false) => {
-                    seen_keys.push(key_tuple_owned);
+                    for (ai, (cols, nnd)) in arbiters.iter().enumerate() {
+                        let kt: Vec<Value<'static>> =
+                            cols.iter().map(|&c| values[c].clone()).collect();
+                        if *nnd || !kt.iter().any(|v| matches!(v, Value::Null)) {
+                            seen_keys[ai].push(kt);
+                        }
+                    }
                     kept.push(values);
                 }
                 (spg_sql::ast::OnConflictAction::Nothing, true) => {
@@ -4006,15 +4061,21 @@ impl Engine {
                     // ("ON CONFLICT DO UPDATE command cannot affect row a second
                     // time").
                     if collides_with_batch {
-                        return Err(EngineError::CardinalityViolation);
+                        // v7.39 (round 240) — PG's own wording (21000); the
+                        // shared CardinalityViolation display is the scalar
+                        // subquery's message and reads as an internal leak
+                        // here.
+                        return Err(EngineError::Unsupported(
+                            "ON CONFLICT DO UPDATE command cannot affect row a second time".into(),
+                        ));
                     }
                     // Claim this key so a later duplicate in the same batch is
-                    // caught above.
-                    seen_keys.push(key_tuple_owned);
+                    // caught above, on the arbiter that produced the hit.
+                    seen_keys[hit_arbiter].push(key_tuple_owned);
                     let target_pos = lookup_row_position_by_keys(
                         self.active_catalog(),
                         table_name,
-                        &conflict_cols,
+                        conflict_cols,
                         &key_tuple,
                     )
                     .ok_or_else(|| {
@@ -4035,6 +4096,7 @@ impl Engine {
                     let updated = apply_on_conflict_assignments(
                         self.active_catalog(),
                         table_name,
+                        alias,
                         target_pos,
                         &values,
                         assignments,
@@ -4267,6 +4329,7 @@ impl Engine {
             let child_stmt = InsertStatement {
                 ctes: Vec::new(),
                 table: child_name,
+                alias: stmt.alias.clone(),
                 columns: stmt.columns.clone(),
                 rows,
                 select_source: None,
@@ -4769,7 +4832,7 @@ impl Engine {
         items: &[SelectItem],
         mutated_rows: Vec<Vec<Value<'static>>>,
     ) -> Result<QueryResult, EngineError> {
-        self.build_returning_rows_old_new(table_name, items, mutated_rows, None, None)
+        self.build_returning_rows_old_new(table_name, None, items, mutated_rows, None, None)
     }
 
     /// v7.39 (read01 round 126) — RETURNING with optional `OLD.col` / `NEW.col`
@@ -4781,6 +4844,10 @@ impl Engine {
     fn build_returning_rows_old_new(
         &self,
         table_name: &str,
+        // v7.39 (round 241) — the target alias when the statement gave one:
+        // the catalog lookup needs the real name, the expression qualifier
+        // (and `alias.*` wildcards) the alias.
+        alias: Option<&str>,
         items: &[SelectItem],
         default_rows: Vec<Vec<Value<'static>>>,
         old_rows: Option<Vec<Vec<Value<'static>>>>,
@@ -4795,7 +4862,8 @@ impl Engine {
         // Output columns come from the ORIGINAL items: `derive_output_columns`
         // resolves `OLD.v` / `NEW.v` by name (ignoring the qualifier) to v's
         // name + type, matching PG.
-        let columns = self.derive_output_columns(items, &schema_cols, table_name);
+        let qualifier = alias.unwrap_or(table_name);
+        let columns = self.derive_output_columns(items, &schema_cols, qualifier);
 
         // Rewrite OLD./NEW. qualifiers to synthetic bare columns for value
         // resolution. If none appear, take the plain fast path.
@@ -4817,7 +4885,7 @@ impl Engine {
             let mut out_rows: Vec<Row<'static>> = Vec::with_capacity(default_rows.len());
             for values in default_rows {
                 let row = Row::new(values);
-                let projected = self.project_row_simple(&row, items, &schema_cols, table_name)?;
+                let projected = self.project_row_simple(&row, items, &schema_cols, qualifier)?;
                 out_rows.push(projected);
             }
             return Ok(QueryResult::Rows {
@@ -4843,7 +4911,7 @@ impl Engine {
         let null_block = || alloc::vec![alloc::vec![Value::Null; arity]; n];
         let old_rows = old_rows.unwrap_or_else(null_block);
         let new_rows = new_rows.unwrap_or_else(null_block);
-        let ctx = self.ev_ctx(&syn_schema, Some(table_name));
+        let ctx = self.ev_ctx(&syn_schema, Some(qualifier));
         let cancel = CancelToken::none();
         let mut out_rows: Vec<Row<'static>> = Vec::with_capacity(n);
         for i in 0..n {
