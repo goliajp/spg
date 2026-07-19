@@ -693,8 +693,14 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
             // Text→typed via codec.
             let dt =
                 crate::conversions::type_name_to_data_type(&resolve_name).ok_or_else(|| {
+                    // v7.39 (round 272) — a numeric typmod outside PG's
+                    // bounds gets PG's own wording rather than being
+                    // reported as an unknown type.
                     EvalError::TypeMismatch {
-                        detail: alloc::format!("unsupported cast target `::{name}`"),
+                        detail: crate::conversions::numeric_typmod_error(&resolve_name)
+                            .unwrap_or_else(|| {
+                                alloc::format!("unsupported cast target `::{name}`")
+                            }),
                     }
                 })?;
             // PG semantics: any value casts to varchar(n) / char(n) through

@@ -1004,13 +1004,16 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
             // v7.39 (round 271) — tag 10 keeps its one-byte scale so
             // every catalog already on disk reads back unchanged; tag 69
             // carries the u16 scale a value can now have.
-            if let Ok(narrow) = u8::try_from(scale) {
+            // v7.39 (round 272) — precision joined scale in widening, so
+            // tag 10 (the shape every catalog on disk already uses) now
+            // needs BOTH to fit a byte; tag 69 carries the wide pair.
+            if let (Ok(np), Ok(ns)) = (u8::try_from(precision), u8::try_from(scale)) {
                 out.push(10);
-                out.push(precision);
-                out.push(narrow);
+                out.push(np);
+                out.push(ns);
             } else {
                 out.push(69);
-                out.push(precision);
+                out.extend_from_slice(&precision.to_le_bytes());
                 out.extend_from_slice(&scale.to_le_bytes());
             }
         }
@@ -1145,17 +1148,18 @@ impl Cursor<'_> {
             8 => Ok(DataType::Varchar(self.read_u32()?)),
             9 => Ok(DataType::Char(self.read_u32()?)),
             10 => {
-                let precision = self.read_u8()?;
+                let precision = u16::from(self.read_u8()?);
                 let scale = u16::from(self.read_u8()?);
                 Ok(DataType::Numeric { precision, scale })
             }
             69 => {
-                let precision = self.read_u8()?;
-                let lo = self.read_u8()?;
-                let hi = self.read_u8()?;
+                let plo = self.read_u8()?;
+                let phi = self.read_u8()?;
+                let slo = self.read_u8()?;
+                let shi = self.read_u8()?;
                 Ok(DataType::Numeric {
-                    precision,
-                    scale: u16::from_le_bytes([lo, hi]),
+                    precision: u16::from_le_bytes([plo, phi]),
+                    scale: u16::from_le_bytes([slo, shi]),
                 })
             }
             11 => Ok(DataType::Date),

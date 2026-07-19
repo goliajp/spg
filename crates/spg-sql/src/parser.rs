@@ -13989,7 +13989,7 @@ impl Parser {
     /// `NUMERIC` may appear without parameters, with one (precision
     /// only, scale=0), or with both. Returns `(precision, scale)` with
     /// 0 = unspecified for the bare form.
-    fn parse_optional_numeric_params(&mut self) -> Result<(u8, u16), ParseError> {
+    fn parse_optional_numeric_params(&mut self) -> Result<(u16, u16), ParseError> {
         if !matches!(self.peek(), Token::LParen) {
             // Bare `NUMERIC` — PG treats this as "unlimited precision";
             // we surface it as precision=0 to mean "unconstrained" so
@@ -13997,12 +13997,25 @@ impl Parser {
             return Ok((0, 0));
         }
         self.advance();
+        // v7.39 (round 272) — PG's declared precision runs to 1000, and
+        // it words the out-of-range case with the value it saw. SPG
+        // capped at 38 (i128's width), so a `numeric(50,10)` column PG
+        // accepts failed to parse at all; values wider than i128 are
+        // carried by the arbitrary-precision form.
         let precision = match self.advance() {
-            Token::Integer(n) if (1..=38).contains(&n) => u8::try_from(n).expect("range-checked"),
+            Token::Integer(n) if (1..=1000).contains(&n) => {
+                u16::try_from(n).expect("range-checked")
+            }
+            Token::Integer(n) => {
+                return Err(ParseError {
+                    message: format!("NUMERIC precision {n} must be between 1 and 1000"),
+                    token_pos: self.pos.saturating_sub(1),
+                });
+            }
             other => {
                 return Err(ParseError {
                     message: format!(
-                        "NUMERIC precision must be an integer in 1..=38, got {other:?}"
+                        "NUMERIC precision must be an integer in 1..=1000, got {other:?}"
                     ),
                     token_pos: self.pos.saturating_sub(1),
                 });
