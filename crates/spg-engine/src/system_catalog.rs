@@ -251,6 +251,12 @@ pub(crate) fn synth_information_schema_columns(
         ColumnSchema::new("numeric_scale", DataType::Int, true),
         ColumnSchema::new("udt_name", DataType::Text, false),
         ColumnSchema::new("is_identity", DataType::Text, false),
+        // v7.39 (round 248) — the columns the sweep found missing: JDBC /
+        // SQLAlchemy read identity_generation and datetime_precision, and
+        // is_updatable is part of the spec's core set.
+        ColumnSchema::new("identity_generation", DataType::Text, true),
+        ColumnSchema::new("datetime_precision", DataType::Int, true),
+        ColumnSchema::new("is_updatable", DataType::Text, false),
         // v7.39 (round 208) — generated-column columns (PG spec):
         // is_generated = ALWAYS for a generated column, else NEVER;
         // generation_expression = its source text (NULL otherwise).
@@ -312,7 +318,34 @@ pub(crate) fn synth_information_schema_columns(
                 DataType::Time => "time",
                 DataType::Interval => "interval",
                 DataType::Numeric { .. } => "numeric",
+                // v7.39 (round 248) — varchar/char kept falling into the
+                // text catch-all, and an array's udt_name is PG's
+                // underscore-prefixed element name (`_text`).
+                DataType::Varchar(_) => "varchar",
+                DataType::Char(_) => "bpchar",
+                DataType::Char1 => "char",
+                DataType::TextArray => "_text",
+                DataType::IntArray => "_int4",
+                DataType::BigIntArray => "_int8",
+                DataType::SmallIntArray => "_int2",
+                DataType::FloatArray => "_float8",
+                DataType::NumericArray => "_numeric",
+                DataType::BoolArray => "_bool",
+                DataType::DateArray => "_date",
+                DataType::TimestampArray => "_timestamp",
+                DataType::TimestamptzArray => "_timestamptz",
+                DataType::UuidArray => "_uuid",
                 _ => "text",
+            };
+            // v7.39 (round 248) — datetime_precision: PG reports 6 for the
+            // microsecond-carrying types and 0 for date.
+            let dt_prec: Value<'static> = match col.ty {
+                DataType::Date => Value::Int(0),
+                DataType::Time
+                | DataType::Timestamp
+                | DataType::Timestamptz
+                | DataType::Interval => Value::Int(6),
+                _ => Value::Null,
             };
             rows.push(Row::new(alloc::vec![
                 Value::text("spg"),
@@ -323,11 +356,29 @@ pub(crate) fn synth_information_schema_columns(
                 Value::text::<&str>(if col.nullable { "YES" } else { "NO" }),
                 Value::text(pg_data_type_text(col.ty)),
                 default_text,
-                Value::Null, // character_maximum_length (SPG TEXT is unbounded)
+                // v7.39 (round 248) — a declared varchar(n)/char(n) reports
+                // its limit; TEXT stays unbounded NULL.
+                match col.ty {
+                    DataType::Varchar(n) | DataType::Char(n) => {
+                        i32::try_from(n).map(Value::Int).unwrap_or(Value::Null)
+                    }
+                    _ => Value::Null,
+                },
                 num_prec,
                 num_scale,
                 Value::text::<&str>(udt),
-                Value::text::<&str>(if col.auto_increment { "YES" } else { "NO" }),
+                // v7.39 (round 248) — a SERIAL column is NOT identity in PG
+                // (is_identity keys off GENERATED … AS IDENTITY). SPG only
+                // records the ALWAYS flavour, so BY DEFAULT identity reports
+                // NO here — recorded residual (needs a catalog field).
+                Value::text::<&str>(if col.identity_always { "YES" } else { "NO" }),
+                if col.identity_always {
+                    Value::text::<&str>("ALWAYS")
+                } else {
+                    Value::Null
+                },
+                dt_prec,
+                Value::text::<&str>("YES"),
                 Value::text::<&str>(if col.generated_stored_expr.is_some() {
                     "ALWAYS"
                 } else {
