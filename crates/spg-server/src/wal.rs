@@ -829,6 +829,21 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
     }
 }
 
+/// v7.39 (round 250) — one explicit fsync of the WAL file, used by the
+/// COPY `ON_ERROR SET_NULL` path: its rows append per-row without sync
+/// (the extension's contract is per-row autocommit, not one
+/// transaction), so the COPY's CommandComplete anchors durability with
+/// a single fsync here instead.
+pub(crate) fn wal_fsync_now(state: &ServerState) -> std::io::Result<()> {
+    let Some(wal) = state.wal.as_ref() else {
+        return Ok(());
+    };
+    let f = wal
+        .lock()
+        .map_err(|_| std::io::Error::other("wal mutex poisoned"))?;
+    client_fsync(state, &f)
+}
+
 pub(crate) fn append_wal(state: &ServerState, sql: &str, sync: bool) -> std::io::Result<()> {
     let Some(wal) = state.wal.as_ref() else {
         return Ok(());
