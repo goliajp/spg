@@ -2882,6 +2882,28 @@ impl Engine {
             return self.exec_select_generate_series(stmt, &from.primary, cancel);
         }
         let primary = &from.primary;
+        // v7.39 (round 244) — a sequence is selectable as a one-row relation
+        // in PG (`SELECT last_value FROM seq` — psql's \d and several ORMs
+        // read it). Synthesize PG's three columns.
+        if self.active_catalog().get(&primary.name).is_none()
+            && let Some(seq) = self.active_catalog().sequences().get(&primary.name)
+        {
+            let rows = alloc::vec![Row::new(alloc::vec![
+                Value::BigInt(seq.last_value),
+                Value::BigInt(0),
+                Value::Bool(seq.is_called),
+            ])];
+            let schema_cols = alloc::vec![
+                ColumnSchema::new("last_value", DataType::BigInt, false),
+                ColumnSchema::new("log_cnt", DataType::BigInt, false),
+                ColumnSchema::new("is_called", DataType::Bool, false),
+            ];
+            let alias = primary
+                .alias
+                .clone()
+                .unwrap_or_else(|| primary.name.clone());
+            return self.exec_select_over_rows(stmt, rows, schema_cols, &alias, cancel);
+        }
         let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
             StorageError::TableNotFound {
                 name: primary.name.clone(),

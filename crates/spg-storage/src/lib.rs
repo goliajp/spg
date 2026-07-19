@@ -4283,9 +4283,7 @@ impl Catalog {
     /// Returns an error on CYCLE-less overflow.
     pub fn sequence_next_value(&mut self, name: &str) -> Result<i64, StorageError> {
         let Some(seq) = self.sequences.get_mut(name) else {
-            return Err(StorageError::Corrupt(format!(
-                "sequence {name:?} does not exist"
-            )));
+            return Err(StorageError::TableNotFound { name: name.into() });
         };
         // PG semantics: when !is_called (fresh sequence or
         // setval(_, false)), the next nextval returns the stored
@@ -4339,9 +4337,7 @@ impl Catalog {
     /// strict per-session semantics later.
     pub fn sequence_current_value(&self, name: &str) -> Result<i64, StorageError> {
         let Some(seq) = self.sequences.get(name) else {
-            return Err(StorageError::Corrupt(format!(
-                "sequence {name:?} does not exist"
-            )));
+            return Err(StorageError::TableNotFound { name: name.into() });
         };
         if !seq.is_called {
             return Err(StorageError::Corrupt(format!(
@@ -4362,10 +4358,17 @@ impl Catalog {
         is_called: bool,
     ) -> Result<i64, StorageError> {
         let Some(seq) = self.sequences.get_mut(name) else {
-            return Err(StorageError::Corrupt(format!(
-                "sequence {name:?} does not exist"
-            )));
+            return Err(StorageError::TableNotFound { name: name.into() });
         };
+        // v7.39 (round 244) — PG refuses a value outside the sequence's
+        // range (22003); SPG accepted it silently, leaving last_value out
+        // of bounds.
+        if value < seq.min_value || value > seq.max_value {
+            return Err(StorageError::Unsupported(format!(
+                "setval: value {value} is out of bounds for sequence \"{name}\" ({}..{})",
+                seq.min_value, seq.max_value
+            )));
+        }
         seq.last_value = value;
         seq.is_called = is_called;
         Ok(value)
@@ -4704,9 +4707,7 @@ impl Catalog {
         owned_by: Option<Option<(String, String)>>,
     ) -> Result<(), StorageError> {
         let Some(seq) = self.sequences.get_mut(name) else {
-            return Err(StorageError::Corrupt(format!(
-                "sequence {name:?} does not exist"
-            )));
+            return Err(StorageError::TableNotFound { name: name.into() });
         };
         if let Some(v) = increment {
             seq.increment = v;

@@ -3689,9 +3689,16 @@ impl Engine {
             .options
             .start
             .unwrap_or(if increment > 0 { min_value } else { max_value });
-        if start < min_value || start > max_value {
+        // v7.39 (round 244) — PG splits the refusal into two named cases
+        // (22023): below MINVALUE and above MAXVALUE.
+        if start < min_value {
             return Err(EngineError::Unsupported(alloc::format!(
-                "START WITH ({start}) is outside MINVALUE..MAXVALUE ({min_value}..{max_value})"
+                "START value ({start}) cannot be less than MINVALUE ({min_value})"
+            )));
+        }
+        if start > max_value {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "START value ({start}) cannot be greater than MAXVALUE ({max_value})"
             )));
         }
         let cache = s.options.cache.unwrap_or(1);
