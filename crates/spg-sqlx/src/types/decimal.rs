@@ -1,7 +1,7 @@
 //! v7.17.0 Phase 3.P0-67 — `Type` / `Encode` / `Decode` for the
 //! NUMERIC family.
 //!
-//! Engine-side, NUMERIC carries `(scaled: i128, scale: u8)`.
+//! Engine-side, NUMERIC carries `(scaled: i128, scale: u16)`.
 //! `(scaled, scale)` ↔ BigDecimal mantissa/exponent is a
 //! straight reshape — both encode "digits × 10^-scale". The
 //! `i128` ceiling caps SPG NUMERIC at precision 38; values
@@ -34,7 +34,7 @@ use crate::value::SpgValueRef;
 /// step so the sqlx adapter and pgwire show identical strings
 /// for the same cell. Inlined here so spg-sqlx doesn't grow a
 /// direct dep on spg-engine.
-pub(crate) fn numeric_to_text(scaled: i128, scale: u8) -> String {
+pub(crate) fn numeric_to_text(scaled: i128, scale: u16) -> String {
     if scale == 0 {
         return format!("{scaled}");
     }
@@ -145,7 +145,7 @@ mod bd {
     /// pair. Errors out if the mantissa overflows i128 (precision
     /// `> 38`) or the exponent is outside `0..=u8::MAX` — both
     /// states fall outside what SPG NUMERIC can represent.
-    fn bigdecimal_to_scaled(d: &BigDecimal) -> Result<(i128, u8), BoxDynError> {
+    fn bigdecimal_to_scaled(d: &BigDecimal) -> Result<(i128, u16), BoxDynError> {
         // BigDecimal::as_bigint_and_exponent gives (mantissa,
         // exponent) where the value = mantissa * 10^(-exponent).
         // Non-negative exponent → `scale = exponent`; negative
@@ -155,16 +155,16 @@ mod bd {
         let (scaled, scale) = if exp < 0 {
             let factor = BigInt::from(10u8).pow((-exp) as u32);
             let folded = mantissa * factor;
-            (folded, 0u8)
-        } else if exp > i64::from(u8::MAX) {
+            (folded, 0u16)
+        } else if exp > i64::from(u16::MAX) {
             return Err(format!(
                 "BigDecimal scale {exp} exceeds SPG NUMERIC ceiling ({})",
-                u8::MAX
+                u16::MAX
             )
             .into());
         } else {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let s = exp as u8;
+            let s = exp as u16;
             (mantissa, s)
         };
         let scaled_i128 = scaled.to_i128().ok_or_else(|| {
@@ -175,7 +175,7 @@ mod bd {
         Ok((scaled_i128, scale))
     }
 
-    fn scaled_to_bigdecimal(scaled: i128, scale: u8) -> BigDecimal {
+    fn scaled_to_bigdecimal(scaled: i128, scale: u16) -> BigDecimal {
         let sign = if scaled < 0 { Sign::Minus } else { Sign::Plus };
         let magnitude: u128 = scaled.unsigned_abs();
         let mantissa = BigInt::from_biguint(sign, num_bigint::BigUint::from(magnitude));

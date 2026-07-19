@@ -155,7 +155,7 @@ fn cast_reg_misc(kind: &str, s: &str) -> Result<Value<'static>, EvalError> {
 
 /// Round a numeric operand (`scaled` × 10^-`scale`) to the nearest
 /// integer, half-away-from-zero — PG's `numeric → int` coercion rule.
-fn numeric_round_to_i128(scaled: i128, scale: u8) -> i128 {
+fn numeric_round_to_i128(scaled: i128, scale: u16) -> i128 {
     let factor = 10_i128.pow(u32::from(scale));
     let neg = scaled < 0;
     let abs = scaled.unsigned_abs() as i128;

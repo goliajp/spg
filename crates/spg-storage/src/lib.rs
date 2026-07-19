@@ -131,7 +131,8 @@ pub enum DataType {
     /// surface as `Numeric { precision: p, scale: 0 }`.
     Numeric {
         precision: u8,
-        scale: u8,
+        /// v7.39 (round 271) — widened alongside the value's scale.
+        scale: u16,
     },
     /// `DATE` — calendar date with day precision, stored as `i32` days
     /// since the Unix epoch (1970-01-01).
@@ -610,7 +611,11 @@ pub enum Value<'arena> {
     /// which ignore `scaled`/`scale` (canonicalized to 0).
     Numeric {
         scaled: i128,
-        scale: u8,
+        /// v7.39 (round 271) — widened from u8. PG's numeric carries a
+        /// display scale up to 16383; at u8 a literal with 256 decimal
+        /// places could not be represented at all, and the conversion
+        /// aborted the query with an internal error.
+        scale: u16,
         kind: NumericKind,
     },
     /// v7.38 (read01, T3) — an exact NUMERIC whose mantissa overflows `i128`
@@ -670,8 +675,8 @@ pub enum Value<'arena> {
     BoolArray(Vec<Option<bool>>),
     SmallIntArray(Vec<Option<i16>>),
     FloatArray(Vec<Option<f64>>),
-    /// PG `NUMERIC[]` — `(scaled: i128, scale: u8)` per element.
-    NumericArray(Vec<Option<(i128, u8)>>),
+    /// PG `NUMERIC[]` — `(scaled: i128, scale: u16)` per element.
+    NumericArray(Vec<Option<(i128, u16)>>),
     DateArray(Vec<Option<i32>>),
     TimestampArray(Vec<Option<i64>>),
     TimestamptzArray(Vec<Option<i64>>),
@@ -1182,7 +1187,7 @@ impl Value<'static> {
     }
 
     /// v7.38 (read01, T6) — a finite NUMERIC from its fixed-point parts.
-    pub const fn numeric(scaled: i128, scale: u8) -> Self {
+    pub const fn numeric(scaled: i128, scale: u16) -> Self {
         Value::Numeric {
             scaled,
             scale,

@@ -3,7 +3,7 @@
 
 use spg_engine::{Engine, QueryResult};
 
-fn numeric(e: &mut Engine, sql: &str) -> (i128, u8) {
+fn numeric(e: &mut Engine, sql: &str) -> (i128, u16) {
     let r = e
         .execute(sql)
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"));

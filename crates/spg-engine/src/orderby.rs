@@ -393,10 +393,10 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
 /// `i128` headroom covers every in-range `NUMERIC`; on the rare
 /// overflow of the alignment multiply we fall back to an `f64`
 /// comparison (imprecise but never panics).
-pub(crate) fn cmp_numeric(xs: i128, xsc: u8, ys: i128, ysc: u8) -> core::cmp::Ordering {
+pub(crate) fn cmp_numeric(xs: i128, xsc: u16, ys: i128, ysc: u16) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     let max_scale = xsc.max(ysc);
-    let widen = |v: i128, sc: u8| -> Option<i128> {
+    let widen = |v: i128, sc: u16| -> Option<i128> {
         10i128
             .checked_pow(u32::from(max_scale - sc))
             .and_then(|f| v.checked_mul(f))
@@ -415,7 +415,7 @@ pub(crate) fn cmp_numeric(xs: i128, xsc: u8, ys: i128, ysc: u8) -> core::cmp::Or
 /// `numeric op float8` demotion (and the f64 fallback inside
 /// `cmp_numeric`). Used by the mixed NUMERIC↔Float comparison arms.
 #[allow(clippy::cast_precision_loss)]
-pub(crate) fn numeric_to_f64(scaled: i128, scale: u8) -> f64 {
+pub(crate) fn numeric_to_f64(scaled: i128, scale: u16) -> f64 {
     scaled as f64 / 10f64.powi(i32::from(scale))
 }
 
@@ -1249,7 +1249,7 @@ mod value_cmp_mixed_numeric_tests {
     use core::cmp::Ordering;
     use spg_storage::Value;
 
-    fn num(scaled: i128, scale: u8) -> Value<'static> {
+    fn num(scaled: i128, scale: u16) -> Value<'static> {
         Value::Numeric {
             scaled,
             scale,

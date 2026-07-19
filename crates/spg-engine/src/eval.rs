@@ -1584,7 +1584,7 @@ fn eval_array_arm(
         return Ok(Value::FloatArray(out));
     }
     if has_numeric {
-        let out: Vec<Option<(i128, u8)>> = materialised
+        let out: Vec<Option<(i128, u16)>> = materialised
             .into_iter()
             .map(|v| match v {
                 Value::Null => None,

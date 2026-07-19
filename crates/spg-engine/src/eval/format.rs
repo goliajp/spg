@@ -1567,7 +1567,7 @@ pub fn format_float_array(items: &[Option<f64>]) -> String {
 }
 
 /// v7.37.5 γ — render a NUMERIC[] in PG external form.
-pub fn format_numeric_array(items: &[Option<(i128, u8)>]) -> String {
+pub fn format_numeric_array(items: &[Option<(i128, u16)>]) -> String {
     let mut out = String::with_capacity(2 + items.len() * 6);
     out.push('{');
     for (i, item) in items.iter().enumerate() {
@@ -1727,7 +1727,7 @@ pub fn format_bytea_hex(b: &[u8]) -> String {
 /// fractional side with leading zeros to exactly `scale` chars.
 /// v7.38 (read01, T6) — render a NUMERIC honoring its special kind. Finite uses
 /// `format_numeric`; the specials render PG's full-word spellings.
-pub fn format_numeric_kind(kind: spg_storage::NumericKind, scaled: i128, scale: u8) -> String {
+pub fn format_numeric_kind(kind: spg_storage::NumericKind, scaled: i128, scale: u16) -> String {
     use spg_storage::NumericKind;
     match kind {
         NumericKind::Finite => format_numeric(scaled, scale),
@@ -1737,7 +1737,7 @@ pub fn format_numeric_kind(kind: spg_storage::NumericKind, scaled: i128, scale: 
     }
 }
 
-pub fn format_numeric(scaled: i128, scale: u8) -> String {
+pub fn format_numeric(scaled: i128, scale: u16) -> String {
     if scale == 0 {
         return format!("{scaled}");
     }

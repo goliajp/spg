@@ -9990,13 +9990,13 @@ fn apply_function_dispatch(
                                 }
                             }
                         }
-                        let exact_scale = result_scale as u8;
+                        let exact_scale = result_scale as u16;
                         let int_part = if exact_scale == 0 {
                             acc.abs()
                         } else {
                             acc.abs() / 10i128.pow(result_scale)
                         };
-                        let display_rscale: u8 = if int_part == 0 {
+                        let display_rscale: u16 = if int_part == 0 {
                             16
                         } else {
                             let mut d = 0u32;
@@ -10005,7 +10005,7 @@ fn apply_function_dispatch(
                                 d += 1;
                                 t /= 10;
                             }
-                            17u32.saturating_sub(d).min(16) as u8
+                            17u32.saturating_sub(d).min(16) as u16
                         };
                         let final_scaled = if !ok {
                             None
@@ -10205,7 +10205,7 @@ fn apply_function_dispatch(
             // truncated i128 remainder (sign of the dividend, like `%`).
             if matches!(args[0], Value::Numeric { .. }) || matches!(args[1], Value::Numeric { .. })
             {
-                let as_num = |v: &Value| -> Option<(i128, u8)> {
+                let as_num = |v: &Value| -> Option<(i128, u16)> {
                     match v {
                         Value::SmallInt(n) => Some((i128::from(*n), 0)),
                         Value::Int(n) => Some((i128::from(*n), 0)),
@@ -10782,7 +10782,7 @@ fn apply_function_dispatch(
                     // `trunc(numeric, int)` overload (implicit int→numeric cast),
                     // so treat it as a scale-0 mantissa here rather than the f64
                     // path.
-                    let numeric_input: Option<(i128, u8)> = match &args[0] {
+                    let numeric_input: Option<(i128, u16)> = match &args[0] {
                         Value::Numeric { scaled, scale, .. } => Some((*scaled, *scale)),
                         Value::SmallInt(v) => Some((i128::from(*v), 0)),
                         Value::Int(v) => Some((i128::from(*v), 0)),
@@ -10794,19 +10794,30 @@ fn apply_function_dispatch(
                         if (0..=38).contains(&n) {
                             #[allow(clippy::cast_sign_loss)]
                             let out = if n >= cur {
-                                scaled.checked_mul(pow10_i128((n - cur) as u8)).map(|m| {
-                                    Value::Numeric { scaled: m, scale: n as u8 , kind: spg_storage::NumericKind::Finite }
+                                scaled.checked_mul(pow10_i128((n - cur) as u16)).map(|m| {
+                                    Value::Numeric { scaled: m, scale: n as u16 , kind: spg_storage::NumericKind::Finite }
                                 })
                             } else {
-                                let factor = pow10_i128((cur - n) as u8);
+                                let factor = pow10_i128((cur - n) as u16);
                                 Some(Value::Numeric {
                                     scaled: scaled / factor,
-                                    scale: n as u8,
+                                    scale: n as u16,
                                  kind: spg_storage::NumericKind::Finite })
                             };
                             if let Some(v) = out {
                                 return Ok(v);
                             }
+                        } else if (39..=i32::from(u16::MAX)).contains(&n) {
+                            // v7.39 (round 271) — a target scale past what
+                            // i128 can carry stays NUMERIC in PG; SPG fell
+                            // through to the f64 tail below and handed back
+                            // double precision. With scale widened to u16
+                            // this is reachable, so route it through the
+                            // arbitrary-precision form.
+                            #[allow(clippy::cast_sign_loss)]
+                            let widened = spg_storage::bignum::BigNumeric::from_i128(scaled, scale)
+                                .round_to(n as u16);
+                            return Ok(crate::eval::binop::bignum_to_value(widened));
                         } else if n < 0 && -n <= 38 && cur - n <= 38 {
                             // v7.39 (read01 round 99) — a NEGATIVE target scale
                             // stays NUMERIC in PG (`trunc(1234.5678, -2)` → numeric
@@ -10816,9 +10827,9 @@ fn apply_function_dispatch(
                             // rescale to scale 0.
                             #[allow(clippy::cast_sign_loss)]
                             let drop = (cur - n) as u8;
-                            let q = scaled / pow10_i128(drop);
+                            let q = scaled / pow10_i128(u16::from(drop));
                             #[allow(clippy::cast_sign_loss)]
-                            if let Some(mag) = q.checked_mul(pow10_i128((-n) as u8)) {
+                            if let Some(mag) = q.checked_mul(pow10_i128((-n) as u16)) {
                                 return Ok(Value::Numeric {
                                     scaled: mag,
                                     scale: 0,
@@ -10926,7 +10937,7 @@ fn apply_function_dispatch(
                     // `round(numeric, int)` overload with an implicit int→numeric
                     // cast (PG returns numeric), so treat it as a scale-0
                     // mantissa here rather than letting it reach the f64 path.
-                    let numeric_input: Option<(i128, u8)> = match &args[0] {
+                    let numeric_input: Option<(i128, u16)> = match &args[0] {
                         Value::Numeric { scaled, scale, .. } => Some((*scaled, *scale)),
                         Value::SmallInt(v) => Some((i128::from(*v), 0)),
                         Value::Int(v) => Some((i128::from(*v), 0)),
@@ -10938,11 +10949,11 @@ fn apply_function_dispatch(
                         if (0..=38).contains(&n) {
                             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                             let out = if n >= cur {
-                                scaled.checked_mul(pow10_i128((n - cur) as u8)).map(|m| {
-                                    Value::Numeric { scaled: m, scale: n as u8 , kind: spg_storage::NumericKind::Finite }
+                                scaled.checked_mul(pow10_i128((n - cur) as u16)).map(|m| {
+                                    Value::Numeric { scaled: m, scale: n as u16 , kind: spg_storage::NumericKind::Finite }
                                 })
                             } else {
-                                let factor = pow10_i128((cur - n) as u8);
+                                let factor = pow10_i128((cur - n) as u16);
                                 let neg = scaled < 0;
                                 let abs = scaled.unsigned_abs() as i128;
                                 let q = abs / factor;
@@ -10950,12 +10961,20 @@ fn apply_function_dispatch(
                                 let mag = if 2 * r >= factor { q + 1 } else { q };
                                 Some(Value::Numeric {
                                     scaled: if neg { -mag } else { mag },
-                                    scale: n as u8,
+                                    scale: n as u16,
                                  kind: spg_storage::NumericKind::Finite })
                             };
                             if let Some(v) = out {
                                 return Ok(v);
                             }
+                        } else if (39..=i32::from(u16::MAX)).contains(&n) {
+                            // v7.39 (round 271) — as in trunc above: a target
+                            // scale past what i128 can carry stays NUMERIC in
+                            // PG, and used to fall through to the f64 tail.
+                            #[allow(clippy::cast_sign_loss)]
+                            let widened = spg_storage::bignum::BigNumeric::from_i128(scaled, scale)
+                                .round_to(n as u16);
+                            return Ok(crate::eval::binop::bignum_to_value(widened));
                         } else if n < 0 && -n <= 38 && cur - n <= 38 {
                             // v7.39 (read01 round 98) — a NEGATIVE target scale
                             // (round to tens / hundreds / …) stays NUMERIC in PG
@@ -10965,14 +10984,14 @@ fn apply_function_dispatch(
                             // 10^|n| place exactly, then rescale to scale 0.
                             #[allow(clippy::cast_sign_loss)]
                             let drop = (cur - n) as u8;
-                            let factor = pow10_i128(drop);
+                            let factor = pow10_i128(u16::from(drop));
                             let neg = scaled < 0;
                             let abs = scaled.unsigned_abs() as i128;
                             let q = abs / factor;
                             let r = abs % factor;
                             let units = if 2 * r >= factor { q + 1 } else { q };
                             #[allow(clippy::cast_sign_loss)]
-                            if let Some(mag) = units.checked_mul(pow10_i128((-n) as u8)) {
+                            if let Some(mag) = units.checked_mul(pow10_i128((-n) as u16)) {
                                 return Ok(Value::Numeric {
                                     scaled: if neg { -mag } else { mag },
                                     scale: 0,
@@ -15673,6 +15692,10 @@ fn apply_function_dispatch(
             match &args[0] {
                 Value::Null => Ok(Value::Null),
                 Value::Numeric { scale, .. } => Ok(Value::Int(i32::from(*scale))),
+                // v7.39 (round 271) — the arbitrary-precision form was
+                // missing here. It became reachable once a scale past
+                // 255 could exist, e.g. round(1e-256, 300).
+                Value::NumericBig(b) => Ok(Value::Int(i32::from(b.scale()))),
                 Value::Int(_) | Value::SmallInt(_) | Value::BigInt(_) => {
                     Ok(Value::Int(0))
                 }

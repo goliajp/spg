@@ -6800,7 +6800,7 @@ fn encode_row_key(row: &Row<'static>) -> Vec<u8> {
 /// Append a scale-independent canonical key for an exact-decimal value: strip
 /// trailing fractional zeros so `1`, `1.0`, `1.00` all key the same. The `\x01`
 /// tag keeps a numeric key from colliding with a text value's `{v:?}` form.
-fn encode_numeric_key(out: &mut Vec<u8>, mut scaled: i128, mut scale: u8) {
+fn encode_numeric_key(out: &mut Vec<u8>, mut scaled: i128, mut scale: u16) {
     while scale > 0 && scaled % 10 == 0 {
         scaled /= 10;
         scale -= 1;

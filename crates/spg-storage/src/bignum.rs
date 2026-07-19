@@ -24,7 +24,7 @@ const BASE_DIGITS: usize = 9;
 pub struct BigNumeric {
     neg: bool,
     limbs: Vec<u32>,
-    scale: u8,
+    scale: u16,
 }
 
 impl BigNumeric {
@@ -35,21 +35,21 @@ impl BigNumeric {
     }
 
     #[must_use]
-    pub fn scale(&self) -> u8 {
+    pub fn scale(&self) -> u16 {
         self.scale
     }
 
     /// v7.38 (read01, T3.C3) — expose the on-disk parts (sign, base-10^9 limbs
     /// little-endian, scale) for the codec.
     #[must_use]
-    pub fn parts(&self) -> (bool, &[u32], u8) {
+    pub fn parts(&self) -> (bool, &[u32], u16) {
         (self.neg, &self.limbs, self.scale)
     }
 
     /// Rebuild from codec parts. Normalizes (a canonical big value never has a
     /// mantissa that fits `i128` — the caller collapses those to `Numeric`).
     #[must_use]
-    pub fn from_parts(neg: bool, limbs: Vec<u32>, scale: u8) -> Self {
+    pub fn from_parts(neg: bool, limbs: Vec<u32>, scale: u16) -> Self {
         let mut out = BigNumeric { neg, limbs, scale };
         out.normalize();
         out
@@ -67,7 +67,7 @@ impl BigNumeric {
 
     /// Build from an `i128` mantissa at a given scale.
     #[must_use]
-    pub fn from_i128(mut v: i128, scale: u8) -> Self {
+    pub fn from_i128(mut v: i128, scale: u16) -> Self {
         let neg = v < 0;
         let mut limbs = Vec::new();
         // Use the unsigned magnitude; i128::MIN's magnitude still fits in u128.
@@ -196,7 +196,7 @@ impl BigNumeric {
 
     /// Align two values to a common scale (the larger of the two), returning the
     /// scaled magnitude limb vectors and the shared scale.
-    fn align(&self, other: &Self) -> (Vec<u32>, Vec<u32>, u8) {
+    fn align(&self, other: &Self) -> (Vec<u32>, Vec<u32>, u16) {
         use core::cmp::Ordering;
         match self.scale.cmp(&other.scale) {
             Ordering::Equal => (self.limbs.clone(), other.limbs.clone(), self.scale),
@@ -475,7 +475,7 @@ impl BigNumeric {
     /// zero — the shape PG's `numeric / numeric` uses. Errors are the caller's:
     /// dividing by zero returns `None`.
     #[must_use]
-    pub fn div(&self, other: &Self, result_scale: u8) -> Option<Self> {
+    pub fn div(&self, other: &Self, result_scale: u16) -> Option<Self> {
         if other.is_zero() {
             return None;
         }
@@ -562,7 +562,7 @@ impl BigNumeric {
     /// `result_scale` (PG's ~16-significant-digit rule) and guarantees it is at
     /// least the argument's own scale.
     #[must_use]
-    pub fn sqrt(&self, result_scale: u8) -> Option<Self> {
+    pub fn sqrt(&self, result_scale: u16) -> Option<Self> {
         use core::cmp::Ordering;
         if self.neg && !self.is_zero() {
             return None;
@@ -616,7 +616,7 @@ impl BigNumeric {
     /// `round_var`). Widening pads with zeros; narrowing drops digits with
     /// rounding.
     #[must_use]
-    pub fn round_to(&self, target_scale: u8) -> Self {
+    pub fn round_to(&self, target_scale: u16) -> Self {
         use core::cmp::Ordering;
         match self.scale.cmp(&target_scale) {
             Ordering::Equal => self.clone(),
@@ -653,7 +653,7 @@ impl BigNumeric {
     /// v7.38 (S1.1b) — the display scale PG gives a numeric transcendental
     /// result (`exp` / `ln` / fractional `^`): ~16 significant digits, i.e.
     /// `17 - int_digits` fractional digits (16 for `|v| < 10`), floored at 0.
-    fn transcendental_scale(&self) -> u8 {
+    fn transcendental_scale(&self) -> u16 {
         let (_, digits, scale) = self.parts();
         // Decimal digit count of the mantissa.
         let ndigits = if digits.is_empty() {
@@ -666,7 +666,7 @@ impl BigNumeric {
         if int_digits <= 1 {
             16
         } else {
-            (17 - int_digits).max(0) as u8
+            (17 - int_digits).max(0) as u16
         }
     }
 
@@ -678,7 +678,7 @@ impl BigNumeric {
     /// last digit across the differential set.
     #[must_use]
     pub fn exp(&self) -> Self {
-        const WS: u8 = 28;
+        const WS: u16 = 28;
         let raw = if self.neg && !self.is_zero() {
             // e^-x = 1 / e^x.
             let pos = self.neg().exp_core(WS);
@@ -693,7 +693,7 @@ impl BigNumeric {
     /// guard digits); the caller rounds down to the display scale. Integer
     /// constants are built at scale 0 (`from_i128(k, 0)` is the value `k`, not
     /// `k * 10^-scale`) and gain scale through the arithmetic.
-    fn exp_core(&self, ws: u8) -> Self {
+    fn exp_core(&self, ws: u16) -> Self {
         let one = BigNumeric::from_i128(1, 0);
         if self.is_zero() {
             return one.round_to(ws);
@@ -737,7 +737,7 @@ impl BigNumeric {
         if self.neg || self.is_zero() {
             return None;
         }
-        const WS: u8 = 30;
+        const WS: u16 = 30;
         let ln_hi = self.ln_at(WS)?;
         let prod = exp.mul(&ln_hi).round_to(WS);
         Some(prod.exp())
@@ -746,7 +746,7 @@ impl BigNumeric {
     /// natural log computed to a fixed working scale `ws` (no display-scale
     /// rounding); shared by `ln` (rounds to display scale) and `pow_numeric`
     /// (needs full precision for the exponent multiply). `None` for `self <= 0`.
-    fn ln_at(&self, ws: u8) -> Option<Self> {
+    fn ln_at(&self, ws: u16) -> Option<Self> {
         if self.neg || self.is_zero() {
             return None;
         }
@@ -802,7 +802,7 @@ impl BigNumeric {
     /// "logarithm of zero / of a negative number" / "division by zero" error.
     #[must_use]
     pub fn log_base(&self, base: &Self) -> Option<Self> {
-        const WS: u8 = 32;
+        const WS: u16 = 32;
         let ln_x = self.ln_at(WS)?;
         let ln_b = base.ln_at(WS)?;
         if ln_b.is_zero() {
@@ -879,7 +879,7 @@ impl BigNumeric {
         {
             return None;
         }
-        let scale = u8::try_from(frac_part.len()).ok()?;
+        let scale = u16::try_from(frac_part.len()).ok()?;
         let mut all: String = String::with_capacity(int_part.len() + frac_part.len());
         all.push_str(int_part);
         all.push_str(frac_part);

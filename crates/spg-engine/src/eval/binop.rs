@@ -2283,7 +2283,7 @@ fn apply_binary_numeric(
 /// Express `v` as a `(scaled_i128, scale)` pair. Plain integers come
 /// back with `scale=0`; NUMERIC keeps its own scale. Anything else
 /// returns `None` and the caller raises a type error.
-fn numeric_or_widen(v: &Value<'static>) -> Option<(i128, u8)> {
+fn numeric_or_widen(v: &Value<'static>) -> Option<(i128, u16)> {
     match v {
         Value::Numeric { scaled, scale, .. } => Some((*scaled, *scale)),
         Value::Int(n) => Some((i128::from(*n), 0)),
@@ -2293,14 +2293,18 @@ fn numeric_or_widen(v: &Value<'static>) -> Option<(i128, u8)> {
     }
 }
 
-fn rescale(scaled: i128, src: u8, dst: u8) -> Option<i128> {
+fn rescale(scaled: i128, src: u16, dst: u16) -> Option<i128> {
     if src == dst {
         return Some(scaled);
     }
+    // v7.39 (round 271) — with `scale` widened to u16 the power can
+    // exceed i128. Returning None here drops the caller onto the
+    // BigNumeric path it already has; the old unchecked `pow10_i128`
+    // panicked and aborted the query.
     if dst > src {
-        scaled.checked_mul(pow10_i128(dst - src))
+        scaled.checked_mul(pow10_i128_checked(dst - src)?)
     } else {
-        let drop = pow10_i128(src - dst);
+        let drop = pow10_i128_checked(src - dst)?;
         let half = drop / 2;
         let r = if scaled >= 0 {
             scaled + half
@@ -2311,14 +2315,25 @@ fn rescale(scaled: i128, src: u8, dst: u8) -> Option<i128> {
     }
 }
 
-pub(super) const fn pow10_i128(p: u8) -> i128 {
+pub(super) const fn pow10_i128(p: u16) -> i128 {
+    match pow10_i128_checked(p) {
+        Some(v) => v,
+        None => i128::MAX,
+    }
+}
+
+/// `10^p`, or None once it leaves the i128 range.
+const fn pow10_i128_checked(p: u16) -> Option<i128> {
     let mut acc: i128 = 1;
     let mut i = 0;
     while i < p {
-        acc *= 10;
+        match acc.checked_mul(10) {
+            Some(v) => acc = v,
+            None => return None,
+        }
         i += 1;
     }
-    acc
+    Some(acc)
 }
 
 const fn cmp_to_bool(op: BinOp, ord: core::cmp::Ordering) -> bool {
@@ -3081,12 +3096,14 @@ fn as_f64(v: &Value<'_>) -> Result<f64, EvalError> {
         Value::Float(x) => Ok(*x),
         Value::Real(x) => Ok(f64::from(*x)),
         #[allow(clippy::cast_precision_loss)]
+            // v7.39 (round 271) — parse the decimal text instead of
+            // dividing by a power built with repeated multiplication,
+            // which accumulated rounding error and ran to infinity once
+            // `scale` could exceed 308.
         Value::Numeric { scaled, scale, .. } => {
-            let mut div = 1.0_f64;
-            for _ in 0..*scale {
-                div *= 10.0;
-            }
-            Ok((*scaled as f64) / div)
+            Ok(crate::eval::format_numeric(*scaled, *scale)
+                .parse()
+                .unwrap_or(f64::NAN))
         }
         // v7.39 (read01 numeric.c) — a big NUMERIC in a mixed float op
         // approximates through its decimal text (same promotion as the
@@ -3169,7 +3186,7 @@ fn array_value_cmp<T>(
 /// (exact, no precision loss) and compare the i128. Mirrors the scalar
 /// `numeric` compare (`apply_binary_numeric`). Rescale overflow
 /// (astronomically different scales) falls back to the raw-scaled compare.
-fn numeric_pair_cmp(a: (i128, u8), b: (i128, u8)) -> core::cmp::Ordering {
+fn numeric_pair_cmp(a: (i128, u16), b: (i128, u16)) -> core::cmp::Ordering {
     let t = a.1.max(b.1);
     match (rescale(a.0, a.1, t), rescale(b.0, b.1, t)) {
         (Some(x), Some(y)) => x.cmp(&y),
@@ -5224,7 +5241,7 @@ pub(super) fn compare(
         {
             // Inline widen (numeric_or_widen wants `&Value<'static>`; these
             // operands are shorter-lived but only their Copy fields are read).
-            let widen = |v: &Value<'_>| -> Option<(i128, u8)> {
+            let widen = |v: &Value<'_>| -> Option<(i128, u16)> {
                 match v {
                     Value::Numeric { scaled, scale, .. } => Some((*scaled, *scale)),
                     Value::Int(n) => Some((i128::from(*n), 0)),

@@ -13,7 +13,7 @@ use crate::EngineError;
 pub(crate) fn numeric_from_integer(
     n: i128,
     precision: u8,
-    scale: u8,
+    scale: u16,
     col_name: &str,
 ) -> Result<Value<'static>, EngineError> {
     let factor = pow10_i128(scale);
@@ -36,7 +36,7 @@ pub(crate) fn numeric_from_integer(
 pub(crate) fn numeric_from_float(
     x: f64,
     precision: u8,
-    scale: u8,
+    scale: u16,
     col_name: &str,
 ) -> Result<Value<'static>, EngineError> {
     if !x.is_finite() {
@@ -75,7 +75,7 @@ pub(crate) fn numeric_from_float(
 }
 
 /// v7.17.0 Phase 3.P0-67 — parse PG-canonical decimal text into
-/// `(mantissa: i128, source_scale: u8)`. Accepts optional sign,
+/// `(mantissa: i128, source_scale: u16)`. Accepts optional sign,
 /// optional integer part, optional fractional part. Rejects
 /// scientific notation, embedded spaces, locale-specific
 /// thousand separators. Returns None on bad input — coerce_value
@@ -212,7 +212,7 @@ pub(crate) fn strip_digit_underscores(s: &str) -> Option<alloc::borrow::Cow<'_, 
     Some(alloc::borrow::Cow::Owned(s.replace('_', "")))
 }
 
-pub(crate) fn parse_numeric_text(s: &str) -> Option<(i128, u8)> {
+pub(crate) fn parse_numeric_text(s: &str) -> Option<(i128, u16)> {
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -226,10 +226,10 @@ pub(crate) fn parse_numeric_text(s: &str) -> Option<(i128, u8)> {
         // Effective scale = base fractional digits minus the exponent.
         let eff = i32::from(base_scale) - exp;
         return if eff >= 0 {
-            Some((mantissa, u8::try_from(eff).ok()?))
+            Some((mantissa, u16::try_from(eff).ok()?))
         } else {
             // Negative scale → shift the mantissa up, land at scale 0.
-            let shift = u8::try_from(-eff).ok()?;
+            let shift = u16::try_from(-eff).ok()?;
             if shift > 38 {
                 return None;
             }
@@ -240,7 +240,7 @@ pub(crate) fn parse_numeric_text(s: &str) -> Option<(i128, u8)> {
 }
 
 /// Parse a plain (no-exponent) decimal `[+-]int[.frac]` into `(mantissa, scale)`.
-fn parse_plain_numeric(s: &str) -> Option<(i128, u8)> {
+fn parse_plain_numeric(s: &str) -> Option<(i128, u16)> {
     if s.is_empty() {
         return None;
     }
@@ -266,10 +266,14 @@ fn parse_plain_numeric(s: &str) -> Option<(i128, u8)> {
         return None;
     }
     let scale_u32 = u32::try_from(frac_part.len()).ok()?;
-    if scale_u32 > u32::from(u8::MAX) {
+    // v7.39 (round 271) — was u8::MAX. The third of three places that
+    // silently dropped a decimal with more than 255 places out of the
+    // numeric path.
+    if scale_u32 > u32::from(u16::MAX) {
         return None;
     }
-    let scale = scale_u32 as u8;
+    #[allow(clippy::cast_possible_truncation)]
+    let scale = scale_u32 as u16;
     let mut digits = alloc::string::String::with_capacity(int_part.len() + frac_part.len() + 1);
     if negative {
         digits.push('-');
@@ -292,9 +296,9 @@ fn parse_plain_numeric(s: &str) -> Option<(i128, u8)> {
 /// multiplies by 10; going down rounds half-away-from-zero.
 pub(crate) fn numeric_rescale(
     scaled: i128,
-    src_scale: u8,
+    src_scale: u16,
     precision: u8,
-    dst_scale: u8,
+    dst_scale: u16,
     col_name: &str,
 ) -> Result<Value<'static>, EngineError> {
     let new_scaled = if dst_scale >= src_scale {
@@ -323,7 +327,7 @@ pub(crate) fn numeric_rescale(
 
 /// Drop the fractional part of a scaled integer, returning the integer
 /// portion (toward zero). Used for NUMERIC → INT casts.
-pub(crate) const fn numeric_truncate_to_integer(scaled: i128, scale: u8) -> i128 {
+pub(crate) const fn numeric_truncate_to_integer(scaled: i128, scale: u16) -> i128 {
     if scale == 0 {
         return scaled;
     }
@@ -335,7 +339,7 @@ pub(crate) const fn numeric_truncate_to_integer(scaled: i128, scale: u8) -> i128
 /// behaviour PG uses when assigning / casting `numeric` to an integer type
 /// (`1.5 → 2`, `-1.5 → -2`, `1.4 → 1`). Used by the integer-column coercion
 /// arms so an INSERT rounds like the `::int` cast rather than truncating.
-pub(crate) const fn numeric_round_to_integer(scaled: i128, scale: u8) -> i128 {
+pub(crate) const fn numeric_round_to_integer(scaled: i128, scale: u16) -> i128 {
     if scale == 0 {
         return scaled;
     }
@@ -359,18 +363,18 @@ pub(crate) const fn numeric_round_to_integer(scaled: i128, scale: u8) -> i128 {
 fn check_precision(
     scaled: i128,
     precision: u8,
-    scale: u8,
+    scale: u16,
     _col_name: &str,
 ) -> Result<(), EngineError> {
     if precision == 0 {
         return Ok(());
     }
-    let limit = pow10_i128(precision);
+    let limit = pow10_i128(u16::from(precision));
     if scaled.unsigned_abs() >= limit.unsigned_abs() {
         return Err(EngineError::Unsupported(alloc::format!(
             "numeric field overflow DETAIL: A field with precision {precision}, \
              scale {scale} must round to an absolute value less than 10^{}.",
-            precision.saturating_sub(scale)
+            u16::from(precision).saturating_sub(scale)
         )));
     }
     Ok(())
@@ -387,10 +391,10 @@ fn check_precision(
 /// to the bignum accumulator instead of saturating to a wrong value.
 pub(crate) fn numeric_add_checked(
     a: i128,
-    a_scale: u8,
+    a_scale: u16,
     b: i128,
-    b_scale: u8,
-) -> Option<(i128, u8)> {
+    b_scale: u16,
+) -> Option<(i128, u16)> {
     if a_scale == b_scale {
         a.checked_add(b).map(|s| (s, a_scale))
     } else if a_scale > b_scale {
@@ -402,7 +406,7 @@ pub(crate) fn numeric_add_checked(
     }
 }
 
-pub(crate) fn numeric_add(a: i128, a_scale: u8, b: i128, b_scale: u8) -> (i128, u8) {
+pub(crate) fn numeric_add(a: i128, a_scale: u16, b: i128, b_scale: u16) -> (i128, u16) {
     if a_scale == b_scale {
         (a.saturating_add(b), a_scale)
     } else if a_scale > b_scale {
@@ -420,7 +424,7 @@ pub(crate) fn numeric_add(a: i128, a_scale: u8, b: i128, b_scale: u8) -> (i128, 
 /// rounds half-away-from-zero, matching PG18's exact avg output text
 /// including trailing digits. `count` must be > 0 (callers gate on
 /// `count == 0 → NULL`).
-pub(crate) fn numeric_avg(sum_scaled: i128, sum_scale: u8, count: i128) -> (i128, u8) {
+pub(crate) fn numeric_avg(sum_scaled: i128, sum_scale: u16, count: i128) -> (i128, u16) {
     let rscale = division_display_scale(sum_scaled, sum_scale, count, 0);
     let (num, den) = if i32::from(rscale) >= i32::from(sum_scale) {
         let k = rscale - sum_scale;
@@ -439,7 +443,7 @@ pub(crate) fn numeric_avg(sum_scaled: i128, sum_scale: u8, count: i128) -> (i128
 /// `(scaled, scale)` pairs; `b != 0` is the caller's contract. Returns `None`
 /// only on i128 overflow of the pre-scale multiply (SPG's fixed-width limit,
 /// surfaced as an honest error rather than a silently-truncated result).
-pub(crate) fn numeric_div(a: i128, sa: u8, b: i128, sb: u8) -> Option<(i128, u8)> {
+pub(crate) fn numeric_div(a: i128, sa: u16, b: i128, sb: u16) -> Option<(i128, u16)> {
     let rscale = division_display_scale(a, sa, b, sb);
     // True value = (a / 10^sa) / (b / 10^sb) = (a * 10^sb) / (b * 10^sa).
     // Express it at `rscale`: result_scaled = round( a * 10^(sb+rscale) /
@@ -479,10 +483,10 @@ fn pow10_checked(p: u32) -> Option<i128> {
 /// display-scale ceiling; SPG then clamps to its `u8` scale field.
 fn division_display_scale(
     dividend: i128,
-    dividend_scale: u8,
+    dividend_scale: u16,
     divisor: i128,
-    divisor_scale: u8,
-) -> u8 {
+    divisor_scale: u16,
+) -> u16 {
     let dwf = base10000_weight_firstdigit(dividend, dividend_scale);
     let vwf = base10000_weight_firstdigit(divisor, divisor_scale);
     division_display_scale_from_wf(dwf, dividend_scale, vwf)
@@ -495,7 +499,7 @@ fn division_display_scale(
 pub(crate) fn division_display_scale_big(
     dividend: &spg_storage::bignum::BigNumeric,
     divisor: &spg_storage::bignum::BigNumeric,
-) -> u8 {
+) -> u16 {
     let (dm, ds) = mantissa_and_scale_big(dividend);
     let (vm, vs) = mantissa_and_scale_big(divisor);
     let dwf = weight_firstdigit_core(&dm, ds);
@@ -508,12 +512,14 @@ pub(crate) fn division_display_scale_big(
 /// (`sweight = (weight+1)*2 - 1`, then `16 - sweight`), floored by the
 /// argument's own scale, capped at PG's 1000-digit ceiling then SPG's `u8`.
 /// Differential-verified: `sqrt(2)` → 15 fractional digits, `sqrt(1e38)` → 0.
-pub(crate) fn sqrt_display_scale_big(arg: &spg_storage::bignum::BigNumeric) -> u8 {
+pub(crate) fn sqrt_display_scale_big(arg: &spg_storage::bignum::BigNumeric) -> u16 {
     let (m, s) = mantissa_and_scale_big(arg);
     let (weight, _lead) = weight_firstdigit_core(&m, s);
     let sweight = (weight + 1) * 2 - 1;
     let scale = (16 - sweight).max(i32::from(s)).max(0).min(1000);
-    scale.min(255) as u8
+    // v7.39 (round 271) — PG's own ceiling is 1000; the 255 was SPG's
+    // u8 scale, which clipped a legitimate display scale.
+    scale as u16
 }
 
 /// Shared tail of `division_display_scale[_big]`: given each operand's
@@ -522,9 +528,9 @@ pub(crate) fn sqrt_display_scale_big(arg: &spg_storage::bignum::BigNumeric) -> u
 /// dividend's own scale, capped at PG's 1000-digit ceiling then SPG's `u8`).
 fn division_display_scale_from_wf(
     (dividend_group, dividend_lead): (i32, i32),
-    dividend_scale: u8,
+    dividend_scale: u16,
     (divisor_group, divisor_lead): (i32, i32),
-) -> u8 {
+) -> u16 {
     // Quotient magnitude ≈ dividend's leading group minus divisor's. When
     // the leading digits tie, the quotient can land a group lower, so drop
     // one group rather than risk under-scaling the result.
@@ -540,13 +546,15 @@ fn division_display_scale_from_wf(
         .max(i32::from(dividend_scale))
         .max(0)
         .min(1000);
-    scale.min(255) as u8
+    // v7.39 (round 271) — PG's own ceiling is 1000; the 255 was SPG's
+    // u8 scale, which clipped a legitimate display scale.
+    scale as u16
 }
 
 /// The unsigned unscaled mantissa (decimal digits, no leading zeros except
 /// "0") and scale of a `BigNumeric`, for the weight logic. Derived from the
 /// rendered decimal so it works regardless of limb layout.
-fn mantissa_and_scale_big(b: &spg_storage::bignum::BigNumeric) -> (alloc::string::String, u8) {
+fn mantissa_and_scale_big(b: &spg_storage::bignum::BigNumeric) -> (alloc::string::String, u16) {
     use alloc::string::{String, ToString};
     let s = b.to_decimal_str();
     let s = s.strip_prefix('-').unwrap_or(&s);
@@ -565,7 +573,7 @@ fn mantissa_and_scale_big(b: &spg_storage::bignum::BigNumeric) -> (alloc::string
 /// the decimal point). Returns `(weight, first_digit)` where `weight`
 /// is in units of 10000 and `first_digit` is the most-significant
 /// non-zero base-10000 digit. Zero → `(0, 0)`.
-fn base10000_weight_firstdigit(scaled: i128, scale: u8) -> (i32, i32) {
+fn base10000_weight_firstdigit(scaled: i128, scale: u16) -> (i32, i32) {
     let a = scaled.unsigned_abs();
     if a == 0 {
         return (0, 0);
@@ -576,7 +584,7 @@ fn base10000_weight_firstdigit(scaled: i128, scale: u8) -> (i32, i32) {
 /// Base-10000 weight + leading digit computed from an unscaled unsigned
 /// mantissa digit string (no leading zeros except "0") and its scale. Shared
 /// by the i128 and BigNumeric division-scale paths.
-fn weight_firstdigit_core(s: &str, scale: u8) -> (i32, i32) {
+fn weight_firstdigit_core(s: &str, scale: u16) -> (i32, i32) {
     if s == "0" {
         return (0, 0);
     }
@@ -627,7 +635,7 @@ fn div_round_half_away(num: i128, den: i128) -> i128 {
 
 /// `10^p` as i128, saturating at `i128::MAX` instead of panicking on
 /// overflow (guards the avg-scale multiply for pathological scales).
-fn pow10_sat(p: u8) -> i128 {
+fn pow10_sat(p: u16) -> i128 {
     let mut acc: i128 = 1;
     for _ in 0..p {
         match acc.checked_mul(10) {
@@ -638,16 +646,23 @@ fn pow10_sat(p: u8) -> i128 {
     acc
 }
 
-const fn pow10_i128_const(p: u8) -> i128 {
+/// v7.39 (round 271) — saturating, not panicking. With `scale` widened
+/// to u16 a caller can now hand this a power well past the i128 range;
+/// it used to overflow and abort the query. Saturating matches the
+/// sibling `pow10_sat` and is a no-op for every power that fits.
+const fn pow10_i128_const(p: u16) -> i128 {
     let mut acc: i128 = 1;
     let mut i = 0;
     while i < p {
-        acc *= 10;
+        match acc.checked_mul(10) {
+            Some(v) => acc = v,
+            None => return i128::MAX,
+        }
         i += 1;
     }
     acc
 }
 
-fn pow10_i128(p: u8) -> i128 {
+fn pow10_i128(p: u16) -> i128 {
     pow10_i128_const(p)
 }

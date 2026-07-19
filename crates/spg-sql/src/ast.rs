@@ -2197,7 +2197,8 @@ pub enum ColumnTypeName {
     },
     /// `NUMERIC` / `NUMERIC(p)` / `NUMERIC(p, s)` — exact decimal.
     /// Bare `NUMERIC` and `NUMERIC(p)` both surface with `scale=0`.
-    Numeric(u8, u8),
+    /// v7.39 (round 271) — scale widened to u16 alongside the value's.
+    Numeric(u8, u16),
     /// `DATE` — calendar day, no time-of-day component.
     Date,
     /// `TIMESTAMP` / `MySQL` `DATETIME` — instant with microsecond
@@ -3622,7 +3623,11 @@ pub enum Literal {
     /// `Float`.)
     Numeric {
         unscaled: i128,
-        scale: u8,
+        /// v7.39 (round 271) — widened to u16. At u8 a literal with more
+        /// than 255 decimal places could not be represented, and the
+        /// conversion's `.expect("lexer-validated decimal")` aborted the
+        /// query with an internal error on SQL PG accepts.
+        scale: u16,
     },
     /// v7.38 (read01, T3.C3) — an exact decimal literal whose mantissa overflows
     /// i128 (kept as its source digit string, `[-]digits[.digits]`). Becomes a
@@ -6615,7 +6620,7 @@ impl fmt::Display for Expr {
 
 /// Render an exact decimal `unscaled / 10^scale`, keeping the scale
 /// (trailing zeros): `(200, 2)` → `2.00`, `(1, 1)` → `0.1`, `(-15, 1)` → `-1.5`.
-pub fn render_exact_decimal(unscaled: i128, scale: u8) -> alloc::string::String {
+pub fn render_exact_decimal(unscaled: i128, scale: u16) -> alloc::string::String {
     use alloc::string::ToString;
     if scale == 0 {
         return alloc::format!("{unscaled}");

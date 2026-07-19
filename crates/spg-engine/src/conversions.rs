@@ -1134,7 +1134,7 @@ pub(crate) fn parse_range_element(
             // Reuse the Numeric parse via the engine's text-coercion
             // path; bail to None on failure.
             let dot = text.find('.');
-            let scale: u8 = dot.map_or(0, |p| (text.len() - p - 1) as u8);
+            let scale: u16 = dot.map_or(0, |p| (text.len() - p - 1) as u16);
             let digits: alloc::string::String = text
                 .chars()
                 .filter(|c| *c == '-' || c.is_ascii_digit())
@@ -2236,7 +2236,7 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
         match head {
             "numeric" | "decimal" => {
                 let precision = nums.first().copied().unwrap_or(0);
-                let scale = nums.get(1).copied().unwrap_or(0);
+                let scale = u16::from(nums.get(1).copied().unwrap_or(0));
                 return Some(DataType::Numeric { precision, scale });
             }
             // `varchar(n)` / `char(n)` carry length caps; SPG stores
@@ -4567,11 +4567,9 @@ pub(crate) fn coerce_value(
                 .into_iter()
                 .map(|o| {
                     o.map(|(scaled, scale)| {
-                        let mut div = 1.0_f64;
-                        for _ in 0..scale {
-                            div *= 10.0;
-                        }
-                        scaled as f64 / div
+                        crate::eval::format_numeric(scaled, scale)
+                            .parse()
+                            .unwrap_or(f64::NAN)
                     })
                 })
                 .collect(),
@@ -4603,13 +4601,13 @@ pub(crate) fn coerce_value(
         (Value::IntArray(items), DataType::NumericArray) => Some(Value::NumericArray(
             items
                 .into_iter()
-                .map(|o| o.map(|n| (i128::from(n), 0_u8)))
+                .map(|o| o.map(|n| (i128::from(n), 0_u16)))
                 .collect(),
         )),
         (Value::BigIntArray(items), DataType::NumericArray) => Some(Value::NumericArray(
             items
                 .into_iter()
-                .map(|o| o.map(|n| (i128::from(n), 0_u8)))
+                .map(|o| o.map(|n| (i128::from(n), 0_u16)))
                 .collect(),
         )),
         (Value::FloatArray(items), DataType::NumericArray) => {
@@ -4904,11 +4902,14 @@ pub(crate) fn coerce_value(
         }
         #[allow(clippy::cast_precision_loss)]
         (Value::Numeric { scaled, scale, .. }, DataType::Float) => {
-            let mut div = 1.0_f64;
-            for _ in 0..scale {
-                div *= 10.0;
-            }
-            let x = (scaled as f64) / div;
+            // v7.39 (round 271) — parse the decimal text rather than
+            // dividing by a power built with repeated multiplication.
+            // With scale widened to u16 that loop both accumulated
+            // rounding error (1e-300 came out 9.999999999999999e-301)
+            // and ran to infinity for a large enough scale, which then
+            // looked like an underflow.
+            let text = crate::eval::format_numeric(scaled, scale);
+            let x: f64 = text.parse().unwrap_or(f64::NAN);
             // v7.39 (round 270) — a nonzero NUMERIC that underflows the
             // double range is an error in PG, quoting the decimal
             // expansion. It used to arrive as a silent zero.

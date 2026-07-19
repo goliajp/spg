@@ -368,7 +368,7 @@ pub(crate) struct AggState {
     /// the running sum as an integral mantissa at `sum_num_scale`
     /// (aligned on the max input scale, so it stays exact — no f64).
     sum_num_scaled: i128,
-    sum_num_scale: u8,
+    sum_num_scale: u16,
     /// v7.39 (read01 numeric.c) — bignum spill for a sum that leaves i128;
     /// see `SumBig`. The i128 lane freezes at zero once this engages.
     sum_big: SumBig,
@@ -1074,7 +1074,7 @@ struct FusedAcc {
     float_not_real: bool,
     num_scaled: i128,
     num_kind: spg_storage::NumericKind,
-    num_scale: u8,
+    num_scale: u16,
     /// v7.39 (read01 numeric.c) — bignum spill; see `SumBig`.
     num_big: SumBig,
     use_numeric: bool,
@@ -1235,10 +1235,10 @@ type SumBig = Option<alloc::boxed::Box<spg_storage::bignum::BigNumeric>>;
 /// Add an exact NUMERIC (mantissa × 10^-scale) into the sum tri-state.
 fn sum_add_exact(
     scaled: &mut i128,
-    scale: &mut u8,
+    scale: &mut u16,
     big: &mut SumBig,
     add_scaled: i128,
-    add_scale: u8,
+    add_scale: u16,
 ) {
     use spg_storage::bignum::BigNumeric;
     if let Some(b) = big {
@@ -1264,7 +1264,7 @@ fn sum_add_exact(
 /// Add a BigNumeric input into the sum tri-state (promotes immediately).
 fn sum_add_bignum(
     scaled: &mut i128,
-    scale: &mut u8,
+    scale: &mut u16,
     big: &mut SumBig,
     b_in: &spg_storage::bignum::BigNumeric,
 ) {
@@ -1973,7 +1973,7 @@ fn accumulate_groups(
         // nothing for this.
         let mut num_scaled: i128 = 0;
         let mut num_kind = spg_storage::NumericKind::Finite;
-        let mut num_scale: u8 = 0;
+        let mut num_scale: u16 = 0;
         let mut num_big: SumBig = None;
         let mut use_numeric = false;
         // Interval accumulator (sum/avg over an interval column).
@@ -4791,7 +4791,7 @@ fn values_to_array(picked: &[Value<'_>]) -> Value<'static> {
 /// percentile_cont). `scaled × 10^-scale`; `10^scale` fits in i128 for the
 /// NUMERIC scale range, so no `f64::powi` (unavailable under no_std) is needed.
 #[allow(clippy::cast_precision_loss)]
-fn numeric_to_f64(scaled: i128, scale: u8) -> f64 {
+fn numeric_to_f64(scaled: i128, scale: u16) -> f64 {
     (scaled as f64) / (10i128.pow(u32::from(scale)) as f64)
 }
 
@@ -6012,7 +6012,7 @@ mod value_cmp_mixed_numeric_tests {
     use core::cmp::Ordering;
     use spg_storage::Value;
 
-    fn num(scaled: i128, scale: u8) -> Value<'static> {
+    fn num(scaled: i128, scale: u16) -> Value<'static> {
         Value::Numeric {
             scaled,
             scale,
