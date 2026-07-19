@@ -165,6 +165,17 @@ pub enum Statement {
         /// text format, no header (bare `COPY … TO STDOUT`).
         options: CopyOptions,
     },
+    /// v7.39 (round 249) — `COPY table [(cols)] FROM '<path>' [(opts)]`.
+    /// The engine is no_std and cannot read the file itself: the host
+    /// (embedded / server / tooling) reads the path and hands the bytes to
+    /// `Engine::copy_from_buffer`. Dispatching this statement straight to
+    /// the engine reports that contract.
+    CopyFromFile {
+        table: String,
+        columns: Option<Vec<String>>,
+        path: String,
+        options: CopyOptions,
+    },
     Select(SelectStatement),
     CreateTable(CreateTableStatement),
     /// v7.9.15 — `CREATE EXTENSION [IF NOT EXISTS] <name>
@@ -3827,7 +3838,8 @@ impl Statement {
             // state / the notification queue: writer path.
             | Statement::Listen(_)
             | Statement::Notify { .. }
-            | Statement::Unlisten(_) => false,
+            | Statement::Unlisten(_)
+            | Statement::CopyFromFile { .. } => false,
         }
     }
 }
@@ -4038,6 +4050,38 @@ impl fmt::Display for Statement {
                     }
                 }
                 write!(f, " TO STDOUT")?;
+                let mut parts: Vec<String> = Vec::new();
+                if options.format == CopyFormat::Csv {
+                    parts.push("FORMAT csv".to_string());
+                }
+                if options.header {
+                    parts.push("HEADER true".to_string());
+                }
+                if let Some(d) = options.delimiter {
+                    parts.push(alloc::format!("DELIMITER '{d}'"));
+                }
+                if let Some(n) = &options.null_str {
+                    parts.push(alloc::format!("NULL '{n}'"));
+                }
+                if let Some(q) = options.quote {
+                    parts.push(alloc::format!("QUOTE '{q}'"));
+                }
+                if !parts.is_empty() {
+                    write!(f, " WITH ({})", parts.join(", "))?;
+                }
+                Ok(())
+            }
+            Self::CopyFromFile {
+                table,
+                columns,
+                path,
+                options,
+            } => {
+                write!(f, "COPY {table}")?;
+                if let Some(cols) = columns {
+                    write!(f, " ({})", cols.join(", "))?;
+                }
+                write!(f, " FROM '{path}'")?;
                 let mut parts: Vec<String> = Vec::new();
                 if options.format == CopyFormat::Csv {
                     parts.push("FORMAT csv".to_string());

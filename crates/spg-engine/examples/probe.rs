@@ -101,6 +101,30 @@ fn main() {
         if stmt.is_empty() {
             continue;
         }
+        // round 249 — `COPY … FROM '<file>'`: the probe is the host, so
+        // it reads the file and feeds the engine's buffer endpoint.
+        if let Some(spec) = spg_engine::copy::parse_copy_from_file(stmt) {
+            match std::fs::read_to_string(&spec.path) {
+                Ok(data) => match e.copy_from_buffer(
+                    &spec.table,
+                    spec.columns.as_deref(),
+                    &spec.options,
+                    &data,
+                ) {
+                    Ok(_) => println!("(ok)"),
+                    Err(err) => println!("ERROR: {err}"),
+                },
+                Err(err) => {
+                    let os = err.to_string();
+                    let os = os.split(" (os error").next().unwrap_or(&os).to_string();
+                    println!(
+                        "ERROR: could not open file \"{}\" for reading: {os}",
+                        spec.path
+                    );
+                }
+            }
+            continue;
+        }
         match e.execute(stmt) {
             Ok(QueryResult::Rows { rows, .. }) => {
                 // One line per statement: columns joined by `|`, rows by `;`

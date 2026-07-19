@@ -2607,6 +2607,14 @@ fn wal_worthy(result: &QueryResult, sql: &str) -> bool {
 /// Head-word match mirrors [`sql_is_read_only`]: only fires when
 /// the first token is `checkpoint`, so a table / column literally
 /// named `checkpoint` inside another statement is unaffected.
+/// v7.39 (round 249) — cheap head-word sniff so only `COPY …`
+/// statements pay the extra host-side parse in [`Database::execute`].
+fn sql_head_is_copy(sql: &str) -> bool {
+    sql.trim_start()
+        .get(..4)
+        .is_some_and(|h| h.eq_ignore_ascii_case("copy"))
+}
+
 fn sql_is_checkpoint(sql: &str) -> bool {
     let head = sql
         .trim_start()
@@ -3670,6 +3678,58 @@ impl Database {
         // self.execute_buffered` call below).
         let counter_arc = Arc::clone(&self.active_query_count);
         let _busy_guard = ActiveQueryGuard::new(&counter_arc);
+        // v7.39 (round 249) — `COPY … FROM '<file>'`: the no_std engine
+        // performs no I/O, so the HOST reads the file here and lowers to
+        // per-row INSERTs through the normal execute path (each row gets
+        // its WAL record; the wrapping transaction makes the whole COPY
+        // one atomic, one-fsync commit — and PG's all-or-nothing COPY).
+        if sql_head_is_copy(sql)
+            && let Some(spec) = spg_engine::copy::parse_copy_from_file(sql)
+        {
+            let target = self
+                .engine
+                .copy_target_columns(&spec.table, spec.columns.as_deref())?;
+            let data = std::fs::read_to_string(&spec.path).map_err(|e| {
+                // PG's wording, without std's " (os error N)" suffix.
+                let os = e.to_string();
+                let os = os.split(" (os error").next().unwrap_or(&os).to_string();
+                EngineError::Unsupported(format!(
+                    "could not open file \"{path}\" for reading: {os}",
+                    path = spec.path
+                ))
+            })?;
+            let inserts = spg_engine::copy::copy_buffer_inserts(
+                &spec.table,
+                spec.columns.as_deref(),
+                &target,
+                &spec.options,
+                &data,
+            )?;
+            let wrap = !self.engine.in_transaction();
+            if wrap {
+                self.execute("BEGIN")?;
+            }
+            let mut affected: usize = 0;
+            for insert in &inserts {
+                match self.execute(insert) {
+                    Ok(QueryResult::CommandOk { affected: n, .. }) => affected += n,
+                    Ok(_) => affected += 1,
+                    Err(e) => {
+                        if wrap {
+                            let _ = self.execute("ROLLBACK");
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            if wrap {
+                self.execute("COMMIT")?;
+            }
+            return Ok(QueryResult::CommandOk {
+                affected,
+                modified_catalog: false,
+            });
+        }
         let (result, ticket) = self.execute_buffered(sql)?;
         if let Some(t) = ticket {
             // v7.39 (round 171) — session `synchronous_commit = off`
