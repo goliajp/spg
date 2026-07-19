@@ -405,6 +405,22 @@ pub fn encode_copy_csv_cells(
     quote: char,
     null_str: &str,
 ) -> String {
+    encode_copy_csv_cells_opts(cells, delimiter, quote, quote, None, null_str)
+}
+
+/// v7.39 (round 247) — the full CSV cell encoder: `escape` is the
+/// character that precedes a quote (or itself) inside a quoted cell
+/// (PG's default is the quote itself — doubling), and `force_quote`
+/// marks per-column forced quoting (NULLs stay bare, as PG's
+/// FORCE_QUOTE does).
+pub fn encode_copy_csv_cells_opts(
+    cells: &[Option<String>],
+    delimiter: char,
+    quote: char,
+    escape: char,
+    force_quote: Option<&[bool]>,
+    null_str: &str,
+) -> String {
     let mut out = String::new();
     for (i, cell) in cells.iter().enumerate() {
         if i > 0 {
@@ -413,14 +429,20 @@ pub fn encode_copy_csv_cells(
         match cell {
             None => out.push_str(null_str),
             Some(s) => {
-                let needs_quote = s.as_str() == null_str
-                    || s.chars()
-                        .any(|c| c == delimiter || c == quote || c == '\n' || c == '\r');
+                let forced = force_quote
+                    .and_then(|f| f.get(i))
+                    .copied()
+                    .unwrap_or(false);
+                let needs_quote = forced
+                    || s.as_str() == null_str
+                    || s.chars().any(|c| {
+                        c == delimiter || c == quote || c == escape || c == '\n' || c == '\r'
+                    });
                 if needs_quote {
                     out.push(quote);
                     for c in s.chars() {
-                        if c == quote {
-                            out.push(quote);
+                        if c == quote || c == escape {
+                            out.push(escape);
                         }
                         out.push(c);
                     }

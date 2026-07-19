@@ -33,6 +33,14 @@ pub struct CopyOptions {
     pub delimiter: Option<char>,
     pub null_str: Option<String>,
     pub quote: Option<char>,
+    /// v7.39 (round 247) — CSV `ESCAPE`: the character that precedes a
+    /// quote (or itself) inside a quoted cell. Defaults to the quote
+    /// character (PG's doubling behavior).
+    pub escape: Option<char>,
+    /// v7.39 (round 247) — CSV `FORCE_QUOTE (col, …)` / `FORCE_QUOTE *`:
+    /// columns whose non-NULL cells always quote. `Some(vec![])` is the
+    /// `*` spelling (every column).
+    pub force_quote: Option<Vec<String>>,
 }
 
 /// v7.39 (round 218) — FETCH / MOVE cursor direction. PG grammar: single-row

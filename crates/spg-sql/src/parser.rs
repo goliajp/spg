@@ -8927,7 +8927,7 @@ impl Parser {
                     _ => true,
                 };
             }
-            "DELIMITER" | "QUOTE" => {
+            "DELIMITER" | "QUOTE" | "ESCAPE" => {
                 let s = match self.advance() {
                     Token::String(s) => s,
                     other => {
@@ -8936,19 +8936,58 @@ impl Parser {
                         )));
                     }
                 };
+                // v7.39 (round 247) — PG's wording (0A000), keyword in
+                // lowercase: "COPY delimiter must be a single one-byte
+                // character".
+                let one_byte_err = || {
+                    self.err(alloc::format!(
+                        "COPY {} must be a single one-byte character",
+                        kw.to_ascii_lowercase()
+                    ))
+                };
                 let mut chars = s.chars();
-                let c = chars.next().ok_or_else(|| {
-                    self.err(alloc::format!("COPY {kw} must be a single character"))
-                })?;
-                if chars.next().is_some() {
-                    return Err(self.err(alloc::format!(
-                        "COPY {kw} must be a single character, got {s:?}"
-                    )));
+                let c = chars.next().ok_or_else(one_byte_err)?;
+                if chars.next().is_some() || c.len_utf8() != 1 {
+                    return Err(one_byte_err());
                 }
-                if kw == "DELIMITER" {
-                    opts.delimiter = Some(c);
+                match kw.as_str() {
+                    "DELIMITER" => opts.delimiter = Some(c),
+                    "QUOTE" => opts.quote = Some(c),
+                    _ => opts.escape = Some(c),
+                }
+            }
+            // v7.39 (round 247) — `FORCE_QUOTE (col, …)` / `FORCE_QUOTE *`.
+            "FORCE_QUOTE" => {
+                if matches!(self.peek(), Token::Star) {
+                    self.advance();
+                    opts.force_quote = Some(Vec::new());
                 } else {
-                    opts.quote = Some(c);
+                    if !matches!(self.peek(), Token::LParen) {
+                        return Err(self.err(alloc::format!(
+                            "expected '(' or '*' after FORCE_QUOTE, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    let mut cols = Vec::new();
+                    loop {
+                        cols.push(self.expect_ident_like()?);
+                        match self.peek() {
+                            Token::Comma => {
+                                self.advance();
+                            }
+                            Token::RParen => {
+                                self.advance();
+                                break;
+                            }
+                            other => {
+                                return Err(self.err(alloc::format!(
+                                    "expected ',' or ')' in FORCE_QUOTE list, got {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    opts.force_quote = Some(cols);
                 }
             }
             "NULL" => {
