@@ -37,13 +37,20 @@ fn pk_lists_own_columns_fk_lists_parent_columns() {
          FROM information_schema.constraint_column_usage \
          ORDER BY constraint_name",
     );
-    assert_eq!(got.len(), 2);
-    // FK row references the PARENT's column (PG semantics).
-    assert_eq!(text(&got[0][2]), "chi_fk");
-    assert_eq!(text(&got[0][0]), "par");
-    assert_eq!(text(&got[0][1]), "id");
-    // PK row lists its own column.
-    assert_eq!(text(&got[1][2]), "par_pkey");
-    assert_eq!(text(&got[1][0]), "par");
-    assert_eq!(text(&got[1][1]), "id");
+    // Live PG 18.4 on this exact fixture:
+    //   par|id|chi_fk;par|id|par_id_not_null;par|id|par_pkey
+    // The middle row is the NOT NULL the PRIMARY KEY implies. This pin
+    // asserted two rows until round 266, which locked in its absence.
+    let got: Vec<String> = got
+        .iter()
+        .map(|r| alloc_join(&[text(&r[0]), text(&r[1]), text(&r[2])]))
+        .collect();
+    assert_eq!(
+        got,
+        vec!["par|id|chi_fk", "par|id|par_id_not_null", "par|id|par_pkey"],
+    );
+}
+
+fn alloc_join(parts: &[String]) -> String {
+    parts.join("|")
 }
