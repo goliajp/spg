@@ -3953,6 +3953,12 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         if msg.contains("missing FROM-clause entry for table") {
             return ("42P01", msg);
         }
+        // v7.39 (round 242) — grouping() over a non-key is PG's 42803
+        // GROUPING_ERROR. Parser-raised, so ahead of the Parse→42601
+        // short-circuit.
+        if msg.contains("arguments to GROUPING must be grouping expressions") {
+            return ("42803", msg);
+        }
         if msg.contains("ON CONFLICT DO UPDATE requires inference specification") {
             return ("42601", msg);
         }
