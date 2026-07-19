@@ -642,6 +642,83 @@ pub fn format_float(x: f64) -> String {
     alloc::format!("{mant}e{sign}{digits:0>2}")
 }
 
+/// v7.39 (round 270) — the shortest decimal for an f32 in PG's sense,
+/// as `{:e}` style ("1.5000001e10").
+///
+/// Rust's `{:e}` gives the shortest decimal that ROUND-TRIPS. PG wants
+/// the shortest that lies STRICTLY INSIDE the value's rounding
+/// interval. The two differ exactly on the values whose short form sits
+/// on a half-ulp boundary: ties-to-even parses that boundary back to
+/// the same float, so Rust accepts it, while PG does not. Measured on
+/// PG 18.4: `15000000512::real` prints 1.5000001e+10, not 1.5e+10 —
+/// 1.5e10 is exactly half an ulp below the value. The same rule shows
+/// up in float8 (`1e23` prints 9.999999999999999e+22).
+///
+/// The boundary test is exact here because an f32 and its neighbour
+/// both widen losslessly into f64 and their midpoint needs only 25
+/// bits, so the midpoint is an f64 value that a <= 9-digit decimal
+/// parses to exactly when — and only when — it IS that midpoint.
+fn shortest_real_sci(x: f32) -> String {
+    let wide = f64::from(x);
+    let below = f64::from(next_f32(x, false));
+    let above = f64::from(next_f32(x, true));
+    // Midpoints to either neighbour; these are exact in f64.
+    let lo = (wide + below) / 2.0;
+    let hi = (wide + above) / 2.0;
+    for p in 1..=9u32 {
+        let cand = alloc::format!("{x:.*e}", (p - 1) as usize);
+        let Ok(v) = cand.parse::<f64>() else { continue };
+        // Round-trips as an f32 AND is not sitting on either boundary.
+        #[allow(clippy::cast_possible_truncation)]
+        if v as f32 == x && v != lo && v != hi {
+            return cand;
+        }
+    }
+    alloc::format!("{x:e}")
+}
+
+/// The adjacent f32 toward +inf (`up`) or -inf. Only ever called on a
+/// finite non-zero value.
+fn next_f32(x: f32, up: bool) -> f32 {
+    let bits = x.to_bits();
+    let stepped = if (x > 0.0) == up {
+        bits + 1
+    } else {
+        bits - 1
+    };
+    f32::from_bits(stepped)
+}
+
+/// Re-render a `{:e}`-style string in fixed-point notation.
+fn fixed_from_sci(sci: &str, exp: i32) -> String {
+    let epos = sci.find('e').expect("{:e} always has an 'e'");
+    let (mant, _) = sci.split_at(epos);
+    let (sign, mant) = match mant.strip_prefix('-') {
+        Some(m) => ("-", m),
+        None => ("", mant),
+    };
+    let digits: String = mant.chars().filter(char::is_ascii_digit).collect();
+    let point = exp + 1; // digits before the decimal point
+    let mut out = String::from(sign);
+    if point <= 0 {
+        out.push_str("0.");
+        for _ in 0..-point {
+            out.push('0');
+        }
+        out.push_str(&digits);
+    } else if (point as usize) >= digits.len() {
+        out.push_str(&digits);
+        for _ in 0..(point as usize - digits.len()) {
+            out.push('0');
+        }
+    } else {
+        out.push_str(&digits[..point as usize]);
+        out.push('.');
+        out.push_str(&digits[point as usize..]);
+    }
+    out
+}
+
 /// v7.38 (read01, T-float4) — PG `float4out`: the f32 shortest round-trip, in
 /// fixed-point for decimal exponents in `-4..=5` and scientific otherwise
 /// (a tighter window than float8's `-4..=14`, so `12345678::real` =
@@ -656,11 +733,14 @@ pub fn format_real(x: f32) -> String {
     if x == 0.0 {
         return if x.is_sign_negative() { "-0" } else { "0" }.into();
     }
-    let sci = alloc::format!("{x:e}");
+    let sci = shortest_real_sci(x);
     let epos = sci.find('e').expect("{:e} always has an 'e'");
     let exp_val: i32 = sci[epos + 1..].parse().unwrap_or(0);
     if (-4..=5).contains(&exp_val) {
-        return alloc::format!("{x}");
+        // Re-expand the (possibly longer than Rust's) mantissa in
+        // fixed-point rather than falling back to `{x}`, which would
+        // reintroduce Rust's choice of digits.
+        return fixed_from_sci(&sci, exp_val);
     }
     let mant = &sci[..epos];
     let exp = &sci[epos + 1..];
