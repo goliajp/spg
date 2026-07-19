@@ -210,6 +210,40 @@ pub(crate) fn view_is_auto_updatable(catalog: &spg_storage::Catalog, view_name: 
     view_redirect_checked(catalog, view_name).is_ok()
 }
 
+/// v7.39 (round 268) — the view's columns that are plain base columns,
+/// i.e. legal write targets. Computed (expression) columns are excluded:
+/// PG keeps such a view updatable but reports is_updatable = NO for that
+/// one column, and a write targeting it errors. Reading it off the same
+/// redirect the write path uses keeps the catalog's per-column answer
+/// and the engine's behaviour in step.
+pub(crate) fn view_simple_column_names(
+    catalog: &spg_storage::Catalog,
+    view_name: &str,
+) -> Vec<String> {
+    let Ok(vr) = view_redirect_checked(catalog, view_name) else {
+        return Vec::new();
+    };
+    if !vr.view_cols.is_empty() {
+        // Filled only when the view has computed columns; the pairing
+        // says which is which.
+        return vr
+            .view_cols
+            .iter()
+            .filter(|(_, base)| base.is_some())
+            .map(|(n, _)| n.clone())
+            .collect();
+    }
+    if !vr.col_map.is_empty() {
+        return vr.col_map.iter().map(|(v, _)| v.clone()).collect();
+    }
+    // The identity shape keeps col_map empty as a fast path: every
+    // column passes through from the base table under its own name.
+    catalog
+        .get(&vr.base)
+        .map(|t| t.schema().columns.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default()
+}
+
 fn view_redirect_to_simple_base(
     catalog: &spg_storage::Catalog,
     view_name: &str,
