@@ -12,7 +12,7 @@ use crate::EngineError;
 /// precision budget.
 pub(crate) fn numeric_from_integer(
     n: i128,
-    precision: u8,
+    precision: u16,
     scale: u16,
     col_name: &str,
 ) -> Result<Value<'static>, EngineError> {
@@ -35,7 +35,7 @@ pub(crate) fn numeric_from_integer(
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 pub(crate) fn numeric_from_float(
     x: f64,
-    precision: u8,
+    precision: u16,
     scale: u16,
     col_name: &str,
 ) -> Result<Value<'static>, EngineError> {
@@ -297,17 +297,29 @@ fn parse_plain_numeric(s: &str) -> Option<(i128, u16)> {
 pub(crate) fn numeric_rescale(
     scaled: i128,
     src_scale: u16,
-    precision: u8,
+    precision: u16,
     dst_scale: u16,
     col_name: &str,
 ) -> Result<Value<'static>, EngineError> {
+    // v7.39 (round 272) — a declared scale of 999 is legal in PG, and no
+    // i128 mantissa can carry it. Rather than report an overflow for a
+    // typmod PG accepts, hand the whole rescale to the
+    // arbitrary-precision form, which the storage layer already carries.
+    if dst_scale >= src_scale && pow10_i128_checked(dst_scale - src_scale).is_none() {
+        let widened =
+            spg_storage::bignum::BigNumeric::from_i128(scaled, src_scale).round_to(dst_scale);
+        return Ok(crate::eval::binop::bignum_to_value(widened));
+    }
     let new_scaled = if dst_scale >= src_scale {
         let bump = pow10_i128(dst_scale - src_scale);
-        scaled.checked_mul(bump).ok_or_else(|| {
-            EngineError::Unsupported(alloc::format!(
-                "overflow rescaling NUMERIC for column `{col_name}`"
-            ))
-        })?
+        match scaled.checked_mul(bump) {
+            Some(v) => v,
+            None => {
+                let widened = spg_storage::bignum::BigNumeric::from_i128(scaled, src_scale)
+                    .round_to(dst_scale);
+                return Ok(crate::eval::binop::bignum_to_value(widened));
+            }
+        }
     } else {
         let drop = pow10_i128(src_scale - dst_scale);
         let half = drop / 2;
@@ -360,22 +372,66 @@ pub(crate) const fn numeric_round_to_integer(scaled: i128, scale: u16) -> i128 {
 /// `numeric field overflow` / `A field with precision P, scale S must
 /// round to an absolute value less than 10^(P-S).` The wire layer
 /// splits the " DETAIL: " tail into the ErrorResponse D field.
-fn check_precision(
-    scaled: i128,
-    precision: u8,
+/// v7.39 (round 272) — the precision check by DIGIT COUNT, for values
+/// (and precisions) the i128 comparison below cannot express. PG's rule
+/// is on the integer part: it must fit `precision - scale` digits.
+pub(crate) fn check_precision_text(
+    v: &Value<'static>,
+    precision: u16,
     scale: u16,
     _col_name: &str,
 ) -> Result<(), EngineError> {
     if precision == 0 {
         return Ok(());
     }
-    let limit = pow10_i128(u16::from(precision));
+    let text = match v {
+        Value::Numeric { scaled, scale, .. } => crate::eval::format_numeric(*scaled, *scale),
+        Value::NumericBig(b) => b.to_decimal_str(),
+        _ => return Ok(()),
+    };
+    let body = text.trim_start_matches('-');
+    let int_part = body.split('.').next().unwrap_or(body).trim_start_matches('0');
+    let allowed = usize::from(precision.saturating_sub(scale));
+    if int_part.len() > allowed {
+        return Err(numeric_field_overflow(precision, scale));
+    }
+    Ok(())
+}
+
+fn numeric_field_overflow(precision: u16, scale: u16) -> EngineError {
+    EngineError::Unsupported(alloc::format!(
+        "numeric field overflow DETAIL: A field with precision {precision}, scale {scale} \
+         must round to an absolute value less than 10^{}.",
+        precision.saturating_sub(scale)
+    ))
+}
+
+fn check_precision(
+    scaled: i128,
+    precision: u16,
+    scale: u16,
+    col_name: &str,
+) -> Result<(), EngineError> {
+    if precision == 0 {
+        return Ok(());
+    }
+    // A precision past i128's width cannot be expressed as a limit here;
+    // fall back to counting digits.
+    if precision > 38 {
+        return check_precision_text(
+            &Value::Numeric {
+                scaled,
+                scale,
+                kind: spg_storage::NumericKind::Finite,
+            },
+            precision,
+            scale,
+            col_name,
+        );
+    }
+    let limit = pow10_i128(precision);
     if scaled.unsigned_abs() >= limit.unsigned_abs() {
-        return Err(EngineError::Unsupported(alloc::format!(
-            "numeric field overflow DETAIL: A field with precision {precision}, \
-             scale {scale} must round to an absolute value less than 10^{}.",
-            u16::from(precision).saturating_sub(scale)
-        )));
+        return Err(numeric_field_overflow(precision, scale));
     }
     Ok(())
 }
@@ -665,4 +721,18 @@ const fn pow10_i128_const(p: u16) -> i128 {
 
 fn pow10_i128(p: u16) -> i128 {
     pow10_i128_const(p)
+}
+
+/// `10^p`, or None once it leaves the i128 range.
+const fn pow10_i128_checked(p: u16) -> Option<i128> {
+    let mut acc: i128 = 1;
+    let mut i = 0;
+    while i < p {
+        match acc.checked_mul(10) {
+            Some(v) => acc = v,
+            None => return None,
+        }
+        i += 1;
+    }
+    Some(acc)
 }

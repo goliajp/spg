@@ -333,6 +333,10 @@ fn info_column_row(
             DataType::Float => (Value::Int(53), Value::Null),
             // v7.39 (round 269) — real carries 24 bits of mantissa.
             DataType::Real => (Value::Int(24), Value::Null),
+            // v7.39 (round 272) — an UNCONSTRAINED `numeric` (the 0/0
+            // sentinel) has no precision to report; PG leaves both NULL
+            // there, and reporting 0 said the column holds nothing.
+            DataType::Numeric { precision: 0, .. } => (Value::Null, Value::Null),
             DataType::Numeric { precision, scale } => (
                 Value::Int(i32::from(precision)),
                 Value::Int(i32::from(scale)),

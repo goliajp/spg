@@ -2216,6 +2216,41 @@ pub(crate) fn parse_time_str(s: &str) -> Option<i64> {
     )
 }
 
+/// v7.39 (round 272) — PG's declared-typmod bounds: precision 1..=1000
+/// and scale -1000..=1000 (SPG does not carry a negative scale yet, so
+/// the lower half is a recorded gap rather than an accepted range).
+pub(crate) fn numeric_typmod_in_range(precision: u16, scale: u16) -> bool {
+    (1..=1000).contains(&precision) && scale <= 1000
+}
+
+/// PG's wording for a typmod outside those bounds, given the text
+/// between the parentheses. `None` when the typmod is fine or the text
+/// is not a numeric one.
+pub(crate) fn numeric_typmod_error(name: &str) -> Option<alloc::string::String> {
+    let lower = name.trim().to_ascii_lowercase();
+    let (head, rest) = lower.split_once('(')?;
+    if !matches!(head.trim(), "numeric" | "decimal") {
+        return None;
+    }
+    let args = rest.strip_suffix(')')?;
+    let mut it = args.split(',').map(str::trim);
+    let p: i64 = it.next()?.parse().ok()?;
+    if !(1..=1000).contains(&p) {
+        return Some(alloc::format!(
+            "NUMERIC precision {p} must be between 1 and 1000"
+        ));
+    }
+    if let Some(s) = it.next() {
+        let s: i64 = s.parse().ok()?;
+        if !(-1000..=1000).contains(&s) {
+            return Some(alloc::format!(
+                "NUMERIC scale {s} must be between -1000 and 1000"
+            ));
+        }
+    }
+    None
+}
+
 /// v7.37.5 ship triage — string-form PG type name → `DataType`
 /// lookup driving `CastTarget::Named` (the generic typed-cast
 /// escape). Covers the v7.37.5 γ/δ/ε/ζ-A type-completeness work
@@ -2229,14 +2264,25 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
     if let Some((head, paren)) = n.split_once('(')
         && let Some(args) = paren.strip_suffix(')')
     {
-        let nums: alloc::vec::Vec<u8> = args
+        // v7.39 (round 272) — parsed as u16. At u8 a typmod PG accepts
+        // (`numeric(1000,999)`) failed to parse and `unwrap_or(0)`
+        // turned it into the UNCONSTRAINED type, so the cast silently
+        // did nothing at all rather than reporting anything.
+        let wide: alloc::vec::Vec<Option<u16>> = args
             .split(',')
-            .map(|s| s.trim().parse::<u8>().unwrap_or(0))
+            .map(|s| s.trim().parse::<u16>().ok())
+            .collect();
+        let nums: alloc::vec::Vec<u8> = wide
+            .iter()
+            .map(|n| n.and_then(|v| u8::try_from(v).ok()).unwrap_or(0))
             .collect();
         match head {
             "numeric" | "decimal" => {
-                let precision = nums.first().copied().unwrap_or(0);
-                let scale = u16::from(nums.get(1).copied().unwrap_or(0));
+                let precision = wide.first().copied().flatten()?;
+                let scale = wide.get(1).copied().flatten().unwrap_or(0);
+                if !numeric_typmod_in_range(precision, scale) {
+                    return None;
+                }
                 return Some(DataType::Numeric { precision, scale });
             }
             // `varchar(n)` / `char(n)` carry length caps; SPG stores
@@ -4898,6 +4944,22 @@ pub(crate) fn coerce_value(
                 Some(numeric_rescale(
                     scaled, src_scale, precision, scale, col_name,
                 )?)
+            }
+        }
+        // v7.39 (round 272) — an arbitrary-precision value cast to a
+        // DECLARED numeric had no arm at all, so a 47-digit literal
+        // going into numeric(50,2) — a column PG accepts — reported an
+        // internal storage type mismatch.
+        (Value::NumericBig(b), DataType::Numeric { precision, scale }) => {
+            if precision == 0 && scale == 0 {
+                Some(Value::NumericBig(b))
+            } else {
+                let rounded = b.round_to(scale);
+                let out = crate::eval::binop::bignum_to_value(rounded);
+                // The declared precision still binds; check it on the
+                // decimal text, which both forms can produce.
+                crate::numeric::check_precision_text(&out, precision, scale, col_name)?;
+                Some(out)
             }
         }
         #[allow(clippy::cast_precision_loss)]

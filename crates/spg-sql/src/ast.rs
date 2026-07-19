@@ -2198,7 +2198,8 @@ pub enum ColumnTypeName {
     /// `NUMERIC` / `NUMERIC(p)` / `NUMERIC(p, s)` — exact decimal.
     /// Bare `NUMERIC` and `NUMERIC(p)` both surface with `scale=0`.
     /// v7.39 (round 271) — scale widened to u16 alongside the value's.
-    Numeric(u8, u16),
+    /// v7.39 (round 272) — precision too: PG's runs to 1000.
+    Numeric(u16, u16),
     /// `DATE` — calendar day, no time-of-day component.
     Date,
     /// `TIMESTAMP` / `MySQL` `DATETIME` — instant with microsecond

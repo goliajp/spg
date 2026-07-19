@@ -130,7 +130,10 @@ pub enum DataType {
     /// precision 38 (the i128-safe ceiling). `NUMERIC` and `NUMERIC(p)`
     /// surface as `Numeric { precision: p, scale: 0 }`.
     Numeric {
-        precision: u8,
+        /// v7.39 (round 272) — widened from u8. PG's declared precision
+        /// runs to 1000; at u8 it could not even be spelled, and the
+        /// parser rejected anything past 38 (i128's width) outright.
+        precision: u16,
         /// v7.39 (round 271) — widened alongside the value's scale.
         scale: u16,
     },
