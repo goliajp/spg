@@ -41,9 +41,11 @@ fn render(v: &Value) -> String {
         Value::TextArray(items) => {
             arr_text(items.iter().map(|v| v.as_ref().map(ToString::to_string)))
         }
-        // Non-scalar / float / numeric values keep the Debug form; wrap the
-        // column in ::text in the probe SQL when an exact value diff is needed.
-        other => format!("{other:?}"),
+        // v7.39 (round 245) — everything else renders through the engine's
+        // own wire-text formatter (tsvector/tsquery, ranges, geometry …),
+        // which is what psql shows. The Debug fallback hid real diffs
+        // behind struct noise for every non-scalar type.
+        other => spg_engine::eval::value_to_text(other),
     }
 }
 

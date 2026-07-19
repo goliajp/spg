@@ -23,10 +23,13 @@ fn single_term_synonym_expansion() {
     // PG doc vector: ts_rewrite('a & b'::tsquery, 'a'::tsquery,
     // 'foo|bar'::tsquery) → 'b & ( foo | bar )' (rendering differs;
     // we assert the structural content via the external form).
+    // v7.39 (round 245) — the simple config: the default (english) now
+    // prunes 'a' as a stopword before ts_rewrite ever sees it, exactly as
+    // PG does, which would make this test assert nothing.
     let got = first_text(
         &mut e,
-        "SELECT ts_rewrite(to_tsquery('a & b'), to_tsquery('a'), \
-         to_tsquery('foo | bar'))::text",
+        "SELECT ts_rewrite(to_tsquery('simple', 'a & b'), to_tsquery('simple', 'a'), \
+         to_tsquery('simple', 'foo | bar'))::text",
     );
     assert!(
         got.contains("foo") && got.contains("bar") && got.contains('b'),
