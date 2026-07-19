@@ -4111,7 +4111,14 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // v7.39 (read01 round 49) — ALTER TYPE ADD VALUE / RENAME VALUE.
         } else if msg.contains("enum label \"") && msg.contains("already exists") {
             "42710"
-        } else if msg.contains("is not an existing enum label") {
+        } else if msg.contains("is not an existing enum label")
+            // v7.39 (read01 round 234) — the jsonb modification family's
+            // refusals are PG's 22023 INVALID_PARAMETER_VALUE too.
+            || msg.contains("cannot delete from scalar")
+            || msg.contains("cannot delete path in scalar")
+            || msg.contains("cannot set path in scalar")
+            || msg.contains("cannot delete from object using integer index")
+        {
             "22023"
         // DROP IDENTITY on a plain column.
         } else if msg.contains("is not an identity column") {

@@ -15,6 +15,10 @@ fn render(v: &Value) -> String {
         Value::SmallInt(n) => n.to_string(),
         // psql renders booleans as t / f.
         Value::Bool(b) => (if *b { "t" } else { "f" }).to_string(),
+        // v7.39 (round 234) — JSON / JSONB print their text form, as psql
+        // does. Without this every json-returning probe row came back as
+        // `Json("{\"a\": 1}")` and drowned real diffs in escaping noise.
+        Value::Json(s) => s.to_string(),
         // Non-scalar / float / numeric values keep the Debug form; wrap the
         // column in ::text in the probe SQL when an exact value diff is needed.
         other => format!("{other:?}"),
