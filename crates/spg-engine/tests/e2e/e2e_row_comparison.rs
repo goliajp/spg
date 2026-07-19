@@ -58,7 +58,11 @@ fn arity_mismatch_errors() {
     let mut e = Engine::new();
     let err = e.execute("SELECT (1, 2) < (1, 2, 3)").unwrap_err();
     let msg = format!("{err:?}");
-    assert!(msg.contains("arity"), "unexpected error: {msg}");
+    // v7.39 (round 239) — PG's wording replaced SPG's "arity mismatch".
+    assert!(
+        msg.contains("unequal number of entries in row expressions"),
+        "unexpected error: {msg}"
+    );
 }
 
 // read01 U3/U4 sibling — the SQL row null predicate. `(row) IS NULL` is

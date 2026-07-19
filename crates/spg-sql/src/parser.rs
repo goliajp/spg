@@ -9552,6 +9552,19 @@ impl Parser {
     }
 
     fn parse_limit_expr(&mut self, label: &str) -> Result<crate::ast::LimitExpr, ParseError> {
+        // v7.39 (round 239) — PG's row-count clause takes a bigint with its
+        // coercion rules, not just an integer token: a NUMERIC rounds half
+        // away from zero (`LIMIT 2.5` keeps 3 rows), a negative count is
+        // refused with PG's wording ("LIMIT must not be negative", 2201W /
+        // 2201X — FETCH FIRST shares LIMIT's), and a string coerces by its
+        // content, failing as an input-syntax error on the value. General
+        // expressions (`LIMIT 1+1`) stay unsupported — a recorded residual;
+        // they need an Expr-carrying LimitExpr variant.
+        let neg_label = if label == "OFFSET" { "OFFSET" } else { "LIMIT" };
+        let err_at = |message: alloc::string::String, pos: usize| ParseError {
+            message,
+            token_pos: pos,
+        };
         match self.advance() {
             Token::Integer(n) if n >= 0 => u32::try_from(n)
                 .map(crate::ast::LimitExpr::Literal)
@@ -9559,6 +9572,67 @@ impl Parser {
                     message: alloc::format!("{label} value too large: {n}"),
                     token_pos: self.pos.saturating_sub(1),
                 }),
+            Token::Integer(_) => Err(err_at(
+                alloc::format!("{neg_label} must not be negative"),
+                self.pos.saturating_sub(1),
+            )),
+            Token::Numeric(t) => {
+                let pos = self.pos.saturating_sub(1);
+                let v: f64 = t.parse().map_err(|_| {
+                    err_at(
+                        alloc::format!("invalid input syntax for type bigint: \"{t}\""),
+                        pos,
+                    )
+                })?;
+                if v < 0.0 {
+                    return Err(err_at(
+                        alloc::format!("{neg_label} must not be negative"),
+                        pos,
+                    ));
+                }
+                // Round half away from zero — PG's numeric→bigint cast.
+                // (no_std: no f64::round; v is non-negative, so truncating
+                // v + 0.5 is the same thing.)
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let rounded = (v + 0.5) as u64;
+                u32::try_from(rounded)
+                    .map(crate::ast::LimitExpr::Literal)
+                    .map_err(|_| err_at(alloc::format!("{label} value too large: {t}"), pos))
+            }
+            Token::Minus => {
+                let pos = self.pos.saturating_sub(1);
+                match self.peek() {
+                    Token::Integer(_) | Token::Numeric(_) => {
+                        self.advance();
+                        Err(err_at(
+                            alloc::format!("{neg_label} must not be negative"),
+                            pos,
+                        ))
+                    }
+                    other => Err(err_at(
+                        alloc::format!(
+                            "expected non-negative integer or $N placeholder after {label}, got {other:?}"
+                        ),
+                        pos,
+                    )),
+                }
+            }
+            Token::String(t) => {
+                let pos = self.pos.saturating_sub(1);
+                match t.trim().parse::<i64>() {
+                    Ok(n) if n < 0 => Err(err_at(
+                        alloc::format!("{neg_label} must not be negative"),
+                        pos,
+                    )),
+                    Ok(n) => u32::try_from(n)
+                        .map(crate::ast::LimitExpr::Literal)
+                        .map_err(|_| err_at(alloc::format!("{label} value too large: {t}"), pos)),
+                    Err(_) => Err(err_at(
+                        alloc::format!("invalid input syntax for type bigint: \"{t}\""),
+                        pos,
+                    )),
+                }
+            }
             Token::Placeholder(n) => Ok(crate::ast::LimitExpr::Placeholder(n)),
             other => Err(ParseError {
                 message: alloc::format!(
@@ -18025,11 +18099,8 @@ impl Parser {
         }
         self.advance();
         if rhs.len() != row.len() {
-            return Err(self.err(alloc::format!(
-                "row comparison arity mismatch: left has {}, right has {}",
-                row.len(),
-                rhs.len()
-            )));
+            // v7.39 (round 239) — PG's wording (42601).
+            return Err(self.err("unequal number of entries in row expressions".to_string()));
         }
         Ok(match op {
             BinOp::Eq => row_eq(&row, &rhs),
