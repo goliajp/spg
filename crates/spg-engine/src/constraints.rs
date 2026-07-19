@@ -2093,8 +2093,12 @@ pub(crate) fn enforce_check_constraints(
     // v7.17.0 Phase 1.5 — domain-level CHECKs are enforced in
     // parallel with table-level CHECKs. Collect both lists up
     // front; if neither exists we early-out.
-    let mut domain_checks_per_col: alloc::vec::Vec<(usize, String, alloc::vec::Vec<Expr>)> =
-        alloc::vec::Vec::new();
+    // v7.39 (round 260) — each parsed CHECK carries its constraint name.
+    let mut domain_checks_per_col: alloc::vec::Vec<(
+        usize,
+        String,
+        alloc::vec::Vec<(String, Expr)>,
+    )> = alloc::vec::Vec::new();
     for (idx, col) in schema.columns.iter().enumerate() {
         let Some(dname) = &col.user_domain_type else {
             continue;
@@ -2102,16 +2106,21 @@ pub(crate) fn enforce_check_constraints(
         let Some(dom) = catalog.domain_types().get(dname) else {
             continue;
         };
-        let mut parsed_for_col: alloc::vec::Vec<Expr> =
+        // v7.39 (round 260) — carry each CHECK's NAME so the violation
+        // message can report the constraint that actually failed rather
+        // than the auto-name of the domain itself (they differ once a
+        // domain has more than one check, or an ALTER-added named one).
+        let mut parsed_for_col: alloc::vec::Vec<(alloc::string::String, Expr)> =
             alloc::vec::Vec::with_capacity(dom.checks.len());
-        for src in &dom.checks {
+        for chk in &dom.checks {
+            let src = &chk.expr;
             let expr = spg_sql::parser::parse_expression(src).map_err(|e| {
                 EngineError::Unsupported(alloc::format!(
                     "DOMAIN {dname:?} CHECK ({src:?}) on column {:?}: re-parse failed: {e:?}",
                     col.name
                 ))
             })?;
-            parsed_for_col.push(expr);
+            parsed_for_col.push((chk.name.clone(), expr));
         }
         if !parsed_for_col.is_empty() {
             domain_checks_per_col.push((idx, dname.clone(), parsed_for_col));
@@ -2176,7 +2185,7 @@ pub(crate) fn enforce_check_constraints(
             let synth_row = spg_storage::Row {
                 values: alloc::vec![cell],
             };
-            for (ci, expr) in checks.iter().enumerate() {
+            for (ci, (cname, expr)) in checks.iter().enumerate() {
                 let v = eval::eval_expr(expr, &synth_row, &synth_ctx).map_err(|e| {
                     EngineError::Unsupported(alloc::format!(
                         "DOMAIN CHECK #{ci} on column {:?} eval at row #{batch_idx}: {e:?}",
@@ -2188,7 +2197,7 @@ pub(crate) fn enforce_check_constraints(
                     // (constraint auto-name `<domain>_check`), matching the
                     // cast path's wording.
                     return Err(EngineError::Unsupported(alloc::format!(
-                        "value for domain {dname} violates check constraint \"{dname}_check\""
+                        "value for domain {dname} violates check constraint \"{cname}\""
                     )));
                 }
             }

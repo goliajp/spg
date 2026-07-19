@@ -1544,6 +1544,7 @@ impl Engine {
             }
             Statement::DropType { names, if_exists } => self.exec_drop_type(&names, if_exists),
             Statement::CreateDomain(s) => self.exec_create_domain(s),
+            Statement::AlterDomain { name, action } => self.exec_alter_domain(&name, action),
             Statement::DropDomain { names, if_exists } => self.exec_drop_domain(&names, if_exists),
             Statement::CreateSchema {
                 name,

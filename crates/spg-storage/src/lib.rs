@@ -3963,6 +3963,15 @@ impl TxWriteSet {
     }
 }
 
+/// v7.39 (round 260) — one named CHECK on a domain. PG auto-names an
+/// unnamed one `<domain>_check`, then `_check1`, `_check2`, … (probed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainCheck {
+    pub name: String,
+    /// The predicate source, referencing the pseudo-column `VALUE`.
+    pub expr: String,
+}
+
 /// `default` / `checks` are stored as Display-form source so
 /// `spg-storage` stays free of `spg-sql` dependency — same
 /// pattern as FunctionDef / ViewDef.
@@ -3972,7 +3981,12 @@ pub struct DomainDef {
     pub base_type: DataType,
     pub nullable: bool,
     pub default: Option<String>,
-    pub checks: Vec<String>,
+    /// v7.39 (round 260) — each CHECK carries its constraint NAME, so
+    /// `ALTER DOMAIN … DROP CONSTRAINT <name>` can find it and the
+    /// violation message can report the constraint that actually failed.
+    /// PG's auto-naming for an unnamed check is `<domain>_check`, then
+    /// `_check1`, `_check2`, … (probed).
+    pub checks: Vec<DomainCheck>,
     /// v7.39 (round 258/259) — when this domain was declared over ANOTHER
     /// domain (`CREATE DOMAIN child AS parent CHECK (…)`), the parent's
     /// name. `base_type` is the ultimate scalar type either way, so
@@ -6944,7 +6958,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 74;
+const FILE_VERSION: u8 = 75;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7878,7 +7892,9 @@ impl Catalog {
                 u16::try_from(d.checks.len()).expect("≤ 65k CHECKs / domain"),
             );
             for c in &d.checks {
-                write_str(&mut out, c);
+                write_str(&mut out, &c.expr);
+                // v7.39 (round 260) — the constraint name (FILE_VERSION 75+).
+                write_str(&mut out, &c.name);
             }
             // v7.39 (round 259) — the parent domain (FILE_VERSION 74+).
             match &d.base_domain {
@@ -8254,9 +8270,20 @@ impl Catalog {
                     }
                 };
                 let check_count = cur.read_u16()? as usize;
-                let mut checks = Vec::with_capacity(check_count);
-                for _ in 0..check_count {
-                    checks.push(cur.read_str()?);
+                let mut checks: Vec<DomainCheck> = Vec::with_capacity(check_count);
+                for i in 0..check_count {
+                    let expr = cur.read_str()?;
+                    // v7.39 (round 260) — names arrived in FILE_VERSION 75.
+                    // An older catalog gets PG's auto-naming applied to the
+                    // checks it stored, which is what they would have been.
+                    let cname = if version >= 75 {
+                        cur.read_str()?
+                    } else if i == 0 {
+                        alloc::format!("{name}_check")
+                    } else {
+                        alloc::format!("{name}_check{i}")
+                    };
+                    checks.push(DomainCheck { name: cname, expr });
                 }
                 // v7.39 (round 259) — the parent domain. Absent before
                 // FILE_VERSION 74; an older catalog reads as a domain over
