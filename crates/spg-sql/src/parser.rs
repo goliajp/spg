@@ -13989,7 +13989,7 @@ impl Parser {
     /// `NUMERIC` may appear without parameters, with one (precision
     /// only, scale=0), or with both. Returns `(precision, scale)` with
     /// 0 = unspecified for the bare form.
-    fn parse_optional_numeric_params(&mut self) -> Result<(u16, u16), ParseError> {
+    fn parse_optional_numeric_params(&mut self) -> Result<(u16, i16), ParseError> {
         if !matches!(self.peek(), Token::LParen) {
             // Bare `NUMERIC` — PG treats this as "unlimited precision";
             // we surface it as precision=0 to mean "unconstrained" so
@@ -14021,17 +14021,33 @@ impl Parser {
                 });
             }
         };
+        // v7.39 (round 273) — PG's declared scale runs -1000..=1000 and is
+        // NOT bounded by the precision (`numeric(10,11)` is legal; a value
+        // then overflows). A negative scale rounds to tens / hundreds / …
         let scale = if matches!(self.peek(), Token::Comma) {
             self.advance();
+            let neg = if matches!(self.peek(), Token::Minus) {
+                self.advance();
+                true
+            } else {
+                false
+            };
             match self.advance() {
-                Token::Integer(n) if (0..=i64::from(precision)).contains(&n) => {
-                    u16::try_from(n).expect("range-checked")
+                Token::Integer(n) => {
+                    let signed = if neg { -n } else { n };
+                    if !(-1000..=1000).contains(&signed) {
+                        return Err(ParseError {
+                            message: format!(
+                                "NUMERIC scale {signed} must be between -1000 and 1000"
+                            ),
+                            token_pos: self.pos.saturating_sub(1),
+                        });
+                    }
+                    i16::try_from(signed).expect("range-checked")
                 }
                 other => {
                     return Err(ParseError {
-                        message: format!(
-                            "NUMERIC scale must be a non-negative integer ≤ precision, got {other:?}"
-                        ),
+                        message: format!("NUMERIC scale must be an integer, got {other:?}"),
                         token_pos: self.pos.saturating_sub(1),
                     });
                 }
@@ -18204,6 +18220,14 @@ impl Parser {
                                 }
                                 Token::Comma => buf.push(','),
                                 Token::Integer(n) => buf.push_str(&alloc::format!("{n}")),
+                                // v7.39 (round 273) — a minus used to fall
+                                // into the catch-all below and vanish, so
+                                // `::numeric(10,-2)` reached the engine as
+                                // the text `numeric(10,2)` and silently
+                                // rounded to two DECIMALS instead of to
+                                // hundreds. A dropped token is not a
+                                // no-op when it carries a sign.
+                                Token::Minus => buf.push('-'),
                                 Token::Eof => break,
                                 _ => {}
                             }

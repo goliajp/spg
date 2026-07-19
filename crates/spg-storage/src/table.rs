@@ -858,7 +858,11 @@ impl Table {
                     // (the precision-0/scale-0 sentinel) stores a value at its
                     // own natural scale, so accept any Numeric scale there; a
                     // declared `numeric(p,s)` still requires the rescaled value.
-                    ) if a == b || (bp == 0 && b == 0)
+                    // v7.39 (round 273) — a NEGATIVE declared scale stores
+                    // the value at display scale 0 (it was rounded to a
+                    // multiple of 10^|s|), so the two scales legitimately
+                    // differ there.
+                    ) if a == b || (bp == 0 && b == 0) || (b < 0 && a == 0)
                 );
             if !compatible {
                 return Err(StorageError::TypeMismatch {
@@ -2260,7 +2264,11 @@ impl Table {
                     // (the precision-0/scale-0 sentinel) stores a value at its
                     // own natural scale, so accept any Numeric scale there; a
                     // declared `numeric(p,s)` still requires the rescaled value.
-                    ) if a == b || (bp == 0 && b == 0)
+                    // v7.39 (round 273) — a NEGATIVE declared scale stores
+                    // the value at display scale 0 (it was rounded to a
+                    // multiple of 10^|s|), so the two scales legitimately
+                    // differ there.
+                    ) if a == b || (bp == 0 && b == 0) || (b < 0 && a == 0)
                 );
             if !compatible {
                 return Err(StorageError::TypeMismatch {

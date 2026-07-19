@@ -195,6 +195,7 @@ mod e2e_real_type_round269;
 mod e2e_float_range_round270;
 mod e2e_numeric_scale_round271;
 mod e2e_numeric_precision_round272;
+mod e2e_numeric_negative_scale_round273;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;

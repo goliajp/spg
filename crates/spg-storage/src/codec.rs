@@ -1149,7 +1149,7 @@ impl Cursor<'_> {
             9 => Ok(DataType::Char(self.read_u32()?)),
             10 => {
                 let precision = u16::from(self.read_u8()?);
-                let scale = u16::from(self.read_u8()?);
+                let scale = i16::from(self.read_u8()?);
                 Ok(DataType::Numeric { precision, scale })
             }
             69 => {
@@ -1159,7 +1159,9 @@ impl Cursor<'_> {
                 let shi = self.read_u8()?;
                 Ok(DataType::Numeric {
                     precision: u16::from_le_bytes([plo, phi]),
-                    scale: u16::from_le_bytes([slo, shi]),
+                    // v7.39 (round 273) — the declared scale is signed;
+                    // tag 69's two bytes carry it in two's complement.
+                    scale: i16::from_le_bytes([slo, shi]),
                 })
             }
             11 => Ok(DataType::Date),

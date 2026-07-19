@@ -2219,8 +2219,8 @@ pub(crate) fn parse_time_str(s: &str) -> Option<i64> {
 /// v7.39 (round 272) — PG's declared-typmod bounds: precision 1..=1000
 /// and scale -1000..=1000 (SPG does not carry a negative scale yet, so
 /// the lower half is a recorded gap rather than an accepted range).
-pub(crate) fn numeric_typmod_in_range(precision: u16, scale: u16) -> bool {
-    (1..=1000).contains(&precision) && scale <= 1000
+pub(crate) fn numeric_typmod_in_range(precision: u16, scale: i16) -> bool {
+    (1..=1000).contains(&precision) && (-1000..=1000).contains(&scale)
 }
 
 /// PG's wording for a typmod outside those bounds, given the text
@@ -2268,9 +2268,9 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
         // (`numeric(1000,999)`) failed to parse and `unwrap_or(0)`
         // turned it into the UNCONSTRAINED type, so the cast silently
         // did nothing at all rather than reporting anything.
-        let wide: alloc::vec::Vec<Option<u16>> = args
+        let wide: alloc::vec::Vec<Option<i32>> = args
             .split(',')
-            .map(|s| s.trim().parse::<u16>().ok())
+            .map(|s| s.trim().parse::<i32>().ok())
             .collect();
         let nums: alloc::vec::Vec<u8> = wide
             .iter()
@@ -2278,8 +2278,9 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
             .collect();
         match head {
             "numeric" | "decimal" => {
-                let precision = wide.first().copied().flatten()?;
-                let scale = wide.get(1).copied().flatten().unwrap_or(0);
+                let precision = u16::try_from(wide.first().copied().flatten()?).ok()?;
+                // v7.39 (round 273) — the declared scale is signed.
+                let scale = i16::try_from(wide.get(1).copied().flatten().unwrap_or(0)).ok()?;
                 if !numeric_typmod_in_range(precision, scale) {
                     return None;
                 }
@@ -4954,7 +4955,13 @@ pub(crate) fn coerce_value(
             if precision == 0 && scale == 0 {
                 Some(Value::NumericBig(b))
             } else {
-                let rounded = b.round_to(scale);
+                #[allow(clippy::cast_sign_loss)]
+                let rounded = if scale < 0 {
+                    // Round to the multiple of 10^|scale| and land at 0.
+                    b.round_to(0)
+                } else {
+                    b.round_to(scale as u16)
+                };
                 let out = crate::eval::binop::bignum_to_value(rounded);
                 // The declared precision still binds; check it on the
                 // decimal text, which both forms can produce.
