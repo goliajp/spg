@@ -9871,6 +9871,150 @@ impl Parser {
         }
     }
 
+
+    /// v7.39 (round 242) — one grouping element of PG's GROUP BY grammar,
+    /// as the list of key sets it contributes. A bare expression is one
+    /// single-key set; `ROLLUP (u1, …, un)` the n+1 unit-prefixes (largest
+    /// first); `CUBE` every unit-subset (largest first); `GROUPING SETS`
+    /// the concatenation of its items' sets, where an item is itself an
+    /// element, a parenthesized key list, or the empty set `()`. A
+    /// ROLLUP/CUBE member in parentheses is a composite UNIT: its keys
+    /// move together.
+    fn parse_grouping_element(&mut self) -> Result<Vec<Vec<Expr>>, ParseError> {
+        let is_kw = |t: &Token, kw: &str| {
+            matches!(t, Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case(kw))
+        };
+        // ROLLUP ( … ) / CUBE ( … )
+        if (is_kw(self.peek(), "rollup") || is_kw(self.peek(), "cube"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            let is_cube = is_kw(self.peek(), "cube");
+            self.advance(); // ROLLUP / CUBE
+            self.advance(); // (
+            let mut units: Vec<Vec<Expr>> = Vec::new();
+            loop {
+                if matches!(self.peek(), Token::LParen) {
+                    // Composite unit: (a, b) rolls up as one.
+                    self.advance();
+                    let mut unit = Vec::new();
+                    if !matches!(self.peek(), Token::RParen) {
+                        loop {
+                            unit.push(self.parse_expr(0)?);
+                            match self.peek() {
+                                Token::Comma => {
+                                    self.advance();
+                                }
+                                Token::RParen => break,
+                                other => {
+                                    return Err(self.err(format!(
+                                        "expected ',' or ')' in grouping unit, got {other:?}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    self.advance(); // )
+                    units.push(unit);
+                } else {
+                    units.push(alloc::vec![self.parse_expr(0)?]);
+                }
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RParen => break,
+                    other => {
+                        return Err(self.err(format!(
+                            "expected ',' or ')' in grouping list, got {other:?}"
+                        )));
+                    }
+                }
+            }
+            self.advance(); // )
+            let flatten = |unit_sel: &[bool]| -> Vec<Expr> {
+                units
+                    .iter()
+                    .zip(unit_sel.iter())
+                    .filter(|(_, keep)| **keep)
+                    .flat_map(|(u, _)| u.iter().cloned())
+                    .collect()
+            };
+            let n = units.len();
+            if is_cube {
+                let mut subsets: Vec<Vec<bool>> = (0..(1u32 << n))
+                    .map(|mask| (0..n).map(|i| mask & (1 << i) != 0).collect())
+                    .collect();
+                subsets.sort_by_key(|sel| core::cmp::Reverse(sel.iter().filter(|b| **b).count()));
+                return Ok(subsets.iter().map(|sel| flatten(sel)).collect());
+            }
+            return Ok((0..=n)
+                .rev()
+                .map(|keep| {
+                    let sel: Vec<bool> = (0..n).map(|i| i < keep).collect();
+                    flatten(&sel)
+                })
+                .collect());
+        }
+        // GROUPING SETS ( item [, item]* )
+        if is_kw(self.peek(), "grouping")
+            && matches!(self.tokens.get(self.pos + 1), Some(t) if is_kw(t, "sets"))
+        {
+            self.advance(); // GROUPING
+            self.advance(); // SETS
+            if !matches!(self.peek(), Token::LParen) {
+                return Err(self.err(format!(
+                    "expected '(' after GROUPING SETS, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance(); // outer (
+            let mut sets: Vec<Vec<Expr>> = Vec::new();
+            loop {
+                if matches!(self.peek(), Token::LParen) {
+                    // A parenthesized key list (or the empty set).
+                    self.advance();
+                    let mut set = Vec::new();
+                    if !matches!(self.peek(), Token::RParen) {
+                        loop {
+                            set.push(self.parse_expr(0)?);
+                            match self.peek() {
+                                Token::Comma => {
+                                    self.advance();
+                                }
+                                Token::RParen => break,
+                                other => {
+                                    return Err(self.err(format!(
+                                        "expected ',' or ')' in grouping set, got {other:?}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    self.advance(); // )
+                    sets.push(set);
+                } else {
+                    // A nested element: ROLLUP/CUBE/GROUPING SETS or a
+                    // bare expression.
+                    sets.extend(self.parse_grouping_element()?);
+                }
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RParen => break,
+                    other => {
+                        return Err(self.err(format!(
+                            "expected ',' or ')' after a grouping set, got {other:?}"
+                        )));
+                    }
+                }
+            }
+            self.advance(); // outer )
+            return Ok(sets);
+        }
+        Ok(alloc::vec![alloc::vec![self.parse_expr(0)?]])
+    }
+
     fn substitute_grouping_calls(expr: &mut Expr, dropped: &[Expr]) {
         // v7.38 (read01) — a reference to a key that is dropped in this grouping
         // set evaluates to NULL, at any depth. Previously only a *top-level*
@@ -9891,7 +10035,16 @@ impl Parser {
                     mask |= 1;
                 }
             }
-            *expr = Expr::Literal(Literal::Integer(mask));
+            // v7.39 (round 242) — wrapped in a cast, NOT a bare integer
+            // literal: a bare integer in a select item is indistinguishable
+            // from a positional reference once `ORDER BY 1` substitutes the
+            // item back in, and the round-232 position check then read the
+            // mask value as an out-of-range position. The cast changes
+            // nothing semantically (grouping() is integer).
+            *expr = Expr::Cast {
+                expr: alloc::boxed::Box::new(Expr::Literal(Literal::Integer(mask))),
+                target: crate::ast::CastTarget::Int,
+            };
             return;
         }
         // Generic recursion over the common expression shapes the
@@ -10356,143 +10509,85 @@ impl Parser {
                 self.advance();
                 group_by_all = true;
                 None
-            } else if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
-                if s.eq_ignore_ascii_case("rollup") || s.eq_ignore_ascii_case("cube"))
-                && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
-            {
-                // GROUP BY ROLLUP(a, b) — prefix subsets;
-                // GROUP BY CUBE(a, b) — every subset.
-                let is_cube = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
-                    if s.eq_ignore_ascii_case("cube"));
-                self.advance(); // ROLLUP / CUBE
-                self.advance(); // (
-                let mut keys = Vec::new();
-                loop {
-                    keys.push(self.parse_expr(0)?);
-                    match self.peek() {
-                        Token::Comma => {
-                            self.advance();
-                        }
-                        Token::RParen => break,
-                        other => {
-                            return Err(self.err(format!(
-                                "expected ',' or ')' in grouping list, got {other:?}"
-                            )));
-                        }
-                    }
-                }
-                self.advance(); // )
-                grouping_universe = keys.clone();
-                if is_cube {
-                    // All subsets, largest first (mask high→low
-                    // keeps the full set as the primary).
-                    let n = keys.len();
-                    let mut subsets: Vec<Vec<Expr>> = (0..(1u32 << n))
-                        .map(|mask| {
-                            keys.iter()
-                                .enumerate()
-                                .filter(|(i, _)| mask & (1 << *i) != 0)
-                                .map(|(_, k)| k.clone())
-                                .collect()
-                        })
-                        .collect();
-                    subsets.sort_by_key(|s| core::cmp::Reverse(s.len()));
-                    grouping_sets = subsets;
-                } else {
-                    grouping_sets = (0..=keys.len())
-                        .rev()
-                        .map(|keep| keys[..keep].to_vec())
-                        .collect();
-                }
-                Some(keys)
-            } else if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
-                if s.eq_ignore_ascii_case("grouping"))
-                && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s2) | Token::QuotedIdent(s2))
-                    if s2.eq_ignore_ascii_case("sets"))
-            {
-                // GROUP BY GROUPING SETS ((a, b), (a), ()) — the
-                // explicit list; an empty () set is the grand total.
-                self.advance(); // GROUPING
-                self.advance(); // SETS
-                if !matches!(self.peek(), Token::LParen) {
-                    return Err(self.err(format!(
-                        "expected '(' after GROUPING SETS, got {:?}",
-                        self.peek()
-                    )));
-                }
-                self.advance(); // outer (
-                let mut sets: Vec<Vec<Expr>> = Vec::new();
-                loop {
-                    if !matches!(self.peek(), Token::LParen) {
-                        return Err(self.err(format!(
-                            "expected '(' to start a grouping set, got {:?}",
-                            self.peek()
-                        )));
-                    }
-                    self.advance(); // inner (
-                    let mut set = Vec::new();
-                    if !matches!(self.peek(), Token::RParen) {
-                        loop {
-                            set.push(self.parse_expr(0)?);
-                            match self.peek() {
-                                Token::Comma => {
-                                    self.advance();
-                                }
-                                Token::RParen => break,
-                                other => {
-                                    return Err(self.err(format!(
-                                        "expected ',' or ')' in grouping set, got {other:?}"
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                    self.advance(); // inner )
-                    sets.push(set);
-                    match self.peek() {
-                        Token::Comma => {
-                            self.advance();
-                        }
-                        Token::RParen => break,
-                        other => {
-                            return Err(self.err(format!(
-                                "expected ',' or ')' after a grouping set, got {other:?}"
-                            )));
-                        }
-                    }
-                }
-                self.advance(); // outer )
-                // Universe = every key that appears in any set.
-                let mut universe: Vec<Expr> = Vec::new();
-                for set in &sets {
-                    for k in set {
-                        if !universe.iter().any(|u| u == k) {
-                            universe.push(k.clone());
-                        }
-                    }
-                }
-                grouping_universe = universe;
-                let primary = sets.first().cloned().unwrap_or_default();
-                grouping_sets = sets;
-                // The empty grouping set `()` is the grand-total group,
-                // NOT "no GROUP BY". Emit `Some(vec![])` so the engine's
-                // aggregate path runs (uses_aggregate keys off
-                // group_by.is_some()) and collapses every row into one
-                // group even when the projection carries no aggregate —
-                // `None` here would fall through to a plain per-row
-                // SELECT (PG: one grand-total row, not N rows).
-                Some(primary)
             } else {
-                let mut groups = Vec::new();
+                // v7.39 (round 242) — PG's general grouping-element grammar:
+                // GROUP BY [DISTINCT] element [, element]*, where an element
+                // is a bare expression, ROLLUP (…), CUBE (…) or GROUPING
+                // SETS (…) — mixed freely. Each element yields a list of
+                // key sets; the query's grouping sets are the CARTESIAN
+                // PRODUCT of the elements' lists (so `a, ROLLUP (b)` is
+                // {(a,b),(a)}), and DISTINCT drops duplicate sets by
+                // content. ROLLUP/CUBE members may be composite
+                // (`ROLLUP ((a, b))` moves a and b as one unit), and a
+                // GROUPING SETS item may itself be a ROLLUP/CUBE. The old
+                // parser handled only a lone ROLLUP/CUBE/GS as the whole
+                // clause.
+                let distinct_sets = if matches!(self.peek(), Token::Distinct) {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                let mut element_sets: Vec<Vec<Vec<Expr>>> = Vec::new();
                 loop {
-                    groups.push(self.parse_expr(0)?);
+                    element_sets.push(self.parse_grouping_element()?);
                     if matches!(self.peek(), Token::Comma) {
                         self.advance();
                     } else {
                         break;
                     }
                 }
-                Some(groups)
+                let mut total: Vec<Vec<Expr>> = alloc::vec![Vec::new()];
+                for el in &element_sets {
+                    let mut next: Vec<Vec<Expr>> = Vec::new();
+                    for base in &total {
+                        for set in el {
+                            let mut merged = base.clone();
+                            for k in set {
+                                if !merged.iter().any(|m| m == k) {
+                                    merged.push(k.clone());
+                                }
+                            }
+                            next.push(merged);
+                        }
+                    }
+                    total = next;
+                }
+                if distinct_sets {
+                    let mut seen: Vec<Vec<String>> = Vec::new();
+                    total.retain(|set| {
+                        let mut key: Vec<String> =
+                            set.iter().map(|e| alloc::format!("{e}")).collect();
+                        key.sort();
+                        if seen.contains(&key) {
+                            false
+                        } else {
+                            seen.push(key);
+                            true
+                        }
+                    });
+                }
+                if total.len() > 1 {
+                    let mut universe: Vec<Expr> = Vec::new();
+                    for set in &total {
+                        for k in set {
+                            if !universe.iter().any(|u| u == k) {
+                                universe.push(k.clone());
+                            }
+                        }
+                    }
+                    grouping_universe = universe;
+                    let primary = total[0].clone();
+                    grouping_sets = total;
+                    Some(primary)
+                } else {
+                    // One set (a plain GROUP BY list, or a single-set
+                    // spelling like GROUPING SETS ((a, b))). An EMPTY
+                    // single set — GROUPING SETS (()) — stays
+                    // `Some(vec![])`: the grand-total group, which must
+                    // run the aggregate path.
+                    Some(total.into_iter().next().unwrap_or_default())
+                }
             }
         } else {
             None
@@ -10618,6 +10713,47 @@ impl Parser {
         // select items must be group keys or aggregates, so a
         // dropped key's occurrences in the projection are exactly
         // the ones to nullify.
+        // v7.39 (round 242) — grouping() OUTSIDE an expansion: PG allows it
+        // over a plain GROUP BY (every argument must be a group key; the
+        // mask is then 0) and rejects anything else with 42803. SPG's
+        // rewrite only ran during the ROLLUP/CUBE expansion, so a plain
+        // `SELECT grouping(a) … GROUP BY a` died at eval with "unknown
+        // function `grouping`".
+        if grouping_sets.len() <= 1 {
+            let keys: Vec<Expr> = stmt.group_by.clone().unwrap_or_default();
+            let mut calls: Vec<Expr> = Vec::new();
+            for item in &stmt.items {
+                if let SelectItem::Expr { expr, .. } = item {
+                    Self::collect_grouping_calls(expr, &mut calls);
+                }
+            }
+            if let Some(h) = &stmt.having {
+                Self::collect_grouping_calls(h, &mut calls);
+            }
+            for call in &calls {
+                let Expr::FunctionCall { args, .. } = call else {
+                    continue;
+                };
+                for a in args {
+                    if !keys.iter().any(|k| k == a) {
+                        return Err(self.err(
+                            "arguments to GROUPING must be grouping expressions of the associated query level"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            if !calls.is_empty() {
+                for item in &mut stmt.items {
+                    if let SelectItem::Expr { expr, .. } = item {
+                        Self::substitute_grouping_calls(expr, &[]);
+                    }
+                }
+                if let Some(h) = &mut stmt.having {
+                    Self::substitute_grouping_calls(h, &[]);
+                }
+            }
+        }
         if grouping_sets.len() > 1 {
             // The primary set's own dropped keys nullify in the
             // HEAD's projection too (GROUPING SETS's first set may
