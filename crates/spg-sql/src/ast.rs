@@ -176,6 +176,17 @@ pub enum Statement {
         path: String,
         options: CopyOptions,
     },
+    /// v7.39 (round 249/252) — `COPY <table> [(cols)] TO '<file>'` (and
+    /// the `COPY (<query>) TO '<file>'` form). The engine is no_std and
+    /// cannot write the file itself: the host renders the payload via
+    /// `Engine::copy_to_buffer` and writes the path.
+    CopyToFile {
+        table: String,
+        columns: Option<Vec<String>>,
+        query: Option<Box<Statement>>,
+        path: String,
+        options: CopyOptions,
+    },
     Select(SelectStatement),
     CreateTable(CreateTableStatement),
     /// v7.9.15 — `CREATE EXTENSION [IF NOT EXISTS] <name>
@@ -3745,6 +3756,7 @@ impl Statement {
         match self {
             Statement::Select(_)
             | Statement::CopyTo { .. }
+            | Statement::CopyToFile { .. }
             | Statement::Explain(_)
             | Statement::ShowTables
             | Statement::ShowDatabases
@@ -4082,6 +4094,43 @@ impl fmt::Display for Statement {
                     write!(f, " ({})", cols.join(", "))?;
                 }
                 write!(f, " FROM '{path}'")?;
+                let mut parts: Vec<String> = Vec::new();
+                if options.format == CopyFormat::Csv {
+                    parts.push("FORMAT csv".to_string());
+                }
+                if options.header {
+                    parts.push("HEADER true".to_string());
+                }
+                if let Some(d) = options.delimiter {
+                    parts.push(alloc::format!("DELIMITER '{d}'"));
+                }
+                if let Some(n) = &options.null_str {
+                    parts.push(alloc::format!("NULL '{n}'"));
+                }
+                if let Some(q) = options.quote {
+                    parts.push(alloc::format!("QUOTE '{q}'"));
+                }
+                if !parts.is_empty() {
+                    write!(f, " WITH ({})", parts.join(", "))?;
+                }
+                Ok(())
+            }
+            Self::CopyToFile {
+                table,
+                columns,
+                query,
+                path,
+                options,
+            } => {
+                if let Some(q) = query {
+                    write!(f, "COPY ({q})")?;
+                } else {
+                    write!(f, "COPY {table}")?;
+                    if let Some(cols) = columns {
+                        write!(f, " ({})", cols.join(", "))?;
+                    }
+                }
+                write!(f, " TO '{path}'")?;
                 let mut parts: Vec<String> = Vec::new();
                 if options.format == CopyFormat::Csv {
                     parts.push("FORMAT csv".to_string());

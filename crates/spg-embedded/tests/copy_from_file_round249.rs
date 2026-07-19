@@ -148,3 +148,41 @@ fn text_format_and_explicit_columns_work_on_the_file_endpoint() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// v7.39 (round 252) — the `COPY … TO '<file>'` HOST endpoint: the
+/// engine renders (read-only), the embedded host writes the file.
+/// Payloads probed byte-identical to PG's written files.
+#[test]
+fn copy_to_file_writes_pg_identical_bytes() {
+    let dir = tmp();
+    let out = dir.join("out.csv");
+    let mut db = Database::open_in_memory();
+    db.execute("CREATE TABLE ct (id int, name text)").unwrap();
+    db.execute("INSERT INTO ct VALUES (1,'a'),(2,NULL)").unwrap();
+    let r = db
+        .execute(&format!(
+            "COPY ct TO '{}' WITH (FORMAT csv, HEADER)",
+            out.display()
+        ))
+        .unwrap();
+    // `COPY 2` — the header line is payload, not count.
+    assert!(
+        matches!(r, spg_engine::QueryResult::CommandOk { affected: 2, .. }),
+        "{r:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "id,name\n1,a\n2,\n");
+    // Overwrite works (PG semantics).
+    db.execute(&format!("COPY ct (id) TO '{}'", out.display())).unwrap();
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "1\n2\n");
+    // Unwritable path takes PG's wording, no os-error suffix.
+    let got = format!(
+        "{}",
+        db.execute("COPY ct TO '/definitely/not/here/out.csv'").unwrap_err()
+    );
+    assert!(
+        got.contains("could not open file \"/definitely/not/here/out.csv\" for writing:"),
+        "{got}"
+    );
+    assert!(!got.contains("os error"), "{got}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

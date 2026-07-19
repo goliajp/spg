@@ -115,6 +115,40 @@ pub fn parse_copy_from_stdin_head(sql: &str) -> Option<CopyFromSpec> {
 }
 
 
+/// v7.39 (round 252) — a parsed `COPY … TO '<file>'` (table or query
+/// form). The HOST renders via `Engine::copy_to_buffer` and writes
+/// `path` itself.
+#[derive(Debug)]
+pub struct CopyToFileSpec {
+    pub table: String,
+    pub columns: Option<Vec<String>>,
+    pub query: Option<alloc::boxed::Box<spg_sql::ast::Statement>>,
+    pub path: String,
+    pub options: spg_sql::ast::CopyOptions,
+}
+
+/// Parse `sql` and return its parts when it is a `COPY … TO '<file>'`
+/// statement (any other statement, or a parse error, returns `None`).
+#[must_use]
+pub fn parse_copy_to_file(sql: &str) -> Option<CopyToFileSpec> {
+    match spg_sql::parser::parse_statement(sql) {
+        Ok(spg_sql::ast::Statement::CopyToFile {
+            table,
+            columns,
+            query,
+            path,
+            options,
+        }) => Some(CopyToFileSpec {
+            table,
+            columns,
+            query,
+            path,
+            options,
+        }),
+        _ => None,
+    }
+}
+
 /// v7.39 (round 249) — a parsed `COPY <table> [(cols)] FROM '<path>'`.
 /// The engine is no_std: the HOST reads `path` and hands the bytes to
 /// [`copy_buffer_inserts`] / `Engine::copy_from_buffer`.

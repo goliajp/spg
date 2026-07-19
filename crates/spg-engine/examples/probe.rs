@@ -101,6 +101,30 @@ fn main() {
         if stmt.is_empty() {
             continue;
         }
+        // round 252 — `COPY … TO '<file>'`: the probe renders via the
+        // engine and writes the file itself.
+        if let Some(spec) = spg_engine::copy::parse_copy_to_file(stmt) {
+            match e.copy_to_buffer(
+                &spec.table,
+                spec.columns.as_deref(),
+                spec.query.as_deref(),
+                &spec.options,
+            ) {
+                Ok((payload, _n)) => match std::fs::write(&spec.path, payload) {
+                    Ok(()) => println!("(ok)"),
+                    Err(err) => {
+                        let os = err.to_string();
+                        let os = os.split(" (os error").next().unwrap_or(&os).to_string();
+                        println!(
+                            "ERROR: could not open file \"{}\" for writing: {os}",
+                            spec.path
+                        );
+                    }
+                },
+                Err(err) => println!("ERROR: {err}"),
+            }
+            continue;
+        }
         // round 249 — `COPY … FROM '<file>'`: the probe is the host, so
         // it reads the file and feeds the engine's buffer endpoint.
         if let Some(spec) = spg_engine::copy::parse_copy_from_file(stmt) {
