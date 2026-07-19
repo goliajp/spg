@@ -1093,6 +1093,11 @@ impl Engine {
                 } else {
                     eval::eval_expr(expr, row, &ctx)?
                 };
+                let v = crate::conversions::normalize_composite_for_column(
+                    v,
+                    &schema_cols[*pos],
+                    Some(&cat_for_ctx),
+                )?;
                 let coerced = coerce_value(v, schema_cols[*pos].ty, &schema_cols[*pos].name, *pos)?;
                 check_unsigned_range(&coerced, &schema_cols[*pos], *pos)?;
                 new_vals[*pos] = coerced;
@@ -5464,7 +5469,17 @@ fn parse_insert_rows(
                     auto_cursors.insert(i, next + 1);
                     raw = Value::BigInt(next);
                 }
-                let coerced = coerce_value(raw.into_owned(), col.ty, &col.name, i)?;
+                // v7.39 (round 263) — a COMPOSITE column relabels + coerces
+                // its value through the declared type first; ROW()'s
+                // placeholder names would otherwise be stored and the
+                // read side, which looks fields up by name, would rebuild
+                // an all-NULL record.
+                let raw = crate::conversions::normalize_composite_for_column(
+                    raw.into_owned(),
+                    col,
+                    catalog,
+                )?;
+                let coerced = coerce_value(raw, col.ty, &col.name, i)?;
                 enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
                 let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;
                 check_unsigned_range(&coerced, col, i)?;
@@ -5505,6 +5520,8 @@ fn parse_insert_rows(
                     auto_cursors.insert(i, next + 1);
                     raw = Value::BigInt(next);
                 }
+                let raw =
+                    crate::conversions::normalize_composite_for_column(raw, col, catalog)?;
                 let coerced = coerce_value(raw, col.ty, &col.name, i)?;
                 enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
                 let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;

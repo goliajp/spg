@@ -123,23 +123,38 @@ fn drop_unknown_type_errors_without_if_exists() {
 }
 
 #[test]
-fn composite_used_as_column_type_stores_as_jsonb() {
+fn composite_used_as_column_type_takes_a_record_literal() {
     let mut e = Engine::new();
     e.execute("CREATE TYPE addr AS (street TEXT, zip INT)")
         .unwrap();
     e.execute("CREATE TABLE customers (id INT NOT NULL, home addr)")
         .unwrap();
-    // Composite-typed column should land as JSONB at the storage tier
-    // (the PG-compatible field-access surface). Insert a JSONB-shaped
-    // value and confirm round-trip.
-    e.execute(r#"INSERT INTO customers VALUES (1, '{"street": "Main", "zip": 90210}')"#)
+    // v7.39 (round 263) — this used to insert a JSON-OBJECT literal and
+    // assert it round-tripped, which asserted SPG's internal storage
+    // form rather than PG's surface: PG refuses that text with
+    // `malformed record literal … Missing left parenthesis` (probed),
+    // and SPG now does too, because a value written into a composite
+    // column is relabelled through the declared type first.
+    let err = e.execute(r#"INSERT INTO customers VALUES (1, '{"street": "Main", "zip": 90210}')"#);
+    assert!(
+        format!("{err:?}").contains("malformed record literal"),
+        "{err:?}"
+    );
+    // The record literal is the accepted spelling, and it round-trips.
+    e.execute(r#"INSERT INTO customers VALUES (1, '("Main",90210)')"#)
         .unwrap();
-    let r = e.execute("SELECT id FROM customers ORDER BY id").unwrap();
+    let r = e
+        .execute("SELECT home FROM customers ORDER BY id")
+        .unwrap();
     let rows = match r {
         spg_engine::QueryResult::Rows { rows, .. } => rows,
         _ => panic!("expected rows"),
     };
     assert_eq!(rows.len(), 1);
+    assert_eq!(
+        spg_engine::eval::value_to_text(&rows[0].values[0]),
+        "(Main,90210)"
+    );
 }
 
 #[test]
