@@ -17352,6 +17352,12 @@ fn parse_by_format(input: &str, fmt: &str) -> Result<(i32, u32, u32, u32, u32, u
             .all(|(k, c)| hay.get(pos + k).is_some_and(|h| h.eq_ignore_ascii_case(&c)))
     }
     fn take_digits(input: &[char], pos: &mut usize, max: usize) -> Option<u64> {
+        // v7.39 (round 246) — PG's non-FX parsing is whitespace-elastic:
+        // a numeric field skips any leading blanks in the input
+        // (`to_date('  05  03 2024','DD MM YYYY')` works).
+        while *pos < input.len() && input[*pos].is_whitespace() {
+            *pos += 1;
+        }
         let start = *pos;
         let mut val: u64 = 0;
         while *pos < input.len() && *pos - start < max {
@@ -17535,8 +17541,15 @@ fn parse_by_format(input: &str, fmt: &str) -> Result<(i32, u32, u32, u32, u32, u
             ii += 2;
             fi += 2;
         } else {
-            // Literal separator — consume one input char.
-            if ii < in_bytes.len() {
+            // Literal separator — consume one input char. A template SPACE
+            // is elastic (round 246): it matches any run of input blanks,
+            // including none, so doubled spaces in either side don't shift
+            // the following fields.
+            if fmt_bytes[fi].is_whitespace() {
+                while ii < in_bytes.len() && in_bytes[ii].is_whitespace() {
+                    ii += 1;
+                }
+            } else if ii < in_bytes.len() {
                 ii += 1;
             }
             fi += 1;
@@ -17612,14 +17625,31 @@ fn parse_by_format(input: &str, fmt: &str) -> Result<(i32, u32, u32, u32, u32, u
         month = m;
         day = dd;
     }
+    // v7.39 (round 246) — PG's wording quotes the ORIGINAL input string
+    // (22008), and the day is checked against the resolved month's real
+    // length: `to_date('2024-02-30','YYYY-MM-DD')` used to roll over
+    // silently to 2024-03-01.
+    let out_of_range = || alloc::format!("date/time field value out of range: \"{input}\"");
     if !(1..=12).contains(&month) {
-        return Err(alloc::format!("month {month} out of range"));
+        return Err(out_of_range());
     }
-    if !(1..=31).contains(&day) {
-        return Err(alloc::format!("day {day} out of range"));
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_len: u32 = match month {
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=month_len).contains(&day) {
+        return Err(out_of_range());
     }
     if hour > 23 || minute > 59 || second > 60 {
-        return Err(alloc::format!("time {hour}:{minute}:{second} out of range"));
+        return Err(out_of_range());
     }
     Ok((year, month, day, hour, minute, second, micros))
 }

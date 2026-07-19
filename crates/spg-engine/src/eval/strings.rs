@@ -1600,6 +1600,10 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     }
     let (days, day_micros) = match &args[0] {
         Value::Date(d) => (*d, 0_i64),
+        // v7.39 (round 246) — to_char(TIME, 'HH24:MI:SS'): the time tokens
+        // render from the time-of-day; date tokens read the epoch date, as
+        // PG's zeroed date fields do.
+        Value::Time(us) => (0_i32, *us),
         Value::Timestamp(t) => {
             let days = t.div_euclid(86_400_000_000);
             (
@@ -1835,11 +1839,32 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             num!(d, 2);
         } else if rest.starts_with(b"MI") {
             num!(mi, 2);
+        } else if rest.starts_with(b"SSSSS") {
+            // v7.39 (round 246) — `SSSSS` is PG's alias for `SSSS`; without
+            // its own arm the four-letter match left a stray literal `S`.
+            let _ = write!(out, "{}", hh24 * 3600 + mi * 60 + ss);
+            consumed = 5;
         } else if rest.starts_with(b"SSSS") {
             // v7.37 — seconds past midnight (0..86399), no zero padding.
             // Must precede the `SS` arm (which `SSSS` also prefix-matches).
             let _ = write!(out, "{}", hh24 * 3600 + mi * 60 + ss);
             consumed = 4;
+        } else if rest.starts_with(b"TZH") {
+            // v7.39 (round 246) — the zone tokens. SPG stores and renders
+            // every timestamp in UTC (the wire renderer prints `+00`), so
+            // the tokens answer for UTC; a session-zone-aware answer is the
+            // same architecture step as the renderer's.
+            out.push_str("+00");
+            consumed = 3;
+        } else if rest.starts_with(b"TZM") {
+            out.push_str("00");
+            consumed = 3;
+        } else if rest.starts_with(b"TZ") || rest.starts_with(b"tz") {
+            out.push_str(if rest.starts_with(b"TZ") { "UTC" } else { "utc" });
+            consumed = 2;
+        } else if rest.starts_with(b"OF") {
+            out.push_str("+00");
+            consumed = 2;
         } else if rest.starts_with(b"FF") && rest.get(2).is_some_and(u8::is_ascii_digit) {
             // v7.37 — `FF1`..`FF6`: the first N digits of the fractional
             // second (from the 6-digit microsecond field). Previously the
