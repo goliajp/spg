@@ -181,6 +181,7 @@ mod e2e_ordered_set_round255;
 mod e2e_multirange_round256;
 mod e2e_array_round257;
 mod e2e_enum_identity_round258;
+mod e2e_domain_round259;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;
