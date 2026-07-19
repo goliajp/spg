@@ -103,6 +103,66 @@ fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> 
     out
 }
 
+/// v7.39 (round 268) — a view's output columns, resolved from its
+/// stored body. `information_schema.columns` had no rows at all for a
+/// view before this, so a reflection tool saw every view as a relation
+/// with no columns.
+///
+/// The namespace a view body resolves against is wider than the
+/// prepared-statement describe path builds: the primary may itself be a
+/// view (recurse), and joined tables contribute their columns too. An
+/// item that cannot be resolved collapses the whole list to empty,
+/// which the caller reports as "no columns known" rather than guessing.
+pub(crate) fn describe_view_columns(catalog: &Catalog, view_name: &str) -> Vec<ColumnSchema> {
+    describe_view_columns_depth(catalog, view_name, 0)
+}
+
+fn describe_view_columns_depth(
+    catalog: &Catalog,
+    view_name: &str,
+    depth: usize,
+) -> Vec<ColumnSchema> {
+    // A view chain deep enough to hit this is either pathological or a
+    // cycle the catalog should not contain; stop rather than recurse.
+    if depth > 16 {
+        return Vec::new();
+    }
+    let Some(view) = catalog.views().get(view_name) else {
+        return Vec::new();
+    };
+    let Ok(Statement::Select(select)) = spg_sql::parser::parse_statement(&view.body) else {
+        return Vec::new();
+    };
+    let mut ns: Vec<ColumnSchema> = Vec::new();
+    if let Some(from) = &select.from {
+        let mut add = |name: &str| {
+            if let Some(t) = catalog.get(name) {
+                ns.extend(t.schema().columns.iter().cloned());
+            } else {
+                ns.extend(describe_view_columns_depth(catalog, name, depth + 1));
+            }
+        };
+        add(&from.primary.name);
+        for j in &from.joins {
+            add(&j.table.name);
+        }
+    }
+    let mut out = describe_select_items(&select.items, &ns);
+    // A rename list overrides the body's own names, positionally.
+    if !view.columns.is_empty() && view.columns.len() == out.len() {
+        for (slot, name) in out.iter_mut().zip(view.columns.iter()) {
+            slot.name = name.clone();
+        }
+    }
+    // Every column of a view is nullable in PG, even where the base
+    // column is NOT NULL: the view's rows are a query result, and PG
+    // does not carry the base constraint through.
+    for c in &mut out {
+        c.nullable = true;
+    }
+    out
+}
+
 pub(crate) struct ExprShape {
     pub(crate) name: String,
     pub(crate) ty: DataType,
@@ -317,6 +377,46 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
         // inner call (DISTINCT / internal ORDER BY don't change the
         // output type).
         Expr::AggregateOrdered { call, .. } => describe_expr(call, schema_cols),
+        // v7.39 (round 268) — a window call. The pure window functions
+        // have fixed result types (measured on PG 18.4); everything else
+        // over OVER() is an aggregate and keeps the aggregate's type, so
+        // it delegates. Without this arm a view with any window column
+        // resolved to nothing at all, and reported no columns.
+        Expr::WindowFunction { name, args, .. } => {
+            let lower = name.to_ascii_lowercase();
+            let fixed = match lower.as_str() {
+                "row_number" | "rank" | "dense_rank" => Some(DataType::BigInt),
+                "ntile" => Some(DataType::Int),
+                "percent_rank" | "cume_dist" => Some(DataType::Float),
+                _ => None,
+            };
+            if let Some(ty) = fixed {
+                return Some(ExprShape {
+                    name: lower,
+                    ty,
+                    nullable: true,
+                });
+            }
+            // lag / lead / first_value / last_value / nth_value report
+            // their first argument's type.
+            if matches!(
+                lower.as_str(),
+                "lag" | "lead" | "first_value" | "last_value" | "nth_value"
+            ) {
+                let inner = describe_expr(args.first()?, schema_cols)?;
+                return Some(ExprShape {
+                    name: lower,
+                    ty: inner.ty,
+                    nullable: true,
+                });
+            }
+            let inner = function_return_shape(name, args, schema_cols)?;
+            Some(ExprShape {
+                name: lower,
+                ty: inner.ty,
+                nullable: true,
+            })
+        }
         // CASE — unify on the first THEN branch's shape (PG unifies
         // across branches; first-branch is the pragmatic subset).
         Expr::Case {
@@ -623,8 +723,49 @@ fn function_return_shape(
                 nullable: true,
             });
         }
+        // v7.39 (round 268) — sum / avg PROMOTE; they were lumped in
+        // with the pass-through math below and reported the argument's
+        // own type. The runtime has always promoted correctly
+        // (sum(int) really does return bigint), so this was a static
+        // description that disagreed with the value the engine sends —
+        // a driver that trusts the RowDescription decodes an int4 and
+        // gets eight bytes. All types measured on PG 18.4.
+        "sum" => {
+            let inner = describe_expr(args.first()?, schema_cols)?;
+            let ty = match inner.ty {
+                DataType::SmallInt | DataType::Int => DataType::BigInt,
+                DataType::BigInt => DataType::Numeric {
+                    precision: 0,
+                    scale: 0,
+                },
+                other => other,
+            };
+            return Some(ExprShape {
+                name: "?column?".to_string(),
+                ty,
+                nullable: true,
+            });
+        }
+        "avg" => {
+            let inner = describe_expr(args.first()?, schema_cols)?;
+            let ty = match inner.ty {
+                DataType::SmallInt | DataType::Int | DataType::BigInt => DataType::Numeric {
+                    precision: 0,
+                    scale: 0,
+                },
+                // real averages as double precision, unlike sum, which
+                // stays real.
+                DataType::Real => DataType::Float,
+                other => other,
+            };
+            return Some(ExprShape {
+                name: "?column?".to_string(),
+                ty,
+                nullable: true,
+            });
+        }
         // Pass-through math: derive the type from the first arg.
-        "sum" | "avg" | "max" | "min" | "abs" | "floor" | "ceil" | "ceiling" | "round"
+        "max" | "min" | "abs" | "floor" | "ceil" | "ceiling" | "round"
         | "trunc" | "mod" | "power" | "pow" | "sqrt" | "sign" => {
             // Use the first arg's shape; fall back to Float for math
             // that can promote (e.g. mod(2, 3) → Float? No — keep

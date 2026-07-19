@@ -272,126 +272,168 @@ pub(crate) fn synth_information_schema_columns(
         for (i, col) in t.schema().columns.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
             let ordinal = (i + 1) as i32;
-            // column_default: v7.38 (read01) — the deparsed source text of the
-            // DEFAULT expression (cached at CREATE TABLE), matching PG's
-            // pg_get_expr output. Falls back to the serial nextval
-            // spelling, else NULL.
-            let default_text: Value<'static> = if let Some(txt) = &col.default_text {
-                Value::text(txt.clone())
-            } else if col.auto_increment {
-                Value::text(alloc::format!(
-                    "nextval('{tname}_{}_seq'::regclass)",
-                    col.name
-                ))
-            } else {
-                Value::Null
-            };
-            let (num_prec, num_scale): (Value<'static>, Value<'static>) = match col.ty {
-                DataType::SmallInt => (Value::Int(16), Value::Int(0)),
-                DataType::Int => (Value::Int(32), Value::Int(0)),
-                DataType::BigInt => (Value::Int(64), Value::Int(0)),
-                DataType::Float => (Value::Int(53), Value::Null),
-                DataType::Numeric { precision, scale } => (
-                    Value::Int(i32::from(precision)),
-                    Value::Int(i32::from(scale)),
-                ),
-                _ => (Value::Null, Value::Null),
-            };
-            // udt_name is PG's internal typname (int4, not integer).
-            let udt: &str = match col.ty {
-                DataType::SmallInt => "int2",
-                DataType::Int => "int4",
-                DataType::BigInt => "int8",
-                DataType::Float => "float8",
-                DataType::Real => "float4",
-                DataType::Bool => "bool",
-                DataType::Text => "text",
-                DataType::Bytes => "bytea",
-                DataType::Json => "jsonb",
-                DataType::Uuid => "uuid",
-                DataType::Date => "date",
-                DataType::Timestamp => "timestamp",
-                // v7.38 (T-tstz Phase 1) — these fell to the `text` catch-all
-                // and mis-reported themselves. PG18.4 udt_name, verified:
-                // timestamptz / time / interval / numeric.
-                DataType::Timestamptz => "timestamptz",
-                DataType::Time => "time",
-                DataType::Interval => "interval",
-                DataType::Numeric { .. } => "numeric",
-                // v7.39 (round 248) — varchar/char kept falling into the
-                // text catch-all, and an array's udt_name is PG's
-                // underscore-prefixed element name (`_text`).
-                DataType::Varchar(_) => "varchar",
-                DataType::Char(_) => "bpchar",
-                DataType::Char1 => "char",
-                DataType::TextArray => "_text",
-                DataType::IntArray => "_int4",
-                DataType::BigIntArray => "_int8",
-                DataType::SmallIntArray => "_int2",
-                DataType::FloatArray => "_float8",
-                DataType::NumericArray => "_numeric",
-                DataType::BoolArray => "_bool",
-                DataType::DateArray => "_date",
-                DataType::TimestampArray => "_timestamp",
-                DataType::TimestamptzArray => "_timestamptz",
-                DataType::UuidArray => "_uuid",
-                _ => "text",
-            };
-            // v7.39 (round 248) — datetime_precision: PG reports 6 for the
-            // microsecond-carrying types and 0 for date.
-            let dt_prec: Value<'static> = match col.ty {
-                DataType::Date => Value::Int(0),
-                DataType::Time
-                | DataType::Timestamp
-                | DataType::Timestamptz
-                | DataType::Interval => Value::Int(6),
-                _ => Value::Null,
-            };
-            rows.push(Row::new(alloc::vec![
-                Value::text("spg"),
-                Value::text("public"),
-                Value::text(tname.clone()),
-                Value::text(col.name.clone()),
-                Value::Int(ordinal),
-                Value::text::<&str>(if col.nullable { "YES" } else { "NO" }),
-                Value::text(pg_data_type_text(col.ty)),
-                default_text,
-                // v7.39 (round 248) — a declared varchar(n)/char(n) reports
-                // its limit; TEXT stays unbounded NULL.
-                match col.ty {
-                    DataType::Varchar(n) | DataType::Char(n) => {
-                        i32::try_from(n).map(Value::Int).unwrap_or(Value::Null)
-                    }
-                    _ => Value::Null,
-                },
-                num_prec,
-                num_scale,
-                Value::text::<&str>(udt),
-                // v7.39 (round 248) — a SERIAL column is NOT identity in PG
-                // (is_identity keys off GENERATED … AS IDENTITY). SPG only
-                // records the ALWAYS flavour, so BY DEFAULT identity reports
-                // NO here — recorded residual (needs a catalog field).
-                Value::text::<&str>(if col.identity_always { "YES" } else { "NO" }),
-                if col.identity_always {
-                    Value::text::<&str>("ALWAYS")
-                } else {
-                    Value::Null
-                },
-                dt_prec,
-                Value::text::<&str>("YES"),
-                Value::text::<&str>(if col.generated_stored_expr.is_some() {
-                    "ALWAYS"
-                } else {
-                    "NEVER"
-                }),
-                match &col.generated_stored_expr {
-                    Some(src) => Value::text(src.clone()),
-                    None => Value::Null,
-                },
-            ]));
+            rows.push(info_column_row(&tname, ordinal, col, None));
+        }
+    }
+    // v7.39 (round 268) — view columns. The view reported NO rows for a
+    // view before this, so a reflection tool saw every view as a
+    // relation with no columns at all. Shapes whose body does not fully
+    // resolve contribute nothing rather than a guess.
+    for (vname, _) in cat.views() {
+        let cols = crate::describe::describe_view_columns(cat, vname);
+        // A column is writable only if the view itself is auto-updatable
+        // AND the column is a plain base column — the same two questions
+        // the write path asks (round 267).
+        let updatable = crate::dml::view_is_auto_updatable(cat, vname);
+        let simple = crate::dml::view_simple_column_names(cat, vname);
+        for (i, col) in cols.iter().enumerate() {
+            #[allow(clippy::cast_possible_wrap)]
+            let ordinal = (i + 1) as i32;
+            let writable = updatable && simple.iter().any(|n| n == &col.name);
+            rows.push(info_column_row(vname, ordinal, col, Some(writable)));
         }
     }
     (schema, rows)
+}
+
+
+/// v7.39 (round 268) — one `information_schema.columns` row. Tables and
+/// views both come through here so the two can never describe the same
+/// column shape differently; `view_updatable` is None for a table and
+/// Some(writable) for a view column.
+fn info_column_row(
+    rel: &str,
+    ordinal: i32,
+    col: &ColumnSchema,
+    view_updatable: Option<bool>,
+) -> Row<'static> {
+        // column_default: v7.38 (read01) — the deparsed source text of the
+        // DEFAULT expression (cached at CREATE TABLE), matching PG's
+        // pg_get_expr output. Falls back to the serial nextval
+        // spelling, else NULL.
+        let default_text: Value<'static> = if let Some(txt) = &col.default_text {
+            Value::text(txt.clone())
+        } else if col.auto_increment {
+            Value::text(alloc::format!(
+                "nextval('{rel}_{}_seq'::regclass)",
+                col.name
+            ))
+        } else {
+            Value::Null
+        };
+        let (num_prec, num_scale): (Value<'static>, Value<'static>) = match col.ty {
+            DataType::SmallInt => (Value::Int(16), Value::Int(0)),
+            DataType::Int => (Value::Int(32), Value::Int(0)),
+            DataType::BigInt => (Value::Int(64), Value::Int(0)),
+            DataType::Float => (Value::Int(53), Value::Null),
+            DataType::Numeric { precision, scale } => (
+                Value::Int(i32::from(precision)),
+                Value::Int(i32::from(scale)),
+            ),
+            _ => (Value::Null, Value::Null),
+        };
+        // udt_name is PG's internal typname (int4, not integer).
+        let udt: &str = match col.ty {
+            DataType::SmallInt => "int2",
+            DataType::Int => "int4",
+            DataType::BigInt => "int8",
+            DataType::Float => "float8",
+            DataType::Real => "float4",
+            DataType::Bool => "bool",
+            DataType::Text => "text",
+            DataType::Bytes => "bytea",
+            DataType::Json => "jsonb",
+            DataType::Uuid => "uuid",
+            DataType::Date => "date",
+            DataType::Timestamp => "timestamp",
+            // v7.38 (T-tstz Phase 1) — these fell to the `text` catch-all
+            // and mis-reported themselves. PG18.4 udt_name, verified:
+            // timestamptz / time / interval / numeric.
+            DataType::Timestamptz => "timestamptz",
+            DataType::Time => "time",
+            DataType::Interval => "interval",
+            DataType::Numeric { .. } => "numeric",
+            // v7.39 (round 248) — varchar/char kept falling into the
+            // text catch-all, and an array's udt_name is PG's
+            // underscore-prefixed element name (`_text`).
+            DataType::Varchar(_) => "varchar",
+            DataType::Char(_) => "bpchar",
+            DataType::Char1 => "char",
+            DataType::TextArray => "_text",
+            DataType::IntArray => "_int4",
+            DataType::BigIntArray => "_int8",
+            DataType::SmallIntArray => "_int2",
+            DataType::FloatArray => "_float8",
+            DataType::NumericArray => "_numeric",
+            DataType::BoolArray => "_bool",
+            DataType::DateArray => "_date",
+            DataType::TimestampArray => "_timestamp",
+            DataType::TimestamptzArray => "_timestamptz",
+            DataType::UuidArray => "_uuid",
+            _ => "text",
+        };
+        // v7.39 (round 248) — datetime_precision: PG reports 6 for the
+        // microsecond-carrying types and 0 for date.
+        let dt_prec: Value<'static> = match col.ty {
+            DataType::Date => Value::Int(0),
+            DataType::Time
+            | DataType::Timestamp
+            | DataType::Timestamptz
+            | DataType::Interval => Value::Int(6),
+            _ => Value::Null,
+        };
+    Row::new(alloc::vec![
+            Value::text("spg"),
+            Value::text("public"),
+            Value::text(rel.to_string()),
+            Value::text(col.name.clone()),
+            Value::Int(ordinal),
+            // A view's columns are all nullable in PG, even over a NOT
+            // NULL base column: the rows are a query result and the base
+            // constraint is not carried through.
+            Value::text::<&str>(if view_updatable.is_some() || col.nullable {
+                "YES"
+            } else {
+                "NO"
+            }),
+            Value::text(pg_data_type_text(col.ty)),
+            default_text,
+            // v7.39 (round 248) — a declared varchar(n)/char(n) reports
+            // its limit; TEXT stays unbounded NULL.
+            match col.ty {
+                DataType::Varchar(n) | DataType::Char(n) => {
+                    i32::try_from(n).map(Value::Int).unwrap_or(Value::Null)
+                }
+                _ => Value::Null,
+            },
+            num_prec,
+            num_scale,
+            Value::text::<&str>(udt),
+            // v7.39 (round 248) — a SERIAL column is NOT identity in PG
+            // (is_identity keys off GENERATED … AS IDENTITY). SPG only
+            // records the ALWAYS flavour, so BY DEFAULT identity reports
+            // NO here — recorded residual (needs a catalog field).
+            Value::text::<&str>(if col.identity_always { "YES" } else { "NO" }),
+            if col.identity_always {
+                Value::text::<&str>("ALWAYS")
+            } else {
+                Value::Null
+            },
+            dt_prec,
+            Value::text::<&str>(match view_updatable {
+                Some(false) => "NO",
+                _ => "YES",
+            }),
+            Value::text::<&str>(if col.generated_stored_expr.is_some() {
+                "ALWAYS"
+            } else {
+                "NEVER"
+            }),
+            match &col.generated_stored_expr {
+                Some(src) => Value::text(src.clone()),
+                None => Value::Null,
+            },
+    ])
 }
 
 /// v7.16.2 — synthesise `information_schema.tables`.
