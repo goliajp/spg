@@ -273,6 +273,44 @@ pub(crate) fn apply_binary(
     // element-typed forms (`tags @> ARRAY['b']`) worked all along, so this was a
     // pure literal-coercion hole, not a missing operator.
     let (l, r) = coerce_array_literal_operands(op, l, r);
+    // v7.39 (round 256) — PG treats a plain range as the one-element
+    // multirange containing it, so the range↔multirange forms of the
+    // CONTAINMENT / OVERLAP / POSITIONAL operators resolve. SPG had only
+    // the multirange↔multirange arms wired: a mixed `range && multirange`
+    // fell through to the INET reading and errored, and `range @>
+    // multirange` / `multirange <@ range` answered a silent FALSE.
+    // Promoting once here is the whole fix — the existing multirange arms
+    // then handle every combination.
+    //
+    // The list is deliberately NOT every operator: PG declares no mixed
+    // overload for the set algebra (`+` `-` `*`) or the comparisons, and
+    // a blanket promotion made `multirange + range` silently answer where
+    // PG raises `operator does not exist` (caught by probing the widened
+    // surface, not by the cases this round set out to fix).
+    let mixed_promotable = matches!(
+        op,
+        BinOp::JsonContains
+            | BinOp::JsonContainedBy
+            | BinOp::InetOverlap
+            | BinOp::InetContainedBy
+            | BinOp::InetContains
+            | BinOp::OverLeft
+            | BinOp::OverRight
+    );
+    let (l, r) = match (
+        mixed_promotable && matches!(l, Value::Multirange { .. }),
+        mixed_promotable && matches!(r, Value::Multirange { .. }),
+    ) {
+        (true, false) => match range_as_multirange(&r) {
+            Some(m) => (l, m),
+            None => (l, r),
+        },
+        (false, true) => match range_as_multirange(&l) {
+            Some(m) => (m, r),
+            None => (l, r),
+        },
+        _ => (l, r),
+    };
     // SQL three-valued logic for AND / OR with NULL is special — handle before
     // the general NULL-propagation rule.
     if let BinOp::And = op {
@@ -959,6 +997,26 @@ pub(crate) fn apply_binary(
                 None => Ok(Value::Null),
             }
         }
+        // v7.39 (round 256) — the POSITIONAL operators read a multirange
+        // as its outer hull (probed: `{[1,3),[9,11)} -|- {[3,5)}` is
+        // FALSE, so it is not an any-element rule). An empty multirange
+        // has no hull and answers false. Rewriting to the hull lets the
+        // existing range arms below do the work.
+        BinOp::InetContainedBy | BinOp::InetContains | BinOp::OverLeft | BinOp::OverRight
+            if matches!(l, Value::Multirange { .. })
+                && matches!(r, Value::Multirange { .. }) =>
+        {
+            let (Value::Multirange { kind, ranges: a }, Value::Multirange { ranges: b, .. }) =
+                (&l, &r)
+            else {
+                unreachable!()
+            };
+            if a.is_empty() || b.is_empty() {
+                return Ok(Value::Bool(false));
+            }
+            let (hl, hr) = (multirange_hull(*kind, a), multirange_hull(*kind, b));
+            apply_binary(op, hl, hr)
+        }
         // Multirange overlap: non-empty intersection.
         BinOp::InetOverlap
             if matches!(l, Value::Multirange { .. }) && matches!(r, Value::Multirange { .. }) =>
@@ -996,6 +1054,19 @@ pub(crate) fn apply_binary(
                     RangeParts::new(*ak, al, au, *ali, *aui, *ae),
                     RangeParts::new(*bk, bl, bu, *bli, *bui, *be),
                 ),
+                // v7.39 (round 256) — an ARRAY is not an element of any
+                // range type: PG reports `operator does not exist:
+                // int4range @> integer[]`, where SPG answered a silent
+                // false through the element path.
+                elem if super::values::array_len(elem).is_some() => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "operator does not exist: {} @> {}",
+                            super::strings::pg_typeof_name(&l),
+                            super::strings::pg_typeof_name(elem)
+                        ),
+                    });
+                }
                 elem => range_contains_elem(*ak, al, au, *ali, *aui, *ae, elem),
             }))
         }
@@ -3687,6 +3758,69 @@ pub(crate) fn multirange_contains(
 
 /// Multirange set algebra: union / difference / intersection, all
 /// returning canonical span lists.
+/// v7.39 (round 256) — a multirange's outer hull as a plain range (the
+/// same value `range_merge(multirange)` returns). PG's POSITIONAL
+/// operators (`<<` `>>` `&<` `&>` `-|-`) treat a multirange as its hull:
+/// probed live, `{[1,3),[9,11)} -|- {[3,5)}` is FALSE even though the
+/// first element is adjacent to the operand — the hull `[1,11)`
+/// overlaps it. An empty multirange has no hull, so those operators
+/// answer false for it.
+pub(crate) fn multirange_hull(
+    kind: spg_storage::RangeKind,
+    ranges: &[spg_storage::RangeSpan],
+) -> Value<'static> {
+    if ranges.is_empty() {
+        return Value::Range {
+            kind,
+            lower: None,
+            upper: None,
+            lower_inc: false,
+            upper_inc: false,
+            empty: true,
+        };
+    }
+    let first = &ranges[0];
+    let last = &ranges[ranges.len() - 1];
+    Value::Range {
+        kind,
+        lower: first.lower.clone(),
+        upper: last.upper.clone(),
+        lower_inc: first.lower_inc,
+        upper_inc: last.upper_inc,
+        empty: false,
+    }
+}
+
+/// v7.39 (round 256) — promote a plain range to the one-element
+/// multirange PG treats it as when the other operand is a multirange
+/// (`range && multirange`, `range @> multirange`, `multirange <@ range`
+/// …). Returns `None` for anything else so the caller leaves it alone.
+pub(crate) fn range_as_multirange(v: &Value<'_>) -> Option<Value<'static>> {
+    let Value::Range {
+        kind,
+        lower,
+        upper,
+        lower_inc,
+        upper_inc,
+        empty,
+    } = v
+    else {
+        return None;
+    };
+    let ranges = if *empty {
+        alloc::vec::Vec::new()
+    } else {
+        alloc::vec![spg_storage::RangeSpan {
+            lower: lower.clone(),
+            upper: upper.clone(),
+            lower_inc: *lower_inc,
+            upper_inc: *upper_inc,
+            empty: false,
+        }]
+    };
+    Some(Value::Multirange { kind: *kind, ranges })
+}
+
 pub(crate) fn multirange_union(
     kind: spg_storage::RangeKind,
     a: &[spg_storage::RangeSpan],
@@ -4760,6 +4894,27 @@ fn geo_contains_point(container: &Value<'_>, p: &Value<'_>) -> Option<bool> {
 /// lower bound value, and exactly one of the two touching bounds is inclusive.
 pub(crate) fn range_adjacent_pair(a: &Value<'_>, b: &Value<'_>) -> Option<bool> {
     use core::cmp::Ordering;
+    // v7.39 (round 256) — `-|-` reads a multirange as its outer hull
+    // (probed: `{[1,3),[9,11)} -|- {[3,5)}` is FALSE, so it is not an
+    // any-element rule), and an empty multirange is never adjacent.
+    if matches!(a, Value::Multirange { .. }) || matches!(b, Value::Multirange { .. }) {
+        let hull = |v: &Value<'_>| -> Option<Value<'static>> {
+            match v {
+                Value::Multirange { kind, ranges } => {
+                    if ranges.is_empty() {
+                        return None;
+                    }
+                    Some(multirange_hull(*kind, ranges))
+                }
+                Value::Range { .. } => Some(v.clone().into_owned()),
+                _ => None,
+            }
+        };
+        let (Some(ha), Some(hb)) = (hull(a), hull(b)) else {
+            return Some(false);
+        };
+        return range_adjacent_pair(&ha, &hb);
+    }
     let (ak, al, au, ali, aui, ae) = match a {
         Value::Range {
             kind,

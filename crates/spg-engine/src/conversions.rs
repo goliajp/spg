@@ -883,6 +883,25 @@ pub(crate) fn canonicalize_range_bounds(
 pub(crate) enum RangeParseError {
     Malformed,
     Misordered,
+    /// v7.39 (round 256) — the bracket/comma STRUCTURE parsed, but a
+    /// bound is not a value of the element type. PG reports the
+    /// element's own input error here (`invalid input syntax for type
+    /// integer: "a"`), reserving "malformed range literal" for a
+    /// structural problem — probed live on both shapes.
+    BadElement(alloc::string::String),
+}
+
+/// v7.39 (round 256) — the PG name of a range type's ELEMENT type, used
+/// when a bound fails to parse (`invalid input syntax for type integer`).
+fn range_element_type_name(kind: spg_storage::RangeKind) -> &'static str {
+    match kind {
+        spg_storage::RangeKind::Int4 => "integer",
+        spg_storage::RangeKind::Int8 => "bigint",
+        spg_storage::RangeKind::Num => "numeric",
+        spg_storage::RangeKind::Ts => "timestamp",
+        spg_storage::RangeKind::TsTz => "timestamp with time zone",
+        spg_storage::RangeKind::Date => "date",
+    }
 }
 
 /// True when both bounds are present and lower sorts after upper —
@@ -931,12 +950,18 @@ pub(crate) fn parse_range_str(
     let lower = if lo_text.is_empty() {
         None
     } else {
-        Some(parse_range_element(lo_text, kind).ok_or(RangeParseError::Malformed)?)
+        Some(
+            parse_range_element(lo_text, kind)
+                .ok_or_else(|| RangeParseError::BadElement(lo_text.trim().into()))?,
+        )
     };
     let upper = if up_text.is_empty() {
         None
     } else {
-        Some(parse_range_element(up_text, kind).ok_or(RangeParseError::Malformed)?)
+        Some(
+            parse_range_element(up_text, kind)
+                .ok_or_else(|| RangeParseError::BadElement(up_text.trim().into()))?,
+        )
     };
     // v7.39 (read01 rangetypes.c) — PG rejects misordered bounds before
     // canonicalization ('[3,1]'::int4range).
@@ -3781,6 +3806,14 @@ pub(crate) fn coerce_value(
                     detail: alloc::format!("malformed range literal: \"{s}\""),
                 }));
             }
+            Err(RangeParseError::BadElement(bad)) => {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "invalid input syntax for type {}: \"{bad}\"",
+                        range_element_type_name(kind)
+                    ),
+                }));
+            }
         },
         // Range → Text canonical form (`[a,b)`, `'empty'`, etc).
         (v @ Value::Range { .. }, DataType::Text) => Some(Value::text(format_range_str(&v))),
@@ -4053,6 +4086,21 @@ pub(crate) fn coerce_value(
         // v7.37.5 δ — Text → Multirange. Accepts `{}` empty and
         // `{[a,b),[c,d),...}` comma-separated ranges; each
         // subrange parses with the parent kind.
+        // v7.39 (round 256) — `range::<type>multirange`: PG casts a range
+        // to the one-element multirange containing it (an empty range
+        // gives the empty multirange).
+        (ref rv @ Value::Range { kind: rk, .. }, DataType::Multirange(kind)) => {
+            if rk != kind {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "cannot cast type {} to {}",
+                        DataType::Range(rk),
+                        DataType::Multirange(kind)
+                    ),
+                }));
+            }
+            crate::eval::binop::range_as_multirange(rv)
+        }
         (Value::Text(s), DataType::Multirange(kind)) => match parse_multirange_str(&s, kind) {
             // v7.39 (round 231) — a multirange is normalized whatever built
             // it. The constructor function already sorted / merged / dropped

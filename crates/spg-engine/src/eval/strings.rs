@@ -766,6 +766,15 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
         Value::Polygon(_) => "polygon",
         Value::Line { .. } => "line",
         Value::Circle { .. } => "circle",
+        // v7.39 (round 256) — the multirange types reported "unknown".
+        Value::Multirange { kind, .. } => match kind {
+            spg_storage::RangeKind::Int4 => "int4multirange",
+            spg_storage::RangeKind::Int8 => "int8multirange",
+            spg_storage::RangeKind::Num => "nummultirange",
+            spg_storage::RangeKind::Ts => "tsmultirange",
+            spg_storage::RangeKind::TsTz => "tstzmultirange",
+            spg_storage::RangeKind::Date => "datemultirange",
+        },
         Value::Range { kind, .. } => match kind {
             spg_storage::RangeKind::Int4 => "int4range",
             spg_storage::RangeKind::Int8 => "int8range",
