@@ -3945,6 +3945,19 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         if msg.contains("query must have the same number of columns") {
             return ("42601", msg);
         }
+        // v7.39 (round 239) — the row-count clause errors come from the
+        // parser, so they must be classified ahead of the Parse
+        // short-circuit below: a negative LIMIT is PG's 2201W, a negative
+        // OFFSET 2201X, and a literal that won't coerce to bigint 22P02.
+        if msg.contains("LIMIT must not be negative") {
+            return ("2201W", msg);
+        }
+        if msg.contains("OFFSET must not be negative") {
+            return ("2201X", msg);
+        }
+        if msg.contains("invalid input syntax for type bigint") {
+            return ("22P02", msg);
+        }
         // v7.39 (round 233) — two set-operation branch columns with no
         // common type are PG's 42804 DATATYPE_MISMATCH.
         if msg.contains(" types ") && msg.contains(" cannot be matched") {

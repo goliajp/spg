@@ -4044,10 +4044,13 @@ impl Engine {
                 c
             })
             .collect();
-        Ok(QueryResult::Rows {
-            columns,
-            rows: alloc::vec![Row::new(values)],
-        })
+        // v7.39 (round 239) — the FROM-less scalar path ignored LIMIT and
+        // OFFSET entirely, so `SELECT 1 LIMIT 0` returned its row where PG
+        // returns none. (The SRF and aggregate arms above already applied
+        // them; this tail was the one that didn't.)
+        let mut rows = alloc::vec![Row::new(values)];
+        apply_offset_and_limit(&mut rows, stmt.offset_literal(), stmt.limit_literal());
+        Ok(QueryResult::Rows { columns, rows })
     }
 
     /// v7.37.x (docker-fair INSUBQ attack) — pre-replacement short-
