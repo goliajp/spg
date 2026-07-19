@@ -2762,6 +2762,23 @@ fn delete_key_inner(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalErro
                 .collect();
             JsonValue::Array(filtered)
         }
+        // v7.39 (round 234) — this used to be a silent catch-all
+        // (`(other, _) => other`), so every unsupported combination handed
+        // the document back untouched. PG names each one (probed 18.4):
+        // deleting from a scalar has nowhere to delete from, and an
+        // integer index is meaningless on an object.
+        (JsonValue::Object(_), Value::Int(_) | Value::SmallInt(_) | Value::BigInt(_)) => {
+            return Err(EvalError::TypeMismatch {
+                detail: "cannot delete from object using integer index".into(),
+            });
+        }
+        (other, _) if !matches!(other, JsonValue::Object(_) | JsonValue::Array(_)) => {
+            return Err(EvalError::TypeMismatch {
+                detail: "cannot delete from scalar".into(),
+            });
+        }
+        // An array minus a key, or any other container/operand pairing PG
+        // accepts as a no-op, keeps the document.
         (other, _) => other,
     };
     Ok(Value::json(out.to_json_text()))
@@ -2869,6 +2886,18 @@ pub fn set(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let new_val = parse(new_text).map_err(|e| EvalError::TypeMismatch {
         detail: alloc::format!("jsonb_set(): invalid JSON new_value — {e}"),
     })?;
+    // v7.39 (round 234) — PG's edge rules for the modification family,
+    // probed against 18.4. An EMPTY path is a no-op (SPG replaced the whole
+    // document with the new value — silently wrong), and a SCALAR target
+    // has nowhere to put a path (SPG returned the scalar unchanged).
+    if path.is_empty() {
+        return Ok(Value::json(root.to_json_text()));
+    }
+    if is_json_scalar(&root) {
+        return Err(EvalError::TypeMismatch {
+            detail: "cannot set path in scalar".into(),
+        });
+    }
     set_at_path(&mut root, &path, new_val, create_missing);
     Ok(Value::json(root.to_json_text()))
 }
@@ -2894,6 +2923,13 @@ fn delete_path_inner(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let mut root = parse(doc_text).map_err(|e| EvalError::TypeMismatch {
         detail: alloc::format!("jsonb_delete_path(): invalid JSON target — {e}"),
     })?;
+    // v7.39 (round 234) — `#-` on a scalar is an error in PG; SPG handed
+    // the scalar back unchanged.
+    if is_json_scalar(&root) && !path.is_empty() {
+        return Err(EvalError::TypeMismatch {
+            detail: "cannot delete path in scalar".into(),
+        });
+    }
     delete_at_path(&mut root, &path);
     Ok(Value::json(root.to_json_text()))
 }
@@ -3035,14 +3071,20 @@ pub fn insert(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     let doc_text = json_text_arg(&args[0], "jsonb_insert", "target")?;
     let path = path_text_arg(&args[1], "jsonb_insert")?;
     let new_text = json_text_arg(&args[2], "jsonb_insert", "new_value")?;
-    if path.is_empty() {
-        return Err(EvalError::TypeMismatch {
-            detail: "jsonb_insert(): path cannot be empty".into(),
-        });
-    }
     let mut root = parse(doc_text).map_err(|e| EvalError::TypeMismatch {
         detail: alloc::format!("jsonb_insert(): invalid JSON target — {e}"),
     })?;
+    // v7.39 (round 234) — PG returns the document untouched for an empty
+    // path (SPG raised its own error) and refuses a scalar target with the
+    // same wording jsonb_set uses.
+    if path.is_empty() {
+        return Ok(Value::json(root.to_json_text()));
+    }
+    if is_json_scalar(&root) {
+        return Err(EvalError::TypeMismatch {
+            detail: "cannot set path in scalar".into(),
+        });
+    }
     let new_val = parse(new_text).map_err(|e| EvalError::TypeMismatch {
         detail: alloc::format!("jsonb_insert(): invalid JSON new_value — {e}"),
     })?;
@@ -4363,4 +4405,11 @@ pub fn mysql_json_value(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
         Some(JsonValue::Null) => Ok(Value::Null),
         Some(v) => Ok(Value::text(v.as_text())),
     }
+}
+
+/// v7.39 (round 234) — a JSON scalar (string / number / boolean / null),
+/// i.e. anything that isn't a container. PG refuses every path-based
+/// modification against one: there is nowhere for a path to point.
+fn is_json_scalar(v: &JsonValue) -> bool {
+    !matches!(v, JsonValue::Object(_) | JsonValue::Array(_))
 }
