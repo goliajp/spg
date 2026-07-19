@@ -4038,7 +4038,10 @@ impl Engine {
                     .create_enum_type(def)
                     .map_err(EngineError::Storage)?;
             }
-            spg_sql::ast::TypeKind::Composite { fields } => {
+            spg_sql::ast::TypeKind::Composite {
+                fields,
+                field_user_types,
+            } => {
                 if fields.is_empty() {
                     return Err(EngineError::Unsupported(
                         "CREATE TYPE … AS (…) must declare at least one field".into(),
@@ -4061,9 +4064,18 @@ impl Engine {
                     .into_iter()
                     .map(|(fname, fty)| (fname, column_type_to_data_type(fty)))
                     .collect::<alloc::vec::Vec<_>>();
+                // v7.39 (round 264) — a field naming another COMPOSITE keeps
+                // that name; the engine resolves the inner record through it.
+                let cat = self.active_catalog();
+                let field_user_types: alloc::vec::Vec<Option<alloc::string::String>> =
+                    field_user_types
+                        .into_iter()
+                        .map(|n| n.filter(|n| cat.composite_types().contains_key(n)))
+                        .collect();
                 let def = spg_storage::CompositeDef {
                     name: s.name.clone(),
                     fields: resolved_fields,
+                    field_user_types,
                 };
                 self.active_catalog_mut()
                     .create_composite_type(def)

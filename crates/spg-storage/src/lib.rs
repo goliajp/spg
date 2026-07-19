@@ -4031,6 +4031,16 @@ pub struct CompositeDef {
     /// literals are positional, so order is part of the type's
     /// identity.
     pub fields: Vec<(String, DataType)>,
+    /// v7.39 (round 264) — parallel to `fields`: the USER type name of
+    /// each field when it is itself a composite (or another named user
+    /// type). `DataType` has no room for one, so a nested composite
+    /// field resolved to the parser's Text placeholder and the inner
+    /// record stayed TEXT — `(x).inner.street` errored, `pg_typeof`
+    /// said text, and `row_to_json` nested a string instead of an
+    /// object. Same shape as `ColumnSchema.user_composite_type` and
+    /// `DomainDef.base_domain`. Catalog FILE_VERSION 76+; an older
+    /// catalog reads all-None, which is what it meant.
+    pub field_user_types: Vec<Option<String>>,
 }
 
 /// v7.17.0 Phase 1.2 — catalogued VIEW. The body is stored as the
@@ -6958,7 +6968,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 75;
+const FILE_VERSION: u8 = 76;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7928,9 +7938,17 @@ impl Catalog {
                 &mut out,
                 u16::try_from(c.fields.len()).expect("≤ 65k fields / composite"),
             );
-            for (fname, fty) in &c.fields {
+            for (i, (fname, fty)) in c.fields.iter().enumerate() {
                 write_str(&mut out, fname);
                 write_data_type(&mut out, *fty);
+                // v7.39 (round 264) — the field's user type (v76+).
+                match c.field_user_types.get(i).and_then(Option::as_ref) {
+                    None => out.push(0),
+                    Some(n) => {
+                        out.push(1);
+                        write_str(&mut out, n);
+                    }
+                }
             }
         }
         // v7.39 (read01 round 50) — COMMENT store (FILE_VERSION 61+).
@@ -8333,13 +8351,36 @@ impl Catalog {
                 let name = cur.read_str()?;
                 let field_count = cur.read_u16()? as usize;
                 let mut fields = Vec::with_capacity(field_count);
+                let mut field_user_types: Vec<Option<String>> =
+                    Vec::with_capacity(field_count);
                 for _ in 0..field_count {
                     let fname = cur.read_str()?;
                     let fty = cur.read_data_type()?;
+                    // v7.39 (round 264) — present from FILE_VERSION 76.
+                    let ut = if version >= 76 {
+                        match cur.read_u8()? {
+                            0 => None,
+                            1 => Some(cur.read_str()?),
+                            other => {
+                                return Err(StorageError::Corrupt(alloc::format!(
+                                    "composite field user-type tag {other}"
+                                )));
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     fields.push((fname, fty));
+                    field_user_types.push(ut);
                 }
-                cat.composite_types
-                    .insert(name.clone(), CompositeDef { name, fields });
+                cat.composite_types.insert(
+                    name.clone(),
+                    CompositeDef {
+                        name,
+                        fields,
+                        field_user_types,
+                    },
+                );
             }
         }
         // v7.39 (read01 round 50) — COMMENT store (FILE_VERSION 61+).

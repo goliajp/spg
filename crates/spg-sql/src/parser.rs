@@ -3947,10 +3947,16 @@ impl Parser {
         if matches!(self.peek(), Token::LParen) {
             self.advance();
             let mut fields: Vec<(String, ColumnTypeName)> = Vec::new();
+            let mut field_user_types: Vec<Option<String>> = Vec::new();
             loop {
                 let field_name = self.expect_ident_like()?;
-                let field_type = self.parse_column_type_name()?;
+                // v7.39 (round 264) — keep the raw type name when it is not
+                // a builtin: that is how a NESTED composite field records
+                // which composite it holds.
+                let (field_type, _, _, field_user_ref, _, _, _, _) =
+                    self.parse_type_with_implied_flags()?;
                 fields.push((field_name, field_type));
+                field_user_types.push(field_user_ref);
                 if matches!(self.peek(), Token::Comma) {
                     self.advance();
                     continue;
@@ -3969,7 +3975,10 @@ impl Parser {
             }
             return Ok(Statement::CreateType(crate::ast::CreateTypeStatement {
                 name,
-                kind: crate::ast::TypeKind::Composite { fields },
+                kind: crate::ast::TypeKind::Composite {
+                    fields,
+                    field_user_types,
+                },
             }));
         }
         // Required `ENUM` ident.

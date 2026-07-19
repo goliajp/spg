@@ -681,6 +681,12 @@ pub enum TypeKind {
     /// composite literals are positional.
     Composite {
         fields: Vec<(String, ColumnTypeName)>,
+        /// v7.39 (round 264) — parallel to `fields`: the raw type NAME
+        /// when a field's type is not a builtin (i.e. another composite).
+        /// The parser already captures it; without carrying it here a
+        /// nested composite field resolved to the Text placeholder and
+        /// the inner record never became a record.
+        field_user_types: Vec<Option<String>>,
     },
 }
 
@@ -4747,7 +4753,7 @@ impl fmt::Display for CreateTypeStatement {
                 }
                 f.write_str(")")
             }
-            TypeKind::Composite { fields } => {
+            TypeKind::Composite { fields, .. } => {
                 f.write_str("(")?;
                 for (i, (n, t)) in fields.iter().enumerate() {
                     if i > 0 {

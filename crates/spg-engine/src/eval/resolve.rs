@@ -399,11 +399,20 @@ pub(crate) fn json_to_composite(
     };
     let mut fields: alloc::vec::Vec<(alloc::string::String, Value<'static>)> =
         alloc::vec::Vec::with_capacity(def.fields.len());
-    for (fname, fty) in &def.fields {
-        let cell = entries
-            .iter()
-            .find(|(k, _)| k == fname)
-            .map_or(Value::Null, |(_, jv)| json_cell_to_value(jv, *fty));
+    for (i, (fname, fty)) in def.fields.iter().enumerate() {
+        let found = entries.iter().find(|(k, _)| k == fname);
+        // v7.39 (round 264) — a field that is ITSELF a composite rebuilds
+        // recursively; otherwise the inner object stayed raw JSON and
+        // `(v).inner.street` errored while `row_to_json` nested a string.
+        let cell = match (found, def.field_user_types.get(i).and_then(Option::as_deref)) {
+            (None, _) => Value::Null,
+            (Some((_, jv)), Some(tn)) => {
+                let inner_text = jv.to_json_text();
+                json_to_composite(&Value::Json(alloc::borrow::Cow::Owned(inner_text)), tn, ctx)
+                    .unwrap_or(Value::Null)
+            }
+            (Some((_, jv)), None) => json_cell_to_value(jv, *fty),
+        };
         fields.push((fname.clone(), cell));
     }
     Some(Value::Composite(fields))
