@@ -32,14 +32,23 @@ SELECT EXTRACT(SECOND FROM t) FROM events WHERE id = 1
 ----
 45.123456
 
-# EXTRACT against a plain DATE — HMS components come back as 0.
+# EXTRACT against a plain DATE — the date fields resolve; the
+# time-of-day ones are REJECTED (PG 18.4: `unit "hour" not supported for
+# type date`). This block used to assert 0 for the HMS components, which
+# was SPG's own pre-round-253 behaviour, not PG's.
 query I nosort
 SELECT EXTRACT(YEAR FROM '2030-06-15'::DATE)
 ----
 2030
 
-query I nosort
+statement error
 SELECT EXTRACT(HOUR FROM '2030-06-15'::DATE)
+
+# date_part(), unlike EXTRACT, promotes a date to timestamp first, so the
+# same field answers 0 there (PG 18.4) — the two forms have DIFFERENT
+# field/type matrices.
+query R nosort
+SELECT date_part('hour', '2030-06-15'::DATE)
 ----
 0
 

@@ -501,7 +501,9 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
 /// The engine threads its session flag through here.
 pub fn parse_statement_with(input: &str, backslash_escapes: bool) -> Result<Statement, ParseError> {
     let tokens = lexer::tokenize_with(input, backslash_escapes)?;
-    let mut p = Parser::new(tokens);
+    // The same session flag names the dialect for both the lexer and
+    // the type mapping.
+    let mut p = Parser::new_with_dialect(tokens, backslash_escapes);
     let stmt = p.parse_one_statement()?;
     if matches!(p.peek(), Token::Semicolon) {
         p.advance();
@@ -535,6 +537,13 @@ pub fn syntax_error_position(
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// v7.39 (round 274) — the session's dialect, carried by the same
+    /// signal that drives string-literal escaping: `SET sql_mode` (only
+    /// MySQL clients and mysqldump preambles emit it) turns it on,
+    /// `SET standard_conforming_strings` (every pg_dump preamble) turns
+    /// it off. Needed here because the two dialects disagree about what
+    /// `REAL` means — see the type mapping below.
+    mysql_dialect: bool,
     /// v7.30.2 (mailrs round-25 ask 2) — live nesting depth of the
     /// mutually recursive expr/select parsers. Bounded so a deeply
     /// nested input returns a parse error instead of overflowing
@@ -590,8 +599,13 @@ enum NamedTableConstraintKind {
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
+        Self::new_with_dialect(tokens, false)
+    }
+
+    fn new_with_dialect(tokens: Vec<Token>, mysql_dialect: bool) -> Self {
         Self {
             tokens,
+            mysql_dialect,
             pos: 0,
             nest_depth: 0,
             pending_sample_preds: Vec::new(),
@@ -13060,7 +13074,16 @@ impl Parser {
                     self.advance();
                 }
                 if ty_ident.eq_ignore_ascii_case("real") {
-                    ColumnTypeName::Real
+                    // v7.39 (round 274) — the two dialects genuinely
+                    // disagree: PG's REAL is 4-byte, MySQL's REAL is a
+                    // synonym for DOUBLE (8-byte). Round 269 made REAL
+                    // 32-bit globally and thereby narrowed the stored
+                    // precision of every MySQL REAL column.
+                    if self.mysql_dialect {
+                        ColumnTypeName::Float
+                    } else {
+                        ColumnTypeName::Real
+                    }
                 } else if ty_ident.eq_ignore_ascii_case("float")
                     && matches!(self.peek(), Token::LParen)
                 {
