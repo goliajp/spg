@@ -1098,6 +1098,14 @@ impl Engine {
                     self.exec_select_cancel(&s, cancel)
                 }
             }
+            // v7.39 (round 249) — the engine is no_std: the HOST reads the
+            // file and calls `copy_from_buffer`. Reaching this arm means a
+            // host that hasn't wired the file endpoint.
+            Statement::CopyFromFile { path, .. } => Err(EngineError::Unsupported(
+                alloc::format!(
+                    "COPY FROM file: the host must read {path:?} and call copy_from_buffer"
+                ),
+            )),
             Statement::CopyTo {
                 table,
                 columns,
@@ -1598,6 +1606,91 @@ impl Engine {
             }
         };
         Ok((escape, force))
+    }
+
+
+    /// v7.39 (round 249) — resolve the effective COPY FROM target column
+    /// list, running PG's pre-file checks in PG's order: the relation
+    /// must exist, an explicit column must exist on it, and no column
+    /// may appear twice — all before a single data row is looked at.
+    ///
+    /// # Errors
+    /// `relation "t" does not exist`, `column "x" of relation "t" does
+    /// not exist` (42703), `column "x" specified more than once` (42701).
+    pub fn copy_target_columns(
+        &self,
+        table: &str,
+        columns: Option<&[alloc::string::String]>,
+    ) -> Result<alloc::vec::Vec<alloc::string::String>, EngineError> {
+        let table_ref = self.active_catalog().get(table).ok_or_else(|| {
+            EngineError::Storage(spg_storage::StorageError::TableNotFound {
+                name: alloc::string::String::from(table),
+            })
+        })?;
+        let schema_cols = &table_ref.schema().columns;
+        match columns {
+            None => Ok(schema_cols.iter().map(|c| c.name.clone()).collect()),
+            Some(cols) => {
+                for (i, name) in cols.iter().enumerate() {
+                    if !schema_cols.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "column \"{name}\" of relation \"{table}\" does not exist"
+                        )));
+                    }
+                    if cols[..i].iter().any(|p| p.eq_ignore_ascii_case(name)) {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "column \"{name}\" specified more than once"
+                        )));
+                    }
+                }
+                Ok(cols.to_vec())
+            }
+        }
+    }
+
+    /// v7.39 (round 249) — execute a parsed `COPY … FROM '<file>'` whose
+    /// file contents the HOST has already read (the engine is no_std and
+    /// performs no I/O). Lowers to per-row INSERTs via
+    /// [`crate::copy::copy_buffer_inserts`]; outside an explicit
+    /// transaction the rows are wrapped in one, so a bad row aborts the
+    /// whole COPY exactly as in PG.
+    ///
+    /// # Errors
+    /// The failing row's INSERT error propagates (after rollback).
+    pub fn copy_from_buffer(
+        &mut self,
+        table: &str,
+        columns: Option<&[alloc::string::String]>,
+        options: &spg_sql::ast::CopyOptions,
+        data: &str,
+    ) -> Result<QueryResult, EngineError> {
+        let target = self.copy_target_columns(table, columns)?;
+        let inserts =
+            crate::copy::copy_buffer_inserts(table, columns, &target, options, data)?;
+        let wrap = !self.in_transaction();
+        if wrap {
+            self.execute("BEGIN")?;
+        }
+        let mut affected: usize = 0;
+        for insert in &inserts {
+            match self.execute(insert) {
+                Ok(QueryResult::CommandOk { affected: n, .. }) => affected += n,
+                Ok(_) => affected += 1,
+                Err(e) => {
+                    if wrap {
+                        let _ = self.execute("ROLLBACK");
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        if wrap {
+            self.execute("COMMIT")?;
+        }
+        Ok(QueryResult::CommandOk {
+            affected,
+            modified_catalog: false,
+        })
     }
 
     /// `COPY table [(cols)] TO STDOUT` — render the visible rows

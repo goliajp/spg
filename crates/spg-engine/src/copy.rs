@@ -114,6 +114,134 @@ pub fn parse_copy_from_stdin_head(sql: &str) -> Option<CopyFromSpec> {
     Some(CopyFromSpec { table, columns })
 }
 
+
+/// v7.39 (round 249) — a parsed `COPY <table> [(cols)] FROM '<path>'`.
+/// The engine is no_std: the HOST reads `path` and hands the bytes to
+/// [`copy_buffer_inserts`] / `Engine::copy_from_buffer`.
+#[derive(Debug)]
+pub struct CopyFromFileSpec {
+    pub table: String,
+    pub columns: Option<Vec<String>>,
+    pub path: String,
+    pub options: spg_sql::ast::CopyOptions,
+}
+
+/// Parse `sql` and return its parts when it is a `COPY … FROM '<file>'`
+/// statement — the host-side sniff for the file endpoint (any other
+/// statement, or a parse error, returns `None` and the caller executes
+/// normally).
+#[must_use]
+pub fn parse_copy_from_file(sql: &str) -> Option<CopyFromFileSpec> {
+    match spg_sql::parser::parse_statement(sql) {
+        Ok(spg_sql::ast::Statement::CopyFromFile {
+            table,
+            columns,
+            path,
+            options,
+        }) => Some(CopyFromFileSpec {
+            table,
+            columns,
+            path,
+            options,
+        }),
+        _ => None,
+    }
+}
+
+/// v7.39 (round 249) — decode a whole `COPY … FROM '<file>'` buffer
+/// (the HOST read the file; the engine is no_std and performs no I/O)
+/// into the per-row INSERT statements both hosts drive. Text and CSV
+/// formats honour DELIMITER / NULL / HEADER / QUOTE; the text-format
+/// `\.` terminator ends the data early, as in PG.
+///
+/// # Errors
+/// Non-UTF-8 CSV input is refused (the text path takes `&str` too, so
+/// it can't arise there).
+pub fn copy_buffer_inserts(
+    table: &str,
+    columns: Option<&[String]>,
+    target_cols: &[String],
+    options: &spg_sql::ast::CopyOptions,
+    data: &str,
+) -> Result<Vec<String>, crate::EngineError> {
+    // PG validates each row's field count against the target column
+    // list before any type conversion: too many fields is "extra data
+    // after last expected column", too few names the first column left
+    // unfilled (both 22P04).
+    let check_row = |values: &Vec<Option<String>>| -> Result<(), crate::EngineError> {
+        if values.len() > target_cols.len() {
+            return Err(crate::EngineError::Unsupported(String::from(
+                "extra data after last expected column",
+            )));
+        }
+        if values.len() < target_cols.len() {
+            return Err(crate::EngineError::Unsupported(format!(
+                "missing data for column \"{}\"",
+                target_cols[values.len()]
+            )));
+        }
+        Ok(())
+    };
+    use spg_sql::ast::CopyFormat;
+    let is_csv = options.format == CopyFormat::Csv;
+    let delimiter = options.delimiter.unwrap_or(if is_csv { ',' } else { '\t' });
+    let quote = options.quote.unwrap_or('"');
+    let null_str = options
+        .null_str
+        .clone()
+        .unwrap_or_else(|| String::from(if is_csv { "" } else { "\\N" }));
+    let mut inserts = Vec::new();
+    let mut first = true;
+    if is_csv {
+        let mut buf: Vec<u8> = data.as_bytes().to_vec();
+        if !buf.is_empty() && !buf.ends_with(b"\n") {
+            buf.push(b'\n');
+        }
+        let d8 = u8::try_from(delimiter as u32).unwrap_or(b',');
+        let q8 = u8::try_from(quote as u32).unwrap_or(b'"');
+        let mut start = 0;
+        while let Some(len) = csv_record_end(&buf[start..], d8, q8) {
+            let mut rec = &buf[start..start + len - 1];
+            start += len;
+            if rec.last() == Some(&b'\r') {
+                rec = &rec[..rec.len() - 1];
+            }
+            if rec.is_empty() {
+                continue;
+            }
+            if first && options.header {
+                first = false;
+                continue;
+            }
+            first = false;
+            let rec_str = core::str::from_utf8(rec).map_err(|_| {
+                crate::EngineError::Unsupported("COPY FROM: non-UTF-8 input".into())
+            })?;
+            let values = decode_copy_csv_record(rec_str, delimiter, quote, &null_str);
+            check_row(&values)?;
+            inserts.push(build_copy_insert(table, columns, &values));
+        }
+    } else {
+        for line in data.lines() {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.is_empty() {
+                continue;
+            }
+            if first && options.header {
+                first = false;
+                continue;
+            }
+            first = false;
+            if line == "\\." {
+                break;
+            }
+            let values = decode_copy_text_row(line);
+            check_row(&values)?;
+            inserts.push(build_copy_insert(table, columns, &values));
+        }
+    }
+    Ok(inserts)
+}
 /// Decode one COPY text-format data row: tab-separated cells,
 /// `\N` = NULL, C-style backslash escapes.
 #[must_use]

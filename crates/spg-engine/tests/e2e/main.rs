@@ -173,6 +173,7 @@ mod e2e_fts_prefix_stem_round245;
 mod e2e_datetime_templates_round246;
 mod e2e_copy_options_round247;
 mod e2e_infoschema_columns_round248;
+mod e2e_copy_from_file_round249;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;

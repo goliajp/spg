@@ -1706,6 +1706,24 @@ impl Parser {
                 } else {
                     None
                 };
+                // v7.39 (round 249) — `COPY t FROM '<path>'`: the file
+                // endpoint. (FROM STDIN still rides the wire/import path —
+                // its data arrives out of band.)
+                if matches!(self.peek(), Token::From)
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::String(_)))
+                {
+                    self.advance(); // FROM
+                    let Token::String(path) = self.advance() else {
+                        unreachable!()
+                    };
+                    let options = self.parse_copy_to_options()?;
+                    return Ok(Statement::CopyFromFile {
+                        table,
+                        columns,
+                        path,
+                        options,
+                    });
+                }
                 if !matches!(self.peek(), Token::To) {
                     return Err(self.err(format!(
                         "COPY: only TO STDOUT is supported here (FROM stdin \
