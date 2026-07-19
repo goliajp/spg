@@ -164,3 +164,64 @@ fn set_operation_errors_carry_pgs_classes() {
         "{msg}"
     );
 }
+
+/// v7.39 (round 235) — the JSON modification (round 234) and jsonpath
+/// strict-mode (round 235) refusals over the wire. PG gives each jsonpath
+/// failure its own SQL/JSON class rather than one shared code, which a
+/// client branching on the SQLSTATE would notice.
+#[test]
+fn json_refusals_carry_pgs_sqlstates() {
+    let (raw, mut s) = {
+        let (raw, addrs) = common::ServerBuilder::new()
+            .arg_path(&unique_db())
+            .with_pgwire()
+            .spawn();
+        let s = pg_connect(addrs.pgwire.as_ref().unwrap());
+        (raw, s)
+    };
+    let _guard = common::ChildGuard(raw);
+    for (sql, code, want) in [
+        // round 234 — the modification family, all 22023.
+        (
+            "SELECT '\"str\"'::jsonb - 'a'",
+            "22023",
+            "cannot delete from scalar",
+        ),
+        (
+            "SELECT '{\"a\":1}'::jsonb - 0",
+            "22023",
+            "cannot delete from object using integer index",
+        ),
+        (
+            "SELECT jsonb_set('\"str\"','{a}','9')",
+            "22023",
+            "cannot set path in scalar",
+        ),
+        // round 235 — jsonpath strict mode, three different classes.
+        (
+            "SELECT jsonb_path_query('{\"a\":1}','strict $.b')",
+            "2203A",
+            "JSON object does not contain key",
+        ),
+        (
+            "SELECT jsonb_path_query('1','strict $.a')",
+            "2203A",
+            "jsonpath member accessor can only be applied to an object",
+        ),
+        (
+            "SELECT jsonb_path_query('[1,2]','strict $[5]')",
+            "22033",
+            "jsonpath array subscript is out of bounds",
+        ),
+        (
+            "SELECT jsonb_path_query('1','strict $[*]')",
+            "22039",
+            "jsonpath wildcard array accessor can only be applied to an array",
+        ),
+    ] {
+        let (got_code, msg) =
+            exec_error(&mut s, sql).unwrap_or_else(|| panic!("no error for {sql}"));
+        assert_eq!(got_code, code, "{sql} → {msg}");
+        assert!(msg.contains(want), "{sql} → {msg}");
+    }
+}
