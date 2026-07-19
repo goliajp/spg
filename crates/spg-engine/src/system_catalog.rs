@@ -339,7 +339,15 @@ fn info_column_row(
             DataType::Numeric { precision: 0, .. } => (Value::Null, Value::Null),
             DataType::Numeric { precision, scale } => (
                 Value::Int(i32::from(precision)),
-                Value::Int(i32::from(scale)),
+                // v7.39 (round 273) — PG reports a NEGATIVE declared scale
+                // as 2048 + scale here (measured: -2 → 2046, -5 → 2043,
+                // -1000 → 1048). Its typmod is stored masked and
+                // information_schema reads the raw field.
+                Value::Int(if scale < 0 {
+                    2048 + i32::from(scale)
+                } else {
+                    i32::from(scale)
+                }),
             ),
             _ => (Value::Null, Value::Null),
         };

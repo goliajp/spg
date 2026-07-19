@@ -2199,7 +2199,10 @@ pub enum ColumnTypeName {
     /// Bare `NUMERIC` and `NUMERIC(p)` both surface with `scale=0`.
     /// v7.39 (round 271) — scale widened to u16 alongside the value's.
     /// v7.39 (round 272) — precision too: PG's runs to 1000.
-    Numeric(u16, u16),
+    /// v7.39 (round 273) — the DECLARED scale is signed (-1000..=1000);
+    /// a negative one rounds to tens / hundreds. A VALUE's display scale
+    /// stays unsigned.
+    Numeric(u16, i16),
     /// `DATE` — calendar day, no time-of-day component.
     Date,
     /// `TIMESTAMP` / `MySQL` `DATETIME` — instant with microsecond

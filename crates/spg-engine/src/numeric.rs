@@ -7,22 +7,67 @@ use spg_storage::Value;
 
 use crate::EngineError;
 
+/// v7.39 (round 273) — apply a NEGATIVE declared scale: round the value
+/// to the nearest multiple of `10^k` and return it at display scale 0,
+/// which is how PG stores `numeric(10,-2)`.
+///
+/// The rounding is done in ONE step against `10^(src_scale + k)`. Going
+/// via the integer first would round twice, and 1249.5 to hundreds would
+/// come out 1300 instead of 1200.
+fn apply_negative_scale(scaled: i128, src_scale: u16, k: u16) -> Option<i128> {
+    let denom = pow10_i128_checked(src_scale.checked_add(k)?)?;
+    let half = denom / 2;
+    let biased = if scaled >= 0 {
+        scaled.checked_add(half)?
+    } else {
+        scaled.checked_sub(half)?
+    };
+    (biased / denom).checked_mul(pow10_i128_checked(k)?)
+}
+
+/// The unsigned part of a declared scale, and whether it was negative.
+const fn split_declared_scale(scale: i16) -> (bool, u16) {
+    if scale < 0 {
+        (true, scale.unsigned_abs())
+    } else {
+        #[allow(clippy::cast_sign_loss)]
+        (false, scale as u16)
+    }
+}
+
 /// Promote an integer to a NUMERIC value at the requested scale.
 /// Rejects values that, after scaling, would overflow the column's
 /// precision budget.
 pub(crate) fn numeric_from_integer(
     n: i128,
     precision: u16,
-    scale: u16,
+    scale: i16,
     col_name: &str,
 ) -> Result<Value<'static>, EngineError> {
+    let (neg, k) = split_declared_scale(scale);
+    if neg {
+        let rounded = apply_negative_scale(n, 0, k).ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!(
+                "integer overflow scaling value for column `{col_name}` to scale {scale}"
+            ))
+        })?;
+        check_precision(rounded, precision, scale, col_name)?;
+        return Ok(Value::Numeric {
+            scaled: rounded,
+            scale: 0,
+            kind: spg_storage::NumericKind::Finite,
+        });
+    }
+    let scale = k;
     let factor = pow10_i128(scale);
     let scaled = n.checked_mul(factor).ok_or_else(|| {
         EngineError::Unsupported(alloc::format!(
             "integer overflow scaling value for column `{col_name}` to scale {scale}"
         ))
     })?;
-    check_precision(scaled, precision, scale, col_name)?;
+    #[allow(clippy::cast_possible_wrap)]
+    let signed_scale = scale as i16;
+    check_precision(scaled, precision, signed_scale, col_name)?;
     Ok(Value::Numeric {
         scaled,
         scale,
@@ -36,9 +81,35 @@ pub(crate) fn numeric_from_integer(
 pub(crate) fn numeric_from_float(
     x: f64,
     precision: u16,
-    scale: u16,
+    scale: i16,
     col_name: &str,
 ) -> Result<Value<'static>, EngineError> {
+    let (neg_scale, k) = split_declared_scale(scale);
+    if neg_scale {
+        if !x.is_finite() {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "cannot store non-finite float in NUMERIC column `{col_name}`"
+            )));
+        }
+        let mut f = 1.0_f64;
+        for _ in 0..k {
+            f *= 10.0;
+        }
+        let q = (x / f).round();
+        #[allow(clippy::cast_possible_truncation)]
+        let rounded = (q as i128).checked_mul(pow10_i128(k)).ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!(
+                "value overflows NUMERIC column `{col_name}`"
+            ))
+        })?;
+        check_precision(rounded, precision, scale, col_name)?;
+        return Ok(Value::Numeric {
+            scaled: rounded,
+            scale: 0,
+            kind: spg_storage::NumericKind::Finite,
+        });
+    }
+    let scale = k;
     if !x.is_finite() {
         return Err(EngineError::Unsupported(alloc::format!(
             "cannot store non-finite float in NUMERIC column `{col_name}`"
@@ -66,7 +137,9 @@ pub(crate) fn numeric_from_float(
         )));
     }
     let scaled = biased as i128;
-    check_precision(scaled, precision, scale, col_name)?;
+    #[allow(clippy::cast_possible_wrap)]
+    let signed_scale = scale as i16;
+    check_precision(scaled, precision, signed_scale, col_name)?;
     Ok(Value::Numeric {
         scaled,
         scale,
@@ -298,9 +371,24 @@ pub(crate) fn numeric_rescale(
     scaled: i128,
     src_scale: u16,
     precision: u16,
-    dst_scale: u16,
+    dst_scale: i16,
     col_name: &str,
 ) -> Result<Value<'static>, EngineError> {
+    let (neg_scale, k) = split_declared_scale(dst_scale);
+    if neg_scale {
+        let rounded = apply_negative_scale(scaled, src_scale, k).ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!(
+                "overflow rescaling NUMERIC for column `{col_name}`"
+            ))
+        })?;
+        check_precision(rounded, precision, dst_scale, col_name)?;
+        return Ok(Value::Numeric {
+            scaled: rounded,
+            scale: 0,
+            kind: spg_storage::NumericKind::Finite,
+        });
+    }
+    let dst_scale = k;
     // v7.39 (round 272) — a declared scale of 999 is legal in PG, and no
     // i128 mantissa can carry it. Rather than report an overflow for a
     // typmod PG accepts, hand the whole rescale to the
@@ -329,7 +417,9 @@ pub(crate) fn numeric_rescale(
             (scaled - half) / drop
         }
     };
-    check_precision(new_scaled, precision, dst_scale, col_name)?;
+    #[allow(clippy::cast_possible_wrap)]
+    let signed_dst = dst_scale as i16;
+    check_precision(new_scaled, precision, signed_dst, col_name)?;
     Ok(Value::Numeric {
         scaled: new_scaled,
         scale: dst_scale,
@@ -378,7 +468,7 @@ pub(crate) const fn numeric_round_to_integer(scaled: i128, scale: u16) -> i128 {
 pub(crate) fn check_precision_text(
     v: &Value<'static>,
     precision: u16,
-    scale: u16,
+    scale: i16,
     _col_name: &str,
 ) -> Result<(), EngineError> {
     if precision == 0 {
@@ -391,25 +481,27 @@ pub(crate) fn check_precision_text(
     };
     let body = text.trim_start_matches('-');
     let int_part = body.split('.').next().unwrap_or(body).trim_start_matches('0');
-    let allowed = usize::from(precision.saturating_sub(scale));
+    // PG's limit is 10^(precision - scale); a NEGATIVE scale therefore
+    // ALLOWS more integer digits, not fewer.
+    let allowed = usize::try_from(i32::from(precision) - i32::from(scale)).unwrap_or(0);
     if int_part.len() > allowed {
         return Err(numeric_field_overflow(precision, scale));
     }
     Ok(())
 }
 
-fn numeric_field_overflow(precision: u16, scale: u16) -> EngineError {
+fn numeric_field_overflow(precision: u16, scale: i16) -> EngineError {
     EngineError::Unsupported(alloc::format!(
         "numeric field overflow DETAIL: A field with precision {precision}, scale {scale} \
          must round to an absolute value less than 10^{}.",
-        precision.saturating_sub(scale)
+        i32::from(precision) - i32::from(scale)
     ))
 }
 
 fn check_precision(
     scaled: i128,
     precision: u16,
-    scale: u16,
+    scale: i16,
     col_name: &str,
 ) -> Result<(), EngineError> {
     if precision == 0 {
@@ -417,11 +509,11 @@ fn check_precision(
     }
     // A precision past i128's width cannot be expressed as a limit here;
     // fall back to counting digits.
-    if precision > 38 {
+    if precision > 38 || scale < 0 {
         return check_precision_text(
             &Value::Numeric {
                 scaled,
-                scale,
+                scale: 0,
                 kind: spg_storage::NumericKind::Finite,
             },
             precision,
@@ -429,6 +521,7 @@ fn check_precision(
             col_name,
         );
     }
+    #[allow(clippy::cast_sign_loss)]
     let limit = pow10_i128(precision);
     if scaled.unsigned_abs() >= limit.unsigned_abs() {
         return Err(numeric_field_overflow(precision, scale));

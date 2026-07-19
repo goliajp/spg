@@ -135,7 +135,10 @@ pub enum DataType {
         /// parser rejected anything past 38 (i128's width) outright.
         precision: u16,
         /// v7.39 (round 271) — widened alongside the value's scale.
-        scale: u16,
+        /// v7.39 (round 273) — and signed: PG's DECLARED scale runs
+        /// -1000..=1000, where a negative one rounds to tens / hundreds.
+        /// A VALUE's display scale is always non-negative.
+        scale: i16,
     },
     /// `DATE` — calendar date with day precision, stored as `i32` days
     /// since the Unix epoch (1970-01-01).
@@ -936,13 +939,16 @@ impl<'arena> Value<'arena> {
             // schema does); we surface precision=0 as "unknown" and let
             // the engine reconcile against the column type at coercion
             // time.
+            // v7.39 (round 273) — a VALUE's display scale is unsigned and
+            // never exceeds PG's 16383 ceiling, so it always fits the
+            // signed declared-scale field this describes itself with.
             Self::Numeric { scale, .. } => Some(DataType::Numeric {
                 precision: 0,
-                scale: *scale,
+                scale: i16::try_from(*scale).unwrap_or(i16::MAX),
             }),
             Self::NumericBig(b) => Some(DataType::Numeric {
                 precision: 0,
-                scale: b.scale(),
+                scale: i16::try_from(b.scale()).unwrap_or(i16::MAX),
             }),
             Self::Date(_) => Some(DataType::Date),
             Self::Timestamp(_) => Some(DataType::Timestamp),
