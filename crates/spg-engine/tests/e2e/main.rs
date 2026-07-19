@@ -157,6 +157,7 @@ mod e2e_window_named_errors_round229;
 mod e2e_window_generic_agg_round230;
 mod e2e_agg_normalize_round231;
 mod e2e_orderby_legality_round232;
+mod e2e_setop_types_round233;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;
