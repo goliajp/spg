@@ -557,6 +557,14 @@ fn handle_pg_simple_query(
             CopyIntent::ToFile(spec) => {
                 handle_copy_to_file(stream, state, role, &spec)?;
             }
+            CopyIntent::BadOption(name) => {
+                send_error(
+                    stream,
+                    "42601",
+                    &format!("option \"{name}\" not recognized"),
+                )?;
+                send_ready_for_query(stream, *tx_state)?;
+            }
             CopyIntent::To(table, opts) => {
                 let sql = format!("SELECT * FROM {table}");
                 handle_copy_to_stdout(stream, state, role, &sql, &opts, tx_state)?;
@@ -4532,6 +4540,11 @@ enum CopyIntent {
     // the engine and writes the file (PG semantics, pg_write_server_files
     // analog: admin only).
     ToFile(spg_engine::copy::CopyToFileSpec),
+    /// v7.39 (round 265) — an unrecognized option name. Carried as an
+    /// intent so the COPY dispatch can raise PG's `option "x" not
+    /// recognized` instead of the previous silent accept, which made the
+    /// statement report success while the option did nothing.
+    BadOption(String),
 }
 
 /// v6.4.7 — `COPY FROM STDIN WITH (...)` option parser. PG-style
@@ -4693,12 +4706,16 @@ fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
             // SQL: option VALUES like `NULL 'NULLTOKEN'` / DELIMITER '|' are
             // case-sensitive (the null token must match the data byte-for-byte),
             // so only KEYS get lowercased inside the parser.
-            let opts = parse_copy_options(trimmed);
-            Some(CopyIntent::From(table, column_list, opts))
+            match parse_copy_options_checked(trimmed) {
+                Ok(opts) => Some(CopyIntent::From(table, column_list, opts)),
+                Err(bad) => Some(CopyIntent::BadOption(bad)),
+            }
         }
         ("to", "stdout") => {
-            let opts = parse_copy_options(trimmed);
-            Some(CopyIntent::To(table, opts))
+            match parse_copy_options_checked(trimmed) {
+                Ok(opts) => Some(CopyIntent::To(table, opts)),
+                Err(bad) => Some(CopyIntent::BadOption(bad)),
+            }
         }
         _ => None,
     }
@@ -4772,18 +4789,33 @@ fn skip_ws_bytes(bytes: &[u8], mut i: usize) -> usize {
 }
 
 /// Find a `WITH (...)` chunk in the SQL and decode the options.
+/// v7.39 (round 265) — returns the parsed options, or the name of the
+/// first UNRECOGNIZED one. The catch-all used to swallow anything it did
+/// not know, so `COPY … WITH (NOSUCHOPT true)` reported success and the
+/// option simply did nothing — the same silent-accept shape round 260
+/// closed for ALTER DOMAIN. PG raises `option "x" not recognized`.
 fn parse_copy_options(sql: &str) -> CopyOptions {
+    parse_copy_options_checked(sql).unwrap_or_else(|_| CopyOptions::default())
+}
+
+fn parse_copy_options_checked(sql: &str) -> Result<CopyOptions, String> {
     let mut opts = CopyOptions::default();
     // Find the WITH (...) group. A `NULL '('`-style token could contain a paren,
     // but PG's option grammar keeps these simple; the outer WITH ( … ) is what
     // we split. Find the LAST '(' after "with" to skip a table column list.
-    let with_pos = sql.to_ascii_lowercase().rfind("with");
-    let search_from = with_pos.unwrap_or(0);
+    // v7.39 (round 265) — NO `WITH` means no options at all. This used to
+    // fall back to position 0 and pick up the TABLE's column list
+    // (`COPY t (a,b) FROM STDIN`) as if it were an option group; the old
+    // catch-all silently ignored the resulting garbage, so it went
+    // unnoticed until unknown options started being rejected.
+    let Some(search_from) = sql.to_ascii_lowercase().rfind("with") else {
+        return Ok(opts);
+    };
     let Some(open) = sql[search_from..].find('(').map(|p| search_from + p) else {
-        return opts;
+        return Ok(opts);
     };
     let Some(close) = sql[open..].rfind(')').map(|p| open + p) else {
-        return opts;
+        return Ok(opts);
     };
     let inner = &sql[open + 1..close];
     for pair in inner.split(',') {
@@ -4833,10 +4865,12 @@ fn parse_copy_options(sql: &str) -> CopyOptions {
                     opts.null_string = Some(t.to_string());
                 }
             }
-            _ => {}
+            other => {
+                return Err(other.to_ascii_lowercase());
+            }
         }
     }
-    opts
+    Ok(opts)
 }
 
 /// Strip the surrounding quotes from a COPY option value like `','` or

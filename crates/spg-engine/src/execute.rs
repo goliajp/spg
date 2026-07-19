@@ -1587,12 +1587,11 @@ impl Engine {
             if options.escape.is_some() {
                 return Err(EngineError::Unsupported("COPY ESCAPE requires CSV mode".into()));
             }
-            if options.force_quote.is_some() {
-                return Err(EngineError::Unsupported(
-                    "COPY FORCE_QUOTE requires CSV mode".into(),
-                ));
-            }
         }
+        // v7.39 (round 265) — the direction-dependent rules (FORCE_QUOTE is
+        // TO-only, FORCE_NOT_NULL / FORCE_NULL are FROM-only), sharing one
+        // validator with the FROM path.
+        crate::copy::validate_copy_option_direction(options, true)?;
         let escape = options.escape.unwrap_or(quote);
         let force = match &options.force_quote {
             None => None,

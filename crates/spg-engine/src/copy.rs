@@ -149,6 +149,52 @@ pub fn parse_copy_to_file(sql: &str) -> Option<CopyToFileSpec> {
     }
 }
 
+/// v7.39 (round 265) — the COPY option rules that depend on DIRECTION,
+/// probed against live PG18.4:
+///
+///   * `FORCE_QUOTE` is COPY TO only; `FORCE_NOT_NULL` and `FORCE_NULL`
+///     are COPY FROM only. PG checks the CSV requirement FIRST, so a
+///     non-CSV `FORCE_NOT_NULL` on a TO reports "requires CSV mode",
+///     not the direction (probed both orders).
+///   * `HEADER match` is COPY FROM only.
+///
+/// `to_direction` is true for COPY TO. Returns `Ok(())` when the
+/// combination is legal.
+///
+/// # Errors
+/// PG's wording for whichever rule the options break.
+pub fn validate_copy_option_direction(
+    options: &spg_sql::ast::CopyOptions,
+    to_direction: bool,
+) -> Result<(), crate::EngineError> {
+    let is_csv = options.format == spg_sql::ast::CopyFormat::Csv;
+    let csv_only = |name: &str| {
+        crate::EngineError::Unsupported(alloc::format!("COPY {name} requires CSV mode"))
+    };
+    let wrong_way = |name: &str| {
+        crate::EngineError::Unsupported(alloc::format!(
+            "COPY {name} cannot be used with COPY {}",
+            if to_direction { "TO" } else { "FROM" }
+        ))
+    };
+    for (present, name, to_only) in [
+        (options.force_quote.is_some(), "FORCE_QUOTE", true),
+        (options.force_not_null.is_some(), "FORCE_NOT_NULL", false),
+        (options.force_null.is_some(), "FORCE_NULL", false),
+    ] {
+        if !present {
+            continue;
+        }
+        if !is_csv {
+            return Err(csv_only(name));
+        }
+        if to_only != to_direction {
+            return Err(wrong_way(name));
+        }
+    }
+    Ok(())
+}
+
 /// v7.39 (round 249) — a parsed `COPY <table> [(cols)] FROM '<path>'`.
 /// The engine is no_std: the HOST reads `path` and hands the bytes to
 /// [`copy_buffer_inserts`] / `Engine::copy_from_buffer`.
@@ -224,6 +270,18 @@ pub fn copy_buffer_inserts(
         .null_str
         .clone()
         .unwrap_or_else(|| String::from(if is_csv { "" } else { "\\N" }));
+    // v7.39 (round 265) — the direction rules, then the two CSV column
+    // lists. `*` (an empty vec) means every column.
+    validate_copy_option_direction(options, false)?;
+    let in_list = |list: &Option<alloc::vec::Vec<String>>, idx: usize| -> bool {
+        match list {
+            None => false,
+            Some(cols) if cols.is_empty() => true,
+            Some(cols) => target_cols
+                .get(idx)
+                .is_some_and(|c| cols.iter().any(|w| w.eq_ignore_ascii_case(c))),
+        }
+    };
     let mut inserts = Vec::new();
     let mut first = true;
     if is_csv {
@@ -251,7 +309,25 @@ pub fn copy_buffer_inserts(
             let rec_str = core::str::from_utf8(rec).map_err(|_| {
                 crate::EngineError::Unsupported("COPY FROM: non-UTF-8 input".into())
             })?;
-            let values = decode_copy_csv_record(rec_str, delimiter, quote, &null_str);
+            let mut values = decode_copy_csv_record(rec_str, delimiter, quote, &null_str);
+            // v7.39 (round 265) — FORCE_NOT_NULL turns a field that decoded
+            // as NULL into the empty string; FORCE_NULL turns one that
+            // decoded as the null token's text (a QUOTED empty under the
+            // CSV default) into NULL. Probed: with neither, `1,` is NULL
+            // and `2,""` is the empty string; FORCE_NOT_NULL makes both
+            // non-NULL and FORCE_NULL makes both NULL.
+            if options.force_not_null.is_some() || options.force_null.is_some() {
+                for (idx, cell) in values.iter_mut().enumerate() {
+                    if in_list(&options.force_not_null, idx) && cell.is_none() {
+                        *cell = Some(String::new());
+                    }
+                    if in_list(&options.force_null, idx)
+                        && cell.as_deref() == Some(null_str.as_str())
+                    {
+                        *cell = None;
+                    }
+                }
+            }
             check_row(&values)?;
             inserts.push(build_copy_insert(table, columns, &values));
         }
