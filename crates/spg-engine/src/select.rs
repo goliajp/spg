@@ -1662,6 +1662,11 @@ impl Engine {
                     // of inbound mail indexed nowhere. Inference
                     // failure keeps the old Text fallback rather
                     // than inventing new error paths here.
+                    // v7.39 (round 258) — take the enum identity from the
+                    // same projection build, not just the type: a constant
+                    // SELECT (`SELECT 'ok'::mood AS x`, which is what a
+                    // VALUES row lowers to) is an EXPRESSION, so it landed
+                    // here and the derived table forgot the enum.
                     let (ty, nullable) =
                         build_projection(core::slice::from_ref(item), schema_cols, table_alias)
                             .ok()
@@ -6501,6 +6506,12 @@ pub(crate) fn build_projection(
                         expr: expr.clone(),
                         output_name,
                         ty: shape.ty,
+                        // v7.39 (round 258) — a projected EXPRESSION keeps its
+                        // enum identity too, not just a bare column. `FROM
+                        // (VALUES ('happy'::mood), …) t(m)` lowers to constant
+                        // SELECTs, so the derived column arrived here as a cast
+                        // and lost the enum — making the outer ORDER BY / min /
+                        // max / array_agg sort by the label's TEXT.
                         nullable: shape.nullable,
                         user_enum_type: None,
                     });
@@ -6509,9 +6520,15 @@ pub(crate) fn build_projection(
                     out.push(ProjectedItem {
                         expr: expr.clone(),
                         output_name,
+                        // A user ENUM has no DataType of its own, so
+                        // `describe_expr` cannot type `'ok'::mood` and the
+                        // item lands HERE, defaulting to text — which is why
+                        // pg_typeof answered `text` and a derived table sorted
+                        // enum values by their label.
                         ty: DataType::Text,
                         nullable: true,
-                        user_enum_type: None,
+                        user_enum_type: crate::eval::expr_enum_type_name_pub(expr, schema_cols)
+                            .map(alloc::string::String::from),
                     });
                 }
             }

@@ -777,6 +777,15 @@ fn apply_enum_cast<'a>(
 /// Enum-ness lives outside the DataType lattice: the witness for "this
 /// expression is enum-typed" is an explicit `::enumtype` cast or a column
 /// whose `ColumnSchema.user_enum_type` is set.
+/// v7.39 (round 258) — crate-visible wrapper so the projection builder
+/// can keep an expression's enum identity (see `select.rs`).
+pub(crate) fn expr_enum_type_name_pub<'e>(
+    e: &'e Expr,
+    columns: &'e [ColumnSchema],
+) -> Option<&'e str> {
+    expr_enum_type_name(e, columns)
+}
+
 fn expr_enum_type_name<'e>(e: &'e Expr, columns: &'e [ColumnSchema]) -> Option<&'e str> {
     match e {
         Expr::Cast {
@@ -1533,6 +1542,38 @@ fn eval_function_call_arm(
     if args.iter().any(|a| matches!(a, Expr::Variadic(_))) {
         let expanded = expand_variadic_args(args, row, ctx)?;
         return eval_function_call_arm(name, &expanded, row, ctx);
+    }
+    // v7.39 (round 258) — `pg_typeof` over an ENUM. An enum value travels
+    // as `Value::Text` (its label), so the value-driven namer answered
+    // `text`; the type lives in the EXPRESSION, which this arm still has.
+    // `expr_enum_type_name` resolves a column or a cast statically — the
+    // same static-only discipline round 253 used for EXTRACT's type name.
+    if name.eq_ignore_ascii_case("pg_typeof")
+        && let [arg] = args
+    {
+        // The name must be a REAL enum in the catalog. `expr_enum_type_name`
+        // returns any named cast's target verbatim — it is only a
+        // pre-filter for `expr_enum_labels`, which does the catalog
+        // lookup — so using it alone hijacked every `x::float8` /
+        // `x::int2` and reported SPG's internal spelling instead of PG's.
+        let is_enum = |e: &Expr| {
+            expr_enum_type_name(e, ctx.columns)
+                .filter(|n| {
+                    ctx.catalog
+                        .is_some_and(|cat| cat.enum_types().contains_key(*n))
+                })
+                .map(alloc::string::String::from)
+        };
+        if let Some(en) = is_enum(arg) {
+            return Ok(Value::text(en));
+        }
+        // `ARRAY[<enum>, …]` reports the array form.
+        if let Expr::Array(items) = arg
+            && let Some(first) = items.first()
+            && let Some(en) = is_enum(first)
+        {
+            return Ok(Value::text(alloc::format!("{en}[]")));
+        }
     }
     if args.iter().any(|a| matches!(a, Expr::NamedArg { .. })) {
         let positional = resolve_named_args(name, args, ctx)?;
