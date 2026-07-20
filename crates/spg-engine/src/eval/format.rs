@@ -627,11 +627,13 @@ pub fn format_float(x: f64) -> String {
     if x == 0.0 {
         return if x.is_sign_negative() { "-0" } else { "0" }.into();
     }
-    let sci = alloc::format!("{x:e}"); // e.g. "1.234e15", "1e-5", "-2.5e-10"
+    let sci = shortest_float_sci(x); // e.g. "1.234e15", "1e-5", "-2.5e-10"
     let epos = sci.find('e').expect("{:e} always has an 'e'");
     let exp_val: i32 = sci[epos + 1..].parse().unwrap_or(0);
     if (-4..=14).contains(&exp_val) {
-        return alloc::format!("{x}"); // fixed-point shortest
+        // Fixed-point rendering of the SAME digits the strict test
+        // chose — `{x}` would re-derive them under Rust's rule.
+        return fixed_from_sci(&sci, exp_val);
     }
     let mant = &sci[..epos];
     let exp = &sci[epos + 1..];
@@ -1811,4 +1813,120 @@ pub fn format_numeric(scaled: i128, scale: u16) -> String {
         out.push_str(&mag_str[split..]);
     }
     out
+}
+
+/// v7.39 (round 292) — the shortest decimal for an f64 in PG's sense,
+/// as `{:e}` style. The f64 sibling of `shortest_real_sci`.
+///
+/// Rust's `{:e}` gives the shortest decimal that ROUND-TRIPS; PG wants
+/// the shortest that lies STRICTLY INSIDE the rounding interval. The
+/// two differ exactly on values whose short form sits on a half-ulp
+/// boundary — measured on PG 18.4, `1e23::float8` prints
+/// `9.999999999999999e+22`, because 1e23 IS the boundary and
+/// ties-to-even parses it back to the same double, so Rust accepts it.
+///
+/// The f32 version can test the boundary by widening to f64. There is
+/// no wider float here, so the test is done in exact INTEGER
+/// arithmetic instead: a midpoint is `M · 2^E` with M odd, a candidate
+/// is `D · 10^K`, and the two are equal only if their odd parts and
+/// their powers of two both match. That forces `5^|K|` to divide a
+/// 57-bit number, which bounds |K| — so the whole comparison fits in
+/// u128 and needs no bignum at all.
+fn shortest_float_sci(x: f64) -> String {
+    let (m, e) = f64_mantissa_exp(x);
+    // Midpoints to the neighbours, as odd·2^exp. The gap BELOW a power
+    // of two is half the gap above it, so that side needs one more bit.
+    let (hi_m, hi_e) = (2 * m + 1, e - 1);
+    let (lo_m, lo_e) = if m == 1 << 52 && e > f64_min_exp() {
+        (4 * m - 1, e - 2)
+    } else {
+        (2 * m - 1, e - 1)
+    };
+    for p in 1..=17u32 {
+        let cand = alloc::format!("{x:.*e}", (p - 1) as usize);
+        let Ok(v) = cand.parse::<f64>() else { continue };
+        if v != x {
+            continue;
+        }
+        let Some((d, k)) = sci_to_digits_exp(&cand) else {
+            continue;
+        };
+        if !decimal_eq_binary(d, k, hi_m, hi_e) && !decimal_eq_binary(d, k, lo_m, lo_e) {
+            return cand;
+        }
+    }
+    alloc::format!("{x:e}")
+}
+
+/// `x` as `mantissa · 2^exp` with the mantissa a positive integer.
+/// Only called on finite non-zero values.
+fn f64_mantissa_exp(x: f64) -> (u128, i32) {
+    let bits = x.abs().to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let frac = u128::from(bits & 0x000f_ffff_ffff_ffff);
+    if biased == 0 {
+        (frac, -1074) // subnormal: no implicit leading bit
+    } else {
+        ((1u128 << 52) | frac, biased - 1075)
+    }
+}
+
+/// The exponent of the smallest normal f64, below which the
+/// gap-below-a-power-of-two rule no longer applies.
+const fn f64_min_exp() -> i32 {
+    -1074
+}
+
+/// Split a `{:e}` string into `(digits, exponent)` such that the value
+/// is `digits · 10^exponent`. `None` when it does not fit u128 (which
+/// cannot happen for the ≤ 17 digits generated here).
+fn sci_to_digits_exp(sci: &str) -> Option<(u128, i32)> {
+    let epos = sci.find('e')?;
+    let (mant, rest) = sci.split_at(epos);
+    let exp: i32 = rest[1..].parse().ok()?;
+    let mant = mant.strip_prefix('-').unwrap_or(mant);
+    let (int_part, frac_part) = match mant.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (mant, ""),
+    };
+    let mut digits: u128 = 0;
+    for c in int_part.chars().chain(frac_part.chars()) {
+        digits = digits.checked_mul(10)?.checked_add(u128::from(c as u8 - b'0'))?;
+    }
+    Some((digits, exp - i32::try_from(frac_part.len()).ok()?))
+}
+
+/// Exactly: does `d · 10^k` equal `m · 2^e`, with `m` odd?
+///
+/// Both sides are split into an odd part and a power of two; they are
+/// equal iff both halves match. `10^k = 2^k · 5^k`, so the 5s must
+/// divide out exactly — which is what bounds the powers involved.
+fn decimal_eq_binary(d: u128, k: i32, m: u128, e: i32) -> bool {
+    if d == 0 {
+        return false;
+    }
+    let a = i32::try_from(d.trailing_zeros()).unwrap_or(i32::MAX);
+    let d_odd = d >> d.trailing_zeros();
+    if k >= 0 {
+        // odd part is d_odd · 5^k — bail as soon as it can only exceed m.
+        let mut lhs = d_odd;
+        for _ in 0..k {
+            match lhs.checked_mul(5) {
+                Some(v) if v <= m => lhs = v,
+                _ => return false,
+            }
+        }
+        lhs == m && a + k == e
+    } else {
+        // d_odd must be divisible by 5^|k|; the quotient is the odd part.
+        let j = -k;
+        let mut lhs = d_odd;
+        for _ in 0..j {
+            if lhs % 5 != 0 {
+                return false;
+            }
+            lhs /= 5;
+        }
+        lhs == m && a - j == e
+    }
 }
