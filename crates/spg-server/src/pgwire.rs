@@ -557,10 +557,11 @@ fn handle_pg_simple_query(
                     cols.as_deref(),
                     &opts,
                     tx_state,
+                    conn_state.tx_id,
                 )?;
             }
             CopyIntent::FromFile(spec) => {
-                handle_copy_from_file(stream, state, role, &spec, tx_state)?;
+                handle_copy_from_file(stream, state, role, &spec, tx_state, conn_state.tx_id)?;
             }
             CopyIntent::ToFile(spec) => {
                 handle_copy_to_file(stream, state, role, &spec)?;
@@ -575,10 +576,26 @@ fn handle_pg_simple_query(
             }
             CopyIntent::To(table, opts) => {
                 let sql = format!("SELECT * FROM {table}");
-                handle_copy_to_stdout(stream, state, role, &sql, &opts, tx_state)?;
+                handle_copy_to_stdout(
+                    stream,
+                    state,
+                    role,
+                    &sql,
+                    &opts,
+                    tx_state,
+                    conn_state.tx_id,
+                )?;
             }
             CopyIntent::ToQuery(query, opts) => {
-                handle_copy_to_stdout(stream, state, role, &query, &opts, tx_state)?;
+                handle_copy_to_stdout(
+                    stream,
+                    state,
+                    role,
+                    &query,
+                    &opts,
+                    tx_state,
+                    conn_state.tx_id,
+                )?;
             }
         }
         send_ready_for_query(wbuf, *tx_state)?;
@@ -957,7 +974,14 @@ fn handle_pg_simple_query(
         match try_queue_plain_dml(state, sql, role, *tx_state, settings) {
             Some(r) => (r, true),
             None => (
-                execute_with_role(state, sql, role, cancel, matches!(*tx_state, b'T' | b'E')),
+                execute_with_role(
+                    state,
+                    sql,
+                    role,
+                    cancel,
+                    matches!(*tx_state, b'T' | b'E'),
+                    conn_state.tx_id,
+                ),
                 false,
             ),
         };
@@ -1029,7 +1053,7 @@ fn handle_pg_simple_query(
             };
             send_command_complete(wbuf, &tag)?;
             // Sync tx state from engine after writes.
-            *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
+            *tx_state = if state.engine.read().is_ok_and(|e| e.is_tx_open(conn_state.tx_id)) {
                 b'T'
             } else {
                 b'I'
@@ -1046,7 +1070,7 @@ fn handle_pg_simple_query(
             // and stays there until ROLLBACK. We track
             // best-effort: if engine still in TX, mark
             // 'E'; otherwise 'I'.
-            *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
+            *tx_state = if state.engine.read().is_ok_and(|e| e.is_tx_open(conn_state.tx_id)) {
                 b'E'
             } else {
                 b'I'
@@ -1222,7 +1246,14 @@ fn handle_pg_simple_query_one_into_wbuf(
         match try_queue_plain_dml(state, sql, role, *tx_state, settings) {
             Some(r) => (r, true),
             None => (
-                execute_with_role(state, sql, role, cancel, matches!(*tx_state, b'T' | b'E')),
+                execute_with_role(
+                    state,
+                    sql,
+                    role,
+                    cancel,
+                    matches!(*tx_state, b'T' | b'E'),
+                    conn_state.tx_id,
+                ),
                 false,
             ),
         };
@@ -1259,7 +1290,7 @@ fn handle_pg_simple_query_one_into_wbuf(
         Ok(QueryResult::CommandOk { affected, .. }) => {
             let tag = command_tag(sql, affected);
             send_command_complete(wbuf, &tag)?;
-            *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
+            *tx_state = if state.engine.read().is_ok_and(|e| e.is_tx_open(conn_state.tx_id)) {
                 b'T'
             } else {
                 b'I'
@@ -1268,7 +1299,7 @@ fn handle_pg_simple_query_one_into_wbuf(
         Err(e) => {
             let (sqlstate, msg) = engine_error_to_wire_conn(&e, conn_state);
             send_error_pos(wbuf, sqlstate, &msg, parse_error_position(&e, sql))?;
-            *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
+            *tx_state = if state.engine.read().is_ok_and(|e| e.is_tx_open(conn_state.tx_id)) {
                 b'E'
             } else {
                 b'I'
@@ -1471,7 +1502,14 @@ fn run_pg_session(
 
     // v6.5.2 — register this connection in the activity registry.
     // Removed when `_conn_guard` drops at function exit.
+    // v7.39 (round 283) — one TX slot per connection, so two clients can
+    // hold open transactions at the same time.
+    let conn_tx_id = match state.engine.write() {
+        Ok(mut e) => e.alloc_tx_id(),
+        Err(_) => spg_engine::IMPLICIT_TX,
+    };
     let conn_state = Arc::new(crate::ConnState {
+        tx_id: conn_tx_id,
         pid: std::process::id().wrapping_add(
             state
                 .active_connections
@@ -1518,6 +1556,14 @@ fn run_pg_session(
             // way PG does at backend exit. Without it a crashed client
             // would hold a lock forever in the shared engine.
             if let Ok(mut e) = self.state.engine.write() {
+                // v7.39 (round 283) — a connection that vanishes mid
+                // transaction must not leave its shadow slot behind. PG
+                // aborts the backend's transaction at exit; without this
+                // the slot (and its uncommitted writes) would sit in
+                // `tx_catalogs` for the life of the process.
+                if e.is_tx_open(self.conn.tx_id) {
+                    let _ = e.execute_in("ROLLBACK", self.conn.tx_id);
+                }
                 e.end_session(self.conn.pid);
             }
             crate::backend_count_decr();
@@ -1957,6 +2003,8 @@ fn execute_with_role(
     // (per-connection tx_state, not the engine's global flag). A SELECT here
     // must then take the write path so it sees the transaction's own writes.
     conn_in_tx: bool,
+    // v7.39 (round 283) — the connection's own TX slot.
+    tx_id: spg_engine::TxId,
 ) -> Result<QueryResult, EngineError> {
     // v5.1: cold-tier preload — kept symmetric with the native
     // Op::Query path so a sweep that drives the server through
@@ -2033,7 +2081,7 @@ fn execute_with_role(
             .engine
             .write()
             .map_err(|_| EngineError::Unsupported("engine rwlock poisoned".into()))?;
-        engine.execute_with_cancel(sql, cancel)
+        engine.execute_in_with_cancel(sql, tx_id, cancel)
     }
 }
 
@@ -3478,7 +3526,7 @@ fn handle_execute(
             // text — text is owned by Parse, not Execute.
             let tag = command_tag_for_ast(&stmt.ast, affected);
             send_command_complete(stream, &tag).map_err(|e| proto(e.to_string()))?;
-            *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
+            *tx_state = if state.engine.read().is_ok_and(|e| e.is_tx_open(conn_state.tx_id)) {
                 b'T'
             } else {
                 b'I'
@@ -5019,6 +5067,7 @@ fn handle_copy_from_file(
     role: Role,
     spec: &spg_engine::copy::CopyFromFileSpec,
     tx_state: &mut u8,
+    tx_id: spg_engine::TxId,
 ) -> std::io::Result<()> {
     if role != Role::Admin {
         // PG: only superuser / pg_read_server_files may read server
@@ -5096,13 +5145,13 @@ fn handle_copy_from_file(
         }
     };
     // Same transaction + WAL discipline as the STDIN path (round 250).
-    let wrap = !state.engine.read().is_ok_and(|e| e.in_transaction());
+    let wrap = !state.engine.read().is_ok_and(|e| e.is_tx_open(tx_id));
     let run = |state: &Arc<ServerState>, sql: &str| -> Result<(), String> {
         state
             .engine
             .write()
             .map_err(|_| "engine rwlock poisoned".to_string())
-            .and_then(|mut e| e.execute(sql).map(|_| ()).map_err(|err| format!("{err}")))
+            .and_then(|mut e| e.execute_in(sql, tx_id).map(|_| ()).map_err(|err| format!("{err}")))
     };
     if wrap {
         if let Err(e) = run(state, "BEGIN") {
@@ -5143,7 +5192,7 @@ fn handle_copy_from_file(
         }
     }
     send_command_complete(stream, &format!("COPY {inserted}"))?;
-    *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
+    *tx_state = if state.engine.read().is_ok_and(|e| e.is_tx_open(tx_id)) {
         b'T'
     } else {
         b'I'
@@ -5161,6 +5210,7 @@ fn handle_copy_from_stdin(
     column_list: Option<&[String]>,
     opts: &CopyOptions,
     tx_state: &mut u8,
+    tx_id: spg_engine::TxId,
 ) -> std::io::Result<()> {
     if !role.can_write() {
         send_error(
@@ -5226,15 +5276,18 @@ fn handle_copy_from_stdin(
     // transaction aborts it (PG semantics) — so that mode keeps the
     // pre-r250 per-row autocommit shape (rows WAL-append per row, one
     // fsync at CommandComplete).
+    // v7.39 (round 283) — ask about THIS connection's slot, not "is any
+    // transaction open anywhere", which with one shared engine was every
+    // other client's transaction too.
     let wrap = !opts.on_error_set_null
-        && !state.engine.read().is_ok_and(|e| e.in_transaction());
+        && !state.engine.read().is_ok_and(|e| e.is_tx_open(tx_id));
     if wrap {
         if let Err(e) = state
             .engine
             .write()
             .map_err(|_| std::io::Error::other("engine rwlock poisoned"))
             .and_then(|mut e| {
-                e.execute("BEGIN")
+                e.execute_in("BEGIN", tx_id)
                     .map(|_| ())
                     .map_err(|err| std::io::Error::other(format!("{err}")))
             })
@@ -5244,7 +5297,7 @@ fn handle_copy_from_stdin(
             return Ok(());
         }
         if let Err(e) = crate::append_wal(state, "BEGIN", false) {
-            let _ = state.engine.write().map(|mut en| en.execute("ROLLBACK"));
+            let _ = state.engine.write().map(|mut en| en.execute_in("ROLLBACK", tx_id));
             send_error(stream, "53100", &format!("{e}"))?;
             drain_copy_in_frames(stream)?;
             return Ok(());
@@ -5254,7 +5307,7 @@ fn handle_copy_from_stdin(
     // below, so the failed COPY leaves nothing — including on replay.
     let rollback_wrap = |state: &Arc<ServerState>| {
         if wrap {
-            let _ = state.engine.write().map(|mut e| e.execute("ROLLBACK"));
+            let _ = state.engine.write().map(|mut e| e.execute_in("ROLLBACK", tx_id));
             let _ = crate::append_wal(state, "ROLLBACK", false);
         }
     };
@@ -5307,6 +5360,7 @@ fn handle_copy_from_stdin(
             &mut inserted,
             &mut skipped,
             opts,
+            tx_id,
         ) {
             let code = if msg.contains("missing data for column")
                 || msg.contains("extra data after last expected column")
@@ -5331,6 +5385,7 @@ fn handle_copy_from_stdin(
         &mut inserted,
         &mut skipped,
         opts,
+        tx_id,
     ) {
         let code = if msg.contains("missing data for column")
             || msg.contains("extra data after last expected column")
@@ -5363,7 +5418,7 @@ fn handle_copy_from_stdin(
             .write()
             .map_err(|_| std::io::Error::other("engine rwlock poisoned"))
             .and_then(|mut e| {
-                e.execute("COMMIT")
+                e.execute_in("COMMIT", tx_id)
                     .map(|_| ())
                     .map_err(|err| std::io::Error::other(format!("{err}")))
             })
@@ -5378,7 +5433,7 @@ fn handle_copy_from_stdin(
         }
     }
     send_command_complete(stream, &format!("COPY {inserted}"))?;
-    *tx_state = if state.engine.read().is_ok_and(|e| e.in_transaction()) {
+    *tx_state = if state.engine.read().is_ok_and(|e| e.is_tx_open(tx_id)) {
         b'T'
     } else {
         b'I'
@@ -5398,6 +5453,11 @@ fn process_copy_chunk(
     inserted: &mut u64,
     skipped: &mut u64,
     opts: &CopyOptions,
+    // v7.39 (round 283) — the rows must land in the SAME slot as the
+    // wrapping BEGIN/COMMIT. Routing them through `execute()` while the
+    // transaction lived on the connection's slot meant COMMIT installed
+    // the BEGIN-time shadow over them and every copied row vanished.
+    tx_id: spg_engine::TxId,
 ) -> Result<(), String> {
     // FORMAT CSV: records are delimited by a newline that is NOT inside
     // a quoted field, so split with the quote-aware boundary scanner
@@ -5442,7 +5502,7 @@ fn process_copy_chunk(
                     .engine
                     .write()
                     .map_err(|_| "engine rwlock poisoned".to_string())?;
-                match engine.execute(&sql) {
+                match engine.execute_in(&sql, tx_id) {
                     Ok(_) => *inserted += 1,
                     Err(e) => {
                         if opts.on_error_set_null {
@@ -5510,7 +5570,7 @@ fn process_copy_chunk(
                 .engine
                 .write()
                 .map_err(|_| "engine rwlock poisoned".to_string())?;
-            match engine.execute(&sql) {
+            match engine.execute_in(&sql, tx_id) {
                 Ok(_) => *inserted += 1,
                 Err(e) => {
                     if opts.on_error_set_null {
@@ -5746,6 +5806,7 @@ fn handle_copy_to_stdout(
     sql: &str,
     opts: &CopyOptions,
     tx_state: &mut u8,
+    tx_id: spg_engine::TxId,
 ) -> std::io::Result<()> {
     let _ = role.can_read(); // every role can read
     // v7.17.0 Phase 2.3 — COPY TO STDOUT does not honor
@@ -5759,6 +5820,7 @@ fn handle_copy_to_stdout(
         role,
         CancelToken::none(),
         matches!(*tx_state, b'T' | b'E'),
+        tx_id,
     );
     let (columns, rows) = match result {
         Ok(QueryResult::Rows { columns, rows }) => (columns, rows),
