@@ -905,8 +905,19 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         // tail (between the non-table-ACL block and the CRC): an empty rule list
         // is a single u32 zero count. EIGHTH appendix this test has caught.
         const EMPTY_RULE_BLOCK: usize = 4;
+        // v7.39 (round 280) — and the v77 extended-statistics block,
+        // written after the RULE block for the same reason: an empty
+        // list is a single u32 zero count. NINTH appendix this test has
+        // caught, which is exactly what it is for — a FILE_VERSION bump
+        // that forgets the tail shows up here as "trailing bytes".
+        const EMPTY_STATS_EXT_BLOCK: usize = 4;
         full.truncate(
-            full.len() - 4 - EMPTY_COMMENT_BLOCK - EMPTY_NONTABLE_ACL_BLOCK - EMPTY_RULE_BLOCK,
+            full.len()
+                - 4
+                - EMPTY_COMMENT_BLOCK
+                - EMPTY_NONTABLE_ACL_BLOCK
+                - EMPTY_RULE_BLOCK
+                - EMPTY_STATS_EXT_BLOCK,
         );
         full
     };

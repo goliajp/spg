@@ -2529,7 +2529,6 @@ impl Parser {
                                 | "large"
                                 | "role"
                                 | "access"
-                                | "statistics"
                                 | "procedure"
                                 | "routine"
                         ) =>
@@ -2537,9 +2536,14 @@ impl Parser {
                         self.consume_until_statement_boundary();
                         Ok(Statement::Empty)
                     }
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("statistics") =>
+                    {
+                        self.parse_drop_statistics_after_drop()
+                    }
                     other => Err(self.err(format!(
                         "expected TABLE / INDEX / SCHEMA / SEQUENCE / USER / PUBLICATION / \
-                         SUBSCRIPTION / TRIGGER / FUNCTION after DROP, got {other:?}"
+                         SUBSCRIPTION / TRIGGER / FUNCTION / STATISTICS after DROP, got {other:?}"
                     ))),
                 }
             }
@@ -3408,12 +3412,114 @@ impl Parser {
         })
     }
 
+    /// v7.39 (round 280) — `CREATE STATISTICS [IF NOT EXISTS] <name>
+    /// [(kind, …)] ON <col>, … FROM <table>`.
+    fn parse_create_statistics_after_create(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // STATISTICS
+        // `IF` / `EXISTS` lex as plain identifiers; only NOT is a keyword.
+        let mut if_not_exists = false;
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Not))
+        {
+            self.advance();
+            self.advance();
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("exists")) {
+                self.advance();
+                if_not_exists = true;
+            }
+        }
+        let name = self.expect_ident_like()?;
+        let mut kinds = Vec::new();
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            loop {
+                let k = self.expect_ident_like()?;
+                // PG stores the single letters; accept the spelled-out
+                // names the SQL uses and record what PG records.
+                kinds.push(match k.to_ascii_lowercase().as_str() {
+                    "ndistinct" => String::from("d"),
+                    "dependencies" => String::from("f"),
+                    "mcv" => String::from("m"),
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "unrecognized statistics kind \"{other}\""
+                        )));
+                    }
+                });
+                match self.advance() {
+                    Token::Comma => {}
+                    Token::RParen => break,
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "expected ',' or ')' in statistics kind list, got {other:?}"
+                        )));
+                    }
+                }
+            }
+        }
+        if !matches!(self.peek(), Token::On) {
+            return Err(self.err(alloc::format!(
+                "expected ON in CREATE STATISTICS, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.expect_ident_like()?);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if !matches!(self.peek(), Token::From) {
+            return Err(self.err(alloc::format!(
+                "expected FROM in CREATE STATISTICS, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let table = self.expect_ident_like()?;
+        Ok(Statement::CreateStatistics {
+            name,
+            if_not_exists,
+            kinds,
+            columns,
+            table,
+        })
+    }
+
+    /// v7.39 (round 280) — `DROP STATISTICS [IF EXISTS] <name>`.
+    fn parse_drop_statistics_after_drop(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // STATISTICS
+        let mut if_exists = false;
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("if"))
+            && matches!(self.tokens.get(self.pos + 1),
+                        Some(Token::Ident(e)) if e.eq_ignore_ascii_case("exists"))
+        {
+            self.advance();
+            self.advance();
+            if_exists = true;
+        }
+        let name = self.expect_ident_like()?;
+        Ok(Statement::DropStatistics { name, if_exists })
+    }
+
     fn parse_create_stmt(&mut self) -> Result<Statement, ParseError> {
         debug_assert!(matches!(self.peek(), Token::Create));
         self.advance();
         match self.peek() {
             Token::Table => self.parse_create_table_stmt_after_create(),
             Token::Index => self.parse_create_index_stmt_after_create(false),
+            // v7.39 (round 280) — CREATE STATISTICS is a real catalog
+            // object now. It used to be consumed by the CREATE-noise
+            // arm, so a pg_dump that declares extended statistics
+            // restored silently without them and reflection showed
+            // nothing.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("statistics") => {
+                self.parse_create_statistics_after_create()
+            }
             // v7.9.29 — `CREATE UNIQUE INDEX … [WHERE pred]`.
             // The `UNIQUE` modifier turns a partial index into a
             // partial-uniqueness invariant (only rows matching the

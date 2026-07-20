@@ -131,6 +131,21 @@ pub enum Statement {
     Execute { name: String, args: Vec<Expr> },
     /// v7.39 (round 277) — `DEALLOCATE {<name> | ALL}`. `None` = ALL.
     Deallocate(Option<String>),
+    /// v7.39 (round 280) — `CREATE STATISTICS [IF NOT EXISTS] <name>
+    /// [(kind, …)] ON <col>, … FROM <table>`. SPG records the object so
+    /// dumps restore and reflection is honest; the planner does not
+    /// consult it yet.
+    CreateStatistics {
+        name: String,
+        if_not_exists: bool,
+        /// Requested kinds as PG's single letters (`d` ndistinct,
+        /// `f` dependencies, `m` mcv). Empty = PG's default set.
+        kinds: Vec<String>,
+        columns: Vec<String>,
+        table: String,
+    },
+    /// v7.39 (round 280) — `DROP STATISTICS [IF EXISTS] <name>`.
+    DropStatistics { name: String, if_exists: bool },
     /// v7.39 (round 278) — `CALL <proc>(…)`. Parses; the engine
     /// reports that the procedure does not exist, because SPG has no
     /// procedure catalog. Carried as a statement rather than raised at
@@ -3853,7 +3868,9 @@ impl Statement {
             | Statement::Execute { .. }
             | Statement::Deallocate(_)
             | Statement::Call(_)
-            | Statement::PrepareTransaction(_) => false,
+            | Statement::PrepareTransaction(_)
+            | Statement::CreateStatistics { .. }
+            | Statement::DropStatistics { .. } => false,
             Statement::Select(_)
             | Statement::CopyTo { .. }
             | Statement::CopyToFile { .. }
@@ -4125,6 +4142,30 @@ impl fmt::Display for Statement {
                     f.write_str(")")?;
                 }
                 Ok(())
+            }
+            Self::CreateStatistics {
+                name,
+                if_not_exists,
+                kinds,
+                columns,
+                table,
+            } => {
+                f.write_str("CREATE STATISTICS ")?;
+                if *if_not_exists {
+                    f.write_str("IF NOT EXISTS ")?;
+                }
+                write!(f, "{}", quote_ident(name))?;
+                if !kinds.is_empty() {
+                    write!(f, " ({})", kinds.join(", "))?;
+                }
+                write!(f, " ON {} FROM {}", columns.join(", "), quote_ident(table))
+            }
+            Self::DropStatistics { name, if_exists } => {
+                f.write_str("DROP STATISTICS ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                write!(f, "{}", quote_ident(name))
             }
             Self::Call(n) => write!(f, "CALL {}()", quote_ident(n)),
             Self::PrepareTransaction(gid) => write!(f, "PREPARE TRANSACTION '{gid}'"),

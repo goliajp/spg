@@ -1035,7 +1035,7 @@ pub(crate) fn synth_pg_policies(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
 ///   * stxowner (BigInt)
 ///   * stxkind (Text) — "{d,f,m,e}" array flattened to comma
 ///   * stxkeys (Text) — int2vector of column positions, flat
-pub(crate) fn synth_pg_statistic_ext(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_statistic_ext(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("stxrelid", DataType::BigInt, false),
@@ -1045,7 +1045,24 @@ pub(crate) fn synth_pg_statistic_ext(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<
         ColumnSchema::new("stxkind", DataType::Text, false),
         ColumnSchema::new("stxkeys", DataType::Text, false),
     ];
-    let rows: Vec<Row<'static>> = Vec::new();
+    // v7.39 (round 280) — one row per catalogued CREATE STATISTICS.
+    // The view was shape-stable empty because the statement was
+    // swallowed; now it reports what the catalog holds.
+    let rows: Vec<Row<'static>> = cat
+        .statistics_ext()
+        .iter()
+        .map(|st| {
+            Row::new(alloc::vec![
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::text(st.name.clone()),
+                Value::BigInt(2200),
+                Value::BigInt(0),
+                Value::text(alloc::format!("{{{}}}", st.kinds.join(","))),
+                Value::text(st.columns.join(" ")),
+            ])
+        })
+        .collect();
     (schema, rows)
 }
 
