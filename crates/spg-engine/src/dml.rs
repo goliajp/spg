@@ -1324,7 +1324,12 @@ impl Engine {
                 .iter()
                 .map(|(_pos, new_vals)| new_vals.clone())
                 .collect();
-            enforce_fk_inserts(self.active_catalog(), &stmt.table, &self_fks, &new_rows)?;
+            // v7.39 (round 288) — a DEFERRED constraint is not checked
+            // here; COMMIT (or SET CONSTRAINTS IMMEDIATE) runs it.
+            let now = self.immediate_fks(&self_fks);
+            if !now.is_empty() {
+                enforce_fk_inserts(self.active_catalog(), &stmt.table, &now, &new_rows)?;
+            }
         }
         // v7.13.0 — CHECK constraint enforcement on UPDATE
         // (mailrs round-5 G3). Predicates evaluated against the
@@ -3978,7 +3983,11 @@ impl Engine {
         // before FK / CHECK, matching PG's not-null-first ordering.
         enforce_not_null(self.active_catalog(), &stmt.table, &all_values)?;
         if !fks.is_empty() {
-            enforce_fk_inserts(self.active_catalog(), &stmt.table, &fks, &all_values)?;
+            // v7.39 (round 288) — same split on the INSERT path.
+            let now = self.immediate_fks(&fks);
+            if !now.is_empty() {
+                enforce_fk_inserts(self.active_catalog(), &stmt.table, &now, &all_values)?;
+            }
         }
         // v7.13.0 — CHECK constraint enforcement (mailrs round-5 G3).
         enforce_check_constraints(self.active_catalog(), &stmt.table, &all_values)?;

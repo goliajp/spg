@@ -1349,6 +1349,28 @@ impl Engine {
             // v7.39 (round 286) — ANALYZE over DML really executes, so it
             // needs the `&mut self` sibling. Everything else (including
             // plain EXPLAIN of a write) stays on the read-only renderer.
+            // v7.39 (round 288) — SET CONSTRAINTS sets the timing for the
+            // rest of the transaction. IMMEDIATE also runs everything the
+            // transaction has postponed, right here — PG raises the
+            // violation at this statement, not at COMMIT.
+            Statement::SetConstraints { deferred } => {
+                // Order matters: run what is CURRENTLY deferred first,
+                // then change the mode. Flipping to immediate first
+                // empties the set the check walks, so the pending
+                // violation sailed through to a successful COMMIT.
+                if !deferred {
+                    self.run_deferred_fk_checks()?;
+                }
+                if let Some(tx_id) = self.current_tx
+                    && let Some(st) = self.tx_catalogs.get_mut(&tx_id)
+                {
+                    st.constraints_deferred = Some(deferred);
+                }
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
             Statement::Explain(e)
                 if e.analyze
                     && !e.suggest

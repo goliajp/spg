@@ -135,6 +135,15 @@ pub(crate) fn deserialize_table(
             } else {
                 crate::MatchType::Simple
             };
+            // v7.39 (round 288) — constraint-timing byte (FILE_VERSION
+            // 79+); older catalogs are NOT DEFERRABLE, which is what
+            // they behaved as.
+            let (deferrable, initially_deferred) = if version >= 79 {
+                let bits = cur.read_u8()?;
+                (bits & 1 != 0, bits & 2 != 0)
+            } else {
+                (false, false)
+            };
             fks.push(ForeignKeyConstraint {
                 name,
                 local_columns,
@@ -143,6 +152,8 @@ pub(crate) fn deserialize_table(
                 on_delete,
                 on_update,
                 match_type,
+                deferrable,
+                initially_deferred,
             });
         }
         t.schema_mut().foreign_keys = fks;

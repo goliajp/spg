@@ -470,6 +470,11 @@ struct TxState {
     /// against. The per-statement rebase extracts/replays write-sets
     /// only for these (see `maybe_rc_rebase`).
     touched_tables: alloc::collections::BTreeSet<String>,
+    /// v7.39 (round 288) — `SET CONSTRAINTS … {DEFERRED|IMMEDIATE}`
+    /// override for this transaction. `None` = each constraint uses
+    /// its own declared timing; `Some(true)` = every DEFERRABLE one is
+    /// deferred; `Some(false)` = every one is immediate.
+    constraints_deferred: Option<bool>,
     /// v7.37.17 — the tx executed a statement whose effect on the
     /// shadow catalog can't be expressed as a versioned row write-set
     /// (DDL, COPY, anything unclassified). The rebase would lose it,
