@@ -674,7 +674,7 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 DataType::PgLsn => 8,
                 // BIT(n) avg 32 bytes (256 bits); BIT VARYING varlena
                 // wider.
-                DataType::Bit | DataType::BitVarying => 32,
+                DataType::Bit(_) | DataType::BitVarying(_) => 32,
                 DataType::Xml => 128,
                 DataType::Char1 => 1,
                 DataType::MoneyArray => 32, // ~4 elements × 9 B

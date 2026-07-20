@@ -119,7 +119,7 @@ fn bit_concat_projected_column_type_is_bit_varying() {
     };
     assert_eq!(
         columns[0].ty,
-        DataType::BitVarying,
+        DataType::BitVarying(0),
         "bit concat projects a bit varying column, not {:?}",
         columns[0].ty
     );

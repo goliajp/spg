@@ -844,8 +844,15 @@ impl Table {
                         | (DataType::Timestamptz, DataType::Timestamp)
                         // v7.37.5 ship triage — BIT / VARBIT share the
                         // BitString storage shape; INET / CIDR likewise.
-                        | (DataType::Bit, DataType::BitVarying)
-                        | (DataType::BitVarying, DataType::Bit)
+                        // v7.39 (round 281) — the two now carry a
+                        // length, so a same-family pair with different
+                        // typmods must still compare compatible here.
+                        // The length contract is enforced at coercion,
+                        // not by this storage-shape check.
+                        | (DataType::Bit(_), DataType::BitVarying(_))
+                        | (DataType::BitVarying(_), DataType::Bit(_))
+                        | (DataType::Bit(_), DataType::Bit(_))
+                        | (DataType::BitVarying(_), DataType::BitVarying(_))
                         | (DataType::Inet, DataType::Cidr)
                         | (DataType::Cidr, DataType::Inet)
                 )
@@ -2250,8 +2257,15 @@ impl Table {
                         | (DataType::Timestamptz, DataType::Timestamp)
                         // v7.37.5 ship triage — BIT / VARBIT share the
                         // BitString storage shape; INET / CIDR likewise.
-                        | (DataType::Bit, DataType::BitVarying)
-                        | (DataType::BitVarying, DataType::Bit)
+                        // v7.39 (round 281) — the two now carry a
+                        // length, so a same-family pair with different
+                        // typmods must still compare compatible here.
+                        // The length contract is enforced at coercion,
+                        // not by this storage-shape check.
+                        | (DataType::Bit(_), DataType::BitVarying(_))
+                        | (DataType::BitVarying(_), DataType::Bit(_))
+                        | (DataType::Bit(_), DataType::Bit(_))
+                        | (DataType::BitVarying(_), DataType::BitVarying(_))
                         | (DataType::Inet, DataType::Cidr)
                         | (DataType::Cidr, DataType::Inet)
                 )
@@ -2848,8 +2862,8 @@ fn validate_row_against_schema(
                     | (DataType::Jsonb, DataType::Json)
                     | (DataType::Timestamp, DataType::Timestamptz)
                     | (DataType::Timestamptz, DataType::Timestamp)
-                    | (DataType::Bit, DataType::BitVarying)
-                    | (DataType::BitVarying, DataType::Bit)
+                    | (DataType::Bit(_), DataType::BitVarying(_))
+                    | (DataType::BitVarying(_), DataType::Bit(_))
                     | (DataType::Inet, DataType::Cidr)
                     | (DataType::Cidr, DataType::Inet)
             )

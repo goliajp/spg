@@ -457,9 +457,11 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                     // `bit varying`, matching PG's pg_typeof — not the left
                     // operand's `bit`.
                     let ty = if matches!(op, B::Concat)
-                        && matches!(inner.ty, DataType::Bit | DataType::BitVarying)
+                        && matches!(inner.ty, DataType::Bit(_) | DataType::BitVarying(_))
                     {
-                        DataType::BitVarying
+                        // The concatenation's length is not a fixed
+                        // typmod, so it widens to unbounded varbit.
+                        DataType::BitVarying(0)
                     } else {
                         inner.ty
                     };

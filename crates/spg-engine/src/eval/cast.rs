@@ -434,7 +434,7 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
             // rejected there, so only fixed-length `bit` is handled here).
             if matches!(v, Value::Int(_) | Value::BigInt(_) | Value::SmallInt(_)) {
                 if let Some(width) = bit_cast_width(&name) {
-                    return int_to_bit_string(v, width);
+                    return int_to_bit_string(v, width.0);
                 }
             }
             // v7.39 (read01 varbit.c) — internal exact-length form for
@@ -480,7 +480,14 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                 _ => None,
             };
             if let Some(Value::BitString { nbits, bytes }) = &bit_src {
-                if let Some(width) = bit_cast_width(&name) {
+                if let Some((width, pads)) = bit_cast_width(&name) {
+                    // varbit truncates but never pads.
+                    if !pads && *nbits <= width {
+                        return Ok(Value::BitString {
+                            nbits: *nbits,
+                            bytes: alloc::borrow::Cow::Owned(bytes.to_vec()),
+                        });
+                    }
                     let mut bits: alloc::vec::Vec<bool> = (0..*nbits as usize)
                         .map(|i| bytes[i / 8] & (0x80 >> (i % 8)) != 0)
                         .collect();
@@ -768,15 +775,26 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
 /// v7.38 (read01, T20) — width of a `bit` cast target: bare `bit` is `bit(1)`,
 /// `bit(N)` is N. `None` for `varbit` / `bit varying` (PG rejects int→varbit) and
 /// any non-bit name.
-fn bit_cast_width(name: &str) -> Option<u32> {
+fn bit_cast_width(name: &str) -> Option<(u32, bool)> {
     let lower = name.to_ascii_lowercase();
     let trimmed = lower.trim();
     if trimmed == "bit" {
-        return Some(1);
+        return Some((1, true));
     }
-    let rest = trimmed.strip_prefix("bit")?.trim_start();
-    let inner = rest.strip_prefix('(')?.strip_suffix(')')?;
-    inner.trim().parse::<u32>().ok()
+    // v7.39 (round 281) — `varbit(n)` / `bit varying(n)` adjust on an
+    // explicit cast too, but only DOWN: PG truncates a too-long value
+    // and leaves a shorter one alone, where `bit(n)` also pads.
+    for (prefix, pads) in [("varbit", false), ("bit varying", false), ("bit", true)] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let rest = rest.trim_start();
+            if let Some(inner) = rest.strip_prefix('(').and_then(|r| r.strip_suffix(')'))
+                && let Ok(n) = inner.trim().parse::<u32>()
+            {
+                return Some((n, pads));
+            }
+        }
+    }
+    None
 }
 
 /// v7.38 (read01, T20) — build a `bit(width)` value from an integer: the low
