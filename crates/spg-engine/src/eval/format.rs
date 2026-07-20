@@ -1130,17 +1130,37 @@ pub fn parse_timestamp_literal_ordered(s: &str, order: DateOrder) -> Option<i64>
 /// session zone for a timestamptz); an offset-bearing literal's are
 /// UTC already.
 pub fn parse_timestamp_literal_tz_ordered(s: &str, order: DateOrder) -> Option<(i64, bool)> {
+    if let Some(v) = timestamp_sentinel(s) {
+        return Some((v, true));
+    }
+    let (days, day_micros, tz) = parse_timestamp_parts(s, order)?;
+    let t = i64::from(days)
+        .checked_mul(86_400_000_000)?
+        .checked_add(day_micros)?
+        .checked_sub(tz.unwrap_or(0))?;
+    Some((t, tz.is_some()))
+}
+
+/// v7.39 (round 289) — the pieces every timestamp-literal reader needs:
+/// the day number, the LOCAL clock inside that day, and the zone offset
+/// the literal carried (if any). Split out so the wall-clock reader and
+/// the UTC reader cannot drift apart — the first attempt duplicated the
+/// body and promptly lost the `BC` era handling.
+fn parse_timestamp_parts(s: &str, order: DateOrder) -> Option<(i32, i64, Option<i64>)> {
     let trimmed = s.trim();
     // PG special timestamp values. `infinity` / `-infinity` use the i64
     // sentinels (they compare greater/less than every finite timestamp).
     if trimmed.eq_ignore_ascii_case("epoch") {
-        return Some((0, true));
+        return Some((0, 0, Some(0)));
     }
-    if trimmed.eq_ignore_ascii_case("infinity") || trimmed.eq_ignore_ascii_case("+infinity") {
-        return Some((i64::MAX, true));
-    }
-    if trimmed.eq_ignore_ascii_case("-infinity") {
-        return Some((i64::MIN, true));
+    // The infinity sentinels are whole i64 instants, not a day+offset
+    // pair, so they cannot ride the parts shape — the two public
+    // readers below special-case them before calling here.
+    if trimmed.eq_ignore_ascii_case("infinity")
+        || trimmed.eq_ignore_ascii_case("+infinity")
+        || trimmed.eq_ignore_ascii_case("-infinity")
+    {
+        return None;
     }
     // v7.39 (GUC knife 6, BC) — the era marker trails the TIME part
     // (`0044-03-15 10:20:30 BC`); strip it and re-map the parsed date.
@@ -1173,27 +1193,55 @@ pub fn parse_timestamp_literal_tz_ordered(s: &str, order: DateOrder) -> Option<(
         None => (0, None),
         Some(t) => parse_time_of_day_micros_tz(t)?,
     };
-    let had_tz = tz_offset.is_some();
-    let tz_offset_micros = tz_offset.unwrap_or(0);
-    // PG semantics: a TIMESTAMPTZ literal with an explicit offset
-    // is normalised to UTC for storage. `'12:00:00+09'` means
-    // 12:00:00 in a UTC+09 zone → 03:00:00 UTC → subtract the
-    // positive offset (or add the negative one). Storage is i64
-    // microseconds UTC for both TIMESTAMP and TIMESTAMPTZ (see
-    // spg-storage::DataType::Timestamptz docs); the wire-level
-    // round-trip then re-applies the session timezone on the
-    // SELECT side when format_timestamp is asked for a TZ-aware
-    // render.
-    // v7.39 (read01 timestamp.c) — an instant past SPG's representable
-    // i64 window (Unix-epoch microseconds; PG's own ceiling sits ~30
-    // years further out on its 2000-based clock — recorded delta) must
-    // fail the parse rather than wrap (debug builds panicked here).
-    let t = i64::from(days)
-        .checked_mul(86_400_000_000)?
-        .checked_add(day_micros)?
-        .checked_sub(tz_offset_micros)?;
-    Some((t, had_tz))
+    Some((days, day_micros, tz_offset))
 }
+
+/// v7.39 (round 289) — the WALL-CLOCK value a literal spells, with any
+/// zone designation ignored.
+///
+/// PG drops the zone when the target type has none: `'2020-01-01
+/// 10:00:00+02'::timestamp` is `10:00:00`, not the `08:00:00` you get by
+/// converting to UTC. SPG converted, so the cast returned a DIFFERENT
+/// INSTANT with no error — the silent-wrong shape. It also refused a
+/// named zone outright, where PG accepts and ignores it.
+///
+/// This is the same parse; it just does not apply the offset (the time
+/// parser already reports the local clock separately) and strips a
+/// trailing named zone the numeric-offset scanner cannot see.
+/// A NAMED zone (`… America/New_York`) is not stripped here: PG
+/// validates it — `'… Bogus/Zone'::timestamp` is `time zone
+/// "bogus/zone" not recognized`, not a silent drop — and the zone
+/// database lives on the host, not in this no_std crate. That case
+/// still errors, which is wrong but LOUD; the numeric-offset case was
+/// wrong and silent, which is why it is the one fixed here.
+pub fn parse_timestamp_literal_wall_ordered(s: &str, order: DateOrder) -> Option<i64> {
+    if let Some(v) = timestamp_sentinel(s) {
+        return Some(v);
+    }
+    // Ignoring the offset is simply not applying it: the parts reader
+    // already reports the LOCAL clock separately.
+    let (days, day_micros, _tz) = parse_timestamp_parts(s, order)?;
+    i64::from(days)
+        .checked_mul(86_400_000_000)?
+        .checked_add(day_micros)
+}
+
+/// `epoch` / `±infinity`, which are whole instants rather than a
+/// date-and-time to assemble.
+fn timestamp_sentinel(s: &str) -> Option<i64> {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("epoch") {
+        return Some(0);
+    }
+    if t.eq_ignore_ascii_case("infinity") || t.eq_ignore_ascii_case("+infinity") {
+        return Some(i64::MAX);
+    }
+    if t.eq_ignore_ascii_case("-infinity") {
+        return Some(i64::MIN);
+    }
+    None
+}
+
 
 /// v7.15.0 — Parse `HH:MM:SS[.frac][<tz>]` and return
 /// `(day_micros, tz_offset_micros)` where `day_micros` is the
