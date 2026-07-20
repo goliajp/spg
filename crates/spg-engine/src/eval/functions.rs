@@ -13904,13 +13904,11 @@ fn apply_function_dispatch(
                 for uc in t.schema().uniqueness_constraints.iter() {
                     let names: alloc::vec::Vec<String> =
                         uc.columns.iter().map(|&p| col_name_at(p)).collect();
-                    // Match synth_pg_constraint's PG-style auto-names:
-                    // `{t}_pkey` / `{t}_{col…}_key`.
-                    let conname = if uc.is_primary_key {
-                        alloc::format!("{tname}_pkey")
-                    } else {
-                        alloc::format!("{tname}_{}_key", names.join("_"))
-                    };
+                    // v7.39 (round 290) — call the shared helper rather
+                    // than re-deriving the name here. This inline copy is
+                    // how the deparse and the views drifted: the helper
+                    // honours a DECLARED constraint name and this did not.
+                    let conname = crate::system_catalog::pg_unique_conname(t, uc, &tname);
                     if conname != bare {
                         continue;
                     }
@@ -13924,11 +13922,16 @@ fn apply_function_dispatch(
                         names.join(", ")
                     )));
                 }
-                for (fi, fk) in t.schema().foreign_keys.iter().enumerate() {
-                    let conname = fk
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| alloc::format!("{tname}_fk{fi}"));
+                for fk in t.schema().foreign_keys.iter() {
+                    // v7.39 (round 290) — name the constraint the way
+                    // `synth_pg_constraint` does. This fell back to
+                    // `{t}_fk{i}` while the view reports PG's
+                    // `{t}_{col}_fkey`, so the lookup never matched and
+                    // EVERY foreign key deparsed to an empty string —
+                    // the comment on the uniqueness arm above promises
+                    // exactly this alignment, and the FK arm did not
+                    // keep it.
+                    let conname = crate::system_catalog::pg_fk_conname(t, fk, &tname);
                     if conname != bare {
                         continue;
                     }
@@ -13974,11 +13977,13 @@ fn apply_function_dispatch(
                         FkAction::SetDefault => Some("SET DEFAULT"),
                         FkAction::Restrict | FkAction::NoAction => None,
                     };
-                    if let Some(w) = action_word(fk.on_delete) {
-                        def.push_str(&alloc::format!(" ON DELETE {w}"));
-                    }
+                    // PG emits ON UPDATE before ON DELETE regardless of
+                    // the order they were declared in.
                     if let Some(w) = action_word(fk.on_update) {
                         def.push_str(&alloc::format!(" ON UPDATE {w}"));
+                    }
+                    if let Some(w) = action_word(fk.on_delete) {
+                        def.push_str(&alloc::format!(" ON DELETE {w}"));
                     }
                     return Ok(Value::text(def));
                 }
