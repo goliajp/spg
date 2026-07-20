@@ -1644,6 +1644,32 @@ fn eval_function_call_arm(
         let expanded = expand_variadic_args(args, row, ctx)?;
         return eval_function_call_arm(name, &expanded, row, ctx);
     }
+    // v7.39 (round 276) — `date_part('timezone'|…, <timestamp>)` must be
+    // REJECTED the way EXTRACT already rejects it, and the judgement
+    // needs the argument's STATIC declared type: SPG stores timestamptz
+    // in the same `Value::Timestamp`, so a timestamptz legitimately
+    // answers 0 while a plain timestamp must error. The dispatch below
+    // receives values, not expressions, so the check belongs here —
+    // the same place, and the same r237 trust rule (only a cast or a
+    // column is believed), that the EXTRACT arm uses.
+    if name.eq_ignore_ascii_case("date_part")
+        && args.len() == 2
+        && let Expr::Literal(spg_sql::ast::Literal::String(unit)) = &args[0]
+        && matches!(
+            unit.to_ascii_lowercase().as_str(),
+            "timezone" | "timezone_hour" | "timezone_minute"
+        )
+        && matches!(&args[1], Expr::Cast { .. } | Expr::Column(_))
+        && let Some(sch) = crate::describe::describe_expr(&args[1], ctx.columns)
+        && matches!(sch.ty, spg_storage::DataType::Timestamp)
+    {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "unit \"{}\" not supported for type timestamp without time zone",
+                unit.to_ascii_lowercase()
+            ),
+        });
+    }
     // v7.39 (round 258) — `pg_typeof` over an ENUM. An enum value travels
     // as `Value::Text` (its label), so the value-driven namer answered
     // `text`; the type lives in the EXPRESSION, which this arm still has.
