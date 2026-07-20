@@ -1216,14 +1216,20 @@ fn cast_to_timestamp(v: Value) -> Result<Value, EvalError> {
         // overflowed on ±infinity dates).
         Value::Date(d) => Ok(Value::Timestamp(crate::conversions::date_days_to_micros(d))),
         Value::Text(s) => {
-            parse_timestamp_literal(&s)
-                .map(Value::Timestamp)
-                .ok_or(EvalError::TypeMismatch {
-                    detail: format!(
-                        "cannot parse {s:?} as TIMESTAMP \
+            // v7.39 (round 289) — the target has no zone, so PG ignores
+            // any the literal carries: `'…+02'::timestamp` keeps the
+            // wall clock rather than converting to UTC.
+            crate::eval::format::parse_timestamp_literal_wall_ordered(
+                &s,
+                crate::eval::format::DateOrder::Mdy,
+            )
+            .map(Value::Timestamp)
+            .ok_or(EvalError::TypeMismatch {
+                detail: format!(
+                    "cannot parse {s:?} as TIMESTAMP \
                      (expected YYYY-MM-DD[ HH:MM:SS[.ffffff]])"
-                    ),
-                })
+                ),
+            })
         }
         other => Err(EvalError::TypeMismatch {
             detail: format!("cannot cast {:?} to TIMESTAMP", other.data_type()),
