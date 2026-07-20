@@ -203,6 +203,7 @@ mod e2e_create_statistics_round280;
 mod e2e_bit_length_round281;
 mod e2e_if_exists_notice_round282;
 mod e2e_limit_expr_round284;
+mod e2e_record_type_round285;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;
