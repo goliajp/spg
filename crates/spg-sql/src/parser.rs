@@ -10266,13 +10266,24 @@ impl Parser {
                 loop {
                     match self.peek() {
                         Token::Ident(_) | Token::QuotedIdent(_) => {
-                            self.advance();
+                            // v7.39 (round 294) — the name is CAPTURED now: PG
+                            // validates it against the FROM clause, and an
+                            // uncaptured list silently means "lock everything".
+                            let mut nm = match self.advance() {
+                                Token::Ident(n) | Token::QuotedIdent(n) => n,
+                                _ => alloc::string::String::new(),
+                            };
                             // Optional schema-qualified `schema.table`.
                             if matches!(self.peek(), Token::Dot) {
                                 self.advance();
-                                if matches!(self.peek(), Token::Ident(_) | Token::QuotedIdent(_)) {
+                                if let Token::Ident(n) | Token::QuotedIdent(n) = self.peek().clone()
+                                {
                                     self.advance();
+                                    nm = n;
                                 }
+                            }
+                            if let Some(c) = seen.as_mut() {
+                                c.of_tables.push(nm);
                             }
                         }
                         _ => break,
