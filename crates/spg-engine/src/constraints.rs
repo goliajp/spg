@@ -163,6 +163,8 @@ pub(crate) fn resolve_foreign_key(
         parent_columns,
         on_delete,
         on_update,
+        deferrable: fk.deferrable,
+        initially_deferred: fk.initially_deferred,
         match_type,
     })
 }
@@ -3073,6 +3075,83 @@ impl Engine {
                 .get_mut(&child)
                 .expect("checked above");
             table.schema_mut().foreign_keys.push(storage_fk);
+        }
+        Ok(())
+    }
+}
+
+impl Engine {
+    /// v7.39 (round 288) — is this constraint deferred for the
+    /// transaction currently running?
+    ///
+    /// A constraint must be DEFERRABLE to be deferred at all; among
+    /// those, `SET CONSTRAINTS` overrides the declared timing for the
+    /// rest of the transaction. Outside a transaction nothing can be
+    /// deferred — there is no later point to check at.
+    pub(crate) fn fk_is_deferred_now(&self, fk: &spg_storage::ForeignKeyConstraint) -> bool {
+        if !fk.deferrable {
+            return false;
+        }
+        let Some(tx_id) = self.current_tx else {
+            return false;
+        };
+        let Some(st) = self.tx_catalogs.get(&tx_id) else {
+            return false;
+        };
+        st.constraints_deferred.unwrap_or(fk.initially_deferred)
+    }
+
+    /// The FKs of `table` that must be checked at THIS statement.
+    pub(crate) fn immediate_fks(
+        &self,
+        fks: &[spg_storage::ForeignKeyConstraint],
+    ) -> alloc::vec::Vec<spg_storage::ForeignKeyConstraint> {
+        fks.iter()
+            .filter(|fk| !self.fk_is_deferred_now(fk))
+            .cloned()
+            .collect()
+    }
+
+    /// v7.39 (round 288) — run every deferred FK check that this
+    /// transaction has postponed. Called at COMMIT, and by
+    /// `SET CONSTRAINTS … IMMEDIATE`, which is where PG runs them too.
+    ///
+    /// The whole table is re-verified rather than a queue of rows
+    /// replayed: a row inserted early can be updated or deleted later
+    /// in the same transaction, and a queued copy would then be
+    /// checked against a value that no longer exists.
+    pub(crate) fn run_deferred_fk_checks(&mut self) -> Result<(), EngineError> {
+        let Some(tx_id) = self.current_tx else {
+            return Ok(());
+        };
+        let Some(st) = self.tx_catalogs.get(&tx_id) else {
+            return Ok(());
+        };
+        let tables: alloc::vec::Vec<String> = st.touched_tables.iter().cloned().collect();
+        let deferred_now = |fk: &spg_storage::ForeignKeyConstraint| {
+            fk.deferrable && st.constraints_deferred.unwrap_or(fk.initially_deferred)
+        };
+        for tname in &tables {
+            let Some(t) = st.catalog.get(tname) else {
+                continue;
+            };
+            let fks: alloc::vec::Vec<_> =
+                t.schema().foreign_keys.iter().filter(|f| deferred_now(f)).cloned().collect();
+            if fks.is_empty() {
+                continue;
+            }
+            // `rows()` includes MVCC tombstones. A row inserted and then
+            // deleted inside this same transaction must NOT be checked —
+            // PG commits that cleanly — so skip the dead ones, the way
+            // the rest of this module already does.
+            let rows: alloc::vec::Vec<alloc::vec::Vec<Value<'static>>> = t
+                .rows()
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !t.headers().get(*i).is_some_and(|h| h.is_deleted()))
+                .map(|(_, r)| r.values.clone())
+                .collect();
+            enforce_fk_inserts(&st.catalog, tname, &fks, &rows)?;
         }
         Ok(())
     }

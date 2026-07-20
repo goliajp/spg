@@ -92,6 +92,14 @@ impl fmt::Display for CursorDirection {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Statement::Select dominates; Boxing would touch every match site
 pub enum Statement {
+    /// v7.39 (round 288) — `SET CONSTRAINTS { ALL | <name>… }
+    /// { DEFERRED | IMMEDIATE }`. `deferred` carries the timing; the
+    /// name list is not yet honoured (ALL is what pg_dump emits and
+    /// what a circular-FK restore needs), so a named form applies to
+    /// all deferrable constraints too rather than silently doing
+    /// nothing.
+    SetConstraints { deferred: bool },
+
     /// v7.14.0 — `DROP TABLE [IF EXISTS] name [, name…]
     /// [CASCADE | RESTRICT]`. Engine removes the matching tables
     /// (each one) from the catalog; IF EXISTS makes the drop
@@ -2142,6 +2150,13 @@ pub struct ForeignKeyConstraint {
     pub on_update: FkAction,
     /// v7.38 (read01, T29) — `MATCH {SIMPLE | FULL}`. Defaults to `Simple`.
     pub match_type: MatchType,
+    /// v7.39 (round 288) — `[NOT] DEFERRABLE`. Parsed since v7.17 and
+    /// dropped on the floor, so a constraint declared DEFERRABLE was
+    /// enforced immediately and a circular-FK migration could not load.
+    pub deferrable: bool,
+    /// `INITIALLY DEFERRED` — the check moves to COMMIT unless
+    /// `SET CONSTRAINTS … IMMEDIATE` pulls it forward.
+    pub initially_deferred: bool,
 }
 
 /// v7.38 (read01, T29) — FK `MATCH` type. SIMPLE (default) skips the check when
@@ -3864,6 +3879,10 @@ impl Statement {
     #[must_use]
     pub fn is_readonly(&self) -> bool {
         match self {
+            // v7.39 (round 288) — SET CONSTRAINTS changes transaction
+            // state, and IMMEDIATE can run the deferred checks there and
+            // then; writer-path.
+            Statement::SetConstraints { .. } => false,
             // v7.39 (round 277) — the prepared-statement surface is
             // session state, like SET; writer-path so it lands on the
             // engine that owns the session. EXECUTE may also run a
@@ -4129,6 +4148,11 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => Ok(()),
+            Self::SetConstraints { deferred } => f.write_str(if *deferred {
+                "SET CONSTRAINTS ALL DEFERRED"
+            } else {
+                "SET CONSTRAINTS ALL IMMEDIATE"
+            }),
             // v7.39 (round 277) — the source text is kept verbatim so
             // `pg_prepared_statements.statement` can report it the way
             // PG does (the whole PREPARE statement, not just the body).

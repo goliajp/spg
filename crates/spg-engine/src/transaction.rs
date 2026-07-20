@@ -437,6 +437,7 @@ impl Engine {
                 savepoints: Vec::new(),
                 cached_snapshot,
                 touched_tables: alloc::collections::BTreeSet::new(),
+                constraints_deferred: None,
                 rebase_poisoned: false,
                 stmts_run: 0,
                 update_pairs: alloc::collections::BTreeMap::new(),
@@ -451,6 +452,15 @@ impl Engine {
     }
 
     pub(crate) fn exec_commit(&mut self) -> Result<QueryResult, EngineError> {
+        // v7.39 (round 288) — everything the transaction deferred is
+        // checked HERE, before anything installs. A violation fails the
+        // COMMIT with the ordinary 23503 wording, and ENDS the
+        // transaction: PG's failed COMMIT rolls back, it does not leave
+        // the session sitting in an aborted block.
+        if let Err(e) = self.run_deferred_fk_checks() {
+            let _ = self.exec_rollback();
+            return Err(e);
+        }
         // v7.37.17 (Phase E2) — final rebase before the shadow is
         // installed: COMMIT replaces the whole committed catalog with
         // the shadow, so anything committed concurrently AFTER this
@@ -654,7 +664,21 @@ impl Engine {
                 let Some(t) = st.catalog.get(tname) else {
                     continue;
                 };
-                let fks = t.schema().foreign_keys.clone();
+                // v7.39 (round 288) — DEFERRED constraints are handled by
+                // `run_deferred_fk_checks` at the top of this function,
+                // which re-verifies LIVE rows. This race check works off
+                // the insert write-set, so a row inserted and then deleted
+                // in the same transaction would still be checked here.
+                let fks: Vec<_> = t
+                    .schema()
+                    .foreign_keys
+                    .iter()
+                    .filter(|f| {
+                        !(f.deferrable
+                            && st.constraints_deferred.unwrap_or(f.initially_deferred))
+                    })
+                    .cloned()
+                    .collect();
                 if fks.is_empty() {
                     continue;
                 }

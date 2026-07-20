@@ -3007,8 +3007,18 @@ impl Parser {
                 if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("constraints"))
                 {
                     self.advance(); // CONSTRAINTS
-                    self.consume_until_statement_boundary();
-                    return Ok(Statement::Empty);
+                    // v7.39 (round 288) — no longer a no-op: the trailing
+                    // DEFERRED / IMMEDIATE sets the transaction's timing.
+                    let mut deferred = false;
+                    while !matches!(self.peek(), Token::Semicolon | Token::Eof) {
+                        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                            if s.eq_ignore_ascii_case("deferred"))
+                        {
+                            deferred = true;
+                        }
+                        self.advance();
+                    }
+                    return Ok(Statement::SetConstraints { deferred });
                 }
                 // v7.16.2 — PG `SET [SESSION] AUTHORIZATION
                 // { DEFAULT | '<role>' | <ident> }` (mailrs
@@ -4933,11 +4943,24 @@ impl Parser {
     /// `[NOT] DEFERRABLE INITIALLY {DEFERRED|IMMEDIATE}` shape.
     /// Stops at the first token that isn't part of the clause.
     fn consume_optional_deferrable_clauses(&mut self) -> Result<(), ParseError> {
+        self.consume_deferrable_clauses_timed().map(|_| ())
+    }
+
+    /// v7.39 (round 288) — the same scan, but reporting what it saw:
+    /// `(deferrable, initially_deferred)`. The clauses were parsed and
+    /// dropped, so `DEFERRABLE INITIALLY DEFERRED` on an FK behaved as
+    /// NOT DEFERRABLE and a circular-FK migration could not load.
+    fn consume_deferrable_clauses_timed(&mut self) -> Result<(bool, bool), ParseError> {
+        let mut deferrable = false;
+        let mut initially_deferred = false;
         loop {
             // Bare `DEFERRABLE` (Phase 3.1 — was hard-error pre-3.1).
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("deferrable")) {
                 self.advance();
-                self.consume_optional_initially_clause()?;
+                deferrable = true;
+                if self.consume_optional_initially_clause()? {
+                    initially_deferred = true;
+                }
                 continue;
             }
             // `NOT DEFERRABLE` — already worked pre-3.1.
@@ -4946,7 +4969,9 @@ impl Parser {
                 if matches!(look, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("deferrable")) {
                     self.advance(); // NOT
                     self.advance(); // DEFERRABLE
-                    self.consume_optional_initially_clause()?;
+                    deferrable = false;
+                    initially_deferred = false;
+                    let _ = self.consume_optional_initially_clause()?;
                     continue;
                 }
                 break;
@@ -4956,27 +4981,32 @@ impl Parser {
             // (the timing keyword alone). pg_dump occasionally
             // emits it on FK constraints that inherit timing.
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("initially")) {
-                self.consume_optional_initially_clause()?;
+                if self.consume_optional_initially_clause()? {
+                    initially_deferred = true;
+                    // PG: a bare `INITIALLY DEFERRED` implies DEFERRABLE.
+                    deferrable = true;
+                }
                 continue;
             }
             break;
         }
-        Ok(())
+        Ok((deferrable, initially_deferred))
     }
 
     /// Helper for [`consume_optional_deferrable_clauses`]. When the
     /// next token is `INITIALLY`, consume it plus the required
     /// `DEFERRED` | `IMMEDIATE` trailer. No-op otherwise.
-    fn consume_optional_initially_clause(&mut self) -> Result<(), ParseError> {
+    /// Returns true when the timing seen was `DEFERRED`.
+    fn consume_optional_initially_clause(&mut self) -> Result<bool, ParseError> {
         if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("initially")) {
-            return Ok(());
+            return Ok(false);
         }
         self.advance(); // INITIALLY
         match self.advance() {
             Token::Ident(s)
                 if s.eq_ignore_ascii_case("deferred") || s.eq_ignore_ascii_case("immediate") =>
             {
-                Ok(())
+                Ok(s.eq_ignore_ascii_case("deferred"))
             }
             other => Err(self.err(alloc::format!(
                 "expected DEFERRED or IMMEDIATE after INITIALLY, got {other:?}"
@@ -12609,7 +12639,7 @@ impl Parser {
         if columns.is_empty() {
             return Err(self.err("FOREIGN KEY requires at least one column".into()));
         }
-        let (parent_table, parent_columns, on_delete, on_update, match_type) =
+        let (parent_table, parent_columns, on_delete, on_update, match_type, deferrable, initially_deferred) =
             self.parse_references_tail(columns.len())?;
         Ok(ForeignKeyConstraint {
             name,
@@ -12619,6 +12649,8 @@ impl Parser {
             on_delete,
             on_update,
             match_type,
+            deferrable,
+            initially_deferred,
         })
     }
 
@@ -12636,6 +12668,9 @@ impl Parser {
             FkAction,
             FkAction,
             crate::ast::MatchType,
+            // v7.39 (round 288) — deferrable, initially_deferred.
+            bool,
+            bool,
         ),
         ParseError,
     > {
@@ -12731,11 +12766,15 @@ impl Parser {
         let mut on_update = FkAction::NoAction;
         let mut seen_on_delete = false;
         let mut seen_on_update = false;
+        let mut deferrable = false;
+        let mut initially_deferred = false;
         loop {
             // DEFERRABLE / NOT DEFERRABLE / INITIALLY shapes.
             let before = self.pos;
-            self.consume_optional_deferrable_clauses()?;
+            let (d, idef) = self.consume_deferrable_clauses_timed()?;
             if self.pos != before {
+                deferrable = d;
+                initially_deferred = idef;
                 continue;
             }
             // ON DELETE / ON UPDATE.
@@ -12773,6 +12812,8 @@ impl Parser {
             on_delete,
             on_update,
             match_type,
+            deferrable,
+            initially_deferred,
         ))
     }
 
@@ -13260,7 +13301,7 @@ impl Parser {
         if !inline_references {
             return Ok((col, None));
         }
-        let (parent_table, parent_columns, on_delete, on_update, match_type) =
+        let (parent_table, parent_columns, on_delete, on_update, match_type, deferrable, initially_deferred) =
             self.parse_references_tail(1)?;
         let fk = ForeignKeyConstraint {
             name: None,
@@ -13270,6 +13311,8 @@ impl Parser {
             on_delete,
             on_update,
             match_type,
+            deferrable,
+            initially_deferred,
         };
         Ok((col, Some(fk)))
     }

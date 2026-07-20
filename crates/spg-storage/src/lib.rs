@@ -1910,6 +1910,11 @@ pub struct ForeignKeyConstraint {
     pub on_update: FkAction,
     /// v7.38 (read01, T29) — `MATCH SIMPLE | FULL`. Defaults to `Simple`.
     pub match_type: MatchType,
+    /// v7.39 (round 288) — `[NOT] DEFERRABLE`.
+    pub deferrable: bool,
+    /// `INITIALLY DEFERRED`: the check runs at COMMIT rather than at
+    /// the statement, unless `SET CONSTRAINTS … IMMEDIATE` pulls it in.
+    pub initially_deferred: bool,
 }
 
 /// v7.38 (read01, T29) — FK MATCH type. Mirrors `spg_sql::ast::MatchType`.
@@ -7087,7 +7092,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 78;
+const FILE_VERSION: u8 = 79;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7413,6 +7418,9 @@ impl Catalog {
                 out.push(fk.on_update.tag());
                 // v7.38 (read01, T29) — MATCH type tag (FILE_VERSION 55+).
                 out.push(fk.match_type.tag());
+                // v7.39 (round 288) — constraint timing (FILE_VERSION 79+).
+                // One byte, bit 0 = DEFERRABLE, bit 1 = INITIALLY DEFERRED.
+                out.push(u8::from(fk.deferrable) | (u8::from(fk.initially_deferred) << 1));
             }
             // v7.9.19 — UniquenessConstraint appendix (catalog
             // FILE_VERSION 15+). Layout per table after the FK
