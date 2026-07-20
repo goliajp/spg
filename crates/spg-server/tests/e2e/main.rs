@@ -344,6 +344,7 @@ mod e2e_pg_scram;
     unused_variables
 )]
 mod e2e_pg_session_vars;
+mod e2e_pg_concurrent_tx_round283;
 mod e2e_pg_tx_visibility_round84;
 #[allow(
     clippy::cast_lossless,

@@ -412,6 +412,16 @@ pub(crate) struct ServerState {
 /// without locking.
 pub(crate) struct ConnState {
     pub(crate) pid: u32,
+    /// v7.39 (round 283) — this connection's TX slot in the shared
+    /// engine. The server runs ONE engine; `Engine::execute()` routes
+    /// everything through `IMPLICIT_TX` (slot 0), so before this every
+    /// connection shared one transaction: a second client's `BEGIN`
+    /// answered "a transaction is already open", and a READ COMMITTED
+    /// tx could not see another connection's commit because there WAS
+    /// no other connection's transaction. The engine has been
+    /// multi-slot since v4.41.1 (`execute_in`) and pins it; the server
+    /// simply never asked for a slot.
+    pub(crate) tx_id: spg_engine::TxId,
     pub(crate) user: String,
     pub(crate) started_at_us: i64,
     pub(crate) current_sql: RwLock<String>,
