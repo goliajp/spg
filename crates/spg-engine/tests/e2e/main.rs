@@ -201,6 +201,7 @@ mod e2e_prepared_sql_round277;
 mod e2e_session_isolation_round279;
 mod e2e_create_statistics_round280;
 mod e2e_bit_length_round281;
+mod e2e_if_exists_notice_round282;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;

@@ -140,7 +140,15 @@ fn main() {
             }
             continue;
         }
-        match e.execute(stmt) {
+        let outcome = e.execute(stmt);
+        // v7.39 (round 282) — surface the NOTICEs the statement raised.
+        // The harness printed only the result, so an `IF EXISTS` skip
+        // looked identical whether or not SPG raised PG's notice, and
+        // the differential could not see the gap it was meant to find.
+        for n in e.take_notices() {
+            println!("NOTICE: {n}");
+        }
+        match outcome {
             Ok(QueryResult::Rows { rows, .. }) => {
                 // One line per statement: columns joined by `|`, rows by `;`
                 // (matches `psql -tA` with rows collapsed onto a line).
