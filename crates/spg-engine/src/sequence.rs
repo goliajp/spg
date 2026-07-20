@@ -105,6 +105,26 @@ impl Engine {
                     *expr = Expr::Literal(value_to_literal(v));
                     return Ok(());
                 }
+                // v7.39 (round 287) — the large-object functions land here
+                // for the same reason: lo_from_bytea / lo_put / lo_unlink
+                // mutate the catalog, and the value dispatch only ever
+                // holds `&EvalContext`. lo_get is read-only but resolves
+                // alongside them so the whole family reads one way.
+                if let Some(v) = self.eval_large_object_call(&lc, args)? {
+                    // `lo_get` yields bytea, and the AST has no bytes
+                    // literal — folding it to a bare literal would hand
+                    // downstream a TEXT of the hex form, so `length()`
+                    // answered 12 for five bytes. Re-attach the type.
+                    *expr = if matches!(v, spg_storage::Value::Bytes(_)) {
+                        Expr::Cast {
+                            expr: alloc::boxed::Box::new(Expr::Literal(value_to_literal(v))),
+                            target: spg_sql::ast::CastTarget::Bytea,
+                        }
+                    } else {
+                        Expr::Literal(value_to_literal(v))
+                    };
+                    return Ok(());
+                }
                 if lc == "nextval" || lc == "currval" || lc == "setval" || lc == "lastval" {
                     let v = self.eval_sequence_call(&lc, args)?;
                     *expr = Expr::Literal(value_to_literal(v));
@@ -429,6 +449,141 @@ impl Engine {
             other => Err(EngineError::Unsupported(alloc::format!(
                 "unknown sequence op {other:?}"
             ))),
+        }
+    }
+}
+
+impl Engine {
+    /// v7.39 (round 287) — PG's server-side large-object functions.
+    ///
+    /// Returns `Ok(None)` when `lc` is not one of them, or when an
+    /// argument is not a literal (a column reference is left for the
+    /// ordinary value dispatch, which reports the function as unknown —
+    /// the same shape the sequence family uses).
+    ///
+    /// Offsets are 0-based, which is PG's convention here and NOT the
+    /// 1-based one `substring` uses: `lo_get(o,1,3)` over 'Hello' is
+    /// 'ell'. Measured, not assumed.
+    pub(crate) fn eval_large_object_call(
+        &mut self,
+        lc: &str,
+        args: &[Expr],
+    ) -> Result<Option<spg_storage::Value<'static>>, EngineError> {
+        use spg_storage::Value;
+        if !matches!(
+            lc,
+            "lo_from_bytea"
+                | "lo_get"
+                | "lo_put"
+                | "lo_unlink"
+                | "lo_create"
+                | "lo_creat"
+        ) {
+            return Ok(None);
+        }
+        // Fold each argument through the catalog-aware literal
+        // evaluator rather than pattern-matching token shapes: a bytea
+        // argument arrives as `Cast { String, Bytea }`, not as a literal,
+        // and the same is true of every other coerced spelling.
+        let mut vals: alloc::vec::Vec<spg_storage::Value<'static>> =
+            alloc::vec::Vec::with_capacity(args.len());
+        for a in args {
+            match crate::conversions::literal_expr_to_value_in(a.clone(), Some(self.active_catalog()))
+            {
+                Ok(v) => vals.push(v),
+                // Not foldable (a column, a subquery) — leave the call
+                // alone, exactly as the sequence family does.
+                Err(_) => return Ok(None),
+            }
+        }
+        let int_arg = |i: usize| -> Option<i64> {
+            match vals.get(i)? {
+                Value::SmallInt(n) => Some(i64::from(*n)),
+                Value::Int(n) => Some(i64::from(*n)),
+                Value::BigInt(n) => Some(*n),
+                _ => None,
+            }
+        };
+        let bytes_arg = |i: usize| -> Option<alloc::vec::Vec<u8>> {
+            match vals.get(i)? {
+                Value::Bytes(b) => Some(b.to_vec()),
+                Value::Text(t) => crate::conversions::decode_bytea_literal(t).ok(),
+                _ => None,
+            }
+        };
+        let missing = |oid: i64| {
+            EngineError::Unsupported(alloc::format!("large object {oid} does not exist"))
+        };
+        match lc {
+            "lo_creat" | "lo_create" => {
+                let Some(req) = int_arg(0) else {
+                    return Ok(None);
+                };
+                // lo_creat(-1) and lo_create(0) both mean "pick an OID".
+                let want = u32::try_from(req).unwrap_or(0);
+                let oid = self
+                    .active_catalog_mut()
+                    .create_large_object(want, alloc::vec::Vec::new())
+                    .map_err(EngineError::Unsupported)?;
+                Ok(Some(Value::Int(i32::try_from(oid).unwrap_or(0))))
+            }
+            "lo_from_bytea" => {
+                let (Some(req), Some(data)) = (int_arg(0), bytes_arg(1)) else {
+                    return Ok(None);
+                };
+                let want = u32::try_from(req).unwrap_or(0);
+                let oid = self
+                    .active_catalog_mut()
+                    .create_large_object(want, data)
+                    .map_err(EngineError::Unsupported)?;
+                Ok(Some(Value::Int(i32::try_from(oid).unwrap_or(0))))
+            }
+            "lo_get" => {
+                let Some(oid) = int_arg(0) else {
+                    return Ok(None);
+                };
+                let key = u32::try_from(oid).map_err(|_| missing(oid))?;
+                let all = self
+                    .active_catalog()
+                    .large_object(key)
+                    .ok_or_else(|| missing(oid))?
+                    .to_vec();
+                if args.len() == 1 {
+                    return Ok(Some(Value::Bytes(all.into())));
+                }
+                let (Some(off), Some(len)) = (int_arg(1), int_arg(2)) else {
+                    return Ok(None);
+                };
+                let start = usize::try_from(off).unwrap_or(0).min(all.len());
+                let end = start
+                    .saturating_add(usize::try_from(len).unwrap_or(0))
+                    .min(all.len());
+                Ok(Some(Value::Bytes(all[start..end].to_vec().into())))
+            }
+            "lo_put" => {
+                let (Some(oid), Some(off), Some(data)) = (int_arg(0), int_arg(1), bytes_arg(2))
+                else {
+                    return Ok(None);
+                };
+                let key = u32::try_from(oid).map_err(|_| missing(oid))?;
+                self.active_catalog_mut()
+                    .put_large_object(key, usize::try_from(off).unwrap_or(0), &data)
+                    .map_err(EngineError::Unsupported)?;
+                // PG's lo_put returns void.
+                Ok(Some(Value::Null))
+            }
+            "lo_unlink" => {
+                let Some(oid) = int_arg(0) else {
+                    return Ok(None);
+                };
+                let key = u32::try_from(oid).map_err(|_| missing(oid))?;
+                if self.active_catalog_mut().unlink_large_object(key) {
+                    Ok(Some(Value::Int(1)))
+                } else {
+                    Err(missing(oid))
+                }
+            }
+            _ => Ok(None),
         }
     }
 }

@@ -577,6 +577,18 @@ impl Engine {
                         crate::system_catalog::synth_pg_stat_user_functions(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.39 (round 287) — pg_catalog.pg_largeobject{,_metadata}.
+                "__spg_pg_largeobject" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_largeobject(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_largeobject_metadata" => {
+                    let (schema, rows) = crate::system_catalog::synth_pg_largeobject_metadata(
+                        self.active_catalog(),
+                    );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.37.23 (23.7-a) — pg_catalog.pg_statistic_ext.
                 "__spg_pg_statistic_ext" => {
                     let (schema, rows) =

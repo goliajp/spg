@@ -9822,6 +9822,8 @@ impl Parser {
             "pg_stat_user_tables",
             "pg_stat_wal",
             "pg_prepared_statements",
+            "pg_largeobject",
+            "pg_largeobject_metadata",
             "pg_statistic",
             "pg_statistic_ext",
             "pg_subscription",
