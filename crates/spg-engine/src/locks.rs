@@ -518,17 +518,14 @@ impl crate::Engine {
                         "could not obtain lock on row in relation \"{tname}\""
                     )));
                 }
+                // The caller (the server) drops the engine lock and
+                // retries; blocking here would stop every connection,
+                // including the one whose COMMIT frees this row.
                 LockOutcome::WouldBlock { .. } => {
-                    return Err(crate::EngineError::Unsupported(alloc::format!(
-                        "{} would block: SPG does not yet wait for a row lock; \
-                         use NOWAIT or SKIP LOCKED",
-                        lock_verb(lock.strength)
-                    )));
+                    return Err(crate::EngineError::LockWouldBlock);
                 }
                 LockOutcome::Deadlock { .. } => {
-                    return Err(crate::EngineError::Unsupported(
-                        "deadlock detected".into(),
-                    ));
+                    return Err(crate::EngineError::LockDeadlock);
                 }
             }
         }

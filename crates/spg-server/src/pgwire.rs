@@ -993,6 +993,7 @@ fn handle_pg_simple_query(
                     cancel,
                     matches!(*tx_state, b'T' | b'E'),
                     conn_state.tx_id,
+                    settings,
                 ),
                 false,
             ),
@@ -1265,6 +1266,7 @@ fn handle_pg_simple_query_one_into_wbuf(
                     cancel,
                     matches!(*tx_state, b'T' | b'E'),
                     conn_state.tx_id,
+                    settings,
                 ),
                 false,
             ),
@@ -2017,6 +2019,9 @@ fn execute_with_role(
     conn_in_tx: bool,
     // v7.39 (round 283) — the connection's own TX slot.
     tx_id: spg_engine::TxId,
+    // v7.39 (round 299) — session GUCs; `lock_timeout` bounds the
+    // blocking `FOR UPDATE` wait.
+    settings: &std::collections::HashMap<String, String>,
 ) -> Result<QueryResult, EngineError> {
     // v5.1: cold-tier preload — kept symmetric with the native
     // Op::Query path so a sweep that drives the server through
@@ -2099,12 +2104,57 @@ fn execute_with_role(
             .map_err(|_| EngineError::Unsupported("engine rwlock poisoned".into()))?;
         engine.execute_readonly_with_cancel(sql, cancel)
     } else {
-        let mut engine = state
-            .engine
-            .write()
-            .map_err(|_| EngineError::Unsupported("engine rwlock poisoned".into()))?;
-        engine.execute_in_with_cancel(sql, tx_id, cancel)
+        // v7.39 (round 299, E3 Phase 2) — the blocking `FOR UPDATE`
+        // wait lives HERE, outside the engine lock.
+        //
+        // PG blocks until the holder commits, then proceeds. SPG cannot
+        // block inside the engine write lock: that would stop every
+        // connection, including the one whose COMMIT releases the row —
+        // the wait would deadlock the server against itself. So the
+        // engine reports `LockWouldBlock` and the retry happens after
+        // the guard drops.
+        //
+        // Re-attempting also re-registers the wait edge, which is what
+        // lets the lock manager's cycle detector fire: two transactions
+        // waiting on each other resolve to 40P01 instead of spinning.
+        let deadline = lock_wait_deadline(settings);
+        loop {
+            let attempt = {
+                let mut engine = state
+                    .engine
+                    .write()
+                    .map_err(|_| EngineError::Unsupported("engine rwlock poisoned".into()))?;
+                engine.execute_in_with_cancel(sql, tx_id, cancel)
+            }; // guard drops here — the holder can now commit
+            match attempt {
+                Err(EngineError::LockWouldBlock) => {
+                    if let Some(d) = deadline
+                        && std::time::Instant::now() >= d
+                    {
+                        return Err(EngineError::Unsupported(
+                            "canceling statement due to lock timeout".into(),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                other => return other,
+            }
+        }
     }
+}
+
+/// v7.39 (round 299) — when to give up waiting for a row lock.
+///
+/// `lock_timeout = 0` (PG's default) means wait forever, which is what
+/// PG does; `None` here carries that. A cycle still terminates, because
+/// each retry re-registers the wait edge and the lock manager's
+/// detector answers 40P01.
+fn lock_wait_deadline(
+    settings: &std::collections::HashMap<String, String>,
+) -> Option<std::time::Instant> {
+    let raw = settings.get("lock_timeout")?;
+    let ms = parse_timeout_ms(raw)?;
+    (ms > 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms))
 }
 
 /// v7.33 (A1) — persist a successful pgwire write to the durability
@@ -4034,6 +4084,18 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
     // 42601. Ahead of the variant short-circuits for the same reason the
     // window arm below is: these arrive as `Unsupported`, whose Display
     // prefixes the message.
+    // v7.39 (round 299, E3 Phase 2) — a wait that ran out of
+    // `lock_timeout` is PG's 55P03, same class as NOWAIT; a wait-for
+    // cycle is 40P01, which clients retry.
+    if let EngineError::LockDeadlock = e {
+        return ("40P01", e.to_string());
+    }
+    {
+        let msg = e.to_string();
+        if msg.contains("canceling statement due to lock timeout") {
+            return ("55P03", msg);
+        }
+    }
     // v7.39 (round 297, E3 Phase 1b) — `FOR UPDATE NOWAIT` on a row
     // another transaction holds is PG's 55P03 LOCK_NOT_AVAILABLE.
     // Clients catch that code specifically to back off and retry, so
@@ -5853,6 +5915,7 @@ fn handle_copy_to_stdout(
         CancelToken::none(),
         matches!(*tx_state, b'T' | b'E'),
         tx_id,
+        &std::collections::HashMap::new(),
     );
     let (columns, rows) = match result {
         Ok(QueryResult::Rows { columns, rows }) => (columns, rows),

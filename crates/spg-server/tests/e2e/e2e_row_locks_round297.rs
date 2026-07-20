@@ -292,3 +292,35 @@ fn an_ordinary_select_is_untouched_by_a_held_lock() {
     );
     assert_eq!(query_all(&mut b, "SELECT count(*) FROM lk"), vec!["4"]);
 }
+
+#[test]
+fn a_bare_for_update_waits_for_the_holder_and_then_proceeds() {
+    // v7.39 (round 299, E3 Phase 2) — PG's default policy BLOCKS until
+    // the holder commits, then takes the lock. Measured against live
+    // PG 18.4: the waiter returns the row after ~2s.
+    //
+    // The wait cannot happen inside the engine write lock — that would
+    // stop every connection, including the one whose COMMIT frees the
+    // row, so the server would deadlock against itself. The engine
+    // reports `LockWouldBlock` and the retry runs after the guard drops.
+    let (_child, addr, mut a) = boot_with_holder("wait");
+    let mut b = open(&addr);
+
+    // B blocks on row 1. Hand it to a thread so this one can commit A.
+    let handle = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let got = query_all(&mut b, "SELECT id FROM lk WHERE id = 1 FOR UPDATE");
+        (got, started.elapsed())
+    });
+
+    // Give the waiter time to actually block, then release.
+    std::thread::sleep(Duration::from_millis(300));
+    query_all(&mut a, "COMMIT");
+
+    let (got, waited) = handle.join().expect("waiter thread");
+    assert_eq!(got, vec!["1"], "the waiter gets the row once it is free");
+    assert!(
+        waited >= Duration::from_millis(250),
+        "it should have WAITED, not returned immediately: {waited:?}",
+    );
+}
