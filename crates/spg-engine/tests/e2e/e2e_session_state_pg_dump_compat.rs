@@ -19,10 +19,19 @@ fn discard_all_no_op() {
 }
 
 #[test]
-fn deallocate_no_op() {
+fn deallocate_names_a_missing_statement() {
+    // v7.39 (round 277) — was `deallocate_no_op`, which asserted that
+    // dropping a name that was never prepared succeeds. PG raises
+    // `prepared statement "myplan" does not exist`; only ALL is
+    // unconditional.
     let mut e = Engine::new();
-    ddl(&mut e, "DEALLOCATE myplan");
-    ddl(&mut e, "DEALLOCATE PREPARE myplan");
+    for sql in ["DEALLOCATE myplan", "DEALLOCATE PREPARE myplan"] {
+        let msg = format!("{:?}", e.execute(sql).unwrap_err());
+        assert!(
+            msg.contains(r#"prepared statement \"myplan\" does not exist"#),
+            "{sql}: {msg}",
+        );
+    }
     ddl(&mut e, "DEALLOCATE ALL");
 }
 

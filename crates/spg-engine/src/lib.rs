@@ -531,6 +531,19 @@ pub struct CatalogSnapshot {
 
 /// CoW-1 (v7.34) — frozen view of the *persisted* committed engine
 /// state. Carries every field the `snapshot()` envelope serializes;
+/// v7.39 (round 277) — one SQL-level prepared statement.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedSqlStatement {
+    /// The body with its `$N` placeholders still in place.
+    pub(crate) body: spg_sql::ast::Statement,
+    /// Declared parameter type names, in order; empty when PG would
+    /// have inferred them.
+    pub(crate) param_types: alloc::vec::Vec<String>,
+    /// The whole `PREPARE …` text, which `pg_prepared_statements`
+    /// reports verbatim.
+    pub(crate) source: String,
+}
+
 /// `Clone` is O(1) on the catalog (Arc bump) and cheap typed-clones
 /// on the trailers. Decouples "capture state" from "serialize bytes"
 /// so the background-checkpoint worker can hold the snapshot and
@@ -726,6 +739,11 @@ pub struct Engine {
     /// nextval() in this Engine (session). Backs PG's lastval().
     /// None until the first nextval; PG errors in that state.
     last_sequence_used: Option<String>,
+    /// v7.39 (round 277) — SQL-level prepared statements, session
+    /// scoped exactly as in PG. Keyed by name; each entry keeps the
+    /// parsed body (placeholders intact), the declared parameter type
+    /// names and the statement text `pg_prepared_statements` reports.
+    prepared_statements: alloc::collections::BTreeMap<String, PreparedSqlStatement>,
     /// Optional wall clock used to satisfy `NOW()` / `CURRENT_TIMESTAMP`
     /// / `CURRENT_DATE`. Set by the host environment.
     clock: Option<ClockFn>,
@@ -1027,6 +1045,7 @@ impl Engine {
             tx_catalogs: BTreeMap::new(),
             current_tx: None,
             backslash_escapes: false,
+            prepared_statements: alloc::collections::BTreeMap::new(),
             last_sequence_used: None,
             next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
@@ -1377,6 +1396,7 @@ impl Engine {
             tx_catalogs: BTreeMap::new(),
             current_tx: None,
             backslash_escapes: false,
+            prepared_statements: alloc::collections::BTreeMap::new(),
             last_sequence_used: None,
             next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
@@ -1484,6 +1504,7 @@ impl Engine {
                     tx_catalogs: BTreeMap::new(),
                     current_tx: None,
                     backslash_escapes: false,
+                    prepared_statements: alloc::collections::BTreeMap::new(),
                     last_sequence_used: None,
                     next_tx_id: 1,
                     active_writer_versions: BTreeSet::new(),
