@@ -21,6 +21,14 @@ pub(crate) fn pg_unique_conname(
     uc: &spg_storage::UniquenessConstraint,
     tname: &str,
 ) -> String {
+    // v7.39 (round 290) — a DECLARED name wins. `CONSTRAINT rdc_uq
+    // UNIQUE (code)` was stored and then ignored here, so both the
+    // catalog views and pg_get_constraintdef reported the synthesised
+    // `rdc_code_key` — a dump would name the constraint something the
+    // user never wrote.
+    if let Some(n) = &uc.name {
+        return n.clone();
+    }
     if uc.is_primary_key {
         return alloc::format!("{tname}_pkey");
     }
@@ -47,6 +55,13 @@ pub(crate) fn pg_fk_conname(
     fk: &spg_storage::ForeignKeyConstraint,
     tname: &str,
 ) -> String {
+    // v7.39 (round 290) — a DECLARED name wins, the same rule the
+    // uniqueness helper follows. Verified against PG: `CONSTRAINT
+    // child_pid_fk FOREIGN KEY …` reports as `child_pid_fk`, not the
+    // synthesised `nchild_pid_fkey`.
+    if let Some(n) = &fk.name {
+        return n.clone();
+    }
     let cols = fk
         .local_columns
         .iter()
