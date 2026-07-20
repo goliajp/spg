@@ -1171,6 +1171,25 @@ fn eval_cast_arm(
             return apply_composite_cast_in(v, comp, ctx.catalog);
         }
     }
+    // v7.39 (round 285) — `::record`, the anonymous composite type. PG
+    // treats it as an IDENTITY cast on anything already composite: the
+    // value keeps its fields and their names, so `(ROW(1,2)::record).f1`
+    // and `(r).x` still resolve. Only a non-composite is refused, with
+    // PG's wording. `record` is not a catalog type, so this cannot live
+    // in the lookups above.
+    if let CastTarget::Named(name) = target
+        && name.eq_ignore_ascii_case("record")
+    {
+        return match v {
+            Value::Composite(_) | Value::Null => Ok(v),
+            other => Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "cannot cast type {} to record",
+                    crate::eval::strings::pg_typeof_name(&other),
+                ),
+            }),
+        };
+    }
     // v7.38 (read01, T22) — a numeric OID cast to regclass reverse-looks
     // up the user relation name (PG's 16384+ band, assigned in
     // table_names() order). System OIDs / non-matches fall through to
@@ -2559,12 +2578,64 @@ fn eval_field_access_arm(
             .into_iter()
             .find(|(name, _)| name == field)
             .map(|(_, val)| val)
-            .ok_or_else(|| EvalError::ColumnNotFound {
-                name: field.to_string(),
-            }),
+            .ok_or_else(|| missing_field_error(base, field, ctx)),
         _ => Err(EvalError::TypeMismatch {
             detail: alloc::format!("field access `.{field}` requires a composite (record) value"),
         }),
+    }
+}
+
+/// v7.39 (round 285) — PG words a missing composite field three ways, and
+/// which one you get depends on the base expression's STATIC type, not on
+/// the value:
+///
+///   * a named composite — `column "nosuch" not found in data type rc9`
+///   * a whole-row table reference — `column rt8.nosuch does not exist`
+///     (unquoted, and qualified — the odd one out)
+///   * an anonymous ROW or `::record` — `could not identify column
+///     "nosuch" in record data type`
+///
+/// All three read off live PG 18.4. A `Value::Composite` carries its field
+/// names but not its type name, so the base expression is what decides.
+fn missing_field_error(base: &Expr, field: &str, ctx: &EvalContext<'_>) -> EvalError {
+    if let Expr::Cast {
+        target: CastTarget::Named(name),
+        ..
+    } = base
+        && ctx
+            .catalog
+            .is_some_and(|c| c.composite_types().contains_key(name.as_str()))
+    {
+        return EvalError::TypeMismatch {
+            detail: alloc::format!("column \"{field}\" not found in data type {name}"),
+        };
+    }
+    if let Expr::Column(c) = base
+        && c.qualifier.is_none()
+    {
+        // A column DECLARED as a named composite reports that type — the
+        // schema records it in `user_composite_type`, which is the only
+        // place the name survives (a `Value::Composite` does not carry it).
+        if let Some(name) = ctx
+            .columns
+            .iter()
+            .find(|col| col.name.eq_ignore_ascii_case(&c.name))
+            .and_then(|col| col.user_composite_type.as_ref())
+        {
+            return EvalError::TypeMismatch {
+                detail: alloc::format!("column \"{field}\" not found in data type {name}"),
+            };
+        }
+        // A whole-row reference to a real table is the odd wording out:
+        // qualified, and unquoted.
+        if ctx.catalog.is_some_and(|cat| cat.get(&c.name).is_some()) {
+            return EvalError::TypeMismatch {
+                detail: alloc::format!("column {}.{field} does not exist", c.name),
+            };
+        }
+    }
+    EvalError::TypeMismatch {
+        detail: alloc::format!("could not identify column \"{field}\" in record data type"),
     }
 }
 
