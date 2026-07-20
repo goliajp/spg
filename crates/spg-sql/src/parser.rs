@@ -107,12 +107,6 @@ fn is_dump_noise_statement(lc: &str) -> bool {
             // point today (extensions ship as first-class crates
             // linked at build time); accept as a no-op.
             | "load"
-            // v7.37.17 (17.6 sibling) — CALL <procedure>(<args>).
-            // PG 11+ procedure call syntax. SPG's stored-procedure
-            // surface is v7.40 PL/pgSQL epic; accept as a no-op so
-            // migrations that reference stored procs don't stall at
-            // parse.
-            | "call"
     )
 }
 
@@ -1164,6 +1158,25 @@ impl Parser {
     fn parse_prepare(&mut self) -> Result<Statement, ParseError> {
         let start = self.pos;
         self.advance(); // PREPARE
+        // v7.39 (round 278) — `PREPARE TRANSACTION '<gid>'` is 2PC, a
+        // different statement that happens to share the keyword. PG
+        // ships with `max_prepared_transactions = 0` and reports it
+        // this way; SPG has no prepared-transaction registry, so the
+        // same wording is the accurate answer rather than a dodge.
+        // Round 277 turned this from a silent no-op into a confusing
+        // "expected AS in PREPARE" parse error.
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("transaction")) {
+            self.advance();
+            let gid = match self.advance() {
+                Token::String(g) => g,
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "expected a transaction identifier after PREPARE TRANSACTION, got {other:?}"
+                    )));
+                }
+            };
+            return Ok(Statement::PrepareTransaction(gid));
+        }
         let name = self.expect_ident_like()?;
         let mut param_types = Vec::new();
         if matches!(self.peek(), Token::LParen) {
@@ -1271,6 +1284,16 @@ impl Parser {
     }
 
     /// v7.39 (round 277) — `DEALLOCATE {[PREPARE] <name> | ALL}`.
+    /// v7.39 (round 278) — `CALL <proc>([args])`. There is no
+    /// procedure catalog yet, so this reports PG's not-found error
+    /// (with its HINT) rather than pretending the call ran.
+    fn parse_call(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // CALL
+        let name = self.expect_ident_like()?;
+        self.consume_until_statement_boundary();
+        Ok(Statement::Call(name))
+    }
+
     fn parse_deallocate(&mut self) -> Result<Statement, ParseError> {
         self.advance(); // DEALLOCATE
         // PG accepts an optional noise `PREPARE` keyword here.
@@ -1447,6 +1470,14 @@ impl Parser {
             }
             if lc == "deallocate" {
                 return self.parse_deallocate();
+            }
+            // v7.39 (round 278) — `CALL <proc>(<args>)` used to be
+            // accepted and dropped, so an application's stored-procedure
+            // invocation reported success and did nothing. SPG has no
+            // procedure catalog, so every CALL names a procedure that
+            // does not exist — which is exactly what PG says.
+            if lc == "call" {
+                return self.parse_call();
             }
             if is_dump_noise_statement(&lc) {
                 self.consume_until_statement_boundary();
