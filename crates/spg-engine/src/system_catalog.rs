@@ -462,6 +462,48 @@ fn info_column_row(
     ])
 }
 
+/// v7.39 (round 277) — synthesise `pg_catalog.pg_prepared_statements`.
+/// One row per SQL-level prepared statement in THIS session. PG reports
+/// the whole `PREPARE …` text as `statement` and the declared parameter
+/// types as a text array.
+pub(crate) fn synth_pg_prepared_statements(
+    prepared: &alloc::collections::BTreeMap<String, crate::PreparedSqlStatement>,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("name", DataType::Text, false),
+        ColumnSchema::new("statement", DataType::Text, false),
+        ColumnSchema::new("parameter_types", DataType::TextArray, false),
+        ColumnSchema::new("from_sql", DataType::Bool, false),
+    ];
+    let rows: Vec<Row<'static>> = prepared
+        .iter()
+        .map(|(name, p)| {
+            Row::new(alloc::vec![
+                Value::text(name.clone()),
+                Value::text(p.source.clone()),
+                Value::TextArray(
+                    p.param_types
+                        .iter()
+                        // PG reports the CANONICAL type name, so a
+                        // declared `int` comes back `integer`. An
+                        // unrecognised name passes through as written.
+                        .map(|t| {
+                            Some(
+                                crate::conversions::type_name_to_data_type(t)
+                                    .map_or_else(|| t.clone(), pg_data_type_text),
+                            )
+                        })
+                        .collect(),
+                ),
+                // Every entry here arrived through SQL PREPARE; the
+                // extended-query path keeps its named plans elsewhere.
+                Value::Bool(true),
+            ])
+        })
+        .collect();
+    (schema, rows)
+}
+
 /// v7.16.2 — synthesise `information_schema.tables`.
 pub(crate) fn synth_information_schema_tables(
     cat: &Catalog,

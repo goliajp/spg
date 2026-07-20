@@ -114,6 +114,23 @@ pub enum Statement {
     /// else lands here. Engine returns CommandOk no-op so
     /// pg_dump / mysqldump preambles (`SET NAMES utf8mb4`
     /// wrapped in conditional comments, etc.) load cleanly.
+    /// v7.39 (round 277) — SQL-level `PREPARE <name> [(type, …)] AS
+    /// <stmt>`. Session-scoped; the body keeps its `$N` placeholders
+    /// and is substituted at EXECUTE time.
+    Prepare {
+        name: String,
+        /// Declared parameter type names, in order. Empty when the
+        /// `(type, …)` list was omitted (PG infers them).
+        param_types: Vec<String>,
+        body: alloc::boxed::Box<Statement>,
+        /// The statement's own source text, which
+        /// `pg_prepared_statements.statement` reports verbatim.
+        source: String,
+    },
+    /// v7.39 (round 277) — `EXECUTE <name> [(arg, …)]`.
+    Execute { name: String, args: Vec<Expr> },
+    /// v7.39 (round 277) — `DEALLOCATE {<name> | ALL}`. `None` = ALL.
+    Deallocate(Option<String>),
     Empty,
     /// v7.39 (round 218) — `DECLARE <name> [BINARY] [INSENSITIVE]
     /// [[NO] SCROLL] CURSOR [{WITH|WITHOUT} HOLD] FOR <select>`. The
@@ -3818,6 +3835,13 @@ impl Statement {
     #[must_use]
     pub fn is_readonly(&self) -> bool {
         match self {
+            // v7.39 (round 277) — the prepared-statement surface is
+            // session state, like SET; writer-path so it lands on the
+            // engine that owns the session. EXECUTE may also run a
+            // write, and its body is only known at execution time.
+            Statement::Prepare { .. }
+            | Statement::Execute { .. }
+            | Statement::Deallocate(_) => false,
             Statement::Select(_)
             | Statement::CopyTo { .. }
             | Statement::CopyToFile { .. }
@@ -4072,6 +4096,26 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => Ok(()),
+            // v7.39 (round 277) — the source text is kept verbatim so
+            // `pg_prepared_statements.statement` can report it the way
+            // PG does (the whole PREPARE statement, not just the body).
+            Self::Prepare { source, .. } => f.write_str(source),
+            Self::Execute { name, args } => {
+                write!(f, "EXECUTE {}", quote_ident(name))?;
+                if !args.is_empty() {
+                    f.write_str("(")?;
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{a}")?;
+                    }
+                    f.write_str(")")?;
+                }
+                Ok(())
+            }
+            Self::Deallocate(None) => f.write_str("DEALLOCATE ALL"),
+            Self::Deallocate(Some(n)) => write!(f, "DEALLOCATE {}", quote_ident(n)),
             Self::DeclareCursor {
                 name,
                 scroll,
@@ -6822,7 +6866,7 @@ impl fmt::Display for BinOp {
 /// non-folded case, leading digit, embedded non-`[A-Za-z0-9_]`, empty).
 /// Otherwise return it as-is. Returns an owned `String` to keep the call site
 /// uniform.
-fn quote_ident(s: &str) -> String {
+pub(crate) fn quote_ident(s: &str) -> String {
     let needs_quote = match s.chars().next() {
         None => true,
         Some(c) if !c.is_ascii_alphabetic() && c != '_' => true,

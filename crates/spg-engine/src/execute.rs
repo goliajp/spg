@@ -691,6 +691,78 @@ impl Engine {
     /// caller-supplied `CancelToken`. Mirrors `execute_prepared`'s
     /// `current_tx` save/restore so the extended-query path stays
     /// transactionally consistent with the simple-query path.
+    /// v7.39 (round 277) — `PREPARE`. Session-scoped, and a duplicate
+    /// name is an error in PG rather than a silent replace.
+    fn exec_prepare(
+        &mut self,
+        name: String,
+        param_types: alloc::vec::Vec<String>,
+        body: Statement,
+        source: String,
+    ) -> Result<QueryResult, EngineError> {
+        if self.prepared_statements.contains_key(&name) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "prepared statement \"{name}\" already exists"
+            )));
+        }
+        self.prepared_statements.insert(
+            name,
+            crate::PreparedSqlStatement {
+                body,
+                param_types,
+                source,
+            },
+        );
+        Ok(QueryResult::CommandOk { affected: 0, modified_catalog: false })
+    }
+
+    /// v7.39 (round 277) — `EXECUTE`. The arguments evaluate as
+    /// constants and splice into the body's `$N` placeholders through
+    /// the same `execute_prepared_with_cancel` the extended-query path
+    /// uses, so a SQL EXECUTE and a wire Bind take the identical route.
+    fn exec_execute(
+        &mut self,
+        name: &str,
+        args: &[spg_sql::ast::Expr],
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let Some(entry) = self.prepared_statements.get(name) else {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "prepared statement \"{name}\" does not exist"
+            )));
+        };
+        let body = entry.body.clone();
+        let empty: alloc::vec::Vec<spg_storage::ColumnSchema> = alloc::vec::Vec::new();
+        let ctx = self.ev_ctx(&empty, None);
+        let blank = spg_storage::Row::new(alloc::vec::Vec::new());
+        let mut params: alloc::vec::Vec<spg_storage::Value<'static>> =
+            alloc::vec::Vec::with_capacity(args.len());
+        for a in args {
+            params.push(crate::eval::eval_expr(a, &blank, &ctx).map_err(EngineError::Eval)?);
+        }
+        self.execute_prepared_with_cancel(body, &params, cancel)
+    }
+
+    /// v7.39 (round 277) — `DEALLOCATE <name>` / `DEALLOCATE ALL`.
+    /// Dropping a name that does not exist is an error in PG; ALL is
+    /// unconditional.
+    fn exec_deallocate(&mut self, name: Option<&str>) -> Result<QueryResult, EngineError> {
+        match name {
+            None => {
+                self.prepared_statements.clear();
+                Ok(QueryResult::CommandOk { affected: 0, modified_catalog: false })
+            }
+            Some(n) => {
+                if self.prepared_statements.remove(n).is_none() {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "prepared statement \"{n}\" does not exist"
+                    )));
+                }
+                Ok(QueryResult::CommandOk { affected: 0, modified_catalog: false })
+            }
+        }
+    }
+
     pub fn execute_prepared_with_cancel(
         &mut self,
         mut stmt: Statement,
@@ -979,6 +1051,15 @@ impl Engine {
         // so nothing changes for a customer who never assumes another role.
         self.acl_check_statement(&stmt)?;
         let result = match stmt {
+            // v7.39 (round 277) — SQL-level prepared statements.
+            Statement::Prepare {
+                name,
+                param_types,
+                body,
+                source,
+            } => self.exec_prepare(name, param_types, *body, source),
+            Statement::Execute { name, args } => self.exec_execute(&name, &args, cancel),
+            Statement::Deallocate(name) => self.exec_deallocate(name.as_deref()),
             Statement::CreateTable(s) => self.exec_create_table(s),
             // v7.39 (round 218) — server-side cursors.
             Statement::DeclareCursor {

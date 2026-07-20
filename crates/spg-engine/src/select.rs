@@ -461,6 +461,13 @@ impl Engine {
                 }
                 // v7.37.21 (21.13) — pg_catalog.pg_replication_slots
                 // (shape-stable empty until 21.12 persists slot state).
+                // v7.39 (round 277) — session-scoped prepared statements.
+                "__spg_pg_prepared_statements" => {
+                    let (schema, rows) = crate::system_catalog::synth_pg_prepared_statements(
+                        &self.prepared_statements,
+                    );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 "__spg_pg_replication_slots" => {
                     let (schema, rows) =
                         crate::system_catalog::synth_pg_replication_slots(self.active_catalog());

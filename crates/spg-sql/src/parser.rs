@@ -93,7 +93,6 @@ fn is_dump_noise_statement(lc: &str) -> bool {
             // option to apply, no separate CREATE/DROP CAST that
             // affects execution.
             | "discard"
-            | "deallocate"
             | "security"
             // v7.37.17 (17.6 siblings) — PG role-cleanup statements
             // pg_dump / pg_dumpall emit around DROP ROLE:
@@ -102,18 +101,6 @@ fn is_dump_noise_statement(lc: &str) -> bool {
             // Both operate on the role's owned objects; SPG has no
             // role-owner model, so accept-and-no-op.
             | "reassign"
-            // v7.37.17 (17.6 siblings) — PG's SQL-level prepared
-            // statement surface. PREPARE / EXECUTE / DEALLOCATE
-            // (already listed above) are runtime prepared-statement
-            // primitives; PG-JDBC + ORMs emit them in some paths.
-            // SPG's extended-query protocol handles per-connection
-            // named plans directly, but the SQL-level surface itself
-            // has no matching machinery. Accept-and-no-op so drivers
-            // that fall back to SQL PREPARE don't break — real
-            // execution of the target query still happens via the
-            // extended-query flow.
-            | "prepare"
-            | "execute"
             // v7.37.17 (17.6 sibling) — LOAD '<library>'. pg_dump
             // + extension scripts use LOAD to preload shared
             // libraries. SPG doesn't have a shared-library extension
@@ -1168,6 +1155,140 @@ impl Parser {
         Ok(grantees)
     }
 
+    /// v7.39 (round 277) — `PREPARE <name> [(type, …)] AS <statement>`.
+    /// The body keeps its `$N` placeholders; substitution happens at
+    /// EXECUTE. The declared types are recorded for
+    /// `pg_prepared_statements.parameter_types` but are not enforced —
+    /// PG infers when the list is omitted, and SPG resolves the values
+    /// at substitution time either way.
+    fn parse_prepare(&mut self) -> Result<Statement, ParseError> {
+        let start = self.pos;
+        self.advance(); // PREPARE
+        let name = self.expect_ident_like()?;
+        let mut param_types = Vec::new();
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            loop {
+                let mut ty = self.expect_ident_like()?;
+                // A parameterised type name (`numeric(10,2)`,
+                // `varchar(20)`) keeps its argument list in the text.
+                if matches!(self.peek(), Token::LParen) {
+                    let mut depth = 0usize;
+                    let mut buf = String::from("(");
+                    loop {
+                        match self.advance() {
+                            Token::LParen => {
+                                depth += 1;
+                                if depth > 1 {
+                                    buf.push('(');
+                                }
+                            }
+                            Token::RParen => {
+                                depth -= 1;
+                                buf.push(')');
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            Token::Comma => buf.push(','),
+                            Token::Integer(n) => buf.push_str(&alloc::format!("{n}")),
+                            Token::Eof => break,
+                            _ => {}
+                        }
+                    }
+                    ty.push_str(&buf);
+                }
+                param_types.push(ty);
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RParen => {
+                        self.advance();
+                        break;
+                    }
+                    other => {
+                        return Err(
+                            self.err(alloc::format!("expected ',' or ')' in PREPARE parameter list, got {other:?}"))
+                        );
+                    }
+                }
+            }
+        }
+        if !matches!(self.peek(), Token::As) {
+            return Err(self.err(alloc::format!(
+                "expected AS in PREPARE, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let body = self.parse_one_statement()?;
+        // The Parser holds tokens, not the source text, so the
+        // statement PG reports in `pg_prepared_statements.statement`
+        // is rebuilt from the AST rather than sliced from the input.
+        let _ = start;
+        let mut source = alloc::format!("PREPARE {}", crate::ast::quote_ident(&name));
+        if !param_types.is_empty() {
+            source.push_str(" (");
+            source.push_str(&param_types.join(", "));
+            source.push(')');
+        }
+        source.push_str(" AS ");
+        source.push_str(&alloc::format!("{body}"));
+        Ok(Statement::Prepare {
+            name,
+            param_types,
+            body: alloc::boxed::Box::new(body),
+            source,
+        })
+    }
+
+    /// v7.39 (round 277) — `EXECUTE <name> [(<expr>, …)]`.
+    fn parse_execute(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // EXECUTE
+        let name = self.expect_ident_like()?;
+        let mut args = Vec::new();
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            if matches!(self.peek(), Token::RParen) {
+                self.advance();
+            } else {
+                loop {
+                    args.push(self.parse_expr(0)?);
+                    match self.advance() {
+                        Token::Comma => {}
+                        Token::RParen => break,
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected ',' or ')' in EXECUTE arguments, got {other:?}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Statement::Execute { name, args })
+    }
+
+    /// v7.39 (round 277) — `DEALLOCATE {[PREPARE] <name> | ALL}`.
+    fn parse_deallocate(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // DEALLOCATE
+        // PG accepts an optional noise `PREPARE` keyword here.
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("prepare")) {
+            self.advance();
+        }
+        if matches!(self.peek(), Token::All) {
+            self.advance();
+            return Ok(Statement::Deallocate(None));
+        }
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("all")) {
+            self.advance();
+            return Ok(Statement::Deallocate(None));
+        }
+        let name = self.expect_ident_like()?;
+        Ok(Statement::Deallocate(Some(name)))
+    }
+
     fn consume_until_statement_boundary(&mut self) {
         loop {
             match self.peek() {
@@ -1311,6 +1432,21 @@ impl Parser {
             // v7.39 (read01 round 57) — so is GRANT / REVOKE.
             if lc == "grant" || lc == "revoke" {
                 return self.parse_grant_or_revoke(lc == "grant");
+            }
+            // v7.39 (round 277) — the SQL-level prepared-statement
+            // surface is REAL now. It used to be accepted and dropped
+            // on the theory that "real execution still happens via the
+            // extended-query flow" — true only for a driver that uses
+            // that flow; a plain SQL PREPARE / EXECUTE returned no
+            // rows at all.
+            if lc == "prepare" {
+                return self.parse_prepare();
+            }
+            if lc == "execute" {
+                return self.parse_execute();
+            }
+            if lc == "deallocate" {
+                return self.parse_deallocate();
             }
             if is_dump_noise_statement(&lc) {
                 self.consume_until_statement_boundary();
@@ -9539,6 +9675,7 @@ impl Parser {
             "pg_stat_user_indexes",
             "pg_stat_user_tables",
             "pg_stat_wal",
+            "pg_prepared_statements",
             "pg_statistic",
             "pg_statistic_ext",
             "pg_subscription",
