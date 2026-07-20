@@ -225,6 +225,17 @@ pub enum EngineError {
     /// first error and rejects everything until it is ended (SQLSTATE
     /// 25P02); this mirrors that so partial work can't slip through.
     InFailedTransaction,
+    /// v7.39 (round 299, E3 Phase 2) — a row lock is held by another
+    /// transaction and the policy is `Wait`.
+    ///
+    /// Its own variant, not an `Unsupported` string: the SERVER has to
+    /// recognise it to retry, and it cannot block inside the engine
+    /// write lock — doing so would stop the whole server, including the
+    /// transaction whose commit would release the lock.
+    LockWouldBlock,
+    /// v7.39 (round 299) — granting the wait would close a wait-for
+    /// cycle. PG's 40P01.
+    LockDeadlock,
     /// v7.38 (read01 P4.02) — a scalar / row subquery used as an
     /// expression returned more than one row. PG raises this as
     /// SQLSTATE 21000 (CARDINALITY_VIOLATION) with a fixed message.
@@ -279,6 +290,8 @@ impl fmt::Display for EngineError {
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
             Self::TransactionAlreadyOpen => f.write_str("a transaction is already open"),
             Self::NoActiveTransaction => f.write_str("no active transaction"),
+            Self::LockWouldBlock => f.write_str("row is locked by another transaction"),
+            Self::LockDeadlock => f.write_str("deadlock detected"),
             Self::InFailedTransaction => f.write_str(
                 "current transaction is aborted, commands ignored until end of transaction block",
             ),
