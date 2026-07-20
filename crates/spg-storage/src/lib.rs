@@ -3583,6 +3583,12 @@ pub struct Catalog {
     /// pg_dump restores them and reflection reports them; the planner
     /// does not consult them yet.
     statistics_ext: Vec<StatisticsExtDef>,
+    /// v7.39 (round 287) — server-side large objects, keyed by OID.
+    /// PG stores them as 2 KB pages in `pg_largeobject`; the page split
+    /// is a storage detail of ITS heap, so SPG holds the whole byte
+    /// string and renders the pages on read. What must match is the
+    /// observable surface: the OIDs, the bytes, and the page rows.
+    large_objects: alloc::collections::BTreeMap<u32, Vec<u8>>,
     /// v7.17.0 — catalogued SEQUENCE objects (Phase 1.1). Each
     /// `nextval(name)` reaches in here, atomically increments
     /// `last_value` / flips `is_called`, returns the new value.
@@ -4179,6 +4185,7 @@ impl Catalog {
             triggers: Vec::new(),
             rules: Vec::new(),
             statistics_ext: Vec::new(),
+            large_objects: alloc::collections::BTreeMap::new(),
             sequences: BTreeMap::new(),
             schema_acl: Vec::new(),
             database_acl: Vec::new(),
@@ -4888,6 +4895,58 @@ impl Catalog {
     #[must_use]
     pub fn statistics_ext(&self) -> &[StatisticsExtDef] {
         &self.statistics_ext
+    }
+
+    /// v7.39 (round 287) — every large object, ascending by OID.
+    #[must_use]
+    pub fn large_objects(&self) -> &alloc::collections::BTreeMap<u32, Vec<u8>> {
+        &self.large_objects
+    }
+
+    /// The bytes of one large object, or `None` when no such OID exists.
+    #[must_use]
+    pub fn large_object(&self, oid: u32) -> Option<&[u8]> {
+        self.large_objects.get(&oid).map(Vec::as_slice)
+    }
+
+    /// Create a large object. `oid` of 0 means "pick one" — PG's
+    /// `lo_create(0)` / `lo_creat(-1)` spelling. Errors when the
+    /// requested OID is taken.
+    pub fn create_large_object(&mut self, oid: u32, bytes: Vec<u8>) -> Result<u32, String> {
+        let id = if oid == 0 { self.next_large_object_oid() } else { oid };
+        if self.large_objects.contains_key(&id) {
+            return Err(format!("large object {id} already exists"));
+        }
+        self.large_objects.insert(id, bytes);
+        Ok(id)
+    }
+
+    /// Overwrite `len` bytes at `offset` (0-based), growing the object
+    /// with zero bytes if the write starts past the end — PG's
+    /// `lo_put` semantics.
+    pub fn put_large_object(&mut self, oid: u32, offset: usize, data: &[u8]) -> Result<(), String> {
+        let Some(buf) = self.large_objects.get_mut(&oid) else {
+            return Err(format!("large object {oid} does not exist"));
+        };
+        let end = offset.saturating_add(data.len());
+        if buf.len() < end {
+            buf.resize(end, 0);
+        }
+        buf[offset..end].copy_from_slice(data);
+        Ok(())
+    }
+
+    /// Remove a large object. `false` when the OID was not there.
+    pub fn unlink_large_object(&mut self, oid: u32) -> bool {
+        self.large_objects.remove(&oid).is_some()
+    }
+
+    /// The next free OID in PG's user band.
+    fn next_large_object_oid(&self) -> u32 {
+        self.large_objects
+            .keys()
+            .next_back()
+            .map_or(16_384, |m| m.saturating_add(1))
     }
 
     /// Register one. `Err(name)` when the name is taken.
@@ -7028,7 +7087,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 77;
+const FILE_VERSION: u8 = 78;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -8129,6 +8188,19 @@ impl Catalog {
                 write_str(&mut out, c);
             }
         }
+        // v7.39 (round 287) — large-object block (FILE_VERSION 78+),
+        // appended after the statistics block for the same reason: an
+        // older reader stops cleanly before it. Layout: [u32 count]
+        // then per object [u32 oid][u32 len][len bytes].
+        write_u32(
+            &mut out,
+            u32::try_from(self.large_objects.len()).expect("≤ 4G large objects"),
+        );
+        for (oid, bytes) in &self.large_objects {
+            write_u32(&mut out, *oid);
+            write_u32(&mut out, u32::try_from(bytes.len()).expect("≤ 4G per object"));
+            out.extend_from_slice(bytes);
+        }
         // v7.38 (read01 P5.05) — CRC32C trailer over the whole image so a
         // corrupted snapshot is rejected on load. FILE_VERSION is >= the
         // trailer version, so this always runs for freshly-written images.
@@ -8581,6 +8653,17 @@ impl Catalog {
                     kinds,
                     columns,
                 });
+            }
+        }
+        // v7.39 (round 287) — large-object block (FILE_VERSION 78+).
+        // Pre-78 images stop before it.
+        if version >= 78 {
+            let count = cur.read_u32()? as usize;
+            for _ in 0..count {
+                let oid = cur.read_u32()?;
+                let len = cur.read_u32()? as usize;
+                let bytes = cur.read_bytes(len)?;
+                cat.large_objects.insert(oid, bytes);
             }
         }
         // v7.38 (read01 P5.05) — v54+ images end with a CRC32C over every

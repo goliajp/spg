@@ -202,6 +202,7 @@ mod e2e_session_isolation_round279;
 mod e2e_create_statistics_round280;
 mod e2e_bit_length_round281;
 mod e2e_if_exists_notice_round282;
+mod e2e_large_object_round287;
 mod e2e_limit_expr_round284;
 mod e2e_explain_analyze_dml_round286;
 mod e2e_record_type_round285;

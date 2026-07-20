@@ -1019,6 +1019,59 @@ pub(crate) fn synth_pg_policies(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
     (schema, rows)
 }
 
+/// v7.39 (round 287) — synthesise `pg_catalog.pg_largeobject`.
+///
+/// PG stores a large object as 2 KB pages, one row per page, and that
+/// page size is observable: a 5000-byte object is three rows of
+/// 2048 / 2048 / 904. SPG keeps the whole byte string and slices it
+/// here, so the storage form stays SPG's while the view matches.
+pub(crate) fn synth_pg_largeobject(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    /// PG's LOBLKSIZE (BLCKSZ/4 at the default 8 KB block).
+    const PAGE: usize = 2048;
+    let schema = alloc::vec![
+        ColumnSchema::new("loid", DataType::BigInt, false),
+        ColumnSchema::new("pageno", DataType::Int, false),
+        ColumnSchema::new("data", DataType::Bytes, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for (oid, bytes) in cat.large_objects() {
+        // An empty object has no page rows at all — PG writes none.
+        for (pageno, chunk) in bytes.chunks(PAGE).enumerate() {
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(i64::from(*oid)),
+                Value::Int(i32::try_from(pageno).unwrap_or(i32::MAX)),
+                Value::Bytes(chunk.to_vec().into()),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
+/// v7.39 (round 287) — synthesise `pg_catalog.pg_largeobject_metadata`.
+/// One row per object, whether or not it has any page rows — which is
+/// how an empty large object is still discoverable.
+pub(crate) fn synth_pg_largeobject_metadata(
+    cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("lomowner", DataType::BigInt, false),
+        ColumnSchema::new("lomacl", DataType::Text, true),
+    ];
+    let rows: Vec<Row<'static>> = cat
+        .large_objects()
+        .keys()
+        .map(|oid| {
+            Row::new(alloc::vec![
+                Value::BigInt(i64::from(*oid)),
+                Value::BigInt(10),
+                Value::Null,
+            ])
+        })
+        .collect();
+    (schema, rows)
+}
+
 /// v7.37.23 (23.7-a) — synthesise `pg_catalog.pg_statistic_ext`.
 /// PG's extended-statistics catalog (one row per CREATE
 /// STATISTICS). SPG accepts CREATE STATISTICS as a parser
