@@ -324,3 +324,65 @@ fn a_bare_for_update_waits_for_the_holder_and_then_proceeds() {
         "it should have WAITED, not returned immediately: {waited:?}",
     );
 }
+
+#[test]
+fn a_deadlock_kills_one_side_and_lets_the_other_through() {
+    // v7.39 (round 300) — A holds row 1 and reaches for row 2 while B
+    // holds row 2 and reaches for row 1. PG breaks the cycle by
+    // aborting ONE transaction with 40P01; the other proceeds.
+    //
+    // Testing this mattered. It found two defects the happy paths could
+    // not: a retryable `LockWouldBlock` was marking the transaction
+    // aborted, so the first block poisoned the waiter and it lost a
+    // deadlock it should have won; and the outcome carries a NAMED
+    // victim which was being ignored, so both sides died where PG kills
+    // one.
+    let dir = unique_tmpdir("deadlock");
+    let db = dir.join("spg.db");
+    let (raw, addrs) = common::ServerBuilder::new()
+        .arg_path(&db)
+        .with_pgwire()
+        .spawn();
+    let _child = common::ChildGuard(raw);
+    let addr = addrs.pgwire.as_ref().unwrap().clone();
+
+    let mut setup = open(&addr);
+    query_all(&mut setup, "CREATE TABLE dl (id int primary key, v int)");
+    query_all(&mut setup, "INSERT INTO dl VALUES (1,10),(2,20)");
+
+    let mut a = open(&addr);
+    let mut b = open(&addr);
+    // The waiter blocks until the cycle is detected; the default 5s
+    // read timeout is shorter than that takes.
+    a.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    b.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    query_all(&mut a, "BEGIN");
+    query_all(&mut a, "SELECT id FROM dl WHERE id = 1 FOR UPDATE");
+    query_all(&mut b, "BEGIN");
+    query_all(&mut b, "SELECT id FROM dl WHERE id = 2 FOR UPDATE");
+
+    // A reaches for B's row; it will block, then the cycle closes when
+    // B reaches for A's.
+    let addr2 = addr.clone();
+    let waiter = std::thread::spawn(move || {
+        let _ = addr2;
+        (
+            query_err(&mut a, "SELECT id FROM dl WHERE id = 2 FOR UPDATE"),
+            a,
+        )
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let b_err = query_err(&mut b, "SELECT id FROM dl WHERE id = 1 FOR UPDATE");
+    // The victim keeps its locks until it ends the block — that is PG's
+    // behaviour too (an aborted transaction still holds what it took).
+    // Without this the survivor waits forever for a row the loser is
+    // still sitting on.
+    let _ = query_err(&mut b, "ROLLBACK");
+    let (a_err, _a) = waiter.join().expect("waiter thread");
+
+    // Exactly one side is the victim, and it carries PG's 40P01.
+    let victims = [&a_err, &b_err].iter().filter(|e| e.is_some()).count();
+    assert_eq!(victims, 1, "a={a_err:?} b={b_err:?}");
+    let victim = a_err.or(b_err).unwrap();
+    assert_eq!(victim, "40P01|deadlock detected", "{victim}");
+}
