@@ -5854,6 +5854,7 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
         replace_agg_exprs(e, &aggs);
     }
     Some(SelectStatement {
+        locking: None,
         ctes: Vec::new(),
         distinct: stmt.distinct,
         distinct_on: outer_distinct_on,

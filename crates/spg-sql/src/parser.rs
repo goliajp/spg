@@ -7628,6 +7628,7 @@ impl Parser {
                 walk(e, &names)
             };
             let sub_select = |items: Vec<SelectItem>| SelectStatement {
+                locking: None,
                 ctes: Vec::new(),
                 distinct: false,
                 distinct_on: Vec::new(),
@@ -7762,6 +7763,7 @@ impl Parser {
             let sub_fc = fc.clone();
             let make_subq = move |leaf: Expr| -> Expr {
                 Expr::ScalarSubquery(Box::new(SelectStatement {
+                    locking: None,
                     ctes: Vec::new(),
                     distinct: false,
                     distinct_on: Vec::new(),
@@ -7791,6 +7793,7 @@ impl Parser {
             }
             Some(Expr::Exists {
                 subquery: Box::new(SelectStatement {
+                    locking: None,
                     ctes: Vec::new(),
                     distinct: false,
                     distinct_on: Vec::new(),
@@ -10174,7 +10177,7 @@ impl Parser {
         // unchanged; callers that rely on FOR UPDATE for read-
         // through-write ordering still get the right answer
         // because SPG serialises writes anyway.
-        self.consume_optional_for_lock_clauses();
+        head.locking = self.consume_optional_for_lock_clauses();
         Ok(())
     }
 
@@ -10184,7 +10187,11 @@ impl Parser {
     /// discarded — SPG's single-writer model already satisfies the
     /// callers' implicit ordering requirement. Stops at the first
     /// token that isn't `FOR`.
-    fn consume_optional_for_lock_clauses(&mut self) {
+    fn consume_optional_for_lock_clauses(&mut self) -> Option<crate::ast::LockingClause> {
+        // v7.39 (round 293, E3 Phase 1) — the clause is REPORTED now,
+        // not discarded. PG keeps the strongest of several clauses; the
+        // policy of the last one wins, which is what this loop records.
+        let mut seen: Option<crate::ast::LockingClause> = None;
         while matches!(self.peek(), Token::For) {
             // v7.37.14 (A2.5-stub) — record that this query asked
             // for a row lock the parser is about to silently
@@ -10197,10 +10204,13 @@ impl Parser {
             self.advance(); // FOR
             // `NO KEY` prefix (PG) — `NO` is reserved-keyword-shaped
             // (`Token::Not` isn't it; PG `NO` lexes as Token::Ident).
+            let mut no_key = false;
+            let mut key = false;
             if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
                 if s.eq_ignore_ascii_case("no"))
             {
                 self.advance(); // NO
+                no_key = true;
                 // The next ident should be KEY but be generous;
                 // anything followed by UPDATE/SHARE is accepted.
                 if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
@@ -10214,22 +10224,37 @@ impl Parser {
                 if s.eq_ignore_ascii_case("key"))
             {
                 self.advance(); // KEY
+                key = true;
             }
             // Lock-strength keyword: UPDATE / SHARE. Required, but
             // we're lenient — an unexpected token here just bails
             // (we already consumed FOR; caller's downstream
             // dispatch will error if anything actually depends on
             // the trailing tokens).
+            let is_update = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("update"));
             if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
                 if s.eq_ignore_ascii_case("update") || s.eq_ignore_ascii_case("share"))
             {
                 self.advance();
+                use crate::ast::LockStrength as LS;
+                let strength = match (is_update, no_key, key) {
+                    (true, true, _) => LS::NoKeyUpdate,
+                    (true, _, _) => LS::Update,
+                    (false, _, true) => LS::KeyShare,
+                    (false, _, _) => LS::Share,
+                };
+                seen = Some(crate::ast::LockingClause {
+                    strength,
+                    of_tables: alloc::vec::Vec::new(),
+                    policy: crate::ast::LockWait::Wait,
+                });
             } else {
                 // FOR by itself (or `FOR KEY` with nothing after) —
                 // give up on the lock-clause path. We've already
                 // advanced past FOR; further attempts to parse
                 // here would clobber state.
-                return;
+                return seen;
             }
             // Optional `OF tbl[, tbl …]`. mailrs emits this when
             // joining and locking only a subset of tables.
@@ -10263,6 +10288,9 @@ impl Parser {
             match self.peek().clone() {
                 Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("nowait") => {
                     self.advance();
+                    if let Some(c) = seen.as_mut() {
+                        c.policy = crate::ast::LockWait::NoWait;
+                    }
                 }
                 Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("skip") => {
                     self.advance(); // SKIP
@@ -10270,12 +10298,16 @@ impl Parser {
                         if s.eq_ignore_ascii_case("locked"))
                     {
                         self.advance(); // LOCKED
+                        if let Some(c) = seen.as_mut() {
+                            c.policy = crate::ast::LockWait::SkipLocked;
+                        }
                     }
                 }
                 _ => {}
             }
             // Loop: PG allows multiple FOR clauses chained.
         }
+        seen
     }
 
     /// v7.9.24 — accept `LIMIT <int>` or `LIMIT $N`. mailrs H2.
@@ -10855,6 +10887,7 @@ impl Parser {
             if has_tail {
                 self.parse_select_tail_into(&mut head)?;
                 head = SelectStatement {
+                    locking: None,
                     ctes: Vec::new(),
                     distinct: false,
                     distinct_on: Vec::new(),
@@ -11378,6 +11411,7 @@ impl Parser {
             None => None,
         };
         let mut stmt = SelectStatement {
+            locking: None,
             ctes: Vec::new(),
             distinct,
             distinct_on,
@@ -15208,6 +15242,7 @@ impl Parser {
             }
             self.advance(); // )
             row_selects.push(SelectStatement {
+                locking: None,
                 ctes: Vec::new(),
                 distinct: false,
                 distinct_on: Vec::new(),
@@ -15307,6 +15342,7 @@ impl Parser {
                 .cloned()
                 .unwrap_or_else(|| "value".to_string());
             let inner_select = crate::ast::SelectStatement {
+                locking: None,
                 ctes: Vec::new(),
                 distinct: false,
                 distinct_on: Vec::new(),
@@ -15628,6 +15664,7 @@ impl Parser {
                 .or_else(|| alias_ident.clone())
                 .unwrap_or_else(|| "regexp_matches".to_string());
             let inner = crate::ast::SelectStatement {
+                locking: None,
                 ctes: Vec::new(),
                 distinct: false,
                 distinct_on: Vec::new(),
@@ -16345,6 +16382,7 @@ impl Parser {
         let name = srf.name.clone();
         let alias = srf.alias.clone();
         let inner = crate::ast::SelectStatement {
+            locking: None,
             ctes: Vec::new(),
             distinct: false,
             distinct_on: Vec::new(),
@@ -16519,6 +16557,7 @@ impl Parser {
         self.advance(); // TABLE
         let tname = self.expect_ident_like()?;
         Ok(SelectStatement {
+            locking: None,
             ctes: Vec::new(),
             distinct: false,
             distinct_on: Vec::new(),
@@ -16716,6 +16755,7 @@ impl Parser {
             None
         };
         let inner = SelectStatement {
+            locking: None,
             ctes: Vec::new(),
             distinct: false,
             distinct_on: Vec::new(),

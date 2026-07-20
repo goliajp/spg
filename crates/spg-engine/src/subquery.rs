@@ -2052,6 +2052,7 @@ impl Engine {
             }))
         };
         let body = SelectStatement {
+            locking: None,
             ctes: Vec::new(),
             distinct: false,
             distinct_on: Vec::new(),
