@@ -96,6 +96,15 @@ impl Engine {
                     self.resolve_sequence_calls_in_expr(a)?;
                 }
                 let lc = name.to_ascii_lowercase();
+                // v7.39 (round 279) — advisory locks resolve here too.
+                // They mutate engine state, and the value dispatch only
+                // ever sees `&EvalContext`; this statement-level pass is
+                // the established home for a state-changing function
+                // (nextval / setval land here for the same reason).
+                if let Some(v) = self.eval_advisory_call(&lc, args)? {
+                    *expr = Expr::Literal(value_to_literal(v));
+                    return Ok(());
+                }
                 if lc == "nextval" || lc == "currval" || lc == "setval" || lc == "lastval" {
                     let v = self.eval_sequence_call(&lc, args)?;
                     *expr = Expr::Literal(value_to_literal(v));
@@ -174,6 +183,75 @@ impl Engine {
     /// directories gain addressability without a storage migration.
     /// The sequence is born synced to the column's current MAX so
     /// `nextval` immediately after creation continues the series.
+    /// v7.39 (round 279) — evaluate an advisory-lock call against the
+    /// shared registry, or `None` when this is not one.
+    ///
+    /// PG's key is either one bigint or two ints packed into one; both
+    /// spellings address the same space, which is why they fold into a
+    /// single i64 here.
+    pub(crate) fn eval_advisory_call(
+        &mut self,
+        lc: &str,
+        args: &[Expr],
+    ) -> Result<Option<spg_storage::Value<'static>>, EngineError> {
+        let is_take = matches!(
+            lc,
+            "pg_advisory_lock"
+                | "pg_advisory_xact_lock"
+                | "pg_advisory_lock_shared"
+                | "pg_advisory_xact_lock_shared"
+        );
+        let is_try = matches!(
+            lc,
+            "pg_try_advisory_lock"
+                | "pg_try_advisory_xact_lock"
+                | "pg_try_advisory_lock_shared"
+                | "pg_try_advisory_xact_lock_shared"
+        );
+        let is_unlock = matches!(lc, "pg_advisory_unlock" | "pg_advisory_unlock_shared");
+        if lc == "pg_advisory_unlock_all" {
+            self.advisory_unlock_all();
+            return Ok(Some(spg_storage::Value::Null));
+        }
+        if !(is_take || is_try || is_unlock) {
+            return Ok(None);
+        }
+        let Some(key) = Self::advisory_key_of(args) else {
+            // A non-literal key (a column, a parameter) is left for the
+            // value dispatch, which keeps the old permissive answer.
+            return Ok(None);
+        };
+        if is_take {
+            // The blocking form cannot wait while the engine lock is
+            // held; it takes the lock when free and returns void either
+            // way, which is PG's answer for every uncontended call.
+            let _ = self.advisory_try_lock(key);
+            return Ok(Some(spg_storage::Value::Null));
+        }
+        if is_try {
+            return Ok(Some(spg_storage::Value::Bool(self.advisory_try_lock(key))));
+        }
+        Ok(Some(spg_storage::Value::Bool(self.advisory_unlock(key))))
+    }
+
+    /// One bigint, or two ints packed high/low into the same space.
+    fn advisory_key_of(args: &[Expr]) -> Option<i64> {
+        let int_of = |e: &Expr| -> Option<i64> {
+            match e {
+                Expr::Literal(spg_sql::ast::Literal::Integer(n)) => Some(*n),
+                _ => None,
+            }
+        };
+        match args {
+            [a] => int_of(a),
+            [a, b] => {
+                let (hi, lo) = (int_of(a)?, int_of(b)?);
+                Some((hi << 32) | (lo & 0xFFFF_FFFF))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn ensure_implicit_sequence(&mut self, seq_name: &str) {
         if self.active_catalog().sequences().contains_key(seq_name) {
             return;

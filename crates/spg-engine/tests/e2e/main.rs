@@ -198,6 +198,7 @@ mod e2e_numeric_precision_round272;
 mod e2e_numeric_negative_scale_round273;
 mod e2e_date_part_matrix_round276;
 mod e2e_prepared_sql_round277;
+mod e2e_session_isolation_round279;
 mod e2e_vacuum_statement_round169;
 mod e2e_index_attrs_survive_rebuild_round170;
 mod e2e_cte_values_materialized;

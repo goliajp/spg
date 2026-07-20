@@ -16289,13 +16289,28 @@ fn apply_function_dispatch(
         // contract — true on lock attempt, true on unlock, void on
         // unlock_all — because under single-writer there's nothing
         // a real lock would block.
-        "pg_advisory_lock"
-        | "pg_advisory_xact_lock"
-        | "pg_advisory_lock_shared"
-        | "pg_advisory_xact_lock_shared" => Ok(Value::Null),
-        "pg_try_advisory_lock"
-        | "pg_try_advisory_xact_lock"
-        | "pg_try_advisory_lock_shared"
+        // v7.39 (round 279) — REAL advisory locks, keyed in the shared
+        // engine by the announcing session.
+        //
+        // The stub they replace returned `true` unconditionally, on the
+        // reasoning that "SPG is single-writer, so there is no
+        // concurrent-writer race for advisory locks to mediate". That
+        // holds for a single STATEMENT. An advisory lock guards a
+        // logical section spanning several — sqlx::migrate!(), the
+        // example the old comment named, does check-then-apply — and
+        // SPG's per-statement write lock does not stop two connections
+        // interleaving between statements. Both migrators got `true`
+        // and both applied.
+        "pg_advisory_lock" | "pg_advisory_xact_lock" | "pg_advisory_lock_shared"
+        | "pg_advisory_xact_lock_shared" => {
+            // Reached only if the statement-level pre-pass did not
+            // rewrite this call (an expression shape it does not walk).
+            // Returning void keeps the old accept-everything behaviour
+            // rather than failing the statement.
+            let _ = args;
+            Ok(Value::Null)
+        }
+        "pg_try_advisory_lock" | "pg_try_advisory_xact_lock" | "pg_try_advisory_lock_shared"
         | "pg_try_advisory_xact_lock_shared"
         | "pg_advisory_unlock"
         | "pg_advisory_unlock_shared" => Ok(Value::Bool(true)),

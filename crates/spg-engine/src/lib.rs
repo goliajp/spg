@@ -531,6 +531,29 @@ pub struct CatalogSnapshot {
 
 /// CoW-1 (v7.34) — frozen view of the *persisted* committed engine
 /// state. Carries every field the `snapshot()` envelope serializes;
+/// v7.39 (round 279) — the per-CONNECTION state, parked while another
+/// connection holds the engine.
+///
+/// The server runs ONE shared `Engine` behind a `RwLock`
+/// (`ServerState.engine`, built once at startup), so everything the
+/// engine called "session state" was in fact process-wide and leaked
+/// between clients: two connections saw each other's prepared
+/// statements, and one client's `SET sql_mode` re-dialected another's
+/// string literals. PG scopes all of this per session.
+///
+/// Rather than thread a session handle through every call site, the
+/// engine keeps the ACTIVE session's state in its own fields — so the
+/// ~40 existing `self.session_params` / `self.backslash_escapes` uses
+/// are untouched — and swaps the whole bag when the caller announces a
+/// different session. Embedded hosts never announce one and stay on
+/// session 0 forever, exactly as before.
+#[derive(Debug, Default)]
+pub(crate) struct SessionBag {
+    pub(crate) session_params: BTreeMap<String, String>,
+    pub(crate) backslash_escapes: bool,
+    pub(crate) prepared_statements: BTreeMap<String, PreparedSqlStatement>,
+}
+
 /// v7.39 (round 277) — one SQL-level prepared statement.
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedSqlStatement {
@@ -744,6 +767,18 @@ pub struct Engine {
     /// parsed body (placeholders intact), the declared parameter type
     /// names and the statement text `pg_prepared_statements` reports.
     prepared_statements: alloc::collections::BTreeMap<String, PreparedSqlStatement>,
+    /// v7.39 (round 279) — which connection's state is currently
+    /// installed in the fields above. 0 is the embedded / default
+    /// session.
+    current_session: u32,
+    /// Parked state for every OTHER connection.
+    sessions: BTreeMap<u32, SessionBag>,
+    /// v7.39 (round 279) — advisory locks, held ACROSS sessions and so
+    /// deliberately NOT part of the swapped bag: the whole purpose of
+    /// an advisory lock is to be visible to the other connection.
+    /// key → (owning session, re-entrant depth). PG allows the same
+    /// session to take a lock it already holds.
+    advisory_locks: BTreeMap<i64, (u32, u32)>,
     /// Optional wall clock used to satisfy `NOW()` / `CURRENT_TIMESTAMP`
     /// / `CURRENT_DATE`. Set by the host environment.
     clock: Option<ClockFn>,
@@ -1046,6 +1081,9 @@ impl Engine {
             current_tx: None,
             backslash_escapes: false,
             prepared_statements: alloc::collections::BTreeMap::new(),
+            current_session: 0,
+            sessions: BTreeMap::new(),
+            advisory_locks: BTreeMap::new(),
             last_sequence_used: None,
             next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
@@ -1397,6 +1435,9 @@ impl Engine {
             current_tx: None,
             backslash_escapes: false,
             prepared_statements: alloc::collections::BTreeMap::new(),
+            current_session: 0,
+            sessions: BTreeMap::new(),
+            advisory_locks: BTreeMap::new(),
             last_sequence_used: None,
             next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
@@ -1505,6 +1546,9 @@ impl Engine {
                     current_tx: None,
                     backslash_escapes: false,
                     prepared_statements: alloc::collections::BTreeMap::new(),
+                    current_session: 0,
+                    sessions: BTreeMap::new(),
+                    advisory_locks: BTreeMap::new(),
                     last_sequence_used: None,
                     next_tx_id: 1,
                     active_writer_versions: BTreeSet::new(),
@@ -1587,6 +1631,86 @@ impl Engine {
 
     /// Builder: attach a wall clock so `NOW()` / `CURRENT_TIMESTAMP` /
     /// `CURRENT_DATE` evaluate to a real value instead of erroring out.
+    /// v7.39 (round 279) — announce which connection is about to run.
+    /// The server calls this before every statement; embedded hosts
+    /// never do and stay on session 0.
+    ///
+    /// Swapping parks the outgoing connection's state and installs the
+    /// incoming one's, creating it on first sight. The plan cache is
+    /// cleared because the string-literal dialect is part of what
+    /// swaps and the same SQL text lexes differently under it.
+    pub fn set_current_session(&mut self, id: u32) {
+        if id == self.current_session {
+            return;
+        }
+        let outgoing = SessionBag {
+            session_params: core::mem::take(&mut self.session_params),
+            backslash_escapes: self.backslash_escapes,
+            prepared_statements: core::mem::take(&mut self.prepared_statements),
+        };
+        self.sessions.insert(self.current_session, outgoing);
+        let incoming = self.sessions.remove(&id).unwrap_or_default();
+        self.session_params = incoming.session_params;
+        self.backslash_escapes = incoming.backslash_escapes;
+        self.prepared_statements = incoming.prepared_statements;
+        self.current_session = id;
+        self.plan_cache.clear();
+    }
+
+    /// v7.39 (round 279) — a connection has gone away: drop its parked
+    /// state and release every advisory lock it still held, which is
+    /// what PG does at backend exit.
+    pub fn end_session(&mut self, id: u32) {
+        self.sessions.remove(&id);
+        self.advisory_locks.retain(|_, (owner, _)| *owner != id);
+        if id == self.current_session {
+            self.session_params.clear();
+            self.prepared_statements.clear();
+            self.backslash_escapes = false;
+            self.current_session = 0;
+        }
+    }
+
+    /// v7.39 (round 279) — take an advisory lock. Returns false only
+    /// when ANOTHER session holds it; re-taking one this session
+    /// already holds bumps a depth counter, as in PG.
+    pub(crate) fn advisory_try_lock(&mut self, key: i64) -> bool {
+        let me = self.current_session;
+        match self.advisory_locks.get_mut(&key) {
+            Some((owner, depth)) if *owner == me => {
+                *depth += 1;
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.advisory_locks.insert(key, (me, 1));
+                true
+            }
+        }
+    }
+
+    /// Release one level. False when this session does not hold it —
+    /// PG answers false and emits a warning; SPG answers false.
+    pub(crate) fn advisory_unlock(&mut self, key: i64) -> bool {
+        let me = self.current_session;
+        match self.advisory_locks.get_mut(&key) {
+            Some((owner, depth)) if *owner == me => {
+                *depth -= 1;
+                if *depth == 0 {
+                    self.advisory_locks.remove(&key);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Release every advisory lock this session holds.
+    pub(crate) fn advisory_unlock_all(&mut self) {
+        let me = self.current_session;
+        self.advisory_locks.retain(|_, (owner, _)| *owner != me);
+    }
+
     #[must_use]
     pub const fn with_clock(mut self, clock: ClockFn) -> Self {
         self.clock = Some(clock);
