@@ -785,6 +785,7 @@ impl Engine {
             name: pk_col.to_string(),
         };
         let probe = SelectStatement {
+            locking: None,
             ctes: Vec::new(),
             distinct: false,
             distinct_on: Vec::new(),

@@ -2730,8 +2730,46 @@ pub enum OnConflictAction {
     },
 }
 
+/// v7.39 (round 293, E3 Phase 1) — a row-locking clause.
+///
+/// `spg-sql` cannot depend on `spg-engine`, so the strengths and
+/// policies are spelled again here and mapped at the engine boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockingClause {
+    pub strength: LockStrength,
+    /// `FOR UPDATE OF t1, t2` — empty means every relation in the FROM.
+    pub of_tables: Vec<String>,
+    pub policy: LockWait,
+}
+
+/// PG's four tuple-lock strengths, weakest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockStrength {
+    KeyShare,
+    Share,
+    NoKeyUpdate,
+    Update,
+}
+
+/// What to do when the row is already locked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LockWait {
+    /// Block until it is free — PG's default.
+    #[default]
+    Wait,
+    /// `NOWAIT` — fail the statement with 55P03.
+    NoWait,
+    /// `SKIP LOCKED` — leave the row out of the result.
+    SkipLocked,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SelectStatement {
+    /// v7.39 (round 293, E3 Phase 1) — `FOR UPDATE` and friends. The
+    /// clause was parsed and DISCARDED since v7.17, so SPG accepted the
+    /// whole syntax and locked nothing: two workers running the classic
+    /// `SKIP LOCKED` queue take both took the same row.
+    pub locking: Option<LockingClause>,
     /// v4.11: `WITH name AS (SELECT ...) [, ...]` common-table
     /// expressions, materialised once at query start before the
     /// body SELECT runs. Empty for a regular SELECT. Non-recursive
@@ -7072,6 +7110,7 @@ mod tests {
     #[test]
     fn select_star_from_table() {
         let s = SelectStatement {
+            locking: None,
             items: vec![SelectItem::Wildcard],
             from: Some(FromClause {
                 primary: TableRef {
