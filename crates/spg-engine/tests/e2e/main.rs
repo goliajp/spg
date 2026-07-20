@@ -203,6 +203,7 @@ mod e2e_create_statistics_round280;
 mod e2e_bit_length_round281;
 mod e2e_if_exists_notice_round282;
 mod e2e_large_object_round287;
+mod e2e_name_type_round291;
 mod e2e_limit_expr_round284;
 mod e2e_constraintdef_round290;
 mod e2e_deferrable_fk_round288;

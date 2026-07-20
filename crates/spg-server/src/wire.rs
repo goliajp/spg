@@ -95,6 +95,7 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         // TEXT on the wire. Schema tracks bounds and precision; values
         // are plain UTF-8 in their canonical text forms.
         DataType::Text
+        | DataType::Name
         | DataType::Varchar(_)
         | DataType::Char(_)
         | DataType::Numeric { .. }

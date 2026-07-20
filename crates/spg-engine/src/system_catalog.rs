@@ -2707,6 +2707,10 @@ fn pg_type_oid(ty: DataType) -> i64 {
     match ty {
         DataType::Bool => 16,
         DataType::Bytes => 17,
+        // v7.39 (round 291) — PG's identifier type has its own OID; the
+        // catch-all mapped it to text (25) and `format_type` then had
+        // no way back to the name.
+        DataType::Name => 19,
         DataType::SmallInt => 21,
         DataType::Int => 23,
         DataType::BigInt => 20,

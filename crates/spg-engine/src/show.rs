@@ -345,6 +345,7 @@ fn render_data_type(ty: DataType) -> String {
         DataType::Float => "FLOAT".into(),
         DataType::Real => "REAL".into(),
         DataType::Text => "TEXT".into(),
+        DataType::Name => "NAME".into(),
         DataType::Varchar(n) => alloc::format!("VARCHAR({n})"),
         DataType::Char(n) => alloc::format!("CHAR({n})"),
         DataType::Bool => "BOOL".into(),

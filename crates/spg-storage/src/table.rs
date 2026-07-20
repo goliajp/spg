@@ -836,8 +836,17 @@ impl Table {
                     (actual, col.ty),
                     (
                         DataType::Text,
-                        DataType::Varchar(_) | DataType::Char(_) | DataType::Json | DataType::Jsonb
-                    ) | (DataType::Json | DataType::Jsonb, DataType::Text)
+                        // v7.39 (round 291) — a NAME column stores a
+                        // Value::Text (the type identity is the schema's,
+                        // not the value's), so the two must be compatible
+                        // in both directions.
+                        DataType::Varchar(_)
+                            | DataType::Char(_)
+                            | DataType::Name
+                            | DataType::Json
+                            | DataType::Jsonb
+                    ) | (DataType::Name, DataType::Text)
+                        | (DataType::Json | DataType::Jsonb, DataType::Text)
                         | (DataType::Json, DataType::Jsonb)
                         | (DataType::Jsonb, DataType::Json)
                         | (DataType::Timestamp, DataType::Timestamptz)
