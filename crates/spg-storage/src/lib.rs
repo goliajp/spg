@@ -3571,6 +3571,10 @@ pub struct Catalog {
     triggers: Vec<TriggerDef>,
     /// v7.39 (round 139) — query-rewrite RULEs, flat like triggers.
     rules: Vec<RuleDef>,
+    /// v7.39 (round 280) — extended-statistics objects. Recorded so a
+    /// pg_dump restores them and reflection reports them; the planner
+    /// does not consult them yet.
+    statistics_ext: Vec<StatisticsExtDef>,
     /// v7.17.0 — catalogued SEQUENCE objects (Phase 1.1). Each
     /// `nextval(name)` reaches in here, atomically increments
     /// `last_value` / flips `is_called`, returns the new value.
@@ -3805,6 +3809,17 @@ pub struct TriggerDef {
     /// (re-parsed at fire time to filter row triggers). Empty = no WHEN.
     /// Persisted from FILE_VERSION 70; older catalogs read back empty.
     pub when_condition: String,
+}
+
+/// v7.39 (round 280) — one `CREATE STATISTICS` object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatisticsExtDef {
+    pub name: String,
+    pub table: String,
+    /// PG's single-letter kinds: `d` ndistinct, `f` dependencies,
+    /// `m` mcv. PG's default set is all three.
+    pub kinds: Vec<String>,
+    pub columns: Vec<String>,
 }
 
 /// v7.39 (round 139) — a catalogued query-rewrite RULE. Stored flat like
@@ -4155,6 +4170,7 @@ impl Catalog {
             functions: BTreeMap::new(),
             triggers: Vec::new(),
             rules: Vec::new(),
+            statistics_ext: Vec::new(),
             sequences: BTreeMap::new(),
             schema_acl: Vec::new(),
             database_acl: Vec::new(),
@@ -4858,6 +4874,28 @@ impl Catalog {
     /// v7.39 (round 139) — the catalogued query-rewrite RULEs.
     pub fn rules(&self) -> &[RuleDef] {
         &self.rules
+    }
+
+    /// v7.39 (round 280) — the catalogued extended-statistics objects.
+    #[must_use]
+    pub fn statistics_ext(&self) -> &[StatisticsExtDef] {
+        &self.statistics_ext
+    }
+
+    /// Register one. `Err(name)` when the name is taken.
+    pub fn create_statistics_ext(&mut self, def: StatisticsExtDef) -> Result<(), String> {
+        if self.statistics_ext.iter().any(|s| s.name == def.name) {
+            return Err(def.name);
+        }
+        self.statistics_ext.push(def);
+        Ok(())
+    }
+
+    /// Drop one by name; false when absent.
+    pub fn drop_statistics_ext(&mut self, name: &str) -> bool {
+        let before = self.statistics_ext.len();
+        self.statistics_ext.retain(|s| s.name != name);
+        before != self.statistics_ext.len()
     }
 
     /// v7.39 (round 139) — register a RULE. Its target relation (table or view)
@@ -6982,7 +7020,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 76;
+const FILE_VERSION: u8 = 77;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -8056,6 +8094,33 @@ impl Catalog {
                 write_str(&mut out, c);
             }
         }
+        // v7.39 (round 280) — extended-statistics block (FILE_VERSION
+        // 77+), appended after the RULE block for the same reason: an
+        // older reader stops cleanly before it. Layout: [u32 count]
+        // then per object [str name][str table][u16 n]([str kind] × n)
+        // [u16 m]([str column] × m).
+        write_u32(
+            &mut out,
+            u32::try_from(self.statistics_ext.len()).expect("≤ 4G statistics objects"),
+        );
+        for st in &self.statistics_ext {
+            write_str(&mut out, &st.name);
+            write_str(&mut out, &st.table);
+            write_u16(
+                &mut out,
+                u16::try_from(st.kinds.len()).expect("≤ 65k kinds"),
+            );
+            for k in &st.kinds {
+                write_str(&mut out, k);
+            }
+            write_u16(
+                &mut out,
+                u16::try_from(st.columns.len()).expect("≤ 65k columns"),
+            );
+            for c in &st.columns {
+                write_str(&mut out, c);
+            }
+        }
         // v7.38 (read01 P5.05) — CRC32C trailer over the whole image so a
         // corrupted snapshot is rejected on load. FILE_VERSION is >= the
         // trailer version, so this always runs for freshly-written images.
@@ -8482,6 +8547,31 @@ impl Catalog {
                     instead,
                     when_condition,
                     commands,
+                });
+            }
+        }
+        // v7.39 (round 280) — extended-statistics block (FILE_VERSION
+        // 77+). Pre-77 images stop before it.
+        if version >= 77 {
+            let count = cur.read_u32()? as usize;
+            for _ in 0..count {
+                let name = cur.read_str()?;
+                let table = cur.read_str()?;
+                let nk = cur.read_u16()? as usize;
+                let mut kinds = Vec::with_capacity(nk);
+                for _ in 0..nk {
+                    kinds.push(cur.read_str()?);
+                }
+                let nc = cur.read_u16()? as usize;
+                let mut columns = Vec::with_capacity(nc);
+                for _ in 0..nc {
+                    columns.push(cur.read_str()?);
+                }
+                cat.statistics_ext.push(StatisticsExtDef {
+                    name,
+                    table,
+                    kinds,
+                    columns,
                 });
             }
         }

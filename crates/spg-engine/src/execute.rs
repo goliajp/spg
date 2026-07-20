@@ -691,6 +691,73 @@ impl Engine {
     /// caller-supplied `CancelToken`. Mirrors `execute_prepared`'s
     /// `current_tx` save/restore so the extended-query path stays
     /// transactionally consistent with the simple-query path.
+    /// v7.39 (round 280) — `CREATE STATISTICS`.
+    fn exec_create_statistics(
+        &mut self,
+        name: String,
+        if_not_exists: bool,
+        kinds: alloc::vec::Vec<String>,
+        columns: alloc::vec::Vec<String>,
+        table: String,
+    ) -> Result<QueryResult, EngineError> {
+        if columns.len() < 2 {
+            return Err(EngineError::Unsupported(String::from(
+                "extended statistics require at least 2 columns",
+            )));
+        }
+        if self.active_catalog().get(&table).is_none() {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "relation \"{table}\" does not exist"
+            )));
+        }
+        // PG's default kind set is all three.
+        let kinds = if kinds.is_empty() {
+            alloc::vec![String::from("d"), String::from("f"), String::from("m")]
+        } else {
+            kinds
+        };
+        let def = spg_storage::StatisticsExtDef {
+            name: name.clone(),
+            table,
+            kinds,
+            columns,
+        };
+        let cat = self.active_catalog_mut();
+        if let Err(taken) = cat.create_statistics_ext(def) {
+            if if_not_exists {
+                return Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                });
+            }
+            return Err(EngineError::Unsupported(alloc::format!(
+                "statistics object \"{taken}\" already exists"
+            )));
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: true,
+        })
+    }
+
+    /// v7.39 (round 280) — `DROP STATISTICS`.
+    fn exec_drop_statistics(
+        &mut self,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
+        let dropped = self.active_catalog_mut().drop_statistics_ext(name);
+        if !dropped && !if_exists {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "statistics object \"{name}\" does not exist"
+            )));
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: dropped,
+        })
+    }
+
     /// v7.39 (round 277) — `PREPARE`. Session-scoped, and a duplicate
     /// name is an error in PG rather than a silent replace.
     fn exec_prepare(
@@ -1064,6 +1131,20 @@ impl Engine {
             // are reported as MISSING OBJECTS rather than as syntax
             // errors, because the SQL parses fine; what is absent is a
             // procedure catalog and a prepared-transaction registry.
+            // v7.39 (round 280) — extended statistics as a real
+            // catalog object. The planner does not consult them yet;
+            // recording them is what makes a pg_dump restore and
+            // reflection honest, instead of the statement vanishing.
+            Statement::CreateStatistics {
+                name,
+                if_not_exists,
+                kinds,
+                columns,
+                table,
+            } => self.exec_create_statistics(name, if_not_exists, kinds, columns, table),
+            Statement::DropStatistics { name, if_exists } => {
+                self.exec_drop_statistics(&name, if_exists)
+            }
             Statement::Call(name) => Err(EngineError::Unsupported(alloc::format!(
                 "procedure {name}() does not exist HINT: No procedure matches the given name \
                  and argument types. You might need to add explicit type casts."
