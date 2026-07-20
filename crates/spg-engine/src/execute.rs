@@ -1084,7 +1084,7 @@ impl Engine {
         result
     }
 
-    fn dispatch_stmt_inner(
+    pub(crate) fn dispatch_stmt_inner(
         &mut self,
         stmt: Statement,
         cancel: CancelToken<'_>,
@@ -1346,6 +1346,19 @@ impl Engine {
             Statement::CreatePolicy(s) => self.exec_create_policy(s),
             Statement::AlterPolicy(s) => self.exec_alter_policy(s),
             Statement::DropPolicy(s) => self.exec_drop_policy(s),
+            // v7.39 (round 286) — ANALYZE over DML really executes, so it
+            // needs the `&mut self` sibling. Everything else (including
+            // plain EXPLAIN of a write) stays on the read-only renderer.
+            Statement::Explain(e)
+                if e.analyze
+                    && !e.suggest
+                    && matches!(
+                        &*e.inner,
+                        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+                    ) =>
+            {
+                self.exec_explain_analyze_dml(&e, cancel)
+            }
             Statement::Explain(e) => self.exec_explain(&e, cancel),
             Statement::AlterIndex(s) => self.exec_alter_index(s),
             Statement::AlterTable(s) => self.exec_alter_table(s),
