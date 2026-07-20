@@ -3566,6 +3566,21 @@ impl Engine {
                 alloc::format!("trigger {name:?} on {table:?} does not exist"),
             )));
         }
+        // v7.39 (round 282) — PG raises a NOTICE when IF EXISTS skips, and
+        // it distinguishes the two ways a DROP TRIGGER can find nothing:
+        // the RELATION is missing (so the trigger could not be looked up
+        // at all), or the relation is there and the trigger is not.
+        if !removed && if_exists {
+            if self.active_catalog().get(table).is_none() {
+                self.notice(alloc::format!(
+                    "relation \"{table}\" does not exist, skipping"
+                ));
+            } else {
+                self.notice(alloc::format!(
+                    "trigger \"{name}\" for relation \"{table}\" does not exist, skipping"
+                ));
+            }
+        }
         Ok(QueryResult::CommandOk {
             affected: usize::from(removed),
             modified_catalog: removed,
@@ -3674,6 +3689,20 @@ impl Engine {
             return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
                 alloc::format!("function {name:?} does not exist"),
             )));
+        }
+        // v7.39 (round 282) — the skipped-function NOTICE. Alone among the
+        // IF EXISTS family PG does NOT quote the name, because it renders a
+        // signature rather than an identifier.
+        if !removed && if_exists {
+            let sig = match args {
+                Some(types) => types
+                    .iter()
+                    .map(|t| pg_signature_type_name(t))
+                    .collect::<alloc::vec::Vec<_>>()
+                    .join(","),
+                None => alloc::string::String::new(),
+            };
+            self.notice(alloc::format!("function {name}({sig}) does not exist, skipping"));
         }
         Ok(QueryResult::CommandOk {
             affected: usize::from(removed),
@@ -5191,4 +5220,44 @@ fn hex_of(bytes: &[u8]) -> alloc::string::String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// v7.39 (round 282) — render one argument type the way PG's NOTICE does.
+///
+/// PG's grammar has two productions for a type name: the SQL-standard
+/// KEYWORDS (`int`, `character varying`, `double precision`, …) become a
+/// `SystemTypeName`, which deparses schema-qualified with the internal
+/// name — `pg_catalog.int4`; anything else is an ordinary identifier and
+/// survives verbatim. So `int` prints as `pg_catalog.int4` while the
+/// equally valid `int4` prints as `int4`, and `date` — not a type keyword
+/// in that production — prints as `date`. Every entry below was read off
+/// live PG 18.4 rather than inferred from the list's shape.
+fn pg_signature_type_name(raw: &str) -> alloc::string::String {
+    let mut norm = alloc::string::String::new();
+    for word in raw.split_whitespace() {
+        if !norm.is_empty() {
+            norm.push(' ');
+        }
+        norm.push_str(&word.to_ascii_lowercase());
+    }
+    let internal = match norm.as_str() {
+        "int" | "integer" => "int4",
+        "smallint" => "int2",
+        "bigint" => "int8",
+        "real" => "float4",
+        "float" | "double precision" => "float8",
+        "decimal" | "dec" | "numeric" => "numeric",
+        "boolean" => "bool",
+        "varchar" | "character varying" => "varchar",
+        "char" | "character" => "bpchar",
+        "time" | "time without time zone" => "time",
+        "time with time zone" => "timetz",
+        "timestamp" | "timestamp without time zone" => "timestamp",
+        "timestamp with time zone" => "timestamptz",
+        "interval" => "interval",
+        "bit" => "bit",
+        "bit varying" => "varbit",
+        _ => return raw.into(),
+    };
+    alloc::format!("pg_catalog.{internal}")
 }

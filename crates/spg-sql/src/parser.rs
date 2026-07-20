@@ -1073,8 +1073,17 @@ impl Parser {
                     }
                 }
             }
-            // `name TYPE` or a bare `TYPE`.
-            let ty = if words.len() >= 2 {
+            // `name TYPE` or a bare `TYPE`. Several of PG's type names are
+            // themselves several words (`double precision`, `character
+            // varying`, `timestamp with time zone`), so "two words means the
+            // first is a parameter name" reads the type off `f(double
+            // precision)` as `precision`. v7.39 (round 282): recognise the
+            // multi-word spellings first — a leading word that STARTS one of
+            // them is part of the type, not a name.
+            let joined = words.join(" ");
+            let ty = if words.len() >= 2 && is_multiword_type(&joined) {
+                joined
+            } else if words.len() >= 2 {
                 words[1..].join(" ")
             } else {
                 words.first().cloned().unwrap_or_default()
@@ -24225,4 +24234,26 @@ $$";
             assert_eq!(s, again, "round-trip mismatch for {sql:?}");
         }
     }
+}
+
+/// v7.39 (round 282) — is this the WHOLE spelling of one of PG's multi-word
+/// type names? Used to tell `f(double precision)` (a bare type) apart from
+/// `f(x integer)` (a named parameter), which a plain word count cannot.
+///
+/// Matching the full spelling rather than the leading word matters: `time`
+/// is a legal parameter NAME, so `f(time integer)` must still read as a
+/// named parameter of type integer.
+fn is_multiword_type(joined: &str) -> bool {
+    matches!(
+        joined.to_ascii_lowercase().as_str(),
+        "double precision"
+            | "character varying"
+            | "national character"
+            | "national character varying"
+            | "bit varying"
+            | "time with time zone"
+            | "time without time zone"
+            | "timestamp with time zone"
+            | "timestamp without time zone"
+    )
 }
