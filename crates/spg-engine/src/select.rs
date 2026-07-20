@@ -1739,6 +1739,7 @@ impl Engine {
         // read core. A superuser session returns from it immediately.
         self.acl_check_select(stmt)?;
         validate_aggregate_placement(stmt)?;
+        validate_locking_clause(stmt)?;
         let result = self.exec_select_cancel_inner(stmt, cancel)?;
         // v7.39 (round 135) — drop the synthetic `__grp_ord_*` ordering columns
         // the parser injects for GROUPING() in ORDER BY on a grouping-set query.
@@ -8313,6 +8314,81 @@ fn setof_column_shape(
 /// an *unknown function* — the same "symptom two layers above the cause" shape
 /// round 78 found with SRFs. Neither can be diagnosed down there: the dispatcher
 /// sees a call, not the clause it came from. The statement knows.
+/// v7.39 (round 294, E3 Phase 1b) — PG's rules on WHERE a row-locking
+/// clause may appear.
+///
+/// PG rejects `FOR UPDATE` on exactly the shapes that have no
+/// identifiable base row to lock, each with its own wording. SPG
+/// accepted all of them and locked nothing, so a query that PG refuses
+/// outright came back looking like it had taken locks.
+///
+/// Every wording read off live PG 18.4.
+fn validate_locking_clause(stmt: &SelectStatement) -> Result<(), EngineError> {
+    let Some(lock) = &stmt.locking else {
+        return Ok(());
+    };
+    let verb = lock_clause_verb(lock.strength);
+    let refuse = |what: &str| {
+        Err(EngineError::Unsupported(alloc::format!(
+            "{verb} is not allowed with {what}"
+        )))
+    };
+    if !stmt.unions.is_empty() {
+        return refuse("UNION/INTERSECT/EXCEPT");
+    }
+    if stmt.distinct || !stmt.distinct_on.is_empty() {
+        return refuse("DISTINCT clause");
+    }
+    if stmt.group_by.is_some() || stmt.group_by_all {
+        return refuse("GROUP BY clause");
+    }
+    let has_agg = stmt.items.iter().any(|it| match it {
+        spg_sql::ast::SelectItem::Expr { expr, .. } => crate::aggregate::contains_aggregate(expr),
+        _ => false,
+    });
+    if has_agg {
+        return refuse("aggregate functions");
+    }
+    // `FOR UPDATE OF t` must name a relation that is actually in FROM.
+    for want in &lock.of_tables {
+        if !locking_from_names(stmt).iter().any(|n| n.eq_ignore_ascii_case(want)) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "relation \"{want}\" in {verb} clause not found in FROM clause"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// How PG names the clause in its diagnostics.
+const fn lock_clause_verb(s: spg_sql::ast::LockStrength) -> &'static str {
+    use spg_sql::ast::LockStrength as LS;
+    match s {
+        LS::Update => "FOR UPDATE",
+        LS::NoKeyUpdate => "FOR NO KEY UPDATE",
+        LS::Share => "FOR SHARE",
+        LS::KeyShare => "FOR KEY SHARE",
+    }
+}
+
+/// Every relation name (or alias) the FROM clause exposes.
+fn locking_from_names(stmt: &SelectStatement) -> alloc::vec::Vec<String> {
+    let mut out = alloc::vec::Vec::new();
+    if let Some(f) = &stmt.from {
+        let mut push = |t: &spg_sql::ast::TableRef| {
+            if let Some(a) = &t.alias {
+                out.push(a.clone());
+            }
+            out.push(t.name.clone());
+        };
+        push(&f.primary);
+        for j in &f.joins {
+            push(&j.table);
+        }
+    }
+    out
+}
+
 fn validate_aggregate_placement(stmt: &SelectStatement) -> Result<(), EngineError> {
     use spg_sql::ast::Expr;
     if let Some(w) = &stmt.where_
