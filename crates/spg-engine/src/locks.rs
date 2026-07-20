@@ -383,3 +383,167 @@ mod tests {
         );
     }
 }
+
+/// v7.39 (round 295, E3 Phase 1b) — the locking pre-pass.
+///
+/// Runs under `&mut self` from the write dispatch, BEFORE the ordinary
+/// SELECT. It reproduces the query's row choice — scan, WHERE, ORDER BY
+/// — then walks the ordered rows taking locks until OFFSET+LIMIT is
+/// satisfied, and stops.
+///
+/// Respecting LIMIT here is the whole point. PG locks only the rows it
+/// RETURNS; a pre-pass that locked every matching row would be
+/// observably wrong — another session's `SKIP LOCKED` would skip rows
+/// this query locked but never returned. (RFC §5.6 shortcut B.)
+///
+/// What it leaves behind is the set of rows it SKIPPED because someone
+/// else holds them. The ordinary SELECT that follows excludes those and
+/// therefore lands on exactly the rows this pass locked.
+impl crate::Engine {
+    pub(crate) fn run_locking_prepass(
+        &mut self,
+        stmt: &spg_sql::ast::SelectStatement,
+    ) -> Result<(), crate::EngineError> {
+        use spg_sql::ast::{LockStrength as LS, LockWait as LW};
+        let Some(lock) = &stmt.locking else {
+            return Ok(());
+        };
+        // Only a plain single-table SELECT carries a row identity all
+        // the way here. PG allows joins and CTEs too; refusing them is
+        // a recorded gap, not a silent one.
+        let Some(from) = &stmt.from else {
+            return Ok(()); // `SELECT 1 FOR UPDATE` — no rows to lock.
+        };
+        let derived = from.primary.lateral_subquery.is_some()
+            || from.primary.unnest_expr.is_some()
+            || from.primary.generate_series_args.is_some()
+            || from.primary.table_fn_call.is_some();
+        if !from.joins.is_empty() || derived {
+            // PG locks the base rows of a join or a derived table; SPG
+            // cannot yet name which relation each result row came from,
+            // so no lock is taken here.
+            //
+            // Refusing the query outright would be a capability
+            // regression on SQL PG accepts. Taking no lock SILENTLY is
+            // what this whole epic exists to kill. So the gap is
+            // announced: the client is told, in the channel PG uses for
+            // exactly this kind of "I did something you should know
+            // about", and the statement proceeds.
+            self.notice(alloc::format!(
+                "{} over a join or subquery is accepted but NOT enforced by SPG yet; \
+                 rows are returned unlocked",
+                lock_verb(lock.strength)
+            ));
+            return Ok(());
+        }
+        let tname = from.primary.name.clone();
+        let Some(table) = self.active_catalog().get(&tname) else {
+            return Ok(()); // a missing relation is the SELECT's error to raise
+        };
+        let mode = match lock.strength {
+            LS::KeyShare => LockMode::KeyShare,
+            LS::Share => LockMode::Share,
+            LS::NoKeyUpdate => LockMode::NoKeyUpdate,
+            LS::Update => LockMode::Exclusive,
+        };
+        let policy = match lock.policy {
+            LW::Wait => WaitPolicy::Wait,
+            LW::NoWait => WaitPolicy::NoWait,
+            LW::SkipLocked => WaitPolicy::SkipLocked,
+        };
+        let version = self
+            .current_tx
+            .and_then(|tx| self.tx_writer_versions.get(&tx).copied())
+            .unwrap_or(0);
+        let rel = table.rel_id();
+        // Reproduce the row choice: visible rows, WHERE, ORDER BY.
+        let snap = self.current_snapshot();
+        let cols = table.schema().columns.clone();
+        let alias = from.primary.alias.clone();
+        let ctx = crate::eval::EvalContext::new(&cols, alias.as_deref())
+            .with_catalog(self.active_catalog());
+        let mut picked: alloc::vec::Vec<(usize, spg_storage::Row<'static>)> =
+            alloc::vec::Vec::new();
+        for (idx, row) in table.scan_visible(&snap) {
+            if let Some(pred) = &stmt.where_ {
+                let keep = crate::eval::eval_expr(pred, row, &ctx)
+                    .map_err(crate::EngineError::Eval)?;
+                if !matches!(keep, spg_storage::Value::Bool(true)) {
+                    continue;
+                }
+            }
+            picked.push((idx, row.clone()));
+        }
+        if !stmt.order_by.is_empty() {
+            let descs: alloc::vec::Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
+            let mut tagged: alloc::vec::Vec<(alloc::vec::Vec<crate::orderby::OrderKey>, usize)> =
+                alloc::vec::Vec::with_capacity(picked.len());
+            for (idx, row) in &picked {
+                tagged.push((
+                    crate::orderby::build_order_keys(&stmt.order_by, row, &ctx)?,
+                    *idx,
+                ));
+            }
+            tagged.sort_by(|a, b| crate::orderby::cmp_multi_key(&a.0, &b.0, &descs));
+            let order: alloc::vec::Vec<usize> = tagged.into_iter().map(|(_, i)| i).collect();
+            picked = order
+                .into_iter()
+                .map(|i| (i, spg_storage::Row::new(alloc::vec::Vec::new())))
+                .collect();
+        }
+        // Walk in result order, locking until the query's window is full.
+        let offset = stmt.offset_literal().unwrap_or(0) as usize;
+        let limit = stmt.limit_literal().map(|n| n as usize);
+        let want = limit.map(|n| n.saturating_add(offset));
+        let mut skipped: alloc::collections::BTreeSet<usize> = alloc::collections::BTreeSet::new();
+        let mut taken = 0usize;
+        for (idx, _) in &picked {
+            if want.is_some_and(|w| taken >= w) {
+                break;
+            }
+            let outcome = self.acquire_row_lock(
+                rel,
+                spg_storage::row_header::RowId(*idx as u64),
+                mode,
+                version,
+                policy,
+            );
+            match outcome {
+                LockOutcome::Granted => taken += 1,
+                LockOutcome::Skip => {
+                    skipped.insert(*idx);
+                }
+                LockOutcome::NotAvailable => {
+                    return Err(crate::EngineError::Unsupported(alloc::format!(
+                        "could not obtain lock on row in relation \"{tname}\""
+                    )));
+                }
+                LockOutcome::WouldBlock { .. } => {
+                    return Err(crate::EngineError::Unsupported(alloc::format!(
+                        "{} would block: SPG does not yet wait for a row lock; \
+                         use NOWAIT or SKIP LOCKED",
+                        lock_verb(lock.strength)
+                    )));
+                }
+                LockOutcome::Deadlock { .. } => {
+                    return Err(crate::EngineError::Unsupported(
+                        "deadlock detected".into(),
+                    ));
+                }
+            }
+        }
+        self.lock_skip_rows = Some((tname, skipped));
+        Ok(())
+    }
+}
+
+/// How PG spells the clause in diagnostics.
+const fn lock_verb(s: spg_sql::ast::LockStrength) -> &'static str {
+    use spg_sql::ast::LockStrength as LS;
+    match s {
+        LS::Update => "FOR UPDATE",
+        LS::NoKeyUpdate => "FOR NO KEY UPDATE",
+        LS::Share => "FOR SHARE",
+        LS::KeyShare => "FOR KEY SHARE",
+    }
+}

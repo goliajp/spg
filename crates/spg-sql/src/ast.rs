@@ -3937,6 +3937,13 @@ impl Statement {
             | Statement::PrepareTransaction(_)
             | Statement::CreateStatistics { .. }
             | Statement::DropStatistics { .. } => false,
+            // v7.39 (round 295, E3 Phase 1b) — a SELECT that asks for row
+            // locks MUTATES the lock table, so it is not a read. Left as
+            // a read it went to the read-only executor and the locking
+            // pre-pass never ran at all — the clause was honoured only
+            // inside an explicit transaction, and silently ignored in
+            // autocommit, which is where a queue worker runs it.
+            Statement::Select(s) if s.locking.is_some() => false,
             Statement::Select(_)
             | Statement::CopyTo { .. }
             | Statement::CopyToFile { .. }

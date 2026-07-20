@@ -652,7 +652,19 @@ fn handle_pg_simple_query(
             // sequence-mutating tokens. Replaces 3 × ci_contains
             // independent passes (~2-4 µs saved on 100-byte SQL).
             let b = sql.as_bytes();
-            if !sql_has_sequence_mutator(b) {
+            // v7.39 (round 295, E3 Phase 1b) — a SELECT asking for row
+            // locks must NOT stream: this path reads under the shared
+            // read lock and never reaches the write dispatch, so the
+            // locking pre-pass could not run and `FOR UPDATE` was
+            // silently ignored in autocommit — where a queue worker
+            // runs it. Three layers routed around the lock table
+            // (streaming, `is_read`, dispatch ordering); this is the
+            // outermost.
+            let wants_locks = ci_contains(b, b" for update")
+                || ci_contains(b, b" for share")
+                || ci_contains(b, b" for no key update")
+                || ci_contains(b, b" for key share");
+            if !sql_has_sequence_mutator(b) && !wants_locks {
                 Some(())
             } else {
                 None
@@ -2040,6 +2052,16 @@ fn execute_with_role(
             // v7.39 (GUC) — set_config writes the session GUC store, so
             // it needs the &mut engine path for the same reason.
             || ci_contains(b, b"set_config(")
+            // v7.39 (round 295, E3 Phase 1b) — a SELECT that asks for row
+            // locks MUTATES the lock table, so it is not a read. Without
+            // this it went to the read-only executor, the locking
+            // pre-pass never ran, and `FOR UPDATE` was silently ignored
+            // in autocommit — which is exactly where a queue worker
+            // runs it.
+            || ci_contains(b, b" for update")
+            || ci_contains(b, b" for share")
+            || ci_contains(b, b" for no key update")
+            || ci_contains(b, b" for key share")
         {
             is_read = false;
         }
@@ -4012,6 +4034,16 @@ fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
     // 42601. Ahead of the variant short-circuits for the same reason the
     // window arm below is: these arrive as `Unsupported`, whose Display
     // prefixes the message.
+    // v7.39 (round 297, E3 Phase 1b) — `FOR UPDATE NOWAIT` on a row
+    // another transaction holds is PG's 55P03 LOCK_NOT_AVAILABLE.
+    // Clients catch that code specifically to back off and retry, so
+    // reporting the generic 42000 would be caught by nothing.
+    {
+        let msg = e.to_string();
+        if msg.contains("could not obtain lock on row in relation") {
+            return ("55P03", msg);
+        }
+    }
     {
         let msg = e.to_string();
         if msg.contains("is not in select list")

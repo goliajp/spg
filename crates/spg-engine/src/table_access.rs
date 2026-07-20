@@ -15,6 +15,20 @@ use crate::eval::{self, EvalContext};
 use crate::{Engine, EngineError};
 
 impl Engine {
+    /// v7.39 (round 295, E3 Phase 1b) — is this base row one the locking
+    /// pre-pass found held by another transaction?
+    ///
+    /// Read-only: the locks were taken under `&mut self` before the scan
+    /// ran, so no scan path needs a mutable lock table. EVERY
+    /// `scan_visible` consumer over a base table has to ask — the filter
+    /// went into one of them first and `SELECT … SKIP LOCKED` quietly
+    /// returned locked rows through the other two.
+    pub(crate) fn row_locked_elsewhere(&self, table_name: &str, idx: usize) -> bool {
+        self.lock_skip_rows
+            .as_ref()
+            .is_some_and(|(t, set)| t.eq_ignore_ascii_case(table_name) && set.contains(&idx))
+    }
+
     /// Multi-table SELECT executor (one or more JOIN peers).
     ///
     /// v1.10 builds the joined row set up-front via nested-loop joins,
@@ -223,8 +237,13 @@ impl Engine {
                 })?;
         // v7.37.15 Phase B — visibility-gated materialise.
         let snap = self.current_snapshot();
-        let mut rows: Vec<Row<'static>> =
-            table.scan_visible(&snap).map(|(_, r)| r.clone()).collect();
+        // v7.39 (round 295, E3 Phase 1b) — drop the rows the locking
+        // pre-pass found held by someone else. Read-only: the locks were
+        // taken under `&mut self` before this scan ran.
+        let mut rows: Vec<Row<'static>> = table
+            .scan_visible(&snap)
+            .map(|(_, r)| r.clone())
+            .collect();
         // v7.35.1 (mailrs prod #6 follow-up) — same fix as the
         // filtered variant: append every cold-tier row (one pass over
         // a unique BTree picks each row exactly once) so non-indexed
@@ -346,7 +365,7 @@ impl Engine {
             None => {
                 // v7.37.15 Phase B — visibility-gated full scan.
                 let snap = self.current_snapshot();
-                for (_, row) in table.scan_visible(&snap) {
+                for (i, row) in table.scan_visible(&snap) {
                     push_if(row, &mut out)?;
                 }
                 // v7.35.1 (mailrs prod #6 follow-up) — cold-tier rows
