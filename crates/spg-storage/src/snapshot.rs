@@ -164,6 +164,16 @@ pub struct Snapshot {
     /// visible to you even before commit. `0` for non-
     /// transactional reads (autocommit SELECT).
     pub tx_id: u64,
+    /// v7.39 (round 297, E3 Phase 1b) — rows a `SKIP LOCKED` pre-pass
+    /// found held by another transaction, as `(relation, row indices)`.
+    ///
+    /// It rides the SNAPSHOT because that is the only channel every row
+    /// source already threads. Adding the filter at individual scan
+    /// sites missed the real path three times running — `index_access`
+    /// alone performs the visibility test in ten places. A row that
+    /// someone else holds is, for this statement, exactly as
+    /// unavailable as a row the snapshot cannot see.
+    pub locked_out: Option<(crate::row_header::RelId, alloc::collections::BTreeSet<usize>)>,
 }
 
 impl Snapshot {
@@ -175,6 +185,7 @@ impl Snapshot {
     #[must_use]
     pub const fn unbounded() -> Self {
         Self {
+            locked_out: None,
             version: u64::MAX,
             in_progress: InProgressSet::empty(),
             oldest_active: u64::MAX,
@@ -189,6 +200,7 @@ impl Snapshot {
     #[must_use]
     pub fn new(version: u64, in_progress: InProgressSet, oldest_active: u64, tx_id: u64) -> Self {
         Self {
+            locked_out: None,
             version,
             in_progress,
             oldest_active,

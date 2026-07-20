@@ -648,6 +648,14 @@ impl Table {
     /// Phase C writers start stamping real `xmin`/`xmax`.
     #[must_use]
     pub fn is_row_visible(&self, idx: usize, snapshot: &crate::snapshot::Snapshot) -> bool {
+        // v7.39 (round 297, E3 Phase 1b) — `SKIP LOCKED` rides here so
+        // that every row source honours it; see `Snapshot::locked_out`.
+        if let Some((rel, set)) = &snapshot.locked_out
+            && *rel == self.rel_id
+            && set.contains(&idx)
+        {
+            return false;
+        }
         match self.headers.get(idx) {
             Some(h) => snapshot.visible(h),
             None => false,

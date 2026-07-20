@@ -1040,13 +1040,15 @@ impl Engine {
         stmt: Statement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
-        if self.tx_aborted {
+        // v7.39 (round 298) — ask THIS transaction, not "is any
+        // transaction anywhere aborted".
+        if self.current_tx_aborted() {
             match stmt {
                 Statement::Rollback | Statement::RollbackToSavepoint(_) => {}
                 // PG performs a ROLLBACK for a COMMIT in an aborted tx.
                 Statement::Commit => {
                     let r = self.dispatch_stmt_inner(Statement::Rollback, cancel);
-                    self.tx_aborted = false;
+                    self.set_current_tx_aborted(false);
                     return r;
                 }
                 _ => return Err(EngineError::InFailedTransaction),
@@ -1070,16 +1072,21 @@ impl Engine {
         if result.is_ok() {
             self.record_tx_stmt(&tx_class);
         }
-        if !self.in_transaction() {
+        // v7.39 (round 298) — the witness is THIS connection's slot.
+        // `in_transaction()` is true whenever ANY connection holds a
+        // transaction, so an autocommit failure used to abort a block
+        // that belonged to somebody else.
+        let mine_open = self.current_tx.is_some_and(|tx| self.is_tx_open(tx));
+        if !mine_open {
             // The tx ended (COMMIT / ROLLBACK) or we were in autocommit;
             // either way there is no aborted block to remember.
-            self.tx_aborted = false;
+            self.set_current_tx_aborted(false);
         } else if result.is_ok() && is_rollback_to_savepoint {
             // Rolling back to a savepoint recovers the transaction.
-            self.tx_aborted = false;
+            self.set_current_tx_aborted(false);
         } else if result.is_err() {
             // A failure inside an open transaction aborts the whole block.
-            self.tx_aborted = true;
+            self.set_current_tx_aborted(true);
         }
         result
     }
@@ -1257,6 +1264,22 @@ impl Engine {
                 Ok(r)
             }
             Statement::Merge(s) => self.exec_merge_cancel(&s, cancel),
+            // v7.39 (round 295, E3 Phase 1b) — a locking SELECT takes its
+            // locks in a `&mut self` pre-pass that respects LIMIT, then
+            // runs the ordinary read path with the rows another
+            // transaction holds excluded.
+            Statement::Select(ref sel) if sel.locking.is_some() => {
+                let sel = sel.clone();
+                self.lock_skip_rows = None;
+                let pre = self.run_locking_prepass(&sel);
+                if let Err(e) = pre {
+                    self.lock_skip_rows = None;
+                    return Err(e);
+                }
+                let out = self.exec_select_cancel(&sel, cancel);
+                self.lock_skip_rows = None;
+                out
+            }
             Statement::Select(s) => {
                 // v7.38 (read01 P3.20) — `SELECT set_config(name, value,
                 // is_local)` is the writing sibling of SHOW / current_setting;

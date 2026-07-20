@@ -122,3 +122,39 @@ fn a_query_without_the_clause_is_unaffected() {
     assert_eq!(ok(&mut e, "SELECT DISTINCT v FROM s1"), 2);
     assert_eq!(ok(&mut e, "SELECT v FROM s1 UNION SELECT w FROM s2"), 3);
 }
+
+#[test]
+fn a_join_is_accepted_but_says_it_did_not_lock() {
+    // v7.39 (round 298) — PG locks the base rows of a join; SPG cannot
+    // yet name which relation each result row came from.
+    //
+    // Three options, each costing something: refuse (a capability
+    // regression on SQL PG accepts), lock nothing silently (the exact
+    // failure this epic exists to remove), or support it (a separate
+    // slice). The choice is to accept, return the rows, and TELL the
+    // client — an announced gap rather than a hidden one.
+    let mut e = fixture();
+    let r = e
+        .execute("SELECT * FROM s1 JOIN s2 USING (id) FOR UPDATE")
+        .expect("PG accepts this shape, so SPG must too");
+    let QueryResult::Rows { rows, .. } = r else {
+        panic!("expected Rows");
+    };
+    assert_eq!(rows.len(), 1);
+    let notices = e.take_notices();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].contains("NOT enforced") && notices[0].starts_with("FOR UPDATE"),
+        "{notices:?}",
+    );
+}
+
+#[test]
+fn a_single_table_lock_says_nothing() {
+    // The announcement must be specific to the unsupported shape — a
+    // notice on every locking SELECT would be noise, and would train
+    // operators to ignore it.
+    let mut e = fixture();
+    e.execute("SELECT * FROM s1 FOR UPDATE").unwrap();
+    assert!(e.take_notices().is_empty());
+}

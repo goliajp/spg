@@ -437,6 +437,7 @@ impl Engine {
                 savepoints: Vec::new(),
                 cached_snapshot,
                 touched_tables: alloc::collections::BTreeSet::new(),
+                aborted: false,
                 constraints_deferred: None,
                 rebase_poisoned: false,
                 stmts_run: 0,
@@ -890,5 +891,26 @@ impl Engine {
             affected: 0,
             modified_catalog: false,
         })
+    }
+}
+
+impl crate::Engine {
+    /// v7.39 (round 298) — is THIS connection's transaction aborted?
+    ///
+    /// Autocommit (no open slot) is never aborted: PG rolls back the
+    /// single failed statement and the session carries on.
+    pub(crate) fn current_tx_aborted(&self) -> bool {
+        self.current_tx
+            .and_then(|tx| self.tx_catalogs.get(&tx))
+            .is_some_and(|st| st.aborted)
+    }
+
+    /// Set (or clear) the aborted state of THIS connection's slot.
+    pub(crate) fn set_current_tx_aborted(&mut self, on: bool) {
+        if let Some(tx) = self.current_tx
+            && let Some(st) = self.tx_catalogs.get_mut(&tx)
+        {
+            st.aborted = on;
+        }
     }
 }

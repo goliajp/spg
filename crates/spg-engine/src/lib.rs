@@ -470,6 +470,16 @@ struct TxState {
     /// against. The per-statement rebase extracts/replays write-sets
     /// only for these (see `maybe_rc_rebase`).
     touched_tables: alloc::collections::BTreeSet<String>,
+    /// v7.39 (round 298) — this transaction is in the aborted state.
+    ///
+    /// Per SLOT. It used to be one flag on the shared `Engine`, guarded
+    /// by `in_transaction()` — the GLOBAL "is any transaction open"
+    /// test. So an autocommit statement that failed while a DIFFERENT
+    /// connection happened to hold a transaction set the flag, and
+    /// every other connection was then refused with 25P02. Round 283
+    /// fixed seven sites of this exact shape in the server; this one is
+    /// in the engine and was missed.
+    aborted: bool,
     /// v7.39 (round 288) — `SET CONSTRAINTS … {DEFERRED|IMMEDIATE}`
     /// override for this transaction. `None` = each constraint uses
     /// its own declared timing; `Some(true)` = every DEFERRABLE one is
@@ -739,6 +749,14 @@ pub struct Engine {
     /// / `exec_rollback` can call
     /// [`Self::commit_writer_version`] on the right entry. Empty
     /// when no explicit transactions are open.
+    /// v7.39 (round 295, E3 Phase 1b) — rows a `SKIP LOCKED` pass found
+    /// held by another transaction. Set by the locking pre-pass and
+    /// consulted by the base scan, which is READ-only here: the locks
+    /// themselves were taken under `&mut self` in the pre-pass, so the
+    /// `&self` scan never mutates the lock table. (A `RefCell` there
+    /// would cost `Engine: Sync`, which the server's `RwLock<Engine>`
+    /// needs — see the RFC's §5.6.)
+    pub(crate) lock_skip_rows: Option<(String, alloc::collections::BTreeSet<usize>)>,
     tx_writer_versions: BTreeMap<TxId, u64>,
     /// v7.37.15 (Epic W slice 2) — the current statement's autocommit
     /// writer version, memoized. In autocommit
@@ -948,12 +966,6 @@ pub struct Engine {
     /// renderers don't re-parse GUC text per cell.
     pub(crate) render_style: crate::eval::RenderStyle,
     pub(crate) savepoint_guc_marks: Vec<(String, usize)>,
-    /// v7.38 (read01 P3.26) — set when a statement fails inside an explicit
-    /// transaction; while true every statement except COMMIT / ROLLBACK /
-    /// ROLLBACK TO SAVEPOINT is rejected with [`EngineError::InFailedTransaction`],
-    /// matching PG's aborted-transaction semantics. Cleared when the tx ends
-    /// or a ROLLBACK TO SAVEPOINT recovers it.
-    pub(crate) tx_aborted: bool,
     /// v7.12.7 — depth counter for trigger-emitted embedded SQL.
     /// Each time the engine executes a `DeferredEmbeddedStmt` it
     /// increments this; the recursive `execute_stmt_with_cancel`
@@ -1097,6 +1109,7 @@ impl Engine {
             mvcc_inplace: !cfg!(feature = "mvcc-inplace-off"),
             autovacuum: true,
             autovacuum_inline: true,
+            lock_skip_rows: None,
             tx_writer_versions: BTreeMap::new(),
             stmt_writer_version: None,
             clock: None,
@@ -1136,7 +1149,6 @@ impl Engine {
             local_guc_saves: Vec::new(),
             render_style: crate::eval::RenderStyle::default(),
             savepoint_guc_marks: Vec::new(),
-            tx_aborted: false,
             trigger_recursion_depth: 0,
             rule_rewrite_active: false,
             foreign_key_checks: true,
@@ -1190,6 +1202,22 @@ impl Engine {
     /// versions (vacuum-floor).
     #[must_use]
     pub fn current_snapshot(&self) -> spg_storage::snapshot::Snapshot {
+        // v7.39 (round 297, E3 Phase 1b) — carry the SKIP LOCKED
+        // exclusions on the snapshot. Every row source threads a
+        // snapshot through `is_row_visible`, so this is the one place
+        // that cannot be routed around; adding the filter per scan site
+        // missed the live path three times.
+        let locked_out = self.lock_skip_rows.as_ref().and_then(|(t, set)| {
+            self.active_catalog()
+                .get(t)
+                .map(|tbl| (tbl.rel_id(), set.clone()))
+        });
+        let mut snap = self.current_snapshot_inner();
+        snap.locked_out = locked_out;
+        return snap;
+    }
+
+    fn current_snapshot_inner(&self) -> spg_storage::snapshot::Snapshot {
         // Phase E — if we're inside a RR/SER tx, return its
         // cached snapshot so the whole tx sees one frozen view.
         if let Some(tx_id) = self.current_tx
@@ -1434,6 +1462,7 @@ impl Engine {
     /// (see `snapshot()`).
     pub fn restore(catalog: Catalog) -> Self {
         Self {
+            lock_skip_rows: None,
             catalog,
             parallel_runner: ParallelRunnerSlot::default(),
             tx_catalogs: BTreeMap::new(),
@@ -1490,7 +1519,6 @@ impl Engine {
             local_guc_saves: Vec::new(),
             render_style: crate::eval::RenderStyle::default(),
             savepoint_guc_marks: Vec::new(),
-            tx_aborted: false,
             trigger_recursion_depth: 0,
             rule_rewrite_active: false,
             foreign_key_checks: true,
@@ -1545,6 +1573,7 @@ impl Engine {
                     None => statistics::Statistics::new(),
                 };
                 Ok(Self {
+                    lock_skip_rows: None,
                     catalog,
                     parallel_runner: ParallelRunnerSlot::default(),
                     tx_catalogs: BTreeMap::new(),
@@ -1601,8 +1630,7 @@ impl Engine {
                     local_guc_saves: Vec::new(),
                     render_style: crate::eval::RenderStyle::default(),
                     savepoint_guc_marks: Vec::new(),
-                    tx_aborted: false,
-                    trigger_recursion_depth: 0,
+                            trigger_recursion_depth: 0,
                     rule_rewrite_active: false,
                     foreign_key_checks: true,
                     meta_views_materialised: false,
