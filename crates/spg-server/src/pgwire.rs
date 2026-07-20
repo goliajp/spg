@@ -405,6 +405,14 @@ fn handle_pg_simple_query(
     // also reuses the existing String buffer (clear + push_str) to
     // skip the per-query heap alloc when the SQL is valid UTF-8 —
     // the common case for psql-shaped clients.
+    // v7.39 (round 279) — announce whose session this is before the
+    // engine touches any session state. One shared Engine serves every
+    // connection, so without this the prepared statements, the
+    // string-literal dialect and the GUC overrides of one client were
+    // visible to all of them.
+    if let Ok(mut e) = state.engine.write() {
+        e.set_current_session(conn_state.pid);
+    }
     let now_us = wallclock_unix_micros();
     conn_state
         .last_query_start_us
@@ -1504,6 +1512,13 @@ fn run_pg_session(
         fn drop(&mut self) {
             if let Ok(mut conns) = self.state.connections.write() {
                 conns.retain(|x| !Arc::ptr_eq(x, &self.conn));
+            }
+            // v7.39 (round 279) — drop this connection's parked session
+            // state and release every advisory lock it still holds, the
+            // way PG does at backend exit. Without it a crashed client
+            // would hold a lock forever in the shared engine.
+            if let Ok(mut e) = self.state.engine.write() {
+                e.end_session(self.conn.pid);
             }
             crate::backend_count_decr();
         }
