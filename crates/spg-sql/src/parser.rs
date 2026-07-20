@@ -10277,7 +10277,64 @@ impl Parser {
         }
     }
 
+    /// v7.39 (round 284) — `LIMIT` / `OFFSET` over a general expression.
+    ///
+    /// PG's row-count clause takes an `a_expr`, so `LIMIT 1+1` and
+    /// `OFFSET 2+3` are legal; only `FETCH FIRST` is restricted to a
+    /// constant, which is why that spelling keeps the token path below.
+    ///
+    /// Constants are folded here rather than carried into the tree: the
+    /// 15+ execution paths that read the row count go through
+    /// `limit_literal()`, which answers `Option<u32>` — and `None` there
+    /// means "no limit". A clause the engine could not resolve would
+    /// therefore return the WHOLE table instead of failing. Folding at
+    /// parse time keeps that impossible; a non-constant clause is still
+    /// a clean error (recorded residual — closing it wants a resolution
+    /// pre-pass on the simple-query path, where `substitute_placeholders`
+    /// does not run).
     fn parse_limit_expr(&mut self, label: &str) -> Result<crate::ast::LimitExpr, ParseError> {
+        // PG restricts FETCH FIRST to a constant — `FETCH FIRST 1+1 ROWS
+        // ONLY` is a syntax error there, so this spelling does not get the
+        // expression grammar.
+        if label == "FETCH FIRST" {
+            return self.parse_limit_constant(label);
+        }
+        // One pass, no rewind: `advance()` takes each token by
+        // `mem::replace`, so a consumed token reads back as Eof and this
+        // parser cannot backtrack. Everything — bare literal included —
+        // is therefore folded from the parsed expression rather than
+        // re-read from the token stream.
+        let start = self.pos;
+        let e = self.parse_expr(0)?;
+        if let crate::ast::Expr::Placeholder(n) = e {
+            return Ok(crate::ast::LimitExpr::Placeholder(n));
+        }
+        let neg_label = if label == "OFFSET" { "OFFSET" } else { "LIMIT" };
+        match fold_limit_constant(&e) {
+            Some(Ok(v)) if v < 0 => Err(ParseError {
+                message: alloc::format!("{neg_label} must not be negative"),
+                token_pos: start,
+            }),
+            Some(Ok(v)) => u32::try_from(v)
+                .map(crate::ast::LimitExpr::Literal)
+                .map_err(|_| ParseError {
+                    message: alloc::format!("{label} value too large: {v}"),
+                    token_pos: start,
+                }),
+            Some(Err(message)) => Err(ParseError {
+                message: message.replace("{L}", neg_label),
+                token_pos: start,
+            }),
+            None => Err(ParseError {
+                message: alloc::format!(
+                    "{label} over a non-constant expression is not yet supported"
+                ),
+                token_pos: start,
+            }),
+        }
+    }
+
+    fn parse_limit_constant(&mut self, label: &str) -> Result<crate::ast::LimitExpr, ParseError> {
         // v7.39 (round 239) — PG's row-count clause takes a bigint with its
         // coercion rules, not just an integer token: a NUMERIC rounds half
         // away from zero (`LIMIT 2.5` keeps 3 rows), a negative count is
@@ -24256,4 +24313,79 @@ fn is_multiword_type(joined: &str) -> bool {
             | "timestamp with time zone"
             | "timestamp without time zone"
     )
+}
+
+/// v7.39 (round 284) — fold a constant `LIMIT` / `OFFSET` expression to a
+/// row count, the way PG evaluates one before applying it.
+///
+/// `None` = not a constant (a column, a subquery, a function call).
+/// `Some(Err(msg))` = PG rejects it, and the message is PG's; `{L}` in the
+/// message stands in for LIMIT / OFFSET, which the caller substitutes.
+/// All wordings were read off live PG 18.4.
+fn fold_limit_constant(e: &crate::ast::Expr) -> Option<Result<i128, alloc::string::String>> {
+    use crate::ast::{BinOp, Expr, Literal, UnOp};
+    match e {
+        Expr::Literal(Literal::Integer(n)) => Some(Ok(i128::from(*n))),
+        Expr::Literal(Literal::Numeric { unscaled, scale }) => {
+            Some(Ok(round_scaled_half_away(*unscaled, *scale)))
+        }
+        // PG coerces a string by its CONTENT, and fails on the value.
+        Expr::Literal(Literal::String(t)) => Some(t.trim().parse::<i64>().map_or_else(
+            |_| Err(alloc::format!("invalid input syntax for type bigint: \"{t}\"")),
+            |n| Ok(i128::from(n)),
+        )),
+        Expr::Literal(Literal::Bool(_)) => Some(Err(
+            "argument of {L} must be type bigint, not type boolean".into(),
+        )),
+        Expr::Unary { op: UnOp::Neg, expr } => match fold_limit_constant(expr)? {
+            Ok(v) => Some(Ok(-v)),
+            e @ Err(_) => Some(e),
+        },
+        Expr::Binary { lhs, op, rhs } => {
+            let a = match fold_limit_constant(lhs)? {
+                Ok(v) => v,
+                e @ Err(_) => return Some(e),
+            };
+            let b = match fold_limit_constant(rhs)? {
+                Ok(v) => v,
+                e @ Err(_) => return Some(e),
+            };
+            let out = match op {
+                BinOp::Add => a.checked_add(b),
+                BinOp::Sub => a.checked_sub(b),
+                BinOp::Mul => a.checked_mul(b),
+                BinOp::Div if b != 0 => a.checked_div(b),
+                BinOp::Div => return Some(Err("division by zero".into())),
+                BinOp::Mod if b != 0 => a.checked_rem(b),
+                BinOp::Mod => return Some(Err("division by zero".into())),
+                _ => return None,
+            };
+            // PG evaluates the arithmetic in the operand's own type, so an
+            // int-by-int product that leaves int range fails there — before
+            // the row count is ever looked at.
+            match out {
+                Some(v) if v > i128::from(i32::MAX) || v < i128::from(i32::MIN) => {
+                    Some(Err("integer out of range".into()))
+                }
+                Some(v) => Some(Ok(v)),
+                None => Some(Err("integer out of range".into())),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Round `unscaled / 10^scale` half away from zero — PG's numeric→bigint
+/// cast, which is what makes `LIMIT 2.5` keep three rows.
+fn round_scaled_half_away(unscaled: i128, scale: u16) -> i128 {
+    if scale == 0 {
+        return unscaled;
+    }
+    let Some(div) = 10i128.checked_pow(u32::from(scale)) else {
+        return 0;
+    };
+    let neg = unscaled < 0;
+    let mag = unscaled.unsigned_abs() as i128;
+    let rounded = (mag + div / 2) / div;
+    if neg { -rounded } else { rounded }
 }
