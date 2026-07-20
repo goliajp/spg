@@ -1069,8 +1069,19 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         DataType::Cidr => out.push(58),
         DataType::Macaddr => out.push(59),
         DataType::Macaddr8 => out.push(60),
-        DataType::Bit => out.push(61),
-        DataType::BitVarying => out.push(62),
+        // v7.39 (round 281) — tags 61/62 mean "no typmod", exactly what
+        // every catalog already on disk holds; 70/71 carry the length a
+        // typmod could not previously express.
+        DataType::Bit(0) => out.push(61),
+        DataType::BitVarying(0) => out.push(62),
+        DataType::Bit(n) => {
+            out.push(70);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        DataType::BitVarying(n) => {
+            out.push(71);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
         DataType::Xml => out.push(63),
         DataType::Char1 => out.push(64),
         DataType::MoneyArray => out.push(65),
@@ -1263,8 +1274,10 @@ impl Cursor<'_> {
             58 => Ok(DataType::Cidr),
             59 => Ok(DataType::Macaddr),
             60 => Ok(DataType::Macaddr8),
-            61 => Ok(DataType::Bit),
-            62 => Ok(DataType::BitVarying),
+            61 => Ok(DataType::Bit(0)),
+            62 => Ok(DataType::BitVarying(0)),
+            70 => Ok(DataType::Bit(self.read_u32()?)),
+            71 => Ok(DataType::BitVarying(self.read_u32()?)),
             63 => Ok(DataType::Xml),
             64 => Ok(DataType::Char1),
             65 => Ok(DataType::MoneyArray),
@@ -2074,8 +2087,8 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
         (Value::PgLsn(l), DataType::PgLsn) => out.extend_from_slice(&l.to_le_bytes()),
         // v7.37.5 ζ-A — BitString shared codec for BIT and BIT VARYING.
         // Body: [u32 LE nbits][ceil(nbits/8) bytes packed BE-in-byte].
-        (Value::BitString { nbits, bytes }, DataType::Bit)
-        | (Value::BitString { nbits, bytes }, DataType::BitVarying) => {
+        (Value::BitString { nbits, bytes }, DataType::Bit(_))
+        | (Value::BitString { nbits, bytes }, DataType::BitVarying(_)) => {
             out.extend_from_slice(&nbits.to_le_bytes());
             out.extend_from_slice(bytes);
         }
@@ -3793,7 +3806,7 @@ impl<'a> Cursor<'a> {
                 m.copy_from_slice(self.take(8)?);
                 Ok(Value::Macaddr8(m))
             }
-            DataType::Bit | DataType::BitVarying => {
+            DataType::Bit(_) | DataType::BitVarying(_) => {
                 let nbits = self.read_u32()?;
                 let nbytes = (nbits as usize).div_ceil(8);
                 let bytes = self.take(nbytes)?.to_vec();

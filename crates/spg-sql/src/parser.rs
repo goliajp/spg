@@ -13582,20 +13582,26 @@ impl Parser {
                 if varying {
                     self.advance();
                 }
-                if matches!(self.peek(), Token::LParen) {
-                    let _ = self.parse_paren_size("BIT")?;
-                }
-                if varying {
-                    ColumnTypeName::BitVarying
+                // v7.39 (round 281) — the length used to be parsed and
+                // dropped, so `bit(3)` accepted a five-bit string.
+                let n = if matches!(self.peek(), Token::LParen) {
+                    self.parse_paren_size("BIT")?
                 } else {
-                    ColumnTypeName::Bit
+                    0
+                };
+                if varying {
+                    ColumnTypeName::BitVarying(n)
+                } else {
+                    ColumnTypeName::Bit(n)
                 }
             }
             "varbit" => {
-                if matches!(self.peek(), Token::LParen) {
-                    let _ = self.parse_paren_size("VARBIT")?;
-                }
-                ColumnTypeName::BitVarying
+                let n = if matches!(self.peek(), Token::LParen) {
+                    self.parse_paren_size("VARBIT")?
+                } else {
+                    0
+                };
+                ColumnTypeName::BitVarying(n)
             }
             "xml" => ColumnTypeName::Xml,
             // v7.17.0 Phase 3.P0-39 — PG hstore extension type.
@@ -18496,6 +18502,15 @@ impl Parser {
                     // reconstruct the `DataType::Numeric { precision,
                     // scale }` (and similar param-carrying types).
                     let mut name = other.to_string();
+                    // v7.39 (round 281) — `::bit varying(3)` is two
+                    // words; fold the tail in so the typmod reaches the
+                    // type resolver instead of tripping the parser.
+                    if name.eq_ignore_ascii_case("bit")
+                        && matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("varying"))
+                    {
+                        self.advance();
+                        name = alloc::string::String::from("varbit");
+                    }
                     if matches!(self.peek(), Token::LParen) {
                         let mut buf = alloc::string::String::from("(");
                         let mut depth = 0usize;

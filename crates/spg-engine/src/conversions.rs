@@ -2277,6 +2277,17 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
             .map(|n| n.and_then(|v| u8::try_from(v).ok()).unwrap_or(0))
             .collect();
         match head {
+            // v7.39 (round 281) — `bit(3)` / `varbit(3)` as cast targets.
+            "bit" => {
+                return Some(DataType::Bit(
+                    u32::try_from(wide.first().copied().flatten()?).ok()?,
+                ));
+            }
+            "varbit" | "bit varying" => {
+                return Some(DataType::BitVarying(
+                    u32::try_from(wide.first().copied().flatten()?).ok()?,
+                ));
+            }
             "numeric" | "decimal" => {
                 let precision = u16::try_from(wide.first().copied().flatten()?).ok()?;
                 // v7.39 (round 273) — the declared scale is signed.
@@ -2297,10 +2308,6 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
             "char" | "character" => {
                 return Some(DataType::Char(nums.first().copied().unwrap_or(0).into()));
             }
-            // bit / varbit precision drops on cast — storage shape
-            // is the BitString regardless.
-            "bit" => return Some(DataType::Bit),
-            "varbit" => return Some(DataType::BitVarying),
             _ => {}
         }
     }
@@ -2318,11 +2325,11 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
         "macaddr8" => DataType::Macaddr8,
         "pg_lsn" => DataType::PgLsn,
         // v7.39 (read01 varbit.c) — the B'...' literal's internal target.
-        "__bit_literal" => DataType::BitVarying,
+        "__bit_literal" => DataType::BitVarying(0),
         // v7.39 (read01 xid8funcs.c) — xid/xid8 carried as bigint.
         "xid" | "xid8" => DataType::BigInt,
-        "bit" => DataType::Bit,
-        "varbit" | "bit varying" => DataType::BitVarying,
+        "bit" => DataType::Bit(0),
+        "varbit" | "bit varying" => DataType::BitVarying(0),
         "xml" => DataType::Xml,
         "money" => DataType::Money,
         "char1" => DataType::Char1,
@@ -2490,8 +2497,8 @@ pub(crate) const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Cidr => DataType::Cidr,
         ColumnTypeName::Macaddr => DataType::Macaddr,
         ColumnTypeName::Macaddr8 => DataType::Macaddr8,
-        ColumnTypeName::Bit => DataType::Bit,
-        ColumnTypeName::BitVarying => DataType::BitVarying,
+        ColumnTypeName::Bit(n) => DataType::Bit(n),
+        ColumnTypeName::BitVarying(n) => DataType::BitVarying(n),
         ColumnTypeName::Xml => DataType::Xml,
         ColumnTypeName::Char1 => DataType::Char1,
         ColumnTypeName::MoneyArray => DataType::MoneyArray,
@@ -4095,15 +4102,35 @@ pub(crate) fn coerce_value(
             }
         },
         // v7.37.5 ship triage — `Value::BitString` self-reports as
-        // `DataType::BitVarying`(see `Value::data_type`), so an
-        // INSERT into a `BIT` column triggers a spurious type
-        // mismatch. Accept BitString into either Bit or BitVarying
-        // unchanged — the column-side fixed-length contract is a
-        // schema concern, not a value-shape one.
-        (Value::BitString { nbits, bytes }, DataType::Bit | DataType::BitVarying) => {
+        // `DataType::BitVarying(0)` (see `Value::data_type`), so an
+        // INSERT into a `BIT` column triggered a spurious type
+        // mismatch. Accept BitString into either.
+        //
+        // v7.39 (round 281) — and enforce the declared length, which
+        // used to be parsed and dropped so `bit(3)` took a five-bit
+        // string. PG's two types differ: BIT is FIXED (a shorter value
+        // is an error too) while BIT VARYING is a maximum. An explicit
+        // CAST still pads or truncates — the same assignment-enforces /
+        // cast-adjusts split the varchar arms below already model.
+        (Value::BitString { nbits, bytes }, DataType::Bit(n)) => {
+            // A bare `bit` is `bit(1)` in PG.
+            let want = if n == 0 { 1 } else { n };
+            if nbits != want {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "bit string length {nbits} does not match type bit({want})"
+                )));
+            }
             Some(Value::BitString { nbits, bytes })
         }
-        (Value::Text(s), DataType::Bit | DataType::BitVarying) => match parse_bit_string_text(&s) {
+        (Value::BitString { nbits, bytes }, DataType::BitVarying(n)) => {
+            if n != 0 && nbits > n {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "bit string too long for type bit varying({n})"
+                )));
+            }
+            Some(Value::BitString { nbits, bytes })
+        }
+        (Value::Text(s), DataType::Bit(_) | DataType::BitVarying(_)) => match parse_bit_string_text(&s) {
             Some((nbits, bytes)) => Some(Value::bit_string(nbits, bytes)),
             None => {
                 // v7.39 (read01 varbit.c) — PG names the first bad digit.

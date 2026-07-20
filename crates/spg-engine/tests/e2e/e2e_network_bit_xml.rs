@@ -108,12 +108,14 @@ fn macaddr8_round_trip_eui64() {
 #[test]
 fn bit_string_round_trip() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id INT NOT NULL, b BIT NOT NULL)")
+    // v7.39 (round 281) — the column is BIT(12), not a bare BIT. This
+    // pin used to declare `b BIT` and store twelve bits in it, which PG
+    // rejects (`bit string length 12 does not match type bit(1)`); it
+    // passed only because the typmod was parsed and dropped.
+    e.execute("CREATE TABLE t (id INT NOT NULL, b BIT(12) NOT NULL)")
         .unwrap();
     // 12-bit string `101010111100` → nbits=12, packed BE per byte
-    // = [10101011 11000000] = [0xab, 0xc0]. (B'...' keeps its exact
-    // length; a bare '...'::bit is bit(1) with truncation, as in PG —
-    // v7.39 read01 varbit.c.)
+    // = [10101011 11000000] = [0xab, 0xc0].
     e.execute("INSERT INTO t VALUES (1, B'101010111100')")
         .unwrap();
     let r = rows(e.execute("SELECT b FROM t").unwrap());
@@ -122,6 +124,17 @@ fn bit_string_round_trip() {
     };
     assert_eq!(*nbits, 12);
     assert_eq!(bytes, &vec![0xab, 0xc0]);
+
+    // And a bare BIT really is bit(1), so the same value is refused.
+    let mut narrow = Engine::new();
+    narrow
+        .execute("CREATE TABLE n (b BIT NOT NULL)")
+        .unwrap();
+    let msg = format!("{:?}", narrow.execute("INSERT INTO n VALUES (B'101010111100')").unwrap_err());
+    assert!(
+        msg.contains("does not match type bit(1)"),
+        "{msg}",
+    );
 }
 
 #[test]
@@ -129,7 +142,7 @@ fn varbit_round_trip() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL, b VARBIT NOT NULL)")
         .unwrap();
-    assert_eq!(col_type(&mut e, "SELECT b FROM t"), DataType::BitVarying);
+    assert_eq!(col_type(&mut e, "SELECT b FROM t"), DataType::BitVarying(0));
     e.execute("INSERT INTO t VALUES (1, '11111111'::varbit)")
         .unwrap();
     let r = rows(e.execute("SELECT b FROM t").unwrap());

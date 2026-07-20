@@ -274,8 +274,14 @@ pub enum DataType {
     ///                         `BIT(n)` constrains at coerce time)
     ///   BitVarying  OID 1562 (variable-length, declared as `VARBIT`)
     /// Catalog tags 61-62.
-    Bit,
-    BitVarying,
+    /// v7.39 (round 281) — `BIT(n)`: a FIXED-length bit string. `0`
+    /// means the type was written without a typmod, which PG treats as
+    /// `bit(1)`. Column assignment requires the length to match
+    /// exactly; an explicit cast pads or truncates instead.
+    Bit(u32),
+    /// v7.39 (round 281) — `BIT VARYING(n)`: `n` is a MAXIMUM, and `0`
+    /// means unbounded (`varbit` with no typmod).
+    BitVarying(u32),
     /// v7.37.5 ζ-A — PG `xml`. Body identical to TEXT (storage is
     /// the verbatim XML string; no parse-time validation). Only
     /// the wire OID (142) differs. Catalog tag 63.
@@ -499,8 +505,10 @@ impl fmt::Display for DataType {
             Self::Macaddr => f.write_str("MACADDR"),
             Self::Macaddr8 => f.write_str("MACADDR8"),
             Self::PgLsn => f.write_str("PG_LSN"),
-            Self::Bit => f.write_str("BIT"),
-            Self::BitVarying => f.write_str("VARBIT"),
+            Self::Bit(0) => f.write_str("BIT"),
+            Self::Bit(n) => write!(f, "BIT({n})"),
+            Self::BitVarying(0) => f.write_str("VARBIT"),
+            Self::BitVarying(n) => write!(f, "VARBIT({n})"),
             Self::Xml => f.write_str("XML"),
             Self::Char1 => f.write_str("\"char\""),
             Self::MoneyArray => f.write_str("MONEY[]"),
@@ -989,7 +997,7 @@ impl<'arena> Value<'arena> {
             // schema decides. Default to BitVarying when called
             // schema-less (rare; storage path is always
             // schema-aware so this only matters for diagnostics).
-            Self::BitString { .. } => Some(DataType::BitVarying),
+            Self::BitString { .. } => Some(DataType::BitVarying(0)),
             Self::Xml(_) => Some(DataType::Xml),
             Self::Char1(_) => Some(DataType::Char1),
             // BpChar reports its declared width from the padded length.

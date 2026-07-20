@@ -157,8 +157,8 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         | DataType::Macaddr
         | DataType::Macaddr8
         | DataType::PgLsn
-        | DataType::Bit
-        | DataType::BitVarying
+        | DataType::Bit(_)
+        | DataType::BitVarying(_)
         | DataType::Xml
         | DataType::Char1
         | DataType::MoneyArray
