@@ -2395,6 +2395,10 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
         "int" | "int4" | "integer" => DataType::Int,
         "bigint" | "int8" => DataType::BigInt,
         "text" => DataType::Text,
+        // v7.39 (round 291) — PG's identifier type. `CREATE TABLE t (a
+        // name)` is legal SQL that SPG answered "type \"name\" does not
+        // exist" to.
+        "name" => DataType::Name,
         "varchar" | "character varying" => DataType::Varchar(0),
         // v7.39 (bpchar epic) — bare `char` / `character` is char(1) (SQL
         // standard, `'xyz'::char` = 'x'); bare `bpchar` is PG's unlimited
@@ -2422,6 +2426,7 @@ pub(crate) const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Float => DataType::Float,
         ColumnTypeName::Real => DataType::Real,
         ColumnTypeName::Text => DataType::Text,
+        ColumnTypeName::Name => DataType::Name,
         ColumnTypeName::Varchar(n) => DataType::Varchar(n),
         ColumnTypeName::Char(n) => DataType::Char(n),
         ColumnTypeName::Bool => DataType::Bool,
@@ -5136,6 +5141,20 @@ pub(crate) fn coerce_value(
         // VARCHAR(n) enforces an upper bound on character count. A bare
         // `varchar` (no typmod) is modelled as `Varchar(0)` and, like PG, holds
         // a string of any length — `'a'::varchar` must not read as VARCHAR(0).
+        // v7.39 (round 291) — `name` is text truncated to NAMEDATALEN-1
+        // (63) bytes. PG truncates silently rather than erroring, which
+        // is the behaviour a catalog identifier column needs.
+        (Value::Text(s), DataType::Name) => {
+            let mut cut = s.into_owned();
+            if cut.len() > 63 {
+                let mut idx = 63;
+                while !cut.is_char_boundary(idx) {
+                    idx -= 1;
+                }
+                cut.truncate(idx);
+            }
+            Some(Value::text(cut))
+        }
         (Value::Text(s), DataType::Varchar(max)) => {
             if max == 0 || u32::try_from(s.chars().count()).unwrap_or(u32::MAX) <= max {
                 Some(Value::text(s))

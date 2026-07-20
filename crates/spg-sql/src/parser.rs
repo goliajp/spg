@@ -13493,6 +13493,7 @@ impl Parser {
             "float4" => ColumnTypeName::Real,
             "float8" => ColumnTypeName::Float,
             "text" => ColumnTypeName::Text,
+            "name" => ColumnTypeName::Name,
             "bool" | "boolean" => ColumnTypeName::Bool,
             "varchar" => ColumnTypeName::Varchar(self.parse_paren_size("VARCHAR")?),
             // v7.39 (bpchar epic) — bare `char` = char(1), same as bare

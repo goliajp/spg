@@ -977,6 +977,10 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // unreachable until round 269 made REAL a column type.
         DataType::Real => out.push(68),
         DataType::Text => out.push(4),
+        // v7.39 (round 291) — tag 72. `name` is stored exactly like
+        // TEXT; only the type identity is new, so no existing byte
+        // moves and no old image needs migrating.
+        DataType::Name => out.push(72),
         DataType::Bool => out.push(5),
         DataType::Vector { dim, encoding } => match encoding {
             // Tag 6: pre-v6 F32 vector. Layout unchanged; pre-v6
@@ -1161,6 +1165,7 @@ impl Cursor<'_> {
             2 => Ok(DataType::BigInt),
             3 => Ok(DataType::Float),
             4 => Ok(DataType::Text),
+            72 => Ok(DataType::Name),
             5 => Ok(DataType::Bool),
             6 => Ok(DataType::Vector {
                 dim: self.read_u32()?,
@@ -1718,7 +1723,10 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
         (Value::Bool(b), DataType::Bool) => out.push(u8::from(*b)),
         (
             Value::Text(s) | Value::BpChar(s),
-            DataType::Text | DataType::Varchar(_) | DataType::Char(_),
+            // v7.39 (round 291) — a NAME column holds a Value::Text; the
+            // body is byte-identical to TEXT and only the schema's type
+            // tag differs.
+            DataType::Text | DataType::Varchar(_) | DataType::Char(_) | DataType::Name,
         ) => {
             write_str(out, s);
         }
@@ -3344,7 +3352,9 @@ impl<'a> Cursor<'a> {
             DataType::Float => Ok(Value::Float(self.read_f64()?)),
             DataType::Real => Ok(Value::Real(self.read_f32()?)),
             DataType::Bool => Ok(Value::Bool(self.read_u8()? != 0)),
-            DataType::Text | DataType::Varchar(_) => Ok(Value::Text(Cow::Owned(self.read_str()?))),
+            DataType::Text | DataType::Varchar(_) | DataType::Name => {
+                Ok(Value::Text(Cow::Owned(self.read_str()?)))
+            }
             // v7.38 (read01, T11) — a CHAR(n) column reads back as bpchar.
             DataType::Char(_) => Ok(Value::BpChar(Cow::Owned(self.read_str()?))),
             DataType::Vector {

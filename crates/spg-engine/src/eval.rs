@@ -1990,6 +1990,33 @@ fn eval_function_call_positional(
     {
         return Ok(Value::text::<alloc::string::String>(cname.into()));
     }
+    // v7.39 (round 291) — `name` is a DECLARED type over a Value::Text,
+    // so the value can never witness it; the schema is the only witness,
+    // exactly as for a composite column above.
+    if args.len() == 1
+        && name.eq_ignore_ascii_case("pg_typeof")
+        && let Expr::Column(c) = &args[0]
+        && ctx
+            .columns
+            .iter()
+            .any(|sc| sc.name.eq_ignore_ascii_case(&c.name)
+                && sc.ty == spg_storage::DataType::Name)
+    {
+        return Ok(Value::text::<alloc::string::String>("name".into()));
+    }
+    // …and the same for a bare `'abc'::name`, where the cast TARGET is
+    // the witness. PG computes pg_typeof statically; SPG reads the
+    // value, which by then is an ordinary text.
+    if args.len() == 1
+        && name.eq_ignore_ascii_case("pg_typeof")
+        && let Expr::Cast {
+            target: spg_sql::ast::CastTarget::Named(n),
+            ..
+        } = &args[0]
+        && n.eq_ignore_ascii_case("name")
+    {
+        return Ok(Value::text::<alloc::string::String>("name".into()));
+    }
     // v7.39 (read01 round 116) — a bare, uncoerced string literal is PG's
     // `unknown` type, not text: `pg_typeof('x')` / `pg_typeof('123')` /
     // `pg_typeof('2024-01-01')` all report `unknown`. The literal only becomes
@@ -3030,6 +3057,7 @@ pub(crate) fn pg_typeof_name_for_datatype(t: spg_storage::DataType) -> Option<&'
         D::Time => "time without time zone",
         D::Timestamp => "timestamp without time zone",
         D::Timestamptz => "timestamp with time zone",
+        D::Name => "name",
         D::Uuid => "uuid",
         D::Interval => "interval",
         _ => return None,

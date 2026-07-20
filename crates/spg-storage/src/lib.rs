@@ -154,6 +154,11 @@ pub enum DataType {
     /// semantics are unchanged: SPG never stored per-row offsets,
     /// and neither did PG — `TIMESTAMPTZ` in PG is also UTC i64.
     Timestamptz,
+    /// v7.39 (round 291) — PG's `name`: the type its catalogs use for
+    /// identifiers. Text truncated to NAMEDATALEN-1 (63) bytes, with
+    /// its own type identity — `pg_typeof('abc'::name)` is `name`, and
+    /// `CREATE TABLE t (a name)` is legal SQL that SPG rejected.
+    Name,
     /// `INTERVAL` — calendar-aware span (months + microseconds). v2.11
     /// supports INTERVAL only as a runtime intermediate (literals,
     /// arithmetic results); on-disk encoding is rejected so this branch
@@ -464,6 +469,7 @@ impl fmt::Display for DataType {
             Self::Date => f.write_str("DATE"),
             Self::Timestamp => f.write_str("TIMESTAMP"),
             Self::Timestamptz => f.write_str("TIMESTAMPTZ"),
+            Self::Name => f.write_str("NAME"),
             Self::Interval => f.write_str("INTERVAL"),
             Self::Json => f.write_str("JSON"),
             Self::Jsonb => f.write_str("JSONB"),

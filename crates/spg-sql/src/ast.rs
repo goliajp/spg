@@ -2229,6 +2229,10 @@ impl fmt::Display for VecEncoding {
 /// happens in `spg-engine` — keeping `spg-sql` free of storage deps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnTypeName {
+    /// v7.39 (round 291) — PG's `name`, the identifier type its
+    /// catalogs use. `CREATE TABLE t (a name)` is legal SQL that SPG
+    /// answered `type "name" does not exist` to.
+    Name,
     SmallInt,
     Int,
     BigInt,
@@ -2425,6 +2429,7 @@ impl fmt::Display for ColumnTypeName {
             Self::Float => f.write_str("FLOAT"),
             Self::Real => f.write_str("REAL"),
             Self::Text => f.write_str("TEXT"),
+            Self::Name => f.write_str("name"),
             Self::Varchar(n) => write!(f, "VARCHAR({n})"),
             Self::Char(n) => write!(f, "CHAR({n})"),
             Self::Bool => f.write_str("BOOL"),

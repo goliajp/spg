@@ -7329,6 +7329,10 @@ fn write_cell_int(out: &mut Vec<u8>, n: i64) -> std::io::Result<()> {
 const fn pg_type_oid(ty: DataType) -> u32 {
     match ty {
         DataType::Bool => 16,
+        // v7.39 (round 291) — PG's identifier type carries its own OID;
+        // reporting text (25) here would make every catalog column
+        // introspect as text, which is what ORMs key off.
+        DataType::Name => 19,
         DataType::SmallInt => 21,
         DataType::Int => 23,
         DataType::BigInt => 20,
