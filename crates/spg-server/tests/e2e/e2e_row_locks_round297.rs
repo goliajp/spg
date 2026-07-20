@@ -386,3 +386,37 @@ fn a_deadlock_kills_one_side_and_lets_the_other_through() {
     let victim = a_err.or(b_err).unwrap();
     assert_eq!(victim, "40P01|deadlock detected", "{victim}");
 }
+
+#[test]
+fn lock_timeout_gives_up_and_reports_pgs_wording() {
+    // v7.39 (round 301) — `SET lock_timeout` bounds the blocking wait.
+    // PG cancels with `canceling statement due to lock timeout` (55P03,
+    // the class clients catch to back off).
+    //
+    // Rounds 299-301 twice recorded this as broken. Both were probe
+    // timing, not code: the earlier scripts held the row only ~4s while
+    // the SET + connect overhead let the holder commit before the
+    // waiter reached for the lock, so the deadline was never tested. A
+    // 10s hold made it fire in ~600ms.
+    let (_child, addr, mut a) = boot_with_holder("timeout");
+    // A already holds row 1 and is not going to commit during this test.
+    let mut b = open(&addr);
+    b.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    query_all(&mut b, "SET lock_timeout = '400ms'");
+
+    let started = std::time::Instant::now();
+    let err = query_err(&mut b, "SELECT id FROM lk WHERE id = 1 FOR UPDATE");
+    let waited = started.elapsed();
+
+    assert_eq!(
+        err,
+        Some("55P03|canceling statement due to lock timeout".into()),
+    );
+    // It gave up NEAR the deadline, not at the holder's release.
+    assert!(
+        waited >= Duration::from_millis(300) && waited < Duration::from_secs(3),
+        "gave up after {waited:?}",
+    );
+    // A is untouched — it still holds its lock.
+    let _ = query_all(&mut a, "COMMIT");
+}
