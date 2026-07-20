@@ -129,11 +129,17 @@ fn explain_dml_shapes() {
 }
 
 #[test]
-fn explain_analyze_dml_rejected() {
+fn explain_analyze_dml_executes() {
+    // r225 pinned the REFUSAL here — "it would execute the write" — which
+    // read like a policy but was a structural fact: the explain path took
+    // `&self`. PG's ANALYZE really runs the statement and does not roll
+    // back, so round 286 gave it a `&mut self` sibling and this pin now
+    // asserts the measured PG behaviour instead.
     let mut e = seeded();
-    let err = e
-        .execute("EXPLAIN ANALYZE DELETE FROM t1 WHERE id = 1")
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("not supported"), "{err}");
+    let lines = plan(&mut e, "EXPLAIN ANALYZE DELETE FROM t1 WHERE id = 1");
+    assert!(lines[0].starts_with("Delete on t1"), "{:?}", lines[0]);
+    let QueryResult::Rows { rows, .. } = e.execute("SELECT count(*) FROM t1").unwrap() else {
+        panic!()
+    };
+    assert_eq!(format!("{:?}", rows[0].values[0]), "BigInt(2)");
 }

@@ -1200,7 +1200,109 @@ fn render_costed(tree: &PlanNode, with_costs: bool, out: &mut Vec<String>) {
     walk(tree, 0, out, with_costs);
 }
 
+
 impl Engine {
+    /// v7.39 (round 286) — the `<Verb> on <table>` root PG puts over a
+    /// DML statement's source plan. Split out of `exec_explain` so the
+    /// ANALYZE path, which has to really execute and therefore needs
+    /// `&mut self`, renders the identical tree.
+    fn dml_plan_tree(&self, inner: &spg_sql::ast::Statement) -> Option<PlanNode> {
+        match inner {
+            spg_sql::ast::Statement::Insert(i) => {
+                let mut root = PlanNode::new(alloc::format!("Insert on {}", i.table));
+                let child = match &i.select_source {
+                    Some(src) => build_plan_tree(src, self),
+                    None => {
+                        let mut r = PlanNode::new(String::from("Result"));
+                        r.cost = Some((0.0, 0.01, i.rows.len().max(1) as u64, 8));
+                        r
+                    }
+                };
+                root.cost = child.cost.map(|(_, ct, _, _)| (0.0, ct, 0, 0));
+                root.children.push(child);
+                Some(root)
+            }
+            spg_sql::ast::Statement::Update(u) => {
+                let mut root = PlanNode::new(alloc::format!("Update on {}", u.table));
+                let child = scan_node(self, &u.table, None, u.where_.as_ref(), &[]);
+                root.cost = child.cost.map(|(cs, ct, _, _)| (cs, ct, 0, 0));
+                root.children.push(child);
+                Some(root)
+            }
+            spg_sql::ast::Statement::Delete(d) => {
+                let mut root = PlanNode::new(alloc::format!("Delete on {}", d.table));
+                let child = scan_node(self, &d.table, None, d.where_.as_ref(), &[]);
+                root.cost = child.cost.map(|(cs, ct, _, _)| (cs, ct, 0, 0));
+                root.children.push(child);
+                Some(root)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Engine {
+    /// v7.39 (round 286) — `EXPLAIN ANALYZE <INSERT|UPDATE|DELETE>`.
+    ///
+    /// PG's ANALYZE really runs the statement — it does not plan-and-
+    /// discard, and it does NOT roll back. SPG refused it outright
+    /// because `exec_explain` takes `&self`, so the write had nowhere
+    /// to happen; that is the whole of the old restriction. This is the
+    /// `&mut self` sibling, reached only from the write dispatch. The
+    /// read-only path still refuses, correctly: a write cannot run there.
+    ///
+    /// The row counts follow PG: the `<Verb> on <table>` node reports
+    /// `rows=0.00` (nothing is returned without RETURNING) while the
+    /// source node reports the rows it produced.
+    pub(crate) fn exec_explain_analyze_dml(
+        &mut self,
+        e: &spg_sql::ast::ExplainStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        let Some(mut tree) = self.dml_plan_tree(&e.inner) else {
+            return Err(EngineError::Unsupported(String::from(
+                "EXPLAIN ANALYZE body must be INSERT / UPDATE / DELETE",
+            )));
+        };
+        let started = self.clock.map(|f| f());
+        let res = self.dispatch_stmt_inner((*e.inner).clone(), cancel)?;
+        let elapsed_micros = match (self.clock, started) {
+            (Some(f), Some(s)) => Some(f().saturating_sub(s)),
+            _ => None,
+        };
+        let affected = match &res {
+            QueryResult::CommandOk { affected, .. } => *affected as u64,
+            QueryResult::Rows { rows, .. } => rows.len() as u64,
+        };
+        let show_time = !e.timing_off && !self.env_cfg().explain_no_costs;
+        let elapsed_ms = if show_time {
+            elapsed_micros.map(|us| us as f64 / 1000.0)
+        } else {
+            None
+        };
+        // The ModifyTable node returns nothing; its source produced the
+        // rows it modified.
+        tree.actual = Some((elapsed_ms, 0));
+        for child in &mut tree.children {
+            child.actual = Some((None, affected));
+        }
+        let mut lines = Vec::<String>::new();
+        render_costed(&tree, !e.costs_off, &mut lines);
+        if !e.summary_off
+            && !self.env_cfg().explain_no_costs
+            && let Some(us) = elapsed_micros
+        {
+            let ms = us as f64 / 1000.0;
+            lines.push(alloc::format!("Execution Time: {ms:.3} ms"));
+        }
+        let columns = alloc::vec![ColumnSchema::new("QUERY PLAN", DataType::Text, false)];
+        let rows: Vec<Row<'static>> = lines
+            .into_iter()
+            .map(|l| Row::new(alloc::vec![Value::text(l)]))
+            .collect();
+        Ok(QueryResult::Rows { columns, rows })
+    }
+
     /// v4.26: `EXPLAIN [ANALYZE] <select>`. Returns a single-column
     /// `QUERY PLAN` text table — first line names the top operator
     /// (Scan / Aggregate / Window / etc.), indented children list
@@ -1227,37 +1329,10 @@ impl Engine {
                 plan_tree = Some(tree);
                 Some(s)
             }
-            spg_sql::ast::Statement::Insert(i) => {
-                let mut root = PlanNode::new(alloc::format!("Insert on {}", i.table));
-                // INSERT … SELECT plans the source; plain VALUES is Result.
-                let child = match &i.select_source {
-                    Some(src) => build_plan_tree(src, self),
-                    None => {
-                        let mut r = PlanNode::new(String::from("Result"));
-                        r.cost = Some((0.0, 0.01, i.rows.len().max(1) as u64, 8));
-                        r
-                    }
-                };
-                root.cost = child.cost.map(|(_, ct, cr, _)| (0.0, ct, cr, 0));
-                root.children.push(child);
-                render_costed(&root, !e.costs_off, &mut lines);
-                plan_tree = Some(root);
-                None
-            }
-            spg_sql::ast::Statement::Update(u) => {
-                let mut root = PlanNode::new(alloc::format!("Update on {}", u.table));
-                let child = scan_node(self, &u.table, None, u.where_.as_ref(), &[]);
-                root.cost = child.cost.map(|(cs, ct, cr, _)| (cs, ct, cr, 0));
-                root.children.push(child);
-                render_costed(&root, !e.costs_off, &mut lines);
-                plan_tree = Some(root);
-                None
-            }
-            spg_sql::ast::Statement::Delete(d) => {
-                let mut root = PlanNode::new(alloc::format!("Delete on {}", d.table));
-                let child = scan_node(self, &d.table, None, d.where_.as_ref(), &[]);
-                root.cost = child.cost.map(|(cs, ct, cr, _)| (cs, ct, cr, 0));
-                root.children.push(child);
+            dml @ (spg_sql::ast::Statement::Insert(_)
+            | spg_sql::ast::Statement::Update(_)
+            | spg_sql::ast::Statement::Delete(_)) => {
+                let root = self.dml_plan_tree(dml).expect("DML arm builds a tree");
                 render_costed(&root, !e.costs_off, &mut lines);
                 plan_tree = Some(root);
                 None
@@ -1306,7 +1381,7 @@ impl Engine {
             // SELECT bodies only (a DML ANALYZE would have to really write).
             let Some(sel) = sel else {
                 return Err(EngineError::Unsupported(String::from(
-                    "EXPLAIN ANALYZE on INSERT/UPDATE/DELETE is not supported (it would execute the write); use plain EXPLAIN",
+                    "EXPLAIN ANALYZE on INSERT/UPDATE/DELETE cannot run on the read-only path",
                 )));
             };
             // v7.39 (round 227, Phase 3) — PG-shaped ANALYZE. Snapshot the
