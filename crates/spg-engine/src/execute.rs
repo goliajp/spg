@@ -1084,6 +1084,12 @@ impl Engine {
         } else if result.is_ok() && is_rollback_to_savepoint {
             // Rolling back to a savepoint recovers the transaction.
             self.set_current_tx_aborted(false);
+        } else if matches!(result, Err(EngineError::LockWouldBlock)) {
+            // v7.39 (round 300) — NOT a failure: the server drops the
+            // engine lock and retries. Marking the block aborted here
+            // made the FIRST block poison the transaction, so the
+            // retry hit the abort firewall and the waiter lost a
+            // deadlock it should have won.
         } else if result.is_err() {
             // A failure inside an open transaction aborts the whole block.
             self.set_current_tx_aborted(true);

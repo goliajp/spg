@@ -524,8 +524,17 @@ impl crate::Engine {
                 LockOutcome::WouldBlock { .. } => {
                     return Err(crate::EngineError::LockWouldBlock);
                 }
-                LockOutcome::Deadlock { .. } => {
+                // v7.39 (round 300) — the detector NAMES a victim, and
+                // only the victim dies. PG breaks a cycle by aborting
+                // one transaction so the other can proceed; erroring on
+                // both sides kills work that was never at fault. A
+                // non-victim keeps waiting — the victim's rollback
+                // releases the row it needs.
+                LockOutcome::Deadlock { victim } if victim == version => {
                     return Err(crate::EngineError::LockDeadlock);
+                }
+                LockOutcome::Deadlock { .. } => {
+                    return Err(crate::EngineError::LockWouldBlock);
                 }
             }
         }
