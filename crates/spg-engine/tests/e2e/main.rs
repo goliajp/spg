@@ -207,6 +207,7 @@ mod e2e_name_type_round291;
 mod e2e_limit_expr_round284;
 mod e2e_constraintdef_round290;
 mod e2e_deferrable_fk_round288;
+mod e2e_float8_shortest_round292;
 mod e2e_timestamp_wall_cast_round289;
 mod e2e_explain_analyze_dml_round286;
 mod e2e_record_type_round285;
