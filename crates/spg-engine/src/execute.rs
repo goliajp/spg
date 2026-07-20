@@ -1060,6 +1060,18 @@ impl Engine {
             } => self.exec_prepare(name, param_types, *body, source),
             Statement::Execute { name, args } => self.exec_execute(&name, &args, cancel),
             Statement::Deallocate(name) => self.exec_deallocate(name.as_deref()),
+            // v7.39 (round 278) — both were accepted and dropped. They
+            // are reported as MISSING OBJECTS rather than as syntax
+            // errors, because the SQL parses fine; what is absent is a
+            // procedure catalog and a prepared-transaction registry.
+            Statement::Call(name) => Err(EngineError::Unsupported(alloc::format!(
+                "procedure {name}() does not exist HINT: No procedure matches the given name \
+                 and argument types. You might need to add explicit type casts."
+            ))),
+            Statement::PrepareTransaction(_) => Err(EngineError::Unsupported(String::from(
+                "prepared transactions are disabled HINT: Set \"max_prepared_transactions\" \
+                 to a nonzero value.",
+            ))),
             Statement::CreateTable(s) => self.exec_create_table(s),
             // v7.39 (round 218) — server-side cursors.
             Statement::DeclareCursor {

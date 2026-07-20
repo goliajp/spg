@@ -131,6 +131,16 @@ pub enum Statement {
     Execute { name: String, args: Vec<Expr> },
     /// v7.39 (round 277) — `DEALLOCATE {<name> | ALL}`. `None` = ALL.
     Deallocate(Option<String>),
+    /// v7.39 (round 278) — `CALL <proc>(…)`. Parses; the engine
+    /// reports that the procedure does not exist, because SPG has no
+    /// procedure catalog. Carried as a statement rather than raised at
+    /// parse time so the failure is a missing OBJECT (42883), not a
+    /// syntax error.
+    Call(String),
+    /// v7.39 (round 278) — `PREPARE TRANSACTION '<gid>'`. Same shape:
+    /// 2PC is unavailable, which PG itself reports when
+    /// `max_prepared_transactions` is 0.
+    PrepareTransaction(String),
     Empty,
     /// v7.39 (round 218) — `DECLARE <name> [BINARY] [INSENSITIVE]
     /// [[NO] SCROLL] CURSOR [{WITH|WITHOUT} HOLD] FOR <select>`. The
@@ -3841,7 +3851,9 @@ impl Statement {
             // write, and its body is only known at execution time.
             Statement::Prepare { .. }
             | Statement::Execute { .. }
-            | Statement::Deallocate(_) => false,
+            | Statement::Deallocate(_)
+            | Statement::Call(_)
+            | Statement::PrepareTransaction(_) => false,
             Statement::Select(_)
             | Statement::CopyTo { .. }
             | Statement::CopyToFile { .. }
@@ -4114,6 +4126,8 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
+            Self::Call(n) => write!(f, "CALL {}()", quote_ident(n)),
+            Self::PrepareTransaction(gid) => write!(f, "PREPARE TRANSACTION '{gid}'"),
             Self::Deallocate(None) => f.write_str("DEALLOCATE ALL"),
             Self::Deallocate(Some(n)) => write!(f, "DEALLOCATE {}", quote_ident(n)),
             Self::DeclareCursor {
