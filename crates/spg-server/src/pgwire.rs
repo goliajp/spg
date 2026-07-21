@@ -6855,44 +6855,7 @@ fn send_error_pos(
     // understood the error precisely, so strip it from the client
     // message (PG has no such prefix).
     let main_msg: &str = if sqlstate != "42000" {
-        // v7.39 (GUC knife 5, extended) — typed states mean we understood
-        // the error precisely; strip EVERY layer of internal prefix (a
-        // coerce error can arrive double-wrapped through the dispatch).
-        let mut m = main;
-        loop {
-            let next = m
-                .strip_prefix("unsupported: ")
-                .or_else(|| m.strip_prefix("storage: "))
-                .or_else(|| m.strip_prefix("eval: "))
-                .or_else(|| m.strip_prefix("type mismatch: "))
-                // v7.39 (read01 round 47) — duplicate-object errors for
-                // sequences / views / types still ride StorageError::Corrupt,
-                // whose Display adds this banner. A typed state means we
-                // recognised the error, so it is not a corruption report; a
-                // genuine corruption never matches a typed pattern and keeps
-                // its prefix.
-                .or_else(|| m.strip_prefix("corrupt on-disk format: "))
-                // v7.39 (read01 numeric.c) — a typed literal-overflow error
-                // can surface from the parser ("parse: parse error at token
-                // #N: value overflows numeric format").
-                .or_else(|| {
-                    let r = m.strip_prefix("parse: parse error at token #")?;
-                    let digits = r.bytes().take_while(u8::is_ascii_digit).count();
-                    if digits == 0 {
-                        return None;
-                    }
-                    r[digits..].strip_prefix(": ")
-                })
-                // r184 — lexer-level errors ride ParseError as
-                // "lex: <message>"; PG's wire message carries none of
-                // SPG's internal class vocabulary.
-                .or_else(|| m.strip_prefix("lex: "));
-            match next {
-                Some(n) => m = n,
-                None => break,
-            }
-        }
-        m
+        crate::strip_internal_error_prefixes(main)
     } else {
         main
     };

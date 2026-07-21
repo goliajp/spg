@@ -1919,6 +1919,36 @@ thread_local! {
     static CONN_PID: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
 }
 
+/// v7.39 (round 323, V24) — strip SPG's internal error-class vocabulary
+/// off a message before it reaches a client. `EngineError` / `StorageError`
+/// / `EvalError` each prefix their Display with the layer they came from
+/// (`unsupported: `, `storage: `, `eval: `, `parse: `, `lex: `, …); neither
+/// PG nor MariaDB emits anything of the sort, and the message bodies
+/// underneath are already the ones they use. A single error can arrive
+/// double-wrapped through the dispatch, so this peels every layer.
+pub(crate) fn strip_internal_error_prefixes(msg: &str) -> &str {
+    let mut m = msg;
+    loop {
+        let next = m
+            .strip_prefix("unsupported: ")
+            .or_else(|| m.strip_prefix("storage: "))
+            .or_else(|| m.strip_prefix("eval: "))
+            .or_else(|| m.strip_prefix("type mismatch: "))
+            // v7.39 (read01 round 47) — duplicate-object errors for
+            // sequences / views / types still ride StorageError::Corrupt,
+            // whose Display adds this banner. A caller that reached here
+            // recognised the error, so it is not a corruption report.
+            .or_else(|| m.strip_prefix("corrupt on-disk format: "))
+            .or_else(|| m.strip_prefix("parse: "))
+            // r184 — lexer-level errors ride ParseError as "lex: <message>".
+            .or_else(|| m.strip_prefix("lex: "));
+        match next {
+            Some(n) => m = n,
+            None => return m,
+        }
+    }
+}
+
 pub(crate) fn set_conn_pid(pid: u32) {
     CONN_PID.with(|c| c.set(pid));
 }

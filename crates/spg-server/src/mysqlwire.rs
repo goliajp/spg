@@ -909,7 +909,16 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
             "70100",
             "Query execution was interrupted".to_string(),
         ),
-        _ => (1064, "42000", e.to_string()),
+        // v7.39 (round 323, V24) — without the internal class vocabulary.
+        // A mysql client used to be handed SPG's own layering, e.g.
+        // "parse: parse error at token #3: expected …"; neither MariaDB
+        // nor PG emits anything of the sort, and pgwire has stripped it
+        // for typed states since r184.
+        _ => (
+            1064,
+            "42000",
+            crate::strip_internal_error_prefixes(&e.to_string()).to_string(),
+        ),
     }
 }
 

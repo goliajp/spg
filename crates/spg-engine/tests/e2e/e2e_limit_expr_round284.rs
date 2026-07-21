@@ -32,14 +32,10 @@ fn err(e: &mut Engine, tail: &str) -> String {
     let sql = format!("SELECT count(*) FROM (SELECT * FROM l2 {tail}) s");
     match e.execute(&sql) {
         Ok(v) => panic!("{sql}: expected an error, got {v:?}"),
-        // The parse-error wrapper is a separate, pre-existing residual;
-        // what this pins is the MESSAGE, which is PG's verbatim.
-        Err(x) => {
-            let raw = format!("{x}");
-            raw.split_once("parse error at token #")
-                .and_then(|(_, rest)| rest.split_once(": "))
-                .map_or(raw.clone(), |(_, msg)| msg.to_string())
-        }
+        // v7.39 (round 323, V24) — the `parse error at token #N: ` wrapper
+        // this used to unpick is gone; only the engine's own layer prefix
+        // is left, and the message under it is PG's verbatim.
+        Err(x) => format!("{x}").trim_start_matches("parse: ").to_string()
     }
 }
 

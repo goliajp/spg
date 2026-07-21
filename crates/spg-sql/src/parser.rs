@@ -440,12 +440,15 @@ pub struct ParseError {
 }
 
 impl fmt::Display for ParseError {
+    /// v7.39 (round 322/V24) — the message ALONE. It used to be prefixed
+    /// with `parse error at token #N: `, which PG has no equivalent of:
+    /// the message bodies are already PG's verbatim (`LIMIT must not be
+    /// negative`, `invalid input syntax for type bigint: "abc"`), and the
+    /// prefix was SPG's internal token index leaking into every one of
+    /// them. `token_pos` stays a field — the wire recovers PG's 1-based
+    /// character position from it for the ErrorResponse `P`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "parse error at token #{}: {}",
-            self.token_pos, self.message
-        )
+        f.write_str(&self.message)
     }
 }
 
