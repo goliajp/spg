@@ -338,6 +338,25 @@ impl Engine {
         });
     }
 
+    /// v7.39 (round 320, V53) — `RESET ALL` / the reset half of
+    /// `DISCARD ALL`: drop every GUC override, keeping the internal keys
+    /// that are not GUCs at all (the connection's login identity and its
+    /// database). Clearing the whole map took those with it.
+    pub(crate) fn reset_all_gucs(&mut self) {
+        let keep: alloc::vec::Vec<(String, String)> = [SESSION_USER_KEY, "spg.database"]
+            .iter()
+            .filter_map(|k| {
+                self.session_params
+                    .get(*k)
+                    .map(|v| (String::from(*k), v.clone()))
+            })
+            .collect();
+        self.session_params.clear();
+        for (k, v) in keep {
+            self.session_params.insert(k, v);
+        }
+    }
+
     /// v7.39 (round 318, V41) — raise a PG-style WARNING. Same channel as
     /// [`Self::notice`], one level louder: PG uses it for "the command
     /// succeeded but did nothing useful" cases such as `SET CONSTRAINTS`

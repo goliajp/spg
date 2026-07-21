@@ -89,6 +89,26 @@ impl fmt::Display for CursorDirection {
     }
 }
 
+/// v7.39 (round 320, V53) — what a `DISCARD` throws away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscardTarget {
+    All,
+    Plans,
+    Sequences,
+    Temp,
+}
+
+impl fmt::Display for DiscardTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::All => "ALL",
+            Self::Plans => "PLANS",
+            Self::Sequences => "SEQUENCES",
+            Self::Temp => "TEMP",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Statement::Select dominates; Boxing would touch every match site
 pub enum Statement {
@@ -328,6 +348,11 @@ pub enum Statement {
     ShowVariables,
     /// v7.17.0 Phase 3.P0-62 — MySQL `SHOW PROCESSLIST`.
     ShowProcesslist,
+    /// v7.39 (round 320, V53) — `DISCARD { ALL | PLANS | SEQUENCES | TEMP }`.
+    /// pgbouncer sends `DISCARD ALL` between pooled client sessions to make
+    /// the connection look brand new to the next client; it used to be
+    /// swallowed as dump noise, so nothing was discarded.
+    Discard(DiscardTarget),
     /// v7.39 (round 318, V51) — MySQL `KILL [CONNECTION | QUERY] <expr>`.
     /// The id is an expression because MariaDB accepts one
     /// (`KILL connection_id()` is the documented way to drop your own
@@ -4108,7 +4133,10 @@ impl Statement {
             | Statement::DropStatistics { .. }
             // v7.39 (round 318, V51) — KILL signals another connection;
             // it must run on the writer path that owns the registry hook.
-            | Statement::Kill { .. } => false,
+            | Statement::Kill { .. }
+            // v7.39 (round 320, V53) — DISCARD throws session state away;
+            // writer path, like SET / RESET.
+            | Statement::Discard(_) => false,
             // v7.39 (round 295, E3 Phase 1b) — a SELECT that asks for row
             // locks MUTATES the lock table, so it is not a read. Left as
             // a read it went to the read-only executor and the locking
@@ -4667,6 +4695,7 @@ impl fmt::Display for Statement {
             Self::ShowStatus => f.write_str("SHOW STATUS"),
             Self::ShowVariables => f.write_str("SHOW VARIABLES"),
             Self::ShowProcesslist => f.write_str("SHOW PROCESSLIST"),
+            Self::Discard(t) => write!(f, "DISCARD {t}"),
             Self::Kill { query_only, id } => {
                 if *query_only {
                     write!(f, "KILL QUERY {id}")

@@ -109,6 +109,14 @@ fn vacuum_and_friends_return_clean_cc() {
     let mut child = common::ChildGuard(raw);
     let mut s = open(addrs.pgwire.as_ref().unwrap());
 
+    // v7.39 (round 320, V53) — VACUUM / ANALYZE reach the engine now
+    // (pgwire used to answer them from a canned table without ever
+    // parsing), so a named relation has to exist. PG agrees: `VACUUM
+    // mytable` on a missing relation is `ERROR: relation "mytable" does
+    // not exist`, measured on PG 18.4.
+    send_query(&mut s, "CREATE TABLE mytable (id INT NOT NULL)");
+    let _ = drain_until_ready(&mut s);
+
     for (sql, tag) in [
         ("VACUUM", "VACUUM"),
         ("VACUUM FULL ANALYZE", "VACUUM"),

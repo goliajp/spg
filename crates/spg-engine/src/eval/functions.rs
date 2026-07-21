@@ -16350,7 +16350,32 @@ fn apply_function_dispatch(
                 .cloned()
                 .unwrap_or_else(|| String::from("spg")),
         )),
-        "current_schema" => Ok(Value::text::<String>("public".into())),
+        // v7.39 (round 320, V53) — the first EXISTING schema on the
+        // session's search_path, as PG resolves it: `SET search_path TO
+        // app` reports `app` once that schema exists and NULL while it
+        // does not. This was hardcoded "public", so it ignored the
+        // client's own search_path (and pgwire canned the same constant a
+        // layer above, which round 320 removed).
+        "current_schema" => {
+            let path = ctx
+                .session_gucs
+                .and_then(|g| g.get("search_path"))
+                .map(String::as_str)
+                .unwrap_or("\"$user\", public");
+            let me = session_user_from_ctx(ctx);
+            let first = path.split(',').find_map(|raw| {
+                let name = raw.trim().trim_matches('"');
+                let name = if name == "$user" { me.as_str() } else { name };
+                if name.is_empty() {
+                    return None;
+                }
+                match ctx.catalog {
+                    Some(cat) if !cat.schema_exists(name) => None,
+                    _ => Some(alloc::string::String::from(name)),
+                }
+            });
+            Ok(first.map_or(Value::Null, Value::text))
+        }
         // v7.39 (RLS) — current_user / user follow `SET ROLE`; session_user is
         // the login identity (unaffected by SET ROLE). Both default to admin.
         "current_user" | "user" => Ok(Value::text(current_role_from_ctx(ctx))),
