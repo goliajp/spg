@@ -19083,7 +19083,12 @@ impl Parser {
             let widened = match &target {
                 CastTarget::Bool => Some(CastTarget::Named("bool_array".to_string())),
                 CastTarget::Date => Some(CastTarget::Named("date_array".to_string())),
-                CastTarget::Timestamp | CastTarget::Timestamptz => {
+                // v7.39 (round 326, V43) — the two temporal types stay
+                // distinct. Both used to widen to `timestamptz_array`, so
+                // `::timestamp[]` named the wrong target in its own error
+                // message and lost the zone-less identity on the way.
+                CastTarget::Timestamp => Some(CastTarget::Named("timestamp_array".to_string())),
+                CastTarget::Timestamptz => {
                     Some(CastTarget::Named("timestamptz_array".to_string()))
                 }
                 CastTarget::Uuid => Some(CastTarget::Named("uuid_array".to_string())),
