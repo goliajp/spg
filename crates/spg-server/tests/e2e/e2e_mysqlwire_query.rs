@@ -354,6 +354,66 @@ fn mysql_dialect_is_isolated_per_connection() {
     assert_eq!(query_scalar(&mut a, r"SELECT LENGTH('\n')"), "2");
 }
 
+/// V22 (round 303) — each mysql connection has its own transaction
+/// slot. Before this every mysql statement ran on the shared slot 0, so
+/// a second connection's `BEGIN` collided with `a transaction is already
+/// open`. pgwire has had per-connection slots since r283.
+#[test]
+fn two_mysql_connections_can_each_hold_a_transaction() {
+    let (_guard, addr) = spawn();
+    let mut a = auth_open_mode(&addr);
+    let mut b = auth_open_mode(&addr);
+    exec_ok(&mut a, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    // Both connections open a transaction concurrently — no collision.
+    exec_ok(&mut a, "BEGIN");
+    exec_ok(&mut b, "BEGIN");
+    exec_ok(&mut a, "INSERT INTO t VALUES (1, 100)");
+    exec_ok(&mut b, "INSERT INTO t VALUES (2, 200)");
+    // Each sees only its own uncommitted row (READ COMMITTED isolation,
+    // same engine machinery pgwire uses).
+    assert_eq!(query_scalar(&mut a, "SELECT COUNT(*) FROM t"), "1");
+    assert_eq!(query_scalar(&mut b, "SELECT COUNT(*) FROM t"), "1");
+    exec_ok(&mut a, "COMMIT");
+    exec_ok(&mut b, "COMMIT");
+    // After both commit, both rows are visible.
+    assert_eq!(query_scalar(&mut a, "SELECT COUNT(*) FROM t"), "2");
+}
+
+/// V22 — BEGIN/ROLLBACK discards; the connection's slot is independent
+/// so a rollback on one connection doesn't touch another's committed
+/// data. Verified vs MariaDB 11 (BEGIN;INSERT;ROLLBACK → row gone).
+#[test]
+fn mysql_transaction_rollback_discards_only_its_own_writes() {
+    let (_guard, addr) = spawn();
+    let mut a = auth_open_mode(&addr);
+    let mut b = auth_open_mode(&addr);
+    exec_ok(&mut a, "CREATE TABLE t (id INT PRIMARY KEY)");
+    exec_ok(&mut a, "INSERT INTO t VALUES (1)");
+    exec_ok(&mut b, "BEGIN");
+    exec_ok(&mut b, "INSERT INTO t VALUES (2)");
+    exec_ok(&mut b, "ROLLBACK");
+    // b's uncommitted row is gone; a's committed row survives.
+    assert_eq!(query_scalar(&mut a, "SELECT COUNT(*) FROM t"), "1");
+}
+
+/// V22 — a transaction left open at disconnect is rolled back, matching
+/// pgwire's backend-exit cleanup. The row must not leak to the next
+/// connection.
+#[test]
+fn mysql_open_transaction_rolls_back_on_disconnect() {
+    let (_guard, addr) = spawn();
+    let mut a = auth_open_mode(&addr);
+    exec_ok(&mut a, "CREATE TABLE t (id INT PRIMARY KEY)");
+    exec_ok(&mut a, "BEGIN");
+    exec_ok(&mut a, "INSERT INTO t VALUES (1)");
+    // Disconnect abruptly with the transaction still open.
+    write_packet(&mut a, 0, &[0x01]); // COM_QUIT
+    drop(a);
+    // A fresh connection sees no uncommitted row.
+    let mut b = auth_open_mode(&addr);
+    assert_eq!(query_scalar(&mut b, "SELECT COUNT(*) FROM t"), "0");
+}
+
 #[test]
 fn unknown_command_returns_err_packet() {
     let (_guard, addr) = spawn();

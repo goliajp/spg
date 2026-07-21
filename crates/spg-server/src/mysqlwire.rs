@@ -560,14 +560,29 @@ fn command_loop(
     // before this the mysql-wire path ran every query on the shared
     // session 0 under PG's standard_conforming_strings=on rules, so
     // `'\n'` silently arrived as two bytes instead of a newline (V15).
+    //
+    // v7.39 (round 303, V22) — also allocate this connection's own
+    // transaction slot. The mysql-wire path used to run every statement
+    // through `engine.execute()` (= IMPLICIT_TX, slot 0), so a second
+    // mysql client's `BEGIN` collided with `a transaction is already
+    // open`. pgwire has kept per-connection slots since r283; mysql-wire
+    // now matches.
+    let conn_tx_id = match state.engine.write() {
+        Ok(mut engine) => {
+            engine.set_current_session(session_id);
+            engine.set_backslash_escapes(true);
+            engine.alloc_tx_id()
+        }
+        Err(_) => spg_engine::IMPLICIT_TX,
+    };
+    let result = run_command_loop(stream, state, session_id, conn_tx_id);
+    // Roll back a transaction the client left open, then drop this
+    // session's parked state + advisory locks — matching pgwire's
+    // disconnect cleanup (rollback then end_session on backend exit).
     if let Ok(mut engine) = state.engine.write() {
-        engine.set_current_session(session_id);
-        engine.set_backslash_escapes(true);
-    }
-    let result = run_command_loop(stream, state, session_id);
-    // Drop this session's parked state + advisory locks at disconnect,
-    // matching pgwire's end_session on backend exit.
-    if let Ok(mut engine) = state.engine.write() {
+        if engine.is_tx_open(conn_tx_id) {
+            let _ = engine.execute_in("ROLLBACK", conn_tx_id);
+        }
         engine.end_session(session_id);
     }
     result
@@ -577,6 +592,7 @@ fn run_command_loop(
     stream: &mut (dyn ReadWrite + '_),
     state: &Arc<ServerState>,
     session_id: u32,
+    conn_tx_id: spg_engine::TxId,
 ) -> std::io::Result<()> {
     let mut prepared = PreparedState::default();
     loop {
@@ -599,7 +615,7 @@ fn run_command_loop(
             CMD_QUIT => return Ok(()),
             CMD_QUERY => {
                 let sql = std::str::from_utf8(&payload[1..]).unwrap_or("").to_string();
-                handle_com_query(stream, state, &sql, reply_seqno, session_id)?;
+                handle_com_query(stream, state, &sql, reply_seqno, session_id, conn_tx_id)?;
             }
             CMD_PING => {
                 // Single OK packet, no body — what mysqladmin
@@ -637,6 +653,7 @@ fn run_command_loop(
                     &payload[1..],
                     reply_seqno,
                     session_id,
+                    conn_tx_id,
                 )?;
             }
             CMD_STMT_CLOSE => {
@@ -700,11 +717,12 @@ fn handle_com_query(
     sql: &str,
     start_seqno: u8,
     session_id: u32,
+    conn_tx_id: spg_engine::TxId,
 ) -> std::io::Result<()> {
-    // Run the SQL through the engine. Mirrors what pgwire's
-    // 'Q' (simple query) path does — single-statement form, no
-    // transaction state changes here (autocommit-only for v7.17
-    // mysql-wire; BEGIN/COMMIT through pgwire still works).
+    // Run the SQL through the engine. Mirrors pgwire's 'Q' (simple
+    // query) path: dispatched into this connection's own transaction
+    // slot so `BEGIN` / `COMMIT` / `ROLLBACK` bracket the connection's
+    // statements and never collide with another connection (V22).
     let outcome = {
         let Ok(mut engine) = state.engine.write() else {
             return write_packet(
@@ -718,7 +736,7 @@ fn handle_com_query(
         // to its own pid. Without this the mysql query would run under
         // another connection's dialect / params (V15).
         engine.set_current_session(session_id);
-        engine.execute(sql)
+        engine.execute_in(sql, conn_tx_id)
     };
     // v7.33 (A1) — persist the write (WAL/snapshot + audit) before
     // acking. The mysql-wire path was non-durable like pgwire pre-7.33:
@@ -879,6 +897,7 @@ fn handle_com_stmt_execute(
     payload: &[u8],
     start_seqno: u8,
     session_id: u32,
+    conn_tx_id: spg_engine::TxId,
 ) -> std::io::Result<()> {
     if payload.len() < 9 {
         return write_packet(
@@ -943,7 +962,7 @@ fn handle_com_stmt_execute(
                 .ok()
                 .map(|()| bind.to_string())
         };
-        (engine.execute_prepared(stmt, &params), render)
+        (engine.execute_prepared_in(stmt, &params, conn_tx_id), render)
     };
     // v7.33 (A1) — persist the prepared write before acking (was
     // non-durable pre-7.33, lost on crash).

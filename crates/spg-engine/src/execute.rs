@@ -832,8 +832,34 @@ impl Engine {
 
     pub fn execute_prepared_with_cancel(
         &mut self,
+        stmt: Statement,
+        params: &[Value<'static>],
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        self.execute_prepared_in_with_cancel(stmt, params, IMPLICIT_TX, cancel)
+    }
+
+    /// v7.39 (round 303, V22) — like [`Self::execute_prepared_with_cancel`]
+    /// but binds the statement to an explicit transaction slot instead of
+    /// the implicit one. The mysql-wire binary-protocol path uses this so a
+    /// prepared INSERT/UPDATE lands in the connection's own `BEGIN`-opened
+    /// transaction (and never collides with another connection on slot 0),
+    /// mirroring what pgwire's `Bind`+`Execute` achieves by rendering
+    /// bind-final SQL through [`Self::execute_in`].
+    pub fn execute_prepared_in(
+        &mut self,
+        stmt: Statement,
+        params: &[Value<'static>],
+        tx_id: TxId,
+    ) -> Result<QueryResult, EngineError> {
+        self.execute_prepared_in_with_cancel(stmt, params, tx_id, CancelToken::none())
+    }
+
+    pub fn execute_prepared_in_with_cancel(
+        &mut self,
         mut stmt: Statement,
         params: &[Value<'static>],
+        tx_id: TxId,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         substitute_placeholders(&mut stmt, params)?;
@@ -848,7 +874,7 @@ impl Engine {
         // BEGIN/COMMIT-bracketed flow. Caught by spg-sqlx's
         // first transaction-visibility test.
         let saved = self.current_tx;
-        self.current_tx = Some(IMPLICIT_TX);
+        self.current_tx = Some(tx_id);
         // v7.38 Epic P (panic isolation) — Slice 2: route the
         // prepared / extended-query path (the one sqlx / asyncpg / most
         // drivers actually use via pgwire `Bind`+`Execute`) through the
