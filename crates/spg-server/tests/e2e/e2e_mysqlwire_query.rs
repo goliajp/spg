@@ -280,6 +280,80 @@ fn com_quit_closes_connection_cleanly() {
     assert_eq!(n, 0, "server closed connection after COM_QUIT");
 }
 
+/// Read a single-column, single-row string result off the wire and
+/// return the decoded value. Consumes the trailing OK.
+fn query_scalar(s: &mut TcpStream, sql: &str) -> String {
+    send_query(s, sql);
+    let (_seq, cc) = read_packet(s);
+    let (col_count, _) = read_lenenc(&cc, 0);
+    for _ in 0..col_count {
+        let _ = read_packet(s);
+    }
+    let (_seq, row) = read_packet(s);
+    let (val, _) = read_lenenc_string(&row, 0);
+    let (_seq, _ok) = read_packet(s);
+    String::from_utf8(val).unwrap()
+}
+
+fn exec_ok(s: &mut TcpStream, sql: &str) {
+    send_query(s, sql);
+    let (_seq, ok) = read_packet(s);
+    assert_eq!(ok[0], 0x00, "expected OK for `{sql}`, got {:#x}", ok[0]);
+}
+
+/// V15 (round 302) — a MySQL-protocol connection defaults to MySQL
+/// string semantics: backslash is an escape character. Before this the
+/// mysql-wire path ran on the shared PG session where `'\n'` was two
+/// literal bytes. Expected values verified against MariaDB 11.
+#[test]
+fn mysql_connection_defaults_to_backslash_escape_dialect() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    // `\n` is a single newline byte, not backslash + n.
+    assert_eq!(query_scalar(&mut s, r"SELECT LENGTH('\n')"), "1");
+    assert_eq!(query_scalar(&mut s, r"SELECT LENGTH('\t')"), "1");
+    assert_eq!(query_scalar(&mut s, r"SELECT LENGTH('\\')"), "1");
+    assert_eq!(query_scalar(&mut s, r"SELECT LENGTH('\'')"), "1");
+    assert_eq!(query_scalar(&mut s, r"SELECT LENGTH('a\nb')"), "3");
+}
+
+/// V15 — `SET sql_mode='NO_BACKSLASH_ESCAPES'` turns the escapes back
+/// off within the session; any other sql_mode (or an empty list) leaves
+/// them on. Verified vs MariaDB 11.
+#[test]
+fn mysql_no_backslash_escapes_sql_mode_disables_escapes() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    assert_eq!(query_scalar(&mut s, r"SELECT LENGTH('\n')"), "1");
+    exec_ok(&mut s, "SET sql_mode='NO_BACKSLASH_ESCAPES'");
+    assert_eq!(query_scalar(&mut s, r"SELECT LENGTH('\n')"), "2");
+    // A different sql_mode replaces the whole value → escapes back on.
+    exec_ok(&mut s, "SET sql_mode='STRICT_TRANS_TABLES'");
+    assert_eq!(query_scalar(&mut s, r"SELECT LENGTH('\n')"), "1");
+    // NO_BACKSLASH_ESCAPES anywhere in the list still disables them.
+    exec_ok(&mut s, "SET sql_mode='ANSI_QUOTES,NO_BACKSLASH_ESCAPES'");
+    assert_eq!(query_scalar(&mut s, r"SELECT LENGTH('\n')"), "2");
+}
+
+/// V15 — the dialect is per-session, not a process-global flag. The
+/// server holds one shared Engine (see the r279/r283 session-bag work),
+/// so a second mysql connection must not inherit the first's
+/// `NO_BACKSLASH_ESCAPES`. Guards against the "shared engine leaks
+/// per-connection state" class of bug.
+#[test]
+fn mysql_dialect_is_isolated_per_connection() {
+    let (_guard, addr) = spawn();
+    let mut a = auth_open_mode(&addr);
+    exec_ok(&mut a, "SET sql_mode='NO_BACKSLASH_ESCAPES'");
+    assert_eq!(query_scalar(&mut a, r"SELECT LENGTH('\n')"), "2");
+    // A fresh connection starts from the MySQL default (escapes on),
+    // uncontaminated by A's session.
+    let mut b = auth_open_mode(&addr);
+    assert_eq!(query_scalar(&mut b, r"SELECT LENGTH('\n')"), "1");
+    // A's session is unchanged by B's traffic.
+    assert_eq!(query_scalar(&mut a, r"SELECT LENGTH('\n')"), "2");
+}
+
 #[test]
 fn unknown_command_returns_err_packet() {
     let (_guard, addr) = spawn();

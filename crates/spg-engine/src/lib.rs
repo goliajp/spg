@@ -1717,6 +1717,23 @@ impl Engine {
         }
     }
 
+    /// v7.39 (round 302, V15) — force the current session's string-literal
+    /// dialect. A MySQL-protocol connection defaults to MySQL semantics
+    /// (backslash is an escape: `'\n'` is a newline), which PG's own
+    /// default (`standard_conforming_strings = on`) does not do. The
+    /// mysql-wire shim calls this once, right after installing its
+    /// session, so a client that never sends `SET sql_mode` still gets
+    /// MySQL string handling; a later `SET sql_mode='NO_BACKSLASH_ESCAPES'`
+    /// flips it back through the normal SET path. Clearing the plan cache
+    /// mirrors [`set_current_session`] — the same SQL text lexes
+    /// differently once the flag moves.
+    pub fn set_backslash_escapes(&mut self, flag: bool) {
+        if flag != self.backslash_escapes {
+            self.backslash_escapes = flag;
+            self.plan_cache.clear();
+        }
+    }
+
     /// v7.39 (round 279) — take an advisory lock. Returns false only
     /// when ANOTHER session holds it; re-taking one this session
     /// already holds bumps a depth counter, as in PG.

@@ -166,6 +166,10 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
         .local_addr()
         .map(|a| u32::from(a.port()))
         .unwrap_or(1);
+    // v7.39 (round 302, V15) — a genuinely per-connection id for the
+    // engine session key. `conn_id` above is the listener port (shared
+    // by every connection) so it can't isolate sessions.
+    let session_seq = MYSQL_SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // 20-byte auth-plugin-data scramble. Deterministic random
     // from the connection id + clock so retries reproduce the
     // same bytes during e2e testing without a separate seed
@@ -240,7 +244,14 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             }
         };
         let scramble = std::mem::take(&mut greeting.scramble);
-        return complete_auth_and_command(&mut tls_stream, state, &parsed, &scramble, seqno_in);
+        return complete_auth_and_command(
+            &mut tls_stream,
+            state,
+            &parsed,
+            &scramble,
+            seqno_in,
+            session_seq,
+        );
     }
     let parsed = match parse_handshake_response_41(&payload) {
         Ok(r) => r,
@@ -264,7 +275,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
     //     carve-out — fast-path failures surface as Access
     //     Denied here.
     let scramble = std::mem::take(&mut greeting.scramble);
-    complete_auth_and_command(&mut stream, state, &parsed, &scramble, seqno_in)
+    complete_auth_and_command(&mut stream, state, &parsed, &scramble, seqno_in, session_seq)
 }
 
 /// v7.17.0 Phase 3.P0-77 — auth verification + command loop
@@ -276,6 +287,7 @@ fn complete_auth_and_command(
     parsed: &HandshakeResponse41,
     scramble: &[u8],
     seqno_in: u8,
+    session_seq: u32,
 ) -> std::io::Result<()> {
     let auth_outcome = verify_handshake_response(state, parsed, scramble);
     let reply_seqno = seqno_in.wrapping_add(1);
@@ -304,7 +316,7 @@ fn complete_auth_and_command(
             );
         }
     }
-    command_loop(stream, state)
+    command_loop(stream, state, session_seq)
 }
 
 /// v7.17.0 Phase 3.P0-77 — detect the `Protocol::SSLRequest`
@@ -521,9 +533,50 @@ struct PreparedEntry {
     param_count: u16,
 }
 
+/// v7.39 (round 302, V15) — the shared engine keys per-connection state
+/// (string-literal dialect, session params, prepared statements, the
+/// transaction slot) by a session id. pgwire uses the backend pid;
+/// mysql-wire allocates a monotonic per-connection sequence, namespaced
+/// into the top half of the u32 so a mysql connection can never collide
+/// with a pgwire pid (`process::id() + count`, always well under 2^31)
+/// or session 0. (The handshake `conn_id` is the listener's local port —
+/// identical for every accepted socket — so it can't serve as the key.)
+const MYSQL_SESSION_NS: u32 = 0x8000_0000;
+
+/// Monotonic per-connection counter feeding the low 31 bits of the
+/// session id. Wrapping after 2^31 connections is harmless — the
+/// namespace bit keeps every value disjoint from pgwire regardless.
+static MYSQL_SESSION_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
 fn command_loop(
     stream: &mut (dyn ReadWrite + '_),
     state: &Arc<ServerState>,
+    session_seq: u32,
+) -> std::io::Result<()> {
+    let session_id = MYSQL_SESSION_NS | (session_seq & 0x7fff_ffff);
+    // Install this connection's session and default it to MySQL string
+    // semantics (backslash is an escape). A mysql/mariadb client that
+    // never sends `SET sql_mode` must still get MySQL string handling —
+    // before this the mysql-wire path ran every query on the shared
+    // session 0 under PG's standard_conforming_strings=on rules, so
+    // `'\n'` silently arrived as two bytes instead of a newline (V15).
+    if let Ok(mut engine) = state.engine.write() {
+        engine.set_current_session(session_id);
+        engine.set_backslash_escapes(true);
+    }
+    let result = run_command_loop(stream, state, session_id);
+    // Drop this session's parked state + advisory locks at disconnect,
+    // matching pgwire's end_session on backend exit.
+    if let Ok(mut engine) = state.engine.write() {
+        engine.end_session(session_id);
+    }
+    result
+}
+
+fn run_command_loop(
+    stream: &mut (dyn ReadWrite + '_),
+    state: &Arc<ServerState>,
+    session_id: u32,
 ) -> std::io::Result<()> {
     let mut prepared = PreparedState::default();
     loop {
@@ -546,7 +599,7 @@ fn command_loop(
             CMD_QUIT => return Ok(()),
             CMD_QUERY => {
                 let sql = std::str::from_utf8(&payload[1..]).unwrap_or("").to_string();
-                handle_com_query(stream, state, &sql, reply_seqno)?;
+                handle_com_query(stream, state, &sql, reply_seqno, session_id)?;
             }
             CMD_PING => {
                 // Single OK packet, no body — what mysqladmin
@@ -574,10 +627,17 @@ fn command_loop(
             }
             CMD_STMT_PREPARE => {
                 let sql = std::str::from_utf8(&payload[1..]).unwrap_or("").to_string();
-                handle_com_stmt_prepare(stream, state, &mut prepared, &sql, reply_seqno)?;
+                handle_com_stmt_prepare(stream, state, &mut prepared, &sql, reply_seqno, session_id)?;
             }
             CMD_STMT_EXECUTE => {
-                handle_com_stmt_execute(stream, state, &mut prepared, &payload[1..], reply_seqno)?;
+                handle_com_stmt_execute(
+                    stream,
+                    state,
+                    &mut prepared,
+                    &payload[1..],
+                    reply_seqno,
+                    session_id,
+                )?;
             }
             CMD_STMT_CLOSE => {
                 // COM_STMT_CLOSE has no response — server just
@@ -639,6 +699,7 @@ fn handle_com_query(
     state: &Arc<ServerState>,
     sql: &str,
     start_seqno: u8,
+    session_id: u32,
 ) -> std::io::Result<()> {
     // Run the SQL through the engine. Mirrors what pgwire's
     // 'Q' (simple query) path does — single-statement form, no
@@ -652,6 +713,11 @@ fn handle_com_query(
                 &encode_err_packet(1815, "HY000", "engine lock poisoned"),
             );
         };
+        // Re-install this connection's session on the shared engine: a
+        // concurrent pgwire statement may have swapped current_session
+        // to its own pid. Without this the mysql query would run under
+        // another connection's dialect / params (V15).
+        engine.set_current_session(session_id);
         engine.execute(sql)
     };
     // v7.33 (A1) — persist the write (WAL/snapshot + audit) before
@@ -709,6 +775,7 @@ fn handle_com_stmt_prepare(
     prepared: &mut PreparedState,
     sql: &str,
     start_seqno: u8,
+    session_id: u32,
 ) -> std::io::Result<()> {
     let (param_count, columns) = {
         let Ok(mut engine) = state.engine.write() else {
@@ -718,6 +785,9 @@ fn handle_com_stmt_prepare(
                 &encode_err_packet(1815, "HY000", "engine lock poisoned"),
             );
         };
+        // See handle_com_query — re-install this connection's session so
+        // the statement lexes under its own MySQL dialect (V15).
+        engine.set_current_session(session_id);
         match engine.prepare(sql) {
             Ok(stmt) => {
                 let (param_oids, cols) = engine.describe_prepared(&stmt);
@@ -808,6 +878,7 @@ fn handle_com_stmt_execute(
     prepared: &mut PreparedState,
     payload: &[u8],
     start_seqno: u8,
+    session_id: u32,
 ) -> std::io::Result<()> {
     if payload.len() < 9 {
         return write_packet(
@@ -852,6 +923,8 @@ fn handle_com_stmt_execute(
                 &encode_err_packet(1815, "HY000", "engine lock poisoned"),
             );
         };
+        // See handle_com_query — re-install this connection's session (V15).
+        engine.set_current_session(session_id);
         let stmt = match engine.prepare(&entry.sql) {
             Ok(s) => s,
             Err(e) => {

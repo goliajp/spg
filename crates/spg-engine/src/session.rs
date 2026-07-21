@@ -152,7 +152,14 @@ impl Engine {
         // sets it to on). The same SQL text lexes differently per
         // dialect, so a flip invalidates the plan cache.
         let new_escapes = if key == "sql_mode" {
-            Some(true)
+            // MySQL/MariaDB turn backslash escapes OFF only when the
+            // sql_mode list contains NO_BACKSLASH_ESCAPES; any other
+            // value (including an empty list) leaves them ON. Verified
+            // vs MariaDB: `SET sql_mode='STRICT_TRANS_TABLES'` → `'\n'`
+            // is a newline, `='NO_BACKSLASH_ESCAPES,STRICT_TRANS_TABLES'`
+            // → two bytes. sql_mode is a full replacement, so evaluate
+            // the whole new value rather than tracking a delta.
+            Some(!normalised.to_ascii_uppercase().contains("NO_BACKSLASH_ESCAPES"))
         } else if key == "standard_conforming_strings" {
             Some(value_off)
         } else {
