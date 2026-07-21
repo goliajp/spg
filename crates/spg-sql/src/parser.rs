@@ -4086,16 +4086,22 @@ impl Parser {
             // Disambiguate by peeking ahead: if the token after
             // the next ident is also an ident, we treat the
             // first as the name.
+            // v7.39 (round 315, V19) — take EVERY ident-like word up to
+            // the comma or paren, then decide. Reading at most two of
+            // them could not spell `x double precision` at all, and
+            // silently mis-read the bare `double precision` as a
+            // parameter named "double" — which is what made the same
+            // signature key two different ways.
             let (name, ty_token) = {
-                let first = self.expect_ident_like()?;
-                // Peek next: if it's an ident (i.e. a type
-                // name) the `first` was the arg name.
-                match self.peek() {
-                    Token::Ident(_) | Token::QuotedIdent(_) => {
-                        let ty = self.expect_ident_like()?;
-                        (Some(first), ty)
-                    }
-                    _ => (None, first),
+                let mut words: Vec<String> = alloc::vec![self.expect_ident_like()?];
+                while matches!(self.peek(), Token::Ident(_) | Token::QuotedIdent(_)) {
+                    words.push(self.expect_ident_like()?);
+                }
+                let whole = words.join(" ");
+                if words.len() >= 2 && !is_multiword_type_phrase(&whole) {
+                    (Some(words[0].clone()), words[1..].join(" "))
+                } else {
+                    (None, whole)
                 }
             };
             // Type — try to map to ColumnTypeName, else Raw.
@@ -22641,6 +22647,36 @@ fn typed_literal_cast_target(ident: &str) -> Option<CastTarget> {
 /// don't parse parameterised forms (`VARCHAR(n)`, `NUMERIC(p,s)`)
 /// here because function-arg types in v7.12.4 are mostly the
 /// bare form (`text`, `int`, `bytea`, …).
+/// v7.39 (round 315, V19) — does this whole phrase name a type, rather
+/// than being `name TYPE`?
+///
+/// The multi-word spellings SQL allows for a bare argument type, each
+/// verified accepted by PG 18.4 as `CREATE FUNCTION f(<phrase>)`.
+///
+/// NOTE this list also exists in `spg-storage`, which computes the
+/// signature key from the rendered argument text and has to reach the
+/// same verdict. The two crates are siblings — neither depends on the
+/// other — and each already carries its own table of type spellings
+/// (`map_type_ident_to_column_type_name` here, `normalize_type_name`
+/// there), so this follows the structure rather than inventing new
+/// duplication. Recorded as V49.
+fn is_multiword_type_phrase(phrase: &str) -> bool {
+    let t = phrase.trim().to_ascii_lowercase();
+    let base = t.split_once('(').map_or(t.as_str(), |(h, _)| h).trim();
+    matches!(
+        base,
+        "double precision"
+            | "character varying"
+            | "bit varying"
+            | "timestamp with time zone"
+            | "timestamp without time zone"
+            | "time with time zone"
+            | "time without time zone"
+            | "national character"
+            | "national character varying"
+    )
+}
+
 fn map_type_ident_to_column_type_name(ident: &str) -> Option<ColumnTypeName> {
     Some(match ident.to_ascii_lowercase().as_str() {
         "smallint" | "tinyint" => ColumnTypeName::SmallInt,
