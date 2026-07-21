@@ -3164,6 +3164,9 @@ fn finalize_synth_rows(
     let mut synth_rows: Vec<Row<'static>> = Vec::new();
     for (gvals, states) in order {
         let mut values: Vec<Value<'static>> = Vec::with_capacity(synth_schema.len());
+        // The synth schema is [group keys…, aggregates…]; the aggregate at
+        // index `i` therefore sits at `group_len + i`.
+        let group_len = gvals.len();
         values.extend(gvals.iter().cloned());
         for (i, st) in states.iter().enumerate() {
             // v7.33 (array_agg argmax) — first_ordered: the running
@@ -3241,6 +3244,21 @@ fn finalize_synth_rows(
                 )?
             } else {
                 finalize(&agg_specs[i].name, st_final)
+            };
+            // v7.39 (round 327, V44) — keep the zone identity. SPG carries a
+            // timestamptz at runtime as `Value::Timestamp`, so the array
+            // `array_agg` builds is a `TimestampArray` and `pg_typeof`
+            // answered `timestamp without time zone[]` for
+            // `array_agg(timestamptz_col)`. The STATIC type in the synth
+            // schema already knows better (`infer_agg_type` maps
+            // Timestamptz ⇒ TimestamptzArray); re-tag the value to match
+            // it. Third code path in this family — V31 fixed the array
+            // constructor, V43 the literal cast.
+            let v = match (v, synth_schema.get(group_len + i).map(|c| c.ty)) {
+                (Value::TimestampArray(items), Some(DataType::TimestamptzArray)) => {
+                    Value::TimestamptzArray(items)
+                }
+                (v, _) => v,
             };
             values.push(v);
         }

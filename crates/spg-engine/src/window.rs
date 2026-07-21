@@ -829,7 +829,20 @@ fn generic_aggregate_window(
             }
         }
         let (_, _, idx) = &slice[i];
-        out_vals[*idx] = crate::aggregate::finalize(name, &st);
+        let v = crate::aggregate::finalize(name, &st);
+        // v7.39 (round 327, V44) — keep the zone identity here too. A
+        // timestamptz rides as `Value::Timestamp` at runtime, so the array
+        // `array_agg(x) OVER (…)` builds is a TimestampArray; the
+        // ARGUMENT's static type is what says otherwise.
+        let v = match (v, args.first().and_then(|a| crate::describe::describe_expr(a, ctx.columns))) {
+            (Value::TimestampArray(items), Some(shape))
+                if shape.ty == spg_storage::DataType::Timestamptz =>
+            {
+                Value::TimestamptzArray(items)
+            }
+            (v, _) => v,
+        };
+        out_vals[*idx] = v;
     }
     Ok(())
 }
