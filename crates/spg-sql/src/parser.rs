@@ -1296,6 +1296,44 @@ impl Parser {
     /// v7.39 (round 278) — `CALL <proc>([args])`. There is no
     /// procedure catalog yet, so this reports PG's not-found error
     /// (with its HINT) rather than pretending the call ran.
+    /// v7.39 (round 318, V51) — MySQL `KILL [HARD|SOFT] [CONNECTION|QUERY]
+    /// <expr>`. MariaDB accepts an expression for the id (its own docs use
+    /// `KILL connection_id()`), and the HARD / SOFT prefixes only pick how
+    /// aggressively the server interrupts, which SPG does not distinguish.
+    /// Bare `KILL <id>` means CONNECTION.
+    fn parse_kill(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // KILL
+        let mut query_only = false;
+        loop {
+            // CONNECTION is a reserved keyword token (it also opens
+            // `CREATE SUBSCRIPTION … CONNECTION '…'`), so it arrives as
+            // `Token::Connection` rather than a bare ident.
+            if matches!(self.peek(), Token::Connection) {
+                self.advance();
+                break;
+            }
+            let (Token::Ident(w) | Token::QuotedIdent(w)) = self.peek() else {
+                break;
+            };
+            match w.to_ascii_lowercase().as_str() {
+                "hard" | "soft" => {
+                    self.advance();
+                }
+                "query" => {
+                    self.advance();
+                    query_only = true;
+                    break;
+                }
+                _ => break,
+            }
+        }
+        let id = self.parse_expr(0)?;
+        Ok(Statement::Kill {
+            query_only,
+            id: Box::new(id),
+        })
+    }
+
     fn parse_call(&mut self) -> Result<Statement, ParseError> {
         self.advance(); // CALL
         let name = self.expect_ident_like()?;
@@ -1487,6 +1525,11 @@ impl Parser {
             // does not exist — which is exactly what PG says.
             if lc == "call" {
                 return self.parse_call();
+            }
+            // v7.39 (round 318, V51) — MySQL `KILL`. Not dump noise: it
+            // names one connection and acts on it.
+            if lc == "kill" {
+                return self.parse_kill();
             }
             if is_dump_noise_statement(&lc) {
                 self.consume_until_statement_boundary();

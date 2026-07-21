@@ -269,6 +269,14 @@ pub enum EngineError {
     /// is discarded; the caller should surface this as a timeout
     /// to the client.
     Cancelled,
+    /// v7.39 (round 318, V51) — MySQL `KILL <id>` naming an id no live
+    /// connection carries. MariaDB 11: `ERROR 1094 (HY000) Unknown thread
+    /// id: N`.
+    UnknownThreadId(u32),
+    /// v7.39 (round 318, V51) — MySQL `KILL <own id>`. The connection
+    /// really is killed; MariaDB reports it to the victim as
+    /// `ERROR 1927 (70100) Connection was killed` and closes.
+    ConnectionKilled,
     /// v7.38 Epic P (panic isolation): a panic unwound out of
     /// statement execution and was caught at the engine's
     /// `execute_*` boundary (see `execute_in_with_cancel`). The
@@ -318,6 +326,8 @@ impl fmt::Display for EngineError {
                 )
             }
             Self::Cancelled => f.write_str("query cancelled (timeout or client request)"),
+            Self::UnknownThreadId(id) => write!(f, "Unknown thread id: {id}"),
+            Self::ConnectionKilled => f.write_str("Connection was killed"),
             Self::Internal(s) => write!(f, "internal error: {s}"),
         }
     }
@@ -358,6 +368,15 @@ pub type BackendCountFn = fn() -> u32;
 /// The host reads a connection-thread-local set at session start; the
 /// no_std engine just calls through. `None` (embedded) → pid 1.
 pub type BackendPidFn = fn() -> u32;
+
+/// v7.39 (round 318, V51) — host-provided connection control. `terminate`
+/// false = cancel the target's running statement (PG `pg_cancel_backend`,
+/// MySQL `KILL QUERY`); true = also close the connection (PG
+/// `pg_terminate_backend`, MySQL `KILL CONNECTION`). Returns whether a
+/// connection with that id exists — the engine has no registry of its own,
+/// so the answer has to come from the host that accepted the sockets.
+/// `None` (embedded, no connections) ⇒ nothing to signal.
+pub type BackendSignalFn = fn(pid: u32, terminate: bool) -> bool;
 
 /// v7.39 (tz epic) — host-injected IANA timezone lookups (the no_std
 /// engine can't read the system zoneinfo directory; spg-tzif is the
@@ -954,7 +973,7 @@ pub struct Engine {
     /// statement (pgwire turns each into an 'N' message, embedded
     /// callers can ignore or surface them). Cleared at the start of
     /// every statement so a notice never leaks into the next one.
-    pending_notices: Vec<String>,
+    pending_notices: Vec<Notice>,
     /// v7.38 (read01 P3.12) — cumulative row-write counters feeding
     /// `pg_stat_database` (database-wide `tup_inserted` / `tup_updated` /
     /// `tup_deleted`). Bumped by the affected-row count of each successful
@@ -973,6 +992,9 @@ pub struct Engine {
     /// wires its connection registry, embedded stays None -> 1).
     pub(crate) backend_count_fn: Option<BackendCountFn>,
     pub(crate) backend_pid_fn: Option<BackendPidFn>,
+    /// v7.39 (round 318, V51) — host connection-control hook. See
+    /// [`BackendSignalFn`].
+    pub(crate) backend_signal_fn: Option<BackendSignalFn>,
     /// v7.39 (tz epic) — injected IANA timezone lookups; None on a
     /// host without zoneinfo (named zones then fail to SET, honestly).
     pub(crate) tz_offset_fn: Option<TzOffsetFn>,
@@ -1118,6 +1140,36 @@ pub struct ActivityRow {
 /// call; engine doesn't cache the slice.
 pub type ActivityProvider = fn() -> Vec<ActivityRow>;
 
+/// v7.39 (round 318, V41) — how loud a diagnostic the statement raised is.
+/// PG distinguishes them on the wire (`S`/`V` fields of NoticeResponse) and
+/// clients act on it: psql prints `WARNING:` in a different colour, and
+/// several drivers surface warnings to the application while dropping
+/// notices. Emitting everything as NOTICE loses that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeSeverity {
+    Notice,
+    Warning,
+}
+
+impl NoticeSeverity {
+    /// The non-localized severity string PG puts in the `V` field.
+    #[must_use]
+    pub const fn as_pg_str(self) -> &'static str {
+        match self {
+            Self::Notice => "NOTICE",
+            Self::Warning => "WARNING",
+        }
+    }
+}
+
+/// v7.39 (round 318, V41) — one diagnostic the statement raised, in PG's
+/// exact wording minus the severity banner (the wire layer adds that).
+#[derive(Debug, Clone)]
+pub struct Notice {
+    pub severity: NoticeSeverity,
+    pub message: String,
+}
+
 /// v6.5.3 — one row of `spg_audit_chain`. Engine-public so
 /// spg-server can construct rows directly from `AuditEntry`.
 #[derive(Debug, Clone)]
@@ -1186,6 +1238,7 @@ impl Engine {
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
             backend_count_fn: None,
             backend_pid_fn: None,
+            backend_signal_fn: None,
             tz_offset_fn: None,
             tz_localize_fn: None,
             tz_canon_fn: None,
@@ -1432,6 +1485,13 @@ impl Engine {
         self.backend_pid_fn = Some(f);
     }
 
+    /// v7.39 (round 318, V51) — inject the host's connection-control hook,
+    /// so `pg_cancel_backend` / `pg_terminate_backend` / `KILL` act instead
+    /// of answering a constant.
+    pub fn set_backend_signal_fn(&mut self, f: BackendSignalFn) {
+        self.backend_signal_fn = Some(f);
+    }
+
     /// v7.39 (tz epic) — inject the host's IANA timezone lookups
     /// (spg-tzif's fn family on std hosts).
     pub fn set_tz_fns(
@@ -1558,6 +1618,7 @@ impl Engine {
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
             backend_count_fn: None,
             backend_pid_fn: None,
+            backend_signal_fn: None,
             tz_offset_fn: None,
             tz_localize_fn: None,
             tz_canon_fn: None,
@@ -1671,6 +1732,7 @@ impl Engine {
                     xact_rollback: core::sync::atomic::AtomicU64::new(0),
                     backend_count_fn: None,
                     backend_pid_fn: None,
+            backend_signal_fn: None,
                     tz_offset_fn: None,
                     tz_localize_fn: None,
                     tz_canon_fn: None,

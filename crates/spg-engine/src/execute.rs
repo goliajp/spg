@@ -1385,6 +1385,7 @@ impl Engine {
             Statement::ShowStatus => Ok(self.exec_show_status()),
             Statement::ShowVariables => Ok(self.exec_show_variables()),
             Statement::ShowProcesslist => Ok(self.exec_show_processlist()),
+            Statement::Kill { query_only, id } => self.exec_kill(query_only, &id),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
             Statement::ShowPublications => Ok(self.exec_show_publications()),

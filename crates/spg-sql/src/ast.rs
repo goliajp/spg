@@ -328,6 +328,12 @@ pub enum Statement {
     ShowVariables,
     /// v7.17.0 Phase 3.P0-62 — MySQL `SHOW PROCESSLIST`.
     ShowProcesslist,
+    /// v7.39 (round 318, V51) — MySQL `KILL [CONNECTION | QUERY] <expr>`.
+    /// The id is an expression because MariaDB accepts one
+    /// (`KILL connection_id()` is the documented way to drop your own
+    /// connection). `query_only` is the `QUERY` form: stop the target's
+    /// running statement but leave it connected.
+    Kill { query_only: bool, id: Box<Expr> },
     /// `SHOW COLUMNS FROM <table>` — return one row per column with
     /// its declared name / type / nullability.
     ShowColumns(String),
@@ -4099,7 +4105,10 @@ impl Statement {
             | Statement::Call(_)
             | Statement::PrepareTransaction(_)
             | Statement::CreateStatistics { .. }
-            | Statement::DropStatistics { .. } => false,
+            | Statement::DropStatistics { .. }
+            // v7.39 (round 318, V51) — KILL signals another connection;
+            // it must run on the writer path that owns the registry hook.
+            | Statement::Kill { .. } => false,
             // v7.39 (round 295, E3 Phase 1b) — a SELECT that asks for row
             // locks MUTATES the lock table, so it is not a read. Left as
             // a read it went to the read-only executor and the locking
@@ -4658,6 +4667,13 @@ impl fmt::Display for Statement {
             Self::ShowStatus => f.write_str("SHOW STATUS"),
             Self::ShowVariables => f.write_str("SHOW VARIABLES"),
             Self::ShowProcesslist => f.write_str("SHOW PROCESSLIST"),
+            Self::Kill { query_only, id } => {
+                if *query_only {
+                    write!(f, "KILL QUERY {id}")
+                } else {
+                    write!(f, "KILL CONNECTION {id}")
+                }
+            }
             Self::ShowColumns(t) => write!(f, "SHOW COLUMNS FROM {}", quote_ident(t)),
             Self::CreateUser(s) => write!(
                 f,

@@ -178,6 +178,9 @@ pub fn spawn_listener(
 
 fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
+    // v7.39 (round 318, V51) — shutdown handle for KILL CONNECTION.
+    // Cloned before the TLS wrapper borrows the stream.
+    let sock = stream.try_clone().ok();
 
     // ---- HandshakeV10 (server → client) ----------------------
     //
@@ -268,6 +271,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             &scramble,
             seqno_in,
             conn_id,
+            sock,
         );
     }
     let parsed = match parse_handshake_response_41(&payload) {
@@ -292,7 +296,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
     //     carve-out — fast-path failures surface as Access
     //     Denied here.
     let scramble = std::mem::take(&mut greeting.scramble);
-    complete_auth_and_command(&mut stream, state, &parsed, &scramble, seqno_in, conn_id)
+    complete_auth_and_command(&mut stream, state, &parsed, &scramble, seqno_in, conn_id, sock)
 }
 
 /// v7.17.0 Phase 3.P0-77 — auth verification + command loop
@@ -305,6 +309,7 @@ fn complete_auth_and_command(
     scramble: &[u8],
     seqno_in: u8,
     conn_id: u32,
+    sock: Option<TcpStream>,
 ) -> std::io::Result<()> {
     let auth_outcome = verify_handshake_response(state, parsed, scramble);
     let reply_seqno = seqno_in.wrapping_add(1);
@@ -338,7 +343,7 @@ fn complete_auth_and_command(
             );
         }
     }
-    command_loop(stream, state, conn_id, &parsed.username)
+    command_loop(stream, state, conn_id, &parsed.username, sock)
 }
 
 /// v7.17.0 Phase 3.P0-77 — detect the `Protocol::SSLRequest`
@@ -566,6 +571,7 @@ fn command_loop(
     state: &Arc<ServerState>,
     conn_id: u32,
     user: &str,
+    sock: Option<TcpStream>,
 ) -> std::io::Result<()> {
     let session_id = conn_id;
     // Install this connection's session and default it to MySQL string
@@ -611,6 +617,8 @@ fn command_loop(
         startup_app_name: String::new(),
         cancel_secret: crate::pgwire::new_cancel_secret(),
         cancel_flag: std::sync::atomic::AtomicBool::new(false),
+        terminate: std::sync::atomic::AtomicBool::new(false),
+        sock,
         notify_queue: std::sync::Mutex::new(Vec::new()),
     });
     // Stamp the id into the thread slot `pg_backend_pid()` /
@@ -666,6 +674,17 @@ fn run_command_loop(
 ) -> std::io::Result<()> {
     let mut prepared = PreparedState::default();
     loop {
+        // v7.39 (round 318, V51) — `KILL CONNECTION` on this connection.
+        // Measured against MariaDB 11: a killed connection is simply
+        // dropped — the victim gets no ERR packet, its client reports a
+        // transport error. So close, don't write. (The killer's own
+        // connection reaches here right after being told 1927.)
+        if conn_state
+            .terminate
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
         let (seqno_in, payload) = match read_packet(stream) {
             Ok(t) => t,
             // Client closed the connection — normal exit.
@@ -852,6 +871,29 @@ fn now_micros() -> i64 {
         .unwrap_or(0)
 }
 
+/// v7.39 (round 318, V51) — map an engine error to the MySQL errno +
+/// SQLSTATE pair a mysql/MariaDB client expects. Everything still falls
+/// back to 1064 / 42000 (parse / unsupported), which is what the whole
+/// surface used to answer; the typed connection-control errors carry
+/// MariaDB's own codes, measured against MariaDB 11:
+///   * `KILL <unknown id>` → `ERROR 1094 (HY000) Unknown thread id: N`
+///   * `KILL <own id>`     → `ERROR 1927 (70100) Connection was killed`
+fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String) {
+    match e {
+        spg_engine::EngineError::UnknownThreadId(_) => (1094, "HY000", e.to_string()),
+        spg_engine::EngineError::ConnectionKilled => (1927, "70100", e.to_string()),
+        // Measured: a MariaDB statement stopped by `KILL QUERY` reports
+        // `ERROR 1317 (70100) Query execution was interrupted` — its own
+        // wording, not the engine's internal cancel text.
+        spg_engine::EngineError::Cancelled => (
+            1317,
+            "70100",
+            "Query execution was interrupted".to_string(),
+        ),
+        _ => (1064, "42000", e.to_string()),
+    }
+}
+
 fn handle_com_query(
     stream: &mut (dyn ReadWrite + '_),
     state: &Arc<ServerState>,
@@ -901,12 +943,8 @@ fn handle_com_query(
     );
     match outcome {
         Err(e) => {
-            // Map engine errors to MySQL errno 1064 (parse / unsupported)
-            // unless the error is a typed mismatch (1146 missing table)
-            // — but the engine doesn't surface that today, so just
-            // surface 1064 with the message.
-            let msg = format!("{e}");
-            write_packet(stream, start_seqno, &encode_err_packet(1064, "42000", &msg))?;
+            let (errno, sqlstate, msg) = mysql_error_parts(&e);
+            write_packet(stream, start_seqno, &encode_err_packet(errno, sqlstate, &msg))?;
         }
         Ok(QueryResult::CommandOk { affected, .. }) => {
             write_packet(
@@ -1138,8 +1176,8 @@ fn handle_com_stmt_execute(
     };
     match outcome {
         Err(e) => {
-            let msg = format!("{e}");
-            write_packet(stream, start_seqno, &encode_err_packet(1064, "42000", &msg))?;
+            let (errno, sqlstate, msg) = mysql_error_parts(&e);
+            write_packet(stream, start_seqno, &encode_err_packet(errno, sqlstate, &msg))?;
         }
         Ok(QueryResult::CommandOk { affected, .. }) => {
             write_packet(

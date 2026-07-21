@@ -205,6 +205,11 @@ pub struct EvalContext<'a> {
     /// v7.39 (read01 pgstatfuncs.c) — calling-connection identity for
     /// pg_backend_pid(); `None` (embedded / detached contexts) → 1.
     pub backend_pid_fn: Option<crate::BackendPidFn>,
+    /// v7.39 (round 318, V51) — host connection-control hook for
+    /// `pg_cancel_backend` / `pg_terminate_backend`. `None` (embedded /
+    /// detached contexts) ⇒ there is nothing to signal, so they answer
+    /// false rather than pretending the signal landed.
+    pub backend_signal_fn: Option<crate::BackendSignalFn>,
     /// v7.38 (read01 P6.08) — host wall clock (µs since Unix epoch). `uuidv7`
     /// uses it for the real time-ordered 48-bit millisecond prefix; `None`
     /// (no host clock) falls back to the deterministic anchor.
@@ -281,6 +286,7 @@ impl<'a> EvalContext<'a> {
             tz_abbrev_fn: None,
             salt_fn: None,
             backend_pid_fn: None,
+            backend_signal_fn: None,
             clock: None,
             xact: None,
             assigned_xid: core::cell::Cell::new(None),
@@ -291,6 +297,13 @@ impl<'a> EvalContext<'a> {
     #[must_use]
     pub const fn with_render_style(mut self, style: crate::eval::format::RenderStyle) -> Self {
         self.render_style = style;
+        self
+    }
+
+    /// v7.39 (round 318, V51) — attach the host connection-control hook.
+    #[must_use]
+    pub const fn with_backend_signal_fn(mut self, f: Option<crate::BackendSignalFn>) -> Self {
+        self.backend_signal_fn = f;
         self
     }
 
