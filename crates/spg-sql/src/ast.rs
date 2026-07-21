@@ -2769,7 +2769,12 @@ pub struct SelectStatement {
     /// clause was parsed and DISCARDED since v7.17, so SPG accepted the
     /// whole syntax and locked nothing: two workers running the classic
     /// `SKIP LOCKED` queue take both took the same row.
-    pub locking: Option<LockingClause>,
+    /// v7.39 (round 305) — boxed. A locking clause appears on a
+    /// vanishing fraction of SELECTs, but an inline `Option<LockingClause>`
+    /// cost every `SelectStatement` 32 bytes, and this struct sits in
+    /// recursive evaluation frames where the engine already runs close to
+    /// its stack budget (a 512 KB depth guard is the canary).
+    pub locking: Option<alloc::boxed::Box<LockingClause>>,
     /// v4.11: `WITH name AS (SELECT ...) [, ...]` common-table
     /// expressions, materialised once at query start before the
     /// body SELECT runs. Empty for a regular SELECT. Non-recursive
@@ -2822,16 +2827,147 @@ pub struct SelectStatement {
     pub limit_with_ties: bool,
 }
 
+impl Expr {
+    /// v7.39 (round 305, V23) — hand every `SelectStatement` nested
+    /// directly inside this expression to `f`. `f` receives each nested
+    /// statement once; descending further (into that statement's own
+    /// clauses) is the caller's job, which keeps this walk finite and
+    /// lets the caller order the recursion.
+    ///
+    /// The match is deliberately **wildcard-free**: a new `Expr` variant
+    /// does not compile until it says whether it can carry a subquery.
+    /// The row-count resolution pass is built on this, and a shape it
+    /// silently failed to visit would leave a `LimitExpr::Expr` behind —
+    /// which every row-count reader would take as "no limit", i.e. the
+    /// whole table. Compile-time exhaustiveness is what rules that out.
+    /// Iterative on purpose. Expression trees here get deep (long
+    /// boolean chains, big IN lists), and this walk is on the path of
+    /// every statement; recursing would add a frame per node to a stack
+    /// budget the engine already runs close to — a depth guard that runs
+    /// on a deliberately small stack caught exactly that. Depth costs
+    /// heap here instead.
+    pub fn for_each_subquery_mut<E>(
+        &mut self,
+        f: &mut impl FnMut(&mut SelectStatement) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut stack: Vec<&mut Self> = alloc::vec![self];
+        while let Some(e) = stack.pop() {
+            match e {
+                Self::Literal(_) | Self::Column(_) | Self::Placeholder(_) => {}
+                Self::NamedArg { expr, .. }
+                | Self::Variadic(expr)
+                | Self::Unary { expr, .. }
+                | Self::Cast { expr, .. }
+                | Self::FieldAccess { base: expr, .. }
+                | Self::IsNull { expr, .. }
+                | Self::Extract { source: expr, .. } => stack.push(expr),
+                Self::Binary { lhs, rhs, .. } => {
+                    stack.push(lhs);
+                    stack.push(rhs);
+                }
+                Self::Like { expr, pattern, .. } => {
+                    stack.push(expr);
+                    stack.push(pattern);
+                }
+                Self::ArraySubscript { target, index } => {
+                    stack.push(target);
+                    stack.push(index);
+                }
+                Self::ArraySlice { target, lo, hi } => {
+                    stack.push(target);
+                    stack.extend(lo.iter_mut().chain(hi.iter_mut()).map(|b| &mut **b));
+                }
+                Self::AnyAll { expr, array, .. } => {
+                    stack.push(expr);
+                    stack.push(array);
+                }
+                Self::FunctionCall { args, .. } | Self::Array(args) => {
+                    stack.extend(args.iter_mut());
+                }
+                Self::AggregateOrdered {
+                    call,
+                    order_by,
+                    filter,
+                    ..
+                } => {
+                    stack.push(call);
+                    stack.extend(order_by.iter_mut().map(|o| &mut o.expr));
+                    stack.extend(filter.iter_mut().map(|b| &mut **b));
+                }
+                Self::WindowFunction {
+                    args,
+                    partition_by,
+                    order_by,
+                    filter,
+                    ..
+                } => {
+                    // `frame` bounds hold folded numbers / interval
+                    // parts, never expressions — nothing to visit there.
+                    stack.extend(args.iter_mut().chain(partition_by.iter_mut()));
+                    stack.extend(order_by.iter_mut().map(|(e, _, _)| e));
+                    stack.extend(filter.iter_mut().map(|b| &mut **b));
+                }
+                Self::InList { expr, list, .. } => {
+                    stack.push(expr);
+                    stack.extend(list.iter_mut());
+                }
+                Self::Case {
+                    operand,
+                    branches,
+                    else_branch,
+                } => {
+                    stack.extend(
+                        operand
+                            .iter_mut()
+                            .chain(else_branch.iter_mut())
+                            .map(|b| &mut **b),
+                    );
+                    for (when, then) in branches.iter_mut() {
+                        stack.push(when);
+                        stack.push(then);
+                    }
+                }
+                Self::ScalarSubquery(s) | Self::Exists { subquery: s, .. } => f(s)?,
+                Self::InSubquery { expr, subquery, .. } => {
+                    stack.push(expr);
+                    f(subquery)?;
+                }
+                Self::RowInSubquery { row, subquery, .. }
+                | Self::RowCmpSubquery { row, subquery, .. } => {
+                    stack.extend(row.iter_mut());
+                    f(subquery)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// v7.9.24 — LIMIT / OFFSET value. Integer literal at parse
 /// time or a placeholder `$N` resolved during extended-query
 /// Bind. mailrs migration follow-up H2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// v7.39 (round 305) — no longer `Copy`/`Eq`: the `Expr` variant boxes
+/// an arbitrary row-count expression. Losing `Copy` is deliberate — it
+/// made the compiler point at every site that used to duplicate a
+/// row-count out of the AST, which is exactly the set that must not
+/// bypass the resolution pre-pass.
+#[derive(Debug, Clone, PartialEq)]
 pub enum LimitExpr {
     /// `LIMIT 10` — value known at parse time.
     Literal(u32),
     /// `LIMIT $N` — the 1-based parameter index, resolved against
     /// the bind values when the prepared statement executes.
     Placeholder(u16),
+    /// v7.39 (round 305, V23) — `LIMIT (SELECT 4)` / `LIMIT
+    /// greatest(2,3)`: a row-count expression that isn't constant, so
+    /// it can't be folded at parse time. Evaluated once, before
+    /// dispatch, by the engine's `resolve_limit_exprs` pre-pass, which
+    /// rewrites it to `Literal` (or to `None` for a NULL result, PG's
+    /// "no limit"). **No execution path may see this variant** —
+    /// `as_literal` would report `None`, which every row-count reader
+    /// takes to mean "unlimited", i.e. the whole table.
+    Expr(alloc::boxed::Box<Expr>),
 }
 
 impl fmt::Display for LimitExpr {
@@ -2839,6 +2975,10 @@ impl fmt::Display for LimitExpr {
         match self {
             Self::Literal(n) => write!(f, "{n}"),
             Self::Placeholder(n) => write!(f, "${n}"),
+            // Parenthesised so the round-trip text re-parses as one
+            // row-count expression (`LIMIT (SELECT 4)`), which is also
+            // the only spelling `FETCH FIRST` accepts.
+            Self::Expr(e) => write!(f, "({e})"),
         }
     }
 }
@@ -2847,10 +2987,27 @@ impl LimitExpr {
     /// Convenience for the simple-query path where no placeholders
     /// can possibly exist. Returns the literal value or `None` if
     /// this is a placeholder (caller must surface as Unsupported).
-    pub fn as_literal(self) -> Option<u32> {
+    ///
+    /// v7.39 (round 305) — `None` is read by every row-count consumer as
+    /// "no limit". An unresolved [`LimitExpr::Expr`] reaching here would
+    /// therefore silently return the whole table, so the engine's
+    /// `resolve_limit_exprs` pre-pass rewrites the variant away before
+    /// dispatch. The assertion makes a missed nesting site fail loudly
+    /// in every test build rather than quietly widening a result set.
+    #[must_use]
+    pub fn as_literal(&self) -> Option<u32> {
         match self {
-            Self::Literal(n) => Some(n),
+            Self::Literal(n) => Some(*n),
             Self::Placeholder(_) => None,
+            Self::Expr(_) => {
+                debug_assert!(
+                    false,
+                    "LimitExpr::Expr reached execution — resolve_limit_exprs \
+                     missed a nesting site; treating it as `no limit` would \
+                     return every row"
+                );
+                None
+            }
         }
     }
 }
@@ -2863,11 +3020,11 @@ impl LimitExpr {
 impl SelectStatement {
     #[must_use]
     pub fn limit_literal(&self) -> Option<u32> {
-        self.limit.and_then(LimitExpr::as_literal)
+        self.limit.as_ref().and_then(LimitExpr::as_literal)
     }
     #[must_use]
     pub fn offset_literal(&self) -> Option<u32> {
-        self.offset.and_then(LimitExpr::as_literal)
+        self.offset.as_ref().and_then(LimitExpr::as_literal)
     }
 }
 

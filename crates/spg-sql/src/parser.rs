@@ -10177,7 +10177,7 @@ impl Parser {
         // unchanged; callers that rely on FOR UPDATE for read-
         // through-write ordering still get the right answer
         // because SPG serialises writes anyway.
-        head.locking = self.consume_optional_for_lock_clauses();
+        head.locking = self.consume_optional_for_lock_clauses().map(alloc::boxed::Box::new);
         Ok(())
     }
 
@@ -10368,10 +10368,12 @@ impl Parser {
     /// pre-pass on the simple-query path, where `substitute_placeholders`
     /// does not run).
     fn parse_limit_expr(&mut self, label: &str) -> Result<crate::ast::LimitExpr, ParseError> {
-        // PG restricts FETCH FIRST to a constant — `FETCH FIRST 1+1 ROWS
-        // ONLY` is a syntax error there, so this spelling does not get the
-        // expression grammar.
-        if label == "FETCH FIRST" {
+        // PG restricts FETCH FIRST to a constant or a PARENTHESISED
+        // expression: `FETCH FIRST 1+1 ROWS ONLY` is a syntax error, but
+        // `FETCH FIRST (1+1) ROWS ONLY` and `FETCH FIRST (SELECT 3) ROWS
+        // ONLY` both work (its grammar takes a c_expr). Both measured
+        // against PG 18.4 in round 305.
+        if label == "FETCH FIRST" && !matches!(self.peek(), Token::LParen) {
             return self.parse_limit_constant(label);
         }
         // One pass, no rewind: `advance()` takes each token by
@@ -10400,12 +10402,10 @@ impl Parser {
                 message: message.replace("{L}", neg_label),
                 token_pos: start,
             }),
-            None => Err(ParseError {
-                message: alloc::format!(
-                    "{label} over a non-constant expression is not yet supported"
-                ),
-                token_pos: start,
-            }),
+            // v7.39 (round 305, V23) — not foldable at parse time
+            // (`LIMIT (SELECT 4)`, `LIMIT greatest(2,3)`). Carry the
+            // expression; the engine evaluates it once before dispatch.
+            None => Ok(crate::ast::LimitExpr::Expr(alloc::boxed::Box::new(e))),
         }
     }
 

@@ -1152,6 +1152,14 @@ impl Engine {
         // resolver — the walk is O(expr-count) and dwarfed by
         // the parse cost we just paid.
         self.pre_resolve_sequence_calls_in_statement(&mut stmt)?;
+        // v7.39 (round 305, V23) — evaluate any non-constant LIMIT /
+        // OFFSET down to a literal row count. It belongs here, at the
+        // one point both the simple-query and the prepared path pass
+        // through, because every executor reads the row count as
+        // `Option<u32>` and takes `None` for "no limit": an expression
+        // that reached execution would silently widen the result to the
+        // whole table rather than fail.
+        self.resolve_limit_exprs_in_statement(&mut stmt, cancel)?;
         // v7.39 (read01 round 57) — the table-privilege gate. A superuser
         // session (the default login, or `SET ROLE admin`) skips it entirely,
         // so nothing changes for a customer who never assumes another role.

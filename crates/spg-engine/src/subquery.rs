@@ -1006,7 +1006,7 @@ impl Engine {
             return Ok(None);
         }
         // LIMIT must be absent or literally 1 (top-1 semantics).
-        if let Some(le) = inner.limit
+        if let Some(le) = &inner.limit
             && le.as_literal() != Some(1)
         {
             return Ok(None);
