@@ -179,7 +179,11 @@ impl Engine {
     ) -> Result<Option<Expr>, EngineError> {
         let mut acc: Option<Expr> = None;
         for r in self.snapshot_rules(table, event) {
-            if !(r.instead && r.commands.is_empty() && !r.when_condition.is_empty()) {
+            // v7.39 (round 333, V59) — a conditional INSTEAD rule takes the
+            // matching rows away from the original statement whether it
+            // substitutes NOTHING or a command; only the unconditional
+            // command form (handled separately) replaces the whole thing.
+            if !r.instead || r.when_condition.is_empty() {
                 continue;
             }
             let mut cond =
@@ -219,13 +223,19 @@ impl Engine {
     ) -> Vec<RuleDef> {
         self.snapshot_rules(table, event)
             .into_iter()
-            .filter(|r| r.instead && r.commands.is_empty() && !r.when_condition.is_empty())
+            // v7.39 (round 333, V59) — with OR without a command body: a
+            // conditional INSTEAD rule takes its matching rows away from
+            // the original either way. The command-carrying ones have
+            // their action run separately, over the same rows.
+            .filter(|r| r.instead && !r.when_condition.is_empty())
             .collect()
     }
 
     /// v7.39 (round 142) — the `DO INSTEAD <command>` rules for `(table, event)`:
-    /// INSTEAD rules that carry a command body. Always unconditional — the
-    /// conditional form is refused at CREATE RULE time.
+    /// INSTEAD rules that carry a command body. v7.39 (round 333, V59) —
+    /// the conditional form is allowed now, so callers must split them:
+    /// an UNCONDITIONAL one replaces the statement outright, a conditional
+    /// one only takes its matching rows (the rest run the original).
     pub(crate) fn instead_command_rules(&self, table: &str, event: &str) -> Vec<RuleDef> {
         self.snapshot_rules(table, event)
             .into_iter()

@@ -141,20 +141,36 @@ fn multi_command_do_also() {
 }
 
 #[test]
-fn conditional_do_instead_command_rejected() {
+fn conditional_do_instead_command_splits_the_statement() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(id int)").unwrap();
     e.execute("CREATE TABLE r(id int)").unwrap();
-    // Unconditional DO INSTEAD <command> is supported since round 142; only the
-    // conditional form remains refused.
-    let m = match e.execute(
+    // v7.39 (round 333, V59) — this used to assert the form was REFUSED
+    // ("not yet implemented"). It is implemented: the rows the WHERE holds
+    // for take the command, the rest are inserted. Measured on PG 18.4 —
+    // inserting (1, -1, 2, -2) answers `INSERT 0 2`.
+    e.execute(
         "CREATE RULE ri AS ON INSERT TO t WHERE NEW.id < 0 DO INSTEAD INSERT INTO r VALUES (NEW.id)",
-    ) {
-        Err(x) => format!("{x}"),
-        Ok(_) => panic!("expected error"),
-    };
-    assert!(
-        m.contains("conditional (WHERE) DO INSTEAD <command> rules are not yet implemented"),
-        "{m}"
-    );
+    )
+    .expect("PG accepts this rule");
+    match e.execute("INSERT INTO t VALUES (1), (-1), (2), (-2)").unwrap() {
+        QueryResult::CommandOk { affected, .. } => assert_eq!(affected, 2),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(ids(&mut e, "SELECT id FROM t ORDER BY id"), vec![1, 2]);
+    assert_eq!(ids(&mut e, "SELECT id FROM r ORDER BY id"), vec![-2, -1]);
+}
+
+/// Read a single INT column.
+fn ids(e: &mut Engine, sql: &str) -> Vec<i32> {
+    match e.execute(sql).unwrap() {
+        QueryResult::Rows { rows, .. } => rows
+            .iter()
+            .filter_map(|r| match r.values.first() {
+                Some(spg_storage::Value::Int(n)) => Some(*n),
+                _ => None,
+            })
+            .collect(),
+        other => panic!("{other:?}"),
+    }
 }

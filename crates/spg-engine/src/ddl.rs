@@ -3617,17 +3617,14 @@ impl Engine {
                 "ON SELECT rules are not supported; use CREATE VIEW".into(),
             ));
         }
-        // Supported: `DO INSTEAD NOTHING` (unconditional or conditional),
-        // `DO ALSO [WHERE …] <command(s)>`, and unconditional
-        // `DO INSTEAD <command(s)>`. The conditional INSTEAD-command form
-        // (matching rows take the command, the rest run the original op) is
-        // refused up front — never stored and silently ignored — so the
-        // catalogue only holds rules the rewriter can honour.
-        if s.instead && !s.commands.is_empty() && s.when_condition.is_some() {
-            return Err(EngineError::Unsupported(
-                "conditional (WHERE) DO INSTEAD <command> rules are not yet implemented".into(),
-            ));
-        }
+        // v7.39 (round 333, V59) — the conditional `DO INSTEAD <command>`
+        // form is supported now: the rows the WHERE holds for take the
+        // command, the rest run the original operation. It used to be
+        // refused up front, which made a rule PG accepts a hard error.
+        // Measured on PG 18.4: with `ON UPDATE TO r WHERE old.id > 1 DO
+        // INSTEAD INSERT INTO log …`, `UPDATE r SET v = 999` answers
+        // `UPDATE 1` — only the non-matching row is updated — and the
+        // matching rows produce log entries instead.
         // Rules may target base tables (and, in PG, views); require the relation
         // to exist so a typo does not silently create a dead rule.
         let known = self.active_catalog().table_names().contains(&s.table)

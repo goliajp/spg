@@ -111,17 +111,14 @@ fn unsupported_rule_forms_are_rejected_not_swallowed() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE u(id int, v int)").unwrap();
     e.execute("CREATE TABLE aud(id int)").unwrap();
-    // Conditional DO INSTEAD <command> — the one remaining unsupported form.
-    let m = match e.execute(
+    // v7.39 (round 333, V59) — the conditional DO INSTEAD <command> form
+    // used to be listed here as the one remaining unsupported shape. It is
+    // supported now, so what this test holds is that the forms SPG still
+    // refuses are refused LOUDLY rather than accepted and ignored.
+    e.execute(
         "CREATE RULE ra AS ON INSERT TO u WHERE NEW.v < 0 DO INSTEAD INSERT INTO aud VALUES (1)",
-    ) {
-        Err(x) => format!("{x}"),
-        Ok(_) => panic!("expected error"),
-    };
-    assert!(
-        m.contains("conditional (WHERE) DO INSTEAD <command> rules are not yet implemented"),
-        "{m}"
-    );
+    )
+    .expect("the conditional instead-command form is implemented");
     // Unconditional DO INSTEAD <command> is supported since round 142; the
     // conditional DO INSTEAD NOTHING form since round 141.
     // ON SELECT — use CREATE VIEW.
