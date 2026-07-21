@@ -1009,7 +1009,7 @@ fn handle_pg_simple_query(
     let result = if queue_persisted {
         result
     } else {
-        match persist_wire_write(state, sql, &result) {
+        match persist_wire_write(state, sql, &result, conn_state.tx_id) {
             Ok(()) => result,
             Err(e) => Err(EngineError::Unsupported(format!(
                 "durability append failed: {e}"
@@ -1279,7 +1279,7 @@ fn handle_pg_simple_query_one_into_wbuf(
     let result = if queue_persisted {
         result
     } else {
-        match persist_wire_write(state, sql, &result) {
+        match persist_wire_write(state, sql, &result, conn_state.tx_id) {
             Ok(()) => result,
             Err(e) => Err(EngineError::Unsupported(format!(
                 "durability append failed: {e}"
@@ -2172,6 +2172,7 @@ pub(crate) fn persist_wire_write(
     state: &Arc<ServerState>,
     sql: &str,
     result: &Result<QueryResult, EngineError>,
+    tx_id: spg_engine::TxId,
 ) -> std::io::Result<()> {
     // v7.39 (round 178) — a DML with RETURNING answers `Rows`, not
     // `CommandOk`. Pre-r178 this let-else dropped it ("SELECT —
@@ -2202,10 +2203,18 @@ pub(crate) fn persist_wire_write(
         // (tx_batch_100 = 100 fsyncs ≈ 740 ms, the panel's 24× worst
         // cell). A crash before the COMMIT fsync loses only the
         // uncommitted tx — exactly PG's contract.
+        //
+        // v7.39 (round 304, V38) — the witness is THIS connection's
+        // slot. `in_transaction()` is true whenever ANY connection
+        // holds a transaction, so an autocommit write on one connection
+        // skipped its fsync — and was acked — merely because a
+        // different connection had a transaction open, breaking
+        // synchronous_commit=on. (Same global-vs-slot confusion r298
+        // fixed for the aborted flag and pgwire's streaming gate.)
         let in_tx = state
             .engine
             .read()
-            .is_ok_and(|e| e.in_transaction());
+            .is_ok_and(|e| e.is_tx_open(tx_id));
         crate::append_wal(state, sql, crate::session_sync_commit(state) && !in_tx)?;
     } else if *modified_catalog && state.db_path.is_some() {
         // No-WAL mode: capture the current committed state.
@@ -3531,7 +3540,7 @@ fn handle_execute(
         let mut bind_ast = stmt.ast.clone();
         spg_engine::substitute_placeholders(&mut bind_ast, &portal.params)
             .map_err(|e| proto(format!("Execute: bind-final render failed: {e}")))?;
-        persist_wire_write(state, &bind_ast.to_string(), &result)
+        persist_wire_write(state, &bind_ast.to_string(), &result, conn_state.tx_id)
             .map_err(|e| proto(format!("Execute: durability append failed: {e}")))?;
     }
     let (wire_style, wire_tz) = state
