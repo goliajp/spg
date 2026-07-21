@@ -849,3 +849,43 @@ fn processlist_host_and_db_describe_the_connection() {
         "db follows the selected database"
     );
 }
+
+/// V24 (round 323) — a MySQL client is not handed SPG's internal error
+/// vocabulary. It used to receive the whole layering, e.g.
+/// `parse: parse error at token #3: expected identifier, got Eof`.
+/// MariaDB 11 answers a syntax error as `ERROR 1064 (42000)` with its own
+/// wording; the errno and SQLSTATE already matched, the message body did
+/// not have to carry SPG's parser internals.
+#[test]
+fn a_parse_error_carries_no_internal_prefix() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    let (errno, sqlstate, msg) = err_of(&mut s, "SELECT * FROM");
+    assert_eq!((errno, sqlstate.as_str()), (1064, "42000"));
+    assert!(
+        !msg.contains("parse error at token"),
+        "SPG's token index leaked: {msg}"
+    );
+    for prefix in ["parse: ", "eval: ", "unsupported: ", "storage: ", "lex: "] {
+        assert!(
+            !msg.starts_with(prefix),
+            "SPG's internal class vocabulary leaked: {msg}"
+        );
+    }
+    // Still usable.
+    assert_eq!(query_scalar(&mut s, "SELECT 1"), "1");
+}
+
+/// The same for an error raised past the parser.
+#[test]
+fn a_runtime_error_carries_no_internal_prefix() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    let (_errno, _sqlstate, msg) = err_of(&mut s, "SELECT * FROM no_such_table");
+    for prefix in ["parse: ", "eval: ", "unsupported: ", "storage: ", "lex: "] {
+        assert!(
+            !msg.starts_with(prefix),
+            "SPG's internal class vocabulary leaked: {msg}"
+        );
+    }
+}
