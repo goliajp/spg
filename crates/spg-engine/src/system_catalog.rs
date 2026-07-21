@@ -2945,8 +2945,42 @@ pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             "array_subscript_handler",
         ));
     }
+    // v7.39 (round 330, V48) — the four domains `information_schema` is
+    // built out of. PG has them in pg_type with `typtype = 'd'` and a real
+    // `typbasetype` (measured: sql_identifier over name, character_data
+    // and yes_or_no over character varying, cardinal_number over integer);
+    // SPG reported nothing at all, so a client resolving the type behind
+    // an information_schema column found no such type.
+    for (full, base) in INFORMATION_SCHEMA_DOMAINS {
+        let bare = full.rsplit('.').next().unwrap_or(full);
+        let (base_oid, len): (i64, i16) = match base {
+            DataType::Name => (19, 64),
+            DataType::Int => (23, 4),
+            _ => (1043, -1),
+        };
+        let mut row = build_row(
+            INFORMATION_SCHEMA_DOMAIN_OID_BASE + base_oid,
+            bare,
+            len,
+            "d",
+            "S",
+            0,
+            0,
+            "-",
+        );
+        // typnamespace → information_schema, typbasetype → the base type.
+        row.values[2] = Value::BigInt(13000);
+        if let Some(slot) = schema.iter().position(|c| c.name == "typbasetype") {
+            row.values[slot] = Value::BigInt(base_oid);
+        }
+        rows.push(row);
+    }
     (schema, rows)
 }
+
+/// v7.39 (round 330, V48) — OID base for the synthesised
+/// information_schema domains. Kept clear of PG's built-in type OIDs.
+pub(crate) const INFORMATION_SCHEMA_DOMAIN_OID_BASE: i64 = 13_500;
 
 /// v7.17.0 Phase 3.P0-51 — synthesise `pg_catalog.pg_proc`. ORM /
 /// pgAdmin probes look up functions by name; SPG synthesises rows
@@ -5560,6 +5594,122 @@ static PG_CATALOG_NAME_COLUMNS: &[(&str, &[&str])] = &[
     ("pg_views", &["schemaname", "viewname", "viewowner"]),
 ];
 
+/// v7.39 (round 330, V48) — the four domains `information_schema` is built
+/// out of, with their base types. PG 18.4 measured:
+/// `sql_identifier` is a domain over `name`, `character_data` and
+/// `yes_or_no` over `character varying`, `cardinal_number` over `integer`,
+/// and every one of them lives in the `information_schema` namespace.
+///
+/// They are NOT registered as catalog domains: a catalog domain is user
+/// data — it serialises into the snapshot and a dump would emit
+/// `CREATE DOMAIN` for it. These are built into the server, so they are a
+/// table the reflection paths consult instead.
+pub(crate) static INFORMATION_SCHEMA_DOMAINS: &[(&str, DataType)] = &[
+    ("information_schema.cardinal_number", DataType::Int),
+    ("information_schema.character_data", DataType::Text),
+    ("information_schema.sql_identifier", DataType::Name),
+    ("information_schema.yes_or_no", DataType::Text),
+];
+
+/// Is `name` one of them?
+#[must_use]
+pub(crate) fn is_information_schema_domain(name: &str) -> bool {
+    INFORMATION_SCHEMA_DOMAINS.iter().any(|(n, _)| *n == name)
+}
+
+/// v7.39 (round 330, V48) — (view, [(column, domain)]) for the
+/// information_schema columns PG declares over one of its domains.
+/// `pg_typeof` reports the DOMAIN there, not the base type, and the
+/// column's storage type follows the domain's base.
+static INFORMATION_SCHEMA_DOMAIN_COLUMNS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "tables",
+        &[
+            ("table_catalog", "information_schema.sql_identifier"),
+            ("table_schema", "information_schema.sql_identifier"),
+            ("table_name", "information_schema.sql_identifier"),
+            ("table_type", "information_schema.character_data"),
+        ],
+    ),
+    (
+        "columns",
+        &[
+            ("table_catalog", "information_schema.sql_identifier"),
+            ("table_schema", "information_schema.sql_identifier"),
+            ("table_name", "information_schema.sql_identifier"),
+            ("column_name", "information_schema.sql_identifier"),
+            ("ordinal_position", "information_schema.cardinal_number"),
+            ("is_nullable", "information_schema.yes_or_no"),
+            ("data_type", "information_schema.character_data"),
+        ],
+    ),
+    (
+        "table_constraints",
+        &[
+            ("constraint_catalog", "information_schema.sql_identifier"),
+            ("constraint_schema", "information_schema.sql_identifier"),
+            ("constraint_name", "information_schema.sql_identifier"),
+            ("table_catalog", "information_schema.sql_identifier"),
+            ("table_schema", "information_schema.sql_identifier"),
+            ("table_name", "information_schema.sql_identifier"),
+        ],
+    ),
+    (
+        "key_column_usage",
+        &[
+            ("constraint_name", "information_schema.sql_identifier"),
+            ("table_name", "information_schema.sql_identifier"),
+            ("column_name", "information_schema.sql_identifier"),
+            ("ordinal_position", "information_schema.cardinal_number"),
+        ],
+    ),
+    (
+        "schemata",
+        &[
+            ("catalog_name", "information_schema.sql_identifier"),
+            ("schema_name", "information_schema.sql_identifier"),
+            ("schema_owner", "information_schema.sql_identifier"),
+        ],
+    ),
+    (
+        "views",
+        &[
+            ("table_catalog", "information_schema.sql_identifier"),
+            ("table_schema", "information_schema.sql_identifier"),
+            ("table_name", "information_schema.sql_identifier"),
+        ],
+    ),
+];
+
+/// Tag the information_schema columns PG declares over a domain, and give
+/// each the domain's base type. Without this `pg_typeof(table_name)`
+/// answered the base spelling (`text`) where PG answers
+/// `information_schema.sql_identifier`.
+fn apply_information_schema_domains(view: &str, columns: &mut [ColumnSchema]) {
+    // The synth views arrive as `__spg_info_<name>`.
+    let Some(bare) = view.strip_prefix("__spg_info_") else {
+        return;
+    };
+    let Some((_, pairs)) = INFORMATION_SCHEMA_DOMAIN_COLUMNS
+        .iter()
+        .find(|(v, _)| *v == bare)
+    else {
+        return;
+    };
+    for c in columns.iter_mut() {
+        let Some((_, domain)) = pairs.iter().find(|(n, _)| *n == c.name) else {
+            continue;
+        };
+        c.user_domain_type = Some(alloc::string::String::from(*domain));
+        if let Some((_, base)) = INFORMATION_SCHEMA_DOMAINS
+            .iter()
+            .find(|(n, _)| n == domain)
+        {
+            c.ty = *base;
+        }
+    }
+}
+
 pub(crate) fn materialise_meta_view(
     catalog: &mut Catalog,
     name: &str,
@@ -5567,6 +5717,7 @@ pub(crate) fn materialise_meta_view(
     rows: Vec<Row<'static>>,
 ) -> Result<(), EngineError> {
     retype_identifier_columns(name, &mut columns);
+    apply_information_schema_domains(name, &mut columns);
     let schema = TableSchema::new(name.to_string(), columns);
     catalog.create_table(schema).map_err(EngineError::Storage)?;
     let table = catalog

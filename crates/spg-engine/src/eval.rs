@@ -1774,13 +1774,18 @@ fn eval_function_call_arm(
         let is_user_type = |e: &Expr| {
             expr_enum_type_name(e, ctx.columns)
                 .filter(|n| {
-                    ctx.catalog.is_some_and(|cat| {
-                        cat.enum_types().contains_key(*n)
-                            || cat.domain_types().contains_key(*n)
-                            // v7.39 (round 263) — composites too: a cast to
-                            // one reported the generic `record`.
-                            || cat.composite_types().contains_key(*n)
-                    })
+                    // v7.39 (round 330, V48) — the information_schema
+                    // domains are built into the server rather than
+                    // catalog objects (a catalog domain is user data and
+                    // would be dumped), so they are recognised here too.
+                    crate::system_catalog::is_information_schema_domain(n)
+                        || ctx.catalog.is_some_and(|cat| {
+                            cat.enum_types().contains_key(*n)
+                                || cat.domain_types().contains_key(*n)
+                                // v7.39 (round 263) — composites too: a cast
+                                // to one reported the generic `record`.
+                                || cat.composite_types().contains_key(*n)
+                        })
                 })
                 .map(alloc::string::String::from)
         };
