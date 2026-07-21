@@ -3098,7 +3098,7 @@ impl Engine {
         let Some(st) = self.tx_catalogs.get(&tx_id) else {
             return false;
         };
-        st.constraints_deferred.unwrap_or(fk.initially_deferred)
+        fk_deferred_in(st, fk)
     }
 
     /// The FKs of `table` that must be checked at THIS statement.
@@ -3121,6 +3121,25 @@ impl Engine {
     /// in the same transaction, and a queued copy would then be
     /// checked against a value that no longer exists.
     pub(crate) fn run_deferred_fk_checks(&mut self) -> Result<(), EngineError> {
+        self.run_deferred_fk_checks_inner(None)
+    }
+
+    /// v7.39 (round 308, V29) — the same sweep, narrowed to the
+    /// constraints a NAMED `SET CONSTRAINTS … IMMEDIATE` listed. The
+    /// ones it did not name stay queued for COMMIT, which is what PG
+    /// does: draining everything would report a violation the statement
+    /// never asked about.
+    pub(crate) fn run_deferred_fk_checks_for(
+        &mut self,
+        names: &[String],
+    ) -> Result<(), EngineError> {
+        self.run_deferred_fk_checks_inner(Some(names))
+    }
+
+    fn run_deferred_fk_checks_inner(
+        &mut self,
+        only: Option<&[String]>,
+    ) -> Result<(), EngineError> {
         let Some(tx_id) = self.current_tx else {
             return Ok(());
         };
@@ -3129,7 +3148,15 @@ impl Engine {
         };
         let tables: alloc::vec::Vec<String> = st.touched_tables.iter().cloned().collect();
         let deferred_now = |fk: &spg_storage::ForeignKeyConstraint| {
-            fk.deferrable && st.constraints_deferred.unwrap_or(fk.initially_deferred)
+            if let Some(names) = only
+                && !fk
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| names.iter().any(|w| w == n))
+            {
+                return false;
+            }
+            fk.deferrable && fk_deferred_in(st, fk)
         };
         for tname in &tables {
             let Some(t) = st.catalog.get(tname) else {
@@ -3154,5 +3181,115 @@ impl Engine {
             enforce_fk_inserts(&st.catalog, tname, &fks, &rows)?;
         }
         Ok(())
+    }
+}
+
+/// v7.39 (round 308, V29) — is this FK deferred right now, per the
+/// transaction's `SET CONSTRAINTS` state?
+///
+/// A NAMED setting wins over the blanket one, so `ALL DEFERRED` followed
+/// by `fk_a IMMEDIATE` leaves fk_a immediate and the rest deferred; with
+/// neither, the constraint's own declared timing decides. A constraint
+/// the catalog holds without a name is reachable only by the blanket
+/// form, which is also true in PG for a constraint nobody named.
+///
+/// One function, because the COMMIT-time sweep and the per-statement
+/// check both ask — and the pair drifting apart is exactly how a
+/// deferred violation would slip through a successful COMMIT.
+/// Answers the timing question only; `deferrable` is the caller's gate.
+pub(crate) fn fk_deferred_in(
+    st: &crate::TxState,
+    fk: &spg_storage::ForeignKeyConstraint,
+) -> bool {
+    if let Some(name) = fk.name.as_deref()
+        && let Some(explicit) = st.constraints_deferred_by_name.get(name)
+    {
+        return *explicit;
+    }
+    st.constraints_deferred.unwrap_or(fk.initially_deferred)
+}
+
+impl crate::Engine {
+    /// v7.39 (round 308, V29) — `SET CONSTRAINTS { ALL | name [, …] }
+    /// { DEFERRED | IMMEDIATE }`.
+    ///
+    /// The named form used to be parsed as if it said ALL, so
+    /// `SET CONSTRAINTS fk_a DEFERRED` deferred every deferrable
+    /// constraint in the transaction — a violation on some OTHER table
+    /// then sailed past the statement that caused it. Measured against
+    /// PG 18.4: naming a constraint affects only that one, an unknown
+    /// name is an error, and naming a constraint that is not deferrable
+    /// is a different error.
+    pub(crate) fn exec_set_constraints(
+        &mut self,
+        names: &[alloc::string::String],
+        deferred: bool,
+    ) -> Result<crate::QueryResult, EngineError> {
+        // Validate every name BEFORE anything changes, so a list with a
+        // bad entry leaves the transaction's timing untouched.
+        for n in names {
+            match self.find_fk_by_name(n) {
+                Some(fk) if fk.deferrable => {}
+                Some(_) => {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "constraint \"{n}\" is not deferrable"
+                    )));
+                }
+                None => {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "constraint \"{n}\" does not exist"
+                    )));
+                }
+            }
+        }
+        // Order matters: run what is CURRENTLY deferred first, then
+        // change the mode. Flipping to immediate first empties the set
+        // the check walks, so the pending violation sailed through to a
+        // successful COMMIT (round 288's lesson). With names, only the
+        // named constraints are drained — the others stay queued.
+        if !deferred {
+            if names.is_empty() {
+                self.run_deferred_fk_checks()?;
+            } else {
+                self.run_deferred_fk_checks_for(names)?;
+            }
+        }
+        if let Some(tx_id) = self.current_tx
+            && let Some(st) = self.tx_catalogs.get_mut(&tx_id)
+        {
+            if names.is_empty() {
+                // A blanket setting replaces the whole picture, so the
+                // per-name overrides go with it — that is what lets a
+                // later `ALL DEFERRED` win over an earlier named one.
+                st.constraints_deferred = Some(deferred);
+                st.constraints_deferred_by_name.clear();
+            } else {
+                for n in names {
+                    st.constraints_deferred_by_name.insert(n.clone(), deferred);
+                }
+            }
+        }
+        Ok(crate::QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: false,
+        })
+    }
+
+    /// The FK carrying this constraint name, from anywhere in the active
+    /// catalog. PG resolves a bare name across the search path and does
+    /// not complain when two tables share one — every match is affected —
+    /// so this only has to answer whether SOME constraint owns the name,
+    /// and what its deferrability is.
+    fn find_fk_by_name(&self, name: &str) -> Option<spg_storage::ForeignKeyConstraint> {
+        let cat = self.active_catalog();
+        cat.table_names().into_iter().find_map(|t| {
+            cat.get(&t).and_then(|tbl| {
+                tbl.schema()
+                    .foreign_keys
+                    .iter()
+                    .find(|fk| fk.name.as_deref() == Some(name))
+                    .cloned()
+            })
+        })
     }
 }
