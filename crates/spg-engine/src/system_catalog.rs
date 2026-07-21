@@ -4218,6 +4218,163 @@ pub(crate) fn synth_pg_extension() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     (schema, rows)
 }
 
+/// v7.39 (round 312, V33) — `pg_get_functiondef`'s output: a complete,
+/// re-runnable CREATE statement.
+///
+/// PG's layout, measured byte-for-byte against 18.4 — the continuation
+/// lines carry a single leading space, the body is delimited by
+/// `$function$`, and there is a trailing newline:
+///
+/// ```text
+/// CREATE OR REPLACE FUNCTION public.f(a integer, b integer)
+///  RETURNS integer
+///  LANGUAGE sql
+/// AS $function$ SELECT a + b $function$
+/// ```
+///
+/// Argument and return types are canonicalised to PG's spelling
+/// (`int` → `integer`), because that is what PG prints regardless of how
+/// the function was declared.
+pub(crate) fn render_function_def(f: &spg_storage::FunctionDef) -> alloc::string::String {
+    let args = canonical_arg_list(&f.args_repr);
+    let returns = canonical_type_word(f.returns.trim());
+    alloc::format!(
+        "CREATE OR REPLACE FUNCTION public.{}({args})\n RETURNS {returns}\n LANGUAGE {}\nAS $function${}$function$\n",
+        f.name,
+        f.language,
+        f.body,
+    )
+}
+
+/// Re-spell a stored argument list (`"(a INT, b INT)"`) the way PG
+/// prints it (`"a integer, b integer"`). A name is kept as written; only
+/// the type word is canonicalised, and anything unrecognised is left
+/// alone rather than guessed at.
+fn canonical_arg_list(args_repr: &str) -> alloc::string::String {
+    let inner = args_repr.trim().trim_start_matches('(').trim_end_matches(')');
+    if inner.trim().is_empty() {
+        return alloc::string::String::new();
+    }
+    inner
+        .split(',')
+        .map(|part| {
+            let part = part.trim();
+            match part.split_once(char::is_whitespace) {
+                Some((name, ty)) => alloc::format!("{name} {}", canonical_type_word(ty.trim())),
+                None => canonical_type_word(part),
+            }
+        })
+        .collect::<alloc::vec::Vec<_>>()
+        .join(", ")
+}
+
+/// `int` → `integer`, `TEXT` → `text`. Falls back to the lower-cased
+/// original when the word is not a type this engine knows, which keeps
+/// user-defined types readable instead of mangling them.
+fn canonical_type_word(word: &str) -> alloc::string::String {
+    crate::conversions::type_name_to_data_type(word)
+        .map_or_else(|| word.to_ascii_lowercase(), pg_type_word)
+}
+
+fn pg_type_word(t: DataType) -> alloc::string::String {
+    crate::conversions::regtype_oid_to_name(pg_type_oid(t))
+        .map_or_else(|| alloc::format!("{t}").to_ascii_lowercase(), Into::into)
+}
+
+/// v7.39 (round 312, V33) — one `CREATE RULE` text, shared by
+/// `pg_rules.definition` and `pg_get_ruledef`.
+///
+/// PG's layout is two lines, and the spacing carries meaning: `DO ` is
+/// followed by `INSTEAD ` or by a second space, so a DO ALSO rule reads
+/// `DO  INSERT …` with the gap where INSTEAD would have gone. Measured
+/// against PG 18.4, which is also where the `qualify` split comes from —
+/// the default form writes `public.<table>`, the pretty one bare.
+pub(crate) fn render_rule_def(r: &spg_storage::RuleDef, qualify: bool) -> alloc::string::String {
+    let table = if qualify {
+        alloc::format!("public.{}", r.table)
+    } else {
+        r.table.clone()
+    };
+    let mut def = alloc::format!("CREATE RULE {} AS\n    ON {} TO {table}", r.name, r.event);
+    if !r.when_condition.is_empty() {
+        // PG gives the qualification its own line, indented by three.
+        def.push_str("\n   WHERE ");
+        def.push_str(&r.when_condition);
+    }
+    def.push_str(" DO ");
+    def.push_str(if r.instead { "INSTEAD " } else { " " });
+    match r.commands.len() {
+        0 => def.push_str("NOTHING"),
+        1 => def.push_str(&r.commands[0]),
+        _ => {
+            def.push('(');
+            def.push_str(&r.commands.join("; "));
+            def.push(')');
+        }
+    }
+    def.push(';');
+    def
+}
+
+/// v7.39 (round 312, V33) — `pg_catalog.pg_rewrite`. The rule catalogue
+/// itself, which `pg_get_ruledef(oid)` resolves against; without it there
+/// was no way to reach a rule by oid at all.
+pub(crate) fn synth_pg_rewrite(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("rulename", DataType::Text, false),
+        ColumnSchema::new("ev_class", DataType::BigInt, false),
+        ColumnSchema::new("ev_type", DataType::Text, false),
+        ColumnSchema::new("ev_enabled", DataType::Text, false),
+        ColumnSchema::new("is_instead", DataType::Bool, false),
+        ColumnSchema::new("ev_qual", DataType::Text, true),
+        ColumnSchema::new("ev_action", DataType::Text, true),
+    ];
+    // `ev_class` has to be the SAME oid pg_class / pg_constraint hand out
+    // for that table, or a join against them silently returns nothing.
+    let mut names: Vec<String> = cat.table_names();
+    names.sort();
+    let by_table: alloc::collections::BTreeMap<String, i64> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), 16_384 + i as i64))
+        .collect();
+    let rows: Vec<Row<'static>> = cat
+        .rules()
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            // PG's ev_type is a single char: 1 SELECT, 2 UPDATE,
+            // 3 INSERT, 4 DELETE.
+            let ev_type = match r.event.to_ascii_uppercase().as_str() {
+                "SELECT" => "1",
+                "UPDATE" => "2",
+                "INSERT" => "3",
+                _ => "4",
+            };
+            Row::new(alloc::vec![
+                Value::BigInt(RULE_OID_BASE + i as i64),
+                Value::text(r.name.clone()),
+                Value::BigInt(*by_table.get(&r.table).unwrap_or(&0)),
+                Value::text(ev_type),
+                Value::text("O"),
+                Value::Bool(r.instead),
+                if r.when_condition.is_empty() {
+                    Value::Null
+                } else {
+                    Value::text(r.when_condition.clone())
+                },
+                Value::text(r.commands.join("; ")),
+            ])
+        })
+        .collect();
+    (schema, rows)
+}
+
+/// The oid band `pg_rewrite` rows occupy, kept away from the other synth
+/// catalogues so a rule oid can only ever resolve to a rule.
+pub(crate) const RULE_OID_BASE: i64 = 500_000;
+
 /// v7.39 (round 143) — synthesise `pg_catalog.pg_rules`: one row per
 /// catalogued query-rewrite RULE. PG's `definition` column is
 /// `pg_get_ruledef`'s pretty-printed deparse; SPG reconstructs the canonical
@@ -4232,30 +4389,10 @@ pub(crate) fn synth_pg_rules(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     for r in cat.rules() {
-        let mut def = alloc::format!(
-            "CREATE RULE {} AS ON {} TO public.{}",
-            r.name,
-            r.event,
-            r.table
-        );
-        if !r.when_condition.is_empty() {
-            def.push_str(" WHERE ");
-            def.push_str(&r.when_condition);
-        }
-        def.push_str(" DO ");
-        if r.instead {
-            def.push_str("INSTEAD ");
-        }
-        match r.commands.len() {
-            0 => def.push_str("NOTHING"),
-            1 => def.push_str(&r.commands[0]),
-            _ => {
-                def.push('(');
-                def.push_str(&r.commands.join("; "));
-                def.push(')');
-            }
-        }
-        def.push(';');
+        // v7.39 (round 312) — `pg_rules.definition` IS `pg_get_ruledef`'s
+        // default form, schema qualification and all (measured: PG shows
+        // `public.r33` here, and drops it only for the pretty spelling).
+        let def = render_rule_def(r, true);
         rows.push(Row::new(alloc::vec![
             Value::text("public"),
             Value::text(r.table.clone()),

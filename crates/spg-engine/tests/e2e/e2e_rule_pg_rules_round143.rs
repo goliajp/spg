@@ -50,21 +50,26 @@ fn pg_rules_lists_every_form() {
     );
     assert_eq!(rows.len(), 3, "{rows:?}");
     assert_eq!(rows[0][..3], ["public", "rt", "r_also"].map(String::from));
-    // DO ALSO deparses as bare `DO <command>` (ALSO is the default), like PG.
+    // v7.39 (round 312) — restated against PG 18.4, not deleted. The
+    // definition is `pg_get_ruledef`'s DEFAULT form: two lines, and
+    // `DO ` followed by a second space where INSTEAD would have gone.
+    // The old single-line expectation, and its claim that a DO ALSO
+    // rule deparses as a bare `DO <command>`, were both measured wrong.
     assert!(
-        rows[0][3].starts_with("CREATE RULE r_also AS ON INSERT TO public.rt DO INSERT INTO raud"),
+        rows[0][3]
+            .starts_with("CREATE RULE r_also AS\n    ON INSERT TO public.rt DO  INSERT INTO raud"),
         "{}",
         rows[0][3]
     );
     assert_eq!(rows[1][..3], ["public", "rt", "r_block"].map(String::from));
     assert_eq!(
         rows[1][3],
-        "CREATE RULE r_block AS ON DELETE TO public.rt DO INSTEAD NOTHING;"
+        "CREATE RULE r_block AS\n    ON DELETE TO public.rt DO INSTEAD NOTHING;"
     );
     assert_eq!(rows[2][..3], ["public", "rt", "r_cond"].map(String::from));
     assert_eq!(
         rows[2][3],
-        "CREATE RULE r_cond AS ON UPDATE TO public.rt WHERE (new.v < 0) DO INSTEAD NOTHING;"
+        "CREATE RULE r_cond AS\n    ON UPDATE TO public.rt\n   WHERE (new.v < 0) DO INSTEAD NOTHING;"
     );
 }
 
