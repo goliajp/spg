@@ -3461,6 +3461,22 @@ impl Engine {
             // v7.39 (read01 round 61) — whoever runs CREATE FUNCTION owns it.
             owner: Some(alloc::string::String::from(self.current_role())),
             acl: alloc::vec::Vec::new(),
+            // v7.39 (round 322, V46) — the declared attribute clauses.
+            volatility: match s.attrs.volatility {
+                spg_sql::ast::FunctionVolatility::Immutable => spg_storage::FN_IMMUTABLE,
+                spg_sql::ast::FunctionVolatility::Stable => spg_storage::FN_STABLE,
+                spg_sql::ast::FunctionVolatility::Volatile => spg_storage::FN_VOLATILE,
+            },
+            strict: s.attrs.strict,
+            security_definer: s.attrs.security_definer,
+            leakproof: s.attrs.leakproof,
+            parallel: match s.attrs.parallel {
+                spg_sql::ast::FunctionParallel::Safe => spg_storage::FN_PARALLEL_SAFE,
+                spg_sql::ast::FunctionParallel::Restricted => spg_storage::FN_PARALLEL_RESTRICTED,
+                spg_sql::ast::FunctionParallel::Unsafe => spg_storage::FN_PARALLEL_UNSAFE,
+            },
+            cost: s.attrs.cost,
+            rows: s.attrs.rows,
         };
         self.active_catalog_mut()
             .create_function(def, s.or_replace)

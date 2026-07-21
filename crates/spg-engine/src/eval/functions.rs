@@ -17136,6 +17136,13 @@ fn call_user_function<'v>(
             detail: format!("function {}({}) does not exist", def.name, sig.join(", ")),
         });
     }
+    // v7.39 (round 322, V46) — `STRICT` / `RETURNS NULL ON NULL INPUT`:
+    // a call with any NULL argument is NULL, and the body never runs.
+    // Measured on PG 18.4 — a strict `f(a int)` whose body is
+    // `SELECT coalesce(a,-1)` answers NULL for `f(NULL)`, not -1.
+    if def.strict && args.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
     // The arguments become the columns of a synthetic one-row table, so the
     // body's `x` resolves through the ordinary column path.
     let owned: Vec<Value<'static>> = args.iter().map(|v| v.clone().into_owned()).collect();

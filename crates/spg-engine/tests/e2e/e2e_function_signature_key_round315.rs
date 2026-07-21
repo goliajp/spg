@@ -112,6 +112,13 @@ fn an_old_images_acl_key_still_resolves() {
         body: " SELECT 1 ".into(),
         owner: None,
         acl: Vec::new(),
+        volatility: spg_storage::FN_VOLATILE,
+        strict: false,
+        security_definer: false,
+        leakproof: false,
+        parallel: spg_storage::FN_PARALLEL_UNSAFE,
+        cost: None,
+        rows: None,
     };
     let new_key = function_signature_key(&def.name, &def.args_repr);
     functions.insert(new_key.clone(), def);

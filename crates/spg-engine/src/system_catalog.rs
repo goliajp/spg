@@ -3114,16 +3114,24 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             } else {
                 14
             }),
-            Value::Float(100.0), // procost — PG's default for a non-internal fn
-            Value::Float(0.0),
+            // v7.39 (round 322, V46) — the DECLARED attributes, not a row
+            // of PG defaults: `CREATE FUNCTION … IMMUTABLE STRICT` was a
+            // parse error until this round, so there was nothing else to
+            // report; now there is.
+            Value::Float(def.cost.unwrap_or(100.0)),
+            Value::Float(def.rows.unwrap_or(0.0)),
             Value::BigInt(0),
             Value::text("f"), // prokind — a normal function
+            Value::Bool(def.security_definer),
+            Value::Bool(def.leakproof),
+            Value::Bool(def.strict),
             Value::Bool(false),
-            Value::Bool(false),
-            Value::Bool(false),
-            Value::Bool(false),
-            Value::text("v"), // provolatile — VOLATILE, PG's default
-            Value::text("u"), // proparallel — UNSAFE, PG's default
+            Value::text(alloc::string::String::from(
+                core::str::from_utf8(&[def.volatility]).unwrap_or("v"),
+            )), // provolatile
+            Value::text(alloc::string::String::from(
+                core::str::from_utf8(&[def.parallel]).unwrap_or("u"),
+            )), // proparallel
             Value::SmallInt(i16::try_from(nargs).unwrap_or(i16::MAX)),
             Value::SmallInt(0),
             Value::BigInt(0),
@@ -4238,12 +4246,68 @@ pub(crate) fn synth_pg_extension() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
 pub(crate) fn render_function_def(f: &spg_storage::FunctionDef) -> alloc::string::String {
     let args = canonical_arg_list(&f.args_repr);
     let returns = canonical_type_word(f.returns.trim());
+    // v7.39 (round 322, V46) — the attribute line, when anything was
+    // declared away from PG's defaults. Measured on PG 18.4, the order is
+    // volatility, PARALLEL, STRICT, SECURITY DEFINER, LEAKPROOF, COST,
+    // ROWS, on its own line between LANGUAGE and AS; an all-default
+    // function has no such line at all.
+    let attrs = function_attr_words(f);
+    let attr_line = if attrs.is_empty() {
+        alloc::string::String::new()
+    } else {
+        alloc::format!(" {}\n", attrs.join(" "))
+    };
     alloc::format!(
-        "CREATE OR REPLACE FUNCTION public.{}({args})\n RETURNS {returns}\n LANGUAGE {}\nAS $function${}$function$\n",
+        "CREATE OR REPLACE FUNCTION public.{}({args})\n RETURNS {returns}\n LANGUAGE {}\n{attr_line}AS $function${}$function$\n",
         f.name,
         f.language,
         f.body,
     )
+}
+
+/// v7.39 (round 322, V46) — the declared attribute words in PG's print
+/// order. Shared by `pg_get_functiondef`; empty when everything is at its
+/// default.
+pub(crate) fn function_attr_words(f: &spg_storage::FunctionDef) -> alloc::vec::Vec<alloc::string::String> {
+    let mut out = alloc::vec::Vec::new();
+    match f.volatility {
+        spg_storage::FN_IMMUTABLE => out.push(alloc::string::String::from("IMMUTABLE")),
+        spg_storage::FN_STABLE => out.push(alloc::string::String::from("STABLE")),
+        _ => {}
+    }
+    match f.parallel {
+        spg_storage::FN_PARALLEL_SAFE => out.push(alloc::string::String::from("PARALLEL SAFE")),
+        spg_storage::FN_PARALLEL_RESTRICTED => {
+            out.push(alloc::string::String::from("PARALLEL RESTRICTED"));
+        }
+        _ => {}
+    }
+    if f.strict {
+        out.push(alloc::string::String::from("STRICT"));
+    }
+    if f.security_definer {
+        out.push(alloc::string::String::from("SECURITY DEFINER"));
+    }
+    if f.leakproof {
+        out.push(alloc::string::String::from("LEAKPROOF"));
+    }
+    if let Some(c) = f.cost {
+        out.push(alloc::format!("COST {}", render_fn_number(c)));
+    }
+    if let Some(r) = f.rows {
+        out.push(alloc::format!("ROWS {}", render_fn_number(r)));
+    }
+    out
+}
+
+/// PG prints a whole-numbered COST / ROWS without a decimal point.
+fn render_fn_number(v: f64) -> alloc::string::String {
+    let whole = v as i64;
+    if v.abs() < 1e15 && (whole as f64) == v {
+        alloc::format!("{whole}")
+    } else {
+        alloc::format!("{v}")
+    }
 }
 
 /// Re-spell a stored argument list (`"(a INT, b INT)"`) the way PG

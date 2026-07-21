@@ -174,6 +174,7 @@ mod e2e_constraintdef_pretty_round311;
 mod e2e_functiondef_ruledef_round312;
 mod e2e_catalog_name_type_round313;
 mod e2e_limit_offset_order_round314;
+mod e2e_function_attrs_round322;
 mod e2e_function_signature_key_round315;
 mod e2e_on_conflict_round240;
 mod e2e_update_from_alias_round241;
