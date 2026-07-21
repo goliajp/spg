@@ -4353,7 +4353,126 @@ fn pg_type_word(t: DataType) -> alloc::string::String {
 /// `DO  INSERT …` with the gap where INSTEAD would have gone. Measured
 /// against PG 18.4, which is also where the `qualify` split comes from —
 /// the default form writes `public.<table>`, the pretty one bare.
-pub(crate) fn render_rule_def(r: &spg_storage::RuleDef, qualify: bool) -> alloc::string::String {
+/// v7.39 (round 328/V47) — re-deparse ONE rule action from its parse tree,
+/// the way PG does, instead of echoing the text the user typed. Measured
+/// on PG 18.4:
+///
+/// ```text
+///  INSERT INTO log33 (id, v)
+///    VALUES (new.id, new.v)
+///  UPDATE r33 SET v = new.v
+///    WHERE (r33.id = old.id)
+///  DELETE FROM log33
+///    WHERE (log33.id = old.id)
+/// ```
+///
+/// So: an INSERT always carries an explicit column list (filled from the
+/// catalog when the user omitted it), and VALUES / WHERE start a new line
+/// indented by two. A WHERE column with no qualifier is printed qualified
+/// by the target table, which is how PG's deparser resolves it against
+/// the range table.
+///
+/// A shape this does not model (`INSERT … SELECT`, whose PG rendering is
+/// the multi-line SELECT pretty-printer) keeps the stored text, as does
+/// anything that no longer parses.
+fn render_rule_action(cmd: &str, cat: Option<&Catalog>) -> alloc::string::String {
+    use spg_sql::ast::Statement;
+    let Ok(stmt) = spg_sql::parser::parse_statement(cmd) else {
+        return alloc::string::String::from(cmd);
+    };
+    match stmt {
+        Statement::Insert(ins) if ins.ctes.is_empty() => {
+            let cols = ins.columns.clone().or_else(|| {
+                cat.and_then(|c| c.get(&ins.table))
+                    .map(|t| t.schema().columns.iter().map(|c| c.name.clone()).collect())
+            });
+            let Some(cols) = cols else {
+                return alloc::string::String::from(cmd);
+            };
+            let head = alloc::format!("INSERT INTO {} ({})", ins.table, cols.join(", "));
+            if let Some(sel) = &ins.select_source {
+                // PG renders the SELECT with its multi-line pretty-printer;
+                // SPG keeps it on one line (recorded in the ledger). The
+                // column list above is PG's either way.
+                return alloc::format!("{head}  {sel}");
+            }
+            let rendered = alloc::format!("{ins}");
+            let Some(vpos) = rendered.find(" VALUES ") else {
+                return rendered;
+            };
+            alloc::format!(
+                "{head}\n  VALUES {}",
+                &rendered[vpos + " VALUES ".len()..]
+            )
+        }
+        Statement::Update(upd) if upd.ctes.is_empty() => {
+            let sets: alloc::vec::Vec<alloc::string::String> = upd
+                .assignments
+                .iter()
+                .map(|(c, e)| alloc::format!("{c} = {e}"))
+                .collect();
+            let mut out = alloc::format!("UPDATE {} SET {}", upd.table, sets.join(", "));
+            if let Some(w) = &upd.where_ {
+                out.push_str(&alloc::format!(
+                    "\n  WHERE {}",
+                    qualify_bare_columns(w, &upd.table)
+                ));
+            }
+            out
+        }
+        Statement::Delete(del) if del.ctes.is_empty() => {
+            let mut out = alloc::format!("DELETE FROM {}", del.table);
+            if let Some(w) = &del.where_ {
+                out.push_str(&alloc::format!(
+                    "\n  WHERE {}",
+                    qualify_bare_columns(w, &del.table)
+                ));
+            }
+            out
+        }
+        other => alloc::format!("{other}"),
+    }
+}
+
+/// Render `e` with every unqualified column reference qualified by
+/// `table`, as PG's deparser does once the range table is resolved
+/// (`WHERE (r33.id = old.id)`). `new` / `old` keep their own qualifier.
+fn qualify_bare_columns(e: &spg_sql::ast::Expr, table: &str) -> alloc::string::String {
+    let mut cloned = e.clone();
+    qualify_in_place(&mut cloned, table);
+    alloc::format!("{cloned}")
+}
+
+fn qualify_in_place(e: &mut spg_sql::ast::Expr, table: &str) {
+    use spg_sql::ast::Expr;
+    let mut stack = alloc::vec![e];
+    while let Some(node) = stack.pop() {
+        if let Expr::Column(c) = node {
+            if c.qualifier.is_none() {
+                c.qualifier = Some(alloc::string::String::from(table));
+            }
+            continue;
+        }
+        match node {
+            Expr::Binary { lhs, rhs, .. } => {
+                stack.push(lhs);
+                stack.push(rhs);
+            }
+            Expr::Unary { expr, .. }
+            | Expr::IsNull { expr, .. }
+            | Expr::BoolTest { expr, .. }
+            | Expr::Cast { expr, .. } => stack.push(expr),
+            Expr::FunctionCall { args, .. } => stack.extend(args.iter_mut()),
+            _ => {}
+        }
+    }
+}
+
+pub(crate) fn render_rule_def(
+    r: &spg_storage::RuleDef,
+    qualify: bool,
+    cat: Option<&Catalog>,
+) -> alloc::string::String {
     let table = if qualify {
         alloc::format!("public.{}", r.table)
     } else {
@@ -4366,13 +4485,28 @@ pub(crate) fn render_rule_def(r: &spg_storage::RuleDef, qualify: bool) -> alloc:
         def.push_str(&r.when_condition);
     }
     def.push_str(" DO ");
-    def.push_str(if r.instead { "INSTEAD " } else { " " });
+    if r.instead {
+        def.push_str("INSTEAD ");
+    }
+    // Measured on PG 18.4: a deparsed ACTION is preceded by one further
+    // space (`DO  INSERT …`, `DO INSTEAD  UPDATE …`) while `NOTHING` is
+    // not (`DO INSTEAD NOTHING`).
+    if !r.commands.is_empty() {
+        def.push(' ');
+    } else if !r.instead {
+        def.push(' ');
+    }
     match r.commands.len() {
         0 => def.push_str("NOTHING"),
-        1 => def.push_str(&r.commands[0]),
+        1 => def.push_str(&render_rule_action(&r.commands[0], cat)),
         _ => {
             def.push('(');
-            def.push_str(&r.commands.join("; "));
+            let rendered: alloc::vec::Vec<alloc::string::String> = r
+                .commands
+                .iter()
+                .map(|c| render_rule_action(c, cat))
+                .collect();
+            def.push_str(&rendered.join("; "));
             def.push(')');
         }
     }
@@ -4456,7 +4590,7 @@ pub(crate) fn synth_pg_rules(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         // v7.39 (round 312) — `pg_rules.definition` IS `pg_get_ruledef`'s
         // default form, schema qualification and all (measured: PG shows
         // `public.r33` here, and drops it only for the pretty spelling).
-        let def = render_rule_def(r, true);
+        let def = render_rule_def(r, true, Some(cat));
         rows.push(Row::new(alloc::vec![
             Value::text("public"),
             Value::text(r.table.clone()),
