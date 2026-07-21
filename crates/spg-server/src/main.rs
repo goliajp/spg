@@ -1847,6 +1847,31 @@ pub(crate) fn set_conn_pid(pid: u32) {
     CONN_PID.with(|c| c.set(pid));
 }
 
+/// v7.39 (round 317, V36) — the ONE connection-id allocator, shared by
+/// every wire. A connection's id is what `pg_backend_pid()`,
+/// `CONNECTION_ID()`, `pg_stat_activity.pid`, `SHOW PROCESSLIST.Id`, the
+/// MySQL handshake greeting and BackendKeyData all report, so it has to
+/// be unique among live connections — otherwise a client cannot address
+/// one specific backend.
+///
+/// Both previous schemes failed that:
+///   * pgwire derived it from `process::id() + active_connections`, which
+///     repeats as soon as one connection leaves and another arrives (the
+///     count returns to a value a still-live connection already used);
+///   * mysql-wire used the listener's local port, identical for every
+///     accepted socket.
+///
+/// A monotonic counter seeded at the OS pid keeps the PG-shaped look
+/// (ids near the process pid) while guaranteeing distinctness for the
+/// process's lifetime.
+static NEXT_CONN_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn alloc_conn_id() -> u32 {
+    let n = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+    // `+ 1` keeps the id clear of session 0 (the embedded / detached slot).
+    std::process::id().wrapping_add(n).wrapping_add(1)
+}
+
 fn current_backend_pid() -> u32 {
     CONN_PID.with(std::cell::Cell::get)
 }

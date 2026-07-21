@@ -5,8 +5,8 @@ Per-corpus pass / fail / skip:
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
 | `duckdb` | 148 | 0 | 0 | 100.0% |
-| `mysql` | 141 | 0 | 0 | 100.0% |
-| `pg_regress` | 1339 | 0 | 0 | 100.0% |
+| `mysql` | 142 | 0 | 0 | 100.0% |
+| `pg_regress` | 1362 | 0 | 0 | 100.0% |
 | `pgvector` | 63 | 0 | 0 | 100.0% |
 | `spg_baseline/01_basic_dml` | 110 | 0 | 0 | 100.0% |
 | `spg_baseline/02_data_types` | 97 | 0 | 0 | 100.0% |
@@ -58,7 +58,7 @@ Per-corpus pass / fail / skip:
 | file | pass | fail | skip |
 |---|---|---|---|
 | `01_dialect.test` | 12 | 0 | 0 |
-| `02_int_types.test` | 5 | 0 | 0 |
+| `02_int_types.test` | 6 | 0 | 0 |
 | `03_inline_key.test` | 17 | 0 | 0 |
 | `05_delimiter.test` | 7 | 0 | 0 |
 | `06_tinyint_bool.test` | 9 | 0 | 0 |
@@ -83,7 +83,7 @@ Per-corpus pass / fail / skip:
 | `04_pg_types.test` | 24 | 0 | 0 |
 | `05_savepoints.test` | 8 | 0 | 0 |
 | `06_date_time.test` | 13 | 0 | 0 |
-| `07_date_functions.test` | 14 | 0 | 0 |
+| `07_date_functions.test` | 15 | 0 | 0 |
 | `08_now_and_date_arith.test` | 10 | 0 | 0 |
 | `09_bare_current.test` | 4 | 0 | 0 |
 | `10_interval.test` | 23 | 0 | 0 |
@@ -165,6 +165,7 @@ Per-corpus pass / fail / skip:
 | `86_pg_views_view.test` | 4 | 0 | 0 |
 | `87_pg_settings_view.test` | 6 | 0 | 0 |
 | `88_boolean.test` | 80 | 0 | 0 |
+| `90_wire_text_forms.test` | 22 | 0 | 0 |
 
 ### `pgvector/`
 

@@ -181,24 +181,18 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
 
     // ---- HandshakeV10 (server → client) ----------------------
     //
-    // Connection id is just the local port to keep it
-    // deterministic per-connection without an extra atomic.
-    // The full Segment G binds it to ServerState.active_connections
-    // once command handling needs the id for KILL.
-    let conn_id = stream
-        .local_addr()
-        .map(|a| u32::from(a.port()))
-        .unwrap_or(1);
-    // v7.39 (round 302, V15) — a genuinely per-connection id for the
-    // engine session key. `conn_id` above is the listener port (shared
-    // by every connection) so it can't isolate sessions.
-    let session_seq = MYSQL_SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // 20-byte auth-plugin-data scramble. Deterministic random
-    // from the connection id + clock so retries reproduce the
-    // same bytes during e2e testing without a separate seed
-    // channel. Production strength is added in P0-71 (where
-    // mysql_native_password verification proves the scramble
-    // was actually random).
+    // v7.39 (round 317, V36) — a genuinely unique connection id from
+    // the process-wide allocator, shared with pgwire. It used to be the
+    // socket's LOCAL port, i.e. the listener's port, identical for every
+    // accepted connection: the greeting, `CONNECTION_ID()` and
+    // `SHOW PROCESSLIST` all named the same id no matter which client
+    // asked, so nothing could address one specific connection. It is now
+    // one id used everywhere — greeting, engine session key, activity
+    // registry, and the `pg_backend_pid()` thread slot.
+    let conn_id = crate::alloc_conn_id();
+    // 20-byte auth-plugin-data scramble, derived from the connection id.
+    // Now that the id really varies per connection so does the scramble
+    // (before this every client was handed identical challenge bytes).
     let scramble = generate_scramble(conn_id);
 
     let mut greeting = HandshakeV10Greeting {
@@ -273,7 +267,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
             &parsed,
             &scramble,
             seqno_in,
-            session_seq,
+            conn_id,
         );
     }
     let parsed = match parse_handshake_response_41(&payload) {
@@ -298,7 +292,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
     //     carve-out — fast-path failures surface as Access
     //     Denied here.
     let scramble = std::mem::take(&mut greeting.scramble);
-    complete_auth_and_command(&mut stream, state, &parsed, &scramble, seqno_in, session_seq)
+    complete_auth_and_command(&mut stream, state, &parsed, &scramble, seqno_in, conn_id)
 }
 
 /// v7.17.0 Phase 3.P0-77 — auth verification + command loop
@@ -310,7 +304,7 @@ fn complete_auth_and_command(
     parsed: &HandshakeResponse41,
     scramble: &[u8],
     seqno_in: u8,
-    session_seq: u32,
+    conn_id: u32,
 ) -> std::io::Result<()> {
     let auth_outcome = verify_handshake_response(state, parsed, scramble);
     let reply_seqno = seqno_in.wrapping_add(1);
@@ -344,7 +338,7 @@ fn complete_auth_and_command(
             );
         }
     }
-    command_loop(stream, state, session_seq)
+    command_loop(stream, state, conn_id, &parsed.username)
 }
 
 /// v7.17.0 Phase 3.P0-77 — detect the `Protocol::SSLRequest`
@@ -563,25 +557,17 @@ struct PreparedEntry {
 
 /// v7.39 (round 302, V15) — the shared engine keys per-connection state
 /// (string-literal dialect, session params, prepared statements, the
-/// transaction slot) by a session id. pgwire uses the backend pid;
-/// mysql-wire allocates a monotonic per-connection sequence, namespaced
-/// into the top half of the u32 so a mysql connection can never collide
-/// with a pgwire pid (`process::id() + count`, always well under 2^31)
-/// or session 0. (The handshake `conn_id` is the listener's local port —
-/// identical for every accepted socket — so it can't serve as the key.)
-const MYSQL_SESSION_NS: u32 = 0x8000_0000;
-
-/// Monotonic per-connection counter feeding the low 31 bits of the
-/// session id. Wrapping after 2^31 connections is harmless — the
-/// namespace bit keeps every value disjoint from pgwire regardless.
-static MYSQL_SESSION_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-
+/// transaction slot) by a session id. Since round 317 both wires draw
+/// that id from the same process-wide allocator (`alloc_conn_id`), so
+/// the connection id IS the session key on both — no namespacing needed,
+/// and one number identifies the connection everywhere it is reported.
 fn command_loop(
     stream: &mut (dyn ReadWrite + '_),
     state: &Arc<ServerState>,
-    session_seq: u32,
+    conn_id: u32,
+    user: &str,
 ) -> std::io::Result<()> {
-    let session_id = MYSQL_SESSION_NS | (session_seq & 0x7fff_ffff);
+    let session_id = conn_id;
     // Install this connection's session and default it to MySQL string
     // semantics (backslash is an escape). A mysql/mariadb client that
     // never sends `SET sql_mode` must still get MySQL string handling —
@@ -603,17 +589,72 @@ fn command_loop(
         }
         Err(_) => spg_engine::IMPLICIT_TX,
     };
-    let result = run_command_loop(stream, state, session_id, conn_tx_id);
-    // Roll back a transaction the client left open, then drop this
-    // session's parked state + advisory locks — matching pgwire's
-    // disconnect cleanup (rollback then end_session on backend exit).
-    if let Ok(mut engine) = state.engine.write() {
-        if engine.is_tx_open(conn_tx_id) {
-            let _ = engine.execute_in("ROLLBACK", conn_tx_id);
-        }
-        engine.end_session(session_id);
+
+    // v7.39 (round 317, V36) — join the process-wide connection registry,
+    // the way a pgwire connection does. Until now a mysql-wire client was
+    // invisible: `SHOW PROCESSLIST` answered one hardcoded row and
+    // `pg_stat_activity` listed only the pgwire side, so an operator could
+    // not see (let alone name) a mysql connection at all.
+    let conn_state = Arc::new(crate::ConnState {
+        tx_id: conn_tx_id,
+        pid: conn_id,
+        user: user.to_string(),
+        started_at_us: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0),
+        current_sql: std::sync::RwLock::new(String::new()),
+        wait_event: std::sync::atomic::AtomicU8::new(0),
+        last_query_start_us: std::sync::atomic::AtomicI64::new(0),
+        in_transaction: std::sync::atomic::AtomicBool::new(false),
+        application_name: std::sync::RwLock::new(String::new()),
+        startup_app_name: String::new(),
+        cancel_secret: crate::pgwire::new_cancel_secret(),
+        cancel_flag: std::sync::atomic::AtomicBool::new(false),
+        notify_queue: std::sync::Mutex::new(Vec::new()),
+    });
+    // Stamp the id into the thread slot `pg_backend_pid()` /
+    // `CONNECTION_ID()` read during evaluation on this thread.
+    crate::set_conn_pid(conn_id);
+    if let Ok(mut conns) = state.connections.write() {
+        conns.push(Arc::clone(&conn_state));
     }
-    result
+    crate::backend_count_incr();
+
+    // RAII so a panicking connection thread cannot leave a dead entry in
+    // the registry (it would be reported by `SHOW PROCESSLIST` /
+    // `pg_stat_activity` forever) nor a transaction slot open.
+    struct ConnGuard<'a> {
+        state: &'a Arc<ServerState>,
+        conn: Arc<crate::ConnState>,
+        session_id: u32,
+        conn_tx_id: spg_engine::TxId,
+    }
+    impl Drop for ConnGuard<'_> {
+        fn drop(&mut self) {
+            if let Ok(mut conns) = self.state.connections.write() {
+                conns.retain(|x| !Arc::ptr_eq(x, &self.conn));
+            }
+            crate::backend_count_decr();
+            // Roll back a transaction the client left open, then drop this
+            // session's parked state + advisory locks — matching pgwire's
+            // disconnect cleanup (rollback then end_session on backend exit).
+            if let Ok(mut engine) = self.state.engine.write() {
+                if engine.is_tx_open(self.conn_tx_id) {
+                    let _ = engine.execute_in("ROLLBACK", self.conn_tx_id);
+                }
+                engine.end_session(self.session_id);
+            }
+        }
+    }
+    let _guard = ConnGuard {
+        state,
+        conn: Arc::clone(&conn_state),
+        session_id,
+        conn_tx_id,
+    };
+
+    run_command_loop(stream, state, session_id, conn_tx_id, &conn_state)
 }
 
 fn run_command_loop(
@@ -621,6 +662,7 @@ fn run_command_loop(
     state: &Arc<ServerState>,
     session_id: u32,
     conn_tx_id: spg_engine::TxId,
+    conn_state: &Arc<crate::ConnState>,
 ) -> std::io::Result<()> {
     let mut prepared = PreparedState::default();
     loop {
@@ -643,7 +685,15 @@ fn run_command_loop(
             CMD_QUIT => return Ok(()),
             CMD_QUERY => {
                 let sql = std::str::from_utf8(&payload[1..]).unwrap_or("").to_string();
-                handle_com_query(stream, state, &sql, reply_seqno, session_id, conn_tx_id)?;
+                handle_com_query(
+                    stream,
+                    state,
+                    &sql,
+                    reply_seqno,
+                    session_id,
+                    conn_tx_id,
+                    conn_state,
+                )?;
             }
             CMD_PING => {
                 // Single OK packet, no body — what mysqladmin
@@ -700,6 +750,7 @@ fn run_command_loop(
                     reply_seqno,
                     session_id,
                     conn_tx_id,
+                    conn_state,
                 )?;
             }
             CMD_STMT_CLOSE => {
@@ -761,6 +812,46 @@ pub(crate) const CMD_STMT_EXECUTE: u8 = 0x17;
 pub(crate) const CMD_STMT_CLOSE: u8 = 0x19;
 pub(crate) const CMD_STMT_RESET: u8 = 0x1a;
 
+/// v7.39 (round 317, V36) — publish what this connection is running.
+/// A mysql-wire connection is in the shared registry now, so it has to
+/// keep `current_sql` / `last_query_start_us` honest the way a pgwire
+/// connection does; otherwise `SHOW PROCESSLIST` and `pg_stat_activity`
+/// would list it as permanently idle while it runs a long statement.
+/// RAII, so an error return clears the slot too.
+struct StatementScope<'a> {
+    conn: &'a Arc<crate::ConnState>,
+}
+
+impl<'a> StatementScope<'a> {
+    fn begin(conn: &'a Arc<crate::ConnState>, sql: &str) -> Self {
+        if let Ok(mut g) = conn.current_sql.write() {
+            g.clear();
+            g.push_str(sql);
+        }
+        conn.last_query_start_us
+            .store(now_micros(), std::sync::atomic::Ordering::Relaxed);
+        Self { conn }
+    }
+}
+
+impl Drop for StatementScope<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.conn.current_sql.write() {
+            g.clear();
+        }
+        self.conn
+            .last_query_start_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
 fn handle_com_query(
     stream: &mut (dyn ReadWrite + '_),
     state: &Arc<ServerState>,
@@ -768,7 +859,9 @@ fn handle_com_query(
     start_seqno: u8,
     session_id: u32,
     conn_tx_id: spg_engine::TxId,
+    conn_state: &Arc<crate::ConnState>,
 ) -> std::io::Result<()> {
+    let _scope = StatementScope::begin(conn_state, sql);
     // Run the SQL through the engine. Mirrors pgwire's 'Q' (simple
     // query) path: dispatched into this connection's own transaction
     // slot so `BEGIN` / `COMMIT` / `ROLLBACK` bracket the connection's
@@ -802,6 +895,10 @@ fn handle_com_query(
     // statement ran: a BEGIN reports IN_TRANS on its own reply, and a
     // COMMIT reports it cleared on its.
     let status = tx_status(state, conn_tx_id);
+    conn_state.in_transaction.store(
+        status & SERVER_STATUS_IN_TRANS != 0,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     match outcome {
         Err(e) => {
             // Map engine errors to MySQL errno 1064 (parse / unsupported)
@@ -954,6 +1051,7 @@ fn handle_com_stmt_execute(
     start_seqno: u8,
     session_id: u32,
     conn_tx_id: spg_engine::TxId,
+    conn_state: &Arc<crate::ConnState>,
 ) -> std::io::Result<()> {
     if payload.len() < 9 {
         return write_packet(
@@ -980,6 +1078,8 @@ fn handle_com_stmt_execute(
             );
         }
     };
+
+    let _scope = StatementScope::begin(conn_state, &entry.sql);
 
     // Parse parameters per the binary protocol.
     let params = match parse_execute_params(&entry, &payload[9..]) {
@@ -1021,6 +1121,10 @@ fn handle_com_stmt_execute(
         (engine.execute_prepared_in(stmt, &params, conn_tx_id), render)
     };
     let status = tx_status(state, conn_tx_id);
+    conn_state.in_transaction.store(
+        status & SERVER_STATUS_IN_TRANS != 0,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // v7.33 (A1) — persist the prepared write before acking (was
     // non-durable pre-7.33, lost on crash).
     let outcome = match render {

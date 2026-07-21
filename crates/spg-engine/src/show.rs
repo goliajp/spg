@@ -231,10 +231,21 @@ impl Engine {
         QueryResult::Rows { columns, rows }
     }
 
-    /// v7.17.0 Phase 3.P0-62 — `SHOW PROCESSLIST`. SPG is
-    /// single-process so the surface returns one synthetic row
-    /// describing the current connection (Id, User, Host, db,
-    /// Command, Time, State, Info).
+    /// v7.17.0 Phase 3.P0-62 — `SHOW PROCESSLIST`.
+    ///
+    /// v7.39 (round 317, V36) — the LIVE connections, read through the
+    /// same activity provider `spg_stat_activity` uses. It used to be a
+    /// single hardcoded row (`Id` 1, user "postgres", Info
+    /// "SHOW PROCESSLIST") no matter how many clients were attached, so
+    /// the one MySQL surface an operator reaches for to find a runaway
+    /// connection could never show one. Measured against MariaDB 11: `Id`
+    /// is the connection's own `CONNECTION_ID()`, an idle connection
+    /// reports Command `Sleep` with NULL `Info`, and a busy one reports
+    /// `Query` with the statement text.
+    ///
+    /// A host with no provider registered (the embedded path, which has
+    /// exactly one logical connection and no registry) keeps the single
+    /// self row.
     pub(crate) fn exec_show_processlist(&self) -> QueryResult {
         let columns = alloc::vec![
             ColumnSchema::new("Id", DataType::Int, false),
@@ -246,16 +257,43 @@ impl Engine {
             ColumnSchema::new("State", DataType::Text, true),
             ColumnSchema::new("Info", DataType::Text, true),
         ];
-        let rows = alloc::vec![Row::new(alloc::vec![
-            Value::Int(1),
-            Value::text("postgres"),
-            Value::text("localhost"),
-            Value::text("postgres"),
-            Value::text::<String>("Query".into()),
-            Value::Int(0),
-            Value::text::<String>("executing".into()),
-            Value::text::<String>("SHOW PROCESSLIST".into()),
-        ])];
+        let Some(provider) = self.activity_provider else {
+            let rows = alloc::vec![Row::new(alloc::vec![
+                Value::Int(1),
+                Value::text("postgres"),
+                Value::text("localhost"),
+                Value::text("postgres"),
+                Value::text::<String>("Query".into()),
+                Value::Int(0),
+                Value::text::<String>("executing".into()),
+                Value::text::<String>("SHOW PROCESSLIST".into()),
+            ])];
+            return QueryResult::Rows { columns, rows };
+        };
+        let rows: Vec<Row<'static>> = provider()
+            .into_iter()
+            .map(|r| {
+                let idle = r.current_sql.is_empty();
+                Row::new(alloc::vec![
+                    Value::Int(i32::try_from(r.pid).unwrap_or(i32::MAX)),
+                    Value::text(r.user),
+                    Value::text("localhost"),
+                    Value::text("postgres"),
+                    Value::text(if idle { "Sleep" } else { "Query" }),
+                    Value::Int(i32::try_from(r.elapsed_us / 1_000_000).unwrap_or(i32::MAX)),
+                    if r.wait_event.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::text(r.wait_event)
+                    },
+                    if idle {
+                        Value::Null
+                    } else {
+                        Value::text(r.current_sql)
+                    },
+                ])
+            })
+            .collect();
         QueryResult::Rows { columns, rows }
     }
 

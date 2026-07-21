@@ -1524,11 +1524,12 @@ fn run_pg_session(
     };
     let conn_state = Arc::new(crate::ConnState {
         tx_id: conn_tx_id,
-        pid: std::process::id().wrapping_add(
-            state
-                .active_connections
-                .load(std::sync::atomic::Ordering::Relaxed) as u32,
-        ),
+        // v7.39 (round 317, V36) — from the process-wide allocator. The
+        // old `process::id() + active_connections` repeated an id as soon
+        // as one connection left and another arrived, so two LIVE backends
+        // could answer the same `pg_backend_pid()` and a CancelRequest
+        // could not name one of them.
+        pid: crate::alloc_conn_id(),
         user: user.clone(),
         started_at_us: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3958,7 +3959,7 @@ fn statement_cancel<'a>(
 /// v7.39 — a per-connection cancel secret. Not cryptographic (PG's
 /// is a plain 32-bit value too); mixed from the thread-unique
 /// RandomState hasher so parallel connections don't collide.
-fn new_cancel_secret() -> u32 {
+pub(crate) fn new_cancel_secret() -> u32 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u64(
