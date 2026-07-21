@@ -809,3 +809,43 @@ fn kill_query_leaves_the_connection_alive() {
         "KILL QUERY must not end the connection"
     );
 }
+
+/// V52 (round 319) — the Host and db columns describe the connection.
+/// `Host` was a hardcoded "localhost" and `db` a hardcoded "postgres" for
+/// every row. Measured on MariaDB 11: `Host` is `addr:port` for a TCP
+/// client, `db` is the database that connection selected, NULL when it
+/// selected none.
+#[test]
+fn processlist_host_and_db_describe_the_connection() {
+    let (_guard, addr) = spawn();
+    let (mut s, my_id) = auth_open_mode_with_id(&addr);
+    let local = s.local_addr().unwrap();
+
+    let own_row = |s: &mut TcpStream| {
+        query_rows(s, "SHOW PROCESSLIST")
+            .into_iter()
+            .find(|r| r[0].as_deref() == Some(my_id.to_string().as_str()))
+            .expect("our own row")
+    };
+
+    let row = own_row(&mut s);
+    assert_eq!(
+        row[2].as_deref(),
+        Some(format!("{}:{}", local.ip(), local.port()).as_str()),
+        "Host is the peer address"
+    );
+    assert_eq!(row[3], None, "no database selected yet");
+
+    // COM_INIT_DB — what a client sends for `USE shop`.
+    let mut pkt = vec![0x02];
+    pkt.extend_from_slice(b"shop");
+    write_packet(&mut s, 0, &pkt);
+    let (_seq, ok) = read_packet(&mut s);
+    assert_eq!(ok[0], 0x00, "COM_INIT_DB accepted");
+
+    assert_eq!(
+        own_row(&mut s)[3].as_deref(),
+        Some("shop"),
+        "db follows the selected database"
+    );
+}

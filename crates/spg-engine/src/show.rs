@@ -277,8 +277,22 @@ impl Engine {
                 Row::new(alloc::vec![
                     Value::Int(i32::try_from(r.pid).unwrap_or(i32::MAX)),
                     Value::text(r.user),
-                    Value::text("localhost"),
-                    Value::text("postgres"),
+                    // Measured on MariaDB 11: `Host` is `addr:port` for a
+                    // TCP client and `localhost` for a unix socket. SPG
+                    // reported a hardcoded "localhost" for every row.
+                    if r.client_addr.is_empty() {
+                        Value::text("localhost")
+                    } else {
+                        Value::text(alloc::format!("{}:{}", r.client_addr, r.client_port))
+                    },
+                    // …and `db` is the database that connection selected,
+                    // NULL when it selected none. This was hardcoded
+                    // "postgres".
+                    if r.database.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::text(r.database)
+                    },
                     Value::text(if idle { "Sleep" } else { "Query" }),
                     Value::Int(i32::try_from(r.elapsed_us / 1_000_000).unwrap_or(i32::MAX)),
                     if r.wait_event.is_empty() {
