@@ -3699,10 +3699,94 @@ pub struct FunctionDef {
     pub acl: Vec<AclItem>,
 }
 
-/// v7.39 (read01 round 62) — the canonical key for one function overload:
-/// `name(type, type)`, lower-cased, with PG's type aliases folded together so
-/// `f(integer)` and `f(int)` are the SAME function (which they are).
+/// v7.39 (round 315, V19) — which catalogued function does a persisted
+/// ACL key refer to?
+///
+/// The key was computed by whichever formula was current when the image
+/// was written, and the multi-word fix changed that formula for bare
+/// types like `double precision`. A miss therefore does NOT mean "no
+/// such function": an older image's key would land nowhere and its owner
+/// and grants would be dropped in silence. Exact match first, then the
+/// pre-fix formula.
 #[must_use]
+pub fn resolve_stored_function_key(
+    functions: &BTreeMap<String, FunctionDef>,
+    stored: &str,
+) -> Option<String> {
+    if functions.contains_key(stored) {
+        return Some(stored.to_string());
+    }
+    functions
+        .values()
+        .find(|f| function_signature_key_legacy(&f.name, &f.args_repr) == stored)
+        .map(|f| function_signature_key(&f.name, &f.args_repr))
+}
+
+/// v7.39 (round 315, V19) — does this whole phrase name a type, rather
+/// than being `name TYPE`?
+///
+/// The multi-word spellings SQL allows for a bare argument type, each
+/// verified accepted by PG 18.4 as `CREATE FUNCTION f(<phrase>)`. A
+/// length or precision modifier is peeled first, so `character
+/// varying(64)` answers the same as `character varying`.
+#[must_use]
+pub fn is_multiword_type_phrase(phrase: &str) -> bool {
+    let t = phrase.trim().to_ascii_lowercase();
+    let base = t.split_once('(').map_or(t.as_str(), |(h, _)| h).trim();
+    matches!(
+        base,
+        "double precision"
+            | "character varying"
+            | "bit varying"
+            | "timestamp with time zone"
+            | "timestamp without time zone"
+            | "time with time zone"
+            | "time without time zone"
+            | "national character"
+            | "national character varying"
+    )
+}
+
+/// v7.39 (round 315, V19) — the signature key as computed BEFORE the
+/// multi-word fix, used only to recognise what an older image wrote.
+///
+/// The function catalogue recomputes its keys from the stored name and
+/// argument text on load, so it needs no migration. The ACL block does
+/// not: it persists the computed key as a string and matches on it. A
+/// key that changed shape would simply fail to match, and the owner and
+/// grants would be dropped without a word — so the loader falls back to
+/// this when the stored key finds nothing.
+#[must_use]
+pub fn function_signature_key_legacy(name: &str, args_repr: &str) -> String {
+    let inner = args_repr
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
+    let types: Vec<String> = if inner.trim().is_empty() {
+        Vec::new()
+    } else {
+        inner
+            .split(',')
+            .map(|part| {
+                let mut words: Vec<&str> = part.split_whitespace().collect();
+                if !words.is_empty()
+                    && (words[0].eq_ignore_ascii_case("OUT")
+                        || words[0].eq_ignore_ascii_case("INOUT"))
+                {
+                    words.remove(0);
+                }
+                let ty = if words.len() >= 2 {
+                    words[1..].join(" ")
+                } else {
+                    words.first().map_or(String::new(), |w| (*w).to_string())
+                };
+                normalize_type_name(&ty)
+            })
+            .collect()
+    };
+    format!("{}({})", name.to_ascii_lowercase(), types.join(","))
+}
+
 pub fn function_signature_key(name: &str, args_repr: &str) -> String {
     let types = function_arg_types(args_repr);
     format!("{}({})", name.to_ascii_lowercase(), types.join(","))
@@ -3730,11 +3814,19 @@ pub fn function_arg_types(args_repr: &str) -> Vec<String> {
             {
                 words.remove(0);
             }
-            // Two or more words = `name TYPE …`; one word = a bare TYPE.
-            let ty = if words.len() >= 2 {
+            // v7.39 (round 315, V19) — two or more words is USUALLY
+            // `name TYPE`, but not when the type itself is spelled in
+            // several words. `double precision` was read as a parameter
+            // named "double" of type "precision", so it keyed differently
+            // from `x double precision` — the same signature written two
+            // ways did not resolve to the same function. Decide by asking
+            // whether the whole phrase names a type first; only then is
+            // the leading word a parameter name.
+            let whole = words.join(" ");
+            let ty = if words.len() >= 2 && !is_multiword_type_phrase(&whole) {
                 words[1..].join(" ")
             } else {
-                words.first().map_or(String::new(), |w| (*w).to_string())
+                whole
             };
             normalize_type_name(&ty)
         })
@@ -8625,7 +8717,17 @@ impl Catalog {
                         None
                     };
                     let acl = read_acl(&mut cur)?;
-                    if let Some(f) = cat.functions.get_mut(&name) {
+                    // v7.39 (round 315, V19) — the stored key was computed
+                    // by whichever formula was current when the image was
+                    // written. A miss is not "no such function": before the
+                    // multi-word fix, `f(double precision)` keyed as
+                    // `f(precision)`, so an older image's grants would land
+                    // nowhere and vanish silently. Fall back to matching by
+                    // the old formula, which re-attaches them.
+                    let target = resolve_stored_function_key(&cat.functions, &name);
+                    if let Some(k) = target
+                        && let Some(f) = cat.functions.get_mut(&k)
+                    {
                         f.owner = owner;
                         f.acl = acl;
                     }
