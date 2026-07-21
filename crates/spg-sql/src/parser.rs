@@ -9871,6 +9871,9 @@ impl Parser {
             "pg_replication_slots",
             "pg_roles",
             // v7.39 (round 143) — the rewrite-rule listing view.
+            // v7.39 (round 312) — and the rule catalogue itself, which
+            // `pg_get_ruledef(oid)` resolves against.
+            "pg_rewrite",
             "pg_rules",
             "pg_sequence",
             "pg_settings",

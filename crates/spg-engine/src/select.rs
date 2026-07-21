@@ -728,6 +728,13 @@ impl Engine {
                         crate::system_catalog::synth_pg_rules(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.39 (round 312) — pg_catalog.pg_rewrite: the rule
+                // catalogue `pg_get_ruledef(oid)` resolves against.
+                "__spg_pg_rewrite" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_rewrite(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.17.0 Phase 3.P0-56 — pg_catalog.pg_matviews.
                 // SPG has no materialised view surface yet so the
                 // table shares pg_views's schema but stays empty.

@@ -14172,11 +14172,49 @@ fn apply_function_dispatch(
             Some(Value::Text(s)) => Ok(Value::text(s.clone())),
             _ => Ok(Value::Null),
         },
-        "pg_get_functiondef"
-        | "pg_get_triggerdef"
-        | "pg_get_ruledef"
-        | "pg_get_partkeydef"
-        | "pg_get_statisticsobjdef" => Ok(Value::Null),
+        // v7.39 (round 312, V33) — the function and rule deparses. Both
+        // were stubs answering NULL; PG returns a complete, re-runnable
+        // statement, which is what reflection tooling and pg_dump read.
+        "pg_get_functiondef" => {
+            let (Some(cat), Some(oid)) = (ctx.catalog, oid_arg(args.first())) else {
+                return Ok(Value::Null);
+            };
+            let (_, rows) = crate::system_catalog::synth_pg_proc(cat);
+            // Resolve against the synth view's own oid assignment, the
+            // way pg_get_constraintdef does — the forward and reverse
+            // directions then cannot drift apart.
+            let Some(name) = rows
+                .iter()
+                .find(|r| matches!(r.values.first(), Some(Value::BigInt(n)) if *n == oid))
+                .and_then(|r| r.values.get(1))
+                .and_then(|v| match v {
+                    Value::Text(s) => Some(s.to_string()),
+                    _ => None,
+                })
+            else {
+                return Ok(Value::Null);
+            };
+            let Some(def) = cat.functions().values().find(|f| f.name == name) else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::text(crate::system_catalog::render_function_def(def)))
+        }
+        "pg_get_ruledef" => {
+            let (Some(cat), Some(oid)) = (ctx.catalog, oid_arg(args.first())) else {
+                return Ok(Value::Null);
+            };
+            let idx = usize::try_from(oid - crate::system_catalog::RULE_OID_BASE).ok();
+            let Some(rule) = idx.and_then(|i| cat.rules().get(i)) else {
+                return Ok(Value::Null);
+            };
+            // The pretty spelling drops the schema qualification; that is
+            // the only thing the second argument changes here (measured).
+            let pretty = matches!(args.get(1), Some(Value::Bool(true)));
+            Ok(Value::text(crate::system_catalog::render_rule_def(
+                rule, !pretty,
+            )))
+        }
+        "pg_get_triggerdef" | "pg_get_partkeydef" | "pg_get_statisticsobjdef" => Ok(Value::Null),
         // pg_get_userbyid always returns "admin" — SPG's single-user
         // model; matches CURRENT_USER default.
         // v7.39 (read01 round 51) — SPG has one login identity per session, so
@@ -17954,3 +17992,14 @@ fn current_or_assign_xid(ctx: &EvalContext<'_>) -> u64 {
     ctx.assigned_xid.set(Some(v));
     v
 }
+
+/// v7.39 (round 312) — read an oid-shaped argument in any integer width.
+fn oid_arg(v: Option<&Value>) -> Option<i64> {
+    match v? {
+        Value::Int(n) => Some(i64::from(*n)),
+        Value::BigInt(n) => Some(*n),
+        Value::SmallInt(n) => Some(i64::from(*n)),
+        _ => None,
+    }
+}
+
