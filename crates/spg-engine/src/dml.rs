@@ -848,6 +848,9 @@ impl Engine {
         // expression, so the predicate — evaluated against the pre-image row —
         // reproduces the rule's post-image test. RETURNING on a fully suppressed
         // statement is rejected as PG does.
+        // v7.39 (round 333, V59) — the statement as the caller wrote it: a
+        // conditional instead-command rule's action runs against THESE rows.
+        let unnarrowed_upd = stmt;
         let rule_blocked_upd;
         let upd_block = if self.rule_blocks_statement(&stmt.table, "UPDATE") {
             if stmt.returning.is_some() {
@@ -873,8 +876,22 @@ impl Engine {
         // NEW per matching row. The guard bounds a rule → update cycle.
         if !self.rule_rewrite_active {
             let instead_upd = self.instead_command_rules(&stmt.table, "UPDATE");
-            if !instead_upd.is_empty() {
-                return self.exec_update_instead_command(stmt, instead_upd, cancel);
+            // v7.39 (round 333, V59) — an UNCONDITIONAL instead-command rule
+            // replaces the statement; a CONDITIONAL one only claims the rows
+            // its WHERE holds for, and the rest still run the original (the
+            // block predicate above has already removed them from it).
+            let (uncond, cond): (Vec<_>, Vec<_>) = instead_upd
+                .into_iter()
+                .partition(|r| r.when_condition.is_empty());
+            if !uncond.is_empty() {
+                let mut all = uncond;
+                all.extend(cond);
+                return self.exec_update_instead_command(unnarrowed_upd, all, cancel);
+            }
+            if !cond.is_empty() {
+                // The actions must see the rows the CALLER asked for, not the
+                // narrowed set — those are exactly the rows they replace.
+                self.run_update_instead_actions(unnarrowed_upd, &cond, cancel)?;
             }
             let also_upd = self.also_rules(&stmt.table, "UPDATE");
             if !also_upd.is_empty() {
@@ -2588,6 +2605,9 @@ impl Engine {
         // rule does not block are deleted. Either way the normal path runs so the
         // `DELETE n` tag / RETURNING stay byte-identical. A RETURNING on a fully
         // (unconditionally) suppressed statement is rejected as PG does.
+        // v7.39 (round 333, V59) — as the caller wrote it; the conditional
+        // instead-command action runs against THESE rows.
+        let unnarrowed_del = stmt;
         let rule_blocked_del;
         let del_block = if self.rule_blocks_statement(&stmt.table, "DELETE") {
             if stmt.returning.is_some() {
@@ -2613,8 +2633,22 @@ impl Engine {
         // matching row. The guard bounds a rule → delete cycle.
         if !self.rule_rewrite_active {
             let instead_del = self.instead_command_rules(&stmt.table, "DELETE");
-            if !instead_del.is_empty() {
-                return self.exec_delete_instead_command(stmt, instead_del, cancel);
+            // v7.39 (round 333, V59) — see the UPDATE path: unconditional
+            // replaces the statement, conditional only claims its own rows.
+            let (uncond, cond): (Vec<_>, Vec<_>) = instead_del
+                .into_iter()
+                .partition(|r| r.when_condition.is_empty());
+            if !uncond.is_empty() {
+                let mut all = uncond;
+                all.extend(cond);
+                return self.exec_delete_instead_command(unnarrowed_del, all, cancel);
+            }
+            if !cond.is_empty() {
+                let (columns, old_rows) =
+                    self.scan_relation_rows(&unnarrowed_del.table, &unnarrowed_del.where_, cancel)?;
+                let rows: Vec<(Option<Row<'static>>, Option<Row<'static>>)> =
+                    old_rows.into_iter().map(|r| (None, Some(r))).collect();
+                self.run_also_rules(&cond, &columns, &rows, cancel)?;
             }
             let also_del = self.also_rules(&stmt.table, "DELETE");
             if !also_del.is_empty() {
@@ -3447,6 +3481,37 @@ impl Engine {
         })
     }
 
+    /// v7.39 (round 333, V59) — run a conditional `DO INSTEAD <command>`
+    /// rule's action for the rows it claims, WITHOUT suppressing the
+    /// original statement. `build_also_rule_stmts` applies each rule's own
+    /// WHERE per row, so a row the condition misses contributes nothing
+    /// here and is left to the (already narrowed) original.
+    fn run_update_instead_actions(
+        &mut self,
+        stmt: &spg_sql::ast::UpdateStatement,
+        rules: &[spg_storage::RuleDef],
+        cancel: CancelToken<'_>,
+    ) -> Result<(), EngineError> {
+        let (columns, old_rows) = self.scan_relation_rows(&stmt.table, &stmt.where_, cancel)?;
+        let mut pairs: Vec<(Option<Row<'static>>, Option<Row<'static>>)> =
+            Vec::with_capacity(old_rows.len());
+        {
+            let ctx = self.ev_ctx(&columns, Some(&stmt.table));
+            for old in &old_rows {
+                let mut new_vals = old.values.clone();
+                for (col, expr) in &stmt.assignments {
+                    let pos = columns.iter().position(|c| &c.name == col).ok_or_else(|| {
+                        EngineError::Eval(EvalError::ColumnNotFound { name: col.clone() })
+                    })?;
+                    new_vals[pos] =
+                        self.eval_expr_with_correlated(expr, old, &ctx, cancel, None)?;
+                }
+                pairs.push((Some(Row::new(new_vals)), Some(old.clone())));
+            }
+        }
+        self.run_also_rules(rules, &columns, &pairs, cancel)
+    }
+
     /// v7.39 (round 140) — a DELETE carrying DO ALSO rules: capture the OLD rows
     /// first, run the real delete with rule rewrite suppressed, then fire each
     /// rule's command once per deleted row (OLD bound, no NEW).
@@ -3934,6 +3999,32 @@ impl Engine {
         // rows a rule's WHERE (over NEW = the post-default row) blocks, before any
         // constraint check, matching PG's query-rewrite ordering.
         let cond_ins = self.conditional_instead_nothing_rules(&stmt.table, "INSERT");
+        // v7.39 (round 333, V59) — a conditional INSTEAD rule that carries a
+        // COMMAND runs it for the rows it claims, and those rows are then
+        // dropped from the original INSERT by the same filter that serves
+        // the NOTHING form. Measured on PG 18.4: with `WHERE new.id < 0 DO
+        // INSTEAD INSERT INTO q59 …`, inserting (1, -1, 2, -2) answers
+        // `INSERT 0 2`, leaves 1 and 2 in the table and -1 / -2 in q59.
+        {
+            let cond_cmd: Vec<spg_storage::RuleDef> = cond_ins
+                .iter()
+                .filter(|r| !r.commands.is_empty())
+                .cloned()
+                .collect();
+            if !cond_cmd.is_empty() {
+                if stmt.returning.is_some() {
+                    return Err(crate::rules::rule_returning_error("INSERT", &stmt.table));
+                }
+                // `build_also_rule_stmts` applies each rule's own WHERE per
+                // row, so handing it every proposed row fires only the
+                // claimed ones.
+                let pairs: Vec<(Option<Row<'static>>, Option<Row<'static>>)> = all_values
+                    .iter()
+                    .map(|v| (Some(Row::new(v.clone())), None))
+                    .collect();
+                self.run_also_rules(&cond_cmd, &column_meta, &pairs, CancelToken::none())?;
+            }
+        }
         if !cond_ins.is_empty() {
             let mut kept: Vec<Vec<Value<'static>>> = Vec::with_capacity(all_values.len());
             for row in all_values {
@@ -3961,7 +4052,13 @@ impl Engine {
         // lands in it); the command runs once per proposed row with NEW = the
         // post-default tuple. PG reports the SOURCE row count in the tag
         // (`INSERT 0 n`) and rejects an outer RETURNING.
-        let instead_ins = self.instead_command_rules(&stmt.table, "INSERT");
+        let instead_ins: Vec<spg_storage::RuleDef> = self
+            .instead_command_rules(&stmt.table, "INSERT")
+            .into_iter()
+            // v7.39 (round 333, V59) — only the UNCONDITIONAL ones replace
+            // the statement; the conditional ones were handled above.
+            .filter(|r| r.when_condition.is_empty())
+            .collect();
         if !instead_ins.is_empty() {
             if stmt.returning.is_some() {
                 return Err(crate::rules::rule_returning_error("INSERT", &stmt.table));
