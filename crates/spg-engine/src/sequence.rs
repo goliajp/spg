@@ -478,6 +478,16 @@ impl Engine {
                 | "lo_unlink"
                 | "lo_create"
                 | "lo_creat"
+                | "lo_open"
+                | "loread"
+                | "lowrite"
+                | "lo_lseek"
+                | "lo_lseek64"
+                | "lo_tell"
+                | "lo_tell64"
+                | "lo_close"
+                | "lo_truncate"
+                | "lo_truncate64"
         ) {
             return Ok(None);
         }
@@ -583,7 +593,168 @@ impl Engine {
                     Err(missing(oid))
                 }
             }
+            // ---- the descriptor family (round 306, V28) -------------
+            //
+            // These share one session-scoped table, emptied when the
+            // transaction ends. Modes are PG's: INV_WRITE 0x20000,
+            // INV_READ 0x40000. Only the write bit is remembered —
+            // reading needs no permission in PG (measured: a
+            // write-only descriptor reads fine).
+            "lo_open" => {
+                let (Some(oid), Some(mode)) = (int_arg(0), int_arg(1)) else {
+                    return Ok(None);
+                };
+                if mode & 0x0006_0000 == 0 {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "invalid flags for opening a large object: {mode}"
+                    )));
+                }
+                let key = u32::try_from(oid).map_err(|_| missing(oid))?;
+                if self.active_catalog().large_object(key).is_none() {
+                    return Err(missing(oid));
+                }
+                let fd = self.lo_next_fd;
+                self.lo_next_fd = self.lo_next_fd.saturating_add(1);
+                self.lo_descriptors.insert(
+                    fd,
+                    crate::LargeObjectDescriptor {
+                        oid: key,
+                        pos: 0,
+                        writable: mode & 0x0002_0000 != 0,
+                    },
+                );
+                Ok(Some(Value::Int(fd)))
+            }
+            "loread" => {
+                let (Some(fd), Some(len)) = (int_arg(0), int_arg(1)) else {
+                    return Ok(None);
+                };
+                let d = *self.lo_descriptor(fd)?;
+                let all = self
+                    .active_catalog()
+                    .large_object(d.oid)
+                    .ok_or_else(|| missing(i64::from(d.oid)))?;
+                let start = usize::try_from(d.pos).unwrap_or(usize::MAX).min(all.len());
+                // A negative length reads nothing — PG answers an empty
+                // bytea rather than erroring.
+                let want = usize::try_from(len).unwrap_or(0);
+                let end = start.saturating_add(want).min(all.len());
+                let out = all[start..end].to_vec();
+                self.lo_descriptor_mut(fd)?.pos = end as u64;
+                Ok(Some(Value::Bytes(out.into())))
+            }
+            "lowrite" => {
+                let (Some(fd), Some(data)) = (int_arg(0), bytes_arg(1)) else {
+                    return Ok(None);
+                };
+                let d = *self.lo_descriptor(fd)?;
+                if !d.writable {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "large object descriptor {fd} was not opened for writing"
+                    )));
+                }
+                let at = usize::try_from(d.pos).unwrap_or(usize::MAX);
+                // `put_large_object` zero-fills a gap, which is what PG
+                // does when the position is past the end.
+                self.active_catalog_mut()
+                    .put_large_object(d.oid, at, &data)
+                    .map_err(EngineError::Unsupported)?;
+                let written = data.len();
+                self.lo_descriptor_mut(fd)?.pos = d.pos.saturating_add(written as u64);
+                Ok(Some(Value::Int(i32::try_from(written).unwrap_or(0))))
+            }
+            "lo_lseek" | "lo_lseek64" => {
+                let (Some(fd), Some(off), Some(whence)) =
+                    (int_arg(0), int_arg(1), int_arg(2))
+                else {
+                    return Ok(None);
+                };
+                let d = *self.lo_descriptor(fd)?;
+                let size = self
+                    .active_catalog()
+                    .large_object(d.oid)
+                    .map_or(0i64, |b| b.len() as i64);
+                let base = match whence {
+                    0 => 0,
+                    1 => i64::try_from(d.pos).unwrap_or(i64::MAX),
+                    2 => size,
+                    _ => {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "invalid whence setting: {whence}"
+                        )));
+                    }
+                };
+                let target = base.saturating_add(off);
+                if target < 0 {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "invalid large object seek target: {target}"
+                    )));
+                }
+                self.lo_descriptor_mut(fd)?.pos = target as u64;
+                Ok(Some(if lc == "lo_lseek" {
+                    Value::Int(i32::try_from(target).unwrap_or(i32::MAX))
+                } else {
+                    Value::BigInt(target)
+                }))
+            }
+            "lo_tell" | "lo_tell64" => {
+                let Some(fd) = int_arg(0) else {
+                    return Ok(None);
+                };
+                let pos = i64::try_from(self.lo_descriptor(fd)?.pos).unwrap_or(i64::MAX);
+                Ok(Some(if lc == "lo_tell" {
+                    Value::Int(i32::try_from(pos).unwrap_or(i32::MAX))
+                } else {
+                    Value::BigInt(pos)
+                }))
+            }
+            "lo_close" => {
+                let Some(fd) = int_arg(0) else {
+                    return Ok(None);
+                };
+                // Validate before removing so a stale descriptor gets
+                // the same wording every other call does.
+                self.lo_descriptor(fd)?;
+                let key = i32::try_from(fd).unwrap_or(-1);
+                self.lo_descriptors.remove(&key);
+                Ok(Some(Value::Int(0)))
+            }
+            "lo_truncate" | "lo_truncate64" => {
+                let (Some(fd), Some(len)) = (int_arg(0), int_arg(1)) else {
+                    return Ok(None);
+                };
+                let d = *self.lo_descriptor(fd)?;
+                if !d.writable {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "large object descriptor {fd} was not opened for writing"
+                    )));
+                }
+                self.active_catalog_mut()
+                    .truncate_large_object(d.oid, usize::try_from(len).unwrap_or(0))
+                    .map_err(EngineError::Unsupported)?;
+                Ok(Some(Value::Int(0)))
+            }
             _ => Ok(None),
         }
+    }
+
+    /// Look up an open descriptor, with PG's wording for a stale or
+    /// never-opened one. The same message covers "closed", "from a
+    /// finished transaction", and "never existed" — as it does in PG.
+    fn lo_descriptor(&self, fd: i64) -> Result<&crate::LargeObjectDescriptor, EngineError> {
+        let key = i32::try_from(fd).unwrap_or(-1);
+        self.lo_descriptors.get(&key).ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!("invalid large-object descriptor: {fd}"))
+        })
+    }
+
+    fn lo_descriptor_mut(
+        &mut self,
+        fd: i64,
+    ) -> Result<&mut crate::LargeObjectDescriptor, EngineError> {
+        let key = i32::try_from(fd).unwrap_or(-1);
+        self.lo_descriptors.get_mut(&key).ok_or_else(|| {
+            EngineError::Unsupported(alloc::format!("invalid large-object descriptor: {fd}"))
+        })
     }
 }

@@ -4947,6 +4947,19 @@ impl Catalog {
         Ok(())
     }
 
+    /// v7.39 (round 306) — `lo_truncate`. PG's truncate sets the object
+    /// to exactly `len` bytes in BOTH directions: it shortens, and it
+    /// GROWS with zero fill when `len` exceeds the current size
+    /// (measured — `lo_truncate(fd, 8)` over a 4-byte object leaves
+    /// eight bytes, the last four zero).
+    pub fn truncate_large_object(&mut self, oid: u32, len: usize) -> Result<(), String> {
+        let Some(buf) = self.large_objects.get_mut(&oid) else {
+            return Err(format!("large object {oid} does not exist"));
+        };
+        buf.resize(len, 0);
+        Ok(())
+    }
+
     /// Remove a large object. `false` when the OID was not there.
     pub fn unlink_large_object(&mut self, oid: u32) -> bool {
         self.large_objects.remove(&oid).is_some()

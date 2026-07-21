@@ -581,6 +581,28 @@ pub(crate) struct SessionBag {
     pub(crate) session_params: BTreeMap<String, String>,
     pub(crate) backslash_escapes: bool,
     pub(crate) prepared_statements: BTreeMap<String, PreparedSqlStatement>,
+    /// v7.39 (round 306) — open large-object descriptors. Per session
+    /// from the start, deliberately: r277/r279/r283 each landed a piece
+    /// of per-connection state on the process-wide engine first and had
+    /// to be unpicked afterwards, so this one never gets a process-wide
+    /// version to regress from. PG additionally scopes descriptors to
+    /// the transaction, so the table is emptied at COMMIT / ROLLBACK.
+    pub(crate) lo_descriptors: BTreeMap<i32, LargeObjectDescriptor>,
+    /// Next descriptor number to hand out. PG starts at 0 and counts up
+    /// within a transaction, restarting once the transaction ends.
+    pub(crate) lo_next_fd: i32,
+}
+
+/// v7.39 (round 306) — one open large-object descriptor.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LargeObjectDescriptor {
+    pub(crate) oid: u32,
+    /// Byte offset the next read / write starts at.
+    pub(crate) pos: u64,
+    /// Whether the descriptor was opened with `INV_WRITE`. Reads need no
+    /// permission at all in PG — a write-only descriptor reads fine —
+    /// so only this half is worth remembering.
+    pub(crate) writable: bool,
 }
 
 /// v7.39 (round 277) — one SQL-level prepared statement.
@@ -795,6 +817,10 @@ pub struct Engine {
     /// preamble) turns it off. The plan cache is cleared on every
     /// flip — the same SQL text lexes differently per dialect.
     backslash_escapes: bool,
+    /// v7.39 (round 306) — the live session's open large-object
+    /// descriptors, swapped in and out with the rest of its bag.
+    pub(crate) lo_descriptors: BTreeMap<i32, LargeObjectDescriptor>,
+    pub(crate) lo_next_fd: i32,
     /// v7.37.17 — name of the sequence most recently advanced by
     /// nextval() in this Engine (session). Backs PG's lastval().
     /// None until the first nextval; PG errors in that state.
@@ -1111,6 +1137,8 @@ impl Engine {
             tx_catalogs: BTreeMap::new(),
             current_tx: None,
             backslash_escapes: false,
+            lo_descriptors: BTreeMap::new(),
+            lo_next_fd: 0,
             prepared_statements: alloc::collections::BTreeMap::new(),
             current_session: 0,
             sessions: BTreeMap::new(),
@@ -1482,6 +1510,8 @@ impl Engine {
             tx_catalogs: BTreeMap::new(),
             current_tx: None,
             backslash_escapes: false,
+            lo_descriptors: BTreeMap::new(),
+            lo_next_fd: 0,
             prepared_statements: alloc::collections::BTreeMap::new(),
             current_session: 0,
             sessions: BTreeMap::new(),
@@ -1593,6 +1623,8 @@ impl Engine {
                     tx_catalogs: BTreeMap::new(),
                     current_tx: None,
                     backslash_escapes: false,
+                    lo_descriptors: BTreeMap::new(),
+                    lo_next_fd: 0,
                     prepared_statements: alloc::collections::BTreeMap::new(),
                     current_session: 0,
                     sessions: BTreeMap::new(),
@@ -1694,12 +1726,16 @@ impl Engine {
             session_params: core::mem::take(&mut self.session_params),
             backslash_escapes: self.backslash_escapes,
             prepared_statements: core::mem::take(&mut self.prepared_statements),
+            lo_descriptors: core::mem::take(&mut self.lo_descriptors),
+            lo_next_fd: self.lo_next_fd,
         };
         self.sessions.insert(self.current_session, outgoing);
         let incoming = self.sessions.remove(&id).unwrap_or_default();
         self.session_params = incoming.session_params;
         self.backslash_escapes = incoming.backslash_escapes;
         self.prepared_statements = incoming.prepared_statements;
+        self.lo_descriptors = incoming.lo_descriptors;
+        self.lo_next_fd = incoming.lo_next_fd;
         self.current_session = id;
         self.plan_cache.clear();
     }
@@ -1714,6 +1750,8 @@ impl Engine {
             self.session_params.clear();
             self.prepared_statements.clear();
             self.backslash_escapes = false;
+            self.lo_descriptors.clear();
+            self.lo_next_fd = 0;
             self.current_session = 0;
         }
     }
