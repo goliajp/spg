@@ -2854,6 +2854,9 @@ fn coerce_text_array_to(
         DataType::TimestampArray => DataType::Timestamp,
         DataType::TimestamptzArray => DataType::Timestamptz,
         DataType::UuidArray => DataType::Uuid,
+        // v7.39 (round 326, V43) — INTERVAL[] joined the covered set;
+        // `'{1 day}'::interval[]` used to fail as a plain type mismatch.
+        DataType::IntervalArray => DataType::Interval,
         _ => return Ok(None),
     };
     let mut scal: alloc::vec::Vec<Option<Value<'static>>> =
@@ -2916,6 +2919,24 @@ fn coerce_text_array_to(
                     o.map(|v| match v {
                         Value::Uuid(u) => u,
                         _ => [0u8; 16],
+                    })
+                })
+                .collect(),
+        ),
+        DataType::IntervalArray => Value::IntervalArray(
+            scal.into_iter()
+                .map(|o| {
+                    o.and_then(|v| match v {
+                        Value::Interval {
+                            months,
+                            days,
+                            micros,
+                        } => Some(spg_storage::IntervalSpan {
+                            months,
+                            days,
+                            micros,
+                        }),
+                        _ => None,
                     })
                 })
                 .collect(),
@@ -4963,8 +4984,27 @@ pub(crate) fn coerce_value(
             | DataType::DateArray
             | DataType::TimestampArray
             | DataType::TimestamptzArray
+            | DataType::IntervalArray
             | DataType::UuidArray),
         ) => coerce_text_array_to(items, dt, col_name)?,
+        // v7.39 (round 326, V43) — the same targets from a STRING LITERAL.
+        // `'{1,2}'::int[]` had a Text arm and worked; `'{…}'::timestamp[]`,
+        // `::timestamptz[]` and `::interval[]` had none, so the literal
+        // stayed TEXT and the cast died as a plain type mismatch — a whole
+        // literal form that simply did not exist for the temporal arrays.
+        (
+            Value::Text(s),
+            dt @ (DataType::TimestampArray
+            | DataType::TimestamptzArray
+            | DataType::IntervalArray),
+        ) => {
+            let items = decode_text_array_literal(&s).map_err(|_| {
+                EngineError::Eval(EvalError::TypeMismatch {
+                    detail: malformed_array_literal(&s),
+                })
+            })?;
+            coerce_text_array_to(items, dt, col_name)?
+        }
         (Value::TextArray(items), DataType::MoneyArray) if items.is_empty() => {
             Some(Value::MoneyArray(alloc::vec::Vec::new()))
         }
