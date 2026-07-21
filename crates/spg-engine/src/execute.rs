@@ -1386,6 +1386,7 @@ impl Engine {
             Statement::ShowVariables => Ok(self.exec_show_variables()),
             Statement::ShowProcesslist => Ok(self.exec_show_processlist()),
             Statement::Kill { query_only, id } => self.exec_kill(query_only, &id),
+            Statement::Discard(target) => self.exec_discard(target),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
             Statement::ShowPublications => Ok(self.exec_show_publications()),
@@ -1821,7 +1822,14 @@ impl Engine {
             Statement::DropSchema { names, if_exists } => self.exec_drop_schema(&names, if_exists),
             Statement::ResetParameter(target) => {
                 match target {
-                    None => self.session_params.clear(),
+                    // v7.39 (round 320, V53) — RESET ALL resets GUCs. It
+                    // must NOT throw away the two internal keys the server
+                    // parks in the same map: the connection's login
+                    // identity and its database. PG has no way to reset
+                    // those with RESET ALL (they are not GUCs), and
+                    // clearing them here made `current_user` fall back to
+                    // the admin default mid-session.
+                    None => self.reset_all_gucs(),
                     Some(name) => {
                         self.session_params.remove(&name.to_ascii_lowercase());
                     }

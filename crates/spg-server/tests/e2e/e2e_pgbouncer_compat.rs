@@ -125,7 +125,10 @@ fn discard_temp_sequences_plans_each_work() {
     for variant in ["DISCARD TEMP", "DISCARD SEQUENCES", "DISCARD PLANS"] {
         send_query(&mut s, variant);
         let msgs = read_until_ready(&mut s);
-        assert_cc_tag(&msgs, "DISCARD");
+        // v7.39 (round 320, V53) — PG tags each subform with the target
+        // it named (`DISCARD TEMP`, not a bare `DISCARD`); measured on
+        // PG 18.4. The bare tag was the canned short-circuit's invention.
+        assert_cc_tag(&msgs, variant);
     }
 }
 

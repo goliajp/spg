@@ -497,7 +497,10 @@ fn handle_pg_simple_query(
                 g.clone_from(&conn_state.startup_app_name);
             }
         };
-        if ci_eq(b, b"reset all") {
+        // v7.39 (round 320, V53) — DISCARD ALL includes RESET ALL, so it
+        // has to drop the wire cache too; otherwise SHOW kept serving an
+        // override the engine had already thrown away.
+        if ci_eq(b, b"reset all") || ci_starts_with(b, b"discard all") {
             settings.clear();
             restore_app_name(settings);
         } else if ci_starts_with(b, b"reset ") {
@@ -1202,7 +1205,9 @@ fn handle_pg_simple_query_one_into_wbuf(
                 g.clone_from(&conn_state.startup_app_name);
             }
         };
-        if ci_eq(b, b"reset all") {
+        // v7.39 (round 320, V53) — see the single-statement path: DISCARD
+        // ALL includes RESET ALL and must drop the wire cache with it.
+        if ci_eq(b, b"reset all") || ci_starts_with(b, b"discard all") {
             settings.clear();
             restore_app_name(settings);
         } else if ci_starts_with(b, b"reset ") {
@@ -2290,6 +2295,22 @@ fn command_tag(sql: &str, affected: usize) -> String {
         "UPDATE" => format!("UPDATE {affected}"),
         "DELETE" => format!("DELETE {affected}"),
         "BEGIN" => "BEGIN".to_string(),
+        // v7.39 (round 320, V53) — PG tags DISCARD with the target it
+        // named: `DISCARD ALL` / `DISCARD PLANS` / …
+        "DISCARD" => {
+            let target = sql
+                .trim_start()
+                .split_ascii_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .trim_end_matches(';')
+                .to_ascii_uppercase();
+            if target.is_empty() {
+                "DISCARD".to_string()
+            } else {
+                format!("DISCARD {target}")
+            }
+        }
         "COMMIT" => "COMMIT".to_string(),
         "ROLLBACK" => "ROLLBACK".to_string(),
         // v7.39 (round 219) — cursor command tags. MOVE reports the moved
@@ -2437,9 +2458,21 @@ fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse
             && let Ok(s) = core::str::from_utf8(rest_trim)
             && let Ok(n) = s.parse::<i64>()
         {
-            return Some(CannedResponse::Rows {
-                columns: vec![ColumnSchema::new("?column?", DataType::BigInt, false)],
-                rows: vec![Row::new(vec![Value::BigInt(n)])],
+            // v7.39 (round 320, V53) — PG types an integer literal that
+            // fits in int4 as `integer`, and only a wider one as `bigint`
+            // (`SELECT pg_typeof(1), pg_typeof(2147483648)` →
+            // `integer|bigint`). This fast path answered int8 for every
+            // literal, so the hottest query on the wire — `SELECT 1` —
+            // reported a type the engine itself does not.
+            return Some(match i32::try_from(n) {
+                Ok(small) => CannedResponse::Rows {
+                    columns: vec![ColumnSchema::new("?column?", DataType::Int, false)],
+                    rows: vec![Row::new(vec![Value::Int(small)])],
+                },
+                Err(_) => CannedResponse::Rows {
+                    columns: vec![ColumnSchema::new("?column?", DataType::BigInt, false)],
+                    rows: vec![Row::new(vec![Value::BigInt(n)])],
+                },
             });
         }
         if ci_eq(rest_trim, b"null") {
@@ -2458,53 +2491,41 @@ fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse
     // so `BEGIN ISOLATION LEVEL REPEATABLE READ; SHOW transaction_isolation`
     // wrongly reported "read committed". Let it fall through to the engine,
     // which reads the live `current_isolation_level`.
-    if ci_starts_with(b, b"show search_path") || ci_eq(b, b"show search_path") {
-        return Some(CannedResponse::single_text(
-            "search_path",
-            "\"$user\", public",
-        ));
-    }
-    if ci_starts_with(b, b"show standard_conforming_strings") {
-        return Some(CannedResponse::single_text(
-            "standard_conforming_strings",
-            "on",
-        ));
-    }
-    if ci_starts_with(b, b"select current_schema()")
-        || ci_eq(b, b"select current_schema()")
-        || ci_eq(b, b"select current_schema")
-    {
-        return Some(CannedResponse::single_text("current_schema", "public"));
-    }
+    // v7.39 (round 320, V53) — `SHOW search_path`, `SHOW
+    // standard_conforming_strings` and `SELECT current_schema()` are NO
+    // LONGER canned, for the reason round 118 un-canned `SHOW
+    // transaction_isolation` and round 319 un-canned `SELECT current_user`:
+    // each answered a fixed value that ignored the client's own `SET`.
+    // Measured on PG 18.4: `SET search_path TO app` makes both
+    // `SHOW search_path` and `current_schema()` report `app`, and
+    // `SET standard_conforming_strings = off` is visible in SHOW. The
+    // engine tracks all three.
     // v7.39 (round 319, V52) — `SELECT current_user` is NO LONGER canned
     // here, for the same reason round 118 un-canned `SHOW
     // transaction_isolation`: a hardcoded "admin" shadowed the engine
     // handler, so it reported neither the identity the client connected as
     // nor the effect of a `SET ROLE`. The engine resolves both.
-    // ---- v4.15 pgbouncer compat: connection-reset statements ----
-    // pgbouncer issues these between pooled client sessions to
-    // wipe per-connection state. SPG doesn't have per-connection
-    // settings worth wiping, so all are no-ops.
-    if ci_starts_with(b, b"discard all") {
-        return Some(CannedResponse::Tag("DISCARD ALL"));
-    }
-    if ci_starts_with(b, b"discard temp")
-        || ci_starts_with(b, b"discard sequences")
-        || ci_starts_with(b, b"discard plans")
-    {
-        return Some(CannedResponse::Tag("DISCARD"));
-    }
-    // v4.18: VACUUM / ANALYZE / CLUSTER / REINDEX — BI clients
-    // (Metabase, DBeaver) run these defensively after schema
-    // changes. SPG has no vacuum or analyze concept (rows are
-    // dense; no MVCC dead tuples; index stats aren't sampled),
-    // so they're all no-ops.
-    if ci_starts_with(b, b"vacuum") {
-        return Some(CannedResponse::Tag("VACUUM"));
-    }
-    if ci_starts_with(b, b"analyze") {
-        return Some(CannedResponse::Tag("ANALYZE"));
-    }
+    // v7.39 (round 320, V53) — DISCARD is NO LONGER canned. pgbouncer
+    // issues it between pooled client sessions to wipe per-connection
+    // state, and the claim that SPG "doesn't have per-connection settings
+    // worth wiping" stopped being true when round 279 gave every
+    // connection its own session bag — so one pooled client's GUCs and
+    // prepared statements survived into the next client's session. The
+    // engine implements it. (The old tag for the non-ALL forms was wrong
+    // too: PG answers `DISCARD PLANS` / `DISCARD TEMP` / `DISCARD
+    // SEQUENCES`, not a bare `DISCARD`.)
+    // v4.18: CLUSTER / REINDEX — BI clients (Metabase, DBeaver) run
+    // these defensively after schema changes. SPG's parser accepts and
+    // ignores both, so the canned tag matches what the engine would do;
+    // it is here only to name the command correctly.
+    //
+    // v7.39 (round 320, V53) — VACUUM and ANALYZE are NOT here any more.
+    // Both do real work in the engine (VACUUM reclaims tombstoned
+    // versions since round 169, under the in-place MVCC gate; ANALYZE
+    // refreshes the planner's statistics), and this short-circuit meant
+    // no client reaching SPG over the wire ever got either — the round
+    // 169 fix for "a customer's manual reclaim is silently ignored"
+    // never actually shipped past pgwire.
     if ci_starts_with(b, b"cluster") {
         return Some(CannedResponse::Tag("CLUSTER"));
     }
@@ -2517,21 +2538,13 @@ fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse
     // variants without disturbing the engine. Real BEGIN dispatch
     // happens through the normal engine path when it's a bare
     // BEGIN / START TRANSACTION (no isolation specifier).
-    if ci_starts_with(b, b"begin isolation level")
-        || ci_starts_with(b, b"begin transaction isolation level")
-        || ci_starts_with(b, b"start transaction isolation level")
-        || ci_starts_with(b, b"set transaction isolation level")
-        || ci_starts_with(b, b"set transaction read")
-        || ci_starts_with(b, b"set transaction snapshot")
-    {
-        // BEGIN-ish variants need to actually open a TX in the
-        // engine. Fall through to the regular path by returning
-        // None; the engine ignores trailing modifiers in BEGIN.
-        // SET TRANSACTION is purely informational — no-op tag.
-        if ci_starts_with(b, b"set transaction") {
-            return Some(CannedResponse::Tag("SET"));
-        }
-    }
+    // v7.39 (round 320, V53) — `SET TRANSACTION …` is NO LONGER a no-op
+    // tag here. It used to be dismissed as "purely informational", which
+    // stopped being true once the engine grew real isolation levels: a
+    // client asking for SERIALIZABLE was answered `SET` and left on READ
+    // COMMITTED. The engine applies the level (and raises PG's 25001 when
+    // the transaction has already run a query). BEGIN-ish variants always
+    // fell through to the engine and still do.
     // v7.39 — the v4.6 canned pg_catalog subset (pg_class /
     // pg_namespace / pg_database / pg_user / pg_roles / pg_tables) is
     // GONE: it hijacked any SQL that merely mentioned those names and
@@ -6526,8 +6539,16 @@ fn encode_select_int_response(out: &mut Vec<u8>, n: i64, tx_state: u8) -> std::i
     //   [2 bytes: format code (0 = text)]
     // body length = 2 + 9 + 4 + 2 + 4 + 2 + 4 + 2 = 29
     // frame total = 1 byte (op 'T') + 4 byte len + 29 body = 34
+    //
+    // v7.39 (round 320, V53) — TWO frames, picked by the literal's width.
+    // PG types an integer literal that fits in int4 as `integer` and only
+    // a wider one as `bigint` (`SELECT pg_typeof(1), pg_typeof(2147483648)`
+    // → `integer|bigint`). This path baked OID 20 into the bytes, so the
+    // single most-run query on the wire — `SELECT 1` — described itself as
+    // int8: a driver that maps by OID handed the application a 64-bit
+    // value where PG (and SPG's own engine) give a 32-bit one.
     #[rustfmt::skip]
-    const ROW_DESC_FRAME: [u8; 34] = [
+    const ROW_DESC_INT8: [u8; 34] = [
         b'T',
         0, 0, 0, 33,         // length = 4 + 29
         0, 1,                 // nfields = 1
@@ -6539,7 +6560,24 @@ fn encode_select_int_response(out: &mut Vec<u8>, n: i64, tx_state: u8) -> std::i
         255, 255, 255, 255,   // type modifier = -1
         0, 0,                 // format code = text
     ];
-    out.extend_from_slice(&ROW_DESC_FRAME);
+    #[rustfmt::skip]
+    const ROW_DESC_INT4: [u8; 34] = [
+        b'T',
+        0, 0, 0, 33,
+        0, 1,
+        b'?', b'c', b'o', b'l', b'u', b'm', b'n', b'?', 0,
+        0, 0, 0, 0,
+        0, 0,
+        0, 0, 0, 23,          // type OID = Int
+        0, 4,                 // type size = 4
+        255, 255, 255, 255,
+        0, 0,
+    ];
+    out.extend_from_slice(if i32::try_from(n).is_ok() {
+        &ROW_DESC_INT4
+    } else {
+        &ROW_DESC_INT8
+    });
 
     // DataRow frame: 1 cell, the decimal text of `n`.
     //   [2 bytes: nfields=1]

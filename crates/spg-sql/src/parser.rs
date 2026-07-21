@@ -20,7 +20,8 @@ use core::mem;
 use crate::ast::{
     AssignTarget, BinOp, CastTarget, Collation, ColumnDef, ColumnName, ColumnTypeName,
     CreateFunctionStatement, CreateIndexStatement, CreatePublicationStatement,
-    CreateSubscriptionStatement, CreateTableStatement, CreateTriggerStatement, Expr, ExtractField,
+    CreateSubscriptionStatement, CreateTableStatement, CreateTriggerStatement,
+    DiscardTarget, Expr, ExtractField,
     FkAction, ForeignKeyConstraint, FrameBound, FrameExclusion, FrameKind, FromClause, FromJoin,
     FunctionArg, FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, GrantObject,
     GrantPriv, GrantStatement, IndexMethod, InsertStatement, IsolationLevel, JoinKind, Literal,
@@ -92,7 +93,6 @@ fn is_dump_noise_statement(lc: &str) -> bool {
             // sequences), no matching security-label / storage-
             // option to apply, no separate CREATE/DROP CAST that
             // affects execution.
-            | "discard"
             | "security"
             // v7.37.17 (17.6 siblings) — PG role-cleanup statements
             // pg_dump / pg_dumpall emit around DROP ROLE:
@@ -1296,6 +1296,32 @@ impl Parser {
     /// v7.39 (round 278) — `CALL <proc>([args])`. There is no
     /// procedure catalog yet, so this reports PG's not-found error
     /// (with its HINT) rather than pretending the call ran.
+    /// v7.39 (round 320, V53) — `DISCARD { ALL | PLANS | SEQUENCES | TEMP }`.
+    /// Bare `DISCARD` is a syntax error in PG; so it is here.
+    fn parse_discard(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // DISCARD
+        let target = match self.advance() {
+            Token::All => DiscardTarget::All,
+            Token::Ident(w) | Token::QuotedIdent(w) => match w.to_ascii_lowercase().as_str() {
+                "all" => DiscardTarget::All,
+                "plans" => DiscardTarget::Plans,
+                "sequences" => DiscardTarget::Sequences,
+                "temp" | "temporary" => DiscardTarget::Temp,
+                other => {
+                    return Err(self.err(format!(
+                        "expected ALL / PLANS / SEQUENCES / TEMP after DISCARD, got {other:?}"
+                    )));
+                }
+            },
+            other => {
+                return Err(self.err(format!(
+                    "expected ALL / PLANS / SEQUENCES / TEMP after DISCARD, got {other:?}"
+                )));
+            }
+        };
+        Ok(Statement::Discard(target))
+    }
+
     /// v7.39 (round 318, V51) — MySQL `KILL [HARD|SOFT] [CONNECTION|QUERY]
     /// <expr>`. MariaDB accepts an expression for the id (its own docs use
     /// `KILL connection_id()`), and the HARD / SOFT prefixes only pick how
@@ -1530,6 +1556,9 @@ impl Parser {
             // names one connection and acts on it.
             if lc == "kill" {
                 return self.parse_kill();
+            }
+            if lc == "discard" {
+                return self.parse_discard();
             }
             if is_dump_noise_statement(&lc) {
                 self.consume_until_statement_boundary();

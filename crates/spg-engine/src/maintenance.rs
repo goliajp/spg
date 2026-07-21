@@ -25,6 +25,61 @@ impl Engine {
     /// can add reservoir sampling at the > 100 K-row mark; not a
     /// scope blocker for the current commit since rows ≤ 100 K
     /// analyse in milliseconds.
+    /// v7.39 (round 320, V53) — `DISCARD { ALL | PLANS | SEQUENCES | TEMP }`.
+    /// pgbouncer sends `DISCARD ALL` between pooled client sessions so the
+    /// next client sees a clean connection. It used to be swallowed as
+    /// "dump noise" on the theory that SPG had no per-connection state
+    /// worth discarding — untrue since round 279 gave every connection its
+    /// own session bag (GUC overrides, prepared statements, large-object
+    /// descriptors). A no-op meant one pooled client's state leaked to the
+    /// next one.
+    ///
+    /// PG 18.4 measured: `SET application_name='x'; PREPARE p …;
+    /// DISCARD ALL` leaves application_name back at its startup value and
+    /// `EXECUTE p` failing with "prepared statement \"p\" does not
+    /// exist"; inside a transaction block it is
+    /// `ERROR: DISCARD ALL cannot run inside a transaction block`.
+    ///
+    /// Cursors are deliberately NOT closed here even though PG's DISCARD
+    /// ALL includes CLOSE ALL: SPG's cursor table is process-wide, not
+    /// per-session, so closing "all" from one connection would close
+    /// another connection's cursors. That is its own defect (see the
+    /// ledger); discarding them is blocked on fixing it.
+    pub(crate) fn exec_discard(
+        &mut self,
+        target: spg_sql::ast::DiscardTarget,
+    ) -> Result<QueryResult, EngineError> {
+        use spg_sql::ast::DiscardTarget;
+        if matches!(target, DiscardTarget::All | DiscardTarget::Temp)
+            && self.current_tx.is_some_and(|tx| self.is_tx_open(tx))
+        {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "DISCARD {target} cannot run inside a transaction block"
+            )));
+        }
+        match target {
+            DiscardTarget::All => {
+                self.reset_all_gucs();
+                self.prepared_statements.clear();
+                self.lo_descriptors.clear();
+                self.lo_next_fd = 0;
+                self.listen_channels.clear();
+                self.plan_cache.clear();
+                self.refresh_render_style();
+            }
+            DiscardTarget::Plans => self.plan_cache.clear(),
+            // SPG has neither temp tables nor per-session sequence state
+            // (`currval` reads the catalog), so there is nothing of either
+            // kind to throw away. Accepted so a client's sequence of
+            // DISCARDs runs, and tagged with the target it named.
+            DiscardTarget::Sequences | DiscardTarget::Temp => {}
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: false,
+        })
+    }
+
     pub(crate) fn exec_analyze(
         &mut self,
         target: Option<&str>,
