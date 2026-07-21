@@ -112,6 +112,29 @@ const CHARSET_UTF8MB4: u8 = 0xff;
 /// SERVER_STATUS_AUTOCOMMIT (we always run autocommit until
 /// BEGIN is wired in a later P0).
 const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
+/// v7.39 (round 316, V37) — set from `BEGIN` until the COMMIT or
+/// ROLLBACK that closes the block. Measured against MariaDB 11: the bit
+/// rides on the BEGIN's own OK packet, on every OK inside the block, on
+/// a result set's terminating packet, and on COM_PING — every packet
+/// that carries status flags reports the CURRENT state. Clients that
+/// probe "is this pooled connection clean?" read exactly this.
+const SERVER_STATUS_IN_TRANS: u16 = 0x0001;
+
+/// The status flags to report right now. `AUTOCOMMIT` is constant here —
+/// this shim has no `SET autocommit=0` (MariaDB clears the bit for that;
+/// recorded as V50) — so the transaction bit is the live part, and it is
+/// read from THIS connection's slot, never the engine-global view.
+fn tx_status(state: &Arc<ServerState>, conn_tx_id: spg_engine::TxId) -> u16 {
+    let in_tx = state
+        .engine
+        .read()
+        .is_ok_and(|e| e.is_tx_open(conn_tx_id));
+    if in_tx {
+        SERVER_STATUS_AUTOCOMMIT | SERVER_STATUS_IN_TRANS
+    } else {
+        SERVER_STATUS_AUTOCOMMIT
+    }
+}
 
 /// Auth plugin name advertised in the initial HandshakeV10. We
 /// pick `mysql_native_password` since it's the simplest and
@@ -293,11 +316,16 @@ fn complete_auth_and_command(
     let reply_seqno = seqno_in.wrapping_add(1);
     match auth_outcome {
         AuthOutcome::Ok => {
-            write_packet(stream, reply_seqno, &encode_ok_packet())?;
+            // No statement has run yet, so no transaction can be open.
+            write_packet(stream, reply_seqno, &encode_ok_packet(SERVER_STATUS_AUTOCOMMIT))?;
         }
         AuthOutcome::CachingSha2FastAuthOk => {
             write_packet(stream, reply_seqno, &[0x01, 0x03])?;
-            write_packet(stream, reply_seqno.wrapping_add(1), &encode_ok_packet())?;
+            write_packet(
+                stream,
+                reply_seqno.wrapping_add(1),
+                &encode_ok_packet(SERVER_STATUS_AUTOCOMMIT),
+            )?;
         }
         AuthOutcome::AccessDenied(msg) => {
             return write_packet(stream, reply_seqno, &encode_err_packet(1045, "28000", &msg));
@@ -619,8 +647,14 @@ fn run_command_loop(
             }
             CMD_PING => {
                 // Single OK packet, no body — what mysqladmin
-                // ping expects.
-                write_packet(stream, reply_seqno, &encode_ok_packet())?;
+                // ping expects. It carries the transaction bit too;
+                // measured against MariaDB, a PING inside a block
+                // answers IN_TRANS.
+                write_packet(
+                    stream,
+                    reply_seqno,
+                    &encode_ok_packet(tx_status(state, conn_tx_id)),
+                )?;
             }
             CMD_INIT_DB => {
                 // SPG runs in single-database mode. mysql clients
@@ -635,7 +669,11 @@ fn run_command_loop(
                         &encode_err_packet(1049, "42000", "Unknown database (empty name)"),
                     )?;
                 } else {
-                    write_packet(stream, reply_seqno, &encode_ok_packet())?;
+                    write_packet(
+                        stream,
+                        reply_seqno,
+                        &encode_ok_packet(tx_status(state, conn_tx_id)),
+                    )?;
                 }
             }
             CMD_FIELD_LIST => {
@@ -643,7 +681,15 @@ fn run_command_loop(
             }
             CMD_STMT_PREPARE => {
                 let sql = std::str::from_utf8(&payload[1..]).unwrap_or("").to_string();
-                handle_com_stmt_prepare(stream, state, &mut prepared, &sql, reply_seqno, session_id)?;
+                handle_com_stmt_prepare(
+                    stream,
+                    state,
+                    &mut prepared,
+                    &sql,
+                    reply_seqno,
+                    session_id,
+                    conn_tx_id,
+                )?;
             }
             CMD_STMT_EXECUTE => {
                 handle_com_stmt_execute(
@@ -669,7 +715,11 @@ fn run_command_loop(
                 // doesn't support COM_STMT_SEND_LONG_DATA yet, so
                 // this is effectively a no-op — but we still
                 // reply OK so the client doesn't error.
-                write_packet(stream, reply_seqno, &encode_ok_packet())?;
+                write_packet(
+                    stream,
+                    reply_seqno,
+                    &encode_ok_packet(tx_status(state, conn_tx_id)),
+                )?;
             }
             _ => {
                 // Unknown command. P0-74 / P0-75 add binary-protocol
@@ -748,6 +798,10 @@ fn handle_com_query(
             "durability append failed: {e}"
         ))),
     };
+    // v7.39 (round 316, V37) — read the transaction state AFTER the
+    // statement ran: a BEGIN reports IN_TRANS on its own reply, and a
+    // COMMIT reports it cleared on its.
+    let status = tx_status(state, conn_tx_id);
     match outcome {
         Err(e) => {
             // Map engine errors to MySQL errno 1064 (parse / unsupported)
@@ -761,11 +815,11 @@ fn handle_com_query(
             write_packet(
                 stream,
                 start_seqno,
-                &encode_ok_with_affected(affected as u64),
+                &encode_ok_with_affected(affected as u64, tx_status(state, conn_tx_id)),
             )?;
         }
         Ok(QueryResult::Rows { columns, rows }) => {
-            encode_text_result_set(stream, &columns, &rows, start_seqno)?;
+            encode_text_result_set(stream, &columns, &rows, start_seqno, status)?;
         }
         // `QueryResult` is `#[non_exhaustive]` — future variants
         // surface as a structured error here until the wire shim
@@ -794,7 +848,9 @@ fn handle_com_stmt_prepare(
     sql: &str,
     start_seqno: u8,
     session_id: u32,
+    conn_tx_id: spg_engine::TxId,
 ) -> std::io::Result<()> {
+    let status = tx_status(state, conn_tx_id);
     let (param_count, columns) = {
         let Ok(mut engine) = state.engine.write() else {
             return write_packet(
@@ -875,7 +931,7 @@ fn handle_com_stmt_prepare(
             seq = seq.wrapping_add(1);
         }
         // Intermediate marker (CLIENT_DEPRECATE_EOF → OK).
-        write_packet(stream, seq, &encode_ok_packet())?;
+        write_packet(stream, seq, &encode_ok_packet(status))?;
         seq = seq.wrapping_add(1);
     }
     // ---- result column definitions ----
@@ -885,7 +941,7 @@ fn handle_com_stmt_prepare(
             write_packet(stream, seq, &buf)?;
             seq = seq.wrapping_add(1);
         }
-        write_packet(stream, seq, &encode_ok_packet())?;
+        write_packet(stream, seq, &encode_ok_packet(status))?;
     }
     Ok(())
 }
@@ -964,6 +1020,7 @@ fn handle_com_stmt_execute(
         };
         (engine.execute_prepared_in(stmt, &params, conn_tx_id), render)
     };
+    let status = tx_status(state, conn_tx_id);
     // v7.33 (A1) — persist the prepared write before acking (was
     // non-durable pre-7.33, lost on crash).
     let outcome = match render {
@@ -984,12 +1041,12 @@ fn handle_com_stmt_execute(
             write_packet(
                 stream,
                 start_seqno,
-                &encode_ok_with_affected(affected as u64),
+                &encode_ok_with_affected(affected as u64, tx_status(state, conn_tx_id)),
             )?;
         }
         Ok(QueryResult::Rows { columns, rows }) => {
             // v7.17.0 Phase 3.P0-76 — true binary result rows.
-            encode_binary_result_set(stream, &columns, &rows, start_seqno)?;
+            encode_binary_result_set(stream, &columns, &rows, start_seqno, status)?;
         }
         Ok(_) => {
             write_packet(
@@ -1013,6 +1070,7 @@ fn encode_binary_result_set(
     columns: &[ColumnSchema],
     rows: &[spg_storage::Row],
     start_seqno: u8,
+    status: u16,
 ) -> std::io::Result<()> {
     // 1) column_count packet.
     let mut payload = Vec::new();
@@ -1032,8 +1090,8 @@ fn encode_binary_result_set(
         write_packet(stream, seq, &buf)?;
         seq = seq.wrapping_add(1);
     }
-    // 4) trailing OK.
-    write_packet(stream, seq, &encode_ok_packet())?;
+    // 4) trailing OK — carries the transaction bit, as MariaDB's does.
+    write_packet(stream, seq, &encode_ok_packet(status))?;
     Ok(())
 }
 
@@ -1380,8 +1438,10 @@ fn handle_com_field_list(
         write_packet(stream, seq, &buf)?;
         seq = seq.wrapping_add(1);
     }
-    // CLIENT_DEPRECATE_EOF — trailing OK marker.
-    write_packet(stream, seq, &encode_ok_packet())?;
+    // CLIENT_DEPRECATE_EOF — trailing OK marker. COM_FIELD_LIST is a
+    // schema probe with no statement behind it; it reports the plain
+    // status, as the handshake does.
+    write_packet(stream, seq, &encode_ok_packet(SERVER_STATUS_AUTOCOMMIT))?;
     Ok(())
 }
 
@@ -1392,6 +1452,7 @@ fn encode_text_result_set(
     columns: &[ColumnSchema],
     rows: &[spg_storage::Row],
     start_seqno: u8,
+    status: u16,
 ) -> std::io::Result<()> {
     // 1) column_count packet — single length-encoded integer.
     let mut payload = Vec::new();
@@ -1413,8 +1474,9 @@ fn encode_text_result_set(
         seq = seq.wrapping_add(1);
     }
     // 4) trailing OK packet (CLIENT_DEPRECATE_EOF replaces the
-    // trailing EOF with OK). status_flags + warnings.
-    write_packet(stream, seq, &encode_ok_packet())?;
+    // trailing EOF with OK). status_flags + warnings — the flags
+    // report the transaction state, as MariaDB's terminator does.
+    write_packet(stream, seq, &encode_ok_packet(status))?;
     Ok(())
 }
 
@@ -1550,12 +1612,12 @@ fn column_length_for(ty: DataType) -> u32 {
 
 // ---- OK / lenenc helpers ------------------------------------
 
-pub(crate) fn encode_ok_with_affected(affected: u64) -> Vec<u8> {
+pub(crate) fn encode_ok_with_affected(affected: u64, status: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(11);
     out.push(0x00);
     encode_lenenc_int(&mut out, affected);
     out.push(0); // last_insert_id = 0
-    out.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
+    out.extend_from_slice(&status.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // warnings
     out
 }
@@ -1658,12 +1720,12 @@ fn verify_handshake_response(
 /// Minimal OK packet — protocol-41 shape.
 ///   0x00 header + lenenc affected_rows(=0) + lenenc last_insert_id(=0)
 ///   + 2-byte status_flags(AUTOCOMMIT) + 2-byte warnings(=0)
-pub(crate) fn encode_ok_packet() -> Vec<u8> {
+pub(crate) fn encode_ok_packet(status: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(7);
     out.push(0x00);
     out.push(0); // affected_rows = 0
     out.push(0); // last_insert_id = 0
-    out.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
+    out.extend_from_slice(&status.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // warnings
     out
 }

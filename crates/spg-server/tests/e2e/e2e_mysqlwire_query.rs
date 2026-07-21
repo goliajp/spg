@@ -425,3 +425,132 @@ fn unknown_command_returns_err_packet() {
     let errno = u16::from_le_bytes(err[1..3].try_into().unwrap());
     assert_eq!(errno, 1047);
 }
+
+/// Read the `status_flags` out of an OK packet. Layout after the 0x00
+/// header: affected_rows (lenenc), last_insert_id (lenenc), then the
+/// two-byte flags.
+fn ok_status(pkt: &[u8]) -> u16 {
+    assert_eq!(pkt[0], 0x00, "expected an OK packet, got {:#x}", pkt[0]);
+    let mut pos = 1;
+    for _ in 0..2 {
+        let (_, used) = read_lenenc(pkt, pos);
+        pos += used;
+    }
+    u16::from_le_bytes([pkt[pos], pkt[pos + 1]])
+}
+
+/// Run a statement that answers a bare OK and return its status flags.
+fn status_of(s: &mut TcpStream, sql: &str) -> u16 {
+    send_query(s, sql);
+    let (_seq, pkt) = read_packet(s);
+    ok_status(&pkt)
+}
+
+/// Run a SELECT and return the status flags on its TERMINATING packet.
+fn status_of_select(s: &mut TcpStream, sql: &str) -> u16 {
+    send_query(s, sql);
+    let (_seq, cc) = read_packet(s);
+    let (col_count, _) = read_lenenc(&cc, 0);
+    for _ in 0..col_count {
+        let _ = read_packet(s);
+    }
+    loop {
+        let (_seq, pkt) = read_packet(s);
+        if pkt[0] == 0x00 {
+            return ok_status(&pkt);
+        }
+    }
+}
+
+const IN_TRANS: u16 = 0x0001;
+const AUTOCOMMIT: u16 = 0x0002;
+
+/// V37 (round 316) — the OK packet's status flags carry the transaction
+/// bit. They used to be a constant `AUTOCOMMIT`, so a client that probes
+/// the server's view of the connection — which is what several pools do
+/// to decide whether a pooled connection is clean — was told "no
+/// transaction" throughout a block.
+///
+/// Measured against MariaDB 11: the bit is set on the BEGIN's own reply,
+/// on every OK inside the block, and cleared by COMMIT and ROLLBACK.
+#[test]
+fn the_ok_packet_reports_the_transaction_state() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    exec_ok(&mut s, "CREATE TABLE t316 (id INT)");
+    // NB a SELECT answers a result SET, so its flags ride the
+    // terminator; only OK-shaped statements go through `status_of`.
+    assert_eq!(status_of_select(&mut s, "SELECT 1"), AUTOCOMMIT, "idle");
+
+    // The BEGIN's own reply already says IN_TRANS.
+    assert_eq!(
+        status_of(&mut s, "BEGIN"),
+        AUTOCOMMIT | IN_TRANS,
+        "BEGIN's own reply"
+    );
+    assert_eq!(
+        status_of(&mut s, "INSERT INTO t316 VALUES (1)"),
+        AUTOCOMMIT | IN_TRANS,
+        "inside the block"
+    );
+    // …and COMMIT's reply says it is over.
+    assert_eq!(status_of(&mut s, "COMMIT"), AUTOCOMMIT, "COMMIT clears it");
+
+    // ROLLBACK closes it the same way.
+    assert_eq!(status_of(&mut s, "BEGIN"), AUTOCOMMIT | IN_TRANS);
+    assert_eq!(status_of(&mut s, "ROLLBACK"), AUTOCOMMIT, "ROLLBACK clears it");
+    assert_eq!(status_of_select(&mut s, "SELECT 1"), AUTOCOMMIT, "idle again");
+}
+
+/// A result set's terminating packet carries the flags too — measured
+/// against MariaDB, where a SELECT inside a block answers IN_TRANS on
+/// its terminator.
+#[test]
+fn a_result_sets_terminator_reports_it_too() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    assert_eq!(status_of_select(&mut s, "SELECT 1"), AUTOCOMMIT);
+    exec_ok(&mut s, "BEGIN");
+    assert_eq!(
+        status_of_select(&mut s, "SELECT 1"),
+        AUTOCOMMIT | IN_TRANS,
+        "SELECT inside a block"
+    );
+    exec_ok(&mut s, "COMMIT");
+    assert_eq!(status_of_select(&mut s, "SELECT 1"), AUTOCOMMIT);
+}
+
+/// COM_PING reports it as well — MariaDB's does, and a pool that pings
+/// to check liveness reads the same field.
+#[test]
+fn com_ping_reports_the_transaction_state() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    write_packet(&mut s, 0, &[0x0e]);
+    let (_seq, pkt) = read_packet(&mut s);
+    assert_eq!(ok_status(&pkt), AUTOCOMMIT, "ping when idle");
+
+    exec_ok(&mut s, "BEGIN");
+    write_packet(&mut s, 0, &[0x0e]);
+    let (_seq, pkt) = read_packet(&mut s);
+    assert_eq!(ok_status(&pkt), AUTOCOMMIT | IN_TRANS, "ping inside a block");
+    exec_ok(&mut s, "ROLLBACK");
+}
+
+/// The bit is per-CONNECTION. A second client's open block must not make
+/// this one look dirty — the same global-vs-slot trap rounds 298 and 304
+/// each had to fix elsewhere.
+#[test]
+fn one_connections_block_does_not_colour_anothers_status() {
+    let (_guard, addr) = spawn();
+    let mut a = auth_open_mode(&addr);
+    let mut b = auth_open_mode(&addr);
+    exec_ok(&mut a, "BEGIN");
+    assert_eq!(status_of_select(&mut a, "SELECT 1"), AUTOCOMMIT | IN_TRANS);
+    assert_eq!(
+        status_of_select(&mut b, "SELECT 1"),
+        AUTOCOMMIT,
+        "B is idle and must say so while A holds a block"
+    );
+    exec_ok(&mut a, "ROLLBACK");
+}
