@@ -889,3 +889,91 @@ fn a_runtime_error_carries_no_internal_prefix() {
         );
     }
 }
+
+/// V50 (round 331) — `SET autocommit=0`.
+///
+/// MariaDB 11 measured: with autocommit off the connection accumulates
+/// changes until COMMIT or ROLLBACK — an INSERT is visible to the session
+/// that made it, `ROLLBACK` discards it, `COMMIT` keeps it, and a
+/// disconnect without either rolls back. `@@autocommit` reads 0, and the
+/// OK packet's status flags drop the AUTOCOMMIT bit (measured in round
+/// 316 with a native-protocol probe).
+///
+/// SPG ignored the setting: every statement committed on its own, so a
+/// client that turned autocommit off and rolled back had already made its
+/// writes permanent.
+#[test]
+fn set_autocommit_off_defers_the_commit() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    exec_ok(&mut s, "CREATE TABLE ac (id INT NOT NULL)");
+    exec_ok(&mut s, "SET autocommit=0");
+
+    exec_ok(&mut s, "INSERT INTO ac VALUES (1)");
+    assert_eq!(
+        query_scalar(&mut s, "SELECT COUNT(*) FROM ac"),
+        "1",
+        "the session sees its own uncommitted write"
+    );
+    exec_ok(&mut s, "ROLLBACK");
+    assert_eq!(
+        query_scalar(&mut s, "SELECT COUNT(*) FROM ac"),
+        "0",
+        "ROLLBACK discards it — with autocommit on it would already be permanent"
+    );
+
+    exec_ok(&mut s, "INSERT INTO ac VALUES (2)");
+    exec_ok(&mut s, "COMMIT");
+    assert_eq!(query_scalar(&mut s, "SELECT COUNT(*) FROM ac"), "1");
+}
+
+/// The flag is readable, as MariaDB's is.
+#[test]
+fn at_at_autocommit_reports_the_setting() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    assert_eq!(query_scalar(&mut s, "SELECT @@autocommit"), "1");
+    exec_ok(&mut s, "SET autocommit=0");
+    assert_eq!(query_scalar(&mut s, "SELECT @@autocommit"), "0");
+    exec_ok(&mut s, "SET autocommit=1");
+    assert_eq!(query_scalar(&mut s, "SELECT @@autocommit"), "1");
+}
+
+/// And the protocol's own status bit follows it (round 316 measured the
+/// bit on MariaDB; this is the other half of that finding).
+#[test]
+fn the_status_flags_drop_autocommit_when_it_is_off() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    assert_eq!(status_of_select(&mut s, "SELECT 1"), AUTOCOMMIT);
+    assert_eq!(status_of(&mut s, "SET autocommit=0"), 0, "the bit is cleared");
+    exec_ok(&mut s, "CREATE TABLE ac2 (id INT NOT NULL)");
+    // Inside the implicit block the transaction bit is on and AUTOCOMMIT
+    // stays off.
+    assert_eq!(status_of(&mut s, "INSERT INTO ac2 VALUES (1)"), IN_TRANS);
+    exec_ok(&mut s, "ROLLBACK");
+    assert_eq!(status_of(&mut s, "SET autocommit=1"), AUTOCOMMIT);
+}
+
+/// A connection that goes away without committing loses the work.
+#[test]
+fn a_disconnect_under_autocommit_off_rolls_back() {
+    let (_guard, addr) = spawn();
+    let mut a = auth_open_mode(&addr);
+    exec_ok(&mut a, "CREATE TABLE ac3 (id INT NOT NULL)");
+
+    {
+        let mut b = auth_open_mode(&addr);
+        exec_ok(&mut b, "SET autocommit=0");
+        exec_ok(&mut b, "INSERT INTO ac3 VALUES (1)");
+        write_packet(&mut b, 0, &[0x01]); // COM_QUIT
+    }
+    // Give the server a moment to finish the disconnect cleanup.
+    for _ in 0..100 {
+        if query_scalar(&mut a, "SELECT COUNT(*) FROM ac3") == "0" {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("an uncommitted write survived the disconnect");
+}

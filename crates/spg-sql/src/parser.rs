@@ -18860,6 +18860,21 @@ impl Parser {
                 let s = unreserved_keyword_text(&other).unwrap();
                 self.finish_ident_atom(s)
             }
+            // v7.39 (round 331, V50) — `@@var` in an EXPRESSION. It parsed
+            // only inside `SET` before, so `SELECT @@autocommit` — which
+            // every MySQL connector asks at handshake — was a parse error.
+            // MariaDB accepts the bare, `@@session.` and `@@global.`
+            // spellings alike and answers from the session's own value.
+            Token::SessionVar(v) => {
+                // The `session.` / `global.` scope is KEPT: a global read
+                // must not see a session override (MariaDB: after `SET
+                // autocommit=0`, `@@global.autocommit` is still 1).
+                let bare = v.trim_start_matches('@').to_ascii_lowercase();
+                Ok(Expr::FunctionCall {
+                    name: String::from("__spg_session_var"),
+                    args: alloc::vec![Expr::Literal(Literal::String(bare))],
+                })
+            }
             other => Err(ParseError {
                 message: format!("unexpected token {other:?} in expression"),
                 token_pos: tok_pos,

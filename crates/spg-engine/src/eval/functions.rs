@@ -13672,6 +13672,74 @@ fn apply_function_dispatch(
         // is honored — when true, unknown params return NULL
         // (matches PG); when false / omitted, error but we're
         // permissive and return empty text so probes complete.
+        // v7.39 (round 331, V50) — `@@var` in an expression. The parser
+        // lowers `SELECT @@autocommit` (and the `@@session.` / `@@global.`
+        // spellings) to this. MySQL clients read session variables this
+        // way at handshake; it used to be a parse error.
+        //
+        // MariaDB 11 measured: a value the session SET wins, the MySQL
+        // variables below carry their server defaults, and an unknown name
+        // is `ERROR 1193 (HY000) Unknown system variable 'x'`.
+        "__spg_session_var" => {
+            let Some(Value::Text(name)) = args.first() else {
+                return Ok(Value::Null);
+            };
+            let raw = name.to_ascii_lowercase();
+            // `@@global.x` reads the server default, never this session's
+            // override — measured on MariaDB 11.
+            let global = raw.starts_with("global.");
+            let lname = raw
+                .strip_prefix("session.")
+                .or_else(|| raw.strip_prefix("global."))
+                .unwrap_or(&raw)
+                .to_string();
+            if !global
+                && let Some(gucs) = ctx.session_gucs
+                && let Some(v) = gucs.get(lname.as_str())
+            {
+                return Ok(Value::text(v.clone()));
+            }
+            let val = match lname.as_str() {
+                // MySQL-side variables a connector asks for. `autocommit`
+                // is 1 until the session says otherwise; the wire keeps
+                // the same answer in its status flags.
+                "autocommit" => "1",
+                "version" => "8.0.35-spg",
+                "version_comment" => "SPG (MySQL-compatible)",
+                "sql_mode" => {
+                    "STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+                }
+                "max_allowed_packet" => "16777216",
+                "character_set_client" | "character_set_connection"
+                | "character_set_results" | "character_set_server" => "utf8mb4",
+                "collation_connection" | "collation_server" => "utf8mb4_general_ci",
+                "transaction_isolation" | "tx_isolation" => "READ-COMMITTED",
+                "lower_case_table_names" => "0",
+                "have_ssl" => "YES",
+                _ => {
+                    // Fall through to the PG GUC inventory, so
+                    // `@@server_version` and friends still answer — but
+                    // ONLY for a name it actually knows. MariaDB answers an
+                    // unknown one with `Unknown system variable 'x'`, and
+                    // `current_setting` would have returned an empty
+                    // string, which reads as "set to nothing".
+                    let known = crate::system_catalog::canonical_gucs()
+                        .iter()
+                        .any(|g| g.0.eq_ignore_ascii_case(&lname));
+                    if !known {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!("Unknown system variable '{lname}'"),
+                        });
+                    }
+                    return apply_function_dispatch(
+                        "current_setting",
+                        &[Value::text(lname.clone()), Value::Bool(false)],
+                        ctx,
+                    );
+                }
+            };
+            Ok(Value::text::<String>(val.into()))
+        }
         "current_setting" => {
             if args.is_empty() || args.len() > 2 {
                 return Err(EvalError::TypeMismatch {

@@ -120,20 +120,24 @@ const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
 /// probe "is this pooled connection clean?" read exactly this.
 const SERVER_STATUS_IN_TRANS: u16 = 0x0001;
 
-/// The status flags to report right now. `AUTOCOMMIT` is constant here —
-/// this shim has no `SET autocommit=0` (MariaDB clears the bit for that;
-/// recorded as V50) — so the transaction bit is the live part, and it is
-/// read from THIS connection's slot, never the engine-global view.
-fn tx_status(state: &Arc<ServerState>, conn_tx_id: spg_engine::TxId) -> u16 {
+/// The status flags to report right now. Both bits are live: the
+/// transaction bit is read from THIS connection's slot (never the
+/// engine-global view), and `AUTOCOMMIT` follows the session's own
+/// setting — v7.39 (round 331, V50) — where it used to be a constant.
+/// Measured on MariaDB 11: `SET autocommit=0` clears it.
+fn tx_status(state: &Arc<ServerState>, conn_tx_id: spg_engine::TxId, autocommit: bool) -> u16 {
     let in_tx = state
         .engine
         .read()
         .is_ok_and(|e| e.is_tx_open(conn_tx_id));
-    if in_tx {
-        SERVER_STATUS_AUTOCOMMIT | SERVER_STATUS_IN_TRANS
-    } else {
-        SERVER_STATUS_AUTOCOMMIT
+    let mut flags = 0;
+    if autocommit {
+        flags |= SERVER_STATUS_AUTOCOMMIT;
     }
+    if in_tx {
+        flags |= SERVER_STATUS_IN_TRANS;
+    }
+    flags
 }
 
 /// Auth plugin name advertised in the initial HandshakeV10. We
@@ -685,6 +689,10 @@ fn run_command_loop(
     conn_state: &Arc<crate::ConnState>,
 ) -> std::io::Result<()> {
     let mut prepared = PreparedState::default();
+    // v7.39 (round 331, V50) — this connection's `autocommit`. MariaDB
+    // starts every session with it ON; `SET autocommit=0` makes the
+    // connection accumulate changes until COMMIT / ROLLBACK.
+    let mut autocommit = true;
     loop {
         // v7.39 (round 318, V51) — `KILL CONNECTION` on this connection.
         // Measured against MariaDB 11: a killed connection is simply
@@ -724,6 +732,7 @@ fn run_command_loop(
                     session_id,
                     conn_tx_id,
                     conn_state,
+                    &mut autocommit,
                 )?;
             }
             CMD_PING => {
@@ -734,7 +743,7 @@ fn run_command_loop(
                 write_packet(
                     stream,
                     reply_seqno,
-                    &encode_ok_packet(tx_status(state, conn_tx_id)),
+                    &encode_ok_packet(tx_status(state, conn_tx_id, autocommit)),
                 )?;
             }
             CMD_INIT_DB => {
@@ -760,7 +769,7 @@ fn run_command_loop(
                     write_packet(
                         stream,
                         reply_seqno,
-                        &encode_ok_packet(tx_status(state, conn_tx_id)),
+                        &encode_ok_packet(tx_status(state, conn_tx_id, autocommit)),
                     )?;
                 }
             }
@@ -777,6 +786,7 @@ fn run_command_loop(
                     reply_seqno,
                     session_id,
                     conn_tx_id,
+                    autocommit,
                 )?;
             }
             CMD_STMT_EXECUTE => {
@@ -789,6 +799,7 @@ fn run_command_loop(
                     session_id,
                     conn_tx_id,
                     conn_state,
+                    autocommit,
                 )?;
             }
             CMD_STMT_CLOSE => {
@@ -807,7 +818,7 @@ fn run_command_loop(
                 write_packet(
                     stream,
                     reply_seqno,
-                    &encode_ok_packet(tx_status(state, conn_tx_id)),
+                    &encode_ok_packet(tx_status(state, conn_tx_id, autocommit)),
                 )?;
             }
             _ => {
@@ -922,6 +933,48 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
     }
 }
 
+/// v7.39 (round 331, V50) — `SET autocommit = 0 | 1` (also `OFF` / `ON` /
+/// `TRUE` / `FALSE`, which MariaDB accepts). `None` when the statement is
+/// something else.
+fn parse_set_autocommit(sql: &str) -> Option<bool> {
+    let t = sql.trim().trim_end_matches(';').trim();
+    let rest = t.strip_prefix("SET ").or_else(|| t.strip_prefix("set "))?;
+    let rest = rest.trim();
+    let rest = rest
+        .strip_prefix("SESSION ")
+        .or_else(|| rest.strip_prefix("session "))
+        .unwrap_or(rest);
+    let (name, value) = rest.split_once('=')?;
+    if !name.trim().eq_ignore_ascii_case("autocommit") {
+        return None;
+    }
+    match value.trim().trim_matches('\'').to_ascii_lowercase().as_str() {
+        "0" | "off" | "false" => Some(false),
+        "1" | "on" | "true" => Some(true),
+        _ => None,
+    }
+}
+
+/// Statements the implicit transaction must not be opened in front of:
+/// the ones that manage it themselves, and `SET`.
+///
+/// `SET` is on the list because MariaDB measurably does not start a
+/// transaction for it — round 316's protocol probe read `0x0000` on the
+/// reply to `SET autocommit=0`, i.e. AUTOCOMMIT cleared and NO
+/// transaction bit. A statement that touches data starts it.
+fn is_tx_control(sql: &str) -> bool {
+    let verb = sql
+        .trim_start()
+        .split([' ', ';', '\t', '\n'])
+        .next()
+        .unwrap_or("");
+    verb.eq_ignore_ascii_case("begin")
+        || verb.eq_ignore_ascii_case("start")
+        || verb.eq_ignore_ascii_case("commit")
+        || verb.eq_ignore_ascii_case("rollback")
+        || verb.eq_ignore_ascii_case("set")
+}
+
 fn handle_com_query(
     stream: &mut (dyn ReadWrite + '_),
     state: &Arc<ServerState>,
@@ -930,8 +983,16 @@ fn handle_com_query(
     session_id: u32,
     conn_tx_id: spg_engine::TxId,
     conn_state: &Arc<crate::ConnState>,
+    autocommit: &mut bool,
 ) -> std::io::Result<()> {
     let _scope = StatementScope::begin(conn_state, sql);
+    // v7.39 (round 331, V50) — `SET autocommit=0|1`. The engine stores it
+    // as a session GUC too (that is what `@@autocommit` reads); the wire
+    // needs its own copy to drive the implicit transaction and the status
+    // flags.
+    if let Some(v) = parse_set_autocommit(sql) {
+        *autocommit = v;
+    }
     // Run the SQL through the engine. Mirrors pgwire's 'Q' (simple
     // query) path: dispatched into this connection's own transaction
     // slot so `BEGIN` / `COMMIT` / `ROLLBACK` bracket the connection's
@@ -949,6 +1010,14 @@ fn handle_com_query(
         // to its own pid. Without this the mysql query would run under
         // another connection's dialect / params (V15).
         engine.set_current_session(session_id);
+        // v7.39 (round 331, V50) — with autocommit off MySQL runs inside an
+        // implicit transaction: the first statement after a COMMIT /
+        // ROLLBACK opens one, and nothing is durable until the client says
+        // so. Measured on MariaDB 11: the session sees its own write,
+        // ROLLBACK discards it, and a disconnect without COMMIT loses it.
+        if !*autocommit && !is_tx_control(sql) && !engine.is_tx_open(conn_tx_id) {
+            let _ = engine.execute_in("BEGIN", conn_tx_id);
+        }
         engine.execute_in(sql, conn_tx_id)
     };
     // v7.33 (A1) — persist the write (WAL/snapshot + audit) before
@@ -964,7 +1033,7 @@ fn handle_com_query(
     // v7.39 (round 316, V37) — read the transaction state AFTER the
     // statement ran: a BEGIN reports IN_TRANS on its own reply, and a
     // COMMIT reports it cleared on its.
-    let status = tx_status(state, conn_tx_id);
+    let status = tx_status(state, conn_tx_id, *autocommit);
     conn_state.in_transaction.store(
         status & SERVER_STATUS_IN_TRANS != 0,
         std::sync::atomic::Ordering::Relaxed,
@@ -978,7 +1047,7 @@ fn handle_com_query(
             write_packet(
                 stream,
                 start_seqno,
-                &encode_ok_with_affected(affected as u64, tx_status(state, conn_tx_id)),
+                &encode_ok_with_affected(affected as u64, tx_status(state, conn_tx_id, *autocommit)),
             )?;
         }
         Ok(QueryResult::Rows { columns, rows }) => {
@@ -1012,8 +1081,9 @@ fn handle_com_stmt_prepare(
     start_seqno: u8,
     session_id: u32,
     conn_tx_id: spg_engine::TxId,
+    autocommit: bool,
 ) -> std::io::Result<()> {
-    let status = tx_status(state, conn_tx_id);
+    let status = tx_status(state, conn_tx_id, autocommit);
     let (param_count, columns) = {
         let Ok(mut engine) = state.engine.write() else {
             return write_packet(
@@ -1118,6 +1188,7 @@ fn handle_com_stmt_execute(
     session_id: u32,
     conn_tx_id: spg_engine::TxId,
     conn_state: &Arc<crate::ConnState>,
+    autocommit: bool,
 ) -> std::io::Result<()> {
     if payload.len() < 9 {
         return write_packet(
@@ -1186,7 +1257,7 @@ fn handle_com_stmt_execute(
         };
         (engine.execute_prepared_in(stmt, &params, conn_tx_id), render)
     };
-    let status = tx_status(state, conn_tx_id);
+    let status = tx_status(state, conn_tx_id, autocommit);
     conn_state.in_transaction.store(
         status & SERVER_STATUS_IN_TRANS != 0,
         std::sync::atomic::Ordering::Relaxed,
@@ -1211,7 +1282,7 @@ fn handle_com_stmt_execute(
             write_packet(
                 stream,
                 start_seqno,
-                &encode_ok_with_affected(affected as u64, tx_status(state, conn_tx_id)),
+                &encode_ok_with_affected(affected as u64, tx_status(state, conn_tx_id, autocommit)),
             )?;
         }
         Ok(QueryResult::Rows { columns, rows }) => {
