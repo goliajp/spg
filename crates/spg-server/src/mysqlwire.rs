@@ -742,7 +742,7 @@ fn handle_com_query(
     // acking. The mysql-wire path was non-durable like pgwire pre-7.33:
     // a COM_QUERY write was lost on crash. A durability failure turns
     // the write into an error, never a silent OK.
-    let outcome = match crate::pgwire::persist_wire_write(state, sql, &outcome) {
+    let outcome = match crate::pgwire::persist_wire_write(state, sql, &outcome, conn_tx_id) {
         Ok(()) => outcome,
         Err(e) => Err(spg_engine::EngineError::Unsupported(format!(
             "durability append failed: {e}"
@@ -967,7 +967,7 @@ fn handle_com_stmt_execute(
     // v7.33 (A1) — persist the prepared write before acking (was
     // non-durable pre-7.33, lost on crash).
     let outcome = match render {
-        Some(render) => match crate::pgwire::persist_wire_write(state, &render, &outcome) {
+        Some(render) => match crate::pgwire::persist_wire_write(state, &render, &outcome, conn_tx_id) {
             Ok(()) => outcome,
             Err(e) => Err(spg_engine::EngineError::Unsupported(format!(
                 "durability append failed: {e}"

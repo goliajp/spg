@@ -2582,7 +2582,10 @@ fn handle_query_op(
         // sync it explicitly anyway against the engine
         // state so a hypothetical engine-internal
         // mismatch can't drift.
-        *in_tx = state.engine.read().is_ok_and(|e| e.in_transaction());
+        *in_tx = state
+            .engine
+            .read()
+            .is_ok_and(|e| e.is_tx_open(spg_engine::IMPLICIT_TX));
         (result, wal_outcome, None)
     } else {
         let mut engine = state
@@ -2614,11 +2617,23 @@ fn handle_query_op(
             // statement that leaves the engine inside an open
             // transaction appends without fsync; the COMMIT (which
             // leaves the tx) fsyncs once for the whole tx.
-            append_wal(state, &sql, sync_commit && !engine.in_transaction())
+            //
+            // v7.39 (round 304, V38) — the witness is THIS path's slot.
+            // The native protocol runs every statement on IMPLICIT_TX,
+            // so that is its transaction. `in_transaction()` is true
+            // whenever ANY connection holds one, which made an
+            // autocommit write here skip its fsync — and get acked —
+            // because some pgwire/mysql connection had a transaction
+            // open. Same defect proven on the pgwire path this round.
+            append_wal(
+                state,
+                &sql,
+                sync_commit && !engine.is_tx_open(spg_engine::IMPLICIT_TX),
+            )
         } else {
             Ok(())
         };
-        *in_tx = engine.in_transaction();
+        *in_tx = engine.is_tx_open(spg_engine::IMPLICIT_TX);
         let snapshot = if state.db_path.is_some() && state.wal.is_none() {
             match &result {
                 Ok(QueryResult::CommandOk {
@@ -2632,7 +2647,8 @@ fn handle_query_op(
                 // statements skip: the base catalog only moves at
                 // COMMIT, and an uncommitted tx must not persist.
                 Ok(QueryResult::Rows { .. })
-                    if sql_is_dmlish(&sql) && !engine.in_transaction() =>
+                    if sql_is_dmlish(&sql)
+                        && !engine.is_tx_open(spg_engine::IMPLICIT_TX) =>
                 {
                     Some(engine.snapshot())
                 }

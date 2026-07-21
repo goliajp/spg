@@ -346,6 +346,7 @@ mod e2e_pg_scram;
 mod e2e_pg_session_vars;
 mod e2e_pg_concurrent_tx_round283;
 mod e2e_row_locks_round297;
+mod e2e_wal_fsync_global_tx_round304;
 mod e2e_pg_tx_visibility_round84;
 #[allow(
     clippy::cast_lossless,
