@@ -983,7 +983,7 @@ fn try_cast_2d_array(
     }
     Some(
         crate::eval::values::build_2d_from_rows(&row_vals).ok_or_else(|| EvalError::TypeMismatch {
-            detail: alloc::format!("malformed array literal: {s:?}"),
+            detail: crate::conversions::malformed_array_literal(s),
         }),
     )
 }
@@ -998,7 +998,7 @@ fn decode_int_array_external(s: &str) -> Result<Vec<Option<i32>>, EvalError> {
         .and_then(|x| x.strip_suffix('}'))
         .or_else(|| trimmed.strip_prefix('[').and_then(|x| x.strip_suffix(']')))
         .ok_or_else(|| EvalError::TypeMismatch {
-            detail: alloc::format!("malformed array literal: {s:?}"),
+            detail: crate::conversions::malformed_array_literal(s),
         })?;
     if inner.trim().is_empty() {
         return Ok(Vec::new());
@@ -1027,7 +1027,10 @@ fn decode_bigint_array_external(s: &str) -> Result<Vec<Option<i64>>, EvalError> 
         .and_then(|x| x.strip_suffix('}'))
         .or_else(|| trimmed.strip_prefix('[').and_then(|x| x.strip_suffix(']')))
         .ok_or_else(|| EvalError::TypeMismatch {
-            detail: alloc::format!("BIGmalformed array literal: {s:?}"),
+            // v7.39 (round 325) — was "BIGmalformed array literal", a
+            // stray edit that shipped: the message a client saw for
+            // `'abc'::bigint[]` began with three letters of BIGINT.
+            detail: crate::conversions::malformed_array_literal(s),
         })?;
     if inner.trim().is_empty() {
         return Ok(Vec::new());

@@ -22,19 +22,26 @@ use crate::numeric::{
 ///   * `\xDEADBEEF` (case-insensitive hex; whitespace stripped)
 ///   * `Hello\000world` (backslash escape form; `\\` for literal backslash)
 ///   * Anything else → raw UTF-8 bytes of the input (PG accepts this too).
-pub(crate) fn decode_bytea_literal(s: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
+/// v7.39 (round 325, V57) — errors are PG's own, verbatim:
+/// `invalid hexadecimal digit: "Z"` (naming the offending character) and
+/// `invalid hexadecimal data: odd number of digits`. They used to be SPG
+/// phrasings wrapped in `cannot parse "…" as BYTEA: `.
+pub(crate) fn decode_bytea_literal(s: &str) -> Result<alloc::vec::Vec<u8>, alloc::string::String> {
     let s = s.trim();
     if let Some(hex) = s.strip_prefix("\\x").or_else(|| s.strip_prefix("\\X")) {
         // Hex form. Each pair of hex digits → one byte.
         let cleaned: alloc::string::String = hex.chars().filter(|c| !c.is_whitespace()).collect();
         if cleaned.len() % 2 != 0 {
-            return Err("odd-length hex literal");
+            return Err(alloc::string::String::from(
+                "invalid hexadecimal data: odd number of digits",
+            ));
         }
         let mut out = alloc::vec::Vec::with_capacity(cleaned.len() / 2);
         let cleaned_bytes = cleaned.as_bytes();
         for i in (0..cleaned_bytes.len()).step_by(2) {
-            let hi = hex_nibble(cleaned_bytes[i])?;
-            let lo = hex_nibble(cleaned_bytes[i + 1])?;
+            let hi = hex_nibble(cleaned_bytes[i]).map_err(|()| bad_hex_digit(cleaned_bytes[i]))?;
+            let lo = hex_nibble(cleaned_bytes[i + 1])
+                .map_err(|()| bad_hex_digit(cleaned_bytes[i + 1]))?;
             out.push((hi << 4) | lo);
         }
         return Ok(out);
@@ -73,13 +80,18 @@ pub(crate) fn decode_bytea_literal(s: &str) -> Result<alloc::vec::Vec<u8>, &'sta
     Ok(out)
 }
 
-pub(crate) fn hex_nibble(b: u8) -> Result<u8, &'static str> {
+pub(crate) fn hex_nibble(b: u8) -> Result<u8, ()> {
     match b {
         b'0'..=b'9' => Ok(b - b'0'),
         b'a'..=b'f' => Ok(b - b'a' + 10),
         b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err("invalid hex digit"),
+        _ => Err(()),
     }
+}
+
+/// PG names the character it choked on.
+fn bad_hex_digit(b: u8) -> alloc::string::String {
+    alloc::format!("invalid hexadecimal digit: \"{}\"", b as char)
 }
 
 /// v7.37.5 γ — uniform array-of-scalar shape detector. Returns
@@ -327,14 +339,82 @@ pub(crate) fn array_literal_widen(items: alloc::vec::Vec<Value<'static>>) -> Val
     Value::IntArray(out)
 }
 
+/// v7.39 (round 325, V57) — PG's message for a literal that will not
+/// become an array, DETAIL and all. Measured on PG 18.4 (INSERT into a
+/// typed column):
+///
+/// | literal | DETAIL |
+/// |---|---|
+/// | `abc` | `Array value must start with "{" or dimension information.` |
+/// | `{1,2` | `Unexpected end of input.` |
+/// | `{1,2}}` · `{1,2}x` | `Junk after closing right brace.` |
+/// | `{1,}` | `Unexpected "}" character.` |
+///
+/// The `" DETAIL: "` separator is the one the wire splits into the
+/// ErrorResponse `D` field. An element that fails to convert is NOT this
+/// error: PG reports the ELEMENT type's own input-syntax error, which is
+/// what the per-element coercion below already produces.
+#[must_use]
+pub(crate) fn malformed_array_literal(text: &str) -> alloc::string::String {
+    let t = text.trim();
+    let detail = if !t.starts_with('{') {
+        "Array value must start with \"{\" or dimension information."
+    } else {
+        // The array ends at the FIRST unquoted `}` — the same rule the
+        // decoder applies, so `{1,2}}` is junk after the brace rather
+        // than an unterminated literal.
+        match first_unquoted_close_brace(&t[1..]) {
+            None => "Unexpected end of input.",
+            Some(close) => {
+                let inner = &t[1..1 + close];
+                if !t[1 + close + 1..].trim().is_empty() {
+                    "Junk after closing right brace."
+                } else if inner.trim_end().ends_with(',') {
+                    "Unexpected \"}\" character."
+                } else {
+                    "Unexpected end of input."
+                }
+            }
+        }
+    };
+    alloc::format!("malformed array literal: \"{text}\" DETAIL: {detail}")
+}
+
+/// Byte offset of the first `}` outside quotes, if any.
+fn first_unquoted_close_brace(body: &str) -> Option<usize> {
+    let bs = body.as_bytes();
+    let mut in_quote = false;
+    let mut k = 0;
+    while k < bs.len() {
+        match bs[k] {
+            b'\\' if in_quote => k += 1,
+            b'"' => in_quote = !in_quote,
+            b'}' if !in_quote => return Some(k),
+            _ => {}
+        }
+        k += 1;
+    }
+    None
+}
+
 pub(crate) fn decode_text_array_literal(
     s: &str,
 ) -> Result<alloc::vec::Vec<Option<alloc::string::String>>, &'static str> {
     let trimmed = s.trim();
-    let inner = trimmed
+    // v7.39 (round 325, V57) — the array ends at the FIRST unquoted `}`,
+    // and anything after it is junk. Peeling one brace off each end let
+    // `{1,2}}` through as the elements `1` and `2}`, so the failure was
+    // reported as a bad INTEGER rather than PG's "Junk after closing right
+    // brace." — a wrong diagnosis, not just wrong words.
+    let body = trimmed
         .strip_prefix('{')
-        .and_then(|x| x.strip_suffix('}'))
         .ok_or("TEXT[] literal must be enclosed in '{...}'")?;
+    let close =
+        first_unquoted_close_brace(body).ok_or("TEXT[] literal must be enclosed in '{...}'")?;
+    if !body[close + 1..].trim().is_empty() {
+        return Err("junk after closing right brace");
+    }
+    let inner = &body[..close];
     let mut out: alloc::vec::Vec<Option<alloc::string::String>> = alloc::vec::Vec::new();
     if inner.trim().is_empty() {
         return Ok(out);
@@ -371,6 +451,13 @@ pub(crate) fn decode_text_array_literal(
                 i += 1;
             }
             let raw = inner[start..i].trim();
+            // v7.39 (round 325, V57) — PG rejects an empty UNQUOTED
+            // element (`{1,}` is `Unexpected "}" character.`); it used to
+            // become an empty string, which then failed as a bad element
+            // of whatever the array's type was.
+            if raw.is_empty() {
+                return Err("empty array element");
+            }
             if raw.eq_ignore_ascii_case("NULL") {
                 out.push(None);
             } else {
@@ -3099,9 +3186,14 @@ fn decode_array_elems(
     col_name: &str,
     position: usize,
 ) -> Result<Vec<Option<Value<'static>>>, EngineError> {
-    let raw = decode_text_array_literal(s).map_err(|e| {
+    // v7.39 (round 325, V57) — PG's wording. This path used to answer
+    // `cannot parse "abc" as an array: TEXT[] literal must be enclosed in
+    // '{...}'` — SPG's own phrasing, naming TEXT[] even for an INT[]
+    // column, and differing from what the `::int[]` CAST path already
+    // said for the very same input.
+    let raw = decode_text_array_literal(s).map_err(|_| {
         EngineError::Eval(EvalError::TypeMismatch {
-            detail: alloc::format!("cannot parse {s:?} as an array: {e}"),
+            detail: malformed_array_literal(s),
         })
     })?;
     let mut out = Vec::with_capacity(raw.len());
@@ -3837,13 +3929,8 @@ pub(crate) fn coerce_value(
         // Errors surface as TypeMismatch so the operator gets a
         // clear "this literal isn't a bytea literal" hint.
         (Value::Text(s), DataType::Bytes) => {
-            let bytes = decode_bytea_literal(&s).map_err(|e| {
-                EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "cannot parse {s:?} as BYTEA: {e}"
-                    ),
-                })
-            })?;
+            let bytes = decode_bytea_literal(&s)
+                .map_err(|e| EngineError::Eval(EvalError::TypeMismatch { detail: e }))?;
             Some(Value::bytes(bytes))
         }
         // v7.10.4 — BYTEA → Text round-trip uses the PG hex
@@ -4139,8 +4226,36 @@ pub(crate) fn coerce_value(
             }
             Some(Value::BitString { nbits, bytes })
         }
-        (Value::Text(s), DataType::Bit(_) | DataType::BitVarying(_)) => match parse_bit_string_text(&s) {
-            Some((nbits, bytes)) => Some(Value::bit_string(nbits, bytes)),
+        (Value::Text(s), bit_ty @ (DataType::Bit(_) | DataType::BitVarying(_))) => match parse_bit_string_text(&s) {
+            Some((nbits, bytes)) => {
+                // v7.39 (round 325, V57) — the DECLARED width applies to a
+                // string literal too. It was checked only on the
+                // `B'…'` bit-literal path, so `INSERT INTO t(b)
+                // VALUES ('10')` into a `BIT(3)` column was accepted and
+                // stored two bits wide — a column that promises a fixed
+                // width silently holding another one. PG 18.4:
+                // `bit string length 2 does not match type bit(3)`, and
+                // `bit string too long for type bit varying(3)` past a
+                // varying cap.
+                match bit_ty {
+                    // A bare `bit` is `bit(1)` in PG, as the arm above.
+                    DataType::Bit(n) => {
+                        let want = if n == 0 { 1 } else { n };
+                        if nbits != want {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "bit string length {nbits} does not match type bit({want})"
+                            )));
+                        }
+                    }
+                    DataType::BitVarying(n) if n != 0 && nbits > n => {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "bit string too long for type bit varying({n})"
+                        )));
+                    }
+                    _ => {}
+                }
+                Some(Value::bit_string(nbits, bytes))
+            }
             None => {
                 // v7.39 (read01 varbit.c) — PG names the first bad digit.
                 let bad = s.chars().find(|c| *c != '0' && *c != '1');
@@ -4425,11 +4540,12 @@ pub(crate) fn coerce_value(
         // is the literal `NULL`; everything else is a quoted or
         // unquoted text element. mailrs `'{label1,label2}'::TEXT[]`.
         (Value::Text(s), DataType::TextArray) => {
-            let arr = decode_text_array_literal(&s).map_err(|e| {
+            // v7.39 (round 325, V57) — PG's wording (and the same message
+            // the CAST path gives for the identical input; this one used to
+            // name TEXT[] whatever the column's element type was).
+            let arr = decode_text_array_literal(&s).map_err(|_| {
                 EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "cannot parse {s:?} as TEXT[]: {e}"
-                    ),
+                    detail: malformed_array_literal(&s),
                 })
             })?;
             Some(Value::TextArray(arr))
@@ -4440,11 +4556,12 @@ pub(crate) fn coerce_value(
         // element as int. Same shape as the TextArray decode
         // above with an element-wise narrow.
         (Value::Text(s), DataType::IntArray) => {
-            let arr = decode_text_array_literal(&s).map_err(|e| {
+            // v7.39 (round 325, V57) — PG's wording (and the same message
+            // the CAST path gives for the identical input; this one used to
+            // name TEXT[] whatever the column's element type was).
+            let arr = decode_text_array_literal(&s).map_err(|_| {
                 EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "cannot parse {s:?} as INT[]: {e}"
-                    ),
+                    detail: malformed_array_literal(&s),
                 })
             })?;
             let mut out: Vec<Option<i32>> = Vec::with_capacity(arr.len());
@@ -4497,7 +4614,7 @@ pub(crate) fn coerce_value(
                 }
                 return crate::eval::values::build_2d_from_rows(&row_vals).ok_or_else(|| {
                     EngineError::Eval(EvalError::TypeMismatch {
-                        detail: alloc::format!("malformed array literal: {s:?}"),
+                        detail: malformed_array_literal(&s),
                     })
                 });
             }
@@ -4556,11 +4673,12 @@ pub(crate) fn coerce_value(
                 .collect(),
         )),
         (Value::Text(s), DataType::BigIntArray) => {
-            let arr = decode_text_array_literal(&s).map_err(|e| {
+            // v7.39 (round 325, V57) — PG's wording (and the same message
+            // the CAST path gives for the identical input; this one used to
+            // name TEXT[] whatever the column's element type was).
+            let arr = decode_text_array_literal(&s).map_err(|_| {
                 EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "cannot parse {s:?} as BIGINT[]: {e}"
-                    ),
+                    detail: malformed_array_literal(&s),
                 })
             })?;
             let mut out: Vec<Option<i64>> = Vec::with_capacity(arr.len());
