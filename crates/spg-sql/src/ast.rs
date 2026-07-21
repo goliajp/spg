@@ -6674,6 +6674,180 @@ impl fmt::Display for ColumnName {
     }
 }
 
+/// v7.39 (round 311) — render the left spine of an AND / OR chain
+/// without re-parenthesising each step, so `((a AND b) AND c)` comes out
+/// as `(a) AND (b) AND (c)` the way PG's deparse writes it. Only the
+/// SAME operator flattens; anything else is an ordinary operand.
+fn write_bool_chain(f: &mut fmt::Formatter<'_>, e: &Expr, op: BinOp) -> fmt::Result {
+    if let Expr::Binary { lhs, op: inner, rhs } = e
+        && *inner == op
+    {
+        write_bool_chain(f, lhs, op)?;
+        return write!(f, " {op} {rhs}");
+    }
+    write!(f, "{e}")
+}
+
+/// v7.39 (round 311, V32) — PG's PRETTY deparse of an expression, the
+/// form `pg_get_constraintdef(oid, true)` and friends return.
+///
+/// The default [`fmt::Display`] parenthesises every operator node, which
+/// is what PG's non-pretty deparse does and what makes the text
+/// round-trip. Pretty drops the pairs the grammar can put back, and the
+/// rule is NOT plain precedence minimisation — measured against PG 18.4
+/// across 37 shapes:
+///
+///   * the boolean layer follows precedence (NOT > AND > OR): an OR
+///     under an AND keeps its parens, an AND under an OR does not, and a
+///     comparison under any of them does not (`NOT a > 1`);
+///   * an associative chain flattens completely, even where the source
+///     nested it to the right (`a AND (b AND c)` prints as one chain);
+///   * but an operand of a comparison or arithmetic operator keeps its
+///     parens whenever it is itself an operator expression — so
+///     `(a + b) > 10` and `(- a) + b`, even though precedence alone
+///     would not require either. A cast, function call, column or
+///     literal in that position does not (`a::text = t`,
+///     `length(code) > 2`); a cast counts as compound exactly when the
+///     thing it casts is (`((a + b)::text) = t`).
+///
+/// Anything outside that layer defers to `Display`, which is never
+/// wrong — only more parenthesised than PG would print.
+#[must_use]
+pub fn pretty_expr(e: &Expr) -> String {
+    let mut out = String::new();
+    write_pretty(&mut out, e, PrettyParent::None, false);
+    out
+}
+
+/// Binding power. Higher binds tighter; 0 means "no enclosing operator".
+fn pretty_prec(e: &Expr) -> u8 {
+    match e {
+        Expr::Binary { op, .. } => match op {
+            BinOp::Or => 1,
+            BinOp::And => 2,
+            BinOp::Add | BinOp::Sub | BinOp::Concat => 5,
+            BinOp::Mul | BinOp::Div | BinOp::Mod => 6,
+            // Everything else in this enum is a comparison-shaped
+            // operator; they share one level, as in the grammar.
+            _ => 4,
+        },
+        Expr::Unary { op, .. } => match op {
+            UnOp::Not => 3,
+            UnOp::Neg | UnOp::BitNot => 7,
+        },
+        _ => u8::MAX,
+    }
+}
+
+/// Is this node an operator expression — the thing an arithmetic or
+/// comparison parent keeps parentheses around? A cast inherits the
+/// answer from what it casts.
+fn pretty_is_compound(e: &Expr) -> bool {
+    match e {
+        Expr::Binary { .. } | Expr::Unary { .. } => true,
+        Expr::Cast { expr, .. } => pretty_is_compound(expr),
+        _ => false,
+    }
+}
+
+/// `parent` describes the enclosing operator: its binding power, and
+/// whether it is a comparison (which keeps parens around any operator
+/// operand) or a NOT (which keeps them at equal power too).
+#[derive(Clone, Copy, PartialEq)]
+enum PrettyParent {
+    /// Nothing encloses this node.
+    None,
+    /// A comparison-shaped operator: an operator operand always keeps
+    /// its parens, whatever precedence would allow.
+    Comparison,
+    /// Arithmetic / concatenation: precedence decides.
+    Arith(u8),
+    /// A boolean connective: precedence decides.
+    Bool(u8),
+    /// `NOT`: precedence decides, but equal power still needs parens so
+    /// `NOT (NOT a > 1)` does not collapse.
+    Not,
+}
+
+fn write_pretty(out: &mut String, e: &Expr, parent: PrettyParent, is_rhs: bool) {
+    let prec = pretty_prec(e);
+    let is_unary_sign = matches!(
+        e,
+        Expr::Unary {
+            op: UnOp::Neg | UnOp::BitNot,
+            ..
+        }
+    );
+    let needs = match parent {
+        PrettyParent::None => false,
+        PrettyParent::Comparison => pretty_is_compound(e),
+        // A sign always keeps its parens under an operator — PG writes
+        // `(- a) + b` even though precedence would not require it.
+        PrettyParent::Arith(p) => {
+            is_unary_sign
+                || (matches!(e, Expr::Binary { .. } | Expr::Unary { .. })
+                    && (prec < p || (prec == p && is_rhs)))
+        }
+        PrettyParent::Bool(p) => {
+            matches!(e, Expr::Binary { .. } | Expr::Unary { .. }) && prec < p
+        }
+        PrettyParent::Not => {
+            matches!(e, Expr::Binary { .. } | Expr::Unary { .. }) && prec <= pretty_prec_not()
+        }
+    };
+    if needs {
+        out.push('(');
+    }
+    match e {
+        Expr::Binary { lhs, op, rhs } => {
+            let child = match op {
+                BinOp::And | BinOp::Or => PrettyParent::Bool(prec),
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                | BinOp::Concat => PrettyParent::Arith(prec),
+                _ => PrettyParent::Comparison,
+            };
+            write_pretty(out, lhs, child, false);
+            out.push(' ');
+            out.push_str(&alloc::format!("{op}"));
+            out.push(' ');
+            // AND / OR are associative, so an explicitly right-nested
+            // chain still prints as one chain.
+            let rhs_is_rhs = !matches!(op, BinOp::And | BinOp::Or);
+            write_pretty(out, rhs, child, rhs_is_rhs);
+        }
+        Expr::Unary { op, expr } => match op {
+            UnOp::Not => {
+                out.push_str("NOT ");
+                write_pretty(out, expr, PrettyParent::Not, false);
+            }
+            UnOp::Neg => {
+                out.push_str("- ");
+                write_pretty(out, expr, PrettyParent::Comparison, false);
+            }
+            UnOp::BitNot => {
+                out.push('~');
+                write_pretty(out, expr, PrettyParent::Comparison, false);
+            }
+        },
+        Expr::Cast { expr, target } => {
+            write_pretty(out, expr, PrettyParent::Comparison, false);
+            out.push_str(&alloc::format!("::{target}"));
+        }
+        Expr::IsNull { expr, negated } => {
+            write_pretty(out, expr, PrettyParent::Comparison, false);
+            out.push_str(if *negated { " IS NOT NULL" } else { " IS NULL" });
+        }
+        other => out.push_str(&alloc::format!("{other}")),
+    }
+    if needs {
+        out.push(')');
+    }
+}
+
+const fn pretty_prec_not() -> u8 {
+    3
+}
+
 impl fmt::Display for Expr {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -6684,13 +6858,31 @@ impl fmt::Display for Expr {
             // Round-trips as the spelling PG's docs lead with.
             Self::NamedArg { name, expr } => write!(f, "{} := {expr}", quote_ident(name)),
             Self::Variadic(expr) => write!(f, "VARIADIC {expr}"),
+            // v7.39 (round 311) — an AND / OR chain that nests to the
+            // LEFT is one chain, and renders flat: `(a) AND (b) AND (c)`,
+            // not `((a) AND (b)) AND (c)`. Explicit right nesting keeps
+            // its parentheses, because that is a different grouping as
+            // written. Both halves measured against PG 18.4's deparse,
+            // which flattens a same-operator left chain at parse time and
+            // leaves `a AND (b AND c)` alone.
+            Self::Binary { lhs, op, rhs } if matches!(op, BinOp::And | BinOp::Or) => {
+                f.write_str("(")?;
+                write_bool_chain(f, lhs, *op)?;
+                write!(f, " {op} {rhs}")?;
+                f.write_str(")")
+            }
             Self::Binary { lhs, op, rhs } => write!(f, "({lhs} {op} {rhs})"),
             Self::Unary { op, expr } => match op {
                 UnOp::Not => write!(f, "(NOT {expr})"),
-                UnOp::Neg => write!(f, "(-{expr})"),
+                // A space after the sign, as PG's deparse writes it.
+                UnOp::Neg => write!(f, "(- {expr})"),
                 UnOp::BitNot => write!(f, "(~{expr})"),
             },
-            Self::Cast { expr, target } => write!(f, "({expr}::{target})"),
+            // The OPERAND carries the parentheses, not the cast:
+            // `(a)::text`, `((a + b))::text`. PG words it this way, and
+            // it is what keeps `a::text = t` from reading as a cast of
+            // the comparison.
+            Self::Cast { expr, target } => write!(f, "({expr})::{target}"),
             Self::FieldAccess { base, field } => write!(f, "({base}).{field}"),
             Self::AggregateOrdered {
                 call,
