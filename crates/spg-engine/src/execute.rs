@@ -347,6 +347,16 @@ impl Engine {
         // rebase is only slower, never wrong).
         if !self.tx_catalogs.contains_key(&tx_id) {
             self.commit_epoch = self.commit_epoch.wrapping_add(1);
+            // v7.39 (round 306) — large-object descriptors live only as
+            // long as the transaction that opened them, so this is
+            // exactly where they die: an autocommit statement (the
+            // implicit transaction just ended) or the COMMIT / ROLLBACK
+            // that closed the slot. Numbering restarts from 0, as PG's
+            // does. Same per-slot witness as the epoch bump above —
+            // another connection's open transaction must not keep this
+            // one's descriptors alive.
+            self.lo_descriptors.clear();
+            self.lo_next_fd = 0;
         }
         if self.redo_capture {
             let mut drained = self.active_catalog_mut().drain_redo();
