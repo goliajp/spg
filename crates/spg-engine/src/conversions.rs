@@ -3101,7 +3101,7 @@ fn decode_array_elems(
 ) -> Result<Vec<Option<Value<'static>>>, EngineError> {
     let raw = decode_text_array_literal(s).map_err(|e| {
         EngineError::Eval(EvalError::TypeMismatch {
-            detail: alloc::format!("cannot parse {s:?} as an array for column `{col_name}`: {e}"),
+            detail: alloc::format!("cannot parse {s:?} as an array: {e}"),
         })
     })?;
     let mut out = Vec::with_capacity(raw.len());
@@ -3840,7 +3840,7 @@ pub(crate) fn coerce_value(
             let bytes = decode_bytea_literal(&s).map_err(|e| {
                 EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "cannot parse {s:?} as BYTEA for column `{col_name}`: {e}"
+                        "cannot parse {s:?} as BYTEA: {e}"
                     ),
                 })
             })?;
@@ -3862,7 +3862,7 @@ pub(crate) fn coerce_value(
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for type uuid: {s:?} (column `{col_name}`)"
+                        "invalid input syntax for type uuid: {s:?}"
                     ),
                 }));
             }
@@ -3882,7 +3882,7 @@ pub(crate) fn coerce_value(
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for type time: {s:?} (column `{col_name}`)"
+                        "invalid input syntax for type time: {s:?}"
                     ),
                 }));
             }
@@ -3904,7 +3904,7 @@ pub(crate) fn coerce_value(
             Err(_) => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for type year: {s:?} (column `{col_name}`)"
+                        "invalid input syntax for type year: {s:?}"
                     ),
                 }));
             }
@@ -3920,7 +3920,7 @@ pub(crate) fn coerce_value(
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "invalid input syntax for type time with time zone: \
-                         {s:?} (column `{col_name}`)"
+                         {s:?}"
                     ),
                 }));
             }
@@ -3937,7 +3937,7 @@ pub(crate) fn coerce_value(
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for type money: {s:?} (column `{col_name}`)"
+                        "invalid input syntax for type money: {s:?}"
                     ),
                 }));
             }
@@ -4080,7 +4080,7 @@ pub(crate) fn coerce_value(
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for INTERVAL: {s:?} (column `{col_name}`)"
+                        "invalid input syntax for type interval: {s:?}"
                     ),
                 }));
             }
@@ -4150,7 +4150,7 @@ pub(crate) fn coerce_value(
                             alloc::format!("\"{c}\" is not a valid binary digit")
                         }
                         None => alloc::format!(
-                            "invalid input syntax for BIT: {s:?} (column `{col_name}`)"
+                            "invalid input syntax for BIT: {s:?}"
                         ),
                     },
                 }));
@@ -4239,7 +4239,7 @@ pub(crate) fn coerce_value(
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for POINT: {s:?} (column `{col_name}`)"
+                        "invalid input syntax for type point: {s:?}"
                     ),
                 }));
             }
@@ -4249,7 +4249,7 @@ pub(crate) fn coerce_value(
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for LSEG: {s:?} (column `{col_name}`)"
+                        "invalid input syntax for type lseg: {s:?}"
                     ),
                 }));
             }
@@ -4259,7 +4259,7 @@ pub(crate) fn coerce_value(
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for BOX: {s:?} (column `{col_name}`)"
+                        "invalid input syntax for type box: {s:?}"
                     ),
                 }));
             }
@@ -4269,7 +4269,7 @@ pub(crate) fn coerce_value(
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for LINE: {s:?} (column `{col_name}`)"
+                        "invalid input syntax for type line: {s:?}"
                     ),
                 }));
             }
@@ -4279,7 +4279,7 @@ pub(crate) fn coerce_value(
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for CIRCLE: {s:?} (column `{col_name}`)"
+                        "invalid input syntax for type circle: {s:?}"
                     ),
                 }));
             }
@@ -4289,7 +4289,7 @@ pub(crate) fn coerce_value(
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for PATH: {s:?} (column `{col_name}`)"
+                        "invalid input syntax for type path: {s:?}"
                     ),
                 }));
             }
@@ -4312,7 +4312,7 @@ pub(crate) fn coerce_value(
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for POLYGON: {s:?} (column `{col_name}`)"
+                        "invalid input syntax for type polygon: {s:?}"
                     ),
                 }));
             }
@@ -4360,7 +4360,7 @@ pub(crate) fn coerce_value(
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for multirange type: {s:?} (column `{col_name}`)"
+                        "invalid input syntax for multirange type: {s:?}"
                     ),
                 }));
             }
@@ -4375,7 +4375,7 @@ pub(crate) fn coerce_value(
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for type hstore: {s:?} (column `{col_name}`)"
+                        "invalid input syntax for type hstore: {s:?}"
                     ),
                 }));
             }
@@ -4389,7 +4389,7 @@ pub(crate) fn coerce_value(
             Err(e) => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for INT[][]: {s:?} (column `{col_name}`): {e}"
+                        "invalid input syntax for INT[][]: {s:?}: {e}"
                     ),
                 }));
             }
@@ -4399,7 +4399,7 @@ pub(crate) fn coerce_value(
             Err(e) => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for BIGINT[][]: {s:?} (column `{col_name}`): {e}"
+                        "invalid input syntax for BIGINT[][]: {s:?}: {e}"
                     ),
                 }));
             }
@@ -4409,7 +4409,7 @@ pub(crate) fn coerce_value(
             Err(e) => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "invalid input syntax for TEXT[][]: {s:?} (column `{col_name}`): {e}"
+                        "invalid input syntax for TEXT[][]: {s:?}: {e}"
                     ),
                 }));
             }
@@ -4428,7 +4428,7 @@ pub(crate) fn coerce_value(
             let arr = decode_text_array_literal(&s).map_err(|e| {
                 EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "cannot parse {s:?} as TEXT[] for column `{col_name}`: {e}"
+                        "cannot parse {s:?} as TEXT[]: {e}"
                     ),
                 })
             })?;
@@ -4443,7 +4443,7 @@ pub(crate) fn coerce_value(
             let arr = decode_text_array_literal(&s).map_err(|e| {
                 EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "cannot parse {s:?} as INT[] for column `{col_name}`: {e}"
+                        "cannot parse {s:?} as INT[]: {e}"
                     ),
                 })
             })?;
@@ -4559,7 +4559,7 @@ pub(crate) fn coerce_value(
             let arr = decode_text_array_literal(&s).map_err(|e| {
                 EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "cannot parse {s:?} as BIGINT[] for column `{col_name}`: {e}"
+                        "cannot parse {s:?} as BIGINT[]: {e}"
                     ),
                 })
             })?;
@@ -4886,7 +4886,7 @@ pub(crate) fn coerce_value(
         (Value::Text(s), DataType::Vector { dim, encoding }) => {
             let parsed = eval::parse_vector_text(&s).ok_or_else(|| {
                 EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!("cannot parse {s:?} as VECTOR for column `{col_name}`"),
+                    detail: alloc::format!("cannot parse {s:?} as VECTOR"),
                 })
             })?;
             if parsed.len() != dim as usize {
@@ -4918,7 +4918,7 @@ pub(crate) fn coerce_value(
             let lexs = eval::decode_tsvector_external(&s).map_err(|e| {
                 EngineError::Eval(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "cannot parse {s:?} as TSVECTOR for column `{col_name}`: {e}"
+                        "cannot parse {s:?} as TSVECTOR: {e}"
                     ),
                 })
             })?;
