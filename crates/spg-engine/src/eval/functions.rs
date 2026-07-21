@@ -8845,7 +8845,14 @@ fn apply_function_dispatch(
         // meaningless in-process); found_rows / row_count /
         // last_insert_id — session counters queue with the MySQL
         // wire epic, 0/-1 keep clients moving.
-        "connection_id" => Ok(Value::BigInt(1)),
+        // v7.39 (round 317, V36) — the REAL calling-connection id, off
+        // the same host slot `pg_backend_pid()` reads, so a MySQL client
+        // gets its own id (and `SHOW PROCESSLIST` can be joined against
+        // it) instead of the constant 1 every connection used to see.
+        // Embedded (no host slot) keeps 1: one logical connection.
+        "connection_id" => Ok(Value::BigInt(
+            ctx.backend_pid_fn.map_or(1, |f| i64::from(f())),
+        )),
         "sleep" | "benchmark" => Ok(Value::Int(0)),
         "found_rows" | "last_insert_id" => Ok(Value::BigInt(0)),
         "row_count" => Ok(Value::BigInt(-1)),

@@ -554,3 +554,150 @@ fn one_connections_block_does_not_colour_anothers_status() {
     );
     exec_ok(&mut a, "ROLLBACK");
 }
+
+/// Walk a handshake like [`auth_open_mode`] but also return the
+/// `connection_id` the greeting announced.
+fn auth_open_mode_with_id(addr: &str) -> (TcpStream, u32) {
+    let mut s = common::connect_to(addr);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let (_seqno, greeting) = read_packet(&mut s);
+    // HandshakeV10: protocol_version(1) + server_version NUL-string +
+    // connection_id (4, LE).
+    let nul = 1 + greeting[1..].iter().position(|&b| b == 0).expect("version NUL");
+    let idpos = nul + 1;
+    let conn_id = u32::from_le_bytes(greeting[idpos..idpos + 4].try_into().unwrap());
+    write_packet(&mut s, 1, &build_handshake_response("anyone"));
+    let (_seqno, ok) = read_packet(&mut s);
+    assert_eq!(ok[0], 0x00, "expected OK after auth, got {:#x}", ok[0]);
+    (s, conn_id)
+}
+
+/// Read a whole text result set. The terminator is the 7-byte OK packet
+/// `encode_ok_packet` writes; a row is never 7 bytes here because its
+/// first column is always a non-empty value.
+fn query_rows(s: &mut TcpStream, sql: &str) -> Vec<Vec<Option<String>>> {
+    send_query(s, sql);
+    let (_seq, cc) = read_packet(s);
+    let (col_count, _) = read_lenenc(&cc, 0);
+    for _ in 0..col_count {
+        let _ = read_packet(s);
+    }
+    let mut out = Vec::new();
+    loop {
+        let (_seq, pkt) = read_packet(s);
+        if pkt[0] == 0x00 && pkt.len() == 7 {
+            return out;
+        }
+        let mut pos = 0;
+        let mut row = Vec::with_capacity(col_count as usize);
+        for _ in 0..col_count {
+            if pkt[pos] == 0xfb {
+                row.push(None);
+                pos += 1;
+            } else {
+                let (v, used) = read_lenenc_string(&pkt, pos);
+                pos += used;
+                row.push(Some(String::from_utf8(v).unwrap()));
+            }
+        }
+        out.push(row);
+    }
+}
+
+/// V36 (round 317) — the connection id is real. It used to be the
+/// LISTENER's port, so every connection was handed the same id in the
+/// greeting and `CONNECTION_ID()` answered a hardcoded 1 regardless:
+/// nothing could name one specific connection.
+///
+/// Measured against MariaDB 11: distinct connections get distinct ids,
+/// the id is stable inside a connection, and it is the same number the
+/// greeting announced.
+#[test]
+fn connection_id_is_per_connection_and_matches_the_greeting() {
+    let (_guard, addr) = spawn();
+    let (mut a, a_id) = auth_open_mode_with_id(&addr);
+    let (mut b, b_id) = auth_open_mode_with_id(&addr);
+
+    assert_ne!(a_id, b_id, "two live connections must not share an id");
+
+    let a_seen = query_scalar(&mut a, "SELECT connection_id()");
+    let b_seen = query_scalar(&mut b, "SELECT connection_id()");
+    assert_eq!(
+        a_seen,
+        a_id.to_string(),
+        "CONNECTION_ID() must be the id the greeting announced"
+    );
+    assert_eq!(b_seen, b_id.to_string());
+    assert_eq!(
+        query_scalar(&mut a, "SELECT connection_id()"),
+        a_seen,
+        "stable within the connection"
+    );
+}
+
+/// V36 (round 317) — `SHOW PROCESSLIST` reports the LIVE connections.
+/// It used to be one hardcoded row (Id 1, user "postgres", Info
+/// "SHOW PROCESSLIST") whatever was attached, so the surface an operator
+/// reaches for to find a connection could never show one.
+///
+/// Measured against MariaDB 11: the asking connection's own row carries
+/// its `CONNECTION_ID()` and the statement text in `Info`; an idle
+/// connection reports Command `Sleep` with NULL `Info`.
+#[test]
+fn show_processlist_lists_the_live_connections() {
+    let (_guard, addr) = spawn();
+    let (mut a, a_id) = auth_open_mode_with_id(&addr);
+    let (mut b, b_id) = auth_open_mode_with_id(&addr);
+    // Make B do something first so it is fully through its handshake.
+    assert_eq!(query_scalar(&mut b, "SELECT 1"), "1");
+
+    let rows = query_rows(&mut a, "SHOW PROCESSLIST");
+    let find = |id: u32| {
+        rows.iter()
+            .find(|r| r[0].as_deref() == Some(id.to_string().as_str()))
+            .unwrap_or_else(|| panic!("no row for connection {id} in {rows:?}"))
+            .clone()
+    };
+    let a_row = find(a_id);
+    let b_row = find(b_id);
+
+    assert_eq!(a_row[4].as_deref(), Some("Query"), "the asker is running one");
+    assert_eq!(
+        a_row[7].as_deref(),
+        Some("SHOW PROCESSLIST"),
+        "its own Info is the statement it is running"
+    );
+    assert_eq!(b_row[4].as_deref(), Some("Sleep"), "B is between statements");
+    assert_eq!(b_row[7], None, "an idle connection has no Info");
+}
+
+/// A connection that goes away leaves the list — otherwise the registry
+/// would grow forever and report dead connections as live.
+#[test]
+fn a_closed_connection_drops_out_of_the_processlist() {
+    let (_guard, addr) = spawn();
+    let (mut a, _a_id) = auth_open_mode_with_id(&addr);
+    let (mut b, b_id) = auth_open_mode_with_id(&addr);
+    assert_eq!(query_scalar(&mut b, "SELECT 1"), "1");
+    assert!(
+        query_rows(&mut a, "SHOW PROCESSLIST")
+            .iter()
+            .any(|r| r[0].as_deref() == Some(b_id.to_string().as_str())),
+        "B is live"
+    );
+
+    // COM_QUIT, then wait for the server to notice the socket closed.
+    write_packet(&mut b, 0, &[0x01]);
+    drop(b);
+    let mut gone = false;
+    for _ in 0..100 {
+        gone = !query_rows(&mut a, "SHOW PROCESSLIST")
+            .iter()
+            .any(|r| r[0].as_deref() == Some(b_id.to_string().as_str()));
+        if gone {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(gone, "a disconnected connection must leave the processlist");
+}
