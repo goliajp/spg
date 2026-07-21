@@ -154,17 +154,29 @@ fn a_name_column_still_behaves_like_the_string_it_holds() {
     }
 }
 
-/// information_schema is a different type family and is untouched here.
+/// information_schema is a different type family: PG declares its columns
+/// over its own DOMAINS, not over `name`.
+///
+/// v7.39 (round 330, V48) — this assertion used to read `text` and carried
+/// the note "the day V48 lands, this test is what has to change". It
+/// landed; the domains are built into the server now.
 #[test]
-fn information_schema_is_not_retyped() {
+fn information_schema_reports_its_own_domain_family() {
     let mut e = fixture();
-    // PG says `information_schema.sql_identifier`; SPG still says text.
-    // Pinned so the day V48 lands, this test is what has to change.
     assert_eq!(
         typeof_of(
             &mut e,
             "SELECT pg_typeof(table_name) FROM information_schema.tables LIMIT 1"
         ),
-        "text"
+        "information_schema.sql_identifier"
+    );
+    // …and NOT `name`, which is the pg_catalog family this round 313 test
+    // is otherwise about.
+    assert_eq!(
+        typeof_of(
+            &mut e,
+            "SELECT pg_typeof(relname) FROM pg_class LIMIT 1"
+        ),
+        "name"
     );
 }
