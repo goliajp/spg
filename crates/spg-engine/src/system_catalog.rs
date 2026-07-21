@@ -5287,12 +5287,88 @@ pub(crate) fn synth_pg_namespace(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
 
 /// v7.16.2 — drop the synthesised meta view into the enriched
 /// catalog so the regular FROM-resolution path can see it.
+/// v7.39 (round 313, V34) — pg_catalog's identifier columns are typed
+/// `name`, not `text`, so `pg_typeof(relname)` answers `name`. Every
+/// synth view built them as Text, and reflection tooling that keys off
+/// the reported type saw the wrong one.
+///
+/// The list is EXHAUSTIVE and taken from PG 18.4 itself — the columns
+/// whose `pg_type.typname` is `name`, intersected with the views this
+/// engine synthesises. It is not derived from the column NAME, because
+/// that does not work: `pg_config.name`, `pg_cursors.name` and
+/// `pg_backend_memory_contexts.name` are all `text`, and every
+/// `*namespace` is an oid. Guessing would have retyped those too.
+///
+/// Applied here, at the single point every synth view passes through,
+/// rather than at each of the sixty column definitions — one place to
+/// audit against the catalogue, and a new view cannot forget to do it.
+///
+/// information_schema is deliberately absent: PG types its identifier
+/// columns `information_schema.sql_identifier`, a DOMAIN over name, and
+/// its other columns other domains again (`yes_or_no`,
+/// `cardinal_number`). Reporting those needs the domains registered in
+/// the catalogue, which is different machinery — recorded as V48.
+fn retype_identifier_columns(view: &str, columns: &mut [ColumnSchema]) {
+    // The synth views arrive under their `__spg_` prefix.
+    let bare = view.strip_prefix("__spg_").unwrap_or(view);
+    let Some((_, names)) = PG_CATALOG_NAME_COLUMNS.iter().find(|(v, _)| *v == bare) else {
+        return;
+    };
+    for c in columns.iter_mut() {
+        if names.iter().any(|n| *n == c.name) {
+            c.ty = DataType::Name;
+        }
+    }
+}
+
+/// (view, columns) pairs PG types as `name`. See
+/// [`retype_identifier_columns`] for why this is a list and not a rule.
+static PG_CATALOG_NAME_COLUMNS: &[(&str, &[&str])] = &[
+    ("pg_am", &["amname"]),
+    ("pg_attribute", &["attname"]),
+    ("pg_class", &["relname"]),
+    ("pg_collation", &["collname"]),
+    ("pg_constraint", &["conname"]),
+    ("pg_database", &["datname"]),
+    ("pg_enum", &["enumlabel"]),
+    ("pg_extension", &["extname"]),
+    ("pg_indexes", &["indexname", "schemaname", "tablename", "tablespace"]),
+    ("pg_matviews", &["matviewname", "matviewowner", "schemaname", "tablespace"]),
+    ("pg_namespace", &["nspname"]),
+    ("pg_policies", &["policyname", "schemaname", "tablename"]),
+    ("pg_policy", &["polname"]),
+    ("pg_proc", &["proname"]),
+    ("pg_publication", &["pubname"]),
+    ("pg_replication_slots", &["database", "plugin", "slot_name"]),
+    ("pg_rewrite", &["rulename"]),
+    ("pg_roles", &["rolname"]),
+    ("pg_rules", &["rulename", "schemaname", "tablename"]),
+    ("pg_stat_database", &["datname"]),
+    ("pg_stat_progress_analyze", &["datname"]),
+    ("pg_stat_progress_create_index", &["datname"]),
+    ("pg_stat_progress_vacuum", &["datname"]),
+    ("pg_stat_replication", &["usename"]),
+    ("pg_stat_subscription_stats", &["subname"]),
+    ("pg_stat_user_functions", &["funcname", "schemaname"]),
+    ("pg_stat_user_indexes", &["indexrelname", "relname", "schemaname"]),
+    ("pg_stat_user_tables", &["relname", "schemaname"]),
+    ("pg_statistic_ext", &["stxname"]),
+    ("pg_subscription", &["subname", "subslotname"]),
+    ("pg_tables", &["schemaname", "tablename", "tableowner", "tablespace"]),
+    ("pg_tablespace", &["spcname"]),
+    ("pg_trigger", &["tgname", "tgnewtable", "tgoldtable"]),
+    ("pg_type", &["typname"]),
+    ("pg_user", &["usename"]),
+    ("pg_views", &["schemaname", "viewname", "viewowner"]),
+];
+
 pub(crate) fn materialise_meta_view(
     catalog: &mut Catalog,
     name: &str,
-    columns: Vec<ColumnSchema>,
+    mut columns: Vec<ColumnSchema>,
     rows: Vec<Row<'static>>,
 ) -> Result<(), EngineError> {
+    retype_identifier_columns(name, &mut columns);
     let schema = TableSchema::new(name.to_string(), columns);
     catalog.create_table(schema).map_err(EngineError::Storage)?;
     let table = catalog
