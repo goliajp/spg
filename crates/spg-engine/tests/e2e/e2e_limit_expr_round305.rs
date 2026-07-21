@@ -62,13 +62,20 @@ fn subquery_and_function_row_counts() {
         rows(&mut e, "SELECT id FROM t23 ORDER BY id OFFSET (SELECT 7)"),
         ["8", "9", "10"]
     );
-    // Both clauses non-constant at once. (Spelled LIMIT-before-OFFSET:
-    // PG takes either order, this parser only the one — V39, unrelated
-    // to row-count expressions and left to its own round.)
+    // Both clauses non-constant at once, in both orders — round 314
+    // (V39) taught the parser the second one, which this round had to
+    // spell around.
     assert_eq!(
         rows(
             &mut e,
             "SELECT id FROM t23 ORDER BY id LIMIT (SELECT 3) OFFSET (SELECT 2)"
+        ),
+        ["3", "4", "5"]
+    );
+    assert_eq!(
+        rows(
+            &mut e,
+            "SELECT id FROM t23 ORDER BY id OFFSET (SELECT 2) LIMIT (SELECT 3)"
         ),
         ["3", "4", "5"]
     );

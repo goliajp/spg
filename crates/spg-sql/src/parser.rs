@@ -10115,92 +10115,112 @@ impl Parser {
         } else {
             parsed_keys
         };
-        head.limit = if matches!(self.peek(), Token::Limit) {
-            self.advance();
-            // v7.17.0 Phase 5.1 — `LIMIT NULL` / `LIMIT ALL` are
-            // PG synonyms for "no limit". Treat both as None
-            // (no head.limit set) so the engine's existing
-            // unlimited-result path takes over. Reject was the
-            // pre-5.1 behaviour and broke pg_dump-flavoured
-            // tooling that occasionally emits LIMIT NULL.
-            if self.consume_limit_unbounded_sentinel() {
-                None
-            } else {
-                let first = self.parse_limit_expr("LIMIT")?;
-                // MySQL `LIMIT offset, count` — the first number is
-                // the offset when a comma follows.
-                if matches!(self.peek(), Token::Comma) {
-                    self.advance();
-                    let count = self.parse_limit_expr("LIMIT")?;
-                    head.offset = Some(first);
-                    Some(count)
+        // v7.39 (round 314, V39) — the row-count clauses come in EITHER
+        // order. PG's grammar takes a limit clause and an offset clause
+        // as an unordered pair, so `OFFSET 2 LIMIT 3` means exactly what
+        // `LIMIT 3 OFFSET 2` does (measured: same rows). This used to
+        // parse them in a fixed LIMIT-then-OFFSET sequence, so the other
+        // spelling died on `expected end of input, got Limit`.
+        //
+        // Each may appear at most once, and LIMIT and FETCH FIRST are
+        // two spellings of the same clause — PG rejects `LIMIT 1 LIMIT 2`,
+        // `OFFSET 1 OFFSET 2` and `LIMIT 2 FETCH FIRST 3 ROWS ONLY` alike.
+        // A second one is left unconsumed here, which the caller reports
+        // as trailing input rather than silently taking the last.
+        let mut saw_limit = false;
+        let mut saw_offset = false;
+        loop {
+            if !saw_limit && matches!(self.peek(), Token::Limit) {
+                self.advance();
+                // v7.17.0 Phase 5.1 — `LIMIT NULL` / `LIMIT ALL` are
+                // PG synonyms for "no limit". Treat both as None
+                // (no head.limit set) so the engine's existing
+                // unlimited-result path takes over. Reject was the
+                // pre-5.1 behaviour and broke pg_dump-flavoured
+                // tooling that occasionally emits LIMIT NULL.
+                if self.consume_limit_unbounded_sentinel() {
+                    head.limit = None;
                 } else {
-                    Some(first)
+                    let first = self.parse_limit_expr("LIMIT")?;
+                    // MySQL `LIMIT offset, count` — the first number is
+                    // the offset when a comma follows.
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                        let count = self.parse_limit_expr("LIMIT")?;
+                        head.offset = Some(first);
+                        saw_offset = true;
+                        head.limit = Some(count);
+                    } else {
+                        head.limit = Some(first);
+                    }
                 }
+                saw_limit = true;
+                continue;
             }
-        } else {
-            None
-        };
-        head.offset = if matches!(self.peek(), Token::Offset) {
-            self.advance();
-            // PG also accepts an optional `ROW` / `ROWS` trailer
-            // after the offset value (`OFFSET 10 ROWS`). The
-            // FETCH-FIRST branch below relies on the same.
-            let off = self.parse_limit_expr("OFFSET")?;
-            self.consume_optional_rows_keyword();
-            Some(off)
-        } else {
-            // Keep an offset the MySQL `LIMIT offset, count` form
-            // already assigned.
-            head.offset.take()
-        };
-        // v7.17.0 Phase 5.1 — `FETCH FIRST <int|$N> ROWS ONLY` is
-        // the SQL-standard alias for LIMIT. PG accepts both
-        // spellings interchangeably; pg_dump emits FETCH FIRST in
-        // newer versions. We map it onto `head.limit` so the
-        // engine path is unified.
-        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("fetch"))
-        {
-            self.advance(); // FETCH
-            // `FIRST` or `NEXT` (both legal per SQL standard).
-            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
-                if s.eq_ignore_ascii_case("first") || s.eq_ignore_ascii_case("next"))
-            {
+            if !saw_offset && matches!(self.peek(), Token::Offset) {
                 self.advance();
+                // PG also accepts an optional `ROW` / `ROWS` trailer
+                // after the offset value (`OFFSET 10 ROWS`). The
+                // FETCH-FIRST branch below relies on the same.
+                let off = self.parse_limit_expr("OFFSET")?;
+                self.consume_optional_rows_keyword();
+                head.offset = Some(off);
+                saw_offset = true;
+                continue;
             }
-            // Count (optional in the bare `FETCH FIRST ROW ONLY` —
-            // implicit 1 — but we always consume one if present).
-            let count = if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
-                if s.eq_ignore_ascii_case("row") || s.eq_ignore_ascii_case("rows"))
+            // v7.17.0 Phase 5.1 — `FETCH FIRST <int|$N> ROWS ONLY` is
+            // the SQL-standard alias for LIMIT. PG accepts both
+            // spellings interchangeably; pg_dump emits FETCH FIRST in
+            // newer versions. We map it onto `head.limit` so the
+            // engine path is unified.
+            if !saw_limit
+                && matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("fetch"))
             {
-                // Bare `FETCH FIRST ROW ONLY` = LIMIT 1.
-                crate::ast::LimitExpr::Literal(1)
-            } else {
-                self.parse_limit_expr("FETCH FIRST")?
-            };
-            // Eat `ROW` / `ROWS` if not already consumed above.
-            self.consume_optional_rows_keyword();
-            // Optional `ONLY` (the spec form) — or the SQL:2008
-            // `WITH TIES` form. v7.17.0 Phase 3.P0-49: the executor
-            // now honours WITH TIES by extending past the LIMIT
-            // truncation point through every row that shares the
-            // last-kept row's ORDER BY key.
-            if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
-                if s.eq_ignore_ascii_case("only"))
-            {
-                self.advance();
-            } else if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
-                if s.eq_ignore_ascii_case("with"))
-            {
-                self.advance(); // WITH
+                self.advance(); // FETCH
+                // `FIRST` or `NEXT` (both legal per SQL standard).
                 if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
-                    if s.eq_ignore_ascii_case("ties"))
+                    if s.eq_ignore_ascii_case("first") || s.eq_ignore_ascii_case("next"))
                 {
                     self.advance();
-                    head.limit_with_ties = true;
                 }
+                // Count (optional in the bare `FETCH FIRST ROW ONLY` —
+                // implicit 1 — but we always consume one if present).
+                let count = if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("row") || s.eq_ignore_ascii_case("rows"))
+                {
+                    // Bare `FETCH FIRST ROW ONLY` = LIMIT 1.
+                    crate::ast::LimitExpr::Literal(1)
+                } else {
+                    self.parse_limit_expr("FETCH FIRST")?
+                };
+                // Eat `ROW` / `ROWS` if not already consumed above.
+                self.consume_optional_rows_keyword();
+                // Optional `ONLY` (the spec form) — or the SQL:2008
+                // `WITH TIES` form. v7.17.0 Phase 3.P0-49: the executor
+                // now honours WITH TIES by extending past the LIMIT
+                // truncation point through every row that shares the
+                // last-kept row's ORDER BY key.
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("only"))
+                {
+                    self.advance();
+                } else if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("with"))
+                {
+                    self.advance(); // WITH
+                    if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("ties"))
+                    {
+                        self.advance();
+                        head.limit_with_ties = true;
+                    }
+                }
+                head.limit = Some(count);
+                saw_limit = true;
+                continue;
             }
-            head.limit = Some(count);
+            break;
         }
         // v7.17.0 Phase 3.4 — trailing row-lock clauses:
         //   FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE }
