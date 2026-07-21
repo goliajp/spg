@@ -447,6 +447,16 @@ pub(crate) struct ConnState {
     /// CancelToken. Reset when the next statement starts (PG: a
     /// between-statements cancel is a no-op).
     pub(crate) cancel_flag: AtomicBool,
+    /// v7.39 (round 318, V51) — set by `pg_terminate_backend` /
+    /// `KILL CONNECTION`. The connection loop checks it before reading the
+    /// next message and answers PG's FATAL before closing.
+    pub(crate) terminate: AtomicBool,
+    /// v7.39 (round 318, V51) — a clone of this connection's socket, used
+    /// ONLY to shut the read half down so a connection parked in `read()`
+    /// wakes up and notices `terminate`. The write half stays open so it
+    /// can still send the FATAL. `None` when the handle could not be
+    /// cloned; the flag is then seen at the next statement boundary.
+    pub(crate) sock: Option<std::net::TcpStream>,
     /// v7.39 (round 222) — LISTEN/NOTIFY per-connection delivery queue.
     /// Whichever connection reaches a statement boundary first drains the
     /// engine's committed-notification queue and BROADCASTS to every
@@ -564,6 +574,54 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0xf) as usize] as char);
     }
     out
+}
+
+// v7.39 (round 318, V51) — diagnostics the connection-control hook raised
+// while evaluating the CALLING connection's statement. The hook runs on
+// that connection's thread (it is called from inside the engine's
+// evaluation), so a thread-local reaches the right wire session; pgwire
+// drains it alongside the engine's own notices.
+thread_local! {
+    static PENDING_WARNINGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn take_host_warnings() -> Vec<String> {
+    PENDING_WARNINGS.with(|w| core::mem::take(&mut *w.borrow_mut()))
+}
+
+/// v7.39 (round 318, V51) — the `BackendSignalFn` the engine calls for
+/// `pg_cancel_backend` / `pg_terminate_backend` / `KILL`. Returns whether a
+/// live connection carries that id; an unknown id also raises PG's warning.
+///
+/// Cancel just trips the target's cancel flag — every engine cancel
+/// checkpoint sees it through the statement's token, and a connection that
+/// is between statements clears the flag before its next one, so an
+/// idle-time cancel is the no-op PG makes it. Terminate additionally
+/// latches `terminate` and shuts the target's READ half down, which wakes
+/// it out of a blocking read while leaving it able to send its FATAL.
+pub(crate) fn signal_backend(pid: u32, terminate: bool) -> bool {
+    let Some(state) = ACTIVITY_STATE.get() else {
+        return false;
+    };
+    let Ok(conns) = state.connections.read() else {
+        return false;
+    };
+    let Some(c) = conns.iter().find(|c| c.pid == pid) else {
+        PENDING_WARNINGS.with(|w| {
+            w.borrow_mut()
+                .push(format!("PID {pid} is not a PostgreSQL backend process"));
+        });
+        return false;
+    };
+    c.cancel_flag.store(true, Ordering::Relaxed);
+    if terminate {
+        c.terminate.store(true, Ordering::Relaxed);
+        if let Some(sock) = &c.sock {
+            let _ = sock.shutdown(std::net::Shutdown::Read);
+        }
+    }
+    true
 }
 
 /// v6.5.2 — Engine-registered activity provider. Snapshots the
@@ -1286,6 +1344,7 @@ fn run(
     // live connection count.
     engine.set_backend_count_fn(live_backend_count);
     engine.set_backend_pid_fn(current_backend_pid);
+    engine.set_backend_signal_fn(signal_backend);
     // v7.39 (tz epic) — named-timezone lookups via the system zoneinfo.
     engine.set_tz_fns(
         spg_tzif::tz_offset_at,

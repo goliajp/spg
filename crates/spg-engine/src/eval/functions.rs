@@ -15003,9 +15003,32 @@ fn apply_function_dispatch(
         | "pg_event_trigger_dropped_objects"
         | "pg_event_trigger_table_rewrite_oid"
         | "pg_event_trigger_table_rewrite_reason" => Ok(Value::Null),
-        // pg_cancel_backend / pg_terminate_backend — admin-level
-        // signal helpers. Return true (as if the cancel took effect).
-        "pg_cancel_backend" | "pg_terminate_backend" => Ok(Value::Bool(true)),
+        // v7.39 (round 318, V51) — pg_cancel_backend / pg_terminate_backend
+        // really signal the named connection through the host's registry.
+        // They used to return `true` unconditionally WITHOUT doing anything,
+        // so an operator (or a supervisor script) was told a runaway
+        // connection had been cancelled while it kept running.
+        //
+        // PG 18.4 measured: an id that is not a live backend answers `f`
+        // with `WARNING: PID N is not a PostgreSQL backend process`; the
+        // host raises that warning, since it is the side that knows.
+        // Cancel stops the target's current statement; terminate also
+        // closes it. Signalling yourself is legal and hits you.
+        "pg_cancel_backend" | "pg_terminate_backend" => {
+            let pid = match args.first() {
+                Some(Value::Int(n)) => i64::from(*n),
+                Some(Value::BigInt(n)) => *n,
+                Some(Value::SmallInt(n)) => i64::from(*n),
+                _ => return Ok(Value::Null),
+            };
+            let Ok(pid) = u32::try_from(pid) else {
+                return Ok(Value::Bool(false));
+            };
+            let terminate = name == "pg_terminate_backend";
+            Ok(Value::Bool(
+                ctx.backend_signal_fn.is_some_and(|f| f(pid, terminate)),
+            ))
+        }
         // v7.37.17 (17.6 siblings) — string / catalog helpers.
         // quote_ident wraps a bare identifier in "…" if it needs
         // quoting; quote_literal / quote_nullable wrap string values

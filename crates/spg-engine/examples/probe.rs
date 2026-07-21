@@ -146,7 +146,7 @@ fn main() {
         // looked identical whether or not SPG raised PG's notice, and
         // the differential could not see the gap it was meant to find.
         for n in e.take_notices() {
-            println!("NOTICE: {n}");
+            println!("{}: {}", n.severity.as_pg_str(), n.message);
         }
         match outcome {
             Ok(QueryResult::Rows { rows, .. }) => {

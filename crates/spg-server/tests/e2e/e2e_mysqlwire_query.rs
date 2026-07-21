@@ -701,3 +701,111 @@ fn a_closed_connection_drops_out_of_the_processlist() {
     }
     assert!(gone, "a disconnected connection must leave the processlist");
 }
+
+/// Read an ERR packet: `0xff`, errno (2, LE), `#`, 5-byte SQLSTATE, message.
+fn err_parts(pkt: &[u8]) -> (u16, String, String) {
+    assert_eq!(pkt[0], 0xff, "expected an ERR packet, got {:#x}", pkt[0]);
+    let errno = u16::from_le_bytes([pkt[1], pkt[2]]);
+    assert_eq!(pkt[3], b'#', "SQLSTATE marker");
+    let sqlstate = String::from_utf8(pkt[4..9].to_vec()).unwrap();
+    let msg = String::from_utf8(pkt[9..].to_vec()).unwrap();
+    (errno, sqlstate, msg)
+}
+
+fn err_of(s: &mut TcpStream, sql: &str) -> (u16, String, String) {
+    send_query(s, sql);
+    let (_seq, pkt) = read_packet(s);
+    err_parts(&pkt)
+}
+
+/// V51 (round 318) — `KILL` exists. The statement used to fail to parse at
+/// all, so the documented MariaDB way to drop a runaway connection was a
+/// syntax error against SPG.
+///
+/// Measured against MariaDB 11: an id no connection carries is
+/// `ERROR 1094 (HY000) Unknown thread id: N`, for both the CONNECTION and
+/// the QUERY form.
+#[test]
+fn kill_of_an_unknown_thread_id_is_error_1094() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    for sql in ["KILL 999999", "KILL QUERY 999999", "KILL CONNECTION 999999"] {
+        let (errno, sqlstate, msg) = err_of(&mut s, sql);
+        assert_eq!((errno, sqlstate.as_str()), (1094, "HY000"), "for `{sql}`");
+        assert_eq!(msg, "Unknown thread id: 999999", "for `{sql}`");
+    }
+    // Still usable afterwards.
+    assert_eq!(query_scalar(&mut s, "SELECT 1"), "1");
+}
+
+/// `KILL CONNECTION <other>` drops that connection and leaves the killer
+/// alone. Measured against MariaDB 11: the victim gets no ERR packet, its
+/// connection is simply closed.
+#[test]
+fn kill_connection_drops_the_named_connection() {
+    let (_guard, addr) = spawn();
+    let (mut killer, _) = auth_open_mode_with_id(&addr);
+    let (mut victim, victim_id) = auth_open_mode_with_id(&addr);
+    assert_eq!(query_scalar(&mut victim, "SELECT 1"), "1");
+
+    exec_ok(&mut killer, &format!("KILL CONNECTION {victim_id}"));
+
+    // The victim is gone: it leaves the processlist, and naming it again
+    // is an unknown thread id.
+    let mut gone = false;
+    for _ in 0..100 {
+        gone = !query_rows(&mut killer, "SHOW PROCESSLIST")
+            .iter()
+            .any(|r| r[0].as_deref() == Some(victim_id.to_string().as_str()));
+        if gone {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(gone, "a killed connection must leave the processlist");
+    let (errno, _, _) = err_of(&mut killer, &format!("KILL CONNECTION {victim_id}"));
+    assert_eq!(errno, 1094, "the id is no longer live");
+
+    // The victim's socket really is closed — a further exchange fails.
+    send_query(&mut victim, "SELECT 1");
+    let mut hdr = [0u8; 4];
+    assert!(
+        victim.read_exact(&mut hdr).is_err(),
+        "the killed connection must be closed"
+    );
+
+    // And the killer is untouched.
+    assert_eq!(query_scalar(&mut killer, "SELECT 1"), "1");
+}
+
+/// Killing your own connection: MariaDB 11 answers
+/// `ERROR 1927 (70100) Connection was killed` and closes.
+#[test]
+fn kill_of_your_own_connection_reports_1927_and_closes() {
+    let (_guard, addr) = spawn();
+    let (mut s, my_id) = auth_open_mode_with_id(&addr);
+    let (errno, sqlstate, msg) = err_of(&mut s, &format!("KILL CONNECTION {my_id}"));
+    assert_eq!((errno, sqlstate.as_str()), (1927, "70100"));
+    assert_eq!(msg, "Connection was killed");
+
+    send_query(&mut s, "SELECT 1");
+    let mut hdr = [0u8; 4];
+    assert!(
+        s.read_exact(&mut hdr).is_err(),
+        "the connection must be closed after killing itself"
+    );
+}
+
+/// `KILL QUERY <self>` only stops a running statement — the connection
+/// survives, so the next statement works.
+#[test]
+fn kill_query_leaves_the_connection_alive() {
+    let (_guard, addr) = spawn();
+    let (mut s, my_id) = auth_open_mode_with_id(&addr);
+    exec_ok(&mut s, &format!("KILL QUERY {my_id}"));
+    assert_eq!(
+        query_scalar(&mut s, "SELECT 1"),
+        "1",
+        "KILL QUERY must not end the connection"
+    );
+}

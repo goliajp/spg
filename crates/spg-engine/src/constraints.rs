@@ -3225,6 +3225,17 @@ impl crate::Engine {
         names: &[alloc::string::String],
         deferred: bool,
     ) -> Result<crate::QueryResult, EngineError> {
+        // v7.39 (round 318, V41) — outside a transaction block the command
+        // succeeds but cannot do anything: the setting dies with the
+        // implicit single-statement transaction it was made in. PG says so
+        // and still reports SET CONSTRAINTS; SPG used to succeed silently.
+        // Per-SLOT, not the global flag: another connection's open block
+        // must not make this one look like it is inside one.
+        if !self.current_tx.is_some_and(|tx| self.is_tx_open(tx)) {
+            self.warning(alloc::string::String::from(
+                "SET CONSTRAINTS can only be used in transaction blocks",
+            ));
+        }
         // Validate every name BEFORE anything changes, so a list with a
         // bad entry leaves the transaction's timing untouched.
         for n in names {

@@ -939,6 +939,15 @@ fn handle_pg_simple_query(
             .store(0, std::sync::atomic::Ordering::Relaxed);
         match stream_result {
             Ok(n) => {
+                // v7.39 (round 318, V51) — and the statement's diagnostics.
+                // The streaming fast path used to skip `drain_notices`
+                // entirely, so a NOTICE or WARNING raised by a SELECT was
+                // dropped on the floor. Nothing raised one until
+                // pg_cancel_backend / pg_terminate_backend started
+                // reporting an unknown pid, which is how the hole showed.
+                // The rows are already in `wbuf`, so it lands just before
+                // CommandComplete rather than ahead of the rows.
+                drain_notices(state, wbuf)?;
                 // v7.39 (round 222) — the streaming fast path also flushes
                 // pending LISTEN/NOTIFY deliveries (the engine read lock is
                 // dropped above, so the drain's write lock is safe).
@@ -1382,6 +1391,9 @@ fn dispatch_pg_simple_query_multi(
 /// session over the plain or TLS-wrapped stream.
 fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
+    // v7.39 (round 318, V51) — a shutdown handle for pg_terminate_backend.
+    // Cloned before the stream is borrowed by the TLS wrapper.
+    let sock = stream.try_clone().ok();
     // v7.39 (TLS) — SSLRequest negotiation. Peek the 8-byte header without
     // consuming it, so a plain-TCP client's StartupMessage is left intact for
     // read_startup; only a real SSLRequest (proto 80877103) is consumed and
@@ -1395,7 +1407,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 let mut tls_conn =
                     crate::mysqlwire::build_server_connection().map_err(std::io::Error::other)?;
                 let mut tls = rustls::Stream::new(&mut tls_conn, &mut stream);
-                return run_pg_session(&mut tls, state, true);
+                return run_pg_session(&mut tls, state, true, sock);
             }
             Some(80877104) => {
                 let mut hdr = [0u8; 8];
@@ -1420,7 +1432,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 }
                 return Ok(());
             }
-            _ => return run_pg_session(&mut stream, state, false),
+            _ => return run_pg_session(&mut stream, state, false, sock),
         }
     }
 }
@@ -1462,6 +1474,7 @@ fn run_pg_session(
     stream: &mut dyn ReadWrite,
     state: &Arc<ServerState>,
     secure: bool,
+    sock: Option<TcpStream>,
 ) -> std::io::Result<()> {
     // ---- Startup phase ----
     let (user, params) = read_startup(stream)?;
@@ -1543,6 +1556,8 @@ fn run_pg_session(
         startup_app_name: startup_app_name.clone(),
         cancel_secret: new_cancel_secret(),
         cancel_flag: std::sync::atomic::AtomicBool::new(false),
+        terminate: std::sync::atomic::AtomicBool::new(false),
+        sock,
         notify_queue: std::sync::Mutex::new(Vec::new()),
     });
 
@@ -1697,6 +1712,16 @@ fn run_pg_session(
     let mut peek_buf = [0u8; 256];
     let mut peek_have: usize = 0;
     loop {
+        // v7.39 (round 318, V51) — `pg_terminate_backend` on this
+        // connection. PG answers the terminated backend with a FATAL and
+        // closes; checking here (and on EOF below) covers both a
+        // connection parked in read — whose read half the signal shut
+        // down, waking it — and one that just finished a statement.
+        if terminated(&conn_state) {
+            let _ = stream.write_all(&wbuf);
+            wbuf.clear();
+            return send_fatal_terminated(stream);
+        }
         // Ensure we have at least 5 bytes for the header. The
         // speculative read pulls up to peek_buf.len() bytes; refills
         // from the socket only when the buffer doesn't already hold
@@ -1706,13 +1731,21 @@ fn run_pg_session(
                 Ok(n) => n,
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        return Ok(());
+                        return if terminated(&conn_state) {
+                            send_fatal_terminated(stream)
+                        } else {
+                            Ok(())
+                        };
                     }
                     return Err(e);
                 }
             };
             if n == 0 {
-                return Ok(());
+                return if terminated(&conn_state) {
+                    send_fatal_terminated(stream)
+                } else {
+                    Ok(())
+                };
             }
             peek_have += n;
         }
@@ -6601,7 +6634,14 @@ fn drain_notices(state: &ServerState, wbuf: &mut Vec<u8>) -> std::io::Result<()>
         Err(_) => return Ok(()),
     };
     for n in &notices {
-        send_notice(wbuf, n)?;
+        send_notice(wbuf, n.severity, &n.message)?;
+    }
+    // v7.39 (round 318, V51) — diagnostics raised by the host side of a
+    // builtin (pg_cancel_backend / pg_terminate_backend naming an id that
+    // is not a live connection). The engine has no registry, so the
+    // warning is produced where the fact is known and drained here.
+    for w in crate::take_host_warnings() {
+        send_notice(wbuf, spg_engine::NoticeSeverity::Warning, &w)?;
     }
     Ok(())
 }
@@ -6653,13 +6693,23 @@ fn drain_notifications(
 /// (successful_completion), which is what PG sends for the `IF EXISTS` /
 /// `IF NOT EXISTS` "…, skipping" notices. `V` carries the non-localized
 /// severity PG has emitted since 9.6; libpq/psql print `NOTICE:  <msg>`.
-fn send_notice(stream: &mut dyn Write, msg: &str) -> std::io::Result<()> {
+fn send_notice(
+    stream: &mut dyn Write,
+    severity: spg_engine::NoticeSeverity,
+    msg: &str,
+) -> std::io::Result<()> {
+    // v7.39 (round 318, V41) — the severity comes from the engine now.
+    // It used to be hardcoded NOTICE, so a PG WARNING arrived as a
+    // NOTICE and the drivers that surface warnings but drop notices
+    // silently swallowed it. SQLSTATE stays `00000` for both: PG's
+    // warnings on this channel carry successful_completion, and the
+    // command did succeed.
     let mut body = Vec::new();
     body.push(b'S');
-    body.extend_from_slice(b"NOTICE");
+    body.extend_from_slice(severity.as_pg_str().as_bytes());
     body.push(0);
     body.push(b'V');
-    body.extend_from_slice(b"NOTICE");
+    body.extend_from_slice(severity.as_pg_str().as_bytes());
     body.push(0);
     body.push(b'C');
     body.extend_from_slice(b"00000");
@@ -6669,6 +6719,38 @@ fn send_notice(stream: &mut dyn Write, msg: &str) -> std::io::Result<()> {
     body.push(0);
     body.push(0);
     stream.write_all(b"N")?;
+    stream.write_all(
+        &u32::try_from(body.len() + 4)
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    )?;
+    stream.write_all(&body)
+}
+
+/// v7.39 (round 318, V51) — has this connection been terminated?
+fn terminated(conn_state: &crate::ConnState) -> bool {
+    conn_state
+        .terminate
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// v7.39 (round 318, V51) — PG's reply to the backend it just terminated:
+/// severity FATAL (not ERROR — the connection is going away), SQLSTATE
+/// `57P01` admin_shutdown, and the exact text PG 18.4 emits.
+fn send_fatal_terminated(stream: &mut dyn Write) -> std::io::Result<()> {
+    let mut body = Vec::new();
+    for (code, val) in [
+        (b'S', "FATAL"),
+        (b'V', "FATAL"),
+        (b'C', "57P01"),
+        (b'M', "terminating connection due to administrator command"),
+    ] {
+        body.push(code);
+        body.extend_from_slice(val.as_bytes());
+        body.push(0);
+    }
+    body.push(0);
+    stream.write_all(b"E")?;
     stream.write_all(
         &u32::try_from(body.len() + 4)
             .unwrap_or(u32::MAX)

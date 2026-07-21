@@ -80,15 +80,18 @@ fn permission_probes_return_true() {
 }
 
 #[test]
-fn admin_signal_funcs_return_true() {
+fn admin_signal_funcs_report_no_such_backend_when_embedded() {
     let mut e = Engine::new();
+    // v7.39 (round 318, V51) — these used to answer `true` unconditionally
+    // and do nothing. An embedded engine has no connections at all, so
+    // every id names nothing: PG's answer for that is false.
     match first(&mut e, "SELECT pg_cancel_backend(1)") {
-        spg_storage::Value::Bool(true) => {}
-        other => panic!("expected true, got {other:?}"),
+        spg_storage::Value::Bool(false) => {}
+        other => panic!("expected false, got {other:?}"),
     }
     match first(&mut e, "SELECT pg_terminate_backend(1)") {
-        spg_storage::Value::Bool(true) => {}
-        other => panic!("expected true, got {other:?}"),
+        spg_storage::Value::Bool(false) => {}
+        other => panic!("expected false, got {other:?}"),
     }
     // pg_backend_pid returns an integer.
     match first(&mut e, "SELECT pg_backend_pid()") {

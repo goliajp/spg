@@ -297,6 +297,61 @@ impl Engine {
         QueryResult::Rows { columns, rows }
     }
 
+    /// v7.39 (round 318, V51) — MySQL `KILL [CONNECTION | QUERY] <id>`.
+    /// The statement did not exist at all before this, so a MySQL client
+    /// (or a DBA following MariaDB's own advice for dropping a runaway
+    /// connection) got a syntax error.
+    ///
+    /// MariaDB 11 measured: an id no connection carries is
+    /// `ERROR 1094 (HY000) Unknown thread id: N`; killing your own
+    /// connection succeeds and then reports
+    /// `ERROR 1927 (70100) Connection was killed` on the way out.
+    /// The host registry answers whether the id is live — the engine has
+    /// no connection registry of its own, and without a host hook
+    /// (embedded) there are no connections, so every id is unknown.
+    pub(crate) fn exec_kill(
+        &mut self,
+        query_only: bool,
+        id: &spg_sql::ast::Expr,
+    ) -> Result<QueryResult, crate::EngineError> {
+        let target = {
+            let empty: Vec<ColumnSchema> = alloc::vec::Vec::new();
+            let ctx = self.ev_ctx(&empty, None);
+            let dummy = Row::new(alloc::vec::Vec::new());
+            crate::eval::eval_expr(id, &dummy, &ctx).map_err(crate::EngineError::Eval)?
+        };
+        let target = match target {
+            Value::Int(n) => i64::from(n),
+            Value::BigInt(n) => n,
+            Value::SmallInt(n) => i64::from(n),
+            other => {
+                return Err(crate::EngineError::Unsupported(alloc::format!(
+                    "KILL expects a connection id, got {:?}",
+                    other.data_type()
+                )));
+            }
+        };
+        let Ok(target) = u32::try_from(target) else {
+            return Err(crate::EngineError::UnknownThreadId(u32::MAX));
+        };
+        let signalled = self
+            .backend_signal_fn
+            .is_some_and(|f| f(target, !query_only));
+        if !signalled {
+            return Err(crate::EngineError::UnknownThreadId(target));
+        }
+        // Killing your own connection works — and then you are told so.
+        // Only the CONNECTION form ends the session; KILL QUERY on
+        // yourself just cancels the statement you are already past.
+        if !query_only && self.backend_pid_fn.is_some_and(|f| f() == target) {
+            return Err(crate::EngineError::ConnectionKilled);
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: false,
+        })
+    }
+
     /// v7.17.0 Phase 3.P0-58 — `SHOW DATABASES` / `SHOW SCHEMAS`.
     /// SPG is single-database so the result is the canonical MySQL
     /// set every mysql/MariaDB client expects at connect time:

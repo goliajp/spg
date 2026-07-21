@@ -18,6 +18,7 @@ mod e2e_alter_rebuild;
     clippy::uninlined_format_args
 )]
 mod e2e_application_name;
+mod e2e_conn_control_round318;
 mod e2e_conn_identity_round317;
 #[allow(
     clippy::cast_lossless,

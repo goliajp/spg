@@ -332,14 +332,28 @@ impl Engine {
     /// banner (the wire layer adds that); e.g. `table "t" does not exist,
     /// skipping`.
     pub(crate) fn notice(&mut self, text: alloc::string::String) {
-        self.pending_notices.push(text);
+        self.pending_notices.push(crate::Notice {
+            severity: crate::NoticeSeverity::Notice,
+            message: text,
+        });
+    }
+
+    /// v7.39 (round 318, V41) — raise a PG-style WARNING. Same channel as
+    /// [`Self::notice`], one level louder: PG uses it for "the command
+    /// succeeded but did nothing useful" cases such as `SET CONSTRAINTS`
+    /// outside a transaction block.
+    pub(crate) fn warning(&mut self, text: alloc::string::String) {
+        self.pending_notices.push(crate::Notice {
+            severity: crate::NoticeSeverity::Warning,
+            message: text,
+        });
     }
 
     /// v7.39 (read01 round 46) — drain the NOTICEs the last statement
     /// raised. pgwire emits one NoticeResponse per entry ahead of the
     /// statement's CommandComplete; embedded callers may ignore them.
     #[must_use]
-    pub fn take_notices(&mut self) -> alloc::vec::Vec<alloc::string::String> {
+    pub fn take_notices(&mut self) -> alloc::vec::Vec<crate::Notice> {
         core::mem::take(&mut self.pending_notices)
     }
 
@@ -403,6 +417,9 @@ impl Engine {
             .with_salt_fn(self.salt_fn)
             // v7.39 (read01 pgstatfuncs.c) — calling-connection identity.
             .with_backend_pid_fn(self.backend_pid_fn)
+            // v7.39 (round 318, V51) — and the connection-control hook, so
+            // pg_cancel_backend / pg_terminate_backend really signal.
+            .with_backend_signal_fn(self.backend_signal_fn)
             // v7.38 (read01 P6.08) — thread the host wall clock so uuidv7 gets
             // a real time-ordered prefix.
             .with_clock(self.clock)

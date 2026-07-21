@@ -141,7 +141,7 @@ fn a_join_is_accepted_but_says_it_did_not_lock() {
         panic!("expected Rows");
     };
     assert_eq!(rows.len(), 1);
-    let notices = e.take_notices();
+    let notices: Vec<String> = e.take_notices().into_iter().map(|n| n.message).collect();
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(
         notices[0].contains("NOT enforced") && notices[0].starts_with("FOR UPDATE"),
