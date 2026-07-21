@@ -1296,6 +1296,57 @@ fn eval_cast_arm(
             _ => {}
         }
     }
+    // v7.39 (round 309, V30) — the mirror of the timestamptz arm
+    // below. A literal carrying a zone NAME is legal input to the
+    // zone-less types, and PG throws the zone away rather than
+    // converting: `'2020-01-01 10:00:00 America/New_York'::timestamp`
+    // is 10:00, not 15:00. Round 289 did this for a numeric `+02`
+    // offset; a named zone still failed to parse at all.
+    //
+    // The name is not simply stripped — PG validates it, and says so
+    // (`time zone "bogus/zone" not recognized`, lowercased) rather than
+    // reporting a malformed literal. That check is why this belongs
+    // here and not in `cast_value`: resolving a zone needs the host
+    // functions, which only the context carries.
+    let zoneless_target = match &target {
+        CastTarget::Timestamp => Some("timestamp"),
+        CastTarget::Date => Some("date"),
+        // `::time` has no CastTarget of its own; it arrives named.
+        CastTarget::Named(n) if n.eq_ignore_ascii_case("time") => Some("time"),
+        _ => None,
+    };
+    if let Some(kind) = zoneless_target
+        && let Value::Text(txt) = &v
+        && let Some((wall, zone)) = split_trailing_zone_name(txt, ctx.render_style.date_order)
+    {
+        if ctx.zone_local_to_utc(zone, wall).is_none() {
+            // Measured boundary: PG calls the token a ZONE NAME — and
+            // so reports a misspelling as such — only when it is
+            // path-shaped. A bare word it does not know (`ABCD`, `QQQ`,
+            // `UTC_X`) makes the whole literal invalid syntax instead,
+            // because nothing marks it as having meant a zone at all.
+            if zone.contains('/') {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "time zone \"{}\" not recognized",
+                        zone.to_ascii_lowercase()
+                    ),
+                });
+            }
+        } else {
+            return Ok(match kind {
+                "date" => Value::Date(
+                    i32::try_from(wall.div_euclid(86_400_000_000)).map_err(|_| {
+                        EvalError::TypeMismatch {
+                            detail: "timestamp out of DATE range".into(),
+                        }
+                    })?,
+                ),
+                "time" => Value::Time(wall.rem_euclid(86_400_000_000)),
+                _ => Value::Timestamp(wall),
+            });
+        }
+    }
     // v7.39 (tz epic) — timestamptz INPUT: an offset-less
     // literal is a wall-clock reading in the session zone
     // (PG); a trailing IANA zone name localises there. Both
@@ -4044,6 +4095,40 @@ pub(crate) fn unify_construct_values(
             })?;
     }
     Ok(())
+}
+
+/// v7.39 (round 309, V30) — split `'<timestamp> <zone name>'` into the
+/// wall-clock reading and the zone token, for the zone-less target types.
+///
+/// Returns `None` when the literal parses on its own (nothing to strip)
+/// or when the trailing token is not zone-SHAPED — those keep the
+/// ordinary "invalid input syntax" path, which is what PG answers for
+/// `'2020-01-01 10:00:00 xyz'`. Whether a zone-shaped token is a REAL
+/// zone is the caller's question; getting that wrong is a different
+/// error in PG, and conflating the two would report a malformed literal
+/// for a merely-misspelled zone.
+///
+/// Deliberately does not accept a bare time (`'10:00:00 America/New_York'`):
+/// PG refuses a named zone there, and only reaches this spelling through
+/// a full timestamp literal.
+fn split_trailing_zone_name(txt: &str, order: format::DateOrder) -> Option<(i64, &str)> {
+    // Already valid without help — leave it alone.
+    if format::parse_timestamp_literal_wall_ordered(txt, order).is_some() {
+        return None;
+    }
+    let trimmed = txt.trim_end();
+    let idx = trimmed.rfind(' ')?;
+    let (head, tail) = (trimmed[..idx].trim(), trimmed[idx + 1..].trim());
+    // An era marker is part of the timestamp, not a zone.
+    let zone_shaped = tail.len() > 1
+        && tail.bytes().any(|b| b.is_ascii_alphabetic())
+        && !tail.eq_ignore_ascii_case("bc")
+        && !tail.eq_ignore_ascii_case("ad");
+    if !zone_shaped {
+        return None;
+    }
+    let wall = format::parse_timestamp_literal_wall_ordered(head, order)?;
+    Some((wall, tail))
 }
 
 #[cfg(test)]

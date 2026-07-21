@@ -168,6 +168,7 @@ mod e2e_limit_expr_round305;
 mod e2e_lo_descriptors_round306;
 mod e2e_composite_identity_round307;
 mod e2e_set_constraints_named_round308;
+mod e2e_named_zone_wall_cast_round309;
 mod e2e_on_conflict_round240;
 mod e2e_update_from_alias_round241;
 mod e2e_grouping_elements_round242;
