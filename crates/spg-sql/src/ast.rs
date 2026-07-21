@@ -3028,6 +3028,7 @@ impl Expr {
                 | Self::Cast { expr, .. }
                 | Self::FieldAccess { base: expr, .. }
                 | Self::IsNull { expr, .. }
+                | Self::BoolTest { expr, .. }
                 | Self::Extract { source: expr, .. } => stack.push(expr),
                 Self::Binary { lhs, rhs, .. } => {
                     stack.push(lhs);
@@ -3603,6 +3604,21 @@ pub enum Expr {
     /// Postfix `IS NULL` / `IS NOT NULL`. Returns BOOL.
     IsNull {
         expr: Box<Expr>,
+        negated: bool,
+    },
+    /// v7.39 (round 328, V45) — `x IS [NOT] TRUE | FALSE | UNKNOWN`, the
+    /// three-valued boolean tests. `value` is `Some(true)` for TRUE,
+    /// `Some(false)` for FALSE and `None` for UNKNOWN.
+    ///
+    /// These used to be lowered to `CASE` / `IS NULL` right in the parser.
+    /// The semantics were right, but the AST then had no way to say what
+    /// the user wrote, so every renderer printed the lowering:
+    /// `CHECK ((a > 1) IS TRUE)` came back as
+    /// `CHECK ((CASE WHEN (a > 1) THEN TRUE ELSE FALSE END))`, and a
+    /// dumped view lost the form too.
+    BoolTest {
+        expr: Box<Expr>,
+        value: Option<bool>,
         negated: bool,
     },
     /// Function call `name(args...)`. v1.4 supports a small built-in set
@@ -7126,6 +7142,22 @@ impl fmt::Display for Expr {
                     write!(f, "({expr} IS NOT NULL)")
                 } else {
                     write!(f, "({expr} IS NULL)")
+                }
+            }
+            Self::BoolTest {
+                expr,
+                value,
+                negated,
+            } => {
+                let word = match value {
+                    Some(true) => "TRUE",
+                    Some(false) => "FALSE",
+                    None => "UNKNOWN",
+                };
+                if *negated {
+                    write!(f, "({expr} IS NOT {word})")
+                } else {
+                    write!(f, "({expr} IS {word})")
                 }
             }
             Self::FunctionCall { name, args } => {

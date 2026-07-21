@@ -61,6 +61,7 @@ fn expr_has_window(e: &Expr) -> bool {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => expr_has_window(expr),
         Expr::FunctionCall { args, .. } => args.iter().any(expr_has_window),
         Expr::Like { expr, pattern, .. } => expr_has_window(expr) || expr_has_window(pattern),
@@ -119,6 +120,7 @@ pub(crate) fn collect_window_nodes(e: &Expr, out: &mut Vec<Expr>) {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             collect_window_nodes(expr, out);
         }
@@ -154,6 +156,7 @@ pub(crate) fn rewrite_window_to_columns(e: &mut Expr, window_nodes: &[Expr]) {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             rewrite_window_to_columns(expr, window_nodes);
         }

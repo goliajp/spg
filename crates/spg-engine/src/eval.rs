@@ -2787,6 +2787,32 @@ fn not_a_composite_error(base: &Expr, field: &str, ctx: &EvalContext<'_>) -> Eva
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
 /// (stack-depth guard budget); body unchanged.
 #[inline(never)]
+/// v7.39 (round 328, V45) — the three-valued boolean tests. None of them
+/// ever answers NULL: a NULL input is "not true" and "not false", and IS
+/// UNKNOWN is precisely the NULL case. Verified against PG 18.4 —
+/// `NULL::bool IS TRUE` is false, `IS NOT TRUE` true, `IS UNKNOWN` true,
+/// and `false IS NOT FALSE` false.
+fn eval_bool_test_arm(
+    expr: &Expr,
+    value: Option<bool>,
+    negated: bool,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let v = eval_expr(expr, row, ctx)?;
+    let hit = match (value, &v) {
+        // IS UNKNOWN — the input is NULL.
+        (None, Value::Null) => true,
+        (None, _) => false,
+        (Some(_), Value::Null) => false,
+        (Some(want), Value::Bool(b)) => *b == want,
+        // A non-boolean input: PG rejects it at parse time; here the
+        // test simply cannot hold.
+        (Some(_), _) => false,
+    };
+    Ok(Value::Bool(hit != negated))
+}
+
 fn eval_is_null_arm(
     expr: &Expr,
     negated: bool,
@@ -2950,6 +2976,15 @@ pub fn eval_expr(
         Expr::Cast { expr, target } => eval_cast_arm(expr, target, row, ctx),
         Expr::FieldAccess { base, field } => eval_field_access_arm(base, field, row, ctx),
         Expr::IsNull { expr, negated } => eval_is_null_arm(expr, *negated, row, ctx),
+        // v7.39 (round 328, V45) — `x IS [NOT] TRUE | FALSE | UNKNOWN`.
+        // Out-of-line like its IS NULL neighbour: an inline body here
+        // grows every frame of the recursive evaluator, which is what
+        // tipped the 512KB depth guard in round 305.
+        Expr::BoolTest {
+            expr,
+            value,
+            negated,
+        } => eval_bool_test_arm(expr, *value, *negated, row, ctx),
         Expr::FunctionCall { name, args } => eval_function_call_arm(name, args, row, ctx),
         // v7.39 (read01 round 100) — VARIADIC is spliced into its enclosing
         // call before the args are evaluated (see eval_function_call_arm); a

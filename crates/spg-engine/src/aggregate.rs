@@ -70,6 +70,7 @@ pub fn contains_aggregate(e: &Expr) -> bool {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => contains_aggregate(expr),
         Expr::Like { expr, pattern, .. } => contains_aggregate(expr) || contains_aggregate(pattern),
         Expr::Extract { source, .. } => contains_aggregate(source),
@@ -3606,7 +3607,8 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
             walk(rhs)?;
         } else if let Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
-        | Expr::IsNull { expr, .. } = e
+        | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. } = e
         {
             walk(expr)?;
         }
@@ -3802,6 +3804,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             collect_aggregates(expr, out);
         }
@@ -5343,6 +5346,15 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
         },
         Expr::IsNull { expr, negated } => Expr::IsNull {
             expr: Box::new(rewrite_expr(expr, group_exprs, aggs)),
+            negated: *negated,
+        },
+        Expr::BoolTest {
+            expr,
+            value,
+            negated,
+        } => Expr::BoolTest {
+            expr: Box::new(rewrite_expr(expr, group_exprs, aggs)),
+            value: *value,
             negated: *negated,
         },
         Expr::FunctionCall { name, args } => Expr::FunctionCall {

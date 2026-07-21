@@ -138,6 +138,7 @@ fn expr_has_scalar_subquery(e: &Expr) -> bool {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => expr_has_scalar_subquery(expr),
         Expr::FunctionCall { args, .. } => args.iter().any(expr_has_scalar_subquery),
         Expr::Like { expr, pattern, .. } => {
@@ -225,6 +226,7 @@ fn expr_has_streaming_disqualifier(e: &Expr) -> bool {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => expr_has_streaming_disqualifier(expr),
         Expr::Like { expr, pattern, .. } => {
             expr_has_streaming_disqualifier(expr) || expr_has_streaming_disqualifier(pattern)
