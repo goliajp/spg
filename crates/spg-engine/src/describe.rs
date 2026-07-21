@@ -23,7 +23,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use spg_sql::ast::{Expr, Literal, SelectItem, SelectStatement, Statement, UnOp};
-use spg_storage::{Catalog, ColumnSchema, DataType};
+use spg_storage::{Catalog, ColumnSchema, DataType, Value};
 
 /// One-shot describe of a prepared `Statement`.
 ///
@@ -1124,6 +1124,41 @@ fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
         }
         Expr::Literal(_) | Expr::Column(_) | Expr::Placeholder(_) => {}
     }
+}
+
+/// v7.39 (round 310, V31) — a TIMESTAMPTZ array has to be recognised from
+/// the element EXPRESSIONS, not from their values.
+///
+/// `Value::Timestamp` is the runtime form of both timestamp types — the
+/// zone-ness rides on the static type, exactly as enum-ness and
+/// composite-ness do (rounds 54 / 56). An array builder picks its variant
+/// by looking at what it materialised, so it could only ever answer
+/// `timestamp without time zone[]`; the array then would not go into a
+/// `timestamptz[]` column and rendered without its offset.
+///
+/// Shared because there are two array builders — the evaluator's and the
+/// literal-folding one INSERT VALUES uses. Fixing only the first left the
+/// INSERT still rejecting its own well-typed array.
+///
+/// Only a uniformly-timestamptz constructor is upgraded. A mixed one has
+/// already been unified by the caller, and if that settled on a plain
+/// timestamp then plain is what PG resolves it to.
+pub(crate) fn upgrade_timestamptz_array(
+    v: Value<'static>,
+    items: &[Expr],
+    columns: &[ColumnSchema],
+) -> Value<'static> {
+    let Value::TimestampArray(elems) = v else {
+        return v;
+    };
+    if items.is_empty()
+        || !items.iter().all(|e| {
+            describe_expr(e, columns).is_some_and(|s| s.ty == DataType::Timestamptz)
+        })
+    {
+        return Value::TimestampArray(elems);
+    }
+    Value::TimestamptzArray(elems)
 }
 
 #[cfg(test)]

@@ -197,9 +197,19 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
         CastTarget::Float => cast_numeric_to_float(v),
         CastTarget::Bool => cast_to_bool(v),
         CastTarget::Date => cast_to_date(v),
-        // TIMESTAMP and TIMESTAMPTZ have identical runtime
-        // representation (i64 microseconds UTC).
-        CastTarget::Timestamp | CastTarget::Timestamptz => cast_to_timestamp(v),
+        // TIMESTAMP and TIMESTAMPTZ share a runtime representation
+        // (i64 microseconds UTC) but NOT an input rule, and conflating
+        // the two silently stored the wrong instant. `::timestamp`
+        // keeps the wall clock a literal's offset was written against
+        // (round 289); `::timestamptz` CONVERTS by it. The evaluator's
+        // context-aware arm intercepts timestamptz before this point,
+        // so the difference only showed on the paths that reach here
+        // directly — INSERT VALUES folds its literals through
+        // `literal_expr_to_value_in`, and stored 10:00 for
+        // `'2020-01-01 10:00:00+02'::timestamptz` where PG stores
+        // 08:00 (round 310).
+        CastTarget::Timestamp => cast_to_timestamp(v),
+        CastTarget::Timestamptz => cast_to_timestamptz(v),
         // v7.9.25 — `expr::INTERVAL`. Currently only TEXT → Interval
         // is supported (the mailrs idiom: `$1::INTERVAL` where the
         // bound param is a string like `'7 days'`).
@@ -1235,6 +1245,27 @@ fn cast_to_timestamp(v: Value) -> Result<Value, EvalError> {
             detail: format!("cannot cast {:?} to TIMESTAMP", other.data_type()),
         }),
     }
+}
+
+/// v7.39 (round 310) — `::timestamptz` from text: an offset in the
+/// literal is APPLIED, unlike the zone-less sibling which discards it.
+/// Naive input (no offset) is read as UTC, which is what the
+/// context-aware arm already assumed when it fell through to here.
+fn cast_to_timestamptz(v: Value) -> Result<Value, EvalError> {
+    let Value::Text(s) = &v else {
+        return cast_to_timestamp(v);
+    };
+    crate::eval::format::parse_timestamp_literal_tz_ordered(
+        s,
+        crate::eval::format::DateOrder::Mdy,
+    )
+    .map(|(micros, _had_tz)| Value::Timestamp(micros))
+    .ok_or_else(|| EvalError::TypeMismatch {
+        detail: format!(
+            "cannot parse {s:?} as TIMESTAMP \
+             (expected YYYY-MM-DD[ HH:MM:SS[.ffffff]])"
+        ),
+    })
 }
 
 /// v7.39 (round 254) — PG refuses to cast a NUMERIC special into any

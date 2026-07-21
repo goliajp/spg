@@ -2633,10 +2633,14 @@ pub(crate) fn literal_expr_to_value_in(
         Expr::Array(items) => {
             let mut materialised: alloc::vec::Vec<Value<'static>> =
                 alloc::vec::Vec::with_capacity(items.len());
-            for elem in items {
-                materialised.push(literal_expr_to_value_in(elem, catalog)?);
+            for elem in &items {
+                materialised.push(literal_expr_to_value_in(elem.clone(), catalog)?);
             }
-            Ok(array_literal_widen(materialised))
+            Ok(crate::describe::upgrade_timestamptz_array(
+                array_literal_widen(materialised),
+                &items,
+                &[],
+            ))
         }
         // Any other Expr shape — fall back to a general evaluation
         // against an empty row + empty schema. This unblocks the
