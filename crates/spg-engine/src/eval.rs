@@ -1565,7 +1565,7 @@ fn eval_array_arm(
     // It usually LOOKED right (array_to_string renders `t` either way), which is
     // exactly what let it sit; the array FUNCTIONS are what tripped over it.
     if let Some(v) = values::homogeneous_typed_array(&materialised) {
-        return Ok(v);
+        return Ok(crate::describe::upgrade_timestamptz_array(v, items, ctx.columns));
     }
     // v7.39 (round 236) — PG resolves an ARRAY constructor's elements to ONE
     // element type and refuses the constructor when they have no common one:
@@ -1582,7 +1582,7 @@ fn eval_array_arm(
     // path before falling into the numeric/text ladder below — otherwise
     // the now-uniform boolean array would still degrade to text[].
     if let Some(v) = values::homogeneous_typed_array(&materialised) {
-        return Ok(v);
+        return Ok(crate::describe::upgrade_timestamptz_array(v, items, ctx.columns));
     }
     let mut has_text = false;
     let mut has_float = false;
