@@ -176,6 +176,7 @@ mod e2e_catalog_name_type_round313;
 mod e2e_limit_offset_order_round314;
 mod e2e_function_attrs_round322;
 mod e2e_array_agg_tz_identity_round327;
+mod e2e_bool_test_shape_round328;
 mod e2e_array_bytea_bit_input_round325;
 mod e2e_temporal_array_cast_round326;
 mod e2e_input_syntax_wording_round324;

@@ -1564,6 +1564,7 @@ fn substitute_locals(expr: &mut Expr, locals: &BTreeMap<String, Value>) {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             substitute_locals(expr, locals);
         }
@@ -1729,6 +1730,7 @@ pub(crate) fn substitute_new_old(
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             substitute_new_old(expr, new_row, old_row, columns)?;
         }

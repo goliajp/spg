@@ -336,6 +336,7 @@ fn rewrite_column_in_expr(e: &mut Expr, old: &str, new: &str) {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             rewrite_column_in_expr(expr, old, new);
         }
@@ -844,6 +845,7 @@ fn substitute_expr(e: &mut Expr, params: &[Value<'static>]) -> Result<(), Engine
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             substitute_expr(expr, params)?;
         }

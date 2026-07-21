@@ -313,6 +313,7 @@ fn rewrite_unqualified(e: &mut Expr, pick: &BTreeMap<String, Expr>) {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. }
         | Expr::Extract { source: expr, .. } => rewrite_unqualified(expr, pick),
         Expr::FunctionCall { args, .. } => {

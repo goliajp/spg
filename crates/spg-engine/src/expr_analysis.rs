@@ -160,6 +160,7 @@ pub(crate) fn visit_expr_columns_and_subqueries<'a>(
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             visit_expr_columns_and_subqueries(expr, on_col, on_sub);
         }
@@ -268,6 +269,7 @@ pub(crate) fn collect_column_qualifiers<'e>(
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             collect_column_qualifiers(expr, out, all_qualified);
         }
@@ -319,6 +321,7 @@ pub(crate) fn expr_refers_to(e: &Expr, target: &str) -> bool {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => expr_refers_to(expr, target),
         Expr::Like { expr, pattern, .. } => {
             expr_refers_to(expr, target) || expr_refers_to(pattern, target)
@@ -400,6 +403,7 @@ pub(crate) fn rewrite_nodes_mut(e: &mut Expr, f: &mut impl FnMut(&mut Expr) -> b
         | Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. }
         | Expr::Extract { source: expr, .. } => rewrite_nodes_mut(expr, f),
         Expr::Binary { lhs, rhs, .. } => {

@@ -673,6 +673,7 @@ impl Engine {
             Expr::Unary { expr, .. }
             | Expr::Cast { expr, .. }
             | Expr::IsNull { expr, .. }
+            | Expr::BoolTest { expr, .. }
             | Expr::FieldAccess { base: expr, .. } => {
                 self.resolve_correlated_in_expr(expr, row, ctx, cancel, memo.as_deref_mut())?;
             }
@@ -1768,6 +1769,7 @@ impl Engine {
             Expr::Unary { expr, .. }
             | Expr::Cast { expr, .. }
             | Expr::IsNull { expr, .. }
+            | Expr::BoolTest { expr, .. }
             | Expr::FieldAccess { base: expr, .. } => {
                 self.pull_up_walk_limit_one(
                     expr,
@@ -2213,6 +2215,7 @@ impl Engine {
             Expr::Unary { expr, .. }
             | Expr::Cast { expr, .. }
             | Expr::IsNull { expr, .. }
+            | Expr::BoolTest { expr, .. }
             | Expr::FieldAccess { base: expr, .. } => {
                 self.pull_up_walk(expr, in_agg, outer_aliases, joins_out);
             }
@@ -3053,6 +3056,7 @@ fn proj_has_disqualifying_shape(
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             proj_has_disqualifying_shape(expr, inner_alias, outer_aliases)
         }
@@ -3145,6 +3149,7 @@ fn disambiguate_expr_unqualified_columns(
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             disambiguate_expr_unqualified_columns(expr, owner);
         }
@@ -3234,6 +3239,7 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             rename_qualifier(expr, from, to);
         }
@@ -3792,6 +3798,7 @@ pub(crate) fn collect_scalar_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a Selec
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             collect_scalar_subqueries(expr, out);
         }
@@ -3862,6 +3869,7 @@ fn hollow_scalar_subqueries(e: &mut Expr) {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             hollow_scalar_subqueries(expr);
         }
@@ -3955,6 +3963,7 @@ fn splice_planned_subqueries(
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             splice_planned_subqueries(expr, plan, idx, row, ctx)
         }
@@ -4044,6 +4053,7 @@ pub(crate) fn collect_exists_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a Selec
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             collect_exists_subqueries(expr, out);
         }
@@ -4137,6 +4147,7 @@ fn splice_planned_exists(
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => splice_planned_exists(expr, plan, idx, row, ctx),
         Expr::Like { expr, pattern, .. } => Ok(splice_planned_exists(expr, plan, idx, row, ctx)?
             && splice_planned_exists(pattern, plan, idx, row, ctx)?),
@@ -4458,6 +4469,7 @@ fn substitute_in_expr(e: &mut Expr, row: &Row<'static>, ctx: &EvalContext<'_>, o
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             substitute_in_expr(expr, row, ctx, outer_alias);
         }
@@ -4600,6 +4612,7 @@ pub(crate) fn expr_has_subquery(e: &Expr) -> bool {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => expr_has_subquery(expr),
         Expr::FunctionCall { args, .. } => args.iter().any(expr_has_subquery),
         Expr::Like { expr, pattern, .. } => expr_has_subquery(expr) || expr_has_subquery(pattern),

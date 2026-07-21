@@ -1507,6 +1507,7 @@ impl Engine {
             Expr::Unary { expr, .. }
             | Expr::Cast { expr, .. }
             | Expr::IsNull { expr, .. }
+            | Expr::BoolTest { expr, .. }
             | Expr::FieldAccess { base: expr, .. } => {
                 self.resolve_expr_subqueries(expr, cancel)?;
             }
@@ -5687,6 +5688,7 @@ fn collect_agg_exprs(e: &Expr, out: &mut Vec<Expr>) {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => collect_agg_exprs(expr, out),
         Expr::FunctionCall { args, .. } => {
             for a in args {
@@ -5737,6 +5739,7 @@ fn replace_agg_exprs(e: &mut Expr, aggs: &[Expr]) {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => replace_agg_exprs(expr, aggs),
         Expr::FunctionCall { args, .. } => {
             for a in args {

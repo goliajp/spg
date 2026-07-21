@@ -163,6 +163,7 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
             rewrite_expr_clock(expr, now);
         }

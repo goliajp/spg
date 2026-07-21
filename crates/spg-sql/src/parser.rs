@@ -18123,34 +18123,17 @@ impl Parser {
                         Token::False => Some(false),
                         _ => None, // UNKNOWN
                     };
-                    let lowered = match test {
-                        // IS TRUE: CASE WHEN x THEN t ELSE f END —
-                        // NULL and false both land in ELSE.
-                        Some(true) => Expr::Case {
-                            operand: None,
-                            branches: alloc::vec![(expr, Expr::Literal(Literal::Bool(!negated)),)],
-                            else_branch: Some(Box::new(Expr::Literal(Literal::Bool(negated)))),
-                        },
-                        // IS FALSE: CASE WHEN NOT x THEN t ELSE f
-                        // END — NOT NULL is NULL, so NULL lands in
-                        // ELSE alongside true.
-                        Some(false) => Expr::Case {
-                            operand: None,
-                            branches: alloc::vec![(
-                                Expr::Unary {
-                                    op: UnOp::Not,
-                                    expr: Box::new(expr),
-                                },
-                                Expr::Literal(Literal::Bool(!negated)),
-                            )],
-                            else_branch: Some(Box::new(Expr::Literal(Literal::Bool(negated)))),
-                        },
-                        None => Expr::IsNull {
-                            expr: Box::new(expr),
-                            negated,
-                        },
+                    // v7.39 (round 328, V45) — kept as what the user
+                    // wrote. These used to be lowered here into `CASE` /
+                    // `IS NULL`; the semantics were right but the AST no
+                    // longer knew the form, so `CHECK ((a > 1) IS TRUE)`
+                    // was echoed back as
+                    // `CHECK ((CASE WHEN (a > 1) THEN TRUE ELSE FALSE END))`.
+                    expr = Expr::BoolTest {
+                        expr: Box::new(expr),
+                        value: test,
+                        negated,
                     };
-                    expr = lowered;
                     {
                         return Ok(Some(expr));
                     }
