@@ -40,11 +40,10 @@ impl Engine {
     /// exist"; inside a transaction block it is
     /// `ERROR: DISCARD ALL cannot run inside a transaction block`.
     ///
-    /// Cursors are deliberately NOT closed here even though PG's DISCARD
-    /// ALL includes CLOSE ALL: SPG's cursor table is process-wide, not
-    /// per-session, so closing "all" from one connection would close
-    /// another connection's cursors. That is its own defect (see the
-    /// ledger); discarding them is blocked on fixing it.
+    /// v7.39 (round 321, V54) — cursors are closed here too, as PG's
+    /// DISCARD ALL does. Round 320 had to leave them alone because the
+    /// cursor table was process-wide: closing "all" from one connection
+    /// would have closed another's. They live in the session bag now.
     pub(crate) fn exec_discard(
         &mut self,
         target: spg_sql::ast::DiscardTarget,
@@ -63,6 +62,7 @@ impl Engine {
                 self.prepared_statements.clear();
                 self.lo_descriptors.clear();
                 self.lo_next_fd = 0;
+                self.cursors.clear();
                 self.listen_channels.clear();
                 self.plan_cache.clear();
                 self.refresh_render_style();

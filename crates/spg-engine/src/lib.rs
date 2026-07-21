@@ -617,6 +617,12 @@ pub(crate) struct SessionBag {
     /// Next descriptor number to hand out. PG starts at 0 and counts up
     /// within a transaction, restarting once the transaction ends.
     pub(crate) lo_next_fd: i32,
+    /// v7.39 (round 321, V54) — open server-side cursors. They lived on
+    /// the shared engine until now, i.e. in ONE namespace for every
+    /// connection: two clients could not both `DECLARE c`, a `FETCH`
+    /// could read another client's rows, and `CLOSE ALL` closed
+    /// everybody's.
+    pub(crate) cursors: BTreeMap<String, cursor::OpenCursor>,
 }
 
 /// v7.39 (round 306) — one open large-object descriptor.
@@ -1807,6 +1813,7 @@ impl Engine {
             prepared_statements: core::mem::take(&mut self.prepared_statements),
             lo_descriptors: core::mem::take(&mut self.lo_descriptors),
             lo_next_fd: self.lo_next_fd,
+            cursors: core::mem::take(&mut self.cursors),
         };
         self.sessions.insert(self.current_session, outgoing);
         let incoming = self.sessions.remove(&id).unwrap_or_default();
@@ -1815,6 +1822,7 @@ impl Engine {
         self.prepared_statements = incoming.prepared_statements;
         self.lo_descriptors = incoming.lo_descriptors;
         self.lo_next_fd = incoming.lo_next_fd;
+        self.cursors = incoming.cursors;
         self.current_session = id;
         self.plan_cache.clear();
     }
@@ -1831,6 +1839,7 @@ impl Engine {
             self.backslash_escapes = false;
             self.lo_descriptors.clear();
             self.lo_next_fd = 0;
+            self.cursors.clear();
             self.current_session = 0;
         }
     }
