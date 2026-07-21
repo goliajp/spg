@@ -1497,35 +1497,20 @@ fn run_pg_session(
         .iter()
         .find_map(|(k, v)| (k == "application_name").then(|| v.clone()))
         .unwrap_or_default();
-    // v7.39 (read01 round 51) — surface the startup `user` so current_user /
-    // session_user / pg_get_userbyid report the identity the client actually
-    // connected as (they used to be hardcoded "admin"). This is the REPORTED
-    // identity only: privilege semantics still key on an explicit SET ROLE
-    // (see Engine::is_superuser), so naming a non-admin login here cannot
-    // silently turn a connection into an RLS subject.
-    if !user.is_empty()
-        && let Ok(mut e) = state.engine.write()
-    {
-        e.set_session_user(&user);
-    }
-    // v7.39 (read01 misc.c) — surface the startup `database` param so
-    // current_database() answers the connection's database name (the
-    // engine session is process-wide; every connection names the same
-    // single database, so the shared GUC is faithful).
-    if let Some(db) = params
+    // v7.39 (read01 misc.c) — the startup `database` param, so
+    // `current_database()` and `pg_stat_activity.datname` name the database
+    // this connection asked for. Applied below, once this connection's
+    // session exists.
+    let startup_db = params
         .iter()
         .find_map(|(k, v)| (k == "database").then(|| v.clone()))
-    {
-        if !db.is_empty()
-            && db
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            if let Ok(mut e) = state.engine.write() {
-                let _ = e.execute(&format!("SET spg.database = '{db}'"));
-            }
-        }
-    }
+        .filter(|db| {
+            !db.is_empty()
+                && db
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+        .unwrap_or_default();
 
     // v6.5.2 — register this connection in the activity registry.
     // Removed when `_conn_guard` drops at function exit.
@@ -1557,9 +1542,35 @@ fn run_pg_session(
         cancel_secret: new_cancel_secret(),
         cancel_flag: std::sync::atomic::AtomicBool::new(false),
         terminate: std::sync::atomic::AtomicBool::new(false),
+        // v7.39 (round 319, V52) — the peer address, so pg_stat_activity's
+        // client_addr / client_port and SHOW PROCESSLIST's Host report who
+        // is actually attached instead of NULL / a hardcoded "localhost".
+        client_addr: sock.as_ref().and_then(|s| s.peer_addr().ok()),
+        database: std::sync::RwLock::new(startup_db.clone()),
         sock,
         notify_queue: std::sync::Mutex::new(Vec::new()),
     });
+
+    // v7.39 (round 319) — install this connection's session BEFORE seeding
+    // its login identity and database. Both are session state, and the
+    // engine is shared: seeding them ahead of `set_current_session` wrote
+    // them into whichever connection's bag happened to be installed, so
+    // `current_user` / `current_database()` answered another connection's
+    // values — and this connection's own bag, created empty on first use,
+    // never got them at all.
+    if let Ok(mut e) = state.engine.write() {
+        e.set_current_session(conn_state.pid);
+        if !user.is_empty() {
+            // The REPORTED identity only: privilege semantics still key on
+            // an explicit SET ROLE (see Engine::is_superuser), so naming a
+            // non-admin login here cannot silently turn a connection into
+            // an RLS subject.
+            e.set_session_user(&user);
+        }
+        if !startup_db.is_empty() {
+            let _ = e.execute(&format!("SET spg.database = '{startup_db}'"));
+        }
+    }
 
     // v7.39 (read01 pgstatfuncs.c) — stamp this connection's pid into the
     // thread-local the engine's pg_backend_pid() slot reads.
@@ -2465,9 +2476,11 @@ fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse
     {
         return Some(CannedResponse::single_text("current_schema", "public"));
     }
-    if ci_eq(b, b"select current_user") || ci_eq(b, b"select user") {
-        return Some(CannedResponse::single_text("current_user", "admin"));
-    }
+    // v7.39 (round 319, V52) — `SELECT current_user` is NO LONGER canned
+    // here, for the same reason round 118 un-canned `SHOW
+    // transaction_isolation`: a hardcoded "admin" shadowed the engine
+    // handler, so it reported neither the identity the client connected as
+    // nor the effect of a `SET ROLE`. The engine resolves both.
     // ---- v4.15 pgbouncer compat: connection-reset statements ----
     // pgbouncer issues these between pooled client sessions to
     // wipe per-connection state. SPG doesn't have per-connection

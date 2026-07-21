@@ -451,6 +451,15 @@ pub(crate) struct ConnState {
     /// `KILL CONNECTION`. The connection loop checks it before reading the
     /// next message and answers PG's FATAL before closing.
     pub(crate) terminate: AtomicBool,
+    /// v7.39 (round 319, V52) — the peer's address. `pg_stat_activity`'s
+    /// client_addr / client_port and `SHOW PROCESSLIST`'s Host used to be
+    /// NULL / a hardcoded "localhost" because nothing remembered it.
+    /// `None` on a connection with no TCP peer.
+    pub(crate) client_addr: Option<std::net::SocketAddr>,
+    /// v7.39 (round 319, V52) — the database this connection named
+    /// (pgwire startup param / mysql handshake + COM_INIT_DB). Empty when
+    /// the client named none, which both wires report as NULL.
+    pub(crate) database: std::sync::RwLock<String>,
     /// v7.39 (round 318, V51) — a clone of this connection's socket, used
     /// ONLY to shut the read half down so a connection parked in `read()`
     /// wakes up and notices `terminate`. The write half stays open so it
@@ -646,6 +655,14 @@ pub(crate) fn activity_snapshot() -> Vec<spg_engine::ActivityRow> {
             spg_engine::ActivityRow {
                 pid: c.pid,
                 user: c.user.clone(),
+                client_addr: c
+                    .client_addr
+                    .map(|a| a.ip().to_string())
+                    .unwrap_or_default(),
+                // PG reports -1 for a connection with no TCP port (its unix
+                // socket case); measured on PG 18.4.
+                client_port: c.client_addr.map_or(-1, |a| i32::from(a.port())),
+                database: c.database.read().map(|g| g.clone()).unwrap_or_default(),
                 started_at_us: c.started_at_us,
                 current_sql,
                 wait_event_type: c.wait_event_type_str().to_string(),

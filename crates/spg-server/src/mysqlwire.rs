@@ -343,7 +343,14 @@ fn complete_auth_and_command(
             );
         }
     }
-    command_loop(stream, state, conn_id, &parsed.username, sock)
+    command_loop(
+        stream,
+        state,
+        conn_id,
+        &parsed.username,
+        parsed.database.clone().unwrap_or_default(),
+        sock,
+    )
 }
 
 /// v7.17.0 Phase 3.P0-77 — detect the `Protocol::SSLRequest`
@@ -571,6 +578,7 @@ fn command_loop(
     state: &Arc<ServerState>,
     conn_id: u32,
     user: &str,
+    database: String,
     sock: Option<TcpStream>,
 ) -> std::io::Result<()> {
     let session_id = conn_id;
@@ -615,6 +623,10 @@ fn command_loop(
         in_transaction: std::sync::atomic::AtomicBool::new(false),
         application_name: std::sync::RwLock::new(String::new()),
         startup_app_name: String::new(),
+        // v7.39 (round 319, V52) — the peer and the database this client
+        // named, for SHOW PROCESSLIST's Host / db columns.
+        client_addr: sock.as_ref().and_then(|s| s.peer_addr().ok()),
+        database: std::sync::RwLock::new(database),
         cancel_secret: crate::pgwire::new_cancel_secret(),
         cancel_flag: std::sync::atomic::AtomicBool::new(false),
         terminate: std::sync::atomic::AtomicBool::new(false),
@@ -738,6 +750,13 @@ fn run_command_loop(
                         &encode_err_packet(1049, "42000", "Unknown database (empty name)"),
                     )?;
                 } else {
+                    // v7.39 (round 319, V52) — remember which database the
+                    // client switched to, so SHOW PROCESSLIST's `db` names
+                    // it (MariaDB reports the selected database there).
+                    if let Ok(mut g) = conn_state.database.write() {
+                        g.clear();
+                        g.push_str(db_name);
+                    }
                     write_packet(
                         stream,
                         reply_seqno,

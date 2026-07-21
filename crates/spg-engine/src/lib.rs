@@ -1119,6 +1119,16 @@ pub type SlowQueryLogger = fn(&str, u64);
 pub struct ActivityRow {
     pub pid: u32,
     pub user: String,
+    /// v7.39 (round 319, V52) — the peer's IP, empty when the connection
+    /// has no TCP peer (PG reports NULL there).
+    pub client_addr: String,
+    /// v7.39 (round 319, V52) — the peer's port. PG reports **-1**, not
+    /// NULL, for a connection with no TCP port; measured on PG 18.4.
+    pub client_port: i32,
+    /// v7.39 (round 319, V52) — the database this connection named. Empty
+    /// when it named none; both `pg_stat_activity.datname` and
+    /// `SHOW PROCESSLIST.db` report that as NULL.
+    pub database: String,
     pub started_at_us: i64,
     pub current_sql: String,
     /// v7.37.14 (B6.3) — PG-style wait-event categorisation

@@ -403,9 +403,6 @@ impl Engine {
             ColumnSchema::new("query", DataType::Text, false),
             ColumnSchema::new("backend_type", DataType::Text, false),
         ];
-        let datname = self
-            .session_param("spg.database")
-            .map_or(Value::Null, |d| Value::text(alloc::string::String::from(d)));
         let rows: Vec<Row<'static>> = self
             .activity_provider
             .map(|f| f())
@@ -423,16 +420,32 @@ impl Engine {
                 };
                 let started = Value::Timestamp(r.started_at_us);
                 Row::new(alloc::vec![
-                    Value::Null,     // datid
-                    datname.clone(), // datname
+                    Value::Null, // datid
+                    // v7.39 (round 319, V52) — each row's OWN database.
+                    // This used to read the ASKING session's GUC and stamp
+                    // it on every row, so one connection's database was
+                    // reported as everybody's.
+                    if r.database.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::text(r.database)
+                    }, // datname
                     Value::Int(i32::try_from(r.pid).unwrap_or(i32::MAX)),
                     Value::Null,         // leader_pid
                     Value::Null,         // usesysid
                     Value::text(r.user), // usename
                     Value::text(r.application_name),
-                    Value::Null,     // client_addr
-                    Value::Null,     // client_hostname
-                    Value::Null,     // client_port
+                    // v7.39 (round 319, V52) — the real peer. PG leaves
+                    // client_hostname NULL unless log_hostname is on, which
+                    // SPG has no equivalent of, so it stays NULL; the port
+                    // is -1 for a connection with no TCP peer, as in PG.
+                    if r.client_addr.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::text(r.client_addr)
+                    }, // client_addr
+                    Value::Null, // client_hostname
+                    Value::Int(r.client_port), // client_port
                     started.clone(), // backend_start
                     if r.in_transaction {
                         started.clone()
