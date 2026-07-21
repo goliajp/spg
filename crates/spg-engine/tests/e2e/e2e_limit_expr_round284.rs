@@ -115,9 +115,11 @@ fn the_type_and_overflow_wordings_are_pgs() {
 
 #[test]
 fn fetch_first_keeps_pgs_constant_only_grammar() {
-    // PG answers `syntax error at or near "+"` here — FETCH FIRST does
-    // NOT take an expression, unlike LIMIT. Accepting it would be a
-    // divergence in the permissive direction, so the token path stays.
+    // PG answers `syntax error at or near "+"` here: FETCH FIRST takes
+    // a constant or a PARENTHESISED expression, never bare arithmetic.
+    // (Round 305 measured the other half — `FETCH FIRST (1+1) ROWS ONLY`
+    // and `FETCH FIRST (SELECT 3) ROWS ONLY` are both legal there, and
+    // are pinned in that round's file.)
     let mut e = fixture();
     assert!(
         e.execute("SELECT * FROM l2 FETCH FIRST 1+1 ROWS ONLY")
@@ -126,18 +128,29 @@ fn fetch_first_keeps_pgs_constant_only_grammar() {
 }
 
 #[test]
-fn a_non_constant_clause_fails_loudly_rather_than_returning_everything() {
-    // The hazard this round had to avoid: `limit_literal()` answers
-    // Option<u32>, and None means "no limit". A clause SPG cannot fold
-    // must therefore ERROR — never quietly widen to the whole table.
+fn a_non_constant_clause_never_quietly_widens_to_the_whole_table() {
+    // The hazard round 284 had to avoid: `limit_literal()` answers
+    // Option<u32>, and None means "no limit", so a clause the parser
+    // cannot fold must never reach execution unresolved. Round 284 met
+    // that by refusing such a clause; round 305 met it properly, by
+    // evaluating it before dispatch (V23). Restated against PG rather
+    // than deleted — what must hold either way is that the row count
+    // takes effect, and the one shape PG itself refuses still fails.
     let mut e = fixture();
-    for tail in [
-        "LIMIT (SELECT 4)",
-        "LIMIT greatest(2,3)",
-        "LIMIT id",
-        "OFFSET (SELECT 1)",
+    for (tail, want) in [
+        ("LIMIT (SELECT 4)", 4),
+        ("LIMIT greatest(2,3)", 3),
+        ("OFFSET (SELECT 1)", 9),
     ] {
-        let sql = format!("SELECT * FROM l2 {tail}");
-        assert!(e.execute(&sql).is_err(), "{tail} must not silently pass");
+        let sql = format!("SELECT * FROM l2 ORDER BY id {tail}");
+        match e.execute(&sql).unwrap_or_else(|x| panic!("{tail}: {x:?}")) {
+            spg_engine::QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), want, "{tail} did not apply its row count");
+            }
+            other => panic!("{tail}: {other:?}"),
+        }
     }
+    // A column reference stays an error — the clause is evaluated once,
+    // before the scan, so PG rejects it too.
+    assert!(e.execute("SELECT * FROM l2 LIMIT id").is_err());
 }

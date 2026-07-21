@@ -732,10 +732,10 @@ pub(crate) fn substitute_select(
     // mailrs H2. After this pass each LIMIT/OFFSET that was a
     // Placeholder is rewritten to Literal so the existing
     // `LimitExpr::as_literal` path consumes a concrete u32.
-    if let Some(le) = s.limit {
+    if let Some(le) = s.limit.take() {
         s.limit = Some(resolve_limit_placeholder(le, params)?);
     }
-    if let Some(le) = s.offset {
+    if let Some(le) = s.offset.take() {
         s.offset = Some(resolve_limit_placeholder(le, params)?);
     }
     Ok(())
@@ -747,10 +747,10 @@ fn resolve_limit_offset_placeholders(
     s: &mut SelectStatement,
     params: &[Value<'static>],
 ) -> Result<(), EngineError> {
-    if let Some(le) = s.limit {
+    if let Some(le) = s.limit.take() {
         s.limit = Some(resolve_limit_placeholder(le, params)?);
     }
-    if let Some(le) = s.offset {
+    if let Some(le) = s.offset.take() {
         s.offset = Some(resolve_limit_placeholder(le, params)?);
     }
     for cte in &mut s.ctes {
@@ -771,6 +771,17 @@ fn resolve_limit_placeholder(
     use spg_sql::ast::LimitExpr;
     match le {
         LimitExpr::Literal(_) => Ok(le),
+        // v7.39 (round 305) — a non-constant row-count expression gets
+        // its value later, from the engine's `resolve_limit_exprs` pass
+        // at dispatch, where a subquery can actually be evaluated. Its
+        // own `$N` nodes have to be substituted here though: the walk
+        // above visits the SELECT's Expr slots, and a row-count
+        // expression is not one of them, so `LIMIT ($1 + 1)` would
+        // otherwise reach evaluation still holding a placeholder.
+        LimitExpr::Expr(mut e) => {
+            substitute_expr(&mut e, params)?;
+            Ok(LimitExpr::Expr(e))
+        }
         LimitExpr::Placeholder(n) => {
             let idx = usize::from(n).saturating_sub(1);
             let v = params.get(idx).ok_or_else(|| {

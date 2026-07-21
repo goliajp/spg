@@ -58,6 +58,7 @@ mod index_access;
 mod join;
 mod join_using;
 mod joinfold;
+mod limit_expr;
 pub mod json;
 pub mod locks;
 mod maintenance;

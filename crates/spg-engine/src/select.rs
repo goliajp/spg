@@ -5870,8 +5870,8 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
         having: None,
         unions: Vec::new(),
         order_by: outer_order,
-        limit: stmt.limit,
-        offset: stmt.offset,
+        limit: stmt.limit.clone(),
+        offset: stmt.offset.clone(),
         limit_with_ties: stmt.limit_with_ties,
     })
 }
