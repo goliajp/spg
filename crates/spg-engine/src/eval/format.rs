@@ -1256,6 +1256,69 @@ fn timestamp_sentinel(s: &str) -> Option<i64> {
 ///   * `+OOMM` / `-OOMM` (no colon, less common but legal)
 ///   * ` UTC` / `UTC` / `Z` — explicit zero offset
 /// Anything else after the seconds = parse failure (the caller
+/// v7.39 (round 324, V42) — PG's message for a text literal that will not
+/// become a date/time value. Two shapes, measured on PG 18.4:
+///
+///   * `invalid input syntax for type <t>: "<text>"` — the text is not
+///     date/time shaped at all (`not-a-date`, `2020`, `2020-01-01 abc`);
+///   * `date/time field value out of range: "<text>"` — it IS shaped like
+///     one but a field's value is impossible (`2020-13-01`, `2020-02-30`,
+///     `2020-01-01 25:00:00`).
+///
+/// The second form carries `HINT: Perhaps you need a different "DateStyle"
+/// setting.` only when the offending field is a month or day outside its
+/// UNIVERSAL range — the case a different field order could have
+/// explained. `2020-02-30` (a day that is fine for the field but not for
+/// that month), a time-of-day overflow and an oversized year get no hint.
+/// The wire splits the `\nHINT:  ` tail into the ErrorResponse `H` field.
+#[must_use]
+pub(crate) fn datetime_input_error_text(text: &str, type_name: &str) -> alloc::string::String {
+    let (kind, hint) = classify_datetime_input(text);
+    match kind {
+        DatetimeInputProblem::Syntax => {
+            alloc::format!("invalid input syntax for type {type_name}: \"{text}\"")
+        }
+        DatetimeInputProblem::OutOfRange => {
+            let mut m = alloc::format!("date/time field value out of range: \"{text}\"");
+            if hint {
+                m.push_str("\nHINT:  Perhaps you need a different \"DateStyle\" setting.");
+            }
+            m
+        }
+    }
+}
+
+enum DatetimeInputProblem {
+    Syntax,
+    OutOfRange,
+}
+
+/// `(problem, wants_datestyle_hint)` for a literal that failed to parse.
+fn classify_datetime_input(text: &str) -> (DatetimeInputProblem, bool) {
+    let t = text.trim();
+    // Any character outside the date/time alphabet means PG never got as
+    // far as reading a field value.
+    if t.is_empty()
+        || !t
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '-' | ':' | '.' | ' ' | 'T' | '+' | 'Z'))
+    {
+        return (DatetimeInputProblem::Syntax, false);
+    }
+    // The date part is everything before the first space or `T`.
+    let date_part = t.split([' ', 'T']).next().unwrap_or("");
+    let fields: alloc::vec::Vec<&str> = date_part.split('-').collect();
+    if fields.len() != 3 || fields.iter().any(|f| f.is_empty() || !f.chars().all(|c| c.is_ascii_digit())) {
+        return (DatetimeInputProblem::Syntax, false);
+    }
+    // Shaped like a date; a month or day outside its universal range is
+    // the case a different DateStyle could have explained.
+    let month = fields[1].parse::<u32>().unwrap_or(0);
+    let day = fields[2].parse::<u32>().unwrap_or(0);
+    let field_out_of_range = !(1..=12).contains(&month) || !(1..=31).contains(&day);
+    (DatetimeInputProblem::OutOfRange, field_out_of_range)
+}
+
 /// surfaces as "cannot parse … as TIMESTAMP").
 fn parse_time_of_day_micros(t: &str) -> Option<(i64, i64)> {
     parse_time_of_day_micros_tz(t).map(|(us, tz)| (us, tz.unwrap_or(0)))

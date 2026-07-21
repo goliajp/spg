@@ -1134,7 +1134,8 @@ fn cast_to_interval(v: Value) -> Result<Value, EvalError> {
             let (months, days, micros) =
                 spg_sql::parser::parse_interval_text(&s).ok_or_else(|| {
                     EvalError::TypeMismatch {
-                        detail: alloc::format!("cannot parse {s:?} as INTERVAL"),
+                        // v7.39 (round 324, V42) — PG's wording.
+                        detail: alloc::format!("invalid input syntax for type interval: \"{s}\""),
                     }
                 })?;
             Ok(Value::Interval {
@@ -1234,11 +1235,11 @@ fn cast_to_timestamp(v: Value) -> Result<Value, EvalError> {
                 crate::eval::format::DateOrder::Mdy,
             )
             .map(Value::Timestamp)
-            .ok_or(EvalError::TypeMismatch {
-                detail: format!(
-                    "cannot parse {s:?} as TIMESTAMP \
-                     (expected YYYY-MM-DD[ HH:MM:SS[.ffffff]])"
-                ),
+            .ok_or_else(|| EvalError::TypeMismatch {
+                // v7.39 (round 324, V42) — PG's wording, and PG's split
+                // between "invalid input syntax" and "date/time field
+                // value out of range".
+                detail: crate::eval::format::datetime_input_error_text(&s, "timestamp"),
             })
         }
         other => Err(EvalError::TypeMismatch {
@@ -1261,10 +1262,9 @@ fn cast_to_timestamptz(v: Value) -> Result<Value, EvalError> {
     )
     .map(|(micros, _had_tz)| Value::Timestamp(micros))
     .ok_or_else(|| EvalError::TypeMismatch {
-        detail: format!(
-            "cannot parse {s:?} as TIMESTAMP \
-             (expected YYYY-MM-DD[ HH:MM:SS[.ffffff]])"
-        ),
+        // v7.39 (round 324, V42) — and with the RIGHT type name: this arm
+        // used to report `TIMESTAMP` for a `::timestamptz` cast.
+        detail: crate::eval::format::datetime_input_error_text(s, "timestamp with time zone"),
     })
 }
 
@@ -1405,7 +1405,8 @@ fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
         Value::Text(s) => crate::conversions::parse_pg_int(&s)
             .map(Value::BigInt)
             .ok_or_else(|| EvalError::TypeMismatch {
-                detail: format!("cannot parse {s:?} as bigint"),
+                // v7.39 (round 324, V42) — PG's wording.
+                detail: format!("invalid input syntax for type bigint: \"{s}\""),
             }),
         Value::Bool(b) => Ok(Value::BigInt(i64::from(b))),
         // PG `bit`/`varbit` → bigint is the MSB-first bit value.
