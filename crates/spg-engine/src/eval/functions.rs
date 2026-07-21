@@ -13860,6 +13860,11 @@ fn apply_function_dispatch(
             let Some(cat) = ctx.catalog else {
                 return Ok(Value::Null);
             };
+            // v7.39 (round 311, V32) — the optional second argument.
+            // Only the CHECK body differs between the two forms; PG
+            // renders NOT NULL / FK / PK / UNIQUE identically either way
+            // (measured), so nothing else consults this.
+            let pretty = matches!(args.get(1), Some(Value::Bool(true)));
             // The name is either given directly (Text) or reached through
             // a pg_constraint OID. SPG has no OID space, so resolve the
             // OID against the pg_constraint synth view itself — its OID
@@ -13997,6 +14002,20 @@ fn apply_function_dispatch(
                         continue;
                     }
                     let inner = pred.expr.trim();
+                    // v7.39 (round 311, V32) — the second argument asks
+                    // for PG's PRETTY form, which drops the parentheses
+                    // the grammar can put back. The predicate is stored
+                    // as text, so it is re-parsed and re-rendered; when
+                    // it will not parse the plain text stands, which is
+                    // never wrong, only more parenthesised.
+                    if pretty {
+                        if let Ok(ast) = spg_sql::parser::parse_expression(inner) {
+                            return Ok(Value::text(alloc::format!(
+                                "CHECK ({})",
+                                spg_sql::ast::pretty_expr(&ast)
+                            )));
+                        }
+                    }
                     let body = if inner.starts_with('(') && inner.ends_with(')') {
                         inner.to_string()
                     } else {
