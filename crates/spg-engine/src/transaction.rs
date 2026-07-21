@@ -439,6 +439,7 @@ impl Engine {
                 touched_tables: alloc::collections::BTreeSet::new(),
                 aborted: false,
                 constraints_deferred: None,
+                constraints_deferred_by_name: alloc::collections::BTreeMap::new(),
                 rebase_poisoned: false,
                 stmts_run: 0,
                 update_pairs: alloc::collections::BTreeMap::new(),

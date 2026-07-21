@@ -3009,16 +3009,52 @@ impl Parser {
                     self.advance(); // CONSTRAINTS
                     // v7.39 (round 288) — no longer a no-op: the trailing
                     // DEFERRED / IMMEDIATE sets the transaction's timing.
-                    let mut deferred = false;
-                    while !matches!(self.peek(), Token::Semicolon | Token::Eof) {
-                        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
-                            if s.eq_ignore_ascii_case("deferred"))
-                        {
-                            deferred = true;
-                        }
+                    // v7.39 (round 308, V29) — and the names are kept.
+                    // They used to be skipped over on the way to the
+                    // DEFERRED keyword, so a named form silently behaved
+                    // as ALL: `SET CONSTRAINTS fk_a DEFERRED` deferred
+                    // every deferrable constraint in the transaction.
+                    let mut names: alloc::vec::Vec<alloc::string::String> =
+                        alloc::vec::Vec::new();
+                    if matches!(self.peek(), Token::All) {
                         self.advance();
+                    } else {
+                        loop {
+                            let mut n = self.expect_ident_like()?;
+                            // A schema-qualified name (`public.fk_a`)
+                            // identifies the same constraint; PG resolves
+                            // it by the trailing segment.
+                            while matches!(self.peek(), Token::Dot) {
+                                self.advance();
+                                n = self.expect_ident_like()?;
+                            }
+                            names.push(n);
+                            if matches!(self.peek(), Token::Comma) {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
                     }
-                    return Ok(Statement::SetConstraints { deferred });
+                    let deferred = match self.peek() {
+                        Token::Ident(s) | Token::QuotedIdent(s)
+                            if s.eq_ignore_ascii_case("deferred") =>
+                        {
+                            true
+                        }
+                        Token::Ident(s) | Token::QuotedIdent(s)
+                            if s.eq_ignore_ascii_case("immediate") =>
+                        {
+                            false
+                        }
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected DEFERRED or IMMEDIATE after SET CONSTRAINTS, got {other:?}"
+                            )));
+                        }
+                    };
+                    self.advance();
+                    return Ok(Statement::SetConstraints { names, deferred });
                 }
                 // v7.16.2 — PG `SET [SESSION] AUTHORIZATION
                 // { DEFAULT | '<role>' | <ident> }` (mailrs
@@ -13338,6 +13374,18 @@ impl Parser {
         &mut self,
     ) -> Result<(ColumnDef, Option<ForeignKeyConstraint>), ParseError> {
         let col = self.parse_column_def()?;
+        // v7.39 (round 308, V29) — an explicitly named inline FK:
+        // `col INT CONSTRAINT fk_a REFERENCES tbl(pcol)`. The column-def
+        // loop leaves this spelling intact precisely so the name can be
+        // kept here; PG reports it in violation messages and matches it
+        // in `SET CONSTRAINTS`.
+        let declared_name = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("constraint"))
+        {
+            self.advance();
+            Some(self.expect_ident_like()?)
+        } else {
+            None
+        };
         // Inline form: `col INT REFERENCES tbl(pcol) [ON DELETE ...] [ON UPDATE ...]`.
         let inline_references = matches!(
             self.peek(),
@@ -13349,7 +13397,7 @@ impl Parser {
         let (parent_table, parent_columns, on_delete, on_update, match_type, deferrable, initially_deferred) =
             self.parse_references_tail(1)?;
         let fk = ForeignKeyConstraint {
-            name: None,
+            name: declared_name,
             columns: vec![col.name.clone()],
             parent_table,
             parent_columns,
@@ -14104,6 +14152,21 @@ impl Parser {
             // NOT NULL`. Accept and discard the name; whatever
             // constraint follows is parsed by the arms below.
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("constraint")) {
+                // v7.39 (round 308, V29) — a name on an inline
+                // REFERENCES belongs to the FOREIGN KEY, and the caller
+                // (`parse_column_def_with_fk`) is what builds it, so
+                // leave the whole clause for it. Dropping the name here
+                // is what made `CONSTRAINT fk_a REFERENCES …` come back
+                // as the synthesised `c_pid_fkey` — which then could
+                // not be matched by `SET CONSTRAINTS fk_a`. Peek only:
+                // `advance()` takes tokens by `mem::replace`, so there
+                // is no rewinding once consumed.
+                if matches!(
+                    self.tokens.get(self.pos + 2),
+                    Some(Token::Ident(s)) if s.eq_ignore_ascii_case("references")
+                ) {
+                    break;
+                }
                 self.advance();
                 let _name = self.expect_ident_like()?;
                 continue;

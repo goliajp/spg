@@ -19,11 +19,31 @@ fn set_constraints_all_immediate_no_op() {
     ddl(&mut e, "SET CONSTRAINTS ALL IMMEDIATE");
 }
 
+/// v7.39 (round 308, V29) — restated, not deleted. The named form used
+/// to be a no-op, so this passed against an engine that had never heard
+/// of those constraints. PG refuses that outright (`constraint "…" does
+/// not exist`), and the named form now means what it says — so the
+/// dump-compat claim has to be made against a schema that HAS them.
 #[test]
-fn set_constraints_named_no_op() {
+fn set_constraints_named_applies_to_the_named_constraints() {
     let mut e = Engine::new();
+    ddl(&mut e, "CREATE TABLE customers (id int PRIMARY KEY)");
     ddl(
         &mut e,
-        "SET CONSTRAINTS fk_orders_customer, uq_orders_ref DEFERRED",
+        "CREATE TABLE orders (id int, cid int CONSTRAINT fk_orders_customer \
+         REFERENCES customers(id) DEFERRABLE)",
     );
+    ddl(&mut e, "BEGIN");
+    ddl(&mut e, "SET CONSTRAINTS fk_orders_customer DEFERRED");
+    ddl(&mut e, "ROLLBACK");
+}
+
+/// The other half of the same statement: a name nothing owns is PG's
+/// error, not a silent success.
+#[test]
+fn set_constraints_named_unknown_is_an_error() {
+    let mut e = Engine::new();
+    ddl(&mut e, "BEGIN");
+    let msg = format!("{:?}", e.execute("SET CONSTRAINTS uq_orders_ref DEFERRED").unwrap_err());
+    assert!(msg.contains("does not exist"), "got {msg}");
 }

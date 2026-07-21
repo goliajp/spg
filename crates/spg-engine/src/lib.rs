@@ -499,6 +499,13 @@ struct TxState {
     /// its own declared timing; `Some(true)` = every DEFERRABLE one is
     /// deferred; `Some(false)` = every one is immediate.
     constraints_deferred: Option<bool>,
+    /// v7.39 (round 308) — per-constraint overrides from the NAMED form
+    /// of `SET CONSTRAINTS`. Consulted before `constraints_deferred`, so
+    /// `ALL DEFERRED` followed by `fk_a IMMEDIATE` leaves fk_a immediate
+    /// and everything else deferred. An `ALL` form clears this map,
+    /// which is what makes a later blanket setting win — PG resets the
+    /// whole set the same way.
+    constraints_deferred_by_name: BTreeMap<String, bool>,
     /// v7.37.17 — the tx executed a statement whose effect on the
     /// shadow catalog can't be expressed as a versioned row write-set
     /// (DDL, COPY, anything unclassified). The rebase would lose it,

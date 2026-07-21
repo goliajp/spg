@@ -98,7 +98,13 @@ pub enum Statement {
     /// what a circular-FK restore needs), so a named form applies to
     /// all deferrable constraints too rather than silently doing
     /// nothing.
-    SetConstraints { deferred: bool },
+    /// v7.39 (round 308) — `SET CONSTRAINTS { ALL | name [, …] }
+    /// { DEFERRED | IMMEDIATE }`. An empty `names` is the ALL form;
+    /// otherwise the timing applies only to the constraints listed.
+    SetConstraints {
+        names: Vec<String>,
+        deferred: bool,
+    },
 
     /// v7.14.0 — `DROP TABLE [IF EXISTS] name [, name…]
     /// [CASCADE | RESTRICT]`. Engine removes the matching tables
@@ -4355,11 +4361,20 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => Ok(()),
-            Self::SetConstraints { deferred } => f.write_str(if *deferred {
-                "SET CONSTRAINTS ALL DEFERRED"
-            } else {
-                "SET CONSTRAINTS ALL IMMEDIATE"
-            }),
+            Self::SetConstraints { names, deferred } => {
+                f.write_str("SET CONSTRAINTS ")?;
+                if names.is_empty() {
+                    f.write_str("ALL")?;
+                } else {
+                    for (i, n) in names.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        f.write_str(n)?;
+                    }
+                }
+                f.write_str(if *deferred { " DEFERRED" } else { " IMMEDIATE" })
+            }
             // v7.39 (round 277) — the source text is kept verbatim so
             // `pg_prepared_statements.statement` can report it the way
             // PG does (the whole PREPARE statement, not just the body).
