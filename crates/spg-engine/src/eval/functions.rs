@@ -14218,7 +14218,9 @@ fn apply_function_dispatch(
             // the only thing the second argument changes here (measured).
             let pretty = matches!(args.get(1), Some(Value::Bool(true)));
             Ok(Value::text(crate::system_catalog::render_rule_def(
-                rule, !pretty,
+                rule,
+                !pretty,
+                Some(cat),
             )))
         }
         "pg_get_triggerdef" | "pg_get_partkeydef" | "pg_get_statisticsobjdef" => Ok(Value::Null),
