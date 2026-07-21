@@ -173,6 +173,7 @@ mod e2e_timestamptz_array_round310;
 mod e2e_constraintdef_pretty_round311;
 mod e2e_functiondef_ruledef_round312;
 mod e2e_catalog_name_type_round313;
+mod e2e_limit_offset_order_round314;
 mod e2e_on_conflict_round240;
 mod e2e_update_from_alias_round241;
 mod e2e_grouping_elements_round242;
