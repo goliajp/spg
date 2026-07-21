@@ -1343,6 +1343,132 @@ pub struct CreateUserStatement {
     pub is_user: bool,
 }
 
+/// v7.39 (round 322, V46) — PG's function volatility class. Declarative:
+/// it tells the planner how far a call may be moved or folded. SPG records
+/// it faithfully (`pg_proc.provolatile`, `pg_get_functiondef`) and does not
+/// yet exploit it for constant folding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FunctionVolatility {
+    Immutable,
+    Stable,
+    #[default]
+    Volatile,
+}
+
+impl FunctionVolatility {
+    /// PG's one-character `pg_proc.provolatile` code.
+    #[must_use]
+    pub const fn as_pg_char(self) -> &'static str {
+        match self {
+            Self::Immutable => "i",
+            Self::Stable => "s",
+            Self::Volatile => "v",
+        }
+    }
+
+    #[must_use]
+    pub const fn as_sql(self) -> &'static str {
+        match self {
+            Self::Immutable => "IMMUTABLE",
+            Self::Stable => "STABLE",
+            Self::Volatile => "VOLATILE",
+        }
+    }
+}
+
+/// v7.39 (round 322, V46) — PG's parallel-safety class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FunctionParallel {
+    #[default]
+    Unsafe,
+    Restricted,
+    Safe,
+}
+
+impl FunctionParallel {
+    /// PG's one-character `pg_proc.proparallel` code.
+    #[must_use]
+    pub const fn as_pg_char(self) -> &'static str {
+        match self {
+            Self::Unsafe => "u",
+            Self::Restricted => "r",
+            Self::Safe => "s",
+        }
+    }
+
+    #[must_use]
+    pub const fn as_sql(self) -> &'static str {
+        match self {
+            Self::Unsafe => "PARALLEL UNSAFE",
+            Self::Restricted => "PARALLEL RESTRICTED",
+            Self::Safe => "PARALLEL SAFE",
+        }
+    }
+}
+
+/// v7.39 (round 322, V46) — the attribute clauses `CREATE FUNCTION` accepts
+/// on either side of its body. Defaults are PG's: VOLATILE, called on null
+/// input, SECURITY INVOKER, not leakproof, PARALLEL UNSAFE, and the
+/// language's default cost / rows.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct FunctionAttrs {
+    pub volatility: FunctionVolatility,
+    /// `STRICT` / `RETURNS NULL ON NULL INPUT`: a call with any NULL
+    /// argument returns NULL without running the body.
+    pub strict: bool,
+    pub security_definer: bool,
+    pub leakproof: bool,
+    pub parallel: FunctionParallel,
+    /// `COST n` — `None` leaves PG's per-language default.
+    pub cost: Option<f64>,
+    /// `ROWS n` — set-returning functions only; `None` = default.
+    pub rows: Option<f64>,
+}
+
+impl FunctionAttrs {
+    /// The attribute words `pg_get_functiondef` puts on their own line,
+    /// in PG's order (measured on 18.4: volatility, PARALLEL, STRICT,
+    /// SECURITY DEFINER, LEAKPROOF, COST, ROWS). Empty when everything is
+    /// at its default — PG then emits no such line at all.
+    #[must_use]
+    pub fn render_words(&self) -> alloc::vec::Vec<alloc::string::String> {
+        let mut out = alloc::vec::Vec::new();
+        if self.volatility != FunctionVolatility::Volatile {
+            out.push(alloc::string::String::from(self.volatility.as_sql()));
+        }
+        if self.parallel != FunctionParallel::Unsafe {
+            out.push(alloc::string::String::from(self.parallel.as_sql()));
+        }
+        if self.strict {
+            out.push(alloc::string::String::from("STRICT"));
+        }
+        if self.security_definer {
+            out.push(alloc::string::String::from("SECURITY DEFINER"));
+        }
+        if self.leakproof {
+            out.push(alloc::string::String::from("LEAKPROOF"));
+        }
+        if let Some(c) = self.cost {
+            out.push(alloc::format!("COST {}", render_attr_number(c)));
+        }
+        if let Some(r) = self.rows {
+            out.push(alloc::format!("ROWS {}", render_attr_number(r)));
+        }
+        out
+    }
+}
+
+/// PG prints a whole-numbered cost / rows without a decimal point.
+fn render_attr_number(v: f64) -> alloc::string::String {
+    // no_std: `f64::fract` lives in std, so compare against the truncation.
+    let whole = v as i64;
+    if v.abs() < 1e15 && (whole as f64) == v {
+        alloc::format!("{whole}")
+    } else {
+        alloc::format!("{v}")
+    }
+}
+
 /// v7.12.4 — `CREATE [OR REPLACE] FUNCTION`. v7.12.4 ships
 /// `RETURNS TRIGGER LANGUAGE plpgsql` as the primary use case
 /// (the row-level trigger body the CREATE TRIGGER below references).
@@ -1373,6 +1499,11 @@ pub struct CreateFunctionStatement {
     /// the raw source text so the v7.12.5+ executor can pick them
     /// up without a parser rev.
     pub body: FunctionBody,
+    /// v7.39 (round 322, V46) — `IMMUTABLE` / `STRICT` / `PARALLEL SAFE` /
+    /// `SECURITY DEFINER` / `LEAKPROOF` / `COST` / `ROWS`. PG accepts them
+    /// on either side of the body; before this they were a parse error, so
+    /// PG's own `pg_dump` output would not restore.
+    pub attrs: FunctionAttrs,
 }
 
 /// v7.12.4 — one positional argument to a `CREATE FUNCTION`.

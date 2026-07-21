@@ -21,7 +21,7 @@ use crate::ast::{
     AssignTarget, BinOp, CastTarget, Collation, ColumnDef, ColumnName, ColumnTypeName,
     CreateFunctionStatement, CreateIndexStatement, CreatePublicationStatement,
     CreateSubscriptionStatement, CreateTableStatement, CreateTriggerStatement,
-    DiscardTarget, Expr, ExtractField,
+    DiscardTarget, Expr, ExtractField, FunctionAttrs, FunctionParallel, FunctionVolatility,
     FkAction, ForeignKeyConstraint, FrameBound, FrameExclusion, FrameKind, FromClause, FromJoin,
     FunctionArg, FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, GrantObject,
     GrantPriv, GrantStatement, IndexMethod, InsertStatement, IsolationLevel, JoinKind, Literal,
@@ -4073,6 +4073,22 @@ impl Parser {
         // Optional LANGUAGE clause (PG also accepts after AS — we'll
         // re-check after the body too).
         let mut language: Option<String> = self.parse_optional_language()?;
+        // v7.39 (round 322, V46) — attribute clauses. PG allows them on
+        // either side of the body and in any order, interleaved with
+        // LANGUAGE; `CREATE FUNCTION f() RETURNS int LANGUAGE sql
+        // IMMUTABLE STRICT AS $$…$$` used to be a parse error, which meant
+        // PG's own pg_dump output did not restore.
+        let mut attrs = FunctionAttrs::default();
+        loop {
+            let before = self.pos;
+            self.parse_function_attrs_into(&mut attrs)?;
+            if language.is_none() {
+                language = self.parse_optional_language()?;
+            }
+            if self.pos == before {
+                break;
+            }
+        }
         // `AS` followed by a $$-quoted body (lexer already
         // collapses both `$$…$$` and `$tag$…$tag$` to a single
         // Token::String). AS is a reserved keyword (Token::As).
@@ -4095,9 +4111,17 @@ impl Parser {
                 )));
             }
         };
-        // Trailing optional LANGUAGE clause (the other PG position).
-        if language.is_none() {
-            language = self.parse_optional_language()?;
+        // Trailing clauses — PG's other accepted position for both the
+        // LANGUAGE and the attributes.
+        loop {
+            let before = self.pos;
+            self.parse_function_attrs_into(&mut attrs)?;
+            if language.is_none() {
+                language = self.parse_optional_language()?;
+            }
+            if self.pos == before {
+                break;
+            }
         }
         let language = language.unwrap_or_else(|| String::from("sql"));
         // PL/pgSQL bodies get structure-parsed. Other languages
@@ -4124,7 +4148,144 @@ impl Parser {
             returns,
             language,
             body,
+            attrs,
         }))
+    }
+
+    /// v7.39 (round 322, V46) — consume any run of `CREATE FUNCTION`
+    /// attribute clauses into `attrs`, stopping at the first token that
+    /// is not one. Measured against PG 18.4, which accepts them in any
+    /// order and on either side of the body.
+    fn parse_function_attrs_into(&mut self, attrs: &mut FunctionAttrs) -> Result<(), ParseError> {
+        loop {
+            let word = match self.peek() {
+                Token::Ident(w) | Token::QuotedIdent(w) => w.to_ascii_lowercase(),
+                // NOT LEAKPROOF — NOT is a reserved keyword token.
+                Token::Not
+                    if matches!(
+                        self.tokens.get(self.pos + 1),
+                        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("leakproof")
+                    ) =>
+                {
+                    self.advance();
+                    self.advance();
+                    attrs.leakproof = false;
+                    continue;
+                }
+                _ => return Ok(()),
+            };
+            match word.as_str() {
+                "immutable" => {
+                    self.advance();
+                    attrs.volatility = FunctionVolatility::Immutable;
+                }
+                "stable" => {
+                    self.advance();
+                    attrs.volatility = FunctionVolatility::Stable;
+                }
+                "volatile" => {
+                    self.advance();
+                    attrs.volatility = FunctionVolatility::Volatile;
+                }
+                "strict" => {
+                    self.advance();
+                    attrs.strict = true;
+                }
+                "leakproof" => {
+                    self.advance();
+                    attrs.leakproof = true;
+                }
+                // RETURNS NULL ON NULL INPUT / CALLED ON NULL INPUT — the
+                // spelled-out forms of STRICT and its opposite.
+                "returns" | "called" => {
+                    let strict = word == "returns";
+                    let mut probe = self.pos + 1;
+                    if strict {
+                        // RETURNS *NULL* ON NULL INPUT; a bare RETURNS here
+                        // is not ours.
+                        match self.tokens.get(probe) {
+                            Some(Token::Null) => probe += 1,
+                            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("null") => probe += 1,
+                            _ => return Ok(()),
+                        }
+                    }
+                    let ok = matches!(self.tokens.get(probe), Some(Token::On))
+                        || matches!(self.tokens.get(probe), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("on"));
+                    if !ok {
+                        return Ok(());
+                    }
+                    probe += 1;
+                    match self.tokens.get(probe) {
+                        Some(Token::Null) => probe += 1,
+                        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("null") => probe += 1,
+                        _ => return Ok(()),
+                    }
+                    match self.tokens.get(probe) {
+                        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("input") => probe += 1,
+                        _ => return Ok(()),
+                    }
+                    self.pos = probe;
+                    attrs.strict = strict;
+                }
+                "security" | "external" => {
+                    // [EXTERNAL] SECURITY { INVOKER | DEFINER }
+                    let mut probe = self.pos + 1;
+                    if word == "external" {
+                        match self.tokens.get(probe) {
+                            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("security") => {
+                                probe += 1;
+                            }
+                            _ => return Ok(()),
+                        }
+                    }
+                    let definer = match self.tokens.get(probe) {
+                        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("definer") => true,
+                        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("invoker") => false,
+                        _ => return Ok(()),
+                    };
+                    self.pos = probe + 1;
+                    attrs.security_definer = definer;
+                }
+                "parallel" => {
+                    let level = match self.tokens.get(self.pos + 1) {
+                        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("safe") => {
+                            FunctionParallel::Safe
+                        }
+                        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("restricted") => {
+                            FunctionParallel::Restricted
+                        }
+                        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("unsafe") => {
+                            FunctionParallel::Unsafe
+                        }
+                        _ => return Ok(()),
+                    };
+                    self.pos += 2;
+                    attrs.parallel = level;
+                }
+                "cost" | "rows" => {
+                    let Some(n) = self.peek_number_at(self.pos + 1) else {
+                        return Ok(());
+                    };
+                    self.pos += 2;
+                    if word == "cost" {
+                        attrs.cost = Some(n);
+                    } else {
+                        attrs.rows = Some(n);
+                    }
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    /// The numeric literal at `idx`, if there is one.
+    fn peek_number_at(&self, idx: usize) -> Option<f64> {
+        match self.tokens.get(idx)? {
+            Token::Integer(n) => Some(*n as f64),
+            Token::Float(f) => Some(*f),
+            Token::Numeric(t) => t.parse::<f64>().ok(),
+            _ => None,
+        }
     }
 
     /// Closing `)`-terminated argument list. v7.12.4 commonly

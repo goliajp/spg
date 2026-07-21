@@ -915,6 +915,11 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         // appended last for the same reason; empty is a u32 zero count.
         // TENTH appendix this test has caught.
         const EMPTY_LARGE_OBJECT_BLOCK: usize = 4;
+        // v7.39 (round 322, V46) — the function-attribute block
+        // (FILE_VERSION 80), appended last; empty is a u32 zero count.
+        // ELEVENTH appendix this test has caught — which is exactly what
+        // it is for.
+        const EMPTY_FUNCTION_ATTR_BLOCK: usize = 4;
         full.truncate(
             full.len()
                 - 4
@@ -922,7 +927,8 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
                 - EMPTY_NONTABLE_ACL_BLOCK
                 - EMPTY_RULE_BLOCK
                 - EMPTY_STATS_EXT_BLOCK
-                - EMPTY_LARGE_OBJECT_BLOCK,
+                - EMPTY_LARGE_OBJECT_BLOCK
+                - EMPTY_FUNCTION_ATTR_BLOCK,
         );
         full
     };
@@ -1057,6 +1063,13 @@ fn v68_overloads_are_separate_functions_with_separate_acls() {
         language: "sql".into(),
         body: body.into(),
         owner: Some("alice".into()),
+        volatility: crate::FN_VOLATILE,
+        strict: false,
+        security_definer: false,
+        leakproof: false,
+        parallel: crate::FN_PARALLEL_UNSAFE,
+        cost: None,
+        rows: None,
         acl: alloc::vec![AclItem {
             grantee: grantee.into(),
             privs: priv_bits::EXECUTE,
@@ -1103,6 +1116,13 @@ fn v67_roundtrip_preserves_function_owner_and_acl() {
             language: "sql".into(),
             body: "SELECT x + 1".into(),
             owner: Some("alice".into()),
+            volatility: crate::FN_VOLATILE,
+            strict: false,
+            security_definer: false,
+            leakproof: false,
+            parallel: crate::FN_PARALLEL_UNSAFE,
+            cost: None,
+            rows: None,
             acl: alloc::vec![AclItem {
                 grantee: "fred".into(),
                 privs: priv_bits::EXECUTE,

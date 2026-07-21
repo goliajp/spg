@@ -3671,7 +3671,8 @@ pub struct Catalog {
 /// invocation. This keeps the storage codec stable when the
 /// PL/pgSQL surface grows (no breaking-change risk on the disk
 /// format).
-#[derive(Debug, Clone, PartialEq, Eq)]
+// v7.39 (round 322, V46) — no longer `Eq`: COST / ROWS are f64, as in PG.
+#[derive(Debug, Clone, PartialEq)]
 pub struct FunctionDef {
     pub name: String,
     /// Display form of the argument list, e.g.
@@ -3697,7 +3698,31 @@ pub struct FunctionDef {
     /// leaves proacl NULL to say so. The list materialises on the first
     /// GRANT / REVOKE.
     pub acl: Vec<AclItem>,
+    /// v7.39 (round 322, V46) — `IMMUTABLE` / `STRICT` / `PARALLEL SAFE` /
+    /// `SECURITY DEFINER` / `LEAKPROOF` / `COST` / `ROWS`. `strict` is the
+    /// only one with execution semantics today (a NULL argument yields a
+    /// NULL result without running the body); the rest are recorded so
+    /// `pg_get_functiondef` and `pg_proc` report what was declared.
+    pub volatility: u8,
+    pub strict: bool,
+    pub security_definer: bool,
+    pub leakproof: bool,
+    pub parallel: u8,
+    pub cost: Option<f64>,
+    pub rows: Option<f64>,
 }
+
+/// v7.39 (round 322, V46) — `FunctionDef.volatility` codes: PG's
+/// `pg_proc.provolatile` letters.
+pub const FN_VOLATILE: u8 = b'v';
+pub const FN_IMMUTABLE: u8 = b'i';
+pub const FN_STABLE: u8 = b's';
+
+/// v7.39 (round 322, V46) — `FunctionDef.parallel` codes: PG's
+/// `pg_proc.proparallel` letters.
+pub const FN_PARALLEL_UNSAFE: u8 = b'u';
+pub const FN_PARALLEL_RESTRICTED: u8 = b'r';
+pub const FN_PARALLEL_SAFE: u8 = b's';
 
 /// v7.39 (round 315, V19) — which catalogued function does a persisted
 /// ACL key refer to?
@@ -7203,7 +7228,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 79;
+const FILE_VERSION: u8 = 80;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -8320,6 +8345,42 @@ impl Catalog {
             write_u32(&mut out, u32::try_from(bytes.len()).expect("≤ 4G per object"));
             out.extend_from_slice(bytes);
         }
+        // v7.39 (round 322, V46) — function-attribute block (FILE_VERSION
+        // 80+), appended last for the same reason as every block before
+        // it: an older reader stops cleanly ahead of it and simply sees
+        // functions with PG's default attributes. Only functions that
+        // declared something non-default are written. Layout: [u32 count]
+        // then per function [str signature_key][u8 volatility][u8 flags]
+        // [u8 parallel][f64 cost or NaN][f64 rows or NaN], where flags bit
+        // 0 = strict, 1 = security definer, 2 = leakproof.
+        let attr_fns: Vec<(&String, &FunctionDef)> = self
+            .functions
+            .iter()
+            .filter(|(_, f)| {
+                f.volatility != FN_VOLATILE
+                    || f.strict
+                    || f.security_definer
+                    || f.leakproof
+                    || f.parallel != FN_PARALLEL_UNSAFE
+                    || f.cost.is_some()
+                    || f.rows.is_some()
+            })
+            .collect();
+        write_u32(
+            &mut out,
+            u32::try_from(attr_fns.len()).expect("≤ 4G functions"),
+        );
+        for (key, f) in attr_fns {
+            write_str(&mut out, key);
+            out.push(f.volatility);
+            let flags = u8::from(f.strict)
+                | (u8::from(f.security_definer) << 1)
+                | (u8::from(f.leakproof) << 2);
+            out.push(flags);
+            out.push(f.parallel);
+            out.extend_from_slice(&f.cost.unwrap_or(f64::NAN).to_le_bytes());
+            out.extend_from_slice(&f.rows.unwrap_or(f64::NAN).to_le_bytes());
+        }
         // v7.38 (read01 P5.05) — CRC32C trailer over the whole image so a
         // corrupted snapshot is rejected on load. FILE_VERSION is >= the
         // trailer version, so this always runs for freshly-written images.
@@ -8384,6 +8445,13 @@ impl Catalog {
                         body,
                         owner: None,
                         acl: Vec::new(),
+                        volatility: FN_VOLATILE,
+                        strict: false,
+                        security_definer: false,
+                        leakproof: false,
+                        parallel: FN_PARALLEL_UNSAFE,
+                        cost: None,
+                        rows: None,
                     },
                 );
             }
@@ -8793,6 +8861,28 @@ impl Catalog {
                 let len = cur.read_u32()? as usize;
                 let bytes = cur.read_bytes(len)?;
                 cat.large_objects.insert(oid, bytes);
+            }
+        }
+        // v7.39 (round 322, V46) — function-attribute block (FILE_VERSION
+        // 80+). Pre-80 images stop before it and keep PG's defaults.
+        if version >= 80 {
+            let count = cur.read_u32()? as usize;
+            for _ in 0..count {
+                let key = cur.read_str()?;
+                let volatility = cur.read_u8()?;
+                let flags = cur.read_u8()?;
+                let parallel = cur.read_u8()?;
+                let cost = f64::from_le_bytes(cur.read_bytes(8)?.try_into().unwrap_or([0; 8]));
+                let rows = f64::from_le_bytes(cur.read_bytes(8)?.try_into().unwrap_or([0; 8]));
+                if let Some(f) = cat.functions.get_mut(&key) {
+                    f.volatility = volatility;
+                    f.strict = flags & 1 != 0;
+                    f.security_definer = flags & 2 != 0;
+                    f.leakproof = flags & 4 != 0;
+                    f.parallel = parallel;
+                    f.cost = (!cost.is_nan()).then_some(cost);
+                    f.rows = (!rows.is_nan()).then_some(rows);
+                }
             }
         }
         // v7.38 (read01 P5.05) — v54+ images end with a CRC32C over every
