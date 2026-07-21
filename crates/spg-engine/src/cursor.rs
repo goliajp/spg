@@ -220,7 +220,14 @@ impl crate::Engine {
         query: spg_sql::ast::Statement,
     ) -> Result<crate::QueryResult, EngineError> {
         // PG: DECLARE requires a transaction block (25P01).
-        if !self.in_transaction() {
+        //
+        // v7.39 (round 321, V54) — THIS connection's block, per slot. The
+        // global flag is true whenever ANY connection has one open, so a
+        // client in autocommit was allowed to declare a cursor because
+        // some other client happened to be inside a transaction (the same
+        // global-vs-slot trap rounds 298 / 304 / 316 each fixed
+        // elsewhere).
+        if !self.current_tx.is_some_and(|tx| self.is_tx_open(tx)) {
             return Err(EngineError::Unsupported(String::from(
                 "DECLARE CURSOR can only be used in transaction blocks",
             )));
