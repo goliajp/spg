@@ -2606,9 +2606,7 @@ fn eval_field_access_arm(
             .find(|(name, _)| name == field)
             .map(|(_, val)| val)
             .ok_or_else(|| missing_field_error(base, field, ctx)),
-        _ => Err(EvalError::TypeMismatch {
-            detail: alloc::format!("field access `.{field}` requires a composite (record) value"),
-        }),
+        _ => Err(not_a_composite_error(base, field, ctx)),
     }
 }
 
@@ -2625,13 +2623,16 @@ fn eval_field_access_arm(
 /// All three read off live PG 18.4. A `Value::Composite` carries its field
 /// names but not its type name, so the base expression is what decides.
 fn missing_field_error(base: &Expr, field: &str, ctx: &EvalContext<'_>) -> EvalError {
-    if let Expr::Cast {
-        target: CastTarget::Named(name),
-        ..
-    } = base
+    // v7.39 (round 307, V25) — the named type may arrive by cast OR from
+    // the schema of a column that a projection produced, so ask once and
+    // let the catalog say whether it is a composite. Before this only
+    // the cast spelling was recognised, which is why a composite that
+    // came through a derived table or a CTE — where the base is a plain
+    // column — fell through to the anonymous-record wording.
+    if let Some(name) = base_named_type(base, ctx)
         && ctx
             .catalog
-            .is_some_and(|c| c.composite_types().contains_key(name.as_str()))
+            .is_some_and(|c| c.composite_types().contains_key(name))
     {
         return EvalError::TypeMismatch {
             detail: alloc::format!("column \"{field}\" not found in data type {name}"),
@@ -2663,6 +2664,59 @@ fn missing_field_error(base: &Expr, field: &str, ctx: &EvalContext<'_>) -> EvalE
     }
     EvalError::TypeMismatch {
         detail: alloc::format!("could not identify column \"{field}\" in record data type"),
+    }
+}
+
+/// v7.39 (round 307, V25) — the user-declared type name behind a field
+/// access, if any: either written as a cast (`ROW(…)::rc9`) or carried on
+/// the column's schema.
+///
+/// All three schema slots are consulted rather than just the composite
+/// one. A projection currently files the name of a `::rc9` cast under
+/// `user_enum_type` — `expr_enum_type_name` answers for ANY named cast,
+/// without asking whether the name is an enum — so keying off one slot
+/// would answer for some shapes and not others. The caller decides what
+/// the name MEANS by asking the catalog, which is the only thing that
+/// actually knows; this function just finds it.
+fn base_named_type<'c>(base: &'c Expr, ctx: &'c EvalContext<'_>) -> Option<&'c str> {
+    match base {
+        Expr::Cast {
+            target: CastTarget::Named(name),
+            ..
+        } => Some(name.as_str()),
+        Expr::Column(c) => ctx
+            .columns
+            .iter()
+            .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+            .and_then(|sc| {
+                sc.user_composite_type
+                    .as_deref()
+                    .or(sc.user_domain_type.as_deref())
+                    .or(sc.user_enum_type.as_deref())
+            }),
+        _ => None,
+    }
+}
+
+/// v7.39 (round 307, V25) — PG's wording when field notation is applied
+/// to something that is not a composite at all. It names the type:
+/// `column notation .f applied to type pos9, which is not a composite
+/// type` — for a domain and an enum alike. Only when the base has no
+/// user-declared type at all does the generic message stand.
+fn not_a_composite_error(base: &Expr, field: &str, ctx: &EvalContext<'_>) -> EvalError {
+    if let Some(name) = base_named_type(base, ctx)
+        && ctx.catalog.is_some_and(|c| {
+            c.enum_types().contains_key(name) || c.domain_types().contains_key(name)
+        })
+    {
+        return EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "column notation .{field} applied to type {name}, which is not a composite type"
+            ),
+        };
+    }
+    EvalError::TypeMismatch {
+        detail: alloc::format!("field access `.{field}` requires a composite (record) value"),
     }
 }
 
