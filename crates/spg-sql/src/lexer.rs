@@ -439,7 +439,7 @@ pub fn tokenize_with_offsets(
                 let (tok, consumed) = if backslash_escapes {
                     // MySQL-dialect session: plain strings decode
                     // backslash escapes — same machinery as E'…'.
-                    lex_escape_string(input, i)?
+                    lex_escape_string(input, i, true)?
                 } else {
                     lex_quoted(input, i, b'\'', false)?
                 };
@@ -454,7 +454,7 @@ pub fn tokenize_with_offsets(
             // downstream parser / cast paths treat it identically
             // to a regular string literal.
             b'E' | b'e' if peek_eq(bytes, i + 1, b'\'') => {
-                let (tok, consumed) = lex_escape_string(input, i + 1)?;
+                let (tok, consumed) = lex_escape_string(input, i + 1, false)?;
                 out.push(tok);
                 i += 1 + consumed;
             }
@@ -1305,7 +1305,26 @@ fn lex_quoted(
 /// follows the lenient behaviour pg_dump output relies on).
 ///
 /// Doubled `''` is still a literal `'` (same as the non-E form).
-fn lex_escape_string(input: &str, start: usize) -> Result<(Token, usize), LexError> {
+/// v7.39 (round 332, V35) — `mysql` selects MySQL's escape table instead
+/// of PG's `E'…'` one. Measured on MariaDB 11 vs PG 18.4, the two agree on
+/// everything except three points:
+///
+/// | escape | PG `E'…'` | MySQL |
+/// |---|---|---|
+/// | `\Z` | `Z` | **0x1A** (ctrl-Z) |
+/// | `\%` / `\_` | `%` / `_` | **both characters kept** — the backslash is
+///   what makes LIKE treat the wildcard literally |
+/// | `\xHH` / `\NNN` | decoded | **not special**: the backslash is dropped
+///   and the rest is literal text |
+///
+/// Sharing one table meant a MySQL client's `'\Z'` arrived as the letter
+/// `Z`, and `'a\%b'` lost the escape LIKE needed — silently wrong bytes,
+/// not an error.
+fn lex_escape_string(
+    input: &str,
+    start: usize,
+    mysql: bool,
+) -> Result<(Token, usize), LexError> {
     let bytes = input.as_bytes();
     debug_assert_eq!(bytes[start], b'\'');
     let mut i = start + 1;
@@ -1329,6 +1348,37 @@ fn lex_escape_string(input: &str, start: usize) -> Result<(Token, usize), LexErr
         }
         if b == b'\\' && i + 1 < bytes.len() {
             let n = bytes[i + 1];
+            // MySQL's own three points; everything below is shared.
+            if mysql {
+                match n {
+                    // `\Z` is ctrl-Z, not the letter Z.
+                    b'Z' => {
+                        s.push('\u{001A}');
+                        i += 2;
+                        continue;
+                    }
+                    // `\%` / `\_` keep BOTH characters: the backslash is
+                    // what LIKE reads as "this wildcard is literal".
+                    b'%' | b'_' => {
+                        s.push('\\');
+                        s.push(n as char);
+                        i += 2;
+                        continue;
+                    }
+                    // `\xHH` and `\NNN` are not escapes at all here.
+                    b'x' | b'X' => {
+                        s.push('x');
+                        i += 2;
+                        continue;
+                    }
+                    d if d.is_ascii_digit() && d != b'0' => {
+                        s.push(d as char);
+                        i += 2;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             match n {
                 b'\\' => {
                     s.push('\\');
