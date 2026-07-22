@@ -3967,6 +3967,7 @@ impl Engine {
         // Stage 1 — parse + AUTO_INC + coerce all rows under the
         // (immutable) table borrow.
         let overriding = stmt.overriding;
+        let mut first_auto: Option<i64> = None;
         let mut all_values = parse_insert_rows(
             table,
             Some(&cat_for_insert),
@@ -3979,6 +3980,7 @@ impl Engine {
             &enum_label_lookup,
             &set_variant_lookup,
             overriding,
+            &mut first_auto,
         )?;
         // Stage 2 — FK enforcement on the immutable catalog.
         // Non-lexical lifetimes release the mutable borrow on
@@ -3989,6 +3991,16 @@ impl Engine {
         // the post-ON-CONFLICT row set.
         let exclusions = table.schema().exclusion_constraints.clone();
         let _ = table;
+        // v7.39 (round 347, M2) — MySQL's LAST_INSERT_ID() reports the
+        // FIRST value this statement generated, and is left ALONE by a
+        // statement that generated none (measured on MariaDB 11: an
+        // explicit id, an UPDATE and an insert into a table with no
+        // AUTO_INCREMENT column all leave it unchanged). Set once the
+        // borrow on `table` is released.
+        if let Some(v) = first_auto {
+            self.last_insert_id
+                .store(v, core::sync::atomic::Ordering::Relaxed);
+        }
         // v7.37.7(sentori Epic 3 P1)— stored generated-column
         // evaluation runs AFTER ordinary INSERT values are coerced
         // (so the expression sees the materialised row)but BEFORE
@@ -5629,6 +5641,12 @@ fn parse_insert_rows(
     enum_label_lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
     set_variant_lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
     overriding: spg_sql::ast::Overriding,
+    // v7.39 (round 347, M2) — the FIRST auto-generated value of this
+    // statement, which is exactly what MySQL's LAST_INSERT_ID() reports
+    // (measured: a three-row insert reports the first id, not the last).
+    // `None` when the statement generated none, in which case MariaDB
+    // leaves the session's previous value alone.
+    first_auto: &mut Option<i64>,
 ) -> Result<Vec<Vec<Value<'static>>>, EngineError> {
     use spg_sql::ast::Overriding;
     let schema_cols_len = column_meta.len();
@@ -5787,6 +5805,9 @@ fn parse_insert_rows(
                         }
                     };
                     auto_cursors.insert(i, next + 1);
+                    if first_auto.is_none() {
+                        *first_auto = Some(next);
+                    }
                     raw = Value::BigInt(next);
                 }
                 // v7.39 (round 263) — a COMPOSITE column relabels + coerces
@@ -5838,6 +5859,9 @@ fn parse_insert_rows(
                         }
                     };
                     auto_cursors.insert(i, next + 1);
+                    if first_auto.is_none() {
+                        *first_auto = Some(next);
+                    }
                     raw = Value::BigInt(next);
                 }
                 let raw =

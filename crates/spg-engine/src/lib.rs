@@ -624,6 +624,14 @@ pub(crate) struct SessionBag {
     /// could read another client's rows, and `CLOSE ALL` closed
     /// everybody's.
     pub(crate) cursors: BTreeMap<String, cursor::OpenCursor>,
+    /// v7.39 (round 347, M2) — MySQL's `LAST_INSERT_ID()`. Per SESSION
+    /// from the start (r277/r279/r283 each paid for landing per-connection
+    /// state on the shared engine first): one connection's insert must not
+    /// be readable as another's. MariaDB, measured: a fresh session reads
+    /// 0; an insert that generates an AUTO_INCREMENT value sets it to the
+    /// FIRST one generated; a statement that generates none — an explicit
+    /// id, an UPDATE, a DELETE, a plain table — leaves it alone.
+    pub(crate) last_insert_id: i64,
 }
 
 /// v7.39 (round 306) — one open large-object descriptor.
@@ -960,6 +968,13 @@ pub struct Engine {
     /// Session-scoped in PG; SPG stores them engine-wide (the same
     /// process-level session-state architecture wall as `session_params`).
     pub(crate) cursors: BTreeMap<String, cursor::OpenCursor>,
+    /// v7.39 (round 347, M2) — the current session's LAST_INSERT_ID().
+    /// Swapped with [`SessionBag`] like every other per-connection slot.
+    /// An atomic because `LAST_INSERT_ID(expr)` SETS it while evaluation
+    /// holds only `&Engine` — and `Engine` must stay `Sync`, which a
+    /// `Cell` would have taken away (spg-embedded-tokio shares one across
+    /// tasks; clippy caught it there before the tests did).
+    pub(crate) last_insert_id: core::sync::atomic::AtomicI64,
     /// v7.39 (round 222) — channels this session LISTENs on. Engine-wide
     /// (the same process-level session-state architecture wall as
     /// `session_params`). Never serialized.
@@ -1247,6 +1262,7 @@ impl Engine {
             slow_query_logger: None,
             session_params: BTreeMap::new(),
             cursors: BTreeMap::new(),
+            last_insert_id: core::sync::atomic::AtomicI64::new(0),
             listen_channels: BTreeSet::new(),
             tx_pending_notifies: Vec::new(),
             delivered_notifies: Vec::new(),
@@ -1627,6 +1643,7 @@ impl Engine {
             slow_query_logger: None,
             session_params: BTreeMap::new(),
             cursors: BTreeMap::new(),
+            last_insert_id: core::sync::atomic::AtomicI64::new(0),
             listen_channels: BTreeSet::new(),
             tx_pending_notifies: Vec::new(),
             delivered_notifies: Vec::new(),
@@ -1741,6 +1758,7 @@ impl Engine {
                     slow_query_logger: None,
                     session_params: BTreeMap::new(),
                     cursors: BTreeMap::new(),
+            last_insert_id: core::sync::atomic::AtomicI64::new(0),
                     listen_channels: BTreeSet::new(),
                     tx_pending_notifies: Vec::new(),
                     delivered_notifies: Vec::new(),
@@ -1815,6 +1833,7 @@ impl Engine {
             lo_descriptors: core::mem::take(&mut self.lo_descriptors),
             lo_next_fd: self.lo_next_fd,
             cursors: core::mem::take(&mut self.cursors),
+            last_insert_id: self.last_insert_id.load(core::sync::atomic::Ordering::Relaxed),
         };
         self.sessions.insert(self.current_session, outgoing);
         let incoming = self.sessions.remove(&id).unwrap_or_default();
@@ -1824,6 +1843,8 @@ impl Engine {
         self.lo_descriptors = incoming.lo_descriptors;
         self.lo_next_fd = incoming.lo_next_fd;
         self.cursors = incoming.cursors;
+        self.last_insert_id
+            .store(incoming.last_insert_id, core::sync::atomic::Ordering::Relaxed);
         self.current_session = id;
         self.plan_cache.clear();
     }
