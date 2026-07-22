@@ -190,6 +190,7 @@ mod e2e_empty_target_list_round341;
 mod e2e_lo_file_round343;
 mod e2e_syntax_error_wording_round340;
 mod e2e_last_insert_id_round347;
+mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;
 mod e2e_relation_oids_round338;

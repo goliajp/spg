@@ -618,7 +618,17 @@ fn apply_function_dispatch(
                     // it's ~50 ns vs the 1 µs `s.chars().count()`
                     // walk. PG `length(text)` returns character count,
                     // which equals byte count when ASCII.
-                    let n = if s.is_ascii() {
+                    //
+                    // v7.39 (round 348, M3) — except that MySQL's LENGTH
+                    // counts BYTES: MariaDB 11 answers 6 for 'héllo' and 9
+                    // for '日本語' where PG answers 5 and 3 (measured).
+                    // SPG answered PG's number on a MySQL session, so a
+                    // length check over multi-byte data was quietly short —
+                    // no error, just a smaller number than the client's
+                    // own database gives. CHAR_LENGTH is the character
+                    // count in BOTH dialects and is untouched.
+                    let bytes = ctx.mysql_dialect && name == "length";
+                    let n = if bytes || s.is_ascii() {
                         i32::try_from(s.len()).unwrap_or(i32::MAX)
                     } else {
                         i32::try_from(s.chars().count()).unwrap_or(i32::MAX)
@@ -641,8 +651,23 @@ fn apply_function_dispatch(
                 Value::TsVector(lexemes) => {
                     Ok(Value::Int(i32::try_from(lexemes.len()).unwrap_or(i32::MAX)))
                 }
+                // v7.39 (round 348, M3) — MySQL applies LENGTH to a number
+                // through its string form (`LENGTH(12345)` is 5, measured);
+                // PG refuses it (`function length(integer) does not exist`),
+                // and SPG refused it in both.
+                other if ctx.mysql_dialect => {
+                    let text = crate::eval::values::value_to_text(other);
+                    Ok(Value::Int(i32::try_from(text.len()).unwrap_or(i32::MAX)))
+                }
+                // v7.39 (round 348, M3) — PG's own wording for a type it has
+                // no `length` for. SPG printed `length() needs text or
+                // bytea, got Some(Int)` — a Rust Debug of an internal
+                // shape, the same leak round 346 cleaned out of NOT.
                 other => Err(EvalError::TypeMismatch {
-                    detail: format!("length() needs text or bytea, got {:?}", other.data_type()),
+                    detail: alloc::format!(
+                        "function {name}({}) does not exist",
+                        crate::eval::strings::pg_typeof_name(other)
+                    ),
                 }),
             }
         }
