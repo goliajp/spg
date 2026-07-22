@@ -1743,9 +1743,23 @@ impl Engine {
         stmt: &SelectStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        self.exec_select_cancel_as(stmt, cancel, None)
+    }
+
+    /// v7.39 (round 334, V55) — the same read core, authorised as
+    /// `as_role`. A `SECURITY DEFINER` function's body runs as the
+    /// function's OWNER: that is the entire point of the form, and without
+    /// it every definer function failed with "permission denied" on the
+    /// very table it exists to expose.
+    pub(crate) fn exec_select_cancel_as(
+        &self,
+        stmt: &SelectStatement,
+        cancel: CancelToken<'_>,
+        as_role: Option<&str>,
+    ) -> Result<QueryResult, EngineError> {
         // v7.39 (read01 round 57) — the table-privilege gate on the common
         // read core. A superuser session returns from it immediately.
-        self.acl_check_select(stmt)?;
+        self.acl_check_select_as(stmt, as_role)?;
         validate_aggregate_placement(stmt)?;
         validate_locking_clause(stmt)?;
         let result = self.exec_select_cancel_inner(stmt, cancel)?;

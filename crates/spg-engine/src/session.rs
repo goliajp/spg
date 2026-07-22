@@ -81,13 +81,18 @@ impl Engine {
         // is any role created SUPERUSER. PG never inherits the attribute
         // through membership, so this reads the role itself, not its set.
         match self.session_params.get(CURRENT_ROLE_KEY) {
-            Some(r) => {
-                r.eq_ignore_ascii_case(LOGIN_ROLE)
-                    || r.eq_ignore_ascii_case(BOOTSTRAP_ROLE)
-                    || self.users.get(r).is_some_and(|rec| rec.superuser)
-            }
+            Some(r) => self.role_is_superuser(r),
             None => true,
         }
+    }
+
+    /// v7.39 (round 334, V55) — is THAT role a superuser? Split out of
+    /// [`Self::is_superuser`] so a `SECURITY DEFINER` body can be
+    /// authorised as the function's owner rather than the session's role.
+    pub(crate) fn role_is_superuser(&self, role: &str) -> bool {
+        role.eq_ignore_ascii_case(LOGIN_ROLE)
+            || role.eq_ignore_ascii_case(BOOTSTRAP_ROLE)
+            || self.users.get(role).is_some_and(|rec| rec.superuser)
     }
 
     /// v7.12.1 — record a `SET <name> = <value>` parameter. Names

@@ -17267,7 +17267,22 @@ fn call_user_function<'v>(
     let mut child = EvalContext::new(&columns, None);
     child.params = ctx.params;
     child.catalog = ctx.catalog;
-    child.session_gucs = ctx.session_gucs;
+    // v7.39 (round 334, V55) — inside a SECURITY DEFINER body PG reports
+    // the function's OWNER as `current_user` (session_user stays the
+    // login). Swap the role the GUC map answers with, for the body only.
+    let definer_gucs;
+    child.session_gucs = match (def.security_definer, def.owner.as_deref(), ctx.session_gucs) {
+        (true, Some(owner), Some(gucs)) => {
+            let mut m = gucs.clone();
+            m.insert(
+                alloc::string::String::from(crate::session::CURRENT_ROLE_KEY),
+                alloc::string::String::from(owner),
+            );
+            definer_gucs = m;
+            Some(&definer_gucs)
+        }
+        _ => ctx.session_gucs,
+    };
     child.users = ctx.users;
     child.render_style = ctx.render_style;
     child.tz_offset_fn = ctx.tz_offset_fn;

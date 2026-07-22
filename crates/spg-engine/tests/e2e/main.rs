@@ -181,6 +181,7 @@ mod e2e_ruledef_deparse_round329;
 mod e2e_array_bytea_bit_input_round325;
 mod e2e_temporal_array_cast_round326;
 mod e2e_conditional_instead_rule_round333;
+mod e2e_security_definer_round334;
 mod e2e_info_schema_domains_round330;
 mod e2e_mysql_escape_table_round332;
 mod e2e_input_syntax_wording_round324;
