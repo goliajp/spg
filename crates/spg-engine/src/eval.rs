@@ -652,37 +652,13 @@ fn apply_domain_checks_of(
 /// `None` when the name is unknown (the caller keeps the legacy text
 /// behaviour so `'anything'::regclass::text` still round-trips).
 pub(crate) fn regclass_name_to_oid(cat: &spg_storage::Catalog, bare: &str) -> Option<i64> {
-    for (pos, tname) in cat.table_names().iter().enumerate() {
-        if tname == bare {
-            return Some(16384 + pos as i64);
-        }
-    }
-    for (pos, (vname, _)) in cat.views().iter().enumerate() {
-        if vname == bare {
-            return Some(32768 + pos as i64);
-        }
-    }
     // v7.39 (round 337, V62) — an INDEX and a SEQUENCE are relations too:
     // both have a `pg_class` row, so both answer to `::regclass` in PG.
-    // Only tables and views resolved here, which is why `'ix'::regclass`
-    // used to fall through to the text spelling. Each band replays the
-    // oid the pg_class synth assigns, so the two agree.
-    let mut idx_oid: i64 = 100_000;
-    for tname in cat.table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
-        for idx in t.indices() {
-            idx_oid += 1;
-            if idx.name == bare {
-                return Some(idx_oid);
-            }
-        }
-    }
-    let mut seq_oid: i64 = 300_000;
-    for name in cat.sequences().keys() {
-        seq_oid += 1;
-        if name == bare {
-            return Some(seq_oid);
-        }
+    // v7.39 (round 338, V64) — and the bands live in ONE allocator now,
+    // shared with the catalog synths, so `pg_class.oid = 'x'::regclass`
+    // holds for every kind rather than only for tables.
+    if let Some(oid) = crate::system_catalog::relation_oid(cat, bare) {
+        return Some(oid);
     }
     Some(match bare {
         "pg_type" => 1247,

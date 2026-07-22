@@ -183,6 +183,7 @@ mod e2e_temporal_array_cast_round326;
 mod e2e_conditional_instead_rule_round333;
 mod e2e_plpgsql_subquery_round335;
 mod e2e_regclass_forms_round337;
+mod e2e_relation_oids_round338;
 mod e2e_viewdef_layout_round336;
 mod e2e_security_definer_round334;
 mod e2e_info_schema_domains_round330;
