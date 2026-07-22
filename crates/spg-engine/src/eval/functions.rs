@@ -17291,7 +17291,29 @@ fn call_user_function<'v>(
     child.fn_depth = ctx.fn_depth + 1;
     child.engine = ctx.engine;
 
-    let out = crate::eval::eval_expr(&body_expr, &row, &child)?;
+    // v7.39 (round 335, V61) — a body expression may contain a scalar
+    // subquery (`RETURN (SELECT count(*) FROM t)`, `RETURN a + (SELECT …)`).
+    // The row evaluator cannot run one — it answered "subquery reached row
+    // eval — engine resolver bug", an internal message — so route through
+    // the engine's subquery-aware evaluator when there is one to route to.
+    let out = if crate::subquery::expr_has_subquery(&body_expr) {
+        let Some(engine) = ctx.engine else {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "function {:?}: a body with a subquery needs the engine \
+                     (this context has none)",
+                    def.name
+                ),
+            });
+        };
+        engine
+            .eval_expr_with_correlated(&body_expr, &row, &child, crate::CancelToken::none(), None)
+            .map_err(|e| EvalError::TypeMismatch {
+                detail: format!("function {:?}: {e}", def.name),
+            })?
+    } else {
+        crate::eval::eval_expr(&body_expr, &row, &child)?
+    };
     // PG coerces the body's value to the DECLARED return type: a function
     // `RETURNS text` whose body yields an int returns text.
     let declared = def.returns.trim();

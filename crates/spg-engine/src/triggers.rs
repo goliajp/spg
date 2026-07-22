@@ -267,6 +267,7 @@ pub fn fire_row_trigger(
         params,
         default_text_search_config,
         &function.name,
+        None,
     )?;
     let mut current_new = new_row;
     let ctx = BodyCtx {
@@ -387,6 +388,7 @@ fn execute_stmts(
                     ctx.table_name,
                     ctx.params,
                     ctx.default_text_search_config,
+                    ctx.select_into_resolver,
                 )
                 .map_err(|cause| TriggerError::EvalFailed {
                     function: ctx.function.into(),
@@ -461,6 +463,7 @@ fn execute_stmts(
                     ctx.table_name,
                     ctx.params,
                     ctx.default_text_search_config,
+                    ctx.select_into_resolver,
                 )
                 .map_err(|cause| TriggerError::EvalFailed {
                     function: ctx.function.into(),
@@ -518,6 +521,7 @@ fn execute_stmts(
                         ctx.table_name,
                         ctx.params,
                         ctx.default_text_search_config,
+                        ctx.select_into_resolver,
                     )
                     .map_err(|cause| TriggerError::EvalFailed {
                         function: ctx.function.into(),
@@ -561,6 +565,7 @@ fn execute_stmts(
                         ctx.table_name,
                         ctx.params,
                         ctx.default_text_search_config,
+                        ctx.select_into_resolver,
                     )
                     .map_err(|cause| TriggerError::EvalFailed {
                         function: ctx.function.into(),
@@ -640,6 +645,7 @@ fn execute_stmts(
                     ctx.table_name,
                     ctx.params,
                     ctx.default_text_search_config,
+                    ctx.select_into_resolver,
                 )
                 .map_err(|cause| TriggerError::EvalFailed {
                     function: ctx.function.into(),
@@ -654,6 +660,7 @@ fn execute_stmts(
                     ctx.table_name,
                     ctx.params,
                     ctx.default_text_search_config,
+                    ctx.select_into_resolver,
                 )
                 .map_err(|cause| TriggerError::EvalFailed {
                     function: ctx.function.into(),
@@ -739,6 +746,7 @@ fn execute_stmts(
                             ctx.table_name,
                             ctx.params,
                             ctx.default_text_search_config,
+                            ctx.select_into_resolver,
                         )
                         .map_err(|cause| TriggerError::EvalFailed {
                             function: ctx.function.into(),
@@ -777,6 +785,7 @@ fn execute_stmts(
                     ctx.table_name,
                     ctx.params,
                     ctx.default_text_search_config,
+                    ctx.select_into_resolver,
                 )
                 .map_err(|cause| TriggerError::EvalFailed {
                     function: ctx.function.into(),
@@ -919,6 +928,7 @@ fn execute_stmts(
                     ctx.table_name,
                     ctx.params,
                     ctx.default_text_search_config,
+                    ctx.select_into_resolver,
                 )
                 .map_err(|cause| TriggerError::EvalFailed {
                     function: ctx.function.into(),
@@ -958,6 +968,7 @@ fn execute_stmts(
                     ctx.table_name,
                     ctx.params,
                     ctx.default_text_search_config,
+                    ctx.select_into_resolver,
                 )
                 .map_err(|cause| TriggerError::EvalFailed {
                     function: ctx.function.into(),
@@ -1001,6 +1012,7 @@ fn execute_stmts(
                             ctx.table_name,
                             ctx.params,
                             ctx.default_text_search_config,
+                            ctx.select_into_resolver,
                         )
                         .map_err(|cause| TriggerError::EvalFailed {
                             function: ctx.function.into(),
@@ -1039,6 +1051,7 @@ fn execute_stmts(
                         ctx.table_name,
                         ctx.params,
                         ctx.default_text_search_config,
+                        ctx.select_into_resolver,
                     )
                     .map_err(|cause| TriggerError::EvalFailed {
                         function: ctx.function.into(),
@@ -1075,6 +1088,7 @@ fn execute_stmts(
                     ctx.table_name,
                     ctx.params,
                     ctx.default_text_search_config,
+                    ctx.select_into_resolver,
                 )
                 .map_err(|cause| TriggerError::EvalFailed {
                     function: ctx.function.into(),
@@ -1092,6 +1106,7 @@ fn execute_stmts(
                             ctx.table_name,
                             ctx.params,
                             ctx.default_text_search_config,
+                            ctx.select_into_resolver,
                         )
                         .map_err(|cause| TriggerError::EvalFailed {
                             function: ctx.function.into(),
@@ -1178,6 +1193,7 @@ pub fn execute_do_block_top_level<'a>(
         &[],
         default_text_search_config,
         "DO",
+        select_into_resolver,
     )?;
     let ctx = BodyCtx {
         function: "DO",
@@ -1297,6 +1313,7 @@ pub fn call_plpgsql_scalar<'a>(
         &[],
         default_text_search_config,
         function,
+        select_into_resolver,
     )?;
     let ctx = BodyCtx {
         function,
@@ -1375,6 +1392,7 @@ pub fn call_plpgsql_scalar<'a>(
                 "",
                 &[],
                 default_text_search_config,
+                ctx.select_into_resolver,
             )
             .map_err(|cause| TriggerError::EvalFailed {
                 function: function.into(),
@@ -1419,6 +1437,7 @@ fn init_locals_from_declarations(
     params: &[Value<'static>],
     default_text_search_config: Option<&str>,
     function_name: &str,
+    subquery_resolver: Option<&SelectIntoResolver<'_>>,
 ) -> Result<(), TriggerError> {
     for d in decls {
         let v = if let Some(init) = &d.default {
@@ -1431,6 +1450,7 @@ fn init_locals_from_declarations(
                 table_name,
                 params,
                 default_text_search_config,
+                subquery_resolver,
             )
             .map_err(|cause| TriggerError::EvalFailed {
                 function: function_name.into(),
@@ -1513,10 +1533,47 @@ fn eval_with_new_old_and_locals(
     table_alias: &str,
     params: &[Value<'static>],
     default_text_search_config: Option<&str>,
+    subquery_resolver: Option<&SelectIntoResolver<'_>>,
 ) -> Result<Value<'static>, EvalError> {
     let mut rewritten = expr.clone();
     substitute_locals(&mut rewritten, locals);
     substitute_new_old(&mut rewritten, new_row, old_row, columns)?;
+    // v7.39 (round 335, V61) — a scalar subquery inside a plpgsql
+    // expression is RUN here, before the row evaluator sees it. The
+    // evaluator cannot execute one — it answered "subquery reached row
+    // eval — engine resolver bug", an internal message, for
+    // `RETURN (SELECT …)`, `n := (SELECT …)` and any expression
+    // containing one. `SELECT … INTO` worked only because it had a
+    // resolver of its own; this gives expressions the same one.
+    if let Some(resolver) = subquery_resolver {
+        let mut failure: Option<EvalError> = None;
+        substitute_locals_visiting(&mut rewritten, locals, &mut |node| {
+            if failure.is_some() {
+                return;
+            }
+            let Expr::ScalarSubquery(sel) = node else {
+                return;
+            };
+            let mut stmt = spg_sql::ast::Statement::Select((**sel).clone());
+            if let Err(e) =
+                substitute_trigger_context_in_statement(&mut stmt, new_row, old_row, locals, columns)
+            {
+                failure = Some(e);
+                return;
+            }
+            match resolver(&stmt) {
+                Ok(v) => *node = value_to_literal_expr(&[], 0, v),
+                Err(e) => {
+                    failure = Some(EvalError::TypeMismatch {
+                        detail: alloc::format!("{e}"),
+                    });
+                }
+            }
+        });
+        if let Some(e) = failure {
+            return Err(e);
+        }
+    }
     let ctx = EvalContext::new(columns, Some(table_alias))
         .with_params(params)
         .with_default_text_search_config(default_text_search_config);
@@ -1530,6 +1587,19 @@ fn eval_with_new_old_and_locals(
 /// so NEW.col / OLD.col references (which have a qualifier) take
 /// the NEW/OLD path normally.
 fn substitute_locals(expr: &mut Expr, locals: &BTreeMap<String, Value>) {
+    substitute_locals_visiting(expr, locals, &mut |_| {});
+}
+
+/// v7.39 (round 335, V61) — the same full-tree walk, calling `visit` on
+/// every node. It exists so a scalar subquery can be found and REPLACED
+/// wherever it sits, reusing the one walker that already knows every
+/// expression shape rather than growing a second one beside it.
+fn substitute_locals_visiting(
+    expr: &mut Expr,
+    locals: &BTreeMap<String, Value>,
+    visit: &mut dyn FnMut(&mut Expr),
+) {
+    visit(expr);
     if let Expr::Column(c) = expr {
         if c.qualifier.is_none()
             && let Some(v) = locals.get(&c.name)
@@ -1549,61 +1619,61 @@ fn substitute_locals(expr: &mut Expr, locals: &BTreeMap<String, Value>) {
         }
     }
     match expr {
-        Expr::NamedArg { expr, .. } => substitute_locals(expr, locals),
-        Expr::Variadic(expr) => substitute_locals(expr, locals),
+        Expr::NamedArg { expr, .. } => substitute_locals_visiting(expr, locals, visit),
+        Expr::Variadic(expr) => substitute_locals_visiting(expr, locals, visit),
         Expr::AggregateOrdered { call, order_by, .. } => {
-            substitute_locals(call, locals);
+            substitute_locals_visiting(call, locals, visit);
             for o in order_by.iter_mut() {
-                substitute_locals(&mut o.expr, locals);
+                substitute_locals_visiting(&mut o.expr, locals, visit);
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
-            substitute_locals(lhs, locals);
-            substitute_locals(rhs, locals);
+            substitute_locals_visiting(lhs, locals, visit);
+            substitute_locals_visiting(rhs, locals, visit);
         }
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
-            substitute_locals(expr, locals);
+            substitute_locals_visiting(expr, locals, visit);
         }
         Expr::Like { expr, pattern, .. } => {
-            substitute_locals(expr, locals);
-            substitute_locals(pattern, locals);
+            substitute_locals_visiting(expr, locals, visit);
+            substitute_locals_visiting(pattern, locals, visit);
         }
         Expr::FunctionCall { args, .. } => {
             for a in args {
-                substitute_locals(a, locals);
+                substitute_locals_visiting(a, locals, visit);
             }
         }
-        Expr::Extract { source, .. } => substitute_locals(source, locals),
+        Expr::Extract { source, .. } => substitute_locals_visiting(source, locals, visit),
         Expr::Array(items) => {
             for elem in items {
-                substitute_locals(elem, locals);
+                substitute_locals_visiting(elem, locals, visit);
             }
         }
         Expr::ArraySubscript { target, index } => {
-            substitute_locals(target, locals);
-            substitute_locals(index, locals);
+            substitute_locals_visiting(target, locals, visit);
+            substitute_locals_visiting(index, locals, visit);
         }
         Expr::ArraySlice { target, lo, hi } => {
-            substitute_locals(target, locals);
+            substitute_locals_visiting(target, locals, visit);
             if let Some(l) = lo {
-                substitute_locals(l, locals);
+                substitute_locals_visiting(l, locals, visit);
             }
             if let Some(h) = hi {
-                substitute_locals(h, locals);
+                substitute_locals_visiting(h, locals, visit);
             }
         }
         Expr::AnyAll { expr, array, .. } => {
-            substitute_locals(expr, locals);
-            substitute_locals(array, locals);
+            substitute_locals_visiting(expr, locals, visit);
+            substitute_locals_visiting(array, locals, visit);
         }
         Expr::InList { expr, list, .. } => {
-            substitute_locals(expr, locals);
+            substitute_locals_visiting(expr, locals, visit);
             for item in list {
-                substitute_locals(item, locals);
+                substitute_locals_visiting(item, locals, visit);
             }
         }
         Expr::Case {
@@ -1612,14 +1682,14 @@ fn substitute_locals(expr: &mut Expr, locals: &BTreeMap<String, Value>) {
             else_branch,
         } => {
             if let Some(o) = operand {
-                substitute_locals(o, locals);
+                substitute_locals_visiting(o, locals, visit);
             }
             for (w, t) in branches {
-                substitute_locals(w, locals);
-                substitute_locals(t, locals);
+                substitute_locals_visiting(w, locals, visit);
+                substitute_locals_visiting(t, locals, visit);
             }
             if let Some(e) = else_branch {
-                substitute_locals(e, locals);
+                substitute_locals_visiting(e, locals, visit);
             }
         }
         Expr::Literal(_)
