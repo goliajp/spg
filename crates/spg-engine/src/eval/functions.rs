@@ -13924,6 +13924,13 @@ fn apply_function_dispatch(
                     resolved = nm;
                     resolved.as_str()
                 }
+                // v7.39 (round 337, V62) — an index name now resolves to a
+                // real oid, so `'ix'::regclass` arrives as RegClass rather
+                // than falling through as text. It carries the name.
+                Some(Value::RegClass(_, n)) => {
+                    resolved = n.to_string();
+                    resolved.as_str()
+                }
                 Some(_) => return Ok(Value::Null),
             };
             let bare = name_arg
@@ -14266,17 +14273,20 @@ fn apply_function_dispatch(
         // written. Numeric-oid input can't map (synthetic oids) →
         // NULL.
         "pg_get_viewdef" => {
-            let name_arg = match args.first() {
-                None | Some(Value::Null) => return Ok(Value::Null),
-                Some(Value::Text(s)) => s.as_ref(),
-                Some(_) => return Ok(Value::Null),
+            // v7.39 (round 337, V62) — a `::regclass` argument is accepted.
+            // It answered NULL, and `::regclass` is the form PG's own
+            // documentation and pg_dump use; only the bare name worked.
+            // `regclass_name_of` already carries the name through the cast,
+            // the way obj_description reads it.
+            let Some(name_arg) = args.first().and_then(regclass_name_of) else {
+                return Ok(Value::Null);
             };
             let Some(cat) = ctx.catalog else {
                 return Ok(Value::Null);
             };
             let bare = name_arg
                 .strip_prefix("public.")
-                .unwrap_or(name_arg)
+                .unwrap_or(&name_arg)
                 .trim_matches('"');
             let pretty = matches!(args.get(1), Some(Value::Bool(true)));
             match cat.views().get(bare) {
@@ -14425,18 +14435,24 @@ fn apply_function_dispatch(
         | "pg_table_size"
         | "pg_total_relation_size"
         | "pg_indexes_size" => {
+            // v7.39 (round 337, V62) — `pg_relation_size('t'::regclass)` is
+            // the spelling PG documents, and it answered 0: only bare TEXT
+            // was read, so the size of a table anyone asked for the normal
+            // way came back as "empty" rather than its bytes.
             let name_arg = match args.first() {
                 None | Some(Value::Null) => return Ok(Value::Null),
-                Some(Value::Text(s)) => s.as_ref(),
-                // Numeric oid — synthetic, no reverse map.
-                Some(_) => return Ok(Value::BigInt(0)),
+                Some(v) => match regclass_name_of(v) {
+                    Some(n) => n,
+                    // Numeric oid — synthetic, no reverse map.
+                    None => return Ok(Value::BigInt(0)),
+                },
             };
             let Some(cat) = ctx.catalog else {
                 return Ok(Value::BigInt(0));
             };
             let bare = name_arg
                 .strip_prefix("public.")
-                .unwrap_or(name_arg)
+                .unwrap_or(&name_arg)
                 .trim_matches('"');
             let Some(t) = cat.get(bare) else {
                 return Ok(Value::Null);
@@ -15027,19 +15043,20 @@ fn apply_function_dispatch(
         // missing relation → 0.
         "pg_relation_is_updatable" => {
             let bare_owned;
+            // v7.39 (round 337, V62) — read the `::regclass` spelling too;
+            // PG's own signature is `pg_relation_is_updatable(regclass, bool)`.
             let bare: &str = match args.first() {
                 None | Some(Value::Null) => return Ok(Value::Null),
-                Some(Value::Text(s)) => {
-                    bare_owned = s
-                        .strip_prefix("public.")
-                        .unwrap_or(s)
-                        .trim_matches('"')
-                        .to_string();
-                    &bare_owned
-                }
-                // Numeric oid input — assume a known relation
-                // (synthetic oids have no reverse map).
-                Some(_) => return Ok(Value::Int(28)),
+                Some(v) => match regclass_name_of(v) {
+                    Some(n) => {
+                        bare_owned =
+                            n.strip_prefix("public.").unwrap_or(&n).trim_matches('"').to_string();
+                        &bare_owned
+                    }
+                    // Numeric oid input — assume a known relation
+                    // (synthetic oids have no reverse map).
+                    None => return Ok(Value::Int(28)),
+                },
             };
             let Some(cat) = ctx.catalog else {
                 return Ok(Value::Int(0));

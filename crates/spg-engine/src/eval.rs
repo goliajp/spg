@@ -662,6 +662,28 @@ pub(crate) fn regclass_name_to_oid(cat: &spg_storage::Catalog, bare: &str) -> Op
             return Some(32768 + pos as i64);
         }
     }
+    // v7.39 (round 337, V62) — an INDEX and a SEQUENCE are relations too:
+    // both have a `pg_class` row, so both answer to `::regclass` in PG.
+    // Only tables and views resolved here, which is why `'ix'::regclass`
+    // used to fall through to the text spelling. Each band replays the
+    // oid the pg_class synth assigns, so the two agree.
+    let mut idx_oid: i64 = 100_000;
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        for idx in t.indices() {
+            idx_oid += 1;
+            if idx.name == bare {
+                return Some(idx_oid);
+            }
+        }
+    }
+    let mut seq_oid: i64 = 300_000;
+    for name in cat.sequences().keys() {
+        seq_oid += 1;
+        if name == bare {
+            return Some(seq_oid);
+        }
+    }
     Some(match bare {
         "pg_type" => 1247,
         "pg_attribute" => 1249,
@@ -1232,6 +1254,40 @@ fn eval_cast_arm(
                 .to_string();
             if let Some(oid) = regclass_name_to_oid(cat, &bare) {
                 return Ok(Value::RegClass(oid, bare.into()));
+            }
+            // v7.39 (round 337, V62) — a name that is no relation at all is
+            // PG's error, not a silent pass-through. `'nope'::regclass`
+            // used to answer the TEXT `nope`, so a downstream
+            // `pg_get_viewdef('nope'::regclass)` reported "no such view"
+            // when the truth is there is no such relation — and a
+            // catalog join on it quietly matched nothing. PG 18.4:
+            // `ERROR: relation "nope" does not exist`. (`to_regclass` is
+            // the spelling that answers NULL instead, and still does.)
+            //
+            // The system views SPG synthesises have no oid space, so they
+            // keep the textual form rather than erroring.
+            const SYSTEM_RELS: &[&str] = &[
+                "pg_roles",
+                "pg_user",
+                "pg_tables",
+                "pg_views",
+                "pg_settings",
+                "pg_stat_activity",
+                "pg_stat_database",
+                "pg_stat_user_tables",
+                "pg_class",
+                "pg_attribute",
+                "pg_type",
+                "pg_proc",
+                "pg_namespace",
+                "pg_constraint",
+                "pg_index",
+                "pg_rewrite",
+            ];
+            if !SYSTEM_RELS.contains(&bare.as_str()) {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("relation \"{bare}\" does not exist"),
+                });
             }
         }
     }
