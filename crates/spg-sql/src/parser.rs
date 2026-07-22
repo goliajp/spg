@@ -15607,6 +15607,15 @@ impl Parser {
 
     fn parse_select_list(&mut self) -> Result<Vec<SelectItem>, ParseError> {
         let mut items = Vec::new();
+        // v7.39 (round 341, V66) — PG's target list may be EMPTY
+        // (`opt_target_list: target_list | /*EMPTY*/`): `SELECT FROM t`
+        // answers one zero-column row per row of t, and a bare `SELECT`
+        // answers a single zero-column row. SPG required at least one
+        // item, so both were syntax errors. Recognised by the token that
+        // follows — nothing that can start an expression appears here.
+        if self.select_list_is_empty_here() {
+            return Ok(items);
+        }
         loop {
             items.push(self.parse_select_item()?);
             if matches!(self.peek(), Token::Comma) {
@@ -15616,6 +15625,33 @@ impl Parser {
             }
         }
         Ok(items)
+    }
+
+    /// Is the target list empty at this point — i.e. does the next token
+    /// end the SELECT's item list rather than start an item?
+    fn select_list_is_empty_here(&self) -> bool {
+        match self.peek() {
+            Token::From
+            | Token::Where
+            | Token::Group
+            | Token::Having
+            | Token::Order
+            | Token::Limit
+            | Token::Offset
+            | Token::Semicolon
+            | Token::RParen
+            | Token::Union
+            | Token::Except
+            | Token::Eof => true,
+            // `FETCH FIRST … ROWS ONLY` and `WINDOW w AS …` are spelled
+            // with unreserved keywords, so they arrive as plain idents.
+            Token::Ident(s) => {
+                s.eq_ignore_ascii_case("fetch")
+                    || s.eq_ignore_ascii_case("window")
+                    || s.eq_ignore_ascii_case("intersect")
+            }
+            _ => false,
+        }
     }
 
     fn parse_select_item(&mut self) -> Result<SelectItem, ParseError> {
