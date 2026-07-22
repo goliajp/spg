@@ -21098,7 +21098,57 @@ impl Parser {
     /// is already consumed; we expect a single string literal next and
     /// resolve it into `Literal::Interval` at parse time so the engine
     /// never has to re-tokenise inside the string.
+    /// The unquoted count of a MySQL `INTERVAL <n> <UNIT>`, when the
+    /// tokens ahead really are one. A quoted count (`INTERVAL '2' DAY`)
+    /// is the SQL-standard form and is left to the path below.
+    fn peek_unquoted_interval_count(&self) -> Option<(alloc::string::String, usize)> {
+        // A negative count lexes as `-` then the number (`INTERVAL -1 DAY`).
+        let (offset, sign) = match self.peek() {
+            Token::Minus => (1, "-"),
+            _ => (0, ""),
+        };
+        let Some(Token::Integer(n)) = self.tokens.get(self.pos + offset) else {
+            return None;
+        };
+        self.tokens
+            .get(self.pos + offset + 1)
+            .filter(|t| mysql_interval_unit(t).is_some())?;
+        Some((alloc::format!("{sign}{n}"), offset + 1))
+    }
+
     fn parse_interval_atom(&mut self) -> Result<Expr, ParseError> {
+        // v7.39 (round 350, M7) — MySQL's `INTERVAL <n> <UNIT>`, with the
+        // number UNQUOTED: `DATE_ADD(d, INTERVAL 1 MONTH)`,
+        // `d + INTERVAL 90 MINUTE`, `INTERVAL -1 DAY`. It is how MySQL
+        // writes every date arithmetic there is, and it did not parse at
+        // all. PG rejects the unquoted form outright (`syntax error at or
+        // near "1"`, measured), so it is taken only in the MySQL dialect —
+        // PG's own `INTERVAL '1' DAY` is untouched below.
+        if self.mysql_dialect
+            && let Some((text, consume)) = self.peek_unquoted_interval_count()
+        {
+            for _ in 0..consume {
+                self.advance(); // the optional `-` and the number
+            }
+            let Some(unit) = mysql_interval_unit(self.peek()) else {
+                return Err(self.err(alloc::format!(
+                    "expected an interval unit after INTERVAL {text}, got {:?}",
+                    self.peek()
+                )));
+            };
+            self.advance(); // the unit
+            let (months, days, micros) = scale_mysql_interval(&text, unit).ok_or_else(|| {
+                self.err(alloc::format!("cannot read INTERVAL {text} {unit}"))
+            })?;
+            return Ok(Expr::Literal(Literal::Interval {
+                months,
+                days,
+                micros,
+                // The canonical rendering, so Display round-trips into a
+                // form both dialects read back.
+                text: alloc::format!("{text} {unit}"),
+            }));
+        }
         let tok = self.advance();
         let Token::String(text) = tok else {
             return Err(self.err(format!(
@@ -22767,6 +22817,44 @@ pub(crate) enum IntervalField {
 /// Recognise an interval field keyword (bare ident, case-insensitive). Plural
 /// spellings aren't standard for the qualifier position, so only the singular
 /// forms are accepted.
+/// v7.39 (round 350, M7) — MySQL's interval units, measured against
+/// MariaDB 11. QUARTER is three months and WEEK seven days; MICROSECOND
+/// is the finest. (The compound spellings — `DAY_HOUR` and friends, which
+/// take a `'1 2'` style literal — are not read here; they stay a parse
+/// error rather than being silently misread.)
+fn mysql_interval_unit(tok: &Token) -> Option<&'static str> {
+    let Token::Ident(s) = tok else { return None };
+    Some(match () {
+        () if s.eq_ignore_ascii_case("microsecond") => "microsecond",
+        () if s.eq_ignore_ascii_case("second") => "second",
+        () if s.eq_ignore_ascii_case("minute") => "minute",
+        () if s.eq_ignore_ascii_case("hour") => "hour",
+        () if s.eq_ignore_ascii_case("day") => "day",
+        () if s.eq_ignore_ascii_case("week") => "week",
+        () if s.eq_ignore_ascii_case("month") => "month",
+        () if s.eq_ignore_ascii_case("quarter") => "quarter",
+        () if s.eq_ignore_ascii_case("year") => "year",
+        () => return None,
+    })
+}
+
+/// `(count, unit)` → `(months, days, micros)`.
+fn scale_mysql_interval(count: &str, unit: &str) -> Option<(i32, i32, i64)> {
+    let n: i64 = count.trim().parse().ok()?;
+    Some(match unit {
+        "microsecond" => (0, 0, n),
+        "second" => (0, 0, n.checked_mul(1_000_000)?),
+        "minute" => (0, 0, n.checked_mul(60_000_000)?),
+        "hour" => (0, 0, n.checked_mul(3_600_000_000)?),
+        "day" => (0, i32::try_from(n).ok()?, 0),
+        "week" => (0, i32::try_from(n.checked_mul(7)?).ok()?, 0),
+        "month" => (i32::try_from(n).ok()?, 0, 0),
+        "quarter" => (i32::try_from(n.checked_mul(3)?).ok()?, 0, 0),
+        "year" => (i32::try_from(n.checked_mul(12)?).ok()?, 0, 0),
+        _ => return None,
+    })
+}
+
 fn interval_field_of(tok: &Token) -> Option<IntervalField> {
     let Token::Ident(s) = tok else { return None };
     Some(match () {

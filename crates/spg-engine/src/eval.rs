@@ -655,6 +655,37 @@ fn apply_domain_checks_of(
 /// `(v1,"v 2",)` record text (double-quote wrapping with doubled quotes,
 /// empty field = NULL) and coerce each field to the declared type; a ROW
 /// value re-labels positionally.
+/// v7.39 (round 350, M7) — MySQL reads a date STRING as the temporal
+/// operand of an INTERVAL shift (`'2024-01-15' + INTERVAL 1 DAY`). Only
+/// that pairing is touched; everything else falls straight through to the
+/// ordinary binary path.
+#[inline(never)]
+fn eval_mysql_temporal_add(
+    lhs: &Expr,
+    op: BinOp,
+    rhs: &Expr,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let l = eval_expr(lhs, row, ctx)?;
+    let r = eval_expr(rhs, row, ctx)?;
+    let (l, r) = match (&l, &r) {
+        (Value::Text(t), Value::Interval { .. }) => (text_as_temporal(t).unwrap_or(l.clone()), r),
+        (Value::Interval { .. }, Value::Text(t)) => (l.clone(), text_as_temporal(t).unwrap_or(r.clone())),
+        _ => (l.clone(), r.clone()),
+    };
+    apply_binary(op, l, r)
+}
+
+/// A date / timestamp string as its temporal value, or `None` when it is
+/// not one (in which case the operand is left exactly as it was).
+#[inline(never)]
+fn text_as_temporal(t: &str) -> Option<Value<'static>> {
+    parse_timestamp_literal(t)
+        .map(Value::Timestamp)
+        .or_else(|| parse_date_literal(t).map(Value::Date))
+}
+
 /// v7.39 (round 346, M1) — the MySQL reading of `AND` / `OR`, out-of-line
 /// so it costs `eval_expr` no frame (see the round-305 frame cliff).
 #[inline(never)]
@@ -3124,6 +3155,15 @@ pub fn eval_expr(
             if ctx.mysql_dialect && matches!(op, BinOp::And | BinOp::Or) =>
         {
             eval_mysql_connective(lhs, *op, rhs, row, ctx)
+        }
+        // v7.39 (round 350, M7) — `'2024-01-15' + INTERVAL 1 DAY`: MySQL
+        // reads a date STRING as the temporal operand. Out-of-line, like
+        // the connective arm above, so `eval_expr`'s frame does not grow
+        // (the round-305 cliff).
+        Expr::Binary { lhs, op, rhs }
+            if ctx.mysql_dialect && matches!(op, BinOp::Add | BinOp::Sub) =>
+        {
+            eval_mysql_temporal_add(lhs, *op, rhs, row, ctx)
         }
         Expr::Binary { lhs, op, rhs } => {
             // v7.32 (P4 borrow channel) — comparison fast path. A pure
