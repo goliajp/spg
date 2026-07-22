@@ -153,6 +153,30 @@ fn cast_reg_misc(kind: &str, s: &str) -> Result<Value<'static>, EvalError> {
     }
 }
 
+/// v7.39 (round 355, M13) — `BINARY expr` / `CAST(expr AS BINARY[(n)])`.
+fn cast_mysql_binary(v: Value<'static>, name: &str) -> Result<Value<'static>, EvalError> {
+    let limit: Option<usize> = name
+        .split_once('(')
+        .and_then(|(_, rest)| rest.trim_end_matches(')').trim().parse().ok());
+    let text = match &v {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(t) => t.to_string(),
+        Value::BpChar(t) => t.to_string(),
+        other => crate::eval::values::value_to_text(other),
+    };
+    Ok(Value::text(match limit {
+        // Byte-wise, which is the point of the type.
+        Some(n) if text.len() > n => {
+            let mut cut = n;
+            while cut > 0 && !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text[..cut].to_string()
+        }
+        _ => text,
+    }))
+}
+
 /// v7.39 (round 352, M8) — `CAST(x AS SIGNED)` / `CAST(x AS UNSIGNED)`.
 fn cast_mysql_integer(v: Value<'static>, unsigned: bool) -> Result<Value<'static>, EvalError> {
     let n: f64 = match &v {
@@ -761,6 +785,17 @@ pub fn cast_value_in(
                         detail: alloc::format!("cannot cast {:?} to jsonpath", other.data_type()),
                     }),
                 };
+            }
+            // v7.39 (round 355, M13) — MySQL's `BINARY` / `BINARY(n)`.
+            // It is a COLLATION coercion, not a type change: MariaDB
+            // renders `BINARY 'abc'` as `abc` (and `HEX()` of it as
+            // 616263), so the value passes through unchanged; `(n)`
+            // truncates to n bytes (`CAST('abc' AS BINARY(2))` is `ab`,
+            // measured). What it really buys is byte-wise comparison,
+            // which `compare_is_case_insensitive` now refuses to fold.
+            if mysql && (name.eq_ignore_ascii_case("binary") || name.to_ascii_lowercase().starts_with("binary("))
+            {
+                return cast_mysql_binary(v, &name);
             }
             // v7.39 (round 352, M8) — MySQL's SIGNED / UNSIGNED targets.
             // Measured on MariaDB 11: a string gives its LEADING number

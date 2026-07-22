@@ -18634,6 +18634,19 @@ impl Parser {
         })
     }
 
+    /// v7.39 (round 355, M13) — `BINARY <expr>`, lowered onto the same
+    /// cast the `CAST(x AS BINARY)` spelling produces. It binds tightly:
+    /// MariaDB reads `BINARY 1 + 1` as `(BINARY 1) + 1` = 2.
+    #[inline(never)]
+    fn parse_binary_prefix(&mut self) -> Result<Expr, ParseError> {
+        self.advance();
+        let e = self.parse_expr(8)?;
+        Ok(Expr::Cast {
+            expr: Box::new(e),
+            target: CastTarget::Named("binary".to_string()),
+        })
+    }
+
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
         match self.peek() {
             Token::Not => {
@@ -18645,6 +18658,15 @@ impl Parser {
                     op: UnOp::Not,
                     expr: Box::new(e),
                 })
+            }
+            // v7.39 (round 355, M13) — MySQL's `BINARY <expr>` prefix.
+            // The body is out-of-line: `parse_unary` is one of the three
+            // frames the parser's MAX_NEST_DEPTH is tuned against, and an
+            // inline arm here overflowed the native stack in
+            // `nesting_budget_errors_cleanly` — the guard test caught it,
+            // exactly as the eval-side cliff did in rounds 346 and 351.
+            Token::Ident(w) if self.mysql_dialect && w.eq_ignore_ascii_case("binary") => {
+                self.parse_binary_prefix()
             }
             // v7.39 (round 353, M10) — MySQL's `!`. It binds TIGHTER than
             // arithmetic, unlike NOT: MariaDB answers 1 for `!1 + 1`
