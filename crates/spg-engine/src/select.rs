@@ -94,7 +94,7 @@ impl Engine {
                     }
                     if let Some(w) = &stmt.where_ {
                         let cond = eval::eval_expr(w, &row, &ctx)?;
-                        if !matches!(cond, Value::Bool(true)) {
+                        if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                             continue;
                         }
                     }
@@ -122,7 +122,7 @@ impl Engine {
                     }
                     if let Some(w) = &stmt.where_ {
                         let cond = eval::eval_expr(w, row, &ctx)?;
-                        if !matches!(cond, Value::Bool(true)) {
+                        if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                             return Ok(());
                         }
                     }
@@ -4029,7 +4029,7 @@ impl Engine {
         let dummy_row = Row::new(Vec::new());
         if let Some(w) = &stmt.where_ {
             let cond = eval::eval_expr(w, &dummy_row, &ctx)?;
-            if !matches!(cond, Value::Bool(true)) {
+            if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                 let columns: Vec<ColumnSchema> = projection
                     .into_iter()
                     .map(|p| {
@@ -4555,11 +4555,11 @@ impl Engine {
                 (Some(cw), _) => {
                     let cond = eval::eval_compiled(cw, row, &ctx, eval_stack)
                         .map_err(EngineError::Eval)?;
-                    Ok(matches!(cond, Value::Bool(true)))
+                    Ok(crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)?)
                 }
                 (None, Some(w)) => {
                     let cond = self.eval_expr_with_correlated(w, row, &ctx, cancel, Some(memo))?;
-                    Ok(matches!(cond, Value::Bool(true)))
+                    Ok(crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)?)
                 }
                 (None, None) => Ok(true),
             }
@@ -4851,13 +4851,13 @@ impl Engine {
             if let Some(cw) = &compiled_where {
                 let cond = eval::eval_compiled(cw, row, &ctx, &mut eval_stack)
                     .map_err(EngineError::Eval)?;
-                if !matches!(cond, Value::Bool(true)) {
+                if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                     return Ok(());
                 }
             } else if let Some(where_expr) = &stmt.where_ {
                 let cond =
                     self.eval_expr_with_correlated(where_expr, row, &ctx, cancel, Some(&mut memo))?;
-                if !matches!(cond, Value::Bool(true)) {
+                if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                     return Ok(());
                 }
             }
@@ -5612,7 +5612,7 @@ impl Engine {
                     .map_err(EngineError::Storage)?;
             if let Some(where_expr) = &stmt.where_ {
                 let cond = self.eval_expr_simple(where_expr, &row, &ctx)?;
-                if !matches!(cond, Value::Bool(true)) {
+                if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                     continue;
                 }
             }

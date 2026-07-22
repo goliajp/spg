@@ -1121,7 +1121,7 @@ impl Engine {
                             crate::constraints::iter_cold_rows_with_pk_key(self.active_catalog(), t)
                         {
                             let cond = eval::eval_expr(w, &row, &ctx).map_err(EngineError::Eval)?;
-                            if matches!(cond, Value::Bool(true)) {
+                            if crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                                 keys.push(key);
                             }
                         }
@@ -1259,7 +1259,7 @@ impl Engine {
                 } else {
                     eval::eval_expr(w, row, &ctx)?
                 };
-                if !matches!(cond, Value::Bool(true)) {
+                if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                     continue;
                 }
             }
@@ -2126,7 +2126,7 @@ impl Engine {
                 combined_vals.extend(src_row.values.iter().cloned());
                 let combined_row = Row::new(combined_vals);
                 let cond = eval::eval_expr(&stmt.on, &combined_row, &combined_ctx)?;
-                if matches!(cond, Value::Bool(true)) {
+                if crate::eval::predicate_is_true(&cond, "JOIN/ON", combined_ctx.mysql_dialect)? {
                     matched_targets.push(t_idx);
                 }
             }
@@ -2799,7 +2799,7 @@ impl Engine {
                             crate::constraints::iter_cold_rows_with_pk_key(self.active_catalog(), t)
                         {
                             let cond = eval::eval_expr(w, &row, &ctx).map_err(EngineError::Eval)?;
-                            if matches!(cond, Value::Bool(true)) {
+                            if crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                                 keys.push(key);
                             }
                         }
@@ -2874,7 +2874,7 @@ impl Engine {
                     continue;
                 };
                 let cond = self.eval_expr_with_correlated(w, row, &ctx, cancel, None)?;
-                if matches!(cond, Value::Bool(true)) {
+                if crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                     hits.push(i);
                 }
             }
@@ -2952,7 +2952,7 @@ impl Engine {
                 hits.binary_search(&i).is_err()
             } else if let Some(w) = &stmt.where_ {
                 let cond = eval::eval_expr(w, row, &ctx)?;
-                !matches!(cond, Value::Bool(true))
+                !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)?
             } else {
                 false
             };
@@ -5563,6 +5563,7 @@ pub(crate) fn apply_generated_stored_columns(
                 default_text_search_config: None,
                 sequence_resolver: None,
                 catalog: None,
+                mysql_dialect: false,
                 session_gucs: None,
                 users: None,
                 fn_depth: 0,

@@ -941,7 +941,7 @@ impl Engine {
                         cancel,
                         Some(&mut memo),
                     )?;
-                    if !matches!(cond, Value::Bool(true)) {
+                    if !crate::eval::predicate_is_true(&cond, "JOIN/ON", ctx.mysql_dialect)? {
                         continue;
                     }
                 }
@@ -1214,7 +1214,7 @@ impl Engine {
                         for r in residual {
                             let cond =
                                 self.eval_expr_with_correlated(r, &combined, ctx, cancel, None)?;
-                            if !matches!(cond, Value::Bool(true)) {
+                            if !crate::eval::predicate_is_true(&cond, "JOIN/ON", ctx.mysql_dialect)? {
                                 k = false;
                                 break;
                             }
@@ -1466,7 +1466,7 @@ impl Engine {
                         for r in residual {
                             let cond =
                                 self.eval_expr_with_correlated(r, &combined, ctx, cancel, None)?;
-                            if !matches!(cond, Value::Bool(true)) {
+                            if !crate::eval::predicate_is_true(&cond, "JOIN/ON", ctx.mysql_dialect)? {
                                 ok = false;
                                 break;
                             }
@@ -1651,7 +1651,7 @@ impl Engine {
                     // referencing earlier join columns).
                     let cond =
                         self.eval_expr_with_correlated(on_expr, &combined, ctx, cancel, None)?;
-                    matches!(cond, Value::Bool(true))
+                    crate::eval::predicate_is_true(&cond, "JOIN/ON", ctx.mysql_dialect)?
                 } else {
                     true
                 };
@@ -2489,7 +2489,7 @@ impl Engine {
                 let mut outer_ok = true;
                 for r in &residual_outer_only {
                     let cond = self.eval_expr_with_correlated(r, left, &outer_ctx, cancel, None)?;
-                    if !matches!(cond, Value::Bool(true)) {
+                    if !crate::eval::predicate_is_true(&cond, "JOIN/ON", ctx.mysql_dialect)? {
                         outer_ok = false;
                         break;
                     }
@@ -2505,7 +2505,7 @@ impl Engine {
                         cancel,
                         Some(&mut outer_memo),
                     )?;
-                    if !matches!(cond, Value::Bool(true)) {
+                    if !crate::eval::predicate_is_true(&cond, "JOIN/ON", ctx.mysql_dialect)? {
                         outer_ok = false;
                         break;
                     }
@@ -2530,7 +2530,7 @@ impl Engine {
                     for r in &residual_mixed {
                         let cond =
                             self.eval_expr_with_correlated(r, &combined, &ctx, cancel, None)?;
-                        if !matches!(cond, Value::Bool(true)) {
+                        if !crate::eval::predicate_is_true(&cond, "JOIN/ON", ctx.mysql_dialect)? {
                             ok = false;
                             break;
                         }
@@ -2546,7 +2546,7 @@ impl Engine {
                             cancel,
                             Some(&mut where_memo),
                         )?;
-                        if !matches!(cond, Value::Bool(true)) {
+                        if !crate::eval::predicate_is_true(&cond, "JOIN/ON", ctx.mysql_dialect)? {
                             ok = false;
                             break;
                         }
@@ -2803,7 +2803,7 @@ impl Engine {
                 let mut ok = true;
                 for r in &residual {
                     let cond = self.eval_expr_with_correlated(r, &combined, &ctx, cancel, None)?;
-                    if !matches!(cond, Value::Bool(true)) {
+                    if !crate::eval::predicate_is_true(&cond, "JOIN/ON", ctx.mysql_dialect)? {
                         ok = false;
                         break;
                     }
@@ -2819,7 +2819,7 @@ impl Engine {
                         cancel,
                         Some(&mut where_memo),
                     )?;
-                    if !matches!(cond, Value::Bool(true)) {
+                    if !crate::eval::predicate_is_true(&cond, "JOIN/ON", ctx.mysql_dialect)? {
                         continue;
                     }
                 }

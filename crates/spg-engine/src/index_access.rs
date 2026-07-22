@@ -99,7 +99,7 @@ pub(crate) fn try_nsw_knn(
             }
             let row = &table.rows()[i];
             let cond = eval::eval_expr(where_expr, row, &ctx).ok()?;
-            if matches!(cond, Value::Bool(true)) {
+            if crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect).ok()? {
                 kept.push(i);
                 if kept.len() >= limit {
                     break;
@@ -271,14 +271,14 @@ pub(crate) fn try_pk_walk_top_n<'a>(
                 // at compile time; `eval_compiled` is allocator-free per
                 // row (stack reused).
                 let cond = eval::eval_compiled(cw, row_cow.as_ref(), &ctx, &mut eval_stack).ok()?;
-                if !matches!(cond, Value::Bool(true)) {
+                if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect).ok()? {
                     continue;
                 }
             } else if let Some(w) = where_expr {
                 let cond = engine
                     .eval_expr_with_correlated(w, row_cow.as_ref(), &ctx, cancel, Some(&mut memo))
                     .ok()?;
-                if !matches!(cond, Value::Bool(true)) {
+                if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect).ok()? {
                     continue;
                 }
             }
