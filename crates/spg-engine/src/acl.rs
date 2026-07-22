@@ -241,14 +241,35 @@ impl Engine {
     /// A superuser always does. An unknown table answers `true` — the caller's
     /// own "relation does not exist" error is the one that should surface.
     pub(crate) fn acl_holds(&self, table: &str, wanted: u16) -> bool {
-        if self.is_superuser() {
+        self.acl_holds_as(table, wanted, None)
+    }
+
+    /// v7.39 (round 334, V55) — the same check evaluated as `as_role`
+    /// instead of the session's own. A `SECURITY DEFINER` function's body
+    /// is authorised as the function's OWNER, which is the whole point of
+    /// the form: it lets an owner expose controlled access to a table the
+    /// caller cannot read directly. `None` means "the session's role", so
+    /// every existing caller is unchanged.
+    pub(crate) fn acl_holds_as(&self, table: &str, wanted: u16, as_role: Option<&str>) -> bool {
+        // ⚠️ The session case must go through `is_superuser`, NOT through
+        // `role_is_superuser(current_role())`: rounds 51 / 58 deliberately
+        // decoupled the REPORTED identity from privilege, so a connection
+        // that merely names itself `alice` in the startup packet is still a
+        // superuser session until it SETs a role. Only an explicit
+        // `as_role` — a definer function's owner — is judged by name.
+        let superuser = match as_role {
+            Some(r) => self.role_is_superuser(r),
+            None => self.is_superuser(),
+        };
+        if superuser {
             return true;
         }
+        let role = as_role.unwrap_or_else(|| self.current_role());
         let Some(t) = self.active_catalog().get(table) else {
             return true;
         };
         let owner = self.table_owner(t.schema()).to_string();
-        let roles = self.users.effective_roles(self.current_role());
+        let roles = self.users.effective_roles(role);
         privs_of_roles(t.schema(), &owner, &roles) & wanted == wanted
     }
 
@@ -860,7 +881,22 @@ impl Engine {
     /// so each takes the gate: a check that only lives on the "normal" path is
     /// not a check.
     pub(crate) fn acl_check_select(&self, s: &SelectStatement) -> Result<(), EngineError> {
-        if self.is_superuser() {
+        self.acl_check_select_as(s, None)
+    }
+
+    /// v7.39 (round 334, V55) — the read gate evaluated as `as_role`.
+    pub(crate) fn acl_check_select_as(
+        &self,
+        s: &SelectStatement,
+        as_role: Option<&str>,
+    ) -> Result<(), EngineError> {
+        // Same rule as `acl_holds_as`: the session case keeps its own
+        // superuser test.
+        let superuser = match as_role {
+            Some(r) => self.role_is_superuser(r),
+            None => self.is_superuser(),
+        };
+        if superuser {
             return Ok(());
         }
         // v7.39 (read01 round 59) — column-aware: a role may hold SELECT on a
@@ -869,7 +905,7 @@ impl Engine {
             alloc::collections::BTreeMap::new();
         self.collect_select_reads(s, &mut reads);
         for (t, read) in &reads {
-            self.acl_require_read(t, read)?;
+            self.acl_require_read_as(t, read, as_role)?;
         }
         Ok(())
     }
@@ -980,7 +1016,17 @@ impl Engine {
     /// (`SELECT count(*)`) needs only *some* column privilege on it, which is
     /// exactly `has_any_column_privilege`.
     pub(crate) fn acl_require_read(&self, table: &str, read: &ColRead) -> Result<(), EngineError> {
-        if self.acl_holds(table, priv_bits::SELECT) {
+        self.acl_require_read_as(table, read, None)
+    }
+
+    /// v7.39 (round 334, V55) — as `as_role`; see [`Self::acl_holds_as`].
+    pub(crate) fn acl_require_read_as(
+        &self,
+        table: &str,
+        read: &ColRead,
+        as_role: Option<&str>,
+    ) -> Result<(), EngineError> {
+        if self.acl_holds_as(table, priv_bits::SELECT, as_role) {
             return Ok(());
         }
         let denied =
@@ -988,7 +1034,9 @@ impl Engine {
         let Some(t) = self.active_catalog().get(table) else {
             return Ok(());
         };
-        let roles = self.users.effective_roles(self.current_role());
+        let roles = self
+            .users
+            .effective_roles(as_role.unwrap_or_else(|| self.current_role()));
         let cols = &t.schema().columns;
         if read.all {
             // Every column, so every column must be granted.

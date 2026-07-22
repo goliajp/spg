@@ -3542,8 +3542,16 @@ impl crate::Engine {
                 }
             })?;
 
+        // v7.39 (round 334, V55) — a SECURITY DEFINER body is authorised as
+        // the function's OWNER. Measured on PG 18.4: a definer function
+        // owned by `owner55` counts rows of a table `caller55` cannot read,
+        // while the SECURITY INVOKER sibling is refused.
+        let as_role = def
+            .security_definer
+            .then(|| def.owner.as_deref())
+            .flatten();
         let out = self
-            .exec_select_cancel(&bound, crate::CancelToken::none())
+            .exec_select_cancel_as(&bound, crate::CancelToken::none(), as_role)
             .map_err(|e| EvalError::TypeMismatch {
                 detail: alloc::format!("function {:?}: {e}", def.name),
             })?;
