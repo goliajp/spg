@@ -14032,7 +14032,19 @@ impl Parser {
                 let encoding = self.parse_optional_vector_encoding()?;
                 ColumnTypeName::Vector { dim, encoding }
             }
-            "numeric" => {
+            // v7.39 (round 345, M5) — `DECIMAL` and `DEC` are the SQL
+            // standard's own spellings of NUMERIC, and PG 18.4 accepts both
+            // (measured: `DECIMAL(10,2)` and `DEC(5,1)` both report as
+            // `numeric`). Only `NUMERIC` parsed, so `CREATE TABLE t (a
+            // DECIMAL(10,2))` — how nearly every money column is written,
+            // in either dialect — was a syntax error and the table was
+            // never created. `FIXED` is MySQL's alias alone, so it is
+            // taken only in that dialect.
+            "numeric" | "decimal" | "dec" => {
+                let (precision, scale) = self.parse_optional_numeric_params()?;
+                ColumnTypeName::Numeric(precision, scale)
+            }
+            "fixed" if self.mysql_dialect => {
                 let (precision, scale) = self.parse_optional_numeric_params()?;
                 ColumnTypeName::Numeric(precision, scale)
             }
