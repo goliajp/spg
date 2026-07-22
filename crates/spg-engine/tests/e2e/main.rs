@@ -194,6 +194,7 @@ mod e2e_clock_precision_round349;
 mod e2e_interval_expr_round350;
 mod e2e_binary_prefix_round355;
 mod e2e_date_format_round357;
+mod e2e_show_create_table_round358;
 mod e2e_unix_timestamp_round356;
 mod e2e_group_concat_round354;
 mod e2e_mysql_cast_round352;
