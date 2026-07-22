@@ -2389,6 +2389,54 @@ pub(crate) fn synth_information_schema_table_constraints(
     (schema, rows)
 }
 
+/// v7.39 (round 338, V64) — the ONE place a relation's oid is decided.
+///
+/// Each kind of relation used to number itself wherever it was
+/// synthesised, and the numbers disagreed: a sequence was 300_001 in
+/// `pg_class` but 32_768 in `pg_sequence`, so PG's canonical
+/// `pg_class JOIN pg_sequence ON oid = seqrelid` returned nothing — and
+/// 32_768 was simultaneously the *view* band, so a view and a sequence
+/// could answer to the same oid. Every synth now reads its band from
+/// here, and so does the `::regclass` cast, which is what makes the
+/// joins between them line up.
+pub(crate) const OID_TABLE_BASE: i64 = 16384;
+pub(crate) const OID_VIEW_BASE: i64 = 32768;
+pub(crate) const OID_INDEX_BASE: i64 = 100_000;
+pub(crate) const OID_SEQ_BASE: i64 = 300_000;
+
+/// Resolve a relation name to the oid every catalog synth uses for it.
+/// The iteration order here IS the assignment order the synths replay.
+pub(crate) fn relation_oid(cat: &Catalog, bare: &str) -> Option<i64> {
+    for (pos, tname) in cat.table_names().iter().enumerate() {
+        if tname == bare {
+            return Some(OID_TABLE_BASE + pos as i64);
+        }
+    }
+    for (pos, vname) in cat.views().keys().enumerate() {
+        if vname == bare {
+            return Some(OID_VIEW_BASE + pos as i64);
+        }
+    }
+    let mut idx_oid = OID_INDEX_BASE;
+    for tname in cat.table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        for idx in t.indices() {
+            idx_oid += 1;
+            if idx.name == bare {
+                return Some(idx_oid);
+            }
+        }
+    }
+    let mut seq_oid = OID_SEQ_BASE;
+    for name in cat.sequences().keys() {
+        seq_oid += 1;
+        if name == bare {
+            return Some(seq_oid);
+        }
+    }
+    None
+}
+
 /// v7.16.2 + v7.37.24 (24.8) — synthesise `pg_catalog.pg_class`.
 /// Widened to cover the columns dashboards / monitoring tools
 /// query (relkind, reltuples for size estimates, relnatts for
@@ -2435,13 +2483,21 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     // PG starts user-relation OIDs above 16384.
-    let mut oid: i64 = 16384;
+    let mut oid: i64 = OID_TABLE_BASE;
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         let schema_ref = t.schema();
-        let relkind: &'static str = match &schema_ref.partition_role {
-            Some(PartitionRole::Parent { .. }) => "p", // partitioned table
-            _ => "r",                                  // regular table
+        // v7.39 (round 338, V64) — a MATERIALIZED VIEW is backed by a real
+        // table in SPG, and that showed through: it reported relkind 'r',
+        // so a tool listing `WHERE relkind = 'm'` found none of them and a
+        // migration tool would recreate it as a plain table.
+        let relkind: &'static str = if cat.materialized_views().contains_key(&tname) {
+            "m"
+        } else {
+            match &schema_ref.partition_role {
+                Some(PartitionRole::Parent { .. }) => "p", // partitioned table
+                _ => "r",                                  // regular table
+            }
         };
         let is_partition = matches!(
             &schema_ref.partition_role,
@@ -2482,7 +2538,17 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             Value::text(relkind),
             Value::SmallInt(relnatts),
             Value::SmallInt(i16::try_from(has_checks).unwrap_or(i16::MAX)),
-            Value::Bool(false), // relhasrules — SPG has no rule system
+            // v7.39 (round 338, V64) — relhasrules for real. It was pinned
+            // false with the note "SPG has no rule system", which stopped
+            // being true when CREATE RULE landed; a matview carries its
+            // _RETURN rule in PG, so it reads true there too.
+            Value::Bool(
+                relkind == "m"
+                    || cat
+                        .rules()
+                        .iter()
+                        .any(|r| r.table.eq_ignore_ascii_case(&tname)),
+            ),
             Value::Bool(has_triggers),
             Value::Bool(false),                         // relhassubclass
             Value::Bool(schema_ref.row_security),       // relrowsecurity (v7.39 RLS)
@@ -2496,6 +2562,50 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         ]));
         oid = oid.saturating_add(1);
     }
+    // v7.39 (round 338, V64) — a row PER VIEW (relkind 'v'). pg_class had
+    // NO view rows at all: `SELECT … FROM pg_class WHERE relname = '<view>'`
+    // came back empty, `WHERE relkind = 'v'` listed none, and every
+    // pg_class-anchored join for a view (pg_attribute, pg_rewrite,
+    // relacl lookups) dead-ended. PG's values, measured: relam 0,
+    // relfilenode 0 (a view has no storage), relpages 0, reltuples -1,
+    // relhasrules TRUE (the _RETURN rule), relreplident 'n'.
+    for vname in cat.views().keys() {
+        let Some(view_oid) = relation_oid(cat, vname) else {
+            continue;
+        };
+        let relnatts = i16::try_from(crate::describe::describe_view_columns(cat, vname).len())
+            .unwrap_or(i16::MAX);
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(view_oid),
+            Value::text(vname.clone()),
+            Value::BigInt(2200), // relnamespace — public
+            Value::BigInt(0),    // reltype
+            Value::BigInt(0),    // reloftype
+            Value::BigInt(10),   // relowner
+            Value::BigInt(0),    // relam — a view has no access method
+            Value::BigInt(0),    // relfilenode — nor any storage
+            Value::BigInt(0),
+            Value::Int(0),      // relpages
+            Value::Float(-1.0), // reltuples — -1 = never analysed
+            Value::Int(0),
+            Value::BigInt(0),
+            Value::Bool(false), // relhasindex
+            Value::Bool(false),
+            Value::text("p"),
+            Value::text("v"), // relkind — view
+            Value::SmallInt(relnatts),
+            Value::SmallInt(0),
+            Value::Bool(true),  // relhasrules — the _RETURN rule
+            Value::Bool(false), // relhastriggers
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(true),  // relispopulated
+            Value::text("n"),   // relreplident — 'n' for a view
+            Value::Bool(false), // relispartition
+            Value::Null,        // relacl
+        ]));
+    }
     // v7.39 (read01 round 53) — pg_class also holds a row PER INDEX
     // (relkind 'i'), which is what makes PG's canonical
     // `pg_class JOIN pg_index ON indexrelid = oid JOIN pg_am ON relam = am.oid`
@@ -2504,7 +2614,7 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     // Index oids follow the SAME sequence synth_pg_index_raw uses (from
     // 100_000, tables in table_names() order, indices in catalog order), so
     // indexrelid and pg_class.oid agree.
-    let mut idx_oid: i64 = 100_000;
+    let mut idx_oid: i64 = OID_INDEX_BASE;
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for idx in t.indices() {
@@ -2546,9 +2656,10 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     // were missing from pg_class entirely, so `SELECT relacl FROM pg_class WHERE
     // relname = '<seq>'` — the canonical way to read a sequence's privileges —
     // came back empty.
-    let mut seq_oid: i64 = 300_000;
     for (name, def) in cat.sequences() {
-        seq_oid += 1;
+        let Some(seq_oid) = relation_oid(cat, name) else {
+            continue;
+        };
         rows.push(Row::new(alloc::vec![
             Value::BigInt(seq_oid),
             Value::text(name.clone()),
@@ -2626,17 +2737,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
             #[allow(clippy::cast_possible_wrap)]
             let attnum = (i + 1) as i16;
             // PG: typlen — fixed-width width in bytes; -1 for var-length.
-            let typlen: i16 = match col.ty {
-                DataType::Bool => 1,
-                DataType::SmallInt => 2,
-                DataType::Int => 4,
-                DataType::BigInt
-                | DataType::Float
-                | DataType::Timestamp
-                | DataType::Timestamptz => 8,
-                DataType::Date => 4,
-                _ => -1,
-            };
+            let typlen: i16 = pg_type_len(col.ty);
             // attndims — number of array dimensions. Most array
             // types are 1-D in SPG; jagged / 2-D arrays report 2.
             let attndims: i32 = match col.ty {
@@ -2703,7 +2804,66 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         }
         attrelid = attrelid.saturating_add(1);
     }
+    // v7.39 (round 338, V64) — a view's columns. pg_attribute was
+    // table-only, so `pg_attribute WHERE attrelid = '<view>'::regclass`
+    // — the join psql \d and every reflection tool run to learn a view's
+    // shape — came back empty even though information_schema.columns
+    // (round 268) already knew the answer. Same resolver, so the two agree.
+    for vname in cat.views().keys() {
+        let Some(view_oid) = relation_oid(cat, vname) else {
+            continue;
+        };
+        for (i, col) in crate::describe::describe_view_columns(cat, vname)
+            .iter()
+            .enumerate()
+        {
+            #[allow(clippy::cast_possible_wrap)]
+            let attnum = (i + 1) as i16;
+            let typlen: i16 = pg_type_len(col.ty);
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(view_oid),
+                Value::text(col.name.clone()),
+                Value::BigInt(pg_type_oid(col.ty)),
+                Value::Int(-1),
+                Value::SmallInt(typlen),
+                Value::SmallInt(attnum),
+                Value::Int(0),
+                Value::Int(-1),
+                Value::Bool(typlen > 0 && typlen <= 8),
+                Value::text(if typlen > 0 { "p" } else { "x" }),
+                Value::text(match typlen {
+                    1 => "c",
+                    2 => "s",
+                    4 => "i",
+                    _ => "d",
+                }),
+                // A view column is nullable regardless of the base
+                // column's constraint — an outer join can null it.
+                Value::Bool(false),
+                Value::Bool(false), // atthasdef
+                Value::text(""),    // attidentity
+                Value::text(""),    // attgenerated
+                Value::Bool(false), // attisdropped
+                Value::Bool(true),  // attislocal
+                Value::Int(0),
+                Value::BigInt(0),
+                Value::Null, // attacl
+            ]));
+        }
+    }
     (schema, rows)
+}
+
+/// v7.39 (round 338) — PG's typlen for a type: the fixed width in bytes,
+/// -1 for a var-length one. Shared by the table and view attribute rows.
+const fn pg_type_len(ty: DataType) -> i16 {
+    match ty {
+        DataType::Bool => 1,
+        DataType::SmallInt => 2,
+        DataType::Int | DataType::Date => 4,
+        DataType::BigInt | DataType::Float | DataType::Timestamp | DataType::Timestamptz => 8,
+        _ => -1,
+    }
 }
 
 /// PG type OID lookup for the SPG DataType set. Used by
@@ -3823,10 +3983,15 @@ pub(crate) fn synth_pg_sequence(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
         ColumnSchema::new("seqcycle", DataType::Bool, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    // Sequence OIDs live in their own synthetic band, monotonically
-    // assigned in name order (stable within a catalog snapshot).
-    let mut seq_oid: i64 = 32768;
-    for (_name, def) in cat.sequences() {
+    // v7.39 (round 338, V64) — seqrelid IS the sequence's pg_class oid, so
+    // it reads from the shared allocator. It used to number sequences from
+    // 32768 while pg_class numbered them from 300_000, which broke PG's
+    // canonical `pg_class JOIN pg_sequence ON oid = seqrelid` outright —
+    // and 32768 was the view band, so the two kinds collided besides.
+    for (name, def) in cat.sequences() {
+        let Some(seq_oid) = relation_oid(cat, name) else {
+            continue;
+        };
         rows.push(Row::new(alloc::vec![
             Value::BigInt(seq_oid),
             Value::BigInt(20), // seqtypid — bigint (OID 20)
@@ -3837,7 +4002,6 @@ pub(crate) fn synth_pg_sequence(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
             Value::BigInt(def.cache),
             Value::Bool(def.cycle),
         ]));
-        seq_oid = seq_oid.saturating_add(1);
     }
     (schema, rows)
 }
