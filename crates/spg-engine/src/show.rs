@@ -34,14 +34,36 @@ impl Engine {
         let t = self.active_catalog().get(name).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound { name: name.into() })
         })?;
+        // v7.39 (round 358, M16) — MySQL's own rendering. Measured on
+        // MariaDB 11 against the same schema; the shape was missing more
+        // than formatting:
+        //   * every column DEFAULT was dropped — `b BIGINT DEFAULT 7`
+        //     came back with no default at all;
+        //   * every secondary index was dropped;
+        //   * AUTO_INCREMENT was dropped from the identity column.
+        // mysqldump round-trips a schema through exactly this statement,
+        // so a client lost its defaults and its indexes without a word.
         let cols: Vec<String> = t
             .schema()
             .columns
             .iter()
             .map(|c| {
-                let ty = render_data_type(c.ty);
+                let ty = render_mysql_type(c.ty);
                 let nullable = if c.nullable { "" } else { " NOT NULL" };
-                alloc::format!("  `{}` {}{}", c.name, ty, nullable)
+                let auto = if c.auto_increment {
+                    " AUTO_INCREMENT"
+                } else {
+                    ""
+                };
+                // MariaDB prints the declared default, and `DEFAULT NULL`
+                // for a nullable column that has none; a NOT NULL column
+                // without one gets nothing.
+                let default = match (&c.default_text, c.nullable, c.auto_increment) {
+                    (Some(d), _, _) => alloc::format!(" DEFAULT {}", mysql_default_text(d)),
+                    (None, true, false) => " DEFAULT NULL".into(),
+                    _ => String::new(),
+                };
+                alloc::format!("  `{}` {}{}{}{}", c.name, ty, nullable, default, auto)
             })
             .collect();
         let mut body = cols.join(",\n");
@@ -64,6 +86,39 @@ impl Engine {
             };
             body.push_str(",\n  ");
             body.push_str(&alloc::format!("{kw} ({})", col_names.join(", ")));
+        }
+        // v7.39 (round 358, M16) — the secondary indexes, which were
+        // absent entirely. MariaDB's order is PRIMARY KEY, then UNIQUE
+        // KEY, then KEY; the uniqueness constraints above already
+        // emitted the first two, so the plain ones follow here.
+        // MariaDB's order is PRIMARY KEY, then UNIQUE KEY, then KEY, so
+        // the unique ones go out first.
+        for unique_pass in [true, false] {
+            for idx in t.indices() {
+                if idx.is_unique != unique_pass {
+                    continue;
+                }
+                let col = t
+                    .schema()
+                    .columns
+                    .get(idx.column_position)
+                    .map_or_else(|| alloc::format!("col{}", idx.column_position), |c| {
+                        alloc::format!("`{}`", c.name)
+                    });
+                // An index that merely backs a declared UNIQUE constraint
+                // was already printed by the loop above.
+                let backs_constraint = t
+                    .schema()
+                    .uniqueness_constraints
+                    .iter()
+                    .any(|uc| uc.columns == [idx.column_position]);
+                if backs_constraint {
+                    continue;
+                }
+                let kw = if idx.is_unique { "UNIQUE KEY" } else { "KEY" };
+                body.push_str(",\n  ");
+                body.push_str(&alloc::format!("{kw} `{}` ({col})", idx.name));
+            }
         }
         // Foreign keys.
         for fk in &t.schema().foreign_keys {
@@ -102,10 +157,21 @@ impl Engine {
                 parent_cols.join(", ")
             ));
         }
+        // v7.39 (round 358, M16) — the AUTO_INCREMENT table option, which
+        // is the next value the table would hand out (MariaDB prints
+        // `AUTO_INCREMENT=3` after two rows).
+        let auto_opt = t
+            .schema()
+            .columns
+            .iter()
+            .position(|c| c.auto_increment)
+            .and_then(|i| t.next_auto_value(i))
+            .map_or_else(String::new, |n| alloc::format!(" AUTO_INCREMENT={n}"));
         let ddl = alloc::format!(
-            "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+            "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB{} DEFAULT CHARSET=utf8mb4",
             name,
-            body
+            body,
+            auto_opt
         );
         let columns = alloc::vec![
             ColumnSchema::new("Table", DataType::Text, false),
@@ -442,6 +508,41 @@ pub(crate) fn render_create_table(name: &str, columns: &[ColumnSchema]) -> Strin
     }
     out.push(')');
     out
+}
+
+/// v7.39 (round 358, M16) — MySQL's spelling of a column type: lower
+/// case, with the display width MariaDB prints (`int(11)`, `bigint(20)`).
+fn render_mysql_type(ty: DataType) -> String {
+    match ty {
+        DataType::SmallInt => "smallint(6)".into(),
+        DataType::Int => "int(11)".into(),
+        DataType::BigInt => "bigint(20)".into(),
+        DataType::Float => "double".into(),
+        DataType::Real => "float".into(),
+        DataType::Text => "text".into(),
+        DataType::Varchar(n) => alloc::format!("varchar({n})"),
+        DataType::Char(n) => alloc::format!("char({n})"),
+        DataType::Bool => "tinyint(1)".into(),
+        DataType::Numeric { precision, scale } => alloc::format!("decimal({precision},{scale})"),
+        DataType::Date => "date".into(),
+        DataType::Timestamp | DataType::Timestamptz => "datetime".into(),
+        DataType::Time => "time".into(),
+        DataType::Bytes => "blob".into(),
+        DataType::Json | DataType::Jsonb => "json".into(),
+        // Anything without a MySQL spelling keeps SPG's own, lower-cased.
+        other => render_data_type(other).to_ascii_lowercase(),
+    }
+}
+
+/// MariaDB prints `current_timestamp()` for the clock default and an
+/// unquoted number for a numeric one; anything else goes through as the
+/// stored text.
+fn mysql_default_text(d: &str) -> String {
+    let t = d.trim();
+    if t.eq_ignore_ascii_case("current_timestamp") || t.eq_ignore_ascii_case("now()") {
+        return "current_timestamp()".into();
+    }
+    alloc::string::String::from(t)
 }
 
 fn render_data_type(ty: DataType) -> String {
