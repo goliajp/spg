@@ -13975,6 +13975,18 @@ impl Parser {
                         ColumnTypeName::Real
                     }
                 } else if ty_ident.eq_ignore_ascii_case("float")
+                    && self.mysql_dialect
+                    && matches!(self.peek(), Token::LParen)
+                    && self.peek_paren_has_comma()
+                {
+                    // v7.39 (round 360) — MySQL's `FLOAT(m,d)` / `DOUBLE(m,d)`
+                    // display form (`FLOAT(10,2)`), which PG has no
+                    // equivalent of. It was `syntax error at or near ","`,
+                    // so the whole CREATE failed. The digits are a display
+                    // hint only; SPG stores the full double.
+                    self.consume_optional_paren_size();
+                    ColumnTypeName::Float
+                } else if ty_ident.eq_ignore_ascii_case("float")
                     && matches!(self.peek(), Token::LParen)
                 {
                     // PG words the two bounds differently, and
@@ -13998,6 +14010,21 @@ impl Parser {
             "float4" => ColumnTypeName::Real,
             "float8" => ColumnTypeName::Float,
             "text" => ColumnTypeName::Text,
+            // v7.39 (round 360) — MySQL's sized TEXT and BLOB families.
+            // `LONGTEXT`, `BLOB` and `VARBINARY` appear in nearly every
+            // real MySQL schema and NONE of them existed: the CREATE
+            // failed outright with `type "blob" does not exist`, so the
+            // table was never made. The sizes differ only in MySQL's
+            // maximum length, which SPG does not cap, so they collapse
+            // onto TEXT and BYTEA the way the unsized spellings do.
+            "tinytext" | "mediumtext" | "longtext" => ColumnTypeName::Text,
+            "blob" | "tinyblob" | "mediumblob" | "longblob" => ColumnTypeName::Bytes,
+            // `VARBINARY(n)` / `BINARY(n)` — a length that SPG does not
+            // enforce, consumed so the declaration parses.
+            "varbinary" | "binary" => {
+                self.consume_optional_paren_size();
+                ColumnTypeName::Bytes
+            }
             "name" => ColumnTypeName::Name,
             "bool" | "boolean" => ColumnTypeName::Bool,
             "varchar" => ColumnTypeName::Varchar(self.parse_paren_size("VARCHAR")?),
@@ -15080,6 +15107,24 @@ impl Parser {
     /// v7.14.0 — consume an optional MySQL display-width
     /// parenthesised number after an integer type, returning
     /// nothing. `TINYINT(1)` etc.
+    /// v7.39 (round 360) — does the parenthesised group ahead contain a
+    /// comma, i.e. is it MySQL's `(m,d)` rather than PG's `(p)`?
+    fn peek_paren_has_comma(&self) -> bool {
+        let mut i = self.pos + 1;
+        let mut depth = 1usize;
+        while depth > 0 {
+            match self.tokens.get(i) {
+                Some(Token::LParen) => depth += 1,
+                Some(Token::RParen) => depth -= 1,
+                Some(Token::Comma) if depth == 1 => return true,
+                None | Some(Token::Eof) => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
     fn consume_optional_paren_size(&mut self) {
         if !matches!(self.peek(), Token::LParen) {
             return;
