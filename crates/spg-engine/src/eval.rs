@@ -43,7 +43,7 @@ pub use crate::conversions::format_money_array;
 pub(crate) use binop::{
     add_interval_to_micros, and_3vl, apply_binary, apply_binary_by_ref, apply_binary_interval,
 };
-use binop::{apply_unary, compare, pow10_i128};
+use binop::{apply_binary_in, apply_unary, compare, pow10_i128};
 pub use cast::{cast_to_vector, cast_value, parse_vector_text};
 pub(crate) use compiled::{
     CompiledExpr, compile_column_pos, compile_expr, eval_compiled, eval_compiled_ref,
@@ -655,26 +655,148 @@ fn apply_domain_checks_of(
 /// `(v1,"v 2",)` record text (double-quote wrapping with doubled quotes,
 /// empty field = NULL) and coerce each field to the declared type; a ROW
 /// value re-labels positionally.
-/// v7.39 (round 350, M7) — MySQL reads a date STRING as the temporal
-/// operand of an INTERVAL shift (`'2024-01-15' + INTERVAL 1 DAY`). Only
-/// that pairing is touched; everything else falls straight through to the
-/// ordinary binary path.
+/// v7.39 (round 350/351, M7 + M11) — how MySQL reads a TEXT operand of
+/// an arithmetic or comparison operator. The identity in the PG dialect,
+/// and out-of-line so it costs the recursive `eval_expr` frame nothing.
+///
+/// Measured on MariaDB 11: `'2024-01-15' + INTERVAL 1 DAY` shifts the
+/// date; `'1abc'+0` is 1, `'abc'+0` is 0, `'2024-01-15'+0` is 2024; two
+/// strings compare as STRINGS (`'10' > '9'` is 0) while a mixed pair
+/// compares numerically (`'10' > 9` is 1).
 #[inline(never)]
-fn eval_mysql_temporal_add(
-    lhs: &Expr,
+pub(crate) fn mysql_operand_reading_pair(
     op: BinOp,
-    rhs: &Expr,
-    row: &Row<'static>,
-    ctx: &EvalContext<'_>,
-) -> Result<Value<'static>, EvalError> {
-    let l = eval_expr(lhs, row, ctx)?;
-    let r = eval_expr(rhs, row, ctx)?;
-    let (l, r) = match (&l, &r) {
+    l: Value<'static>,
+    r: Value<'static>,
+) -> (Value<'static>, Value<'static>) {
+    if !mysql_coerces(op) {
+        return (l, r);
+    }
+    match (&l, &r) {
         (Value::Text(t), Value::Interval { .. }) => (text_as_temporal(t).unwrap_or(l.clone()), r),
-        (Value::Interval { .. }, Value::Text(t)) => (l.clone(), text_as_temporal(t).unwrap_or(r.clone())),
-        _ => (l.clone(), r.clone()),
+        (Value::Interval { .. }, Value::Text(t)) => {
+            let rr = text_as_temporal(t).unwrap_or(r.clone());
+            (l, rr)
+        }
+        (Value::Text(t), other) if other.data_type().is_some_and(is_numeric_type) => {
+            (mysql_number_of(t), r)
+        }
+        (other, Value::Text(t)) if other.data_type().is_some_and(is_numeric_type) => {
+            let rr = mysql_number_of(t);
+            (l, rr)
+        }
+        // Arithmetic between two strings is numeric; comparison is not.
+        (Value::Text(a), Value::Text(b)) if mysql_arith(op) => {
+            (mysql_number_of(a), mysql_number_of(b))
+        }
+        _ => (l, r),
+    }
+}
+
+/// Is this a mixed string/number pair, which MySQL compares numerically?
+fn mysql_mixed_pair(l: &Value<'_>, r: &Value<'_>) -> bool {
+    matches!((l, r), (Value::Text(_), o) | (o, Value::Text(_))
+        if o.data_type().is_some_and(is_numeric_type))
+}
+
+const fn mysql_arith(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+    )
+}
+
+/// Does this comparison need the owned path — because a value's type
+/// wants it, because a CI collation folds it, or (MySQL) because a mixed
+/// string/number pair compares NUMERICALLY there while two strings
+/// compare as strings.
+#[inline(never)]
+fn needs_owned_compare(
+    lc: &Value<'_>,
+    rc: &Value<'_>,
+    lhs: &Expr,
+    rhs: &Expr,
+    ctx: &EvalContext<'_>,
+) -> bool {
+    is_owned_compare_value(lc)
+        || is_owned_compare_value(rc)
+        || compare_is_case_insensitive(lhs, rhs, ctx)
+        || (ctx.mysql_dialect && mysql_mixed_pair(lc, rc))
+}
+
+/// Which operators take MySQL's string→number reading.
+const fn mysql_coerces(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Mod
+            | BinOp::Eq
+            | BinOp::NotEq
+            | BinOp::Lt
+            | BinOp::LtEq
+            | BinOp::Gt
+            | BinOp::GtEq
+    )
+}
+
+/// Does this type take part in MySQL's numeric coercion?
+fn is_numeric_type(t: spg_storage::DataType) -> bool {
+    use spg_storage::DataType as D;
+    matches!(
+        t,
+        D::SmallInt | D::Int | D::BigInt | D::Float | D::Real | D::Numeric { .. }
+    )
+}
+
+/// A string as MySQL reads it in numeric position: an exact integer when
+/// the leading number is one, otherwise a double.
+#[inline(never)]
+fn mysql_number_of(s: &str) -> Value<'static> {
+    let n = mysql_leading_number(s);
+    if n.fract() == 0.0 && n.abs() < 9.007_199_254_740_992e15 {
+        #[allow(clippy::cast_possible_truncation)]
+        Value::BigInt(n as i64)
+    } else {
+        Value::Float(n)
+    }
+}
+
+/// MySQL's `/`: a real division, and NULL on a zero divisor. `None`
+/// when this pairing is not the integer/integer case PG and MySQL
+/// disagree about.
+#[inline(never)]
+pub(crate) fn mysql_true_division(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Option<Value<'static>> {
+    if !matches!(op, BinOp::Div) {
+        return None;
+    }
+    let int_of = |v: &Value<'_>| match v {
+        Value::SmallInt(n) => Some(f64::from(*n)),
+        Value::Int(n) => Some(f64::from(*n)),
+        #[allow(clippy::cast_precision_loss)]
+        Value::BigInt(n) => Some(*n as f64),
+        _ => None,
     };
-    apply_binary(op, l, r)
+    let (a, b) = (int_of(l)?, int_of(r)?);
+    Some(if b == 0.0 {
+        Value::Null
+    } else {
+        Value::Float(a / b)
+    })
+}
+
+/// `-'5'` in the MySQL dialect. Out-of-line for the same frame reason.
+#[inline(never)]
+fn mysql_negate_text(
+    op: spg_sql::ast::UnOp,
+    v: &Value<'static>,
+) -> Option<Result<Value<'static>, EvalError>> {
+    match v {
+        Value::Text(t) => Some(apply_unary(op, mysql_number_of(t))),
+        _ => None,
+    }
 }
 
 /// A date / timestamp string as its temporal value, or `None` when it is
@@ -776,16 +898,27 @@ fn mysql_truthy(v: &Value<'_>) -> bool {
 
 /// The leading numeric prefix of a string, MySQL-style: `'1abc'` is 1,
 /// `'abc'` and `''` are 0.
+#[inline(never)]
 pub(crate) fn mysql_leading_number(s: &str) -> f64 {
     let t = s.trim_start();
     let mut end = 0usize;
     let mut seen_dot = false;
     let mut seen_digit = false;
+    // v7.39 (round 351, M11) — the exponent form counts: MariaDB reads
+    // `'1e3'` as 1000 and `'1.5e2'` as 150 (measured). A trailing `e`
+    // with no digits after it is not part of the number (`'1e'` is 1).
+    let mut seen_exp = false;
+    let mut exp_at = 0usize;
     for (i, c) in t.char_indices() {
         match c {
             '-' | '+' if i == 0 => {}
+            '-' | '+' if seen_exp && i == exp_at + 1 => {}
             '0'..='9' => seen_digit = true,
-            '.' if !seen_dot => seen_dot = true,
+            '.' if !seen_dot && !seen_exp => seen_dot = true,
+            'e' | 'E' if seen_digit && !seen_exp => {
+                seen_exp = true;
+                exp_at = i;
+            }
             _ => break,
         }
         end = i + c.len_utf8();
@@ -793,7 +926,12 @@ pub(crate) fn mysql_leading_number(s: &str) -> f64 {
     if !seen_digit {
         return 0.0;
     }
-    t[..end].parse::<f64>().unwrap_or(0.0)
+    // Trim an exponent that never got its digits.
+    let mut text = &t[..end];
+    while !text.is_empty() && text.parse::<f64>().is_err() {
+        text = &text[..text.len() - 1];
+    }
+    text.parse::<f64>().unwrap_or(0.0)
 }
 
 /// v7.39 (read01 ruleutils.c) — resolve a relation name to its synthetic
@@ -3143,6 +3281,13 @@ pub fn eval_expr(
             {
                 return mysql_not(&v);
             }
+            // v7.39 (round 351, M11) — `-'5'` is -5 and `-'abc'` is 0 in
+            // MariaDB (measured); it was `operator does not exist: - text`.
+            if ctx.mysql_dialect && matches!(op, spg_sql::ast::UnOp::Neg) {
+                if let Some(r) = mysql_negate_text(*op, &v) {
+                    return r;
+                }
+            }
             apply_unary(*op, v)
         }
         // v7.39 (round 346, M1) — MariaDB reads both sides of AND / OR as
@@ -3155,15 +3300,6 @@ pub fn eval_expr(
             if ctx.mysql_dialect && matches!(op, BinOp::And | BinOp::Or) =>
         {
             eval_mysql_connective(lhs, *op, rhs, row, ctx)
-        }
-        // v7.39 (round 350, M7) — `'2024-01-15' + INTERVAL 1 DAY`: MySQL
-        // reads a date STRING as the temporal operand. Out-of-line, like
-        // the connective arm above, so `eval_expr`'s frame does not grow
-        // (the round-305 cliff).
-        Expr::Binary { lhs, op, rhs }
-            if ctx.mysql_dialect && matches!(op, BinOp::Add | BinOp::Sub) =>
-        {
-            eval_mysql_temporal_add(lhs, *op, rhs, row, ctx)
         }
         Expr::Binary { lhs, op, rhs } => {
             // v7.32 (P4 borrow channel) — comparison fast path. A pure
@@ -3192,9 +3328,12 @@ pub fn eval_expr(
                 {
                     return r;
                 }
-                let owned_path = is_owned_compare_value(lc.as_ref())
-                    || is_owned_compare_value(rc.as_ref())
-                    || compare_is_case_insensitive(lhs, rhs, ctx);
+                // v7.39 (round 351, M11) — the three conditions fold into
+                // ONE call. Adding a fourth as another `||` here tipped the
+                // 768 KiB stack guard on its own (measured — this is the
+                // hottest recursive frame there is); one call is cheaper
+                // than the three it replaces.
+                let owned_path = needs_owned_compare(lc.as_ref(), rc.as_ref(), lhs, rhs, ctx);
                 if !owned_path {
                     if lc.as_ref().is_null() || rc.as_ref().is_null() {
                         return Ok(Value::Null);
@@ -3209,7 +3348,7 @@ pub fn eval_expr(
                     rc.into_owned(),
                     ctx,
                 );
-                return apply_binary(*op, l, r);
+                return apply_binary_in(*op, l, r, ctx.mysql_dialect);
             }
             let l = eval_expr(lhs, row, ctx)?;
             let r = eval_expr(rhs, row, ctx)?;
@@ -3247,7 +3386,7 @@ pub fn eval_expr(
                 let (sl, sr) = (styled(l), styled(r));
                 return apply_binary(*op, sl, sr);
             }
-            apply_binary(*op, l, r)
+            apply_binary_in(*op, l, r, ctx.mysql_dialect)
         }
         Expr::Cast { expr, target } => eval_cast_arm(expr, target, row, ctx),
         Expr::FieldAccess { base, field } => eval_field_access_arm(base, field, row, ctx),

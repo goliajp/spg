@@ -2947,6 +2947,29 @@ fn arith(
     }
 }
 
+/// v7.39 (round 351, M11) — `apply_binary` with the session dialect.
+///
+/// It lives HERE, at the leaf, and not as an arm of `eval_expr`: that
+/// function is the recursive frame the 768 KiB stack budget is tuned
+/// against, and the guard test refused three separate shapes that added
+/// locals to it (the round-305 frame cliff, twice in one round). A leaf
+/// costs one frame, once.
+pub(crate) fn apply_binary_in(
+    op: BinOp,
+    l: Value<'static>,
+    r: Value<'static>,
+    mysql: bool,
+) -> Result<Value<'static>, EvalError> {
+    if !mysql {
+        return apply_binary(op, l, r);
+    }
+    let (l, r) = super::mysql_operand_reading_pair(op, l, r);
+    if let Some(v) = super::mysql_true_division(op, &l, &r) {
+        return Ok(v);
+    }
+    apply_binary(op, l, r)
+}
+
 /// L2 (Euclidean) distance between two vectors of equal dimension.
 /// Returned as `Value::Float(d)` so it composes with the existing
 /// comparison / sort plumbing. Mismatched dims or non-vector operands
