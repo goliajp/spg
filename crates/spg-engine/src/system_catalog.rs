@@ -163,6 +163,32 @@ pub(crate) fn pg_check_connames(
 /// values mailrs's migrations probe (`'ARRAY'`, `'integer'`,
 /// `'text'`, …). Unknown variants fall back to the SPG name
 /// downcased — better than panicking on a future DataType.
+/// v7.39 (round 360, M18) — MariaDB's `information_schema.data_type`
+/// name (bare, no display width — that is the separate `column_type`
+/// column). Measured on MariaDB 11.
+pub(crate) fn mysql_data_type_text(ty: DataType) -> alloc::string::String {
+    let s = match ty {
+        DataType::SmallInt => "smallint",
+        DataType::Int => "int",
+        DataType::BigInt => "bigint",
+        DataType::Float => "double",
+        DataType::Real => "float",
+        DataType::Numeric { .. } => "decimal",
+        DataType::Bool => "tinyint",
+        DataType::Text => "text",
+        DataType::Varchar(_) => "varchar",
+        DataType::Char(_) => "char",
+        DataType::Date => "date",
+        DataType::Time => "time",
+        DataType::Timestamp | DataType::Timestamptz => "datetime",
+        DataType::Bytes => "blob",
+        DataType::Json | DataType::Jsonb => "json",
+        // No MySQL spelling — fall back to the PG name, lower-cased.
+        other => return pg_data_type_text(other).to_ascii_lowercase(),
+    };
+    alloc::string::String::from(s)
+}
+
 pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
     // Ranges report their concrete type name (`int4range`, `numrange`,
     // …); multiranges append `multirange` (`int4multirange`).
@@ -249,6 +275,7 @@ pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
 /// maximum_length, udt_name, …) lands as needed.
 pub(crate) fn synth_information_schema_columns(
     cat: &Catalog,
+    mysql: bool,
 ) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("table_catalog", DataType::Text, false),
@@ -292,7 +319,7 @@ pub(crate) fn synth_information_schema_columns(
         for (i, col) in t.schema().columns.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
             let ordinal = (i + 1) as i32;
-            rows.push(info_column_row(&tname, ordinal, col, None));
+            rows.push(info_column_row(&tname, ordinal, col, None, mysql));
         }
     }
     // v7.39 (round 268) — view columns. The view reported NO rows for a
@@ -310,7 +337,7 @@ pub(crate) fn synth_information_schema_columns(
             #[allow(clippy::cast_possible_wrap)]
             let ordinal = (i + 1) as i32;
             let writable = updatable && simple.iter().any(|n| n == &col.name);
-            rows.push(info_column_row(vname, ordinal, col, Some(writable)));
+            rows.push(info_column_row(vname, ordinal, col, Some(writable), mysql));
         }
     }
     (schema, rows)
@@ -326,6 +353,7 @@ fn info_column_row(
     ordinal: i32,
     col: &ColumnSchema,
     view_updatable: Option<bool>,
+    mysql: bool,
 ) -> Row<'static> {
         // column_default: v7.38 (read01) — the deparsed source text of the
         // DEFAULT expression (cached at CREATE TABLE), matching PG's
@@ -430,7 +458,18 @@ fn info_column_row(
             } else {
                 "NO"
             }),
-            Value::text(pg_data_type_text(col.ty)),
+            // v7.39 (round 360, M18) — the `data_type` name is dialect's:
+            // MariaDB reports `int` / `datetime` / `decimal` / `double`
+            // where PG reports `integer` / `timestamp without time zone`
+            // / `numeric` / `double precision` (both measured). A MySQL
+            // reflection tool (SQLAlchemy's mysql dialect, JDBC) reads
+            // this to pick the column's Python/Java type, so the PG name
+            // on a MySQL session sent it down the wrong branch.
+            Value::text(if mysql {
+                mysql_data_type_text(col.ty)
+            } else {
+                pg_data_type_text(col.ty)
+            }),
             default_text,
             // v7.39 (round 248) — a declared varchar(n)/char(n) reports
             // its limit; TEXT stays unbounded NULL.
