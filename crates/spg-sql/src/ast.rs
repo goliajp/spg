@@ -4129,6 +4129,11 @@ pub enum BinOp {
     /// PG-style JOIN ON predicates and pg_dump output.
     IsDistinctFrom,
     IsNotDistinctFrom,
+    /// v7.39 (round 353, M9) — MySQL's `DIV`: integer division that
+    /// truncates TOWARD ZERO (`-7 DIV 2` is -3, measured on MariaDB 11)
+    /// and answers NULL on a zero divisor. MySQL-dialect only; `/` there
+    /// is a real division (round 351).
+    IntDiv,
     Lt,
     LtEq,
     Gt,
@@ -7523,6 +7528,7 @@ impl fmt::Display for BinOp {
             Self::NotEq => "<>",
             Self::IsDistinctFrom => "IS DISTINCT FROM",
             Self::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
+            Self::IntDiv => "DIV",
             Self::Lt => "<",
             Self::LtEq => "<=",
             Self::Gt => ">",

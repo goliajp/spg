@@ -679,6 +679,16 @@ pub(crate) fn mysql_operand_reading_pair(
             let rr = text_as_temporal(t).unwrap_or(r.clone());
             (l, rr)
         }
+        // v7.39 (round 353, M10) — a boolean IS an integer in MySQL, so
+        // `!1 + 1` is 1 (measured). It was `operator does not exist:
+        // boolean + integer`.
+        (Value::Bool(b), other) if mysql_arith(op) && other.data_type().is_some_and(is_numeric_type) => {
+            (Value::BigInt(i64::from(*b)), r)
+        }
+        (other, Value::Bool(b)) if mysql_arith(op) && other.data_type().is_some_and(is_numeric_type) => {
+            let rr = Value::BigInt(i64::from(*b));
+            (l, rr)
+        }
         (Value::Text(t), other) if other.data_type().is_some_and(is_numeric_type) => {
             (mysql_number_of(t), r)
         }

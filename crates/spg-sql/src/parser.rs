@@ -18480,8 +18480,8 @@ impl Parser {
             // operator token before the normal dispatch.
             let explicit = self.peek_explicit_operator();
             let dispatch = match &explicit {
-                Some((_, tok)) => binop_from(tok),
-                None => binop_from(self.peek()),
+                Some((_, tok)) => self.binop_here(tok),
+                None => self.binop_here(self.peek()),
             };
             let Some((op, prec)) = dispatch else {
                 if let Some(e) = self.try_symbol_operator(&lhs, min_prec)? {
@@ -18641,6 +18641,17 @@ impl Parser {
                 // NOT sits between AND (2) and comparisons (4) — bind everything
                 // ≥3, which leaves AND/OR outside.
                 let e = self.parse_expr(3)?;
+                Ok(Expr::Unary {
+                    op: UnOp::Not,
+                    expr: Box::new(e),
+                })
+            }
+            // v7.39 (round 353, M10) — MySQL's `!`. It binds TIGHTER than
+            // arithmetic, unlike NOT: MariaDB answers 1 for `!1 + 1`
+            // (`(!1)+1`) and 0 for `NOT 1 + 1` (`NOT (1+1)`), measured.
+            Token::Bang => {
+                self.advance();
+                let e = self.parse_expr(8)?;
                 Ok(Expr::Unary {
                     op: UnOp::Not,
                     expr: Box::new(e),
@@ -22536,6 +22547,40 @@ fn maybe_not(expr: Expr, negated: bool) -> Expr {
         }
     } else {
         expr
+    }
+}
+
+/// v7.39 (round 353, M9/M10) — three operator TOKENS mean different
+/// things in the two dialects, and SPG read all three PG's way:
+///
+/// | token | PG (and SPG) | MySQL, measured |
+/// |---|---|---|
+/// | `\|\|` | string concatenation | **OR** — `1 \|\| 0` is 1, not '10' |
+/// | `&&` | inet / array overlap | **AND** |
+/// | `<=>` | pgvector cosine distance | **NULL-safe equal** |
+///
+/// `1 || 0` answering the string '10' on a MySQL session is a wrong
+/// answer with no error, which is why they are routed here rather than
+/// left to the shared table.
+impl Parser {
+    fn binop_here(&self, tok: &Token) -> Option<(BinOp, u8)> {
+        if self.mysql_dialect {
+            // v7.39 (round 353, M9) — `DIV` is MySQL's truncating integer
+            // division (`5 DIV 2` is 2, `-7 DIV 2` is -3 — toward zero —
+            // and `5 DIV 0` is NULL). It is a plain ident to the lexer.
+            if let Token::Ident(w) = tok
+                && w.eq_ignore_ascii_case("div")
+            {
+                return Some((BinOp::IntDiv, 7));
+            }
+            match tok {
+                Token::Concat => return Some((BinOp::Or, 1)),
+                Token::InetOverlap => return Some((BinOp::And, 2)),
+                Token::CosineDistance => return Some((BinOp::IsNotDistinctFrom, 4)),
+                _ => {}
+            }
+        }
+        binop_from(tok)
     }
 }
 
