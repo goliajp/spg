@@ -772,8 +772,25 @@ pub(super) fn unix_timestamp_of(args: &[Value<'_>]) -> Result<Value<'static>, Ev
     }
     match &args[0] {
         Value::Null => Ok(Value::Null),
-        Value::Timestamp(t) => Ok(Value::BigInt(t.div_euclid(1_000_000))),
+        Value::Timestamp(t) => Ok(unix_seconds(*t)),
         Value::Date(d) => Ok(Value::BigInt(i64::from(*d) * 86_400)),
+        // v7.39 (round 356, M14) — MySQL reads a date/datetime STRING
+        // here, which is how the function is nearly always called:
+        // `UNIX_TIMESTAMP('2024-01-15 00:00:00')` is 1705276800 and
+        // `UNIX_TIMESTAMP('2024-01-15')` the same (measured on MariaDB
+        // 11, session time zone UTC). It refused every string outright.
+        // A fractional part is kept: `'…10:30:45.5'` is 1705314645.5.
+        Value::Text(t) | Value::BpChar(t) => Ok(text_unix_seconds(t)),
+        // …and the bare numeric YYYYMMDD form (`20240115`).
+        Value::Int(_) | Value::BigInt(_) | Value::SmallInt(_) => {
+            let n = match &args[0] {
+                Value::Int(n) => i64::from(*n),
+                Value::SmallInt(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                _ => unreachable!("guarded above"),
+            };
+            Ok(text_unix_seconds(&alloc::format!("{n}")))
+        }
         other => Err(EvalError::TypeMismatch {
             detail: format!(
                 "unix_timestamp() needs DATE or TIMESTAMP, got {:?}",
@@ -781,6 +798,36 @@ pub(super) fn unix_timestamp_of(args: &[Value<'_>]) -> Result<Value<'static>, Ev
             ),
         }),
     }
+}
+
+/// Whole seconds when there is no fraction, a double when there is —
+/// MariaDB answers 1705314645.5 for a `.5` datetime.
+fn unix_seconds(micros: i64) -> Value<'static> {
+    let frac = micros.rem_euclid(1_000_000);
+    if frac == 0 {
+        Value::BigInt(micros.div_euclid(1_000_000))
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        Value::Float(micros as f64 / 1_000_000.0)
+    }
+}
+
+/// v7.39 (round 356, M14) — a date / datetime string (or a bare
+/// `YYYYMMDD`) as epoch seconds. Anything unreadable is NULL, which is
+/// what MariaDB answers for `'not a date'` and for `''` — not an error.
+fn text_unix_seconds(t: &str) -> Value<'static> {
+    let trimmed = t.trim();
+    // `20240115` — the numeric form, spelled either way.
+    if trimmed.len() == 8 && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        let iso = alloc::format!("{}-{}-{}", &trimmed[..4], &trimmed[4..6], &trimmed[6..]);
+        return crate::eval::parse_date_literal(&iso)
+            .map_or(Value::Null, |d| Value::BigInt(i64::from(d) * 86_400));
+    }
+    if let Some(micros) = crate::eval::parse_timestamp_literal(trimmed) {
+        return unix_seconds(micros);
+    }
+    crate::eval::parse_date_literal(trimmed)
+        .map_or(Value::Null, |d| Value::BigInt(i64::from(d) * 86_400))
 }
 
 /// v7.17.0 Phase 3.P0-29 — `FROM_UNIXTIME(n)` returns a TIMESTAMP
