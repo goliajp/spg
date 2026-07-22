@@ -20,6 +20,7 @@ mod e2e_alter_rebuild;
 mod e2e_application_name;
 mod e2e_canned_audit_round320;
 mod e2e_conn_attrs_round319;
+mod e2e_empty_target_list_round341;
 mod e2e_cursor_isolation_round321;
 mod e2e_conn_control_round318;
 mod e2e_conn_identity_round317;

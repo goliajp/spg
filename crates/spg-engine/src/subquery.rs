@@ -104,6 +104,22 @@ use crate::{
 /// carries SQL three-valued logic for free (NULL propagates through
 /// `=` / `<` / AND / OR / NOT). Used to resolve `RowCmpSubquery` once the
 /// subquery's single row is known.
+/// v7.39 (round 341, V66) — a scalar subquery must project exactly ONE
+/// column. Nothing checked, so `SELECT (SELECT a, b FROM t LIMIT 1)`
+/// silently answered the FIRST column where PG 18.4 raises
+/// `subquery must return only one column` — a wrong answer, not a
+/// missing feature. Zero columns became reachable in this round
+/// (PG allows an empty target list), which is what surfaced it.
+fn scalar_subquery_arity(ncols: usize) -> Result<(), EngineError> {
+    if ncols == 1 {
+        Ok(())
+    } else {
+        Err(EngineError::Unsupported(
+            "subquery must return only one column".into(),
+        ))
+    }
+}
+
 fn build_row_comparison(row: &[Expr], op: spg_sql::ast::BinOp, rhs: &[Expr]) -> Expr {
     use alloc::boxed::Box;
     use spg_sql::ast::{BinOp, UnOp};
@@ -448,11 +464,12 @@ impl Engine {
                 let mut s = (**inner).clone();
                 substitute_outer_columns(&mut s, row, ctx);
                 let r = self.exec_select_cancel(&s, cancel)?;
-                let QueryResult::Rows { rows, .. } = r else {
+                let QueryResult::Rows { columns, rows, .. } = r else {
                     return Err(EngineError::Unsupported(
                         "scalar subquery: inner did not return rows".into(),
                     ));
                 };
+                scalar_subquery_arity(columns.len())?;
                 let value = match rows.as_slice() {
                     [] => Value::Null,
                     [r0] => r0.values.first().cloned().unwrap_or(Value::Null),
@@ -530,10 +547,19 @@ impl Engine {
                     ));
                 };
                 if columns.len() != 1 {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "IN-subquery must project exactly one column; got {}",
-                        columns.len()
-                    )));
+                    // v7.39 (round 341, V66) — PG's two wordings, measured
+                    // on 18.4: `subquery has too few columns` /
+                    // `subquery has too many columns`. SPG named its own
+                    // internal shape ("IN-subquery must project exactly
+                    // one column; got 0").
+                    return Err(EngineError::Unsupported(
+                        if columns.is_empty() {
+                            "subquery has too few columns"
+                        } else {
+                            "subquery has too many columns"
+                        }
+                        .into(),
+                    ));
                 }
                 let mut found = false;
                 let mut any_null = false;
@@ -782,11 +808,12 @@ impl Engine {
                     Err(e) if is_correlation_error(&e) => return Ok(None),
                     Err(e) => return Err(e),
                 };
-                let QueryResult::Rows { rows, .. } = r else {
+                let QueryResult::Rows { columns, rows, .. } = r else {
                     return Err(EngineError::Unsupported(
                         "scalar subquery: inner statement did not return rows".into(),
                     ));
                 };
+                scalar_subquery_arity(columns.len())?;
                 let value = match rows.as_slice() {
                     [] => Value::Null,
                     [row] => row.values.first().cloned().unwrap_or(Value::Null),
@@ -835,10 +862,19 @@ impl Engine {
                     ));
                 };
                 if columns.len() != 1 {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "IN-subquery must project exactly one column; got {}",
-                        columns.len()
-                    )));
+                    // v7.39 (round 341, V66) — PG's two wordings, measured
+                    // on 18.4: `subquery has too few columns` /
+                    // `subquery has too many columns`. SPG named its own
+                    // internal shape ("IN-subquery must project exactly
+                    // one column; got 0").
+                    return Err(EngineError::Unsupported(
+                        if columns.is_empty() {
+                            "subquery has too few columns"
+                        } else {
+                            "subquery has too many columns"
+                        }
+                        .into(),
+                    ));
                 }
                 // v7.30.2 (mailrs round-25) — flat InList, NOT an OR-Eq
                 // chain: chain depth scaled with the inner result's ROW
