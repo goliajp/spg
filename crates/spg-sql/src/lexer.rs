@@ -109,6 +109,9 @@ pub enum Token {
     /// single token so parse_expr doesn't have to distinguish
     /// range-`.` from struct-field-`.`.
     DotDot,
+    /// v7.39 (round 353, M10) — MySQL's `!` (logical negation). Its own
+    /// token because its precedence is nothing like `NOT`'s.
+    Bang,
     /// v7.17.0 Phase 2.6 — standalone `@` punctuation. Emitted when
     /// `@` is NOT followed by an ident-start byte (i.e. the
     /// `@VAR` / `@@VAR` SessionVar path doesn't match). Lets the
@@ -813,6 +816,15 @@ pub fn tokenize_with_offsets(
             b'!' if peek_eq(bytes, i + 1, b'~') => {
                 out.push(Token::NotTilde);
                 i += 2;
+            }
+            // v7.39 (round 353, M10) — MySQL's `!` negation, after every
+            // two- and three-byte `!…` operator above so none is stolen.
+            // It reuses the NOT token; the parser gives it MySQL's tight
+            // precedence (`!1 + 1` is 1 — `(!1)+1` — while `NOT 1 + 1`
+            // is 0, measured on MariaDB 11).
+            b'!' => {
+                out.push(Token::Bang);
+                i += 1;
             }
             // v7.9.27 — PG dollar-quoted string `$$ … $$` (or
             // `$tag$ … $tag$`). Used in `DO $$ … $$ LANGUAGE

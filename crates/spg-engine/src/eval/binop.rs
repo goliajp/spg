@@ -736,6 +736,12 @@ pub(crate) fn apply_binary(
         BinOp::Sub => arith(l, r, i64::checked_sub, |a, b| a - b, "-"),
         BinOp::Mul => arith(l, r, i64::checked_mul, |a, b| a * b, "*"),
         BinOp::Div => div_op(l, r),
+        // v7.39 (round 353, M9) — MySQL's `DIV`: integer division that
+        // truncates TOWARD ZERO (`-7 DIV 2` is -3, `7 DIV -2` is -3) and
+        // answers NULL on a zero divisor rather than raising. Measured on
+        // MariaDB 11; a fractional or string operand is read as a number
+        // first (`7.5 DIV 2` is 3, `'9' DIV 2` is 4).
+        BinOp::IntDiv => int_div_op(&l, &r),
         BinOp::Mod => mod_op(l, r),
         // v7.39 (round 245) — `tsquery <-> tsquery` is PG's phrase
         // concatenation (tsquery_phrase, distance 1), a different operator
@@ -2048,6 +2054,12 @@ fn apply_binary_numeric(
     l: Value<'static>,
     r: Value<'static>,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.39 (round 353, M9) — `DIV` reads a NUMERIC operand as a number
+    // like every other one (`7.5 DIV 2` is 3, measured); it has no
+    // fixed-point form of its own to compute here.
+    if matches!(op, BinOp::IntDiv) {
+        return int_div_op(&l, &r);
+    }
     // v7.38 (read01, T3.C3) — an already-big operand skips the i128 fast path.
     if matches!(l, Value::NumericBig(_)) || matches!(r, Value::NumericBig(_)) {
         if let Some(res) = numeric_big_op(op, &l, &r) {
@@ -2968,6 +2980,35 @@ pub(crate) fn apply_binary_in(
         return Ok(v);
     }
     apply_binary(op, l, r)
+}
+
+/// v7.39 (round 353, M9) — `a DIV b`.
+fn int_div_op(l: &Value<'_>, r: &Value<'_>) -> Result<Value<'static>, EvalError> {
+    let num = |v: &Value<'_>| -> Option<f64> {
+        Some(match v {
+            Value::SmallInt(n) => f64::from(*n),
+            Value::Int(n) => f64::from(*n),
+            #[allow(clippy::cast_precision_loss)]
+            Value::BigInt(n) => *n as f64,
+            Value::Float(f) => *f,
+            Value::Real(f) => f64::from(*f),
+            #[allow(clippy::cast_precision_loss)]
+            Value::Numeric { scaled, scale, .. } => {
+                *scaled as f64 / 10_f64.powi(i32::from(*scale))
+            }
+            Value::Text(t) | Value::BpChar(t) => crate::eval::mysql_leading_number(t),
+            Value::Null => return None,
+            _ => return None,
+        })
+    };
+    let (Some(a), Some(b)) = (num(l), num(r)) else {
+        return Ok(Value::Null);
+    };
+    if b == 0.0 {
+        return Ok(Value::Null);
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(Value::BigInt((a / b).trunc() as i64))
 }
 
 /// L2 (Euclidean) distance between two vectors of equal dimension.
@@ -5689,7 +5730,8 @@ pub(super) fn compare(
         BinOp::LtEq => ord.is_le(),
         BinOp::Gt => ord.is_gt(),
         BinOp::GtEq => ord.is_ge(),
-        BinOp::And
+        BinOp::IntDiv
+        | BinOp::And
         | BinOp::Or
         | BinOp::BitOr
         | BinOp::BitAnd

@@ -194,6 +194,7 @@ mod e2e_clock_precision_round349;
 mod e2e_interval_expr_round350;
 mod e2e_mysql_cast_round352;
 mod e2e_mysql_coercion_round351;
+mod e2e_mysql_operators_round353;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;
