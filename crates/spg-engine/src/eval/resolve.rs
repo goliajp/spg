@@ -132,12 +132,31 @@ pub(super) fn is_owned_compare_value(v: &Value) -> bool {
 /// true the fast path defers to the owned path so the fold still runs.
 #[inline]
 pub(super) fn compare_is_case_insensitive(lhs: &Expr, rhs: &Expr, ctx: &EvalContext<'_>) -> bool {
+    // v7.39 (round 355, M13) — MySQL's `BINARY x` forces the binary
+    // collation, so a comparison touching one is byte-wise even when the
+    // other side is a CI column. Measured on MariaDB 11: `'a' = 'A'` is 1
+    // under the default collation and `BINARY 'a' = 'A'` is 0.
+    if is_binary_coerced(lhs) || is_binary_coerced(rhs) {
+        return false;
+    }
     matches!(
         column_collation(lhs, ctx),
         Some(spg_storage::Collation::CaseInsensitive)
     ) || matches!(
         column_collation(rhs, ctx),
         Some(spg_storage::Collation::CaseInsensitive)
+    )
+}
+
+/// Is this expression coerced to the binary collation — `BINARY x` or
+/// `CAST(x AS BINARY[(n)])`?
+fn is_binary_coerced(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Cast {
+            target: spg_sql::ast::CastTarget::Named(n),
+            ..
+        } if n.eq_ignore_ascii_case("binary") || n.to_ascii_lowercase().starts_with("binary(")
     )
 }
 
