@@ -7051,30 +7051,39 @@ fn apply_function_dispatch(
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
-            match (&args[0], &args[1]) {
-                (Value::Timestamp(t), Value::Interval { months, days, micros }) => {
-                    let m = i64::from(*months);
-                    let d = i64::from(*days);
-                    let extra = m
-                        .saturating_mul(30 * 86_400_000_000)
-                        + d.saturating_mul(86_400_000_000)
-                        + micros;
-                    Ok(Value::Timestamp(t.saturating_add(extra)))
+            // v7.39 (round 350, M7) — a MONTH is a calendar month, not 30
+            // days. This arm multiplied months by 30 × 86_400_000_000, so
+            // `DATE_ADD('2024-01-31', INTERVAL 1 MONTH)` answered 2024-03-01
+            // where MariaDB 11 and PG 18.4 both answer 2024-02-29 (measured;
+            // the month is clamped to the target's last day). Silently, on
+            // every month-granular date shift there is. The `+ INTERVAL`
+            // OPERATOR was always right — this is the same helper it uses.
+            let base = match &args[0] {
+                Value::Timestamp(t) => Some(*t),
+                Value::Date(d) => Some(i64::from(*d).saturating_mul(86_400_000_000)),
+                // MySQL reads a date STRING here (`DATE_ADD('2024-01-15',
+                // INTERVAL 1 DAY)`); PG has no date_add at all.
+                Value::Text(t) if ctx.mysql_dialect => {
+                    crate::eval::parse_timestamp_literal(t)
+                        .or_else(|| crate::eval::parse_date_literal(t)
+                            .map(|d| i64::from(d).saturating_mul(86_400_000_000)))
                 }
-                (Value::Date(d), Value::Interval { months, days, micros }) => {
-                    let base_us = i64::from(*d).saturating_mul(86_400_000_000);
-                    let m = i64::from(*months);
-                    let dd = i64::from(*days);
-                    let extra = m
-                        .saturating_mul(30 * 86_400_000_000)
-                        + dd.saturating_mul(86_400_000_000)
-                        + micros;
-                    Ok(Value::Timestamp(base_us.saturating_add(extra)))
+                _ => None,
+            };
+            match (base, &args[1]) {
+                (Some(t), Value::Interval { months, days, micros }) => {
+                    let out = crate::eval::add_interval_to_micros(
+                        t,
+                        i64::from(*months),
+                        i64::from(*days),
+                        *micros,
+                    )?;
+                    Ok(Value::Timestamp(out))
                 }
-                (a, b) => Err(EvalError::TypeMismatch {
+                (_, b) => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "date_add() needs (timestamp|date, interval), got ({:?}, {:?})",
-                        a.data_type(),
+                        args[0].data_type(),
                         b.data_type()
                     ),
                 }),
@@ -7098,18 +7107,36 @@ fn apply_function_dispatch(
             let base_is_date = matches!(&args[0], Value::Date(_))
                 || matches!(&args[0], Value::Text(s) if !s.contains(':'));
             let base = super::datetime::text_or_temporal_micros(&args[0], name)?;
-            let (shift_micros, day_granular) = match &args[1] {
-                Value::Int(n) => (i64::from(*n) * 86_400_000_000, true),
-                Value::SmallInt(n) => (i64::from(*n) * 86_400_000_000, true),
-                Value::BigInt(n) => (n.saturating_mul(86_400_000_000), true),
+            // v7.39 (round 350, M7) — a MONTH is a calendar month here too.
+            // It was 30 × 86_400_000_000, so `DATE_SUB('2024-03-31',
+            // INTERVAL 1 MONTH)` answered 2024-03-01 where MariaDB 11 and
+            // PG 18.4 both answer 2024-02-29 (measured). The month-granular
+            // path now runs through the same helper the `+ INTERVAL`
+            // operator uses, which clamps to the target month's last day.
+            let (out, day_granular) = match &args[1] {
+                Value::Int(n) => (
+                    base.saturating_add(sign.saturating_mul(i64::from(*n) * 86_400_000_000)),
+                    true,
+                ),
+                Value::SmallInt(n) => (
+                    base.saturating_add(sign.saturating_mul(i64::from(*n) * 86_400_000_000)),
+                    true,
+                ),
+                Value::BigInt(n) => (
+                    base.saturating_add(sign.saturating_mul(n.saturating_mul(86_400_000_000))),
+                    true,
+                ),
                 Value::Interval {
                     months,
                     days,
                     micros,
                 } => (
-                    i64::from(*months).saturating_mul(30 * 86_400_000_000)
-                        + i64::from(*days).saturating_mul(86_400_000_000)
-                        + micros,
+                    crate::eval::add_interval_to_micros(
+                        base,
+                        sign.saturating_mul(i64::from(*months)),
+                        sign.saturating_mul(i64::from(*days)),
+                        sign.saturating_mul(*micros),
+                    )?,
                     *micros == 0,
                 ),
                 other => {
@@ -7121,7 +7148,6 @@ fn apply_function_dispatch(
                     });
                 }
             };
-            let out = base.saturating_add(sign.saturating_mul(shift_micros));
             if base_is_date && day_granular {
                 Ok(Value::Date(
                     i32::try_from(out.div_euclid(86_400_000_000)).unwrap_or(i32::MAX),
@@ -7139,30 +7165,26 @@ fn apply_function_dispatch(
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
-            match (&args[0], &args[1]) {
-                (Value::Timestamp(t), Value::Interval { months, days, micros }) => {
-                    let m = i64::from(*months);
-                    let d = i64::from(*days);
-                    let extra = m
-                        .saturating_mul(30 * 86_400_000_000)
-                        + d.saturating_mul(86_400_000_000)
-                        + micros;
-                    Ok(Value::Timestamp(t.saturating_sub(extra)))
+            // v7.39 (round 350, M7) — calendar months here as well.
+            let base = match &args[0] {
+                Value::Timestamp(t) => Some(*t),
+                Value::Date(d) => Some(i64::from(*d).saturating_mul(86_400_000_000)),
+                _ => None,
+            };
+            match (base, &args[1]) {
+                (Some(t), Value::Interval { months, days, micros }) => {
+                    let out = crate::eval::add_interval_to_micros(
+                        t,
+                        -i64::from(*months),
+                        -i64::from(*days),
+                        -*micros,
+                    )?;
+                    Ok(Value::Timestamp(out))
                 }
-                (Value::Date(d), Value::Interval { months, days, micros }) => {
-                    let base_us = i64::from(*d).saturating_mul(86_400_000_000);
-                    let m = i64::from(*months);
-                    let dd = i64::from(*days);
-                    let extra = m
-                        .saturating_mul(30 * 86_400_000_000)
-                        + dd.saturating_mul(86_400_000_000)
-                        + micros;
-                    Ok(Value::Timestamp(base_us.saturating_sub(extra)))
-                }
-                (a, b) => Err(EvalError::TypeMismatch {
+                (_, b) => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "date_subtract() needs (timestamp|date, interval), got ({:?}, {:?})",
-                        a.data_type(),
+                        args[0].data_type(),
                         b.data_type()
                     ),
                 }),
