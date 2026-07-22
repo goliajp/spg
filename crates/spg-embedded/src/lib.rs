@@ -3707,6 +3707,43 @@ impl Database {
                 modified_catalog: false,
             });
         }
+        // v7.39 (round 343, V40) — the two lo_* calls that touch a file.
+        // Same host contract COPY-from-a-file uses: the engine owns the
+        // shape and the messages, the host owns the `std::fs`. An embed
+        // host runs as its own process, so there is no role to check —
+        // the caller already has the filesystem.
+        if let Some(call) = spg_engine::largeobject::parse_lo_file_call(sql) {
+            use spg_engine::largeobject::LoFileCall;
+            let value = match &call {
+                LoFileCall::Import { path, oid } => {
+                    let data = std::fs::read(path).map_err(|e| {
+                        EngineError::Unsupported(spg_engine::largeobject::could_not_open(
+                            path,
+                            &e.to_string(),
+                        ))
+                    })?;
+                    i64::from(self.engine.lo_import_bytes(oid.unwrap_or(0), data)?)
+                }
+                LoFileCall::Export { oid, path } => {
+                    let bytes = self.engine.lo_export_bytes(*oid)?;
+                    std::fs::write(path, &bytes).map_err(|e| {
+                        EngineError::Unsupported(spg_engine::largeobject::could_not_create(
+                            path,
+                            &e.to_string(),
+                        ))
+                    })?;
+                    1
+                }
+            };
+            return Ok(QueryResult::Rows {
+                columns: vec![spg_storage::ColumnSchema::new(
+                    call.column_name().to_string(),
+                    spg_storage::DataType::BigInt,
+                    false,
+                )],
+                rows: vec![spg_storage::Row::new(vec![spg_storage::Value::BigInt(value)])],
+            });
+        }
         if sql_head_is_copy(sql)
             && let Some(spec) = spg_engine::copy::parse_copy_from_file(sql)
         {

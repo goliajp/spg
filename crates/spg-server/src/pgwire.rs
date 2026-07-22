@@ -542,6 +542,17 @@ fn handle_pg_simple_query(
         wbuf.clear();
         return Ok(());
     }
+    // v7.39 (round 343, V40) — `lo_import` / `lo_export` are the only
+    // lo_* calls that touch a server file, and the engine is `no_std`.
+    // Same contract COPY-from-a-file uses since round 249: the engine
+    // owns the shape and every message, the host owns the `std::fs`.
+    if let Some(call) = spg_engine::largeobject::parse_lo_file_call(sql) {
+        handle_lo_file_call(wbuf, state, role, &call)?;
+        send_ready_for_query(wbuf, *tx_state)?;
+        stream.write_all(wbuf)?;
+        wbuf.clear();
+        return Ok(());
+    }
     if let Some(copy) = parse_copy_intent(sql) {
         // COPY mode handles its own protocol roundtrips —
         // flush any pending output so the COPY handler
@@ -5222,6 +5233,79 @@ fn handle_copy_to_file(
 /// Non-admin roles get PG's 42501 refusal; a missing file is PG's
 /// 58P01 with the psql \copy HINT. The rows drive the same
 /// BEGIN / per-row INSERT+WAL / COMMIT-or-ROLLBACK sequence as the
+/// v7.39 (round 343, V40) — run a `SELECT lo_import(…)` /
+/// `SELECT lo_export(…)`. PG 18.4, measured: the result column is named
+/// after the function, `lo_import` answers the new oid and `lo_export`
+/// answers `1`; both are superuser-only.
+fn handle_lo_file_call(
+    wbuf: &mut Vec<u8>,
+    state: &Arc<ServerState>,
+    role: Role,
+    call: &spg_engine::largeobject::LoFileCall,
+) -> std::io::Result<()> {
+    use spg_engine::largeobject::LoFileCall;
+    if role != Role::Admin {
+        return send_error(
+            wbuf,
+            "42501",
+            &spg_engine::largeobject::permission_denied(call),
+        );
+    }
+    let value = match call {
+        LoFileCall::Import { path, oid } => {
+            let data = match std::fs::read(path) {
+                Ok(d) => d,
+                Err(e) => {
+                    return send_error(
+                        wbuf,
+                        "58P01",
+                        &spg_engine::largeobject::could_not_open(path, &e.to_string()),
+                    );
+                }
+            };
+            let mut eng = state
+                .engine
+                .write()
+                .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+            match eng.lo_import_bytes(oid.unwrap_or(0), data) {
+                Ok(new_oid) => i64::from(new_oid),
+                Err(e) => return send_error(wbuf, "58P01", &format!("{e}")),
+            }
+        }
+        LoFileCall::Export { oid, path } => {
+            let bytes = {
+                let eng = state
+                    .engine
+                    .read()
+                    .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+                match eng.lo_export_bytes(*oid) {
+                    Ok(b) => b,
+                    Err(e) => return send_error(wbuf, "42704", &format!("{e}")),
+                }
+            };
+            if let Err(e) = std::fs::write(path, &bytes) {
+                return send_error(
+                    wbuf,
+                    "58P01",
+                    &spg_engine::largeobject::could_not_create(path, &e.to_string()),
+                );
+            }
+            1
+        }
+    };
+    send_canned(
+        wbuf,
+        &CannedResponse::Rows {
+            columns: vec![ColumnSchema::new(
+                call.column_name().to_string(),
+                DataType::BigInt,
+                false,
+            )],
+            rows: vec![Row::new(vec![Value::BigInt(value)])],
+        },
+    )
+}
+
 /// round-250 STDIN path, so the COPY is atomic and durable (one fsync
 /// at COMMIT, crash mid-COPY replays to the end-of-WAL auto-rollback).
 fn handle_copy_from_file(

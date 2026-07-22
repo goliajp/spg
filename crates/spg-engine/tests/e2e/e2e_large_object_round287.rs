@@ -58,12 +58,12 @@ fn err(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn a_round_trip_through_bytea() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT lo_from_bytea(0, '\\x48656c6c6f'::bytea)"), "16384");
-    assert_eq!(one(&mut e, "SELECT lo_get(16384)"), "\\x48656c6c6f");
-    assert_eq!(one(&mut e, "SELECT encode(lo_get(16384), 'escape')"), "Hello");
+    assert_eq!(one(&mut e, "SELECT lo_from_bytea(0, '\\x48656c6c6f'::bytea)"), "500000");
+    assert_eq!(one(&mut e, "SELECT lo_get(500000)"), "\\x48656c6c6f");
+    assert_eq!(one(&mut e, "SELECT encode(lo_get(500000), 'escape')"), "Hello");
     // The result must still BE bytea downstream — folding it to a bare
     // literal handed `length()` the hex text and it answered 12.
-    assert_eq!(one(&mut e, "SELECT length(lo_get(16384))"), "5");
+    assert_eq!(one(&mut e, "SELECT length(lo_get(500000))"), "5");
 }
 
 #[test]
@@ -72,27 +72,27 @@ fn the_offsets_are_zero_based() {
     e.execute("SELECT lo_from_bytea(0, '\\x48656c6c6f'::bytea)")
         .unwrap();
     // 'Hello' — byte 1 for 3 bytes is 'ell', not 'Hel'.
-    assert_eq!(one(&mut e, "SELECT lo_get(16384, 1, 3)"), "\\x656c6c");
+    assert_eq!(one(&mut e, "SELECT lo_get(500000, 1, 3)"), "\\x656c6c");
     // …and lo_put writes at the same 0-based offset.
-    e.execute("SELECT lo_put(16384, 1, '\\x41'::bytea)").unwrap();
-    assert_eq!(one(&mut e, "SELECT encode(lo_get(16384),'escape')"), "HAllo");
+    e.execute("SELECT lo_put(500000, 1, '\\x41'::bytea)").unwrap();
+    assert_eq!(one(&mut e, "SELECT encode(lo_get(500000),'escape')"), "HAllo");
 }
 
 #[test]
 fn lo_put_returns_void() {
     let mut e = Engine::new();
     e.execute("SELECT lo_from_bytea(0, '\\x4142'::bytea)").unwrap();
-    assert_eq!(one(&mut e, "SELECT lo_put(16384, 0, '\\x5a'::bytea)"), "");
+    assert_eq!(one(&mut e, "SELECT lo_put(500000, 0, '\\x5a'::bytea)"), "");
 }
 
 #[test]
 fn unlink_removes_it_and_the_wording_is_pgs() {
     let mut e = Engine::new();
     e.execute("SELECT lo_from_bytea(0, '\\x41'::bytea)").unwrap();
-    assert_eq!(one(&mut e, "SELECT lo_unlink(16384)"), "1");
+    assert_eq!(one(&mut e, "SELECT lo_unlink(500000)"), "1");
     assert_eq!(
-        err(&mut e, "SELECT lo_get(16384)"),
-        "large object 16384 does not exist",
+        err(&mut e, "SELECT lo_get(500000)"),
+        "large object 500000 does not exist",
     );
     assert_eq!(
         err(&mut e, "SELECT lo_unlink(9999999)"),
@@ -108,23 +108,23 @@ fn the_page_split_matches_pgs_2kb() {
     assert_eq!(
         one(
             &mut e,
-            "SELECT loid, pageno, length(data) FROM pg_largeobject WHERE loid = 16384 ORDER BY pageno",
+            "SELECT loid, pageno, length(data) FROM pg_largeobject WHERE loid = 500000 ORDER BY pageno",
         ),
-        "16384|0|2048;16384|1|2048;16384|2|904",
+        "500000|0|2048;500000|1|2048;500000|2|904",
     );
 }
 
 #[test]
 fn an_empty_object_has_metadata_but_no_pages() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT lo_from_bytea(0, ''::bytea)"), "16384");
+    assert_eq!(one(&mut e, "SELECT lo_from_bytea(0, ''::bytea)"), "500000");
     assert_eq!(
-        one(&mut e, "SELECT count(*) FROM pg_largeobject WHERE loid = 16384"),
+        one(&mut e, "SELECT count(*) FROM pg_largeobject WHERE loid = 500000"),
         "0",
     );
     assert_eq!(
         one(&mut e, "SELECT oid, lomowner, lomacl FROM pg_largeobject_metadata"),
-        "16384|10|",
+        "500000|10|",
     );
 }
 
@@ -132,8 +132,8 @@ fn an_empty_object_has_metadata_but_no_pages() {
 fn lo_creat_and_lo_create_both_allocate() {
     let mut e = Engine::new();
     // PG spells "pick an OID" as lo_creat(-1) and lo_create(0).
-    assert_eq!(one(&mut e, "SELECT lo_creat(-1)"), "16384");
-    assert_eq!(one(&mut e, "SELECT lo_create(0)"), "16385");
+    assert_eq!(one(&mut e, "SELECT lo_creat(-1)"), "500000");
+    assert_eq!(one(&mut e, "SELECT lo_create(0)"), "500001");
     assert_eq!(one(&mut e, "SELECT count(*) FROM pg_largeobject_metadata"), "2");
 }
 
@@ -147,7 +147,7 @@ fn the_objects_survive_a_catalog_round_trip() {
     let bytes = e.catalog().serialize();
     let mut restored = Engine::restore_envelope(&bytes).expect("reload");
     assert_eq!(
-        one(&mut restored, "SELECT encode(lo_get(16384),'escape')"),
+        one(&mut restored, "SELECT encode(lo_get(500000),'escape')"),
         "Hello",
     );
     assert_eq!(

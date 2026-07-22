@@ -190,6 +190,23 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
         // arms below read the special's canonical mantissa and answered 0.
         // The float / numeric targets pass it through instead — handled in
         // their own arms, which now consult `kind`.
+        // v7.39 (round 343) — an OID-typed reference casts to an integer
+        // the way PG's do (`'t'::regclass::bigint` is 27830 there). SPG
+        // reported `cannot cast None to bigint`: the integer path read the
+        // value's storage DataType, which these two deliberately do not
+        // have, and the message leaked that `None` to the client.
+        CastTarget::BigInt | CastTarget::Int
+            if matches!(v, Value::RegClass(..) | Value::RegProc(..)) =>
+        {
+            let (Value::RegClass(oid, _) | Value::RegProc(oid, _)) = v else {
+                unreachable!("guarded above")
+            };
+            Ok(if matches!(target, CastTarget::BigInt) {
+                Value::BigInt(oid)
+            } else {
+                Value::Int(i32::try_from(oid).unwrap_or(i32::MAX))
+            })
+        }
         CastTarget::Int => cast_numeric_special_reject(&v, "integer")
             .unwrap_or_else(|| cast_numeric_to_int(v)),
         CastTarget::BigInt => cast_numeric_special_reject(&v, "bigint")

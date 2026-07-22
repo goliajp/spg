@@ -5093,11 +5093,19 @@ impl Catalog {
     }
 
     /// The next free OID in PG's user band.
+    /// v7.39 (round 343, V40) — large objects have their own oid band.
+    /// It used to start at 16_384, which is where user TABLES start, so
+    /// the first large object and the first table shared an oid — and
+    /// `pg_largeobject_metadata.oid` is joinable against `pg_class.oid`,
+    /// so a join across them matched a row that has nothing to do with
+    /// it. (PG cannot collide: every oid there comes off one counter.)
+    /// An object already stored keeps the oid it was given; only new
+    /// ones land in the band.
     fn next_large_object_oid(&self) -> u32 {
         self.large_objects
             .keys()
             .next_back()
-            .map_or(16_384, |m| m.saturating_add(1))
+            .map_or(500_000, |m| m.saturating_add(1))
     }
 
     /// Register one. `Err(name)` when the name is taken.

@@ -86,6 +86,17 @@ fn it_renders_as_the_name_and_casts_to_the_oid() {
         first(&mut e, "SELECT 'ff'::regproc::oid > 0"),
         Value::Bool(true)
     );
+    // v7.39 (round 343) — and straight to an integer, as PG casts its own
+    // (`'t'::regclass::bigint` is the oid there). This used to answer
+    // `cannot cast None to bigint`.
+    assert!(matches!(
+        first(&mut e, "SELECT 'ff'::regproc::bigint"),
+        Value::BigInt(n) if n >= 400_000
+    ));
+    assert!(matches!(
+        first(&mut e, "SELECT 'ff'::regproc::int"),
+        Value::Int(_)
+    ));
     assert_eq!(
         first(&mut e, "SELECT 'g(int,text)'::regprocedure::text"),
         Value::text("g(integer,text)"),

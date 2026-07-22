@@ -60,6 +60,7 @@ mod join_using;
 mod joinfold;
 mod limit_expr;
 pub mod json;
+pub mod largeobject;
 pub mod locks;
 mod maintenance;
 pub mod memoize;
