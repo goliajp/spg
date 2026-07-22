@@ -21360,6 +21360,25 @@ impl Parser {
         Ok(Some(Box::new(cond)))
     }
 
+    /// v7.39 (round 354, M12) — consume a `SEPARATOR '<s>'` tail and push
+    /// the separator as the aggregate's second argument, which is the
+    /// shape `string_agg` already takes. Returns whether one was there.
+    fn consume_group_concat_separator(&mut self, args: &mut Vec<Expr>) -> Result<bool, ParseError> {
+        if !matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("separator")) {
+            return Ok(false);
+        }
+        self.advance();
+        let Token::String(sep) = self.peek().clone() else {
+            return Err(self.err(alloc::format!(
+                "expected a string literal after SEPARATOR, got {:?}",
+                self.peek()
+            )));
+        };
+        self.advance();
+        args.push(Expr::Literal(Literal::String(sep)));
+        Ok(true)
+    }
+
     /// v7.32 (round-29) — `WITHIN GROUP ( ORDER BY <sort_spec> )` tail
     /// for ordered-set aggregates. `WITHIN` is unreserved (arrives as an
     /// `Ident`); `GROUP` and `ORDER`/`BY` are keywords. Returns the sort
@@ -21851,6 +21870,9 @@ impl Parser {
             // positional order after the loop (the AST stays positional).
             let mut arg_names: Vec<Option<String>> = Vec::new();
             let mut agg_order_by: Vec<OrderBy> = Vec::new();
+            // v7.39 (round 354, M12) — whether a `SEPARATOR '<s>'` tail was
+            // seen, so the value arguments before it can be folded.
+            let mut saw_separator = false;
             // v7.25 (round-17) — `COUNT(DISTINCT x)` and friends.
             // v7.32 (round-29) — accept the dual `ALL` quantifier too
             // (the default; ORMs emit `COUNT(ALL x)` / `SUM(ALL x)`).
@@ -22369,12 +22391,26 @@ impl Parser {
                                 break;
                             }
                         }
+                        // v7.39 (round 354, M12) — `SEPARATOR '<s>'` may
+                        // follow the ORDER BY inside GROUP_CONCAT.
+                        if self.consume_group_concat_separator(&mut args)? {
+                            saw_separator = true;
+                        }
                         if !matches!(self.peek(), Token::RParen) {
                             return Err(self.err(format!(
                                 "expected ')' after aggregate ORDER BY, got {:?}",
                                 self.peek()
                             )));
                         }
+                        break;
+                    }
+                    // v7.39 (round 354, M12) — …or directly after the
+                    // arguments (`GROUP_CONCAT(t SEPARATOR '|')`). MySQL's
+                    // own spelling of what PG passes as string_agg's second
+                    // argument; it was a parse error, so every MySQL query
+                    // that names its own separator failed outright.
+                    if self.consume_group_concat_separator(&mut args)? {
+                        saw_separator = true;
                         break;
                     }
                     match self.peek() {
@@ -22387,6 +22423,26 @@ impl Parser {
                                 "expected ',' or ')' in function args, got {other:?}"
                             )));
                         }
+                    }
+                }
+            }
+            // v7.39 (round 354, M12) — MySQL's GROUP_CONCAT concatenates
+            // its value arguments PER ROW: `GROUP_CONCAT(n, ':', t)` is
+            // `3:c,1:a,…` (measured on MariaDB 11), NOT a second argument
+            // meaning a separator — that is what the explicit SEPARATOR
+            // tail is for. Fold them into one `concat(...)` so the
+            // aggregate keeps its single value argument.
+            if self.mysql_dialect && first.eq_ignore_ascii_case("group_concat") {
+                let values = args.len() - usize::from(saw_separator);
+                if values > 1 {
+                    let sep_arg = if saw_separator { args.pop() } else { None };
+                    let folded = Expr::FunctionCall {
+                        name: "concat".to_string(),
+                        args: core::mem::take(&mut args),
+                    };
+                    args.push(folded);
+                    if let Some(sep) = sep_arg {
+                        args.push(sep);
                     }
                 }
             }

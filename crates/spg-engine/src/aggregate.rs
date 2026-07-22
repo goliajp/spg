@@ -203,7 +203,12 @@ fn is_regression_name(name: &str) -> bool {
 /// argument: `string_agg(v, sep)`, the regression family `f(Y, X)`, and
 /// `json_object_agg(key, value)`.
 fn agg_uses_second_arg(name: &str) -> bool {
-    name == "string_agg"
+    // v7.39 (round 354, M12) — group_concat's SEPARATOR is lowered onto the
+    // same second argument string_agg takes; without this the separator was
+    // parsed and then dropped, so `SEPARATOR '|'` silently kept the default
+    // comma.
+    name == "group_concat"
+        || name == "string_agg"
         || name.starts_with("json_object_agg")
         || name.starts_with("jsonb_object_agg")
         || name == "jsonb_object_agg"
@@ -3577,8 +3582,14 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
                 | "stddev" | "stddev_samp" | "stddev_pop"
                 | "variance" | "var_samp" | "var_pop"
                 | "bit_and" | "bit_or" | "bit_xor"
-                | "json_agg" | "jsonb_agg" | "group_concat" | "xmlagg"
+                | "json_agg" | "jsonb_agg" | "xmlagg"
                 | "json_arrayagg" | "json_agg_strict" | "jsonb_agg_strict" => Some(1),
+                // v7.39 (round 354, M12) — GROUP_CONCAT takes any number of
+                // arguments: MySQL concatenates them PER ROW
+                // (`GROUP_CONCAT(n, ':', t)` is `3:c,1:a,…`, measured), and
+                // the parser lowers a `SEPARATOR '<s>'` tail onto the last
+                // one. Fixing the arity at 1 refused both.
+                "group_concat" => None,
                 // v7.32 (round-29) — two-argument aggregates: string_agg,
                 // the regression family f(Y, X), and json_object_agg.
                 "string_agg"
