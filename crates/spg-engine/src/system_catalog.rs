@@ -4535,6 +4535,26 @@ fn canonical_arg_list(args_repr: &str) -> alloc::string::String {
         .join(", ")
 }
 
+/// v7.39 (round 339, V63) — the same list with the parameter NAMES
+/// dropped: `"(a INT, b TEXT)"` → `"integer,text"`. That is the form
+/// `regprocedure` renders and compares by, and PG prints it without a
+/// space after the comma (`g(integer,text)`, measured on 18.4).
+pub(crate) fn canonical_arg_types(args_repr: &str) -> alloc::string::String {
+    let inner = args_repr.trim().trim_start_matches('(').trim_end_matches(')');
+    if inner.trim().is_empty() {
+        return alloc::string::String::new();
+    }
+    inner
+        .split(',')
+        .map(|part| {
+            let part = part.trim();
+            let ty = part.split_once(char::is_whitespace).map_or(part, |(_, t)| t);
+            canonical_type_word(ty.trim())
+        })
+        .collect::<alloc::vec::Vec<_>>()
+        .join(",")
+}
+
 /// `int` → `integer`, `TEXT` → `text`. Falls back to the lower-cased
 /// original when the word is not a type this engine knows, which keeps
 /// user-defined types readable instead of mangling them.

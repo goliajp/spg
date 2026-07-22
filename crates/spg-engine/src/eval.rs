@@ -1267,6 +1267,53 @@ fn eval_cast_arm(
             }
         }
     }
+    // v7.39 (round 339, V63) — `::regproc` / `::regprocedure` resolve
+    // against the USER function catalog too. Name resolution ran against
+    // the static pg_proc table alone, so `'my_fn'::regproc` — the form
+    // every catalog query and pg_dump uses to name a function — raised
+    // `function "my_fn" does not exist` for a function that plainly did.
+    // The cast layer has no catalog handle; this is the same interception
+    // point the `::regclass` block above uses.
+    if let (CastTarget::Named(tname), Some(cat), Value::Text(s)) = (target, ctx.catalog, &v) {
+        let lower = tname.to_ascii_lowercase();
+        if matches!(lower.as_str(), "regproc" | "regprocedure") {
+            let raw = s.trim();
+            // regprocedure carries the argument list: `f(int,text)`.
+            let (name_part, args_part) = match raw.split_once('(') {
+                Some((n, rest)) => (n.trim(), Some(rest.trim_end_matches(')'))),
+                None => (raw, None),
+            };
+            let bare = name_part
+                .strip_prefix("public.")
+                .unwrap_or(name_part)
+                .trim_matches('"');
+            let cands = cat.functions_named(bare);
+            if let Some(args_txt) = args_part {
+                // An overload IS distinguishable here — the argument list
+                // is what regprocedure exists to carry.
+                let want = crate::system_catalog::canonical_arg_types(&alloc::format!("({args_txt})"));
+                if let Some(f) = cands
+                    .iter()
+                    .find(|f| crate::system_catalog::canonical_arg_types(&f.args_repr) == want)
+                {
+                    return Ok(Value::text(alloc::format!(
+                        "{bare}({})",
+                        crate::system_catalog::canonical_arg_types(&f.args_repr)
+                    )));
+                }
+            } else {
+                match cands.len() {
+                    0 => {}
+                    1 => return Ok(Value::text(bare.to_string())),
+                    _ => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!("more than one function named \"{bare}\""),
+                        });
+                    }
+                }
+            }
+        }
+    }
     // v7.38 (T-tstz Phase 1) — `<timestamptz>::text` renders the offset
     // (`2024-01-15 10:30:00+00`); plain timestamp does not. The runtime
     // value is the same tz-less `Value::Timestamp`, so consult the
