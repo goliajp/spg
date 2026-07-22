@@ -1900,6 +1900,32 @@ impl Engine {
     /// # Errors
     /// `relation "t" does not exist`, `column "x" of relation "t" does
     /// not exist` (42703), `column "x" specified more than once` (42701).
+    /// v7.39 (round 343, V40) — store a file the host just read as a
+    /// large object. The host does the IO (the engine is `no_std`); the
+    /// catalog side is the same `create_large_object` the rest of the
+    /// lo_* family uses, so an imported object is indistinguishable from
+    /// one built with `lo_from_bytea`.
+    pub fn lo_import_bytes(
+        &mut self,
+        want_oid: u32,
+        data: alloc::vec::Vec<u8>,
+    ) -> Result<u32, EngineError> {
+        self.active_catalog_mut()
+            .create_large_object(want_oid, data)
+            .map_err(EngineError::Unsupported)
+    }
+
+    /// v7.39 (round 343, V40) — the bytes the host is about to write out.
+    /// PG's message for a missing object, verbatim.
+    pub fn lo_export_bytes(&self, oid: u32) -> Result<alloc::vec::Vec<u8>, EngineError> {
+        self.active_catalog()
+            .large_object(oid)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!("large object {oid} does not exist"))
+            })
+    }
+
     pub fn copy_target_columns(
         &self,
         table: &str,
