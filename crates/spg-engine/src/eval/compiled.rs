@@ -850,6 +850,17 @@ where
                 // build owned results (arithmetic, concat, json get,
                 // etc.) apply_binary_by_ref returns None and we fall
                 // through to the owning path.
+                // v7.39 (round 346, M1) — the MySQL reading of AND / OR
+                // has to be here TOO: a compiled predicate never passes
+                // through `eval_expr`'s arm, so `WHERE a AND 1` still
+                // errored on a MySQL session while the interpreted form
+                // answered. (The pin found this, not the reading.)
+                if ctx.mysql_dialect && matches!(op, BinOp::And | BinOp::Or) {
+                    let r = super::as_mysql_truth(stack.pop().unwrap_or(Value::Null).into_owned())?;
+                    let l = super::as_mysql_truth(stack.pop().unwrap_or(Value::Null).into_owned())?;
+                    stack.push(apply_binary(*op, l, r)?);
+                    continue;
+                }
                 let n = stack.len();
                 if n >= 2 {
                     if let Some(result) =
@@ -875,6 +886,13 @@ where
             }
             Step::Unary(op) => {
                 let v = stack.pop().unwrap_or(Value::Null).into_owned();
+                if ctx.mysql_dialect
+                    && matches!(op, UnOp::Not)
+                    && !matches!(v, Value::Bool(_) | Value::Null)
+                {
+                    stack.push(Value::Bool(!super::predicate_is_true(&v, "NOT", true)?));
+                    continue;
+                }
                 stack.push(apply_unary(*op, v)?);
             }
             Step::IsNull { negated } => {

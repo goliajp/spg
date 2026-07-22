@@ -3388,7 +3388,7 @@ fn project_groups(
     for srow in synth_rows {
         if let Some(hc) = &having_compiled {
             let cond = eval::eval_compiled(hc, &srow, &synth_ctx, &mut stack)?;
-            if !matches!(cond, Value::Bool(true)) {
+            if !crate::eval::predicate_is_true(&cond, "HAVING", synth_ctx.mysql_dialect)? {
                 continue;
             }
         } else if let Some(h) = &having_rewritten {
@@ -3396,7 +3396,7 @@ fn project_groups(
                 Some(f) if crate::expr_has_subquery(h) => f(h, &srow, &synth_ctx)?,
                 _ => eval::eval_expr(h, &srow, &synth_ctx)?,
             };
-            if !matches!(cond, Value::Bool(true)) {
+            if !crate::eval::predicate_is_true(&cond, "HAVING", synth_ctx.mysql_dialect)? {
                 continue;
             }
         }

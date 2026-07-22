@@ -474,13 +474,13 @@ impl Engine {
             if let Some(cw) = compiled_where {
                 let cond =
                     eval::eval_compiled(cw, row, ctx, eval_stack).map_err(EngineError::Eval)?;
-                if !matches!(cond, Value::Bool(true)) {
+                if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                     return Ok(());
                 }
             } else if let Some(where_expr) = &stmt.where_ {
                 let cond =
                     engine.eval_expr_with_correlated(where_expr, row, ctx, cancel, Some(memo))?;
-                if !matches!(cond, Value::Bool(true)) {
+                if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                     return Ok(());
                 }
             }

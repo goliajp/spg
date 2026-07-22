@@ -155,8 +155,16 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
             detail: format!("cannot apply ~ to {other:?}"),
         }),
         (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
+        // v7.39 (round 346, M1) — PG names the type it wanted, in its own
+        // words; SPG printed `NOT applied to Some(Int)`, which is a Rust
+        // Debug of an internal shape. MariaDB negates any truth value
+        // (`NOT 5` is 0), and that reading is applied by the caller, which
+        // is where the dialect is known.
         (UnOp::Not, other) => Err(EvalError::TypeMismatch {
-            detail: format!("NOT applied to {:?}", other.data_type()),
+            detail: alloc::format!(
+                "argument of NOT must be type boolean, not type {}",
+                super::strings::pg_typeof_name(&other)
+            ),
         }),
     }
 }

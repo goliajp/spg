@@ -145,6 +145,13 @@ pub struct EvalContext<'a> {
     /// engine populates `Some(&self.catalog)` only at the engine's
     /// top-level entry points where the borrow is unambiguous.
     pub catalog: Option<&'a spg_storage::Catalog>,
+    /// v7.39 (round 346, M1) — is this a MySQL-dialect session? The two
+    /// dialects disagree about what counts as a truth value: MariaDB
+    /// takes any non-zero number (and a string's leading number) as
+    /// true, PG refuses anything that is not boolean. Set from the
+    /// engine by [`EvalContext::with_engine`]; a context built without
+    /// one keeps PG's stricter reading.
+    pub mysql_dialect: bool,
     /// Session GUCs set via `SET name = value` / `set_config`, keyed by
     /// lowercased name. `current_setting('app.foo')` reads custom
     /// (namespaced) settings from here — the mechanism apps use for
@@ -269,6 +276,7 @@ impl<'a> EvalContext<'a> {
             default_text_search_config: None,
             sequence_resolver: None,
             catalog: None,
+            mysql_dialect: false,
             session_gucs: None,
             users: None,
             fn_depth: 0,
@@ -404,6 +412,7 @@ impl<'a> EvalContext<'a> {
     #[must_use]
     /// v7.39 (read01 round 63) — thread the engine (see `engine`).
     pub const fn with_engine(mut self, engine: &'a crate::Engine) -> Self {
+        self.mysql_dialect = engine.backslash_escapes;
         self.engine = Some(engine);
         self
     }
@@ -646,6 +655,116 @@ fn apply_domain_checks_of(
 /// `(v1,"v 2",)` record text (double-quote wrapping with doubled quotes,
 /// empty field = NULL) and coerce each field to the declared type; a ROW
 /// value re-labels positionally.
+/// v7.39 (round 346, M1) — the MySQL reading of `AND` / `OR`, out-of-line
+/// so it costs `eval_expr` no frame (see the round-305 frame cliff).
+#[inline(never)]
+fn eval_mysql_connective(
+    lhs: &Expr,
+    op: BinOp,
+    rhs: &Expr,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let l = as_mysql_truth(eval_expr(lhs, row, ctx)?)?;
+    let r = as_mysql_truth(eval_expr(rhs, row, ctx)?)?;
+    apply_binary(op, l, r)
+}
+
+#[inline(never)]
+pub(crate) fn as_mysql_truth(v: Value<'static>) -> Result<Value<'static>, EvalError> {
+    Ok(match v {
+        Value::Null => Value::Null,
+        other => Value::Bool(predicate_is_true(&other, "AND", true)?),
+    })
+}
+
+/// The MySQL reading of `NOT`, likewise out-of-line.
+#[inline(never)]
+fn mysql_not(v: &Value<'_>) -> Result<Value<'static>, EvalError> {
+    Ok(Value::Bool(!predicate_is_true(v, "NOT", true)?))
+}
+
+/// v7.39 (round 346, M1) — is this value TRUE, in a position that wants a
+/// truth value (WHERE / CASE WHEN / NOT / AND / OR / HAVING / ON)?
+///
+/// The engine used to write `matches!(v, Value::Bool(true))` at every such
+/// position, so anything that was not already a boolean silently read as
+/// FALSE. `SELECT CASE WHEN 1 THEN 'a' END` answered NULL and — far worse —
+/// `SELECT … WHERE 1` returned **no rows at all**. Neither dialect does
+/// that: MariaDB 11 takes any non-zero number as true, and PG 18.4 raises
+/// `argument of WHERE must be type boolean, not type integer`.
+///
+/// NULL is not true (three-valued logic) and is not an error in either.
+pub(crate) fn predicate_is_true(
+    v: &Value<'_>,
+    kw: &str,
+    mysql: bool,
+) -> Result<bool, EvalError> {
+    match v {
+        Value::Bool(b) => Ok(*b),
+        Value::Null => Ok(false),
+        _ if mysql => Ok(mysql_truthy(v)),
+        // PG resolves a bare literal in this position through boolean
+        // INPUT, so `CASE WHEN 'true'` is legal and `'abc'` is not.
+        Value::Text(t) => match crate::eval::cast::cast_value(
+            Value::text(t.to_string()),
+            spg_sql::ast::CastTarget::Bool,
+        )? {
+            Value::Bool(b) => Ok(b),
+            _ => Ok(false),
+        },
+        other => Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "argument of {kw} must be type boolean, not type {}",
+                crate::eval::strings::pg_typeof_name(other)
+            ),
+        }),
+    }
+}
+
+/// MariaDB 11's reading, measured: a number is true when it is not zero
+/// (`-1` and `0.5` are both true); a string contributes its LEADING
+/// number, so `'1abc'` is true while `'abc'` and `''` are false.
+fn mysql_truthy(v: &Value<'_>) -> bool {
+    match v {
+        Value::Bool(b) => *b,
+        Value::Null => false,
+        Value::SmallInt(n) => *n != 0,
+        Value::Int(n) => *n != 0,
+        Value::BigInt(n) => *n != 0,
+        Value::Float(f) => *f != 0.0,
+        Value::Real(f) => *f != 0.0,
+        Value::Numeric { scaled, .. } => *scaled != 0,
+        Value::Text(t) => mysql_leading_number(t) != 0.0,
+        Value::BpChar(t) => mysql_leading_number(t) != 0.0,
+        // Everything else converts to a non-zero number in MariaDB (a
+        // DATE reads as its YYYYMMDD digits, for one).
+        _ => true,
+    }
+}
+
+/// The leading numeric prefix of a string, MySQL-style: `'1abc'` is 1,
+/// `'abc'` and `''` are 0.
+pub(crate) fn mysql_leading_number(s: &str) -> f64 {
+    let t = s.trim_start();
+    let mut end = 0usize;
+    let mut seen_dot = false;
+    let mut seen_digit = false;
+    for (i, c) in t.char_indices() {
+        match c {
+            '-' | '+' if i == 0 => {}
+            '0'..='9' => seen_digit = true,
+            '.' if !seen_dot => seen_dot = true,
+            _ => break,
+        }
+        end = i + c.len_utf8();
+    }
+    if !seen_digit {
+        return 0.0;
+    }
+    t[..end].parse::<f64>().unwrap_or(0.0)
+}
+
 /// v7.39 (read01 ruleutils.c) — resolve a relation name to its synthetic
 /// oid: user tables in the 16384+ band (table_names order), views at
 /// 32768+, and the synthesised system catalogs at their REAL PG oids.
@@ -2466,7 +2585,11 @@ fn eval_case_arm(
     for (when_expr, then_expr) in branches {
         let when_value = eval_expr(when_expr, row, ctx)?;
         let matched = match &operand_value {
-            None => matches!(when_value, Value::Bool(true)),
+            // v7.39 (round 346, M1) — the WHEN condition is a truth value,
+            // not a boolean-shaped one: `CASE WHEN 1 THEN 'a' END` used to
+            // answer NULL in BOTH dialects, where MariaDB answers `a` and
+            // PG raises `argument of CASE/WHEN must be type boolean`.
+            None => predicate_is_true(&when_value, "CASE/WHEN", ctx.mysql_dialect)?,
             Some(op_v) => matches!(
                 apply_binary(spg_sql::ast::BinOp::Eq, op_v.clone(), when_value)?,
                 Value::Bool(true)
@@ -2979,7 +3102,28 @@ pub fn eval_expr(
         }
         Expr::Unary { op, expr } => {
             let v = eval_expr(expr, row, ctx)?;
+            // v7.39 (round 346, M1) — MariaDB negates any truth value
+            // (`NOT 5` is 0, measured). The dialect is known here and not
+            // down in apply_unary, so the operand is read as a truth value
+            // first; the PG path is untouched and still refuses it.
+            if ctx.mysql_dialect
+                && matches!(op, spg_sql::ast::UnOp::Not)
+                && !matches!(v, Value::Bool(_) | Value::Null)
+            {
+                return mysql_not(&v);
+            }
             apply_unary(*op, v)
+        }
+        // v7.39 (round 346, M1) — MariaDB reads both sides of AND / OR as
+        // truth values (`1 AND 2` is 1, measured). apply_binary has no
+        // dialect, so the coercion happens here, where it does. The body
+        // is out-of-line: `eval_expr` is the recursive frame the 768 KiB
+        // stack-depth budget is tuned against, and locals added here cost
+        // one nesting level each (the round-305 frame cliff).
+        Expr::Binary { lhs, op, rhs }
+            if ctx.mysql_dialect && matches!(op, BinOp::And | BinOp::Or) =>
+        {
+            eval_mysql_connective(lhs, *op, rhs, row, ctx)
         }
         Expr::Binary { lhs, op, rhs } => {
             // v7.32 (P4 borrow channel) — comparison fast path. A pure
