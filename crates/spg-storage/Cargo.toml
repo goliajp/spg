@@ -14,6 +14,11 @@ workspace = true
 
 [dependencies]
 spg-crypto = { workspace = true }
+# v7.39 (round 344, V49) — the SQL type spellings have ONE owner. This
+# crate held a byte-identical copy of `is_multiword_type_phrase` because
+# the two were siblings; spg-sql is a dependency-free leaf, so depending
+# on it is acyclic, and the publish order already puts it first.
+spg-sql    = { workspace = true }
 # v7.37.42-arena (T1) — bump arena for query-scoped Value lifetime.
 # Direct dep instead of transitive so Value<'arena>'s bumpalo helpers
 # (bumpalo::collections::Vec, bumpalo::collections::String) are reachable.

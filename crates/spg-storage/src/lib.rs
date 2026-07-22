@@ -3757,30 +3757,12 @@ pub fn resolve_stored_function_key(
         .map(|f| function_signature_key(&f.name, &f.args_repr))
 }
 
-/// v7.39 (round 315, V19) — does this whole phrase name a type, rather
-/// than being `name TYPE`?
-///
-/// The multi-word spellings SQL allows for a bare argument type, each
-/// verified accepted by PG 18.4 as `CREATE FUNCTION f(<phrase>)`. A
-/// length or precision modifier is peeled first, so `character
-/// varying(64)` answers the same as `character varying`.
-#[must_use]
-pub fn is_multiword_type_phrase(phrase: &str) -> bool {
-    let t = phrase.trim().to_ascii_lowercase();
-    let base = t.split_once('(').map_or(t.as_str(), |(h, _)| h).trim();
-    matches!(
-        base,
-        "double precision"
-            | "character varying"
-            | "bit varying"
-            | "timestamp with time zone"
-            | "timestamp without time zone"
-            | "time with time zone"
-            | "time without time zone"
-            | "national character"
-            | "national character varying"
-    )
-}
+/// v7.39 (round 344, V49) — re-exported from [`spg_sql`], which owns the
+/// SQL type spellings. This crate carried a byte-identical copy because
+/// the two were siblings that did not depend on each other; spg-sql is a
+/// dependency-free leaf, so the dependency is acyclic and the publish
+/// order already puts it first. One list, one place to keep it right.
+pub use spg_sql::parser::is_multiword_type_phrase;
 
 /// v7.39 (round 315, V19) — the signature key as computed BEFORE the
 /// multi-word fix, used only to recognise what an older image wrote.

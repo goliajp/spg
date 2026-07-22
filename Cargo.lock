@@ -1915,6 +1915,7 @@ dependencies = [
  "bumpalo",
  "criterion",
  "spg-crypto",
+ "spg-sql",
 ]
 
 [[package]]

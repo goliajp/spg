@@ -1197,7 +1197,7 @@ impl Parser {
             // multi-word spellings first — a leading word that STARTS one of
             // them is part of the type, not a name.
             let joined = words.join(" ");
-            let ty = if words.len() >= 2 && is_multiword_type(&joined) {
+            let ty = if words.len() >= 2 && is_multiword_type_phrase(&joined) {
                 joined
             } else if words.len() >= 2 {
                 words[1..].join(" ")
@@ -4407,6 +4407,33 @@ impl Parser {
     /// Closing `)`-terminated argument list. v7.12.4 commonly
     /// sees the empty `()`; typed args round-trip but the
     /// executor (yet) doesn't invoke them.
+    /// v7.39 (round 344) — consume a `( n [, m] )` type modifier and throw
+    /// it away, which is what PG does with one on a function parameter.
+    fn skip_type_modifier(&mut self) {
+        if !matches!(self.peek(), Token::LParen) {
+            return;
+        }
+        // Only a numeric modifier — anything else is not one, and eating
+        // it would swallow real grammar.
+        let mut i = self.pos + 1;
+        let mut seen_number = false;
+        loop {
+            match self.tokens.get(i) {
+                Some(Token::Integer(_)) => seen_number = true,
+                Some(Token::Comma) => {}
+                Some(Token::RParen) => break,
+                _ => return,
+            }
+            i += 1;
+        }
+        if !seen_number {
+            return;
+        }
+        while self.pos <= i {
+            self.advance();
+        }
+    }
+
     fn parse_function_arg_list(&mut self) -> Result<Vec<FunctionArg>, ParseError> {
         let mut args: Vec<FunctionArg> = Vec::new();
         if matches!(self.peek(), Token::RParen) {
@@ -4446,6 +4473,13 @@ impl Parser {
                 while matches!(self.peek(), Token::Ident(_) | Token::QuotedIdent(_)) {
                     words.push(self.expect_ident_like()?);
                 }
+                // v7.39 (round 344) — a length / precision modifier on the
+                // type: `f(character varying(9))`, `f(numeric(10,2))`. PG
+                // accepts it and DROPS it — `pg_get_function_arguments`
+                // reports plain `character varying` / `numeric`, measured on
+                // 18.4 — but SPG raised `syntax error at or near "("`,
+                // because the modifier's parens were never consumed.
+                self.skip_type_modifier();
                 let whole = words.join(" ");
                 if words.len() >= 2 && !is_multiword_type_phrase(&whole) {
                     (Some(words[0].clone()), words[1..].join(" "))
@@ -23054,7 +23088,7 @@ fn typed_literal_cast_target(ident: &str) -> Option<CastTarget> {
 /// (`map_type_ident_to_column_type_name` here, `normalize_type_name`
 /// there), so this follows the structure rather than inventing new
 /// duplication. Recorded as V49.
-fn is_multiword_type_phrase(phrase: &str) -> bool {
+pub fn is_multiword_type_phrase(phrase: &str) -> bool {
     let t = phrase.trim().to_ascii_lowercase();
     let base = t.split_once('(').map_or(t.as_str(), |(h, _)| h).trim();
     matches!(
@@ -24905,28 +24939,6 @@ $$";
             assert_eq!(s, again, "round-trip mismatch for {sql:?}");
         }
     }
-}
-
-/// v7.39 (round 282) — is this the WHOLE spelling of one of PG's multi-word
-/// type names? Used to tell `f(double precision)` (a bare type) apart from
-/// `f(x integer)` (a named parameter), which a plain word count cannot.
-///
-/// Matching the full spelling rather than the leading word matters: `time`
-/// is a legal parameter NAME, so `f(time integer)` must still read as a
-/// named parameter of type integer.
-fn is_multiword_type(joined: &str) -> bool {
-    matches!(
-        joined.to_ascii_lowercase().as_str(),
-        "double precision"
-            | "character varying"
-            | "national character"
-            | "national character varying"
-            | "bit varying"
-            | "time with time zone"
-            | "time without time zone"
-            | "timestamp with time zone"
-            | "timestamp without time zone"
-    )
 }
 
 /// v7.39 (round 284) — fold a constant `LIMIT` / `OFFSET` expression to a
