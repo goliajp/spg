@@ -8900,7 +8900,37 @@ fn apply_function_dispatch(
             ctx.backend_pid_fn.map_or(1, |f| i64::from(f())),
         )),
         "sleep" | "benchmark" => Ok(Value::Int(0)),
-        "found_rows" | "last_insert_id" => Ok(Value::BigInt(0)),
+        // v7.39 (round 347, M2) — LAST_INSERT_ID() answers the session's
+        // real value. It was hard-coded 0, so a client that inserted a row
+        // and then used the id as the parent key for the next insert wrote
+        // a 0 — silently, since 0 is a legal integer.
+        // One argument SETS it and returns it, which is MySQL's own way of
+        // stashing a value in the session (measured: LAST_INSERT_ID(42)
+        // answers 42 and every later bare call answers 42 too).
+        "last_insert_id" => {
+            let Some(engine) = ctx.engine else {
+                return Ok(Value::BigInt(0));
+            };
+            match args.first() {
+                None => Ok(Value::BigInt(
+                    engine.last_insert_id.load(core::sync::atomic::Ordering::Relaxed),
+                )),
+                Some(Value::Null) => Ok(Value::Null),
+                Some(v) => {
+                    let n = match v {
+                        Value::SmallInt(n) => i64::from(*n),
+                        Value::Int(n) => i64::from(*n),
+                        Value::BigInt(n) => *n,
+                        _ => 0,
+                    };
+                    engine
+                        .last_insert_id
+                        .store(n, core::sync::atomic::Ordering::Relaxed);
+                    Ok(Value::BigInt(n))
+                }
+            }
+        }
+        "found_rows" => Ok(Value::BigInt(0)),
         "row_count" => Ok(Value::BigInt(-1)),
         // MySQL uuid_short() — 64-bit sequential-ish id off the
         // PRNG (uniqueness within a session, like MySQL's within-
