@@ -19167,6 +19167,27 @@ impl Parser {
                 // v7.12.0 — `::tsvector` / `::tsquery`.
                 // Engine decodes the LHS text via the PG
                 // external form parser.
+                // v7.39 (round 352, M8) — MySQL's own cast targets.
+                // `CAST(x AS SIGNED)` / `UNSIGNED`, with the optional
+                // `INTEGER` / `INT` tail MariaDB also accepts. PG has no
+                // such type, so they are taken only in that dialect and
+                // fall through to the "type does not exist" arm otherwise.
+                "signed" | "unsigned" if self.mysql_dialect => {
+                    if matches!(self.peek(), Token::Ident(k)
+                        if k.eq_ignore_ascii_case("integer") || k.eq_ignore_ascii_case("int"))
+                    {
+                        self.advance();
+                    }
+                    CastTarget::Named(s.to_ascii_lowercase())
+                }
+                // v7.39 (round 352, M8) — `CAST(x AS CHAR)` is UNBOUNDED
+                // in MySQL: MariaDB answers '123' where the SQL-standard
+                // reading (PG's, and SPG's) is `char(1)` and answers '1'.
+                // Truncating a number to its first digit is a wrong answer
+                // with no error, so the MySQL session gets MySQL's reading.
+                "char" if self.mysql_dialect && !matches!(self.peek(), Token::LParen) => {
+                    CastTarget::Text
+                }
                 "tsvector" => CastTarget::TsVector,
                 "tsquery" => CastTarget::TsQuery,
                 // v7.17.0 — `::uuid`. Engine decodes the LHS

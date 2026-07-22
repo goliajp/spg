@@ -153,6 +153,45 @@ fn cast_reg_misc(kind: &str, s: &str) -> Result<Value<'static>, EvalError> {
     }
 }
 
+/// v7.39 (round 352, M8) — `CAST(x AS SIGNED)` / `CAST(x AS UNSIGNED)`.
+fn cast_mysql_integer(v: Value<'static>, unsigned: bool) -> Result<Value<'static>, EvalError> {
+    let n: f64 = match &v {
+        Value::Null => return Ok(Value::Null),
+        Value::Bool(b) => f64::from(u8::from(*b)),
+        Value::SmallInt(x) => f64::from(*x),
+        Value::Int(x) => f64::from(*x),
+        #[allow(clippy::cast_precision_loss)]
+        Value::BigInt(x) => *x as f64,
+        Value::Float(x) => *x,
+        Value::Real(x) => f64::from(*x),
+        #[allow(clippy::cast_precision_loss)]
+        Value::Numeric { scaled, scale, .. } => {
+            *scaled as f64 / 10_f64.powi(i32::from(*scale))
+        }
+        Value::Text(t) | Value::BpChar(t) => crate::eval::mysql_leading_number(t),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("cannot cast {:?} to integer", other.data_type()),
+            });
+        }
+    };
+    // Half away from zero, which is what MariaDB does (2.5 → 3, -2.5 → -3).
+    let rounded = if n >= 0.0 { (n + 0.5).floor() } else { (n - 0.5).ceil() };
+    #[allow(clippy::cast_possible_truncation)]
+    let as_i64 = rounded as i64;
+    if unsigned && as_i64 < 0 {
+        // MariaDB wraps through the full u64 range.
+        #[allow(clippy::cast_sign_loss)]
+        let wrapped = as_i64 as u64;
+        return Ok(Value::Numeric {
+            scaled: i128::from(wrapped),
+            scale: 0,
+            kind: spg_storage::NumericKind::Finite,
+        });
+    }
+    Ok(Value::BigInt(as_i64))
+}
+
 /// Round a numeric operand (`scaled` × 10^-`scale`) to the nearest
 /// integer, half-away-from-zero — PG's `numeric → int` coercion rule.
 fn numeric_round_to_i128(scaled: i128, scale: u16) -> i128 {
@@ -167,6 +206,17 @@ fn numeric_round_to_i128(scaled: i128, scale: u16) -> i128 {
 
 /// PG-style `expr::TYPE` coercion. NULL always casts as NULL.
 pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static>, EvalError> {
+    cast_value_in(v, target, false)
+}
+
+/// v7.39 (round 352, M8) — `cast_value` with the session dialect, for the
+/// targets the two disagree about (`SIGNED` / `UNSIGNED` exist only in
+/// MySQL: PG says `type "signed" does not exist`, measured).
+pub fn cast_value_in(
+    v: Value<'static>,
+    target: CastTarget,
+    mysql: bool,
+) -> Result<Value<'static>, EvalError> {
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
     }
@@ -711,6 +761,18 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
                         detail: alloc::format!("cannot cast {:?} to jsonpath", other.data_type()),
                     }),
                 };
+            }
+            // v7.39 (round 352, M8) — MySQL's SIGNED / UNSIGNED targets.
+            // Measured on MariaDB 11: a string gives its LEADING number
+            // (`'12abc'` → 12, `'abc'` → 0); a fractional value ROUNDS
+            // half-away-from-zero (1.5 → 2, 2.5 → 3, -2.5 → -3) rather
+            // than truncating; and UNSIGNED wraps a negative through u64
+            // (`-1` → 18446744073709551615).
+            // PG has no such type — `type "signed" does not exist` — so the
+            // reading is gated on the dialect, not just on the spelling.
+            if mysql && (name.eq_ignore_ascii_case("signed") || name.eq_ignore_ascii_case("unsigned"))
+            {
+                return cast_mysql_integer(v, name.eq_ignore_ascii_case("unsigned"));
             }
             let temporal_prec = temporal_typmod(&name);
             let resolve_name: alloc::borrow::Cow<'_, str> = if temporal_prec.is_some() {

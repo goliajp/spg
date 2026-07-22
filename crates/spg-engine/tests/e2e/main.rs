@@ -192,6 +192,7 @@ mod e2e_syntax_error_wording_round340;
 mod e2e_last_insert_id_round347;
 mod e2e_clock_precision_round349;
 mod e2e_interval_expr_round350;
+mod e2e_mysql_cast_round352;
 mod e2e_mysql_coercion_round351;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
