@@ -747,6 +747,66 @@ pub(super) fn date_format_mysql(args: &[Value<'_>]) -> Result<Value<'static>, Ev
             b'%' => {
                 out.push('%');
             }
+            // v7.39 (round 357, M17) — the specifiers that were echoed as
+            // bare letters, so a format string came back with `W` where
+            // MariaDB writes `Monday`. Every value below is from the
+            // MariaDB 11 run over nine dates (2024-01-01/07/15,
+            // 2023-01-01, 2024-12-31, 2024-02-29, 2024-03-02/03,
+            // 2021-01-01), not from the manual.
+            b'k' => {
+                let _ = write!(out, "{hh24}");
+            }
+            b'l' => {
+                let _ = write!(out, "{hh12}");
+            }
+            b'W' => {
+                out.push_str(DAY_FULL[weekday_sunday0(days) as usize]);
+            }
+            b'a' => {
+                out.push_str(DAY_ABBR[weekday_sunday0(days) as usize]);
+            }
+            b'w' => {
+                let _ = write!(out, "{}", weekday_sunday0(days));
+            }
+            b'j' => {
+                let _ = write!(out, "{:03}", day_of_year(y, mo, d));
+            }
+            // `15th`, `1st`, `2nd`, `3rd` — English ordinal.
+            b'D' => {
+                let _ = write!(out, "{d}{}", ordinal_suffix(d));
+            }
+            b'r' => {
+                let _ = write!(out, "{hh12:02}:{mi:02}:{ss:02} {ampm}");
+            }
+            b'T' => {
+                let _ = write!(out, "{hh24:02}:{mi:02}:{ss:02}");
+            }
+            // Week numbers. `%U` counts from Sunday and `%u` from Monday,
+            // both 00-based; `%V`/`%X` are the Sunday-start pair whose
+            // week 1 begins on the year's FIRST SUNDAY, and `%v`/`%x` are
+            // ISO-8601. All four verified against the measured table.
+            b'U' => {
+                let _ = write!(out, "{:02}", week_of_year(y, mo, d, days, false));
+            }
+            b'u' => {
+                let _ = write!(out, "{:02}", week_of_year(y, mo, d, days, true));
+            }
+            b'V' => {
+                let _ = write!(out, "{:02}", sunday_week(days).1);
+            }
+            b'X' => {
+                let _ = write!(out, "{:04}", sunday_week(days).0);
+            }
+            b'v' => {
+                let _ = write!(out, "{:02}", iso_week(days).1);
+            }
+            b'x' => {
+                let _ = write!(out, "{:04}", iso_week(days).0);
+            }
+            // SPG keeps one clock, in UTC.
+            b'Z' => {
+                out.push_str("UTC");
+            }
             other => {
                 // Unknown specifier — MySQL emits the letter
                 // verbatim (without the `%`).
@@ -756,6 +816,90 @@ pub(super) fn date_format_mysql(args: &[Value<'_>]) -> Result<Value<'static>, Ev
         i += 2;
     }
     Ok(Value::text(out))
+}
+
+const DAY_FULL: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+const DAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// v7.39 (round 357, M17) — weekday with Sunday = 0, which is what `%w`
+/// reports. 1970-01-01 was a Thursday.
+fn weekday_sunday0(days: i32) -> u32 {
+    u32::try_from((days + 4).rem_euclid(7)).unwrap_or(0)
+}
+
+fn ordinal_suffix(d: u32) -> &'static str {
+    match (d % 10, d % 100) {
+        (1, 1 | 21 | 31) => "st",
+        (2, 2 | 22) => "nd",
+        (3, 3 | 23) => "rd",
+        _ => "th",
+    }
+}
+
+fn day_of_year(y: i32, mo: u32, d: u32) -> u32 {
+    const CUM: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    CUM[(mo - 1) as usize] + d + u32::from(leap && mo > 2)
+}
+
+/// `%U` / `%u`: 00-based week, counting from the year's first Sunday (or
+/// Monday). Verified against MariaDB for all nine measured dates.
+fn week_of_year(y: i32, mo: u32, d: u32, days: i32, monday_first: bool) -> u32 {
+    let doy = day_of_year(y, mo, d);
+    let w = if monday_first {
+        (weekday_sunday0(days) + 6) % 7
+    } else {
+        weekday_sunday0(days)
+    };
+    (doy + 6 - w) / 7
+}
+
+/// `%V` / `%X`: week 1 begins on the year's FIRST SUNDAY; a date before
+/// it belongs to the previous year's last week (measured: 2024-01-01 is
+/// week 53 of 2023).
+fn sunday_week(days: i32) -> (i32, u32) {
+    reckon_week(days, 0)
+}
+
+/// `%v` / `%x`: ISO-8601 — weeks start on Monday and week 1 is the one
+/// holding the year's first Thursday.
+fn iso_week(days: i32) -> (i32, u32) {
+    reckon_week(days, 1)
+}
+
+/// Shared week reckoning. `start` is the weekday the week begins on
+/// (0 = Sunday, 1 = Monday). For the Sunday form week 1 starts on the
+/// first such weekday of the year; for the Monday form it is ISO's
+/// first-Thursday rule.
+fn reckon_week(days: i32, start: u32) -> (i32, u32) {
+    let (y, _, _) = civil_from_days(days);
+    for probe in [y + 1, y, y - 1] {
+        let first = days_from_civil(probe, 1, 1);
+        let first_wd = weekday_sunday0(first);
+        // Days from Jan 1 to the first `start` weekday.
+        let offset = i32::try_from((start + 7 - first_wd) % 7).unwrap_or(0);
+        let week1 = if start == 1 {
+            // ISO: week 1 holds the first Thursday, i.e. it starts on the
+            // Monday on or before Jan 4.
+            let jan4 = days_from_civil(probe, 1, 4);
+            jan4 - i32::try_from((weekday_sunday0(jan4) + 6) % 7).unwrap_or(0)
+        } else {
+            first + offset
+        };
+        if days >= week1 {
+            let w = u32::try_from((days - week1) / 7 + 1).unwrap_or(1);
+            return (probe, w);
+        }
+    }
+    (y, 1)
 }
 
 /// v7.17.0 Phase 3.P0-29 — `UNIX_TIMESTAMP(t)` returns epoch
