@@ -200,6 +200,7 @@ mod e2e_group_concat_round354;
 mod e2e_mysql_cast_round352;
 mod e2e_mysql_coercion_round351;
 mod e2e_mysql_operators_round353;
+mod e2e_mysql_types_round360;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;
