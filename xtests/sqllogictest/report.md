@@ -6,7 +6,7 @@ Per-corpus pass / fail / skip:
 |---|---|---|---|---|
 | `duckdb` | 148 | 0 | 0 | 100.0% |
 | `mysql` | 142 | 0 | 0 | 100.0% |
-| `pg_regress` | 1359 | 3 | 0 | 99.8% |
+| `pg_regress` | 1366 | 0 | 0 | 100.0% |
 | `pgvector` | 63 | 0 | 0 | 100.0% |
 | `spg_baseline/01_basic_dml` | 110 | 0 | 0 | 100.0% |
 | `spg_baseline/02_data_types` | 97 | 0 | 0 | 100.0% |
@@ -24,14 +24,6 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/14_dialect_compat` | 0 | 0 | 0 | 0.0% |
 | `spg_baseline/15_regressions` | 46 | 0 | 0 | 100.0% |
 | `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% |
-
-## Top fail patterns
-
-| count | pattern |
-|---|---|
-| 1 | `record 0: eval: type mismatch: relation` |
-| 1 | `record 1: eval: type mismatch: relation` |
-| 1 | `record 4: eval: type mismatch: relation` |
 
 ## Per-file detail
 
@@ -115,7 +107,7 @@ Per-corpus pass / fail / skip:
 | `28_deferrable.test` | 14 | 0 | 0 |
 | `29_generate_series.test` | 10 | 0 | 0 |
 | `30_limit_extras.test` | 9 | 0 | 0 |
-| `31_regtype_regclass.test` | 2 | 3 | 0 |
+| `31_regtype_regclass.test` | 9 | 0 | 0 |
 | `32_format.test` | 10 | 0 | 0 |
 | `33_regexp_family.test` | 13 | 0 | 0 |
 | `34_jsonb_path_query.test` | 12 | 0 | 0 |
@@ -174,13 +166,6 @@ Per-corpus pass / fail / skip:
 | `87_pg_settings_view.test` | 6 | 0 | 0 |
 | `88_boolean.test` | 80 | 0 | 0 |
 | `90_wire_text_forms.test` | 22 | 0 | 0 |
-
-<details><summary>`31_regtype_regclass.test` fail snippets</summary>
-
-- record 0: eval: type mismatch: relation "t" does not exist
-- record 1: eval: type mismatch: relation "users" does not exist
-- record 4: eval: type mismatch: relation "users" does not exist
-</details>
 
 ### `pgvector/`
 

@@ -78,7 +78,7 @@
         { "file": "16_info_schema_mysql.test", "pass": 10, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 1359, "fail": 3, "skip": 0,
+    { "name": "pg_regress", "pass": 1366, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -140,8 +140,8 @@
           "fail_reasons": [] },
         { "file": "30_limit_extras.test", "pass": 9, "fail": 0, "skip": 0,
           "fail_reasons": [] },
-        { "file": "31_regtype_regclass.test", "pass": 2, "fail": 3, "skip": 0,
-          "fail_reasons": ["record 0: eval: type mismatch: relation \"t\" does not exist", "record 1: eval: type mismatch: relation \"users\" does not exist", "record 4: eval: type mismatch: relation \"users\" does not exist"] },
+        { "file": "31_regtype_regclass.test", "pass": 9, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
         { "file": "32_format.test", "pass": 10, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "33_regexp_family.test", "pass": 13, "fail": 0, "skip": 0,
