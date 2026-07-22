@@ -397,7 +397,7 @@ impl Engine {
     pub fn prepare(&self, sql: &str) -> Result<Statement, ParseError> {
         let mut stmt = parser::parse_statement_with(sql, self.backslash_escapes)?;
         let now_micros = self.clock.map(|f| f());
-        rewrite_clock_calls(&mut stmt, now_micros);
+        rewrite_clock_calls(&mut stmt, now_micros, self.backslash_escapes);
         if let Statement::Select(s) = &mut stmt {
             // v6.4.1 — expand `GROUP BY ALL` to every non-aggregate
             // SELECT-list item BEFORE position / alias resolution so
