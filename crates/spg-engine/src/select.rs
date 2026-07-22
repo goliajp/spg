@@ -402,7 +402,8 @@ impl Engine {
             }
             match view.as_str() {
                 "__spg_info_columns" => {
-                    let (schema, rows) = synth_information_schema_columns(self.active_catalog());
+                    let (schema, rows) =
+                        synth_information_schema_columns(self.active_catalog(), self.backslash_escapes);
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 "__spg_info_tables" => {
