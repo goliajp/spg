@@ -2403,6 +2403,40 @@ pub(crate) const OID_TABLE_BASE: i64 = 16384;
 pub(crate) const OID_VIEW_BASE: i64 = 32768;
 pub(crate) const OID_INDEX_BASE: i64 = 100_000;
 pub(crate) const OID_SEQ_BASE: i64 = 300_000;
+/// v7.39 (round 342, V65) — user functions, keyed by signature the way
+/// `pg_proc` iterates them.
+pub(crate) const OID_FUNC_BASE: i64 = 400_000;
+
+/// Resolve a function NAME to the oid `pg_proc` gives it. `None` when no
+/// function has that name, or when the name is overloaded — an overload
+/// needs a signature (`regprocedure`), which is PG's rule too.
+pub(crate) fn function_oid(cat: &Catalog, bare: &str) -> Option<i64> {
+    let mut oid = OID_FUNC_BASE;
+    let mut hit = None;
+    for def in cat.functions().values() {
+        oid += 1;
+        if def.name == bare {
+            if hit.is_some() {
+                return None;
+            }
+            hit = Some(oid);
+        }
+    }
+    hit
+}
+
+/// The oid of one specific overload, matched by its canonical argument
+/// types (`integer,text`).
+pub(crate) fn function_oid_by_signature(cat: &Catalog, bare: &str, arg_types: &str) -> Option<i64> {
+    let mut oid = OID_FUNC_BASE;
+    for def in cat.functions().values() {
+        oid += 1;
+        if def.name == bare && canonical_arg_types(&def.args_repr) == arg_types {
+            return Some(oid);
+        }
+    }
+    None
+}
 
 /// Resolve a relation name to the oid every catalog synth uses for it.
 /// The iteration order here IS the assignment order the synths replay.
@@ -3295,7 +3329,7 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
     // v7.39 (read01 round 61) — and one row per USER-DEFINED function. They were
     // missing entirely, so `SELECT proacl FROM pg_proc WHERE proname = 'f1'` —
     // the canonical way to read a function's privileges — came back empty.
-    let mut user_oid: i64 = 400_000;
+    let mut user_oid: i64 = OID_FUNC_BASE;
     // v7.39 (read01 round 62) — the map is keyed by SIGNATURE now, so `proname`
     // comes off the definition, not the key: two overloads are two rows sharing
     // one name, exactly as in PG.

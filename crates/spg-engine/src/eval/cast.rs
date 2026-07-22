@@ -182,7 +182,7 @@ pub fn cast_value(v: Value<'static>, target: CastTarget) -> Result<Value<'static
             // (unlike the padded wire display).
             Value::BpChar(s) => s.trim_end_matches(' ').to_string(),
             // v7.39 (read01 ruleutils.c) — regclass::text is the name.
-            Value::RegClass(_, name) => name.to_string(),
+            Value::RegClass(_, name) | Value::RegProc(_, name) => name.to_string(),
             _ => value_to_text(&v),
         })),
         // v7.39 (round 254) — the integer targets refuse a NUMERIC special

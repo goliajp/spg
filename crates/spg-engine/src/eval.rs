@@ -1296,15 +1296,23 @@ fn eval_cast_arm(
                     .iter()
                     .find(|f| crate::system_catalog::canonical_arg_types(&f.args_repr) == want)
                 {
-                    return Ok(Value::text(alloc::format!(
+                    let rendered = alloc::format!(
                         "{bare}({})",
                         crate::system_catalog::canonical_arg_types(&f.args_repr)
-                    )));
+                    );
+                    // v7.39 (round 342, V65) — dual shape: the oid for
+                    // catalog joins, the rendering for display.
+                    let oid = crate::system_catalog::function_oid_by_signature(cat, bare, &want)
+                        .unwrap_or(0);
+                    return Ok(Value::RegProc(oid, rendered.into()));
                 }
             } else {
                 match cands.len() {
                     0 => {}
-                    1 => return Ok(Value::text(bare.to_string())),
+                    1 => {
+                        let oid = crate::system_catalog::function_oid(cat, bare).unwrap_or(0);
+                        return Ok(Value::RegProc(oid, bare.into()));
+                    }
                     _ => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!("more than one function named \"{bare}\""),

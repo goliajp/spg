@@ -46,7 +46,12 @@ fn fixture() -> Engine {
 #[test]
 fn regproc_resolves_a_user_function() {
     let mut e = fixture();
-    assert_eq!(first(&mut e, "SELECT 'ff'::regproc"), Value::text("ff"));
+    // v7.39 (round 342, V65) — a regproc carries its oid now; the
+    // rendering is still the name.
+    assert!(matches!(
+        first(&mut e, "SELECT 'ff'::regproc"),
+        Value::RegProc(_, _)
+    ));
     assert_eq!(first(&mut e, "SELECT 'ff'::regproc::text"), Value::text("ff"));
     // A name that is no function is still PG's error…
     assert_eq!(
@@ -84,11 +89,18 @@ fn regprocedure_renders_the_canonical_signature() {
 #[test]
 fn to_regproc_and_to_regprocedure_answer_for_user_functions() {
     let mut e = fixture();
-    assert_eq!(first(&mut e, "SELECT to_regproc('ff')"), Value::text("ff"));
-    assert_eq!(first(&mut e, "SELECT to_regproc('g')"), Value::text("g"));
+    // v7.39 (round 342, V65) — the reg* shape, read through ::text.
+    assert_eq!(
+        first(&mut e, "SELECT to_regproc('ff')::text"),
+        Value::text("ff")
+    );
+    assert_eq!(
+        first(&mut e, "SELECT to_regproc('g')::text"),
+        Value::text("g")
+    );
     assert_eq!(first(&mut e, "SELECT to_regproc('nosuchfn')"), Value::Null);
     assert_eq!(
-        first(&mut e, "SELECT to_regprocedure('ff(integer)')"),
+        first(&mut e, "SELECT to_regprocedure('ff(integer)')::text"),
         Value::text("ff(integer)"),
     );
     assert_eq!(first(&mut e, "SELECT to_regprocedure('ff(text)')"), Value::Null);
