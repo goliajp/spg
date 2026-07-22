@@ -14307,7 +14307,20 @@ fn apply_function_dispatch(
         // were stubs answering NULL; PG returns a complete, re-runnable
         // statement, which is what reflection tooling and pg_dump read.
         "pg_get_functiondef" => {
-            let (Some(cat), Some(oid)) = (ctx.catalog, oid_arg(args.first())) else {
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Null);
+            };
+            // v7.39 (round 339, V63) — `pg_get_functiondef('f'::regproc)`
+            // is the spelling PG's docs use, and SPG carries a regproc as
+            // its name. Resolve a name directly; the oid form is unchanged.
+            if let Some(Value::Text(nm)) = args.first() {
+                let bare = nm.strip_prefix("public.").unwrap_or(nm.as_ref());
+                let bare = bare.split_once('(').map_or(bare, |(n, _)| n.trim());
+                if let Some(def) = cat.functions().values().find(|f| f.name == bare) {
+                    return Ok(Value::text(crate::system_catalog::render_function_def(def)));
+                }
+            }
+            let Some(oid) = oid_arg(args.first()) else {
                 return Ok(Value::Null);
             };
             let (_, rows) = crate::system_catalog::synth_pg_proc(cat);
@@ -15642,6 +15655,15 @@ fn apply_function_dispatch(
             None | Some(Value::Null) => Ok(Value::Null),
             Some(Value::Text(s)) => {
                 let bare = s.strip_prefix("pg_catalog.").unwrap_or(s.as_ref());
+                // v7.39 (round 339, V63) — a USER function resolves too.
+                // Only the static pg_proc table was consulted, so
+                // to_regproc named its own functions NULL.
+                if ctx
+                    .catalog
+                    .is_some_and(|c| c.functions_named(bare).len() == 1)
+                {
+                    return Ok(Value::text(bare.to_string()));
+                }
                 let hits = crate::system_catalog::PG_PROC_FUNCS
                     .iter()
                     .filter(|(_, n, ..)| *n == bare)
@@ -15656,10 +15678,31 @@ fn apply_function_dispatch(
         },
         // Operator/role resolvers — the oid spaces queue with
         // system_catalog v7.40 widening.
-        "to_regoper"
-        | "to_regprocedure"
-        | "to_regoperator"
-        | "to_regrole" => Ok(Value::Null),
+        // v7.39 (round 339, V63) — to_regprocedure resolves a user
+        // function by its signature; it answered NULL for every input.
+        "to_regprocedure" => {
+            let (Some(cat), Some(Value::Text(s))) = (ctx.catalog, args.first()) else {
+                return Ok(Value::Null);
+            };
+            let raw = s.trim();
+            let Some((nm, rest)) = raw.split_once('(') else {
+                return Ok(Value::Null);
+            };
+            let want =
+                crate::system_catalog::canonical_arg_types(&alloc::format!("({})", rest.trim_end_matches(')')));
+            let bare = nm.trim().strip_prefix("public.").unwrap_or(nm.trim());
+            Ok(cat
+                .functions_named(bare)
+                .iter()
+                .find(|f| crate::system_catalog::canonical_arg_types(&f.args_repr) == want)
+                .map_or(Value::Null, |f| {
+                    Value::text(alloc::format!(
+                        "{bare}({})",
+                        crate::system_catalog::canonical_arg_types(&f.args_repr)
+                    ))
+                }))
+        }
+        "to_regoper" | "to_regoperator" | "to_regrole" => Ok(Value::Null),
         // pg_client_encoding — SPG always speaks UTF8.
         "pg_client_encoding" => Ok(Value::text::<String>("UTF8".into())),
         // pg_is_in_recovery / pg_is_wal_replay_paused — replication /
