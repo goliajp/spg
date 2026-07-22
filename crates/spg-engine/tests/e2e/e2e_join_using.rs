@@ -101,11 +101,10 @@ fn join_using_missing_parens_errors() {
     let err = e
         .execute("SELECT * FROM a JOIN b USING id")
         .expect_err("USING must be followed by '('");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("USING") || msg.contains("'('"),
-        "error should mention USING grammar, got: {msg}"
-    );
+    // v7.39 (round 340, V56) — PG 18.4 measured, verbatim:
+    // `syntax error at or near "id"`. It used to be SPG's own prose
+    // naming the USING grammar; PG has only its two syntax wordings.
+    assert_eq!(format!("{err}"), "parse: syntax error at or near \"id\"");
 }
 
 #[test]
@@ -114,6 +113,6 @@ fn join_using_empty_paren_errors() {
     let err = e
         .execute("SELECT * FROM a JOIN b USING ()")
         .expect_err("USING () should reject — must list at least one column");
-    let msg = format!("{err:?}");
-    assert!(msg.contains("USING") || msg.contains("column"));
+    // PG 18.4: `syntax error at or near ")"`.
+    assert_eq!(format!("{err}"), "parse: syntax error at or near \")\"");
 }
