@@ -72,16 +72,23 @@ pub(crate) fn value_to_literal(v: Value) -> Literal {
     }
 }
 
-pub(crate) fn rewrite_clock_calls(stmt: &mut Statement, now_micros: Option<i64>) {
+pub(crate) fn rewrite_clock_calls(
+    stmt: &mut Statement,
+    now_micros: Option<i64>,
+    // v7.39 (round 349, M6) — `NOW(3)` is MariaDB's spelling and PG has
+    // no `now(integer)` at all (measured), so the precision argument on
+    // THAT name is dialect-gated.
+    mysql: bool,
+) {
     let Some(now) = now_micros else {
         return;
     };
     match stmt {
-        Statement::Select(s) => rewrite_select_clock(s, now),
+        Statement::Select(s) => rewrite_select_clock(s, now, mysql),
         Statement::Insert(ins) => {
             for row in &mut ins.rows {
                 for e in row {
-                    rewrite_expr_clock(e, now);
+                    rewrite_expr_clock(e, now, mysql);
                 }
             }
             // `ON CONFLICT … DO UPDATE SET created_at = NOW()` —
@@ -94,10 +101,10 @@ pub(crate) fn rewrite_clock_calls(stmt: &mut Statement, now_micros: Option<i64>)
                 } = &mut clause.action
             {
                 for (_, e) in assignments.iter_mut() {
-                    rewrite_expr_clock(e, now);
+                    rewrite_expr_clock(e, now, mysql);
                 }
                 if let Some(w) = where_ {
-                    rewrite_expr_clock(w, now);
+                    rewrite_expr_clock(w, now, mysql);
                 }
             }
         }
@@ -106,28 +113,28 @@ pub(crate) fn rewrite_clock_calls(stmt: &mut Statement, now_micros: Option<i64>)
         // SELECT / INSERT-rows were walked).
         Statement::Update(u) => {
             for (_, e) in &mut u.assignments {
-                rewrite_expr_clock(e, now);
+                rewrite_expr_clock(e, now, mysql);
             }
             if let Some(w) = &mut u.where_ {
-                rewrite_expr_clock(w, now);
+                rewrite_expr_clock(w, now, mysql);
             }
         }
         Statement::Delete(d) => {
             if let Some(w) = &mut d.where_ {
-                rewrite_expr_clock(w, now);
+                rewrite_expr_clock(w, now, mysql);
             }
         }
         _ => {}
     }
 }
 
-fn rewrite_select_clock(s: &mut SelectStatement, now: i64) {
+fn rewrite_select_clock(s: &mut SelectStatement, now: i64, mysql: bool) {
     // v7.25.1 (round-18) — shared traversal: CTE bodies, LATERAL
     // subqueries, JOIN ON, and UNION peers all get the clock
     // rewrite (NOW() inside a CTE previously survived to eval as
     // "unknown function `now`").
     let _ = walk_select_exprs_mut(s, &mut |e| {
-        rewrite_expr_clock(e, now);
+        rewrite_expr_clock(e, now, mysql);
         Ok(())
     });
 }
@@ -139,33 +146,33 @@ fn rewrite_select_clock(s: &mut SelectStatement, now: i64) {
 /// functions, and bare `CURRENT_TIMESTAMP` / `CURRENT_DATE` column
 /// refs) sit on their own arms with match guards so the fall-through
 /// to the recursive arms is unambiguous.
-fn rewrite_expr_clock(e: &mut Expr, now: i64) {
+fn rewrite_expr_clock(e: &mut Expr, now: i64, mysql: bool) {
     // Fast-path test on the no-recursion shapes first. We can't fold
     // them into the big match below because they need to *replace* `e`
     // outright; the recursive arms below match on its sub-fields.
-    if let Some(replacement) = clock_replacement_for(e, now) {
+    if let Some(replacement) = clock_replacement_for(e, now, mysql) {
         *e = replacement;
         return;
     }
     match e {
-        Expr::NamedArg { expr, .. } => rewrite_expr_clock(expr, now),
-        Expr::Variadic(expr) => rewrite_expr_clock(expr, now),
+        Expr::NamedArg { expr, .. } => rewrite_expr_clock(expr, now, mysql),
+        Expr::Variadic(expr) => rewrite_expr_clock(expr, now, mysql),
         Expr::AggregateOrdered { call, order_by, .. } => {
-            rewrite_expr_clock(call, now);
+            rewrite_expr_clock(call, now, mysql);
             for o in order_by.iter_mut() {
-                rewrite_expr_clock(&mut o.expr, now);
+                rewrite_expr_clock(&mut o.expr, now, mysql);
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
-            rewrite_expr_clock(lhs, now);
-            rewrite_expr_clock(rhs, now);
+            rewrite_expr_clock(lhs, now, mysql);
+            rewrite_expr_clock(rhs, now, mysql);
         }
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
-            rewrite_expr_clock(expr, now);
+            rewrite_expr_clock(expr, now, mysql);
         }
         Expr::FunctionCall { name, args } => {
             // v7.39 (read01 round 97) — the single-arg `age(t)` form is PG's
@@ -187,34 +194,34 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
                 args.insert(0, today);
             }
             for a in args {
-                rewrite_expr_clock(a, now);
+                rewrite_expr_clock(a, now, mysql);
             }
         }
         Expr::Like { expr, pattern, .. } => {
-            rewrite_expr_clock(expr, now);
-            rewrite_expr_clock(pattern, now);
+            rewrite_expr_clock(expr, now, mysql);
+            rewrite_expr_clock(pattern, now, mysql);
         }
-        Expr::Extract { source, .. } => rewrite_expr_clock(source, now),
+        Expr::Extract { source, .. } => rewrite_expr_clock(source, now, mysql),
         // v4.10 subquery nodes — recurse into the inner SELECT's
         // expression slots so e.g. SELECT NOW() in a scalar
         // subquery picks up the same instant as the outer query.
-        Expr::ScalarSubquery(s) => rewrite_select_clock(s, now),
-        Expr::Exists { subquery, .. } => rewrite_select_clock(subquery, now),
+        Expr::ScalarSubquery(s) => rewrite_select_clock(s, now, mysql),
+        Expr::Exists { subquery, .. } => rewrite_select_clock(subquery, now, mysql),
         Expr::InSubquery { expr, subquery, .. } => {
-            rewrite_expr_clock(expr, now);
-            rewrite_select_clock(subquery, now);
+            rewrite_expr_clock(expr, now, mysql);
+            rewrite_select_clock(subquery, now, mysql);
         }
         Expr::RowInSubquery { row, subquery, .. } => {
             for el in row {
-                rewrite_expr_clock(el, now);
+                rewrite_expr_clock(el, now, mysql);
             }
-            rewrite_select_clock(subquery, now);
+            rewrite_select_clock(subquery, now, mysql);
         }
         Expr::RowCmpSubquery { row, subquery, .. } => {
             for el in row {
-                rewrite_expr_clock(el, now);
+                rewrite_expr_clock(el, now, mysql);
             }
-            rewrite_select_clock(subquery, now);
+            rewrite_select_clock(subquery, now, mysql);
         }
         // v4.12 window functions — args + PARTITION BY + ORDER BY
         // may all reference clock literals.
@@ -225,42 +232,42 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
             ..
         } => {
             for a in args {
-                rewrite_expr_clock(a, now);
+                rewrite_expr_clock(a, now, mysql);
             }
             for p in partition_by {
-                rewrite_expr_clock(p, now);
+                rewrite_expr_clock(p, now, mysql);
             }
             for (e, _, _) in order_by {
-                rewrite_expr_clock(e, now);
+                rewrite_expr_clock(e, now, mysql);
             }
         }
         Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => {}
         Expr::Array(items) => {
             for elem in items {
-                rewrite_expr_clock(elem, now);
+                rewrite_expr_clock(elem, now, mysql);
             }
         }
         Expr::ArraySubscript { target, index } => {
-            rewrite_expr_clock(target, now);
-            rewrite_expr_clock(index, now);
+            rewrite_expr_clock(target, now, mysql);
+            rewrite_expr_clock(index, now, mysql);
         }
         Expr::ArraySlice { target, lo, hi } => {
-            rewrite_expr_clock(target, now);
+            rewrite_expr_clock(target, now, mysql);
             if let Some(l) = lo {
-                rewrite_expr_clock(l, now);
+                rewrite_expr_clock(l, now, mysql);
             }
             if let Some(h) = hi {
-                rewrite_expr_clock(h, now);
+                rewrite_expr_clock(h, now, mysql);
             }
         }
         Expr::AnyAll { expr, array, .. } => {
-            rewrite_expr_clock(expr, now);
-            rewrite_expr_clock(array, now);
+            rewrite_expr_clock(expr, now, mysql);
+            rewrite_expr_clock(array, now, mysql);
         }
         Expr::InList { expr, list, .. } => {
-            rewrite_expr_clock(expr, now);
+            rewrite_expr_clock(expr, now, mysql);
             for item in list {
-                rewrite_expr_clock(item, now);
+                rewrite_expr_clock(item, now, mysql);
             }
         }
         Expr::Case {
@@ -269,14 +276,14 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
             else_branch,
         } => {
             if let Some(o) = operand {
-                rewrite_expr_clock(o, now);
+                rewrite_expr_clock(o, now, mysql);
             }
             for (w, t) in branches {
-                rewrite_expr_clock(w, now);
-                rewrite_expr_clock(t, now);
+                rewrite_expr_clock(w, now, mysql);
+                rewrite_expr_clock(t, now, mysql);
             }
             if let Some(e) = else_branch {
-                rewrite_expr_clock(e, now);
+                rewrite_expr_clock(e, now, mysql);
             }
         }
     }
@@ -288,9 +295,37 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64) {
 /// `CURRENT_TIMESTAMP()` / `CURRENT_DATE()`) and bare-identifier forms
 /// (`CURRENT_TIMESTAMP` / `CURRENT_DATE` as unqualified column refs,
 /// which is how PG accepts them without parens).
-fn clock_replacement_for(e: &Expr, now: i64) -> Option<Expr> {
+fn clock_replacement_for(e: &Expr, now: i64, mysql: bool) -> Option<Expr> {
+    // v7.39 (round 349, M6) — the fractional-seconds precision argument:
+    // `NOW(3)`, `CURRENT_TIMESTAMP(3)`, `CURTIME(3)`. MariaDB 11 renders
+    // `NOW(3)` as `2026-07-22 12:46:41.541` and `NOW(6)` with six digits;
+    // PG spells it `current_timestamp(3)` / `localtimestamp(3)` /
+    // `current_time(3)`. EVERY parenthesised form was
+    // `function now(integer) does not exist` here — a PG-line gap as much
+    // as a MySQL one. (PG really has no `now(integer)`, and that one
+    // error was right; it stays.)
+    let precision = match e {
+        Expr::FunctionCall { name, args }
+            if args.len() == 1 && (mysql || !name.eq_ignore_ascii_case("now")) =>
+        {
+            match args.first() {
+                // Out of range: leave the call alone so the ordinary
+                // dispatcher reports it (MariaDB 11: `Too big precision
+                // specified for 'current_timestamp'. Maximum is 6`), rather
+                // than silently handing back full microseconds.
+                Some(Expr::Literal(spg_sql::ast::Literal::Integer(n)))
+                    if (0..=6).contains(n) =>
+                {
+                    Some(*n)
+                }
+                _ => return None,
+            }
+        }
+        _ => None,
+    };
     let (kind, name) = match e {
         Expr::FunctionCall { name, args } if args.is_empty() => (ClockSite::Fn, name.as_str()),
+        Expr::FunctionCall { name, .. } if precision.is_some() => (ClockSite::Fn, name.as_str()),
         Expr::Column(c) if c.qualifier.is_none() => (ClockSite::BareIdent, c.name.as_str()),
         _ => return None,
     };
@@ -377,14 +412,32 @@ fn clock_replacement_for(e: &Expr, now: i64) -> Option<Expr> {
         _ => None,
     };
     let shape = shape?;
+    // A precision of `p` keeps p fractional digits; 0 keeps none. Both
+    // oracles truncate rather than round (measured).
+    let now = match precision {
+        Some(p) => {
+            let div = 10_i64.pow(6 - u32::try_from(p).unwrap_or(6));
+            now.div_euclid(div) * div
+        }
+        None => now,
+    };
     if matches!(shape, ClockShape::TimeText) {
-        let day_secs = now.rem_euclid(86_400_000_000) / 1_000_000;
-        let text = alloc::format!(
+        let day_us = now.rem_euclid(86_400_000_000);
+        let day_secs = day_us / 1_000_000;
+        let mut text = alloc::format!(
             "{:02}:{:02}:{:02}",
             day_secs / 3600,
             (day_secs / 60) % 60,
             day_secs % 60
         );
+        if let Some(p) = precision
+            && (1..=6).contains(&p)
+        {
+            let frac = day_us % 1_000_000;
+            let digits = usize::try_from(p).unwrap_or(6);
+            text.push('.');
+            text.push_str(&alloc::format!("{frac:06}")[..digits]);
+        }
         return Some(Expr::Literal(spg_sql::ast::Literal::String(text)));
     }
     let payload = match shape {
