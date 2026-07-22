@@ -467,10 +467,13 @@ impl From<LexError> for ParseError {
 /// parser the statement path uses; this entry point just skips the
 /// statement dispatch.
 pub fn parse_expression(input: &str) -> Result<Expr, ParseError> {
-    let tokens = lexer::tokenize(input)?;
+    let (tokens, offsets) =
+        lexer::tokenize_with_offsets(input, false).map_err(|e| shape_lex_error(&e, input))?;
     let mut p = Parser::new(tokens);
-    let expr = p.parse_expr(0)?;
-    p.expect_eof()?;
+    let expr = p
+        .parse_expr(0)
+        .and_then(|e| p.expect_eof().map(|()| e))
+        .map_err(|e| shape_syntax_error(e, input, &offsets))?;
     Ok(expr)
 }
 
@@ -484,16 +487,111 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
 /// selects MySQL-style string lexing (see `lexer::tokenize_with`).
 /// The engine threads its session flag through here.
 pub fn parse_statement_with(input: &str, backslash_escapes: bool) -> Result<Statement, ParseError> {
-    let tokens = lexer::tokenize_with(input, backslash_escapes)?;
+    let (tokens, offsets) = lexer::tokenize_with_offsets(input, backslash_escapes)
+        .map_err(|e| shape_lex_error(&e, input))?;
     // The same session flag names the dialect for both the lexer and
     // the type mapping.
     let mut p = Parser::new_with_dialect(tokens, backslash_escapes);
-    let stmt = p.parse_one_statement()?;
-    if matches!(p.peek(), Token::Semicolon) {
-        p.advance();
-    }
-    p.expect_eof()?;
+    let stmt = (|| {
+        let stmt = p.parse_one_statement()?;
+        if matches!(p.peek(), Token::Semicolon) {
+            p.advance();
+        }
+        p.expect_eof()?;
+        Ok(stmt)
+    })()
+    .map_err(|e: ParseError| shape_syntax_error(e, input, &offsets))?;
     Ok(stmt)
+}
+
+/// v7.39 (round 340, V56) — PG has exactly two syntax-error wordings:
+/// `syntax error at or near "<token>"` and `syntax error at end of input`
+/// (measured on 18.4 across a dozen shapes). SPG wrote its own per-site
+/// prose — `expected identifier, got Eof`, `unexpected token From in
+/// expression`, `expected end of input, got Ident("with")` — which named
+/// internal token types and, in the Debug forms, leaked the parser's own
+/// enum into a message clients read.
+///
+/// Applied once on the way out, so every construction site is covered and
+/// the token named is the one the error itself points at. Messages whose
+/// bodies are already PG's verbatim (`LIMIT must not be negative`,
+/// `invalid input syntax for type bigint: "abc"`) are left alone — those
+/// are PG's own errors, not its syntax error.
+fn shape_syntax_error(e: ParseError, input: &str, offsets: &[usize]) -> ParseError {
+    if !(e.message.starts_with("expected ") || e.message.starts_with("unexpected token ")) {
+        return e;
+    }
+    let message = match offending_lexeme(input, offsets, e.token_pos) {
+        Some(tok) => alloc::format!("syntax error at or near \"{tok}\""),
+        None => "syntax error at end of input".into(),
+    };
+    ParseError {
+        message,
+        token_pos: e.token_pos,
+    }
+}
+
+/// v7.39 (round 340, V56) — a lexer-level failure the way PG words it.
+/// Measured on 18.4: `unterminated quoted string at or near "'abc"`,
+/// `unterminated quoted identifier at or near ""abc"`, `unterminated /*
+/// comment at or near "/* x"` — the quoted part runs from the opening
+/// delimiter to the end of the input. SPG reported its own internal
+/// shape instead (`unterminated string literal at byte 7`), which named
+/// a byte offset no client can use.
+fn shape_lex_error(e: &lexer::LexError, input: &str) -> ParseError {
+    use lexer::LexErrorKind as K;
+    let from_here = input.get(e.pos..).map(str::trim_end).unwrap_or("");
+    let message = match &e.kind {
+        K::UnterminatedString => {
+            alloc::format!("unterminated quoted string at or near \"{from_here}\"")
+        }
+        K::UnterminatedQuotedIdent => {
+            alloc::format!("unterminated quoted identifier at or near \"{from_here}\"")
+        }
+        K::UnterminatedBlockComment => {
+            alloc::format!("unterminated /* comment at or near \"{from_here}\"")
+        }
+        // PG has no "unknown character" error of its own — the character
+        // is skipped and the parser reports the next token. SPG stops at
+        // the character itself and names it, which is the same shape.
+        K::UnknownChar(c) => alloc::format!("syntax error at or near \"{c}\""),
+        // The number-literal kinds already carry PG's `at or near` form.
+        other => alloc::format!("{}", lexer::LexError {
+            kind: other.clone(),
+            pos: e.pos,
+        }),
+    };
+    ParseError {
+        message,
+        token_pos: 0,
+    }
+}
+
+/// The offending token exactly as it appears in the input, or `None` at
+/// end of input. PG echoes the source spelling — a lower-case `frm`
+/// reports as `frm`, not as a canonicalised keyword.
+fn offending_lexeme<'a>(input: &'a str, offsets: &[usize], token_pos: usize) -> Option<&'a str> {
+    let start = *offsets.get(token_pos)?;
+    if start >= input.len() {
+        return None;
+    }
+    let end = offsets
+        .get(token_pos + 1)
+        .copied()
+        .unwrap_or(input.len())
+        .min(input.len());
+    let seg = input.get(start..end)?.trim();
+    if seg.is_empty() {
+        return None;
+    }
+    // A quoted literal / identifier keeps its inner spaces; anything else
+    // ends at the first whitespace (the segment runs to the NEXT token's
+    // start, which may swallow a comment).
+    if seg.starts_with('\'') || seg.starts_with('"') || seg.starts_with('`') {
+        Some(seg)
+    } else {
+        seg.split_whitespace().next()
+    }
 }
 
 /// v7.39 (read01 round 95) — recover PG's 1-based CHARACTER error position for
@@ -544,6 +642,9 @@ struct Parser {
     /// keyword is the argument separator, not a membership test.
     /// The postfix loop leaves IN unconsumed when this is set.
     suppress_in_tail: bool,
+    /// Index of the token the last `advance()` returned — see
+    /// [`Parser::consumed_pos`].
+    last_consumed: usize,
 }
 
 /// Max expr/select parser nesting (parens, subqueries, CASE, …).
@@ -594,6 +695,7 @@ impl Parser {
             nest_depth: 0,
             pending_sample_preds: Vec::new(),
             suppress_in_tail: false,
+            last_consumed: 0,
         }
     }
 
@@ -617,10 +719,21 @@ impl Parser {
 
     fn advance(&mut self) -> Token {
         let t = mem::replace(&mut self.tokens[self.pos], Token::Eof);
+        self.last_consumed = self.pos;
         if self.pos + 1 < self.tokens.len() {
             self.pos += 1;
         }
         t
+    }
+
+    /// v7.39 (round 340, V56) — the index of the token `advance()` just
+    /// returned. It was computed as `pos - 1`, which is wrong at both
+    /// ends: `advance()` parks on the final Eof rather than running off
+    /// the end (so `SELECT * FROM` named `FROM` where PG says `at end of
+    /// input`), and after backtracking `pos` is no longer one past the
+    /// token that failed. Recorded by `advance()` itself instead.
+    const fn consumed_pos(&self) -> usize {
+        self.last_consumed
     }
 
     fn err(&self, message: String) -> ParseError {
@@ -695,7 +808,7 @@ impl Parser {
                 other => {
                     return Err(ParseError {
                         message: alloc::format!("expected identifier, got {other:?}"),
-                        token_pos: self.pos.saturating_sub(1),
+                        token_pos: self.consumed_pos(),
                     });
                 }
             }
@@ -1473,7 +1586,7 @@ impl Parser {
             other => {
                 return Err(ParseError {
                     message: format!("expected identifier, got {other:?}"),
-                    token_pos: self.pos.saturating_sub(1),
+                    token_pos: self.consumed_pos(),
                 });
             }
         };
@@ -1493,7 +1606,7 @@ impl Parser {
                 other => {
                     return Err(ParseError {
                         message: format!("expected identifier after '{first}.', got {other:?}"),
-                        token_pos: self.pos.saturating_sub(1),
+                        token_pos: self.consumed_pos(),
                     });
                 }
             }
@@ -6986,7 +7099,7 @@ impl Parser {
                 other => {
                     return Err(ParseError {
                         message: format!("expected parameter name, got {other:?}"),
-                        token_pos: self.pos.saturating_sub(1),
+                        token_pos: self.consumed_pos(),
                     });
                 }
             };
@@ -7189,11 +7302,11 @@ impl Parser {
             Token::Integer(n) if n >= 0 => Ok(n as u64),
             Token::Integer(n) => Err(ParseError {
                 message: format!("expected non-negative integer, got {n}"),
-                token_pos: self.pos.saturating_sub(1),
+                token_pos: self.consumed_pos(),
             }),
             other => Err(ParseError {
                 message: format!("expected integer literal, got {other:?}"),
-                token_pos: self.pos.saturating_sub(1),
+                token_pos: self.consumed_pos(),
             }),
         }
     }
@@ -10177,7 +10290,7 @@ impl Parser {
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case(kw) => Ok(()),
             other => Err(ParseError {
                 message: format!("expected {kw:?}, got {other:?}"),
-                token_pos: self.pos.saturating_sub(1),
+                token_pos: self.consumed_pos(),
             }),
         }
     }
@@ -10190,7 +10303,7 @@ impl Parser {
             Token::Ident(s) | Token::QuotedIdent(s) | Token::String(s) => Ok(s),
             other => Err(ParseError {
                 message: format!("expected identifier or string, got {other:?}"),
-                token_pos: self.pos.saturating_sub(1),
+                token_pos: self.consumed_pos(),
             }),
         }
     }
@@ -10200,7 +10313,7 @@ impl Parser {
             Token::String(s) => Ok(s),
             other => Err(ParseError {
                 message: format!("expected quoted string, got {other:?}"),
-                token_pos: self.pos.saturating_sub(1),
+                token_pos: self.consumed_pos(),
             }),
         }
     }
@@ -10729,7 +10842,7 @@ impl Parser {
                 .map(crate::ast::LimitExpr::Literal)
                 .map_err(|_| ParseError {
                     message: alloc::format!("{label} value too large: {n}"),
-                    token_pos: self.pos.saturating_sub(1),
+                    token_pos: self.consumed_pos(),
                 }),
             Token::Integer(_) => Err(err_at(
                 alloc::format!("{neg_label} must not be negative"),
@@ -10797,7 +10910,7 @@ impl Parser {
                 message: alloc::format!(
                     "expected non-negative integer or $N placeholder after {label}, got {other:?}"
                 ),
-                token_pos: self.pos.saturating_sub(1),
+                token_pos: self.consumed_pos(),
             }),
         }
     }
@@ -13719,7 +13832,7 @@ impl Parser {
             other => {
                 return Err(ParseError {
                     message: format!("expected column type, got {other:?}"),
-                    token_pos: self.pos.saturating_sub(1),
+                    token_pos: self.consumed_pos(),
                 });
             }
         };
@@ -14797,7 +14910,7 @@ impl Parser {
             Token::Integer(n) => {
                 return Err(ParseError {
                     message: format!("NUMERIC precision {n} must be between 1 and 1000"),
-                    token_pos: self.pos.saturating_sub(1),
+                    token_pos: self.consumed_pos(),
                 });
             }
             other => {
@@ -14805,7 +14918,7 @@ impl Parser {
                     message: format!(
                         "NUMERIC precision must be an integer in 1..=1000, got {other:?}"
                     ),
-                    token_pos: self.pos.saturating_sub(1),
+                    token_pos: self.consumed_pos(),
                 });
             }
         };
@@ -14828,7 +14941,7 @@ impl Parser {
                             message: format!(
                                 "NUMERIC scale {signed} must be between -1000 and 1000"
                             ),
-                            token_pos: self.pos.saturating_sub(1),
+                            token_pos: self.consumed_pos(),
                         });
                     }
                     i16::try_from(signed).expect("range-checked")
@@ -14836,7 +14949,7 @@ impl Parser {
                 other => {
                     return Err(ParseError {
                         message: format!("NUMERIC scale must be an integer, got {other:?}"),
-                        token_pos: self.pos.saturating_sub(1),
+                        token_pos: self.consumed_pos(),
                     });
                 }
             }
@@ -14947,12 +15060,12 @@ impl Parser {
         let n = match self.advance() {
             Token::Integer(n) if n > 0 => u32::try_from(n).map_err(|_| ParseError {
                 message: format!("{label} size too large: {n}"),
-                token_pos: self.pos.saturating_sub(1),
+                token_pos: self.consumed_pos(),
             })?,
             other => {
                 return Err(ParseError {
                     message: format!("expected positive integer {label} size, got {other:?}"),
-                    token_pos: self.pos.saturating_sub(1),
+                    token_pos: self.consumed_pos(),
                 });
             }
         };
@@ -15541,7 +15654,7 @@ impl Parser {
                 alias: None,
             });
         }
-        let alias = self.parse_optional_alias();
+        let alias = self.parse_optional_alias()?;
         Ok(SelectItem::Expr { expr, alias })
     }
 
@@ -15664,7 +15777,7 @@ impl Parser {
                 )));
             }
             self.advance();
-            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
+            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns()?;
             let alias = alias_ident.clone().unwrap_or_else(|| each_fn.clone());
             // Synthesise: SELECT __srf__.key AS <key_alias>, __srf__.value AS <value_alias>
             //               FROM jsonb_each_text(<arg>) AS __srf__
@@ -15782,7 +15895,7 @@ impl Parser {
                 )));
             }
             self.advance();
-            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
+            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns()?;
             let name = alias_ident.clone().unwrap_or_else(|| "values".to_string());
             return Ok(TableRef {
                 name,
@@ -15839,7 +15952,7 @@ impl Parser {
             // `AS t(a, b)` column-alias list rides the
             // unnest_column_aliases field (same positional-rename
             // contract the unnest SRFs use).
-            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
+            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns()?;
             let name = alias_ident
                 .clone()
                 .unwrap_or_else(|| "subquery".to_string());
@@ -15883,7 +15996,7 @@ impl Parser {
             // v7.37 D.28 — `LATERAL (…) AS t(cols)` column-alias list (also how a
             // `(VALUES …) t(g)` derived table round-trips through view-body
             // Display, which renders on the lateral_subquery channel).
-            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
+            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns()?;
             let name = alias_ident.clone().unwrap_or_else(|| "lateral".to_string());
             return Ok(TableRef {
                 name,
@@ -15925,7 +16038,7 @@ impl Parser {
                 )));
             }
             self.advance();
-            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
+            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns()?;
             let name = alias_ident.clone().unwrap_or_else(|| each_fn.clone());
             return Ok(TableRef {
                 name,
@@ -15988,7 +16101,7 @@ impl Parser {
             // it, so it died on the `with` token while every other table function
             // accepted it.
             let with_ordinality = self.absorb_with_ordinality();
-            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
+            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns()?;
             let table_alias = alias_ident
                 .clone()
                 .unwrap_or_else(|| "regexp_matches".to_string());
@@ -16086,7 +16199,7 @@ impl Parser {
             }
             self.advance();
             let with_ordinality = self.absorb_with_ordinality();
-            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
+            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns()?;
             let name = alias_ident.clone().unwrap_or_else(|| fn_name.clone());
             // PG's natural column name: the array-elements SRFs
             // declare an OUT parameter `value`; jsonb_object_keys
@@ -16257,7 +16370,7 @@ impl Parser {
             }
             self.advance();
             let with_ordinality = self.absorb_with_ordinality();
-            let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns();
+            let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns()?;
             let name = alias_ident.clone().unwrap_or_else(|| "rows".to_string());
             // v7.39 (read01 round 74) — some entry had no array form, so the whole
             // list rides the generic channel.
@@ -16349,7 +16462,7 @@ impl Parser {
                 }
             };
             let with_ordinality = self.absorb_with_ordinality();
-            let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns();
+            let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns()?;
             let name = alias_ident.clone().unwrap_or_else(|| "unnest".to_string());
             let correlated = Self::expr_has_any_column(&expr);
             let tref = TableRef {
@@ -16464,7 +16577,7 @@ impl Parser {
                 )));
             }
             let with_ordinality = self.absorb_with_ordinality();
-            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns();
+            let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns()?;
             let name = alias_ident
                 .clone()
                 .unwrap_or_else(|| "generate_series".to_string());
@@ -16551,7 +16664,7 @@ impl Parser {
         {
             None
         } else {
-            self.parse_optional_alias()
+            self.parse_optional_alias()?
         };
         // `TABLESAMPLE BERNOULLI(p) | SYSTEM(p)` follows the alias
         // (PG grammar). BERNOULLI lowers to a per-row
@@ -17176,7 +17289,7 @@ impl Parser {
         // counter column rides after the function's own, and the alias list
         // names it.
         let with_ordinality = self.absorb_with_ordinality();
-        let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns();
+        let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns()?;
         let name = alias_ident.clone().unwrap_or_else(|| fn_name.clone());
         Ok(TableRef {
             name,
@@ -17244,7 +17357,7 @@ impl Parser {
             )));
         }
         self.advance();
-        let alias_ident = self.parse_optional_alias();
+        let alias_ident = self.parse_optional_alias()?;
         let name = alias_ident.clone().unwrap_or_else(|| String::from("json_table"));
         Ok(TableRef {
             name,
@@ -17446,10 +17559,12 @@ impl Parser {
         })
     }
 
-    fn parse_optional_alias_with_columns(&mut self) -> (Option<String>, Vec<String>) {
-        let alias = self.parse_optional_alias();
+    fn parse_optional_alias_with_columns(
+        &mut self,
+    ) -> Result<(Option<String>, Vec<String>), ParseError> {
+        let alias = self.parse_optional_alias()?;
         if alias.is_none() {
-            return (None, Vec::new());
+            return Ok((None, Vec::new()));
         }
         let mut cols: Vec<String> = Vec::new();
         if matches!(self.peek(), Token::LParen) {
@@ -17467,7 +17582,7 @@ impl Parser {
                 self.advance();
             }
         }
-        (alias, cols)
+        Ok((alias, cols))
     }
 
     /// v7.37.16 — parse a `left(str, n)` / `right(str, n)` function call
@@ -17738,17 +17853,21 @@ impl Parser {
     /// `AS <ident>` is unambiguous; a bare `<ident>` directly after is also
     /// accepted (PG-style implicit alias). Returns `None` if the next token
     /// is not alias-shaped (e.g. comma, FROM, WHERE, semicolon, EOF, operator).
-    fn parse_optional_alias(&mut self) -> Option<String> {
+    fn parse_optional_alias(&mut self) -> Result<Option<String>, ParseError> {
         if matches!(self.peek(), Token::As) {
             self.advance();
-            // After AS, the next token MUST be an identifier-like — if not,
-            // we still return None and let the caller surface the error on the
-            // next expectation. v0.2 keeps the alias path forgiving; the
-            // corpus tests don't exercise the malformed case.
+            // v7.39 (round 340, V56) — after AS the next token MUST be an
+            // identifier. This used to return None and "let the caller
+            // surface the error on the next expectation", but when AS is
+            // the LAST token there is no next expectation: `SELECT 1 AS`
+            // parsed clean and silently dropped the alias. PG rejects it.
             if let Token::Ident(_) | Token::QuotedIdent(_) = self.peek() {
-                return self.expect_ident_like().ok();
+                return self.expect_ident_like().map(Some);
             }
-            return None;
+            return Err(self.err(alloc::format!(
+                "expected an alias after AS, got {:?}",
+                self.peek()
+            )));
         }
         // v7.17.0 Phase 1.3 — implicit alias (no `AS`). PG's
         // grammar reserves a long list of follow-keywords from the
@@ -17759,11 +17878,11 @@ impl Parser {
         // CONFLICT WHERE shapes.
         if let Token::Ident(s) | Token::QuotedIdent(s) = self.peek() {
             if is_alias_stopword(s) {
-                return None;
+                return Ok(None);
             }
-            return self.expect_ident_like().ok();
+            return Ok(self.expect_ident_like().ok());
         }
-        None
+        Ok(None)
     }
 
     /// Pratt loop. `min_prec` is the minimum binary-op precedence we'll accept.
@@ -18598,14 +18717,14 @@ impl Parser {
                 let Statement::Select(s) = inner else {
                     return Err(ParseError {
                         message: "scalar subquery body must be a SELECT".into(),
-                        token_pos: self.pos.saturating_sub(1),
+                        token_pos: self.consumed_pos(),
                     });
                 };
                 Ok(Expr::ScalarSubquery(Box::new(s)))
             }
             other => Err(ParseError {
                 message: format!("expected ')' after scalar subquery, got {other:?}"),
-                token_pos: self.pos.saturating_sub(1),
+                token_pos: self.consumed_pos(),
             }),
         }
     }
@@ -18723,7 +18842,7 @@ impl Parser {
                         Token::RParen => Ok(e),
                         other => Err(ParseError {
                             message: format!("expected ')', got {other:?}"),
-                            token_pos: self.pos.saturating_sub(1),
+                            token_pos: self.consumed_pos(),
                         }),
                     }
                 }
@@ -19063,7 +19182,7 @@ impl Parser {
             other => {
                 return Err(ParseError {
                     message: format!("expected type ident after `::`, got {other:?}"),
-                    token_pos: self.pos.saturating_sub(1),
+                    token_pos: self.consumed_pos(),
                 });
             }
         };
@@ -20939,7 +21058,7 @@ impl Parser {
                      microsecond[s], millisecond[s], second[s], minute[s], \
                      hour[s], day[s], week[s], month[s], year[s]"
             ),
-            token_pos: self.pos.saturating_sub(1),
+            token_pos: self.consumed_pos(),
         })?;
         Ok(Expr::Literal(Literal::Interval {
             months,
@@ -24079,7 +24198,7 @@ mod tests {
         // v4.4: UPDATE is real SQL now. Use a fabricated keyword so
         // the top-level dispatch still has no branch to take.
         let err = parse_statement("FROBNICATE foo SET x = 1").unwrap_err();
-        assert!(err.message.contains("expected SELECT"));
+        assert_eq!(err.message, "syntax error at or near \"FROBNICATE\"");
     }
 
     // --- v0.8 CREATE INDEX --------------------------------------------------
@@ -24187,7 +24306,8 @@ mod tests {
     #[test]
     fn create_unique_without_index_errors() {
         let err = parse_statement("CREATE UNIQUE TABLE t (a INT)").unwrap_err();
-        assert!(err.message.contains("INDEX"), "{}", err.message);
+        // v7.39 (round 340, V56) — PG 18.4, verbatim.
+        assert_eq!(err.message, "syntax error at or near \"TABLE\"");
     }
 
     // --- v7.10.4 BYTES / BYTEA column type (Epic 1) ----------------------
@@ -24301,7 +24421,7 @@ mod tests {
         // Parser-side error now requires a NON-ident after `::`
         // (e.g. a punctuation token).
         let err = parse_statement("SELECT 1::, FROM t").unwrap_err();
-        assert!(err.message.contains("expected type ident after `::`"));
+        assert_eq!(err.message, "syntax error at or near \",\"");
     }
 
     #[test]
@@ -24472,14 +24592,14 @@ mod tests {
     fn parser_rejects_create_subscription_missing_connection() {
         let err = parse_statement("CREATE SUBSCRIPTION s PUBLICATION p")
             .expect_err("must error on missing CONNECTION");
-        assert!(err.message.contains("CONNECTION"), "got: {}", err.message);
+        assert_eq!(err.message, "syntax error at or near \"PUBLICATION\"");
     }
 
     #[test]
     fn parser_rejects_create_subscription_missing_publication() {
         let err = parse_statement("CREATE SUBSCRIPTION s CONNECTION 'host=x'")
             .expect_err("must error on missing PUBLICATION");
-        assert!(err.message.contains("PUBLICATION"), "got: {}", err.message);
+        assert_eq!(err.message, "syntax error at end of input");
     }
 
     #[test]
