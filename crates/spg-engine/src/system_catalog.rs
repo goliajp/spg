@@ -669,7 +669,12 @@ pub(crate) fn synth_information_schema_views(
                 Value::text("spg"),
                 Value::text("public"),
                 Value::text(v.name.clone()),
-                Value::text(v.body.clone()),
+                // v7.39 (round 336, V58) — the DEPARSED definition, the same
+                // text `pg_get_viewdef` gives. This used to be the stored
+                // body verbatim, which meant no layout and — worse — SPG's
+                // internal `count_star()` spelling reaching a client that
+                // introspects views (PG says `count(*)`).
+                Value::text(crate::eval::functions::pg_viewdef_render(&v.body, false)),
                 // v7.39 (round 132) — WITH CHECK OPTION: 0=NONE, 1=LOCAL, 2=CASCADED.
                 Value::text(match v.check_option {
                     1 => "LOCAL",

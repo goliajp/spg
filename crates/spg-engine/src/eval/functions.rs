@@ -134,16 +134,16 @@ fn numeric_gcd_lcm(x: &Value<'_>, y: &Value<'_>, want_lcm: bool) -> Option<Value
 /// WHERE, trailing semicolon). `pretty` drops the redundant top-level
 /// WHERE parentheses, as PG's pretty mode does. Shapes beyond a plain
 /// single-table SELECT fall back to the stored single-line body.
-fn pg_viewdef_render(body: &str, pretty: bool) -> String {
+pub(crate) fn pg_viewdef_render(body: &str, pretty: bool) -> String {
     let Ok(spg_sql::ast::Statement::Select(stmt)) = spg_sql::parser::parse_statement(body) else {
         return body.to_string();
     };
-    // Narrow shape: no CTEs / unions / grouping / ordering / limits.
+    // v7.39 (round 336, V58) — GROUP BY / HAVING / ORDER BY are laid out
+    // now, each on its own line at PG's own indent (measured on 18.4:
+    // two spaces for GROUP BY / ORDER BY / WHERE, one for HAVING). CTEs,
+    // set operations, joins and LIMIT still fall back to the stored body.
     let simple = stmt.ctes.is_empty()
         && stmt.unions.is_empty()
-        && stmt.group_by.is_none()
-        && stmt.having.is_none()
-        && stmt.order_by.is_empty()
         && stmt.limit.is_none()
         && stmt.offset.is_none()
         && !stmt.distinct;
@@ -159,7 +159,11 @@ fn pg_viewdef_render(body: &str, pretty: bool) -> String {
         return body.to_string();
     }
     let mut out = String::from(" SELECT ");
-    let items: Vec<String> = stmt.items.iter().map(|i| alloc::format!("{i}")).collect();
+    let items: Vec<String> = stmt
+        .items
+        .iter()
+        .map(|i| viewdef_item_text(i))
+        .collect();
     out.push_str(&items.join(",\n    "));
     out.push_str("\n   FROM ");
     out.push_str(&from.primary.name);
@@ -197,8 +201,50 @@ fn pg_viewdef_render(body: &str, pretty: bool) -> String {
         }
         out.push_str(&pred);
     }
+    // Measured on PG 18.4: `  GROUP BY v`, ` HAVING (count(*) > 1)`,
+    // `  ORDER BY id` — HAVING sits one space in, the others two.
+    if let Some(g) = &stmt.group_by {
+        let keys: Vec<String> = g.iter().map(|e| alloc::format!("{e}")).collect();
+        out.push_str("\n  GROUP BY ");
+        out.push_str(&keys.join(", "));
+    }
+    if let Some(h) = &stmt.having {
+        out.push_str("\n HAVING ");
+        out.push_str(&viewdef_expr_text(h));
+    }
+    if !stmt.order_by.is_empty() {
+        let keys: Vec<String> = stmt
+            .order_by
+            .iter()
+            .map(|o| {
+                let mut t = viewdef_expr_text(&o.expr);
+                if o.desc {
+                    t.push_str(" DESC");
+                }
+                t
+            })
+            .collect();
+        out.push_str("\n  ORDER BY ");
+        out.push_str(&keys.join(", "));
+    }
     out.push(';');
     out
+}
+
+/// v7.39 (round 336, V58) — one projection item as the view definition
+/// prints it. SPG's own `count_star()` spelling is PG's `count(*)`, and a
+/// reflected definition must not carry the engine's internal vocabulary
+/// (the same rule round 323 applied to error messages).
+fn viewdef_item_text(item: &spg_sql::ast::SelectItem) -> String {
+    viewdef_detokenize(&alloc::format!("{item}"))
+}
+
+fn viewdef_expr_text(e: &spg_sql::ast::Expr) -> String {
+    viewdef_detokenize(&alloc::format!("{e}"))
+}
+
+fn viewdef_detokenize(s: &str) -> String {
+    s.replace("count_star()", "count(*)")
 }
 
 pub(super) fn apply_function(
