@@ -5427,9 +5427,18 @@ pub(super) fn compare(
         (Value::BigInt(a), Value::RegClass(b, _)) => a.cmp(b),
         (Value::RegClass(a, _), Value::Int(b)) => a.cmp(&i64::from(*b)),
         (Value::Int(a), Value::RegClass(b, _)) => i64::from(*a).cmp(b),
+        // v7.39 (round 342, V65) — regproc joins on oid the same way:
+        // `pg_proc.oid = 'f'::regproc` is the point of carrying it.
+        (Value::RegProc(a, _), Value::RegProc(b, _)) => a.cmp(b),
+        (Value::RegProc(a, _), Value::BigInt(b)) => a.cmp(b),
+        (Value::BigInt(a), Value::RegProc(b, _)) => a.cmp(b),
+        (Value::RegProc(a, _), Value::Int(b)) => a.cmp(&i64::from(*b)),
+        (Value::Int(a), Value::RegProc(b, _)) => i64::from(*a).cmp(b),
         // Text form compares by name (the pre-dual-shape contract).
         (Value::RegClass(_, a), Value::Text(b)) => a.as_ref().cmp(b.as_ref()),
         (Value::Text(a), Value::RegClass(_, b)) => a.as_ref().cmp(b.as_ref()),
+        (Value::RegProc(_, a), Value::Text(b)) => a.as_ref().cmp(b.as_ref()),
+        (Value::Text(a), Value::RegProc(_, b)) => a.as_ref().cmp(b.as_ref()),
         // v7.37.17 — same-type array `=` / `<>` / `<` / `<=` / `>` /
         // `>=` for the remaining Ord-element array variants. PG's
         // `array_cmp` total order = element-wise (`cmp_array`); uuid is

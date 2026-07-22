@@ -778,6 +778,14 @@ pub enum Value<'arena> {
     /// `conrelid = 't'::regclass` and `'t'::regclass::text` agree.
     /// Eval-only (no column storage).
     RegClass(i64, alloc::boxed::Box<str>),
+    /// v7.39 (round 342, V65) — PG `regproc`: an OID-typed FUNCTION
+    /// reference that renders as the function name. Same dual shape
+    /// [`Value::RegClass`] carries, and for the same reason: without the
+    /// oid half, `pg_proc.oid = 'f'::regproc` cannot join, and a callee
+    /// cannot tell `pg_get_functiondef('f'::regproc)` — which PG answers
+    /// — from `pg_get_functiondef('f')` — which PG rejects.
+    /// Eval-only (no column storage).
+    RegProc(i64, alloc::boxed::Box<str>),
     /// v7.37.5 ζ-A — PG `bit` / `bit varying`. `nbits` is the
     /// actual bit count; `bytes` is the packed representation
     /// (big-endian within each byte; final byte right-padded
@@ -1029,7 +1037,7 @@ impl<'arena> Value<'arena> {
             Self::Composite(_) => None,
             // v7.39 (read01 ruleutils.c) — regclass is eval-only (dual
             // oid+name shape); no column storage type.
-            Self::RegClass(..) => None,
+            Self::RegClass(..) | Self::RegProc(..) => None,
             Self::Null => None,
         }
     }
@@ -1102,6 +1110,7 @@ impl<'arena> Value<'arena> {
             // v7.38 (read01, T9) — Composite fields are already `Value<'static>`.
             Value::Composite(fields) => Value::Composite(fields),
             Value::RegClass(oid, name) => Value::RegClass(oid, name),
+            Value::RegProc(oid, name) => Value::RegProc(oid, name),
             Value::Point(p) => Value::Point(p),
             Value::Lseg(a, b) => Value::Lseg(a, b),
             Value::Path { points, closed } => Value::Path { points, closed },
@@ -2113,7 +2122,8 @@ impl IndexKey {
             | Value::Char1(_)
             | Value::MoneyArray(_)
             | Value::Composite(_)
-            | Value::RegClass(..) => None,
+            | Value::RegClass(..)
+            | Value::RegProc(..) => None,
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this

@@ -14311,14 +14311,21 @@ fn apply_function_dispatch(
                 return Ok(Value::Null);
             };
             // v7.39 (round 339, V63) — `pg_get_functiondef('f'::regproc)`
-            // is the spelling PG's docs use, and SPG carries a regproc as
-            // its name. Resolve a name directly; the oid form is unchanged.
-            if let Some(Value::Text(nm)) = args.first() {
-                let bare = nm.strip_prefix("public.").unwrap_or(nm.as_ref());
-                let bare = bare.split_once('(').map_or(bare, |(n, _)| n.trim());
+            // is the spelling PG's docs use.
+            // v7.39 (round 342, V65) — and it is now told apart from a
+            // bare string: a regproc arrives as its own value, so the
+            // TEXT form falls through to the oid path and reports PG's
+            // `invalid input syntax for type oid`, as PG does.
+            if let Some(Value::RegProc(_, nm)) = args.first() {
+                let bare = nm.split_once('(').map_or(nm.as_ref(), |(n, _)| n.trim());
                 if let Some(def) = cat.functions().values().find(|f| f.name == bare) {
                     return Ok(Value::text(crate::system_catalog::render_function_def(def)));
                 }
+            }
+            if let Some(Value::Text(nm)) = args.first() {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("invalid input syntax for type oid: \"{nm}\""),
+                });
             }
             let Some(oid) = oid_arg(args.first()) else {
                 return Ok(Value::Null);
@@ -15658,11 +15665,14 @@ fn apply_function_dispatch(
                 // v7.39 (round 339, V63) — a USER function resolves too.
                 // Only the static pg_proc table was consulted, so
                 // to_regproc named its own functions NULL.
-                if ctx
-                    .catalog
-                    .is_some_and(|c| c.functions_named(bare).len() == 1)
+                // v7.39 (round 342, V65) — and it answers the regproc
+                // shape, not a bare string: PG's `pg_typeof(to_regproc(…))`
+                // is `regproc`, so `pg_proc.oid = to_regproc('f')` joins.
+                if let Some(cat) = ctx.catalog
+                    && cat.functions_named(bare).len() == 1
                 {
-                    return Ok(Value::text(bare.to_string()));
+                    let oid = crate::system_catalog::function_oid(cat, bare).unwrap_or(0);
+                    return Ok(Value::RegProc(oid, bare.into()));
                 }
                 let hits = crate::system_catalog::PG_PROC_FUNCS
                     .iter()
@@ -15696,10 +15706,17 @@ fn apply_function_dispatch(
                 .iter()
                 .find(|f| crate::system_catalog::canonical_arg_types(&f.args_repr) == want)
                 .map_or(Value::Null, |f| {
-                    Value::text(alloc::format!(
-                        "{bare}({})",
-                        crate::system_catalog::canonical_arg_types(&f.args_repr)
-                    ))
+                    let oid =
+                        crate::system_catalog::function_oid_by_signature(cat, bare, &want)
+                            .unwrap_or(0);
+                    Value::RegProc(
+                        oid,
+                        alloc::format!(
+                            "{bare}({})",
+                            crate::system_catalog::canonical_arg_types(&f.args_repr)
+                        )
+                        .into(),
+                    )
                 }))
         }
         "to_regoper" | "to_regoperator" | "to_regrole" => Ok(Value::Null),
