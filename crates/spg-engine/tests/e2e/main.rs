@@ -188,6 +188,7 @@ mod e2e_regproc_value_round342;
 mod e2e_empty_target_list_round341;
 mod e2e_lo_file_round343;
 mod e2e_syntax_error_wording_round340;
+mod e2e_type_phrase_owner_round344;
 mod e2e_relation_oids_round338;
 mod e2e_viewdef_layout_round336;
 mod e2e_security_definer_round334;
