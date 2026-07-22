@@ -30,7 +30,7 @@ mod datetime;
 mod encoding;
 mod encodings;
 mod format;
-mod functions;
+pub(crate) mod functions;
 mod inet;
 pub(crate) mod math;
 mod regexp;
