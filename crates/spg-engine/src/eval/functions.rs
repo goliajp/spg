@@ -8707,6 +8707,13 @@ fn apply_function_dispatch(
         //     rendering (shared with `format()`'s %s specifier
         //     via `value_to_format_text`).
         "concat" => {
+            // v7.39 (round 374) — MySQL's CONCAT returns NULL if ANY
+            // argument is NULL (measured: `CONCAT('a', NULL, 'b')` is
+            // NULL on MariaDB 11), unlike PG's CONCAT which skips NULLs.
+            // CONCAT_WS keeps skipping them in both dialects.
+            if ctx.mysql_dialect && args.iter().any(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
             let mut out = String::new();
             for v in args {
                 if matches!(v, Value::Null) {
