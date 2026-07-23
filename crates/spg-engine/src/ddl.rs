@@ -5134,6 +5134,13 @@ fn column_def_to_schema(c: ColumnDef, mysql: bool) -> Result<ColumnSchema, Engin
     // v7.17.0 Phase 4.4 — MySQL `UNSIGNED` flag propagates to
     // storage so engine INSERT / UPDATE can range-check.
     schema.is_unsigned = c.is_unsigned;
+    // v7.39 (round 386, type-fidelity epic P1) — declared TINYINT /
+    // MEDIUMINT width, lost when the type collapsed to SmallInt / Int.
+    // Drives the epic-P2 write-path range check.
+    schema.mysql_int_width = c.mysql_int_width.map(|w| match w {
+        spg_sql::ast::MysqlIntWidth::Tiny => spg_storage::MysqlIntWidth::Tiny,
+        spg_sql::ast::MysqlIntWidth::Medium => spg_storage::MysqlIntWidth::Medium,
+    });
     // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM variant list.
     // INSERT validation lives in coerce_value (Text → Text path
     // with the column's variant list as the accept-set).

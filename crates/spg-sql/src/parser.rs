@@ -25,6 +25,7 @@ use crate::ast::{
     FkAction, ForeignKeyConstraint, FrameBound, FrameExclusion, FrameKind, FromClause, FromJoin,
     FunctionArg, FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, GrantObject,
     GrantPriv, GrantStatement, IndexMethod, InsertStatement, IsolationLevel, JoinKind, Literal,
+    MysqlIntWidth,
     NullTreatment, OrderBy, Overriding, PlPgSqlBlock, PlPgSqlDeclare, PlPgSqlStmt,
     PublicationScope, RaiseLevel, RangeKindAst, ReturnTarget, SelectItem, SelectStatement,
     Statement, TableRef, TriggerEvent, TriggerForEach, TriggerTiming, UnOp, UnionKind, VecEncoding,
@@ -4632,7 +4633,8 @@ impl Parser {
         // v7.39 (round 259) — keep the raw type NAME when the base is not
         // a builtin: it is how `CREATE DOMAIN child AS parent` records its
         // parent domain.
-        let (base_type, _, _, base_user_ref, _, _, _, _, _) = self.parse_type_with_implied_flags()?;
+        let (base_type, _, _, base_user_ref, _, _, _, _, _, _) =
+            self.parse_type_with_implied_flags()?;
         let mut default: Option<Expr> = None;
         let mut not_null = false;
         let mut checks: Vec<Expr> = Vec::new();
@@ -4726,7 +4728,7 @@ impl Parser {
                 // v7.39 (round 264) — keep the raw type name when it is not
                 // a builtin: that is how a NESTED composite field records
                 // which composite it holds.
-                let (field_type, _, _, field_user_ref, _, _, _, _, _) =
+                let (field_type, _, _, field_user_ref, _, _, _, _, _, _) =
                     self.parse_type_with_implied_flags()?;
                 fields.push((field_name, field_type));
                 field_user_types.push(field_user_ref);
@@ -13867,7 +13869,7 @@ impl Parser {
     /// shorthands — callers that don't expect those (ALTER COLUMN
     /// TYPE) can discard them.
     fn parse_column_type_name(&mut self) -> Result<ColumnTypeName, ParseError> {
-        let (ty, _, _, _, _, _, _, _, _) = self.parse_type_with_implied_flags()?;
+        let (ty, _, _, _, _, _, _, _, _, _) = self.parse_type_with_implied_flags()?;
         Ok(ty)
     }
 
@@ -13891,6 +13893,9 @@ impl Parser {
             // v7.17.0 Phase 3.P0-37 — MySQL inline SET variant
             // list. Distinct from ENUM (subset semantics).
             Option<Vec<String>>,
+            // v7.39 (round 386, epic P1) — declared TINYINT / MEDIUMINT
+            // width, lost when the type collapses to SmallInt / Int.
+            Option<MysqlIntWidth>,
         ),
         ParseError,
     > {
@@ -13927,6 +13932,10 @@ impl Parser {
         let mut inline_enum_variants: Option<Vec<String>> = None;
         // v7.17.0 Phase 3.P0-37 — MySQL inline SET variant list.
         let mut inline_set_variants: Option<Vec<String>> = None;
+        // v7.39 (round 386, type-fidelity epic P1) — the declared MySQL
+        // narrow-int width (TINYINT / MEDIUMINT), captured before the type
+        // collapses to SmallInt / Int. Only under the MySQL dialect.
+        let mut mysql_int_width: Option<MysqlIntWidth> = None;
         let mut ty = match ty_ident.as_str() {
             // PG SERIAL family. Implies NOT NULL + AUTO_INCREMENT.
             "smallserial" | "serial2" => {
@@ -13977,10 +13986,23 @@ impl Parser {
                 if width == Some(1) {
                     ColumnTypeName::Bool
                 } else {
+                    // v7.39 (round 386, epic P1) — TINYINT is i8; record the
+                    // lost width so the write path can enforce -128..127.
+                    if self.mysql_dialect {
+                        mysql_int_width = Some(MysqlIntWidth::Tiny);
+                    }
                     ColumnTypeName::SmallInt
                 }
             }
-            "int" | "integer" | "int4" | "mediumint" => {
+            "mediumint" => {
+                self.consume_optional_paren_size();
+                // v7.39 (round 386, epic P1) — MEDIUMINT is 24-bit; record it.
+                if self.mysql_dialect {
+                    mysql_int_width = Some(MysqlIntWidth::Medium);
+                }
+                ColumnTypeName::Int
+            }
+            "int" | "integer" | "int4" => {
                 self.consume_optional_paren_size();
                 ColumnTypeName::Int
             }
@@ -14588,6 +14610,7 @@ impl Parser {
             is_unsigned,
             inline_enum_variants,
             inline_set_variants,
+            mysql_int_width,
         ))
     }
 
@@ -14629,6 +14652,7 @@ impl Parser {
             is_unsigned,
             inline_enum_variants,
             inline_set_variants,
+            mysql_int_width,
         ) = self.parse_type_with_implied_flags()?;
         // Column constraints: `DEFAULT <expr>`, `NOT NULL`, and the
         // MySQL-flavoured `AUTO_INCREMENT` may appear in any order;
@@ -15037,6 +15061,7 @@ impl Parser {
             inline_set_variants,
             generated_stored_expr,
             identity_always,
+            mysql_int_width,
         })
     }
 

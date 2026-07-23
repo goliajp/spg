@@ -61,6 +61,7 @@ pub(crate) fn deserialize_table(
             default_text: None,
             auto_restart: None,
             scalar_row_source: false,
+            mysql_int_width: None,
         });
     }
     let n_cols = cols.len();
@@ -531,6 +532,28 @@ pub(crate) fn deserialize_table(
             let floor = cur.read_i64()?;
             if let Some(col) = t.schema_mut().columns.get_mut(pos) {
                 col.auto_restart = Some(floor);
+            }
+        }
+    }
+    // v7.39 (round 386, type-fidelity epic P1) — mysql_int_width appendix
+    // (FILE_VERSION 81+). Sparse: only TINYINT / MEDIUMINT columns. v80-and-
+    // below catalogs leave every column at None.
+    if version >= 81 {
+        let n = cur.read_u16()? as usize;
+        for _ in 0..n {
+            let pos = cur.read_u16()? as usize;
+            let tag = cur.read_u8()?;
+            let width = match tag {
+                0 => MysqlIntWidth::Tiny,
+                1 => MysqlIntWidth::Medium,
+                other => {
+                    return Err(StorageError::Corrupt(format!(
+                        "unknown mysql_int_width tag {other}"
+                    )));
+                }
+            };
+            if let Some(col) = t.schema_mut().columns.get_mut(pos) {
+                col.mysql_int_width = Some(width);
             }
         }
     }

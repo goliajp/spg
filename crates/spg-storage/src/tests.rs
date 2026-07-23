@@ -987,12 +987,16 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
     // v7.39 (round 220) — and the v73 identity-RESTART appendix: a zero u16
     // count when no column carries a RESTART floor. SEVENTH.
     const EMPTY_RESTART_APPENDIX: usize = 2;
+    // v7.39 (round 386) — and the v81 mysql_int_width appendix: a zero u16
+    // count when no column is a TINYINT / MEDIUMINT. EIGHTH trailing appendix.
+    const EMPTY_MYSQL_INT_WIDTH_APPENDIX: usize = 2;
     let tail_v60plus = EMPTY_CONSTRAINT_NAME_APPENDIX
         + EMPTY_COMPOSITE_APPENDIX
         + EMPTY_OWNER_ACL_APPENDIX
         + EMPTY_COLUMN_ACL_APPENDIX
         + EMPTY_EXCLUSION_APPENDIX
-        + EMPTY_RESTART_APPENDIX;
+        + EMPTY_RESTART_APPENDIX
+        + EMPTY_MYSQL_INT_WIDTH_APPENDIX;
     let mut v52 = Vec::with_capacity(v53.len() - appendix.len() - trailing_v53plus - tail_v60plus);
     v52.extend_from_slice(&v53[..start - trailing_v53plus]);
     v52.extend_from_slice(&v53[start + appendix.len() + tail_v60plus..]);

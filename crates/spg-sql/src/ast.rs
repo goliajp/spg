@@ -2247,6 +2247,13 @@ pub struct ColumnDef {
     /// value into column …") unless the INSERT carries `OVERRIDING SYSTEM
     /// VALUE`. Only meaningful when the column is also an identity column.
     pub identity_always: bool,
+    /// v7.39 (round 386, type-fidelity epic P1) — the declared MySQL narrow
+    /// integer width (TINYINT / MEDIUMINT), captured before the type
+    /// collapses to SmallInt / Int. The engine copies it to
+    /// `ColumnSchema.mysql_int_width` at CREATE TABLE time so the write
+    /// path can enforce the real range. None for every other column and
+    /// under the PG dialect.
+    pub mysql_int_width: Option<MysqlIntWidth>,
 }
 
 /// v7.17.0 Phase 2.5 — text collation classification surfaced
@@ -2261,6 +2268,17 @@ pub struct ColumnDef {
 pub enum Collation {
     Binary,
     CaseInsensitive,
+}
+
+/// v7.39 (round 386, type-fidelity epic P1) — the declared MySQL narrow
+/// integer width for a column whose `ColumnTypeName` is too wide to carry
+/// it: `TINYINT` collapses to `SmallInt`, `MEDIUMINT` to `Int`. Mirrors
+/// `spg_storage::MysqlIntWidth`; the engine bridges the two at CREATE
+/// TABLE time. Only recorded under the MySQL dialect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MysqlIntWidth {
+    Tiny,
+    Medium,
 }
 
 #[allow(clippy::derivable_impls)]
