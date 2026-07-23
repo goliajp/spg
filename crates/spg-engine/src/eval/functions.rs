@@ -5416,6 +5416,36 @@ fn apply_function_dispatch(
             } else {
                 None
             };
+            // v7.39 (round 376) — MySQL indexes a negative start from the
+            // END (`SUBSTRING('abcdef', -2)` is 'ef'), and returns the
+            // empty string for start 0, an out-of-range negative start, or
+            // a negative length — where PG clamps the start to 1 and raises
+            // on a negative length (measured on MariaDB 11).
+            let start = if ctx.mysql_dialect {
+                let empty = || match &args[0] {
+                    Value::Bytes(_) => Value::bytes(Vec::new()),
+                    _ => Value::text(String::new()),
+                };
+                if start == 0 || length.is_some_and(|l| l < 0) {
+                    return Ok(empty());
+                }
+                if start < 0 {
+                    let content_len: i64 = match &args[0] {
+                        Value::Text(s) => s.chars().count() as i64,
+                        Value::Bytes(b) => b.len() as i64,
+                        _ => 0,
+                    };
+                    let shifted = content_len + start + 1;
+                    if shifted < 1 {
+                        return Ok(empty());
+                    }
+                    shifted
+                } else {
+                    start
+                }
+            } else {
+                start
+            };
             // PG: when length is given, end = start + length; if
             // end < start the result is empty. Clip start to 1.
             let (effective_start, effective_length): (i64, Option<i64>) = match length {
