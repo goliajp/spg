@@ -10330,6 +10330,11 @@ fn apply_function_dispatch(
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
+            // v7.39 (round 372) — MySQL's MOD(x, 0) is NULL, not the PG
+            // "division by zero" error (matches `x % 0`).
+            if ctx.mysql_dialect && crate::eval::value_is_zero(&args[1]) {
+                return Ok(Value::Null);
+            }
             // NUMERIC operands: PG returns an exact numeric remainder
             // (`mod(7.5, 2.0) = 1.5`). Align the two scales, then take the
             // truncated i128 remainder (sign of the dividend, like `%`).
