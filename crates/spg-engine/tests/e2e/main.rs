@@ -211,6 +211,7 @@ mod e2e_mysql_collate_binary_round370;
 mod e2e_mysql_collate_expr_round371;
 mod e2e_mysql_mod_zero_round372;
 mod e2e_mysql_date_add_type_round373;
+mod e2e_mysql_concat_null_round374;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;
