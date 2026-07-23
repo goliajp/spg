@@ -2908,13 +2908,16 @@ fn eval_in_list_arm(
     // v7.39 (round 364, M4 P2) — a MySQL session folds text before the
     // membership test, so `t IN ('FOO')` matches 'Foo'. `BINARY` is not
     // reachable through a bare column needle here; the fold is text-only.
-    let needle = mysql_collation_key(eval_expr(expr, row, ctx)?, ctx.mysql_dialect);
+    // v7.39 (round 370, M4 P4a) — an explicit `COLLATE utf8mb4_bin` needle
+    // column is byte-wise, so it does not fold.
+    let in_fold = ctx.mysql_dialect && !resolve::operand_is_binary_column(expr, ctx);
+    let needle = mysql_collation_key(eval_expr(expr, row, ctx)?, in_fold);
     let needle_null = matches!(needle, Value::Null);
     let mut saw_null = needle_null && !list.is_empty();
     let mut matched = false;
     if !needle_null {
         for item in list {
-            let v = mysql_collation_key(eval_expr(item, row, ctx)?, ctx.mysql_dialect);
+            let v = mysql_collation_key(eval_expr(item, row, ctx)?, in_fold);
             if matches!(v, Value::Null) {
                 saw_null = true;
                 continue;
@@ -2981,7 +2984,9 @@ fn eval_like_arm(
     // accent- and case-insensitive, so `LIKE` folds both sides the way
     // `ILIKE` does; the wildcards `%` / `_` are not Latin letters so the
     // fold leaves them alone.
-    let mysql = ctx.mysql_dialect;
+    // v7.39 (round 370, M4 P4a) — an explicit `COLLATE utf8mb4_bin` column
+    // matches byte-wise, so it does not fold.
+    let mysql = ctx.mysql_dialect && !resolve::operand_is_binary_column(expr, ctx);
     let m = if case_insensitive {
         like_match(&text.to_lowercase(), &pat.to_lowercase())?
     } else if mysql {

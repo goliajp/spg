@@ -2201,6 +2201,13 @@ pub struct ColumnDef {
     /// the raw collation name into the variants in `Collation`.
     /// Default `Binary` preserves the legacy compare path.
     pub collation: Collation,
+    /// v7.39 (round 370, M4 P4a) — whether `collation` came from an
+    /// explicit `COLLATE <name>` clause rather than the default. Under the
+    /// MySQL dialect a text column with NO explicit clause takes the
+    /// folding default collation, while an explicit `COLLATE utf8mb4_bin`
+    /// stays byte-wise — and both resolve to `Collation::Binary`, so this
+    /// flag is the only thing that tells them apart.
+    pub collation_explicit: bool,
     /// v7.17.0 Phase 4.4 — MySQL `UNSIGNED` modifier flag. Pre-
     /// 4.4 SPG accepted and discarded the keyword, leaving
     /// negative values silently accepted on a column the

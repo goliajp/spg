@@ -86,7 +86,13 @@ pub(super) fn collation_fold_for_compare(
     // only those touching a `COLLATE case_insensitive` column. `BINARY x`
     // (or `CAST(x AS BINARY)`) still forces byte-wise, which is why the
     // dialect fold is suppressed when either side is binary-coerced.
-    let mysql = ctx.mysql_dialect && !(is_binary_coerced(lhs) || is_binary_coerced(rhs));
+    // v7.39 (round 370, M4 P4a) — an explicit `COLLATE utf8mb4_bin` column
+    // (stored `Binary`) is byte-wise even under the dialect.
+    let any_binary = is_binary_coerced(lhs)
+        || is_binary_coerced(rhs)
+        || operand_is_binary_column(lhs, ctx)
+        || operand_is_binary_column(rhs, ctx);
+    let mysql = ctx.mysql_dialect && !any_binary;
     let lhs_col = column_collation(lhs, ctx);
     let rhs_col = column_collation(rhs, ctx);
     let ci = matches!(lhs_col, Some(spg_storage::Collation::CaseInsensitive))
@@ -152,8 +158,13 @@ pub(super) fn compare_is_case_insensitive(lhs: &Expr, rhs: &Expr, ctx: &EvalCont
     // comparison (see `collation_fold_for_compare`), so it must take the
     // owned path where the fold runs. Non-text operands fold to
     // themselves, so this only costs the mysql dialect the owned route.
+    // v7.39 (round 370, M4 P4a) — EXCEPT when an operand is a column with
+    // an explicit `COLLATE utf8mb4_bin` (stored `Collation::Binary`): that
+    // column is byte-wise, so the comparison does not fold. A folding
+    // default column stores `CaseInsensitive`, so only the explicit binary
+    // column reaches here as `Binary`.
     if ctx.mysql_dialect {
-        return true;
+        return !operand_is_binary_column(lhs, ctx) && !operand_is_binary_column(rhs, ctx);
     }
     matches!(
         column_collation(lhs, ctx),
@@ -169,11 +180,27 @@ pub(super) fn compare_is_case_insensitive(lhs: &Expr, rhs: &Expr, ctx: &EvalCont
 /// side is `BINARY`-coerced (which forces byte-wise). Shared by the
 /// interpreter and the compiled stepper so they cannot disagree.
 pub(super) fn mysql_text_fold_applies(lhs: &Expr, rhs: &Expr, ctx: &EvalContext<'_>) -> bool {
-    ctx.mysql_dialect && !is_binary_coerced(lhs) && !is_binary_coerced(rhs)
+    ctx.mysql_dialect
+        && !is_binary_coerced(lhs)
+        && !is_binary_coerced(rhs)
+        // v7.39 (round 370, M4 P4a) — an explicit `COLLATE utf8mb4_bin`
+        // column stays byte-wise even on the compiled comparison path.
+        && !operand_is_binary_column(lhs, ctx)
+        && !operand_is_binary_column(rhs, ctx)
 }
 
 /// Is this expression coerced to the binary collation — `BINARY x` or
 /// `CAST(x AS BINARY[(n)])`?
+/// v7.39 (round 370, M4 P4a) — is `e` a column REFERENCE whose stored
+/// collation is the explicit byte-wise `Binary` (an explicit `COLLATE
+/// utf8mb4_bin`)? A MySQL folding default column stores `CaseInsensitive`,
+/// and a literal / expression has no column collation, so only a column
+/// deliberately declared binary answers true — and it suppresses the
+/// dialect's default fold.
+pub(super) fn operand_is_binary_column(e: &Expr, ctx: &EvalContext<'_>) -> bool {
+    matches!(column_collation(e, ctx), Some(spg_storage::Collation::Binary))
+}
+
 pub(crate) fn is_binary_coerced(e: &Expr) -> bool {
     matches!(
         e,

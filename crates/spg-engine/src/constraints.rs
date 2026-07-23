@@ -1405,9 +1405,16 @@ fn collated_key_cell(
     // fold the same way the read path (P2) does, or a value the read
     // path treats as a duplicate could still be inserted. A binary-typed
     // column stores `Bytea`, not `Text`, so it naturally keeps both
-    // byte-distinct values — matching MariaDB's VARBINARY UNIQUE. An
-    // explicit `COLLATE utf8mb4_bin` on a text column is P4.
-    if mysql {
+    // byte-distinct values — matching MariaDB's VARBINARY UNIQUE.
+    // v7.39 (round 370, M4 P4a) — an explicit `COLLATE utf8mb4_bin` text
+    // column (stored `Binary`) is byte-wise: its UNIQUE keeps both 'a' and
+    // 'A'. The folding default column stores `CaseInsensitive`, so only an
+    // explicit binary column is `Binary` here and skips the fold.
+    let explicit_binary = schema
+        .columns
+        .get(column_position)
+        .is_some_and(|c| matches!(c.collation, spg_storage::Collation::Binary));
+    if mysql && !explicit_binary {
         match v {
             spg_storage::Value::Text(s) => {
                 return spg_storage::Value::text(spg_storage::mysql_ci_fold(s));
