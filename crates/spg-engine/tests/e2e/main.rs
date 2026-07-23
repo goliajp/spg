@@ -221,6 +221,7 @@ mod e2e_mysql_regexp_op_round380;
 mod e2e_mysql_stddev_pop_round381;
 mod e2e_mysql_extract_string_round382;
 mod e2e_mysql_bitwise_unsigned_round383;
+mod e2e_mysql_bitwise_intctx_round384;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;

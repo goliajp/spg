@@ -897,11 +897,17 @@ fn mysql_bit_u64(v: &Value<'_>) -> Option<u64> {
     }
 }
 
-/// A MySQL bitwise result — a `BIGINT UNSIGNED`. SPG has no unsigned
-/// integer, so the value is a scale-0 NUMERIC, which holds the whole
-/// `0..=2^64-1` range and renders as the plain integer MySQL prints.
+/// A MySQL bitwise result — a `BIGINT UNSIGNED`. It stays a signed
+/// `BigInt` while it fits (so an integer-context consumer — MAKE_SET
+/// bits, ELT / SUBSTRING / REPEAT counts — still takes it); a value past
+/// `i64::MAX` (a set bit 63, e.g. `~5`) has no signed integer type, so it
+/// becomes a scale-0 NUMERIC, which holds the whole `0..=2^64-1` range and
+/// renders as the plain integer MySQL prints.
 fn u64_as_value(n: u64) -> Value<'static> {
-    Value::numeric(i128::from(n), 0)
+    match i64::try_from(n) {
+        Ok(v) => Value::BigInt(v),
+        Err(_) => Value::numeric(i128::from(n), 0),
+    }
 }
 
 /// v7.39 (round 383) — the MySQL bitwise operators on UNSIGNED 64-bit
