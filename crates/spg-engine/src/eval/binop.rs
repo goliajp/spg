@@ -2985,6 +2985,12 @@ pub(crate) fn apply_binary_in(
     if let Some(v) = super::mysql_true_division(op, &l, &r) {
         return Ok(v);
     }
+    // v7.39 (round 383) — `& | ^ << >>` are UNSIGNED 64-bit here, and
+    // `^` reaches this path as BitXor (the parser maps `^` to XOR under
+    // the MySQL dialect, not PG's `power`).
+    if let Some(v) = super::mysql_bitwise(op, &l, &r) {
+        return Ok(v);
+    }
     apply_binary(op, l, r)
 }
 

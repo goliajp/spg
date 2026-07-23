@@ -855,6 +855,87 @@ pub(crate) fn mysql_true_division(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Op
     })
 }
 
+/// v7.39 (round 383) — the UNSIGNED 64-bit value a MySQL bitwise operand
+/// reads as. MySQL's `& | ^ ~ << >>` all work on `BIGINT UNSIGNED`, so an
+/// operand is its 64-bit two's-complement pattern (a negative integer:
+/// `-5` is `0xFFFF…FB`), rounded to the nearest integer (a float / numeric:
+/// `2.9` is 3), its big-endian value (a `0x…` binary string), or its
+/// leading number (a string). Anything else (an inet, a range, a
+/// bit-string) returns None so the operator keeps its own meaning.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn mysql_bit_u64(v: &Value<'_>) -> Option<u64> {
+    match v {
+        Value::SmallInt(n) => Some(i64::from(*n) as u64),
+        Value::Int(n) => Some(i64::from(*n) as u64),
+        Value::BigInt(n) => Some(*n as u64),
+        Value::Bool(b) => Some(u64::from(*b)),
+        Value::Float(x) => Some(x.round() as i64 as u64),
+        Value::Real(x) => Some(f64::from(*x).round() as i64 as u64),
+        Value::Numeric {
+            scaled,
+            scale,
+            kind: spg_storage::NumericKind::Finite,
+        } => {
+            // Round half away from zero to an integer, then take the low
+            // 64 bits (two's complement) — `~2.9` is `~3`.
+            if *scale > 38 {
+                return None;
+            }
+            let div = 10i128.pow(u32::from(*scale));
+            let q = scaled / div;
+            let rem = scaled % div;
+            let rounded = if rem.unsigned_abs() * 2 >= div.unsigned_abs() {
+                q + scaled.signum()
+            } else {
+                q
+            };
+            Some(rounded as u64)
+        }
+        Value::Bytes(b) => mysql_bit_u64(&mysql_bytes_as_number(b)),
+        Value::Text(s) => mysql_bit_u64(&mysql_number_of(s)),
+        _ => None,
+    }
+}
+
+/// A MySQL bitwise result — a `BIGINT UNSIGNED`. SPG has no unsigned
+/// integer, so the value is a scale-0 NUMERIC, which holds the whole
+/// `0..=2^64-1` range and renders as the plain integer MySQL prints.
+fn u64_as_value(n: u64) -> Value<'static> {
+    Value::numeric(i128::from(n), 0)
+}
+
+/// v7.39 (round 383) — the MySQL bitwise operators on UNSIGNED 64-bit
+/// integers. Returns None when either operand is not number-like (so an
+/// `inet << int` / `bit(n) & bit(n)` / geometric `#` keeps its own path)
+/// or the operator is not bitwise. A shift of 64 or more is 0 (MySQL does
+/// not mask the shift count).
+pub(crate) fn mysql_bitwise(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Option<Value<'static>> {
+    let out = match op {
+        BinOp::BitAnd => mysql_bit_u64(l)? & mysql_bit_u64(r)?,
+        BinOp::BitOr => mysql_bit_u64(l)? | mysql_bit_u64(r)?,
+        BinOp::BitXor => mysql_bit_u64(l)? ^ mysql_bit_u64(r)?,
+        // `<<` / `>>` share the inet-containment BinOps; a numeric pair is a
+        // shift, anything else stays inet / range / bit-string.
+        BinOp::InetContainedBy => {
+            let (a, n) = (mysql_bit_u64(l)?, mysql_bit_u64(r)?);
+            if n >= 64 { 0 } else { a << n }
+        }
+        BinOp::InetContains => {
+            let (a, n) = (mysql_bit_u64(l)?, mysql_bit_u64(r)?);
+            if n >= 64 { 0 } else { a >> n }
+        }
+        _ => return None,
+    };
+    Some(u64_as_value(out))
+}
+
+/// v7.39 (round 383) — MySQL unary `~x`: the UNSIGNED 64-bit complement
+/// (`~5` is 18446744073709551610). None for a non-number operand (a
+/// bit-string / inet / macaddr keeps PG's typed complement).
+pub(crate) fn mysql_bit_not(v: &Value<'_>) -> Option<Value<'static>> {
+    Some(u64_as_value(!mysql_bit_u64(v)?))
+}
+
 /// v7.39 (round 372) — is `v` a numeric zero (any width / kind)? Used to
 /// route `x % 0` / `MOD(x, 0)` to NULL under the MySQL dialect.
 pub(crate) fn value_is_zero(v: &Value<'_>) -> bool {
@@ -877,6 +958,29 @@ fn mysql_negate_text(
 ) -> Option<Result<Value<'static>, EvalError>> {
     match v {
         Value::Text(t) => Some(apply_unary(op, mysql_number_of(t))),
+        _ => None,
+    }
+}
+
+/// The MySQL reading of a unary operator, or None to let `apply_unary` (the
+/// PG path) run. Kept out of `eval_expr`'s recursive frame — see the
+/// round-383 frame cliff. Covers `NOT` on any truth value (round 346),
+/// `-'str'` numeric negation (round 351), and the unsigned `~` complement
+/// (round 383).
+#[inline(never)]
+fn mysql_unary_arm(
+    op: spg_sql::ast::UnOp,
+    v: &Value<'static>,
+) -> Option<Result<Value<'static>, EvalError>> {
+    use spg_sql::ast::UnOp;
+    match op {
+        // `NOT 5` is 0 — read any non-bool as a truth value; a bool / NULL
+        // keeps the PG path (still refused there for non-bool).
+        UnOp::Not if !matches!(v, Value::Bool(_) | Value::Null) => Some(mysql_not(v)),
+        // `-'5'` is -5, `-'abc'` is 0.
+        UnOp::Neg => mysql_negate_text(op, v),
+        // `~5` is the unsigned 64-bit complement; NULL stays NULL (PG path).
+        UnOp::BitNot if !matches!(v, Value::Null) => mysql_bit_not(v).map(Ok),
         _ => None,
     }
 }
@@ -3389,20 +3493,13 @@ pub fn eval_expr(
         }
         Expr::Unary { op, expr } => {
             let v = eval_expr(expr, row, ctx)?;
-            // v7.39 (round 346, M1) — MariaDB negates any truth value
-            // (`NOT 5` is 0, measured). The dialect is known here and not
-            // down in apply_unary, so the operand is read as a truth value
-            // first; the PG path is untouched and still refuses it.
-            if ctx.mysql_dialect
-                && matches!(op, spg_sql::ast::UnOp::Not)
-                && !matches!(v, Value::Bool(_) | Value::Null)
-            {
-                return mysql_not(&v);
-            }
-            // v7.39 (round 351, M11) — `-'5'` is -5 and `-'abc'` is 0 in
-            // MariaDB (measured); it was `operator does not exist: - text`.
-            if ctx.mysql_dialect && matches!(op, spg_sql::ast::UnOp::Neg) {
-                if let Some(r) = mysql_negate_text(*op, &v) {
+            // The MySQL-specific unary readings (NOT any truth value, `-`/`~`
+            // on a string, `~` unsigned) live out-of-line: `eval_expr` is the
+            // recursive frame the 768 KiB stack-depth budget is tuned
+            // against, and locals added here cost one nesting level each (the
+            // round-305 / round-383 frame cliff).
+            if ctx.mysql_dialect {
+                if let Some(r) = mysql_unary_arm(*op, &v) {
                     return r;
                 }
             }

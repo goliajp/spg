@@ -230,6 +230,25 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             None => steps.push(Step::Subtree(e.clone())),
         },
         Expr::Binary { lhs, op, rhs } => {
+            // v7.39 (round 383) — the MySQL bitwise operators are UNSIGNED
+            // 64-bit (`~ & | ^ << >>`); the VM's Step::Binary calls the
+            // dialect-blind apply_binary, so route them to the interpreter,
+            // which has the dialect (eval.rs `mysql_bitwise`). `<< >>` share
+            // the inet-containment BinOps — the interpreter still keeps the
+            // inet meaning for non-numeric operands.
+            if ctx.mysql_dialect
+                && matches!(
+                    op,
+                    BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                        | BinOp::InetContainedBy
+                        | BinOp::InetContains
+                )
+            {
+                steps.push(Step::Subtree(e.clone()));
+                return;
+            }
             let cmp = matches!(
                 op,
                 BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
@@ -268,6 +287,13 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             });
         }
         Expr::Unary { op, expr } => {
+            // v7.39 (round 383) — MySQL `~x` is the UNSIGNED 64-bit
+            // complement; route to the interpreter (eval.rs `mysql_bit_not`)
+            // since Step::Unary calls the dialect-blind apply_unary.
+            if ctx.mysql_dialect && matches!(op, UnOp::BitNot) {
+                steps.push(Step::Subtree(e.clone()));
+                return;
+            }
             compile_into(expr, ctx, steps);
             steps.push(Step::Unary(*op));
         }
