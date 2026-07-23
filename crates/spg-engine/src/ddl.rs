@@ -2135,9 +2135,12 @@ impl Engine {
             // so a validation failure must ROLL IT BACK. PG's CREATE UNIQUE
             // INDEX is atomic; SPG used to leave the half-built index in the
             // catalog (pg_indexes listed an index that "failed" to create).
-            if let Err(e) =
-                check_existing_unique_violation(idx_ref, &snapshot_schema, &snapshot_rows)
-            {
+            if let Err(e) = check_existing_unique_violation(
+                idx_ref,
+                &snapshot_schema,
+                &snapshot_rows,
+                self.backslash_escapes,
+            ) {
                 let name = stmt.name.clone();
                 self.active_catalog_mut().drop_named_index(&name);
                 return Err(e);
