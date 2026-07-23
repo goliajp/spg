@@ -218,6 +218,7 @@ mod e2e_mysql_charset_fn_round377;
 mod e2e_mysql_week_mode_round378;
 mod e2e_mysql_generated_short_round379;
 mod e2e_mysql_regexp_op_round380;
+mod e2e_mysql_stddev_pop_round381;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;
