@@ -1417,7 +1417,7 @@ fn collated_key_cell(
     if mysql && !explicit_binary {
         match v {
             spg_storage::Value::Text(s) => {
-                return spg_storage::Value::text(spg_storage::mysql_ci_fold(s));
+                return spg_storage::Value::text(spg_storage::mysql_compare_fold(s));
             }
             spg_storage::Value::BpChar(s) => {
                 return spg_storage::Value::text(spg_storage::mysql_ci_fold(
