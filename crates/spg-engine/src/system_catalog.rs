@@ -313,13 +313,28 @@ pub(crate) fn synth_information_schema_columns(
         ColumnSchema::new("is_generated", DataType::Text, false),
         ColumnSchema::new("generation_expression", DataType::Text, true),
     ];
+    // v7.39 (round 362, M18) — MySQL's `information_schema.columns` has a
+    // `column_type` column PG has no equivalent of: the full declared
+    // type WITH its display width (`int(11)`, `varchar(10)`,
+    // `decimal(10,2)`), which SQLAlchemy's mysql reflection reads to
+    // recover a column's length and unsigned-ness. It is appended only in
+    // the MySQL dialect, so the view's shape stays PG's on a PG session
+    // (a PG query naming `column_type` still errors, as it does in PG).
+    let mut schema = schema;
+    if mysql {
+        schema.push(ColumnSchema::new("column_type", DataType::Text, false));
+    }
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for (i, col) in t.schema().columns.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
             let ordinal = (i + 1) as i32;
-            rows.push(info_column_row(&tname, ordinal, col, None, mysql));
+            let mut row = info_column_row(&tname, ordinal, col, None, mysql);
+            if mysql {
+                row.values.push(Value::text(crate::show::render_mysql_type(col.ty)));
+            }
+            rows.push(row);
         }
     }
     // v7.39 (round 268) — view columns. The view reported NO rows for a
@@ -337,7 +352,11 @@ pub(crate) fn synth_information_schema_columns(
             #[allow(clippy::cast_possible_wrap)]
             let ordinal = (i + 1) as i32;
             let writable = updatable && simple.iter().any(|n| n == &col.name);
-            rows.push(info_column_row(vname, ordinal, col, Some(writable), mysql));
+            let mut row = info_column_row(vname, ordinal, col, Some(writable), mysql);
+            if mysql {
+                row.values.push(Value::text(crate::show::render_mysql_type(col.ty)));
+            }
+            rows.push(row);
         }
     }
     (schema, rows)

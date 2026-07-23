@@ -512,7 +512,7 @@ pub(crate) fn render_create_table(name: &str, columns: &[ColumnSchema]) -> Strin
 
 /// v7.39 (round 358, M16) — MySQL's spelling of a column type: lower
 /// case, with the display width MariaDB prints (`int(11)`, `bigint(20)`).
-fn render_mysql_type(ty: DataType) -> String {
+pub(crate) fn render_mysql_type(ty: DataType) -> String {
     match ty {
         DataType::SmallInt => "smallint(6)".into(),
         DataType::Int => "int(11)".into(),
