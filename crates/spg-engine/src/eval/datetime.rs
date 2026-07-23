@@ -850,6 +850,83 @@ fn day_of_year(y: i32, mo: u32, d: u32) -> u32 {
     CUM[(mo - 1) as usize] + d + u32::from(leap && mo > 2)
 }
 
+/// v7.39 (round 378) — MySQL `WEEK(date, mode)` / `YEARWEEK(date, mode)`
+/// with the full 0..7 mode set. Returns `(year, week)`. The mode bits:
+/// `1` = weeks start Monday (else Sunday); `2` = "with year" (a leading
+/// partial week rolls into the previous year's last week instead of being
+/// week 0); `4` = week 1 is the first week that contains the year's first
+/// week-start day (else the first week with 4+ days this year). Clean-room
+/// from those documented rules, validated against MariaDB 11 across the
+/// measured dates (2020/2021 Jan 1, mid-year, Dec 31). PG has no WEEK mode.
+pub(crate) fn mysql_calc_week(days: i32, mode: u32) -> (i32, u32) {
+    // MySQL normalises the mode first: when Monday-first is NOT set, the
+    // "first weekday" bit is flipped, so mode 0 means "week 1 is the first
+    // week containing a Sunday", mode 4 means "first week with 4+ days",
+    // etc. (this is MySQL's `week_mode`).
+    let mode = {
+        let m = mode & 7;
+        if m & 1 == 0 {
+            m ^ 4
+        } else {
+            m
+        }
+    };
+    let monday_first = mode & 1 != 0;
+    let mut week_year = mode & 2 != 0;
+    let first_weekday = mode & 4 != 0;
+    // Weekday of a day number, 0 = the week's first day (Monday or Sunday).
+    let weekday = |dn: i32| -> i32 {
+        if monday_first {
+            (dn + 3).rem_euclid(7)
+        } else {
+            (dn + 4).rem_euclid(7)
+        }
+    };
+    let days_in_year = |yr: i32| -> i32 {
+        if (yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0 {
+            366
+        } else {
+            365
+        }
+    };
+    // Does the year's first week start with a leading partial (so the
+    // year's first `wd` days belong to the previous week)? Mirrors MySQL's
+    // `(first_weekday && weekday != 0) || (!first_weekday && weekday >= 4)`.
+    let partial_before = |wd: i32| -> bool {
+        if first_weekday {
+            wd != 0
+        } else {
+            wd >= 4
+        }
+    };
+    let (mut year, mo, d) = civil_from_days(days);
+    let mut first_daynr = days_from_civil(year, 1, 1);
+    let mut wd = weekday(first_daynr);
+    if mo == 1 && i32::try_from(d).unwrap_or(1) <= 7 - wd {
+        if !week_year && partial_before(wd) {
+            return (year, 0);
+        }
+        week_year = true;
+        year -= 1;
+        let diy = days_in_year(year);
+        first_daynr -= diy;
+        wd = (wd + 7 - diy.rem_euclid(7)).rem_euclid(7);
+    }
+    let offset = if partial_before(wd) {
+        days - (first_daynr + (7 - wd))
+    } else {
+        days - (first_daynr - wd)
+    };
+    if week_year && offset >= 52 * 7 {
+        let diy = days_in_year(year);
+        let wd_end = (wd + diy).rem_euclid(7);
+        if !partial_before(wd_end) {
+            return (year + 1, 1);
+        }
+    }
+    (year, u32::try_from(offset / 7 + 1).unwrap_or(1))
+}
+
 /// `%U` / `%u`: 00-based week, counting from the year's first Sunday (or
 /// Monday). Verified against MariaDB for all nine measured dates.
 fn week_of_year(y: i32, mo: u32, d: u32, days: i32, monday_first: bool) -> u32 {
