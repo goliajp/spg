@@ -14670,6 +14670,37 @@ impl Parser {
                 let _name = self.expect_ident_like()?;
                 continue;
             }
+            // v7.39 (round 379) — MySQL's SHORT generated-column form
+            // omits `GENERATED ALWAYS`: `<col> <type> AS (<expr>)
+            // [STORED | VIRTUAL]`. mysqldump emits the long form (handled
+            // below), but hand-written schemas and app migrations use this.
+            // STORED / VIRTUAL is optional (MySQL defaults to VIRTUAL);
+            // SPG computes-and-stores either way, like the long form.
+            if matches!(self.peek(), Token::As) {
+                self.advance();
+                if !matches!(self.peek(), Token::LParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected '(' after AS in a generated column, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let expr = self.parse_expr(0)?;
+                if !matches!(self.peek(), Token::RParen) {
+                    return Err(self.err(alloc::format!(
+                        "expected ')' after AS (<expr>), got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                if matches!(self.peek(), Token::Ident(s)
+                    if s.eq_ignore_ascii_case("stored") || s.eq_ignore_ascii_case("virtual"))
+                {
+                    self.advance();
+                }
+                generated_stored_expr = Some(alloc::boxed::Box::new(expr));
+                continue;
+            }
             // v7.22 (round-13 T2) — inline `GENERATED { ALWAYS |
             // BY DEFAULT } AS IDENTITY [(seq options)]` (PG 10+;
             // the modern replacement for SERIAL in hand-written
