@@ -1391,7 +1391,13 @@ impl Engine {
                     }
                 }
             }
-            enforce_unique_updates(self.active_catalog(), &stmt.table, &planned, &changed_cols)?;
+            enforce_unique_updates(
+                self.active_catalog(),
+                &stmt.table,
+                &planned,
+                &changed_cols,
+                self.backslash_escapes,
+            )?;
             // v7.39 (round 210) — EXCLUDE constraints on the post-update rows;
             // each updated row's pre-image is excluded from the scan.
             let exclusions = self
@@ -4144,8 +4150,15 @@ impl Engine {
         // Both run on the post-ON-CONFLICT row set: conflicting rows
         // already left `all_values` (DO NOTHING drop / DO UPDATE
         // reroute), so what remains must be genuinely unique.
-        enforce_uniqueness_inserts(self.active_catalog(), &stmt.table, &uniqueness, &all_values)?;
-        enforce_unique_index_inserts(self.active_catalog(), &stmt.table, &all_values)?;
+        let mysql = self.backslash_escapes;
+        enforce_uniqueness_inserts(
+            self.active_catalog(),
+            &stmt.table,
+            &uniqueness,
+            &all_values,
+            mysql,
+        )?;
+        enforce_unique_index_inserts(self.active_catalog(), &stmt.table, &all_values, mysql)?;
         crate::constraints::enforce_exclusion_inserts(
             self.active_catalog(),
             &stmt.table,

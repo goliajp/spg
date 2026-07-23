@@ -661,8 +661,17 @@ fn uc_probe_index<'t>(
     table: &'t spg_storage::Table,
     columns: &[usize],
     nulls_not_distinct: bool,
+    mysql: bool,
 ) -> Option<&'t spg_storage::Index> {
     if nulls_not_distinct || columns.is_empty() {
+        return None;
+    }
+    // v7.39 (round 365, M4 P3) — under the folding MySQL dialect the
+    // btree probe can't be used: it looks a candidate up by its RAW
+    // leading value, so `'a'` and `'A'` (byte-distinct, fold-equal) never
+    // meet. Fall to the whole-table fold path, exactly as a
+    // CaseInsensitive column already does below.
+    if mysql {
         return None;
     }
     let schema = table.schema();
@@ -722,6 +731,7 @@ pub(crate) fn enforce_uniqueness_inserts(
     child_table: &str,
     constraints: &[spg_storage::UniquenessConstraint],
     rows: &[Vec<Value<'static>>],
+    mysql: bool,
 ) -> Result<(), EngineError> {
     if constraints.is_empty() {
         return Ok(());
@@ -747,7 +757,7 @@ pub(crate) fn enforce_uniqueness_inserts(
                 .iter()
                 .map(|&i| {
                     let v = values.get(i).cloned().unwrap_or(Value::Null);
-                    collated_key_cell(&v, i, schema)
+                    collated_key_cell(&v, i, schema, mysql)
                 })
                 .collect()
         };
@@ -757,7 +767,7 @@ pub(crate) fn enforce_uniqueness_inserts(
         // installs it) is maintained incrementally on every write, so
         // a probe is O(log n) per row — this was the 6.3ms/row (94%)
         // component of the r164 write losses.
-        if let Some(idx) = uc_probe_index(table, &uc.columns, uc.nulls_not_distinct) {
+        if let Some(idx) = uc_probe_index(table, &uc.columns, uc.nulls_not_distinct, mysql) {
             let mut batch_seen: hashbrown::HashSet<String> =
                 hashbrown::HashSet::with_capacity(rows.len());
             let mut probe_ok = true;
@@ -1388,7 +1398,28 @@ fn collated_key_cell(
     v: &spg_storage::Value,
     column_position: usize,
     schema: &spg_storage::TableSchema,
+    mysql: bool,
 ) -> spg_storage::Value<'static> {
+    // v7.39 (round 364/365, M4 P2/P3) — the MySQL dialect's default
+    // collation folds case AND accent, so its UNIQUE / index keys must
+    // fold the same way the read path (P2) does, or a value the read
+    // path treats as a duplicate could still be inserted. A binary-typed
+    // column stores `Bytea`, not `Text`, so it naturally keeps both
+    // byte-distinct values — matching MariaDB's VARBINARY UNIQUE. An
+    // explicit `COLLATE utf8mb4_bin` on a text column is P4.
+    if mysql {
+        match v {
+            spg_storage::Value::Text(s) => {
+                return spg_storage::Value::text(spg_storage::mysql_ci_fold(s));
+            }
+            spg_storage::Value::BpChar(s) => {
+                return spg_storage::Value::text(spg_storage::mysql_ci_fold(
+                    s.trim_end_matches(' '),
+                ));
+            }
+            _ => return v.clone().into_owned(),
+        }
+    }
     match (v, schema.columns.get(column_position).map(|c| c.collation)) {
         (spg_storage::Value::Text(s), Some(spg_storage::Collation::CaseInsensitive)) => {
             spg_storage::Value::text(s.to_ascii_lowercase())
@@ -1423,6 +1454,7 @@ pub(crate) fn check_existing_unique_violation(
     idx: &spg_storage::Index,
     schema: &spg_storage::TableSchema,
     rows: &[spg_storage::Row<'static>],
+    mysql: bool,
 ) -> Result<(), EngineError> {
     let predicate_expr = match idx.partial_predicate.as_deref() {
         Some(s) => Some(spg_sql::parser::parse_expression(s).map_err(|e| {
@@ -1455,7 +1487,7 @@ pub(crate) fn check_existing_unique_violation(
                     .get(p)
                     .cloned()
                     .unwrap_or(spg_storage::Value::Null);
-                collated_key_cell(&v, p, schema)
+                collated_key_cell(&v, p, schema, mysql)
             })
             .collect();
         // v7.39 (read01 round 52) — NULLS NOT DISTINCT keeps NULL keys in the
@@ -1497,6 +1529,7 @@ pub(crate) fn enforce_unique_index_inserts(
     catalog: &Catalog,
     table_name: &str,
     rows: &[alloc::vec::Vec<spg_storage::Value<'static>>],
+    mysql: bool,
 ) -> Result<(), EngineError> {
     let table = catalog.get(table_name).ok_or_else(|| {
         EngineError::Storage(StorageError::TableNotFound {
@@ -1551,7 +1584,7 @@ pub(crate) fn enforce_unique_index_inserts(
                 .iter()
                 .map(|&p| {
                     let v = values.get(p).cloned().unwrap_or(spg_storage::Value::Null);
-                    collated_key_cell(&v, p, schema)
+                    collated_key_cell(&v, p, schema, mysql)
                 })
                 .collect())
         };
@@ -1580,21 +1613,23 @@ pub(crate) fn enforce_unique_index_inserts(
             && matches!(idx.kind, spg_storage::IndexKind::BTree(_))
         {
             let positions = unique_key_positions(idx);
-            let schema_ok = positions.iter().all(|&i| {
-                schema.columns.get(i).is_some_and(|c| {
-                    !matches!(c.collation, spg_storage::Collation::CaseInsensitive)
+            let schema_ok = !mysql
+                && positions.iter().all(|&i| {
+                    schema.columns.get(i).is_some_and(|c| {
+                        !matches!(c.collation, spg_storage::Collation::CaseInsensitive)
+                    })
                 })
-            }) && schema
-                .columns
-                .get(idx.column_position)
-                .is_some_and(|c| indexkeyable_type(&c.ty));
+                && schema
+                    .columns
+                    .get(idx.column_position)
+                    .is_some_and(|c| indexkeyable_type(&c.ty));
             if schema_ok {
                 let fold = |values: &[spg_storage::Value<'static>]| -> Vec<spg_storage::Value<'static>> {
                     positions
                         .iter()
                         .map(|&p| {
                             let v = values.get(p).cloned().unwrap_or(spg_storage::Value::Null);
-                            collated_key_cell(&v, p, schema)
+                            collated_key_cell(&v, p, schema, mysql)
                         })
                         .collect()
                 };
@@ -1726,13 +1761,14 @@ fn probe_replay(
     schema: &spg_storage::TableSchema,
     key_str: &KeyStrFn<'_>,
     on_conflict: &dyn Fn(usize) -> EngineError,
+    mysql: bool,
 ) -> Result<bool, EngineError> {
     let fold = |values: &[Value<'static>]| -> Vec<Value<'static>> {
         columns
             .iter()
             .map(|&i| {
                 let v = values.get(i).cloned().unwrap_or(Value::Null);
-                collated_key_cell(&v, i, schema)
+                collated_key_cell(&v, i, schema, mysql)
             })
             .collect()
     };
@@ -1779,6 +1815,7 @@ pub(crate) fn enforce_unique_updates(
     table_name: &str,
     planned: &[(usize, Vec<Value<'static>>)],
     changed_cols: &hashbrown::HashSet<usize>,
+    mysql: bool,
 ) -> Result<(), EngineError> {
     if planned.is_empty() {
         return Ok(());
@@ -1839,7 +1876,7 @@ pub(crate) fn enforce_unique_updates(
                 .iter()
                 .map(|&i| {
                     let v = values.get(i).cloned().unwrap_or(Value::Null);
-                    collated_key_cell(&v, i, schema)
+                    collated_key_cell(&v, i, schema, mysql)
                 })
                 .collect();
             if key.iter().any(|v| matches!(v, Value::Null)) && !uc.nulls_not_distinct {
@@ -1867,8 +1904,17 @@ pub(crate) fn enforce_unique_updates(
             ))
         };
         // v7.39 (round 166, attack A3) — probe path first.
-        if let Some(pidx) = uc_probe_index(table, &uc.columns, uc.nulls_not_distinct)
-            && probe_replay(table, pidx, &uc.columns, planned, schema, &key_str, &on_conflict)?
+        if let Some(pidx) = uc_probe_index(table, &uc.columns, uc.nulls_not_distinct, mysql)
+            && probe_replay(
+                table,
+                pidx,
+                &uc.columns,
+                planned,
+                schema,
+                &key_str,
+                &on_conflict,
+                mysql,
+            )?
         {
             continue;
         }
@@ -1938,7 +1984,7 @@ pub(crate) fn enforce_unique_updates(
                     .iter()
                     .map(|&p| {
                         let v = values.get(p).cloned().unwrap_or(Value::Null);
-                        collated_key_cell(&v, p, schema)
+                        collated_key_cell(&v, p, schema, mysql)
                     })
                     .collect()
             };
@@ -1957,7 +2003,8 @@ pub(crate) fn enforce_unique_updates(
         // v7.39 (round 166, attack A3) — a plain unique index probes its
         // own btree (expression / partial / NULLS-NOT-DISTINCT / collated
         // shapes stay on the fold replay).
-        if !is_expr_or_partial
+        if !mysql
+            && !is_expr_or_partial
             && !idx.nulls_not_distinct
             && matches!(idx.kind, spg_storage::IndexKind::BTree(_))
             && key_positions.iter().all(|&i| {
@@ -1977,6 +2024,7 @@ pub(crate) fn enforce_unique_updates(
                 schema,
                 &key_str,
                 &on_conflict,
+                mysql,
             )?
         {
             continue;
