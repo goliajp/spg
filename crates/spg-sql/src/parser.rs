@@ -18212,6 +18212,9 @@ impl Parser {
                 4,
             ),
             Token::CaretAt => (Sym::StartsWith, 4),
+            // PG `^` is exponentiation; MySQL `^` is bitwise XOR (and binds
+            // tighter than `* / & |`, which the prec-8 rung preserves).
+            Token::Caret if self.mysql_dialect => (Sym::Xor, 8),
             Token::Caret => (Sym::Power, 8),
             Token::Hash => (Sym::Xor, 6),
             Token::Adjacent => (Sym::RangeAdjacent, 4),
