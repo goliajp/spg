@@ -5792,6 +5792,31 @@ fn apply_function_dispatch(
         // MySQL ord(s) — the code of the first character: for
         // multi-byte chars, its UTF-8 bytes read as a big-endian
         // number (matches MySQL's utf8mb4 behavior).
+        // v7.39 (round 377) — MySQL introspection: CHARSET(x) / COLLATION(x)
+        // report the argument's character set / collation. SPG stores text
+        // as UTF-8 with the folding default collation, so a text-typed
+        // argument is `utf8mb4` / `utf8mb4_uca1400_ai_ci`; a number or a
+        // binary string is `binary` / `binary` (measured on MariaDB 11).
+        // PG has no such functions, so this only resolves under the dialect.
+        "charset" | "collation" if ctx.mysql_dialect => {
+            if args.len() != 1 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
+                });
+            }
+            let is_text = matches!(
+                &args[0],
+                Value::Text(_) | Value::Json(_) | Value::BpChar(_)
+            );
+            let out = if name == "charset" {
+                if is_text { "utf8mb4" } else { "binary" }
+            } else if is_text {
+                "utf8mb4_uca1400_ai_ci"
+            } else {
+                "binary"
+            };
+            Ok(Value::text(out))
+        }
         "ord" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
