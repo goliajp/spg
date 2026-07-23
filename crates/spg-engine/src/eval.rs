@@ -3046,6 +3046,13 @@ fn eval_extract_arm(
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     let v = eval_expr(source, row, ctx)?;
+    // v7.39 (round 382) — MySQL coerces a date/time STRING to its temporal
+    // value for EXTRACT (`EXTRACT(YEAR FROM '2020-05-15')` is 2020, and the
+    // time fields read a `'... HH:MM:SS'` string); PG needs a typed source.
+    let v = match &v {
+        Value::Text(s) if ctx.mysql_dialect => text_as_temporal(s).unwrap_or(v),
+        _ => v,
+    };
     // v7.39 (tz epic) — timezone[_hour|_minute] of a timestamptz
     // reports the SESSION offset at that instant (PG: 32400 for
     // Tokyo; -14400 for New York in July).
