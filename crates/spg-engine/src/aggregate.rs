@@ -1513,11 +1513,20 @@ fn accumulate_groups(
         p.and_then(|i| schema_cols.get(i))
             .is_some_and(|c| matches!(c.collation, spg_storage::Collation::Binary))
     };
-    let mysql_fold_groups: bool =
-        ctx.mysql_dialect && !group_pos.iter().any(|&p| is_binary_key_col(p));
-    let distinct_fold: Vec<bool> = arg_pos
+    // v7.39 (round 371, M4 P4b) — a per-expression `… COLLATE utf8mb4_bin`
+    // / `BINARY …` key is byte-wise too, so its GROUP BY / DISTINCT does
+    // not fold. The clause lowers to a `binary` cast the parser emits.
+    let mysql_fold_groups: bool = ctx.mysql_dialect
+        && !group_pos.iter().any(|&p| is_binary_key_col(p))
+        && !group_exprs.iter().any(|e| crate::eval::is_binary_coerced(e));
+    let distinct_fold: Vec<bool> = agg_specs
         .iter()
-        .map(|&p| ctx.mysql_dialect && !is_binary_key_col(p))
+        .enumerate()
+        .map(|(i, spec)| {
+            ctx.mysql_dialect
+                && !is_binary_key_col(arg_pos[i])
+                && !spec.arg.as_ref().is_some_and(|e| crate::eval::is_binary_coerced(e))
+        })
         .collect();
     // v7.37.x (mailrs Track A 100k attack) — dedicated tight loop
     // for the "single-Text GROUP BY + single MAX(bound numeric arg)"
