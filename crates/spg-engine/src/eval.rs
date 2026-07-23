@@ -783,7 +783,7 @@ fn is_numeric_type(t: spg_storage::DataType) -> bool {
 /// whose comparisons do not pass through `collation_fold_for_compare`.
 fn mysql_collation_key(v: Value<'static>, mysql: bool) -> Value<'static> {
     match v {
-        Value::Text(s) if mysql => Value::text(spg_storage::mysql_ci_fold(&s)),
+        Value::Text(s) if mysql => Value::text(spg_storage::mysql_compare_fold(&s)),
         other => other,
     }
 }

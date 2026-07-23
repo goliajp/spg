@@ -902,7 +902,7 @@ where
                 // its ASCII-only contract.
                 let fold = |v: Value<'static>| match v {
                     Value::Text(s) if ctx.mysql_dialect => {
-                        Value::text(spg_storage::mysql_ci_fold(&s))
+                        Value::text(spg_storage::mysql_compare_fold(&s))
                     }
                     Value::Text(s) => Value::text(s.to_ascii_lowercase()),
                     other => other,

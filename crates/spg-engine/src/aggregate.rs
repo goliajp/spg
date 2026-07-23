@@ -2452,7 +2452,7 @@ fn accumulate_groups(
                         // v7.39 (round 370, M4 P4a) — but an explicit
                         // `COLLATE utf8mb4_bin` column de-dups byte-wise.
                         if distinct_fold[i] {
-                            let k = spg_storage::mysql_ci_fold(s);
+                            let k = spg_storage::mysql_compare_fold(s);
                             if entry.1[i].seen.contains(k.as_str()) {
                                 continue;
                             }
@@ -2983,7 +2983,7 @@ fn accumulate_groups(
                     // (stored CaseInsensitive) folds case AND accent; a PG
                     // CITEXT column stays ASCII-only.
                     key_vals[i] = Value::text(if ctx.mysql_dialect {
-                        spg_storage::mysql_ci_fold(s)
+                        spg_storage::mysql_compare_fold(s)
                     } else {
                         s.to_ascii_lowercase()
                     });
@@ -5595,7 +5595,7 @@ fn encode_one_in(out: &mut String, v: &Value, mysql: bool) {
     use core::fmt::Write;
     if mysql {
         if let Value::Text(s) | Value::Json(s) = v {
-            let _ = write!(out, "S{}|", spg_storage::mysql_ci_fold(s));
+            let _ = write!(out, "S{}|", spg_storage::mysql_compare_fold(s));
             return;
         }
         if let Value::BpChar(s) = v {

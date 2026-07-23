@@ -70,7 +70,7 @@ pub(crate) fn order_by_value_cmp_in(
         (false, false) => {
             let c = if mysql {
                 if let (Value::Text(x), Value::Text(y)) = (a, b) {
-                    spg_storage::mysql_ci_fold(x).cmp(&spg_storage::mysql_ci_fold(y))
+                    spg_storage::mysql_compare_fold(x).cmp(&spg_storage::mysql_compare_fold(y))
                 } else {
                     value_cmp(a, b)
                 }

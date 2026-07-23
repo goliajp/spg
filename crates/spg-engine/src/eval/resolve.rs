@@ -103,7 +103,7 @@ pub(super) fn collation_fold_for_compare(
     // A PG `case_insensitive` column keeps its ASCII-only contract; the
     // MySQL session uses the full accent-aware fold measured in P1.
     let fold = |v: Value<'static>| match v {
-        Value::Text(s) if mysql => Value::text(spg_storage::mysql_ci_fold(&s)),
+        Value::Text(s) if mysql => Value::text(spg_storage::mysql_compare_fold(&s)),
         Value::Text(s) => Value::text(s.to_ascii_lowercase()),
         other => other,
     };

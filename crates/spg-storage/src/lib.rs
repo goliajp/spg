@@ -1542,6 +1542,17 @@ pub fn mysql_ci_fold(s: &str) -> String {
     out
 }
 
+/// v7.39 (round 375) — the fold used to COMPARE / GROUP / de-dup text on
+/// the MySQL dialect. Its default collation is PAD SPACE: trailing spaces
+/// do not affect a comparison (`'a' = 'a '`, `'' = ' '`, measured on
+/// MariaDB 11), so they are stripped before the case/accent fold. Only
+/// literal spaces pad — a tab or other whitespace is significant — and
+/// this is NOT used by `LIKE`, whose pattern treats a trailing space
+/// literally.
+pub fn mysql_compare_fold(s: &str) -> String {
+    mysql_ci_fold(s.trim_end_matches(' '))
+}
+
 /// The base letter(s) a lower-cased Latin character folds to, or `None`
 /// when it is already a base / has no fold. Expansions (`ß` → `ss`) are
 /// why this returns a string.
