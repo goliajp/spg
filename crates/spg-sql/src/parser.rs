@@ -320,6 +320,43 @@ pub fn expand_scientific_literal(s: &str) -> SciExpanded {
     SciExpanded::Expanded(alloc::format!("{sign}{plain}"))
 }
 
+/// v7.39 (round 367, M20) — lower a MySQL hexadecimal binary-string
+/// literal (`0x…` / `X'…'`) onto the existing bytea cast. The hex digits
+/// are left-padded to an even count (`0x123` → byte string `01 23`, per
+/// MariaDB) and handed to the PG bytea input format (`\x…`).
+#[inline(never)]
+fn hex_literal_to_bytea_expr(hex: &str) -> Expr {
+    let padded = if hex.len() % 2 == 1 {
+        alloc::format!("0{hex}")
+    } else {
+        hex.to_string()
+    };
+    Expr::Cast {
+        expr: alloc::boxed::Box::new(Expr::Literal(Literal::String(alloc::format!(
+            "\\x{padded}"
+        )))),
+        target: CastTarget::Named("bytea".to_string()),
+    }
+}
+
+/// v7.39 (round 367, M20) — lower a MySQL bit-value literal (`b'1010'`)
+/// onto the bytea cast. The bits are read big-endian and left-padded to a
+/// whole number of bytes (`b'1010'` → one byte `0x0A`, per MariaDB).
+#[inline(never)]
+fn bits_literal_to_bytea_expr(bits: &str) -> Expr {
+    let pad = (8 - bits.len() % 8) % 8;
+    let mut hex = String::with_capacity((bits.len() + pad).div_ceil(4));
+    let padded: String = core::iter::repeat_n('0', pad).chain(bits.chars()).collect();
+    for nibble in padded.as_bytes().chunks(4) {
+        let mut v = 0u8;
+        for &b in nibble {
+            v = (v << 1) | (b - b'0');
+        }
+        hex.push(char::from_digit(u32::from(v), 16).unwrap_or('0'));
+    }
+    hex_literal_to_bytea_expr(&hex)
+}
+
 /// Resolve a lexer `Token::Numeric` into its literal. PG semantics: a dotted
 /// or over-i64 literal is exact NUMERIC; scientific notation is NUMERIC too
 /// (expanded to the plain decimal form); only a fractional depth beyond SPG's
@@ -18889,49 +18926,88 @@ impl Parser {
         }
     }
 
-    fn parse_atom(&mut self) -> Result<Expr, ParseError> {
-        // `B'1010'` / `X'1F'` — SQL bit-string literals. The lexer
-        // splits them into an ident + string; recombine here and
-        // lower onto the existing `::bit` cast (the X form is the
-        // hex spelling — each digit expands to 4 bits).
-        if let Token::Ident(prefix) = self.peek()
-            && (prefix.eq_ignore_ascii_case("b") || prefix.eq_ignore_ascii_case("x"))
-            && matches!(self.tokens.get(self.pos + 1), Some(Token::String(_)))
-        {
-            let is_hex = prefix.eq_ignore_ascii_case("x");
-            self.advance();
-            let Token::String(body) = self.advance() else {
-                unreachable!("guarded above");
-            };
-            let bits = if is_hex {
-                let mut out = String::with_capacity(body.len() * 4);
+    /// `B'1010'` / `X'1F'` bit-string (PG) or binary-string (MySQL)
+    /// literals. The lexer splits them into an ident + string; recombine
+    /// here. Out-of-line and returning `Option` so `parse_atom` — the
+    /// recursive frame the 768 KiB stack budget is tuned against — pays no
+    /// frame for the `body` / `bits` strings and their char loops (the
+    /// round-367 frame cliff, M20).
+    #[inline(never)]
+    fn try_parse_bit_string_literal(&mut self) -> Option<Result<Expr, ParseError>> {
+        let is_hex = match self.peek() {
+            Token::Ident(p) if p.eq_ignore_ascii_case("x") => true,
+            Token::Ident(p) if p.eq_ignore_ascii_case("b") => false,
+            _ => return None,
+        };
+        if !matches!(self.tokens.get(self.pos + 1), Some(Token::String(_))) {
+            return None;
+        }
+        self.advance();
+        let Token::String(body) = self.advance() else {
+            unreachable!("guarded above");
+        };
+        // v7.39 (round 367, M20) — in the MySQL dialect `X'…'` and `b'…'`
+        // are BINARY STRINGS, not PG bit strings. `X'41'` is the byte 0x41
+        // (hex pairs, even count required — MariaDB errors on an odd
+        // count); `b'1010'` packs its bits big-endian, left-padded to a
+        // byte. Lower both onto the bytea cast.
+        if self.mysql_dialect {
+            if is_hex {
+                if body.len() % 2 == 1 {
+                    return Some(Err(self.err(alloc::format!(
+                        "invalid hex string literal X'{body}': odd digit count"
+                    ))));
+                }
                 for c in body.chars() {
-                    let Some(d) = c.to_digit(16) else {
-                        return Err(self.err(alloc::format!(
-                            "invalid hexadecimal digit {c:?} in X'…' bit string"
-                        )));
-                    };
-                    out.push_str(&alloc::format!("{d:04b}"));
+                    if !c.is_ascii_hexdigit() {
+                        return Some(Err(self.err(alloc::format!(
+                            "invalid hexadecimal digit {c:?} in X'…'"
+                        ))));
+                    }
                 }
-                out
-            } else {
-                if let Some(bad) = body.chars().find(|c| *c != '0' && *c != '1') {
-                    return Err(self.err(alloc::format!(
-                        "invalid binary digit {bad:?} in B'…' bit string"
-                    )));
-                }
-                body
-            };
-            // Route through the postfix-cast loop so a chained cast like
-            // `B'1010'::int` attaches onto the implicit `::bit` cast instead
-            // of erroring at the `::`.
-            // v7.39 (read01 varbit.c) — a distinct internal target: a
-            // B'...' literal keeps its exact length, while an explicit
-            // `::bit` cast is bit(1) with pad/truncate semantics (PG).
-            return self.finish_postfix_casts(Expr::Cast {
-                expr: Box::new(Expr::Literal(Literal::String(bits))),
-                target: CastTarget::Named("__bit_literal".to_string()),
-            });
+                return Some(self.finish_postfix_casts(hex_literal_to_bytea_expr(&body)));
+            }
+            if let Some(bad) = body.chars().find(|c| *c != '0' && *c != '1') {
+                return Some(Err(self.err(alloc::format!(
+                    "invalid binary digit {bad:?} in b'…'"
+                ))));
+            }
+            return Some(self.finish_postfix_casts(bits_literal_to_bytea_expr(&body)));
+        }
+        let bits = if is_hex {
+            let mut out = String::with_capacity(body.len() * 4);
+            for c in body.chars() {
+                let Some(d) = c.to_digit(16) else {
+                    return Some(Err(self.err(alloc::format!(
+                        "invalid hexadecimal digit {c:?} in X'…' bit string"
+                    ))));
+                };
+                out.push_str(&alloc::format!("{d:04b}"));
+            }
+            out
+        } else {
+            if let Some(bad) = body.chars().find(|c| *c != '0' && *c != '1') {
+                return Some(Err(self.err(alloc::format!(
+                    "invalid binary digit {bad:?} in B'…' bit string"
+                ))));
+            }
+            body
+        };
+        // Route through the postfix-cast loop so a chained cast like
+        // `B'1010'::int` attaches onto the implicit `::bit` cast instead
+        // of erroring at the `::`.
+        // v7.39 (read01 varbit.c) — a distinct internal target: a B'...'
+        // literal keeps its exact length, while an explicit `::bit` cast is
+        // bit(1) with pad/truncate semantics (PG).
+        Some(self.finish_postfix_casts(Expr::Cast {
+            expr: Box::new(Expr::Literal(Literal::String(bits))),
+            target: CastTarget::Named("__bit_literal".to_string()),
+        }))
+    }
+
+    fn parse_atom(&mut self) -> Result<Expr, ParseError> {
+        if let Some(res) = self.try_parse_bit_string_literal() {
+            return res;
         }
         let tok_pos = self.pos;
         match self.advance() {
@@ -18948,6 +19024,11 @@ impl Parser {
                 Err(msg) => Err(self.err(msg)),
             },
             Token::String(s) => Ok(Expr::Literal(Literal::String(s))),
+            // v7.39 (round 367, M20) — a MySQL `0x…` binary-string literal
+            // (the lexer only emits this token in the MySQL dialect). Lower
+            // onto the existing bytea cast; out-of-line to keep this arm off
+            // the parse recursion frame.
+            Token::HexBytes(s) => Ok(hex_literal_to_bytea_expr(&s)),
             Token::True => Ok(Expr::Literal(Literal::Bool(true))),
             Token::False => Ok(Expr::Literal(Literal::Bool(false))),
             Token::Null => Ok(Expr::Literal(Literal::Null)),

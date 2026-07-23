@@ -3947,6 +3947,7 @@ impl Engine {
         // v7.39 (read01 round 55) — the catalog for user-named casts in VALUES.
         // Taken BEFORE the &mut borrow below (Catalog::clone is an Arc bump).
         let cat_for_insert = self.active_catalog().clone();
+        let insert_mysql = self.backslash_escapes;
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -3987,6 +3988,7 @@ impl Engine {
             &set_variant_lookup,
             overriding,
             &mut first_auto,
+            insert_mysql,
         )?;
         // Stage 2 — FK enforcement on the immutable catalog.
         // Non-lexical lifetimes release the mutable borrow on
@@ -5660,6 +5662,11 @@ fn parse_insert_rows(
     // `None` when the statement generated none, in which case MariaDB
     // leaves the session's previous value alone.
     first_auto: &mut Option<i64>,
+    // v7.39 (round 367, M20) — the session dialect, so a `0x…` / `X'…'`
+    // binary-string literal coerces into its target column the MySQL way
+    // (big-endian number into a numeric column, bytes-as-string into a
+    // text column) instead of failing the byte→column type check.
+    mysql: bool,
 ) -> Result<Vec<Vec<Value<'static>>>, EngineError> {
     use spg_sql::ast::Overriding;
     let schema_cols_len = column_meta.len();
@@ -5833,6 +5840,7 @@ fn parse_insert_rows(
                     col,
                     catalog,
                 )?;
+                let raw = crate::conversions::mysql_bytes_for_column(raw, col.ty, mysql);
                 let coerced = coerce_value(raw, col.ty, &col.name, i)?;
                 enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
                 let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;
@@ -5879,6 +5887,7 @@ fn parse_insert_rows(
                 }
                 let raw =
                     crate::conversions::normalize_composite_for_column(raw, col, catalog)?;
+                let raw = crate::conversions::mysql_bytes_for_column(raw, col.ty, mysql);
                 let coerced = coerce_value(raw, col.ty, &col.name, i)?;
                 enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
                 let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;
