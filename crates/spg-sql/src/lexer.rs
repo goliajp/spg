@@ -61,6 +61,11 @@ pub enum Token {
     // carried so no precision is lost before it becomes a Value::Numeric.
     Numeric(String),
     String(String),
+    /// v7.39 (round 367, M20) — a MySQL `0x…` hexadecimal literal in the
+    /// MySQL dialect: a BINARY STRING, not an integer. Carries the raw hex
+    /// digits (parser decodes, left-padding an odd count). The PG dialect
+    /// never emits this — there `0x…` stays a radix-16 `Integer`.
+    HexBytes(String),
 
     // Operators
     Plus,
@@ -499,13 +504,13 @@ pub fn tokenize_with_offsets(
             }
             b if b.is_ascii_digit() => {
                 let (tok, consumed) =
-                    lex_number(&input[i..]).map_err(|kind| LexError { kind, pos: i })?;
+                    lex_number(&input[i..], backslash_escapes).map_err(|kind| LexError { kind, pos: i })?;
                 out.push(tok);
                 i += consumed;
             }
             b'.' if peek_pred(bytes, i + 1, u8::is_ascii_digit) => {
                 let (tok, consumed) =
-                    lex_number(&input[i..]).map_err(|kind| LexError { kind, pos: i })?;
+                    lex_number(&input[i..], backslash_escapes).map_err(|kind| LexError { kind, pos: i })?;
                 out.push(tok);
                 i += consumed;
             }
@@ -1615,7 +1620,7 @@ fn hex_digit_value(b: u8) -> Option<u32> {
     }
 }
 
-fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
+fn lex_number(s: &str, mysql: bool) -> Result<(Token, usize), LexErrorKind> {
     let bytes = s.as_bytes();
     let mut i = 0usize;
     // v7.39 (round 184) — PG scan.l rejects a numeric literal that is
@@ -1675,6 +1680,14 @@ fn lex_number(s: &str) -> Result<(Token, usize), LexErrorKind> {
                 ));
             }
             junk_check(j)?;
+            // v7.39 (round 367, M20) — in the MySQL dialect a `0x…`
+            // hexadecimal literal is a BINARY STRING, not an integer
+            // (mysqldump emits `0x…` for BINARY / BLOB column data, and
+            // `0x41` is the string 'A'). The octal / binary radices keep
+            // their integer reading — only `0x` diverges.
+            if mysql && radix == 16 {
+                return Ok((Token::HexBytes(digits), j));
+            }
             return match i64::from_str_radix(&digits, radix) {
                 Ok(v) => Ok((Token::Integer(v), j)),
                 // Over i64 → keep as decimal NUMERIC text.

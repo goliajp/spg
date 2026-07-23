@@ -3510,6 +3510,51 @@ fn try_coerce_json_scalar(
     )
 }
 
+/// v7.39 (round 367, M20 P2) — in the MySQL dialect a binary-string
+/// literal (`0x…` / `X'…'` / `b'…'`, backed by `Value::Bytes`) coerces to
+/// the target column like MariaDB does: into a BINARY / BLOB column it
+/// stays bytes (handled by `coerce_value` itself); into a NUMERIC column
+/// it is the bytes' big-endian integer (`INSERT … VALUES (0x10)` stores
+/// 16); into a CHAR / VARCHAR / TEXT column it is the bytes read as a
+/// latin-1 string (`0x4546` → 'EF'). A PostgreSQL session never produces
+/// a `Value::Bytes` from these literals, so this only fires under the
+/// dialect and leaves every other value untouched.
+pub(crate) fn mysql_bytes_for_column(
+    v: Value<'static>,
+    expected: DataType,
+    mysql: bool,
+) -> Value<'static> {
+    if !mysql {
+        return v;
+    }
+    let Value::Bytes(ref b) = v else {
+        return v;
+    };
+    match expected {
+        DataType::SmallInt
+        | DataType::Int
+        | DataType::BigInt
+        | DataType::Float
+        | DataType::Real
+        | DataType::Numeric { .. } => {
+            let start = b.len().saturating_sub(16);
+            let acc = b[start..]
+                .iter()
+                .fold(0u128, |a, &x| (a << 8) | u128::from(x));
+            if acc <= i64::MAX as u128 {
+                #[allow(clippy::cast_possible_truncation)]
+                Value::BigInt(acc as i64)
+            } else {
+                big_literal_to_value(&alloc::format!("{acc}"))
+            }
+        }
+        DataType::Text | DataType::Varchar(_) | DataType::Char(_) => {
+            Value::text(b.iter().map(|&x| x as char).collect::<alloc::string::String>())
+        }
+        _ => v,
+    }
+}
+
 pub(crate) fn coerce_value(
     v: Value<'static>,
     expected: DataType,

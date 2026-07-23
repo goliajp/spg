@@ -696,6 +696,17 @@ pub(crate) fn mysql_operand_reading_pair(
             let rr = mysql_number_of(t);
             (l, rr)
         }
+        // v7.39 (round 367, M20 P2) — a binary string beside a number
+        // reads as its big-endian integer value (`0x10 + 0` = 16,
+        // `0x10 = 16` is true). Beside a Text operand it stays bytes so
+        // the byte-wise string compare (`0x61 = 'a'`) still fires.
+        (Value::Bytes(b), other) if other.data_type().is_some_and(is_numeric_type) => {
+            (mysql_bytes_as_number(b), r)
+        }
+        (other, Value::Bytes(b)) if other.data_type().is_some_and(is_numeric_type) => {
+            let rr = mysql_bytes_as_number(b);
+            (l, rr)
+        }
         // Arithmetic between two strings is numeric; comparison is not.
         (Value::Text(a), Value::Text(b)) if mysql_arith(op) => {
             (mysql_number_of(a), mysql_number_of(b))
@@ -783,6 +794,26 @@ fn mysql_number_of(s: &str) -> Value<'static> {
         Value::BigInt(n as i64)
     } else {
         Value::Float(n)
+    }
+}
+
+/// v7.39 (round 367, M20 P2) — a MySQL binary string (a `0x…` / `X'…'` /
+/// `b'…'` literal, backed by `Value::Bytes`) reads as its bytes'
+/// BIG-ENDIAN unsigned integer in a numeric context: `0x4142 + 0` is
+/// 16706, `0x10 = 16` is true (measured on MariaDB 11). Only the low 16
+/// bytes participate — a hex literal used in arithmetic is at most an
+/// 8-byte BIGINT in practice — and a value past `i64::MAX` becomes a
+/// NUMERIC so nothing wraps negative.
+fn mysql_bytes_as_number(b: &[u8]) -> Value<'static> {
+    let start = b.len().saturating_sub(16);
+    let acc = b[start..]
+        .iter()
+        .fold(0u128, |a, &x| (a << 8) | u128::from(x));
+    if acc <= i64::MAX as u128 {
+        #[allow(clippy::cast_possible_truncation)]
+        Value::BigInt(acc as i64)
+    } else {
+        crate::conversions::big_literal_to_value(&alloc::format!("{acc}"))
     }
 }
 
