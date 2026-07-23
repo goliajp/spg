@@ -18300,11 +18300,17 @@ impl Parser {
                 if min_prec <= 4
                     && (matches!(self.peek(), Token::Ident(s)
                             if s.eq_ignore_ascii_case("ilike")
+                                || (self.mysql_dialect
+                                    && (s.eq_ignore_ascii_case("regexp")
+                                        || s.eq_ignore_ascii_case("rlike")))
                                 || (s.eq_ignore_ascii_case("similar")
                                     && matches!(self.tokens.get(self.pos + 1), Some(Token::To))))
                         || (matches!(self.peek(), Token::Not)
                             && matches!(self.tokens.get(self.pos + 1),
                                 Some(Token::Ident(s)) if s.eq_ignore_ascii_case("ilike")
+                                    || (self.mysql_dialect
+                                        && (s.eq_ignore_ascii_case("regexp")
+                                            || s.eq_ignore_ascii_case("rlike")))
                                     || s.eq_ignore_ascii_case("similar")))) => {}
             _ => return Ok(None),
         }
@@ -18490,6 +18496,8 @@ impl Parser {
                 let next = self.tokens.get(self.pos + 1);
                 matches!(next, Some(Token::Between | Token::In | Token::Like))
                     || matches!(next, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("ilike")
+                    || (self.mysql_dialect
+                        && (s.eq_ignore_ascii_case("regexp") || s.eq_ignore_ascii_case("rlike")))
                     || s.eq_ignore_ascii_case("similar"))
             } else {
                 false
@@ -18591,6 +18599,27 @@ impl Parser {
                 {
                     return Ok(Some(expr));
                 }
+            }
+            // v7.39 (round 380) — MySQL's REGEXP / RLIKE regex-match
+            // operator (RLIKE is the alias). It is a keyword, not `~`, and
+            // matches case-insensitively under the default collation, so it
+            // lowers onto the same `regexp_like(expr, pattern, 'i')` the
+            // `~*` operator uses, wrapped in NOT when negated.
+            if self.mysql_dialect
+                && matches!(self.peek(), Token::Ident(s)
+                    if s.eq_ignore_ascii_case("regexp") || s.eq_ignore_ascii_case("rlike"))
+            {
+                self.advance();
+                let pattern = self.parse_expr(5)?;
+                let call = Expr::FunctionCall {
+                    name: String::from("regexp_like"),
+                    args: alloc::vec![
+                        expr,
+                        pattern,
+                        Expr::Literal(Literal::String(String::from("i"))),
+                    ],
+                };
+                return Ok(Some(maybe_not(call, negated)));
             }
         }
         let _ = expr;
