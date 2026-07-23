@@ -841,6 +841,10 @@ pub(super) fn value_to_format_text_styled(v: &Value, style: &super::format::Rend
             }
         }
         Value::Null => String::new(),
+        // v7.39 (round 368, M20 P3) — a binary string in the MySQL dialect
+        // reads as its raw bytes (latin-1): `CONCAT(0x41,'B')` is 'AB', not
+        // PG's `\x41B`. The PG dialect keeps the `\x…` hex form below.
+        Value::Bytes(b) if style.mysql => b.iter().map(|&x| x as char).collect(),
         // Every other type (Date / Timestamp / Interval / arrays / Bytea /
         // UUID / Time / Money / Range / Hstore / 2D arrays / …) renders via
         // the canonical value→text renderer — the same PG-faithful form SELECT

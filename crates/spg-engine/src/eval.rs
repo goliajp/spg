@@ -289,6 +289,7 @@ impl<'a> EvalContext<'a> {
                 date_order: crate::eval::format::DateOrder::Mdy,
                 interval_style: crate::eval::format::IntervalStyleKind::Postgres,
                 extra_float_digits: 1,
+                mysql: false,
             },
             tz_offset_fn: None,
             tz_localize_fn: None,
@@ -414,6 +415,9 @@ impl<'a> EvalContext<'a> {
     /// v7.39 (read01 round 63) — thread the engine (see `engine`).
     pub const fn with_engine(mut self, engine: &'a crate::Engine) -> Self {
         self.mysql_dialect = engine.backslash_escapes;
+        // v7.39 (round 368, M20 P3) — the dialect also decides how a binary
+        // string renders in a string context (latin-1 bytes vs PG `\x…`).
+        self.render_style.mysql = engine.backslash_escapes;
         self.engine = Some(engine);
         self
     }
