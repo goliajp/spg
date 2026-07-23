@@ -1502,6 +1502,23 @@ fn accumulate_groups(
         .iter()
         .map(|spec| spec.arg.as_ref().and_then(|e| col_pos(e)))
         .collect();
+    // v7.39 (round 370, M4 P4a) — the MySQL dialect folds GROUP BY /
+    // DISTINCT text keys (M4 P2), EXCEPT over a column with an explicit
+    // `COLLATE utf8mb4_bin` (stored `Binary`), which de-dups byte-wise.
+    // A folding default column stores `CaseInsensitive`, so only an
+    // explicit binary column suppresses the fold. Multi-column GROUP BY
+    // mixing a binary and a folding column is treated byte-wise as a whole
+    // (rare; residual).
+    let is_binary_key_col = |p: Option<usize>| -> bool {
+        p.and_then(|i| schema_cols.get(i))
+            .is_some_and(|c| matches!(c.collation, spg_storage::Collation::Binary))
+    };
+    let mysql_fold_groups: bool =
+        ctx.mysql_dialect && !group_pos.iter().any(|&p| is_binary_key_col(p));
+    let distinct_fold: Vec<bool> = arg_pos
+        .iter()
+        .map(|&p| ctx.mysql_dialect && !is_binary_key_col(p))
+        .collect();
     // v7.37.x (mailrs Track A 100k attack) — dedicated tight loop
     // for the "single-Text GROUP BY + single MAX(bound numeric arg)"
     // shape. This is the mailrs `/api/conversations` minimal shape
@@ -2247,7 +2264,7 @@ fn accumulate_groups(
                     // the generic encoded path for correctness.
                     refs.clear();
                     refs.push(kv);
-                    encode_key_refs_into_in(&refs, &mut keybuf_s, ctx.mysql_dialect);
+                    encode_key_refs_into_in(&refs, &mut keybuf_s, mysql_fold_groups);
                     match groups.get(keybuf_s.as_str()) {
                         Some(&i) => i,
                         None => {
@@ -2423,7 +2440,9 @@ fn accumulate_groups(
                         // the distinct key (case/accent) so `Foo`/`foo`
                         // count once. The `seen` set stays internally
                         // consistent: both probe and insert fold.
-                        if ctx.mysql_dialect {
+                        // v7.39 (round 370, M4 P4a) — but an explicit
+                        // `COLLATE utf8mb4_bin` column de-dups byte-wise.
+                        if distinct_fold[i] {
                             let k = spg_storage::mysql_ci_fold(s);
                             if entry.1[i].seen.contains(k.as_str()) {
                                 continue;
@@ -2446,7 +2465,7 @@ fn accumulate_groups(
                             continue;
                         }
                     } else {
-                        encode_key_refs_into_in(core::slice::from_ref(&arg_ref), &mut dkeybuf, ctx.mysql_dialect);
+                        encode_key_refs_into_in(core::slice::from_ref(&arg_ref), &mut dkeybuf, distinct_fold[i]);
                         if entry.1[i].seen.contains(dkeybuf.as_str()) {
                             continue;
                         }
@@ -2594,7 +2613,7 @@ fn accumulate_groups(
                         // non-single-Text branch below.
                         refs.clear();
                         refs.push(v);
-                        encode_key_refs_into_in(&refs, &mut keybuf_s, ctx.mysql_dialect);
+                        encode_key_refs_into_in(&refs, &mut keybuf_s, mysql_fold_groups);
                         match groups.get(keybuf_s.as_str()) {
                             Some(&i) => i,
                             None => {
@@ -2645,7 +2664,7 @@ fn accumulate_groups(
                         // (coercion edge) — encoded-path fallback.
                         refs.clear();
                         refs.push(v);
-                        encode_key_refs_into_in(&refs, &mut keybuf_s, ctx.mysql_dialect);
+                        encode_key_refs_into_in(&refs, &mut keybuf_s, mysql_fold_groups);
                         match groups.get(keybuf_s.as_str()) {
                             Some(&i) => i,
                             None => {
@@ -2666,7 +2685,7 @@ fn accumulate_groups(
                         .iter()
                         .map(|p| row.get(p.unwrap()).unwrap_or(&Value::Null)),
                 );
-                encode_key_refs_into_in(&refs, &mut keybuf_s, ctx.mysql_dialect);
+                encode_key_refs_into_in(&refs, &mut keybuf_s, mysql_fold_groups);
                 match groups.get(keybuf_s.as_str()) {
                     Some(&i) => i,
                     None => {
@@ -2824,7 +2843,7 @@ fn accumulate_groups(
                             continue;
                         }
                     } else {
-                        encode_key_refs_into_in(core::slice::from_ref(&arg_ref), &mut dkeybuf, ctx.mysql_dialect);
+                        encode_key_refs_into_in(core::slice::from_ref(&arg_ref), &mut dkeybuf, distinct_fold[i]);
                         if entry.1[i].seen.contains(dkeybuf.as_str()) {
                             continue;
                         }
@@ -2951,7 +2970,14 @@ fn accumulate_groups(
             let mut key_vals = group_vals.clone();
             for &i in &ci_positions {
                 if let Value::Text(s) = &key_vals[i] {
-                    key_vals[i] = Value::text(s.to_ascii_lowercase());
+                    // v7.39 (round 370, M4 P4a) — a MySQL folding column
+                    // (stored CaseInsensitive) folds case AND accent; a PG
+                    // CITEXT column stays ASCII-only.
+                    key_vals[i] = Value::text(if ctx.mysql_dialect {
+                        spg_storage::mysql_ci_fold(s)
+                    } else {
+                        s.to_ascii_lowercase()
+                    });
                 }
             }
             encode_key(&key_vals)

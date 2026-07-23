@@ -4632,7 +4632,7 @@ impl Parser {
         // v7.39 (round 259) — keep the raw type NAME when the base is not
         // a builtin: it is how `CREATE DOMAIN child AS parent` records its
         // parent domain.
-        let (base_type, _, _, base_user_ref, _, _, _, _) = self.parse_type_with_implied_flags()?;
+        let (base_type, _, _, base_user_ref, _, _, _, _, _) = self.parse_type_with_implied_flags()?;
         let mut default: Option<Expr> = None;
         let mut not_null = false;
         let mut checks: Vec<Expr> = Vec::new();
@@ -4726,7 +4726,7 @@ impl Parser {
                 // v7.39 (round 264) — keep the raw type name when it is not
                 // a builtin: that is how a NESTED composite field records
                 // which composite it holds.
-                let (field_type, _, _, field_user_ref, _, _, _, _) =
+                let (field_type, _, _, field_user_ref, _, _, _, _, _) =
                     self.parse_type_with_implied_flags()?;
                 fields.push((field_name, field_type));
                 field_user_types.push(field_user_ref);
@@ -13867,7 +13867,7 @@ impl Parser {
     /// shorthands — callers that don't expect those (ALTER COLUMN
     /// TYPE) can discard them.
     fn parse_column_type_name(&mut self) -> Result<ColumnTypeName, ParseError> {
-        let (ty, _, _, _, _, _, _, _) = self.parse_type_with_implied_flags()?;
+        let (ty, _, _, _, _, _, _, _, _) = self.parse_type_with_implied_flags()?;
         Ok(ty)
     }
 
@@ -13881,6 +13881,8 @@ impl Parser {
             bool,
             Option<String>,
             Collation,
+            // v7.39 (round 370, M4 P4a) — was `COLLATE` written explicitly?
+            bool,
             bool,
             // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM variant
             // list captured at type-parse time. None for all
@@ -14432,6 +14434,12 @@ impl Parser {
         // resolved by Collation::from_collation_name on the bare
         // identifier after the dot.
         let mut collation = Collation::Binary;
+        // v7.39 (round 370, M4 P4a) — whether an explicit `COLLATE <name>`
+        // clause was written. The engine needs this to tell an explicit
+        // `COLLATE utf8mb4_bin` (byte-wise) apart from a column with no
+        // clause at all: both resolve to `Collation::Binary`, but under the
+        // MySQL dialect the latter takes the folding default collation.
+        let mut collation_explicit = false;
         loop {
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("character"))
                 && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("set"))
@@ -14479,6 +14487,7 @@ impl Parser {
                     alloc::string::String::new()
                 };
                 if !raw.is_empty() {
+                    collation_explicit = true;
                     let parsed = Collation::from_collation_name(&raw);
                     // Last COLLATE clause wins, but `Binary` from a
                     // bare keyword like `default` should not
@@ -14575,6 +14584,7 @@ impl Parser {
             implied_not_null,
             user_type_ref,
             collation,
+            collation_explicit,
             is_unsigned,
             inline_enum_variants,
             inline_set_variants,
@@ -14615,6 +14625,7 @@ impl Parser {
             implied_not_null,
             user_type_ref,
             collation,
+            collation_explicit,
             is_unsigned,
             inline_enum_variants,
             inline_set_variants,
@@ -14989,6 +15000,7 @@ impl Parser {
             user_type_ref,
             on_update_runtime,
             collation,
+            collation_explicit,
             is_unsigned,
             inline_enum_variants,
             inline_set_variants,

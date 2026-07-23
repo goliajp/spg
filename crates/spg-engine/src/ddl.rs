@@ -922,6 +922,7 @@ impl Engine {
         // existing row. Column positions don't shift, so we
         // skip index rebuild.
         let clock = self.clock;
+        let add_mysql = self.backslash_escapes;
         let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
         })?;
@@ -950,7 +951,7 @@ impl Engine {
         let col_name = column.name.clone();
         let nullable = column.nullable;
         let has_default = column.default.is_some() || column.auto_increment;
-        let col_schema = column_def_to_schema(column)?;
+        let col_schema = column_def_to_schema(column, add_mysql)?;
         let row_count = table.row_count();
         // Compute the back-fill value. Literal / runtime DEFAULT
         // funnels through the same resolver that INSERT uses
@@ -2237,7 +2238,7 @@ impl Engine {
             let col_name = col_def.name.clone();
             let nullable = col_def.nullable;
             let has_default = col_def.default.is_some() || col_def.auto_increment;
-            let col_schema = column_def_to_schema(col_def)?;
+            let col_schema = column_def_to_schema(col_def, self.backslash_escapes)?;
             let fill_value: Value<'static> = if has_default || col_schema.runtime_default.is_some()
             {
                 resolve_column_default_free(&col_schema, clock)?
@@ -2817,9 +2818,10 @@ impl Engine {
         // leading column (the existing single-column storage tier)
         // and registers a UniquenessConstraint on the schema for
         // INSERT-time enforcement of the full tuple. mailrs G1/G6.
+        let mysql = self.backslash_escapes;
         let cols = columns
             .into_iter()
-            .map(column_def_to_schema)
+            .map(|c| column_def_to_schema(c, mysql))
             .collect::<Result<Vec<_>, _>>()?;
         // v7.17.0 Phase 1.4 + 1.5 — classify every raw
         // user_type_ref (parked as user_enum_type by
@@ -5091,7 +5093,7 @@ pub(crate) fn enforce_enum_label(
     }
 }
 
-fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
+fn column_def_to_schema(c: ColumnDef, mysql: bool) -> Result<ColumnSchema, EngineError> {
     let ty = column_type_to_data_type(c.ty);
     let mut schema = ColumnSchema::new(c.name.clone(), ty, c.nullable);
     // user_type_ref is the raw ident the parser couldn't resolve
@@ -5111,9 +5113,23 @@ fn column_def_to_schema(c: ColumnDef) -> Result<ColumnSchema, EngineError> {
     // v7.17.0 Phase 2.5 — bridge the AST `Collation` enum to the
     // storage one. Same variants, different crates (spg-storage
     // owns no dep on spg-sql).
-    schema.collation = match c.collation {
-        spg_sql::ast::Collation::Binary => spg_storage::Collation::Binary,
-        spg_sql::ast::Collation::CaseInsensitive => spg_storage::Collation::CaseInsensitive,
+    // v7.39 (round 370, M4 P4a) — under the MySQL dialect a TEXT column
+    // with NO explicit `COLLATE` takes the folding default collation
+    // (utf8mb4_uca1400_ai_ci), so it stores CaseInsensitive and the
+    // read/write paths fold it. An explicit `COLLATE utf8mb4_bin` keeps
+    // Binary (byte-wise) — both resolve to AST `Binary`, so the explicit
+    // flag is what tells them apart.
+    let is_text_col = matches!(
+        ty,
+        spg_storage::DataType::Text | spg_storage::DataType::Varchar(_) | spg_storage::DataType::Char(_)
+    );
+    schema.collation = if mysql && is_text_col && !c.collation_explicit {
+        spg_storage::Collation::CaseInsensitive
+    } else {
+        match c.collation {
+            spg_sql::ast::Collation::Binary => spg_storage::Collation::Binary,
+            spg_sql::ast::Collation::CaseInsensitive => spg_storage::Collation::CaseInsensitive,
+        }
     };
     // v7.17.0 Phase 4.4 — MySQL `UNSIGNED` flag propagates to
     // storage so engine INSERT / UPDATE can range-check.
