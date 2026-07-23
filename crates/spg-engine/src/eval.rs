@@ -83,7 +83,7 @@ use resolve::{
     collation_fold_for_compare, compare_is_case_insensitive, composite_eq, eval_expr_cow,
     is_owned_compare_value, resolve_column, resolve_column_borrowed, text_prefix_chars,
 };
-pub(crate) use resolve::{column_collation, find_column_pos};
+pub(crate) use resolve::{column_collation, find_column_pos, is_binary_coerced};
 use strings::{
     TrimSide, format_string, pg_quote_ident, pg_quote_literal, pg_typeof_name, string_left_right,
     string_pad, string_trim, to_char, value_to_format_text,
@@ -760,6 +760,17 @@ fn is_numeric_type(t: spg_storage::DataType) -> bool {
         t,
         D::SmallInt | D::Int | D::BigInt | D::Float | D::Real | D::Numeric { .. }
     )
+}
+
+/// v7.39 (round 364, M4 P2) — a value as it participates in a MySQL
+/// session's default-collation comparison: text folds (accent- and
+/// case-insensitive), everything else is itself. Used by IN and LIKE,
+/// whose comparisons do not pass through `collation_fold_for_compare`.
+fn mysql_collation_key(v: Value<'static>, mysql: bool) -> Value<'static> {
+    match v {
+        Value::Text(s) if mysql => Value::text(spg_storage::mysql_ci_fold(&s)),
+        other => other,
+    }
 }
 
 /// A string as MySQL reads it in numeric position: an exact integer when
@@ -2859,13 +2870,16 @@ fn eval_in_list_arm(
     // like round 237: evaluating the rest of the list to inspect it would
     // change when side effects fire.
     require_in_list_comparable(expr, list, ctx)?;
-    let needle = eval_expr(expr, row, ctx)?;
+    // v7.39 (round 364, M4 P2) — a MySQL session folds text before the
+    // membership test, so `t IN ('FOO')` matches 'Foo'. `BINARY` is not
+    // reachable through a bare column needle here; the fold is text-only.
+    let needle = mysql_collation_key(eval_expr(expr, row, ctx)?, ctx.mysql_dialect);
     let needle_null = matches!(needle, Value::Null);
     let mut saw_null = needle_null && !list.is_empty();
     let mut matched = false;
     if !needle_null {
         for item in list {
-            let v = eval_expr(item, row, ctx)?;
+            let v = mysql_collation_key(eval_expr(item, row, ctx)?, ctx.mysql_dialect);
             if matches!(v, Value::Null) {
                 saw_null = true;
                 continue;
@@ -2928,8 +2942,18 @@ fn eval_like_arm(
     };
     // v7.25 (round-17) — ILIKE folds both operands (PG
     // lowercases per the default collation).
+    // v7.39 (round 364, M4 P2) — a MySQL session's default collation is
+    // accent- and case-insensitive, so `LIKE` folds both sides the way
+    // `ILIKE` does; the wildcards `%` / `_` are not Latin letters so the
+    // fold leaves them alone.
+    let mysql = ctx.mysql_dialect;
     let m = if case_insensitive {
         like_match(&text.to_lowercase(), &pat.to_lowercase())?
+    } else if mysql {
+        like_match(
+            &spg_storage::mysql_ci_fold(&text),
+            &spg_storage::mysql_ci_fold(&pat),
+        )?
     } else {
         like_match(&text, &pat)?
     };

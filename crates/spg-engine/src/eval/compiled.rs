@@ -257,6 +257,10 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                     column_collation(rhs, ctx),
                     Some(spg_storage::Collation::CaseInsensitive)
                 ));
+            // v7.39 (round 364, M4 P2) — a MySQL session folds every text
+            // comparison, so it needs the CI step too (the step chooses
+            // the accent-aware fold at run time).
+            let ci = ci || (cmp && super::resolve::mysql_text_fold_applies(lhs, rhs, ctx));
             steps.push(if ci {
                 Step::BinaryCi(*op)
             } else {
@@ -276,6 +280,14 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             list,
             negated,
         } => {
+            // v7.39 (round 364, M4 P2) — a MySQL session folds text before
+            // the membership test; the set-based compiled path compares
+            // raw. Route it to the interpreter, which folds (eval.rs
+            // `eval_in_list_arm`). The perf-critical InSet path is PG-only.
+            if ctx.mysql_dialect {
+                steps.push(Step::Subtree(e.clone()));
+                return;
+            }
             // I2: the set is built at compile time. The gate
             // (`fully_compilable`) guarantees we only reach here
             // when the list builds a set and the needle compiles —
@@ -298,7 +310,15 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             pattern,
             negated,
             case_insensitive,
-        } => match literal_text_pattern(pattern) {
+        } => {
+            // v7.39 (round 364, M4 P2) — LIKE folds accents + case on a
+            // MySQL session (eval.rs `eval_like_arm`); the compiled
+            // pattern walk does not. Route to the interpreter.
+            if ctx.mysql_dialect {
+                steps.push(Step::Subtree(e.clone()));
+                return;
+            }
+            match literal_text_pattern(pattern) {
             Some(pat) if fully_compilable(expr) => {
                 // v7.36 (perf — mailrs Phase 1, get_contacts hot
                 // inner) — trivial all-`%` pattern (`%`, `%%`, …)
@@ -339,6 +359,7 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 });
             }
             _ => steps.push(Step::Subtree(e.clone())),
+            }
         },
         // v7.36 — PURE scalar function call: emit args then a
         // single Function step that pops them. `fully_compilable`
@@ -876,7 +897,13 @@ where
                 stack.push(apply_binary(*op, l, r)?);
             }
             Step::BinaryCi(op) => {
+                // v7.39 (round 364, M4 P2) — the MySQL session uses the
+                // accent-aware fold; a PG `case_insensitive` column keeps
+                // its ASCII-only contract.
                 let fold = |v: Value<'static>| match v {
+                    Value::Text(s) if ctx.mysql_dialect => {
+                        Value::text(spg_storage::mysql_ci_fold(&s))
+                    }
                     Value::Text(s) => Value::text(s.to_ascii_lowercase()),
                     other => other,
                 };
