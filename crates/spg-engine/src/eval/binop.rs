@@ -2975,11 +2975,70 @@ pub(crate) fn apply_binary_in(
     if !mysql {
         return apply_binary(op, l, r);
     }
+    // Date ± date-granular interval keeps a DATE — checked on the ORIGINAL
+    // operands, before the operand-reading pair lifts a bare date string
+    // to a midnight timestamp.
+    if let Some(v) = mysql_date_plus_interval(op, &l, &r) {
+        return Ok(v);
+    }
     let (l, r) = super::mysql_operand_reading_pair(op, l, r);
     if let Some(v) = super::mysql_true_division(op, &l, &r) {
         return Ok(v);
     }
     apply_binary(op, l, r)
+}
+
+/// The DATE (days since the epoch) a `date ± INTERVAL` operand carries: a
+/// `Value::Date`, or a bare date string with no time part.
+fn date_operand_days(v: &Value<'_>) -> Option<i32> {
+    match v {
+        Value::Date(d) => Some(*d),
+        Value::Text(s) if !s.contains(':') => crate::eval::parse_date_literal(s),
+        _ => None,
+    }
+}
+
+/// v7.39 (round 373) — `date ± INTERVAL` keeps a DATE result under the
+/// MySQL dialect when the interval has no time component (YEAR / MONTH /
+/// DAY / WEEK): `DATE_ADD('2020-01-31', INTERVAL 1 MONTH)` is DATE
+/// 2020-02-29 on MariaDB, not the midnight DATETIME PG produces. An
+/// interval carrying a sub-day part (HOUR / MINUTE / SECOND) still lifts
+/// to DATETIME, so this returns None for it and the PG path runs.
+fn mysql_date_plus_interval(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Option<Value<'static>> {
+    let iv = |v: &Value<'_>| match v {
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => Some((*months, *days, *micros)),
+        _ => None,
+    };
+    let (date, months, days, micros, sign) = match op {
+        BinOp::Add => {
+            if let (Some(d), Some((m, dd, us))) = (date_operand_days(l), iv(r)) {
+                (d, m, dd, us, 1i64)
+            } else if let (Some((m, dd, us)), Some(d)) = (iv(l), date_operand_days(r)) {
+                (d, m, dd, us, 1i64)
+            } else {
+                return None;
+            }
+        }
+        BinOp::Sub => {
+            if let (Some(d), Some((m, dd, us))) = (date_operand_days(l), iv(r)) {
+                (d, m, dd, us, -1i64)
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    if micros != 0 {
+        return None; // a time component lifts the result to DATETIME
+    }
+    let base = i64::from(date).checked_mul(86_400_000_000)?;
+    let res = add_interval_to_micros(base, i64::from(months) * sign, i64::from(days) * sign, 0).ok()?;
+    let day = res.div_euclid(86_400_000_000);
+    Some(Value::Date(i32::try_from(day).ok()?))
 }
 
 /// v7.39 (round 353, M9) — `a DIV b`.
