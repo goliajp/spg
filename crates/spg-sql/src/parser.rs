@@ -19632,10 +19632,28 @@ impl Parser {
                     }
                 };
                 let lc = cname.to_ascii_lowercase();
+                // v7.39 (round 371, M4 P4b) — a per-expression MySQL
+                // collation override. `… COLLATE utf8mb4_bin` (any `_bin`
+                // family / `binary`) forces byte-wise, which is exactly
+                // what `BINARY expr` does — lower onto that so every fold
+                // site (comparison, LIKE, ORDER BY) suppresses via
+                // `is_binary_coerced`. A `_ci` family override folds, and
+                // under the MySQL dialect the default already folds, so it
+                // absorbs as a no-op; likewise the C / byte-order spellings.
+                if self.mysql_dialect && (lc.ends_with("_bin") || lc == "binary") {
+                    expr = Expr::Cast {
+                        expr: alloc::boxed::Box::new(expr),
+                        target: CastTarget::Named("binary".to_string()),
+                    };
+                    continue;
+                }
+                let mysql_ci = self.mysql_dialect
+                    && (lc.ends_with("_ci") || matches!(lc.as_str(), "case_insensitive" | "nocase"));
                 if !matches!(
                     lc.as_str(),
                     "c" | "posix" | "default" | "ucs_basic" | "pg_c_utf8"
-                ) {
+                ) && !mysql_ci
+                {
                     return Err(self.err(alloc::format!(
                         "COLLATE {cname:?}: SPG orders text by bytes (the C \
                          collation); locale collations are not supported yet — \
