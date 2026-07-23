@@ -6114,15 +6114,11 @@ fn apply_function_dispatch(
                     let jan1 = super::days_from_civil(y, 1, 1);
                     Ok(Value::Int(days - jan1 + 1))
                 }
-                "weekofyear" => {
-                    // ISO 8601 week number: the week containing the
-                    // year's first Thursday is week 1.
-                    let weekday = (i64::from(days) + 3).rem_euclid(7) as i32; // 0=Mon
-                    let thursday = days + (3 - weekday);
-                    let (ty, ..) = super::civil_from_days(thursday);
-                    let jan1 = super::days_from_civil(ty, 1, 1);
-                    Ok(Value::Int((thursday - jan1) / 7 + 1))
-                }
+                // v7.39 (round 378) — WEEKOFYEAR is WEEK(date, 3): ISO-8601,
+                // week 1 holds the year's first Thursday.
+                "weekofyear" => Ok(Value::Int(
+                    super::datetime::mysql_calc_week(days, 3).1 as i32,
+                )),
                 "last_day" => {
                     let next_month = if m == 12 {
                         super::days_from_civil(y + 1, 1, 1)
@@ -6312,17 +6308,19 @@ fn apply_function_dispatch(
                 "weekday" => {
                     Ok(Value::Int((i64::from(days) + 3).rem_euclid(7) as i32))
                 }
-                // WEEK mode 0: weeks start Sunday; days before the
-                // year's first Sunday are week 0.
+                // v7.39 (round 378) — WEEK(date [, mode]) honours the full
+                // 0..7 mode set; SPG previously ignored the mode and always
+                // computed mode 0.
                 "week" => {
-                    let jan1 = super::days_from_civil(y, 1, 1);
-                    let wd_sun = (i64::from(jan1) + 4).rem_euclid(7) as i32;
-                    let first_sunday = jan1 + ((7 - wd_sun) % 7);
-                    if days >= first_sunday {
-                        Ok(Value::Int((days - first_sunday) / 7 + 1))
-                    } else {
-                        Ok(Value::Int(0))
-                    }
+                    let mode = match args.get(1) {
+                        Some(Value::Int(n)) => *n as u32,
+                        Some(Value::SmallInt(n)) => u32::from(*n as u16),
+                        Some(Value::BigInt(n)) => *n as u32,
+                        _ => 0,
+                    };
+                    Ok(Value::Int(
+                        super::datetime::mysql_calc_week(days, mode).1 as i32,
+                    ))
                 }
                 _ => unreachable!(),
             }
@@ -6647,30 +6645,19 @@ fn apply_function_dispatch(
                 // MySQL TO_DAYS counts from year 0:
                 // to_days('1970-01-01') = 719528.
                 "to_days" => Ok(Value::BigInt(i64::from(days) + 719_528)),
+                // v7.39 (round 378) — YEARWEEK(date [, mode]) honours the
+                // mode and always uses the "with year" reckoning (a leading
+                // partial week rolls into the previous year's last week), so
+                // it forces the WEEK_YEAR bit on. Result is year*100 + week.
                 "yearweek" => {
-                    // MySQL default mode 0: weeks start Sunday;
-                    // days before the year's first Sunday belong to
-                    // the previous year's last week.
-                    fn week_of(days: i32, year: i32) -> Option<i32> {
-                        let jan1 = crate::eval::format::days_from_civil(year, 1, 1);
-                        // Weekday with Sunday=0: 1970-01-01 was
-                        // Thursday (Sunday-based index 4).
-                        let wd_sun = (i64::from(jan1) + 4).rem_euclid(7) as i32;
-                        let first_sunday = jan1 + ((7 - wd_sun) % 7);
-                        if days >= first_sunday {
-                            Some((days - first_sunday) / 7 + 1)
-                        } else {
-                            None
-                        }
-                    }
-                    match week_of(days, y) {
-                        Some(w) => Ok(Value::Int(y * 100 + w)),
-                        None => {
-                            // Belongs to the previous year's count.
-                            let w = week_of(days, y - 1).unwrap_or(52);
-                            Ok(Value::Int((y - 1) * 100 + w))
-                        }
-                    }
+                    let mode = match args.get(1) {
+                        Some(Value::Int(n)) => *n as u32,
+                        Some(Value::SmallInt(n)) => u32::from(*n as u16),
+                        Some(Value::BigInt(n)) => *n as u32,
+                        _ => 0,
+                    };
+                    let (yr, wk) = super::datetime::mysql_calc_week(days, mode | 2);
+                    Ok(Value::Int(yr * 100 + wk as i32))
                 }
                 _ => unreachable!(),
             }
