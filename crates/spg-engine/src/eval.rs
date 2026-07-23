@@ -826,6 +826,17 @@ fn mysql_bytes_as_number(b: &[u8]) -> Value<'static> {
 /// disagree about.
 #[inline(never)]
 pub(crate) fn mysql_true_division(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Option<Value<'static>> {
+    // v7.39 (round 372) — MySQL's `x % 0` / `x MOD 0` is NULL, not the PG
+    // "division by zero" error (measured on MariaDB 11: `10%0`, `10 MOD
+    // 0`, `10.5%0` are all NULL, matching `1/0`). A non-zero divisor takes
+    // the normal modulo path.
+    if matches!(op, BinOp::Mod) {
+        return if value_is_zero(r) {
+            Some(Value::Null)
+        } else {
+            None
+        };
+    }
     if !matches!(op, BinOp::Div) {
         return None;
     }
@@ -842,6 +853,20 @@ pub(crate) fn mysql_true_division(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Op
     } else {
         Value::Float(a / b)
     })
+}
+
+/// v7.39 (round 372) — is `v` a numeric zero (any width / kind)? Used to
+/// route `x % 0` / `MOD(x, 0)` to NULL under the MySQL dialect.
+pub(crate) fn value_is_zero(v: &Value<'_>) -> bool {
+    match v {
+        Value::SmallInt(n) => *n == 0,
+        Value::Int(n) => *n == 0,
+        Value::BigInt(n) => *n == 0,
+        Value::Float(x) => *x == 0.0,
+        Value::Real(x) => *x == 0.0,
+        Value::Numeric { scaled, .. } => *scaled == 0,
+        _ => false,
+    }
 }
 
 /// `-'5'` in the MySQL dialect. Out-of-line for the same frame reason.

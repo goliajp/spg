@@ -209,6 +209,7 @@ mod e2e_mysql_binary_literal_round367;
 mod e2e_mysql_binary_string_ctx_round368;
 mod e2e_mysql_collate_binary_round370;
 mod e2e_mysql_collate_expr_round371;
+mod e2e_mysql_mod_zero_round372;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;
