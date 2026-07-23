@@ -5359,3 +5359,83 @@ mod tx_writeset {
         assert!(fresh2.replay_tx_writeset(&ws1, 88).is_empty());
     }
 }
+
+// v7.39 (round 363, M4 P1) — the MySQL default-collation fold. Every
+// case here is a MariaDB 11 measurement: two strings that MariaDB's
+// `utf8mb4_uca1400_ai_ci` reports equal must fold to the same bytes, and
+// two it reports different must not.
+#[cfg(test)]
+mod mysql_ci_fold_tests {
+    use crate::mysql_ci_fold;
+
+    fn eq(a: &str, b: &str) -> bool {
+        mysql_ci_fold(a) == mysql_ci_fold(b)
+    }
+
+    #[test]
+    fn case_folds() {
+        assert!(eq("Foo", "foo"));
+        assert!(eq("FOO", "foo"));
+        assert!(eq("a", "A"));
+        assert!(eq("z", "Z"));
+        assert_eq!(mysql_ci_fold("MixedCase"), "mixedcase");
+    }
+
+    #[test]
+    fn accents_strip_to_the_base() {
+        for accented in ["á", "à", "â", "ä", "ã", "å"] {
+            assert!(eq("a", accented), "{accented} should fold to a");
+        }
+        for accented in ["é", "è", "ê", "ë"] {
+            assert!(eq("e", accented), "{accented} should fold to e");
+        }
+        assert!(eq("i", "í"));
+        assert!(eq("o", "ó"));
+        assert!(eq("o", "ö"));
+        assert!(eq("u", "ü"));
+        assert!(eq("n", "ñ"));
+        assert!(eq("c", "ç"));
+        assert!(eq("y", "ý"));
+        // Uppercase accented too.
+        assert!(eq("A", "Ä"));
+        assert!(eq("O", "Ö"));
+        assert!(eq("U", "Ü"));
+    }
+
+    #[test]
+    fn ligatures_expand() {
+        // MariaDB: 'ss'='ß' is 1, 's'='ß' is 0.
+        assert!(eq("ss", "ß"));
+        assert!(!eq("s", "ß"));
+        // 'ae'='æ' is 1, 'a'='æ' is 0.
+        assert!(eq("ae", "æ"));
+        assert!(!eq("a", "æ"));
+        // 'oe'='œ' is 1.
+        assert!(eq("oe", "œ"));
+        // ø folds to o, ð folds to d.
+        assert!(eq("o", "ø"));
+        assert!(eq("d", "ð"));
+    }
+
+    #[test]
+    fn words_measured_on_mariadb() {
+        // 'Bär'='bar' is 1, 'Bär'='baer' is 0.
+        assert!(eq("Bär", "bar"));
+        assert!(!eq("Bär", "baer"));
+        // 'straße'='strasse' is 1, ='strase' is 0.
+        assert!(eq("straße", "strasse"));
+        assert!(!eq("straße", "strase"));
+        // café=cafe, naïve=naive, RÉSUMÉ=resume.
+        assert!(eq("café", "cafe"));
+        assert!(eq("naïve", "naive"));
+        assert!(eq("RÉSUMÉ", "resume"));
+    }
+
+    #[test]
+    fn ascii_and_unknown_scripts_pass_through() {
+        assert_eq!(mysql_ci_fold("hello123"), "hello123");
+        assert_eq!(mysql_ci_fold(""), "");
+        // A script with no fold entry keeps its (lower-cased) self.
+        assert_eq!(mysql_ci_fold("日本語"), "日本語");
+    }
+}

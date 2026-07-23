@@ -1510,6 +1510,67 @@ pub enum Collation {
     CaseInsensitive,
 }
 
+/// v7.39 (round 363, M4 P1) — MySQL's default accent- and
+/// case-insensitive fold (`utf8mb4_uca1400_ai_ci`).
+///
+/// This is the primitive M4 rests on: a session on the MySQL dialect
+/// compares, groups, sorts and de-duplicates text by its FOLDED form, so
+/// `Foo` = `foo` = `FOO` and, because the default collation is accent-
+/// insensitive too, `Bär` = `bar`. The later stages (read path, then the
+/// UNIQUE / index write path) all route through here so they cannot fold
+/// differently from one another.
+///
+/// The fold is more than case + strip-combining: MariaDB EXPANDS some
+/// letters — `ß` → `ss`, `æ` → `ae`, `œ` → `oe` — which is why the result
+/// is built as a `String` rather than mapped char-for-char. Every mapping
+/// below was measured on MariaDB 11 (`'Bär'='bar'` is 1, `'straße'=
+/// 'strasse'` is 1, `'a'='æ'` is 0, `'s'='ß'` is 0). Characters with no
+/// entry keep their lower-cased self, so ASCII and unknown scripts pass
+/// through unchanged.
+#[must_use]
+pub fn mysql_ci_fold(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        // Lower-case first (`À` → `à`, `Æ` → `æ`), then fold the base.
+        for lc in ch.to_lowercase() {
+            match fold_latin_base(lc) {
+                Some(base) => out.push_str(base),
+                None => out.push(lc),
+            }
+        }
+    }
+    out
+}
+
+/// The base letter(s) a lower-cased Latin character folds to, or `None`
+/// when it is already a base / has no fold. Expansions (`ß` → `ss`) are
+/// why this returns a string.
+fn fold_latin_base(c: char) -> Option<&'static str> {
+    Some(match c {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => "a",
+        'æ' => "ae",
+        'ç' | 'ć' | 'č' | 'ĉ' | 'ċ' => "c",
+        'ð' | 'ď' | 'đ' => "d",
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => "e",
+        'ĝ' | 'ğ' | 'ġ' | 'ģ' => "g",
+        'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' => "i",
+        'ĵ' => "j",
+        'ķ' => "k",
+        'ł' | 'ĺ' | 'ļ' | 'ľ' => "l",
+        'ñ' | 'ń' | 'ņ' | 'ň' => "n",
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => "o",
+        'œ' => "oe",
+        'ŕ' | 'ŗ' | 'ř' => "r",
+        'ś' | 'š' | 'ŝ' | 'ş' => "s",
+        'ß' => "ss",
+        'ţ' | 'ť' | 'ŧ' => "t",
+        'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => "u",
+        'ý' | 'ÿ' => "y",
+        'ź' | 'ž' | 'ż' => "z",
+        _ => return None,
+    })
+}
+
 #[allow(clippy::derivable_impls)]
 impl Default for Collation {
     fn default() -> Self {
