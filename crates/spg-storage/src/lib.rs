@@ -1489,6 +1489,12 @@ pub struct ColumnSchema {
     /// (`SELECT j FROM jsonb_array_elements('[1]') AS j` → `1`, PG). Runtime
     /// only — a catalogued table column is never one, and it is not persisted.
     pub scalar_row_source: bool,
+    /// v7.39 (round 386, type-fidelity epic P1) — the declared MySQL narrow
+    /// integer width (TINYINT / MEDIUMINT) whose range the storage `ty`
+    /// (SmallInt / Int) is too wide to enforce. `None` for every other
+    /// column. Drives the epic-P2 write-path range check. Persisted in the
+    /// FILE_VERSION 81+ sparse appendix; older catalogs deserialise as None.
+    pub mysql_int_width: Option<MysqlIntWidth>,
 }
 
 /// v7.17.0 Phase 2.5 — column-level text collation. Drives the
@@ -1508,6 +1514,25 @@ pub struct ColumnSchema {
 pub enum Collation {
     Binary,
     CaseInsensitive,
+}
+
+/// v7.39 (round 386, type-fidelity epic P1) — the declared MySQL narrow
+/// integer type for a column whose storage `DataType` cannot express it.
+/// MySQL `TINYINT` (i8, -128..127) collapses to `DataType::SmallInt` (i16)
+/// and `MEDIUMINT` (24-bit) to `DataType::Int` (i32) — both wider than the
+/// declared type, so a range check against `ty` alone accepts out-of-range
+/// values (`INSERT 128 INTO TINYINT` is stored silently where MariaDB
+/// strict raises ERROR 1264). This annotation records the lost width so the
+/// write path (epic P2) can enforce the real bounds. `SMALLINT` / `INT` /
+/// `BIGINT` need no marker — their storage `DataType` is already faithful.
+/// Sparse: only TINYINT / MEDIUMINT columns carry it; persisted in the
+/// FILE_VERSION 81+ appendix, older catalogs deserialise as None.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MysqlIntWidth {
+    /// MySQL `TINYINT` — signed -128..127, unsigned 0..255.
+    Tiny,
+    /// MySQL `MEDIUMINT` — signed -8388608..8388607, unsigned 0..16777215.
+    Medium,
 }
 
 /// v7.39 (round 363, M4 P1) — MySQL's default accent- and
@@ -6951,6 +6976,7 @@ impl ColumnSchema {
             default_text: None,
             auto_restart: None,
             scalar_row_source: false,
+            mysql_int_width: None,
         }
     }
 
@@ -7300,7 +7326,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 80;
+const FILE_VERSION: u8 = 81;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -8084,6 +8110,35 @@ impl Catalog {
             for (pos, n) in restarts {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
                 out.extend_from_slice(&n.to_le_bytes());
+            }
+            // v7.39 (round 386, type-fidelity epic P1) — per-table
+            // mysql_int_width appendix (FILE_VERSION 81+). Sparse: only
+            // TINYINT / MEDIUMINT columns land. Layout:
+            // `[u16 count]([u16 col_pos][u8 width_tag]) × count`
+            // (tag 0 = Tiny, 1 = Medium). v80-and-below readers stop after
+            // the identity-RESTART appendix, leaving every column at None.
+            let int_widths: Vec<(usize, u8)> = t
+                .schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| {
+                    c.mysql_int_width.map(|w| {
+                        let tag = match w {
+                            MysqlIntWidth::Tiny => 0u8,
+                            MysqlIntWidth::Medium => 1u8,
+                        };
+                        (i, tag)
+                    })
+                })
+                .collect();
+            write_u16(
+                &mut out,
+                u16::try_from(int_widths.len()).expect("≤ 65k narrow-int columns/table"),
+            );
+            for (pos, tag) in int_widths {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                out.push(tag);
             }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
