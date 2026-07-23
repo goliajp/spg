@@ -3308,7 +3308,7 @@ fn finalize_synth_rows(
                     ctx.mysql_dialect,
                 )?
             } else {
-                finalize(&agg_specs[i].name, st_final)
+                finalize(&agg_specs[i].name, st_final, ctx.mysql_dialect)
             };
             // v7.39 (round 327, V44) — keep the zone identity. SPG carries a
             // timestamptz at runtime as `Value::Timestamp`, so the array
@@ -4412,7 +4412,7 @@ pub(crate) fn update_state(
 }
 
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-pub(crate) fn finalize(name: &str, st: &AggState) -> Value<'static> {
+pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static> {
     match name {
         "count" | "count_star" => Value::BigInt(st.count),
         "sum" => {
@@ -4626,7 +4626,12 @@ pub(crate) fn finalize(name: &str, st: &AggState) -> Value<'static> {
                 return Value::Null;
             }
             let nf = n as f64;
-            let pop = name.ends_with("_pop");
+            // v7.39 (round 381) — MySQL's bare STDDEV / VARIANCE are the
+            // POPULATION statistics (`STDDEV` = `STDDEV_POP`, `VARIANCE` =
+            // `VAR_POP` on MariaDB 11), where PG's bare forms are the
+            // SAMPLE ones. `_samp` / `_pop` are explicit and unchanged.
+            let pop = name.ends_with("_pop")
+                || (mysql && (name == "stddev" || name == "variance"));
             if !pop && n < 2 {
                 // var_samp / stddev (samp) with n == 1 → NULL.
                 return Value::Null;

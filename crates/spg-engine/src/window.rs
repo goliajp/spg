@@ -832,7 +832,7 @@ fn generic_aggregate_window(
             }
         }
         let (_, _, idx) = &slice[i];
-        let v = crate::aggregate::finalize(name, &st);
+        let v = crate::aggregate::finalize(name, &st, ctx.mysql_dialect);
         // v7.39 (round 327, V44) — keep the zone identity here too. A
         // timestamptz rides as `Value::Timestamp` at runtime, so the array
         // `array_agg(x) OVER (…)` builds is a TimestampArray; the
