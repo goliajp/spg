@@ -54,6 +54,11 @@ pub struct RenderStyle {
     /// PG default 1: >= 1 means shortest-round-trip output; 0 and
     /// negative trim to 15+n (float8) / 6+n (float4) significant digits.
     pub extra_float_digits: i32,
+    /// v7.39 (round 368, M20 P3) — the session is on the MySQL dialect, so
+    /// a binary string (`Value::Bytes`, e.g. a `0x…` literal) renders as
+    /// its raw bytes read latin-1 (`0x41` → 'A', `CONCAT(0x41,'B')` →
+    /// 'AB'), not as PG's `\x…` hex form.
+    pub mysql: bool,
 }
 
 impl Default for RenderStyle {
@@ -63,6 +68,7 @@ impl Default for RenderStyle {
             date_order: DateOrder::Mdy,
             interval_style: IntervalStyleKind::Postgres,
             extra_float_digits: 1,
+            mysql: false,
         }
     }
 }
