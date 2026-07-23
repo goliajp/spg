@@ -7058,6 +7058,11 @@ fn apply_function_dispatch(
             // the month is clamped to the target's last day). Silently, on
             // every month-granular date shift there is. The `+ INTERVAL`
             // OPERATOR was always right — this is the same helper it uses.
+            // v7.39 (round 373) — a DATE input plus a day-granular interval
+            // (no HH:MM:SS part) stays a DATE on MySQL, like DATE_SUB /
+            // ADDDATE already do; a time component lifts it to DATETIME.
+            let base_is_date = matches!(&args[0], Value::Date(_))
+                || matches!(&args[0], Value::Text(s) if !s.contains(':'));
             let base = match &args[0] {
                 Value::Timestamp(t) => Some(*t),
                 Value::Date(d) => Some(i64::from(*d).saturating_mul(86_400_000_000)),
@@ -7078,6 +7083,11 @@ fn apply_function_dispatch(
                         i64::from(*days),
                         *micros,
                     )?;
+                    if base_is_date && *micros == 0 && ctx.mysql_dialect {
+                        return Ok(Value::Date(
+                            i32::try_from(out.div_euclid(86_400_000_000)).unwrap_or(i32::MAX),
+                        ));
+                    }
                     Ok(Value::Timestamp(out))
                 }
                 (_, b) => Err(EvalError::TypeMismatch {
