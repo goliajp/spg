@@ -33,6 +33,22 @@ pub(crate) fn order_by_value_cmp(
     a: &Value,
     b: &Value,
 ) -> core::cmp::Ordering {
+    order_by_value_cmp_in(desc, nulls_first, a, b, false)
+}
+
+/// v7.39 (round 364, M4 P2) — ORDER BY comparator with the session
+/// dialect. On a MySQL session, text sorts by its FOLDED form (accent-
+/// and case-insensitive), so `bar`/`Bär` sort adjacent and before
+/// `foo`/`Foo`. Values that fold equal keep an implementation-defined
+/// order between them (MariaDB does too — GROUP_CONCAT's tie order among
+/// collation-equal values is not specified).
+pub(crate) fn order_by_value_cmp_in(
+    desc: bool,
+    nulls_first: Option<bool>,
+    a: &Value,
+    b: &Value,
+    mysql: bool,
+) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     let nf = nulls_first.unwrap_or(desc);
     match (matches!(a, Value::Null), matches!(b, Value::Null)) {
@@ -52,7 +68,15 @@ pub(crate) fn order_by_value_cmp(
             }
         }
         (false, false) => {
-            let c = value_cmp(a, b);
+            let c = if mysql {
+                if let (Value::Text(x), Value::Text(y)) = (a, b) {
+                    spg_storage::mysql_ci_fold(x).cmp(&spg_storage::mysql_ci_fold(y))
+                } else {
+                    value_cmp(a, b)
+                }
+            } else {
+                value_cmp(a, b)
+            };
             if desc { c.reverse() } else { c }
         }
     }

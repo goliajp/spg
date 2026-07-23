@@ -81,14 +81,23 @@ pub(super) fn collation_fold_for_compare(
     ) {
         return (l, r);
     }
+    // v7.39 (round 364, M4 P2) — a MySQL session's default collation is
+    // accent- AND case-insensitive, so EVERY text comparison folds, not
+    // only those touching a `COLLATE case_insensitive` column. `BINARY x`
+    // (or `CAST(x AS BINARY)`) still forces byte-wise, which is why the
+    // dialect fold is suppressed when either side is binary-coerced.
+    let mysql = ctx.mysql_dialect && !(is_binary_coerced(lhs) || is_binary_coerced(rhs));
     let lhs_col = column_collation(lhs, ctx);
     let rhs_col = column_collation(rhs, ctx);
     let ci = matches!(lhs_col, Some(spg_storage::Collation::CaseInsensitive))
         || matches!(rhs_col, Some(spg_storage::Collation::CaseInsensitive));
-    if !ci {
+    if !ci && !mysql {
         return (l, r);
     }
+    // A PG `case_insensitive` column keeps its ASCII-only contract; the
+    // MySQL session uses the full accent-aware fold measured in P1.
     let fold = |v: Value<'static>| match v {
+        Value::Text(s) if mysql => Value::text(spg_storage::mysql_ci_fold(&s)),
         Value::Text(s) => Value::text(s.to_ascii_lowercase()),
         other => other,
     };
@@ -139,6 +148,13 @@ pub(super) fn compare_is_case_insensitive(lhs: &Expr, rhs: &Expr, ctx: &EvalCont
     if is_binary_coerced(lhs) || is_binary_coerced(rhs) {
         return false;
     }
+    // v7.39 (round 364, M4 P2) — a MySQL session folds every text
+    // comparison (see `collation_fold_for_compare`), so it must take the
+    // owned path where the fold runs. Non-text operands fold to
+    // themselves, so this only costs the mysql dialect the owned route.
+    if ctx.mysql_dialect {
+        return true;
+    }
     matches!(
         column_collation(lhs, ctx),
         Some(spg_storage::Collation::CaseInsensitive)
@@ -148,9 +164,17 @@ pub(super) fn compare_is_case_insensitive(lhs: &Expr, rhs: &Expr, ctx: &EvalCont
     )
 }
 
+/// v7.39 (round 364, M4 P2) — does a MySQL session's default-collation
+/// fold apply to this comparison? True on the MySQL dialect unless either
+/// side is `BINARY`-coerced (which forces byte-wise). Shared by the
+/// interpreter and the compiled stepper so they cannot disagree.
+pub(super) fn mysql_text_fold_applies(lhs: &Expr, rhs: &Expr, ctx: &EvalContext<'_>) -> bool {
+    ctx.mysql_dialect && !is_binary_coerced(lhs) && !is_binary_coerced(rhs)
+}
+
 /// Is this expression coerced to the binary collation — `BINARY x` or
 /// `CAST(x AS BINARY[(n)])`?
-fn is_binary_coerced(e: &Expr) -> bool {
+pub(crate) fn is_binary_coerced(e: &Expr) -> bool {
     matches!(
         e,
         Expr::Cast {

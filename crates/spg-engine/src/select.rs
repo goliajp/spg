@@ -23,7 +23,7 @@ use crate::{
     apply_offset_and_limit, apply_offset_and_limit_tagged, approx_row_bytes, build_order_keys,
     collect_meta_view_names, collect_qualified_refs, collect_scalar_subqueries,
     collect_window_nodes, compute_window_partition, eval, expr_tree_has_subquery,
-    materialise_in_order, materialise_meta_view, memoize, order_by_value_cmp, order_key_cmp,
+    materialise_in_order, materialise_meta_view, memoize, order_by_value_cmp_in, order_key_cmp,
     partial_sort_tagged, partition_key_cmp, rewrite_window_to_columns, select_has_window,
     select_references_meta_view, select_refers_to, sort_by_keys, synth_info_key_column_usage,
     synth_info_referential_constraints, synth_info_routines, synth_info_statistics,
@@ -2491,7 +2491,13 @@ impl Engine {
             indexed.sort_by(|a, b| {
                 for (idx, (ka, kb)) in a.1.iter().zip(b.1.iter()).enumerate() {
                     let o = &order_by[idx];
-                    let cmp = order_by_value_cmp(o.desc, o.nulls_first, ka, kb);
+                    let cmp = order_by_value_cmp_in(
+                        o.desc,
+                        o.nulls_first,
+                        ka,
+                        kb,
+                        scan_ctx.mysql_dialect && !crate::eval::is_binary_coerced(&o.expr),
+                    );
                     if cmp != core::cmp::Ordering::Equal {
                         return cmp;
                     }
@@ -2681,7 +2687,13 @@ impl Engine {
             indexed.sort_by(|a, b| {
                 for (idx, (ka, kb)) in a.1.iter().zip(b.1.iter()).enumerate() {
                     let o = &stmt.order_by[idx];
-                    let cmp = order_by_value_cmp(o.desc, o.nulls_first, ka, kb);
+                    let cmp = order_by_value_cmp_in(
+                        o.desc,
+                        o.nulls_first,
+                        ka,
+                        kb,
+                        scan_ctx.mysql_dialect && !crate::eval::is_binary_coerced(&o.expr),
+                    );
                     if cmp != core::cmp::Ordering::Equal {
                         return cmp;
                     }
@@ -3719,7 +3731,13 @@ impl Engine {
             indexed.sort_by(|a, b| {
                 for (idx, (ka, kb)) in a.1.iter().zip(b.1.iter()).enumerate() {
                     let o = &stmt.order_by[idx];
-                    let cmp = order_by_value_cmp(o.desc, o.nulls_first, ka, kb);
+                    let cmp = order_by_value_cmp_in(
+                        o.desc,
+                        o.nulls_first,
+                        ka,
+                        kb,
+                        scan_ctx.mysql_dialect && !crate::eval::is_binary_coerced(&o.expr),
+                    );
                     if cmp != core::cmp::Ordering::Equal {
                         return cmp;
                     }
@@ -3959,7 +3977,13 @@ impl Engine {
             indexed.sort_by(|a, b| {
                 for (idx, (ka, kb)) in a.1.iter().zip(b.1.iter()).enumerate() {
                     let o = &stmt.order_by[idx];
-                    let cmp = order_by_value_cmp(o.desc, o.nulls_first, ka, kb);
+                    let cmp = order_by_value_cmp_in(
+                        o.desc,
+                        o.nulls_first,
+                        ka,
+                        kb,
+                        scan_ctx.mysql_dialect && !crate::eval::is_binary_coerced(&o.expr),
+                    );
                     if cmp != core::cmp::Ordering::Equal {
                         return cmp;
                     }

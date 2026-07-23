@@ -877,6 +877,7 @@ pub(crate) fn run(
             correlated_eval,
             keep_n,
             catalog,
+            engine.is_some_and(|e| e.backslash_escapes),
         )?;
         kept_synth = sorted_synth;
         out_rows = sorted_out;
@@ -1470,7 +1471,11 @@ fn accumulate_groups(
     // v7.37.x — single-col GROUP BY on a TEXT-typed column lets the
     // hot loop key the hash map by the column text directly. Resolved
     // once from the bound position against `schema_cols`.
-    let single_text_group_col: bool = group_pos.len() == 1
+    // v7.39 (round 364, M4 P2) — the raw-text GROUP BY fast path keys
+    // by the column's bytes, which cannot fold; a MySQL session takes
+    // the general encoder path (which folds) instead.
+    let single_text_group_col: bool = !ctx.mysql_dialect
+        && group_pos.len() == 1
         && group_pos[0].is_some_and(|p| {
             schema_cols
                 .get(p)
@@ -2242,7 +2247,7 @@ fn accumulate_groups(
                     // the generic encoded path for correctness.
                     refs.clear();
                     refs.push(kv);
-                    encode_key_refs_into(&refs, &mut keybuf_s);
+                    encode_key_refs_into_in(&refs, &mut keybuf_s, ctx.mysql_dialect);
                     match groups.get(keybuf_s.as_str()) {
                         Some(&i) => i,
                         None => {
@@ -2386,7 +2391,7 @@ fn accumulate_groups(
                         let better = match &st.first_best {
                             None => true,
                             Some((bk, _)) => {
-                                cmp_order_keys(&spec.order_by, &spec.order_enum_labels, &keys, bk)
+                                cmp_order_keys(&spec.order_by, &spec.order_enum_labels, &keys, bk, ctx.mysql_dialect)
                                     == core::cmp::Ordering::Less
                             }
                         };
@@ -2414,10 +2419,22 @@ fn accumulate_groups(
                     // probes; skipping `encode_key_refs_into` saves
                     // ~100 ns of alloc + format churn per row.
                     if let Value::Text(s) = arg_ref {
-                        if entry.1[i].seen.contains(s.as_ref()) {
-                            continue;
+                        // v7.39 (round 364, M4 P2) — a MySQL session folds
+                        // the distinct key (case/accent) so `Foo`/`foo`
+                        // count once. The `seen` set stays internally
+                        // consistent: both probe and insert fold.
+                        if ctx.mysql_dialect {
+                            let k = spg_storage::mysql_ci_fold(s);
+                            if entry.1[i].seen.contains(k.as_str()) {
+                                continue;
+                            }
+                            entry.1[i].seen.insert(k);
+                        } else {
+                            if entry.1[i].seen.contains(s.as_ref()) {
+                                continue;
+                            }
+                            entry.1[i].seen.insert(s.to_string());
                         }
-                        entry.1[i].seen.insert(s.to_string());
                     } else if let Value::BigInt(n) = arg_ref {
                         let set = entry.1[i].seen_int.get_or_insert_with(BTreeSet::new);
                         if !set.insert(*n) {
@@ -2429,7 +2446,7 @@ fn accumulate_groups(
                             continue;
                         }
                     } else {
-                        encode_key_refs_into(core::slice::from_ref(&arg_ref), &mut dkeybuf);
+                        encode_key_refs_into_in(core::slice::from_ref(&arg_ref), &mut dkeybuf, ctx.mysql_dialect);
                         if entry.1[i].seen.contains(dkeybuf.as_str()) {
                             continue;
                         }
@@ -2577,7 +2594,7 @@ fn accumulate_groups(
                         // non-single-Text branch below.
                         refs.clear();
                         refs.push(v);
-                        encode_key_refs_into(&refs, &mut keybuf_s);
+                        encode_key_refs_into_in(&refs, &mut keybuf_s, ctx.mysql_dialect);
                         match groups.get(keybuf_s.as_str()) {
                             Some(&i) => i,
                             None => {
@@ -2628,7 +2645,7 @@ fn accumulate_groups(
                         // (coercion edge) — encoded-path fallback.
                         refs.clear();
                         refs.push(v);
-                        encode_key_refs_into(&refs, &mut keybuf_s);
+                        encode_key_refs_into_in(&refs, &mut keybuf_s, ctx.mysql_dialect);
                         match groups.get(keybuf_s.as_str()) {
                             Some(&i) => i,
                             None => {
@@ -2649,7 +2666,7 @@ fn accumulate_groups(
                         .iter()
                         .map(|p| row.get(p.unwrap()).unwrap_or(&Value::Null)),
                 );
-                encode_key_refs_into(&refs, &mut keybuf_s);
+                encode_key_refs_into_in(&refs, &mut keybuf_s, ctx.mysql_dialect);
                 match groups.get(keybuf_s.as_str()) {
                     Some(&i) => i,
                     None => {
@@ -2774,7 +2791,7 @@ fn accumulate_groups(
                         let better = match &st.first_best {
                             None => true,
                             Some((bk, _)) => {
-                                cmp_order_keys(&spec.order_by, &spec.order_enum_labels, &keys, bk)
+                                cmp_order_keys(&spec.order_by, &spec.order_enum_labels, &keys, bk, ctx.mysql_dialect)
                                     == core::cmp::Ordering::Less
                             }
                         };
@@ -2807,7 +2824,7 @@ fn accumulate_groups(
                             continue;
                         }
                     } else {
-                        encode_key_refs_into(core::slice::from_ref(&arg_ref), &mut dkeybuf);
+                        encode_key_refs_into_in(core::slice::from_ref(&arg_ref), &mut dkeybuf, ctx.mysql_dialect);
                         if entry.1[i].seen.contains(dkeybuf.as_str()) {
                             continue;
                         }
@@ -2992,7 +3009,7 @@ fn accumulate_groups(
                     let better = match &st.first_best {
                         None => true,
                         Some((bk, _)) => {
-                            cmp_order_keys(&spec.order_by, &spec.order_enum_labels, &keys, bk)
+                            cmp_order_keys(&spec.order_by, &spec.order_enum_labels, &keys, bk, ctx.mysql_dialect)
                                 == core::cmp::Ordering::Less
                         }
                     };
@@ -3109,6 +3126,7 @@ fn cmp_order_keys(
     order_enum_labels: &[Option<Vec<String>>],
     a: &[Value<'static>],
     b: &[Value<'static>],
+    mysql: bool,
 ) -> core::cmp::Ordering {
     for (k, o) in order_by.iter().enumerate() {
         // v7.39 (enum order knife) — an enum-typed sort key compares by
@@ -3124,7 +3142,11 @@ fn cmp_order_keys(
             }
             continue;
         }
-        let cmp = crate::order_by_value_cmp(o.desc, o.nulls_first, &a[k], &b[k]);
+        // v7.37 (M4 P2) — `ORDER BY BINARY x` forces byte-wise sorting
+        // even under the folding MySQL dialect, so a per-key BINARY
+        // coercion turns folding back off for that key alone.
+        let fold = mysql && !crate::eval::is_binary_coerced(&o.expr);
+        let cmp = crate::order_by_value_cmp_in(o.desc, o.nulls_first, &a[k], &b[k], fold);
         if cmp != core::cmp::Ordering::Equal {
             return cmp;
         }
@@ -3199,6 +3221,7 @@ fn finalize_synth_rows(
                             &agg_specs[i].order_enum_labels,
                             &st.item_keys[x],
                             &st.item_keys[y],
+                            ctx.mysql_dialect,
                         )
                     });
                     let mut sorted = st.clone();
@@ -3231,7 +3254,7 @@ fn finalize_synth_rows(
                         {
                             return ord;
                         }
-                        crate::order_by_value_cmp(false, Some(false), a, b)
+                        crate::order_by_value_cmp_in(false, Some(false), a, b, ctx.mysql_dialect)
                     });
                     st_sorted = sorted;
                     &st_sorted
@@ -3247,6 +3270,7 @@ fn finalize_synth_rows(
                     direct_arg_vals[i].as_ref(),
                     &direct_extra_vals[i],
                     &agg_specs[i].order_by,
+                    ctx.mysql_dialect,
                 )?
             } else {
                 finalize(&agg_specs[i].name, st_final)
@@ -3464,6 +3488,7 @@ fn sort_synth_by_order_by(
     correlated_eval: Option<CorrelatedEval<'_>>,
     keep_n: Option<usize>,
     catalog: Option<&spg_storage::Catalog>,
+    mysql: bool,
 ) -> Result<(Vec<Row<'static>>, Vec<Row<'static>>), EvalError> {
     let mut synth_ctx = EvalContext::new(synth_schema, None);
     if let Some(cat) = catalog {
@@ -3526,7 +3551,7 @@ fn sort_synth_by_order_by(
                 }
                 continue;
             }
-            let c = crate::order_by_value_cmp(desc, nf, ka, kb);
+            let c = crate::order_by_value_cmp_in(desc, nf, ka, kb, mysql);
             if c != Ordering::Equal {
                 return c;
             }
@@ -4846,6 +4871,7 @@ fn finalize_ordered_set(
     direct: Option<&Value>,
     direct_extra: &[Value<'static>],
     order_by: &[spg_sql::ast::OrderBy],
+    mysql: bool,
 ) -> Result<Value<'static>, EvalError> {
     let fraction = direct;
     // v7.39 (read01 orderedsetaggs.c) — PG validates the percentile
@@ -4916,9 +4942,9 @@ fn finalize_ordered_set(
                 .map_or((false, None), |o| (o.desc, o.nulls_first));
             let cmp_i = |i: usize| -> core::cmp::Ordering {
                 if multi {
-                    cmp_order_keys(order_by, &[], &st.item_keys[i], &hv)
+                    cmp_order_keys(order_by, &[], &st.item_keys[i], &hv, mysql)
                 } else {
-                    crate::order_by_value_cmp(desc, nulls_first, &items[i], h)
+                    crate::order_by_value_cmp_in(desc, nulls_first, &items[i], h, mysql)
                 }
             };
             let mut before: Vec<usize> = Vec::new(); // sort strictly before h
@@ -4944,7 +4970,7 @@ fn finalize_ordered_set(
                     // item_keys in the multi-key form, so sort + dedup).
                     let tuple_cmp = |&x: &usize, &y: &usize| -> core::cmp::Ordering {
                         if multi {
-                            cmp_order_keys(order_by, &[], &st.item_keys[x], &st.item_keys[y])
+                            cmp_order_keys(order_by, &[], &st.item_keys[x], &st.item_keys[y], mysql)
                         } else {
                             value_cmp(&items[x], &items[y])
                         }
@@ -5522,6 +5548,31 @@ fn rewrite_group_keys_in_select(
 /// Canonical string key for a tuple of group values. Used as map key.
 /// Per-value group-key encoding (shared by owned and borrowed paths).
 fn encode_one(out: &mut String, v: &Value) {
+    encode_one_in(out, v, false);
+}
+
+/// v7.39 (round 364, M4 P2) — key encoder with the session dialect. On a
+/// MySQL session a text group / distinct key is FOLDED (accent- and
+/// case-insensitive) so `Foo`/`foo`/`FOO` share one group and `bar`/`Bär`
+/// merge — while the group's OUTPUT value stays the first row's original,
+/// because only the key is folded, not the stored value.
+fn encode_one_in(out: &mut String, v: &Value, mysql: bool) {
+    use core::fmt::Write;
+    if mysql {
+        if let Value::Text(s) | Value::Json(s) = v {
+            let _ = write!(out, "S{}|", spg_storage::mysql_ci_fold(s));
+            return;
+        }
+        if let Value::BpChar(s) = v {
+            let folded = spg_storage::mysql_ci_fold(s.trim_end_matches(' '));
+            let _ = write!(out, "S{folded}|");
+            return;
+        }
+    }
+    encode_one_raw(out, v);
+}
+
+fn encode_one_raw(out: &mut String, v: &Value) {
     use core::fmt::Write;
     match v {
         Value::Null => out.push_str("N|"),
@@ -5676,9 +5727,14 @@ pub(crate) fn encode_key_refs(vals: &[&Value]) -> String {
 /// allocator just to LOOK UP a map; the scratch form allocates
 /// only when a map actually has to take ownership (vacant insert).
 pub(crate) fn encode_key_refs_into(vals: &[&Value], out: &mut String) {
+    encode_key_refs_into_in(vals, out, false);
+}
+
+/// v7.39 (round 364, M4 P2) — key encode with the session dialect.
+pub(crate) fn encode_key_refs_into_in(vals: &[&Value], out: &mut String, mysql: bool) {
     out.clear();
     for v in vals {
-        encode_one(out, v);
+        encode_one_in(out, v, mysql);
     }
 }
 

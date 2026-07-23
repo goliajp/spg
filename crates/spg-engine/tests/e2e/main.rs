@@ -203,6 +203,7 @@ mod e2e_mysql_operators_round353;
 mod e2e_mysql_types_round360;
 mod e2e_infoschema_dialect_round361;
 mod e2e_infoschema_column_type_round362;
+mod e2e_mysql_collation_round364;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;
