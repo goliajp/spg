@@ -474,6 +474,78 @@ fn mysql_int_as_temporal(n: i64) -> Option<Value<'static>> {
     }
 }
 
+/// v7.39 (round 418) — read a value as a DATETIME (epoch micros), or None
+/// when it is not one. A bare TIME string (`'10:00:00'`) is deliberately NOT
+/// a datetime — MySQL's ADDTIME / TIMEDIFF branch on exactly this
+/// distinction. Requires a `-` in a text operand so a time never reaches the
+/// timestamp parser.
+fn mysql_datetime_us(v: &Value<'_>) -> Option<i64> {
+    match v {
+        Value::Timestamp(us) => Some(*us),
+        Value::Date(d) => i64::from(*d).checked_mul(86_400_000_000),
+        Value::Text(s) if s.contains('-') => crate::eval::parse_timestamp_literal(s)
+            .or_else(|| {
+                crate::eval::parse_date_literal(s)
+                    .and_then(|d| i64::from(d).checked_mul(86_400_000_000))
+            }),
+        _ => None,
+    }
+}
+
+/// v7.39 (round 418) — MySQL DATETIME rendering: `YYYY-MM-DD HH:MM:SS`, with
+/// a `.ffffff` tail — padded to SIX digits — only when the value carries a
+/// sub-second part. PG's `format_timestamp` trims trailing zeros
+/// (`…01.5`), where MariaDB pads (`…01.500000`), so ADDTIME / SUBTIME /
+/// TIMESTAMP(d, t) get their own renderer rather than the shared one.
+fn format_datetime_us(us: i64) -> alloc::string::String {
+    let days = us.div_euclid(86_400_000_000);
+    let tod = us.rem_euclid(86_400_000_000);
+    let date = i32::try_from(days).map_or_else(
+        |_| alloc::string::String::from("0000-00-00"),
+        crate::eval::format_date,
+    );
+    let hh = tod / 3_600_000_000;
+    let mi = (tod / 60_000_000) % 60;
+    let ss = (tod / 1_000_000) % 60;
+    let frac = tod % 1_000_000;
+    if frac == 0 {
+        alloc::format!("{date} {hh:02}:{mi:02}:{ss:02}")
+    } else {
+        alloc::format!("{date} {hh:02}:{mi:02}:{ss:02}.{frac:06}")
+    }
+}
+
+/// v7.39 (round 418) — read a MySQL TIME operand as signed microseconds.
+/// Accepts `[-]HH:MM[:SS[.ffffff]]` text (hours may exceed 24) and a stored
+/// TIME value. `None` for anything else.
+fn mysql_time_operand_us(v: &Value<'_>) -> Option<i64> {
+    match v {
+        Value::Time(us) => Some(*us),
+        Value::Text(s) => {
+            let s = s.trim();
+            let (neg, body) = match s.strip_prefix('-') {
+                Some(rest) => (true, rest),
+                None => (false, s),
+            };
+            let mut parts = body.split(':');
+            let h: i64 = parts.next()?.parse().ok()?;
+            let m: i64 = parts.next().unwrap_or("0").parse().ok()?;
+            let sec_part = parts.next().unwrap_or("0");
+            let (sec_s, frac_s) = sec_part.split_once('.').unwrap_or((sec_part, ""));
+            let sec: i64 = sec_s.parse().ok()?;
+            let mut frac = alloc::string::String::from(frac_s);
+            while frac.len() < 6 {
+                frac.push('0');
+            }
+            frac.truncate(6);
+            let micros: i64 = frac.parse().ok()?;
+            let total = h * 3_600_000_000 + m * 60_000_000 + sec * 1_000_000 + micros;
+            Some(if neg { -total } else { total })
+        }
+        _ => None,
+    }
+}
+
 /// v7.39 (round 414) — for each date-family function, the argument positions
 /// where MySQL reads a plain integer as a DATE / TIMESTAMP (per its YYYYMMDD
 /// / YYMMDD / YYYYMMDDHHMMSS / YYMMDDHHMMSS shape). Anything absent from this
@@ -6681,6 +6753,35 @@ fn apply_function_dispatch(
         // SPG carries TIME as text; these parse '[-]H:MM:SS[.ffffff]'
         // into signed microseconds and format back (hours may exceed
         // 24, like MySQL's TIME type).
+        // v7.39 (round 418) — MySQL's TWO-argument `TIMESTAMP(date, time)`
+        // composes a DATETIME by adding the time to the date (the time may be
+        // negative or exceed 24h, rolling the date: `TIMESTAMP('2020-01-05',
+        // '25:00:00')` is 2020-01-06 01:00:00). The ONE-arg spelling is a
+        // cast and is handled before function dispatch, so only the 2-arg
+        // form lands here. MySQL only — PG has no `timestamp(a, b)` function.
+        "timestamp" if ctx.mysql_dialect && args.len() == 2 => {
+            if args.iter().any(|a| matches!(a, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let Some(base) = mysql_datetime_us(&args[0]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "timestamp(): first argument must be a date or datetime, got {:?}",
+                        args[0].data_type()
+                    ),
+                });
+            };
+            // The time operand rides the same reader ADDTIME uses.
+            let Some(offset) = mysql_time_operand_us(&args[1]) else {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "timestamp(): second argument must be a time, got {:?}",
+                        args[1].data_type()
+                    ),
+                });
+            };
+            Ok(Value::text(format_datetime_us(base + offset)))
+        }
         "time_to_sec" | "sec_to_time" | "maketime" | "addtime" | "subtime"
         | "timediff" | "microsecond" => {
             fn parse_time_us(s: &str) -> Option<i64> {
@@ -6820,6 +6921,38 @@ fn apply_function_dispatch(
                                 args.len()
                             ),
                         });
+                    }
+                    // v7.39 (round 418) — MySQL's ADDTIME / SUBTIME accept a
+                    // DATETIME as the first operand and return a DATETIME
+                    // (`ADDTIME('2020-01-05 23:00:00','02:00:00')` rolls into
+                    // the 6th); TIMEDIFF over two DATETIMEs is their full
+                    // difference as a TIME. A datetime paired with a bare
+                    // time on the OTHER side is NULL, as MariaDB answers.
+                    // The old code read every operand as a time-of-day, so a
+                    // datetime string errored "invalid time".
+                    let da = mysql_datetime_us(&args[0]);
+                    let db = mysql_datetime_us(&args[1]);
+                    if let Some(a_us) = da {
+                        return Ok(match name {
+                            // dt ± time -> datetime
+                            "addtime" | "subtime" if db.is_none() => {
+                                let Some(t) = time_arg(&args[1], name)? else {
+                                    return Ok(Value::Null);
+                                };
+                                let signed = if name == "addtime" { t } else { -t };
+                                Value::text(format_datetime_us(a_us + signed))
+                            }
+                            // dt - dt -> time difference
+                            "timediff" if db.is_some() => {
+                                Value::text(format_time_us(a_us - db.unwrap_or(0)))
+                            }
+                            // dt paired with the wrong shape on the other side
+                            _ => Value::Null,
+                        });
+                    }
+                    if db.is_some() {
+                        // time <op> datetime — MariaDB answers NULL.
+                        return Ok(Value::Null);
                     }
                     let (Some(a), Some(b)) = (
                         time_arg(&args[0], name)?,

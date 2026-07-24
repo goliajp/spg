@@ -3380,6 +3380,15 @@ fn eval_extract_arm(
             ),
         });
     }
+    // v7.39 (round 418) — MySQL's compound units (`DAY_SECOND`, `YEAR_MONTH`,
+    // …) reach here as `ExtractField::Other`, which PG rejects. Under the
+    // MySQL dialect they pack several components into one integer instead.
+    if ctx.mysql_dialect
+        && let spg_sql::ast::ExtractField::Other(name) = field
+        && let Some(packed) = crate::eval::datetime::mysql_compound_extract(name, &v)
+    {
+        return Ok(packed);
+    }
     extract_field(field, &v, src_name)
 }
 
