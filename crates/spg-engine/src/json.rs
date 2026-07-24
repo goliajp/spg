@@ -3867,7 +3867,12 @@ fn mysql_json_mutate(
         let newval = value_to_jsonvalue(&pair[1])?;
         mutate_at(&mut doc, &steps, mode, &newval);
     }
-    Ok(Value::Json(alloc::borrow::Cow::Owned(doc.to_json_text())))
+    // v7.39 (round 392) — MariaDB renders JSON with `": "` / `", "` spacing
+    // (`{"a": 1, "b": 2}`); canonicalise so JSON_SET / INSERT / REPLACE /
+    // REMOVE match, like JSON_OBJECT (r391).
+    Ok(canonicalize_value(Value::Json(alloc::borrow::Cow::Owned(
+        doc.to_json_text(),
+    ))))
 }
 
 /// v7.37.17 (17.6 siblings) — MySQL JSON_SET / JSON_INSERT /
@@ -3959,7 +3964,10 @@ pub fn mysql_json_remove(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
         }
         remove_at(&mut doc, &steps);
     }
-    Ok(Value::Json(alloc::borrow::Cow::Owned(doc.to_json_text())))
+    // v7.39 (round 392) — MariaDB's `": "` / `", "` JSON render spacing.
+    Ok(canonicalize_value(Value::Json(alloc::borrow::Cow::Owned(
+        doc.to_json_text(),
+    ))))
 }
 
 /// Apply `f` to the value AT the full path (not its parent). Missing
@@ -4042,7 +4050,10 @@ pub fn mysql_json_array_append(args: &[Value<'_>]) -> Result<Value<'static>, Eva
             }
         });
     }
-    Ok(Value::Json(alloc::borrow::Cow::Owned(doc.to_json_text())))
+    // v7.39 (round 392) — MariaDB's `": "` / `", "` JSON render spacing.
+    Ok(canonicalize_value(Value::Json(alloc::borrow::Cow::Owned(
+        doc.to_json_text(),
+    ))))
 }
 
 /// v7.37.17 (17.6 siblings) — MySQL JSON_ARRAY_INSERT(doc, path,
@@ -4079,7 +4090,10 @@ pub fn mysql_json_array_insert(args: &[Value<'_>]) -> Result<Value<'static>, Eva
             }
         });
     }
-    Ok(Value::Json(alloc::borrow::Cow::Owned(doc.to_json_text())))
+    // v7.39 (round 392) — MariaDB's `": "` / `", "` JSON render spacing.
+    Ok(canonicalize_value(Value::Json(alloc::borrow::Cow::Owned(
+        doc.to_json_text(),
+    ))))
 }
 
 /// MySQL JSON containment recursion: candidate object ⊆ target
@@ -4250,9 +4264,10 @@ fn mysql_json_merge(
             Some(prev) => combine(prev, doc),
         });
     }
-    Ok(Value::Json(alloc::borrow::Cow::Owned(
+    // v7.39 (round 392) — MariaDB's `": "` / `", "` JSON render spacing.
+    Ok(canonicalize_value(Value::Json(alloc::borrow::Cow::Owned(
         acc.unwrap().to_json_text(),
-    )))
+    ))))
 }
 
 /// v7.37.17 (17.6 siblings) — MySQL JSON_MERGE_PATCH (RFC 7396).
