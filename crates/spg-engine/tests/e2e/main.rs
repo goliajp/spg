@@ -239,6 +239,7 @@ mod e2e_mysql_greatest_null_round400;
 mod e2e_mysql_enum_order_round401;
 mod e2e_mysql_enum_ordinal_round402;
 mod e2e_mysql_null_sort_round403;
+mod e2e_mysql_having_alias_round404;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;
