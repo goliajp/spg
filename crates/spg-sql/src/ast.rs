@@ -4202,6 +4202,12 @@ pub enum BinOp {
     BitAnd,
     /// Bitwise XOR `#` on integers and equal-length bit strings.
     BitXor,
+    /// v7.39 (round 407) — MySQL's logical `XOR` operator. Reads both
+    /// sides as truth values and returns their exclusive-or (`1 XOR 0`
+    /// is 1, `1 XOR 1` is 0); NULL on either side yields NULL. Only the
+    /// MySQL dialect produces it; PG has no logical XOR. Its precedence
+    /// sits between OR (loosest) and AND.
+    LogicalXor,
     /// v4.14 `json -> key` — element access by string key (object)
     /// or integer index (array). Returns a JSON value.
     JsonGet,
@@ -6947,17 +6953,22 @@ pub fn pretty_expr(e: &Expr) -> String {
 fn pretty_prec(e: &Expr) -> u8 {
     match e {
         Expr::Binary { op, .. } => match op {
+            // v7.39 (round 407) — this deparse ladder mirrors the parser's:
+            // OR < XOR < AND < NOT < comparison < additive < multiplicative.
+            // XOR (MySQL-only) sits between OR and AND, so AND and everything
+            // above shifted +1 to open rung 2 for it.
             BinOp::Or => 1,
-            BinOp::And => 2,
-            BinOp::Add | BinOp::Sub | BinOp::Concat => 5,
-            BinOp::Mul | BinOp::Div | BinOp::Mod => 6,
+            BinOp::LogicalXor => 2,
+            BinOp::And => 3,
+            BinOp::Add | BinOp::Sub | BinOp::Concat => 6,
+            BinOp::Mul | BinOp::Div | BinOp::Mod => 7,
             // Everything else in this enum is a comparison-shaped
             // operator; they share one level, as in the grammar.
-            _ => 4,
+            _ => 5,
         },
         Expr::Unary { op, .. } => match op {
-            UnOp::Not => 3,
-            UnOp::Neg | UnOp::BitNot => 7,
+            UnOp::Not => 4,
+            UnOp::Neg | UnOp::BitNot => 8,
         },
         _ => u8::MAX,
     }
@@ -7069,7 +7080,9 @@ fn write_pretty(out: &mut String, e: &Expr, parent: PrettyParent, is_rhs: bool) 
 }
 
 const fn pretty_prec_not() -> u8 {
-    3
+    // Must match `pretty_prec`'s `UnOp::Not` rung (v7.39 round 407: 3 → 4
+    // when the XOR insertion shifted the deparse ladder up by one).
+    4
 }
 
 impl fmt::Display for Expr {
@@ -7579,6 +7592,7 @@ impl fmt::Display for BinOp {
             Self::BitOr => "|",
             Self::BitAnd => "&",
             Self::BitXor => "#",
+            Self::LogicalXor => "xor",
             Self::JsonGet => "->",
             Self::JsonGetText => "->>",
             Self::JsonGetPath => "#>",

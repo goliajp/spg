@@ -18217,28 +18217,28 @@ impl Parser {
                     ci: false,
                     negated: false,
                 },
-                4,
+                5,
             ),
             Token::TildeStar => (
                 Sym::Regex {
                     ci: true,
                     negated: false,
                 },
-                4,
+                5,
             ),
             Token::NotTilde => (
                 Sym::Regex {
                     ci: false,
                     negated: true,
                 },
-                4,
+                5,
             ),
             Token::NotTildeStar => (
                 Sym::Regex {
                     ci: true,
                     negated: true,
                 },
-                4,
+                5,
             ),
             // v7.37 D.25 — PG operator spellings of LIKE/ILIKE.
             Token::DoubleTilde => (
@@ -18246,36 +18246,37 @@ impl Parser {
                     ci: false,
                     negated: false,
                 },
-                4,
+                5,
             ),
             Token::DoubleTildeStar => (
                 Sym::Like {
                     ci: true,
                     negated: false,
                 },
-                4,
+                5,
             ),
             Token::NotDoubleTilde => (
                 Sym::Like {
                     ci: false,
                     negated: true,
                 },
-                4,
+                5,
             ),
             Token::NotDoubleTildeStar => (
                 Sym::Like {
                     ci: true,
                     negated: true,
                 },
-                4,
+                5,
             ),
-            Token::CaretAt => (Sym::StartsWith, 4),
+            Token::CaretAt => (Sym::StartsWith, 5),
             // PG `^` is exponentiation; MySQL `^` is bitwise XOR (and binds
-            // tighter than `* / & |`, which the prec-8 rung preserves).
-            Token::Caret if self.mysql_dialect => (Sym::Xor, 8),
-            Token::Caret => (Sym::Power, 8),
-            Token::Hash => (Sym::Xor, 6),
-            Token::Adjacent => (Sym::RangeAdjacent, 4),
+            // tighter than `* / & |`, which the prec-9 rung preserves —
+            // v7.39 round 407: +1 from the pre-XOR ladder's rung 8).
+            Token::Caret if self.mysql_dialect => (Sym::Xor, 9),
+            Token::Caret => (Sym::Power, 9),
+            Token::Hash => (Sym::Xor, 7),
+            Token::Adjacent => (Sym::RangeAdjacent, 5),
             _ => return Ok(None),
         };
         if prec < min_prec {
@@ -18349,16 +18350,18 @@ impl Parser {
         // frame chain; the lhs clones only when a predicate actually
         // consumes it.
         match self.peek() {
-            Token::Is if min_prec <= 3 => {}
-            Token::Between | Token::In | Token::Like if min_prec <= 4 => {}
+            // v7.39 (round 407) — IS is rung 4, the BETWEEN/IN/LIKE
+            // comparison family rung 5 (each +1 from the pre-XOR ladder).
+            Token::Is if min_prec <= 4 => {}
+            Token::Between | Token::In | Token::Like if min_prec <= 5 => {}
             Token::Not
-                if min_prec <= 4
+                if min_prec <= 5
                     && matches!(
                         self.tokens.get(self.pos + 1),
                         Some(Token::Between | Token::In | Token::Like)
                     ) => {}
             Token::Not | Token::Ident(_)
-                if min_prec <= 4
+                if min_prec <= 5
                     && (matches!(self.peek(), Token::Ident(s)
                             if s.eq_ignore_ascii_case("ilike")
                                 || (self.mysql_dialect
@@ -18376,9 +18379,9 @@ impl Parser {
             _ => return Ok(None),
         }
         let mut expr = lhs.clone();
-        // IS family: rung 3 (NOT parses at 3, so `NOT x IS NULL` still
-        // groups as NOT (x IS NULL); AND/OR at 1-2 stay outside).
-        if min_prec <= 3 {
+        // IS family: rung 4 (NOT's operand parses at 4, so `NOT x IS NULL`
+        // still groups as NOT (x IS NULL); OR/XOR/AND at 1-3 stay outside).
+        if min_prec <= 4 {
             if matches!(self.peek(), Token::Is) {
                 self.advance();
                 let negated = if matches!(self.peek(), Token::Not) {
@@ -18400,9 +18403,9 @@ impl Parser {
                     }
                     self.advance();
                     // Right-hand side: parse at the same precedence
-                    // tier as comparison so `x IS DISTINCT FROM a + b`
+                    // tier as comparison (rung 5) so `x IS DISTINCT FROM a + b`
                     // groups as `x IS DISTINCT FROM (a + b)`.
-                    let rhs = self.parse_expr(4)?;
+                    let rhs = self.parse_expr(5)?;
                     let op = if negated {
                         BinOp::IsNotDistinctFrom
                     } else {
@@ -18548,8 +18551,8 @@ impl Parser {
                 }
             }
         }
-        // BETWEEN / IN / LIKE / ILIKE / SIMILAR: comparison rung.
-        if min_prec <= 4 {
+        // BETWEEN / IN / LIKE / ILIKE / SIMILAR: comparison rung (5).
+        if min_prec <= 5 {
             // `x [NOT] BETWEEN a AND b`, `x [NOT] IN (...)`, `x [NOT] LIKE p`.
             // Look one token ahead so a stray `NOT` not followed by any of
             // these flows through to the early return below untouched.
@@ -18594,11 +18597,11 @@ impl Parser {
             {
                 self.advance(); // SIMILAR
                 self.advance(); // TO
-                let pattern = self.parse_expr(5)?;
+                let pattern = self.parse_expr(6)?;
                 let mut args = alloc::vec![expr, pattern];
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("escape")) {
                     self.advance();
-                    args.push(self.parse_expr(5)?);
+                    args.push(self.parse_expr(6)?);
                 }
                 let call = Expr::FunctionCall {
                     name: "__similar_to".to_string(),
@@ -18620,14 +18623,14 @@ impl Parser {
                 }
                 // Pattern at the same precedence as other comparison RHSes —
                 // 5 leaves AND/OR alone so `a LIKE 'x%' AND b` parses right.
-                let mut pattern = self.parse_expr(5)?;
+                let mut pattern = self.parse_expr(6)?;
                 // `ESCAPE 'c'` — rewrite a literal pattern to the
                 // default backslash escape at parse time. Custom
                 // escapes on non-literal patterns would need
                 // matcher support; error honestly.
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("escape")) {
                     self.advance();
-                    let esc = self.parse_expr(5)?;
+                    let esc = self.parse_expr(6)?;
                     pattern = Self::rewrite_like_escape(pattern, esc).map_err(|m| self.err(m))?;
                 }
                 expr = Expr::Like {
@@ -18650,7 +18653,7 @@ impl Parser {
                         return Ok(Some(expr));
                     }
                 }
-                let pattern = self.parse_expr(5)?;
+                let pattern = self.parse_expr(6)?;
                 expr = Expr::Like {
                     expr: Box::new(expr),
                     pattern: Box::new(pattern),
@@ -18671,7 +18674,7 @@ impl Parser {
                     if s.eq_ignore_ascii_case("regexp") || s.eq_ignore_ascii_case("rlike"))
             {
                 self.advance();
-                let pattern = self.parse_expr(5)?;
+                let pattern = self.parse_expr(6)?;
                 let call = Expr::FunctionCall {
                     name: String::from("regexp_like"),
                     args: alloc::vec![
@@ -18829,7 +18832,7 @@ impl Parser {
     #[inline(never)]
     fn parse_prefix_center(&mut self) -> Result<Expr, ParseError> {
         self.advance();
-        let e = self.parse_expr(8)?;
+        let e = self.parse_expr(9)?;
         Ok(build_center_call(e))
     }
 
@@ -18838,7 +18841,7 @@ impl Parser {
     #[inline(never)]
     fn parse_prefix_geom_axis(&mut self, vertical: bool) -> Result<Expr, ParseError> {
         self.advance();
-        let e = self.parse_expr(8)?;
+        let e = self.parse_expr(9)?;
         Ok(Expr::FunctionCall {
             name: alloc::string::String::from(if vertical {
                 "isvertical"
@@ -18855,7 +18858,7 @@ impl Parser {
     #[inline(never)]
     fn parse_binary_prefix(&mut self) -> Result<Expr, ParseError> {
         self.advance();
-        let e = self.parse_expr(8)?;
+        let e = self.parse_expr(9)?;
         Ok(Expr::Cast {
             expr: Box::new(e),
             target: CastTarget::Named("binary".to_string()),
@@ -18866,9 +18869,13 @@ impl Parser {
         match self.peek() {
             Token::Not => {
                 self.advance();
-                // NOT sits between AND (2) and comparisons (4) — bind everything
-                // ≥3, which leaves AND/OR outside.
-                let e = self.parse_expr(3)?;
+                // NOT binds tighter than AND / XOR / OR but looser than
+                // comparisons — its operand takes everything ≥ the comparison
+                // rung (4), leaving AND (3) / XOR (2) / OR (1) outside so
+                // `NOT a AND b` groups as `(NOT a) AND b`. (v7.39 round 407:
+                // was rung 3, behaviour-identical when 3 was unused; AND now
+                // occupies 3, so this must be 4 to keep NOT tighter than AND.)
+                let e = self.parse_expr(4)?;
                 Ok(Expr::Unary {
                     op: UnOp::Not,
                     expr: Box::new(e),
@@ -18888,7 +18895,7 @@ impl Parser {
             // (`(!1)+1`) and 0 for `NOT 1 + 1` (`NOT (1+1)`), measured.
             Token::Bang => {
                 self.advance();
-                let e = self.parse_expr(8)?;
+                let e = self.parse_expr(9)?;
                 Ok(Expr::Unary {
                     op: UnOp::Not,
                     expr: Box::new(e),
@@ -18898,7 +18905,7 @@ impl Parser {
                 self.advance();
                 // Unary minus binds tighter than `*`/`/` (now at prec 7 after
                 // `<->` slotted into 5 and arithmetic shifted up).
-                let e = self.parse_expr(8)?;
+                let e = self.parse_expr(9)?;
                 Ok(Expr::Unary {
                     op: UnOp::Neg,
                     expr: Box::new(e),
@@ -18907,7 +18914,7 @@ impl Parser {
             Token::Tilde => {
                 self.advance();
                 // Bitwise NOT binds like unary minus.
-                let e = self.parse_expr(8)?;
+                let e = self.parse_expr(9)?;
                 Ok(Expr::Unary {
                     op: UnOp::BitNot,
                     expr: Box::new(e),
@@ -18929,7 +18936,7 @@ impl Parser {
                 self.advance();
                 // tsquery `!!` prefix negation — lowered to the catalog
                 // function. Binds like unary minus.
-                let e = self.parse_expr(8)?;
+                let e = self.parse_expr(9)?;
                 Ok(Expr::FunctionCall {
                     name: String::from("tsquery_not"),
                     args: alloc::vec![e],
@@ -19730,7 +19737,7 @@ impl Parser {
                 self.advance(); // TIME
                 self.advance(); // ZONE
                 // Zone at comparison precedence so AND/OR stay out.
-                let zone = self.parse_expr(5)?;
+                let zone = self.parse_expr(6)?;
                 expr = Expr::FunctionCall {
                     name: "timezone".to_string(),
                     args: alloc::vec![zone, expr],
@@ -20245,7 +20252,7 @@ impl Parser {
             }
             false
         };
-        let low = self.parse_expr(5)?;
+        let low = self.parse_expr(6)?;
         if !matches!(self.peek(), Token::And) {
             return Err(self.err(format!(
                 "expected AND after BETWEEN low bound, got {:?}",
@@ -20253,7 +20260,7 @@ impl Parser {
             )));
         }
         self.advance();
-        let high = self.parse_expr(5)?;
+        let high = self.parse_expr(6)?;
         let target = Box::new(expr);
         let range = |lo: Expr, hi: Expr| Expr::Binary {
             lhs: Box::new(Expr::Binary {
@@ -22926,7 +22933,7 @@ impl Parser {
             if let Token::Ident(w) = tok
                 && w.eq_ignore_ascii_case("div")
             {
-                return Some((BinOp::IntDiv, 7));
+                return Some((BinOp::IntDiv, 8));
             }
             // v7.39 (round 394) — `MOD` is MySQL's modulo operator, a synonym
             // for `%` (`10 MOD 3` is 1, `5.5 MOD 2` is 1.5). A plain ident to
@@ -22935,12 +22942,22 @@ impl Parser {
             if let Token::Ident(w) = tok
                 && w.eq_ignore_ascii_case("mod")
             {
-                return Some((BinOp::Mod, 7));
+                return Some((BinOp::Mod, 8));
+            }
+            // v7.39 (round 407) — `XOR` is MySQL's logical exclusive-or, a
+            // plain ident to the lexer. Its precedence sits between OR (1)
+            // and AND (3) — hence rung 2, the slot freed by moving AND up.
+            if let Token::Ident(w) = tok
+                && w.eq_ignore_ascii_case("xor")
+            {
+                return Some((BinOp::LogicalXor, 2));
             }
             match tok {
                 Token::Concat => return Some((BinOp::Or, 1)),
-                Token::InetOverlap => return Some((BinOp::And, 2)),
-                Token::CosineDistance => return Some((BinOp::IsNotDistinctFrom, 4)),
+                // MySQL's `&&` is logical AND, sharing AND's rung (3).
+                Token::InetOverlap => return Some((BinOp::And, 3)),
+                // MySQL's `<=>` is NULL-safe equal, at the comparison rung (5).
+                Token::CosineDistance => return Some((BinOp::IsNotDistinctFrom, 5)),
                 _ => {}
             }
         }
@@ -22948,80 +22965,86 @@ impl Parser {
     }
 }
 
+// v7.39 (round 407) — precedence ladder. To open a rung for MySQL's `XOR`
+// (which sits strictly between OR and AND), every level from AND upward was
+// shifted +1: the ladder is now OR=1, XOR=2, AND=3, IS=4, comparison=5,
+// distance=6, additive/concat/bitwise=7, multiplicative/JSON=8, prefix=9.
+// XOR only exists in the MySQL dialect (binop_here); PG never sees it, and
+// the *relative* order of every PG operator is unchanged by the shift.
 fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
     let pair = match tok {
         Token::Or => (BinOp::Or, 1),
-        Token::And => (BinOp::And, 2),
-        Token::Eq => (BinOp::Eq, 4),
-        Token::NotEq => (BinOp::NotEq, 4),
-        Token::Lt => (BinOp::Lt, 4),
-        Token::LtEq => (BinOp::LtEq, 4),
-        Token::Gt => (BinOp::Gt, 4),
-        Token::GtEq => (BinOp::GtEq, 4),
+        Token::And => (BinOp::And, 3),
+        Token::Eq => (BinOp::Eq, 5),
+        Token::NotEq => (BinOp::NotEq, 5),
+        Token::Lt => (BinOp::Lt, 5),
+        Token::LtEq => (BinOp::LtEq, 5),
+        Token::Gt => (BinOp::Gt, 5),
+        Token::GtEq => (BinOp::GtEq, 5),
         // pgvector distance ops all sit on the same rung — tighter than
-        // comparisons (4) so `col <-> v < threshold` parses correctly.
-        Token::L2Distance => (BinOp::L2Distance, 5),
+        // comparisons (5) so `col <-> v < threshold` parses correctly.
+        Token::L2Distance => (BinOp::L2Distance, 6),
         // v7.39 (read01 geo_ops.c) — geometric predicates ride the
         // comparison rung.
-        Token::GeomParallel => (BinOp::GeomParallel, 4),
+        Token::GeomParallel => (BinOp::GeomParallel, 5),
         // v7.39 (read01 rangetypes.c) — range `&<` / `&>` on the
         // comparison rung.
-        Token::OverLeft => (BinOp::OverLeft, 4),
-        Token::OverRight => (BinOp::OverRight, 4),
-        Token::GeomPerp => (BinOp::GeomPerp, 4),
-        Token::GeomSameAs => (BinOp::GeomSameAs, 4),
-        Token::ClosestPoint => (BinOp::ClosestPoint, 5),
-        Token::GeomHoriz => (BinOp::GeomHoriz, 4),
-        Token::InnerProduct => (BinOp::InnerProduct, 5),
-        Token::CosineDistance => (BinOp::CosineDistance, 5),
-        Token::Plus => (BinOp::Add, 6),
-        Token::Minus => (BinOp::Sub, 6),
+        Token::OverLeft => (BinOp::OverLeft, 5),
+        Token::OverRight => (BinOp::OverRight, 5),
+        Token::GeomPerp => (BinOp::GeomPerp, 5),
+        Token::GeomSameAs => (BinOp::GeomSameAs, 5),
+        Token::ClosestPoint => (BinOp::ClosestPoint, 6),
+        Token::GeomHoriz => (BinOp::GeomHoriz, 5),
+        Token::InnerProduct => (BinOp::InnerProduct, 6),
+        Token::CosineDistance => (BinOp::CosineDistance, 6),
+        Token::Plus => (BinOp::Add, 7),
+        Token::Minus => (BinOp::Sub, 7),
         // `||` sits beside `+`/`-` (matches PG conceptually — concat groups
         // by the same level as binary additive arithmetic).
-        Token::Concat => (BinOp::Concat, 6),
+        Token::Concat => (BinOp::Concat, 7),
         // Bitwise `|` / `&` ride the same rung as `||` — PG groups
         // all "other" operators between additive and comparison, so
         // `flags & $1 = 0` parses as `(flags & $1) = 0`.
         //
         // Known divergence (the same one `||` has carried since v1):
-        // SPG's rung 6 TIES with `+ -`, while PG binds generic
+        // SPG's rung 7 TIES with `+ -`, while PG binds generic
         // operators LOOSER than additive — `a & b + 1` is
         // `(a & b) + 1` here vs `a & (b + 1)` in PG. Parenthesise
         // mixed bitwise/arithmetic. Keeping every generic operator
         // on one shared rung is deliberate: splitting bitwise off
         // would fix that case but skew `a || b & c`, which PG
         // left-folds at a single level.
-        Token::Pipe => (BinOp::BitOr, 6),
-        Token::Amp => (BinOp::BitAnd, 6),
-        Token::Star => (BinOp::Mul, 7),
-        Token::Slash => (BinOp::Div, 7),
-        Token::Percent => (BinOp::Mod, 7),
-        // v4.14: JSON path ops bind tighter than comparisons (4)
-        // and additive (6) so `doc->'k' = 'v'` parses correctly.
+        Token::Pipe => (BinOp::BitOr, 7),
+        Token::Amp => (BinOp::BitAnd, 7),
+        Token::Star => (BinOp::Mul, 8),
+        Token::Slash => (BinOp::Div, 8),
+        Token::Percent => (BinOp::Mod, 8),
+        // v4.14: JSON path ops bind tighter than comparisons (5)
+        // and additive (7) so `doc->'k' = 'v'` parses correctly.
         // Same rung as the multiplicative ops.
-        Token::JsonGet => (BinOp::JsonGet, 7),
-        Token::JsonGetText => (BinOp::JsonGetText, 7),
-        Token::JsonGetPath => (BinOp::JsonGetPath, 7),
-        Token::JsonGetPathText => (BinOp::JsonGetPathText, 7),
-        Token::JsonContains => (BinOp::JsonContains, 7),
-        Token::JsonPathExists => (BinOp::JsonPathExists, 7),
-        Token::JsonContainedBy => (BinOp::JsonContainedBy, 7),
-        Token::JsonKeyExists => (BinOp::JsonKeyExists, 7),
-        Token::JsonKeysAny => (BinOp::JsonKeysAny, 7),
-        Token::JsonKeysAll => (BinOp::JsonKeysAll, 7),
-        Token::JsonDeletePath => (BinOp::JsonDeletePath, 7),
+        Token::JsonGet => (BinOp::JsonGet, 8),
+        Token::JsonGetText => (BinOp::JsonGetText, 8),
+        Token::JsonGetPath => (BinOp::JsonGetPath, 8),
+        Token::JsonGetPathText => (BinOp::JsonGetPathText, 8),
+        Token::JsonContains => (BinOp::JsonContains, 8),
+        Token::JsonPathExists => (BinOp::JsonPathExists, 8),
+        Token::JsonContainedBy => (BinOp::JsonContainedBy, 8),
+        Token::JsonKeyExists => (BinOp::JsonKeyExists, 8),
+        Token::JsonKeysAny => (BinOp::JsonKeysAny, 8),
+        Token::JsonKeysAll => (BinOp::JsonKeysAll, 8),
+        Token::JsonDeletePath => (BinOp::JsonDeletePath, 8),
         // v7.12.2 — `@@` binds at the comparison rung (looser than
         // arithmetic, tighter than AND / OR). PG places `@@` at
         // the same precedence as `=` / `<`, so we follow.
-        Token::TsMatch => (BinOp::TsMatch, 4),
+        Token::TsMatch => (BinOp::TsMatch, 5),
         // v7.17.0 Phase 3.P0-47 — PG INET / CIDR containment + overlap.
         // PG places these at the comparison rung (same level as `=`),
         // so we follow.
-        Token::InetContainedBy => (BinOp::InetContainedBy, 4),
-        Token::InetContainedByEq => (BinOp::InetContainedByEq, 4),
-        Token::InetContains => (BinOp::InetContains, 4),
-        Token::InetContainsEq => (BinOp::InetContainsEq, 4),
-        Token::InetOverlap => (BinOp::InetOverlap, 4),
+        Token::InetContainedBy => (BinOp::InetContainedBy, 5),
+        Token::InetContainedByEq => (BinOp::InetContainedByEq, 5),
+        Token::InetContains => (BinOp::InetContains, 5),
+        Token::InetContainsEq => (BinOp::InetContainsEq, 5),
+        Token::InetOverlap => (BinOp::InetOverlap, 5),
         _ => return None,
     };
     Some(pair)

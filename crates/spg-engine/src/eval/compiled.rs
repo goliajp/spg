@@ -249,6 +249,15 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 steps.push(Step::Subtree(e.clone()));
                 return;
             }
+            // v7.39 (round 407) — MySQL's logical `XOR` reads both sides as
+            // truth values, which the VM's dialect-blind apply_binary (no
+            // LogicalXor arm) cannot do. Route to the interpreter, whose
+            // eval_expr arm handles the connective (eval.rs
+            // `eval_mysql_connective`).
+            if ctx.mysql_dialect && matches!(op, BinOp::LogicalXor) {
+                steps.push(Step::Subtree(e.clone()));
+                return;
+            }
             // v7.39 (round 402) — an arithmetic op on a SET / inline-ENUM
             // column reads the column numerically (bitmask / 1-based
             // ordinal), which the VM's value-level Add cannot see (it has the
