@@ -1104,6 +1104,17 @@ pub(crate) fn build_order_keys(
             // the label text: `ORDER BY mood` puts 'sad' < 'ok' < 'happy'
             // when that is the CREATE TYPE order, not alphabetical.
             keys.push(OrderKey::Num(ord));
+        } else if ctx.mysql_dialect && matches!(v, Value::Text(_) | Value::BpChar(_)) {
+            // v7.39 (round 411) — under the MySQL collation (case- and
+            // accent-insensitive, PAD SPACE) ORDER BY sorts by the FOLDED
+            // text, so `apple`/`Apple` sort adjacent and `Zebra` after
+            // `Mango`. The precomputed key must fold to match
+            // `order_by_value_cmp_in`; a byte key would sort by ASCII case.
+            let s = match &v {
+                Value::Text(s) | Value::BpChar(s) => s.as_ref(),
+                _ => unreachable!("guarded by matches! above"),
+            };
+            keys.push(OrderKey::Text(spg_storage::mysql_compare_fold(s)));
         } else {
             keys.push(value_to_order_key(&v)?);
         }
