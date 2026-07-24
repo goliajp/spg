@@ -717,6 +717,33 @@ pub(crate) fn run(
     }
     let group_exprs: Vec<Expr> = stmt.group_by.clone().unwrap_or_default();
 
+    // v7.39 (round 405) — MySQL's loose GROUP BY: wrap each non-grouped,
+    // non-aggregated column in `any_value(col)` so the rest of the pipeline
+    // treats it as an aggregate (first-seen value per group). Only under the
+    // dialect and only when there is an explicit GROUP BY; PG keeps the
+    // strict "must appear in GROUP BY / be aggregated" rule.
+    let loose_stmt;
+    let stmt = if engine.is_some_and(|e| e.backslash_escapes) && !group_exprs.is_empty() {
+        let mut s = stmt.clone();
+        for item in &mut s.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                let taken = core::mem::replace(expr, Expr::Literal(spg_sql::ast::Literal::Null));
+                *expr = wrap_loose_group_columns(taken, &group_exprs, schema_cols);
+            }
+        }
+        for o in &mut s.order_by {
+            let taken = core::mem::replace(&mut o.expr, Expr::Literal(spg_sql::ast::Literal::Null));
+            o.expr = wrap_loose_group_columns(taken, &group_exprs, schema_cols);
+        }
+        if let Some(h) = s.having.take() {
+            s.having = Some(wrap_loose_group_columns(h, &group_exprs, schema_cols));
+        }
+        loose_stmt = s;
+        &loose_stmt
+    } else {
+        stmt
+    };
+
     // Collect aggregate sub-expressions across items + order_by.
     let mut agg_specs: Vec<AggSpec> = Vec::new();
     for item in &stmt.items {
@@ -5280,6 +5307,100 @@ fn agg_or_group_type(e: &Expr, synth: &[ColumnSchema]) -> DataType {
     crate::describe::describe_expr(e, synth)
         .map(|shape| shape.ty)
         .unwrap_or(DataType::Text)
+}
+
+/// v7.39 (round 405) — MySQL's loose GROUP BY: a non-aggregated column
+/// that is not in GROUP BY is allowed and reads any (the first-seen) row's
+/// value in the group. PG (and SPG until now) rejects it. Wrapping such a
+/// bare column in `any_value(col)` reuses the existing aggregate machinery.
+/// A whole grouping expression stays as-is; an aggregate call is not
+/// descended into (its inner columns are already fine); a non-aggregate
+/// function's argument columns are wrapped individually
+/// (`UPPER(name)` → `UPPER(any_value(name))`).
+fn wrap_loose_group_columns(e: Expr, group_exprs: &[Expr], columns: &[ColumnSchema]) -> Expr {
+    if group_exprs.iter().any(|g| *g == e) {
+        return e;
+    }
+    let wrap = |x: Expr| wrap_loose_group_columns(x, group_exprs, columns);
+    match e {
+        Expr::Column(c) => {
+            if columns.iter().any(|col| col.name.eq_ignore_ascii_case(&c.name)) {
+                Expr::FunctionCall {
+                    name: String::from("any_value"),
+                    args: alloc::vec![Expr::Column(c)],
+                }
+            } else {
+                Expr::Column(c)
+            }
+        }
+        Expr::FunctionCall { name, args } if is_aggregate_name(&name.to_ascii_lowercase()) => {
+            Expr::FunctionCall { name, args }
+        }
+        Expr::AggregateOrdered { .. } => e,
+        Expr::FunctionCall { name, args } => Expr::FunctionCall {
+            name,
+            args: args.into_iter().map(wrap).collect(),
+        },
+        Expr::Binary { op, lhs, rhs } => Expr::Binary {
+            op,
+            lhs: Box::new(wrap(*lhs)),
+            rhs: Box::new(wrap(*rhs)),
+        },
+        Expr::Unary { op, expr } => Expr::Unary {
+            op,
+            expr: Box::new(wrap(*expr)),
+        },
+        Expr::Cast { expr, target } => Expr::Cast {
+            expr: Box::new(wrap(*expr)),
+            target,
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(wrap(*expr)),
+            negated,
+        },
+        Expr::BoolTest {
+            expr,
+            value,
+            negated,
+        } => Expr::BoolTest {
+            expr: Box::new(wrap(*expr)),
+            value,
+            negated,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+        } => Expr::Like {
+            expr: Box::new(wrap(*expr)),
+            pattern: Box::new(wrap(*pattern)),
+            negated,
+            case_insensitive,
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(wrap(*expr)),
+            list: list.into_iter().map(wrap).collect(),
+            negated,
+        },
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => Expr::Case {
+            operand: operand.map(|o| Box::new(wrap(*o))),
+            branches: branches
+                .into_iter()
+                .map(|(w, t)| (wrap(w), wrap(t)))
+                .collect(),
+            else_branch: else_branch.map(|b| Box::new(wrap(*b))),
+        },
+        other => other,
+    }
 }
 
 /// v7.39 (round 404) — MySQL lets HAVING (and ORDER BY) reference a
