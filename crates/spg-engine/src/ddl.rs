@@ -5140,7 +5140,28 @@ fn column_def_to_schema(c: ColumnDef, mysql: bool) -> Result<ColumnSchema, Engin
     schema.mysql_int_width = c.mysql_int_width.map(|w| match w {
         spg_sql::ast::MysqlIntWidth::Tiny => spg_storage::MysqlIntWidth::Tiny,
         spg_sql::ast::MysqlIntWidth::Medium => spg_storage::MysqlIntWidth::Medium,
+        spg_sql::ast::MysqlIntWidth::Small => spg_storage::MysqlIntWidth::Small,
+        spg_sql::ast::MysqlIntWidth::Int => spg_storage::MysqlIntWidth::Int,
     });
+    // v7.39 (round 389, type-fidelity epic P4a) — a "real" SMALLINT /
+    // INT UNSIGNED holds a range its signed storage tag cannot (65535 /
+    // 4294967295), so widen the storage one step and record the declared
+    // width for the range check + dump rendering. The `is_none()` guard
+    // skips TINYINT UNSIGNED (i16 already holds 0..255) and MEDIUMINT
+    // UNSIGNED (i32 already holds 0..16777215) — they keep their tag.
+    if schema.is_unsigned && schema.mysql_int_width.is_none() {
+        match schema.ty {
+            spg_storage::DataType::SmallInt => {
+                schema.ty = spg_storage::DataType::Int;
+                schema.mysql_int_width = Some(spg_storage::MysqlIntWidth::Small);
+            }
+            spg_storage::DataType::Int => {
+                schema.ty = spg_storage::DataType::BigInt;
+                schema.mysql_int_width = Some(spg_storage::MysqlIntWidth::Int);
+            }
+            _ => {}
+        }
+    }
     // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM variant list.
     // INSERT validation lives in coerce_value (Text → Text path
     // with the column's variant list as the accept-set).

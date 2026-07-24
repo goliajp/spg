@@ -2830,11 +2830,18 @@ pub(crate) fn check_unsigned_range(
     // the declared MySQL type, so the real bounds are enforced here. The
     // unsigned variant's 0 lower bound also covers the negative check.
     if let Some(width) = schema.mysql_int_width {
+        // Small / Int are only ever set on an UNSIGNED column (a signed
+        // SMALLINT / INT keeps its faithful storage tag and no marker); the
+        // signed arms are unreachable but keep the match total.
         let (lo, hi) = match (width, schema.is_unsigned) {
             (spg_storage::MysqlIntWidth::Tiny, false) => (-128, 127),
             (spg_storage::MysqlIntWidth::Tiny, true) => (0, 255),
+            (spg_storage::MysqlIntWidth::Small, false) => (-32_768, 32_767),
+            (spg_storage::MysqlIntWidth::Small, true) => (0, 65_535),
             (spg_storage::MysqlIntWidth::Medium, false) => (-8_388_608, 8_388_607),
             (spg_storage::MysqlIntWidth::Medium, true) => (0, 16_777_215),
+            (spg_storage::MysqlIntWidth::Int, false) => (-2_147_483_648, 2_147_483_647),
+            (spg_storage::MysqlIntWidth::Int, true) => (0, 4_294_967_295),
         };
         if n < lo || n > hi {
             // MariaDB's wording (SQLSTATE 22003); SPG tracks the column,

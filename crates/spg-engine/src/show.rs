@@ -48,7 +48,7 @@ impl Engine {
             .columns
             .iter()
             .map(|c| {
-                let ty = render_mysql_type(c.ty);
+                let ty = render_mysql_type(c);
                 let nullable = if c.nullable { "" } else { " NOT NULL" };
                 let auto = if c.auto_increment {
                     " AUTO_INCREMENT"
@@ -510,13 +510,61 @@ pub(crate) fn render_create_table(name: &str, columns: &[ColumnSchema]) -> Strin
     out
 }
 
+/// v7.39 (round 389, epic P4a) — the MySQL integer-family base name a
+/// column reports, from its declared width annotation (TINYINT / MEDIUMINT,
+/// and the widened SMALLINT / INT UNSIGNED) or, absent one, its storage
+/// tag. `None` for a non-integer column. Shared by `render_mysql_type`
+/// (the `column_type` form) and `mysql_data_type_text` (the bare
+/// `data_type` form).
+pub(crate) fn mysql_int_base_name(
+    ty: DataType,
+    width: Option<spg_storage::MysqlIntWidth>,
+) -> Option<&'static str> {
+    use spg_storage::MysqlIntWidth as W;
+    match width {
+        Some(W::Tiny) => Some("tinyint"),
+        Some(W::Small) => Some("smallint"),
+        Some(W::Medium) => Some("mediumint"),
+        Some(W::Int) => Some("int"),
+        None => match ty {
+            DataType::SmallInt => Some("smallint"),
+            DataType::Int => Some("int"),
+            DataType::BigInt => Some("bigint"),
+            _ => None,
+        },
+    }
+}
+
+/// The display width MariaDB prints for an integer type — one narrower for
+/// UNSIGNED (no sign character): `int(11)` / `int(10) unsigned`.
+fn mysql_int_display_width(base: &str, unsigned: bool) -> u8 {
+    match (base, unsigned) {
+        ("tinyint", false) => 4,
+        ("tinyint", true) => 3,
+        ("smallint", false) => 6,
+        ("smallint", true) => 5,
+        ("mediumint", false) => 9,
+        ("mediumint", true) => 8,
+        ("int", false) => 11,
+        ("int", true) => 10,
+        _ => 20, // bigint (signed and unsigned both 20)
+    }
+}
+
 /// v7.39 (round 358, M16) — MySQL's spelling of a column type: lower
-/// case, with the display width MariaDB prints (`int(11)`, `bigint(20)`).
-pub(crate) fn render_mysql_type(ty: DataType) -> String {
-    match ty {
-        DataType::SmallInt => "smallint(6)".into(),
-        DataType::Int => "int(11)".into(),
-        DataType::BigInt => "bigint(20)".into(),
+/// case, with the display width MariaDB prints (`int(11)`, `bigint(20)`),
+/// the narrow name (`tinyint(4)`, `mediumint(9)`) and the ` unsigned`
+/// suffix (round 389, epic P4a).
+pub(crate) fn render_mysql_type(col: &ColumnSchema) -> String {
+    if let Some(base) = mysql_int_base_name(col.ty, col.mysql_int_width) {
+        let width = mysql_int_display_width(base, col.is_unsigned);
+        let mut s = alloc::format!("{base}({width})");
+        if col.is_unsigned {
+            s.push_str(" unsigned");
+        }
+        return s;
+    }
+    match col.ty {
         DataType::Float => "double".into(),
         DataType::Real => "float".into(),
         DataType::Text => "text".into(),
