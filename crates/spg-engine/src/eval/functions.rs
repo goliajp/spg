@@ -10581,6 +10581,16 @@ fn apply_function_dispatch(
                     detail: alloc::format!("{name}() takes at least 1 arg"),
                 });
             }
+            // v7.39 (round 400) — MySQL GREATEST/LEAST return NULL if ANY
+            // argument is NULL; PG ignores NULLs and returns the greatest /
+            // least non-null one. The internal `*_larger` / `*_smaller`
+            // catalog functions keep PG semantics.
+            if ctx.mysql_dialect
+                && (name.eq_ignore_ascii_case("greatest") || name.eq_ignore_ascii_case("least"))
+                && args.iter().any(|v| matches!(v, Value::Null))
+            {
+                return Ok(Value::Null);
+            }
             let non_null_refs: alloc::vec::Vec<&Value> =
                 args.iter().filter(|v| !matches!(v, Value::Null)).collect();
             if non_null_refs.is_empty() {
