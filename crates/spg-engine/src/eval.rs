@@ -3519,8 +3519,12 @@ fn eval_bool_test_arm(
         (None, _) => false,
         (Some(_), Value::Null) => false,
         (Some(want), Value::Bool(b)) => *b == want,
-        // A non-boolean input: PG rejects it at parse time; here the
-        // test simply cannot hold.
+        // v7.39 (round 397) — MySQL reads a non-boolean as a truth value
+        // for `IS TRUE` / `IS FALSE` (`5 IS TRUE` is 1, `0 IS FALSE` is 1,
+        // `'abc' IS TRUE` is 0). PG rejects a non-boolean at parse time, so
+        // this only fires under the dialect; a NULL is already handled.
+        (Some(want), other) if ctx.mysql_dialect => mysql_truthy(other) == want,
+        // A non-boolean input on PG: the test simply cannot hold.
         (Some(_), _) => false,
     };
     Ok(Value::Bool(hit != negated))
