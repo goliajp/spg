@@ -1048,12 +1048,23 @@ pub(crate) fn enum_order_ordinal(expr: &Expr, v: &Value, ctx: &EvalContext) -> O
     let Expr::Column(c) = expr else { return None };
     let Value::Text(label) = v else { return None };
     let pos = eval::find_column_pos(c, ctx)?;
-    let enum_name = ctx.columns.get(pos)?.user_enum_type.as_deref()?;
-    let def = ctx.catalog?.enum_types().get(enum_name)?;
-    let ord = def
-        .labels
-        .iter()
-        .position(|l| l.as_str() == label.as_ref())?;
+    let col = ctx.columns.get(pos)?;
+    // v7.39 (round 401) — an inline MySQL `ENUM('a','b',…)` column sorts by
+    // its variant declaration order too (`ORDER BY e` is low, mid, high, not
+    // the alphabetical high, low, mid), like a PG CREATE TYPE enum.
+    let ord = if let Some(enum_name) = col.user_enum_type.as_deref() {
+        ctx.catalog?
+            .enum_types()
+            .get(enum_name)?
+            .labels
+            .iter()
+            .position(|l| l.as_str() == label.as_ref())?
+    } else {
+        col.inline_enum_variants
+            .as_deref()?
+            .iter()
+            .position(|l| l.as_str() == label.as_ref())?
+    };
     #[allow(clippy::cast_precision_loss)]
     Some(ord as f64)
 }

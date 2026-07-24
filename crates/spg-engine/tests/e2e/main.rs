@@ -236,6 +236,7 @@ mod e2e_mysql_is_true_round397;
 mod e2e_mysql_case_mixed_round398;
 mod e2e_mysql_format_round_round399;
 mod e2e_mysql_greatest_null_round400;
+mod e2e_mysql_enum_order_round401;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;
