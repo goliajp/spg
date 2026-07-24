@@ -50,7 +50,11 @@ pub(crate) fn order_by_value_cmp_in(
     mysql: bool,
 ) -> core::cmp::Ordering {
     use core::cmp::Ordering;
-    let nf = nulls_first.unwrap_or(desc);
+    // v7.39 (round 403) — MySQL treats NULL as the SMALLEST value, so its
+    // default is NULLS FIRST for ASC / NULLS LAST for DESC; PG's default is
+    // the reverse (NULLS LAST for ASC / FIRST for DESC). An explicit
+    // NULLS FIRST/LAST still wins.
+    let nf = nulls_first.unwrap_or(if mysql { !desc } else { desc });
     match (matches!(a, Value::Null), matches!(b, Value::Null)) {
         (true, true) => Ordering::Equal,
         (true, false) => {
@@ -1084,7 +1088,12 @@ pub(crate) fn build_order_keys(
         // nf == desc → +INF (ASC default last / DESC default
         // first), nf != desc → -INF (the explicit flips).
         if matches!(v, Value::Null) {
-            let nf = o.nulls_first.unwrap_or(o.desc);
+            // v7.39 (round 403) — MySQL treats NULL as the SMALLEST value
+            // (NULLS FIRST for ASC / LAST for DESC); PG's default is the
+            // reverse. An explicit NULLS FIRST/LAST still wins.
+            let nf = o
+                .nulls_first
+                .unwrap_or(if ctx.mysql_dialect { !o.desc } else { o.desc });
             keys.push(if nf == o.desc {
                 OrderKey::NullBig
             } else {

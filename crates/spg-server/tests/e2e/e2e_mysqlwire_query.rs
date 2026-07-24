@@ -243,15 +243,17 @@ fn null_values_decode_as_0xfb_byte() {
     let (_seq, _c1) = read_packet(&mut s);
     let (_seq, _c2) = read_packet(&mut s);
     let (_seq, row1) = read_packet(&mut s);
-    // row1 ordered "x" first (NULL b sorts later). row1 should
-    // be NULL(0xfb) + 'x'.
-    assert_eq!(row1[0], 0xfb, "NULL int column");
-    let (b1, _) = read_lenenc_string(&row1, 1);
-    assert_eq!(b1, b"x");
+    // v7.39 (round 403) — the MySQL wire session sorts NULL FIRST for ASC
+    // (NULL is the smallest value), so the `b IS NULL` row `(1, NULL)` comes
+    // before `(NULL, 'x')`. row1 is '1' + NULL(0xfb).
+    let (a1, c) = read_lenenc_string(&row1, 0);
+    assert_eq!(a1, b"1");
+    assert_eq!(row1[c], 0xfb, "NULL text column");
     let (_seq, row2) = read_packet(&mut s);
-    let (a2, c) = read_lenenc_string(&row2, 0);
-    assert_eq!(a2, b"1");
-    assert_eq!(row2[c], 0xfb, "NULL text column");
+    // row2 is NULL(0xfb) int + 'x'.
+    assert_eq!(row2[0], 0xfb, "NULL int column");
+    let (b2, _) = read_lenenc_string(&row2, 1);
+    assert_eq!(b2, b"x");
     let (_seq, _ok) = read_packet(&mut s);
 }
 
