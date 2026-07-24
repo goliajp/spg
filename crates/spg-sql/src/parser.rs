@@ -8054,6 +8054,28 @@ impl Parser {
         } else {
             None
         };
+        // v7.39 (round 413) — MySQL `UPDATE … [ORDER BY …] [LIMIT n]`. PG
+        // has no such clause on UPDATE, so this is accepted only under the
+        // MySQL dialect; a PG session's `UPDATE … ORDER BY …` still errors.
+        let update_order_by = if self.mysql_dialect {
+            self.parse_order_by_keys()?
+        } else {
+            Vec::new()
+        };
+        let update_limit = if self.mysql_dialect && matches!(self.peek(), Token::Limit) {
+            self.advance();
+            let tok = self.advance();
+            let Token::Integer(n) = tok else {
+                return Err(self.err(alloc::format!(
+                    "expected integer after UPDATE LIMIT, got {tok:?}"
+                )));
+            };
+            let n = u32::try_from(n)
+                .map_err(|_| self.err(alloc::format!("UPDATE LIMIT out of range: {n}")))?;
+            Some(n)
+        } else {
+            None
+        };
         let mut returning = self.parse_optional_returning()?;
         let (assignments, where_) = if let Some(fc) = from_clause {
             let names: Vec<String> = core::iter::once(&fc.primary)
@@ -8155,12 +8177,21 @@ impl Parser {
         } else {
             (assignments, where_)
         };
+        let order_limit = if update_order_by.is_empty() && update_limit.is_none() {
+            None
+        } else {
+            Some(alloc::boxed::Box::new(crate::ast::UpdateOrderLimit {
+                order_by: update_order_by,
+                limit: update_limit,
+            }))
+        };
         Ok(Statement::Update(crate::ast::UpdateStatement {
             ctes: Vec::new(),
             table,
             alias,
             assignments,
             where_,
+            order_limit,
             returning,
         }))
     }

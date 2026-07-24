@@ -2718,6 +2718,15 @@ impl fmt::Display for ColumnTypeName {
 /// engine evaluates `expr` per matched row in the table's row order
 /// and rewrites cells in place. Indexed columns are dropped + re-
 /// inserted into the affected B-tree on each row change.
+/// v7.39 (round 413) — the boxed payload for MySQL `UPDATE ORDER BY [LIMIT]`.
+/// Boxed off `UpdateStatement` so the PG-only common path stays at its
+/// pre-r413 size (see the round-305 nesting-stack lesson).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateOrderLimit {
+    pub order_by: Vec<OrderBy>,
+    pub limit: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateStatement {
     /// v7.37.43-T4.4 — leading `WITH cte AS (…)` clauses on a top-
@@ -2730,6 +2739,13 @@ pub struct UpdateStatement {
     pub alias: Option<String>,
     pub assignments: Vec<(String, Expr)>,
     pub where_: Option<Expr>,
+    /// v7.39 (round 413) — MySQL's `UPDATE … [ORDER BY … [LIMIT n]]`:
+    /// mutate the first `limit` rows in the given order. PG has no such
+    /// clause; the parser accepts it only under the MySQL dialect. Boxed
+    /// so a PG UPDATE (the common case) grows this struct by ONE pointer,
+    /// not `Vec<OrderBy> + Option<u32>` — a naked add tipped the parser's
+    /// 512 KiB nesting stack under a full workspace test (round 305 kin).
+    pub order_limit: Option<alloc::boxed::Box<UpdateOrderLimit>>,
     /// v7.9.4 — `RETURNING <projection>`. None = no RETURNING
     /// clause (legacy CommandComplete path). Some = engine
     /// evaluates the projection over each mutated row and
@@ -6469,6 +6485,29 @@ impl fmt::Display for UpdateStatement {
         }
         if let Some(w) = &self.where_ {
             write!(f, " WHERE {w}")?;
+        }
+        // v7.39 (round 413) — MySQL `UPDATE … ORDER BY … LIMIT n`.
+        if let Some(ol) = self.order_limit.as_deref() {
+            if !ol.order_by.is_empty() {
+                f.write_str(" ORDER BY ")?;
+                for (i, o) in ol.order_by.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", o.expr)?;
+                    if o.desc {
+                        f.write_str(" DESC")?;
+                    }
+                    match o.nulls_first {
+                        Some(true) => f.write_str(" NULLS FIRST")?,
+                        Some(false) => f.write_str(" NULLS LAST")?,
+                        None => {}
+                    }
+                }
+            }
+            if let Some(n) = ol.limit {
+                write!(f, " LIMIT {n}")?;
+            }
         }
         write_returning(self.returning.as_deref(), f)?;
         Ok(())
