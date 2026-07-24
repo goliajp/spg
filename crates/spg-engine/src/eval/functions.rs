@@ -4003,21 +4003,36 @@ fn apply_function_dispatch(
                 });
             }
             use sha1::{Digest, Sha1};
-            match &args[0] {
-                Value::Null => Ok(Value::Null),
+            let digest = match &args[0] {
+                Value::Null => return Ok(Value::Null),
                 Value::Text(s) => {
                     let mut h = Sha1::new();
                     h.update(s.as_bytes());
-                    Ok(Value::Bytes(h.finalize().to_vec().into()))
+                    h.finalize().to_vec()
                 }
                 Value::Bytes(b) => {
                     let mut h = Sha1::new();
                     h.update(b.as_ref());
-                    Ok(Value::Bytes(h.finalize().to_vec().into()))
+                    h.finalize().to_vec()
                 }
-                other => Err(EvalError::TypeMismatch {
-                    detail: format!("sha1() needs text or bytea, got {:?}", other.data_type()),
-                }),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!("sha1() needs text or bytea, got {:?}", other.data_type()),
+                    });
+                }
+            };
+            // v7.39 (round 415) — MySQL's SHA1 (and its SHA alias) return the
+            // 40-char lowercase hex text (not bytes), so `SHA1(s) = 'abc…'`
+            // compares directly. PG's own sha1() returns bytea; keep that.
+            if ctx.mysql_dialect {
+                let mut hex = alloc::string::String::with_capacity(40);
+                for b in &digest {
+                    use core::fmt::Write;
+                    let _ = write!(hex, "{b:02x}");
+                }
+                Ok(Value::text(hex))
+            } else {
+                Ok(Value::Bytes(digest.into()))
             }
         }
         "sha224" | "sha256" | "sha384" | "sha512" => {
