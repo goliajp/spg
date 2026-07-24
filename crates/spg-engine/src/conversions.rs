@@ -2806,26 +2806,48 @@ pub(crate) fn int_value_for(n: i64) -> Value<'static> {
 /// (`BigInt → Int` succeeds only when the value fits in `i32`). Everything
 /// else returns `TypeMismatch` carrying the column name for caller diagnostics.
 /// `NULL` is always permitted; the nullability check happens later in storage.
-#[allow(clippy::too_many_lines)]
-/// v7.17.0 Phase 4.4 — reject negative integer values on UNSIGNED
-/// columns. Called after `coerce_value` at each INSERT / UPDATE
-/// site that has ColumnSchema context. NULL passes through (a
-/// nullable UNSIGNED column can legitimately hold NULL).
+/// v7.17.0 Phase 4.4 / v7.39 round 387 (type-fidelity epic P2) — enforce
+/// the integer range a column's storage `DataType` is too wide to hold.
+/// Two cases: an UNSIGNED column rejects negatives (Phase 4.4), and a
+/// TINYINT / MEDIUMINT column (whose storage is the wider SmallInt / Int)
+/// rejects values outside its real bounds — `INSERT 128 INTO TINYINT` was
+/// stored silently where MariaDB strict raises ERROR 1264. Called after
+/// `coerce_value` at each INSERT / UPDATE site. NULL / non-integer cells
+/// pass through. SPG always presents STRICT_TRANS_TABLES, so out of range
+/// is an error (the non-strict clamp is a later stage).
 pub(crate) fn check_unsigned_range(
     v: &Value,
     schema: &ColumnSchema,
     position: usize,
 ) -> Result<(), EngineError> {
-    if !schema.is_unsigned {
-        return Ok(());
-    }
     let n = match v {
         Value::SmallInt(x) => i64::from(*x),
         Value::Int(x) => i64::from(*x),
         Value::BigInt(x) => *x,
         _ => return Ok(()), // non-integer cells (NULL, default) skip
     };
-    if n < 0 {
+    // TINYINT / MEDIUMINT: the storage tag (SmallInt / Int) is wider than
+    // the declared MySQL type, so the real bounds are enforced here. The
+    // unsigned variant's 0 lower bound also covers the negative check.
+    if let Some(width) = schema.mysql_int_width {
+        let (lo, hi) = match (width, schema.is_unsigned) {
+            (spg_storage::MysqlIntWidth::Tiny, false) => (-128, 127),
+            (spg_storage::MysqlIntWidth::Tiny, true) => (0, 255),
+            (spg_storage::MysqlIntWidth::Medium, false) => (-8_388_608, 8_388_607),
+            (spg_storage::MysqlIntWidth::Medium, true) => (0, 16_777_215),
+        };
+        if n < lo || n > hi {
+            // MariaDB's wording (SQLSTATE 22003); SPG tracks the column,
+            // not the multi-row row number the "at row N" suffix carries.
+            return Err(EngineError::Unsupported(alloc::format!(
+                "Out of range value for column '{}'",
+                schema.name
+            )));
+        }
+        return Ok(());
+    }
+    // Other columns: reject a negative on any UNSIGNED column (Phase 4.4).
+    if schema.is_unsigned && n < 0 {
         return Err(EngineError::Unsupported(alloc::format!(
             "column {:?} is UNSIGNED but got negative value {n} at position {position}",
             schema.name
