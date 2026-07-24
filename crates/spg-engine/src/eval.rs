@@ -1006,6 +1006,31 @@ pub(crate) fn expr_set_variants<'e>(
     }
 }
 
+/// v7.39 (round 402) — the inline `ENUM('a','b',…)` variant list an
+/// expression's column is declared with, or None. Like `expr_set_variants`.
+pub(crate) fn expr_inline_enum_variants<'e>(
+    e: &'e Expr,
+    columns: &'e [ColumnSchema],
+) -> Option<&'e [String]> {
+    match e {
+        Expr::Column(c) => columns
+            .iter()
+            .find(|col| col.name == c.name)
+            .and_then(|col| col.inline_enum_variants.as_deref()),
+        _ => None,
+    }
+}
+
+/// The 1-based ordinal a stored inline-ENUM text carries in a numeric
+/// context (`e + 0` is 1 for the first member); the empty string / an
+/// unknown member is 0 (MySQL's implicit `''` enum error value).
+pub(crate) fn enum_text_to_ordinal(text: &str, variants: &[String]) -> i64 {
+    variants
+        .iter()
+        .position(|v| v == text)
+        .map_or(0, |p| p as i64 + 1)
+}
+
 /// The bitmask a stored SET text carries in a numeric context: each
 /// comma-separated member contributes `1 << its position` in the declared
 /// variant list (`'a,c'` over `('a','b','c','d')` is 1 | 4 = 5). An empty
