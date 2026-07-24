@@ -30,7 +30,7 @@ fn array_append_vectors() {
             &mut e,
             "SELECT json_array_append('[\"a\", [\"b\", \"c\"], \"d\"]', '$[1]', 1)"
         )),
-        "[\"a\",[\"b\",\"c\",1],\"d\"]"
+        "[\"a\", [\"b\", \"c\", 1], \"d\"]"
     );
     // Non-array target wraps as [old, new].
     assert_eq!(
@@ -38,7 +38,7 @@ fn array_append_vectors() {
             &mut e,
             "SELECT json_array_append('[\"a\", [\"b\", \"c\"], \"d\"]', '$[0]', 2)"
         )),
-        "[[\"a\",2],[\"b\",\"c\"],\"d\"]"
+        "[[\"a\", 2], [\"b\", \"c\"], \"d\"]"
     );
 }
 
@@ -52,7 +52,7 @@ fn array_insert_vectors() {
             &mut e,
             "SELECT json_array_insert('[\"a\", {\"b\": [1, 2]}, [3, 4]]', '$[1]', 'x')"
         )),
-        "[\"a\",\"x\",{\"b\":[1,2]},[3,4]]"
+        "[\"a\", \"x\", {\"b\": [1, 2]}, [3, 4]]"
     );
     // Past-the-end appends.
     assert_eq!(
@@ -60,7 +60,7 @@ fn array_insert_vectors() {
             &mut e,
             "SELECT json_array_insert('[1, 2]', '$[100]', 3)"
         )),
-        "[1,2,3]"
+        "[1, 2, 3]"
     );
     // Path not ending in [N] errors.
     let err = e

@@ -31,7 +31,7 @@ fn merge_patch_vectors() {
             &mut e,
             "SELECT json_merge_patch('{\"a\": 1, \"b\": 2}', '{\"a\": 3, \"c\": 4}')"
         )),
-        "{\"a\":3,\"b\":2,\"c\":4}"
+        "{\"a\": 3, \"b\": 2, \"c\": 4}"
     );
     // null removes the key (RFC 7396).
     assert_eq!(
@@ -39,7 +39,7 @@ fn merge_patch_vectors() {
             &mut e,
             "SELECT json_merge_patch('{\"a\": 1, \"b\": 2}', '{\"b\": null}')"
         )),
-        "{\"a\":1}"
+        "{\"a\": 1}"
     );
     // Non-object patch replaces wholesale.
     assert_eq!(
@@ -47,7 +47,7 @@ fn merge_patch_vectors() {
             &mut e,
             "SELECT json_merge_patch('{\"a\": 1}', '[1, 2]')"
         )),
-        "[1,2]"
+        "[1, 2]"
     );
 }
 
@@ -61,7 +61,7 @@ fn merge_preserve_vectors() {
             &mut e,
             "SELECT json_merge_preserve('[1, 2]', '[true, false]')"
         )),
-        "[1,2,true,false]"
+        "[1, 2, true, false]"
     );
     // MySQL doc vector: duplicate keys combine into arrays.
     assert_eq!(
@@ -69,10 +69,10 @@ fn merge_preserve_vectors() {
             &mut e,
             "SELECT json_merge_preserve('{\"name\": \"x\"}', '{\"name\": \"y\"}')"
         )),
-        "{\"name\":[\"x\",\"y\"]}"
+        "{\"name\": [\"x\", \"y\"]}"
     );
     // Scalars combine into an array; deprecated json_merge alias.
-    assert_eq!(text(&first(&mut e, "SELECT json_merge('1', '2')")), "[1,2]");
+    assert_eq!(text(&first(&mut e, "SELECT json_merge('1', '2')")), "[1, 2]");
 }
 
 #[test]

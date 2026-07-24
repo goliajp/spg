@@ -27,12 +27,12 @@ fn json_set_replaces_and_creates() {
             &mut e,
             "SELECT json_set('{\"a\": 1, \"b\": [2, 3]}', '$.a', 10, '$.c', '[true, false]')"
         ),
-        "{\"a\":10,\"b\":[2,3],\"c\":\"[true, false]\"}"
+        "{\"a\": 10, \"b\": [2, 3], \"c\": \"[true, false]\"}"
     );
     // Array index past the end appends.
     assert_eq!(
         first_text(&mut e, "SELECT json_set('[1, 2]', '$[5]', 9)"),
-        "[1,2,9]"
+        "[1, 2, 9]"
     );
 }
 
@@ -45,7 +45,7 @@ fn json_insert_creates_only() {
             &mut e,
             "SELECT json_insert('{\"a\": 1}', '$.a', 99, '$.b', 2)"
         ),
-        "{\"a\":1,\"b\":2}"
+        "{\"a\": 1, \"b\": 2}"
     );
 }
 
@@ -58,7 +58,7 @@ fn json_replace_replaces_only() {
             &mut e,
             "SELECT json_replace('{\"a\": 1}', '$.a', 99, '$.b', 2)"
         ),
-        "{\"a\":99}"
+        "{\"a\": 99}"
     );
 }
 
@@ -73,11 +73,11 @@ fn json_remove_keys_and_elements() {
             &mut e,
             "SELECT json_remove('[0, 1, 2, [3, 4]]', '$[0]', '$[2]')"
         ),
-        "[1,2]"
+        "[1, 2]"
     );
     assert_eq!(
         first_text(&mut e, "SELECT json_remove('{\"a\": 1, \"b\": 2}', '$.b')"),
-        "{\"a\":1}"
+        "{\"a\": 1}"
     );
     // Root removal errors like MySQL.
     let err = e
