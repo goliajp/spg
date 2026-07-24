@@ -226,6 +226,7 @@ mod e2e_mysql_int_width_round386;
 mod e2e_mysql_int_range_round387;
 mod e2e_mysql_unsigned_wide_round389;
 mod e2e_mysql_set_bitmask_round390;
+mod e2e_mysql_json_object_round391;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;

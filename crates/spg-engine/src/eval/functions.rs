@@ -12026,6 +12026,15 @@ fn apply_function_dispatch(
         // of alternating key/value pairs. 2-array form
         // json_object(keys, values) also supported.
         "json_object" | "jsonb_object" => {
+            // v7.39 (round 391) — MySQL `JSON_OBJECT(k1, v1, k2, v2, …)` is
+            // the variadic key/value constructor (PG's json_build_object),
+            // not PG's array-based `json_object(text[] [, text[]])`. A NULL
+            // value is kept (`JSON_OBJECT('a', NULL)` is `{"a": null}`).
+            // Canonicalise so the render matches MariaDB's `{"k": 1}` (space
+            // after the colon), like `jsonb_build_object`.
+            if ctx.mysql_dialect && name == "json_object" {
+                return crate::json::build_object(args).map(crate::json::canonicalize_value);
+            }
             if args.is_empty() || args.len() > 2 {
                 return Err(EvalError::TypeMismatch {
                     detail: format!("json_object() takes 1 or 2 args, got {}", args.len()),
