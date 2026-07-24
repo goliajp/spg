@@ -2324,7 +2324,7 @@ fn accumulate_groups(
                 let upd = match &st.extreme {
                     None => true,
                     Some(prev) => {
-                        extreme_cmp(agg_specs[0].enum_labels.as_deref(), av, prev)
+                        extreme_cmp(agg_specs[0].enum_labels.as_deref(), av, prev, ctx.mysql_dialect)
                             == core::cmp::Ordering::Greater
                     }
                 };
@@ -2523,7 +2523,7 @@ fn accumulate_groups(
                             let upd = match &st.extreme {
                                 None => true,
                                 Some(prev) => {
-                                    extreme_cmp(spec.enum_labels.as_deref(), arg_ref, prev)
+                                    extreme_cmp(spec.enum_labels.as_deref(), arg_ref, prev, ctx.mysql_dialect)
                                         == core::cmp::Ordering::Greater
                                 }
                             };
@@ -2538,7 +2538,7 @@ fn accumulate_groups(
                             let upd = match &st.extreme {
                                 None => true,
                                 Some(prev) => {
-                                    extreme_cmp(spec.enum_labels.as_deref(), arg_ref, prev)
+                                    extreme_cmp(spec.enum_labels.as_deref(), arg_ref, prev, ctx.mysql_dialect)
                                         == core::cmp::Ordering::Less
                                 }
                             };
@@ -2577,6 +2577,7 @@ fn accumulate_groups(
                             arg2_val.as_ref(),
                             order_keys,
                             spec.enum_labels.as_deref(),
+                            ctx.mysql_dialect,
                         )?,
                     },
                     AggKind::BoolAnd => match arg_ref {
@@ -2593,6 +2594,7 @@ fn accumulate_groups(
                             arg2_val.as_ref(),
                             order_keys,
                             spec.enum_labels.as_deref(),
+                            ctx.mysql_dialect,
                         )?,
                     },
                     _ => {
@@ -2604,6 +2606,7 @@ fn accumulate_groups(
                             arg2_val.as_ref(),
                             order_keys,
                             spec.enum_labels.as_deref(),
+                            ctx.mysql_dialect,
                         )?;
                     }
                 }
@@ -2901,7 +2904,7 @@ fn accumulate_groups(
                             let upd = match &st.extreme {
                                 None => true,
                                 Some(prev) => {
-                                    extreme_cmp(spec.enum_labels.as_deref(), arg_ref, prev)
+                                    extreme_cmp(spec.enum_labels.as_deref(), arg_ref, prev, ctx.mysql_dialect)
                                         == core::cmp::Ordering::Greater
                                 }
                             };
@@ -2916,7 +2919,7 @@ fn accumulate_groups(
                             let upd = match &st.extreme {
                                 None => true,
                                 Some(prev) => {
-                                    extreme_cmp(spec.enum_labels.as_deref(), arg_ref, prev)
+                                    extreme_cmp(spec.enum_labels.as_deref(), arg_ref, prev, ctx.mysql_dialect)
                                         == core::cmp::Ordering::Less
                                 }
                             };
@@ -2955,6 +2958,7 @@ fn accumulate_groups(
                             arg2_val.as_ref(),
                             order_keys,
                             spec.enum_labels.as_deref(),
+                            ctx.mysql_dialect,
                         )?,
                     },
                     AggKind::BoolAnd => match arg_ref {
@@ -2971,6 +2975,7 @@ fn accumulate_groups(
                             arg2_val.as_ref(),
                             order_keys,
                             spec.enum_labels.as_deref(),
+                            ctx.mysql_dialect,
                         )?,
                     },
                     _ => {
@@ -2982,6 +2987,7 @@ fn accumulate_groups(
                             arg2_val.as_ref(),
                             order_keys,
                             spec.enum_labels.as_deref(),
+                            ctx.mysql_dialect,
                         )?;
                     }
                 }
@@ -3118,6 +3124,7 @@ fn accumulate_groups(
                 arg2_val.as_ref(),
                 order_keys,
                 spec.enum_labels.as_deref(),
+                ctx.mysql_dialect,
             )?;
         }
     }
@@ -4036,6 +4043,7 @@ pub(crate) fn update_state(
     arg2: Option<&Value<'_>>,
     order_keys: Option<Vec<Value<'static>>>,
     enum_labels: Option<&[String]>,
+    mysql: bool,
 ) -> Result<(), EvalError> {
     let is_null = matches!(v, Value::Null);
     // v7.37.4 (R34) — dispatch by pre-classified `kind` (`Copy`
@@ -4135,7 +4143,7 @@ pub(crate) fn update_state(
             match &st.extreme {
                 None => st.extreme = Some(v.clone().into_owned()),
                 Some(cur) => {
-                    if extreme_cmp(enum_labels, v, cur) == core::cmp::Ordering::Less {
+                    if extreme_cmp(enum_labels, v, cur, mysql) == core::cmp::Ordering::Less {
                         st.extreme = Some(v.clone().into_owned());
                     }
                 }
@@ -4210,7 +4218,7 @@ pub(crate) fn update_state(
             match &st.extreme {
                 None => st.extreme = Some(v.clone().into_owned()),
                 Some(cur) => {
-                    if extreme_cmp(enum_labels, v, cur) == core::cmp::Ordering::Greater {
+                    if extreme_cmp(enum_labels, v, cur, mysql) == core::cmp::Ordering::Greater {
                         st.extreme = Some(v.clone().into_owned());
                     }
                 }
@@ -6122,11 +6130,25 @@ fn fold_sum_kind(
 
 /// v7.39 (enum order knife) — min/max extreme comparison: member order when
 /// the spec's argument is enum-typed, the generic value order otherwise.
-fn extreme_cmp(enum_labels: Option<&[String]>, a: &Value, b: &Value) -> core::cmp::Ordering {
+fn extreme_cmp(
+    enum_labels: Option<&[String]>,
+    a: &Value,
+    b: &Value,
+    mysql: bool,
+) -> core::cmp::Ordering {
     if let Some(labels) = enum_labels
         && let Some(ord) = crate::eval::enum_ord_cmp(labels, a, b)
     {
         return ord;
+    }
+    // v7.39 (round 412) — MIN / MAX over text under the MySQL default
+    // collation compares by the folded form (case- and accent-insensitive,
+    // PAD SPACE), matching ORDER BY (round 411).
+    if mysql {
+        if let (Value::Text(x), Value::Text(y)) | (Value::BpChar(x), Value::BpChar(y)) = (a, b) {
+            return spg_storage::mysql_compare_fold(x)
+                .cmp(&spg_storage::mysql_compare_fold(y));
+        }
     }
     value_cmp(a, b)
 }

@@ -10662,7 +10662,7 @@ fn apply_function_dispatch(
                 || name.ends_with("larger");
             let mut best: Value<'static> = non_null[0].clone();
             for v in &non_null[1..] {
-                let ord = value_cmp_for_min_max(&best, v);
+                let ord = value_cmp_for_min_max(&best, v, ctx.mysql_dialect);
                 let take = if is_greatest {
                     ord == core::cmp::Ordering::Less
                 } else {
