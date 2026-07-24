@@ -2981,8 +2981,13 @@ pub(crate) fn apply_binary_in(
     if let Some(v) = mysql_date_plus_interval(op, &l, &r) {
         return Ok(v);
     }
+    // v7.39 (round 393) — a STRING operand makes `/` a DOUBLE (`'10'/'4'`
+    // is 2.5, not the DECIMAL 2.5000 that `10/4` is), checked on the
+    // ORIGINAL operands before the reading pair lifts a string to a number.
+    let div_text_operand = matches!(op, BinOp::Div)
+        && (matches!(l, Value::Text(_)) || matches!(r, Value::Text(_)));
     let (l, r) = super::mysql_operand_reading_pair(op, l, r);
-    if let Some(v) = super::mysql_true_division(op, &l, &r) {
+    if let Some(v) = super::mysql_true_division(op, &l, &r, div_text_operand) {
         return Ok(v);
     }
     // v7.39 (round 383) — `& | ^ << >>` are UNSIGNED 64-bit here, and

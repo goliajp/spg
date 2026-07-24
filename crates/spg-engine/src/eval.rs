@@ -825,7 +825,12 @@ fn mysql_bytes_as_number(b: &[u8]) -> Value<'static> {
 /// when this pairing is not the integer/integer case PG and MySQL
 /// disagree about.
 #[inline(never)]
-pub(crate) fn mysql_true_division(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Option<Value<'static>> {
+pub(crate) fn mysql_true_division(
+    op: BinOp,
+    l: &Value<'_>,
+    r: &Value<'_>,
+    text_operand: bool,
+) -> Option<Value<'static>> {
     // v7.39 (round 372) — MySQL's `x % 0` / `x MOD 0` is NULL, not the PG
     // "division by zero" error (measured on MariaDB 11: `10%0`, `10 MOD
     // 0`, `10.5%0` are all NULL, matching `1/0`). A non-zero divisor takes
@@ -840,19 +845,62 @@ pub(crate) fn mysql_true_division(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Op
     if !matches!(op, BinOp::Div) {
         return None;
     }
-    let int_of = |v: &Value<'_>| match v {
-        Value::SmallInt(n) => Some(f64::from(*n)),
-        Value::Int(n) => Some(f64::from(*n)),
-        #[allow(clippy::cast_precision_loss)]
-        Value::BigInt(n) => Some(*n as f64),
-        _ => None,
-    };
-    let (a, b) = (int_of(l)?, int_of(r)?);
-    Some(if b == 0.0 {
-        Value::Null
+    // v7.39 (round 393) — MariaDB `/` on exact (int / decimal) operands is a
+    // DECIMAL whose scale is the LEFT operand's scale + 4 (`7/2` is 3.5000,
+    // `10.0/3` is 3.33333, `7.00/2` is 3.500000), NOT a float. A float /
+    // double operand — or a STRING one, `'10'/'4'` is 2.5 (double) — makes
+    // the result a float; a zero divisor is NULL.
+    if text_operand
+        || matches!(l, Value::Float(_) | Value::Real(_))
+        || matches!(r, Value::Float(_) | Value::Real(_))
+    {
+        let f = |v: &Value<'_>| -> Option<f64> {
+            match v {
+                Value::Float(x) => Some(*x),
+                Value::Real(x) => Some(f64::from(*x)),
+                Value::SmallInt(n) => Some(f64::from(*n)),
+                Value::Int(n) => Some(f64::from(*n)),
+                #[allow(clippy::cast_precision_loss)]
+                Value::BigInt(n) => Some(*n as f64),
+                _ => None,
+            }
+        };
+        let (a, b) = (f(l)?, f(r)?);
+        return Some(if b == 0.0 { Value::Null } else { Value::Float(a / b) });
+    }
+    let (ls, lsc) = exact_decimal_parts(l)?;
+    let (rs, rsc) = exact_decimal_parts(r)?;
+    if rs == 0 {
+        return Some(Value::Null);
+    }
+    let result_scale = u32::from(lsc) + 4;
+    // result_scaled = round( ls * 10^(rsc + 4) / rs ), half away from zero.
+    let pow = 10i128.checked_pow(u32::from(rsc) + 4)?;
+    let num = ls.checked_mul(pow)?;
+    let q = num / rs;
+    let rem = num % rs;
+    let bump = if rem.unsigned_abs() * 2 >= rs.unsigned_abs() {
+        if (num < 0) == (rs < 0) { 1 } else { -1 }
     } else {
-        Value::Float(a / b)
-    })
+        0
+    };
+    Some(Value::numeric(q + bump, u16::try_from(result_scale).ok()?))
+}
+
+/// The `(scaled, scale)` of an exact integer / NUMERIC value: an integer
+/// has scale 0. None for a float / non-numeric (they take the float path).
+fn exact_decimal_parts(v: &Value<'_>) -> Option<(i128, u16)> {
+    match v {
+        Value::SmallInt(n) => Some((i128::from(*n), 0)),
+        Value::Int(n) => Some((i128::from(*n), 0)),
+        Value::BigInt(n) => Some((i128::from(*n), 0)),
+        Value::Numeric {
+            scaled,
+            scale,
+            kind: spg_storage::NumericKind::Finite,
+        } => Some((*scaled, *scale)),
+        _ => None,
+    }
 }
 
 /// v7.39 (round 383) — the UNSIGNED 64-bit value a MySQL bitwise operand

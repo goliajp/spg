@@ -53,7 +53,7 @@ fn div_truncates_toward_zero() {
     }
     assert_eq!(one(&mut e, "SELECT 5 DIV 0"), Value::Null);
     // …and `/` is still the real division round 351 measured.
-    assert_eq!(one(&mut e, "SELECT 5/2"), Value::Float(2.5));
+    assert_eq!(one(&mut e, "SELECT 5/2"), Value::numeric(25000, 4));
 }
 
 /// `!` negates a truth value, and binds tighter than arithmetic.
