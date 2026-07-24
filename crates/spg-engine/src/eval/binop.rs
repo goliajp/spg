@@ -1394,7 +1394,8 @@ pub(crate) fn apply_binary(
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             compare(op, &l, &r)
         }
-        BinOp::And | BinOp::Or | BinOp::IsDistinctFrom | BinOp::IsNotDistinctFrom => {
+        BinOp::And | BinOp::Or | BinOp::LogicalXor
+        | BinOp::IsDistinctFrom | BinOp::IsNotDistinctFrom => {
             unreachable!("handled above")
         }
     }
@@ -5803,6 +5804,7 @@ pub(super) fn compare(
         BinOp::IntDiv
         | BinOp::And
         | BinOp::Or
+        | BinOp::LogicalXor
         | BinOp::BitOr
         | BinOp::BitAnd
         | BinOp::BitXor

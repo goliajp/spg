@@ -1138,6 +1138,25 @@ fn eval_mysql_connective(
 ) -> Result<Value<'static>, EvalError> {
     let l = as_mysql_truth(eval_expr(lhs, row, ctx)?)?;
     let r = as_mysql_truth(eval_expr(rhs, row, ctx)?)?;
+    apply_mysql_connective(op, l, r)
+}
+
+/// v7.39 (round 407) — apply a MySQL logical connective (`AND` / `OR` /
+/// `XOR`) to two operands already reduced to truth values (`Bool` or
+/// `Null`). AND / OR reuse the dialect-blind `apply_binary`; `XOR` is
+/// MySQL-only (no `apply_binary` arm) and computed here: NULL on either
+/// side yields NULL, otherwise the exclusive-or of the two truth values.
+pub(crate) fn apply_mysql_connective(
+    op: BinOp,
+    l: Value<'static>,
+    r: Value<'static>,
+) -> Result<Value<'static>, EvalError> {
+    if op == BinOp::LogicalXor {
+        return Ok(match (&l, &r) {
+            (Value::Bool(a), Value::Bool(b)) => Value::Bool(a != b),
+            _ => Value::Null,
+        });
+    }
     apply_binary(op, l, r)
 }
 
@@ -3648,7 +3667,7 @@ pub fn eval_expr(
         // stack-depth budget is tuned against, and locals added here cost
         // one nesting level each (the round-305 frame cliff).
         Expr::Binary { lhs, op, rhs }
-            if ctx.mysql_dialect && matches!(op, BinOp::And | BinOp::Or) =>
+            if ctx.mysql_dialect && matches!(op, BinOp::And | BinOp::Or | BinOp::LogicalXor) =>
         {
             eval_mysql_connective(lhs, *op, rhs, row, ctx)
         }
