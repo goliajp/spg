@@ -245,6 +245,7 @@ mod e2e_mysql_insert_ignore_round406;
 mod e2e_mysql_logical_xor_round407;
 mod e2e_mysql_str_coerce_round408;
 mod e2e_mysql_interval_fn_round409;
+mod e2e_mysql_setop_collation_round410;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;
