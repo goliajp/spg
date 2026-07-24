@@ -7823,23 +7823,88 @@ fn expr_refs_tables(e: &Expr, names: &[String]) -> bool {
 impl Parser {
     /// v4.4 `UPDATE <table> SET col = expr [, col = expr]* [WHERE cond]`.
     /// Caller already consumed the leading `UPDATE` ident.
+    /// v7.39 (round 420) — does a JOIN clause start here? Used to spot
+    /// MySQL's multi-table `UPDATE a JOIN b ON …` / `UPDATE a LEFT JOIN b …`
+    /// after the target name has been read. `JOIN` is a reserved token;
+    /// the qualifiers are bare idents.
+    fn peek_is_update_join_start(&self) -> bool {
+        match self.peek() {
+            // JOIN and its qualifiers are reserved lexer tokens (the grammar
+            // dedicates arms to `LEFT [OUTER] JOIN` and friends).
+            Token::Join
+            | Token::Inner
+            | Token::Left
+            | Token::Right
+            | Token::Cross
+            | Token::Full => true,
+            // NATURAL / STRAIGHT_JOIN arrive as bare idents.
+            Token::Ident(s) | Token::QuotedIdent(s) => {
+                matches!(s.to_ascii_lowercase().as_str(), "natural" | "straight_join")
+            }
+            _ => false,
+        }
+    }
+
     fn parse_update_after_keyword(&mut self) -> Result<Statement, ParseError> {
         let table = self.expect_ident_like()?;
         // v7.39 (round 241) — `UPDATE t [AS] alias SET …`. PG allows the
         // bare spelling; a bare identifier that is the SET keyword itself
         // is the clause, not an alias.
+        // v7.39 (round 420) — nor is a bare join qualifier (`LEFT` / `INNER`
+        // / …) an alias: `UPDATE a LEFT JOIN b …` starts the MySQL
+        // multi-table form, and swallowing `LEFT` as `a`'s alias made the
+        // following JOIN a syntax error.
+        let starts_join = self.mysql_dialect && self.peek_is_update_join_start();
         let alias = if matches!(self.peek(), Token::As) {
             self.advance();
             Some(self.expect_ident_like()?)
         } else {
             match self.peek() {
-                Token::Ident(s) | Token::QuotedIdent(s) if !s.eq_ignore_ascii_case("set") => {
+                Token::Ident(s) | Token::QuotedIdent(s)
+                    if !s.eq_ignore_ascii_case("set") && !starts_join =>
+                {
                     let a = s.clone();
                     self.advance();
                     Some(a)
                 }
                 _ => None,
             }
+        };
+        // v7.39 (round 420) — MySQL's multi-table UPDATE:
+        //     UPDATE a, b        SET a.v = b.v WHERE a.id = b.id
+        //     UPDATE a JOIN b ON a.id = b.id      SET a.v = b.v + 1
+        //     UPDATE a LEFT JOIN b ON a.id = b.id SET a.v = COALESCE(b.v, -1)
+        // The FIRST table is the mutation target and the rest are sources —
+        // exactly the shape PG spells `UPDATE a SET … FROM b WHERE …`, which
+        // SPG already lowers onto correlated subqueries. So rewind, let
+        // `parse_from_clause` read the whole list (it handles aliases, comma
+        // lists, and every JOIN form), then peel the target off the front.
+        let (mysql_from, mysql_on, mysql_outer) = if self.mysql_dialect
+            && (matches!(self.peek(), Token::Comma) || self.peek_is_update_join_start())
+        {
+            // NOTE: `advance()` destroys the tokens it returns
+            // (`mem::replace(.., Eof)`), so re-parsing by rewinding `self.pos`
+            // is NOT possible — the tail is read forward, once, through the
+            // same grammar `parse_from_clause` uses after its primary.
+            let target_qual = alias.clone().unwrap_or_else(|| table.clone());
+            let mut joins = self.parse_from_joins(&target_qual)?;
+            if joins.is_empty() {
+                return Err(self.err(alloc::string::String::from(
+                    "multi-table UPDATE needs at least one source table",
+                )));
+            }
+            let head = joins.remove(0);
+            // A LEFT join keeps every target row (the unmatched ones see NULL
+            // on the source side), so it must NOT get the EXISTS row filter
+            // the inner / comma forms use.
+            let outer = matches!(head.kind, crate::ast::JoinKind::Left);
+            let src = FromClause {
+                primary: head.table,
+                joins,
+            };
+            (Some(src), head.on, outer)
+        } else {
+            (None, None, false)
         };
         self.expect_keyword_ident("set")?;
         let mut assignments = Vec::new();
@@ -7934,7 +7999,36 @@ impl Parser {
                 }
                 break;
             }
+            // v7.39 (round 420) — MySQL's multi-table UPDATE qualifies its
+            // assignment targets (`SET a.v = b.v`). `expect_ident_like`
+            // SILENTLY strips a `<qual>.` prefix (it exists for PG's
+            // `public.` dump qualifiers), so the qualifier has to be read off
+            // the token stream first — otherwise `SET b.v = 888` would write
+            // to the TARGET table's `v` while naming a source table, a
+            // silent-wrong. A qualifier naming a SOURCE table means a
+            // multi-TARGET update — mutating two tables in one statement —
+            // which SPG does not model, so it is refused loudly.
+            let set_qual: Option<String> = if mysql_from.is_some()
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Dot))
+            {
+                match self.peek() {
+                    Token::Ident(s) | Token::QuotedIdent(s) => Some(s.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let col = self.expect_ident_like()?;
+            if let Some(q) = set_qual {
+                let names_target = q.eq_ignore_ascii_case(&table)
+                    || alias.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(&q));
+                if !names_target {
+                    return Err(self.err(alloc::format!(
+                        "multi-table UPDATE can only assign to its first table \
+                         ({table}); `{q}.{col}` targets another table"
+                    )));
+                }
+            }
             // v7.37 D.53 — array element assignment target `SET arr[i] = v`,
             // desugared to `arr = __array_assign(arr, i, v)` (mirrors the
             // `__column_default` marker lowering just below). PG assigns to the
@@ -8042,7 +8136,18 @@ impl Parser {
         // multi-match, which PG resolves by arbitrary pick,
         // surfaces as a scalar-subquery cardinality error instead
         // of a silent arbitrary result.
-        let from_clause = if matches!(self.peek(), Token::From) {
+        // v7.39 (round 420) — the MySQL multi-table form supplies the source
+        // list up front (`UPDATE a, b SET …`) instead of via FROM, so it feeds
+        // the SAME lowering below. Both spellings together is not legal in
+        // either dialect.
+        let from_clause = if let Some(fc) = mysql_from {
+            if matches!(self.peek(), Token::From) {
+                return Err(self.err(alloc::string::String::from(
+                    "multi-table UPDATE already names its sources; drop the FROM clause",
+                )));
+            }
+            Some(fc)
+        } else if matches!(self.peek(), Token::From) {
             self.advance();
             Some(self.parse_from_clause()?)
         } else {
@@ -8053,6 +8158,17 @@ impl Parser {
             Some(self.parse_expr(0)?)
         } else {
             None
+        };
+        // A `JOIN … ON <cond>` carries its predicate in the ON clause; AND it
+        // onto the WHERE so the shared lowering sees one condition.
+        let where_ = match (mysql_on, where_) {
+            (Some(on), Some(w)) => Some(Expr::Binary {
+                lhs: Box::new(on),
+                op: crate::ast::BinOp::And,
+                rhs: Box::new(w),
+            }),
+            (Some(on), None) => Some(on),
+            (None, w) => w,
         };
         // v7.39 (round 413) — MySQL `UPDATE … [ORDER BY …] [LIMIT n]`. PG
         // has no such clause on UPDATE, so this is accepted only under the
@@ -8173,7 +8289,15 @@ impl Parser {
                     }
                 }
             }
-            (assignments, Some(exists))
+            // v7.39 (round 420) — a MySQL LEFT JOIN keeps EVERY target row
+            // (an unmatched one just reads NULL from the source side, which
+            // the correlated scalar subquery already yields), so it must not
+            // get the EXISTS row filter the inner / comma forms use.
+            if mysql_outer {
+                (assignments, None)
+            } else {
+                (assignments, Some(exists))
+            }
         } else {
             (assignments, where_)
         };
@@ -17948,6 +18072,28 @@ impl Parser {
     /// semantics).
     fn parse_from_clause(&mut self) -> Result<FromClause, ParseError> {
         let primary = self.parse_table_ref()?;
+        let primary_qual = primary
+            .alias
+            .clone()
+            .unwrap_or_else(|| primary.name.clone());
+        let joins = self.parse_from_joins(&primary_qual)?;
+        Ok(FromClause { primary, joins })
+    }
+
+    /// v7.39 (round 420) — the join tail of a FROM clause, factored out of
+    /// [`Self::parse_from_clause`] so MySQL's multi-table UPDATE can read the
+    /// SAME grammar after its target table has already been consumed.
+    /// (`advance()` destroys the tokens it returns — `mem::replace(.., Eof)`
+    /// — so re-parsing by rewinding `self.pos` is not possible; the tail must
+    /// be parsed forward, once.)
+    /// `left_primary_qual` is the qualifier (alias, else name) of whatever
+    /// sits to the LEFT of the first join — the FROM primary, or the UPDATE
+    /// target in the MySQL multi-table form. It only feeds the `USING (…)`
+    /// desugaring, which needs a name for the left side of each equality.
+    fn parse_from_joins(
+        &mut self,
+        left_primary_qual: &str,
+    ) -> Result<Vec<FromJoin>, ParseError> {
         let mut joins = Vec::new();
         loop {
             // `, <table>` — cross-product with no ON.
@@ -18127,12 +18273,7 @@ impl Parser {
                             .clone()
                             .unwrap_or_else(|| j.table.name.clone())
                     })
-                    .unwrap_or_else(|| {
-                        primary
-                            .alias
-                            .clone()
-                            .unwrap_or_else(|| primary.name.clone())
-                    });
+                    .unwrap_or_else(|| alloc::string::String::from(left_primary_qual));
                 let right_qual = table.alias.clone().unwrap_or_else(|| table.name.clone());
                 let mut iter = cols.into_iter().map(|c| Expr::Binary {
                     lhs: alloc::boxed::Box::new(Expr::Column(crate::ast::ColumnName {
@@ -18168,7 +18309,7 @@ impl Parser {
                 natural: false,
             });
         }
-        Ok(FromClause { primary, joins })
+        Ok(joins)
     }
 
     /// Optional alias after an expression or table:
