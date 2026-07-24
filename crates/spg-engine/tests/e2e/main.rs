@@ -248,6 +248,7 @@ mod e2e_mysql_interval_fn_round409;
 mod e2e_mysql_setop_collation_round410;
 mod e2e_mysql_order_collation_round411;
 mod e2e_mysql_value_pick_collation_round412;
+mod e2e_mysql_update_order_limit_round413;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;

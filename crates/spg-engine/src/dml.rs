@@ -1301,6 +1301,52 @@ impl Engine {
             }
             planned.push((i, new_vals));
         }
+        // v7.39 (round 413) — MySQL `UPDATE … ORDER BY … LIMIT n`. Sort the
+        // matched rows by the ORDER BY keys (evaluated on the pre-image row),
+        // truncate to the LIMIT, then restore position order so the FK /
+        // trigger / apply passes below see the ascending-row invariant.
+        // UPDATE's ctx above does not thread the engine (a long-standing site,
+        // not touched here), so read the dialect straight off the session.
+        if self.backslash_escapes
+            && let Some(ol) = stmt.order_limit.as_deref()
+        {
+            if !ol.order_by.is_empty() {
+                let mut tagged: Vec<(Vec<Value<'static>>, usize, Vec<Value<'static>>)> = planned
+                    .into_iter()
+                    .map(|(pos, new_vals)| {
+                        let row = table
+                            .rows()
+                            .get(pos)
+                            .expect("planned position was visible under scan_snapshot");
+                        let keys: Vec<Value<'static>> = ol
+                            .order_by
+                            .iter()
+                            .map(|o| eval::eval_expr(&o.expr, row, &ctx))
+                            .collect::<Result<_, _>>()?;
+                        Ok::<_, EngineError>((keys, pos, new_vals))
+                    })
+                    .collect::<Result<_, _>>()?;
+                tagged.sort_by(|a, b| {
+                    for (k, o) in ol.order_by.iter().enumerate() {
+                        let cmp = crate::order_by_value_cmp_in(
+                            o.desc,
+                            o.nulls_first,
+                            &a.0[k],
+                            &b.0[k],
+                            true,
+                        );
+                        if cmp != core::cmp::Ordering::Equal {
+                            return cmp;
+                        }
+                    }
+                    core::cmp::Ordering::Equal
+                });
+                planned = tagged.into_iter().map(|(_, i, v)| (i, v)).collect();
+            }
+            if let Some(n) = ol.limit {
+                planned.truncate(n as usize);
+            }
+        }
         // planned must stay position-sorted: downstream passes
         // (FK pairing, trigger walks, the apply loop) iterate it
         // assuming ascending row order, which the full-scan path
