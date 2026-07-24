@@ -837,6 +837,7 @@ pub(crate) fn run(
         correlated_eval,
         defer_projection,
         catalog,
+        engine.is_some_and(|e| e.backslash_escapes),
     )?;
 
     // (4) ORDER BY on the aggregated output (the caller applies LIMIT).
@@ -3346,6 +3347,7 @@ fn project_groups(
     correlated_eval: Option<CorrelatedEval<'_>>,
     defer_projection: bool,
     catalog: Option<&spg_storage::Catalog>,
+    mysql: bool,
 ) -> Result<Projection, EvalError> {
     // Rewrite the user's SELECT items + ORDER BY to reference synthetic
     // columns. After rewriting, every remaining `Expr::Column` must
@@ -3383,10 +3385,35 @@ fn project_groups(
     if let Some(cat) = catalog {
         synth_ctx = synth_ctx.with_catalog(cat);
     }
-    let having_rewritten = stmt
-        .having
-        .as_ref()
-        .map(|h| rewrite_expr(h, group_exprs, agg_specs));
+    // v7.39 (round 404) — a MySQL session lets HAVING name a SELECT alias.
+    // Build the (alias, expr) map from renaming SELECT items, then subst
+    // before the aggregate rewrite.
+    let having_aliases: Vec<(String, Expr)> = if mysql {
+        stmt.items
+            .iter()
+            .filter_map(|it| match it {
+                SelectItem::Expr {
+                    expr,
+                    alias: Some(a),
+                } if !matches!(expr, Expr::Column(c)
+                    if c.qualifier.is_none() && c.name.eq_ignore_ascii_case(a)) =>
+                {
+                    Some((a.clone(), expr.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let having_rewritten = stmt.having.as_ref().map(|h| {
+        let h = if having_aliases.is_empty() {
+            h.clone()
+        } else {
+            substitute_having_aliases(h.clone(), &having_aliases)
+        };
+        rewrite_expr(&h, group_exprs, agg_specs)
+    });
     // v7.30 (phase 3e-1) - rewrite SELECT items ONCE. This ran per
     // GROUP (23.5k x 9 items of AST cloning = ~48% of the inbox
     // query in sampled stacks); the rewrite is group-independent.
@@ -5253,6 +5280,95 @@ fn agg_or_group_type(e: &Expr, synth: &[ColumnSchema]) -> DataType {
     crate::describe::describe_expr(e, synth)
         .map(|shape| shape.ty)
         .unwrap_or(DataType::Text)
+}
+
+/// v7.39 (round 404) — MySQL lets HAVING (and ORDER BY) reference a
+/// SELECT-list alias (`SELECT g, SUM(v) AS sv … HAVING sv > 30`); PG does
+/// not. Before the aggregate rewrite, replace a bare `Column(alias)` with
+/// the SELECT expression it names, so the aggregate rewrite then maps it to
+/// its synthetic column. A nesting this walker does not cover simply leaves
+/// the column unresolved (the pre-existing "column does not exist" error),
+/// never a wrong result.
+fn substitute_having_aliases(e: Expr, aliases: &[(String, Expr)]) -> Expr {
+    use spg_sql::ast::ColumnName;
+    let sub = |x: Expr| substitute_having_aliases(x, aliases);
+    match e {
+        Expr::Column(ColumnName {
+            qualifier: None,
+            name,
+        }) => aliases
+            .iter()
+            .find(|(a, _)| a.eq_ignore_ascii_case(&name))
+            .map_or_else(
+                || {
+                    Expr::Column(ColumnName {
+                        qualifier: None,
+                        name,
+                    })
+                },
+                |(_, expr)| expr.clone(),
+            ),
+        Expr::Binary { op, lhs, rhs } => Expr::Binary {
+            op,
+            lhs: Box::new(sub(*lhs)),
+            rhs: Box::new(sub(*rhs)),
+        },
+        Expr::Unary { op, expr } => Expr::Unary {
+            op,
+            expr: Box::new(sub(*expr)),
+        },
+        Expr::FunctionCall { name, args } => Expr::FunctionCall {
+            name,
+            args: args.into_iter().map(sub).collect(),
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(sub(*expr)),
+            negated,
+        },
+        Expr::BoolTest {
+            expr,
+            value,
+            negated,
+        } => Expr::BoolTest {
+            expr: Box::new(sub(*expr)),
+            value,
+            negated,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+        } => Expr::Like {
+            expr: Box::new(sub(*expr)),
+            pattern: Box::new(sub(*pattern)),
+            negated,
+            case_insensitive,
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(sub(*expr)),
+            list: list.into_iter().map(sub).collect(),
+            negated,
+        },
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => Expr::Case {
+            operand: operand.map(|o| Box::new(sub(*o))),
+            branches: branches.into_iter().map(|(w, t)| (sub(w), sub(t))).collect(),
+            else_branch: else_branch.map(|b| Box::new(sub(*b))),
+        },
+        Expr::Cast { expr, target } => Expr::Cast {
+            expr: Box::new(sub(*expr)),
+            target,
+        },
+        other => other,
+    }
 }
 
 fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
