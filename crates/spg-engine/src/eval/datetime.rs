@@ -14,6 +14,61 @@ use spg_storage::Value;
 
 use super::{EvalError, MONTH_ABBR, MONTH_FULL, civil_from_days, days_from_civil};
 
+/// v7.39 (round 418) — MySQL's COMPOUND `EXTRACT` units, which PG has no
+/// spelling for: `EXTRACT(DAY_SECOND FROM ts)` packs several components into
+/// ONE integer by decimal concatenation (day·10^6 + hour·10^4 + min·10^2 +
+/// sec = 5103045 for 2020-03-05 10:30:45). Returns `None` when `name` is not
+/// one of them, so the caller keeps PG's "unit not recognized" error.
+///
+/// Out-of-line: the caller (`eval_extract_arm`) sits on `eval_expr`'s
+/// recursive frame chain, so the component locals live here instead.
+#[inline(never)]
+pub(super) fn mysql_compound_extract(name: &str, v: &Value) -> Option<Value<'static>> {
+    // Decompose to civil components. DATE has a zero time-of-day, which is
+    // exactly what MariaDB reports (`EXTRACT(DAY_SECOND FROM '2020-03-05')`
+    // is 5000000).
+    let (days, tod_us): (i32, i64) = match v {
+        Value::Date(d) => (*d, 0),
+        Value::Timestamp(us) => (
+            i32::try_from(us.div_euclid(86_400_000_000)).ok()?,
+            us.rem_euclid(86_400_000_000),
+        ),
+        _ => return None,
+    };
+    let (y, mo, d) = civil_from_days(days);
+    let (y, mo, d) = (i64::from(y), i64::from(mo), i64::from(d));
+    let hh = tod_us / 3_600_000_000;
+    let mi = (tod_us / 60_000_000) % 60;
+    let ss = (tod_us / 1_000_000) % 60;
+    let us = tod_us % 1_000_000;
+    let n: i64 = match name {
+        "year_month" => y * 100 + mo,
+        "day_hour" => d * 100 + hh,
+        "day_minute" => d * 10_000 + hh * 100 + mi,
+        "day_second" => d * 1_000_000 + hh * 10_000 + mi * 100 + ss,
+        "hour_minute" => hh * 100 + mi,
+        "hour_second" => hh * 10_000 + mi * 100 + ss,
+        "minute_second" => mi * 100 + ss,
+        "day_microsecond" => {
+            d * 1_000_000_000_000
+                + hh * 10_000_000_000
+                + mi * 100_000_000
+                + ss * 1_000_000
+                + us
+        }
+        "hour_microsecond" => hh * 10_000_000_000 + mi * 100_000_000 + ss * 1_000_000 + us,
+        "minute_microsecond" => mi * 100_000_000 + ss * 1_000_000 + us,
+        "second_microsecond" => ss * 1_000_000 + us,
+        _ => return None,
+    };
+    // EXTRACT results are NUMERIC, like every other unit.
+    Some(Value::Numeric {
+        scaled: i128::from(n),
+        scale: 0,
+        kind: spg_storage::NumericKind::Finite,
+    })
+}
+
 /// Pull an integer component (year / month / ... / microsecond) out
 /// of a `DATE` or `TIMESTAMP`. Returns NULL on a NULL source, errors
 /// when the source isn't a calendar type.
