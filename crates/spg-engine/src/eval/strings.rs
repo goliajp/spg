@@ -68,6 +68,7 @@ pub(super) fn string_left_right(
     args: &[Value<'_>],
     is_left: bool,
     fn_name: &str,
+    mysql: bool,
 ) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
@@ -93,7 +94,10 @@ pub(super) fn string_left_right(
     };
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len() as i64;
-    if n == 0 {
+    // v7.39 (round 395) — MySQL LEFT/RIGHT with a negative length is the
+    // empty string (`LEFT('abc', -1)` is ''), where PG drops the last /
+    // first |k| chars (`left('abc', -1)` is 'ab').
+    if n == 0 || (mysql && n < 0) {
         return Ok(Value::text(String::new()));
     }
     let (start, end) = if is_left {

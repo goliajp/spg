@@ -11295,8 +11295,8 @@ fn apply_function_dispatch(
                 }),
             }
         }
-        "left" => string_left_right(args, true, "left"),
-        "right" => string_left_right(args, false, "right"),
+        "left" => string_left_right(args, true, "left", ctx.mysql_dialect),
+        "right" => string_left_right(args, false, "right", ctx.mysql_dialect),
         "strpos" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {

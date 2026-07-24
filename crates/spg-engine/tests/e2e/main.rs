@@ -230,6 +230,7 @@ mod e2e_mysql_json_object_round391;
 mod e2e_mysql_json_render_round392;
 mod e2e_mysql_div_scale_round393;
 mod e2e_mysql_mod_infix_round394;
+mod e2e_mysql_left_right_neg_round395;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;
