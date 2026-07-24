@@ -8159,9 +8159,21 @@ impl Parser {
         } else {
             None
         };
-        // A `JOIN … ON <cond>` carries its predicate in the ON clause; AND it
-        // onto the WHERE so the shared lowering sees one condition.
-        let where_ = match (mysql_on, where_) {
+        // v7.39 (round 421, fixing round 420) — the SOURCE subquery's filter
+        // and the TARGET-row filter are NOT the same predicate once a LEFT
+        // join is involved:
+        //   * inner / comma / PG's `FROM`: the ON predicate and the WHERE are
+        //     one conjunction, and the whole thing filters target rows via
+        //     EXISTS.
+        //   * LEFT join: only the ON predicate belongs inside the source
+        //     subquery. The WHERE still filters TARGET rows (with source
+        //     columns read through the correlated subquery, which yields NULL
+        //     for an unmatched row — exactly LEFT-join semantics).
+        // Round 420 folded ON into WHERE unconditionally and then dropped the
+        // outer filter for the LEFT case, so `UPDATE a LEFT JOIN b ON … SET …
+        // WHERE a.id > 1` updated EVERY row.
+        let sub_where = match (mysql_on.clone(), where_.clone()) {
+            _ if mysql_outer => mysql_on.clone(),
             (Some(on), Some(w)) => Some(Expr::Binary {
                 lhs: Box::new(on),
                 op: crate::ast::BinOp::And,
@@ -8236,7 +8248,7 @@ impl Parser {
                 distinct_on: Vec::new(),
                 items,
                 from: Some(fc.clone()),
-                where_: where_.clone(),
+                where_: sub_where.clone(),
                 group_by: None,
                 group_by_all: false,
                 having: None,
@@ -8289,12 +8301,18 @@ impl Parser {
                     }
                 }
             }
-            // v7.39 (round 420) — a MySQL LEFT JOIN keeps EVERY target row
-            // (an unmatched one just reads NULL from the source side, which
-            // the correlated scalar subquery already yields), so it must not
-            // get the EXISTS row filter the inner / comma forms use.
+            // v7.39 (round 420, corrected in 421) — a MySQL LEFT JOIN keeps
+            // EVERY matching target row: it gets no EXISTS filter, but the
+            // caller's WHERE still applies, with source columns read through
+            // the correlated subquery (NULL when unmatched — LEFT-join
+            // semantics). `sub_where` above already excluded the WHERE from
+            // the source subquery for this case.
             if mysql_outer {
-                (assignments, None)
+                let mut outer = where_;
+                if let Some(w) = outer.as_mut() {
+                    wrap_from_leaves(w, &names, &make_subq, &refs_list);
+                }
+                (assignments, outer)
             } else {
                 (assignments, Some(exists))
             }
@@ -8323,6 +8341,27 @@ impl Parser {
     /// v4.4 `DELETE FROM <table> [WHERE cond]`. Caller already consumed
     /// the leading `DELETE` ident.
     fn parse_delete_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        // v7.39 (round 421) — MySQL's multi-table DELETE names its target(s)
+        // BEFORE the FROM: `DELETE a FROM a JOIN b ON …`. (`DELETE FROM a
+        // USING a, b WHERE …` — the third MySQL spelling — needs no special
+        // parse here; it reaches the existing USING path with the target
+        // repeated in the list, which the source-list peel below handles.)
+        // More than one name is a multi-TARGET delete, which SPG does not
+        // model; it is refused rather than half-applied.
+        let mysql_pre_target: Option<String> = if self.mysql_dialect
+            && !matches!(self.peek(), Token::From)
+        {
+            let first = self.expect_ident_like()?;
+            if matches!(self.peek(), Token::Comma) {
+                return Err(self.err(alloc::format!(
+                    "multi-table DELETE can only delete from one table; \
+                     `DELETE {first}, …` names several"
+                )));
+            }
+            Some(first)
+        } else {
+            None
+        };
         if !matches!(self.peek(), Token::From) {
             return Err(self.err(format!("expected FROM after DELETE, got {:?}", self.peek())));
         }
@@ -8347,14 +8386,68 @@ impl Parser {
                 _ => None,
             }
         };
+        // v7.39 (round 421) — MySQL's multi-table DELETE source list, read
+        // through the SAME join grammar the FROM clause uses (see the
+        // `advance()`-destroys-tokens note on `parse_from_joins`).
+        let mut mysql_on: Option<Expr> = None;
+        let mut mysql_outer = false;
+        let mysql_using = if mysql_pre_target.is_some()
+            && (matches!(self.peek(), Token::Comma) || self.peek_is_update_join_start())
+        {
+            let target_qual = alias.clone().unwrap_or_else(|| table.clone());
+            let mut joins = self.parse_from_joins(&target_qual)?;
+            if joins.is_empty() {
+                return Err(self.err(alloc::string::String::from(
+                    "multi-table DELETE needs at least one source table",
+                )));
+            }
+            let head = joins.remove(0);
+            mysql_outer = matches!(head.kind, crate::ast::JoinKind::Left);
+            mysql_on = head.on;
+            Some(FromClause {
+                primary: head.table,
+                joins,
+            })
+        } else {
+            None
+        };
+        // The pre-FROM target must be the table the FROM names (or its
+        // alias) — `DELETE b FROM a JOIN b …` would delete from a table that
+        // is not the scan target.
+        if let Some(t) = &mysql_pre_target {
+            let names_target = t.eq_ignore_ascii_case(&table)
+                || alias.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(t));
+            if !names_target {
+                return Err(self.err(alloc::format!(
+                    "DELETE target `{t}` is not the first table in the FROM clause ({table})"
+                )));
+            }
+        }
         // `DELETE FROM t USING src [, …] WHERE cond` — PG's joined
         // delete. Same lowering as UPDATE … FROM: the WHERE
         // becomes EXISTS(SELECT 1 FROM src WHERE cond), driven per
         // target row by the correlated machinery.
-        let using_clause = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using"))
-        {
+        let using_clause = if let Some(fc) = mysql_using {
+            Some(fc)
+        } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using")) {
             self.advance();
-            Some(self.parse_from_clause()?)
+            let mut fc = self.parse_from_clause()?;
+            // v7.39 (round 421) — MySQL's `DELETE FROM a USING a, b WHERE …`
+            // repeats the TARGET as the first USING entry (PG's spelling
+            // lists only the extra sources). Peel it so the source subquery
+            // does not re-scan — and shadow — the target table.
+            let primary_is_target = fc.primary.name.eq_ignore_ascii_case(&table)
+                && fc.primary.alias.is_none();
+            if self.mysql_dialect && primary_is_target && !fc.joins.is_empty() {
+                let head = fc.joins.remove(0);
+                mysql_outer = matches!(head.kind, crate::ast::JoinKind::Left);
+                mysql_on = head.on;
+                fc = FromClause {
+                    primary: head.table,
+                    joins: fc.joins,
+                };
+            }
+            Some(fc)
         } else {
             None
         };
@@ -8378,7 +8471,22 @@ impl Parser {
                         .chain(core::iter::once(t.name.clone()))
                 })
                 .collect();
-            let sub_where = where_.clone();
+            // v7.39 (round 421) — same ON / WHERE split as UPDATE: a LEFT
+            // join filters the SOURCE subquery on the ON predicate alone and
+            // leaves the WHERE filtering TARGET rows (so the anti-join idiom
+            // `LEFT JOIN b ON … WHERE b.id IS NULL` deletes the unmatched
+            // rows); every other form folds ON and WHERE into one EXISTS.
+            let sub_where = match (mysql_on.clone(), where_.clone()) {
+                _ if mysql_outer => mysql_on.clone(),
+                (Some(on), Some(w)) => Some(Expr::Binary {
+                    lhs: Box::new(on),
+                    op: crate::ast::BinOp::And,
+                    rhs: Box::new(w),
+                }),
+                (Some(on), None) => Some(on),
+                (None, w) => w,
+            };
+            let exists_where = sub_where.clone();
             let sub_fc = fc.clone();
             let make_subq = move |leaf: Expr| -> Expr {
                 Expr::ScalarSubquery(Box::new(SelectStatement {
@@ -8410,29 +8518,40 @@ impl Parser {
                     }
                 }
             }
-            Some(Expr::Exists {
-                subquery: Box::new(SelectStatement {
-                    locking: None,
-                    ctes: Vec::new(),
-                    distinct: false,
-                    distinct_on: Vec::new(),
-                    items: alloc::vec![SelectItem::Expr {
-                        expr: Expr::Literal(Literal::Integer(1)),
-                        alias: None,
-                    }],
-                    from: Some(fc),
-                    where_,
-                    group_by: None,
-                    group_by_all: false,
-                    having: None,
-                    unions: Vec::new(),
-                    order_by: Vec::new(),
-                    limit: None,
-                    offset: None,
-                    limit_with_ties: false,
-                }),
-                negated: false,
-            })
+            // A LEFT join deletes the target rows the WHERE selects, reading
+            // source columns through the correlated subquery (NULL when
+            // unmatched); no EXISTS row filter.
+            if mysql_outer {
+                let mut outer = where_;
+                if let Some(w) = outer.as_mut() {
+                    wrap_from_leaves(w, &names, &make_subq, &refs);
+                }
+                outer
+            } else {
+                Some(Expr::Exists {
+                    subquery: Box::new(SelectStatement {
+                        locking: None,
+                        ctes: Vec::new(),
+                        distinct: false,
+                        distinct_on: Vec::new(),
+                        items: alloc::vec![SelectItem::Expr {
+                            expr: Expr::Literal(Literal::Integer(1)),
+                            alias: None,
+                        }],
+                        from: Some(fc),
+                        where_: exists_where,
+                        group_by: None,
+                        group_by_all: false,
+                        having: None,
+                        unions: Vec::new(),
+                        order_by: Vec::new(),
+                        limit: None,
+                        offset: None,
+                        limit_with_ties: false,
+                    }),
+                    negated: false,
+                })
+            }
         } else {
             where_
         };
