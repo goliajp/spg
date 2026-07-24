@@ -4811,6 +4811,14 @@ pub(crate) fn unify_branch_types_static(
     if matches!(target, DataType::Text) {
         return Ok(());
     }
+    // v7.39 (round 398) — MySQL aggregates a mixed int/string CASE /
+    // COALESCE to a string (`CASE WHEN 1 THEN 1 ELSE 'x' END` is '1', not an
+    // error); PG requires the untyped string literals to coerce to the
+    // resolved numeric type, so it refuses. Under the dialect, skip that
+    // coercion check — the value is returned as-is / widened by the caller.
+    if ctx.mysql_dialect {
+        return Ok(());
+    }
     for e in branches {
         if !untyped(e) {
             continue;
