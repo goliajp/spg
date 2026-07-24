@@ -366,6 +366,49 @@ const BPCHAR_PADDED_FNS: &[&str] = &[
     "pg_typeof",
 ];
 
+/// v7.39 (round 408) — MySQL implicitly stringifies a numeric or temporal
+/// scalar passed to a string function (`LOCATE(2, 12345)` searches "2" in
+/// "12345"; `SUBSTRING_INDEX(123.456, '.', 1)` is "123"; a DATE becomes its
+/// `YYYY-MM-DD` text). Returns the argument as text: borrowed for a real
+/// string, coerced (owned) for the MySQL-stringifiable scalars, or None so
+/// the caller keeps its PG type error. NULL is handled by the caller first.
+fn mysql_str_arg<'a>(v: &'a Value<'_>, mysql: bool) -> Option<Cow<'a, str>> {
+    match v {
+        Value::Text(s) => Some(Cow::Borrowed(s.as_ref())),
+        _ if mysql
+            && matches!(
+                v,
+                Value::SmallInt(_)
+                    | Value::Int(_)
+                    | Value::BigInt(_)
+                    | Value::Numeric { .. }
+                    | Value::NumericBig(_)
+                    | Value::Float(_)
+                    | Value::Real(_)
+                    | Value::Date(_)
+                    | Value::Time(_)
+                    | Value::Timestamp(_)
+            ) =>
+        {
+            Some(Cow::Owned(crate::eval::values::value_to_text(v)))
+        }
+        _ => None,
+    }
+}
+
+/// v7.39 (round 408) — MySQL's `FIELD` compares as strings only when every
+/// argument is a string; if any is a number it compares them all as DOUBLE
+/// (`FIELD(2, 'a', '2')` is 2 because 2.0 == 2.0, and 'a' reads as 0.0).
+/// Reads a value's MySQL double value: numbers directly, a string via its
+/// leading-numeric prefix, NULL / non-numeric as None.
+fn mysql_field_f64(v: &Value<'_>) -> Option<f64> {
+    match v {
+        Value::Null => None,
+        Value::Text(s) => Some(crate::eval::mysql_leading_number(s.as_ref())),
+        other => value_to_f64(other),
+    }
+}
+
 fn apply_function_dispatch(
     name: &str,
     args: &[Value<'_>],
@@ -10651,15 +10694,19 @@ fn apply_function_dispatch(
                     ),
                 });
             }
-            let (needle, hay) = match (&args[0], &args[1]) {
-                (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
-                (Value::Text(n), Value::Text(h)) => (n.as_ref(), h.as_ref()),
+            if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let m = ctx.mysql_dialect;
+            let (needle, hay) = match (mysql_str_arg(&args[0], m), mysql_str_arg(&args[1], m)) {
+                (Some(n), Some(h)) => (n, h),
                 _ => {
                     return Err(EvalError::TypeMismatch {
                         detail: "locate() takes TEXT args".into(),
                     });
                 }
             };
+            let (needle, hay) = (needle.as_ref(), hay.as_ref());
             let start = match args.get(2) {
                 None => 1i64,
                 Some(Value::Null) => return Ok(Value::Null),
@@ -10700,16 +10747,17 @@ fn apply_function_dispatch(
                     detail: format!("instr() takes 2 args, got {}", args.len()),
                 });
             }
-            match (&args[0], &args[1]) {
-                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                (Value::Text(hay), Value::Text(needle)) => {
-                    match hay.find(needle.as_ref()) {
-                        Some(byte_pos) => Ok(Value::Int(
-                            hay[..byte_pos].chars().count() as i32 + 1,
-                        )),
-                        None => Ok(Value::Int(0)),
+            if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let m = ctx.mysql_dialect;
+            match (mysql_str_arg(&args[0], m), mysql_str_arg(&args[1], m)) {
+                (Some(hay), Some(needle)) => match hay.as_ref().find(needle.as_ref()) {
+                    Some(byte_pos) => {
+                        Ok(Value::Int(hay.as_ref()[..byte_pos].chars().count() as i32 + 1))
                     }
-                }
+                    None => Ok(Value::Int(0)),
+                },
                 _ => Err(EvalError::TypeMismatch {
                     detail: "instr() takes 2 TEXT args".into(),
                 }),
@@ -10727,15 +10775,19 @@ fn apply_function_dispatch(
                     ),
                 });
             }
-            let (s, delim) = match (&args[0], &args[1]) {
-                (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
-                (Value::Text(s), Value::Text(d)) => (s.as_ref(), d.as_ref()),
+            if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let m = ctx.mysql_dialect;
+            let (s, delim) = match (mysql_str_arg(&args[0], m), mysql_str_arg(&args[1], m)) {
+                (Some(s), Some(d)) => (s, d),
                 _ => {
                     return Err(EvalError::TypeMismatch {
                         detail: "substring_index() takes TEXT args".into(),
                     });
                 }
             };
+            let (s, delim) = (s.as_ref(), delim.as_ref());
             let count = match &args[2] {
                 Value::Null => return Ok(Value::Null),
                 Value::Int(n) => i64::from(*n),
@@ -10794,13 +10846,16 @@ fn apply_function_dispatch(
                     ),
                 });
             }
-            match (&args[0], &args[1]) {
-                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                (Value::Text(needle), Value::Text(list)) => {
-                    if list.is_empty() {
+            if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let m = ctx.mysql_dialect;
+            match (mysql_str_arg(&args[0], m), mysql_str_arg(&args[1], m)) {
+                (Some(needle), Some(list)) => {
+                    if list.as_ref().is_empty() {
                         return Ok(Value::Int(0));
                     }
-                    for (i, item) in list.split(',').enumerate() {
+                    for (i, item) in list.as_ref().split(',').enumerate() {
                         if item == needle.as_ref() {
                             return Ok(Value::Int(i as i32 + 1));
                         }
@@ -10828,6 +10883,19 @@ fn apply_function_dispatch(
                 Value::Int(n) => i64::from(*n),
                 Value::BigInt(n) => *n,
                 Value::SmallInt(n) => i64::from(*n),
+                // MySQL rounds a fractional index (ELT(1.9, …) picks the 2nd,
+                // ELT(2.5, …) the 3rd — round half away from zero).
+                other if ctx.mysql_dialect => match value_to_f64(other) {
+                    Some(x) => super::math::f64_round_half_away(x) as i64,
+                    None => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "elt() index must be integer, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                },
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
@@ -10853,26 +10921,46 @@ fn apply_function_dispatch(
                     ),
                 });
             }
-            let needle = match &args[0] {
-                Value::Null => return Ok(Value::Int(0)),
-                Value::Text(s) => s.as_ref(),
-                other => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "field() needs text, got {:?}",
-                            other.data_type()
-                        ),
-                    });
-                }
-            };
-            for (i, candidate) in args[1..].iter().enumerate() {
-                if let Value::Text(c) = candidate {
-                    if c.as_ref() == needle {
-                        return Ok(Value::Int(i as i32 + 1));
+            // A NULL search value never matches.
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Int(0));
+            }
+            // MySQL: when every argument is a string they compare as strings;
+            // if any is a number they all compare as DOUBLE (`FIELD(2,'a','2')`
+            // is 2). PG keeps the byte-exact string form and errors on a
+            // non-text search value.
+            let all_text = args.iter().all(|v| matches!(v, Value::Text(_) | Value::Null));
+            if all_text {
+                let Value::Text(needle) = &args[0] else {
+                    unreachable!("all_text guarantees Text");
+                };
+                for (i, candidate) in args[1..].iter().enumerate() {
+                    if let Value::Text(c) = candidate {
+                        if c.as_ref() == needle.as_ref() {
+                            return Ok(Value::Int(i as i32 + 1));
+                        }
                     }
                 }
+                return Ok(Value::Int(0));
             }
-            Ok(Value::Int(0))
+            if ctx.mysql_dialect {
+                if let Some(needle) = mysql_field_f64(&args[0]) {
+                    for (i, candidate) in args[1..].iter().enumerate() {
+                        if let Some(c) = mysql_field_f64(candidate) {
+                            if c == needle {
+                                return Ok(Value::Int(i as i32 + 1));
+                            }
+                        }
+                    }
+                    return Ok(Value::Int(0));
+                }
+            }
+            Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "field() needs text, got {:?}",
+                    args[0].data_type()
+                ),
+            })
         }
         // MySQL space(n) — a string of n spaces.
         "space" => {
