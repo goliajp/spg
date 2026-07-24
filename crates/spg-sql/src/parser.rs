@@ -21455,6 +21455,39 @@ impl Parser {
     }
 
     fn parse_interval_atom(&mut self) -> Result<Expr, ParseError> {
+        // v7.39 (round 409) — MySQL's `INTERVAL(N, N1, N2, …)` function
+        // (the index of the last Ni ≤ N), distinct from the interval literal.
+        // `INTERVAL (` is ambiguous with `INTERVAL (expr) UNIT`, so parse the
+        // parenthesised group and only take the function form when it is NOT a
+        // single expression followed by a time unit; otherwise restore and
+        // fall through to the literal path (unchanged behaviour). MySQL only.
+        if self.mysql_dialect && matches!(self.peek(), Token::LParen) {
+            let save = self.pos;
+            self.advance(); // (
+            let mut args = Vec::new();
+            if !matches!(self.peek(), Token::RParen) {
+                loop {
+                    args.push(self.parse_expr(0)?);
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            if matches!(self.peek(), Token::RParen)
+                && !(args.len() == 1
+                    && mysql_interval_unit(self.tokens.get(self.pos + 1).unwrap_or(&Token::Eof))
+                        .is_some())
+            {
+                self.advance(); // )
+                return Ok(Expr::FunctionCall {
+                    name: alloc::string::String::from("interval"),
+                    args,
+                });
+            }
+            self.pos = save;
+        }
         // v7.39 (round 350, M7) — MySQL's `INTERVAL <n> <UNIT>`, with the
         // number UNQUOTED: `DATE_ADD(d, INTERVAL 1 MONTH)`,
         // `d + INTERVAL 90 MINUTE`, `INTERVAL -1 DAY`. It is how MySQL
