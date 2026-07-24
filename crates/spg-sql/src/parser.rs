@@ -15309,6 +15309,110 @@ impl Parser {
     /// v7.39 (round 406) — the `ON CONFLICT DO NOTHING` clause that MySQL's
     /// `INSERT IGNORE` lowers to: a bare target (arbitrate on every unique
     /// key, like MySQL) whose action skips conflicting rows.
+    /// v7.39 (round 419) — resolve the conflict clause for ANY of the four
+    /// INSERT source forms (VALUES / SELECT / parenthesized source / WITH).
+    /// Before this the MySQL upsert lowerings (`ON DUPLICATE KEY UPDATE`,
+    /// `REPLACE INTO`) were wired into the VALUES branch ONLY, so the very
+    /// common bulk-upsert spellings —
+    ///     INSERT INTO t SELECT … ON DUPLICATE KEY UPDATE c = VALUES(c)
+    ///     REPLACE INTO t SELECT …
+    /// — were a parse error / a duplicate-key failure respectively.
+    ///
+    /// Precedence: an explicitly written clause beats a statement-level flag.
+    /// `ON DUPLICATE KEY UPDATE` first, then PG's own `ON CONFLICT`, then the
+    /// implicit `REPLACE` and `IGNORE` lowerings.
+    fn parse_insert_conflict_clause(
+        &mut self,
+        replace: bool,
+        ignore: bool,
+    ) -> Result<Option<crate::ast::OnConflictClause>, ParseError> {
+        if let Some(c) = self.parse_optional_on_duplicate_key()? {
+            return Ok(Some(c));
+        }
+        if let Some(c) = self.parse_optional_on_conflict()? {
+            return Ok(Some(c));
+        }
+        if replace {
+            // REPLACE INTO = delete-then-insert, which PG spells as
+            // `ON CONFLICT DO UPDATE SET` over every column; the engine
+            // reads an empty assignment list as "take the incoming row".
+            return Ok(Some(crate::ast::OnConflictClause {
+                target_columns: Vec::new(),
+                index_where: None,
+                constraint_name: None,
+                mysql_lowered: true,
+                action: crate::ast::OnConflictAction::Update {
+                    assignments: Vec::new(),
+                    where_: None,
+                },
+            }));
+        }
+        if ignore {
+            return Ok(Some(Self::insert_ignore_clause()));
+        }
+        Ok(None)
+    }
+
+    /// v7.39 (round 419, extracted from the VALUES branch) — MySQL's
+    /// `ON DUPLICATE KEY UPDATE col = expr [, …]`. Bare target (MySQL
+    /// watches every unique key, which `mysql_lowered` records); `VALUES(col)`
+    /// in an assignment is MySQL's spelling of `EXCLUDED.col`.
+    fn parse_optional_on_duplicate_key(
+        &mut self,
+    ) -> Result<Option<crate::ast::OnConflictClause>, ParseError> {
+        if !(matches!(self.peek(), Token::On)
+            && matches!(self.tokens.get(self.pos + 1),
+                Some(Token::Ident(s)) if s.eq_ignore_ascii_case("duplicate")))
+        {
+            return Ok(None);
+        }
+        self.advance(); // ON
+        self.advance(); // DUPLICATE
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("key")) {
+            return Err(self.err(format!(
+                "expected KEY after ON DUPLICATE, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("update")) {
+            return Err(self.err(format!(
+                "expected UPDATE after ON DUPLICATE KEY, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        let mut assignments: Vec<(String, Expr)> = Vec::new();
+        loop {
+            let col = self.expect_ident_like()?;
+            if !matches!(self.peek(), Token::Eq) {
+                return Err(self.err(format!(
+                    "expected '=' in ON DUPLICATE KEY UPDATE, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let mut expr = self.parse_expr(0)?;
+            Self::rewrite_mysql_values_refs(&mut expr);
+            assignments.push((col, expr));
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(Some(crate::ast::OnConflictClause {
+            target_columns: Vec::new(),
+            index_where: None,
+            constraint_name: None,
+            mysql_lowered: true,
+            action: crate::ast::OnConflictAction::Update {
+                assignments,
+                where_: None,
+            },
+        }))
+    }
+
     fn insert_ignore_clause() -> crate::ast::OnConflictClause {
         crate::ast::OnConflictClause {
             target_columns: Vec::new(),
@@ -15379,10 +15483,7 @@ impl Parser {
                     )));
                 }
                 self.advance();
-                let mut on_conflict = self.parse_optional_on_conflict()?;
-                if ignore && on_conflict.is_none() {
-                    on_conflict = Some(Self::insert_ignore_clause());
-                }
+                let on_conflict = self.parse_insert_conflict_clause(replace, ignore)?;
                 let returning = self.parse_optional_returning()?;
                 return Ok(Statement::Insert(InsertStatement {
                     ctes: Vec::new(),
@@ -15464,10 +15565,7 @@ impl Parser {
             if columns.is_some() {
                 return Err(self.err("DEFAULT VALUES cannot follow an INSERT column list".into()));
             }
-            let mut on_conflict = self.parse_optional_on_conflict()?;
-            if ignore && on_conflict.is_none() {
-                on_conflict = Some(Self::insert_ignore_clause());
-            }
+            let on_conflict = self.parse_insert_conflict_clause(replace, ignore)?;
             let returning = self.parse_optional_returning()?;
             return Ok(Statement::Insert(InsertStatement {
                 ctes: Vec::new(),
@@ -15500,10 +15598,7 @@ impl Parser {
                     }
                 }
             };
-            let mut on_conflict = self.parse_optional_on_conflict()?;
-            if ignore && on_conflict.is_none() {
-                on_conflict = Some(Self::insert_ignore_clause());
-            }
+            let on_conflict = self.parse_insert_conflict_clause(replace, ignore)?;
             let returning = self.parse_optional_returning()?;
             return Ok(Statement::Insert(InsertStatement {
                 ctes: Vec::new(),
@@ -15584,76 +15679,7 @@ impl Parser {
         // matches MySQL's any-unique-key behaviour for the common
         // single-key case). `VALUES(col)` in the assignments is
         // MySQL's spelling of EXCLUDED.col.
-        let mysql_dup = if matches!(self.peek(), Token::On)
-            && matches!(self.tokens.get(self.pos + 1),
-                Some(Token::Ident(s)) if s.eq_ignore_ascii_case("duplicate"))
-        {
-            self.advance(); // ON
-            self.advance(); // DUPLICATE
-            if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("key")) {
-                return Err(self.err(format!(
-                    "expected KEY after ON DUPLICATE, got {:?}",
-                    self.peek()
-                )));
-            }
-            self.advance();
-            if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("update")) {
-                return Err(self.err(format!(
-                    "expected UPDATE after ON DUPLICATE KEY, got {:?}",
-                    self.peek()
-                )));
-            }
-            self.advance();
-            let mut assignments: Vec<(String, Expr)> = Vec::new();
-            loop {
-                let col = self.expect_ident_like()?;
-                if !matches!(self.peek(), Token::Eq) {
-                    return Err(self.err(format!(
-                        "expected '=' in ON DUPLICATE KEY UPDATE, got {:?}",
-                        self.peek()
-                    )));
-                }
-                self.advance();
-                let mut expr = self.parse_expr(0)?;
-                Self::rewrite_mysql_values_refs(&mut expr);
-                assignments.push((col, expr));
-                if matches!(self.peek(), Token::Comma) {
-                    self.advance();
-                    continue;
-                }
-                break;
-            }
-            Some(crate::ast::OnConflictClause {
-                target_columns: Vec::new(),
-                index_where: None,
-                constraint_name: None,
-                mysql_lowered: true,
-                action: crate::ast::OnConflictAction::Update {
-                    assignments,
-                    where_: None,
-                },
-            })
-        } else {
-            None
-        };
-        let on_conflict = if let Some(c) = mysql_dup {
-            Some(c)
-        } else if replace {
-            Some(crate::ast::OnConflictClause {
-                target_columns: Vec::new(),
-                index_where: None,
-                constraint_name: None,
-                mysql_lowered: true,
-                action: crate::ast::OnConflictAction::Update {
-                    assignments: Vec::new(),
-                    where_: None,
-                },
-            })
-        } else if ignore {
-            Some(Self::insert_ignore_clause())
-        } else {
-            self.parse_optional_on_conflict()?
-        };
+        let on_conflict = self.parse_insert_conflict_clause(replace, ignore)?;
         let returning = self.parse_optional_returning()?;
         Ok(Statement::Insert(InsertStatement {
             ctes: Vec::new(),
