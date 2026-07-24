@@ -1924,6 +1924,35 @@ impl Engine {
         self.advisory_locks.retain(|_, (owner, _)| *owner != me);
     }
 
+    /// v7.39 (round 417) — the current session's id (for MySQL
+    /// `IS_USED_LOCK`, which reports the connection that holds a lock).
+    pub(crate) const fn current_session_id(&self) -> u32 {
+        self.current_session
+    }
+
+    /// v7.39 (round 417) — who holds an advisory-lock key (any session id),
+    /// or `None` when nobody holds it. Used by MySQL `IS_USED_LOCK` and to
+    /// separate `RELEASE_LOCK`'s "not held by anyone" (returns NULL) from
+    /// "held by someone else" (returns 0).
+    pub(crate) fn advisory_holder(&self, key: i64) -> Option<u32> {
+        self.advisory_locks.get(&key).map(|(owner, _)| *owner)
+    }
+
+    /// v7.39 (round 417) — MySQL `RELEASE_ALL_LOCKS()` returns the number of
+    /// locks it released; PG's `pg_advisory_unlock_all()` returns void.
+    pub(crate) fn advisory_unlock_all_count(&mut self) -> i32 {
+        let me = self.current_session;
+        // Total depth held by this session, so re-locked keys count as many.
+        let mut n: i32 = 0;
+        for (_, (owner, depth)) in &self.advisory_locks {
+            if *owner == me {
+                n = n.saturating_add(*depth as i32);
+            }
+        }
+        self.advisory_locks.retain(|_, (owner, _)| *owner != me);
+        n
+    }
+
     #[must_use]
     pub const fn with_clock(mut self, clock: ClockFn) -> Self {
         self.clock = Some(clock);
