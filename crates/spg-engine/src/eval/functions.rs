@@ -10962,6 +10962,35 @@ fn apply_function_dispatch(
                 ),
             })
         }
+        // MySQL interval(N, N1, N2, …) — the count of leading list values
+        // that are ≤ N (a binary-search index into an ascending list): 0 when
+        // N < N1, k when Nk ≤ N < N(k+1). A NULL search value returns -1; a
+        // NULL list element sorts below N (counted). Numbers compare as
+        // doubles, strings via their leading-numeric prefix.
+        "interval" if ctx.mysql_dialect => {
+            if args.len() < 2 {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("interval() takes 2+ args, got {}", args.len()),
+                });
+            }
+            let n = match mysql_field_f64(&args[0]) {
+                None => return Ok(Value::Int(-1)),
+                Some(x) => x,
+            };
+            let mut count = 0i32;
+            for e in &args[1..] {
+                let below = match e {
+                    Value::Null => true,
+                    _ => mysql_field_f64(e).is_some_and(|ev| n >= ev),
+                };
+                if below {
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+            Ok(Value::Int(count))
+        }
         // MySQL space(n) — a string of n spaces.
         "space" => {
             let n = match args.first() {
