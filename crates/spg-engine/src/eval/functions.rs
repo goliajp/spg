@@ -2359,6 +2359,42 @@ fn apply_function_dispatch(
             };
             Ok(Value::Int(bucket as i32))
         }
+        // v7.39 (round 396) — MySQL `CHAR(n1, n2, …)`: each integer's
+        // big-endian minimal bytes (≥1), concatenated into a binary string;
+        // NULL args are skipped and a float / decimal arg rounds. `CHAR(72,
+        // 73)` is 'HI', `CHAR(256)` is 0x0100. A binary string renders
+        // latin1 under the dialect. PG has no `char()` function.
+        "char" if ctx.mysql_dialect => {
+            let mut out: Vec<u8> = Vec::new();
+            for a in args {
+                #[allow(clippy::cast_possible_truncation)]
+                let n: i64 = match a {
+                    Value::Null => continue,
+                    Value::SmallInt(x) => i64::from(*x),
+                    Value::Int(x) => i64::from(*x),
+                    Value::BigInt(x) => *x,
+                    Value::Float(x) => x.round() as i64,
+                    Value::Real(x) => f64::from(*x).round() as i64,
+                    #[allow(clippy::cast_precision_loss)]
+                    Value::Numeric { scaled, scale, .. } => {
+                        (*scaled as f64 / 10f64.powi(i32::from(*scale))).round() as i64
+                    }
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "char() needs integer args, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                };
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let be = (n as u32).to_be_bytes();
+                let start = be.iter().position(|&b| b != 0).unwrap_or(3);
+                out.extend_from_slice(&be[start..]);
+            }
+            Ok(Value::bytes(out))
+        }
         // v7.37.17 (17.6 siblings) — chr(int) / ascii(text) /
         // initcap(text). PG-standard string builders.
         "chr" => {
