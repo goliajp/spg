@@ -409,11 +409,152 @@ fn mysql_field_f64(v: &Value<'_>) -> Option<f64> {
     }
 }
 
+/// v7.39 (round 414) — MySQL implicitly reads a numeric integer as a DATE
+/// or TIMESTAMP when the digit shape matches one of its canonical forms:
+///   * 8 digits YYYYMMDD → DATE
+///   * 6 digits YYMMDD    → DATE (YY < 70 → 20YY, else 19YY, per MariaDB)
+///   * 14 digits YYYYMMDDHHMMSS → TIMESTAMP
+///   * 12 digits YYMMDDHHMMSS   → TIMESTAMP (same YY rule)
+/// Everything else (including negative numbers or an unrecognised shape)
+/// returns None so the caller can keep its PG type error / MariaDB NULL.
+fn mysql_int_as_temporal(n: i64) -> Option<Value<'static>> {
+    if n < 0 {
+        return None;
+    }
+    let (y, mo, d, hh, mm, ss, ts) = match n {
+        // 8-digit YYYYMMDD (DATE)
+        10_000_000..=99_999_999 => {
+            (
+                (n / 10_000) as i32,
+                ((n / 100) % 100) as u32,
+                (n % 100) as u32,
+                0, 0, 0, false,
+            )
+        }
+        // 6-digit YYMMDD (DATE)
+        100_000..=999_999 => {
+            let yy = (n / 10_000) as i32;
+            let y = if yy < 70 { 2000 + yy } else { 1900 + yy };
+            (y, ((n / 100) % 100) as u32, (n % 100) as u32, 0, 0, 0, false)
+        }
+        // 14-digit YYYYMMDDHHMMSS (TIMESTAMP)
+        10_000_000_000_000..=99_999_999_999_999 => {
+            (
+                (n / 10_000_000_000) as i32,
+                ((n / 100_000_000) % 100) as u32,
+                ((n / 1_000_000) % 100) as u32,
+                ((n / 10_000) % 100) as u32,
+                ((n / 100) % 100) as u32,
+                (n % 100) as u32,
+                true,
+            )
+        }
+        // 12-digit YYMMDDHHMMSS (TIMESTAMP)
+        100_000_000_000..=999_999_999_999 => {
+            let yy = (n / 10_000_000_000) as i32;
+            let y = if yy < 70 { 2000 + yy } else { 1900 + yy };
+            (
+                y,
+                ((n / 100_000_000) % 100) as u32,
+                ((n / 1_000_000) % 100) as u32,
+                ((n / 10_000) % 100) as u32,
+                ((n / 100) % 100) as u32,
+                (n % 100) as u32,
+                true,
+            )
+        }
+        _ => return None,
+    };
+    if ts {
+        let text = alloc::format!("{y:04}-{mo:02}-{d:02} {hh:02}:{mm:02}:{ss:02}");
+        crate::eval::parse_timestamp_literal(&text).map(Value::Timestamp)
+    } else {
+        let text = alloc::format!("{y:04}-{mo:02}-{d:02}");
+        crate::eval::parse_date_literal(&text).map(Value::Date)
+    }
+}
+
+/// v7.39 (round 414) — for each date-family function, the argument positions
+/// where MySQL reads a plain integer as a DATE / TIMESTAMP (per its YYYYMMDD
+/// / YYMMDD / YYYYMMDDHHMMSS / YYMMDDHHMMSS shape). Anything absent from this
+/// table keeps its int semantics: WEEK's 2nd arg is a MODE, TIMESTAMPADD's
+/// 3rd arg is a COUNT, FROM_UNIXTIME's arg is UNIX SECONDS — never dates.
+/// UNIX_TIMESTAMP is intentionally omitted (its int arg is ambiguous —
+/// MariaDB itself doesn't fully commit either way).
+fn date_int_coerce_positions(name: &str) -> Option<&'static [usize]> {
+    Some(match name {
+        // Single-date-arg fns: position 0.
+        "date" | "date_add" | "date_sub" | "adddate" | "subdate"
+        | "year" | "month" | "day" | "dayofmonth" | "dayofyear" | "dayofweek"
+        | "weekday" | "dayname" | "monthname" | "quarter"
+        | "week" | "weekofyear" | "yearweek"
+        | "hour" | "minute" | "second" | "microsecond"
+        | "date_format" | "time_format" | "timestamp"
+        | "last_day" | "to_days" | "to_seconds"
+        | "addtime" | "subtime" => &[0],
+        // Two-date-arg fns: positions 0 and 1.
+        "datediff" | "timediff" => &[0, 1],
+        // TIMESTAMPDIFF / TIMESTAMPADD: unit at position 0; position 2 is
+        // the date (COUNT at position 1 is an integer, don't touch it).
+        "timestampdiff" => &[1, 2],
+        "timestampadd" => &[2],
+        _ => return None,
+    })
+}
+
 fn apply_function_dispatch(
     name: &str,
     args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.39 (round 414) — MySQL reads a plain integer (YYYYMMDD / YYMMDD /
+    // YYYYMMDDHHMMSS / YYMMDDHHMMSS) as a DATE / TIMESTAMP when a date-family
+    // function sees one; an unrecognised shape (`DATE(202005)`, `YEAR(69)`)
+    // returns NULL. Only the positions listed in `date_int_coerce_positions`
+    // participate — WEEK's mode arg, TIMESTAMPADD's count, FROM_UNIXTIME's
+    // seconds are never dates. We re-dispatch only when at least one arg was
+    // actually replaced, so a call whose date positions carry non-int values
+    // (e.g. `WEEK('2020-01-01', 0)`) falls straight through unchanged.
+    if ctx.mysql_dialect
+        && let Some(date_positions) = date_int_coerce_positions(name)
+    {
+        let mut any_int_at_date_pos = false;
+        for &p in date_positions {
+            if let Some(a) = args.get(p)
+                && matches!(a, Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_))
+            {
+                any_int_at_date_pos = true;
+                break;
+            }
+        }
+        if any_int_at_date_pos {
+            let mut coerced: alloc::vec::Vec<Value<'_>> =
+                alloc::vec::Vec::with_capacity(args.len());
+            for (i, a) in args.iter().enumerate() {
+                if !date_positions.contains(&i) {
+                    coerced.push(a.clone());
+                    continue;
+                }
+                let (was_int, replaced) = match a {
+                    Value::SmallInt(n) => (true, mysql_int_as_temporal(i64::from(*n))),
+                    Value::Int(n) => (true, mysql_int_as_temporal(i64::from(*n))),
+                    Value::BigInt(n) => (true, mysql_int_as_temporal(*n)),
+                    _ => (false, None),
+                };
+                if was_int {
+                    match replaced {
+                        Some(v) => coerced.push(v),
+                        // An integer at a date position with no MySQL shape
+                        // → NULL, the MariaDB reading (`DATE(202005)`).
+                        None => return Ok(Value::Null),
+                    }
+                } else {
+                    coerced.push(a.clone());
+                }
+            }
+            return apply_function_dispatch(name, &coerced, ctx);
+        }
+    }
     // v7.39 (bpchar epic) — normalise bpchar arguments to stripped text
     // before dispatch so every text builtin (upper / substring / position /
     // length / …) accepts CHAR(n) without a per-function arm. The padded

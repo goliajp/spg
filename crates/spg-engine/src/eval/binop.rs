@@ -3006,8 +3006,39 @@ fn date_operand_days(v: &Value<'_>) -> Option<i32> {
     match v {
         Value::Date(d) => Some(*d),
         Value::Text(s) if !s.contains(':') => crate::eval::parse_date_literal(s),
+        // v7.39 (round 414) — only reached from `mysql_date_plus_interval`
+        // (an out-of-line, MySQL-only step), so an integer here is MySQL's
+        // YYYYMMDD / YYMMDD form. PG never reaches this arm.
+        Value::SmallInt(n) => mysql_int_as_date_days(i64::from(*n)),
+        Value::Int(n) => mysql_int_as_date_days(i64::from(*n)),
+        Value::BigInt(n) => mysql_int_as_date_days(*n),
         _ => None,
     }
+}
+
+/// v7.39 (round 414) — read a MySQL YYYYMMDD (8) / YYMMDD (6) integer as
+/// day offset. Bigger int shapes carry a time component and lift the result
+/// to DATETIME, which is out of scope here — `mysql_date_plus_interval`
+/// falls through and the operator errors, matching MariaDB's own refusal.
+fn mysql_int_as_date_days(n: i64) -> Option<i32> {
+    if n < 0 {
+        return None;
+    }
+    let (y, mo, d) = match n {
+        10_000_000..=99_999_999 => (
+            (n / 10_000) as i32,
+            ((n / 100) % 100) as u32,
+            (n % 100) as u32,
+        ),
+        100_000..=999_999 => {
+            let yy = (n / 10_000) as i32;
+            let y = if yy < 70 { 2000 + yy } else { 1900 + yy };
+            (y, ((n / 100) % 100) as u32, (n % 100) as u32)
+        }
+        _ => return None,
+    };
+    let text = alloc::format!("{y:04}-{mo:02}-{d:02}");
+    crate::eval::parse_date_literal(&text)
 }
 
 /// v7.39 (round 373) — `date ± INTERVAL` keeps a DATE result under the
