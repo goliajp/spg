@@ -91,9 +91,9 @@ fn comparison_converts_only_a_mixed_pair() {
 #[test]
 fn division_splits_by_dialect() {
     let mut m = mysql();
-    assert_eq!(one(&mut m, "SELECT 10/4"), Value::Float(2.5));
-    assert_eq!(one(&mut m, "SELECT 7/2"), Value::Float(3.5));
-    assert_eq!(one(&mut m, "SELECT -7/2"), Value::Float(-3.5));
+    assert_eq!(one(&mut m, "SELECT 10/4"), Value::numeric(25000, 4));
+    assert_eq!(one(&mut m, "SELECT 7/2"), Value::numeric(35000, 4));
+    assert_eq!(one(&mut m, "SELECT -7/2"), Value::numeric(-35000, 4));
     assert_eq!(one(&mut m, "SELECT 10/0"), Value::Null, "MariaDB: NULL");
 
     let mut p = Engine::new();
