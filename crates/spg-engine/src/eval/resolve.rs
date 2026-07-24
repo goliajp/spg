@@ -83,10 +83,21 @@ pub(super) fn collation_fold_for_compare(
     // round-390 frame cliff). Comparison ops fall through — `s = 'a,c'`
     // stays a text compare.
     if ctx.mysql_dialect && super::is_mysql_numeric_binop(op) {
+        // v7.39 (round 402) — an inline ENUM column reads as its 1-based
+        // ordinal in the same numeric context (`e + 0` is 1 for the first
+        // member), like the SET bitmask above.
         let fold_set = |expr: &Expr, v: Value<'static>| -> Value<'static> {
-            match (&v, super::expr_set_variants(expr, ctx.columns)) {
-                (Value::Text(s), Some(variants)) => {
-                    Value::BigInt(super::set_text_to_bitmask(s, variants))
+            match &v {
+                Value::Text(s) => {
+                    if let Some(variants) = super::expr_set_variants(expr, ctx.columns) {
+                        Value::BigInt(super::set_text_to_bitmask(s, variants))
+                    } else if let Some(variants) =
+                        super::expr_inline_enum_variants(expr, ctx.columns)
+                    {
+                        Value::BigInt(super::enum_text_to_ordinal(s, variants))
+                    } else {
+                        v
+                    }
                 }
                 _ => v,
             }
