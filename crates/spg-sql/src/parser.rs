@@ -22895,6 +22895,15 @@ impl Parser {
             {
                 return Some((BinOp::IntDiv, 7));
             }
+            // v7.39 (round 394) — `MOD` is MySQL's modulo operator, a synonym
+            // for `%` (`10 MOD 3` is 1, `5.5 MOD 2` is 1.5). A plain ident to
+            // the lexer; the `MOD(x, y)` function form is unaffected (MOD
+            // there sits in operand position, not infix).
+            if let Token::Ident(w) = tok
+                && w.eq_ignore_ascii_case("mod")
+            {
+                return Some((BinOp::Mod, 7));
+            }
             match tok {
                 Token::Concat => return Some((BinOp::Or, 1)),
                 Token::InetOverlap => return Some((BinOp::And, 2)),
