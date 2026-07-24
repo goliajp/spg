@@ -3096,10 +3096,27 @@ fn eval_case_arm(
             // answer NULL in BOTH dialects, where MariaDB answers `a` and
             // PG raises `argument of CASE/WHEN must be type boolean`.
             None => predicate_is_true(&when_value, "CASE/WHEN", ctx.mysql_dialect)?,
-            Some(op_v) => matches!(
-                apply_binary(spg_sql::ast::BinOp::Eq, op_v.clone(), when_value)?,
-                Value::Bool(true)
-            ),
+            // v7.39 (round 412) — under the MySQL default collation the
+            // `CASE op WHEN v` equality folds Text/BpChar operands (CI +
+            // accent + PAD SPACE), matching `op = v` outside CASE.
+            Some(op_v) => {
+                let (l, r) = if ctx.mysql_dialect {
+                    match (op_v, &when_value) {
+                        (Value::Text(x), Value::Text(y))
+                        | (Value::BpChar(x), Value::BpChar(y)) => (
+                            Value::text(spg_storage::mysql_compare_fold(x)),
+                            Value::text(spg_storage::mysql_compare_fold(y)),
+                        ),
+                        _ => (op_v.clone(), when_value),
+                    }
+                } else {
+                    (op_v.clone(), when_value)
+                };
+                matches!(
+                    apply_binary(spg_sql::ast::BinOp::Eq, l, r)?,
+                    Value::Bool(true)
+                )
+            }
         };
         if matched {
             return coerce(eval_expr(then_expr, row, ctx)?);

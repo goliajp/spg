@@ -827,6 +827,7 @@ fn generic_aggregate_window(
                     arg2.as_ref().and_then(|a| a.get(j)),
                     None,
                     None,
+                    ctx.mysql_dialect,
                 )
                 .map_err(EngineError::Eval)?;
             }
