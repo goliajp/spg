@@ -9891,6 +9891,52 @@ fn apply_function_dispatch(
             }
             Ok(Value::Uuid(gen_random_uuid_bytes()))
         }
+        // v7.39 (round 416) — MySQL's `UUID()` returns the 36-char text form
+        // (`8-4-4-4-12` hex with hyphens), typed CHAR(36) — so callers'
+        // `LENGTH(UUID()) = 36` and `UUID() REGEXP '...'` work directly. PG's
+        // `gen_random_uuid()` returns the typed UUID and stays that way; this
+        // is the MySQL-only spelling.
+        //
+        // Version is UUID **v7** (RFC 9562): 48-bit big-endian unix-millis
+        // timestamp in bytes 0..6, then random with the version=7 nibble and
+        // variant=10 bits pinned. Rationale: MariaDB emits v1 (time + MAC),
+        // which likewise sorts by insertion time — so downstream B-tree index
+        // fragmentation stays low. v7 keeps the sortable property WITHOUT
+        // leaking the MAC (v1's known privacy issue), and is the current RFC
+        // spelling; v4's fully-random layout would satisfy the format check
+        // but lose the sort locality MariaDB users rely on. If the session
+        // has no wall clock (embedded, `ctx.engine.clock == None`), the ts
+        // bytes are zeroed and the UUID is effectively v4-random.
+        "uuid" if ctx.mysql_dialect => {
+            if !args.is_empty() {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("uuid() takes 0 args, got {}", args.len()),
+                });
+            }
+            let mut b = gen_random_uuid_bytes();
+            // Overlay 48-bit unix_ts_ms in big-endian across bytes 0..6.
+            let ts_ms = ctx
+                .clock
+                .map(|c| c().div_euclid(1000))
+                .unwrap_or(0)
+                .max(0) as u64;
+            b[0] = ((ts_ms >> 40) & 0xff) as u8;
+            b[1] = ((ts_ms >> 32) & 0xff) as u8;
+            b[2] = ((ts_ms >> 24) & 0xff) as u8;
+            b[3] = ((ts_ms >> 16) & 0xff) as u8;
+            b[4] = ((ts_ms >> 8) & 0xff) as u8;
+            b[5] = (ts_ms & 0xff) as u8;
+            // Version 7: top nibble of byte 6 = 0111.
+            b[6] = (b[6] & 0x0f) | 0x70;
+            // Variant 1 (RFC 4122/9562): top two bits of byte 8 = 10.
+            b[8] = (b[8] & 0x3f) | 0x80;
+            let text = alloc::format!(
+                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+            );
+            Ok(Value::text(text))
+        }
         // v7.37.17 (17.6 siblings) — uuid-ossp namespace constants
         // + uuid_generate_v5 (SHA-1 name-based) + v3 (MD5).
         "uuid_nil" => {
