@@ -17,6 +17,20 @@ use spg_storage::Value;
 
 use crate::{Engine, EngineError, value_to_literal};
 
+/// v7.39 (round 417) — MySQL advisory-lock names are arbitrary strings;
+/// SPG's shared advisory registry is keyed by i64. Fold the name via
+/// FNV-1a-64 (canonical spec, no seed, deterministic across runs) and
+/// bit-cast to i64. Collisions are cryptographically negligible for the
+/// practical namespace an app touches.
+fn mysql_lock_key(name: &str) -> i64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV_OFFSET_BASIS
+    for &b in name.as_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV_PRIME
+    }
+    h as i64
+}
+
 impl Engine {
     /// v7.17.0 Phase 1.1 — walk a Statement tree and pre-resolve
     /// any sequence FunctionCall nodes inside its Expr slots.
@@ -214,6 +228,18 @@ impl Engine {
         lc: &str,
         args: &[Expr],
     ) -> Result<Option<spg_storage::Value<'static>>, EngineError> {
+        // v7.39 (round 417) — MySQL's advisory-lock family:
+        //   GET_LOCK(name, timeout) / RELEASE_LOCK(name) / IS_FREE_LOCK(name)
+        //   IS_USED_LOCK(name) / RELEASE_ALL_LOCKS().
+        // Route to the same shared registry PG advisory locks use, hashing
+        // the string name to an i64 with FNV-1a-64. NULL name → NULL for
+        // every arm, matching MariaDB. Only under a MySQL session — a PG
+        // session keeps errors on these names.
+        if self.backslash_escapes
+            && let Some(v) = self.eval_mysql_lock_call(lc, args)?
+        {
+            return Ok(Some(v));
+        }
         let is_take = matches!(
             lc,
             "pg_advisory_lock"
@@ -269,6 +295,111 @@ impl Engine {
                 Some((hi << 32) | (lo & 0xFFFF_FFFF))
             }
             _ => None,
+        }
+    }
+
+    /// v7.39 (round 417) — MySQL GET_LOCK / RELEASE_LOCK / IS_FREE_LOCK /
+    /// IS_USED_LOCK / RELEASE_ALL_LOCKS. Returns None when the call is not
+    /// one of these (so the caller falls through to the sequence / PG
+    /// advisory path); returns Some(value) when it handled it (including a
+    /// NULL for a non-literal or NULL name — matches MariaDB).
+    fn eval_mysql_lock_call(
+        &mut self,
+        lc: &str,
+        args: &[Expr],
+    ) -> Result<Option<spg_storage::Value<'static>>, EngineError> {
+        // Pull the lock name as a string literal, or NULL when either the
+        // whole argument is NULL or the name is a non-literal (a bound
+        // parameter / column / expression — MariaDB itself refuses these
+        // with the same NULL answer for the constant-fold path).
+        let string_lit = |e: &Expr| -> Option<Option<String>> {
+            match e {
+                Expr::Literal(spg_sql::ast::Literal::String(s)) => Some(Some(s.clone())),
+                Expr::Literal(spg_sql::ast::Literal::Null) => Some(None),
+                _ => None,
+            }
+        };
+        match lc {
+            "release_all_locks" => {
+                if !args.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some(spg_storage::Value::Int(self.advisory_unlock_all_count())))
+            }
+            "get_lock" => {
+                // GET_LOCK(name, timeout) — timeout is not honoured (there is
+                // no other writer to wait for; we take when free, and if
+                // held by another session return 0 immediately). MariaDB's
+                // own default is "wait up to timeout"; SPG's single-process
+                // model makes an uncontended lock always available and a
+                // contended one impossible to release from a peer, so the
+                // wait is a no-op either way.
+                if args.len() != 2 {
+                    return Ok(None);
+                }
+                let Some(name) = string_lit(&args[0]) else {
+                    return Ok(None);
+                };
+                let Some(name) = name else {
+                    return Ok(Some(spg_storage::Value::Null));
+                };
+                let key = mysql_lock_key(&name);
+                let got = self.advisory_try_lock(key);
+                Ok(Some(spg_storage::Value::Int(i32::from(got))))
+            }
+            "release_lock" => {
+                if args.len() != 1 {
+                    return Ok(None);
+                }
+                let Some(name) = string_lit(&args[0]) else {
+                    return Ok(None);
+                };
+                let Some(name) = name else {
+                    return Ok(Some(spg_storage::Value::Null));
+                };
+                let key = mysql_lock_key(&name);
+                let me = self.current_session_id();
+                Ok(Some(match self.advisory_holder(key) {
+                    None => spg_storage::Value::Null,
+                    Some(owner) if owner == me => {
+                        // We hold it; release one level.
+                        let _ = self.advisory_unlock(key);
+                        spg_storage::Value::Int(1)
+                    }
+                    Some(_) => spg_storage::Value::Int(0),
+                }))
+            }
+            "is_free_lock" => {
+                if args.len() != 1 {
+                    return Ok(None);
+                }
+                let Some(name) = string_lit(&args[0]) else {
+                    return Ok(None);
+                };
+                let Some(name) = name else {
+                    return Ok(Some(spg_storage::Value::Null));
+                };
+                let key = mysql_lock_key(&name);
+                let free = self.advisory_holder(key).is_none();
+                Ok(Some(spg_storage::Value::Int(i32::from(free))))
+            }
+            "is_used_lock" => {
+                if args.len() != 1 {
+                    return Ok(None);
+                }
+                let Some(name) = string_lit(&args[0]) else {
+                    return Ok(None);
+                };
+                let Some(name) = name else {
+                    return Ok(Some(spg_storage::Value::Null));
+                };
+                let key = mysql_lock_key(&name);
+                Ok(Some(match self.advisory_holder(key) {
+                    None => spg_storage::Value::Null,
+                    Some(owner) => spg_storage::Value::BigInt(i64::from(owner)),
+                }))
+            }
+            _ => Ok(None),
         }
     }
 
