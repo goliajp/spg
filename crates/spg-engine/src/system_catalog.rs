@@ -166,11 +166,18 @@ pub(crate) fn pg_check_connames(
 /// v7.39 (round 360, M18) — MariaDB's `information_schema.data_type`
 /// name (bare, no display width — that is the separate `column_type`
 /// column). Measured on MariaDB 11.
-pub(crate) fn mysql_data_type_text(ty: DataType) -> alloc::string::String {
+pub(crate) fn mysql_data_type_text(
+    ty: DataType,
+    width: Option<spg_storage::MysqlIntWidth>,
+) -> alloc::string::String {
+    // v7.39 (round 389, epic P4a) — the bare integer name honours the
+    // declared width (TINYINT / MEDIUMINT / the widened SMALLINT / INT
+    // UNSIGNED), no display width and no ` unsigned` suffix (that is the
+    // separate `column_type`).
+    if let Some(base) = crate::show::mysql_int_base_name(ty, width) {
+        return alloc::string::String::from(base);
+    }
     let s = match ty {
-        DataType::SmallInt => "smallint",
-        DataType::Int => "int",
-        DataType::BigInt => "bigint",
         DataType::Float => "double",
         DataType::Real => "float",
         DataType::Numeric { .. } => "decimal",
@@ -332,7 +339,7 @@ pub(crate) fn synth_information_schema_columns(
             let ordinal = (i + 1) as i32;
             let mut row = info_column_row(&tname, ordinal, col, None, mysql);
             if mysql {
-                row.values.push(Value::text(crate::show::render_mysql_type(col.ty)));
+                row.values.push(Value::text(crate::show::render_mysql_type(col)));
             }
             rows.push(row);
         }
@@ -354,7 +361,7 @@ pub(crate) fn synth_information_schema_columns(
             let writable = updatable && simple.iter().any(|n| n == &col.name);
             let mut row = info_column_row(vname, ordinal, col, Some(writable), mysql);
             if mysql {
-                row.values.push(Value::text(crate::show::render_mysql_type(col.ty)));
+                row.values.push(Value::text(crate::show::render_mysql_type(col)));
             }
             rows.push(row);
         }
@@ -485,7 +492,7 @@ fn info_column_row(
             // this to pick the column's Python/Java type, so the PG name
             // on a MySQL session sent it down the wrong branch.
             Value::text(if mysql {
-                mysql_data_type_text(col.ty)
+                mysql_data_type_text(col.ty, col.mysql_int_width)
             } else {
                 pg_data_type_text(col.ty)
             }),

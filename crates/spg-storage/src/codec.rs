@@ -546,6 +546,8 @@ pub(crate) fn deserialize_table(
             let width = match tag {
                 0 => MysqlIntWidth::Tiny,
                 1 => MysqlIntWidth::Medium,
+                2 => MysqlIntWidth::Small,
+                3 => MysqlIntWidth::Int,
                 other => {
                     return Err(StorageError::Corrupt(format!(
                         "unknown mysql_int_width tag {other}"

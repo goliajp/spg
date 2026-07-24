@@ -1529,10 +1529,17 @@ pub enum Collation {
 /// FILE_VERSION 81+ appendix, older catalogs deserialise as None.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MysqlIntWidth {
-    /// MySQL `TINYINT` — signed -128..127, unsigned 0..255.
+    /// MySQL `TINYINT` — signed -128..127, unsigned 0..255. Storage i16.
     Tiny,
+    /// MySQL `SMALLINT UNSIGNED` — 0..65535. Storage widened to i32 (a
+    /// signed SMALLINT keeps `DataType::SmallInt` and carries no marker).
+    Small,
     /// MySQL `MEDIUMINT` — signed -8388608..8388607, unsigned 0..16777215.
+    /// Storage i32.
     Medium,
+    /// MySQL `INT UNSIGNED` — 0..4294967295. Storage widened to i64 (a
+    /// signed INT keeps `DataType::Int` and carries no marker).
+    Int,
 }
 
 /// v7.39 (round 363, M4 P1) — MySQL's default accent- and
@@ -8127,6 +8134,8 @@ impl Catalog {
                         let tag = match w {
                             MysqlIntWidth::Tiny => 0u8,
                             MysqlIntWidth::Medium => 1u8,
+                            MysqlIntWidth::Small => 2u8,
+                            MysqlIntWidth::Int => 3u8,
                         };
                         (i, tag)
                     })

@@ -2278,7 +2278,9 @@ pub enum Collation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MysqlIntWidth {
     Tiny,
+    Small,
     Medium,
+    Int,
 }
 
 #[allow(clippy::derivable_impls)]
