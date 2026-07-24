@@ -15275,6 +15275,19 @@ impl Parser {
         Ok(n)
     }
 
+    /// v7.39 (round 406) — the `ON CONFLICT DO NOTHING` clause that MySQL's
+    /// `INSERT IGNORE` lowers to: a bare target (arbitrate on every unique
+    /// key, like MySQL) whose action skips conflicting rows.
+    fn insert_ignore_clause() -> crate::ast::OnConflictClause {
+        crate::ast::OnConflictClause {
+            target_columns: Vec::new(),
+            index_where: None,
+            constraint_name: None,
+            mysql_lowered: true,
+            action: crate::ast::OnConflictAction::Nothing,
+        }
+    }
+
     fn parse_insert_stmt(&mut self, replace: bool) -> Result<Statement, ParseError> {
         debug_assert!(
             matches!(self.peek(), Token::Insert)
@@ -15282,6 +15295,15 @@ impl Parser {
                     && matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("replace")))
         );
         self.advance();
+        // v7.39 (round 406) — MySQL `INSERT IGNORE INTO t …` skips a row that
+        // would raise a duplicate-key error instead of failing the statement,
+        // i.e. `ON CONFLICT DO NOTHING` over every unique key. IGNORE is a
+        // plain ident to the lexer; only the MySQL dialect accepts it here.
+        let ignore = self.mysql_dialect
+            && matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("ignore"));
+        if ignore {
+            self.advance();
+        }
         if !matches!(self.peek(), Token::Into) {
             return Err(self.err(format!("expected INTO after INSERT, got {:?}", self.peek())));
         }
@@ -15326,7 +15348,10 @@ impl Parser {
                     )));
                 }
                 self.advance();
-                let on_conflict = self.parse_optional_on_conflict()?;
+                let mut on_conflict = self.parse_optional_on_conflict()?;
+                if ignore && on_conflict.is_none() {
+                    on_conflict = Some(Self::insert_ignore_clause());
+                }
                 let returning = self.parse_optional_returning()?;
                 return Ok(Statement::Insert(InsertStatement {
                     ctes: Vec::new(),
@@ -15408,7 +15433,10 @@ impl Parser {
             if columns.is_some() {
                 return Err(self.err("DEFAULT VALUES cannot follow an INSERT column list".into()));
             }
-            let on_conflict = self.parse_optional_on_conflict()?;
+            let mut on_conflict = self.parse_optional_on_conflict()?;
+            if ignore && on_conflict.is_none() {
+                on_conflict = Some(Self::insert_ignore_clause());
+            }
             let returning = self.parse_optional_returning()?;
             return Ok(Statement::Insert(InsertStatement {
                 ctes: Vec::new(),
@@ -15441,7 +15469,10 @@ impl Parser {
                     }
                 }
             };
-            let on_conflict = self.parse_optional_on_conflict()?;
+            let mut on_conflict = self.parse_optional_on_conflict()?;
+            if ignore && on_conflict.is_none() {
+                on_conflict = Some(Self::insert_ignore_clause());
+            }
             let returning = self.parse_optional_returning()?;
             return Ok(Statement::Insert(InsertStatement {
                 ctes: Vec::new(),
@@ -15587,6 +15618,8 @@ impl Parser {
                     where_: None,
                 },
             })
+        } else if ignore {
+            Some(Self::insert_ignore_clause())
         } else {
             self.parse_optional_on_conflict()?
         };
