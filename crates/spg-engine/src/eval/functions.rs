@@ -8730,15 +8730,34 @@ fn apply_function_dispatch(
                     });
                 }
             };
-            let rendered = alloc::format!("{x:.d$}");
-            let (int_part, frac_part) = match rendered.split_once('.') {
-                Some((i, f)) => (i, Some(f)),
-                None => (rendered.as_str(), None),
+            // v7.39 (round 399) — MariaDB FORMAT rounds half AWAY from zero
+            // (`FORMAT(2.5,0)` is 3, `FORMAT(0.5,0)` is 1); Rust's `{:.d$}`
+            // rounds half to EVEN (2, 0). Round the scaled integer with
+            // half-away and lay out the decimal point from it, so no second
+            // (banker's) rounding happens.
+            #[allow(clippy::cast_possible_truncation)]
+            let factor = libm::pow(10.0, d as f64);
+            let scaled = super::math::f64_round_half_away(x * factor);
+            let neg_num = scaled < 0.0;
+            // `scaled` is integer-valued; render it without a fraction.
+            let mut digits_all = alloc::format!("{:.0}", scaled.abs());
+            while digits_all.len() <= d {
+                digits_all.insert(0, '0');
+            }
+            let split = digits_all.len() - d;
+            let owned_int = digits_all[..split].to_string();
+            let frac_owned = if d > 0 {
+                Some(digits_all[split..].to_string())
+            } else {
+                None
             };
-            let (sign, digits) = match int_part.strip_prefix('-') {
-                Some(rest) => ("-", rest),
-                None => ("", int_part),
+            let sign = if neg_num && digits_all.chars().any(|c| c != '0') {
+                "-"
+            } else {
+                ""
             };
+            let digits = owned_int.as_str();
+            let frac_part = frac_owned.as_deref();
             let mut grouped = alloc::string::String::new();
             for (i, c) in digits.chars().enumerate() {
                 if i > 0 && (digits.len() - i).is_multiple_of(3) {

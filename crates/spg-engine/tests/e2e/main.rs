@@ -234,6 +234,7 @@ mod e2e_mysql_left_right_neg_round395;
 mod e2e_mysql_char_fn_round396;
 mod e2e_mysql_is_true_round397;
 mod e2e_mysql_case_mixed_round398;
+mod e2e_mysql_format_round_round399;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;
