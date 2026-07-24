@@ -75,6 +75,24 @@ pub(super) fn collation_fold_for_compare(
     r: Value<'static>,
     ctx: &EvalContext<'_>,
 ) -> (Value<'static>, Value<'static>) {
+    // v7.39 (round 390, epic P5) — a MySQL SET column reads as its bitmask
+    // under an arith / bitwise op (`s + 0` is 5, `WHERE s & flag` filters by
+    // membership); SPG stores SET as text, so the numeric path saw `'a,c'`
+    // and coerced it to 0. Fold it here, reusing this already-out-of-line
+    // call site so `eval_expr`'s maxed recursion frame gains nothing (the
+    // round-390 frame cliff). Comparison ops fall through — `s = 'a,c'`
+    // stays a text compare.
+    if ctx.mysql_dialect && super::is_mysql_numeric_binop(op) {
+        let fold_set = |expr: &Expr, v: Value<'static>| -> Value<'static> {
+            match (&v, super::expr_set_variants(expr, ctx.columns)) {
+                (Value::Text(s), Some(variants)) => {
+                    Value::BigInt(super::set_text_to_bitmask(s, variants))
+                }
+                _ => v,
+            }
+        };
+        return (fold_set(lhs, l), fold_set(rhs, r));
+    }
     if !matches!(
         op,
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq

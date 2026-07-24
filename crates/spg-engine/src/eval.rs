@@ -942,6 +942,59 @@ pub(crate) fn mysql_bit_not(v: &Value<'_>) -> Option<Value<'static>> {
     Some(u64_as_value(!mysql_bit_u64(v)?))
 }
 
+/// v7.39 (round 390, type-fidelity epic P5) — the inline `SET('a','b',…)`
+/// variant list an expression's column is declared with, or None. Mirrors
+/// `expr_enum_type_name` — a bare `Expr::Column` looked up by name.
+pub(crate) fn expr_set_variants<'e>(
+    e: &'e Expr,
+    columns: &'e [ColumnSchema],
+) -> Option<&'e [String]> {
+    match e {
+        Expr::Column(c) => columns
+            .iter()
+            .find(|col| col.name == c.name)
+            .and_then(|col| col.inline_set_variants.as_deref()),
+        _ => None,
+    }
+}
+
+/// The bitmask a stored SET text carries in a numeric context: each
+/// comma-separated member contributes `1 << its position` in the declared
+/// variant list (`'a,c'` over `('a','b','c','d')` is 1 | 4 = 5). An empty
+/// string is 0; an unknown member (should not occur — the write path
+/// validates) contributes nothing.
+pub(crate) fn set_text_to_bitmask(text: &str, variants: &[String]) -> i64 {
+    if text.is_empty() {
+        return 0;
+    }
+    let mut bits = 0i64;
+    for member in text.split(',') {
+        if let Some(pos) = variants.iter().position(|v| v == member) {
+            bits |= 1i64 << pos;
+        }
+    }
+    bits
+}
+
+/// Is this an arithmetic / bitwise operator MySQL evaluates a SET column
+/// numerically under? (`s + 0`, `s & flag`, …). The comparison operators
+/// are NOT here — `s = 'a,c'` stays a text compare.
+pub(crate) const fn is_mysql_numeric_binop(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Mod
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::InetContainedBy
+            | BinOp::InetContains
+    )
+}
+
 /// v7.39 (round 372) — is `v` a numeric zero (any width / kind)? Used to
 /// route `x % 0` / `MOD(x, 0)` to NULL under the MySQL dialect.
 pub(crate) fn value_is_zero(v: &Value<'_>) -> bool {
