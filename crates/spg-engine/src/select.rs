@@ -355,7 +355,7 @@ impl Engine {
         // after ORDER BY (duplicate rows share sort keys, so order is preserved)
         // and before LIMIT.
         if stmt.distinct {
-            out_rows = dedup_rows(out_rows);
+            out_rows = dedup_rows(out_rows, self.backslash_escapes);
         }
         apply_offset_and_limit(&mut out_rows, stmt.offset_literal(), stmt.limit_literal());
         let final_cols: Vec<ColumnSchema> = projection
@@ -2086,18 +2086,22 @@ impl Engine {
                     columns[i].nullable = true;
                 }
             }
+            // v7.39 (round 410) — under MySQL, set-op dedup / matching folds
+            // text by the session collation (CI + accent + PAD SPACE), like
+            // GROUP BY. PG stays byte-exact.
+            let mysql = self.backslash_escapes;
             match kind {
                 UnionKind::All => rows.extend(peer_rows),
                 UnionKind::Distinct => {
                     rows.extend(peer_rows);
-                    rows = dedup_rows(rows);
+                    rows = dedup_rows(rows, mysql);
                 }
                 // v7.37.17 (17.6 siblings) — PG set semantics.
                 // INTERSECT: distinct rows present on both sides.
                 UnionKind::Intersect => {
-                    rows = dedup_rows(rows)
+                    rows = dedup_rows(rows, mysql)
                         .into_iter()
-                        .filter(|r| peer_rows.iter().any(|p| row_eq_norm(p, r)))
+                        .filter(|r| peer_rows.iter().any(|p| row_eq_norm(p, r, mysql)))
                         .collect();
                 }
                 // INTERSECT ALL: multiset intersection — each row
@@ -2106,7 +2110,7 @@ impl Engine {
                     let mut peer_pool = peer_rows;
                     let mut kept: Vec<Row<'static>> = Vec::new();
                     for r in rows {
-                        if let Some(pos) = peer_pool.iter().position(|p| row_eq_norm(p, &r)) {
+                        if let Some(pos) = peer_pool.iter().position(|p| row_eq_norm(p, &r, mysql)) {
                             peer_pool.swap_remove(pos);
                             kept.push(r);
                         }
@@ -2115,9 +2119,9 @@ impl Engine {
                 }
                 // EXCEPT: distinct left rows absent from the right.
                 UnionKind::Except => {
-                    rows = dedup_rows(rows)
+                    rows = dedup_rows(rows, mysql)
                         .into_iter()
-                        .filter(|r| !peer_rows.iter().any(|p| row_eq_norm(p, r)))
+                        .filter(|r| !peer_rows.iter().any(|p| row_eq_norm(p, r, mysql)))
                         .collect();
                 }
                 // EXCEPT ALL: multiset subtraction — each right
@@ -2126,7 +2130,7 @@ impl Engine {
                     let mut peer_pool = peer_rows;
                     let mut kept: Vec<Row<'static>> = Vec::new();
                     for r in rows {
-                        if let Some(pos) = peer_pool.iter().position(|p| row_eq_norm(p, &r)) {
+                        if let Some(pos) = peer_pool.iter().position(|p| row_eq_norm(p, &r, mysql)) {
                             peer_pool.swap_remove(pos);
                         } else {
                             kept.push(r);
@@ -2511,7 +2515,7 @@ impl Engine {
         }
         // v7.38 (read01) — DISTINCT over a synthetic source was dropped here.
         if stmt.distinct {
-            projected_rows = dedup_rows(projected_rows);
+            projected_rows = dedup_rows(projected_rows, scan_ctx.mysql_dialect);
         }
         // LIMIT / OFFSET — apply at the tail.
         if let Some(offset) = stmt.offset_literal() {
@@ -2707,7 +2711,7 @@ impl Engine {
         }
         // v7.38 (read01) — DISTINCT over a synthetic source was dropped here.
         if stmt.distinct {
-            projected_rows = dedup_rows(projected_rows);
+            projected_rows = dedup_rows(projected_rows, scan_ctx.mysql_dialect);
         }
         if let Some(offset) = stmt.offset_literal() {
             let off = (offset as usize).min(projected_rows.len());
@@ -3751,7 +3755,7 @@ impl Engine {
         }
         // v7.38 (read01) — DISTINCT over a synthetic source was dropped here.
         if stmt.distinct {
-            projected_rows = dedup_rows(projected_rows);
+            projected_rows = dedup_rows(projected_rows, scan_ctx.mysql_dialect);
         }
         if let Some(offset) = stmt.offset_literal() {
             let off = (offset as usize).min(projected_rows.len());
@@ -3997,7 +4001,7 @@ impl Engine {
         }
         // v7.38 (read01) — DISTINCT over a synthetic source was dropped here.
         if stmt.distinct {
-            projected_rows = dedup_rows(projected_rows);
+            projected_rows = dedup_rows(projected_rows, scan_ctx.mysql_dialect);
         }
         if let Some(offset) = stmt.offset_literal() {
             let off = (offset as usize).min(projected_rows.len());
@@ -4902,9 +4906,9 @@ impl Engine {
                 for out in expand_srf_row(self, &projection, &srf_idxs, row, &ctx)? {
                     if stmt.distinct {
                         let bucket = seen_distinct
-                            .entry(norm_hash_row(&out, &distinct_hb))
+                            .entry(norm_hash_row(&out, &distinct_hb, ctx.mysql_dialect))
                             .or_default();
-                        if bucket.iter().any(|&i| row_eq_norm(&tagged[i].1, &out)) {
+                        if bucket.iter().any(|&i| row_eq_norm(&tagged[i].1, &out, ctx.mysql_dialect)) {
                             continue;
                         }
                         bucket.push(tagged.len());
@@ -4946,9 +4950,9 @@ impl Engine {
                 let out = Row::new(values);
                 if stmt.distinct {
                     let bucket = seen_distinct
-                        .entry(norm_hash_row(&out, &distinct_hb))
+                        .entry(norm_hash_row(&out, &distinct_hb, ctx.mysql_dialect))
                         .or_default();
-                    if bucket.iter().any(|&i| row_eq_norm(&tagged[i].1, &out)) {
+                    if bucket.iter().any(|&i| row_eq_norm(&tagged[i].1, &out, ctx.mysql_dialect)) {
                         return Ok(());
                     }
                     bucket.push(tagged.len());
@@ -5524,9 +5528,9 @@ impl Engine {
             // build_order_keys eval and never enter `tagged`.
             if stmt.distinct {
                 let bucket = seen_distinct
-                    .entry(norm_hash_row(&out_row, &distinct_hb))
+                    .entry(norm_hash_row(&out_row, &distinct_hb, ctx.mysql_dialect))
                     .or_default();
-                if bucket.iter().any(|&i| row_eq_norm(&tagged[i].1, &out_row)) {
+                if bucket.iter().any(|&i| row_eq_norm(&tagged[i].1, &out_row, ctx.mysql_dialect)) {
                     continue;
                 }
                 bucket.push(tagged.len());
@@ -5925,8 +5929,8 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
     })
 }
 
-fn dedup_rows(rows: Vec<Row<'static>>) -> Vec<Row<'static>> {
-    dedup_by_row(rows, |r| r)
+fn dedup_rows(rows: Vec<Row<'static>>, mysql: bool) -> Vec<Row<'static>> {
+    dedup_by_row(rows, |r| r, mysql)
 }
 
 /// v7.37.16 — hash-bucketed DISTINCT. The old `out.iter().any(row_eq_norm)`
@@ -5936,13 +5940,17 @@ fn dedup_rows(rows: Vec<Row<'static>>) -> Vec<Row<'static>> {
 /// order is preserved, and correctness needs only the one-way guarantee
 /// "row_eq_norm-Equal ⇒ equal hash" (collisions are re-checked exactly).
 /// Small inputs keep the linear scan — no hasher setup for a 10-row page.
-fn dedup_by_row<T>(items: Vec<T>, row_of: impl Fn(&T) -> &Row<'static>) -> Vec<T> {
+fn dedup_by_row<T>(
+    items: Vec<T>,
+    row_of: impl Fn(&T) -> &Row<'static>,
+    mysql: bool,
+) -> Vec<T> {
     if items.len() <= 32 {
         let mut out: Vec<T> = Vec::with_capacity(items.len());
         for it in items {
             if !out
                 .iter()
-                .any(|seen| row_eq_norm(row_of(seen), row_of(&it)))
+                .any(|seen| row_eq_norm(row_of(seen), row_of(&it), mysql))
             {
                 out.push(it);
             }
@@ -5957,11 +5965,11 @@ fn dedup_by_row<T>(items: Vec<T>, row_of: impl Fn(&T) -> &Row<'static>) -> Vec<T
     let mut buckets: hashbrown::HashMap<u64, alloc::vec::Vec<usize>> =
         hashbrown::HashMap::with_capacity(items.len());
     for it in items {
-        let h = norm_hash_row(row_of(&it), &bh);
+        let h = norm_hash_row(row_of(&it), &bh, mysql);
         let bucket = buckets.entry(h).or_default();
         if !bucket
             .iter()
-            .any(|&i| row_eq_norm(row_of(&out[i]), row_of(&it)))
+            .any(|&i| row_eq_norm(row_of(&out[i]), row_of(&it), mysql))
         {
             bucket.push(out.len());
             out.push(it);
@@ -5994,10 +6002,19 @@ fn dedup_by_row<T>(items: Vec<T>, row_of: impl Fn(&T) -> &Row<'static>) -> Vec<T
 /// - Everything value_cmp falls back to debug-format ordering for
 ///   (Json, arrays, vectors, geometry, ranges, …) shares one constant
 ///   bucket — degrades to the exact linear scan, never wrong.
-fn norm_hash_row(row: &Row<'static>, bh: &hashbrown::DefaultHashBuilder) -> u64 {
-    use core::hash::{BuildHasher, Hasher};
+fn norm_hash_row(row: &Row<'static>, bh: &hashbrown::DefaultHashBuilder, mysql: bool) -> u64 {
+    use core::hash::{BuildHasher, Hash, Hasher};
     let mut h = bh.build_hasher();
     for v in &row.values {
+        // v7.39 (round 410) — hash the folded key when the MySQL collation
+        // deduplicates a text value, so `row_eq_norm`-equal rows (`'a'` vs
+        // `'A'` vs `'a '`) share a hash bucket.
+        if mysql {
+            if let Some(folded) = mysql_dedup_fold(v) {
+                folded.hash(&mut h);
+                continue;
+            }
+        }
         norm_hash_value(v, &mut h);
     }
     h.finish()
@@ -6174,12 +6191,31 @@ fn norm_hash_value<H: core::hash::Hasher>(v: &Value<'static>, h: &mut H) {
 /// (`1 = 1.0 = 1.00`), matching PG (and GROUP BY). Uses the scale-aware
 /// `orderby::value_cmp`, so `Int(1)` and `Numeric{10,1}` compare Equal; plain
 /// `Row` `==` would keep them distinct.
-pub(crate) fn row_eq_norm(a: &Row<'static>, b: &Row<'static>) -> bool {
+/// v7.39 (round 410) — under the MySQL dialect a set operation / DISTINCT
+/// deduplicates by the session collation (`utf8mb4_uca1400_ai_ci`, which is
+/// case- and accent-insensitive and PAD SPACE): `'a'`, `'A'`, and `'a '`
+/// collapse to one row, exactly as GROUP BY already folds its keys. Returns
+/// the folded comparison key for a text value, None for anything else (which
+/// keeps the byte-exact `value_cmp` path).
+fn mysql_dedup_fold(v: &Value) -> Option<String> {
+    match v {
+        Value::Text(s) | Value::BpChar(s) => {
+            Some(spg_storage::mysql_ci_fold(s.trim_end_matches(' ')))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn row_eq_norm(a: &Row<'static>, b: &Row<'static>, mysql: bool) -> bool {
     a.values.len() == b.values.len()
-        && a.values
-            .iter()
-            .zip(&b.values)
-            .all(|(x, y)| crate::orderby::value_cmp(x, y) == core::cmp::Ordering::Equal)
+        && a.values.iter().zip(&b.values).all(|(x, y)| {
+            if mysql {
+                if let (Some(fx), Some(fy)) = (mysql_dedup_fold(x), mysql_dedup_fold(y)) {
+                    return fx == fy;
+                }
+            }
+            crate::orderby::value_cmp(x, y) == core::cmp::Ordering::Equal
+        })
 }
 
 /// Coerce a `Value` to an `f64` sort key for ORDER BY. Numbers map directly;
