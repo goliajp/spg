@@ -21771,15 +21771,53 @@ impl Parser {
         Some((alloc::format!("{sign}{n}"), offset + 1))
     }
 
+    /// v7.39 (round 422) — is the parenthesised group starting at the CURRENT
+    /// `(` a single quantity followed by a time unit (`INTERVAL (1+1) DAY`),
+    /// rather than the argument list of MySQL's `INTERVAL(N, N1, …)` function?
+    ///
+    /// Scans `self.tokens` by index and consumes NOTHING. Round 409 decided
+    /// this by parsing the group and then restoring `self.pos` — which could
+    /// never have worked, because `advance()` DESTROYS the token it returns
+    /// (`mem::replace(.., Eof)`); the restore yielded a stream of Eof. It was
+    /// inert only because both branches errored back then.
+    fn interval_paren_is_quantity(&self) -> bool {
+        let mut depth = 0usize;
+        let mut saw_top_level_comma = false;
+        let mut i = self.pos;
+        while let Some(tok) = self.tokens.get(i) {
+            match tok {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return !saw_top_level_comma
+                            && mysql_interval_unit(
+                                self.tokens.get(i + 1).unwrap_or(&Token::Eof),
+                            )
+                            .is_some();
+                    }
+                }
+                // A comma directly inside the outermost parens means the
+                // argument list of the INTERVAL() function.
+                Token::Comma if depth == 1 => saw_top_level_comma = true,
+                Token::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
     fn parse_interval_atom(&mut self) -> Result<Expr, ParseError> {
         // v7.39 (round 409) — MySQL's `INTERVAL(N, N1, N2, …)` function
         // (the index of the last Ni ≤ N), distinct from the interval literal.
-        // `INTERVAL (` is ambiguous with `INTERVAL (expr) UNIT`, so parse the
-        // parenthesised group and only take the function form when it is NOT a
-        // single expression followed by a time unit; otherwise restore and
-        // fall through to the literal path (unchanged behaviour). MySQL only.
-        if self.mysql_dialect && matches!(self.peek(), Token::LParen) {
-            let save = self.pos;
+        // `INTERVAL (` is ambiguous with `INTERVAL (expr) UNIT`, so the shape
+        // is decided by a non-destructive lookahead (round 422) before either
+        // branch consumes anything. MySQL only.
+        if self.mysql_dialect
+            && matches!(self.peek(), Token::LParen)
+            && !self.interval_paren_is_quantity()
+        {
             self.advance(); // (
             let mut args = Vec::new();
             if !matches!(self.peek(), Token::RParen) {
@@ -21792,18 +21830,17 @@ impl Parser {
                     break;
                 }
             }
-            if matches!(self.peek(), Token::RParen)
-                && !(args.len() == 1
-                    && mysql_interval_unit(self.tokens.get(self.pos + 1).unwrap_or(&Token::Eof))
-                        .is_some())
-            {
-                self.advance(); // )
-                return Ok(Expr::FunctionCall {
-                    name: alloc::string::String::from("interval"),
-                    args,
-                });
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after INTERVAL() arguments, got {:?}",
+                    self.peek()
+                )));
             }
-            self.pos = save;
+            self.advance(); // )
+            return Ok(Expr::FunctionCall {
+                name: alloc::string::String::from("interval"),
+                args,
+            });
         }
         // v7.39 (round 350, M7) — MySQL's `INTERVAL <n> <UNIT>`, with the
         // number UNQUOTED: `DATE_ADD(d, INTERVAL 1 MONTH)`,
@@ -21836,6 +21873,28 @@ impl Parser {
                 // form both dialects read back.
                 text: alloc::format!("{text} {unit}"),
             }));
+        }
+        // v7.39 (round 422) — MySQL's interval QUANTITY may be any expression,
+        // not just a literal: `DATE_ADD(d, INTERVAL n DAY)`,
+        // `d + INTERVAL n*2 DAY`, `INTERVAL (1+1) DAY`, `INTERVAL ABS(-5) DAY`.
+        // Those cannot fold into a compile-time `Literal::Interval`, so they
+        // lower onto the existing `make_interval(y, mo, w, d, h, mi, s)`
+        // builtin, which builds the value at run time (and yields NULL for a
+        // NULL quantity, as MariaDB does). The literal path above still folds
+        // the constant case — it is cheaper and round-trips through Display.
+        //
+        // Guarded off a String operand so PG's own `INTERVAL '1 day'` (and
+        // MySQL's quoted spelling) keep the qualifier path below.
+        if self.mysql_dialect && !matches!(self.peek(), Token::String(_)) {
+            let qty = self.parse_expr(0)?;
+            let Some(unit) = mysql_interval_unit(self.peek()) else {
+                return Err(self.err(alloc::format!(
+                    "expected an interval unit after INTERVAL <expr>, got {:?}",
+                    self.peek()
+                )));
+            };
+            self.advance(); // the unit
+            return Ok(make_interval_call(qty, unit));
         }
         let tok = self.advance();
         let Token::String(text) = tok else {
@@ -23639,6 +23698,54 @@ fn mysql_interval_unit(tok: &Token) -> Option<&'static str> {
         () if s.eq_ignore_ascii_case("year") => "year",
         () => return None,
     })
+}
+
+/// v7.39 (round 422) — lower `INTERVAL <expr> <unit>` onto the existing
+/// `make_interval(years, months, weeks, days, hours, mins, secs)` builtin,
+/// which constructs the value at run time. Only the slot the unit names
+/// carries the quantity; QUARTER and MICROSECOND scale it into the nearest
+/// slot the builtin has (months and fractional seconds respectively).
+fn make_interval_call(qty: Expr, unit: &str) -> Expr {
+    let zero = || Expr::Literal(Literal::Integer(0));
+    let scaled = |op: crate::ast::BinOp, by: Expr| Expr::Binary {
+        lhs: alloc::boxed::Box::new(qty.clone()),
+        op,
+        rhs: alloc::boxed::Box::new(by),
+    };
+    // (years, months, weeks, days, hours, mins, secs)
+    let mut args = alloc::vec![zero(), zero(), zero(), zero(), zero(), zero(), zero()];
+    match unit {
+        "year" => args[0] = qty,
+        "quarter" => {
+            args[1] = scaled(
+                crate::ast::BinOp::Mul,
+                Expr::Literal(Literal::Integer(3)),
+            );
+        }
+        "month" => args[1] = qty,
+        "week" => args[2] = qty,
+        "day" => args[3] = qty,
+        "hour" => args[4] = qty,
+        "minute" => args[5] = qty,
+        "second" => args[6] = qty,
+        // The builtin's seconds slot takes a fraction, so microseconds ride
+        // it scaled down; the divisor is a NUMERIC literal so the division
+        // stays exact rather than going through a float.
+        "microsecond" => {
+            args[6] = scaled(
+                crate::ast::BinOp::Div,
+                Expr::Literal(Literal::Numeric {
+                    unscaled: 1_000_000,
+                    scale: 0,
+                }),
+            );
+        }
+        _ => args[3] = qty,
+    }
+    Expr::FunctionCall {
+        name: alloc::string::String::from("make_interval"),
+        args,
+    }
 }
 
 /// `(count, unit)` → `(months, days, micros)`.
