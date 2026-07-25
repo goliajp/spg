@@ -411,7 +411,11 @@ impl Engine {
             .map(|r| {
                 // PG `state`: a running query is 'active'; otherwise
                 // 'idle in transaction' inside a txn, else 'idle'.
-                let state = if !r.current_sql.is_empty() {
+                // v7.39 (round 474) — PG reports NULL state for a background
+                // process; only a client backend is idle or active.
+                let state = if r.backend_type != "client backend" {
+                    ""
+                } else if !r.current_sql.is_empty() {
                     "active"
                 } else if r.in_transaction {
                     "idle in transaction"
@@ -460,12 +464,19 @@ impl Engine {
                     Value::Null,     // state_change
                     Value::text(r.wait_event_type),
                     Value::text(r.wait_event),
-                    Value::text(alloc::string::String::from(state)),
+                    if state.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::text(alloc::string::String::from(state))
+                    },
                     Value::Null,                // backend_xid
                     Value::Null,                // backend_xmin
                     Value::Null,                // query_id
                     Value::text(r.current_sql), // query
-                    Value::text(alloc::string::String::from("client backend")),
+                    // v7.39 (round 474) — the row's own backend_type, so a
+                    // background worker reports as itself rather than as a
+                    // client connection.
+                    Value::text(r.backend_type.clone()),
                 ])
             })
             .collect();
