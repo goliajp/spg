@@ -1495,6 +1495,18 @@ pub struct ColumnSchema {
     /// column. Drives the epic-P2 write-path range check. Persisted in the
     /// FILE_VERSION 81+ sparse appendix; older catalogs deserialise as None.
     pub mysql_int_width: Option<MysqlIntWidth>,
+    /// v7.39 (round 424, type-fidelity epic) — the declared MySQL
+    /// fractional-seconds precision of a temporal column: `DATETIME(3)` is
+    /// `Some(3)`, a BARE `DATETIME` / `TIME` / `TIMESTAMP` is `Some(0)`
+    /// (MySQL's default is zero — the fraction is dropped on write), and
+    /// `None` means "not a MySQL-declared temporal column", which is every
+    /// PG column and leaves microsecond behaviour untouched.
+    ///
+    /// Drives write-path truncation (toward zero) and render padding
+    /// (exactly this many digits, `.000` when the fraction is zero).
+    /// Persisted in the FILE_VERSION 82+ sparse appendix; older catalogs
+    /// deserialise as None.
+    pub mysql_fsp: Option<u8>,
 }
 
 /// v7.17.0 Phase 2.5 — column-level text collation. Drives the
@@ -6984,6 +6996,7 @@ impl ColumnSchema {
             auto_restart: None,
             scalar_row_source: false,
             mysql_int_width: None,
+            mysql_fsp: None,
         }
     }
 
@@ -7333,7 +7346,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 81;
+const FILE_VERSION: u8 = 82;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -8148,6 +8161,27 @@ impl Catalog {
             for (pos, tag) in int_widths {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
                 out.push(tag);
+            }
+            // v7.39 (round 424, type-fidelity epic) — per-table mysql_fsp
+            // appendix (FILE_VERSION 82+). Sparse: only MySQL-declared
+            // temporal columns land. Layout:
+            // `[u16 count]([u16 col_pos][u8 fsp]) × count`, fsp in 0..=6.
+            // v81-and-below readers stop after the int-width appendix,
+            // leaving every column at None (PG microsecond behaviour).
+            let fsps: Vec<(usize, u8)> = t
+                .schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.mysql_fsp.map(|p| (i, p)))
+                .collect();
+            write_u16(
+                &mut out,
+                u16::try_from(fsps.len()).expect("≤ 65k temporal columns/table"),
+            );
+            for (pos, fsp) in fsps {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                out.push(fsp);
             }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions

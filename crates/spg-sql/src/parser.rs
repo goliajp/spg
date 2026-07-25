@@ -4633,7 +4633,7 @@ impl Parser {
         // v7.39 (round 259) — keep the raw type NAME when the base is not
         // a builtin: it is how `CREATE DOMAIN child AS parent` records its
         // parent domain.
-        let (base_type, _, _, base_user_ref, _, _, _, _, _, _) =
+        let (base_type, _, _, base_user_ref, _, _, _, _, _, _, _) =
             self.parse_type_with_implied_flags()?;
         let mut default: Option<Expr> = None;
         let mut not_null = false;
@@ -4728,7 +4728,7 @@ impl Parser {
                 // v7.39 (round 264) — keep the raw type name when it is not
                 // a builtin: that is how a NESTED composite field records
                 // which composite it holds.
-                let (field_type, _, _, field_user_ref, _, _, _, _, _, _) =
+                let (field_type, _, _, field_user_ref, _, _, _, _, _, _, _) =
                     self.parse_type_with_implied_flags()?;
                 fields.push((field_name, field_type));
                 field_user_types.push(field_user_ref);
@@ -14143,7 +14143,7 @@ impl Parser {
     /// shorthands — callers that don't expect those (ALTER COLUMN
     /// TYPE) can discard them.
     fn parse_column_type_name(&mut self) -> Result<ColumnTypeName, ParseError> {
-        let (ty, _, _, _, _, _, _, _, _, _) = self.parse_type_with_implied_flags()?;
+        let (ty, _, _, _, _, _, _, _, _, _, _) = self.parse_type_with_implied_flags()?;
         Ok(ty)
     }
 
@@ -14170,6 +14170,9 @@ impl Parser {
             // v7.39 (round 386, epic P1) — declared TINYINT / MEDIUMINT
             // width, lost when the type collapses to SmallInt / Int.
             Option<MysqlIntWidth>,
+            // v7.39 (round 424) — declared fractional-seconds precision of a
+            // MySQL temporal column (bare spelling = 0). None under PG.
+            Option<u8>,
         ),
         ParseError,
     > {
@@ -14210,6 +14213,10 @@ impl Parser {
         // narrow-int width (TINYINT / MEDIUMINT), captured before the type
         // collapses to SmallInt / Int. Only under the MySQL dialect.
         let mut mysql_int_width: Option<MysqlIntWidth> = None;
+        // v7.39 (round 424) — the declared fractional-seconds precision of a
+        // MySQL temporal column. Set by the temporal arms below; stays None
+        // for PG (whose temporal columns keep full microseconds).
+        let mut mysql_fsp: Option<u8> = None;
         let mut ty = match ty_ident.as_str() {
             // PG SERIAL family. Implies NOT NULL + AUTO_INCREMENT.
             "smallserial" | "serial2" => {
@@ -14416,9 +14423,15 @@ impl Parser {
             "timestamp" | "datetime" => {
                 // pg_dump emits `TIMESTAMP(6) WITH TIME ZONE` — the optional
                 // fractional-seconds precision comes BEFORE the `WITH/WITHOUT
-                // TIME ZONE` clause, so consume it first. SPG stores µs always;
-                // accept + discard the precision.
-                self.consume_optional_paren_size();
+                // TIME ZONE` clause, so consume it first.
+                // v7.39 (round 424) — under MySQL the precision is SEMANTIC
+                // (it truncates on write and pads on render), so capture it;
+                // a bare spelling means precision 0 there. PG stores µs always
+                // and keeps `None`.
+                let n = self.take_optional_paren_size();
+                if self.mysql_dialect {
+                    mysql_fsp = Some(n.unwrap_or(0).min(6));
+                }
                 // v7.14.0 — PG canonical `TIMESTAMP WITH TIME ZONE`
                 // / `TIMESTAMP WITHOUT TIME ZONE`. pg_dump emits
                 // the full form. SPG canonicalises:
@@ -14441,9 +14454,8 @@ impl Parser {
                     self.advance(); // ZONE
                     ColumnTypeName::Timestamp
                 } else {
-                    // Optional `(precision)` parenthesised modifier
-                    // (PG fractional seconds precision). SPG stores
-                    // µs always; accept + discard.
+                    // A second `(precision)` cannot legally follow, but the
+                    // old grammar tolerated it; keep that tolerance.
                     self.consume_optional_paren_size();
                     ColumnTypeName::Timestamp
                 }
@@ -14505,7 +14517,12 @@ impl Parser {
             // i64 microseconds since 00:00:00. Wire OID 1083.
             // pg_dump emits `TIME(6)` and `TIME(6) WITH TIME ZONE`.
             "time" => {
-                self.consume_optional_paren_size();
+                // v7.39 (round 424) — MySQL TIME carries a semantic
+                // fractional-seconds precision, bare meaning 0.
+                let n = self.take_optional_paren_size();
+                if self.mysql_dialect {
+                    mysql_fsp = Some(n.unwrap_or(0).min(6));
+                }
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("with"))
                     && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("time"))
                     && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("zone"))
@@ -14885,6 +14902,7 @@ impl Parser {
             inline_enum_variants,
             inline_set_variants,
             mysql_int_width,
+            mysql_fsp,
         ))
     }
 
@@ -14927,6 +14945,7 @@ impl Parser {
             inline_enum_variants,
             inline_set_variants,
             mysql_int_width,
+            mysql_fsp,
         ) = self.parse_type_with_implied_flags()?;
         // Column constraints: `DEFAULT <expr>`, `NOT NULL`, and the
         // MySQL-flavoured `AUTO_INCREMENT` may appear in any order;
@@ -15336,6 +15355,7 @@ impl Parser {
             generated_stored_expr,
             identity_always,
             mysql_int_width,
+            mysql_fsp,
         })
     }
 
@@ -15502,6 +15522,29 @@ impl Parser {
             i += 1;
         }
         false
+    }
+
+    /// v7.39 (round 424) — the same optional `(N)` modifier, but RETURNING
+    /// the number. Temporal columns need it: MySQL's `DATETIME(3)` declares a
+    /// fractional-seconds precision that drives write truncation and render
+    /// padding, where `consume_optional_paren_size` throws it away.
+    /// `Some(0)` for an explicit `(0)`, `None` when no modifier is written.
+    fn take_optional_paren_size(&mut self) -> Option<u8> {
+        let Some(Token::Integer(n)) = self
+            .tokens
+            .get(self.pos + 1)
+            .filter(|_| matches!(self.peek(), Token::LParen))
+            .cloned()
+        else {
+            self.consume_optional_paren_size();
+            return None;
+        };
+        if !matches!(self.tokens.get(self.pos + 2), Some(Token::RParen)) {
+            self.consume_optional_paren_size();
+            return None;
+        }
+        self.consume_optional_paren_size();
+        u8::try_from(n).ok()
     }
 
     fn consume_optional_paren_size(&mut self) {

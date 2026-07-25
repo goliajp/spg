@@ -1290,6 +1290,7 @@ impl Engine {
                     Some(&cat_for_ctx),
                 )?;
                 let coerced = coerce_value(v, schema_cols[*pos].ty, &schema_cols[*pos].name, *pos)?;
+                let coerced = crate::conversions::truncate_to_column_fsp(coerced, &schema_cols[*pos]);
                 check_unsigned_range(&coerced, &schema_cols[*pos], *pos)?;
                 new_vals[*pos] = coerced;
             }
@@ -5890,6 +5891,7 @@ fn parse_insert_rows(
                 let coerced = coerce_value(raw, col.ty, &col.name, i)?;
                 enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
                 let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;
+                let coerced = crate::conversions::truncate_to_column_fsp(coerced, col);
                 check_unsigned_range(&coerced, col, i)?;
                 out.push(coerced);
             }
@@ -5937,6 +5939,7 @@ fn parse_insert_rows(
                 let coerced = coerce_value(raw, col.ty, &col.name, i)?;
                 enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
                 let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;
+                let coerced = crate::conversions::truncate_to_column_fsp(coerced, col);
                 check_unsigned_range(&coerced, col, i)?;
                 out.push(coerced);
             }

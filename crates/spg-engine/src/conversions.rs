@@ -2815,6 +2815,30 @@ pub(crate) fn int_value_for(n: i64) -> Value<'static> {
 /// `coerce_value` at each INSERT / UPDATE site. NULL / non-integer cells
 /// pass through. SPG always presents STRICT_TRANS_TABLES, so out of range
 /// is an error (the non-strict clamp is a later stage).
+/// v7.39 (round 424, type-fidelity epic) — apply a MySQL temporal column's
+/// declared fractional-seconds precision to a value on its way in. MariaDB
+/// TRUNCATES toward zero to the declared digits — `DATETIME(1)` stores
+/// `.256789` as `.2`, and a BARE `DATETIME` (precision 0) drops the fraction
+/// entirely. Called next to `check_unsigned_range` at each INSERT / UPDATE
+/// site; a column with no declared precision (every PG column) is untouched,
+/// which is what keeps microsecond behaviour intact there.
+pub(crate) fn truncate_to_column_fsp(v: Value<'static>, schema: &ColumnSchema) -> Value<'static> {
+    let Some(fsp) = schema.mysql_fsp else {
+        return v;
+    };
+    if fsp >= 6 {
+        return v;
+    }
+    let scale = 10i64.pow(u32::from(6 - fsp));
+    // Toward zero, so a negative TIME loses the same digits.
+    let cut = |micros: i64| (micros / scale) * scale;
+    match v {
+        Value::Timestamp(m) => Value::Timestamp(cut(m)),
+        Value::Time(m) => Value::Time(cut(m)),
+        other => other,
+    }
+}
+
 pub(crate) fn check_unsigned_range(
     v: &Value,
     schema: &ColumnSchema,

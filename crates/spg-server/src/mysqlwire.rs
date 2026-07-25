@@ -1159,6 +1159,7 @@ fn handle_com_stmt_prepare(
                 auto_restart: None,
                 scalar_row_source: false,
                 mysql_int_width: None,
+                mysql_fsp: None,
             };
             let buf = encode_column_def_41(&placeholder);
             write_packet(stream, seq, &buf)?;
