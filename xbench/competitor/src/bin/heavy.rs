@@ -33,6 +33,24 @@ const N5: i64 = 500_000;
 const WARMUP: usize = 3;
 const RUNS: usize = 31; // odd → clean median
 
+/// v7.39 (round 477) — effective run count, overridable without a rebuild.
+///
+/// At 31 runs the per-side medians are stable (SPGE 1-8 %, PG 4-5 % sample
+/// stdev) but their RATIO carries about +/-10 %: `big_in` read 0.65x, 0.76x,
+/// 0.83x and 0.87x across four back-to-back runs. The six shapes the audit
+/// called "narrow wins" all sit inside 0.72-0.87, which is narrower than
+/// that band — so the ledger's ORDERING of them was noise, and picking an
+/// attack target off it would be picking noise. The methodology's answer to
+/// a band too wide to rank is to widen the sample, not to reason harder
+/// about the numbers.
+fn runs() -> usize {
+    std::env::var("SPG_BENCH_RUNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 3)
+        .unwrap_or(RUNS)
+}
+
 /// The read shapes under test. Same SQL text runs on both engines.
 // avg(...) is cast to float8 — sqlx's Any driver can't decode PG NUMERIC, and
 // the cast is a trivial, identical cost on both engines.
@@ -147,7 +165,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Report.
     println!();
-    println!("# heavy read shapes — median ms over {RUNS} runs, {N}-row table");
+    println!(
+        "# heavy read shapes — median ms over {} runs, {N}-row table",
+        runs()
+    );
     println!("| shape        |   SPGE ms |   PG18 ms | SPGE/PG | verdict |");
     println!("|--------------|----------:|----------:|--------:|---------|");
     for (i, (name, _)) in SHAPES.iter().enumerate() {
@@ -235,8 +256,8 @@ fn bench_spg_embedded() -> Vec<f64> {
             for _ in 0..WARMUP {
                 eng.execute(sql).unwrap();
             }
-            let mut samples = Vec::with_capacity(RUNS);
-            for _ in 0..RUNS {
+            let mut samples = Vec::with_capacity(runs());
+            for _ in 0..runs() {
                 let t0 = Instant::now();
                 eng.execute(sql).unwrap();
                 samples.push(t0.elapsed().as_secs_f64() * 1000.0);
@@ -307,8 +328,8 @@ async fn bench_pg(pool: &AnyPool) -> Result<Vec<f64>, sqlx::Error> {
         for _ in 0..WARMUP {
             let _ = sqlx::query(sql).fetch_all(pool).await?;
         }
-        let mut samples = Vec::with_capacity(RUNS);
-        for _ in 0..RUNS {
+        let mut samples = Vec::with_capacity(runs());
+        for _ in 0..runs() {
             let t0 = Instant::now();
             let _ = sqlx::query(sql).fetch_all(pool).await?;
             samples.push(t0.elapsed().as_secs_f64() * 1000.0);
