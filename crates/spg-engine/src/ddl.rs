@@ -1565,7 +1565,7 @@ impl Engine {
                 }
             }
             "sequence" => {
-                if !cat.sequences().contains_key(name) {
+                if !cat.has_sequence(name) {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "relation {name:?} does not exist"
                     )));
@@ -3572,7 +3572,7 @@ impl Engine {
         };
         // v7.39 (round 137) — INSTEAD OF triggers may only target views; BEFORE /
         // AFTER row triggers may only target base tables. PG's exact wording.
-        let target_is_view = self.active_catalog().views().contains_key(&s.table);
+        let target_is_view = self.active_catalog().has_view(&s.table);
         if matches!(s.timing, spg_sql::ast::TriggerTiming::InsteadOf) {
             if !target_is_view {
                 return Err(EngineError::Unsupported(alloc::format!(
@@ -3684,7 +3684,7 @@ impl Engine {
         // Rules may target base tables (and, in PG, views); require the relation
         // to exist so a typo does not silently create a dead rule.
         let known = self.active_catalog().table_names().contains(&s.table)
-            || self.active_catalog().views().contains_key(&s.table);
+            || self.active_catalog().has_view(&s.table);
         if !known {
             return Err(EngineError::Unsupported(alloc::format!(
                 "relation \"{}\" does not exist",
@@ -3786,6 +3786,22 @@ impl Engine {
         &mut self,
         s: spg_sql::ast::CreateSequenceStatement,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 (round 469) — a TEMPORARY sequence lives in the calling
+        // session's namespace, exactly as round 436 put temporary tables
+        // there. Until this round the keyword parsed and was dropped, so
+        // the sequence was permanent: another connection saw it in
+        // pg_class and could call nextval() on it. Measured against PG18,
+        // where a second session sees nothing and errors on use.
+        if s.temporary {
+            let logical = s.name.clone();
+            let mut inner = s;
+            inner.temporary = false;
+            inner.name = self.session_temp_name(&logical);
+            let result = self.exec_create_sequence(inner)?;
+            self.temp_sequences.insert(logical);
+            self.refresh_temp_prefix();
+            return Ok(result);
+        }
         use spg_sql::ast::{SeqBound, SequenceDataType as AstDt};
         use spg_storage::{SequenceDataType, SequenceDef};
         let dt = match s.data_type {
@@ -3858,7 +3874,7 @@ impl Engine {
         // v7.39 (read01 round 46) — PG's IF NOT EXISTS skip NOTICE. The
         // storage call swallows the collision when the flag is set, so
         // detect it here before handing over.
-        if s.if_not_exists && self.active_catalog().sequences().contains_key(&s.name) {
+        if s.if_not_exists && self.active_catalog().has_sequence(&s.name) {
             self.notice(alloc::format!(
                 "relation {:?} already exists, skipping",
                 s.name
@@ -3894,7 +3910,7 @@ impl Engine {
             });
         }
         let cat = self.active_catalog_mut();
-        if !cat.sequences().contains_key(&s.name) {
+        if !cat.has_sequence(&s.name) {
             if s.if_exists {
                 return Ok(QueryResult::CommandOk {
                     affected: 0,
@@ -3944,6 +3960,19 @@ impl Engine {
         &mut self,
         s: spg_sql::ast::CreateViewStatement,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 (round 469) — same as the temporary sequence above: the
+        // keyword parsed and was dropped, so the view was permanent and
+        // every other connection could select from it.
+        if s.temporary {
+            let logical = s.name.clone();
+            let mut inner = s;
+            inner.temporary = false;
+            inner.name = self.session_temp_name(&logical);
+            let result = self.exec_create_view(inner)?;
+            self.temp_views.insert(logical);
+            self.refresh_temp_prefix();
+            return Ok(result);
+        }
         // v7.39 (round 151) — PG rejects data-modifying CTEs in a view
         // body (DefineView, view.c): the definition would run the write
         // on every reference. Read-only WITH is fine.
@@ -3959,7 +3988,7 @@ impl Engine {
         // let every one of these through and silently swapped the view's shape,
         // so a downstream `SELECT known_col FROM v` would start resolving to a
         // different column, or vanish — data corruption disguised as a DDL.
-        if s.or_replace && self.active_catalog().views().contains_key(&s.name) {
+        if s.or_replace && self.active_catalog().has_view(&s.name) {
             self.check_view_replace_columns(&s)?;
         }
         // Render the SELECT body to canonical form so the catalog
@@ -4024,7 +4053,7 @@ impl Engine {
         &self,
         s: &spg_sql::ast::CreateViewStatement,
     ) -> Result<(), EngineError> {
-        let old_def = self.active_catalog().views().get(&s.name).cloned();
+        let old_def = self.active_catalog().view(&s.name).cloned();
         let Some(old_def) = old_def else {
             return Ok(());
         };
@@ -4077,12 +4106,12 @@ impl Engine {
                 alloc::format!("type {:?} would shadow an existing table", s.name),
             )));
         }
-        if cat.sequences().contains_key(&s.name) {
+        if cat.has_sequence(&s.name) {
             return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
                 alloc::format!("type {:?} would shadow an existing sequence", s.name),
             )));
         }
-        if cat.views().contains_key(&s.name) {
+        if cat.has_view(&s.name) {
             return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
                 alloc::format!("type {:?} would shadow an existing view", s.name),
             )));
@@ -4381,8 +4410,8 @@ impl Engine {
             )));
         }
         if cat.get(&s.name).is_some()
-            || cat.sequences().contains_key(&s.name)
-            || cat.views().contains_key(&s.name)
+            || cat.has_sequence(&s.name)
+            || cat.has_view(&s.name)
             || cat.enum_types().contains_key(&s.name)
         {
             return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
@@ -4594,7 +4623,7 @@ impl Engine {
                 alloc::format!("materialized view {:?} already exists", s.name),
             )));
         }
-        if cat.views().contains_key(&s.name) {
+        if cat.has_view(&s.name) {
             return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
                 alloc::format!(
                     "materialized view {:?} would shadow an existing view",
@@ -4602,7 +4631,7 @@ impl Engine {
                 ),
             )));
         }
-        if cat.sequences().contains_key(&s.name) {
+        if cat.has_sequence(&s.name) {
             return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
                 alloc::format!(
                     "materialized view {:?} would shadow an existing sequence",
@@ -4765,7 +4794,15 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         let mut removed = 0usize;
         for name in names {
-            let was_present = self.active_catalog_mut().drop_view(name);
+            // v7.39 (round 469) — a bare DROP names the session's
+            // temporary view first, the way `Catalog::drop_table` resolves
+            // a temporary table.
+            let key = self.active_catalog().view_key(name);
+            let was_present = self.active_catalog_mut().drop_view(&key);
+            if was_present && key != *name {
+                self.temp_views.remove(name);
+                self.refresh_temp_prefix();
+            }
             if !was_present {
                 if !if_exists {
                     // v7.39 (read01 round 89) — PG's 42P01 wording, without the
@@ -4795,7 +4832,12 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         let mut removed = 0usize;
         for name in names {
-            let was_present = self.active_catalog_mut().drop_sequence(name);
+            let key = self.active_catalog().sequence_key(name);
+            let was_present = self.active_catalog_mut().drop_sequence(&key);
+            if was_present && key != *name {
+                self.temp_sequences.remove(name);
+                self.refresh_temp_prefix();
+            }
             if !was_present {
                 if !if_exists {
                     return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(

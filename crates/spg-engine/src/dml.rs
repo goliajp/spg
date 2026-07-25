@@ -256,7 +256,7 @@ fn view_redirect_checked(
     view_name: &str,
 ) -> Result<ViewRedirect, ViewNotUpdatable> {
     let view = catalog
-        .views()
+        .views_all()
         .get(view_name)
         .ok_or(ViewNotUpdatable::Unsupported)?;
     let this_check = view.check_option;
@@ -404,7 +404,7 @@ fn view_redirect_checked(
         });
     }
     // Nested: the primary is itself an auto-updatable view — recurse and compose.
-    if catalog.views().contains_key(&primary_name) {
+    if catalog.has_view(&primary_name) {
         let inner = view_redirect_checked(catalog, &primary_name)?;
         let inner_map: alloc::collections::BTreeMap<String, String> =
             inner.col_map.iter().cloned().collect();
@@ -914,7 +914,7 @@ impl Engine {
         // the wrong wording — it denies the existence of an object the
         // catalog plainly has.
         if let Err(reason) = view_redirect_checked(self.active_catalog(), &stmt.table) {
-            if self.active_catalog().views().contains_key(&stmt.table) {
+            if self.active_catalog().has_view(&stmt.table) {
                 return Err(view_not_updatable_error(&stmt.table, &UPDATE_VERB, reason, false));
             }
         }
@@ -943,7 +943,7 @@ impl Engine {
             // view's own option drives the cascade.
             let written_opt = self
                 .active_catalog()
-                .views()
+                .views_all()
                 .get(&stmt.table)
                 .map_or(0, |v| v.check_option);
             // v7.39 (round 152) — a lower view carrying its OWN check
@@ -1782,7 +1782,7 @@ impl Engine {
         // FIRST WHEN clause (measured on PG 18.4) and names MERGE in the
         // HINT instead of offering a rewrite rule.
         if let Err(reason) = view_redirect_checked(self.active_catalog(), &stmt.target) {
-            if self.active_catalog().views().contains_key(&stmt.target) {
+            if self.active_catalog().has_view(&stmt.target) {
                 let verb = stmt
                     .clauses
                     .iter()
@@ -2050,7 +2050,7 @@ impl Engine {
             // regardless of it (PG, probe P6).
             let written_opt = self
                 .active_catalog()
-                .views()
+                .views_all()
                 .get(&stmt.target)
                 .map_or(0, |v| v.check_option);
             let check = if written_opt != 0 || vr.check_chain.iter().any(|(_, _, o)| *o != 0) {
@@ -2777,7 +2777,7 @@ impl Engine {
         // the wrong wording — it denies the existence of an object the
         // catalog plainly has.
         if let Err(reason) = view_redirect_checked(self.active_catalog(), &stmt.table) {
-            if self.active_catalog().views().contains_key(&stmt.table) {
+            if self.active_catalog().has_view(&stmt.table) {
                 return Err(view_not_updatable_error(&stmt.table, &DELETE_VERB, reason, false));
             }
         }
@@ -3439,7 +3439,7 @@ impl Engine {
             alloc::collections::BTreeMap::new();
         for (i, col) in pre_borrow_column_meta.iter().enumerate() {
             if col.auto_increment
-                && let Some(sd) = self.active_catalog().sequences().get(&alloc::format!(
+                && let Some(sd) = self.active_catalog().sequence(&alloc::format!(
                     "{}_{}_seq",
                     table_name,
                     col.name
@@ -3482,7 +3482,7 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         let view_def = self
             .active_catalog()
-            .views()
+            .views_all()
             .get(&stmt.table)
             .cloned()
             .ok_or_else(|| {
@@ -3998,7 +3998,7 @@ impl Engine {
         // the wrong wording — it denies the existence of an object the
         // catalog plainly has.
         if let Err(reason) = view_redirect_checked(self.active_catalog(), &stmt.table) {
-            if self.active_catalog().views().contains_key(&stmt.table) {
+            if self.active_catalog().has_view(&stmt.table) {
                 return Err(view_not_updatable_error(&stmt.table, &INSERT_VERB, reason, false));
             }
         }
@@ -4026,7 +4026,7 @@ impl Engine {
             }
             let written_opt = self
                 .active_catalog()
-                .views()
+                .views_all()
                 .get(&stmt.table)
                 .map_or(0, |v| v.check_option);
             // v7.39 (round 152) — arm the check whenever any level of the

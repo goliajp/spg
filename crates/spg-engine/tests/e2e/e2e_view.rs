@@ -174,7 +174,7 @@ fn catalog_round_trip_preserves_view() {
     e.execute("CREATE VIEW v AS SELECT id FROM t").unwrap();
     let snapshot = e.catalog().serialize();
     let restored = spg_storage::Catalog::deserialize(&snapshot).expect("round-trip");
-    let view = restored.views().get("v").expect("view persisted");
+    let view = restored.view("v").expect("view persisted");
     assert!(view.body.to_ascii_lowercase().contains("select"));
     assert!(view.body.contains("t"));
 }

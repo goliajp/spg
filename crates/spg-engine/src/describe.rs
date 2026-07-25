@@ -153,7 +153,7 @@ fn relation_columns(
         }
         return Some(cols);
     }
-    if catalog.views().contains_key(&t.name) {
+    if catalog.has_view(&t.name) {
         let cols = describe_view_columns_depth(catalog, &t.name, depth + 1);
         return (!cols.is_empty()).then_some(cols);
     }
@@ -230,7 +230,7 @@ fn describe_view_columns_depth(
     if depth > MAX_DESCRIBE_DEPTH {
         return Vec::new();
     }
-    let Some(view) = catalog.views().get(view_name) else {
+    let Some(view) = catalog.view(view_name) else {
         return Vec::new();
     };
     let Ok(Statement::Select(select)) = spg_sql::parser::parse_statement(&view.body) else {

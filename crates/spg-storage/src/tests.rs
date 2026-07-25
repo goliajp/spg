@@ -1198,7 +1198,7 @@ fn v66_roundtrip_preserves_sequence_schema_and_database_acls() {
     });
 
     let restored = Catalog::deserialize(&c.serialize()).expect("v66 image loads");
-    let sq = restored.sequences().get("sq").unwrap();
+    let sq = restored.sequence("sq").unwrap();
     assert_eq!(sq.owner.as_deref(), Some("alice"));
     assert_eq!(sq.acl.len(), 1);
     assert_eq!(sq.acl[0].privs, priv_bits::USAGE);

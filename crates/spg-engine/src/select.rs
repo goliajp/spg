@@ -1875,7 +1875,7 @@ impl Engine {
         // CTE. Recurses on views-in-views via the regular CTE
         // dispatch below. Fast-path: skip the walker entirely when
         // the catalog has no views (the typical OLTP load).
-        if !self.active_catalog().views().is_empty() {
+        if !self.active_catalog().views_all().is_empty() {
             if let Some(rewritten) = self.expand_views_in_select(stmt)? {
                 return self.exec_select_cancel(&rewritten, cancel);
             }
@@ -2999,7 +2999,7 @@ impl Engine {
         // in PG (`SELECT last_value FROM seq` — psql's \d and several ORMs
         // read it). Synthesize PG's three columns.
         if self.active_catalog().get(&primary.name).is_none()
-            && let Some(seq) = self.active_catalog().sequences().get(&primary.name)
+            && let Some(seq) = self.active_catalog().sequence(&primary.name)
         {
             let rows = alloc::vec![Row::new(alloc::vec![
                 Value::BigInt(seq.last_value),
@@ -7724,7 +7724,7 @@ impl Engine {
         }
         let mut new_ctes: Vec<spg_sql::ast::Cte> = Vec::with_capacity(referenced.len());
         for name in &referenced {
-            let view = cat.views().get(name).ok_or_else(|| {
+            let view = cat.view(name).ok_or_else(|| {
                 EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
                     "view {name:?} disappeared mid-expansion"
                 )))

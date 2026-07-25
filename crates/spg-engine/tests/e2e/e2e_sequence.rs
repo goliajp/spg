@@ -156,7 +156,7 @@ fn catalog_round_trip_preserves_sequence_state() {
     e.execute("SELECT nextval('s')").unwrap();
     let snapshot = e.catalog().serialize();
     let restored = spg_storage::Catalog::deserialize(&snapshot).expect("round-trip");
-    let seq = restored.sequences().get("s").expect("sequence persisted");
+    let seq = restored.sequence("s").expect("sequence persisted");
     assert_eq!(seq.start, 100);
     assert_eq!(seq.increment, 7);
     assert_eq!(seq.last_value, 107);

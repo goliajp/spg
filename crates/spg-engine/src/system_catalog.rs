@@ -348,7 +348,12 @@ pub(crate) fn synth_information_schema_columns(
     // view before this, so a reflection tool saw every view as a
     // relation with no columns at all. Shapes whose body does not fully
     // resolve contribute nothing rather than a guess.
-    for (vname, _) in cat.views() {
+    for (vname, _) in cat.views_all() {
+        // v7.39 (round 469) — a temporary view belongs to one session; the
+        // others must not see it listed under its mangled storage name.
+        let Some(vname) = cat.listed_name(vname) else {
+            continue;
+        };
         let cols = crate::describe::describe_view_columns(cat, vname);
         // A column is writable only if the view itself is auto-updatable
         // AND the column is a plain base column — the same two questions
@@ -636,12 +641,15 @@ pub(crate) fn synth_information_schema_tables(
     // reflection tool saw a database with no views in it. table_type is
     // VIEW and is_insertable_into follows the same auto-updatability
     // judgement the write path uses.
-    for (name, _) in cat.views() {
+    for (name, _) in cat.views_all() {
+        let Some(name) = cat.listed_name(name) else {
+            continue;
+        };
         let insertable = crate::dml::view_is_auto_updatable(cat, name);
         rows.push(Row::new(alloc::vec![
             Value::text("spg"),
             Value::text("public"),
-            Value::text(name.clone()),
+            Value::text(name.to_string()),
             Value::text("VIEW"),
             Value::Null,
             Value::Null,
@@ -727,13 +735,16 @@ pub(crate) fn synth_information_schema_views(
         ColumnSchema::new("is_trigger_insertable_into", DataType::Text, false),
     ];
     let rows: Vec<Row<'static>> = cat
-        .views()
+        .views_all()
         .values()
-        .map(|v| {
+        // v7.39 (round 469) — a temporary view belongs to one session; the
+        // others must not see it listed under its mangled storage name.
+        .filter_map(|v| cat.listed_name(&v.name).map(|n| (n.to_string(), v)))
+        .map(|(vname, v)| {
             Row::new(alloc::vec![
                 Value::text("spg"),
                 Value::text("public"),
-                Value::text(v.name.clone()),
+                Value::text(vname),
                 // v7.39 (round 336, V58) — the DEPARSED definition, the same
                 // text `pg_get_viewdef` gives. This used to be the stored
                 // body verbatim, which meant no layout and — worse — SPG's
@@ -2517,7 +2528,10 @@ pub(crate) fn relation_oid(cat: &Catalog, bare: &str) -> Option<i64> {
             return Some(OID_TABLE_BASE + pos as i64);
         }
     }
-    for (pos, vname) in cat.views().keys().enumerate() {
+    for (pos, vname) in cat.views_all().keys().enumerate() {
+        let Some(vname) = cat.listed_name(vname) else {
+            continue;
+        };
         if vname == bare {
             return Some(OID_VIEW_BASE + pos as i64);
         }
@@ -2533,7 +2547,10 @@ pub(crate) fn relation_oid(cat: &Catalog, bare: &str) -> Option<i64> {
         }
     }
     let mut seq_oid = OID_SEQ_BASE;
-    for name in cat.sequences().keys() {
+    for name in cat.sequences_all().keys() {
+        let Some(name) = cat.listed_name(name) else {
+            continue;
+        };
         seq_oid += 1;
         if name == bare {
             return Some(seq_oid);
@@ -2680,7 +2697,10 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     // relacl lookups) dead-ended. PG's values, measured: relam 0,
     // relfilenode 0 (a view has no storage), relpages 0, reltuples -1,
     // relhasrules TRUE (the _RETURN rule), relreplident 'n'.
-    for vname in cat.views().keys() {
+    for vname in cat.views_all().keys() {
+        let Some(vname) = cat.listed_name(vname) else {
+            continue;
+        };
         let Some(view_oid) = relation_oid(cat, vname) else {
             continue;
         };
@@ -2688,7 +2708,7 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             .unwrap_or(i16::MAX);
         rows.push(Row::new(alloc::vec![
             Value::BigInt(view_oid),
-            Value::text(vname.clone()),
+            Value::text(vname.to_string()),
             Value::BigInt(2200), // relnamespace — public
             Value::BigInt(0),    // reltype
             Value::BigInt(0),    // reloftype
@@ -2767,13 +2787,16 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     // were missing from pg_class entirely, so `SELECT relacl FROM pg_class WHERE
     // relname = '<seq>'` — the canonical way to read a sequence's privileges —
     // came back empty.
-    for (name, def) in cat.sequences() {
+    for (name, def) in cat.sequences_all() {
+        let Some(name) = cat.listed_name(name) else {
+            continue;
+        };
         let Some(seq_oid) = relation_oid(cat, name) else {
             continue;
         };
         rows.push(Row::new(alloc::vec![
             Value::BigInt(seq_oid),
-            Value::text(name.clone()),
+            Value::text(name.to_string()),
             Value::BigInt(2200), // relnamespace — public
             Value::BigInt(0),
             Value::BigInt(0),
@@ -2920,7 +2943,10 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
     // — the join psql \d and every reflection tool run to learn a view's
     // shape — came back empty even though information_schema.columns
     // (round 268) already knew the answer. Same resolver, so the two agree.
-    for vname in cat.views().keys() {
+    for vname in cat.views_all().keys() {
+        let Some(vname) = cat.listed_name(vname) else {
+            continue;
+        };
         let Some(view_oid) = relation_oid(cat, vname) else {
             continue;
         };
@@ -3816,7 +3842,10 @@ pub(crate) fn synth_info_sequences(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row
         ColumnSchema::new("cycle_option", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for (name, def) in cat.sequences() {
+    for (name, def) in cat.sequences_all() {
+        let Some(name) = cat.listed_name(name) else {
+            continue;
+        };
         let dt = match def.data_type {
             spg_storage::SequenceDataType::SmallInt => "smallint",
             spg_storage::SequenceDataType::Int => "integer",
@@ -3825,7 +3854,7 @@ pub(crate) fn synth_info_sequences(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row
         rows.push(Row::new(alloc::vec![
             Value::text("spg"),
             Value::text("public"),
-            Value::text(name.clone()),
+            Value::text(name.to_string()),
             Value::text::<&str>(dt),
             Value::BigInt(def.start),
             Value::BigInt(def.min_value),
@@ -4099,7 +4128,10 @@ pub(crate) fn synth_pg_sequence(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
     // 32768 while pg_class numbered them from 300_000, which broke PG's
     // canonical `pg_class JOIN pg_sequence ON oid = seqrelid` outright —
     // and 32768 was the view band, so the two kinds collided besides.
-    for (name, def) in cat.sequences() {
+    for (name, def) in cat.sequences_all() {
+        let Some(name) = cat.listed_name(name) else {
+            continue;
+        };
         let Some(seq_oid) = relation_oid(cat, name) else {
             continue;
         };
@@ -4942,10 +4974,13 @@ pub(crate) fn synth_pg_views(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         ColumnSchema::new("definition", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for (name, def) in cat.views() {
+    for (name, def) in cat.views_all() {
+        let Some(name) = cat.listed_name(name) else {
+            continue;
+        };
         rows.push(Row::new(alloc::vec![
             Value::text("public"),
-            Value::text(name.clone()),
+            Value::text(name.to_string()),
             Value::text(def.body.clone()),
         ]));
     }
@@ -6046,7 +6081,7 @@ pub(crate) fn collect_view_refs(
     cat: &spg_storage::Catalog,
     into: &mut Vec<String>,
 ) {
-    if cat.views().contains_key(&tref.name)
+    if cat.has_view(&tref.name)
         && cat.get(&tref.name).is_none()
         && !into.iter().any(|n| n == &tref.name)
     {
