@@ -320,6 +320,22 @@ impl Engine {
         // and once a later slice flips the release profile.
         let pre_in_tx = self.in_transaction();
         let result = self.execute_inner_catching(sql, cancel);
+        // v7.39 (round 426) — MySQL's ROW_COUNT() reads what the LAST
+        // statement did. Measured on MariaDB 11: a DML statement leaves the
+        // number of rows it changed (0 when it matched none), a
+        // row-returning statement leaves -1, and DDL leaves 0. One place,
+        // because every statement funnels through here — and it must be
+        // AFTER the dispatch, so ROW_COUNT()'s own SELECT is what sets -1
+        // for the call after it (as MariaDB does).
+        //
+        // A failed statement leaves the previous value alone: MariaDB keeps
+        // the last successful statement's count through an error.
+        if let Ok(res) = &result {
+            self.row_count = match res {
+                QueryResult::CommandOk { affected, .. } => i64::try_from(*affected).unwrap_or(-1),
+                QueryResult::Rows { .. } => -1,
+            };
+        }
         // v7.39 (pg_stat knife A) — PG counts every statement outside a
         // transaction block as one implicit xact (commit on success,
         // rollback on error). Statements INSIDE a block are counted

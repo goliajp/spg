@@ -261,6 +261,7 @@ mod e2e_mysql_interval_expr_round422;
 mod e2e_mysql_temporal_precision_round423;
 mod e2e_mysql_column_fsp_round424;
 mod e2e_mysql_fsp_render_round425;
+mod e2e_mysql_row_count_round426;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;

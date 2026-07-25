@@ -9424,7 +9424,16 @@ fn apply_function_dispatch(
             }
         }
         "found_rows" => Ok(Value::BigInt(0)),
-        "row_count" => Ok(Value::BigInt(-1)),
+        // v7.39 (round 426) — MySQL's ROW_COUNT(): how many rows the LAST
+        // statement changed. The statement driver stamps it per session
+        // (see `execute_in_with_cancel`); -1 after a row-returning
+        // statement, which is also why two calls in a row answer -1 the
+        // second time — the first one's SELECT is itself the "last
+        // statement". Without an engine (a bare expression evaluation)
+        // there is no session to read, so the never-ran answer stands.
+        "row_count" => Ok(Value::BigInt(
+            ctx.engine.map_or(-1, |engine| engine.row_count),
+        )),
         // MySQL uuid_short() — 64-bit sequential-ish id off the
         // PRNG (uniqueness within a session, like MySQL's within-
         // server promise).

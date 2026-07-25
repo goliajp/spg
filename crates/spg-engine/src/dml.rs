@@ -1477,6 +1477,9 @@ impl Engine {
         // in-place update_row, byte-for-byte unchanged.
         let inplace = self.mvcc_inplace();
         let v = self.writer_version_for_current_stmt();
+        // v7.39 (round 426) — read the dialect BEFORE the table mut-borrow
+        // opens; the affected-count rule below needs it.
+        let mysql_changed_count = self.backslash_escapes;
         // Stage 3b — apply the original UPDATE.
         let table = self
             .active_catalog_mut()
@@ -1579,7 +1582,20 @@ impl Engine {
         } else {
             Vec::new()
         };
-        let affected = applied_after_before.len();
+        // v7.39 (round 426) — MySQL reports rows CHANGED, not rows matched:
+        // `UPDATE t SET v = v` over three rows answers `Rows matched: 3
+        // Changed: 0`, and ROW_COUNT() reads the 0. PG's UPDATE tag counts
+        // every matched row (each gets a new row version), so this is
+        // dialect-gated. The comparison is against the pre-image the apply
+        // loop already carries — no extra read.
+        let affected = if mysql_changed_count {
+            applied_after_before
+                .iter()
+                .filter(|(_pos, new_row, old_row)| new_row.values != old_row.values)
+                .count()
+        } else {
+            applied_after_before.len()
+        };
         // Apply, then fire AFTER triggers per row. AFTER runs read-
         // only against the freshly-written row; v7.12.4-shape
         // assignment errors with a clear message.
