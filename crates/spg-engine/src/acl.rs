@@ -440,7 +440,7 @@ impl Engine {
         match &g.object {
             GrantObject::Sequences(names) => {
                 for n in names {
-                    if self.active_catalog().sequences().get(n).is_none() {
+                    if self.active_catalog().sequence(n).is_none() {
                         return Err(EngineError::Unsupported(alloc::format!(
                             "relation \"{n}\" does not exist"
                         )));
@@ -1369,7 +1369,7 @@ impl Engine {
         seq: &str,
         roles: &alloc::collections::BTreeSet<String>,
     ) -> u16 {
-        let Some(s) = self.active_catalog().sequences().get(seq) else {
+        let Some(s) = self.active_catalog().sequence(seq) else {
             return 0;
         };
         let owner = s.owner.as_deref().unwrap_or(crate::session::LOGIN_ROLE);
@@ -1391,7 +1391,7 @@ impl Engine {
         if self.is_superuser() {
             return Ok(());
         }
-        if self.active_catalog().sequences().get(seq).is_none() {
+        if self.active_catalog().sequence(seq).is_none() {
             return Ok(());
         }
         let roles = self.users.effective_roles(self.current_role());
@@ -1511,7 +1511,7 @@ impl Engine {
         let grantor = alloc::string::String::from(self.current_role());
         let owner = self
             .active_catalog()
-            .sequences()
+            .sequences_all()
             .get(seq)
             .and_then(|s| s.owner.clone())
             .unwrap_or_else(|| alloc::string::String::from(crate::session::LOGIN_ROLE));

@@ -15032,7 +15032,7 @@ fn apply_function_dispatch(
                 .unwrap_or(&name_arg)
                 .trim_matches('"');
             let pretty = matches!(args.get(1), Some(Value::Bool(true)));
-            match cat.views().get(bare) {
+            match cat.view(bare) {
                 Some(def) => Ok(Value::text(pg_viewdef_render(&def.body, pretty))),
                 None => Ok(Value::Null),
             }
@@ -15512,7 +15512,7 @@ fn apply_function_dispatch(
                 let Some(sname) = regclass_name_of(obj_arg) else {
                     return Ok(Value::Bool(true));
                 };
-                let Some(seq) = cat.sequences().get(&sname) else {
+                let Some(seq) = cat.sequence(&sname) else {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!("relation \"{sname}\" does not exist"),
                     });
@@ -15825,7 +15825,7 @@ fn apply_function_dispatch(
                 return Ok(Value::Int(0));
             };
             let known = cat.get(bare).is_some()
-                || cat.views().contains_key(bare);
+                || cat.has_view(bare);
             Ok(Value::Int(if known { 28 } else { 0 }))
         }
         // pg_column_is_updatable(rel, attnum, include_triggers) —
@@ -15849,7 +15849,7 @@ fn apply_function_dispatch(
                 return Ok(Value::Bool(false));
             };
             let known = cat.get(bare).is_some()
-                || cat.views().contains_key(bare);
+                || cat.has_view(bare);
             Ok(Value::Bool(known))
         }
         // row_security_active(rel) — SPG has no row-level security.

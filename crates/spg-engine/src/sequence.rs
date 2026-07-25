@@ -404,7 +404,7 @@ impl Engine {
     }
 
     pub(crate) fn ensure_implicit_sequence(&mut self, seq_name: &str) {
-        if self.active_catalog().sequences().contains_key(seq_name) {
+        if self.active_catalog().has_sequence(seq_name) {
             return;
         }
         let Some(rest) = seq_name.strip_suffix("_seq") else {

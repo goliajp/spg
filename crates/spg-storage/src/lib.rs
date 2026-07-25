@@ -4540,8 +4540,14 @@ impl Catalog {
     }
 
     /// v7.39 (read01 round 60) — mutable sequence access, for GRANT.
+    /// v7.39 (round 469) — resolves the session's temporary sequence
+    /// first, like its read-only twin. `nextval` and `setval` reach the
+    /// map through here, so a temporary sequence shadowing a permanent one
+    /// advances the temporary one — measured against PG18, where the
+    /// permanent sequence's counter is untouched while the temp exists.
     pub fn sequence_mut(&mut self, name: &str) -> Option<&mut SequenceDef> {
-        self.sequences.get_mut(name)
+        let key = self.sequence_key(name);
+        self.sequences.get_mut(&key)
     }
 
     /// v7.39 (read01 round 61) — mutable function access, for GRANT.
@@ -4549,8 +4555,43 @@ impl Catalog {
         self.functions.get_mut(name)
     }
 
-    pub const fn sequences(&self) -> &BTreeMap<String, SequenceDef> {
+    /// Every catalogued sequence, temp ones included under their mangled
+    /// storage names. Listing code filters these through
+    /// [`Self::listed_name`]; anything resolving ONE name by its logical
+    /// spelling wants [`Self::sequence`] instead.
+    pub const fn sequences_all(&self) -> &BTreeMap<String, SequenceDef> {
         &self.sequences
+    }
+
+    /// v7.39 (round 469) — resolve one sequence by its logical name, the
+    /// session's temporary one winning over a permanent one of the same
+    /// name. The same rule [`Self::resolve_index`] applies to tables.
+    #[must_use]
+    pub fn sequence(&self, name: &str) -> Option<&SequenceDef> {
+        if let Some(mangled) = self.temp_name_for(name)
+            && let Some(def) = self.sequences.get(&mangled)
+        {
+            return Some(def);
+        }
+        self.sequences.get(name)
+    }
+
+    /// Does a sequence of this logical name exist for this session?
+    #[must_use]
+    pub fn has_sequence(&self, name: &str) -> bool {
+        self.sequence(name).is_some()
+    }
+
+    /// The storage key a sequence of this logical name resolves to — the
+    /// session's temp mangling when it has one, else the name itself.
+    #[must_use]
+    pub fn sequence_key(&self, name: &str) -> String {
+        if let Some(mangled) = self.temp_name_for(name)
+            && self.sequences.contains_key(&mangled)
+        {
+            return mangled;
+        }
+        name.into()
     }
 
     /// v7.17.0 — register a new SEQUENCE. Errors if `name`
@@ -4607,7 +4648,8 @@ impl Catalog {
     /// `increment`, returns the new value, sets `is_called`.
     /// Returns an error on CYCLE-less overflow.
     pub fn sequence_next_value(&mut self, name: &str) -> Result<i64, StorageError> {
-        let Some(seq) = self.sequences.get_mut(name) else {
+        let key = self.sequence_key(name);
+        let Some(seq) = self.sequences.get_mut(&key) else {
             return Err(StorageError::TableNotFound { name: name.into() });
         };
         // PG semantics: when !is_called (fresh sequence or
@@ -4682,7 +4724,8 @@ impl Catalog {
         value: i64,
         is_called: bool,
     ) -> Result<i64, StorageError> {
-        let Some(seq) = self.sequences.get_mut(name) else {
+        let key = self.sequence_key(name);
+        let Some(seq) = self.sequences.get_mut(&key) else {
             return Err(StorageError::TableNotFound { name: name.into() });
         };
         // v7.39 (round 244) — PG refuses a value outside the sequence's
@@ -4699,9 +4742,42 @@ impl Catalog {
         Ok(value)
     }
 
-    /// v7.17.0 Phase 1.2 — read-only handle to catalogued views.
-    pub const fn views(&self) -> &BTreeMap<String, ViewDef> {
+    /// v7.17.0 Phase 1.2 — read-only handle to catalogued views. Temp ones
+    /// are in here under their mangled storage names; listing code filters
+    /// through [`Self::listed_name`], and anything resolving ONE name by
+    /// its logical spelling wants [`Self::view`].
+    pub const fn views_all(&self) -> &BTreeMap<String, ViewDef> {
         &self.views
+    }
+
+    /// v7.39 (round 469) — resolve one view by its logical name, the
+    /// session's temporary one winning over a permanent one of the same
+    /// name.
+    #[must_use]
+    pub fn view(&self, name: &str) -> Option<&ViewDef> {
+        if let Some(mangled) = self.temp_name_for(name)
+            && let Some(def) = self.views.get(&mangled)
+        {
+            return Some(def);
+        }
+        self.views.get(name)
+    }
+
+    /// Does a view of this logical name exist for this session?
+    #[must_use]
+    pub fn has_view(&self, name: &str) -> bool {
+        self.view(name).is_some()
+    }
+
+    /// The storage key a view of this logical name resolves to.
+    #[must_use]
+    pub fn view_key(&self, name: &str) -> String {
+        if let Some(mangled) = self.temp_name_for(name)
+            && self.views.contains_key(&mangled)
+        {
+            return mangled;
+        }
+        name.into()
     }
 
     /// v7.17.0 Phase 1.2 — install a VIEW. `or_replace=true`

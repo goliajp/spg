@@ -649,6 +649,11 @@ pub(crate) struct SessionBag {
     /// set is what says "resolve `t` to my temp one" and what `end_session`
     /// walks to drop them.
     pub(crate) temp_tables: alloc::collections::BTreeSet<String>,
+    /// v7.39 (round 469) — the session's TEMPORARY sequences and views, by
+    /// logical name. Separate sets because dropping one at session end has
+    /// to name the catalog map it lives in.
+    pub(crate) temp_sequences: alloc::collections::BTreeSet<String>,
+    pub(crate) temp_views: alloc::collections::BTreeSet<String>,
 }
 
 /// v7.39 (round 306) — one open large-object descriptor.
@@ -1003,6 +1008,8 @@ pub struct Engine {
     /// v7.39 (round 436) — the logical names of this session's TEMPORARY
     /// tables. Swapped with [`SessionBag`]; see `session_temp_name`.
     pub(crate) temp_tables: BTreeSet<String>,
+    pub(crate) temp_sequences: BTreeSet<String>,
+    pub(crate) temp_views: BTreeSet<String>,
     /// v7.39 (round 222) — channels this session LISTENs on. Engine-wide
     /// (the same process-level session-state architecture wall as
     /// `session_params`). Never serialized.
@@ -1294,6 +1301,8 @@ impl Engine {
             row_count: 0,
             user_vars: BTreeMap::new(),
             temp_tables: BTreeSet::new(),
+            temp_sequences: BTreeSet::new(),
+            temp_views: BTreeSet::new(),
             listen_channels: BTreeSet::new(),
             tx_pending_notifies: Vec::new(),
             delivered_notifies: Vec::new(),
@@ -1678,6 +1687,8 @@ impl Engine {
             row_count: 0,
             user_vars: BTreeMap::new(),
             temp_tables: BTreeSet::new(),
+            temp_sequences: BTreeSet::new(),
+            temp_views: BTreeSet::new(),
             listen_channels: BTreeSet::new(),
             tx_pending_notifies: Vec::new(),
             delivered_notifies: Vec::new(),
@@ -1796,6 +1807,8 @@ impl Engine {
             row_count: 0,
             user_vars: BTreeMap::new(),
             temp_tables: BTreeSet::new(),
+            temp_sequences: BTreeSet::new(),
+            temp_views: BTreeSet::new(),
                     listen_channels: BTreeSet::new(),
                     tx_pending_notifies: Vec::new(),
                     delivered_notifies: Vec::new(),
@@ -1874,6 +1887,8 @@ impl Engine {
             row_count: self.row_count,
             user_vars: core::mem::take(&mut self.user_vars),
             temp_tables: core::mem::take(&mut self.temp_tables),
+            temp_sequences: core::mem::take(&mut self.temp_sequences),
+            temp_views: core::mem::take(&mut self.temp_views),
         };
         self.sessions.insert(self.current_session, outgoing);
         let incoming = self.sessions.remove(&id).unwrap_or_default();
@@ -1888,6 +1903,8 @@ impl Engine {
         self.row_count = incoming.row_count;
         self.user_vars = incoming.user_vars;
         self.temp_tables = incoming.temp_tables;
+        self.temp_sequences = incoming.temp_sequences;
+        self.temp_views = incoming.temp_views;
         self.current_session = id;
         // The incoming session's temp namespace must be live before its very
         // first statement resolves a name.
@@ -1913,7 +1930,10 @@ impl Engine {
     /// Both the committed catalog and any open transaction's shadow are set:
     /// a temp table created inside a transaction must resolve there too.
     pub(crate) fn refresh_temp_prefix(&mut self) {
-        let prefix = if self.temp_tables.is_empty() {
+        let prefix = if self.temp_tables.is_empty()
+            && self.temp_sequences.is_empty()
+            && self.temp_views.is_empty()
+        {
             None
         } else {
             Some(Self::temp_prefix_for(self.current_session))
@@ -1939,14 +1959,42 @@ impl Engine {
                 .map(|b| b.temp_tables.iter().cloned().collect())
                 .unwrap_or_default()
         };
-        if !owned.is_empty() {
+        // v7.39 (round 469) — the same for TEMPORARY sequences and views,
+        // which PG also drops at backend exit.
+        let owned_seqs: Vec<String> = if id == self.current_session {
+            self.temp_sequences.iter().cloned().collect()
+        } else {
+            self.sessions
+                .get(&id)
+                .map(|b| b.temp_sequences.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+        let owned_views: Vec<String> = if id == self.current_session {
+            self.temp_views.iter().cloned().collect()
+        } else {
+            self.sessions
+                .get(&id)
+                .map(|b| b.temp_views.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+        if !owned.is_empty() || !owned_seqs.is_empty() || !owned_views.is_empty() {
             let prefix = Self::temp_prefix_for(id);
             for logical in owned {
                 let mangled = alloc::format!("{prefix}{logical}");
                 self.catalog.drop_table(&mangled);
             }
+            for logical in owned_seqs {
+                let mangled = alloc::format!("{prefix}{logical}");
+                self.catalog.drop_sequence(&mangled);
+            }
+            for logical in owned_views {
+                let mangled = alloc::format!("{prefix}{logical}");
+                self.catalog.drop_view(&mangled);
+            }
             if id == self.current_session {
                 self.temp_tables.clear();
+                self.temp_sequences.clear();
+                self.temp_views.clear();
                 self.refresh_temp_prefix();
             }
         }
