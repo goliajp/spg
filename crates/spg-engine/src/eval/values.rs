@@ -202,6 +202,42 @@ pub fn gen_random_uuid_bytes() -> [u8; 16] {
     out
 }
 
+/// v7.39 (round 425) — render a value the way a MySQL client expects a
+/// column with a DECLARED fractional-seconds precision to look: EXACTLY
+/// `fsp` fractional digits, zero-padded (`DATETIME(3)` shows `.250`, and
+/// `.000` for a whole second), or none at all at precision 0. PG's renderer
+/// trims trailing zeros, which is right for PG and wrong for MySQL — the
+/// stored instant is identical either way.
+///
+/// `fsp` is `ColumnSchema.mysql_fsp`, which is `None` for every PG column
+/// and for any expression that reads no MySQL temporal column; those fall
+/// straight through to [`value_to_text`].
+#[must_use]
+pub fn value_to_text_with_fsp(v: &Value, fsp: Option<u8>) -> String {
+    let Some(fsp) = fsp else {
+        return value_to_text(v);
+    };
+    let (whole, micros) = match v {
+        Value::Timestamp(us) => (
+            crate::eval::format_timestamp(us.div_euclid(1_000_000) * 1_000_000),
+            us.rem_euclid(1_000_000),
+        ),
+        Value::Time(us) => (
+            crate::eval::format_time(us.div_euclid(1_000_000) * 1_000_000),
+            us.rem_euclid(1_000_000),
+        ),
+        other => return value_to_text(other),
+    };
+    if fsp == 0 {
+        return whole;
+    }
+    let digits = usize::from(fsp.min(6));
+    // `micros` is already truncated to the column's precision on write, so
+    // this only ever pads — it never drops a digit the caller could see.
+    let frac = format!("{micros:06}");
+    format!("{whole}.{}", &frac[..digits])
+}
+
 pub fn value_to_text(v: &Value) -> String {
     value_to_text_styled(v, &crate::eval::RenderStyle::default())
 }

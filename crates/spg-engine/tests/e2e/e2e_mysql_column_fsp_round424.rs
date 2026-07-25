@@ -107,16 +107,25 @@ fn precision_survives_and_keeps_applying() {
     );
 }
 
-/// BASELINE for the follow-up round: the stored instant is right, but a
-/// value with fewer significant digits than the declared precision renders
-/// trimmed where MariaDB pads (`.250` / `.000` at DATETIME(3)).
+/// Round 425 closed the render half: the RESULT schema now carries the
+/// precision and the wire encoder pads to it. `value_to_text` (the
+/// dialect-blind renderer this file uses) still trims, which is correct for
+/// it — see `e2e_mysql_fsp_render_round425` for the padded contract.
 #[test]
-fn render_padding_is_not_yet_modelled() {
+fn stored_instant_is_exact_regardless_of_renderer() {
     let mut e = mysql();
     e.execute("CREATE TABLE p(d3 DATETIME(3))").unwrap();
     e.execute("INSERT INTO p VALUES('2020-01-01 00:00:00.25')").unwrap();
-    // MariaDB: '2020-01-01 00:00:00.250'
     assert_eq!(one(&mut e, "SELECT d3 FROM p"), "2020-01-01 00:00:00.25");
+    // The same value through the fsp-aware renderer is MariaDB's text.
+    assert_eq!(
+        match e.execute("SELECT d3 FROM p").unwrap() {
+            QueryResult::Rows { columns, rows } =>
+                spg_engine::eval::value_to_text_with_fsp(&rows[0].values[0], columns[0].mysql_fsp),
+            other => panic!("{other:?}"),
+        },
+        "2020-01-01 00:00:00.250"
+    );
 }
 
 /// A PostgreSQL session's temporal columns keep full microseconds — the
