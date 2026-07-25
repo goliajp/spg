@@ -299,7 +299,19 @@ pub fn cast_value_in(
         // `literal_expr_to_value_in`, and stored 10:00 for
         // `'2020-01-01 10:00:00+02'::timestamptz` where PG stores
         // 08:00 (round 310).
-        CastTarget::Timestamp => cast_to_timestamp(v),
+        // v7.39 (round 423) — `CAST(x AS DATETIME)` / `AS TIMESTAMP` reach
+        // here as the dedicated variant rather than `Named`, so the MySQL
+        // "bare temporal type has fractional precision 0" rule has to be
+        // applied here too: MariaDB drops the fraction, PG keeps every
+        // microsecond.
+        CastTarget::Timestamp => {
+            let out = cast_to_timestamp(v)?;
+            Ok(if mysql {
+                round_temporal_to_precision(out, 0, true)
+            } else {
+                out
+            })
+        }
         CastTarget::Timestamptz => cast_to_timestamptz(v),
         // v7.9.25 — `expr::INTERVAL`. Currently only TEXT → Interval
         // is supported (the mailrs idiom: `$1::INTERVAL` where the
@@ -809,7 +821,12 @@ pub fn cast_value_in(
             {
                 return cast_mysql_integer(v, name.eq_ignore_ascii_case("unsigned"));
             }
-            let temporal_prec = temporal_typmod(&name);
+            // v7.39 (round 423) — a bare MySQL temporal type carries
+            // fractional precision 0, so `CAST(x AS DATETIME)` drops the
+            // fraction (measured on MariaDB 11). PG's `::timestamp` keeps
+            // every microsecond, so the default is dialect-gated.
+            let temporal_prec = temporal_typmod(&name)
+                .or_else(|| (mysql && is_bare_temporal_type(&name)).then_some(0));
             let resolve_name: alloc::borrow::Cow<'_, str> = if temporal_prec.is_some() {
                 alloc::borrow::Cow::Owned(
                     name.split('(').next().unwrap_or(&name).trim().to_string(),
@@ -889,7 +906,7 @@ pub fn cast_value_in(
                     },
                 })?;
             Ok(match temporal_prec {
-                Some(prec) => round_temporal_to_precision(coerced, prec),
+                Some(prec) => round_temporal_to_precision(coerced, prec, mysql),
                 None => coerced,
             })
         }
@@ -973,24 +990,43 @@ fn temporal_typmod(name: &str) -> Option<u8> {
 
 /// Round a TIME / TIMESTAMP value's microsecond field to `prec` fractional-
 /// second digits (`prec` 0..=6), half-away-from-zero as PG's AdjustTimestamp.
-fn round_temporal_to_precision(v: Value<'static>, prec: u8) -> Value<'static> {
+/// v7.39 (round 423) — `truncate` selects MySQL's reduction mode. PG's
+/// AdjustTimestamp ROUNDS half-away-from-zero (`::timestamp(1)` of `.256` is
+/// `.3`); MariaDB TRUNCATES toward zero (`.2`, measured). Same function, one
+/// flag, because everything else about the reduction is identical.
+fn round_temporal_to_precision(v: Value<'static>, prec: u8, truncate: bool) -> Value<'static> {
     if prec >= 6 {
         return v;
     }
     let scale = 10i64.pow(u32::from(6 - prec));
-    let round = |micros: i64| -> i64 {
-        let half = scale / 2;
-        if micros >= 0 {
-            ((micros + half) / scale) * scale
+    let reduce = |micros: i64| -> i64 {
+        if truncate {
+            // Toward zero, so a negative time-of-day loses the same digits.
+            (micros / scale) * scale
         } else {
-            -(((-micros + half) / scale) * scale)
+            let half = scale / 2;
+            if micros >= 0 {
+                ((micros + half) / scale) * scale
+            } else {
+                -(((-micros + half) / scale) * scale)
+            }
         }
     };
     match v {
-        Value::Timestamp(m) => Value::Timestamp(round(m)),
-        Value::Time(m) => Value::Time(round(m)),
+        Value::Timestamp(m) => Value::Timestamp(reduce(m)),
+        Value::Time(m) => Value::Time(reduce(m)),
         other => other,
     }
+}
+
+/// v7.39 (round 423) — is `name` a bare temporal type (no `(N)` modifier)?
+/// MySQL gives those fractional precision ZERO — `CAST(x AS DATETIME)` drops
+/// the fraction entirely — where PG's `::timestamp` keeps full microseconds.
+fn is_bare_temporal_type(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "time" | "timestamp" | "datetime"
+    )
 }
 
 fn cast_to_int_array(v: Value) -> Result<Value, EvalError> {
