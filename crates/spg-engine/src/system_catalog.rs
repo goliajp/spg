@@ -332,7 +332,7 @@ pub(crate) fn synth_information_schema_columns(
         schema.push(ColumnSchema::new("column_type", DataType::Text, false));
     }
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for (i, col) in t.schema().columns.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
@@ -608,7 +608,7 @@ pub(crate) fn synth_information_schema_tables(
         ColumnSchema::new("commit_action", DataType::Text, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         // v7.39 (round 267) — a materialized view is backed by a real
         // table in SPG, but PG omits materialized views from this view
         // entirely (they are not in the SQL standard), and reporting one
@@ -889,7 +889,7 @@ pub(crate) fn synth_pg_inherits(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
     let mut by_name: alloc::collections::BTreeMap<String, i64> =
         alloc::collections::BTreeMap::new();
     let mut oid: i64 = 16384;
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         by_name.insert(tname.clone(), oid);
         oid = oid.saturating_add(1);
     }
@@ -898,7 +898,7 @@ pub(crate) fn synth_pg_inherits(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
     // index — matches PG's pg_inherits.inhseqno semantics.
     let mut per_parent_seq: alloc::collections::BTreeMap<i64, i32> =
         alloc::collections::BTreeMap::new();
-    for cname in cat.table_names() {
+    for cname in cat.visible_table_names() {
         let Some(c) = cat.get(&cname) else { continue };
         let parent_name = match &c.schema().partition_role {
             Some(PartitionRole::Range { parent_name, .. })
@@ -982,7 +982,7 @@ pub(crate) fn synth_pg_attrdef(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut table_oid: i64 = 16384;
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else {
             table_oid = table_oid.saturating_add(1);
             continue;
@@ -1030,7 +1030,7 @@ pub(crate) fn synth_pg_policy(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut table_oid: i64 = 16384;
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else {
             table_oid = table_oid.saturating_add(1);
             continue;
@@ -1077,7 +1077,7 @@ pub(crate) fn synth_pg_policies(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
         ColumnSchema::new("with_check", DataType::Text, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for p in &t.schema().policies {
             let roles = if p.roles.is_empty() {
@@ -1232,7 +1232,7 @@ pub(crate) fn synth_pg_statistic(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut starelid: i64 = 16384;
-    for name in cat.table_names() {
+    for name in cat.visible_table_names() {
         if crate::is_internal_table_name(&name) {
             continue;
         }
@@ -1753,7 +1753,7 @@ pub(crate) fn synth_pg_stat_user_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, V
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut relid: i64 = 16384;
     let mut indexrelid: i64 = 100_000;
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         if crate::is_internal_table_name(&tname) {
             continue;
         }
@@ -1823,7 +1823,7 @@ pub(crate) fn synth_pg_stat_user_tables(
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut relid: i64 = 16384; // PG user-relation OID floor
-    for name in cat.table_names() {
+    for name in cat.visible_table_names() {
         if crate::is_internal_table_name(&name) {
             continue;
         }
@@ -1967,7 +1967,7 @@ pub(crate) fn synth_pg_stat_database(
     {
         use core::sync::atomic::Ordering;
         let cat = eng.active_catalog();
-        for name in cat.table_names() {
+        for name in cat.visible_table_names() {
             if let Some(t) = cat.get(&name) {
                 let sc = t.scan_stats();
                 tup_returned = tup_returned
@@ -2342,7 +2342,7 @@ pub(crate) fn synth_information_schema_table_constraints(
         ColumnSchema::new("enforced", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         // Uniqueness constraints — both PK and UNIQUE forms.
         for uc in t.schema().uniqueness_constraints.iter() {
@@ -2506,8 +2506,14 @@ pub(crate) fn function_oid_by_signature(cat: &Catalog, bare: &str, arg_types: &s
 /// Resolve a relation name to the oid every catalog synth uses for it.
 /// The iteration order here IS the assignment order the synths replay.
 pub(crate) fn relation_oid(cat: &Catalog, bare: &str) -> Option<i64> {
+    // v7.39 (round 437) — the RAW list, because that is the order the synths
+    // assign oids in (a foreign session's temporary table still consumes
+    // its slot, it is only left out of the OUTPUT). The name is matched
+    // through the session's temp namespace, so `tmp` finds the caller's own
+    // temporary table at its real catalog position.
+    let stored = cat.temp_name_for(bare);
     for (pos, tname) in cat.table_names().iter().enumerate() {
-        if tname == bare {
+        if tname == bare || Some(tname) == stored.as_ref() {
             return Some(OID_TABLE_BASE + pos as i64);
         }
     }
@@ -2517,7 +2523,7 @@ pub(crate) fn relation_oid(cat: &Catalog, bare: &str) -> Option<i64> {
         }
     }
     let mut idx_oid = OID_INDEX_BASE;
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for idx in t.indices() {
             idx_oid += 1;
@@ -2582,8 +2588,15 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     // PG starts user-relation OIDs above 16384.
-    let mut oid: i64 = OID_TABLE_BASE;
-    for tname in cat.table_names() {
+    // v7.39 (round 437) — walk the RAW list so an OID stays tied to a
+    // table's catalog position, which is exactly what `relation_oid`
+    // replays. Another session's temporary table still consumes its oid;
+    // it is only skipped from the OUTPUT.
+    for (pos, stored) in cat.table_names().into_iter().enumerate() {
+        let this_oid = OID_TABLE_BASE + pos as i64;
+        let Some(tname) = cat.listed_name(&stored).map(alloc::string::String::from) else {
+            continue;
+        };
         let Some(t) = cat.get(&tname) else { continue };
         let schema_ref = t.schema();
         // v7.39 (round 338, V64) — a MATERIALIZED VIEW is backed by a real
@@ -2618,14 +2631,14 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             .any(|tr| tr.table.eq_ignore_ascii_case(&tname));
         let has_checks = schema_ref.checks.len();
         rows.push(Row::new(alloc::vec![
-            Value::BigInt(oid),
+            Value::BigInt(this_oid),
             Value::text(tname.clone()),
             Value::BigInt(2200),  // public namespace
             Value::BigInt(0),     // reltype (composite type OID; SPG no composite)
             Value::BigInt(0),     // reloftype
             Value::BigInt(10),    // relowner — PG postgres superuser OID
             Value::BigInt(0),     // relam (table AM; 0 == default heap)
-            Value::BigInt(oid),   // relfilenode shares oid in SPG (no separate fork)
+            Value::BigInt(this_oid),   // relfilenode shares oid in SPG (no separate fork)
             Value::BigInt(0),     // reltablespace (0 == default)
             Value::Int(relpages), // hot_bytes in 8 KiB PG-page units
             Value::Float(reltuples),
@@ -2659,7 +2672,6 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             // has ever run, then the aclitem array PG prints.
             crate::acl::render_relacl(schema_ref).map_or(Value::Null, Value::text),
         ]));
-        oid = oid.saturating_add(1);
     }
     // v7.39 (round 338, V64) — a row PER VIEW (relkind 'v'). pg_class had
     // NO view rows at all: `SELECT … FROM pg_class WHERE relname = '<view>'`
@@ -2714,7 +2726,7 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     // 100_000, tables in table_names() order, indices in catalog order), so
     // indexrelid and pg_class.oid agree.
     let mut idx_oid: i64 = OID_INDEX_BASE;
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for idx in t.indices() {
             idx_oid += 1;
@@ -2827,7 +2839,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut attrelid: i64 = 16384;
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else {
             attrelid = attrelid.saturating_add(1);
             continue;
@@ -3652,7 +3664,7 @@ pub(crate) fn synth_info_constraint_column_usage(
             Value::text(conname),
         ]));
     };
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         let cols = &t.schema().columns;
         let col_name_at = |pos: usize| -> String {
@@ -3754,7 +3766,7 @@ pub(crate) fn synth_info_check_constraints(
         ColumnSchema::new("check_clause", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         // Same PG-canonical `{table}_{col}_check` naming pg_constraint
         // and pg_get_constraintdef use, so the three agree.
@@ -3839,7 +3851,7 @@ pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, 
         ColumnSchema::new("position_in_unique_constraint", DataType::Int, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         let cols = &t.schema().columns;
         let col_name_at = |pos: usize| -> String {
@@ -3953,7 +3965,7 @@ pub(crate) fn synth_info_referential_constraints(
         }
     }
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for fk in t.schema().foreign_keys.iter() {
             let conname = fk
@@ -4019,7 +4031,7 @@ pub(crate) fn synth_info_statistics(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Ro
         ColumnSchema::new("index_type", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for idx in t.indices() {
             let col = t
@@ -4136,7 +4148,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     // Build the same name → oid map pg_class uses (start at 16384).
-    let names = cat.table_names();
+    let names = cat.visible_table_names();
     let mut by_table: alloc::collections::BTreeMap<String, i64> =
         alloc::collections::BTreeMap::new();
     let mut next_oid: i64 = 16384;
@@ -4852,7 +4864,7 @@ pub(crate) fn synth_pg_rewrite(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
     ];
     // `ev_class` has to be the SAME oid pg_class / pg_constraint hand out
     // for that table, or a join against them silently returns nothing.
-    let mut names: Vec<String> = cat.table_names();
+    let mut names: Vec<String> = cat.visible_table_names();
     names.sort();
     let by_table: alloc::collections::BTreeMap<String, i64> = names
         .iter()
@@ -5330,7 +5342,7 @@ pub(crate) fn synth_pg_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
         ColumnSchema::new("rowsecurity", DataType::Bool, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         let has_indexes = !t.indices().is_empty() || !t.schema().uniqueness_constraints.is_empty();
         rows.push(Row::new(alloc::vec![
@@ -5372,7 +5384,7 @@ pub(crate) fn synth_info_role_table_grants(
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let _ = grantee;
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         let sc = t.schema();
         let owner = sc
@@ -5459,7 +5471,7 @@ pub(crate) fn synth_info_column_privileges(
         ColumnSchema::new("is_grantable", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for col in &t.schema().columns {
             for a in &col.acl {
@@ -5641,7 +5653,7 @@ pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
         ColumnSchema::new("indexdef", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.table_names() {
+    for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
         for idx in t.indices() {
             let indexdef = render_indexdef(t, idx, &tname);
@@ -5698,7 +5710,7 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
     // Build a name → user-relation OID map so indrelid matches
     // pg_class.oid (synth_pg_class starts at 16384). Without
     // this, joins between pg_index and pg_class fail.
-    let names = cat.table_names();
+    let names = cat.visible_table_names();
     let mut table_oid: i64 = 16384;
     let mut by_table: alloc::collections::BTreeMap<String, i64> =
         alloc::collections::BTreeMap::new();
