@@ -971,6 +971,9 @@ fn mysql_code_for_sqlstate(pg_state: &str) -> (u16, &'static str) {
         "42P07" => (1050, "42S01"),
         "42701" => (1060, "42S21"),
         "22012" => (1365, "22012"),
+        // v7.39 (round 467) — MariaDB's 1690 for an arithmetic result
+        // outside BIGINT UNSIGNED. Measured: `ERROR 1690 (22003)`.
+        "22003" => (1690, "22003"),
         _ => (1064, "42000"),
     }
 }

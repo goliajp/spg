@@ -50,6 +50,12 @@ fn main() {
             .unwrap_or(0)
     }
     let mut e = Engine::new().with_clock(wall_clock_micros);
+    // v7.39 (round 467) — `SPG_PROBE_MYSQL=1` runs the probe in the MySQL
+    // dialect, the same switch mysqlwire flips per connection. Without it a
+    // MySQL differential probes the PG path and proves nothing.
+    if std::env::var("SPG_PROBE_MYSQL").is_ok_and(|v| v == "1") {
+        e.set_backslash_escapes(true);
+    }
     // v7.39 (round 221) — named-timezone lookups, same wiring as
     // spg-embedded / spg-server, so tz differentials probe the real path.
     e.set_tz_fns(
