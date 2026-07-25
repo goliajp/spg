@@ -9464,6 +9464,22 @@ impl Parser {
             }
             Token::Ident(s) if s.eq_ignore_ascii_case("add") => {
                 self.advance();
+                // v7.39 (round 431) — MySQL's `ALTER TABLE t ADD [UNIQUE]
+                // {INDEX|KEY} [name] (cols)`, which every ORM migration
+                // emits. The same grammar CREATE TABLE already accepts
+                // inline (`KEY idx (a)`, prefix lengths and all), so it goes
+                // through the SAME parser — an ALTER-only copy would be a
+                // second place for the two to drift.
+                if self.peek_mysql_inline_key_start() {
+                    return Ok(match self.parse_mysql_inline_key()? {
+                        Some(c) => {
+                            alloc::vec![crate::ast::AlterTableTarget::AddTableConstraint(c)]
+                        }
+                        // FULLTEXT / SPATIAL parse and are accepted as a
+                        // no-op here exactly as they are inline.
+                        None => Vec::new(),
+                    });
+                }
                 // v7.14.0 — ADD CONSTRAINT <name> { FOREIGN KEY |
                 // PRIMARY KEY | UNIQUE | CHECK }. pg_dump emits
                 // PRIMARY KEY this way; mysqldump emits both.
@@ -9659,6 +9675,25 @@ impl Parser {
                         self.advance();
                         "column"
                     }
+                    // v7.39 (round 431) — MySQL `DROP {INDEX|KEY} name`.
+                    // `INDEX` lexes as the reserved Token::Index, so it is
+                    // unambiguous. `KEY` is a plain ident, and PG allows a
+                    // column literally named "key", so only read it as the
+                    // keyword when a name follows it.
+                    Token::Index => {
+                        self.advance();
+                        "index"
+                    }
+                    Token::Ident(s)
+                        if s.eq_ignore_ascii_case("key")
+                            && matches!(
+                                self.tokens.get(self.pos + 1),
+                                Some(Token::Ident(_) | Token::QuotedIdent(_))
+                            ) =>
+                    {
+                        self.advance();
+                        "index"
+                    }
                     // PG-canonical bare `DROP <col>` without COLUMN
                     // keyword is also valid; treat any other ident
                     // as the column name.
@@ -9691,7 +9726,12 @@ impl Parser {
                     }
                     self.advance();
                 }
-                if subject == "constraint" {
+                if subject == "index" {
+                    Ok(alloc::vec![crate::ast::AlterTableTarget::DropIndex {
+                        name,
+                        if_exists,
+                    }])
+                } else if subject == "constraint" {
                     Ok(alloc::vec![crate::ast::AlterTableTarget::DropForeignKey {
                         name,
                         if_exists,

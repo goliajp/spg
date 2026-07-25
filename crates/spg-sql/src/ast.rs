@@ -1048,6 +1048,10 @@ pub enum AlterTableTarget {
     /// `if_exists` (v7.13.2 mailrs round-6 S7) makes the drop a
     /// no-op when no FK with that name exists; otherwise raises.
     DropForeignKey { name: String, if_exists: bool },
+    /// v7.39 (round 431) — MySQL's `ALTER TABLE t DROP {INDEX|KEY} name`,
+    /// the counterpart of `ADD INDEX`. Lowers to the same catalog action
+    /// as the standalone `DROP INDEX` statement.
+    DropIndex { name: String, if_exists: bool },
     /// v7.13.0 — `ALTER TABLE t ADD [COLUMN] [IF NOT EXISTS] <col>
     /// <type> [DEFAULT <expr>] [NOT NULL]`. mailrs round-5 G1
     /// (20 migrate-*.sql hits). Engine appends the column to the
@@ -5984,6 +5988,13 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
         AlterTableTarget::AddForeignKey(fk) => write!(f, "ADD {fk}"),
         AlterTableTarget::DropForeignKey { name, if_exists } => {
             f.write_str("DROP CONSTRAINT ")?;
+            if *if_exists {
+                f.write_str("IF EXISTS ")?;
+            }
+            write!(f, "{}", quote_ident(name))
+        }
+        AlterTableTarget::DropIndex { name, if_exists } => {
+            f.write_str("DROP INDEX ")?;
             if *if_exists {
                 f.write_str("IF EXISTS ")?;
             }

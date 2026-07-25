@@ -111,6 +111,12 @@ impl Engine {
             T::DropForeignKey { name, if_exists } => {
                 self.alter_drop_foreign_key(tbl, name, if_exists)
             }
+            // v7.39 (round 431) — `ALTER TABLE t DROP {INDEX|KEY} name`
+            // shares the standalone DROP INDEX path, so the two spellings
+            // cannot diverge on the not-found / IF EXISTS behaviour.
+            T::DropIndex { name, if_exists } => {
+                self.exec_drop_index(name, if_exists).map(|_| ())
+            }
             T::AddColumn {
                 column,
                 if_not_exists,
@@ -1220,17 +1226,35 @@ impl Engine {
                 // post-CREATE-TABLE shape; build a BTree
                 // on the leading column using the
                 // user-supplied or synthesised name.
+                //
+                // v7.39 (round 431) — the outcome now matches a measured
+                // MariaDB 11 run in three ways it did not before:
+                //   * a second index on an already-indexed column is
+                //     BUILT, not skipped. Skipping it made the following
+                //     `DROP INDEX <that name>` fail with "does not
+                //     exist" — the name was never registered.
+                //   * a name collision raises 42710 (MariaDB: 1061
+                //     "Duplicate key name") instead of being swallowed.
+                //   * an unknown column raises 42703 (MariaDB: 1072 "Key
+                //     column doesn't exist in table") instead of being
+                //     swallowed into a no-op.
                 let leading = &columns[0];
-                let already_idx = table.indices().iter().any(|idx| {
-                    matches!(idx.kind, spg_storage::IndexKind::BTree(_))
-                        && table.schema().columns[idx.column_position].name == *leading
-                });
-                if !already_idx {
-                    let idx_name = name
-                        .clone()
-                        .unwrap_or_else(|| alloc::format!("{}_{leading}_idx", tbl));
-                    let _ = table.add_index(idx_name, leading);
-                }
+                let idx_name = match name {
+                    Some(n) => n.clone(),
+                    // Unnamed `ADD INDEX (col)` takes the column's own
+                    // name, with `_2`, `_3`, … on collision — measured
+                    // on MariaDB 11.
+                    None => {
+                        let mut candidate = leading.clone();
+                        let mut n = 1;
+                        while table.indices().iter().any(|idx| idx.name == candidate) {
+                            n += 1;
+                            candidate = alloc::format!("{leading}_{n}");
+                        }
+                        candidate
+                    }
+                };
+                table.add_index(idx_name, leading).map_err(EngineError::Storage)?;
             }
             spg_sql::ast::TableConstraint::FulltextIndex { name, columns } => {
                 // v7.17.0 Phase 2.2 — ALTER TABLE ADD
