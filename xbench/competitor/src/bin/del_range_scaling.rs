@@ -8,6 +8,7 @@
 //! the cost scales with the TABLE, not with the 1000 rows removed. Embedded,
 //! so the wire is out of it.
 use spg_engine::Engine;
+use std::fmt::Write as _;
 use std::time::Instant;
 
 fn batch_sql(base: i64, rows: i64) -> String {
@@ -18,7 +19,7 @@ fn batch_sql(base: i64, rows: i64) -> String {
         if k > 0 {
             s.push(',');
         }
-        s.push_str(&format!("({id},{},{})", id % 100, id * 7 % 100_000));
+        let _ = write!(s, "({id},{},{})", id % 100, id * 7 % 100_000);
     }
     s
 }
@@ -28,7 +29,7 @@ fn median(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
-fn run(total: i64) -> (f64, f64, f64, f64, f64) {
+fn run(total: i64) -> (f64, f64, f64, f64, f64, f64) {
     let mut e = Engine::new();
     e.execute("CREATE TABLE wb(id INT PRIMARY KEY, g INT, v INT)")
         .unwrap();
@@ -62,11 +63,16 @@ fn run(total: i64) -> (f64, f64, f64, f64, f64) {
         seg + 700,
         seg + 701
     );
+    // Equality UPDATE: same one row, same mutation, no range predicate.
+    // If this is flat the cost tracks the WHERE shape; if it scales, the
+    // flat one is equality-DELETE's own fast path.
+    let upd_eq = format!("UPDATE wb SET v = v WHERE id = {}", seg + 700);
     let mut rv = Vec::new();
     let mut ev = Vec::new();
     let mut r1v = Vec::new();
     let mut sv = Vec::new();
     let mut uv = Vec::new();
+    let mut uev = Vec::new();
     for _ in 0..21 {
         let t = Instant::now();
         e.execute(&del).unwrap();
@@ -86,13 +92,25 @@ fn run(total: i64) -> (f64, f64, f64, f64, f64) {
         let t = Instant::now();
         e.execute(&upd).unwrap();
         uv.push(t.elapsed().as_secs_f64() * 1000.0);
+        let t = Instant::now();
+        e.execute(&upd_eq).unwrap();
+        uev.push(t.elapsed().as_secs_f64() * 1000.0);
     }
-    (median(rv), median(ev), median(r1v), median(sv), median(uv))
+    (
+        median(rv),
+        median(ev),
+        median(r1v),
+        median(sv),
+        median(uv),
+        median(uev),
+    )
 }
 
-fn idx_scans(e: &mut Engine) -> i64 {
+fn stat(e: &mut Engine, col: &str) -> i64 {
     match e
-        .execute("SELECT idx_scan FROM pg_stat_user_tables WHERE relname='wb'")
+        .execute(&format!(
+            "SELECT {col} FROM pg_stat_user_tables WHERE relname='wb'"
+        ))
         .unwrap()
     {
         spg_engine::QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0])
@@ -130,13 +148,34 @@ fn seek_fired(total: i64) {
             "DELETE equality",
             format!("DELETE FROM wb WHERE id = {}", seg + 5),
         ),
+        // Control: `g` carries no index, so this one MUST scan. If
+        // seq_tup_read stays 0 here, the counter is not wired for the
+        // mutation path and "no scan" cannot be read off it.
+        (
+            "DELETE unindexed",
+            "DELETE FROM wb WHERE g = 999999".to_string(),
+        ),
     ];
-    println!("# did the index seek fire? (idx_scan delta on a {total}-row table)");
+    println!("# seek behaviour on a {total}-row table (each predicate matches ONE row)");
+    println!("  statement          idx_scan  rows fetched by the seek  rows read");
     for (label, sql) in cases {
-        let before = idx_scans(&mut e);
+        let (s0, f0, r0) = (
+            stat(&mut e, "idx_scan"),
+            stat(&mut e, "idx_tup_fetch"),
+            stat(&mut e, "seq_tup_read"),
+        );
         e.execute(&sql).unwrap();
-        let after = idx_scans(&mut e);
-        println!("  {label:<16} idx_scan +{}", after - before);
+        let (s1, f1, r1) = (
+            stat(&mut e, "idx_scan"),
+            stat(&mut e, "idx_tup_fetch"),
+            stat(&mut e, "seq_tup_read"),
+        );
+        println!(
+            "  {label:<16}   +{:<6}  {:>22}  {:>9}",
+            s1 - s0,
+            f1 - f0,
+            r1 - r0
+        );
     }
 }
 
@@ -146,15 +185,15 @@ fn main() {
     println!("# DELETE cost vs table size (embedded), median of 21");
     println!("# all range predicates below match exactly ONE row");
     println!(
-        "| table rows | DEL 1000 | DEL range | UPD range | SEL range | DEL equality |"
+        "| table rows | DEL range | UPD range | DEL equality | UPD equality | SEL range |"
     );
     println!(
-        "|-----------:|---------:|----------:|----------:|----------:|-------------:|"
+        "|-----------:|----------:|----------:|-------------:|-------------:|----------:|"
     );
     for total in [10_000i64, 50_000, 200_000] {
-        let (r, eq, r1, sel, upd) = run(total);
+        let (_r, eq, r1, sel, upd, upd_eq) = run(total);
         println!(
-            "| {total:10} | {r:5.3} ms | {r1:6.3} ms | {upd:6.3} ms | {sel:6.3} ms | {eq:9.3} ms |"
+            "| {total:10} | {r1:6.3} ms | {upd:6.3} ms | {eq:9.3} ms | {upd_eq:9.3} ms | {sel:6.3} ms |"
         );
     }
 }
