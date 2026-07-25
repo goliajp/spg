@@ -362,10 +362,30 @@ pub(crate) fn try_index_seek_positions(
     // caller re-applies the full WHERE per candidate and sorts, exactly
     // as for the equality seek. A cold locator falls through to the
     // legacy paths (the mutation walk operates on hot rows only).
+    // v7.39 (round 461) — the cap's budget is counted in LIVE rows.
+    //
+    // The cap exists so an index walk never costs more than the scan it
+    // replaces: return more than a quarter of the table and the seek is
+    // refused. But the seek hands back one locator per row VERSION, and a
+    // churned table's index still carries the dead ones — so the count being
+    // compared was inflated by exactly the rows the caller then discards.
+    //
+    // Measured (round 460): delete-and-reinsert 1000 rows on a 50k table
+    // with autovacuum off, and by cycle 20 a 1000-row range returns ~22000
+    // candidates against a cap of 17750, so `lookup_range_capped` refuses
+    // and every DELETE becomes a 71000-row scan. The seek it refused would
+    // have walked 22000 — still three times cheaper than the scan it fell
+    // back to. The knee is visible in the timings as 0.23 ms -> 4.48 ms.
+    //
+    // Adding `dead_rows()` to the budget keeps the guarantee (the seek still
+    // returns at most a quarter of the LIVE rows plus whatever dead noise
+    // the table is carrying, which is bounded by the table itself) while no
+    // longer spending the budget on versions nobody will look at.
+    let seek_cap = table.rows().len() / 4 + usize::try_from(table.dead_rows()).unwrap_or(0);
     if let Some((col_pos, lo, hi)) = parse_range_bounds(where_expr, schema_cols, table_alias)
         && let Some(idx) = table.index_on(col_pos)
         && let Some(locators) =
-            idx.lookup_range_capped(bound_as_ref(&lo), bound_as_ref(&hi), table.rows().len() / 4)
+            idx.lookup_range_capped(bound_as_ref(&lo), bound_as_ref(&hi), seek_cap)
     {
         let mut out = Vec::with_capacity(locators.len());
         let mut all_hot = true;
