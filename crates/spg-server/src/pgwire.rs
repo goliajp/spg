@@ -1803,6 +1803,7 @@ fn run_pg_session(
             peek_have = 0;
         }
         let body: &[u8] = &rbuf;
+        trace_frontend_message(msg_type, body, tx_state);
 
         match msg_type {
             b'Q' => handle_pg_simple_query(
@@ -2229,6 +2230,43 @@ fn lock_wait_deadline(
 /// writes from psql / sqlx / mysql clients were lost on crash. `sql` is
 /// the statement text to replay — bind-final (params substituted to
 /// literals) on the prepared paths so replay reproduces the effect.
+/// v7.39 (round 443) — one stderr line per frontend message when
+/// `SPG_PGWIRE_TRACE=1`. Off by default (one `OnceLock<bool>` load per
+/// message), and the only way to answer "what does this client actually send
+/// between statements?" without guessing. Round 442 needed exactly that: a
+/// transaction driven through a sqlx pool commits into the WAL but not into
+/// live state, and the difference from the working dedicated-connection case
+/// is whatever the pool does around each statement.
+fn trace_frontend_message(msg_type: u8, body: &[u8], tx_state: u8) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("SPG_PGWIRE_TRACE").is_ok_and(|v| v != "0")) {
+        return;
+    }
+    // Parse is `name NUL sql NUL …`, so the interesting text is the SECOND
+    // NUL-terminated string; every other message's first one will do.
+    let field = |n: usize| -> String {
+        body.split(|b| *b == 0)
+            .nth(n)
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            .filter(|b| b.is_ascii_graphic() || *b == b' ')
+            .map(char::from)
+            .take(70)
+            .collect()
+    };
+    let head = if msg_type == b'P' {
+        format!("{} | {}", field(0), field(1))
+    } else {
+        field(0)
+    };
+    eprintln!(
+        "[pgwire-trace] tx={} {} {head}",
+        tx_state as char,
+        msg_type as char
+    );
+}
+
 pub(crate) fn persist_wire_write(
     state: &Arc<ServerState>,
     sql: &str,
@@ -3588,7 +3626,34 @@ fn handle_execute(
             if needs_write && matches!(role, Role::ReadOnly) {
                 return Err(proto("permission denied: readonly role".to_string()));
             }
-            eng.execute_prepared_with_cancel(stmt.ast.clone(), &portal.params, cancel)
+            // v7.39 (round 443) — bind the statement to THIS connection's
+            // transaction slot.
+            //
+            // `execute_prepared_with_cancel` hardcodes `IMPLICIT_TX`, so a
+            // `BEGIN` arriving over the extended protocol registered its
+            // transaction on slot 0 instead of the connection's. Nothing
+            // downstream could then see it: `is_tx_open(conn tx_id)` stayed
+            // false, so ReadyForQuery kept reporting 'I', every following
+            // DML took the `tx_state == b'I'` group-commit route, and the
+            // client's COMMIT closed a slot that held none of the writes.
+            // The WAL still recorded BEGIN / … / COMMIT as text, so a
+            // restart replayed the rows the live engine had never applied —
+            // measured in round 442 as a disk image that disagrees with
+            // memory.
+            //
+            // Every client that prepares statements — sqlx's `query()`,
+            // JDBC, psycopg3, the ORMs on top of them — is on this path.
+            //
+            // The slot-taking entry point has existed since round 303, which
+            // added it for mysql-wire; its doc comment says pgwire "achieves
+            // [the same] by rendering bind-final SQL through execute_in",
+            // and that was true of the simple-query path only.
+            eng.execute_prepared_in_with_cancel(
+                stmt.ast.clone(),
+                &portal.params,
+                conn_state.tx_id,
+                cancel,
+            )
         };
         (result, false)
     };
