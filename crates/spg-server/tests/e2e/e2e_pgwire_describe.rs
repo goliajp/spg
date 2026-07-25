@@ -211,7 +211,7 @@ fn describe_statement_returns_nodata_for_non_select() {
 }
 
 #[test]
-fn describe_statement_returns_nodata_for_join() {
+fn describe_statement_returns_row_description_for_join() {
     let dir = unique_tmpdir("join");
     let db = dir.join("spg.db");
     let (raw, addrs) = local_spawn(&db);
@@ -237,9 +237,15 @@ fn describe_statement_returns_nodata_for_join() {
     let param_desc = read_message(&mut s);
     assert_eq!(param_desc.ty, b't');
     let response = read_message(&mut s);
-    // JOIN currently falls through to NoData per v6.3.3 carve-out.
+    // v7.39 (round 462) — this used to require NoData. Execute never
+    // sends a RowDescription, so NoData meant a sqlx / JDBC client
+    // received the join's rows with no column metadata at all and
+    // `row.get(0)` was out of bounds. PG18 describes it; so must SPG.
     assert_eq!(
-        response.ty, b'n',
-        "JOIN should describe as NoData in v6.3.3 (not part of the byte-correct surface)"
+        response.ty, b'T',
+        "a JOIN must declare its columns — Describe is the only place they are sent"
     );
+    // Two `id` columns, one per side, named bare as PG18 names them.
+    let n = u16::from_be_bytes([response.body[0], response.body[1]]);
+    assert_eq!(n, 2, "join of two one-column tables declares two columns");
 }

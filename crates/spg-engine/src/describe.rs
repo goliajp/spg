@@ -8,16 +8,27 @@
 //! - `parameter_oids`: count distinct `$N` placeholders in the AST
 //!   and return a Vec<u32> of zeros (oid=0 = "let the server infer
 //!   at Bind time"). PG drivers happily accept this.
-//! - `output_columns`: for `SELECT` against a single (non-JOIN)
-//!   FROM clause, resolve each `SELECT` item to a column shape via
-//!   the existing catalog lookups. For everything else (JOIN,
-//!   subquery, non-SELECT, INSERT, UPDATE, DELETE without
-//!   RETURNING — and SPG has no RETURNING yet) return an empty Vec
-//!   which the pgwire layer maps to a `NoData` reply.
+//! - `output_columns`: resolve the FROM namespace — table, view,
+//!   CTE, derived table, and every joined relation — then describe
+//!   each SELECT item against it. Anything that cannot be resolved
+//!   collapses the whole list to empty, which the pgwire layer maps
+//!   to a `NoData` reply.
 //!
-//! This covers what JDBC / sqlx / pgx / psycopg3 actually call
-//! Describe on: plain `SELECT col1, col2 FROM t WHERE …` shapes.
-//! Complex shapes degrade to NoData, which drivers tolerate.
+//! v7.39 (round 462) — "complex shapes degrade to NoData, which
+//! drivers tolerate" was wrong, and the cost was silent.
+//!
+//! Execute never sends a RowDescription (Describe owns it), so a
+//! shape Describe cannot resolve reaches an extended-protocol client
+//! as data rows with NO column metadata at all. Measured against
+//! PG18 over sqlx: a view, a JOIN, a derived table, a UNION, a CTE
+//! and every system catalog view all declared zero columns, so
+//! `row.get(0)` was out of bounds on rows that plainly carried
+//! values. Only a bare single-table SELECT worked. PG18 declares all
+//! of them.
+//!
+//! Describe and execution must therefore agree by construction —
+//! [`crate::tests`] pins the two against each other over a shape
+//! corpus so a future shape cannot drift the way views did.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -35,36 +46,128 @@ pub fn describe_prepared(stmt: &Statement, catalog: &Catalog) -> (Vec<u32>, Vec<
     (params, columns)
 }
 
+/// A relation chain deep enough to hit this is either pathological or
+/// a cycle the catalog should not contain; stop rather than recurse.
+const MAX_DESCRIBE_DEPTH: usize = 16;
+
 fn describe_output_columns(stmt: &Statement, catalog: &Catalog) -> Vec<ColumnSchema> {
     let Statement::Select(s) = stmt else {
         return Vec::new();
     };
-    // Multi-arm UNION falls through to NoData (drivers tolerate).
-    if !s.unions.is_empty() {
+    describe_select_columns(s, catalog, &[], 0)
+}
+
+/// Output columns of one SELECT, resolved against `catalog` plus any
+/// CTEs already in scope from an enclosing query.
+pub(crate) fn describe_select_columns(
+    s: &SelectStatement,
+    catalog: &Catalog,
+    outer_ctes: &[&spg_sql::ast::Cte],
+    depth: usize,
+) -> Vec<ColumnSchema> {
+    if depth > MAX_DESCRIBE_DEPTH {
         return Vec::new();
     }
+    // A CTE shadows an outer binding of the same name, so this query's
+    // own list goes first — `relation_columns` takes the first match.
+    let mut ctes: Vec<&spg_sql::ast::Cte> = s.ctes.iter().collect();
+    ctes.extend(outer_ctes.iter());
+
     // No FROM (`SELECT 1::INT AS one`) → describe items against an
-    // empty schema; literal / cast / function items still resolve.
-    let Some(from) = &s.from else {
-        return describe_select_items(&s.items, &[]);
+    // empty namespace; literal / cast / function items still resolve.
+    let ns = match &s.from {
+        None => Vec::new(),
+        Some(from) => {
+            let Some(mut ns) = relation_columns(&from.primary, catalog, &ctes, depth) else {
+                return Vec::new();
+            };
+            for j in &from.joins {
+                let Some(cols) = relation_columns(&j.table, catalog, &ctes, depth) else {
+                    return Vec::new();
+                };
+                ns.extend(cols);
+            }
+            ns
+        }
     };
-    // JOIN / subquery FROM falls through to NoData.
-    if !from.joins.is_empty() {
+    // `t.*` over a multi-relation FROM cannot be answered from the flat
+    // namespace — it carries no record of which columns came from which
+    // relation, so expanding it would describe every column instead of
+    // t's. NoData is the honest answer until the namespace is keyed.
+    if s.from.as_ref().is_some_and(|f| !f.joins.is_empty())
+        && s.items
+            .iter()
+            .any(|i| matches!(i, SelectItem::QualifiedWildcard(_)))
+    {
         return Vec::new();
     }
-    let Some(table) = catalog.get(&from.primary.name) else {
-        return Vec::new();
-    };
-    let schema_cols = &table.schema().columns;
-    describe_select_items(&s.items, schema_cols)
+    let out = describe_select_items(&s.items, &ns);
+    if out.is_empty() {
+        return out;
+    }
+    // A set operation takes its column NAMES from the first arm, so
+    // `out` is already right — but only if the arms actually line up.
+    // A width disagreement means the query will fail at execution;
+    // describing it as if it succeeded would be worse than NoData.
+    for (_, arm) in &s.unions {
+        if describe_select_columns(arm, catalog, &ctes, depth + 1).len() != out.len() {
+            return Vec::new();
+        }
+    }
+    out
+}
+
+/// Columns one FROM entry contributes to the namespace, or `None` when
+/// the relation cannot be resolved (the caller then reports NoData
+/// rather than describing a partial namespace).
+fn relation_columns(
+    t: &spg_sql::ast::TableRef,
+    catalog: &Catalog,
+    ctes: &[&spg_sql::ast::Cte],
+    depth: usize,
+) -> Option<Vec<ColumnSchema>> {
+    // A derived table (`FROM (SELECT …) x`, LATERAL or not) rides the
+    // lateral_subquery channel.
+    if let Some(sub) = &t.lateral_subquery {
+        let cols = describe_select_columns(sub, catalog, &[], depth + 1);
+        return (!cols.is_empty()).then_some(cols);
+    }
+    if let Some(table) = catalog.get(&t.name) {
+        return Some(table.schema().columns.clone());
+    }
+    if let Some(cte) = ctes.iter().find(|c| c.name == t.name) {
+        let spg_sql::ast::CteBody::Select(body) = &cte.body else {
+            // A data-modifying CTE is described by its RETURNING list,
+            // which needs the modifying statement's own describe path.
+            return None;
+        };
+        let mut cols = describe_select_columns(body, catalog, &[], depth + 1);
+        if cols.is_empty() {
+            return None;
+        }
+        // `WITH name(a, b, c)` renames positionally.
+        if !cte.column_overrides.is_empty() && cte.column_overrides.len() == cols.len() {
+            for (slot, name) in cols.iter_mut().zip(cte.column_overrides.iter()) {
+                slot.name = name.clone();
+            }
+        }
+        return Some(cols);
+    }
+    if catalog.views().contains_key(&t.name) {
+        let cols = describe_view_columns_depth(catalog, &t.name, depth + 1);
+        return (!cols.is_empty()).then_some(cols);
+    }
+    // UNNEST / VALUES / anything else the executor synthesises has no
+    // catalog shape to read here.
+    None
 }
 
 fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> Vec<ColumnSchema> {
     let mut out: Vec<ColumnSchema> = Vec::with_capacity(items.len());
     for item in items {
         match item {
-            // A qualified wildcard describes the same as `*` here (single-table
-            // describe); a joined describe degrades to NoData elsewhere anyway.
+            // A qualified wildcard over a single relation describes the
+            // same as `*`; the multi-relation case is refused above.
             SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
                 for c in schema_cols {
                     out.push(c.clone());
@@ -124,9 +227,7 @@ fn describe_view_columns_depth(
     view_name: &str,
     depth: usize,
 ) -> Vec<ColumnSchema> {
-    // A view chain deep enough to hit this is either pathological or a
-    // cycle the catalog should not contain; stop rather than recurse.
-    if depth > 16 {
+    if depth > MAX_DESCRIBE_DEPTH {
         return Vec::new();
     }
     let Some(view) = catalog.views().get(view_name) else {
@@ -135,21 +236,10 @@ fn describe_view_columns_depth(
     let Ok(Statement::Select(select)) = spg_sql::parser::parse_statement(&view.body) else {
         return Vec::new();
     };
-    let mut ns: Vec<ColumnSchema> = Vec::new();
-    if let Some(from) = &select.from {
-        let mut add = |name: &str| {
-            if let Some(t) = catalog.get(name) {
-                ns.extend(t.schema().columns.iter().cloned());
-            } else {
-                ns.extend(describe_view_columns_depth(catalog, name, depth + 1));
-            }
-        };
-        add(&from.primary.name);
-        for j in &from.joins {
-            add(&j.table.name);
-        }
-    }
-    let mut out = describe_select_items(&select.items, &ns);
+    // v7.39 (round 462) — the body resolves through the same namespace
+    // walk a top-level SELECT uses, so a view over a join, a derived
+    // table or a CTE describes exactly as that query would.
+    let mut out = describe_select_columns(&select, catalog, &[], depth);
     // A rename list overrides the body's own names, positionally.
     if !view.columns.is_empty() && view.columns.len() == out.len() {
         for (slot, name) in out.iter_mut().zip(view.columns.iter()) {
@@ -1214,7 +1304,12 @@ mod tests {
     }
 
     #[test]
-    fn describe_emits_empty_columns_for_join() {
+    fn describe_resolves_a_join_namespace() {
+        // v7.39 (round 462) — this used to assert the opposite: a JOIN
+        // fell through to NoData "which drivers tolerate". They do not.
+        // Execute owes no RowDescription, so NoData here left every
+        // extended-protocol client holding rows with no column metadata.
+        // PG18 describes the same statement as four columns.
         let mut eng = Engine::new();
         eng.execute("CREATE TABLE a (id INT)").unwrap();
         eng.execute("CREATE TABLE b (id INT)").unwrap();
@@ -1222,8 +1317,10 @@ mod tests {
             .prepare("SELECT * FROM a JOIN b ON a.id = b.id")
             .unwrap();
         let (_, cols) = describe_prepared(&stmt, eng_catalog(&eng));
-        // JOIN shape falls through to NoData → empty Vec.
-        assert!(cols.is_empty());
+        let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        // PG labels a join's `*` by the BARE column names, duplicates and
+        // all — measured on PG18: `id | id`.
+        assert_eq!(names, alloc::vec!["id", "id"]);
     }
 
     #[test]

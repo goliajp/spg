@@ -550,10 +550,23 @@ impl Engine {
 
     /// v6.3.3 — Describe a prepared `Statement` without executing.
     /// Returns `(parameter_oids, output_columns)`. Empty
-    /// `output_columns` means the statement has no row-producing
-    /// shape we could resolve here (JOIN, subquery, non-SELECT, …)
-    /// — pgwire layer maps that to a `NoData` reply.
+    /// `output_columns` means the statement has no row-producing shape
+    /// we could resolve here — the pgwire layer maps that to `NoData`.
+    ///
+    /// v7.39 (round 462) — a SELECT over a system catalog view resolves
+    /// against the same materialised catalog execution builds, so the
+    /// two paths cannot disagree about what a system view looks like.
     pub fn describe_prepared(&self, stmt: &Statement) -> (Vec<u32>, Vec<ColumnSchema>) {
+        if let Statement::Select(s) = stmt {
+            if crate::system_catalog::select_references_meta_view(s)
+                && let Ok(catalog) = self.meta_view_catalog(s)
+            {
+                return describe::describe_prepared(stmt, &catalog);
+            }
+            if let Some(catalog) = self.admin_view_catalog(s) {
+                return describe::describe_prepared(stmt, &catalog);
+            }
+        }
         describe::describe_prepared(stmt, self.active_catalog())
     }
 
