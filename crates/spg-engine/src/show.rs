@@ -275,6 +275,9 @@ impl Engine {
             ("collation_server", "utf8mb4_0900_ai_ci"),
             ("max_allowed_packet", "67108864"),
             ("autocommit", "ON"),
+            // v7.39 (round 470) — the session's own value when it set one;
+            // a client that reads sql_mode back after setting it was told
+            // the default regardless.
             ("sql_mode", "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"),
             ("time_zone", "SYSTEM"),
             ("transaction_isolation", "REPEATABLE-READ"),
