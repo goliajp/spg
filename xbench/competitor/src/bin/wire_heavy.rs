@@ -195,26 +195,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("# SPGS = spg-server DURABLE (db+WAL) via pgwire; PG18 = postgres:18-alpine");
     println!("# identical client stack (sqlx postgres driver, 1 conn); same SQL both sides");
+    println!("#");
+    println!("# v7.39 (round 451) — the VERDICT column reads the execution path");
+    println!("# (synchronous_commit=off), not the durable total.");
+    println!("#");
+    println!("# Round 450 measured the durable commit costing the two engines within");
+    println!("# ~7% of each other on the same filesystem (SPGS 3.25/3.45 ms vs PG18");
+    println!("# 3.05/3.23 ms), and costing BOTH of them ~3.2 ms where the same cell had");
+    println!("# been ~0.5 ms on a quieter machine. A ratio built on that base moves with");
+    println!("# ambient fsync cost rather than with either engine — which is why the");
+    println!("# durable ratio for a shape has swung between 0.87x and 3.10x across this");
+    println!("# audit while nothing in either engine changed. The durability columns are");
+    println!("# still printed, as the two engines' cost for the same guarantee; they are");
+    println!("# just not what the verdict is read from.");
     println!(
-        "| shape             | SPGSon ms |  PGon ms |  on-ratio | SPGSoff ms | PGoff ms | off-ratio |"
+        "| shape             | SPGSoff ms | PGoff ms | VERDICT   | durability: SPGS | PG18   |"
     );
     println!(
-        "|-------------------|----------:|---------:|----------:|-----------:|---------:|----------:|"
+        "|-------------------|-----------:|---------:|-----------|-----------------:|-------:|"
     );
     for (i, (name, _)) in SHAPES.iter().enumerate() {
-        let r_on = spgs_on[i] / pg_on[i];
         let r_off = spgs_off[i] / pg_off[i];
         println!(
-            "| {:<17} | {:>9.3} | {:>8.3} | {:>4.2}× {:<5} | {:>10.3} | {:>8.3} | {:>4.2}× {:<5} |",
+            "| {:<17} | {:>10.3} | {:>8.3} | {:>4.2}× {:<5} | {:>16.3} | {:>6.3} |",
             name,
-            spgs_on[i],
-            pg_on[i],
-            r_on,
-            verdict(r_on),
             spgs_off[i],
             pg_off[i],
             r_off,
-            verdict(r_off)
+            verdict(r_off),
+            spgs_on[i] - spgs_off[i],
+            pg_on[i] - pg_off[i],
         );
     }
     Ok(())
