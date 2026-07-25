@@ -16,8 +16,29 @@ use std::fmt::Write as _;
 use std::time::Instant;
 
 pub const N: i64 = 50_000;
-pub const WARMUP: usize = 2;
-pub const RUNS: usize = 11; // odd → clean median
+pub const WARMUP: usize = 5;
+/// v7.39 (round 445) — 11 was not enough to call a winner.
+///
+/// Measured: five back-to-back panel runs put `insert_singles_100` anywhere
+/// between 0.90x and 3.68x and `delete_reinsert_1k` between 1.31x and 3.17x.
+/// Every single-run verdict on those shapes was inside its own noise. The
+/// shapes are dominated by fsync latency on a virtualised disk, which is
+/// jittery by nature, so the only fix is more samples: the methodology's
+/// "n 100 -> 1000, runs 3 -> 10" applied to this panel.
+///
+/// `SPG_BENCH_RUNS` overrides it, so a variance sweep can push higher still
+/// without a rebuild.
+pub const RUNS: usize = 51; // odd → clean median
+
+/// Effective run count: `SPG_BENCH_RUNS` when set and sane, else [`RUNS`].
+#[must_use]
+pub fn runs() -> usize {
+    std::env::var("SPG_BENCH_RUNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 3)
+        .unwrap_or(RUNS)
+}
 
 /// One write shape: (name, setup-free timed body). The body receives a
 /// per-run id base so inserts never collide; the harness deletes the
@@ -202,8 +223,9 @@ pub fn bench_engine(exec: &mut dyn FnMut(&str)) -> Vec<f64> {
             run_shape(*shape, next_base, exec);
             next_base += 10_000;
         }
-        let mut samples = Vec::with_capacity(RUNS);
-        for _ in 0..RUNS {
+        let n_runs = runs();
+        let mut samples = Vec::with_capacity(n_runs);
+        for _ in 0..n_runs {
             samples.push(run_shape(*shape, next_base, exec));
             next_base += 10_000;
         }
