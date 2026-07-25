@@ -28,7 +28,7 @@ fn median(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
-fn run(total: i64) -> (f64, f64, f64) {
+fn run(total: i64) -> (f64, f64, f64, f64, f64) {
     let mut e = Engine::new();
     e.execute("CREATE TABLE wb(id INT PRIMARY KEY, g INT, v INT)")
         .unwrap();
@@ -52,9 +52,21 @@ fn run(total: i64) -> (f64, f64, f64) {
         e.execute(&del).unwrap();
         e.execute(&ins).unwrap();
     }
+    let sel = format!(
+        "SELECT count(*) FROM wb WHERE id >= {} AND id < {}",
+        seg + 700,
+        seg + 701
+    );
+    let upd = format!(
+        "UPDATE wb SET v = v WHERE id >= {} AND id < {}",
+        seg + 700,
+        seg + 701
+    );
     let mut rv = Vec::new();
     let mut ev = Vec::new();
     let mut r1v = Vec::new();
+    let mut sv = Vec::new();
+    let mut uv = Vec::new();
     for _ in 0..21 {
         let t = Instant::now();
         e.execute(&del).unwrap();
@@ -68,16 +80,81 @@ fn run(total: i64) -> (f64, f64, f64) {
         e.execute(&r1).unwrap();
         r1v.push(t.elapsed().as_secs_f64() * 1000.0);
         e.execute(&r1_ins).unwrap();
+        let t = Instant::now();
+        e.execute(&sel).unwrap();
+        sv.push(t.elapsed().as_secs_f64() * 1000.0);
+        let t = Instant::now();
+        e.execute(&upd).unwrap();
+        uv.push(t.elapsed().as_secs_f64() * 1000.0);
     }
-    (median(rv), median(ev), median(r1v))
+    (median(rv), median(ev), median(r1v), median(sv), median(uv))
+}
+
+fn idx_scans(e: &mut Engine) -> i64 {
+    match e
+        .execute("SELECT idx_scan FROM pg_stat_user_tables WHERE relname='wb'")
+        .unwrap()
+    {
+        spg_engine::QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0])
+            .parse()
+            .unwrap_or(-1),
+        _ => -1,
+    }
+}
+
+/// The engine already counts index scans (`note_index_scan` ->
+/// `pg_stat_user_tables.idx_scan`), so whether a seek fired is observable
+/// without adding anything: run one statement, read the delta.
+fn seek_fired(total: i64) {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE wb(id INT PRIMARY KEY, g INT, v INT)")
+        .unwrap();
+    for chunk in 0..(total / 1000) {
+        e.execute(&batch_sql(chunk * 1000, 1000)).unwrap();
+    }
+    let seg = total / 2;
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "SELECT range",
+            format!("SELECT count(*) FROM wb WHERE id >= {seg} AND id < {}", seg + 1),
+        ),
+        (
+            "UPDATE range",
+            format!("UPDATE wb SET v = v WHERE id >= {seg} AND id < {}", seg + 1),
+        ),
+        (
+            "DELETE range",
+            format!("DELETE FROM wb WHERE id >= {seg} AND id < {}", seg + 1),
+        ),
+        (
+            "DELETE equality",
+            format!("DELETE FROM wb WHERE id = {}", seg + 5),
+        ),
+    ];
+    println!("# did the index seek fire? (idx_scan delta on a {total}-row table)");
+    for (label, sql) in cases {
+        let before = idx_scans(&mut e);
+        e.execute(&sql).unwrap();
+        let after = idx_scans(&mut e);
+        println!("  {label:<16} idx_scan +{}", after - before);
+    }
 }
 
 fn main() {
+    seek_fired(50_000);
+    println!();
     println!("# DELETE cost vs table size (embedded), median of 21");
-    println!("| table rows | range DEL 1000 | range DEL 1 | equality DEL 1 |");
-    println!("|-----------:|---------------:|------------:|---------------:|");
+    println!("# all range predicates below match exactly ONE row");
+    println!(
+        "| table rows | DEL 1000 | DEL range | UPD range | SEL range | DEL equality |"
+    );
+    println!(
+        "|-----------:|---------:|----------:|----------:|----------:|-------------:|"
+    );
     for total in [10_000i64, 50_000, 200_000] {
-        let (r, eq, r1) = run(total);
-        println!("| {total:10} | {r:11.3} ms | {r1:8.3} ms | {eq:11.3} ms |");
+        let (r, eq, r1, sel, upd) = run(total);
+        println!(
+            "| {total:10} | {r:5.3} ms | {r1:6.3} ms | {upd:6.3} ms | {sel:6.3} ms | {eq:9.3} ms |"
+        );
     }
 }
