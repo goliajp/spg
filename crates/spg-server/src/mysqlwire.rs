@@ -1766,16 +1766,24 @@ fn encode_column_def_41(c: &ColumnSchema) -> Vec<u8> {
     buf
 }
 
-fn encode_text_row(values: &[Value], _columns: &[ColumnSchema]) -> Vec<u8> {
+fn encode_text_row(values: &[Value], columns: &[ColumnSchema]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(values.len() * 8);
-    for v in values {
+    for (i, v) in values.iter().enumerate() {
         match v {
             Value::Null => {
                 // MySQL text protocol: NULL is a single byte 0xfb.
                 buf.push(0xfb);
             }
             other => {
-                let text = value_to_mysql_text(other);
+                // v7.39 (round 425) — a temporal column with a DECLARED
+                // fractional-seconds precision prints exactly that many
+                // digits, zero-padded (`DATETIME(3)` -> `.250`, `.000`).
+                // `None` (every PG column, and any expression that reads no
+                // MySQL temporal column) keeps the engine's own rendering.
+                let text = match columns.get(i).and_then(|c| c.mysql_fsp) {
+                    Some(fsp) => spg_engine::eval::value_to_text_with_fsp(other, Some(fsp)),
+                    None => value_to_mysql_text(other),
+                };
                 encode_lenenc_string(&mut buf, text.as_bytes());
             }
         }

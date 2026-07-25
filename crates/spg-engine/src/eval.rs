@@ -104,6 +104,7 @@ pub(crate) fn datetime_resolve_zone_offset(z: &str) -> Option<i64> {
 }
 
 pub use values::value_to_text;
+pub use values::value_to_text_with_fsp;
 pub use values::value_to_text_styled;
 use values::{
     array_2d_dims, array_element_at, array_len, array_rebuild, value_cmp_for_min_max, value_to_f64,
@@ -1510,6 +1511,62 @@ pub(crate) fn expr_enum_type_name_pub<'e>(
     columns: &'e [ColumnSchema],
 ) -> Option<&'e str> {
     expr_enum_type_name(e, columns)
+}
+
+/// v7.39 (round 425) — the fractional-seconds precision a projected
+/// expression should RENDER with: the widest declared precision among the
+/// MySQL temporal columns it reads. `MAX(d3)` and `d3 + INTERVAL 1 SECOND`
+/// both keep `d3`'s three digits, as MariaDB does. `None` when the
+/// expression touches no such column, which leaves PG rendering untouched.
+///
+/// Residual (recorded, not modelled): MariaDB also WIDENS the precision from
+/// some operands — `DATE_ADD(d3, INTERVAL 1 MICROSECOND)` prints six digits
+/// there. Taking the max over referenced columns covers the common shapes
+/// and never narrows below the source column.
+pub(crate) fn expr_mysql_fsp(e: &Expr, columns: &[ColumnSchema]) -> Option<u8> {
+    fn walk(e: &Expr, columns: &[ColumnSchema], best: &mut Option<u8>) {
+        match e {
+            Expr::Column(c) => {
+                if let Some(f) = columns
+                    .iter()
+                    .find(|col| col.name == c.name)
+                    .and_then(|col| col.mysql_fsp)
+                {
+                    *best = Some(best.map_or(f, |b: u8| b.max(f)));
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                walk(lhs, columns, best);
+                walk(rhs, columns, best);
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => walk(expr, columns, best),
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    walk(a, columns, best);
+                }
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                if let Some(o) = operand.as_deref() {
+                    walk(o, columns, best);
+                }
+                for (w, t) in branches {
+                    walk(w, columns, best);
+                    walk(t, columns, best);
+                }
+                if let Some(el) = else_branch.as_deref() {
+                    walk(el, columns, best);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut best = None;
+    walk(e, columns, &mut best);
+    best
 }
 
 fn expr_enum_type_name<'e>(e: &'e Expr, columns: &'e [ColumnSchema]) -> Option<&'e str> {

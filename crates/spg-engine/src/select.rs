@@ -363,6 +363,7 @@ impl Engine {
             .map(|p| {
                 let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
                 c.user_enum_type = p.user_enum_type;
+                c.mysql_fsp = p.mysql_fsp;
                 c
             })
             .collect();
@@ -2469,6 +2470,7 @@ impl Engine {
             .map(|p| {
                 let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
                 c.user_enum_type = p.user_enum_type.clone();
+                c.mysql_fsp = p.mysql_fsp;
                 c
             })
             .collect();
@@ -2669,6 +2671,7 @@ impl Engine {
             .map(|p| {
                 let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
                 c.user_enum_type = p.user_enum_type.clone();
+                c.mysql_fsp = p.mysql_fsp;
                 c
             })
             .collect();
@@ -3713,6 +3716,7 @@ impl Engine {
             .map(|p| {
                 let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
                 c.user_enum_type = p.user_enum_type.clone();
+                c.mysql_fsp = p.mysql_fsp;
                 c
             })
             .collect();
@@ -3939,6 +3943,7 @@ impl Engine {
             .map(|p| {
                 let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
                 c.user_enum_type = p.user_enum_type.clone();
+                c.mysql_fsp = p.mysql_fsp;
                 c
             })
             .collect();
@@ -4064,6 +4069,7 @@ impl Engine {
                     .map(|p| {
                         let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
                         c.user_enum_type = p.user_enum_type;
+                c.mysql_fsp = p.mysql_fsp;
                         c
                     })
                     .collect();
@@ -4087,6 +4093,7 @@ impl Engine {
                 .map(|p| {
                     let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
                     c.user_enum_type = p.user_enum_type;
+                c.mysql_fsp = p.mysql_fsp;
                     c
                 })
                 .collect();
@@ -4139,6 +4146,7 @@ impl Engine {
             .map(|p| {
                 let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
                 c.user_enum_type = p.user_enum_type;
+                c.mysql_fsp = p.mysql_fsp;
                 c
             })
             .collect();
@@ -5084,6 +5092,7 @@ impl Engine {
             .map(|p| {
                 let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
                 c.user_enum_type = p.user_enum_type;
+                c.mysql_fsp = p.mysql_fsp;
                 c
             })
             .collect();
@@ -5267,6 +5276,7 @@ impl Engine {
             .map(|p| {
                 let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
                 c.user_enum_type = p.user_enum_type.clone();
+                c.mysql_fsp = p.mysql_fsp;
                 c
             })
             .collect();
@@ -5569,6 +5579,7 @@ impl Engine {
             .map(|p| {
                 let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
                 c.user_enum_type = p.user_enum_type;
+                c.mysql_fsp = p.mysql_fsp;
                 c
             })
             .collect();
@@ -5695,6 +5706,13 @@ pub(crate) struct ProjectedItem {
     /// it — and a UNION's combined `ORDER BY <enum col>`, which sorts against
     /// that schema, silently fell back to TEXT order instead of member order.
     pub(crate) user_enum_type: Option<String>,
+    /// v7.39 (round 425) — a projected MySQL temporal column keeps its
+    /// declared fractional-seconds precision, so the renderer can pad to
+    /// exactly that many digits (`DATETIME(3)` shows `.250`, and `.000` for
+    /// a whole second). Like `user_enum_type` this lives outside the
+    /// DataType lattice, so a projection that dropped it made the RESULT
+    /// schema forget how wide the fraction should print.
+    pub(crate) mysql_fsp: Option<u8>,
 }
 
 /// Dedupe a row set, preserving first-seen order. `Row`'s `PartialEq` is
@@ -6545,6 +6563,7 @@ pub(crate) fn build_projection(
                         ty: col.ty,
                         nullable: col.nullable,
                         user_enum_type: col.user_enum_type.clone(),
+                        mysql_fsp: col.mysql_fsp,
                     });
                 }
             }
@@ -6579,6 +6598,7 @@ pub(crate) fn build_projection(
                         ty: col.ty,
                         nullable: col.nullable,
                         user_enum_type: col.user_enum_type.clone(),
+                        mysql_fsp: col.mysql_fsp,
                     });
                 }
                 if matched == 0 {
@@ -6605,6 +6625,7 @@ pub(crate) fn build_projection(
                         // v7.39 (read01 round 54) — a bare enum column keeps
                         // its enum identity through the projection.
                         user_enum_type: sch.user_enum_type.clone(),
+                        mysql_fsp: sch.mysql_fsp,
                     });
                 } else if let Some(shape) = describe::describe_expr(expr, schema_cols) {
                     let output_name = alias.clone().unwrap_or_else(|| expr.to_string());
@@ -6620,6 +6641,7 @@ pub(crate) fn build_projection(
                         // max / array_agg sort by the label's TEXT.
                         nullable: shape.nullable,
                         user_enum_type: None,
+                        mysql_fsp: crate::eval::expr_mysql_fsp(expr, schema_cols),
                     });
                 } else {
                     let output_name = alias.clone().unwrap_or_else(|| expr.to_string());
@@ -6635,6 +6657,7 @@ pub(crate) fn build_projection(
                         nullable: true,
                         user_enum_type: crate::eval::expr_enum_type_name_pub(expr, schema_cols)
                             .map(alloc::string::String::from),
+                        mysql_fsp: crate::eval::expr_mysql_fsp(expr, schema_cols),
                     });
                 }
             }
