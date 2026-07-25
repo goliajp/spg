@@ -5880,6 +5880,41 @@ impl Catalog {
         self.tables.iter().map(|t| t.schema.name.clone()).collect()
     }
 
+    /// v7.39 (round 436) — the marker every session's temporary-table
+    /// namespace starts with. Public so the catalog synths can tell a
+    /// temp table from an ordinary one without knowing the session id.
+    pub const TEMP_NAME_MARKER: &'static str = "__spg_temp_";
+
+    /// v7.39 (round 437) — how a stored table name should appear to the
+    /// CALLING session in a catalog listing (SHOW TABLES, pg_class,
+    /// information_schema, …):
+    ///   * an ordinary table → its own name
+    ///   * this session's temporary table → its logical name, prefix stripped
+    ///   * another session's temporary table → `None`, i.e. not listed
+    ///
+    /// Measured on both oracles: MariaDB 11 and PG 18 each list the calling
+    /// session's own temporary tables and neither lists anybody else's.
+    /// Round 436 stored temp tables under a prefix without teaching the
+    /// listings about it, so the mangled names leaked to every client.
+    #[must_use]
+    pub fn listed_name<'a>(&self, stored: &'a str) -> Option<&'a str> {
+        if !stored.starts_with(Self::TEMP_NAME_MARKER) {
+            return Some(stored);
+        }
+        let prefix = self.temp_prefix.as_ref()?;
+        stored.strip_prefix(prefix.as_str())
+    }
+
+    /// The listing names of every table this session may see, in catalog
+    /// order. See [`Catalog::listed_name`].
+    #[must_use]
+    pub fn visible_table_names(&self) -> Vec<String> {
+        self.tables
+            .iter()
+            .filter_map(|t| self.listed_name(&t.schema.name).map(String::from))
+            .collect()
+    }
+
     /// v5.1: register a cold-tier segment that already lives in
     /// memory (caller did the file read). Returns the
     /// `segment_id` that `RowLocator::Cold { segment_id, .. }`
