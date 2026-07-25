@@ -2918,6 +2918,16 @@ pub struct InsertStatement {
     ///     column and generate from the sequence instead (no effect on
     ///     non-identity columns).
     pub overriding: Overriding,
+    /// v7.39 (round 434) — the statement was spelled `INSERT IGNORE`.
+    /// Round 406 lowered that to `ON CONFLICT DO NOTHING`, which covers the
+    /// key-conflict half of MySQL's IGNORE. The other half is that IGNORE
+    /// also downgrades per-VALUE errors to coercions (out-of-range clamps,
+    /// over-long strings truncate, a non-numeric string becomes 0, a NULL
+    /// into a NOT NULL column becomes the type's default), and the engine
+    /// cannot recover that intent from the conflict clause alone. A plain
+    /// `bool` lands in this struct's existing padding, so the AST does not
+    /// grow — measured, per the round-305 / 413 nesting-stack lesson.
+    pub mysql_ignore: bool,
 }
 
 /// v7.38 (read01) — `OVERRIDING { SYSTEM | USER } VALUE` on an INSERT.
