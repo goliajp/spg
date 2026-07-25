@@ -5785,6 +5785,18 @@ pub(crate) fn render_indexdef(
     } else {
         ""
     };
+    // v7.39 (round 475) — the access method the index actually is. This was
+    // the literal `btree` for every index, so a GIN index reported itself as
+    // a btree — and a dump of it restored as one.
+    let am = match &idx.kind {
+        spg_storage::IndexKind::Gin(_)
+        | spg_storage::IndexKind::GinTrgm(_)
+        | spg_storage::IndexKind::GinFulltext(_)
+        | spg_storage::IndexKind::GinJsonb(_) => "gin",
+        spg_storage::IndexKind::Brin { .. } => "brin",
+        spg_storage::IndexKind::Nsw(_) => "hnsw",
+        spg_storage::IndexKind::BTree(_) => "btree",
+    };
     match &idx.partial_predicate {
         Some(pred) => {
             let p = pred.trim();
@@ -5794,12 +5806,12 @@ pub(crate) fn render_indexdef(
                 alloc::format!("({p})")
             };
             alloc::format!(
-                "CREATE {unique_kw}INDEX {} ON public.{tname} USING btree ({key}){nnd} WHERE {wrapped}",
+                "CREATE {unique_kw}INDEX {} ON public.{tname} USING {am} ({key}){nnd} WHERE {wrapped}",
                 idx.name,
             )
         }
         None => alloc::format!(
-            "CREATE {unique_kw}INDEX {} ON public.{tname} USING btree ({key}){nnd}",
+            "CREATE {unique_kw}INDEX {} ON public.{tname} USING {am} ({key}){nnd}",
             idx.name,
         ),
     }

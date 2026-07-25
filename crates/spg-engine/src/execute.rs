@@ -1459,6 +1459,45 @@ impl Engine {
                     "COPY TO file: the host must render via copy_to_buffer and write {path:?}"
                 ),
             )),
+            // v7.39 (round 475) — a redundant BEGIN inside a transaction.
+            //
+            // SPG raised "a transaction is already open" AND left the
+            // transaction in the aborted state, so the next statement failed
+            // with "current transaction is aborted" and the whole block was
+            // lost. A connection pooler or a framework that wraps its own
+            // BEGIN around one the caller already opened does this routinely.
+            //
+            // The two oracles genuinely differ, and both were measured:
+            //   PG18       WARNING: there is already a transaction in
+            //              progress — the BEGIN is a no-op and the existing
+            //              transaction continues (a later ROLLBACK undoes
+            //              everything, both rows in the probe).
+            //   MariaDB 11 START TRANSACTION implicitly COMMITS the open one
+            //              and begins a new one (the first row survives the
+            //              rollback, the second does not).
+            // The predicate is THIS connection's slot, not the engine-global
+            // `in_transaction()`: the server shares one Engine, so the global
+            // form makes connection B's BEGIN see connection A's transaction
+            // (rounds 279 / 283 / 298 / 304 / 443 / 444 are the same trap).
+            Statement::Begin(_)
+                if self
+                    .current_tx
+                    .is_some_and(|t| self.is_tx_open(t))
+                    && !self.backslash_escapes =>
+            {
+                self.warning(alloc::string::String::from(
+                    "there is already a transaction in progress",
+                ));
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
+            Statement::Begin(isolation) if self.current_tx.is_some_and(|t| self.is_tx_open(t)) => {
+                // MySQL dialect: commit what is open, then start fresh.
+                self.exec_commit()?;
+                self.exec_begin(isolation)
+            }
             Statement::Begin(isolation) => self.exec_begin(isolation),
             // v7.39 (round 435) — a bare COMMIT / ROLLBACK outside a
             // transaction is a no-op that SUCCEEDS. Measured on both

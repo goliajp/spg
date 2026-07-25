@@ -36,11 +36,13 @@ SELECT v FROM t ORDER BY v
 1
 2
 
-# Double BEGIN errors.
+# v7.39 (round 475) — a double BEGIN used to be pinned as an error. That
+# was SPG's own answer and it also left the transaction aborted, losing the
+# block. PG18 warns and treats it as a no-op.
 statement ok
 BEGIN
 
-statement error
+statement ok
 BEGIN
 
 statement ok

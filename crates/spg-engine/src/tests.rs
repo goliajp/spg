@@ -786,12 +786,22 @@ fn begin_sets_in_transaction_flag() {
     assert!(e.in_transaction());
 }
 
+// v7.39 (round 475) — this used to assert an ERROR, which was SPG's own
+// answer rather than either oracle's, and it also left the transaction
+// ABORTED so the whole block was lost. PG18 warns and treats the second
+// BEGIN as a no-op; MariaDB 11 implicitly commits and starts a new one.
+// Both measured live; `e2e_redundant_begin_and_gin_expr_round475` pins the
+// rollback semantics that distinguish them.
 #[test]
-fn double_begin_errors() {
+fn double_begin_warns_and_keeps_the_transaction() {
     let mut e = Engine::new();
     e.execute("BEGIN").unwrap();
-    let err = e.execute("BEGIN").unwrap_err();
-    assert_eq!(err, EngineError::TransactionAlreadyOpen);
+    e.execute("BEGIN")
+        .expect("a redundant BEGIN is a no-op in a PG session");
+    assert!(e.in_transaction());
+    // And the block is still usable, which the old ERROR path destroyed.
+    e.execute("CREATE TABLE t (a INT)").unwrap();
+    e.execute("ROLLBACK").unwrap();
 }
 
 // v7.39 (round 435) — these two used to assert an ERROR, which was SPG's

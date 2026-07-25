@@ -283,6 +283,7 @@ mod e2e_bigint_unsigned_round471;
 mod e2e_with_rollup_round472;
 mod e2e_nulls_not_distinct_catalog_round473;
 mod e2e_catalog_completeness_round474;
+mod e2e_redundant_begin_and_gin_expr_round475;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;
