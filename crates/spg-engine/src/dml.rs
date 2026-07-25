@@ -2967,6 +2967,15 @@ impl Engine {
         // `::mood`" — the same SELECT worked. Catalog::clone is a structural
         // Arc bump, so it is cheap; taken BEFORE the &mut borrow below.
         let cat_for_ctx = self.active_catalog().clone();
+        // v7.39 (round 432) — MySQL `DELETE … ORDER BY … [LIMIT n]`. Read the
+        // session dialect BEFORE the &mut catalog borrow below, which makes
+        // `self` unreachable for the rest of the scan. (DELETE's ctx, like
+        // UPDATE's, does not thread the engine — a long-standing site.)
+        let mysql_order_limit = if self.backslash_escapes {
+            stmt.order_limit.as_deref()
+        } else {
+            None
+        };
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -3030,6 +3039,65 @@ impl Engine {
                 if need_old_rows {
                     to_delete_rows.push(row.values.clone());
                 }
+            }
+        }
+        // v7.39 (round 432) — MySQL `DELETE … ORDER BY … LIMIT n`: order the
+        // MATCHED rows by the ORDER BY keys (evaluated on the pre-delete row),
+        // keep the first `limit`, then restore position order — every pass
+        // below (FK pairing, trigger walks, the apply loop) reads `positions`
+        // assuming ascending row order. `to_delete_rows` is parallel to
+        // `positions` when it is populated at all, so it moves in lockstep.
+        if let Some(ol) = mysql_order_limit {
+            if !ol.order_by.is_empty() {
+                let mut keyed: Vec<(Vec<Value<'static>>, usize)> = positions
+                    .iter()
+                    .map(|&pos| {
+                        let row = table
+                            .rows()
+                            .get(pos)
+                            .expect("matched position was visible under scan_snapshot");
+                        let keys: Vec<Value<'static>> = ol
+                            .order_by
+                            .iter()
+                            .map(|o| eval::eval_expr(&o.expr, row, &ctx))
+                            .collect::<Result<_, _>>()?;
+                        Ok::<_, EngineError>((keys, pos))
+                    })
+                    .collect::<Result<_, _>>()?;
+                keyed.sort_by(|a, b| {
+                    for (k, o) in ol.order_by.iter().enumerate() {
+                        let cmp = crate::order_by_value_cmp_in(
+                            o.desc,
+                            o.nulls_first,
+                            &a.0[k],
+                            &b.0[k],
+                            true,
+                        );
+                        if cmp != core::cmp::Ordering::Equal {
+                            return cmp;
+                        }
+                    }
+                    core::cmp::Ordering::Equal
+                });
+                positions = keyed.into_iter().map(|(_, pos)| pos).collect();
+            }
+            if let Some(n) = ol.limit {
+                positions.truncate(n as usize);
+            }
+            positions.sort_unstable();
+            if need_old_rows {
+                let kept: Vec<Vec<Value<'static>>> = positions
+                    .iter()
+                    .map(|&pos| {
+                        table
+                            .rows()
+                            .get(pos)
+                            .expect("kept position was matched above")
+                            .values
+                            .clone()
+                    })
+                    .collect();
+                to_delete_rows = kept;
             }
         }
         // v7.6.3 / v7.6.4 — Stage 2: FK enforcement on the immutable

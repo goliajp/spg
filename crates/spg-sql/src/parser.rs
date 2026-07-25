@@ -8240,25 +8240,7 @@ impl Parser {
         // v7.39 (round 413) — MySQL `UPDATE … [ORDER BY …] [LIMIT n]`. PG
         // has no such clause on UPDATE, so this is accepted only under the
         // MySQL dialect; a PG session's `UPDATE … ORDER BY …` still errors.
-        let update_order_by = if self.mysql_dialect {
-            self.parse_order_by_keys()?
-        } else {
-            Vec::new()
-        };
-        let update_limit = if self.mysql_dialect && matches!(self.peek(), Token::Limit) {
-            self.advance();
-            let tok = self.advance();
-            let Token::Integer(n) = tok else {
-                return Err(self.err(alloc::format!(
-                    "expected integer after UPDATE LIMIT, got {tok:?}"
-                )));
-            };
-            let n = u32::try_from(n)
-                .map_err(|_| self.err(alloc::format!("UPDATE LIMIT out of range: {n}")))?;
-            Some(n)
-        } else {
-            None
-        };
+        let update_order_limit = self.parse_mysql_dml_order_limit("UPDATE")?;
         let mut returning = self.parse_optional_returning()?;
         let (assignments, where_) = if let Some(fc) = from_clause {
             let names: Vec<String> = core::iter::once(&fc.primary)
@@ -8374,23 +8356,65 @@ impl Parser {
         } else {
             (assignments, where_)
         };
-        let order_limit = if update_order_by.is_empty() && update_limit.is_none() {
-            None
-        } else {
-            Some(alloc::boxed::Box::new(crate::ast::UpdateOrderLimit {
-                order_by: update_order_by,
-                limit: update_limit,
-            }))
-        };
         Ok(Statement::Update(crate::ast::UpdateStatement {
             ctes: Vec::new(),
             table,
             alias,
             assignments,
             where_,
-            order_limit,
+            order_limit: update_order_limit,
             returning,
         }))
+    }
+
+    /// v7.39 (round 432) — MySQL's `[ORDER BY …] [LIMIT n]` tail on a DML
+    /// statement. UPDATE grew it in round 413 and DELETE in round 432; the
+    /// clause and its meaning are identical, so both call this rather than
+    /// keeping two copies that could disagree on, say, whether `LIMIT 0` is
+    /// legal. PG has no such clause on either statement, so it is read only
+    /// under the MySQL dialect — a PG session's `DELETE … ORDER BY …` still
+    /// errors.
+    ///
+    /// `#[inline(never)]`: its locals would otherwise land on the statement-
+    /// parsing recursion frame, which is what tipped the 512 KiB nesting
+    /// stack in round 430.
+    #[inline(never)]
+    fn parse_mysql_dml_order_limit(
+        &mut self,
+        what: &str,
+    ) -> Result<Option<alloc::boxed::Box<crate::ast::DmlOrderLimit>>, ParseError> {
+        if !self.mysql_dialect {
+            return Ok(None);
+        }
+        let order_by = self.parse_order_by_keys()?;
+        let limit = if matches!(self.peek(), Token::Limit) {
+            self.advance();
+            let tok = self.advance();
+            let Token::Integer(n) = tok else {
+                return Err(
+                    self.err(alloc::format!("expected integer after {what} LIMIT, got {tok:?}"))
+                );
+            };
+            // MySQL rejects the `LIMIT offset, count` form here — only a
+            // single row count is legal on a DML statement.
+            if matches!(self.peek(), Token::Comma) {
+                return Err(self.err(alloc::format!(
+                    "{what} LIMIT takes a row count, not an offset"
+                )));
+            }
+            let n = u32::try_from(n)
+                .map_err(|_| self.err(alloc::format!("{what} LIMIT out of range: {n}")))?;
+            Some(n)
+        } else {
+            None
+        };
+        if order_by.is_empty() && limit.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(alloc::boxed::Box::new(crate::ast::DmlOrderLimit {
+            order_by,
+            limit,
+        })))
     }
 
     /// v4.4 `DELETE FROM <table> [WHERE cond]`. Caller already consumed
@@ -8512,6 +8536,9 @@ impl Parser {
         } else {
             None
         };
+        // v7.39 (round 432) — MySQL's `DELETE … [ORDER BY …] [LIMIT n]`,
+        // read before RETURNING (MariaDB's own extension trails the LIMIT).
+        let delete_order_limit = self.parse_mysql_dml_order_limit("DELETE")?;
         let mut returning = self.parse_optional_returning()?;
         let where_ = if let Some(fc) = using_clause {
             // v7.39 (round 241) — same RETURNING lowering as UPDATE…FROM:
@@ -8615,6 +8642,7 @@ impl Parser {
             table,
             alias,
             where_,
+            order_limit: delete_order_limit,
             returning,
         }))
     }
