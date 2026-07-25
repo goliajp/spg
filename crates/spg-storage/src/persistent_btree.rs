@@ -481,6 +481,243 @@ impl<K: Ord + Clone, V: Clone> PersistentBTreeMap<K, V> {
         }
         prev_v
     }
+
+    /// `O(log₈ N)` transient remove. Returns the value that was stored
+    /// under `key`, or `None` when the key was absent (the map is then
+    /// untouched).
+    ///
+    /// v7.39 (round 465) — the map had no removal at all: `new / get /
+    /// predecessor / from_sorted / iter / iter_rev / range / insert /
+    /// insert_mut`. That is why dropping a single index entry meant
+    /// rebuilding the whole map from the rows, and why one autovacuum tick
+    /// costs 11 ms on a 50k-row table with one secondary index — five
+    /// times the INSERT it exists to protect, all of it under the engine
+    /// write lock. Round 464 measured a filtered rebuild and it lost to
+    /// the existing from-the-rows rebuild, because iterating a
+    /// structurally-shared tree is pointer chasing while the rebuild is a
+    /// linear scan plus one sort. Removal is the operation that was
+    /// missing; with it, reclaiming k rows touches k spines instead of
+    /// rebuilding n entries.
+    ///
+    /// Walks `Arc::make_mut` down the spine like `insert_mut`, so a
+    /// uniquely-owned tree mutates in place and an outstanding snapshot
+    /// (a Catalog clone inside a TX wrap) path-copies only the spine.
+    pub fn remove_mut(&mut self, key: &K) -> Option<V> {
+        let removed = remove_transient_helper(&mut self.root, key)?;
+        // The root is the one node allowed to underflow, but an internal
+        // root emptied of entries has exactly one child and must be
+        // replaced by it or the tree grows a permanently useless level.
+        let collapse = match self.root.as_ref() {
+            BNode::Internal { entries, children } if entries.is_empty() => {
+                debug_assert_eq!(children.len(), 1);
+                children.first().cloned()
+            }
+            _ => None,
+        };
+        if let Some(only) = collapse {
+            self.root = only;
+        }
+        self.len -= 1;
+        Some(removed)
+    }
+
+    /// Immutable removal, for symmetry with [`Self::insert`]. Returns
+    /// `(new_map, previous_value)`; the receiver is untouched.
+    #[must_use]
+    pub fn remove(&self, key: &K) -> (Self, Option<V>) {
+        let mut next = self.clone();
+        let prev = next.remove_mut(key);
+        (next, prev)
+    }
+}
+
+/// Minimum entries in any node but the root. A node that drops below this
+/// borrows from a sibling, or merges with one.
+const MIN_ENTRIES: usize = ORDER / 2 - 1; // 3
+
+impl<K, V> BNode<K, V> {
+    fn entry_count(&self) -> usize {
+        match self {
+            BNode::Leaf { entries } | BNode::Internal { entries, .. } => entries.len(),
+        }
+    }
+}
+
+/// Transient remove worker. Returns the removed value, or `None` when the
+/// key is not in this subtree (in which case nothing was modified).
+fn remove_transient_helper<K: Ord + Clone, V: Clone>(
+    node: &mut Arc<BNode<K, V>>,
+    key: &K,
+) -> Option<V> {
+    // Probe before `make_mut`: a miss must not path-copy the spine.
+    let (found, idx) = match node.as_ref() {
+        BNode::Leaf { entries } | BNode::Internal { entries, .. } => {
+            match entries.binary_search_by(|(ek, _)| ek.cmp(key)) {
+                Ok(i) => (true, i),
+                Err(i) => (false, i),
+            }
+        }
+    };
+    if !found && matches!(node.as_ref(), BNode::Leaf { .. }) {
+        return None;
+    }
+    let inner = Arc::make_mut(node);
+    match inner {
+        BNode::Leaf { entries } => Some(entries.remove(idx).1),
+        BNode::Internal { entries, children } => {
+            if found {
+                // Standard B-tree interior delete: swap in the in-order
+                // predecessor, which always lives in a leaf, then repair
+                // the subtree it came out of.
+                let pred = remove_max(&mut children[idx]);
+                let old = core::mem::replace(&mut entries[idx], pred);
+                fix_child(entries, children, idx);
+                Some(old.1)
+            } else {
+                let removed = remove_transient_helper(&mut children[idx], key)?;
+                fix_child(entries, children, idx);
+                Some(removed)
+            }
+        }
+    }
+}
+
+/// Detach the largest entry of this subtree. The subtree must be non-empty;
+/// callers only reach it from an internal node whose children are populated.
+fn remove_max<K: Ord + Clone, V: Clone>(node: &mut Arc<BNode<K, V>>) -> (K, V) {
+    let inner = Arc::make_mut(node);
+    match inner {
+        BNode::Leaf { entries } => entries.pop().expect("a B-tree leaf is never empty"),
+        BNode::Internal { entries, children } => {
+            let last = children.len() - 1;
+            let kv = remove_max(&mut children[last]);
+            fix_child(entries, children, last);
+            kv
+        }
+    }
+}
+
+/// Restore `children[i]`'s minimum occupancy by borrowing from a sibling, or
+/// merging with one when neither sibling can spare an entry.
+fn fix_child<K: Ord + Clone, V: Clone>(
+    entries: &mut Vec<(K, V)>,
+    children: &mut Vec<Arc<BNode<K, V>>>,
+    i: usize,
+) {
+    if children[i].entry_count() >= MIN_ENTRIES {
+        return;
+    }
+    if i > 0 && children[i - 1].entry_count() > MIN_ENTRIES {
+        rotate_from_left(entries, children, i);
+    } else if i + 1 < children.len() && children[i + 1].entry_count() > MIN_ENTRIES {
+        rotate_from_right(entries, children, i);
+    } else if i > 0 {
+        merge_children(entries, children, i - 1);
+    } else {
+        merge_children(entries, children, i);
+    }
+}
+
+/// Move the left sibling's largest entry up into the separator slot and the
+/// old separator down into `children[i]`'s front.
+fn rotate_from_left<K: Ord + Clone, V: Clone>(
+    entries: &mut [(K, V)],
+    children: &mut [Arc<BNode<K, V>>],
+    i: usize,
+) {
+    let (moved_entry, moved_child) = match Arc::make_mut(&mut children[i - 1]) {
+        BNode::Leaf { entries: le } => (le.pop().expect("sibling has entries to spare"), None),
+        BNode::Internal {
+            entries: le,
+            children: lc,
+        } => (
+            le.pop().expect("sibling has entries to spare"),
+            Some(lc.pop().expect("internal node has entries.len()+1 children")),
+        ),
+    };
+    let separator = core::mem::replace(&mut entries[i - 1], moved_entry);
+    match Arc::make_mut(&mut children[i]) {
+        BNode::Leaf { entries: ce } => {
+            debug_assert!(moved_child.is_none());
+            ce.insert(0, separator);
+        }
+        BNode::Internal {
+            entries: ce,
+            children: cc,
+        } => {
+            ce.insert(0, separator);
+            cc.insert(0, moved_child.expect("sibling of an internal node is internal"));
+        }
+    }
+}
+
+/// Mirror of [`rotate_from_left`] using the right sibling.
+fn rotate_from_right<K: Ord + Clone, V: Clone>(
+    entries: &mut [(K, V)],
+    children: &mut [Arc<BNode<K, V>>],
+    i: usize,
+) {
+    let (moved_entry, moved_child) = match Arc::make_mut(&mut children[i + 1]) {
+        BNode::Leaf { entries: re } => (re.remove(0), None),
+        BNode::Internal {
+            entries: re,
+            children: rc,
+        } => (re.remove(0), Some(rc.remove(0))),
+    };
+    let separator = core::mem::replace(&mut entries[i], moved_entry);
+    match Arc::make_mut(&mut children[i]) {
+        BNode::Leaf { entries: ce } => {
+            debug_assert!(moved_child.is_none());
+            ce.push(separator);
+        }
+        BNode::Internal {
+            entries: ce,
+            children: cc,
+        } => {
+            ce.push(separator);
+            cc.push(moved_child.expect("sibling of an internal node is internal"));
+        }
+    }
+}
+
+/// Fold `children[sep + 1]` and the separator entry into `children[sep]`.
+/// Both children are at minimum occupancy, so the result fits.
+fn merge_children<K: Ord + Clone, V: Clone>(
+    entries: &mut Vec<(K, V)>,
+    children: &mut Vec<Arc<BNode<K, V>>>,
+    sep: usize,
+) {
+    let separator = entries.remove(sep);
+    let right = children.remove(sep + 1);
+    let right = Arc::try_unwrap(right).unwrap_or_else(|shared| (*shared).clone());
+    match (Arc::make_mut(&mut children[sep]), right) {
+        (BNode::Leaf { entries: le }, BNode::Leaf { entries: re }) => {
+            le.push(separator);
+            le.extend(re);
+        }
+        (
+            BNode::Internal {
+                entries: le,
+                children: lc,
+            },
+            BNode::Internal {
+                entries: re,
+                children: rc,
+            },
+        ) => {
+            le.push(separator);
+            le.extend(re);
+            lc.extend(rc);
+        }
+        // Siblings are always at the same depth, so the mixed cases are
+        // unreachable; putting the separator back keeps the map a valid
+        // (if larger) tree rather than losing an entry.
+        (BNode::Leaf { entries: le }, BNode::Internal { .. })
+        | (BNode::Internal { entries: le, .. }, BNode::Leaf { .. }) => {
+            debug_assert!(false, "B-tree siblings must be at the same depth");
+            le.push(separator);
+        }
+    }
 }
 
 /// Transient insert worker — walks `Arc::make_mut` down the spine so each
@@ -811,6 +1048,213 @@ mod tests {
     use super::*;
     use alloc::collections::BTreeMap;
     use alloc::vec;
+
+    // ---- round 465: structural checks for removal ----
+
+    /// Depth of every leaf, or `None` when they disagree. Also asserts each
+    /// node's local shape: entry count in range, entries strictly ascending,
+    /// and `children.len() == entries.len() + 1`.
+    fn check_node<K: Ord + core::fmt::Debug, V>(
+        node: &BNode<K, V>,
+        is_root: bool,
+        depth: usize,
+    ) -> usize {
+        let entries = match node {
+            BNode::Leaf { entries } | BNode::Internal { entries, .. } => entries,
+        };
+        assert!(
+            entries.len() <= MAX_ENTRIES,
+            "node overfull: {} entries",
+            entries.len()
+        );
+        if !is_root {
+            assert!(
+                entries.len() >= MIN_ENTRIES,
+                "non-root node underfull: {} entries",
+                entries.len()
+            );
+        }
+        for w in entries.windows(2) {
+            assert!(w[0].0 < w[1].0, "entries out of order inside a node");
+        }
+        match node {
+            BNode::Leaf { .. } => depth,
+            BNode::Internal { entries, children } => {
+                assert_eq!(
+                    children.len(),
+                    entries.len() + 1,
+                    "internal node must have entries.len()+1 children"
+                );
+                let mut seen: Option<usize> = None;
+                for c in children {
+                    let d = check_node(c, false, depth + 1);
+                    match seen {
+                        None => seen = Some(d),
+                        Some(prev) => assert_eq!(prev, d, "leaves at different depths"),
+                    }
+                }
+                seen.expect("internal node has children")
+            }
+        }
+    }
+
+    fn check_map<K: Ord + Clone + core::fmt::Debug, V: Clone>(m: &PersistentBTreeMap<K, V>) {
+        check_node(m.root.as_ref(), true, 0);
+        // In-order traversal must be globally sorted, and `len` must match.
+        let keys: Vec<&K> = m.iter().map(|(k, _)| k).collect();
+        for w in keys.windows(2) {
+            assert!(w[0] < w[1], "iteration order is not globally sorted");
+        }
+        assert_eq!(keys.len(), m.len(), "len disagrees with iteration");
+    }
+
+    /// Deterministic sequence — no rand dependency, and a failure is
+    /// reproducible from the seed alone.
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        *state >> 33
+    }
+
+    #[test]
+    fn round465_remove_absent_key_is_a_no_op() {
+        let mut pb: PersistentBTreeMap<i64, i64> = PersistentBTreeMap::new();
+        for i in 0..50_i64 {
+            pb.insert_mut(i * 2, i);
+        }
+        let before = pb.len();
+        assert_eq!(pb.remove_mut(&7), None);
+        assert_eq!(pb.remove_mut(&-1), None);
+        assert_eq!(pb.remove_mut(&1000), None);
+        assert_eq!(pb.len(), before);
+        check_map(&pb);
+    }
+
+    #[test]
+    fn round465_remove_every_key_empties_the_map() {
+        for n in [1_i64, 7, 8, 9, 100, 500] {
+            let mut pb: PersistentBTreeMap<i64, i64> = PersistentBTreeMap::new();
+            for i in 0..n {
+                pb.insert_mut(i, i * 3);
+            }
+            for i in 0..n {
+                assert_eq!(pb.remove_mut(&i), Some(i * 3), "n={n} i={i}");
+                assert_eq!(pb.len() as i64, n - i - 1);
+                check_map(&pb);
+                // Everything not yet removed must still be reachable.
+                for j in (i + 1)..n {
+                    assert_eq!(pb.get(&j), Some(&(j * 3)), "n={n} lost {j} after removing {i}");
+                }
+            }
+            assert!(pb.is_empty());
+        }
+    }
+
+    #[test]
+    fn round465_remove_in_reverse_order_empties_the_map() {
+        // Descending removal drives the merge path from the other side —
+        // rotate_from_left instead of rotate_from_right.
+        let mut pb: PersistentBTreeMap<i64, i64> = PersistentBTreeMap::new();
+        for i in 0..300_i64 {
+            pb.insert_mut(i, i);
+        }
+        for i in (0..300_i64).rev() {
+            assert_eq!(pb.remove_mut(&i), Some(i));
+            check_map(&pb);
+        }
+        assert!(pb.is_empty());
+    }
+
+    #[test]
+    fn round465_matches_btreemap_under_mixed_traffic() {
+        let mut pb: PersistentBTreeMap<i64, i64> = PersistentBTreeMap::new();
+        let mut model: BTreeMap<i64, i64> = BTreeMap::new();
+        let mut seed = 0x5eed_1234_u64;
+        for step in 0..4000 {
+            let k = (lcg(&mut seed) % 300) as i64;
+            if lcg(&mut seed) % 3 == 0 {
+                assert_eq!(pb.remove_mut(&k), model.remove(&k), "step {step} remove {k}");
+            } else {
+                let v = (lcg(&mut seed) % 1000) as i64;
+                assert_eq!(pb.insert_mut(k, v), model.insert(k, v), "step {step} insert {k}");
+            }
+            assert_eq!(pb.len(), model.len(), "step {step}");
+            if step % 97 == 0 {
+                check_map(&pb);
+                let got: Vec<(i64, i64)> = pb.iter().map(|(k, v)| (*k, *v)).collect();
+                let want: Vec<(i64, i64)> = model.iter().map(|(k, v)| (*k, *v)).collect();
+                assert_eq!(got, want, "step {step}");
+            }
+        }
+        check_map(&pb);
+        let got: Vec<(i64, i64)> = pb.iter().map(|(k, v)| (*k, *v)).collect();
+        let want: Vec<(i64, i64)> = model.iter().map(|(k, v)| (*k, *v)).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn round465_remove_leaves_a_shared_snapshot_untouched() {
+        // The whole point of the persistent structure: a clone taken before
+        // the removal must still see the removed key.
+        let mut pb: PersistentBTreeMap<i64, i64> = PersistentBTreeMap::new();
+        for i in 0..200_i64 {
+            pb.insert_mut(i, i * 5);
+        }
+        let snapshot = pb.clone();
+        for i in 0..100_i64 {
+            pb.remove_mut(&(i * 2));
+        }
+        check_map(&pb);
+        check_map(&snapshot);
+        assert_eq!(snapshot.len(), 200);
+        for i in 0..200_i64 {
+            assert_eq!(snapshot.get(&i), Some(&(i * 5)), "snapshot lost {i}");
+        }
+        for i in 0..100_i64 {
+            assert_eq!(pb.get(&(i * 2)), None);
+            assert_eq!(pb.get(&(i * 2 + 1)), Some(&(i * 10 + 5)));
+        }
+    }
+
+    #[test]
+    fn round465_immutable_remove_does_not_touch_the_receiver() {
+        let mut pb: PersistentBTreeMap<i64, i64> = PersistentBTreeMap::new();
+        for i in 0..60_i64 {
+            pb.insert_mut(i, i);
+        }
+        let (next, prev) = pb.remove(&30);
+        assert_eq!(prev, Some(30));
+        assert_eq!(pb.get(&30), Some(&30), "receiver must be untouched");
+        assert_eq!(next.get(&30), None);
+        assert_eq!(pb.len(), 60);
+        assert_eq!(next.len(), 59);
+        check_map(&pb);
+        check_map(&next);
+    }
+
+    #[test]
+    fn round465_range_and_predecessor_still_work_after_removals() {
+        // Removal rewires spines; the ordered readers must follow.
+        let mut pb: PersistentBTreeMap<i64, i64> = PersistentBTreeMap::new();
+        for i in 0..400_i64 {
+            pb.insert_mut(i, i);
+        }
+        for i in 0..400_i64 {
+            if i % 3 == 0 {
+                pb.remove_mut(&i);
+            }
+        }
+        check_map(&pb);
+        let in_range: Vec<i64> = pb
+            .range(Bound::Included(&100), Bound::Excluded(&120))
+            .map(|(k, _)| *k)
+            .collect();
+        let want: Vec<i64> = (100..120).filter(|i| i % 3 != 0).collect();
+        assert_eq!(in_range, want);
+        // 99 is a multiple of 3 and was removed, so 100's predecessor is 98.
+        assert_eq!(pb.predecessor(&100).map(|(k, _)| *k), Some(98));
+        let rev: Vec<i64> = pb.iter_rev().map(|(k, _)| *k).take(3).collect();
+        assert_eq!(rev, vec![398, 397, 395]);
+    }
 
     #[test]
     fn empty_map_is_empty() {

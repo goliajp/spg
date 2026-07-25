@@ -17,6 +17,7 @@
 #![allow(clippy::doc_markdown, clippy::uninlined_format_args)]
 
 use spg_bench_competitor::write_shapes::{N, batch_insert_sql, runs};
+use sqlx::Executor as _;
 use sqlx::any::AnyPoolOptions;
 use std::time::{Duration, Instant};
 
@@ -32,7 +33,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let mut c = pool.acquire().await?;
 
-    use sqlx::Executor as _;
     let _ = c.execute("DROP TABLE IF EXISTS wb").await;
     c.execute("SET synchronous_commit = off").await?;
     c.execute("CREATE TABLE wb (id INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL)")
