@@ -225,3 +225,114 @@ async fn round27_returning_arithmetic_types_as_int_not_text() {
     .expect("typed decode of arithmetic RETURNING over pgwire");
     assert_eq!((id, uid, new_modseq), (1, 1, 1));
 }
+
+/// v7.39 (round 443) — a transaction driven the way sqlx drives one must be
+/// a transaction.
+///
+/// pgwire's `Execute` called `execute_prepared_with_cancel`, which hardcodes
+/// `IMPLICIT_TX`, so a prepared `BEGIN` registered on slot 0 instead of the
+/// connection's. ReadyForQuery then kept reporting 'I', every following DML
+/// took the `tx_state == b'I'` group-commit route, and COMMIT closed a slot
+/// holding none of the writes. Measured before the fix: 0 rows here, while
+/// the server's WAL had recorded BEGIN / … / COMMIT — so a restart replayed
+/// writes the live engine had never applied.
+///
+/// This lives here rather than in the raw-socket e2e because THIS is the
+/// shape that reproduces it: statements prepared and executed through a pool,
+/// against a server with a WAL (no WAL, no group-commit route, no defect).
+/// Every driver that prepares — sqlx, JDBC, psycopg3 — is on this path; the
+/// simple-query path was always correct, which is why psql never showed it.
+#[tokio::test]
+#[ignore]
+async fn prepared_begin_commit_is_a_real_transaction() {
+    let pool = pool().await;
+    sqlx::query("DROP TABLE IF EXISTS sqlx_tx")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE sqlx_tx (id INT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query("BEGIN").execute(&pool).await.unwrap();
+    for k in 0..3_i32 {
+        sqlx::query("INSERT INTO sqlx_tx VALUES ($1)")
+            .bind(k)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("COMMIT").execute(&pool).await.unwrap();
+
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlx_tx")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 3, "committed rows must be visible after COMMIT");
+}
+
+/// The other half, through sqlx's own transaction API — the idiomatic shape,
+/// where the driver holds ONE connection for the whole transaction.
+///
+/// A raw `BEGIN` sent through a pool is not a transaction on either engine
+/// (the pool is free to hand each statement a different connection, and PG18
+/// keeps the rows too — measured). `pool.begin()` is, so this is where the
+/// rollback contract can actually be asserted.
+#[tokio::test]
+#[ignore]
+async fn transaction_api_rollback_discards_its_writes() {
+    let pool = pool().await;
+    sqlx::query("DROP TABLE IF EXISTS sqlx_tx_rb")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE sqlx_tx_rb (id INT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO sqlx_tx_rb VALUES (1)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlx_tx_rb")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "a rolled-back transaction must leave no rows");
+}
+
+/// …and its commit counterpart on the same API.
+#[tokio::test]
+#[ignore]
+async fn transaction_api_commit_persists_its_writes() {
+    let pool = pool().await;
+    sqlx::query("DROP TABLE IF EXISTS sqlx_tx_c")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE sqlx_tx_c (id INT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    for k in 0..3_i32 {
+        sqlx::query("INSERT INTO sqlx_tx_c VALUES ($1)")
+            .bind(k)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlx_tx_c")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 3, "a committed transaction must keep its rows");
+}
