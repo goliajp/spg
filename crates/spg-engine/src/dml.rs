@@ -5640,6 +5640,75 @@ fn is_column_default_marker(e: &Expr) -> bool {
     matches!(e, Expr::FunctionCall { name, args } if name == "__column_default" && args.is_empty())
 }
 
+/// v7.39 (round 433) — does this AUTO_INCREMENT column need a generated
+/// value for the supplied cell?
+///
+/// PG's answer is "only when the cell is NULL". MySQL's — measured on
+/// MariaDB 11 — also counts an explicit **zero**: `INSERT INTO t(id) VALUES
+/// (0)` stores the next generated id, exactly as `VALUES (NULL)` does, and
+/// LAST_INSERT_ID() reports the generated value. Legacy code and several
+/// ORMs write 0 for "please assign one", so treating it literally stored a
+/// row with id 0 AND left every later id one short of MySQL's.
+///
+/// The zero is recognised through the same widening every integer literal
+/// gets, so `'0'` (MariaDB generates for it too) and a zero of any integer
+/// width all qualify. A float / decimal zero does not: MySQL only applies
+/// this to integer AUTO_INCREMENT columns, which is the only shape SPG
+/// allows the attribute on.
+///
+/// MySQL's `NO_AUTO_VALUE_ON_ZERO` sql_mode turns this off and stores the 0
+/// literally. SPG tracks only the escaping bit of sql_mode today, so that
+/// mode is not honoured — the default (this behaviour) is what a session
+/// gets. Noted rather than guessed at.
+fn auto_increment_needs_value(col: &ColumnSchema, raw: &Value<'_>, mysql: bool) -> bool {
+    if !col.auto_increment {
+        return false;
+    }
+    if raw.is_null() {
+        return true;
+    }
+    mysql
+        && match raw {
+            Value::SmallInt(n) => *n == 0,
+            Value::Int(n) => *n == 0,
+            Value::BigInt(n) => *n == 0,
+            Value::Text(s) => s.trim().parse::<i64>() == Ok(0),
+            _ => false,
+        }
+}
+
+/// v7.39 (round 433) — the value an AUTO_INCREMENT cell was explicitly
+/// given, as an integer, or None when it is not an integer at all. Same
+/// widening as [`auto_increment_needs_value`] reads.
+fn explicit_auto_value(raw: &Value<'_>) -> Option<i64> {
+    match raw {
+        Value::SmallInt(n) => Some(i64::from(*n)),
+        Value::Int(n) => Some(i64::from(*n)),
+        Value::BigInt(n) => Some(*n),
+        Value::Text(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// v7.39 (round 433) — the statement-local AUTO_INCREMENT cursor's starting
+/// point for `col`: the table's next value, floored by any sequence restart.
+/// Extracted so the generate path and the explicit-value bump path below can
+/// never seed from different places.
+fn auto_cursor_seed(
+    table: &spg_storage::Table,
+    i: usize,
+    col: &ColumnSchema,
+    seq_floors: &alloc::collections::BTreeMap<usize, i64>,
+) -> Result<i64, EngineError> {
+    let base = table.next_auto_value(i).ok_or_else(|| {
+        EngineError::Unsupported(alloc::format!(
+            "AUTO_INCREMENT applies to integer columns only (column `{}`)",
+            col.name
+        ))
+    })?;
+    Ok(base.max(seq_floors.get(&i).copied().unwrap_or(i64::MIN)))
+}
+
 /// The `DEFAULT`-slot marker expression (`__column_default()`), used to
 /// force a column to its declared default / sequence value.
 fn column_default_marker() -> Expr {
@@ -5968,24 +6037,36 @@ fn parse_insert_rows(
                     },
                     None => resolve_column_default_free(col, clock)?,
                 };
-                if col.auto_increment && raw.is_null() {
+                if auto_increment_needs_value(col, &raw, mysql) {
                     let next = match auto_cursors.get(&i) {
                         Some(n) => *n,
-                        None => {
-                            let base = table.next_auto_value(i).ok_or_else(|| {
-                                EngineError::Unsupported(alloc::format!(
-                                    "AUTO_INCREMENT applies to integer columns only (column `{}`)",
-                                    col.name
-                                ))
-                            })?;
-                            base.max(seq_floors.get(&i).copied().unwrap_or(i64::MIN))
-                        }
+                        None => auto_cursor_seed(table, i, col, seq_floors)?,
                     };
                     auto_cursors.insert(i, next + 1);
                     if first_auto.is_none() {
                         *first_auto = Some(next);
                     }
                     raw = Value::BigInt(next);
+                } else if mysql
+                    && col.auto_increment
+                    && let Some(n) = explicit_auto_value(&raw)
+                {
+                    // v7.39 (round 433) — an explicit value inside a
+                    // multi-row INSERT raises the counter for the LATER rows
+                    // of the same statement, measured on MariaDB 11:
+                    // `(NULL,·),(7,·),(NULL,·)` yields 1, 7, 8. SPG derives
+                    // the next value from the table's current max, which has
+                    // not moved yet mid-statement, so the third row used to
+                    // land on 2 — a value the statement had already handed
+                    // out on a wider table, and a silent drift from MySQL's
+                    // ids either way. A LOWER explicit value never pulls the
+                    // counter back (`(50,·),(3,·),(NULL,·)` yields 51), so
+                    // the seed still comes from the table.
+                    let cursor = match auto_cursors.get(&i) {
+                        Some(c) => *c,
+                        None => auto_cursor_seed(table, i, col, seq_floors)?,
+                    };
+                    auto_cursors.insert(i, cursor.max(n.saturating_add(1)));
                 }
                 // v7.39 (round 263) — a COMPOSITE column relabels + coerces
                 // its value through the declared type first; ROW()'s
@@ -6024,24 +6105,36 @@ fn parse_insert_rows(
                 } else {
                     resolve_column_default_free(col, clock)?
                 };
-                if col.auto_increment && raw.is_null() {
+                if auto_increment_needs_value(col, &raw, mysql) {
                     let next = match auto_cursors.get(&i) {
                         Some(n) => *n,
-                        None => {
-                            let base = table.next_auto_value(i).ok_or_else(|| {
-                                EngineError::Unsupported(alloc::format!(
-                                    "AUTO_INCREMENT applies to integer columns only (column `{}`)",
-                                    col.name
-                                ))
-                            })?;
-                            base.max(seq_floors.get(&i).copied().unwrap_or(i64::MIN))
-                        }
+                        None => auto_cursor_seed(table, i, col, seq_floors)?,
                     };
                     auto_cursors.insert(i, next + 1);
                     if first_auto.is_none() {
                         *first_auto = Some(next);
                     }
                     raw = Value::BigInt(next);
+                } else if mysql
+                    && col.auto_increment
+                    && let Some(n) = explicit_auto_value(&raw)
+                {
+                    // v7.39 (round 433) — an explicit value inside a
+                    // multi-row INSERT raises the counter for the LATER rows
+                    // of the same statement, measured on MariaDB 11:
+                    // `(NULL,·),(7,·),(NULL,·)` yields 1, 7, 8. SPG derives
+                    // the next value from the table's current max, which has
+                    // not moved yet mid-statement, so the third row used to
+                    // land on 2 — a value the statement had already handed
+                    // out on a wider table, and a silent drift from MySQL's
+                    // ids either way. A LOWER explicit value never pulls the
+                    // counter back (`(50,·),(3,·),(NULL,·)` yields 51), so
+                    // the seed still comes from the table.
+                    let cursor = match auto_cursors.get(&i) {
+                        Some(c) => *c,
+                        None => auto_cursor_seed(table, i, col, seq_floors)?,
+                    };
+                    auto_cursors.insert(i, cursor.max(n.saturating_add(1)));
                 }
                 let raw =
                     crate::conversions::normalize_composite_for_column(raw, col, catalog)?;
