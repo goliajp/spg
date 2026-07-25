@@ -15740,6 +15740,63 @@ impl Parser {
         } else {
             None
         };
+        // v7.39 (round 428) — MySQL's SET-form INSERT:
+        //     INSERT INTO t SET a = 1, b = 'x'
+        // It is exactly `INSERT INTO t (a, b) VALUES (1, 'x')` — omitted
+        // columns take their DEFAULT, `SET a = DEFAULT` is legal, and it
+        // composes with IGNORE / ON DUPLICATE KEY UPDATE / REPLACE (all
+        // measured). So it lowers to the column list + one VALUES row and
+        // rejoins the ordinary path, which already handles every one of
+        // those. PG has no such spelling, hence the dialect gate.
+        if self.mysql_dialect
+            && matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("set"))
+        {
+            self.advance(); // SET
+            let mut names = Vec::new();
+            let mut values = Vec::new();
+            loop {
+                names.push(self.expect_ident_like()?);
+                if !matches!(self.peek(), Token::Eq) {
+                    return Err(self.err(alloc::format!(
+                        "expected '=' in INSERT … SET, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                // `SET a = DEFAULT` rides the same `__column_default` marker
+                // the VALUES-row and UPDATE-SET paths use; the INSERT
+                // executor resolves it against the target column.
+                if matches!(self.peek(), Token::Default) {
+                    self.advance();
+                    values.push(Expr::FunctionCall {
+                        name: "__column_default".to_string(),
+                        args: Vec::new(),
+                    });
+                } else {
+                    values.push(self.parse_expr(0)?);
+                }
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            let on_conflict = self.parse_insert_conflict_clause(replace, ignore)?;
+            let returning = self.parse_optional_returning()?;
+            return Ok(Statement::Insert(InsertStatement {
+                ctes: Vec::new(),
+                table,
+                alias,
+                columns: Some(names),
+                rows: alloc::vec![values],
+                select_source: None,
+                // MySQL's SET form has no `OVERRIDING …` clause (that is
+                // PG's identity-column spelling).
+                overriding: Overriding::None,
+                on_conflict,
+                returning,
+            }));
+        }
         // Optional column list — `INSERT INTO t (a, b) VALUES ...`.
         // v7.39 (round 151) — a SELECT or WITH right after the paren is
         // a parenthesized query source instead (PG select_with_parens:
