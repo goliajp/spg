@@ -2460,6 +2460,22 @@ impl Parser {
                         self.consume_until_statement_boundary();
                         Ok(Statement::Empty)
                     }
+                    // v7.39 (round 436) — MySQL's `DROP TEMPORARY TABLE t`.
+                    // It drops only a TEMPORARY table, and name resolution
+                    // already prefers the session's own, so the keyword is
+                    // consumed and the ordinary DROP TABLE path runs.
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("temporary") || s.eq_ignore_ascii_case("temp") =>
+                    {
+                        self.advance();
+                        if !matches!(self.peek(), Token::Table) {
+                            return Err(self.err(alloc::format!(
+                                "expected TABLE after DROP TEMPORARY, got {:?}",
+                                self.peek()
+                            )));
+                        }
+                        self.parse_drop_table_after_keyword()
+                    }
                     Token::Publication => {
                         self.advance();
                         let name = self.expect_ident_or_string()?;
@@ -2552,27 +2568,7 @@ impl Parser {
                     // overwrites prior state. SPG accepts and removes
                     // matching tables; CASCADE/RESTRICT trailers
                     // accepted silently.
-                    Token::Table => {
-                        self.advance();
-                        let if_exists = self.consume_if_exists();
-                        let mut names: Vec<String> = Vec::new();
-                        loop {
-                            names.push(self.expect_ident_like()?);
-                            if matches!(self.peek(), Token::Comma) {
-                                self.advance();
-                                continue;
-                            }
-                            break;
-                        }
-                        if matches!(
-                            self.peek(),
-                            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
-                                || s.eq_ignore_ascii_case("restrict")
-                        ) {
-                            self.advance();
-                        }
-                        Ok(Statement::DropTable { names, if_exists })
-                    }
+                    Token::Table => self.parse_drop_table_after_keyword(),
                     // v7.14.0 — DROP INDEX [IF EXISTS] name
                     // [CASCADE|RESTRICT]. PG / mysqldump emit this
                     // for partial-index renames and pgvector
@@ -3785,6 +3781,33 @@ impl Parser {
     }
 
     /// v7.39 (round 280) — `DROP STATISTICS [IF EXISTS] <name>`.
+    /// v7.39 (round 436) — the body of `DROP TABLE [IF EXISTS] a[, b] …`,
+    /// entered with the `TABLE` keyword still unconsumed. Extracted so
+    /// `DROP TEMPORARY TABLE` (MySQL) runs the identical grammar instead of
+    /// a second copy — the parser cannot rewind, so re-dispatch has to be a
+    /// forward call.
+    fn parse_drop_table_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // TABLE
+        let if_exists = self.consume_if_exists();
+        let mut names: Vec<String> = Vec::new();
+        loop {
+            names.push(self.expect_ident_like()?);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        if matches!(
+            self.peek(),
+            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
+                || s.eq_ignore_ascii_case("restrict")
+        ) {
+            self.advance();
+        }
+        Ok(Statement::DropTable { names, if_exists })
+    }
+
     fn parse_drop_statistics_after_drop(&mut self) -> Result<Statement, ParseError> {
         self.advance(); // STATISTICS
         let mut if_exists = false;
@@ -4037,9 +4060,29 @@ impl Parser {
                     self.advance();
                     self.parse_create_view_after_keyword(false, false, true)
                 } else {
-                    // TEMP TABLE etc — consume to boundary as noop for now.
-                    self.consume_until_statement_boundary();
-                    Ok(Statement::Empty)
+                    // v7.39 (round 436) — `CREATE TEMPORARY TABLE` used to be
+                    // consumed and answered OK while creating nothing, so
+                    // every statement that touched the table afterwards failed
+                    // with "table not found" — the DDL itself lied. It is a
+                    // real CREATE TABLE now, marked temporary so the executor
+                    // puts it in the session's own namespace. An optional
+                    // TABLE keyword may or may not be present (`CREATE TEMP t`
+                    // is not legal, but the keyword is consumed by the
+                    // CREATE TABLE parser itself).
+                    let stmt = self.parse_create_table_stmt_after_create()?;
+                    match stmt {
+                        Statement::CreateTable(mut c) => {
+                            c.temporary = true;
+                            Ok(Statement::CreateTable(c))
+                        }
+                        // `CREATE TEMPORARY TABLE x AS <select>` lowers to the
+                        // CTAS node, which needs the same session namespace.
+                        Statement::CreateMaterializedView(mut m) if m.as_plain_table => {
+                            m.temporary = true;
+                            Ok(Statement::CreateMaterializedView(m))
+                        }
+                        other => Ok(other),
+                    }
                 }
             }
             // v7.17.0 Phase 4.2 — MySQL `CREATE PROCEDURE name (…)
@@ -4880,6 +4923,7 @@ impl Parser {
         let with_data = self.parse_optional_with_data(true)?;
         Ok(Statement::CreateMaterializedView(
             crate::ast::CreateMaterializedViewStatement {
+                temporary: false,
                 name,
                 if_not_exists,
                 columns,
@@ -12498,6 +12542,7 @@ impl Parser {
             self.advance(); // of
             let partition_of = self.parse_partition_of_tail()?;
             return Ok(Statement::CreateTable(CreateTableStatement {
+                temporary: false,
                 name,
                 columns: Vec::new(),
                 if_not_exists,
@@ -12522,6 +12567,7 @@ impl Parser {
             let with_data = self.parse_optional_with_data(true)?;
             return Ok(Statement::CreateMaterializedView(
                 crate::ast::CreateMaterializedViewStatement {
+                    temporary: false,
                     name,
                     if_not_exists,
                     columns: Vec::new(),
@@ -12666,6 +12712,7 @@ impl Parser {
             None
         };
         Ok(Statement::CreateTable(CreateTableStatement {
+            temporary: false,
             name,
             columns,
             if_not_exists,

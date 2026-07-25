@@ -935,6 +935,10 @@ pub struct CreateMaterializedViewStatement {
     /// executor creates a plain table and does NOT register it in the
     /// materialized-view registry (no REFRESH semantics).
     pub as_plain_table: bool,
+    /// v7.39 (round 436) — `CREATE TEMPORARY TABLE … AS <select>`. Only
+    /// meaningful together with `as_plain_table`; the executor puts the
+    /// resulting table in the creating session's namespace.
+    pub temporary: bool,
 }
 
 /// v7.39 (read01 round 132) — `WITH [LOCAL | CASCADED] CHECK OPTION` on an
@@ -1991,6 +1995,11 @@ pub enum IndexMethod {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateTableStatement {
+    /// v7.39 (round 436) — `CREATE TEMPORARY TABLE`. The table lives in the
+    /// creating session's own namespace: it shadows a permanent table of the
+    /// same name, other sessions never see it, and it is dropped when the
+    /// session ends. A `bool` here lands in the struct's existing padding.
+    pub temporary: bool,
     pub name: String,
     pub columns: Vec<ColumnDef>,
     /// `IF NOT EXISTS` — engine returns `CommandOk` no-op when the
@@ -4375,13 +4384,14 @@ impl Statement {
     #[must_use]
     pub fn mysql_implicit_commit(&self) -> bool {
         match self {
+            // MySQL's documented exception, measured on MariaDB 11: a
+            // TEMPORARY table is not DDL for this purpose and does not
+            // commit. (Round 435 got this for free because the parser then
+            // lowered that spelling to `Statement::Empty`; round 436 made it
+            // a real CREATE TABLE, and the round-435 pin caught it.)
+            Self::CreateTable(c) => !c.temporary,
             // MySQL commits the open transaction and opens a fresh one.
-            // MySQL's documented exception — `CREATE TEMPORARY TABLE` does
-            // not commit — needs no arm here: the parser lowers that
-            // spelling to `Statement::Empty`, so it never reaches
-            // `CreateTable` and falls through to `false` below.
-            Self::CreateTable(_)
-            | Self::Begin { .. }
+            Self::Begin { .. }
             | Self::DropTable { .. }
             | Self::DropIndex { .. }
             | Self::CreateIndex(_)
