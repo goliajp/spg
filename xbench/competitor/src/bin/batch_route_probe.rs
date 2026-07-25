@@ -39,30 +39,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         c.execute(batch_sql(chunk * 1000, 1000).as_str()).await?;
     }
 
-    let mut on = Vec::new();
-    let mut off = Vec::new();
+    // 2x2: {autocommit -> group-commit queue, explicit tx -> ordinary path}
+    // x {synchronous_commit on, off}. One fsync on this filesystem costs
+    // ~0.5 ms (measured separately), PG pays 0.911 ms per statement and SPGS
+    // 1.741 ms, so the gap is not the syscall — this says which route carries
+    // it.
     let mut base = 2_000_000i64;
-    for mode in ["on", "off"] {
-        c.execute(format!("SET synchronous_commit = {mode}").as_str())
-            .await?;
-        // Warm.
+    let mut results: Vec<(String, f64)> = Vec::new();
+    c.execute("SET synchronous_commit = on").await?;
+
+    // The panel's insert_batch_1k times only the INSERT, but every timed
+    // insert is preceded by a DELETE of the previous batch — the table is
+    // CHURNED at a steady 50k rows. This probe's earlier runs let the table
+    // grow monotonically instead, and reported 1.16-1.35x where the panel
+    // reports 2.47x. Churn is the difference worth testing: if it is what
+    // costs, it would also explain `delete_reinsert_1k`, the only other
+    // surviving loss.
+    for churn in [false, true] {
         for _ in 0..5 {
             c.execute(batch_sql(base, 1000).as_str()).await?;
+            if churn {
+                c.execute(
+                    format!("DELETE FROM wb WHERE id >= {base} AND id < {}", base + 1000).as_str(),
+                )
+                .await?;
+            }
             base += 1000;
         }
+        let mut v = Vec::with_capacity(31);
         for _ in 0..31 {
             let sql = batch_sql(base, 1000);
-            base += 1000;
             let t = Instant::now();
             c.execute(sql.as_str()).await?;
-            let ms = t.elapsed().as_secs_f64() * 1000.0;
-            if mode == "on" { on.push(ms) } else { off.push(ms) }
+            v.push(t.elapsed().as_secs_f64() * 1000.0);
+            if churn {
+                c.execute(
+                    format!("DELETE FROM wb WHERE id >= {base} AND id < {}", base + 1000).as_str(),
+                )
+                .await?;
+            }
+            base += 1000;
         }
+        let label = if churn {
+            "insert after DELETE (panel shape)"
+        } else {
+            "insert into growing table"
+        };
+        results.push((label.to_string(), median(v)));
     }
-    let (mon, moff) = (median(on), median(off));
-    println!("# 1000-row VALUES insert over the wire, median of 31");
-    println!("  synchronous_commit = on  : {mon:.3} ms");
-    println!("  synchronous_commit = off : {moff:.3} ms");
-    println!("  delta (one fsync)        : {:.3} ms", mon - moff);
+    println!("# 1000-row VALUES insert, sync=on, median of 31");
+    for (k, ms) in &results {
+        println!("  {k:<34}: {ms:.3} ms");
+    }
     Ok(())
 }
