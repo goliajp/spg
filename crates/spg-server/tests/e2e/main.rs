@@ -253,6 +253,7 @@ mod e2e_mysqlwire_caching_sha2;
     clippy::uninlined_format_args
 )]
 mod e2e_mysqlwire_handshake;
+mod e2e_mysqlwire_errno_round429;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,

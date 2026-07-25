@@ -920,16 +920,58 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
             "70100",
             "Query execution was interrupted".to_string(),
         ),
-        // v7.39 (round 323, V24) — without the internal class vocabulary.
-        // A mysql client used to be handed SPG's own layering, e.g.
-        // "parse: parse error at token #3: expected …"; neither MariaDB
-        // nor PG emits anything of the sort, and pgwire has stripped it
-        // for typed states since r184.
-        _ => (
-            1064,
-            "42000",
-            crate::strip_internal_error_prefixes(&e.to_string()).to_string(),
-        ),
+        // v7.39 (round 429) — every OTHER error used to answer 1064 / 42000,
+        // MySQL's SYNTAX ERROR. Clients branch on errno — a duplicate key
+        // (1062) drives upsert fallbacks, "table already exists" (1050)
+        // makes a migration idempotent, "cannot be null" (1048) and "table
+        // doesn't exist" (1146) drive their own paths — so reporting every
+        // one of them as a syntax error sent all of that logic down the
+        // wrong branch.
+        //
+        // The classification itself is NOT duplicated: pgwire already sorts
+        // the engine's errors into PG SQLSTATEs and is tested on it, so the
+        // MySQL errno is derived from that one answer. The two protocols
+        // disagree on spelling, never on which failure it was.
+        _ => {
+            let (pg_state, msg) = crate::pgwire::engine_error_to_wire(e);
+            let (errno, my_state) = mysql_code_for_sqlstate(pg_state);
+            (errno, my_state, crate::strip_internal_error_prefixes(&msg).to_string())
+        }
+    }
+}
+
+/// v7.39 (round 429) — PG SQLSTATE → the MySQL errno + SQLSTATE a
+/// mysql/MariaDB client expects. Every pair measured against MariaDB 11:
+///
+/// | failure              | PG    | MariaDB              |
+/// |----------------------|-------|----------------------|
+/// | duplicate key        | 23505 | 1062 (23000)         |
+/// | NOT NULL violation   | 23502 | 1048 (23000)         |
+/// | foreign key          | 23503 | 1452 (23000)         |
+/// | CHECK violation      | 23514 | 4025 (23000)         |
+/// | value too long       | 22001 | 1406 (22001)         |
+/// | unknown column       | 42703 | 1054 (42S22)         |
+/// | unknown table        | 42P01 | 1146 (42S02)         |
+/// | table already exists | 42P07 | 1050 (42S01)         |
+/// | duplicate column     | 42701 | 1060 (42S21)         |
+/// | division by zero     | 22012 | 1365 (22012)         |
+///
+/// Anything unclassified keeps the historical 1064 / 42000.
+fn mysql_code_for_sqlstate(pg_state: &str) -> (u16, &'static str) {
+    match pg_state {
+        "23505" => (1062, "23000"),
+        "23502" => (1048, "23000"),
+        "23503" => (1452, "23000"),
+        "23514" => (4025, "23000"),
+        "22001" => (1406, "22001"),
+        "42703" => (1054, "42S22"),
+        // MariaDB spells a missing table on DROP as 1051 and everywhere else
+        // as 1146; both carry 42S02, which is what a client branches on.
+        "42P01" => (1146, "42S02"),
+        "42P07" => (1050, "42S01"),
+        "42701" => (1060, "42S21"),
+        "22012" => (1365, "22012"),
+        _ => (1064, "42000"),
     }
 }
 

@@ -4137,7 +4137,10 @@ fn parse_error_position(e: &EngineError, sql: &str) -> Option<usize> {
     }
 }
 
-fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
+/// v7.39 (round 429) — crate-visible so the MySQL wire can derive its own
+/// errno from the SAME classification: the two protocols disagree only on
+/// the code's spelling, never on which failure it was.
+pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
     if let EngineError::Cancelled = e {
         return (
             "57014",
