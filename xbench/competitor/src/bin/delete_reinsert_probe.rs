@@ -67,7 +67,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         c.execute(ins.as_str()).await?;
         iv.push(t.elapsed().as_secs_f64() * 1000.0);
     }
+    // v7.39 (round 459) — did the DELETE reach the index over THIS path?
+    // The embedded engine seeks (round 457: 0.184 ms for 1000 rows); the
+    // profile of the named connection thread is dominated by per-row
+    // `eval_expr` / `binop` / `is_row_visible`, which is what a filter scan
+    // looks like. These two counters say which.
+    let idx: i64 = sqlx::query_scalar(
+        "SELECT idx_scan FROM pg_stat_user_tables WHERE relname='wb'",
+    )
+    .fetch_one(&mut c)
+    .await
+    .unwrap_or(-1);
+    let seq: i64 = sqlx::query_scalar(
+        "SELECT seq_tup_read FROM pg_stat_user_tables WHERE relname='wb'",
+    )
+    .fetch_one(&mut c)
+    .await
+    .unwrap_or(-1);
     println!("# delete_reinsert_1k split, sync=off, median of {iters}");
+    println!("  idx_scan={idx}  seq_tup_read={seq}");
     println!("  DELETE 1000 rows : {:.3} ms", median(dv));
     println!("  re-INSERT 1000   : {:.3} ms", median(iv));
     Ok(())

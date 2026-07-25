@@ -97,19 +97,34 @@ pub fn spawn_listener(
 ) -> std::io::Result<std::net::SocketAddr> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else {
-                continue;
-            };
-            let state = Arc::clone(&state);
-            thread::spawn(move || {
-                if let Err(e) = handle_conn(stream, &state) {
-                    eprintln!("spg-server: pg-wire conn error: {e}");
-                }
-            });
-        }
-    });
+    // v7.39 (round 459) — name both the listener and each connection
+    // thread. Every other thread this server starts is named
+    // (`spg-autovacuum`, `spg-freezer`, `spg-flusher`, `spg-auto-analyze`,
+    // `spg-follower`); the ones that actually serve clients were the
+    // anonymous ones, which is exactly backwards for anyone reading a
+    // profile, a crash log or `ps -M`.
+    //
+    // It cost a round: profiling a DELETE, the only way to find the serving
+    // thread was "first block in the sample that mentions an engine frame",
+    // which is a guess, and the attribution it produced turned out to be
+    // five background workers' idle sleep.
+    let _ = thread::Builder::new()
+        .name("spg-pgwire-listen".into())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else {
+                    continue;
+                };
+                let state = Arc::clone(&state);
+                let _ = thread::Builder::new()
+                    .name("spg-pgwire-conn".into())
+                    .spawn(move || {
+                        if let Err(e) = handle_conn(stream, &state) {
+                            eprintln!("spg-server: pg-wire conn error: {e}");
+                        }
+                    });
+            }
+        });
     Ok(local)
 }
 
