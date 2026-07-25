@@ -372,6 +372,64 @@ const BPCHAR_PADDED_FNS: &[&str] = &[
 /// `YYYY-MM-DD` text). Returns the argument as text: borrowed for a real
 /// string, coerced (owned) for the MySQL-stringifiable scalars, or None so
 /// the caller keeps its PG type error. NULL is handled by the caller first.
+/// v7.39 (round 468) — the integer a `substring` / `substr` / `mid`
+/// position or length argument contributes.
+///
+/// `substr('abcdef','2')` answered NULL where PG answers `bcdef`, because a
+/// TEXT argument reached the positional path and was refused. PG coerces
+/// the unknown-typed literal to integer (whitespace and all — `' 2 '`
+/// works) and raises `invalid input syntax for type integer` on anything
+/// that is not one. Measured on PG18.
+///
+/// MySQL never raises here: it reads the longest LEADING integer and treats
+/// the rest as zero, so `SUBSTR('abcdef','x')` is position 0 (the empty
+/// string) and `SUBSTR('abcdef','2.7')` is position 2 — note that a numeric
+/// `2.7` rounds to 3 there while the STRING '2.7' truncates to 2. Both
+/// measured on MariaDB 11.
+fn substring_position_arg(v: &Value<'_>, mysql: bool, what: &str) -> Result<i64, EvalError> {
+    match v {
+        Value::SmallInt(n) => return Ok(i64::from(*n)),
+        Value::Int(n) => return Ok(i64::from(*n)),
+        Value::BigInt(n) => return Ok(*n),
+        _ => {}
+    }
+    if let Value::Text(t) = v {
+        if mysql {
+            return Ok(mysql_leading_int(t));
+        }
+        let trimmed = t.trim();
+        if let Ok(n) = trimmed.parse::<i64>() {
+            return Ok(n);
+        }
+        return Err(EvalError::TypeMismatch {
+            detail: format!("invalid input syntax for type integer: {t:?}"),
+        });
+    }
+    // MySQL reads a number out of anything it can render; PG keeps its
+    // "start must be integer" refusal for the shapes that are not text.
+    if mysql
+        && let Some(text) = mysql_str_arg(v, true)
+    {
+        return Ok(mysql_leading_int(&text));
+    }
+    Err(EvalError::TypeMismatch {
+        detail: format!("substring() {what} must be integer, got {:?}", v.data_type()),
+    })
+}
+
+/// The leading integer of a string, MySQL-style: optional sign, then digits,
+/// stopping at the first character that is not one. Everything else is 0.
+fn mysql_leading_int(s: &str) -> i64 {
+    let t = s.trim_start();
+    let (neg, rest) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let n: i64 = digits.parse().unwrap_or(0);
+    if neg { -n } else { n }
+}
+
 fn mysql_str_arg<'a>(v: &'a Value<'_>, mysql: bool) -> Option<Cow<'a, str>> {
     match v {
         Value::Text(s) => Some(Cow::Borrowed(s.as_ref())),
@@ -5667,7 +5725,19 @@ fn apply_function_dispatch(
             // v7.38 (read01, T7) — `substring(string FROM pattern)` returns the
             // first capturing group when the pattern has one (else the whole
             // match), matching PG. NULL args pass through as NULL.
-            if name != "mid" && args.len() == 2 && matches!(&args[1], Value::Text(_)) {
+            // v7.39 (round 468) — the regex reading belongs to PG's
+            // `substring(string, pattern)` ALONE. `substr` has no such
+            // overload there (PG coerces the literal and answers `bcdef`
+            // for `substr('abcdef','2')`), and MySQL has no regex form at
+            // all — MariaDB answers `bcdef` for `SUBSTRING('abcdef','2')`
+            // and the empty string for `SUBSTRING('abcdef','bc')`. Both
+            // measured; both used to reach the pattern matcher and answer
+            // NULL or a match.
+            if name == "substring"
+                && !ctx.mysql_dialect
+                && args.len() == 2
+                && matches!(&args[1], Value::Text(_))
+            {
                 let (Value::Text(src), Value::Text(pat)) = (&args[0], &args[1]) else {
                     return Ok(Value::Null);
                 };
@@ -5679,7 +5749,8 @@ fn apply_function_dispatch(
             // markers become a capturing group, then reuse the group-extracting
             // POSIX substring. Only fires when both arg1 and arg2 are TEXT so a
             // real numeric `FOR len` still takes the positional path below.
-            if name != "mid"
+            if name == "substring"
+                && !ctx.mysql_dialect
                 && args.len() == 3
                 && matches!(&args[1], Value::Text(_))
                 && matches!(&args[2], Value::Text(_))
@@ -5693,33 +5764,13 @@ fn apply_function_dispatch(
                 let posix = similar_substring_to_posix(pat, esc_ch);
                 return super::regexp::substring_pattern(src, &posix);
             }
-            let start: i64 = match args[1] {
-                Value::Int(n) => i64::from(n),
-                Value::BigInt(n) => n,
-                Value::SmallInt(n) => i64::from(n),
-                _ => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "substring() start must be integer, got {:?}",
-                            args[1].data_type()
-                        ),
-                    });
-                }
-            };
+            let start: i64 = substring_position_arg(&args[1], ctx.mysql_dialect, "start")?;
             let length: Option<i64> = if args.len() == 3 {
-                match args[2] {
-                    Value::Int(n) => Some(i64::from(n)),
-                    Value::BigInt(n) => Some(n),
-                    Value::SmallInt(n) => Some(i64::from(n)),
-                    _ => {
-                        return Err(EvalError::TypeMismatch {
-                            detail: format!(
-                                "substring() length must be integer, got {:?}",
-                                args[2].data_type()
-                            ),
-                        });
-                    }
-                }
+                Some(substring_position_arg(
+                    &args[2],
+                    ctx.mysql_dialect,
+                    "length",
+                )?)
             } else {
                 None
             };

@@ -276,6 +276,7 @@ mod e2e_dml_seq_scan_stats_round455;
 mod e2e_churn_seek_cap_round461;
 mod e2e_describe_matches_execute_round462;
 mod e2e_mysql_unsigned_arith_round467;
+mod e2e_substr_text_position_round468;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;
