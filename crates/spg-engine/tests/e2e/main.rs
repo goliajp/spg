@@ -274,6 +274,7 @@ mod e2e_temporary_tables_round436;
 mod e2e_temp_table_visibility_round437;
 mod e2e_dml_seq_scan_stats_round455;
 mod e2e_churn_seek_cap_round461;
+mod e2e_describe_matches_execute_round462;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;

@@ -394,6 +394,33 @@ impl Engine {
         stmt: &SelectStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        let catalog = self.meta_view_catalog(stmt)?;
+        let mut temp = Engine::restore(catalog);
+        if let Some(c) = self.clock {
+            temp = temp.with_clock(c);
+        }
+        if let Some(f) = self.salt_fn {
+            temp = temp.with_salt_fn(f);
+        }
+        temp.meta_views_materialised = true;
+        temp.exec_select_cancel(stmt, cancel)
+    }
+
+    /// v7.39 (round 462) — the catalog a meta-view SELECT resolves
+    /// against: this engine's catalog with every `__spg_*` view the
+    /// statement references materialised into it.
+    ///
+    /// Split out of `exec_select_with_meta_views` so Describe can reach
+    /// the same shapes execution reaches. Describe used to look the FROM
+    /// relation up in the plain catalog, where a system view does not
+    /// exist, and reported "no columns" for every one of them — so an
+    /// extended-protocol client reading `pg_stat_user_tables` got rows
+    /// with no column metadata. Sharing the materialisation means a
+    /// view added here is described correctly the day it is added.
+    pub(crate) fn meta_view_catalog(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<Catalog, EngineError> {
         let mut needed: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
         collect_meta_view_names(stmt, &mut needed);
         let mut catalog = self.active_catalog().clone();
@@ -874,15 +901,7 @@ impl Engine {
                 }
             }
         }
-        let mut temp = Engine::restore(catalog);
-        if let Some(c) = self.clock {
-            temp = temp.with_clock(c);
-        }
-        if let Some(f) = self.salt_fn {
-            temp = temp.with_salt_fn(f);
-        }
-        temp.meta_views_materialised = true;
-        temp.exec_select_cancel(stmt, cancel)
+        Ok(catalog)
     }
 
     pub(crate) fn exec_with_ctes(
@@ -1738,6 +1757,33 @@ impl Engine {
             "spg_database_ddl" => self.exec_spg_database_ddl(),
             _ => return None,
         })
+    }
+
+    /// v7.39 (round 462) — the catalog an admin / stat view SELECT
+    /// describes against: this engine's catalog with the view staged as a
+    /// table, exactly as `exec_select_cancel_as` stages it for a
+    /// non-bare query.
+    ///
+    /// These views never reach the catalog — each is a fixed row set built
+    /// inside its own `exec_*` — so Describe reported no columns for all
+    /// seventeen of them. Rows are deliberately not inserted: Describe
+    /// only needs the shape, and `infer_column_types` reads the rows we
+    /// already have in hand.
+    pub(crate) fn admin_view_catalog(&self, stmt: &SelectStatement) -> Option<Catalog> {
+        let from = stmt.from.as_ref()?;
+        if !from.joins.is_empty() || self.active_catalog().get(&from.primary.name).is_some() {
+            return None;
+        }
+        let lower = from.primary.name.to_ascii_lowercase();
+        let QueryResult::Rows { columns, rows } = self.meta_view_result(&lower)? else {
+            return None;
+        };
+        let mut catalog = self.active_catalog().clone();
+        let cols = infer_column_types(&columns, &rows);
+        catalog
+            .create_table(TableSchema::new(from.primary.name.clone(), cols))
+            .ok()?;
+        Some(catalog)
     }
 
     pub(crate) fn exec_select_cancel(
@@ -6549,6 +6595,30 @@ pub(crate) fn build_projection(
     schema_cols: &[ColumnSchema],
     table_alias: &str,
 ) -> Result<Vec<ProjectedItem>, EngineError> {
+    // v7.39 (round 462) — a join's combined schema qualifies every column
+    // `alias.col` so the deferred-join cell lookups resolve by composite
+    // name. That is an internal convention, and `*` was handing it to the
+    // client: PG18 answers `SELECT * FROM a JOIN b` with the BARE names
+    // (`id, g, id, h` — duplicates and all), SPG answered `a.id, a.g,
+    // b.id, b.h`, so name-keyed row access found nothing. Round 128 had
+    // already learned this for `q.*`; plain `*` never got the same rule.
+    //
+    // The signal is the schema itself, not the call site: only a combined
+    // join schema arrives with no table alias AND every column qualified.
+    // A single-table schema carries its alias, an empty schema has nothing
+    // to strip, and a synthetic schema's names carry no dot.
+    let joined_schema = table_alias.is_empty()
+        && !schema_cols.is_empty()
+        && schema_cols.iter().all(|c| c.name.contains('.'));
+    let bare_name = |name: &str| -> String {
+        if !joined_schema {
+            return name.to_string();
+        }
+        match name.split_once('.') {
+            Some((_, rest)) if !rest.is_empty() => rest.to_string(),
+            _ => name.to_string(),
+        }
+    };
     let mut out = Vec::new();
     for item in items {
         match item {
@@ -6559,7 +6629,7 @@ pub(crate) fn build_projection(
                             qualifier: None,
                             name: col.name.clone(),
                         }),
-                        output_name: col.name.clone(),
+                        output_name: bare_name(&col.name),
                         ty: col.ty,
                         nullable: col.nullable,
                         user_enum_type: col.user_enum_type.clone(),
