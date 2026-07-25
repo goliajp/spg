@@ -644,6 +644,11 @@ pub(crate) struct SessionBag {
     /// separate from the `@@` session parameters. Reading an unset one
     /// answers NULL, as MariaDB does.
     pub(crate) user_vars: BTreeMap<String, spg_storage::Value<'static>>,
+    /// v7.39 (round 436) — the logical names of this session's TEMPORARY
+    /// tables. Each is stored in the catalog under a per-session prefix; this
+    /// set is what says "resolve `t` to my temp one" and what `end_session`
+    /// walks to drop them.
+    pub(crate) temp_tables: alloc::collections::BTreeSet<String>,
 }
 
 /// v7.39 (round 306) — one open large-object descriptor.
@@ -995,6 +1000,9 @@ pub struct Engine {
     /// v7.39 (round 430) — this session's MySQL USER variables.
     /// Swapped with [`SessionBag`] like every other per-connection slot.
     pub(crate) user_vars: BTreeMap<String, spg_storage::Value<'static>>,
+    /// v7.39 (round 436) — the logical names of this session's TEMPORARY
+    /// tables. Swapped with [`SessionBag`]; see `session_temp_name`.
+    pub(crate) temp_tables: BTreeSet<String>,
     /// v7.39 (round 222) — channels this session LISTENs on. Engine-wide
     /// (the same process-level session-state architecture wall as
     /// `session_params`). Never serialized.
@@ -1285,6 +1293,7 @@ impl Engine {
             last_insert_id: core::sync::atomic::AtomicI64::new(0),
             row_count: 0,
             user_vars: BTreeMap::new(),
+            temp_tables: BTreeSet::new(),
             listen_channels: BTreeSet::new(),
             tx_pending_notifies: Vec::new(),
             delivered_notifies: Vec::new(),
@@ -1668,6 +1677,7 @@ impl Engine {
             last_insert_id: core::sync::atomic::AtomicI64::new(0),
             row_count: 0,
             user_vars: BTreeMap::new(),
+            temp_tables: BTreeSet::new(),
             listen_channels: BTreeSet::new(),
             tx_pending_notifies: Vec::new(),
             delivered_notifies: Vec::new(),
@@ -1785,6 +1795,7 @@ impl Engine {
             last_insert_id: core::sync::atomic::AtomicI64::new(0),
             row_count: 0,
             user_vars: BTreeMap::new(),
+            temp_tables: BTreeSet::new(),
                     listen_channels: BTreeSet::new(),
                     tx_pending_notifies: Vec::new(),
                     delivered_notifies: Vec::new(),
@@ -1862,6 +1873,7 @@ impl Engine {
             last_insert_id: self.last_insert_id.load(core::sync::atomic::Ordering::Relaxed),
             row_count: self.row_count,
             user_vars: core::mem::take(&mut self.user_vars),
+            temp_tables: core::mem::take(&mut self.temp_tables),
         };
         self.sessions.insert(self.current_session, outgoing);
         let incoming = self.sessions.remove(&id).unwrap_or_default();
@@ -1875,14 +1887,69 @@ impl Engine {
             .store(incoming.last_insert_id, core::sync::atomic::Ordering::Relaxed);
         self.row_count = incoming.row_count;
         self.user_vars = incoming.user_vars;
+        self.temp_tables = incoming.temp_tables;
         self.current_session = id;
+        // The incoming session's temp namespace must be live before its very
+        // first statement resolves a name.
+        self.refresh_temp_prefix();
         self.plan_cache.clear();
+    }
+
+    /// v7.39 (round 436) — the catalog-name prefix session `id` stores its
+    /// TEMPORARY tables under. Mirrors PG's per-session `pg_temp_N` schema;
+    /// the leading underscores keep it out of any name a client can write.
+    fn temp_prefix_for(id: u32) -> String {
+        alloc::format!("__spg_temp_{id}__")
+    }
+
+    /// The catalog name this session's TEMPORARY table `logical` takes.
+    pub(crate) fn session_temp_name(&self, logical: &str) -> String {
+        alloc::format!("{}{logical}", Self::temp_prefix_for(self.current_session))
+    }
+
+    /// v7.39 (round 436) — point every catalog this session can reach at its
+    /// temp namespace, or at none when it owns no temporary tables (so a
+    /// session that never made one pays a single `Option` check per lookup).
+    /// Both the committed catalog and any open transaction's shadow are set:
+    /// a temp table created inside a transaction must resolve there too.
+    pub(crate) fn refresh_temp_prefix(&mut self) {
+        let prefix = if self.temp_tables.is_empty() {
+            None
+        } else {
+            Some(Self::temp_prefix_for(self.current_session))
+        };
+        self.catalog.set_temp_prefix(prefix.clone());
+        for shadow in self.tx_catalogs.values_mut() {
+            shadow.catalog.set_temp_prefix(prefix.clone());
+        }
     }
 
     /// v7.39 (round 279) — a connection has gone away: drop its parked
     /// state and release every advisory lock it still held, which is
     /// what PG does at backend exit.
     pub fn end_session(&mut self, id: u32) {
+        // v7.39 (round 436) — a TEMPORARY table dies with its session, in
+        // both PG and MySQL. Done before the bag is dropped, since the bag
+        // is what knows which tables the session owns.
+        let owned: Vec<String> = if id == self.current_session {
+            self.temp_tables.iter().cloned().collect()
+        } else {
+            self.sessions
+                .get(&id)
+                .map(|b| b.temp_tables.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+        if !owned.is_empty() {
+            let prefix = Self::temp_prefix_for(id);
+            for logical in owned {
+                let mangled = alloc::format!("{prefix}{logical}");
+                self.catalog.drop_table(&mangled);
+            }
+            if id == self.current_session {
+                self.temp_tables.clear();
+                self.refresh_temp_prefix();
+            }
+        }
         self.sessions.remove(&id);
         self.advisory_locks.retain(|_, (owner, _)| *owner != id);
         if id == self.current_session {

@@ -2353,7 +2353,15 @@ impl Engine {
                     )));
                 }
             }
+            // v7.39 (round 436) — if this was one of the session's TEMPORARY
+            // tables, forget it too, so a permanent namesake becomes visible
+            // again and `end_session` does not chase a gone table.
+            let was_temp = self.temp_tables.contains(&name);
             let dropped = self.active_catalog_mut().drop_table(&name);
+            if dropped && was_temp {
+                self.temp_tables.remove(&name);
+                self.refresh_temp_prefix();
+            }
             if dropped {
                 // r192 — drop the non-transactional DML counters so a
                 // later same-named table starts at zero (PG resets
@@ -2405,6 +2413,24 @@ impl Engine {
         &mut self,
         stmt: CreateTableStatement,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 (round 436) — a TEMPORARY table is created under the calling
+        // session's namespace prefix and remembered there, so it shadows a
+        // permanent table of the same name, stays invisible to other
+        // sessions, and goes away with the session. Everything downstream
+        // (the whole DDL body, and every later statement) then works on an
+        // ordinary table: name resolution happens at the ONE place a name
+        // becomes an index, `Catalog::resolve_index`.
+        if stmt.temporary {
+            let logical = stmt.name.clone();
+            let mangled = self.session_temp_name(&logical);
+            let mut inner = stmt;
+            inner.temporary = false;
+            inner.name = mangled;
+            let result = self.exec_create_table(inner)?;
+            self.temp_tables.insert(logical);
+            self.refresh_temp_prefix();
+            return Ok(result);
+        }
         if stmt.if_not_exists && self.active_catalog().get(&stmt.name).is_some() {
             // v7.39 (read01 round 46) — PG's IF NOT EXISTS skip NOTICE.
             self.notice(alloc::format!(
@@ -4533,6 +4559,20 @@ impl Engine {
         &mut self,
         s: spg_sql::ast::CreateMaterializedViewStatement,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 (round 436) — `CREATE TEMPORARY TABLE x AS <select>` arrives
+        // here (CTAS lowers to this node with `as_plain_table`). Same
+        // treatment as the column-list form: build it under the session's
+        // namespace prefix and remember it there.
+        if s.temporary && s.as_plain_table {
+            let logical = s.name.clone();
+            let mut inner = s;
+            inner.temporary = false;
+            inner.name = self.session_temp_name(&logical);
+            let result = self.exec_create_materialized_view(inner)?;
+            self.temp_tables.insert(logical);
+            self.refresh_temp_prefix();
+            return Ok(result);
+        }
         // v7.39 (round 151) — PG's matview wording differs from the
         // plain-view one (transformCreateTableAsStmt, analyze.c).
         if s.body.ctes.iter().any(|c| c.body.is_modifying()) {

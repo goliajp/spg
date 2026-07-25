@@ -3672,6 +3672,16 @@ pub struct Catalog {
     /// `name → tables[index]`. Kept in lock-step with `tables`.
     /// `create_table` is the only write path.
     by_name: BTreeMap<String, usize>,
+    /// v7.39 (round 436) — the current session's temporary-table namespace.
+    /// A temp table is stored under `<prefix><name>`, and every lookup tries
+    /// that first: exactly PG's `pg_temp` search-path rule, and MySQL's
+    /// "a TEMPORARY table shadows a permanent one of the same name".
+    ///
+    /// Process-local, never serialised: the engine sets it per session, and
+    /// a catalog read back from disk starts with none. Kept here rather than
+    /// at each of the ~170 engine call sites because `by_name` is private —
+    /// this is the ONE place a table name becomes an index.
+    temp_prefix: Option<String>,
     /// v7.37.15 (Phase C.1) — monotonic allocator for stable
     /// [`RelId`](row_header::RelId)s. Pre-incremented on each
     /// `create_table` so real ids start at 1 (0 is `UNASSIGNED`);
@@ -4415,6 +4425,7 @@ impl Catalog {
             },
             tables: Vec::new(),
             by_name: BTreeMap::new(),
+            temp_prefix: None,
             next_rel_id: 0,
             cold_segments: Vec::new(),
             functions: BTreeMap::new(),
@@ -5277,13 +5288,45 @@ impl Catalog {
         Ok(())
     }
 
+    /// v7.39 (round 436) — the session's temporary table of this name wins
+    /// over a permanent one, as `pg_temp` does in PG's search path and as
+    /// MySQL's TEMPORARY shadowing does. Every name → index resolution in
+    /// this catalog goes through here.
+    fn resolve_index(&self, name: &str) -> Option<usize> {
+        if let Some(prefix) = &self.temp_prefix {
+            let mut mangled = String::with_capacity(prefix.len() + name.len());
+            mangled.push_str(prefix);
+            mangled.push_str(name);
+            if let Some(idx) = self.by_name.get(&mangled) {
+                return Some(*idx);
+            }
+        }
+        self.by_name.get(name).copied()
+    }
+
+    /// v7.39 (round 436) — install the calling session's temp namespace.
+    /// `None` disables temp resolution entirely (a session that never made
+    /// one pays a single `Option` check per lookup).
+    pub fn set_temp_prefix(&mut self, prefix: Option<String>) {
+        self.temp_prefix = prefix;
+    }
+
+    /// The mangled storage name a temp table of `name` takes in this
+    /// session, or `None` when the session has no temp namespace.
+    #[must_use]
+    pub fn temp_name_for(&self, name: &str) -> Option<String> {
+        self.temp_prefix
+            .as_ref()
+            .map(|p| alloc::format!("{p}{name}"))
+    }
+
     pub fn get(&self, name: &str) -> Option<&Table> {
-        let idx = *self.by_name.get(name)?;
+        let idx = self.resolve_index(name)?;
         self.tables.get(idx)
     }
 
     pub fn get_mut(&mut self, name: &str) -> Option<&mut Table> {
-        let idx = *self.by_name.get(name)?;
+        let idx = self.resolve_index(name)?;
         self.tables.get_mut(idx)
     }
 
@@ -5294,7 +5337,7 @@ impl Catalog {
     /// descent. The returned index is stable for the lifetime of the
     /// catalog snapshot the caller holds (same engine read guard).
     pub fn tables_position_of(&self, name: &str) -> Option<usize> {
-        self.by_name.get(name).copied()
+        self.resolve_index(name)
     }
 
     /// Direct positional fetch counterpart to [`tables_position_of`].
@@ -5719,7 +5762,23 @@ impl Catalog {
     /// where the dump re-creates schema and starts with
     /// `DROP TABLE IF EXISTS`.
     pub fn drop_table(&mut self, name: &str) -> bool {
-        let Some(idx) = self.by_name.remove(name) else {
+        // v7.39 (round 436) — resolve through the session's temp namespace
+        // first, exactly as a read would: MariaDB's plain `DROP TABLE tmp`
+        // drops the TEMPORARY one and leaves a permanent namesake standing
+        // (measured). Removing by the raw name would have dropped the
+        // permanent table out from under every other session.
+        let key = match self.temp_prefix.as_ref() {
+            Some(p) => {
+                let mangled = alloc::format!("{p}{name}");
+                if self.by_name.contains_key(&mangled) {
+                    mangled
+                } else {
+                    name.into()
+                }
+            }
+            None => name.into(),
+        };
+        let Some(idx) = self.by_name.remove(&key) else {
             return false;
         };
         // swap_remove invalidates the trailing index → rebuild
