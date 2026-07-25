@@ -320,6 +320,7 @@ pub(crate) fn append_durability_marker(state: &ServerState) -> std::io::Result<u
     // and `wal` reference the same kernel file; `sync_data` only
     // needs `&File`. Client INSERTs can re-acquire the mutex
     // freely during the fsync.
+    WAL_FSYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(sync_handle) = state.wal_sync_clone.as_ref() {
         sync_handle.sync_data()?;
     } else {
@@ -360,8 +361,63 @@ pub(crate) fn append_durability_marker(state: &ServerState) -> std::io::Result<u
 /// v7.39 (round 190, D13) — client-path fsync with chaos injection.
 /// `SPG_FAIL_FSYNC_AT=K` makes the K-th call (1-based, process-wide)
 /// fail once with an injected EIO; unset costs one branch.
+/// v7.39 (round 438) — always-on WAL commit-path counters.
+///
+/// The 2026-07-25 audit found SPGS losing 20x to PG18 on `tx_batch_100`
+/// (BEGIN + 100 INSERTs + COMMIT), with the same wall time as 100 autocommit
+/// INSERTs — i.e. the transaction bought no fsync amortisation, even though
+/// `persist_wire_write` is written to skip the fsync while a transaction is
+/// open. Wall-clock arithmetic can only *suggest* how many fsyncs ran; these
+/// count them. Free when nothing reads them (two relaxed adds on a path that
+/// is about to do disk I/O), so they are always on rather than env-gated —
+/// a counter you have to remember to enable is a counter you do not have
+/// when you need it.
+pub(crate) static WAL_APPENDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static WAL_FSYNCS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// v7.39 (round 438) — one stderr line per fsync when `SPG_WAL_TRACE=1`.
+/// Off by default (one relaxed load of a `OnceLock<bool>`), so a perf run
+/// can count fsyncs exactly instead of inferring the count from wall time.
+pub(crate) fn trace_wal_counters(site: &str) {
+    // `SPG_WAL_TRACE=1` → stderr. `SPG_WAL_TRACE=<path>` → append to that
+    // file, which is what a bench harness needs: it owns the child's stderr
+    // for its own handshake and would otherwise drop (or block on) the trace.
+    static DEST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(dest) = DEST
+        .get_or_init(|| std::env::var("SPG_WAL_TRACE").ok().filter(|v| v != "0"))
+        .as_deref()
+    else {
+        return;
+    };
+    let (a, f) = wal_counters();
+    let line = format!("[wal-trace] {site} appends={a} fsyncs={f}\n");
+    if dest == "1" {
+        eprint!("{line}");
+    } else if let Ok(mut fh) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dest)
+    {
+        use std::io::Write as _;
+        let _ = fh.write_all(line.as_bytes());
+    }
+}
+
+/// `(appends, fsyncs)` since process start.
+#[must_use]
+pub(crate) fn wal_counters() -> (u64, u64) {
+    (
+        WAL_APPENDS.load(std::sync::atomic::Ordering::Relaxed),
+        WAL_FSYNCS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 fn client_fsync(state: &ServerState, f: &std::fs::File) -> std::io::Result<()> {
     static FSYNC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    WAL_FSYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    trace_wal_counters("client_fsync");
     if let Some(k) = state.chaos.fail_fsync_at {
         let n = FSYNC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n == k {
@@ -848,6 +904,7 @@ pub(crate) fn append_wal(state: &ServerState, sql: &str, sync: bool) -> std::io:
     let Some(wal) = state.wal.as_ref() else {
         return Ok(());
     };
+    WAL_APPENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let entry = encode_wal_record(sql)?;
     let mut f = wal
         .lock()
