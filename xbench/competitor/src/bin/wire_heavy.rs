@@ -19,7 +19,7 @@
 #![allow(clippy::doc_markdown, clippy::uninlined_format_args)]
 
 use spg_bench_competitor::connection_strings;
-use spg_bench_competitor::write_shapes::{N, RUNS, SHAPES, bench_engine, verdict};
+use spg_bench_competitor::write_shapes::{N, SHAPES, bench_engine, runs, verdict};
 use sqlx::any::AnyPoolOptions;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -189,7 +189,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pg_on = bench_url(pg_url.clone(), "on")?;
     let pg_off = bench_url(pg_url, "off")?;
 
-    println!("# wire write-heavy shapes — median ms over {RUNS} runs, {N}-row seeded table");
+    println!(
+        "# wire write-heavy shapes — median ms over {} runs, {N}-row seeded table",
+        runs()
+    );
     println!("# SPGS = spg-server DURABLE (db+WAL) via pgwire; PG18 = postgres:18-alpine");
     println!("# identical client stack (sqlx postgres driver, 1 conn); same SQL both sides");
     println!(
