@@ -70,6 +70,32 @@ use crate::{
     literal_expr_to_value, resolve_foreign_key, rewrite_column_in_source, users,
 };
 
+/// v7.39 (round 475) — the column a `to_tsvector(…)` index key reads.
+///
+/// PG's full-text idiom is `CREATE INDEX … USING gin (to_tsvector('simple',
+/// body))`, and it is the reason a PG schema reaches the expression path at
+/// all. SPG already builds a fulltext GIN over a column for MySQL's
+/// `FULLTEXT KEY`; this recognises the shape so the PG spelling lands on the
+/// same index instead of being refused.
+///
+/// `None` for anything else, including `to_tsvector` over an expression
+/// rather than a bare column — indexing a derived value is a different
+/// build, and guessing at it would be worse than refusing.
+fn tsvector_source_column(e: &spg_sql::ast::Expr) -> Option<String> {
+    let spg_sql::ast::Expr::FunctionCall { name, args } = e else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("to_tsvector") {
+        return None;
+    }
+    // `to_tsvector(col)` or `to_tsvector(config, col)` — either way the
+    // column is the last argument.
+    match args.last() {
+        Some(spg_sql::ast::Expr::Column(c)) => Some(c.name.clone()),
+        _ => None,
+    }
+}
+
 impl Engine {
     /// v6.7.2 — `ALTER TABLE t SET hot_tier_bytes = X`. Dispatch
     /// arm. Currently the only setting is `hot_tier_bytes`; later
@@ -1953,6 +1979,41 @@ impl Engine {
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
+        // v7.39 (round 475) — an expression key a method cannot take is
+        // refused BEFORE anything is built.
+        //
+        // The check used to run after the index was created, so
+        // `CREATE INDEX gx ON g USING gin (to_tsvector('simple', doc))`
+        // raised an error AND left a btree index named `gx` on `doc`
+        // behind. The message said nothing had happened, the catalog said
+        // otherwise, and a dump carried an index the user never wrote.
+        let gin_fulltext_col = match (&stmt.expression, stmt.method) {
+            (Some(e), IndexMethod::Gin) => tsvector_source_column(e),
+            _ => None,
+        };
+        if let Some(key_expr) = &stmt.expression
+            && gin_fulltext_col.is_none()
+            && matches!(
+                stmt.method,
+                IndexMethod::Hnsw | IndexMethod::Brin | IndexMethod::Gin
+            )
+        {
+            // The old wording named HNSW and BRIN while also covering GIN,
+            // so a refused GIN index reported two methods it was not.
+            let method = match stmt.method {
+                IndexMethod::Hnsw => "HNSW",
+                IndexMethod::Brin => "BRIN",
+                _ => "GIN",
+            };
+            return Err(EngineError::Unsupported(alloc::format!(
+                "expression keys are not supported on {method} indexes: {key_expr}"
+            )));
+        }
+        if let Some(col) = gin_fulltext_col.clone() {
+            table
+                .add_gin_fulltext_index(stmt.name.clone(), &col)
+                .map_err(EngineError::Storage)?;
+        } else {
         match stmt.method {
             IndexMethod::BTree => {
                 table.add_index(stmt.name.clone(), &stmt.column)?;
@@ -2049,6 +2110,7 @@ impl Engine {
                 }
             }
         }
+        }
         if !included_positions.is_empty()
             && let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name)
         {
@@ -2086,14 +2148,8 @@ impl Engine {
         // round-trip + future planner work. Carved-out in
         // STABILITY § "Out of v6.8".
         if let Some(key_expr) = &stmt.expression {
-            if matches!(
-                stmt.method,
-                IndexMethod::Hnsw | IndexMethod::Brin | IndexMethod::Gin
-            ) {
-                return Err(EngineError::Unsupported(
-                    "Expression keys are not supported on HNSW or BRIN indexes".into(),
-                ));
-            }
+            // v7.39 (round 475) — the method check moved above, before
+            // anything is built.
             let canonical = key_expr.to_string();
             if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name) {
                 idx.expression = Some(canonical);
