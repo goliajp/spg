@@ -3373,6 +3373,19 @@ impl Parser {
                         local: set_local,
                     });
                 }
+                // v7.39 (round 430) — `SET @x = <expr> [, @y := <expr>]` is a
+                // MySQL USER-variable assignment: its own per-session
+                // namespace, an arbitrary expression on the right, and `:=`
+                // as a second spelling of `=`. It used to fall into the
+                // session-PARAMETER list below, whose values are literals and
+                // whose store nothing reads back under a `@` name — so the
+                // assignment reported success and vanished.
+                //
+                // A `@@`-prefixed LHS is a real engine setting and keeps the
+                // old path.
+                if matches!(self.peek(), Token::SessionVar(s) if !s.starts_with("@@")) {
+                    return self.parse_set_user_vars();
+                }
                 // v7.14.0 — multi-assignment form
                 // `SET a = 1, b = 2, …`. Single-assignment is the
                 // 1-element case. Each LHS may be a regular ident
@@ -7843,6 +7856,48 @@ impl Parser {
             }
             _ => false,
         }
+    }
+
+    /// v7.39 (round 430) — `SET @x = <expr> [, @y := <expr>]`, MySQL's
+    /// USER-variable assignment. Its own per-session namespace, an arbitrary
+    /// expression on the right, and `:=` as a second spelling of `=`.
+    ///
+    /// Out-of-line (`inline(never)`): the statement-parse frame it is called
+    /// from sits on the nesting recursion chain (a CTE body, a subquery),
+    /// and holding this loop's `Vec` + `String` locals there overflowed the
+    /// 512 KiB guard (`e2e_in_list_depth::round25_union_cte_search_shape`).
+    #[inline(never)]
+    fn parse_set_user_vars(&mut self) -> Result<Statement, ParseError> {
+        let mut assigns: Vec<(String, Expr)> = Vec::new();
+        loop {
+            let Token::SessionVar(raw) = self.peek().clone() else {
+                return Err(self.err(alloc::format!(
+                    "expected a user variable after SET, got {:?}",
+                    self.peek()
+                )));
+            };
+            if raw.starts_with("@@") {
+                return Err(self.err(alloc::string::String::from(
+                    "cannot mix `@@` settings with `@` user variables in one SET",
+                )));
+            }
+            self.advance();
+            if !matches!(self.peek(), Token::Eq | Token::ColonEq) {
+                return Err(self.err(alloc::format!(
+                    "expected `=` or `:=` after {raw}, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let value = self.parse_expr(0)?;
+            assigns.push((raw.trim_start_matches('@').to_ascii_lowercase(), value));
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(Statement::SetUserVars(assigns))
     }
 
     fn parse_update_after_keyword(&mut self) -> Result<Statement, ParseError> {
@@ -19783,14 +19838,13 @@ impl Parser {
             // MariaDB accepts the bare, `@@session.` and `@@global.`
             // spellings alike and answers from the session's own value.
             Token::SessionVar(v) => {
-                // The `session.` / `global.` scope is KEPT: a global read
-                // must not see a session override (MariaDB: after `SET
-                // autocommit=0`, `@@global.autocommit` is still 1).
-                let bare = v.trim_start_matches('@').to_ascii_lowercase();
-                Ok(Expr::FunctionCall {
-                    name: String::from("__spg_session_var"),
-                    args: alloc::vec![Expr::Literal(Literal::String(bare))],
-                })
+                // v7.39 (round 430) — ONE `@` is a MySQL USER variable, which
+                // has nothing to do with a `@@` engine setting: its own
+                // per-session namespace, and an unset one reads NULL instead
+                // of raising. Stripping every `@` (as this did) made `@x` and
+                // `@@x` the same node, so `SELECT @x` answered "Unknown
+                // system variable".
+                Ok(variable_ref_atom(&v))
             }
             other => Err(ParseError {
                 message: format!("unexpected token {other:?} in expression"),
@@ -23784,6 +23838,34 @@ pub(crate) enum IntervalField {
 /// is the finest. (The compound spellings — `DAY_HOUR` and friends, which
 /// take a `'1 2'` style literal — are not read here; they stay a parse
 /// error rather than being silently misread.)
+/// v7.39 (round 430) — lower a `@name` / `@@name` reference to its call.
+///
+/// ONE `@` is a MySQL USER variable: its own per-session namespace, nothing
+/// to do with a `@@` engine setting, and an unset one reads NULL rather
+/// than raising. (The parser used to strip every `@`, so `@x` and `@@x`
+/// were the same node and `SELECT @x` answered "Unknown system variable".)
+/// For `@@`, the `session.` / `global.` scope is KEPT: a global read must
+/// not see a session override — measured, after `SET autocommit=0`,
+/// `@@global.autocommit` is still 1.
+///
+/// Out-of-line and NOT a method: `parse_atom` is the giant recursive frame
+/// the parser's nesting budget is tuned against, and building these
+/// `String` + `Vec` locals inside it overflowed the guard's stack (the same
+/// wall `parse_left_right_atom` and friends were factored out for).
+#[inline(never)]
+fn variable_ref_atom(raw: &str) -> Expr {
+    let user_var = !raw.starts_with("@@");
+    let bare = raw.trim_start_matches('@').to_ascii_lowercase();
+    Expr::FunctionCall {
+        name: String::from(if user_var {
+            "__spg_user_var"
+        } else {
+            "__spg_session_var"
+        }),
+        args: alloc::vec![Expr::Literal(Literal::String(bare))],
+    }
+}
+
 fn mysql_interval_unit(tok: &Token) -> Option<&'static str> {
     let Token::Ident(s) = tok else { return None };
     Some(match () {

@@ -1191,6 +1191,43 @@ impl Engine {
         // so nothing changes for a customer who never assumes another role.
         self.acl_check_statement(&stmt)?;
         let result = match stmt {
+            // v7.39 (round 430) — MySQL USER variables. The value is an
+            // arbitrary expression, evaluated against an empty row (a
+            // user-variable assignment is a statement, not a per-row thing),
+            // and stored in the session's own namespace.
+            //
+            // Every right-hand side sees the state as it was BEFORE the
+            // statement — the assignments do NOT become visible to each
+            // other. Measured on MariaDB 11: with both fresh,
+            // `SET @p = 1, @q = @p + 1` leaves @q NULL; with @r already 100,
+            // `SET @r = 1, @s = @r + 1` leaves @s at 101, i.e. @r's OLD
+            // value. (Separate statements do chain, as you would expect.)
+            // So: evaluate them all, THEN apply them all.
+            Statement::SetUserVars(assigns) => {
+                let mut resolved: Vec<(String, spg_storage::Value<'static>)> =
+                    Vec::with_capacity(assigns.len());
+                for (name, mut expr) in assigns {
+                    // `SET @total = (SELECT SUM(v) FROM t)` is ordinary MySQL,
+                    // so the scalar subqueries have to be materialised the way
+                    // every other statement's do — eval_expr itself refuses to
+                    // meet one.
+                    self.resolve_expr_subqueries(&mut expr, cancel)?;
+                    let cols: Vec<ColumnSchema> = Vec::new();
+                    let value = {
+                        let ctx = self.ev_ctx(&cols, None);
+                        let empty = spg_storage::Row::new(Vec::new());
+                        crate::eval::eval_expr(&expr, &empty, &ctx).map_err(EngineError::Eval)?
+                    };
+                    resolved.push((name, value.into_owned()));
+                }
+                for (name, value) in resolved {
+                    self.user_vars.insert(name, value);
+                }
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
             // v7.39 (round 277) — SQL-level prepared statements.
             Statement::Prepare {
                 name,
