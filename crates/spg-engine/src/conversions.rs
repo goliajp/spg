@@ -2839,6 +2839,159 @@ pub(crate) fn truncate_to_column_fsp(v: Value<'static>, schema: &ColumnSchema) -
     }
 }
 
+/// v7.39 (round 434) — the integer bounds a column actually accepts: the
+/// declared MySQL width when one is annotated (TINYINT / MEDIUMINT store in a
+/// wider tag), otherwise the storage type's own range. Shared by the strict
+/// range check below and the `INSERT IGNORE` clamp.
+fn column_int_bounds(schema: &ColumnSchema) -> Option<(i64, i64)> {
+    if let Some(width) = schema.mysql_int_width {
+        return Some(match (width, schema.is_unsigned) {
+            (spg_storage::MysqlIntWidth::Tiny, false) => (-128, 127),
+            (spg_storage::MysqlIntWidth::Tiny, true) => (0, 255),
+            (spg_storage::MysqlIntWidth::Small, false) => (-32_768, 32_767),
+            (spg_storage::MysqlIntWidth::Small, true) => (0, 65_535),
+            (spg_storage::MysqlIntWidth::Medium, false) => (-8_388_608, 8_388_607),
+            (spg_storage::MysqlIntWidth::Medium, true) => (0, 16_777_215),
+            (spg_storage::MysqlIntWidth::Int, false) => (-2_147_483_648, 2_147_483_647),
+            (spg_storage::MysqlIntWidth::Int, true) => (0, 4_294_967_295),
+        });
+    }
+    let (lo, hi) = match schema.ty {
+        DataType::SmallInt => (i64::from(i16::MIN), i64::from(i16::MAX)),
+        DataType::Int => (i64::from(i32::MIN), i64::from(i32::MAX)),
+        DataType::BigInt => (i64::MIN, i64::MAX),
+        _ => return None,
+    };
+    Some(if schema.is_unsigned { (0, hi) } else { (lo, hi) })
+}
+
+/// v7.39 (round 434) — bend a value so a MySQL `INSERT IGNORE` can store it.
+///
+/// MySQL's IGNORE does two things. Round 406 implemented the first: skip a
+/// row that violates a unique key. This is the second: per-VALUE errors are
+/// downgraded to coercions, so a bulk load never stops. Measured on
+/// MariaDB 11 —
+///   * a NULL into a NOT NULL column becomes the type's default (0 / '')
+///   * an out-of-range integer clamps to the declared type's bound
+///     (99999999999999 into INT → 2147483647)
+///   * a non-numeric string into an integer column takes its leading numeric
+///     prefix, or 0 when there is none ('12abc' → 12, 'abc' → 0)
+///   * an over-long string truncates to the declared length
+///
+/// Anything this does not recognise is returned unchanged, so the ordinary
+/// coercion path still raises its ordinary error. That is deliberate: where
+/// SPG cannot represent MySQL's answer (a `'0000-00-00'` zero date, an ENUM's
+/// empty error-member) the statement fails loudly rather than silently
+/// storing a value MySQL would not have stored.
+pub(crate) fn mysql_ignore_fit(v: Value<'static>, schema: &ColumnSchema) -> Value<'static> {
+    if v.is_null() {
+        if schema.nullable {
+            return v;
+        }
+        // MySQL fills a NOT NULL column with its type's zero value.
+        return match schema.ty {
+            DataType::SmallInt | DataType::Int | DataType::BigInt => Value::BigInt(0),
+            DataType::Float | DataType::Real => Value::Float(0.0),
+            DataType::Text | DataType::Varchar(_) | DataType::Char(_) => Value::text(""),
+            _ => v,
+        };
+    }
+    // A string bound for an integer column: MySQL reads the leading numeric
+    // prefix and calls the rest a truncation warning.
+    if let Value::Text(ref s) = v
+        && matches!(
+            schema.ty,
+            DataType::SmallInt | DataType::Int | DataType::BigInt
+        )
+        && s.trim().parse::<i64>().is_err()
+    {
+        return Value::BigInt(leading_numeric_prefix(s));
+    }
+    // An out-of-range integer clamps to the column's bound.
+    let as_int = match v {
+        Value::SmallInt(n) => Some(i64::from(n)),
+        Value::Int(n) => Some(i64::from(n)),
+        Value::BigInt(n) => Some(n),
+        _ => None,
+    };
+    if let Some(n) = as_int
+        && let Some((lo, hi)) = column_int_bounds(schema)
+        && (n < lo || n > hi)
+    {
+        return Value::BigInt(n.clamp(lo, hi));
+    }
+    // An over-long string truncates to the declared length.
+    if let Value::Text(ref s) = v {
+        let max = match schema.ty {
+            DataType::Varchar(m) | DataType::Char(m) if m > 0 => m as usize,
+            _ => return v,
+        };
+        if s.chars().count() > max {
+            return Value::text(s.chars().take(max).collect::<alloc::string::String>());
+        }
+    }
+    v
+}
+
+/// MySQL's string → integer coercion: take the longest leading numeric
+/// prefix, read it as a double, and round half AWAY FROM ZERO. Measured on
+/// MariaDB 11 — `'3.7abc'` → 4, `'2.4'` → 2, `'2.5'` → 3, `'-2.5'` → -3,
+/// `'1e3x'` → 1000, `'0x10'` → 0 (the prefix is just the leading `0`),
+/// `'abc'` / `'-'` / `''` → 0.
+///
+/// The prefix is a float, not an integer: reading only digits would answer 0
+/// for `'.5'` where MySQL answers 1.
+fn leading_numeric_prefix(s: &str) -> i64 {
+    let t = s.trim_start();
+    let b = t.as_bytes();
+    let mut i = 0;
+    if i < b.len() && (b[i] == b'-' || b[i] == b'+') {
+        i += 1;
+    }
+    let int_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    let mut end = i;
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        // A lone "." after the sign is not a number; digits on either side
+        // of it are.
+        if i > int_start + 1 {
+            end = i;
+        }
+    }
+    // An exponent only counts when it has at least one digit AND a mantissa.
+    if end > int_start && i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        let mut j = i + 1;
+        if j < b.len() && (b[j] == b'-' || b[j] == b'+') {
+            j += 1;
+        }
+        let digits_start = j;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > digits_start {
+            end = j;
+        }
+    }
+    let Ok(f) = t[..end].parse::<f64>() else {
+        return 0;
+    };
+    // `f64::round` is already half-away-from-zero, which is MySQL's rule.
+    let r = f.round();
+    if r >= i64::MAX as f64 {
+        i64::MAX
+    } else if r <= i64::MIN as f64 {
+        i64::MIN
+    } else {
+        r as i64
+    }
+}
+
 pub(crate) fn check_unsigned_range(
     v: &Value,
     schema: &ColumnSchema,

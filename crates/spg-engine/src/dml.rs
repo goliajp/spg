@@ -4060,6 +4060,8 @@ impl Engine {
                 on_conflict: stmt.on_conflict,
                 returning: stmt.returning,
                 overriding: stmt.overriding,
+                // The materialised rows are still the IGNORE statement's.
+                mysql_ignore: stmt.mysql_ignore,
             };
             return self.exec_insert(recurse);
         }
@@ -4120,6 +4122,7 @@ impl Engine {
             overriding,
             &mut first_auto,
             insert_mysql,
+            insert_mysql && stmt.mysql_ignore,
         )?;
         // Stage 2 — FK enforcement on the immutable catalog.
         // Non-lexical lifetimes release the mutable borrow on
@@ -4843,6 +4846,8 @@ impl Engine {
                 on_conflict: None,
                 returning: None,
                 overriding: stmt.overriding,
+                // Routing a row to its partition keeps the statement's IGNORE.
+                mysql_ignore: stmt.mysql_ignore,
             };
             let result = self.exec_insert(child_stmt)?;
             if let QueryResult::CommandOk { affected, .. } = result {
@@ -5893,6 +5898,10 @@ fn parse_insert_rows(
     // (big-endian number into a numeric column, bytes-as-string into a
     // text column) instead of failing the byte→column type check.
     mysql: bool,
+    // v7.39 (round 434) — the statement was spelled `INSERT IGNORE`, so a
+    // value the ordinary path would reject is bent to fit instead (see
+    // `mysql_ignore_fit`). MySQL-only; a PG session never sets it.
+    ignore: bool,
 ) -> Result<Vec<Vec<Value<'static>>>, EngineError> {
     use spg_sql::ast::Overriding;
     let schema_cols_len = column_meta.len();
@@ -6079,6 +6088,14 @@ fn parse_insert_rows(
                     catalog,
                 )?;
                 let raw = crate::conversions::mysql_bytes_for_column(raw, col.ty, mysql);
+                // v7.39 (round 434) — `INSERT IGNORE` bends a value that
+                // would otherwise raise, so a MySQL bulk load never stops
+                // mid-file. Values the ordinary path accepts are untouched.
+                let raw = if ignore {
+                    crate::conversions::mysql_ignore_fit(raw, col)
+                } else {
+                    raw
+                };
                 let coerced = coerce_value(raw, col.ty, &col.name, i)?;
                 enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
                 let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;
@@ -6139,6 +6156,14 @@ fn parse_insert_rows(
                 let raw =
                     crate::conversions::normalize_composite_for_column(raw, col, catalog)?;
                 let raw = crate::conversions::mysql_bytes_for_column(raw, col.ty, mysql);
+                // v7.39 (round 434) — `INSERT IGNORE` bends a value that
+                // would otherwise raise, so a MySQL bulk load never stops
+                // mid-file. Values the ordinary path accepts are untouched.
+                let raw = if ignore {
+                    crate::conversions::mysql_ignore_fit(raw, col)
+                } else {
+                    raw
+                };
                 let coerced = coerce_value(raw, col.ty, &col.name, i)?;
                 enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
                 let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;

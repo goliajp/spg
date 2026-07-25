@@ -15916,6 +15916,7 @@ impl Parser {
                 // MySQL's SET form has no `OVERRIDING …` clause (that is
                 // PG's identity-column spelling).
                 overriding: Overriding::None,
+                mysql_ignore: ignore,
                 on_conflict,
                 returning,
             }));
@@ -15961,6 +15962,7 @@ impl Parser {
                     on_conflict,
                     returning,
                     overriding: Overriding::None,
+                    mysql_ignore: ignore,
                 }));
             }
             let mut names = Vec::new();
@@ -16043,6 +16045,7 @@ impl Parser {
                 on_conflict,
                 returning,
                 overriding,
+                mysql_ignore: ignore,
             }));
         }
         // v7.13.0 — `INSERT INTO t [(cols)] SELECT …` (mailrs
@@ -16076,6 +16079,7 @@ impl Parser {
                 on_conflict,
                 returning,
                 overriding,
+                mysql_ignore: ignore,
             }));
         }
         if !matches!(self.peek(), Token::Values) {
@@ -16157,6 +16161,7 @@ impl Parser {
             on_conflict,
             returning,
             overriding,
+            mysql_ignore: ignore,
         }))
     }
 
