@@ -498,6 +498,19 @@ pub enum Statement {
     /// a recognised engine parameter (e.g. `FOREIGN_KEY_CHECKS`)
     /// go through the regular `set_session_param` path.
     SetParameterList(Vec<(String, SetValue)>),
+    /// v7.39 (round 430) — MySQL's USER-defined variables:
+    /// `SET @x = 5, @s := CONCAT('a','b')`. Distinct from
+    /// [`Self::SetParameter`] (a `@@`-style engine/session setting) in
+    /// every way that matters: the value is an arbitrary EXPRESSION, the
+    /// name lives in its own per-session namespace, and reading an unset
+    /// one answers NULL rather than raising. `:=` and `=` are the same
+    /// assignment here.
+    ///
+    /// Before this the parser stripped every `@`, so `@x` and `@@x` were
+    /// the same node: `SET @x = 5` silently landed in the session-parameter
+    /// store where nothing could read it back, and `SELECT @x` failed with
+    /// "Unknown system variable".
+    SetUserVars(Vec<(String, Expr)>),
     /// v7.38 轴 4 — `SET [SESSION] TRANSACTION ISOLATION LEVEL …`
     /// (plus optional READ ONLY / READ WRITE / DEFERRABLE clauses
     /// silently accepted). PG-standard surface for picking an
@@ -4413,6 +4426,7 @@ impl Statement {
             | Statement::CompactColdSegments
             | Statement::SetParameter { .. }
             | Statement::SetParameterList(_)
+            | Statement::SetUserVars(_)
             | Statement::SetTransaction { .. }
             | Statement::ShowParameter(_)
             | Statement::ResetParameter(_)
@@ -5106,6 +5120,16 @@ impl fmt::Display for Statement {
                 f.write_str(name)
             }
             Self::ShowParameter(name) => write!(f, "SHOW {name}"),
+            Self::SetUserVars(assigns) => {
+                f.write_str("SET ")?;
+                for (i, (name, value)) in assigns.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "@{name} = {value}")?;
+                }
+                Ok(())
+            }
             Self::SetParameterList(pairs) => {
                 f.write_str("SET ")?;
                 for (i, (name, value)) in pairs.iter().enumerate() {

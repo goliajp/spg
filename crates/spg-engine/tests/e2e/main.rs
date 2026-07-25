@@ -264,6 +264,7 @@ mod e2e_mysql_fsp_render_round425;
 mod e2e_mysql_row_count_round426;
 mod e2e_mysql_upsert_count_round427;
 mod e2e_mysql_insert_set_round428;
+mod e2e_mysql_user_vars_round430;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;

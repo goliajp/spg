@@ -14402,6 +14402,22 @@ fn apply_function_dispatch(
         // MariaDB 11 measured: a value the session SET wins, the MySQL
         // variables below carry their server defaults, and an unknown name
         // is `ERROR 1193 (HY000) Unknown system variable 'x'`.
+        // v7.39 (round 430) — a MySQL USER variable (`@x`, ONE at-sign). Its
+        // own per-session namespace, nothing to do with the `@@` settings
+        // below: an unset one reads NULL rather than raising, which is what
+        // makes `SELECT @never_set` legal in MariaDB. Without an engine (a
+        // bare expression evaluation) there is no session to read.
+        "__spg_user_var" => {
+            let Some(Value::Text(name)) = args.first() else {
+                return Ok(Value::Null);
+            };
+            Ok(ctx.engine.map_or(Value::Null, |engine| {
+                engine
+                    .user_var(&name.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            }))
+        }
         "__spg_session_var" => {
             let Some(Value::Text(name)) = args.first() else {
                 return Ok(Value::Null);

@@ -639,6 +639,11 @@ pub(crate) struct SessionBag {
     /// nothing leaves 0); a SELECT leaves -1; DDL leaves 0. A FRESH
     /// session reads 0 (measured), not -1.
     pub(crate) row_count: i64,
+    /// v7.39 (round 430) — MySQL USER variables (`SET @x = 5`). Per
+    /// SESSION like `last_insert_id` / `row_count`; its own namespace,
+    /// separate from the `@@` session parameters. Reading an unset one
+    /// answers NULL, as MariaDB does.
+    pub(crate) user_vars: BTreeMap<String, spg_storage::Value<'static>>,
 }
 
 /// v7.39 (round 306) — one open large-object descriptor.
@@ -987,6 +992,9 @@ pub struct Engine {
     /// i64: unlike LAST_INSERT_ID it is only ever WRITTEN from the
     /// statement driver, which holds `&mut Engine`.
     pub(crate) row_count: i64,
+    /// v7.39 (round 430) — this session's MySQL USER variables.
+    /// Swapped with [`SessionBag`] like every other per-connection slot.
+    pub(crate) user_vars: BTreeMap<String, spg_storage::Value<'static>>,
     /// v7.39 (round 222) — channels this session LISTENs on. Engine-wide
     /// (the same process-level session-state architecture wall as
     /// `session_params`). Never serialized.
@@ -1276,6 +1284,7 @@ impl Engine {
             cursors: BTreeMap::new(),
             last_insert_id: core::sync::atomic::AtomicI64::new(0),
             row_count: 0,
+            user_vars: BTreeMap::new(),
             listen_channels: BTreeSet::new(),
             tx_pending_notifies: Vec::new(),
             delivered_notifies: Vec::new(),
@@ -1658,6 +1667,7 @@ impl Engine {
             cursors: BTreeMap::new(),
             last_insert_id: core::sync::atomic::AtomicI64::new(0),
             row_count: 0,
+            user_vars: BTreeMap::new(),
             listen_channels: BTreeSet::new(),
             tx_pending_notifies: Vec::new(),
             delivered_notifies: Vec::new(),
@@ -1774,6 +1784,7 @@ impl Engine {
                     cursors: BTreeMap::new(),
             last_insert_id: core::sync::atomic::AtomicI64::new(0),
             row_count: 0,
+            user_vars: BTreeMap::new(),
                     listen_channels: BTreeSet::new(),
                     tx_pending_notifies: Vec::new(),
                     delivered_notifies: Vec::new(),
@@ -1850,6 +1861,7 @@ impl Engine {
             cursors: core::mem::take(&mut self.cursors),
             last_insert_id: self.last_insert_id.load(core::sync::atomic::Ordering::Relaxed),
             row_count: self.row_count,
+            user_vars: core::mem::take(&mut self.user_vars),
         };
         self.sessions.insert(self.current_session, outgoing);
         let incoming = self.sessions.remove(&id).unwrap_or_default();
@@ -1862,6 +1874,7 @@ impl Engine {
         self.last_insert_id
             .store(incoming.last_insert_id, core::sync::atomic::Ordering::Relaxed);
         self.row_count = incoming.row_count;
+        self.user_vars = incoming.user_vars;
         self.current_session = id;
         self.plan_cache.clear();
     }
@@ -1942,6 +1955,13 @@ impl Engine {
 
     /// v7.39 (round 417) — the current session's id (for MySQL
     /// `IS_USED_LOCK`, which reports the connection that holds a lock).
+    /// v7.39 (round 430) — read one of this session's MySQL USER
+    /// variables. `None` when it was never set, which the caller turns
+    /// into NULL (MariaDB reads an unset user variable as NULL).
+    pub(crate) fn user_var(&self, name: &str) -> Option<&spg_storage::Value<'static>> {
+        self.user_vars.get(name)
+    }
+
     pub(crate) const fn current_session_id(&self) -> u32 {
         self.current_session
     }
