@@ -136,6 +136,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos()
         ));
+        // v7.39 (round 440) — docker-fair. Spawning SPGS natively while PG18
+        // runs in a Linux container compares two DURABILITY CONTRACTS, not two
+        // implementations: on macOS `sync_data` is F_FULLFSYNC (a real device
+        // flush, measured at ~4 ms by `fsync_probe`) while a container's
+        // `fdatasync` hits a virtual disk and never becomes one (~0.06 ms for
+        // the host's plain fsync). `SPG_WIRE_URL` points this panel at an
+        // ALREADY-RUNNING SPGS — put it in a Linux container beside PG and
+        // both legs finally get the same contract.
+        if let Ok(url) = std::env::var("SPG_WIRE_URL")
+            && !url.is_empty()
+        {
+            return bench_url(url, mode).map_err(std::convert::Into::into);
+        }
         std::fs::create_dir_all(&dir)?;
         let (mut child, addr) = spawn_spgs(&dir)?;
         let url = format!("postgres://bench:bench@{addr}/bench");
