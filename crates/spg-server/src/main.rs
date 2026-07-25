@@ -1507,6 +1507,15 @@ fn run(
             .with_activity_provider(activity_snapshot)
             .with_audit_providers(audit_chain_snapshot, audit_verify_snapshot)
             .with_slow_query_log(slow_us, log_slow_query);
+        // v7.39 (round 476) — `pg_current_wal_lsn()` reports the WAL's real
+        // byte position. Only when a WAL exists: without one, 0/0 is the
+        // truth rather than a stub.
+        if state.wal.is_some()
+            && let Some(p) = state.wal_path.clone()
+        {
+            let _ = wal::WAL_PATH.set(p);
+            e.set_wal_lsn_fn(wal::wal_lsn_position);
+        }
         // v6.5.6 — operator-tunable plan cache cap.
         if let Ok(s) = std::env::var("SPG_PLAN_CACHE_MAX")
             && let Ok(n) = s.parse::<usize>()

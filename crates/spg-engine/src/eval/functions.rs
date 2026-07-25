@@ -17389,11 +17389,21 @@ fn apply_function_dispatch(
         // instance, so NULL causes false-positive alerts. Real
         // seq_no ↔ LSN mapping threads with the replication-
         // protocol RFC.
+        // v7.39 (round 476) — the WAL's real byte position when there is a
+        // WAL. It answered the literal "0/0" forever, so a monitor watching
+        // WAL progress saw an instance that had never written anything, and
+        // `pg_wal_lsn_diff` over two samples was always zero. SPG's WAL is a
+        // file and its length IS an LSN in every sense a monitor uses one.
+        // Embedded, or a server started without a WAL, still answers 0/0 —
+        // there, nothing is being written and that is the truth.
         "pg_current_wal_lsn"
         | "pg_current_wal_flush_lsn"
         | "pg_current_wal_insert_lsn"
         | "pg_last_wal_receive_lsn"
-        | "pg_last_wal_replay_lsn" => Ok(Value::text::<String>("0/0".into())),
+        | "pg_last_wal_replay_lsn" => {
+            let pos = ctx.wal_lsn_fn.map_or(0, |f| f());
+            Ok(Value::text(format!("{:X}/{:X}", pos >> 32, pos & 0xFFFF_FFFF)))
+        }
         // pg_last_xact_replay_timestamp — replica lag probe.
         "pg_last_xact_replay_timestamp" => Ok(Value::Null),
         // Range bound predicates — real text-form parsing. SPG

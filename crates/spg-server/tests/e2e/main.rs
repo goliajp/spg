@@ -404,6 +404,7 @@ mod e2e_pgwire_client_compat;
     clippy::uninlined_format_args
 )]
 mod e2e_pgwire_describe;
+mod e2e_wal_lsn_round476;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
