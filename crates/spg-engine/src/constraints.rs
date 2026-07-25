@@ -1300,6 +1300,9 @@ fn unique_key_detail(cols: &[String], key: &[Value<'_>]) -> String {
         .iter()
         .map(|v| match v {
             Value::Text(s) => s.to_string(),
+            // v7.39 (round 473) — PG writes a NULL key part lowercase here:
+            // `Key (a, b)=(1, null) already exists.` Measured on PG18.
+            Value::Null => alloc::string::String::from("null"),
             other => crate::eval::value_to_text(other),
         })
         .collect::<Vec<_>>()
@@ -1575,6 +1578,20 @@ pub(crate) fn enforce_unique_index_inserts(
             None => None,
         };
         let key_positions = unique_key_positions(idx);
+        // v7.39 (round 473) — the key's column names, for the 23505 DETAIL.
+        // An expression index reports the expression, as PG does.
+        let key_col_names: alloc::vec::Vec<alloc::string::String> = match &expr_key {
+            Some(_) => alloc::vec![idx.expression.clone().unwrap_or_else(|| idx.name.clone())],
+            None => key_positions
+                .iter()
+                .map(|&p| {
+                    schema
+                        .columns
+                        .get(p)
+                        .map_or_else(|| alloc::format!("col{p}"), |c| c.name.clone())
+                })
+                .collect(),
+        };
         let key_of = |values: &[spg_storage::Value<'static>]| -> Result<alloc::vec::Vec<spg_storage::Value<'static>>, EngineError> {
             if let Some(expr) = &expr_key {
                 let tmp_row = spg_storage::Row {
@@ -1660,9 +1677,13 @@ pub(crate) fn enforce_unique_index_inserts(
                     if !batch_seen.insert(aggregate::encode_key(&key))
                         || probe_key_conflict(table, idx, &leading, &key, &fold).is_some()
                     {
+                        // v7.39 (round 473) — a unique INDEX is a unique
+                        // constraint to a client, and PG gives it the same
+                        // DETAIL a table constraint gets. This path had none.
+                        let detail = unique_key_detail(&key_col_names, &key);
                         return Err(EngineError::Unsupported(alloc::format!(
                             "duplicate key value violates unique constraint \"{}\" \
-                             on table \"{table_name}\"",
+                             on table \"{table_name}\"{detail}",
                             idx.name
                         )));
                     }
@@ -1711,9 +1732,10 @@ pub(crate) fn enforce_unique_index_inserts(
             if !seen.insert(aggregate::encode_key(&key)) {
                 // v7.39 (SQLSTATE fidelity) — a unique INDEX is a unique
                 // constraint to clients; same PG 23505 phrasing.
+                let detail = unique_key_detail(&key_col_names, &key);
                 return Err(EngineError::Unsupported(alloc::format!(
                     "duplicate key value violates unique constraint \"{}\" \
-                     on table \"{table_name}\"",
+                     on table \"{table_name}\"{detail}",
                     idx.name
                 )));
             }

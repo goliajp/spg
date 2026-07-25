@@ -1950,6 +1950,29 @@ fn eval_cast_arm(
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     let v = eval_expr(expr, row, ctx)?;
+    // v7.39 (round 473) — `<oid>::regclass` names the relation.
+    //
+    // The cast itself has no catalog, so it answered the bare number:
+    // `indexrelid::regclass` printed `100001` where PG prints `ix1`, and
+    // pg_class / pg_index rows are read by joining on oids and rendering
+    // them — a tool cannot match the two up. `relation_name_for_oid`
+    // mirrors `relation_oid`'s walks so the two directions agree; an oid
+    // that names nothing keeps rendering as the number, which is what PG
+    // does for a dropped relation's oid too.
+    if matches!(target, CastTarget::RegClass)
+        && let Some(cat) = ctx.catalog
+    {
+        let oid = match &v {
+            Value::Int(n) => Some(i64::from(*n)),
+            Value::BigInt(n) => Some(*n),
+            _ => None,
+        };
+        if let Some(oid) = oid
+            && let Some(name) = crate::system_catalog::relation_name_for_oid(cat, oid)
+        {
+            return Ok(Value::text(name));
+        }
+    }
     // v7.38 (read01 P6.40) — a cast to a user DOMAIN (`x::posint`)
     // enforces the domain's NOT NULL + CHECK constraints, matching PG.
     // The base-type coercion already happened when `v` was produced
