@@ -2315,6 +2315,8 @@ pub enum MysqlIntWidth {
     Small,
     Medium,
     Int,
+    /// v7.39 (round 471, epic P4b) — `BIGINT UNSIGNED`.
+    Big,
 }
 
 #[allow(clippy::derivable_impls)]

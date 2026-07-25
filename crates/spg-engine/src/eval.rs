@@ -1672,6 +1672,11 @@ fn mysql_int_operand(v: &Value<'_>) -> Option<i128> {
         Value::SmallInt(n) => Some(i128::from(*n)),
         Value::Int(n) => Some(i128::from(*n)),
         Value::BigInt(n) => Some(i128::from(*n)),
+        // v7.39 (round 471) — a BIGINT UNSIGNED cell is stored as Numeric
+        // with scale 0, so the range check has to see it as the integer it
+        // is. Without this arm the column's own type moved it out of reach
+        // of round 467's guard and `c - 5` went back to answering -4.
+        Value::Numeric { scaled, scale, .. } if *scale == 0 => Some(*scaled),
         _ => None,
     }
 }

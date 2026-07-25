@@ -5249,6 +5249,7 @@ fn column_def_to_schema(c: ColumnDef, mysql: bool) -> Result<ColumnSchema, Engin
         spg_sql::ast::MysqlIntWidth::Medium => spg_storage::MysqlIntWidth::Medium,
         spg_sql::ast::MysqlIntWidth::Small => spg_storage::MysqlIntWidth::Small,
         spg_sql::ast::MysqlIntWidth::Int => spg_storage::MysqlIntWidth::Int,
+        spg_sql::ast::MysqlIntWidth::Big => spg_storage::MysqlIntWidth::Big,
     });
     // v7.39 (round 424, type-fidelity epic) — declared fractional-seconds
     // precision of a MySQL temporal column. Drives write-path truncation
@@ -5269,6 +5270,21 @@ fn column_def_to_schema(c: ColumnDef, mysql: bool) -> Result<ColumnSchema, Engin
             spg_storage::DataType::Int => {
                 schema.ty = spg_storage::DataType::BigInt;
                 schema.mysql_int_width = Some(spg_storage::MysqlIntWidth::Int);
+            }
+            // v7.39 (round 471, epic P4b) — BIGINT UNSIGNED reaches
+            // 18446744073709551615, which i64 cannot hold at all: SPG used
+            // to REFUSE anything past 2^63-1 with `expected BIGINT, got
+            // NUMERIC(0)`, so a MariaDB table with a real u64 in it could
+            // not be loaded. Numeric is i128-backed with scale 0 and
+            // already compares, orders, indexes and renders as an exact
+            // integer; the width marker keeps the declared type for
+            // SHOW CREATE and information_schema.
+            spg_storage::DataType::BigInt => {
+                schema.ty = spg_storage::DataType::Numeric {
+                    precision: 20,
+                    scale: 0,
+                };
+                schema.mysql_int_width = Some(spg_storage::MysqlIntWidth::Big);
             }
             _ => {}
         }

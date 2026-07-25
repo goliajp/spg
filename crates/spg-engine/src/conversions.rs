@@ -2843,7 +2843,7 @@ pub(crate) fn truncate_to_column_fsp(v: Value<'static>, schema: &ColumnSchema) -
 /// declared MySQL width when one is annotated (TINYINT / MEDIUMINT store in a
 /// wider tag), otherwise the storage type's own range. Shared by the strict
 /// range check below and the `INSERT IGNORE` clamp.
-fn column_int_bounds(schema: &ColumnSchema) -> Option<(i64, i64)> {
+fn column_int_bounds(schema: &ColumnSchema) -> Option<(i128, i128)> {
     if let Some(width) = schema.mysql_int_width {
         return Some(match (width, schema.is_unsigned) {
             (spg_storage::MysqlIntWidth::Tiny, false) => (-128, 127),
@@ -2854,12 +2854,18 @@ fn column_int_bounds(schema: &ColumnSchema) -> Option<(i64, i64)> {
             (spg_storage::MysqlIntWidth::Medium, true) => (0, 16_777_215),
             (spg_storage::MysqlIntWidth::Int, false) => (-2_147_483_648, 2_147_483_647),
             (spg_storage::MysqlIntWidth::Int, true) => (0, 4_294_967_295),
+            // v7.39 (round 471, epic P4b) — the whole point of i128 bounds:
+            // 18446744073709551615 does not fit the i64 these used to be.
+            (spg_storage::MysqlIntWidth::Big, false) => {
+                (i128::from(i64::MIN), i128::from(i64::MAX))
+            }
+            (spg_storage::MysqlIntWidth::Big, true) => (0, i128::from(u64::MAX)),
         });
     }
     let (lo, hi) = match schema.ty {
-        DataType::SmallInt => (i64::from(i16::MIN), i64::from(i16::MAX)),
-        DataType::Int => (i64::from(i32::MIN), i64::from(i32::MAX)),
-        DataType::BigInt => (i64::MIN, i64::MAX),
+        DataType::SmallInt => (i128::from(i16::MIN), i128::from(i16::MAX)),
+        DataType::Int => (i128::from(i32::MIN), i128::from(i32::MAX)),
+        DataType::BigInt => (i128::from(i64::MIN), i128::from(i64::MAX)),
         _ => return None,
     };
     Some(if schema.is_unsigned { (0, hi) } else { (lo, hi) })
@@ -2909,16 +2915,18 @@ pub(crate) fn mysql_ignore_fit(v: Value<'static>, schema: &ColumnSchema) -> Valu
     }
     // An out-of-range integer clamps to the column's bound.
     let as_int = match v {
-        Value::SmallInt(n) => Some(i64::from(n)),
-        Value::Int(n) => Some(i64::from(n)),
-        Value::BigInt(n) => Some(n),
+        Value::SmallInt(n) => Some(i128::from(n)),
+        Value::Int(n) => Some(i128::from(n)),
+        Value::BigInt(n) => Some(i128::from(n)),
+        // v7.39 (round 471) — a BIGINT UNSIGNED cell arrives as Numeric.
+        Value::Numeric { scaled, scale: 0, .. } => Some(scaled),
         _ => None,
     };
     if let Some(n) = as_int
         && let Some((lo, hi)) = column_int_bounds(schema)
         && (n < lo || n > hi)
     {
-        return Value::BigInt(n.clamp(lo, hi));
+        return int_value_for_column(n.clamp(lo, hi));
     }
     // An over-long string truncates to the declared length.
     if let Value::Text(ref s) = v {
@@ -2992,15 +3000,28 @@ fn leading_numeric_prefix(s: &str) -> i64 {
     }
 }
 
+/// v7.39 (round 471) — the Value an integer takes when it may exceed i64.
+/// Mirrors `eval::u64_as_value`: BigInt while it fits, Numeric (scale 0)
+/// past it, which is how a BIGINT UNSIGNED cell is stored.
+fn int_value_for_column(n: i128) -> Value<'static> {
+    match i64::try_from(n) {
+        Ok(v) => Value::BigInt(v),
+        Err(_) => Value::numeric(n, 0),
+    }
+}
+
 pub(crate) fn check_unsigned_range(
     v: &Value,
     schema: &ColumnSchema,
     position: usize,
 ) -> Result<(), EngineError> {
-    let n = match v {
-        Value::SmallInt(x) => i64::from(*x),
-        Value::Int(x) => i64::from(*x),
-        Value::BigInt(x) => *x,
+    let n: i128 = match v {
+        Value::SmallInt(x) => i128::from(*x),
+        Value::Int(x) => i128::from(*x),
+        Value::BigInt(x) => i128::from(*x),
+        // v7.39 (round 471) — a BIGINT UNSIGNED cell arrives as Numeric,
+        // which is the whole reason the bounds are i128 now.
+        Value::Numeric { scaled, scale, .. } if *scale == 0 => *scaled,
         _ => return Ok(()), // non-integer cells (NULL, default) skip
     };
     // TINYINT / MEDIUMINT: the storage tag (SmallInt / Int) is wider than
@@ -3010,16 +3031,10 @@ pub(crate) fn check_unsigned_range(
         // Small / Int are only ever set on an UNSIGNED column (a signed
         // SMALLINT / INT keeps its faithful storage tag and no marker); the
         // signed arms are unreachable but keep the match total.
-        let (lo, hi) = match (width, schema.is_unsigned) {
-            (spg_storage::MysqlIntWidth::Tiny, false) => (-128, 127),
-            (spg_storage::MysqlIntWidth::Tiny, true) => (0, 255),
-            (spg_storage::MysqlIntWidth::Small, false) => (-32_768, 32_767),
-            (spg_storage::MysqlIntWidth::Small, true) => (0, 65_535),
-            (spg_storage::MysqlIntWidth::Medium, false) => (-8_388_608, 8_388_607),
-            (spg_storage::MysqlIntWidth::Medium, true) => (0, 16_777_215),
-            (spg_storage::MysqlIntWidth::Int, false) => (-2_147_483_648, 2_147_483_647),
-            (spg_storage::MysqlIntWidth::Int, true) => (0, 4_294_967_295),
-        };
+        // v7.39 (round 471) — one bounds table, not two. The copy here
+        // drifted out of reach the moment BIGINT UNSIGNED needed i128.
+        let _ = width;
+        let (lo, hi) = column_int_bounds(schema).unwrap_or((i128::MIN, i128::MAX));
         if n < lo || n > hi {
             // MariaDB's wording (SQLSTATE 22003); SPG tracks the column,
             // not the multi-row row number the "at row N" suffix carries.
