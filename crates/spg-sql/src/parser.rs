@@ -12157,6 +12157,12 @@ impl Parser {
         // key list used to compute each peer's dropped keys.
         let mut grouping_sets: Vec<Vec<Expr>> = Vec::new();
         let mut grouping_universe: Vec<Expr> = Vec::new();
+        // v7.39 (round 472) — did the GROUP BY end in MySQL's `WITH ROLLUP`?
+        // A BOOL, not the key list: this frame is the statement parser's, and
+        // round 430 measured that a `Vec` local here is enough on its own to
+        // tip the 512 KiB nesting guard. The keys are recoverable from
+        // `grouping_universe`, which a rollup fills with exactly them.
+        let mut mysql_rollup = false;
         let group_by = if matches!(self.peek(), Token::Group) {
             self.advance();
             if !matches!(self.peek(), Token::By) {
@@ -12212,6 +12218,34 @@ impl Parser {
                         }
                     }
                     total = next;
+                }
+                // v7.39 (round 472) — MySQL spells a rollup as a SUFFIX:
+                // `GROUP BY a, b WITH ROLLUP` is PG's `GROUP BY ROLLUP(a, b)`.
+                // The keys and the aggregates come out identical; the ROW
+                // ORDER does not, and that is the part a report depends on.
+                // MySQL interleaves each group's subtotal right after its
+                // own rows (east/a, east/b, east/NULL, west/a, …, NULL/NULL)
+                // where the union-of-grouping-sets expansion emits every
+                // leaf first and then every subtotal. MariaDB REFUSES an
+                // ORDER BY next to ROLLUP (1221), so a client cannot fix the
+                // order itself — measured on MariaDB 11 and MySQL 9.7, which
+                // agree on the order and disagree only on whether ORDER BY
+                // is allowed (MySQL allows it; SPG allows it too, since
+                // refusing would break the clients that can write it).
+                if self.mysql_dialect
+                    && matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("with"))
+                    && matches!(
+                        self.tokens.get(self.pos + 1),
+                        Some(Token::Ident(r)) if r.eq_ignore_ascii_case("rollup")
+                    )
+                {
+                    self.advance(); // WITH
+                    self.advance(); // ROLLUP
+                    let keys = total.into_iter().next().unwrap_or_default();
+                    mysql_rollup = true;
+                    // n+1 prefixes, largest first — the same expansion
+                    // `ROLLUP (…)` produces.
+                    total = (0..=keys.len()).rev().map(|n| keys[..n].to_vec()).collect();
                 }
                 if distinct_sets {
                     let mut seen: Vec<Vec<String>> = Vec::new();
@@ -12485,8 +12519,26 @@ impl Parser {
             // preserves this pre-set order_by; the engine strips `__grp_ord_*`
             // from the final output. A standalone grouping-set query has ORDER BY
             // (not an explicit set-op) next, so consuming it here is safe.
-            if matches!(self.peek(), Token::Order) {
-                let mut order_keys = self.parse_order_by_keys()?;
+            // v7.39 (round 472) — absent the client's own ORDER BY, a MySQL
+            // rollup carries the hierarchical order: sort by the grouping
+            // keys with the rolled-up NULLs last, which is exactly the
+            // interleaving both oracles emit. A client's own ORDER BY wins,
+            // which is what MySQL does (MariaDB refuses to let one be
+            // written at all).
+            // The synthesised keys have to travel the SAME path a written
+            // ORDER BY does: the block below is what turns a `grouping()`
+            // call into the per-branch `__grp_ord_K` column the engine can
+            // actually sort on. Bypassing it left a bare `grouping(text)`
+            // for the evaluator to reject.
+            let synthesised_or_parsed: Vec<OrderBy> = if matches!(self.peek(), Token::Order) {
+                self.parse_order_by_keys()?
+            } else if mysql_rollup {
+                Self::mysql_rollup_order(&grouping_universe)
+            } else {
+                Vec::new()
+            };
+            if !synthesised_or_parsed.is_empty() {
+                let mut order_keys = synthesised_or_parsed;
                 let mut grp_exprs: Vec<Expr> = Vec::new();
                 for ob in &order_keys {
                     Self::collect_grouping_calls(&ob.expr, &mut grp_exprs);
@@ -12523,6 +12575,42 @@ impl Parser {
             }
         }
         Ok(stmt)
+    }
+
+    /// v7.39 (round 472) — the row order MySQL's `WITH ROLLUP` promises,
+    /// as ORDER BY keys.
+    ///
+    /// Per key: the rollup marker, then the key. Sorting on the key alone
+    /// is not enough, and a table with a NULL in it says why — MariaDB puts
+    /// the DATA-NULL group where a plain GROUP BY puts it (first) and only
+    /// the ROLLUP-introduced NULL last, and both print as NULL.
+    /// `GROUPING(k)` is the one thing that tells them apart: 0 for every
+    /// real group including the data-NULL one, 1 only for the row the
+    /// rollup added. Measured on MariaDB 11 — `('a',1),(NULL,2),('b',3)`
+    /// rolls up to NULL|2, a|1, b|3, NULL|6.
+    ///
+    /// `#[inline(never)]`: its locals must not join the statement parser's
+    /// frame, which round 430 measured sitting against the nesting guard.
+    #[inline(never)]
+    fn mysql_rollup_order(keys: &[Expr]) -> Vec<OrderBy> {
+        let mut out: Vec<OrderBy> = Vec::with_capacity(keys.len() * 2);
+        for e in keys {
+            out.push(OrderBy {
+                expr: Expr::FunctionCall {
+                    name: "grouping".into(),
+                    args: alloc::vec![e.clone()],
+                },
+                desc: false,
+                nulls_first: None,
+            });
+            out.push(OrderBy {
+                expr: e.clone(),
+                desc: false,
+                // MySQL orders NULL first on an ascending key.
+                nulls_first: Some(true),
+            });
+        }
+        out
     }
 
     fn parse_create_table_stmt_after_create(&mut self) -> Result<Statement, ParseError> {
