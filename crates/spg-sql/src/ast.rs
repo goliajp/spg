@@ -2254,6 +2254,14 @@ pub struct ColumnDef {
     /// path can enforce the real range. None for every other column and
     /// under the PG dialect.
     pub mysql_int_width: Option<MysqlIntWidth>,
+    /// v7.39 (round 424, type-fidelity epic) — the declared MySQL
+    /// fractional-seconds precision of a temporal column (`DATETIME(3)` is
+    /// `Some(3)`; a bare `DATETIME` / `TIME` / `TIMESTAMP` is `Some(0)`,
+    /// MySQL's default). The engine copies it to `ColumnSchema.mysql_fsp` at
+    /// CREATE TABLE time so the write path can truncate and the render path
+    /// can pad. None under the PG dialect, where temporal columns keep full
+    /// microseconds.
+    pub mysql_fsp: Option<u8>,
 }
 
 /// v7.17.0 Phase 2.5 — text collation classification surfaced

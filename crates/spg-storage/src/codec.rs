@@ -62,6 +62,7 @@ pub(crate) fn deserialize_table(
             auto_restart: None,
             scalar_row_source: false,
             mysql_int_width: None,
+            mysql_fsp: None,
         });
     }
     let n_cols = cols.len();
@@ -556,6 +557,24 @@ pub(crate) fn deserialize_table(
             };
             if let Some(col) = t.schema_mut().columns.get_mut(pos) {
                 col.mysql_int_width = Some(width);
+            }
+        }
+    }
+    // v7.39 (round 424, type-fidelity epic) — mysql_fsp appendix
+    // (FILE_VERSION 82+). Sparse: only MySQL-declared temporal columns.
+    // v81-and-below catalogs leave every column at None.
+    if version >= 82 {
+        let n = cur.read_u16()? as usize;
+        for _ in 0..n {
+            let pos = cur.read_u16()? as usize;
+            let fsp = cur.read_u8()?;
+            if fsp > 6 {
+                return Err(StorageError::Corrupt(format!(
+                    "mysql_fsp out of range: {fsp}"
+                )));
+            }
+            if let Some(col) = t.schema_mut().columns.get_mut(pos) {
+                col.mysql_fsp = Some(fsp);
             }
         }
     }

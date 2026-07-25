@@ -5143,6 +5143,10 @@ fn column_def_to_schema(c: ColumnDef, mysql: bool) -> Result<ColumnSchema, Engin
         spg_sql::ast::MysqlIntWidth::Small => spg_storage::MysqlIntWidth::Small,
         spg_sql::ast::MysqlIntWidth::Int => spg_storage::MysqlIntWidth::Int,
     });
+    // v7.39 (round 424, type-fidelity epic) — declared fractional-seconds
+    // precision of a MySQL temporal column. Drives write-path truncation
+    // and render padding; None keeps PG's full-microsecond behaviour.
+    schema.mysql_fsp = c.mysql_fsp;
     // v7.39 (round 389, type-fidelity epic P4a) — a "real" SMALLINT /
     // INT UNSIGNED holds a range its signed storage tag cannot (65535 /
     // 4294967295), so widen the storage one step and record the declared

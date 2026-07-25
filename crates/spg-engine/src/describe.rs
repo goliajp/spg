@@ -97,6 +97,7 @@ fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> 
                     auto_restart: None,
                     scalar_row_source: false,
                     mysql_int_width: None,
+                    mysql_fsp: None,
                 });
             }
         }

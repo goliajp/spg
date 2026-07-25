@@ -115,19 +115,21 @@ fn timestamp_function_keeps_fraction() {
     );
 }
 
-/// BASELINE for the follow-up round: a column's declared precision is not
-/// modelled yet, so the fraction survives where MariaDB would truncate
-/// (`DATETIME`) or pad (`DATETIME(6)` renders `.250000` there).
+/// Round 424 closed the write half of the column story: a bare `DATETIME`
+/// column now truncates like MariaDB. Only the RENDER padding is still
+/// outstanding (`DATETIME(6)` shows `.250000` there, `.25` here) — see
+/// `e2e_mysql_column_fsp_round424`.
 #[test]
-fn column_precision_is_not_yet_modelled() {
+fn column_precision_write_half_is_modelled() {
     let mut e = mysql();
     e.execute("CREATE TABLE t0(d DATETIME)").unwrap();
     e.execute("CREATE TABLE t6(d DATETIME(6))").unwrap();
     e.execute("INSERT INTO t0 VALUES('2020-01-01 00:00:00.25')").unwrap();
     e.execute("INSERT INTO t6 VALUES('2020-01-01 00:00:00.25')").unwrap();
-    // MariaDB: '2020-01-01 00:00:00' — SPG keeps the fraction (queued).
-    assert_eq!(one(&mut e, "SELECT d FROM t0"), "2020-01-01 00:00:00.25");
-    // MariaDB: '2020-01-01 00:00:00.250000' — SPG trims (queued).
+    // Precision 0 -> the fraction is dropped, as MariaDB does (round 424).
+    assert_eq!(one(&mut e, "SELECT d FROM t0"), "2020-01-01 00:00:00");
+    // MariaDB renders '2020-01-01 00:00:00.250000'; the instant matches and
+    // only the zero-padding is queued.
     assert_eq!(one(&mut e, "SELECT d FROM t6"), "2020-01-01 00:00:00.25");
 }
 
