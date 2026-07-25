@@ -453,6 +453,7 @@ impl Engine {
             .with_salt_fn(self.salt_fn)
             // v7.39 (read01 pgstatfuncs.c) — calling-connection identity.
             .with_backend_pid_fn(self.backend_pid_fn)
+            .with_wal_lsn_fn(self.wal_lsn_fn)
             // v7.39 (round 318, V51) — and the connection-control hook, so
             // pg_cancel_backend / pg_terminate_backend really signal.
             .with_backend_signal_fn(self.backend_signal_fn)

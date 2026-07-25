@@ -214,6 +214,8 @@ pub struct EvalContext<'a> {
     /// v7.39 (read01 pgstatfuncs.c) — calling-connection identity for
     /// pg_backend_pid(); `None` (embedded / detached contexts) → 1.
     pub backend_pid_fn: Option<crate::BackendPidFn>,
+    /// v7.39 (round 476) — the WAL byte position, for the LSN functions.
+    pub wal_lsn_fn: Option<crate::WalLsnFn>,
     /// v7.39 (round 318, V51) — host connection-control hook for
     /// `pg_cancel_backend` / `pg_terminate_backend`. `None` (embedded /
     /// detached contexts) ⇒ there is nothing to signal, so they answer
@@ -297,6 +299,7 @@ impl<'a> EvalContext<'a> {
             tz_abbrev_fn: None,
             salt_fn: None,
             backend_pid_fn: None,
+            wal_lsn_fn: None,
             backend_signal_fn: None,
             clock: None,
             xact: None,
@@ -315,6 +318,13 @@ impl<'a> EvalContext<'a> {
     #[must_use]
     pub const fn with_backend_signal_fn(mut self, f: Option<crate::BackendSignalFn>) -> Self {
         self.backend_signal_fn = f;
+        self
+    }
+
+    /// v7.39 (round 476) — attach the WAL byte-position provider.
+    #[must_use]
+    pub const fn with_wal_lsn_fn(mut self, f: Option<crate::WalLsnFn>) -> Self {
+        self.wal_lsn_fn = f;
         self
     }
 

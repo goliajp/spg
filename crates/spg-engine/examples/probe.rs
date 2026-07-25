@@ -155,12 +155,40 @@ fn main() {
             println!("{}: {}", n.severity.as_pg_str(), n.message);
         }
         match outcome {
-            Ok(QueryResult::Rows { rows, .. }) => {
-                // One line per statement: columns joined by `|`, rows by `;`
-                // (matches `psql -tA` with rows collapsed onto a line).
+            Ok(QueryResult::Rows { columns, rows }) => {
+                // v7.39 (round 476) — render a TIMESTAMPTZ in the session's
+                // zone, as the wire does.
+                //
+                // There is no scalar `Value::Timestamptz`: a timestamptz is a
+                // `Value::Timestamp` and only the COLUMN says which it is. The
+                // probe rendered the value alone, so `SET TIME ZONE
+                // 'Asia/Tokyo'; SELECT now()` printed UTC with no offset while
+                // a real client over pgwire correctly got `+09`. Every
+                // timezone differential run through this probe was therefore
+                // reporting a defect the server does not have — measured
+                // against PG18 and against SPG's own wire, which agree.
+                let tz = e.session_tz();
                 let line: Vec<String> = rows
                     .iter()
-                    .map(|row| row.values.iter().map(render).collect::<Vec<_>>().join("|"))
+                    .map(|row| {
+                        row.values
+                            .iter()
+                            .enumerate()
+                            .map(|(i, v)| match (v, columns.get(i).map(|c| c.ty)) {
+                                (
+                                    Value::Timestamp(micros),
+                                    Some(spg_storage::DataType::Timestamptz),
+                                ) => spg_engine::eval::format_timestamptz_tz(
+                                    *micros,
+                                    &e.render_style(),
+                                    tz.offset_at(*micros),
+                                    tz.abbrev_at(*micros).as_deref(),
+                                ),
+                                _ => render(v),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    })
                     .collect();
                 println!("{}", line.join(";"));
             }

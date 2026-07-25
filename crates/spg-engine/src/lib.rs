@@ -371,6 +371,18 @@ pub type BackendCountFn = fn() -> u32;
 /// no_std engine just calls through. `None` (embedded) → pid 1.
 pub type BackendPidFn = fn() -> u32;
 
+/// v7.39 (round 476) — the WAL's current byte position, as a PG LSN.
+///
+/// `pg_current_wal_lsn()` answered the literal `0/0` forever, so every
+/// monitor watching WAL progress or replication lag saw an instance that
+/// had never written anything. SPG's WAL is a file and its length IS an
+/// LSN in every sense a monitor uses one: monotonic, byte-denominated, and
+/// comparable — `pg_wal_lsn_diff` over two samples gives real bytes.
+///
+/// `None` (embedded, or a server started without a WAL) keeps `0/0`, which
+/// is the honest answer there: nothing is being written.
+pub type WalLsnFn = fn() -> u64;
+
 /// v7.39 (round 318, V51) — host-provided connection control. `terminate`
 /// false = cancel the target's running statement (PG `pg_cancel_backend`,
 /// MySQL `KILL QUERY`); true = also close the connection (PG
@@ -1058,6 +1070,8 @@ pub struct Engine {
     /// wires its connection registry, embedded stays None -> 1).
     pub(crate) backend_count_fn: Option<BackendCountFn>,
     pub(crate) backend_pid_fn: Option<BackendPidFn>,
+    /// v7.39 (round 476) — see [`WalLsnFn`].
+    pub(crate) wal_lsn_fn: Option<WalLsnFn>,
     /// v7.39 (round 318, V51) — host connection-control hook. See
     /// [`BackendSignalFn`].
     pub(crate) backend_signal_fn: Option<BackendSignalFn>,
@@ -1353,6 +1367,7 @@ impl Engine {
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
             backend_count_fn: None,
             backend_pid_fn: None,
+            wal_lsn_fn: None,
             backend_signal_fn: None,
             tz_offset_fn: None,
             tz_localize_fn: None,
@@ -1596,6 +1611,11 @@ impl Engine {
 
     /// v7.39 (read01 pgstatfuncs.c) — inject the host's calling-connection
     /// identity for pg_backend_pid().
+    /// v7.39 (round 476) — register the WAL byte-position provider.
+    pub fn set_wal_lsn_fn(&mut self, f: WalLsnFn) {
+        self.wal_lsn_fn = Some(f);
+    }
+
     pub fn set_backend_pid_fn(&mut self, f: BackendPidFn) {
         self.backend_pid_fn = Some(f);
     }
@@ -1740,6 +1760,7 @@ impl Engine {
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
             backend_count_fn: None,
             backend_pid_fn: None,
+            wal_lsn_fn: None,
             backend_signal_fn: None,
             tz_offset_fn: None,
             tz_localize_fn: None,
@@ -1861,6 +1882,7 @@ impl Engine {
                     xact_rollback: core::sync::atomic::AtomicU64::new(0),
                     backend_count_fn: None,
                     backend_pid_fn: None,
+            wal_lsn_fn: None,
             backend_signal_fn: None,
                     tz_offset_fn: None,
                     tz_localize_fn: None,

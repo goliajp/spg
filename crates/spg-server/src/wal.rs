@@ -372,6 +372,27 @@ pub(crate) fn append_durability_marker(state: &ServerState) -> std::io::Result<u
 /// is about to do disk I/O), so they are always on rather than env-gated —
 /// a counter you have to remember to enable is a counter you do not have
 /// when you need it.
+/// v7.39 (round 476) — the WAL file, so `pg_current_wal_lsn()` can report
+/// its byte position.
+pub(crate) static WAL_PATH: std::sync::OnceLock<std::path::PathBuf> =
+    std::sync::OnceLock::new();
+
+/// The WAL byte position, as `Engine::set_wal_lsn_fn` wants it.
+///
+/// Reads the file rather than keeping a counter. There are three append
+/// paths (`append_wal`, the v3 group append, and the durability marker) and
+/// the first cut incremented a counter in only one of them — the LSN then
+/// froze the moment traffic took the group-commit route, which is the route
+/// the panel uses. The file's length cannot be forgotten by a new path.
+/// `pg_current_wal_lsn()` is a monitoring call, not a hot path, so the stat
+/// is affordable; 0 when there is no WAL, which is the honest answer there.
+pub(crate) fn wal_lsn_position() -> u64 {
+    WAL_PATH
+        .get()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map_or(0, |m| m.len())
+}
+
 pub(crate) static WAL_APPENDS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static WAL_FSYNCS: std::sync::atomic::AtomicU64 =

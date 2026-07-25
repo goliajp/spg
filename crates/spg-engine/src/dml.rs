@@ -5915,6 +5915,7 @@ pub(crate) fn apply_generated_stored_columns(
                 // DEFAULT, so the deterministic fallbacks are acceptable here.
                 salt_fn: None,
                 backend_pid_fn: None,
+                wal_lsn_fn: None,
                 backend_signal_fn: None,
                 clock: None,
                 xact: None,
