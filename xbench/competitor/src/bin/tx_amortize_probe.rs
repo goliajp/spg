@@ -29,6 +29,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = std::env::var("SPG_WIRE_URL")
         .map_err(|_| "set SPG_WIRE_URL to the server under test")?;
 
+    // `pool` mode reproduces the shape that loses rows on SPGS but not on
+    // PG18: every statement through `execute(&pool)`, so the connection is
+    // acquired and released around each one while a raw `BEGIN` is open.
+    if mode == "pool" {
+        return pool_mode(&url, rows).await;
+    }
     // A DEDICATED connection, not a pool: `sqlx::query(..).execute(&pool)`
     // acquires and releases per statement, which muddies "is this the
     // extended protocol?" with "what does the pool do between statements?".
@@ -55,5 +61,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fetch_one(&mut c)
         .await?;
     println!("mode={mode} rows={rows} wall={ms:.1}ms stored={n}");
+    Ok(())
+}
+
+/// The row-losing shape, isolated. Round 441 measured PG18 keeping all rows
+/// here and SPGS keeping none, with identical client code.
+async fn pool_mode(url: &str, rows: i64) -> Result<(), Box<dyn std::error::Error>> {
+    use sqlx::any::AnyPoolOptions;
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect(url)
+        .await?;
+    sqlx::query("DROP TABLE IF EXISTS amort").execute(&pool).await?;
+    sqlx::query("CREATE TABLE amort(id INT PRIMARY KEY, v INT)")
+        .execute(&pool)
+        .await?;
+    sqlx::query("BEGIN").execute(&pool).await?;
+    for k in 0..rows {
+        sqlx::query(&format!("INSERT INTO amort VALUES ({k}, {k})"))
+            .execute(&pool)
+            .await?;
+    }
+    sqlx::query("COMMIT").execute(&pool).await?;
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM amort")
+        .fetch_one(&pool)
+        .await?;
+    println!("mode=pool rows={rows} stored={n}");
     Ok(())
 }
