@@ -14,6 +14,7 @@ publish      = false
 # out unsafe_code for spg-crypto; this crate inherits the default deny.
 
 [dependencies]
+libc = "0.2"
 spg-engine         = { path = "../../crates/spg-engine", version = "7.32" }
 spg-storage        = { path = "../../crates/spg-storage", version = "7.32" }
 spg-wire           = { path = "../../crates/spg-wire", version = "7.32" }
