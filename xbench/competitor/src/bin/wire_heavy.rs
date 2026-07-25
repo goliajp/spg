@@ -76,6 +76,9 @@ fn spawn_spgs(dir: &std::path::Path) -> Result<(Child, String), Box<dyn std::err
     Err(format!("spg-server pgwire didn't report ready; last line: {line}").into())
 }
 
+// The panel is one linear script: connect, run each engine's two commit
+// modes, print the table. Splitting it would only move the sequence around.
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sqlx::any::install_default_drivers();
@@ -105,13 +108,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| format!("set sync: {e}"))?;
                 Ok::<(), String>(())
             })?;
+            // v7.39 (round 441) — hold ONE connection for the whole shape.
+            //
+            // `execute(&pool)` acquires and releases around every statement,
+            // and sqlx rolls a connection back when it is returned with an
+            // open transaction. So a shape that spells `BEGIN` in raw SQL —
+            // `tx_batch_100` — was never measuring a transaction at all: it
+            // paid 100 separate commits, which is exactly why it looked like
+            // a 3.83x loss. Driven on a dedicated connection the same shape
+            // is 15.6 ms against PG18's 16.7 ms.
+            let mut conn = rt
+                .block_on(pool.acquire())
+                .map_err(|e| format!("acquire: {e}"))?;
             let rt2 = rt.clone();
-            let pool2 = pool.clone();
             let out = bench_engine(&mut |sql| {
                 rt2.block_on(async {
-                    sqlx::query(sql).execute(&pool2).await.unwrap();
+                    use sqlx::Executor as _;
+                    conn.execute(sql).await.unwrap();
                 });
             });
+            drop(conn);
             rt.block_on(async {
                 let _ = sqlx::query("DROP TABLE IF EXISTS wb").execute(&pool).await;
                 pool.close().await;
