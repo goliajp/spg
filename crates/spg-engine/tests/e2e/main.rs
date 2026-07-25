@@ -279,6 +279,7 @@ mod e2e_mysql_unsigned_arith_round467;
 mod e2e_substr_text_position_round468;
 mod e2e_temp_sequence_view_round469;
 mod e2e_mysql_non_strict_round470;
+mod e2e_bigint_unsigned_round471;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;

@@ -549,6 +549,8 @@ pub(crate) fn deserialize_table(
                 1 => MysqlIntWidth::Medium,
                 2 => MysqlIntWidth::Small,
                 3 => MysqlIntWidth::Int,
+                // v7.39 (round 471, epic P4b) — BIGINT UNSIGNED.
+                4 => MysqlIntWidth::Big,
                 other => {
                     return Err(StorageError::Corrupt(format!(
                         "unknown mysql_int_width tag {other}"

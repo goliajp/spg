@@ -1552,6 +1552,12 @@ pub enum MysqlIntWidth {
     /// MySQL `INT UNSIGNED` — 0..4294967295. Storage widened to i64 (a
     /// signed INT keeps `DataType::Int` and carries no marker).
     Int,
+    /// v7.39 (round 471, epic P4b) — MySQL `BIGINT UNSIGNED` —
+    /// 0..18446744073709551615. i64 stops at 2^63-1, so the storage tag is
+    /// widened to `Numeric` (i128-backed, scale 0), which already compares,
+    /// orders, indexes and renders as an exact integer. A signed BIGINT
+    /// keeps `DataType::BigInt` and carries no marker.
+    Big,
 }
 
 /// v7.39 (round 363, M4 P1) — MySQL's default accent- and
@@ -8319,6 +8325,7 @@ impl Catalog {
                             MysqlIntWidth::Medium => 1u8,
                             MysqlIntWidth::Small => 2u8,
                             MysqlIntWidth::Int => 3u8,
+                            MysqlIntWidth::Big => 4u8,
                         };
                         (i, tag)
                     })

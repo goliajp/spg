@@ -1,6 +1,11 @@
 # MySQL-flavoured integer / numeric type aliases (v2.8). Each maps to
-# the closest SPG type; UNSIGNED is parsed and dropped (no semantic
-# effect — SPG holds the value in the signed twin).
+# the closest SPG type.
+#
+# v7.39 (round 471) — the header used to say "UNSIGNED is parsed and
+# dropped (no semantic effect — SPG holds the value in the signed twin)".
+# It no longer is: BIGINT UNSIGNED carries its full 0..2^64-1 range, and
+# SHOW COLUMNS reports the DECLARED type in a MySQL session rather than
+# the storage tag. The expectations below are a live MariaDB 11 run.
 
 # v7.39 (round 274) — declare the session's dialect the way a mysqldump
 # preamble does. PG's REAL is 4-byte and MySQL's REAL is a synonym for
@@ -24,25 +29,25 @@ query TTI nosort
 SHOW COLUMNS FROM mixed
 ----
 tiny_v
-SMALLINT
+tinyint(4)
 0
 mid_v
-INT
+mediumint(9)
 0
 int_v
-INT
+int(11)
 0
 big_v
-BIGINT
+bigint(20) unsigned
 0
 d_v
-FLOAT
+double
 1
 r_v
-FLOAT
+double
 1
 flag
-BOOL
+tinyint(1)
 1
 
 statement ok

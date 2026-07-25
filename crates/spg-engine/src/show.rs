@@ -478,7 +478,18 @@ impl Engine {
             .map(|c| {
                 Row::new(alloc::vec![
                     Value::text(c.name.clone()),
-                    Value::text(alloc::format!("{}", c.ty)),
+                    // v7.39 (round 471) — a MySQL session reads the DECLARED
+                    // type, the same rendering SHOW CREATE and
+                    // information_schema already give: `tinyint(4)`,
+                    // `bigint(20) unsigned`. This reported the storage tag
+                    // instead (`SMALLINT`, `NUMERIC(20)`), which was never
+                    // what MariaDB says and became visibly so once BIGINT
+                    // UNSIGNED moved its storage to Numeric.
+                    Value::text(if self.backslash_escapes {
+                        render_mysql_type(c)
+                    } else {
+                        alloc::format!("{}", c.ty)
+                    }),
                     Value::Bool(c.nullable),
                 ])
             })
@@ -529,6 +540,9 @@ pub(crate) fn mysql_int_base_name(
         Some(W::Small) => Some("smallint"),
         Some(W::Medium) => Some("mediumint"),
         Some(W::Int) => Some("int"),
+        // v7.39 (round 471, epic P4b) — BIGINT UNSIGNED stores as Numeric;
+        // the marker is what keeps it reporting as a bigint.
+        Some(W::Big) => Some("bigint"),
         None => match ty {
             DataType::SmallInt => Some("smallint"),
             DataType::Int => Some("int"),
