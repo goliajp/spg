@@ -272,6 +272,7 @@ mod e2e_mysql_insert_ignore_values_round434;
 mod e2e_mysql_implicit_commit_round435;
 mod e2e_temporary_tables_round436;
 mod e2e_temp_table_visibility_round437;
+mod e2e_dml_seq_scan_stats_round455;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;

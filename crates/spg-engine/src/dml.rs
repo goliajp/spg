@@ -1226,7 +1226,22 @@ impl Engine {
         let mut planned: Vec<(usize, Vec<Value<'static>>)> = Vec::new();
         let candidate_positions: Vec<usize> = match &seek_positions {
             Some(list) => list.clone(),
-            None => (0..table.row_count()).collect(),
+            None => {
+                // v7.39 (round 455) — a mutation that finds no usable index
+                // walks the table, and PG counts those tuples: its
+                // `pg_stat_user_tables.seq_tup_read` covers DML, not just
+                // SELECT. SPG only reported from `scan_visible`, which the
+                // mutation paths do not use, so an UPDATE or DELETE that
+                // scanned every row reported reading none — measured in
+                // round 454 with a deliberately unindexed predicate over
+                // 50k rows, which came back 0.
+                //
+                // Silently-wrong monitoring for any write workload, and the
+                // instrument the round-452 investigation needs to tell a
+                // range mutation's seek from a scan.
+                table.note_seq_scan();
+                (0..table.row_count()).collect()
+            }
         };
         // v7.37.16 (gate-on inventory) — MVCC visibility gate for the
         // UPDATE target scan. Without it, a tombstoned old version
@@ -3011,7 +3026,22 @@ impl Engine {
                 list.sort_unstable();
                 list
             }
-            None => (0..table.row_count()).collect(),
+            None => {
+                // v7.39 (round 455) — a mutation that finds no usable index
+                // walks the table, and PG counts those tuples: its
+                // `pg_stat_user_tables.seq_tup_read` covers DML, not just
+                // SELECT. SPG only reported from `scan_visible`, which the
+                // mutation paths do not use, so an UPDATE or DELETE that
+                // scanned every row reported reading none — measured in
+                // round 454 with a deliberately unindexed predicate over
+                // 50k rows, which came back 0.
+                //
+                // Silently-wrong monitoring for any write workload, and the
+                // instrument the round-452 investigation needs to tell a
+                // range mutation's seek from a scan.
+                table.note_seq_scan();
+                (0..table.row_count()).collect()
+            }
         };
         for (loop_n, &i) in candidate_positions.iter().enumerate() {
             if loop_n.is_multiple_of(256) {
