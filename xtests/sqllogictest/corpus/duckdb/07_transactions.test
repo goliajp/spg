@@ -46,6 +46,13 @@ BEGIN
 statement ok
 ROLLBACK
 
-# COMMIT without active TX errors.
-statement error
+# COMMIT without an active TX.
+#
+# v7.39 (round 435) — DuckDB errors here ("cannot commit - no transaction is
+# active"), and SPG used to as well. Both of SPG's drop-in targets disagree,
+# measured live: PG18 replies `WARNING: there is no transaction in progress`
+# and still reports COMMIT; MariaDB 11 succeeds silently. A PG/MySQL drop-in
+# has to answer the way PG and MySQL answer, so this is a deliberate,
+# recorded deviation from the DuckDB corpus rather than a silent one.
+statement ok
 COMMIT

@@ -4358,6 +4358,75 @@ impl Statement {
     /// writer-path here. Same for `BEGIN` / `COMMIT` /
     /// `ROLLBACK` / `SAVEPOINT` — transaction control is
     /// always writer-path.
+    /// v7.39 (round 435) — does this statement implicitly COMMIT an open
+    /// transaction under MySQL?
+    ///
+    /// PG runs DDL inside the transaction; MySQL commits before (and after)
+    /// it, so `START TRANSACTION; INSERT …; CREATE TABLE …; ROLLBACK` keeps
+    /// the INSERT on MySQL and loses it on PG. Measured on MariaDB 11 for
+    /// CREATE TABLE, ALTER TABLE, DROP TABLE, TRUNCATE, CREATE INDEX and a
+    /// nested START TRANSACTION; and measured NOT to fire for `CREATE
+    /// TEMPORARY TABLE`, `SET`, or a SELECT.
+    ///
+    /// A positive list, not "everything that is not DML": a statement
+    /// wrongly listed here commits a client's data early, which is as bad as
+    /// the divergence it fixes. SPG-only maintenance verbs (VACUUM, DISCARD,
+    /// COMPACT) are left out — a MySQL session never sends them.
+    #[must_use]
+    pub fn mysql_implicit_commit(&self) -> bool {
+        match self {
+            // MySQL commits the open transaction and opens a fresh one.
+            // MySQL's documented exception — `CREATE TEMPORARY TABLE` does
+            // not commit — needs no arm here: the parser lowers that
+            // spelling to `Statement::Empty`, so it never reaches
+            // `CreateTable` and falls through to `false` below.
+            Self::CreateTable(_)
+            | Self::Begin { .. }
+            | Self::DropTable { .. }
+            | Self::DropIndex { .. }
+            | Self::CreateIndex(_)
+            | Self::AlterIndex { .. }
+            | Self::AlterTable(_)
+            | Self::Truncate { .. }
+            | Self::Analyze { .. }
+            | Self::CreateStatistics { .. }
+            | Self::DropStatistics { .. }
+            | Self::CreateView { .. }
+            | Self::DropView { .. }
+            | Self::CreateMaterializedView { .. }
+            | Self::RefreshMaterializedView { .. }
+            | Self::DropMaterializedView { .. }
+            | Self::CreateSequence(_)
+            | Self::AlterSequence { .. }
+            | Self::DropSequence { .. }
+            | Self::CreateFunction(_)
+            | Self::DropFunction { .. }
+            | Self::CreateTrigger(_)
+            | Self::DropTrigger { .. }
+            | Self::CreateRule(_)
+            | Self::DropRule { .. }
+            | Self::CreateType(_)
+            | Self::DropType { .. }
+            | Self::AlterTypeAddValue { .. }
+            | Self::AlterTypeRenameValue { .. }
+            | Self::CreateDomain(_)
+            | Self::AlterDomain { .. }
+            | Self::DropDomain { .. }
+            | Self::CreateSchema { .. }
+            | Self::DropSchema { .. }
+            | Self::CreateUser { .. }
+            | Self::DropUser { .. }
+            | Self::Grant { .. }
+            | Self::Revoke { .. }
+            | Self::CreatePolicy(_)
+            | Self::AlterPolicy(_)
+            | Self::DropPolicy { .. }
+            | Self::CommentOn { .. }
+            | Self::CreateExtension { .. } => true,
+            _ => false,
+        }
+    }
+
     #[must_use]
     pub fn is_readonly(&self) -> bool {
         match self {
