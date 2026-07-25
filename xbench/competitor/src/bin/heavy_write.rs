@@ -28,6 +28,18 @@ const N: i64 = 50_000;
 const WARMUP: usize = 2;
 const RUNS: usize = 15; // odd → clean median
 
+/// v7.39 (round 477) — effective run count, overridable without a rebuild.
+/// Same reason as `heavy`: at the default the RATIO carries enough noise to
+/// make the "narrow win" shapes unrankable, and picking an attack target off
+/// an unrankable list is picking noise.
+fn runs() -> usize {
+    std::env::var("SPG_BENCH_RUNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 3)
+        .unwrap_or(RUNS)
+}
+
 fn val_for(i: i64) -> i64 {
     ((i as u64).wrapping_mul(2_654_435_761) % 100_000) as i64
 }
@@ -91,7 +103,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pool.close().await;
 
     println!();
-    println!("# heavy write shapes — median ms over {RUNS} runs (BEGIN..ROLLBACK), {N}-row table");
+    println!(
+        "# heavy write shapes — median ms over {} runs (BEGIN..ROLLBACK), {N}-row table",
+        runs()
+    );
     println!("| shape          |   SPGE ms |   PG18 ms | SPGE/PG | verdict |");
     println!("|----------------|----------:|----------:|--------:|---------|");
     for (i, (name, _)) in shapes().iter().enumerate() {
@@ -137,8 +152,8 @@ fn bench_spg_embedded() -> Vec<f64> {
                 eng.execute(sql).unwrap();
                 eng.execute("ROLLBACK").unwrap();
             }
-            let mut samples = Vec::with_capacity(RUNS);
-            for _ in 0..RUNS {
+            let mut samples = Vec::with_capacity(runs());
+            for _ in 0..runs() {
                 eng.execute("BEGIN").unwrap();
                 let t0 = Instant::now();
                 eng.execute(sql).unwrap();
@@ -176,8 +191,8 @@ async fn bench_pg(pool: &AnyPool) -> Result<Vec<f64>, sqlx::Error> {
             sqlx::query(sql).execute(pool).await?;
             sqlx::query("ROLLBACK").execute(pool).await?;
         }
-        let mut samples = Vec::with_capacity(RUNS);
-        for _ in 0..RUNS {
+        let mut samples = Vec::with_capacity(runs());
+        for _ in 0..runs() {
             sqlx::query("BEGIN").execute(pool).await?;
             let t0 = Instant::now();
             sqlx::query(sql).execute(pool).await?;
