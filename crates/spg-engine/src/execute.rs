@@ -1197,7 +1197,18 @@ impl Engine {
         // them on SPG — silently, since nothing errors. This is the one
         // point every path (simple query, prepared, extended) passes
         // through, so the commit cannot be skipped by a spelling.
-        if self.backslash_escapes && self.in_transaction() && stmt.mysql_implicit_commit() {
+        //
+        // v7.39 (round 444) — the witness is THIS connection's slot, not
+        // `in_transaction()`. That predicate is true whenever ANY connection
+        // holds a transaction, so a second client's `BEGIN` tried to commit a
+        // slot of its own that held nothing and answered an error instead —
+        // caught by `two_mysql_connections_can_each_hold_a_transaction`, which
+        // had been failing since round 435 introduced this hook. Same
+        // global-vs-slot confusion rounds 279 / 283 / 298 / 304 each fixed
+        // elsewhere; `current_tx` is the connection's own slot here, set by
+        // `execute_in_with_cancel` before dispatch.
+        let in_own_tx = self.current_tx.is_some_and(|t| self.is_tx_open(t));
+        if self.backslash_escapes && in_own_tx && stmt.mysql_implicit_commit() {
             self.exec_commit()?;
         }
         let result = match stmt {
