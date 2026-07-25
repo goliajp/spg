@@ -46,13 +46,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let del = format!("DELETE FROM wb WHERE id >= {seg} AND id < {}", seg + 1000);
     let ins = batch_sql(seg, 1000);
 
+    // v7.39 (round 458) — `SPG_PROBE_ITERS` lengthens the timed loop so a
+    // sampler has something to catch. Round 457's profile came back all
+    // idle threads because the probe finished before `sample` started.
+    let iters: usize = std::env::var("SPG_PROBE_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(31);
     let mut dv = Vec::new();
     let mut iv = Vec::new();
     for _ in 0..5 {
         c.execute(del.as_str()).await?;
         c.execute(ins.as_str()).await?;
     }
-    for _ in 0..31 {
+    for _ in 0..iters {
         let t = Instant::now();
         c.execute(del.as_str()).await?;
         dv.push(t.elapsed().as_secs_f64() * 1000.0);
@@ -60,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         c.execute(ins.as_str()).await?;
         iv.push(t.elapsed().as_secs_f64() * 1000.0);
     }
-    println!("# delete_reinsert_1k split, sync=off, median of 31");
+    println!("# delete_reinsert_1k split, sync=off, median of {iters}");
     println!("  DELETE 1000 rows : {:.3} ms", median(dv));
     println!("  re-INSERT 1000   : {:.3} ms", median(iv));
     Ok(())
