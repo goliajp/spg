@@ -2743,11 +2743,14 @@ impl fmt::Display for ColumnTypeName {
 /// engine evaluates `expr` per matched row in the table's row order
 /// and rewrites cells in place. Indexed columns are dropped + re-
 /// inserted into the affected B-tree on each row change.
-/// v7.39 (round 413) — the boxed payload for MySQL `UPDATE ORDER BY [LIMIT]`.
-/// Boxed off `UpdateStatement` so the PG-only common path stays at its
-/// pre-r413 size (see the round-305 nesting-stack lesson).
+/// v7.39 (round 413) — the boxed payload for MySQL's `ORDER BY [LIMIT]`
+/// tail on a DML statement. Boxed off the statement struct so the PG-only
+/// common path stays at its pre-r413 size (see the round-305 nesting-stack
+/// lesson). v7.39 (round 431+1) — DELETE carries the identical clause with
+/// the identical meaning, so both share this one payload rather than each
+/// growing its own.
 #[derive(Debug, Clone, PartialEq)]
-pub struct UpdateOrderLimit {
+pub struct DmlOrderLimit {
     pub order_by: Vec<OrderBy>,
     pub limit: Option<u32>,
 }
@@ -2770,7 +2773,7 @@ pub struct UpdateStatement {
     /// so a PG UPDATE (the common case) grows this struct by ONE pointer,
     /// not `Vec<OrderBy> + Option<u32>` — a naked add tipped the parser's
     /// 512 KiB nesting stack under a full workspace test (round 305 kin).
-    pub order_limit: Option<alloc::boxed::Box<UpdateOrderLimit>>,
+    pub order_limit: Option<alloc::boxed::Box<DmlOrderLimit>>,
     /// v7.9.4 — `RETURNING <projection>`. None = no RETURNING
     /// clause (legacy CommandComplete path). Some = engine
     /// evaluates the projection over each mutated row and
@@ -2790,6 +2793,12 @@ pub struct DeleteStatement {
     /// the WHERE / RETURNING expressions refer to the target row by.
     pub alias: Option<String>,
     pub where_: Option<Expr>,
+    /// v7.39 (round 432) — MySQL's `DELETE … [ORDER BY … [LIMIT n]]`, the
+    /// batched-cleanup idiom. Same clause and same meaning as the UPDATE
+    /// form (round 413), so it shares that payload — and it is boxed for
+    /// the same reason: a naked `Vec<OrderBy> + Option<u32>` on a DML
+    /// statement tipped the parser's 512 KiB nesting stack.
+    pub order_limit: Option<alloc::boxed::Box<DmlOrderLimit>>,
     /// v7.9.4 — `RETURNING <projection>`.
     pub returning: Option<Vec<SelectItem>>,
 }
