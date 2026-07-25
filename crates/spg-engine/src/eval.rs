@@ -1569,6 +1569,113 @@ pub(crate) fn expr_mysql_fsp(e: &Expr, columns: &[ColumnSchema]) -> Option<u8> {
     best
 }
 
+/// v7.39 (round 467) — is this expression MySQL-UNSIGNED?
+///
+/// MySQL decides unsignedness statically, from the expression's type, not
+/// from the value it happens to produce. Measured on MariaDB 11: `SUM(a) -
+/// 100` answers -99 even though `a` is `INT UNSIGNED`, because SUM's result
+/// type is not unsigned; `a - 5` on the same column raises 1690. So this
+/// walks the expression the way MySQL's type resolution does.
+///
+/// A cast names its target `unsigned` (the parser lowercases MySQL's
+/// `CAST(x AS UNSIGNED)` into `CastTarget::Named`). Arithmetic is unsigned
+/// when EITHER operand is — that is MySQL's rule, and it is why `1 - b`
+/// raises while `5 - a` does not: both are unsigned expressions, but only
+/// the first has a negative result.
+///
+/// Deliberately NOT unsigned: unary minus (MariaDB answers -1 for
+/// `-CAST(1 AS UNSIGNED)`), and every function result including the
+/// aggregates. Both measured.
+pub(crate) fn expr_is_mysql_unsigned(e: &Expr, columns: &[ColumnSchema]) -> bool {
+    match e {
+        Expr::Column(c) => columns
+            .iter()
+            .find(|col| col.name == c.name)
+            .is_some_and(|col| col.is_unsigned),
+        Expr::Cast {
+            target: CastTarget::Named(n),
+            ..
+        } => n.eq_ignore_ascii_case("unsigned"),
+        Expr::Binary {
+            lhs,
+            op: BinOp::Add | BinOp::Sub | BinOp::Mul,
+            rhs,
+        } => expr_is_mysql_unsigned(lhs, columns) || expr_is_mysql_unsigned(rhs, columns),
+        _ => false,
+    }
+}
+
+/// v7.39 (round 467) — MySQL arithmetic over an UNSIGNED operand, with
+/// MySQL's range check.
+///
+/// `INT UNSIGNED` columns holding 1 and 5 made `a - b` answer **-4** in a
+/// MySQL session. MariaDB raises `ERROR 1690 (22003): BIGINT UNSIGNED value
+/// is out of range`. A negative answer where the server promises a
+/// non-negative one is the kind of thing an application stores back into
+/// the same column, so it was silent and wrong in the worst direction.
+///
+/// The check runs in i128 so the subtraction that underflows is observed
+/// rather than wrapped, and it only fires when the expression is unsigned
+/// AND both operands are integers — a NUMERIC or float operand takes the
+/// ordinary path, as it does in MySQL.
+///
+/// `#[inline(never)]`: this is called from the recursive evaluator's
+/// hottest frame, which already sits against the stack guard.
+#[inline(never)]
+fn apply_binary_mysql_unsigned(
+    op: BinOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    l: Value<'static>,
+    r: Value<'static>,
+    ctx: &EvalContext,
+) -> Result<Value<'static>, EvalError> {
+    if ctx.mysql_dialect
+        && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+        && let Some(a) = mysql_int_operand(&l)
+        && let Some(b) = mysql_int_operand(&r)
+        && (expr_is_mysql_unsigned(lhs, ctx.columns) || expr_is_mysql_unsigned(rhs, ctx.columns))
+    {
+        let out = match op {
+            BinOp::Add => a.checked_add(b),
+            BinOp::Sub => a.checked_sub(b),
+            _ => a.checked_mul(b),
+        };
+        let in_range = out.is_some_and(|v| (0..=i128::from(u64::MAX)).contains(&v));
+        if !in_range {
+            // MariaDB names the offending expression in the message, with
+            // minimal parentheses — `a * 0 - 1`, not `((a * 0) - 1)`.
+            // `pretty_expr` is the deparser that already produces that
+            // shape. Residual, recorded rather than faked: MariaDB writes
+            // its columns fully qualified in backticks
+            // (`db`.`tbl`.`col`), and the database name is not something
+            // the evaluation context carries.
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "BIGINT UNSIGNED value is out of range in '{}'",
+                    spg_sql::ast::pretty_expr(&Expr::Binary {
+                        lhs: alloc::boxed::Box::new(lhs.clone()),
+                        op,
+                        rhs: alloc::boxed::Box::new(rhs.clone()),
+                    })
+                ),
+            });
+        }
+    }
+    apply_binary_in(op, l, r, ctx.mysql_dialect)
+}
+
+/// The integer an operand contributes to the unsigned range check, or
+/// `None` when it is not an integer at all (NULL, text, NUMERIC, float).
+fn mysql_int_operand(v: &Value<'_>) -> Option<i128> {
+    match v {
+        Value::SmallInt(n) => Some(i128::from(*n)),
+        Value::Int(n) => Some(i128::from(*n)),
+        Value::BigInt(n) => Some(i128::from(*n)),
+        _ => None,
+    }
+}
+
 fn expr_enum_type_name<'e>(e: &'e Expr, columns: &'e [ColumnSchema]) -> Option<&'e str> {
     match e {
         Expr::Cast {
@@ -3839,7 +3946,7 @@ pub fn eval_expr(
                 let (sl, sr) = (styled(l), styled(r));
                 return apply_binary(*op, sl, sr);
             }
-            apply_binary_in(*op, l, r, ctx.mysql_dialect)
+            apply_binary_mysql_unsigned(*op, lhs, rhs, l, r, ctx)
         }
         Expr::Cast { expr, target } => eval_cast_arm(expr, target, row, ctx),
         Expr::FieldAccess { base, field } => eval_field_access_arm(base, field, row, ctx),

@@ -176,6 +176,33 @@ fn each_failure_carries_its_own_mariadb_errno() {
 
 /// A real syntax error still answers 1064 / 42000 — the historical default
 /// is now reserved for what it actually names.
+/// read01 round 467 — MySQL's UNSIGNED arithmetic range check on the wire.
+///
+/// `INT UNSIGNED` columns holding 1 and 5 made `a - b` answer -4 in a MySQL
+/// session. MariaDB 11 raises, and a client branches on the errno:
+///
+///   ERROR 1690 (22003): BIGINT UNSIGNED value is out of range in
+///   '`db`.`u`.`a` - `db`.`u`.`b`'
+#[test]
+fn round467_unsigned_underflow_is_1690() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    ok_query(&mut s, "CREATE TABLE u(a INT UNSIGNED, b INT UNSIGNED)");
+    ok_query(&mut s, "INSERT INTO u VALUES(1,5)");
+    assert_eq!(
+        err_of(&mut s, "SELECT a - b FROM u"),
+        (1690, "22003".to_string())
+    );
+    // A literal on the left is no different — both sides being part of an
+    // unsigned expression is what matters, not which side the column is on.
+    assert_eq!(
+        err_of(&mut s, "SELECT 1 - b FROM u"),
+        (1690, "22003".to_string())
+    );
+    // And a result that stays in range is still just a result.
+    ok_query(&mut s, "SELECT b - a FROM u");
+}
+
 #[test]
 fn syntax_error_still_1064() {
     let (_guard, addr) = spawn();
