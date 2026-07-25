@@ -636,6 +636,22 @@ pub(crate) fn signal_backend(pid: u32, terminate: bool) -> bool {
 /// v6.5.2 — Engine-registered activity provider. Snapshots the
 /// live `connections` registry into the `ActivityRow` shape the
 /// engine renders.
+/// v7.39 (round 474) — the background workers this process actually
+/// started, in boot order.
+///
+/// pg_stat_activity listed client connections and nothing else, so SPG's
+/// own workers — the ones holding the engine write lock, which is exactly
+/// what an operator wants to see when a statement stalls — were invisible.
+/// PG18 lists eight beside the single client backend on an idle server.
+///
+/// Registered at the CALL sites, not inside each `spawn`, because that is
+/// where the return value says whether the thread really started: a
+/// freezer disabled by env, or an autovacuum worker gated off, must not
+/// appear. Nothing SPG does not run is listed — the point is to report
+/// this process, not to imitate PG's process table.
+pub(crate) static BACKGROUND_WORKERS: std::sync::OnceLock<Vec<&'static str>> =
+    std::sync::OnceLock::new();
+
 pub(crate) fn activity_snapshot() -> Vec<spg_engine::ActivityRow> {
     let Some(state) = ACTIVITY_STATE.get() else {
         return Vec::new();
@@ -643,7 +659,7 @@ pub(crate) fn activity_snapshot() -> Vec<spg_engine::ActivityRow> {
     let Ok(conns) = state.connections.read() else {
         return Vec::new();
     };
-    conns
+    let mut out: Vec<spg_engine::ActivityRow> = conns
         .iter()
         .map(|c| {
             let current_sql = c.current_sql.read().map(|g| g.clone()).unwrap_or_default();
@@ -670,9 +686,23 @@ pub(crate) fn activity_snapshot() -> Vec<spg_engine::ActivityRow> {
                 elapsed_us: c.elapsed_us(),
                 in_transaction: c.in_transaction.load(Ordering::Relaxed),
                 application_name,
+                backend_type: "client backend".into(),
             }
         })
-        .collect()
+        .collect();
+    // The workers this process actually started, after the connections —
+    // PG's own ordering is unspecified, and a client that cares sorts.
+    // Their pids are synthetic: SPG runs threads, and a thread id is not
+    // the process id every row would otherwise carry.
+    if let Some(workers) = BACKGROUND_WORKERS.get() {
+        for (i, name) in workers.iter().enumerate() {
+            out.push(spg_engine::ActivityRow::background(
+                u32::try_from(i + 1).unwrap_or(u32::MAX),
+                name,
+            ));
+        }
+    }
+    out
 }
 
 /// Default `SPG_HOT_TIER_BYTES` when the env var is unset / invalid —
@@ -1509,8 +1539,11 @@ fn run(
     // batch of rows from the largest table with a BTree integer-PK
     // index. Opt-out via `SPG_FREEZER_DISABLE=1` for tests that
     // don't want background mutations under them.
+    let mut workers: Vec<&'static str> = Vec::new();
     if freezer::spawn(Arc::clone(&state)).is_none() {
         eprintln!("spg-server: freezer disabled via SPG_FREEZER_DISABLE");
+    } else {
+        workers.push("freezer");
     }
 
     // v5.4.1: background flusher. In async-commit mode (env
@@ -1523,6 +1556,7 @@ fn run(
     // v7.37.15, but dormant (no markers, no fsync) until async
     // commits actually happen.
     let _ = flusher::spawn(Arc::clone(&state));
+    workers.push("flusher");
 
     // v7.39 (round 173): background autovacuum worker — the other
     // half of the inline-off flip above. Spawned under the same
@@ -1530,7 +1564,9 @@ fn run(
     // neither the statement path nor a worker vacuums.
     if autovacuum_enabled {
         let _ = autovacuum::spawn(Arc::clone(&state));
+        workers.push("autovacuum worker");
     }
+    let _ = BACKGROUND_WORKERS.set(workers);
 
     // v4.33 graceful shutdown: keep the blocking accept loop the
     // original code had (the per-connection timing is sensitive —

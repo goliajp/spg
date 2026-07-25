@@ -731,7 +731,7 @@ impl Engine {
                 // pg_database surfaces just `postgres`; pg_roles
                 // / pg_user walk the engine's UserStore.
                 "__spg_pg_database" => {
-                    let (schema, rows) = synth_pg_database(self.active_catalog());
+                    let (schema, rows) = synth_pg_database(self);
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 "__spg_pg_roles" | "__spg_pg_user" => {

@@ -4491,20 +4491,64 @@ fn fk_action_char(action: spg_storage::FkAction) -> &'static str {
 /// SPG is single-database so we surface a single row keyed on the
 /// canonical `postgres` database name (matching what every PG
 /// admin tool's startup screen expects to find).
-pub(crate) fn synth_pg_database(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_database(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    // v7.39 (round 474) — PG18's pg_database has eighteen columns; this had
+    // five, so `SELECT datfrozenxid FROM pg_database` — what a monitoring
+    // query asks to watch wraparound — failed outright with "column does
+    // not exist".
+    //
+    // It also named the database `postgres` while `current_database()`
+    // answers `spg`, so a client joining the two found no row at all.
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("datname", DataType::Text, false),
         ColumnSchema::new("datdba", DataType::BigInt, false),
         ColumnSchema::new("encoding", DataType::Int, false),
+        ColumnSchema::new("datlocprovider", DataType::Text, false),
+        ColumnSchema::new("datistemplate", DataType::Bool, false),
+        ColumnSchema::new("datallowconn", DataType::Bool, false),
+        ColumnSchema::new("dathasloginevt", DataType::Bool, false),
+        ColumnSchema::new("datconnlimit", DataType::Int, false),
+        ColumnSchema::new("datfrozenxid", DataType::BigInt, false),
+        ColumnSchema::new("datminmxid", DataType::BigInt, false),
+        ColumnSchema::new("dattablespace", DataType::BigInt, false),
         ColumnSchema::new("datcollate", DataType::Text, false),
+        ColumnSchema::new("datctype", DataType::Text, false),
+        ColumnSchema::new("datlocale", DataType::Text, true),
+        ColumnSchema::new("daticurules", DataType::Text, true),
+        ColumnSchema::new("datcollversion", DataType::Text, true),
+        ColumnSchema::new("datacl", DataType::Text, true),
     ];
     let rows = alloc::vec![Row::new(alloc::vec![
         Value::BigInt(16384),
-        Value::text("postgres"),
+        // The name `current_database()` answers, read from the same place
+        // it reads, so the two cannot drift apart again.
+        Value::text(
+            engine
+                .session_params
+                .get("spg.database")
+                .cloned()
+                .unwrap_or_else(|| alloc::string::String::from("spg")),
+        ),
         Value::BigInt(10),
         Value::Int(6), // UTF8
-        Value::text("en_US.UTF-8"),
+        // 'c' = libc provider, which is what SPG's C collation is.
+        Value::text("c"),
+        Value::Bool(false), // datistemplate
+        Value::Bool(true),  // datallowconn
+        Value::Bool(false), // dathasloginevt
+        Value::Int(-1),     // datconnlimit — unlimited
+        // The real MVCC floor, not a placeholder: this is the number a
+        // wraparound monitor is watching, and SPG has one to give.
+        Value::BigInt(i64::try_from(engine.vacuum_oldest_active()).unwrap_or(i64::MAX)),
+        Value::BigInt(1), // datminmxid — SPG has no multixact
+        Value::BigInt(1663), // dattablespace — pg_default
+        Value::text("C"),
+        Value::text("C"),
+        Value::Null, // datlocale
+        Value::Null, // daticurules
+        Value::Null, // datcollversion
+        Value::Null, // datacl
     ])];
     (schema, rows)
 }
@@ -5049,6 +5093,28 @@ pub(crate) fn canonical_gucs() -> &'static [(
     &'static str,
 )] {
     &[
+        // v7.39 (round 474) — `synchronous_commit` is a REAL durability
+        // control here (round 171 gated the WAL-fsync wait on it, and the
+        // fair panel drives both engines through it), but neither
+        // `SHOW synchronous_commit` nor `pg_settings` admitted it existed:
+        // a client that set it and read it back was told the parameter is
+        // not recognised.
+        //
+        // Metadata copied from PG18: `on | Write-Ahead Log / Settings |
+        // enum | user`.
+        //
+        // Nothing else was added. SPG lists thirty parameters because it
+        // implements thirty; PG18's other 368 are knobs SPG does not read,
+        // and reporting one would tell a tuning tool that turning it does
+        // something. `enable_seqscan` is the case in point — SET validates
+        // it and nothing ever reads it, so it stays out.
+        (
+            "synchronous_commit",
+            "on",
+            "Write-Ahead Log / Settings",
+            "enum",
+            "user",
+        ),
         (
             "server_version",
             "18.4 (spg)",

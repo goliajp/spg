@@ -1210,6 +1210,38 @@ pub struct ActivityRow {
     /// last value the client sent via `SET application_name = '...'`).
     /// Empty when the client never declared one.
     pub application_name: String,
+    /// v7.39 (round 474) — PG's `backend_type`: `client backend` for a
+    /// connection, or the worker's own name for a background process.
+    ///
+    /// pg_stat_activity used to hardcode `client backend`, so SPG's own
+    /// background workers — the ones that hold the engine write lock and
+    /// are exactly what an operator is looking for when a statement
+    /// stalls — did not appear at all. PG18 lists eight of them beside
+    /// the single client backend on an idle server.
+    pub backend_type: String,
+}
+
+impl ActivityRow {
+    /// The `backend_type` PG gives a background process: no database, no
+    /// user, no query, and a state PG reports as NULL.
+    #[must_use]
+    pub fn background(pid: u32, backend_type: &str) -> Self {
+        Self {
+            pid,
+            user: String::new(),
+            client_addr: String::new(),
+            client_port: -1,
+            database: String::new(),
+            started_at_us: 0,
+            current_sql: String::new(),
+            wait_event_type: String::new(),
+            wait_event: String::new(),
+            elapsed_us: 0,
+            in_transaction: false,
+            application_name: String::new(),
+            backend_type: backend_type.into(),
+        }
+    }
 }
 
 /// v6.5.2 — provider callback type. Fresh snapshot returned each
