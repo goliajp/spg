@@ -794,18 +794,22 @@ fn double_begin_errors() {
     assert_eq!(err, EngineError::TransactionAlreadyOpen);
 }
 
+// v7.39 (round 435) — these two used to assert an ERROR, which was SPG's
+// own answer rather than either oracle's: PG18 replies `WARNING: there is
+// no transaction in progress` and still reports COMMIT / ROLLBACK, and
+// MariaDB 11 succeeds silently. Both measured live; the tests now pin that.
 #[test]
-fn commit_without_begin_errors() {
+fn commit_without_begin_is_a_no_op() {
     let mut e = Engine::new();
-    let err = e.execute("COMMIT").unwrap_err();
-    assert_eq!(err, EngineError::NoActiveTransaction);
+    e.execute("COMMIT").expect("bare COMMIT is a no-op");
+    assert!(!e.in_transaction());
 }
 
 #[test]
-fn rollback_without_begin_errors() {
+fn rollback_without_begin_is_a_no_op() {
     let mut e = Engine::new();
-    let err = e.execute("ROLLBACK").unwrap_err();
-    assert_eq!(err, EngineError::NoActiveTransaction);
+    e.execute("ROLLBACK").expect("bare ROLLBACK is a no-op");
+    assert!(!e.in_transaction());
 }
 
 #[test]
@@ -1758,8 +1762,11 @@ fn epic_p_panic_in_query_is_caught_and_engine_survives() {
     }
 
     // The transaction is gone (rolled back), not still open.
+    // v7.39 (round 435) — ask the engine directly. This used to probe by
+    // running COMMIT and expecting NoActiveTransaction, which stopped being
+    // a signal once a bare COMMIT became the no-op both oracles answer with.
     assert!(
-        matches!(g.execute("COMMIT"), Err(EngineError::NoActiveTransaction)),
+        !g.in_transaction(),
         "panicked tx should have been rolled back, leaving no active tx"
     );
 }
@@ -1859,8 +1866,10 @@ fn epic_p_panic_in_prepared_query_is_caught_and_engine_survives() {
     }
 
     // The transaction is gone (rolled back), not still open.
+    // v7.39 (round 435) — see the sibling test: ask the engine directly now
+    // that a bare COMMIT is the no-op both oracles answer with.
     assert!(
-        matches!(g.execute("COMMIT"), Err(EngineError::NoActiveTransaction)),
+        !g.in_transaction(),
         "prepared-path panicked tx should have been rolled back, leaving no active tx"
     );
 }

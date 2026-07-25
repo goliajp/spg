@@ -1190,6 +1190,16 @@ impl Engine {
         // session (the default login, or `SET ROLE admin`) skips it entirely,
         // so nothing changes for a customer who never assumes another role.
         self.acl_check_statement(&stmt)?;
+        // v7.39 (round 435) — MySQL commits an open transaction BEFORE it
+        // runs DDL (and before a nested START TRANSACTION), where PG keeps
+        // the DDL inside the transaction. A MySQL client that writes rows,
+        // runs DDL and then rolls back keeps those rows on MySQL and lost
+        // them on SPG — silently, since nothing errors. This is the one
+        // point every path (simple query, prepared, extended) passes
+        // through, so the commit cannot be skipped by a spelling.
+        if self.backslash_escapes && self.in_transaction() && stmt.mysql_implicit_commit() {
+            self.exec_commit()?;
+        }
         let result = match stmt {
             // v7.39 (round 430) — MySQL USER variables. The value is an
             // arbitrary expression, evaluated against an empty row (a
@@ -1426,6 +1436,26 @@ impl Engine {
                 ),
             )),
             Statement::Begin(isolation) => self.exec_begin(isolation),
+            // v7.39 (round 435) — a bare COMMIT / ROLLBACK outside a
+            // transaction is a no-op that SUCCEEDS. Measured on both
+            // oracles: PG18 answers `WARNING: there is no transaction in
+            // progress` and still reports COMMIT / ROLLBACK; MariaDB 11
+            // succeeds silently. SPG answered "no active transaction" as an
+            // ERROR to both dialects — a divergence from each of them.
+            // It moved onto the hot path with the implicit-commit rule
+            // above, which leaves a client's trailing ROLLBACK with nothing
+            // to roll back.
+            Statement::Commit | Statement::Rollback if !self.in_transaction() => {
+                if !self.backslash_escapes {
+                    self.warning(alloc::string::String::from(
+                        "there is no transaction in progress",
+                    ));
+                }
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
             Statement::Commit => self.exec_commit(),
             Statement::Rollback => self.exec_rollback(),
             Statement::Savepoint(name) => self.exec_savepoint(name),
