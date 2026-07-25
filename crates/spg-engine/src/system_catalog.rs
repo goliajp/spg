@@ -2516,6 +2516,53 @@ pub(crate) fn function_oid_by_signature(cat: &Catalog, bare: &str, arg_types: &s
 
 /// Resolve a relation name to the oid every catalog synth uses for it.
 /// The iteration order here IS the assignment order the synths replay.
+/// v7.39 (round 473) — the inverse of [`relation_oid`].
+///
+/// `indexrelid::regclass` answered the bare number, because the cast had no
+/// catalog to look the oid up in. It does now, and pg_index / pg_class rows
+/// are read by joining on oids and rendering them — a tool that printed
+/// `100001` where PG prints `ix1` cannot match the two up.
+///
+/// Deliberately mirrors `relation_oid`'s walks step for step, in the same
+/// order over the same lists, so the two cannot disagree about which oid
+/// belongs to which relation.
+pub(crate) fn relation_name_for_oid(cat: &Catalog, oid: i64) -> Option<String> {
+    for (pos, tname) in cat.table_names().iter().enumerate() {
+        if OID_TABLE_BASE + pos as i64 == oid {
+            return cat.listed_name(tname).map(alloc::string::String::from);
+        }
+    }
+    for (pos, vname) in cat.views_all().keys().enumerate() {
+        let Some(vname) = cat.listed_name(vname) else {
+            continue;
+        };
+        if OID_VIEW_BASE + pos as i64 == oid {
+            return Some(alloc::string::String::from(vname));
+        }
+    }
+    let mut idx_oid = OID_INDEX_BASE;
+    for tname in cat.visible_table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        for idx in t.indices() {
+            idx_oid += 1;
+            if idx_oid == oid {
+                return Some(idx.name.clone());
+            }
+        }
+    }
+    let mut seq_oid = OID_SEQ_BASE;
+    for name in cat.sequences_all().keys() {
+        let Some(name) = cat.listed_name(name) else {
+            continue;
+        };
+        seq_oid += 1;
+        if seq_oid == oid {
+            return Some(alloc::string::String::from(name));
+        }
+    }
+    None
+}
+
 pub(crate) fn relation_oid(cat: &Catalog, bare: &str) -> Option<i64> {
     // v7.39 (round 437) — the RAW list, because that is the order the synths
     // assign oids in (a foreign session's temporary table still consumes
@@ -5660,6 +5707,18 @@ pub(crate) fn render_indexdef(
         Some(expr) => expr.clone(),
         None => cols,
     };
+    // v7.39 (round 473) — `NULLS NOT DISTINCT` sits after the key list and
+    // before WHERE, measured on PG18:
+    //   CREATE UNIQUE INDEX pix ON public.p USING btree (a)
+    //   NULLS NOT DISTINCT WHERE (b > 0)
+    // The index has enforced this since round 52; the definition it reports
+    // did not carry it, so a dump / restore silently dropped the semantics
+    // and rows the original refused became acceptable in the copy.
+    let nnd = if idx.nulls_not_distinct {
+        " NULLS NOT DISTINCT"
+    } else {
+        ""
+    };
     match &idx.partial_predicate {
         Some(pred) => {
             let p = pred.trim();
@@ -5669,12 +5728,12 @@ pub(crate) fn render_indexdef(
                 alloc::format!("({p})")
             };
             alloc::format!(
-                "CREATE {unique_kw}INDEX {} ON public.{tname} USING btree ({key}) WHERE {wrapped}",
+                "CREATE {unique_kw}INDEX {} ON public.{tname} USING btree ({key}){nnd} WHERE {wrapped}",
                 idx.name,
             )
         }
         None => alloc::format!(
-            "CREATE {unique_kw}INDEX {} ON public.{tname} USING btree ({key})",
+            "CREATE {unique_kw}INDEX {} ON public.{tname} USING btree ({key}){nnd}",
             idx.name,
         ),
     }
@@ -5795,7 +5854,11 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::SmallInt(i16::try_from(n_attrs_total).unwrap_or(i16::MAX)),
                 Value::SmallInt(i16::try_from(n_attrs_total).unwrap_or(i16::MAX)),
                 Value::Bool(idx.is_unique),
-                Value::Bool(false), // indnullsnotdistinct — pending UniquenessConstraint plumb-through
+                // v7.39 (round 473) — the index has carried this since
+                // round 52 and enforces it; only the catalog was still
+                // answering `f`, so a migration tool reading pg_index saw
+                // a plain unique index and would have tried to "fix" it.
+                Value::Bool(idx.nulls_not_distinct),
                 Value::Bool(is_primary),
                 Value::Bool(false), // indisexclusion — EXCLUDE constraint
                 Value::Bool(true),  // indimmediate

@@ -281,6 +281,7 @@ mod e2e_temp_sequence_view_round469;
 mod e2e_mysql_non_strict_round470;
 mod e2e_bigint_unsigned_round471;
 mod e2e_with_rollup_round472;
+mod e2e_nulls_not_distinct_catalog_round473;
 mod e2e_length_bytes_round348;
 mod e2e_truth_value_round346;
 mod e2e_type_phrase_owner_round344;
