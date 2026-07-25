@@ -1743,6 +1743,7 @@ name = "spg-bench-competitor"
 version = "7.37.12"
 dependencies = [
  "criterion",
+ "libc",
  "spg-embedded",
  "spg-embedded-tokio",
  "spg-engine",
