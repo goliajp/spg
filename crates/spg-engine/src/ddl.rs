@@ -1019,7 +1019,8 @@ impl Engine {
         // ALTER anyway would leave the segments unreadable under
         // the new schema. Match PG / MariaDB's invariant of "never
         // half-apply a schema change" by raising explicitly.
-        if table.count_cold_locators() > 0 {
+        // v7.39 (round 456) — O(1) predicate first; see the DELETE path.
+        if table.has_cold_rows_fast() && table.count_cold_locators() > 0 {
             return Err(EngineError::Unsupported(alloc::format!(
                 "ALTER COLUMN TYPE on {tbl:?}: cold-tier rows exist for this table; \
                  cold-tier schema rewrite is a v7.37 candidate. Run COMPACT to bring \
