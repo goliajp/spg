@@ -134,19 +134,18 @@ fn postgres_update_tag_counts_matched() {
     assert_eq!(affected(&mut e, "UPDATE t SET v = v WHERE 1 = 1"), 3);
 }
 
-/// BASELINE for a follow-up round: MariaDB reports 2 for an
-/// `ON DUPLICATE KEY UPDATE` that changed a row (and 0 for one that did
-/// not); SPG reports the plain row count.
+/// Round 427 modelled the upsert accounting after measuring the sub-rules
+/// exhaustively — see `e2e_mysql_upsert_count_round427` for the full table.
 #[test]
-fn upsert_counts_are_not_modelled() {
+fn upsert_counts_match_mariadb() {
     let mut e = mysql();
     e.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
     e.execute("INSERT INTO t VALUES(1,10),(2,20)").unwrap();
+    // A conflict that CHANGED the row counts as delete+insert.
     e.execute("INSERT INTO t VALUES(2,999) ON DUPLICATE KEY UPDATE v = 999")
         .unwrap();
-    // MariaDB: 2
-    assert_eq!(row_count(&mut e), 1);
-    // The pure-insert case already agrees with MariaDB.
+    assert_eq!(row_count(&mut e), 2);
+    // A pure insert counts 1.
     e.execute("INSERT INTO t VALUES(9,9) ON DUPLICATE KEY UPDATE v = 9")
         .unwrap();
     assert_eq!(row_count(&mut e), 1);

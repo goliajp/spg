@@ -4216,6 +4216,25 @@ impl Engine {
         // already left `all_values` (DO NOTHING drop / DO UPDATE
         // reroute), so what remains must be genuinely unique.
         let mysql = self.backslash_escapes;
+        // v7.39 (round 427) — which MySQL upsert spelling produced the
+        // DO UPDATE clause. Both lower onto the same AST; REPLACE is the one
+        // whose assignment list is EMPTY (round 419's "take the incoming
+        // row"). They charge an unchanged row differently, so the kind has
+        // to reach `insert_parsed_rows`.
+        let mysql_upsert_kind = if mysql {
+            match stmt.on_conflict.as_ref().map(|c| &c.action) {
+                Some(spg_sql::ast::OnConflictAction::Update { assignments, .. }) => {
+                    Some(if assignments.is_empty() {
+                        MysqlUpsertCount::Replace
+                    } else {
+                        MysqlUpsertCount::OnDuplicate
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         enforce_uniqueness_inserts(
             self.active_catalog(),
             &stmt.table,
@@ -4258,6 +4277,13 @@ impl Engine {
             insert_parsed_rows(
                 table,
                 xmin_for_stmt,
+                // v7.39 (round 427) — MySQL's upsert row accounting. REPLACE
+                // and ON DUPLICATE KEY UPDATE both lower onto the same
+                // DO UPDATE clause; the parser distinguishes them by the
+                // assignment list, which REPLACE leaves EMPTY ("take the
+                // incoming row", round 419). They count an unchanged row
+                // differently, so the distinction has to survive to here.
+                mysql_upsert_kind,
                 inplace_for_stmt,
                 all_values,
                 pending_updates,
@@ -5992,9 +6018,30 @@ struct MergeRetRecord {
     source: Vec<Value<'static>>,
 }
 
+/// v7.39 (round 427) — how MySQL counts a row an upsert resolved by
+/// UPDATING an existing one. Measured on MariaDB 11, per row:
+///
+/// | shape                                    | ON DUPLICATE | REPLACE |
+/// |------------------------------------------|--------------|---------|
+/// | no conflict (plain insert)               | 1            | 1       |
+/// | conflict, row CHANGED                    | 2            | 2       |
+/// | conflict, row identical to what was there| 0            | 1       |
+///
+/// (`ON DUPLICATE` counts the update as delete+insert only when it really
+/// changed something; `REPLACE` still charges for the insert either way.)
+/// `None` is the PG dialect, where every affected row counts 1.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MysqlUpsertCount {
+    OnDuplicate,
+    Replace,
+}
+
 fn insert_parsed_rows(
     table: &mut spg_storage::Table,
     xmin: u64,
+    // v7.39 (round 427) — MySQL's per-row upsert accounting; None keeps
+    // PG's "one per affected row".
+    mysql_upsert: Option<MysqlUpsertCount>,
     // v7.37.15 (Phase C.3, step 4b) — in-place kill switch, threaded
     // from the caller (fetched before the table mut borrow). When on,
     // the ON CONFLICT DO UPDATE pass below tombstones + inserts instead
@@ -6140,6 +6187,11 @@ fn insert_parsed_rows(
     // in the conflict-resolution pass. update_row handles
     // index maintenance + body re-encoding.
     for (pos, new_row, old_row) in pending_updates {
+        // v7.39 (round 427) — MySQL charges an upsert-resolved-by-update as
+        // delete+insert (2) only when the row really changed; an ON
+        // DUPLICATE that rewrote identical values counts 0, while a REPLACE
+        // still charges 1 for its insert. Compute before `old_row` moves.
+        let row_changed = new_row != old_row;
         if returning_enabled {
             returning_rows.push(new_row.clone());
             // DO UPDATE: OLD is the pre-update conflicting row.
@@ -6165,7 +6217,12 @@ fn insert_parsed_rows(
         } else {
             table.update_row(pos, new_row)?;
         }
-        affected += 1;
+        affected += match (mysql_upsert, row_changed) {
+            (Some(_), true) => 2,
+            (Some(MysqlUpsertCount::OnDuplicate), false) => 0,
+            (Some(MysqlUpsertCount::Replace), false) => 1,
+            (None, _) => 1,
+        };
     }
     Ok((
         returning_rows,
