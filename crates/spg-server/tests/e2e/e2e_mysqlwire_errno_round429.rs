@@ -203,6 +203,35 @@ fn round467_unsigned_underflow_is_1690() {
     ok_query(&mut s, "SELECT b - a FROM u");
 }
 
+/// read01 round 470 — a strict session's two different NOT NULL refusals.
+///
+/// MariaDB 11 distinguishes them, and a migration tool branches on which:
+///   * an OMITTED column with no default → 1364 (HY000)
+///   * an EXPLICIT NULL                  → 1048 (23000)
+#[test]
+fn round470_omitted_and_explicit_null_carry_different_errnos() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    ok_query(&mut s, "SET sql_mode='STRICT_TRANS_TABLES'");
+    ok_query(&mut s, "CREATE TABLE nn(id INT, n INT NOT NULL)");
+    assert_eq!(
+        err_of(&mut s, "INSERT INTO nn (id) VALUES (1)"),
+        (1364, "HY000".to_string())
+    );
+    assert_eq!(
+        err_of(&mut s, "INSERT INTO nn (id,n) VALUES (2,NULL)"),
+        (1048, "23000".to_string())
+    );
+    // Non-strict fills the omitted column and still refuses the explicit
+    // NULL — measured on MariaDB 11.
+    ok_query(&mut s, "SET sql_mode=''");
+    ok_query(&mut s, "INSERT INTO nn (id) VALUES (3)");
+    assert_eq!(
+        err_of(&mut s, "INSERT INTO nn (id,n) VALUES (4,NULL)"),
+        (1048, "23000".to_string())
+    );
+}
+
 #[test]
 fn syntax_error_still_1064() {
     let (_guard, addr) = spawn();

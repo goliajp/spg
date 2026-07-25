@@ -4403,6 +4403,12 @@ pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("BIGINT UNSIGNED value is out of range")
         {
             "22003"
+        // v7.39 (round 470) — MySQL's "omitted column has no default"
+        // (1364 / HY000). MySQL-only: a PG session never raises it, so
+        // carrying MySQL's own SQLSTATE here costs a PG client nothing and
+        // lets the mysqlwire errno table find it.
+        } else if msg.contains("doesn't have a default value") {
+            "HY000"
         // v7.39 (read01 int.c) — PG's 22012 DIVISION_BY_ZERO.
         } else if msg.contains("division by zero") {
             "22012"

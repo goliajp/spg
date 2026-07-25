@@ -608,6 +608,13 @@ pub struct CatalogSnapshot {
 pub(crate) struct SessionBag {
     pub(crate) session_params: BTreeMap<String, String>,
     pub(crate) backslash_escapes: bool,
+    /// v7.39 (round 470) — is the MySQL session in a strict `sql_mode`?
+    ///
+    /// MariaDB's default includes `STRICT_TRANS_TABLES`, so this starts
+    /// true; `SET sql_mode=''` (or any list without a STRICT_ flag) turns
+    /// it off and a value that would otherwise raise is bent to fit
+    /// instead — the same conversion `INSERT IGNORE` uses.
+    pub(crate) mysql_strict: bool,
     pub(crate) prepared_statements: BTreeMap<String, PreparedSqlStatement>,
     /// v7.39 (round 306) — open large-object descriptors. Per session
     /// from the start, deliberately: r277/r279/r283 each landed a piece
@@ -880,6 +887,8 @@ pub struct Engine {
     /// preamble) turns it off. The plan cache is cleared on every
     /// flip — the same SQL text lexes differently per dialect.
     backslash_escapes: bool,
+    /// v7.39 (round 470) — see [`SessionBag::mysql_strict`].
+    mysql_strict: bool,
     /// v7.39 (round 306) — the live session's open large-object
     /// descriptors, swapped in and out with the rest of its bag.
     pub(crate) lo_descriptors: BTreeMap<i32, LargeObjectDescriptor>,
@@ -1263,6 +1272,7 @@ impl Engine {
             tx_catalogs: BTreeMap::new(),
             current_tx: None,
             backslash_escapes: false,
+            mysql_strict: true,
             lo_descriptors: BTreeMap::new(),
             lo_next_fd: 0,
             prepared_statements: alloc::collections::BTreeMap::new(),
@@ -1650,6 +1660,7 @@ impl Engine {
             tx_catalogs: BTreeMap::new(),
             current_tx: None,
             backslash_escapes: false,
+            mysql_strict: true,
             lo_descriptors: BTreeMap::new(),
             lo_next_fd: 0,
             prepared_statements: alloc::collections::BTreeMap::new(),
@@ -1770,6 +1781,7 @@ impl Engine {
                     tx_catalogs: BTreeMap::new(),
                     current_tx: None,
                     backslash_escapes: false,
+            mysql_strict: true,
                     lo_descriptors: BTreeMap::new(),
                     lo_next_fd: 0,
                     prepared_statements: alloc::collections::BTreeMap::new(),
@@ -1879,6 +1891,7 @@ impl Engine {
         let outgoing = SessionBag {
             session_params: core::mem::take(&mut self.session_params),
             backslash_escapes: self.backslash_escapes,
+            mysql_strict: self.mysql_strict,
             prepared_statements: core::mem::take(&mut self.prepared_statements),
             lo_descriptors: core::mem::take(&mut self.lo_descriptors),
             lo_next_fd: self.lo_next_fd,
@@ -1894,6 +1907,7 @@ impl Engine {
         let incoming = self.sessions.remove(&id).unwrap_or_default();
         self.session_params = incoming.session_params;
         self.backslash_escapes = incoming.backslash_escapes;
+        self.mysql_strict = incoming.mysql_strict;
         self.prepared_statements = incoming.prepared_statements;
         self.lo_descriptors = incoming.lo_descriptors;
         self.lo_next_fd = incoming.lo_next_fd;
@@ -2004,6 +2018,7 @@ impl Engine {
             self.session_params.clear();
             self.prepared_statements.clear();
             self.backslash_escapes = false;
+            self.mysql_strict = true;
             self.lo_descriptors.clear();
             self.lo_next_fd = 0;
             self.cursors.clear();

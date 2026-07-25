@@ -4153,6 +4153,9 @@ impl Engine {
         // Taken BEFORE the &mut borrow below (Catalog::clone is an Arc bump).
         let cat_for_insert = self.active_catalog().clone();
         let insert_mysql = self.backslash_escapes;
+        // v7.39 (round 470) — read before the &mut borrow below, same
+        // reason `cat_for_insert` is.
+        let insert_non_strict = insert_mysql && !self.mysql_strict;
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -4194,7 +4197,10 @@ impl Engine {
             overriding,
             &mut first_auto,
             insert_mysql,
+            // v7.39 (round 470) — `INSERT IGNORE` bends values, and so does
+            // a non-strict `sql_mode`. Same conversion, different trigger.
             insert_mysql && stmt.mysql_ignore,
+            insert_non_strict,
         )?;
         // Stage 2 — FK enforcement on the immutable catalog.
         // Non-lexical lifetimes release the mutable borrow on
@@ -5974,6 +5980,13 @@ fn parse_insert_rows(
     // value the ordinary path would reject is bent to fit instead (see
     // `mysql_ignore_fit`). MySQL-only; a PG session never sets it.
     ignore: bool,
+    // v7.39 (round 470) — the session's `sql_mode` has no STRICT_ flag, so
+    // a value that would raise is bent to fit. NOT the same trigger as
+    // `ignore`, and measured on MariaDB 11 to differ in one place: a
+    // non-strict session still raises 1048 on an EXPLICIT NULL into a NOT
+    // NULL column, while `INSERT IGNORE` stores 0 for it. Only an OMITTED
+    // column gets the implicit default.
+    non_strict: bool,
 ) -> Result<Vec<Vec<Value<'static>>>, EngineError> {
     use spg_sql::ast::Overriding;
     let schema_cols_len = column_meta.len();
@@ -6111,6 +6124,12 @@ fn parse_insert_rows(
                 .collect::<Result<_, _>>()?;
             let mut out = Vec::with_capacity(schema_cols_len);
             for (i, col) in column_meta.iter().enumerate() {
+                // v7.39 (round 470) — a column the statement did not name,
+                // or named as `DEFAULT`, is "omitted" for MySQL's purposes.
+                let omitted = match map[i] {
+                    Some(j) => raw_tuple[j].is_none(),
+                    None => true,
+                };
                 let mut raw = match map[i] {
                     Some(j) => match &raw_tuple[j] {
                         Some(v) => v.clone(),
@@ -6163,7 +6182,27 @@ fn parse_insert_rows(
                 // v7.39 (round 434) — `INSERT IGNORE` bends a value that
                 // would otherwise raise, so a MySQL bulk load never stops
                 // mid-file. Values the ordinary path accepts are untouched.
-                let raw = if ignore {
+                // v7.39 (round 470) — a non-strict `sql_mode` bends the same
+                // values `INSERT IGNORE` bends. Same conversion, different
+                // trigger: one is per-statement, the other per-session.
+                // v7.39 (round 470) — a strict MySQL session refuses an
+                // OMITTED NOT NULL column with its own error, not the
+                // not-null one: MariaDB says `Field 'n' doesn't have a
+                // default value` (1364), which is what a migration tool
+                // branches on, where an explicit NULL is 1048. The generic
+                // not-null check downstream cannot tell the two apart —
+                // only here is it known that the column was never named.
+                if mysql && !non_strict && !ignore && omitted && raw.is_null() && !col.nullable {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "Field '{}' doesn't have a default value",
+                        col.name
+                    )));
+                }
+                // v7.39 (round 470) — non-strict bends a SUPPLIED value that
+                // would not fit, and fills an OMITTED column; it does not
+                // bend an explicit NULL, which MariaDB still rejects with
+                // 1048 whatever the mode.
+                let raw = if ignore || (non_strict && (omitted || !raw.is_null())) {
                     crate::conversions::mysql_ignore_fit(raw, col)
                 } else {
                     raw
@@ -6231,7 +6270,13 @@ fn parse_insert_rows(
                 // v7.39 (round 434) — `INSERT IGNORE` bends a value that
                 // would otherwise raise, so a MySQL bulk load never stops
                 // mid-file. Values the ordinary path accepts are untouched.
-                let raw = if ignore {
+                // v7.39 (round 470) — a non-strict `sql_mode` bends the same
+                // values `INSERT IGNORE` bends. Same conversion, different
+                // trigger: one is per-statement, the other per-session.
+                // v7.39 (round 470) — the positional path names every column,
+                // so nothing here is omitted and an explicit NULL stays an
+                // explicit NULL.
+                let raw = if ignore || (non_strict && !raw.is_null()) {
                     crate::conversions::mysql_ignore_fit(raw, col)
                 } else {
                     raw

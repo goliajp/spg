@@ -176,6 +176,18 @@ impl Engine {
             self.backslash_escapes = flag;
             self.plan_cache.clear();
         }
+        // v7.39 (round 470) — the OTHER thing sql_mode carries: strictness.
+        // MariaDB's default list has STRICT_TRANS_TABLES, and a list
+        // without any STRICT_ flag makes a value that would raise get bent
+        // to fit instead. Measured on MariaDB 11 with `SET sql_mode=''`:
+        // INT <- 99999999999999 stores 2147483647, TINYINT <- 999 stores
+        // 127, INT UNSIGNED <- -5 stores 0, VARCHAR(3) <- 'toolong' stores
+        // 'too', INT <- 'abc' stores 0 and <- '12xy' stores 12.
+        if key == "sql_mode" {
+            let upper = normalised.to_ascii_uppercase();
+            self.mysql_strict =
+                upper.contains("STRICT_TRANS_TABLES") || upper.contains("STRICT_ALL_TABLES");
+        }
         // v7.39 (GUC) — PG stores ms-unit time GUCs as an integer and
         // renders SHOW/current_setting in the largest whole unit
         // ("250" → "250ms", "5000" → "5s"). Normalise at store time so

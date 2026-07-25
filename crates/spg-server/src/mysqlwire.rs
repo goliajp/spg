@@ -974,6 +974,10 @@ fn mysql_code_for_sqlstate(pg_state: &str) -> (u16, &'static str) {
         // v7.39 (round 467) — MariaDB's 1690 for an arithmetic result
         // outside BIGINT UNSIGNED. Measured: `ERROR 1690 (22003)`.
         "22003" => (1690, "22003"),
+        // v7.39 (round 470) — a strict session refusing an OMITTED column
+        // with no default. Measured: `ERROR 1364 (HY000)`, distinct from
+        // the 1048 an explicit NULL gets.
+        "HY000" => (1364, "HY000"),
         _ => (1064, "42000"),
     }
 }
