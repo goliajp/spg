@@ -1871,6 +1871,15 @@ impl Engine {
                             effective(&name, boot)
                         } else if let Some(v) = self.session_param(&name) {
                             alloc::string::String::from(v)
+                        } else if let Some(boot) =
+                            crate::guc_catalog::guc_boot_value(&name)
+                        {
+                            // v7.39 (round 534) — a parameter PG18 knows but
+                            // SPG does not model reports its compiled-in
+                            // default. `SHOW random_page_cost` printed
+                            // nothing at all before, and `SHOW fsync` with
+                            // it.
+                            alloc::string::String::from(boot)
                         } else {
                             return Err(EngineError::Unsupported(alloc::format!(
                                 "SHOW {name:?}: parameter not recognised; \

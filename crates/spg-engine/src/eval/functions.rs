@@ -15198,6 +15198,15 @@ fn apply_function_dispatch(
                     {
                         return Ok(Value::text::<String>((*boot).into()));
                     }
+                    // v7.39 (round 534) — a parameter PG18 knows but SPG
+                    // does not model reports its compiled-in default,
+                    // not an empty string. `current_setting('block_size')`
+                    // answered `''` where PG answers `8192`, which is
+                    // neither the value nor an error the caller can
+                    // branch on.
+                    if let Some(boot) = crate::guc_catalog::guc_boot_value(&lname) {
+                        return Ok(Value::text::<String>(boot.into()));
+                    }
                     if missing_ok {
                         return Ok(Value::Null);
                     }

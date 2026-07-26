@@ -4001,6 +4001,13 @@ fn render_show(name: &str, settings: &std::collections::HashMap<String, String>)
                 .find(|(k, _)| *k == name)
                 .map(|(_, v)| (*v).to_string())
         })
+        // v7.39 (round 534) — a parameter PG18 knows but this list does
+        // not reports its compiled-in default. The wire answers SHOW
+        // from its own small inventory and `unwrap_or_default()` turned
+        // everything else into an EMPTY ROW, so `SHOW fsync` over the
+        // wire returned a blank where PG returns `on` — and where the
+        // engine, asked the same question, now answers too.
+        .or_else(|| spg_engine::pg_guc_boot_value(name).map(str::to_string))
         .unwrap_or_default();
     let columns = vec![ColumnSchema::new(name.to_string(), DataType::Text, false)];
     CannedResponse::Rows {
