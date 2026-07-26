@@ -31,6 +31,74 @@ fn mysql_lock_key(name: &str) -> i64 {
     h as i64
 }
 
+/// v7.39 (round 498) — the function names that must reach the `&mut`
+/// executor, as lowercase byte needles including the opening paren.
+///
+/// The server's read fast path runs `SELECT` through a `&self` executor,
+/// which cannot fire the statement-level pre-pass below — so every
+/// state-changing function has to be recognised from the SQL text before
+/// routing. That list used to live in `pgwire.rs` and was maintained by
+/// hand, so it drifted: it carried the sequence family and `set_config`,
+/// but not the advisory locks (round 279), the large objects (round 287)
+/// or MySQL's lock family (round 417).
+///
+/// The measured consequence, over the wire against PG18 (`iso_session`):
+/// `pg_try_advisory_lock(4981)` answered TRUE on two different
+/// connections at once, and a session could "unlock" a lock it never
+/// took — the calls never reached the registry and fell through to a stub
+/// that answers true unconditionally. Advisory locks get used as mutexes,
+/// so that is mutual exclusion silently not happening. `lastval()`
+/// answered nothing at all for the same reason.
+///
+/// It lives HERE, next to the pre-pass that handles these families, so
+/// adding one has a single obvious place to register it.
+pub const MUTATING_CALL_NEEDLES: &[&[u8]] = &[
+    // Sequences. `currval` / `lastval` do not mutate, but they read
+    // session state the `&self` executor cannot see.
+    b"nextval(",
+    b"setval(",
+    b"currval(",
+    b"lastval(",
+    // Session GUC store.
+    b"set_config(",
+    // Advisory locks — round 279's registry, keyed by session.
+    b"pg_advisory_lock(",
+    b"pg_advisory_xact_lock(",
+    b"pg_advisory_lock_shared(",
+    b"pg_advisory_xact_lock_shared(",
+    b"pg_try_advisory_lock(",
+    b"pg_try_advisory_xact_lock(",
+    b"pg_try_advisory_lock_shared(",
+    b"pg_try_advisory_xact_lock_shared(",
+    b"pg_advisory_unlock(",
+    b"pg_advisory_unlock_shared(",
+    b"pg_advisory_unlock_all(",
+    // MySQL's spelling of the same registry — round 417.
+    b"get_lock(",
+    b"release_lock(",
+    b"release_all_locks(",
+    b"is_free_lock(",
+    b"is_used_lock(",
+    // Large objects — round 287. `lo_get` is read-only but resolves with
+    // the family.
+    b"lo_from_bytea(",
+    b"lo_get(",
+    b"lo_put(",
+    b"lo_unlink(",
+    b"lo_create(",
+    b"lo_creat(",
+    b"lo_open(",
+    b"loread(",
+    b"lowrite(",
+    b"lo_lseek(",
+    b"lo_lseek64(",
+    b"lo_tell(",
+    b"lo_tell64(",
+    b"lo_close(",
+    b"lo_truncate(",
+    b"lo_truncate64(",
+];
+
 impl Engine {
     /// v7.17.0 Phase 1.1 — walk a Statement tree and pre-resolve
     /// any sequence FunctionCall nodes inside its Expr slots.

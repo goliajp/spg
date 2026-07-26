@@ -550,3 +550,57 @@ fn a_sequence_created_and_committed_keeps_its_counter() {
     let mut b = open(&addr);
     assert_eq!(query_one(&mut b, "SELECT nextval('made2')"), Some("4".into()));
 }
+
+/// v7.39 (round 498) — an advisory lock is exclusive across connections.
+///
+/// Measured over this wire against PG18 (`iso_session` T6):
+/// `pg_try_advisory_lock(4981)` answered TRUE on two connections at once,
+/// and a connection could "unlock" a lock it never took. Advisory locks
+/// get used as mutexes, so that is mutual exclusion silently not
+/// happening — `sqlx::migrate!()` is the example the engine's own comment
+/// names.
+///
+/// The registry was correct all along; the ROUTING was not. A `SELECT`
+/// takes a read path on a `&self` executor that cannot fire the
+/// statement-level pre-pass, and which statements are excluded was a
+/// hand-maintained token list — in THREE places, as the round-295 comment
+/// beside one of them says. Two of the three carried only the sequence
+/// family, and one also carried an anchor optimisation that inspected
+/// positions beginning `s`, `n` or `c` — while `pg_` starts with `p`.
+/// Both now derive from `spg_engine::MUTATING_CALL_NEEDLES`.
+///
+/// The give-away in the measurement: the same call inside a transaction
+/// answered correctly, because `conn_in_tx` forces the write path.
+#[test]
+fn an_advisory_lock_is_exclusive_across_connections() {
+    let (_child, addr) = boot("advisory");
+    let mut a = open(&addr);
+    let mut b = open(&addr);
+
+    assert_eq!(query_one(&mut a, "SELECT pg_try_advisory_lock(4981)"), Some("t".into()));
+    // PG18: false. Before this round: true, on the read path.
+    assert_eq!(query_one(&mut b, "SELECT pg_try_advisory_lock(4981)"), Some("f".into()));
+    assert_eq!(query_one(&mut b, "SELECT pg_try_advisory_lock(4981)"), Some("f".into()));
+    // And B cannot release what it never took.
+    assert_eq!(query_one(&mut b, "SELECT pg_advisory_unlock(4981)"), Some("f".into()));
+    // A's own second take is re-entrant, and it takes two unlocks.
+    assert_eq!(query_one(&mut a, "SELECT pg_try_advisory_lock(4981)"), Some("t".into()));
+    assert_eq!(query_one(&mut a, "SELECT pg_advisory_unlock(4981)"), Some("t".into()));
+    assert_eq!(query_one(&mut b, "SELECT pg_try_advisory_lock(4981)"), Some("f".into()));
+    assert_eq!(query_one(&mut a, "SELECT pg_advisory_unlock(4981)"), Some("t".into()));
+    // Fully released — now B may have it.
+    assert_eq!(query_one(&mut b, "SELECT pg_try_advisory_lock(4981)"), Some("t".into()));
+}
+
+/// `lastval()` reads the session's own last sequence, so it needs the same
+/// routing. It answered nothing at all over the wire for the same reason.
+#[test]
+fn lastval_reaches_the_sessions_own_state() {
+    let (_child, addr) = boot("lastval");
+    let mut a = open(&addr);
+    query_one(&mut a, "CREATE SEQUENCE lv");
+    assert_eq!(query_one(&mut a, "SELECT nextval('lv')"), Some("1".into()));
+    assert_eq!(query_one(&mut a, "SELECT lastval()"), Some("1".into()));
+    assert_eq!(query_one(&mut a, "SELECT nextval('lv')"), Some("2".into()));
+    assert_eq!(query_one(&mut a, "SELECT lastval()"), Some("2".into()));
+}
