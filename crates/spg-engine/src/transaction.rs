@@ -763,6 +763,13 @@ impl Engine {
         // `SELECT lo_write(…)` classifies read-only and mutates, which the
         // large-object pins caught when this was first written against
         // `touched_tables`.
+        // v7.39 (round 497) — a sequence's counter is shared state that
+        // `nextval` advanced on the committed catalog, so the install must
+        // not put the transaction's BEGIN-time copy back over it. Saved
+        // before the install and restored after, for the sequences that
+        // still exist; one the transaction CREATED is absent from the save
+        // and keeps the value it was given.
+        let live_counters = self.catalog.sequence_counters();
         if state.shadow_dirty {
             // v7.39 (round 496) — a frozen-view tx that could NOT use the
             // row-level merge installs only the tables it changed, not the
@@ -800,6 +807,7 @@ impl Engine {
             } else {
                 self.catalog = state.catalog;
             }
+            self.catalog.restore_sequence_counters(&live_counters);
         }
         // v7.37.15 Phase C — mark the writer version this tx
         // allocated as committed so subsequent reader snapshots

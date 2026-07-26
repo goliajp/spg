@@ -4703,6 +4703,35 @@ impl Catalog {
     /// v7.17.0 — atomic nextval. Increments `last_value` per
     /// `increment`, returns the new value, sets `is_called`.
     /// Returns an error on CYCLE-less overflow.
+    /// v7.39 (round 497) — the counter state of every sequence, for
+    /// carrying across a commit install.
+    ///
+    /// A sequence's VALUE is not transactional in PG: `nextval` advances
+    /// shared state that a rollback does not give back, because two
+    /// sessions must never receive the same number. SPG keeps sequences in
+    /// the catalog, and a transaction works on a catalog CLONE, so
+    /// installing that clone at COMMIT would restore whatever the counter
+    /// was at BEGIN. These two let the install put the live counters back.
+    #[must_use]
+    pub fn sequence_counters(&self) -> Vec<(String, i64, bool)> {
+        self.sequences
+            .iter()
+            .map(|(k, d)| (k.clone(), d.last_value, d.is_called))
+            .collect()
+    }
+
+    /// Restore counters saved by [`Self::sequence_counters`], for the
+    /// sequences that still exist. A sequence the transaction CREATED is
+    /// absent from the saved set and keeps the value it was given.
+    pub fn restore_sequence_counters(&mut self, saved: &[(String, i64, bool)]) {
+        for (k, last, called) in saved {
+            if let Some(d) = self.sequences.get_mut(k) {
+                d.last_value = *last;
+                d.is_called = *called;
+            }
+        }
+    }
+
     pub fn sequence_next_value(&mut self, name: &str) -> Result<i64, StorageError> {
         let key = self.sequence_key(name);
         let Some(seq) = self.sequences.get_mut(&key) else {
