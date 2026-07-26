@@ -15727,23 +15727,56 @@ fn apply_function_dispatch(
             // the spelling PG documents, and it answered 0: only bare TEXT
             // was read, so the size of a table anyone asked for the normal
             // way came back as "empty" rather than its bytes.
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::BigInt(0));
+            };
+            // v7.39 (round 519) — the two ends were inverted against PG.
+            // Measured: an oid that names NOTHING is NULL there, and a
+            // relation with no storage — a view, and every catalog relation
+            // SPG synthesises rather than stores — is 0, not NULL. SPG
+            // answered 0 for the unknown oid and NULL for the view, which is
+            // exactly backwards: a monitoring query summing sizes skipped
+            // the rows it should have counted as zero and counted the ones
+            // it should have skipped.
             let name_arg = match args.first() {
                 None | Some(Value::Null) => return Ok(Value::Null),
                 Some(v) => match regclass_name_of(v) {
                     Some(n) => n,
-                    // Numeric oid — synthetic, no reverse map.
-                    None => return Ok(Value::BigInt(0)),
+                    // A bare oid: reverse it through the same map regclass
+                    // uses. Naming nothing is PG's NULL.
+                    None => {
+                        let oid = match v {
+                            Value::Int(n) => i64::from(*n),
+                            Value::BigInt(n) => *n,
+                            _ => return Ok(Value::Null),
+                        };
+                        match crate::system_catalog::relation_name_for_oid(cat, oid) {
+                            Some(n) => n,
+                            None => return Ok(Value::Null),
+                        }
+                    }
                 },
-            };
-            let Some(cat) = ctx.catalog else {
-                return Ok(Value::BigInt(0));
             };
             let bare = name_arg
                 .strip_prefix("public.")
                 .unwrap_or(&name_arg)
                 .trim_matches('"');
             let Some(t) = cat.get(bare) else {
-                return Ok(Value::Null);
+                // A relation that exists but stores nothing here — a view,
+                // or a synthesised catalog relation — weighs 0. A name that
+                // is not a relation at all is NULL.
+                //
+                // "Synthesised catalog relation" is recognised by its
+                // namespace rather than a list: every one SPG answers lives
+                // under `pg_` or `information_schema`, and a user table
+                // cannot take those names.
+                let is_catalog =
+                    bare.starts_with("pg_") || bare.starts_with("information_schema");
+                return Ok(if cat.has_view(bare) || is_catalog {
+                    Value::BigInt(0)
+                } else {
+                    Value::Null
+                });
             };
             let heap = t.hot_bytes() as i64;
             let idx: i64 = t

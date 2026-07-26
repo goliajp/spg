@@ -29,10 +29,15 @@ PAIRS = [
      "SELECT pg_visible_in_snapshot('25'::xid8,'10:20:'::pg_snapshot)"),
     ("txid_status", "SELECT txid_status(1::bigint)", "SELECT txid_status(999999999::bigint)"),
     ("pg_column_size", "SELECT pg_column_size(1::int)", "SELECT pg_column_size('abcdefghij'::text)"),
+    # Size questions must be asked of a relation that STORES something. A
+    # first pass asked them of `pg_class` and an empty database and reported
+    # all three as constants — `pg_class` is a synthesised catalog relation
+    # in SPG with no bytes of its own, and an empty database really does
+    # weigh nothing. The functions were right; the probe was wrong.
     ("pg_database_size", "SELECT pg_database_size(current_database()) > 0",
      "SELECT pg_database_size(current_database()) > 1e15"),
-    ("pg_total_relation_size", "SELECT pg_total_relation_size('pg_class'::regclass) >= 0",
-     "SELECT pg_total_relation_size('pg_class'::regclass) > 1e15"),
+    ("pg_total_relation_size", "SELECT pg_total_relation_size('probe_sz'::regclass) > 0",
+     "SELECT pg_total_relation_size('probe_sz'::regclass) > 1e15"),
     ("has_table_privilege", "SELECT has_table_privilege('pg_class','SELECT')",
      "SELECT has_table_privilege('pg_class','INSERT')"),
     ("has_schema_privilege", "SELECT has_schema_privilege('pg_catalog','USAGE')",
@@ -56,8 +61,8 @@ PAIRS = [
     ("age(xid)", "SELECT age('1'::xid) >= 0", "SELECT age('1'::xid) < 0"),
     ("pg_relation_filenode", "SELECT pg_relation_filenode('pg_class'::regclass) IS NOT NULL",
      "SELECT pg_relation_filenode(999999::oid) IS NOT NULL"),
-    ("pg_indexes_size", "SELECT pg_indexes_size('pg_class'::regclass) >= 0",
-     "SELECT pg_indexes_size('pg_class'::regclass) > 1e15"),
+    ("pg_indexes_size", "SELECT pg_indexes_size('probe_sz'::regclass) > 0",
+     "SELECT pg_indexes_size('probe_sz'::regclass) > 1e15"),
     ("pg_size_pretty", "SELECT pg_size_pretty(1024::bigint)",
      "SELECT pg_size_pretty(1048576::bigint)"),
     ("row_security_active", "SELECT row_security_active('pg_class'::regclass)",
@@ -95,8 +100,22 @@ def run(host, port, db, user, password, sql):
     return (r.stdout or "").strip() or "<null>"
 
 
+# The panel's own subject, made on both servers so a size question has
+# something to weigh. Left behind deliberately: a run that depended on a
+# table an EARLIER run happened to leave is not a measurement.
+SETUP = [
+    "DROP TABLE IF EXISTS probe_sz CASCADE",
+    "CREATE TABLE probe_sz (a int, b text)",
+    "INSERT INTO probe_sz SELECT g, repeat('x',100) FROM generate_series(1,500) g",
+    "CREATE INDEX probe_sz_a ON probe_sz(a)",
+]
+
+
 def main():
     pg_host, pg_port, spg_host, spg_port = sys.argv[1:5]
+    for sql in SETUP:
+        run(pg_host, pg_port, "bench", "bench", "bench", sql)
+        run(spg_host, spg_port, "postgres", "unmei", None, sql)
     print(f"{'function':<34} {'PG a|b':<22} SPG a|b")
     suspects = 0
     for label, a, b in PAIRS:
