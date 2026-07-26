@@ -4431,6 +4431,18 @@ impl Engine {
         // ON CONFLICT DO UPDATE tombstone+insert path, read before the
         // table mut borrow and threaded into insert_parsed_rows.
         let inplace_for_stmt = self.mvcc_inplace();
+        // v7.39 (round 493) — the floor below which a deleted version is
+        // invisible to everyone, read before the table mut borrow (it needs
+        // `&self`) and published so the insert path can drop this key's dead
+        // index entries while it already holds the posting list.
+        //
+        // Only under in-place MVCC: with the gate off a delete removes the
+        // row physically and no dead versions exist to prune.
+        let prune_horizon = if inplace_for_stmt {
+            self.vacuum_oldest_active()
+        } else {
+            0
+        };
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -4439,6 +4451,7 @@ impl Engine {
                     name: stmt.table.clone(),
                 })
             })?;
+        table.set_prune_horizon(prune_horizon);
         // Stage 3 — insert the surviving rows + fire row triggers under
         // a fresh mutable borrow, then apply queued ON CONFLICT updates.
         let (returning_rows, deferred_embedded, affected, oc_pairs, oc_old_images) =

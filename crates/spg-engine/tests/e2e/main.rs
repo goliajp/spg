@@ -288,6 +288,7 @@ mod e2e_fast_predicate_round482;
 mod e2e_distinct_buffer_round485;
 mod e2e_bound_column_projection_round487;
 mod e2e_like_fast_path_round488;
+mod e2e_index_prune_round493;
 mod e2e_seek_skips_dead_round490;
 mod e2e_in_set_fast_path_round486;
 mod e2e_like_byte_scan_round484;
