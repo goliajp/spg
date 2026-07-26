@@ -309,9 +309,10 @@ pub(crate) fn materialise_in_order(
     schema_cols: &[ColumnSchema],
     table_alias: &str,
     ordered_rows: &[Cow<'_, Row<'static>>],
+    mysql: bool,
 ) -> Result<QueryResult, EngineError> {
     let ctx = EvalContext::new(schema_cols, Some(table_alias));
-    let projection = build_projection(&stmt.items, schema_cols, table_alias)?;
+    let projection = build_projection(&stmt.items, schema_cols, table_alias, mysql)?;
     let mut output_rows: Vec<Row<'static>> = Vec::with_capacity(ordered_rows.len());
     for row_cow in ordered_rows {
         let row = row_cow.as_ref();

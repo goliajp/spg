@@ -2565,7 +2565,7 @@ impl Engine {
         // Already in ORDER BY order from the walk.
         let mut output = plain_sink;
         apply_offset_and_limit(&mut output, stmt.offset_literal(), stmt.limit_literal());
-        let projection = build_projection(&stmt.items, &combined_schema, "")?;
+        let projection = build_projection(&stmt.items, &combined_schema, "", self.backslash_escapes)?;
         let mut proj_memo = memoize::MemoizeCache::default();
         let mut rows: Vec<Row<'static>> = Vec::with_capacity(output.len());
         for row in &output {
@@ -2859,7 +2859,7 @@ impl Engine {
             heap.into_sorted_vec().into_iter().map(|e| e.row).collect()
         };
         apply_offset_and_limit(&mut output, stmt.offset_literal(), stmt.limit_literal());
-        let projection = build_projection(&stmt.items, &combined_schema, "")?;
+        let projection = build_projection(&stmt.items, &combined_schema, "", self.backslash_escapes)?;
         let mut proj_memo = memoize::MemoizeCache::default();
         let mut rows: Vec<Row<'static>> = Vec::with_capacity(output.len());
         for row in &output {

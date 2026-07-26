@@ -3398,7 +3398,9 @@ fn project_groups(
             }
             SelectItem::Expr { expr, alias } => {
                 let rewritten = rewrite_expr(expr, group_exprs, agg_specs);
-                let name = alias.clone().unwrap_or_else(|| expr.to_string());
+                let name = alias
+                    .clone()
+                    .unwrap_or_else(|| crate::select::default_output_name(expr, mysql));
                 Ok(ColumnSchema::new(
                     name,
                     agg_or_group_type(&rewritten, synth_schema),
