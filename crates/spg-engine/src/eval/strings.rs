@@ -1570,6 +1570,19 @@ fn left_pad_spaces(s: &str, width: usize) -> String {
 
 /// Insert commas every three digits from the right of a pure-digit
 /// integer string.
+/// v7.39 (round 523) — the `TZH` / `OF` spelling of a zone offset.
+fn zone_hours(zone: Option<(&str, i64)>) -> String {
+    let secs = zone.map_or(0, |(_, off)| off / 1_000_000);
+    let h = secs / 3600;
+    alloc::format!("{}{:02}", if h < 0 { '-' } else { '+' }, h.abs())
+}
+
+/// v7.39 (round 523) — the `TZM` spelling: whole minutes past the hour.
+fn zone_minutes(zone: Option<(&str, i64)>) -> String {
+    let secs = zone.map_or(0, |(_, off)| off / 1_000_000);
+    alloc::format!("{:02}", (secs.abs() / 60) % 60)
+}
+
 fn group_thousands(int_str: &str) -> String {
     let bytes: alloc::vec::Vec<char> = int_str.chars().collect();
     let mut out = String::new();
@@ -1584,6 +1597,17 @@ fn group_thousands(int_str: &str) -> String {
 }
 
 pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    to_char_in_zone(args, None)
+}
+
+/// v7.39 (round 523) — `to_char` with the SESSION zone's designation and
+/// offset, for a timestamptz source. The zone tokens answered a fixed
+/// `UTC` / `+00` whatever the session was set to, so a formatted stamp
+/// named a zone the value was not being read in.
+pub(super) fn to_char_in_zone(
+    args: &[Value<'_>],
+    zone: Option<(&str, i64)>,
+) -> Result<Value<'static>, EvalError> {
     use core::fmt::Write as _;
     if args.len() != 2 {
         return Err(EvalError::TypeMismatch {
@@ -1878,20 +1902,26 @@ pub(super) fn to_char(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             let _ = write!(out, "{}", hh24 * 3600 + mi * 60 + ss);
             consumed = 4;
         } else if rest.starts_with(b"TZH") {
-            // v7.39 (round 246) — the zone tokens. SPG stores and renders
-            // every timestamp in UTC (the wire renderer prints `+00`), so
-            // the tokens answer for UTC; a session-zone-aware answer is the
-            // same architecture step as the renderer's.
-            out.push_str("+00");
+            // v7.39 (round 246) — the zone tokens.
+            // v7.39 (round 523) — they answer for the SESSION zone now,
+            // which is the one the value beside them is being read in.
+            // A fixed `UTC` / `+00` here named a zone the rest of the
+            // string did not agree with.
+            out.push_str(&zone_hours(zone));
             consumed = 3;
         } else if rest.starts_with(b"TZM") {
-            out.push_str("00");
+            out.push_str(&zone_minutes(zone));
             consumed = 3;
         } else if rest.starts_with(b"TZ") || rest.starts_with(b"tz") {
-            out.push_str(if rest.starts_with(b"TZ") { "UTC" } else { "utc" });
+            let name = zone.map_or_else(|| String::from("UTC"), |(n, _)| String::from(n));
+            out.push_str(&if rest.starts_with(b"TZ") {
+                name.to_uppercase()
+            } else {
+                name.to_lowercase()
+            });
             consumed = 2;
         } else if rest.starts_with(b"OF") {
-            out.push_str("+00");
+            out.push_str(&zone_hours(zone));
             consumed = 2;
         } else if rest.starts_with(b"FF") && rest.get(2).is_some_and(u8::is_ascii_digit) {
             // v7.37 — `FF1`..`FF6`: the first N digits of the fractional

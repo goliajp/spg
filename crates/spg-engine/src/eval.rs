@@ -388,10 +388,7 @@ impl<'a> EvalContext<'a> {
     /// (PG's DST disambiguation for named zones).
     #[must_use]
     pub fn zone_local_to_utc(&self, zone: &str, local_micros: i64) -> Option<i64> {
-        if let Some(off) = datetime::resolve_zone_offset(zone) {
-            return Some(local_micros - off);
-        }
-        self.tz_localize_fn.and_then(|f| f(zone, local_micros))
+        zone_local_to_utc_with(zone, local_micros, self.tz_localize_fn)
     }
 
     /// v7.38 (read01 P5.24) — attach the host CSPRNG so cryptographic
@@ -502,6 +499,60 @@ impl<'a> EvalContext<'a> {
     pub const fn with_default_text_search_config(mut self, cfg: Option<&'a str>) -> Self {
         self.default_text_search_config = cfg;
         self
+    }
+}
+
+/// v7.39 (round 523) — read a timestamp literal, reporting whether it
+/// carried an offset. Re-exported for the INSERT path, which decides
+/// there whether a value already names an instant.
+pub(crate) fn parse_timestamp_literal_tz_ordered_pub(
+    s: &str,
+    order: DateOrder,
+) -> Option<(i64, bool)> {
+    format::parse_timestamp_literal_tz_ordered(s, order)
+}
+
+/// v7.39 (round 523) — a FIXED zone's offset, when the name is one
+/// (`+09`, `UTC-5`). Named zones go through the host's tzdb instead.
+#[must_use]
+pub(crate) fn resolve_zone_offset_pub(zone: &str) -> Option<i64> {
+    datetime::resolve_zone_offset(zone)
+}
+
+/// v7.39 (round 523) — a wall-clock reading in `zone` as a UTC instant.
+///
+/// A free function because the INSERT path needs it too, and that path
+/// carries no `EvalContext`: it evaluates VALUES through a context-free
+/// literal walker. `EvalContext::zone_local_to_utc` delegates here so the
+/// two cannot drift.
+#[must_use]
+pub(crate) fn zone_local_to_utc_with(
+    zone: &str,
+    local_micros: i64,
+    localize: Option<crate::TzLocalizeFn>,
+) -> Option<i64> {
+    if let Some(off) = datetime::resolve_zone_offset(zone) {
+        return Some(local_micros - off);
+    }
+    localize.and_then(|f| f(zone, local_micros))
+}
+
+/// v7.39 (round 523) — the session zone an assignment to a timestamptz
+/// column is read in, or `None` when the session is on UTC and no shift
+/// applies.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionZone {
+    pub zone: alloc::string::String,
+    pub localize: Option<crate::TzLocalizeFn>,
+    /// The session's date order, which the offset detection parses with.
+    pub order: DateOrder,
+}
+
+impl SessionZone {
+    /// The UTC instant a naive wall-clock reading names in this zone.
+    #[must_use]
+    pub(crate) fn wall_to_utc(&self, wall: i64) -> Option<i64> {
+        zone_local_to_utc_with(&self.zone, wall, self.localize)
     }
 }
 
@@ -2423,6 +2474,50 @@ fn eval_cast_arm(
             return Ok(Value::Timestamp(wall));
         }
     }
+    // v7.39 (round 523) — a NAIVE timestamp cast to timestamptz is a
+    // wall-clock reading in the session zone, exactly as the text form
+    // above already is. This was a no-op, so under `SET TimeZone =
+    // 'Asia/Tokyo'` a `TIMESTAMP '2020-01-01 00:00:00'::timestamptz`
+    // named 09:00 JST — a different INSTANT, nine hours from the one PG
+    // stores, not a different rendering of the same one.
+    //
+    // The source's static type is the witness: SPG keeps timestamptz in
+    // the same `Value::Timestamp`, so only an expression that is not
+    // ALREADY timestamptz may be shifted, or a tstz-to-tstz cast would
+    // move the instant twice.
+    if matches!(target, CastTarget::Timestamptz)
+        && let Value::Timestamp(wall) = &v
+        && !matches!(
+            crate::describe::describe_expr(expr, ctx.columns).map(|s| s.ty),
+            Some(spg_storage::DataType::Timestamptz)
+        )
+        && let Some(zone) = ctx.session_gucs.and_then(|g| g.get("timezone"))
+        && !zone.eq_ignore_ascii_case("utc")
+        && !zone.eq_ignore_ascii_case("gmt")
+        && let Some(utc) = ctx.zone_local_to_utc(zone, *wall)
+    {
+        return Ok(Value::Timestamp(utc));
+    }
+    // v7.39 (round 523) — and the other direction: a timestamptz cast
+    // DOWN to a zone-free type reads the local clock in the session
+    // zone. `(TIMESTAMPTZ '2020-01-01 15:00:00Z')::date` answered
+    // 2020-01-01 in Tokyo where PG answers 2020-01-02 — a whole day out
+    // for every instant in the last nine hours of a UTC day, which is
+    // exactly the shape a daily report groups on. `now()::timestamp`
+    // likewise disagreed with `now() AT TIME ZONE <session zone>`, which
+    // PG defines to be the same value.
+    if matches!(target, CastTarget::Timestamp | CastTarget::Date)
+        && let Value::Timestamp(t) = &v
+        && crate::describe::describe_expr(expr, ctx.columns)
+            .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
+    {
+        let local = t.saturating_add(ctx.session_tz_offset_at(*t));
+        return Ok(match target {
+            CastTarget::Date => i32::try_from(local.div_euclid(86_400_000_000))
+                .map_or(Value::Timestamp(local), Value::Date),
+            _ => Value::Timestamp(local),
+        });
+    }
     // v7.39 (GUC knife 3) — the out-function casts honour the
     // session render style, like PG's date_out/interval_out/
     // float8out under DateStyle/IntervalStyle/extra_float_digits.
@@ -2989,6 +3084,55 @@ fn eval_function_call_positional(
     //   naive AT ZONE  -> that zone's wall clock -> UTC instant
     //   tstz  AT ZONE  -> UTC instant -> that zone's wall clock
     // Fixed offsets / abbreviations keep the legacy path below.
+    // v7.39 (round 523) — `to_char(tstz, fmt)` renders the LOCAL clock
+    // in the session zone, and its zone tokens name that zone. It was
+    // rendering the UTC reading and spelling it `UTC`, so a formatted
+    // stamp disagreed with the same value's own `::text`.
+    if args.len() == 2
+        && name.eq_ignore_ascii_case("to_char")
+        && let Some(zone) = ctx.session_gucs.and_then(|g| g.get("timezone"))
+        && !zone.eq_ignore_ascii_case("utc")
+        && !zone.eq_ignore_ascii_case("gmt")
+        && crate::describe::describe_expr(&args[0], ctx.columns)
+            .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
+        && let Value::Timestamp(t) = eval_expr(&args[0], row, ctx)?
+    {
+        let off = ctx.session_tz_offset_at(t);
+        let abbrev = ctx
+            .session_tz_abbrev_at(t)
+            .unwrap_or_else(|| zone.to_uppercase());
+        let vals = [
+            Value::Timestamp(t.saturating_add(off)),
+            eval_expr(&args[1], row, ctx)?,
+        ];
+        return crate::eval::strings::to_char_in_zone(&vals, Some((&abbrev, off)));
+    }
+    // v7.39 (round 523) — `date_trunc(unit, tstz)` truncates on the
+    // LOCAL calendar in the session zone. It was truncating in UTC and
+    // rendering the result in the session zone, so under `SET TimeZone =
+    // 'Asia/Tokyo'` a day truncation answered `2020-01-01 09:00:00+09` —
+    // not a day boundary at all, and the wrong day for anything before
+    // 09:00. Every report grouped by day was cut nine hours late.
+    //
+    // The three-argument form already does exactly this, DST reverse
+    // lookup and all, so the session zone is passed to THAT rather than
+    // written a second time. Only a statically-known timestamptz shifts:
+    // a naive timestamp has no zone to be read in.
+    if args.len() == 2
+        && (name.eq_ignore_ascii_case("date_trunc") || name.eq_ignore_ascii_case("date_bin"))
+        && let Some(zone) = ctx.session_gucs.and_then(|g| g.get("timezone"))
+        && !zone.eq_ignore_ascii_case("utc")
+        && !zone.eq_ignore_ascii_case("gmt")
+        && crate::describe::describe_expr(&args[1], ctx.columns)
+            .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
+    {
+        let vals = [
+            eval_expr(&args[0], row, ctx)?,
+            eval_expr(&args[1], row, ctx)?,
+            Value::text(zone.clone()),
+        ];
+        return datetime::date_trunc(&vals, ctx);
+    }
     if args.len() == 2
         && name.eq_ignore_ascii_case("timezone")
         && let zone_v = eval_expr(&args[0], row, ctx)?
@@ -3656,6 +3800,30 @@ fn eval_extract_arm(
             kind: spg_storage::NumericKind::Finite,
         });
     }
+    // v7.39 (round 523) — and every OTHER field of a timestamptz reads
+    // the local clock in the session zone, which is the whole reason PG
+    // has the type. `extract(hour from …)` answered the UTC hour under
+    // `SET TimeZone = 'Asia/Tokyo'` — 0 where PG says 9 — and
+    // `extract(dow …)` therefore named the wrong DAY, so a report
+    // grouped by weekday put nine hours of every Sunday under Saturday.
+    // Only fields of the local clock shift; epoch and julian are
+    // absolute, and the timezone fields answered above.
+    let v = match &v {
+        Value::Timestamp(t)
+            if !matches!(
+                field,
+                spg_sql::ast::ExtractField::Epoch
+                    | spg_sql::ast::ExtractField::Julian
+                    | spg_sql::ast::ExtractField::Timezone
+                    | spg_sql::ast::ExtractField::TimezoneHour
+                    | spg_sql::ast::ExtractField::TimezoneMinute
+            ) && crate::describe::describe_expr(source, ctx.columns)
+                .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz)) =>
+        {
+            Value::Timestamp(t.saturating_add(ctx.session_tz_offset_at(*t)))
+        }
+        _ => v,
+    };
     // v7.39 (round 253) — the source's PG type name for error wording,
     // upgraded from the declared type when statically known (a tstz
     // VALUE is indistinguishable from a timestamp). Only a cast /

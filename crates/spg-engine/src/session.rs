@@ -477,6 +477,47 @@ impl Engine {
     /// `default_text_search_config`. Engine-internal callers use
     /// this instead of `EvalContext::new` so the FTS function
     /// dispatcher sees the SET configuration.
+    /// v7.39 (round 523) — the session zone's offset at a UTC instant,
+    /// or 0 when the session is on UTC.
+    ///
+    /// The clock rewrite needs it: `current_date` and the local-clock
+    /// family read the session's wall clock, and SPG's unified clock
+    /// reads UTC, so `SET TimeZone = 'Asia/Tokyo'` left `current_date`
+    /// naming yesterday for nine hours of every day.
+    pub(crate) fn session_tz_offset_at(&self, utc_micros: i64) -> i64 {
+        let Some(zone) = self.session_params.get("timezone") else {
+            return 0;
+        };
+        if zone.eq_ignore_ascii_case("utc") || zone.eq_ignore_ascii_case("gmt") {
+            return 0;
+        }
+        if let Some(off) = crate::eval::resolve_zone_offset_pub(zone) {
+            return off;
+        }
+        self.tz_offset_fn
+            .and_then(|f| f(zone, utc_micros))
+            .unwrap_or(0)
+    }
+
+    /// v7.39 (round 523) — the session zone an assignment into a
+    /// timestamptz column is read in, or `None` when the session is on
+    /// UTC and no shift applies.
+    ///
+    /// The INSERT path evaluates VALUES through a context-free literal
+    /// walker with no `EvalContext`, so it takes the zone as an argument
+    /// the way it already takes the dialect.
+    pub(crate) fn session_zone_for_assignment(&self) -> Option<crate::eval::SessionZone> {
+        let zone = self.session_params.get("timezone")?;
+        if zone.eq_ignore_ascii_case("utc") || zone.eq_ignore_ascii_case("gmt") {
+            return None;
+        }
+        Some(crate::eval::SessionZone {
+            zone: zone.clone(),
+            localize: self.tz_localize_fn,
+            order: self.render_style.date_order,
+        })
+    }
+
     pub(crate) fn ev_ctx<'a>(
         &'a self,
         columns: &'a [ColumnSchema],

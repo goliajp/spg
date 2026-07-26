@@ -155,7 +155,9 @@ impl Engine {
         let now_micros = snapshot.clock.map(|f| f());
         // A snapshot carries no session, so PG's reading — the stricter
         // one — is the honest default here.
-        rewrite_clock_calls(&mut stmt, now_micros, false);
+        // A snapshot carries no session, so there is no zone to read the
+        // local-clock family in — UTC, as before.
+        rewrite_clock_calls(&mut stmt, now_micros, false, 0);
         if let Statement::Select(s) = &mut stmt {
             expand_group_by_all(s);
             resolve_order_by_position(s);
@@ -202,7 +204,12 @@ impl Engine {
     ) -> Result<spg_sql::ast::SelectStatement, EngineError> {
         let mut stmt = parser::parse_statement_with(sql, self.backslash_escapes)?;
         let now_micros = self.clock.map(|f| f());
-        rewrite_clock_calls(&mut stmt, now_micros, self.backslash_escapes);
+        rewrite_clock_calls(
+            &mut stmt,
+            now_micros,
+            self.backslash_escapes,
+            now_micros.map_or(0, |n| self.session_tz_offset_at(n)),
+        );
         let Statement::Select(mut s) = stmt else {
             return Err(EngineError::Unsupported(
                 "prepare_select_streaming: not a SELECT".into(),
@@ -229,7 +236,12 @@ impl Engine {
         // Wrap as Statement::Select temporarily to reuse the public
         // walker; cheap (one enum tag manipulation).
         let mut stmt = Statement::Select(core::mem::take(s));
-        rewrite_clock_calls(&mut stmt, now_micros, self.backslash_escapes);
+        rewrite_clock_calls(
+            &mut stmt,
+            now_micros,
+            self.backslash_escapes,
+            now_micros.map_or(0, |n| self.session_tz_offset_at(n)),
+        );
         if let Statement::Select(rewritten) = stmt {
             *s = rewritten;
         }
@@ -360,7 +372,12 @@ impl Engine {
         cancel.check()?;
         let mut stmt = parser::parse_statement_with(sql, self.backslash_escapes)?;
         let now_micros = self.clock.map(|f| f());
-        rewrite_clock_calls(&mut stmt, now_micros, self.backslash_escapes);
+        rewrite_clock_calls(
+            &mut stmt,
+            now_micros,
+            self.backslash_escapes,
+            now_micros.map_or(0, |n| self.session_tz_offset_at(n)),
+        );
         let Statement::Select(mut s) = stmt else {
             return Err(EngineError::Unsupported(
                 "execute_readonly_select_streaming: not a SELECT".into(),
@@ -417,7 +434,12 @@ impl Engine {
         cancel.check()?;
         let mut stmt = parser::parse_statement_with(sql, self.backslash_escapes)?;
         let now_micros = self.clock.map(|f| f());
-        rewrite_clock_calls(&mut stmt, now_micros, self.backslash_escapes);
+        rewrite_clock_calls(
+            &mut stmt,
+            now_micros,
+            self.backslash_escapes,
+            now_micros.map_or(0, |n| self.session_tz_offset_at(n)),
+        );
         if let Statement::Select(s) = &mut stmt {
             resolve_order_by_position(s);
             // v6.2.3 — cost-based JOIN reorder (read path).
