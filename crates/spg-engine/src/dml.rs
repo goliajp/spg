@@ -4233,6 +4233,9 @@ impl Engine {
         // v7.39 (round 470) — read before the &mut borrow below, same
         // reason `cat_for_insert` is.
         let insert_non_strict = insert_mysql && !self.mysql_strict;
+        // v7.39 (round 523) — read BEFORE the table borrow: the zone lives
+        // in the session params, and `table` borrows self mutably.
+        let session_zone = self.session_zone_for_assignment();
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -4278,6 +4281,7 @@ impl Engine {
             // a non-strict `sql_mode`. Same conversion, different trigger.
             insert_mysql && stmt.mysql_ignore,
             insert_non_strict,
+            session_zone.as_ref(),
         )?;
         // Stage 2 — FK enforcement on the immutable catalog.
         // Non-lexical lifetimes release the mutable borrow on
@@ -6041,6 +6045,59 @@ mod spg_engine_no_alias {
 /// scoped cursors), run DEFAULT / ENUM / SET / unsigned-range checks.
 /// Reads the table immutably (`next_auto_value`); no row is written yet.
 #[allow(clippy::too_many_arguments)]
+/// v7.39 (round 523) — does this VALUES expression already name an
+/// INSTANT, rather than a wall-clock reading that still needs a zone?
+///
+/// Neither the value nor the expression's SHAPE is enough on its own.
+/// SPG keeps timestamptz in the same `Value::Timestamp` as a naive one,
+/// so by the time there is a value the two are indistinguishable; and a
+/// bare string names an instant exactly when it carries an offset
+/// (`'2020-01-01 00:00:00+05'` does, `'2020-01-01 00:00:00'` does not).
+/// A first cut keyed on the shape alone shifted the offset-bearing form
+/// a second time.
+///
+/// `TIMESTAMP '…'` is a wall-clock reading whatever it carries — PG
+/// drops the offset for that type — so only the string's own offset,
+/// read where the type does not already answer, decides.
+fn expr_names_an_instant(e: &Expr, order: crate::eval::DateOrder) -> bool {
+    let text_carries_offset = |s: &str| {
+        crate::eval::parse_timestamp_literal_tz_ordered_pub(s, order)
+            .is_some_and(|(_, had_tz)| had_tz)
+    };
+    match e {
+        Expr::Literal(spg_sql::ast::Literal::String(s)) => text_carries_offset(s),
+        Expr::Cast { expr, target } => match target {
+            // A naive type, whatever the literal says.
+            spg_sql::ast::CastTarget::Timestamp | spg_sql::ast::CastTarget::Date => false,
+            spg_sql::ast::CastTarget::Timestamptz => match &**expr {
+                Expr::Literal(spg_sql::ast::Literal::String(s)) => text_carries_offset(s),
+                _ => true,
+            },
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// v7.39 (round 523) — PG's assignment cast into a timestamptz column.
+///
+/// A no-op unless the session is on a non-UTC zone, the column is
+/// timestamptz, and the source was a wall-clock reading.
+fn localize_assignment_to_tstz(
+    v: Value<'static>,
+    col: &ColumnSchema,
+    src_names_an_instant: bool,
+    zone: Option<&crate::eval::SessionZone>,
+) -> Value<'static> {
+    if src_names_an_instant || col.ty != DataType::Timestamptz {
+        return v;
+    }
+    let (Some(z), Value::Timestamp(wall)) = (zone, &v) else {
+        return v;
+    };
+    z.wall_to_utc(*wall).map_or(v, Value::Timestamp)
+}
+
 fn parse_insert_rows(
     table: &spg_storage::Table,
     // v7.39 (read01 round 55) — the catalog, so a user-named cast in an
@@ -6078,8 +6135,19 @@ fn parse_insert_rows(
     // NULL column, while `INSERT IGNORE` stores 0 for it. Only an OMITTED
     // column gets the implicit default.
     non_strict: bool,
+    // v7.39 (round 523) — the session zone, when it is not UTC. PG reads a
+    // naive value assigned to a timestamptz column as a wall-clock reading
+    // in the session zone; this path evaluates VALUES through a
+    // context-free literal walker, so the zone has to arrive as an
+    // argument like the other session facts above. Without it, `SET
+    // TimeZone = 'Asia/Tokyo'` followed by an INSERT of a naive timestamp
+    // stored an instant nine hours from the one PG stores.
+    session_zone: Option<&crate::eval::SessionZone>,
 ) -> Result<Vec<Vec<Value<'static>>>, EngineError> {
     use spg_sql::ast::Overriding;
+    // v7.39 (round 523) — the session's date order, which the
+    // offset-detection above parses with.
+    let date_order = session_zone.map_or(crate::eval::DateOrder::Mdy, |z| z.order);
     let schema_cols_len = column_meta.len();
     let mut all_values: Vec<Vec<Value<'static>>> = Vec::with_capacity(rows.len());
     // v7.24 (round-16 collateral) — statement-scoped serial
@@ -6203,6 +6271,11 @@ fn parse_insert_rows(
             // Permuted path: still need raw_tuple to index by `map[i]`. A
             // `DEFAULT` marker maps to None here and is resolved per-column
             // below (it has no column-free value).
+            // v7.39 (round 523) — captured before the expressions are
+            // consumed: only the EXPRESSION can say whether a value already
+            // names an instant (see the fast path's note).
+            let slot_is_tstz: Vec<bool> =
+                tuple.iter().map(|e| expr_names_an_instant(e, date_order)).collect();
             let raw_tuple: Vec<Option<Value<'static>>> = tuple
                 .into_iter()
                 .map(|e| {
@@ -6299,6 +6372,12 @@ fn parse_insert_rows(
                     raw
                 };
                 let coerced = coerce_value(raw, col.ty, &col.name, i)?;
+                let coerced = localize_assignment_to_tstz(
+                    coerced,
+                    col,
+                    map[i].is_some_and(|j| slot_is_tstz[j]),
+                    session_zone,
+                );
                 enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
                 let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;
                 let coerced = crate::conversions::truncate_to_column_fsp(coerced, col);
@@ -6314,11 +6393,18 @@ fn parse_insert_rows(
             let tuple_len = tuple.len();
             let mut tuple_iter = tuple.into_iter();
             for (i, col) in column_meta.iter().enumerate() {
+                // v7.39 (round 523) — whether the VALUES expression already
+                // names an instant, which only the EXPRESSION can say: SPG
+                // keeps timestamptz in the same `Value::Timestamp` as a
+                // naive one, so by the time there is a value the two are
+                // indistinguishable.
+                let mut src_is_tstz = false;
                 let mut raw = if i < tuple_len {
                     let e = tuple_iter.next().expect("i < tuple_len has a value");
                     if is_column_default_marker(&e) {
                         resolve_column_default_free(col, clock)?
                     } else {
+                        src_is_tstz = expr_names_an_instant(&e, date_order);
                         literal_expr_to_value_in(e, catalog)?
                     }
                 } else {
@@ -6373,6 +6459,7 @@ fn parse_insert_rows(
                     raw
                 };
                 let coerced = coerce_value(raw, col.ty, &col.name, i)?;
+                let coerced = localize_assignment_to_tstz(coerced, col, src_is_tstz, session_zone);
                 enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
                 let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;
                 let coerced = crate::conversions::truncate_to_column_fsp(coerced, col);
