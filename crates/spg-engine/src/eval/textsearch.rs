@@ -19,6 +19,14 @@ use super::{EvalContext, EvalError};
 /// optional weight-array / normalisation arguments error with an
 /// "unsupported" message rather than silently changing semantics.
 pub(super) fn fts_ts_rank(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    // v7.39 (round 510) — strict, as PG's is. `parse_rank_args` sorts the
+    // optional weight array and norm flag out by their VALUE shape, so an
+    // all-NULL call matched neither and was reported as a bad argument list
+    // where PG simply answers NULL. Every form works with real values; it
+    // was only the NULLs that had nowhere to land.
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
     let (weights, vec, query, norm) = parse_rank_args("ts_rank", args)?;
     match (vec, query) {
         (None, _) | (_, None) => Ok(Value::Null),
@@ -34,6 +42,10 @@ pub(super) fn fts_ts_rank(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
 }
 
 pub(super) fn fts_ts_rank_cd(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    // Strict, for the same reason as `fts_ts_rank` above.
+    if args.iter().any(|a| matches!(a, Value::Null)) {
+        return Ok(Value::Null);
+    }
     let (weights, vec, query, norm) = parse_rank_args("ts_rank_cd", args)?;
     if norm & 4 != 0 {
         return Err(EvalError::TypeMismatch {
