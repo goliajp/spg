@@ -116,6 +116,37 @@ fn read_lenenc_string(buf: &[u8], pos: usize) -> (Vec<u8>, usize) {
     (s, consumed + n as usize)
 }
 
+/// v7.39 (round 504) — consume the marker that closes a result set's column
+/// definitions.
+///
+/// This harness does not take CLIENT_DEPRECATE_EOF (see
+/// `build_handshake_response`), and neither does MariaDB's own client
+/// library, so the server must send one. Measured off MariaDB 11 answering
+/// `SELECT 1` on such a connection: `fe 00 00 02 00`.
+///
+/// Before round 504 SPG left it out for every client, because it framed
+/// result sets against the capabilities it ADVERTISED rather than the ones
+/// the client took — and these tests asserted that, so the suite was green
+/// while a real `mariadb` CLI could not read `SELECT 1` at all.
+fn read_columns_eof(s: &mut TcpStream) {
+    let (_seq, pkt) = read_packet(s);
+    assert_eq!(pkt[0], 0xfe, "EOF closes the column definitions");
+    assert_eq!(pkt.len(), 5, "protocol-41 EOF: header + warnings + status");
+}
+
+/// The trailing marker of a result set, for a client without
+/// CLIENT_DEPRECATE_EOF: an EOF packet, not an OK packet.
+fn read_result_eof(s: &mut TcpStream) {
+    read_columns_eof(s);
+}
+
+/// True for the EOF that ends the rows. A text row could only begin with
+/// 0xfe if its first column were 16 MB or larger, which is why the length
+/// is part of the test — that is how real clients tell them apart.
+fn is_result_eof(pkt: &[u8]) -> bool {
+    pkt[0] == 0xfe && pkt.len() < 9
+}
+
 #[test]
 fn select_literal_int_returns_one_column_one_row() {
     let (_guard, addr) = spawn();
@@ -145,11 +176,12 @@ fn select_literal_int_returns_one_column_one_row() {
     let type_byte = col_def[pos + 1 + 2 + 4];
     // SPG widens integer literals fitting in i32 to MYSQL_TYPE_LONG (0x03).
     assert_eq!(type_byte, 0x03, "MYSQL_TYPE_LONG");
+    read_columns_eof(&mut s);
     let (_seq, row) = read_packet(&mut s);
     let (value, _) = read_lenenc_string(&row, 0);
     assert_eq!(value, b"42");
-    let (_seq, ok) = read_packet(&mut s);
-    assert_eq!(ok[0], 0x00, "trailing OK");
+    let (_seq, eof) = read_packet(&mut s);
+    assert_eq!(eof[0], 0xfe, "trailing EOF");
 }
 
 #[test]
@@ -159,10 +191,11 @@ fn select_text_literal_round_trips_through_lenenc_string() {
     send_query(&mut s, "SELECT 'hello, mysql' AS greeting");
     let (_seq, _cc) = read_packet(&mut s);
     let (_seq, _col) = read_packet(&mut s);
+    read_columns_eof(&mut s);
     let (_seq, row) = read_packet(&mut s);
     let (value, _) = read_lenenc_string(&row, 0);
     assert_eq!(value, b"hello, mysql");
-    let (_seq, _ok) = read_packet(&mut s);
+    read_result_eof(&mut s);
 }
 
 #[test]
@@ -206,11 +239,11 @@ fn select_from_table_returns_correct_rows() {
     assert_eq!(col_count, 2);
     let (_seq, _col1) = read_packet(&mut s);
     let (_seq, _col2) = read_packet(&mut s);
+    read_columns_eof(&mut s);
     let mut got_rows: Vec<(String, String)> = Vec::new();
     loop {
         let (_seq, pkt) = read_packet(&mut s);
-        if pkt[0] == 0x00 {
-            // trailing OK
+        if is_result_eof(&pkt) {
             break;
         }
         let (id_bytes, c) = read_lenenc_string(&pkt, 0);
@@ -242,6 +275,7 @@ fn null_values_decode_as_0xfb_byte() {
     let (_seq, _cc) = read_packet(&mut s);
     let (_seq, _c1) = read_packet(&mut s);
     let (_seq, _c2) = read_packet(&mut s);
+    read_columns_eof(&mut s);
     let (_seq, row1) = read_packet(&mut s);
     // v7.39 (round 403) — the MySQL wire session sorts NULL FIRST for ASC
     // (NULL is the smallest value), so the `b IS NULL` row `(1, NULL)` comes
@@ -254,7 +288,7 @@ fn null_values_decode_as_0xfb_byte() {
     assert_eq!(row2[0], 0xfb, "NULL int column");
     let (b2, _) = read_lenenc_string(&row2, 1);
     assert_eq!(b2, b"x");
-    let (_seq, _ok) = read_packet(&mut s);
+    read_result_eof(&mut s);
 }
 
 #[test]
@@ -291,9 +325,10 @@ fn query_scalar(s: &mut TcpStream, sql: &str) -> String {
     for _ in 0..col_count {
         let _ = read_packet(s);
     }
+    read_columns_eof(s);
     let (_seq, row) = read_packet(s);
     let (val, _) = read_lenenc_string(&row, 0);
-    let (_seq, _ok) = read_packet(s);
+    read_result_eof(s);
     String::from_utf8(val).unwrap()
 }
 
@@ -448,6 +483,12 @@ fn status_of(s: &mut TcpStream, sql: &str) -> u16 {
     ok_status(&pkt)
 }
 
+/// The status flags on an EOF packet: 0xfe + 2-byte warnings + 2-byte status.
+fn eof_status(pkt: &[u8]) -> u16 {
+    assert_eq!(pkt[0], 0xfe, "expected an EOF packet, got {:#x}", pkt[0]);
+    u16::from_le_bytes([pkt[3], pkt[4]])
+}
+
 /// Run a SELECT and return the status flags on its TERMINATING packet.
 fn status_of_select(s: &mut TcpStream, sql: &str) -> u16 {
     send_query(s, sql);
@@ -456,10 +497,11 @@ fn status_of_select(s: &mut TcpStream, sql: &str) -> u16 {
     for _ in 0..col_count {
         let _ = read_packet(s);
     }
+    read_columns_eof(s);
     loop {
         let (_seq, pkt) = read_packet(s);
-        if pkt[0] == 0x00 {
-            return ok_status(&pkt);
+        if is_result_eof(&pkt) {
+            return eof_status(&pkt);
         }
     }
 }
@@ -574,9 +616,8 @@ fn auth_open_mode_with_id(addr: &str) -> (TcpStream, u32) {
     (s, conn_id)
 }
 
-/// Read a whole text result set. The terminator is the 7-byte OK packet
-/// `encode_ok_packet` writes; a row is never 7 bytes here because its
-/// first column is always a non-empty value.
+/// Read a whole text result set. This client takes no CLIENT_DEPRECATE_EOF,
+/// so an EOF closes the column definitions and another closes the rows.
 fn query_rows(s: &mut TcpStream, sql: &str) -> Vec<Vec<Option<String>>> {
     send_query(s, sql);
     let (_seq, cc) = read_packet(s);
@@ -584,10 +625,11 @@ fn query_rows(s: &mut TcpStream, sql: &str) -> Vec<Vec<Option<String>>> {
     for _ in 0..col_count {
         let _ = read_packet(s);
     }
+    read_columns_eof(s);
     let mut out = Vec::new();
     loop {
         let (_seq, pkt) = read_packet(s);
-        if pkt[0] == 0x00 && pkt.len() == 7 {
+        if is_result_eof(&pkt) {
             return out;
         }
         let mut pos = 0;

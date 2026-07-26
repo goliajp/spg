@@ -109,6 +109,16 @@ fn read_prepare_ok(s: &mut TcpStream) -> (u32, u16, u16) {
     (stmt_id, num_columns, num_params)
 }
 
+/// v7.39 (round 504) — consume the EOF that closes a result set's column
+/// definitions. This harness does not take CLIENT_DEPRECATE_EOF, so the
+/// server owes it one; SPG used to leave it out for every client, having
+/// framed against its advertised capabilities instead of the taken ones.
+fn read_columns_eof(s: &mut TcpStream) {
+    let (_seq, pkt) = read_packet(s);
+    assert_eq!(pkt[0], 0xfe, "EOF closes the column definitions");
+    assert_eq!(pkt.len(), 5, "protocol-41 EOF: header + warnings + status");
+}
+
 fn read_lenenc(buf: &[u8], pos: usize) -> (u64, usize) {
     let first = buf[pos];
     match first {
@@ -186,6 +196,7 @@ fn binary_row_int_column_encodes_as_4_bytes_le() {
     // column_count + 1 column_def + 3 binary rows + trailing OK.
     let _ = read_packet(&mut s); // column_count
     let _ = read_packet(&mut s); // column_def
+    read_columns_eof(&mut s);
     let mut got: Vec<i32> = Vec::new();
     for _ in 0..3 {
         let (_seq, pkt) = read_packet(&mut s);
@@ -213,6 +224,7 @@ fn binary_row_text_column_uses_lenenc_string() {
     execute_no_params(&mut s, stmt_id);
     let _ = read_packet(&mut s); // column_count
     let _ = read_packet(&mut s); // column_def
+    read_columns_eof(&mut s);
     let mut got: Vec<String> = Vec::new();
     for _ in 0..2 {
         let (_seq, pkt) = read_packet(&mut s);
@@ -239,6 +251,7 @@ fn binary_row_null_column_sets_null_bitmap_bit() {
     execute_no_params(&mut s, stmt_id);
     let _ = read_packet(&mut s); // column_count
     let _ = read_packet(&mut s); // column_def
+    read_columns_eof(&mut s);
     let (_seq, pkt1) = read_packet(&mut s);
     assert_eq!(pkt1[0], 0x00);
     let bitmap1 = pkt1[1];
@@ -262,8 +275,9 @@ fn binary_row_bigint_column_encodes_as_8_bytes_le() {
     send_prepare(&mut s, "SELECT n FROM t");
     let (stmt_id, _nc, _np) = read_prepare_ok(&mut s);
     execute_no_params(&mut s, stmt_id);
-    let _ = read_packet(&mut s);
-    let _ = read_packet(&mut s);
+    let _ = read_packet(&mut s); // column_count
+    let _ = read_packet(&mut s); // column_def
+    read_columns_eof(&mut s);
     let (_seq, pkt) = read_packet(&mut s);
     let v = i64::from_le_bytes(pkt[2..10].try_into().unwrap());
     assert_eq!(v, 9_000_000_000);
@@ -292,6 +306,7 @@ fn binary_row_multi_column_packs_in_declared_order() {
     for _ in 0..3 {
         let _ = read_packet(&mut s); // column defs
     }
+    read_columns_eof(&mut s);
     // bitmap_len = (3 + 7 + 2) / 8 = 1
     let (_seq, row1) = read_packet(&mut s);
     assert_eq!(row1[0], 0x00);
@@ -331,8 +346,9 @@ fn binary_row_float_column_encodes_as_8_bytes_le_double() {
     send_prepare(&mut s, "SELECT x FROM t");
     let (stmt_id, _nc, _np) = read_prepare_ok(&mut s);
     execute_no_params(&mut s, stmt_id);
-    let _ = read_packet(&mut s);
-    let _ = read_packet(&mut s);
+    let _ = read_packet(&mut s); // column_count
+    let _ = read_packet(&mut s); // column_def
+    read_columns_eof(&mut s);
     let (_seq, pkt) = read_packet(&mut s);
     let v = f64::from_le_bytes(pkt[2..10].try_into().unwrap());
     assert!((v - 3.14159265358979).abs() < 1e-15, "got {v}");
