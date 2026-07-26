@@ -267,6 +267,7 @@ mod e2e_mysqlwire_query;
     clippy::doc_markdown,
     clippy::uninlined_format_args
 )]
+mod e2e_mysqlwire_deprecate_eof_round504;
 mod e2e_mysqlwire_ssl;
 mod e2e_mysqlwire_returning_durability_round181;
 #[allow(

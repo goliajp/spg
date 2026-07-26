@@ -105,6 +105,34 @@ pub(crate) const SERVER_CAPABILITIES: u32 = CLIENT_LONG_PASSWORD
     | CLIENT_DEPRECATE_EOF
     | CLIENT_SSL;
 
+/// v7.39 (round 504) — the capabilities the client ACTUALLY took.
+///
+/// `SERVER_CAPABILITIES` is what we offer; the client answers with the
+/// subset it accepts, and the encoders below must follow the answer. They
+/// used to follow the offer, which is only ever right when every client
+/// accepts everything — and MariaDB's client library does not implement
+/// CLIENT_DEPRECATE_EOF at all. So SPG framed every result set in the
+/// modern form, and a real `mariadb` CLI could not read one: `SELECT 1`
+/// came back as `ERROR 2000 (HY000) Unknown or undefined error code`,
+/// with nothing wrong on the server side to log.
+///
+/// The handshake response was already parsed into `client_capabilities`
+/// and then dropped on the floor. This carries it.
+#[derive(Clone, Copy)]
+pub(crate) struct ClientCaps(u32);
+
+impl ClientCaps {
+    pub(crate) const fn new(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    /// Result sets carry no intermediate EOF and end with an OK packet;
+    /// otherwise both markers are EOF packets.
+    pub(crate) const fn deprecate_eof(self) -> bool {
+        self.0 & CLIENT_DEPRECATE_EOF != 0
+    }
+}
+
 /// utf8mb4 collation id — what MySQL 8.0+ servers advertise by
 /// default.
 const CHARSET_UTF8MB4: u8 = 0xff;
@@ -354,6 +382,7 @@ fn complete_auth_and_command(
         &parsed.username,
         parsed.database.clone().unwrap_or_default(),
         sock,
+        ClientCaps::new(parsed.client_capabilities),
     )
 }
 
@@ -584,6 +613,7 @@ fn command_loop(
     user: &str,
     database: String,
     sock: Option<TcpStream>,
+    caps: ClientCaps,
 ) -> std::io::Result<()> {
     let session_id = conn_id;
     // Install this connection's session and default it to MySQL string
@@ -678,7 +708,7 @@ fn command_loop(
         conn_tx_id,
     };
 
-    run_command_loop(stream, state, session_id, conn_tx_id, &conn_state)
+    run_command_loop(stream, state, session_id, conn_tx_id, &conn_state, caps)
 }
 
 fn run_command_loop(
@@ -687,6 +717,7 @@ fn run_command_loop(
     session_id: u32,
     conn_tx_id: spg_engine::TxId,
     conn_state: &Arc<crate::ConnState>,
+    caps: ClientCaps,
 ) -> std::io::Result<()> {
     let mut prepared = PreparedState::default();
     // v7.39 (round 331, V50) — this connection's `autocommit`. MariaDB
@@ -733,6 +764,7 @@ fn run_command_loop(
                     conn_tx_id,
                     conn_state,
                     &mut autocommit,
+                    caps,
                 )?;
             }
             CMD_PING => {
@@ -774,7 +806,7 @@ fn run_command_loop(
                 }
             }
             CMD_FIELD_LIST => {
-                handle_com_field_list(stream, state, &payload[1..], reply_seqno)?;
+                handle_com_field_list(stream, state, &payload[1..], reply_seqno, caps)?;
             }
             CMD_STMT_PREPARE => {
                 let sql = std::str::from_utf8(&payload[1..]).unwrap_or("").to_string();
@@ -787,6 +819,7 @@ fn run_command_loop(
                     session_id,
                     conn_tx_id,
                     autocommit,
+                    caps,
                 )?;
             }
             CMD_STMT_EXECUTE => {
@@ -800,6 +833,7 @@ fn run_command_loop(
                     conn_tx_id,
                     conn_state,
                     autocommit,
+                    caps,
                 )?;
             }
             CMD_STMT_CLOSE => {
@@ -1033,6 +1067,7 @@ fn handle_com_query(
     conn_tx_id: spg_engine::TxId,
     conn_state: &Arc<crate::ConnState>,
     autocommit: &mut bool,
+    caps: ClientCaps,
 ) -> std::io::Result<()> {
     let _scope = StatementScope::begin(conn_state, sql);
     // v7.39 (round 331, V50) — `SET autocommit=0|1`. The engine stores it
@@ -1100,7 +1135,7 @@ fn handle_com_query(
             )?;
         }
         Ok(QueryResult::Rows { columns, rows }) => {
-            encode_text_result_set(stream, &columns, &rows, start_seqno, status)?;
+            encode_text_result_set(stream, &columns, &rows, start_seqno, status, caps)?;
         }
         // `QueryResult` is `#[non_exhaustive]` — future variants
         // surface as a structured error here until the wire shim
@@ -1131,6 +1166,7 @@ fn handle_com_stmt_prepare(
     session_id: u32,
     conn_tx_id: spg_engine::TxId,
     autocommit: bool,
+    caps: ClientCaps,
 ) -> std::io::Result<()> {
     let status = tx_status(state, conn_tx_id, autocommit);
     let (param_count, columns) = {
@@ -1214,8 +1250,8 @@ fn handle_com_stmt_prepare(
             write_packet(stream, seq, &buf)?;
             seq = seq.wrapping_add(1);
         }
-        // Intermediate marker (CLIENT_DEPRECATE_EOF → OK).
-        write_packet(stream, seq, &encode_ok_packet(status))?;
+        // Marker closing the parameter definitions.
+        write_packet(stream, seq, &encode_result_terminator(caps, status))?;
         seq = seq.wrapping_add(1);
     }
     // ---- result column definitions ----
@@ -1225,7 +1261,8 @@ fn handle_com_stmt_prepare(
             write_packet(stream, seq, &buf)?;
             seq = seq.wrapping_add(1);
         }
-        write_packet(stream, seq, &encode_ok_packet(status))?;
+        // Marker closing the result column definitions.
+        write_packet(stream, seq, &encode_result_terminator(caps, status))?;
     }
     Ok(())
 }
@@ -1240,6 +1277,7 @@ fn handle_com_stmt_execute(
     conn_tx_id: spg_engine::TxId,
     conn_state: &Arc<crate::ConnState>,
     autocommit: bool,
+    caps: ClientCaps,
 ) -> std::io::Result<()> {
     if payload.len() < 9 {
         return write_packet(
@@ -1338,7 +1376,7 @@ fn handle_com_stmt_execute(
         }
         Ok(QueryResult::Rows { columns, rows }) => {
             // v7.17.0 Phase 3.P0-76 — true binary result rows.
-            encode_binary_result_set(stream, &columns, &rows, start_seqno, status)?;
+            encode_binary_result_set(stream, &columns, &rows, start_seqno, status, caps)?;
         }
         Ok(_) => {
             write_packet(
@@ -1363,6 +1401,7 @@ fn encode_binary_result_set(
     rows: &[spg_storage::Row],
     start_seqno: u8,
     status: u16,
+    caps: ClientCaps,
 ) -> std::io::Result<()> {
     // 1) column_count packet.
     let mut payload = Vec::new();
@@ -1376,14 +1415,19 @@ fn encode_binary_result_set(
         write_packet(stream, seq, &buf)?;
         seq = seq.wrapping_add(1);
     }
-    // 3) binary row packets.
+    // 3) the marker closing the column definitions — see the text path.
+    if !caps.deprecate_eof() {
+        write_packet(stream, seq, &encode_eof_packet(status))?;
+        seq = seq.wrapping_add(1);
+    }
+    // 4) binary row packets.
     for row in rows {
         let buf = encode_binary_row(&row.values, columns);
         write_packet(stream, seq, &buf)?;
         seq = seq.wrapping_add(1);
     }
-    // 4) trailing OK — carries the transaction bit, as MariaDB's does.
-    write_packet(stream, seq, &encode_ok_packet(status))?;
+    // 5) trailing marker — carries the transaction bit, as MariaDB's does.
+    write_packet(stream, seq, &encode_result_terminator(caps, status))?;
     Ok(())
 }
 
@@ -1695,6 +1739,7 @@ fn handle_com_field_list(
     state: &Arc<ServerState>,
     payload: &[u8],
     start_seqno: u8,
+    caps: ClientCaps,
 ) -> std::io::Result<()> {
     let nul = payload
         .iter()
@@ -1730,10 +1775,13 @@ fn handle_com_field_list(
         write_packet(stream, seq, &buf)?;
         seq = seq.wrapping_add(1);
     }
-    // CLIENT_DEPRECATE_EOF — trailing OK marker. COM_FIELD_LIST is a
-    // schema probe with no statement behind it; it reports the plain
-    // status, as the handshake does.
-    write_packet(stream, seq, &encode_ok_packet(SERVER_STATUS_AUTOCOMMIT))?;
+    // Trailing marker. COM_FIELD_LIST is a schema probe with no statement
+    // behind it; it reports the plain status, as the handshake does.
+    write_packet(
+        stream,
+        seq,
+        &encode_result_terminator(caps, SERVER_STATUS_AUTOCOMMIT),
+    )?;
     Ok(())
 }
 
@@ -1745,6 +1793,7 @@ fn encode_text_result_set(
     rows: &[spg_storage::Row],
     start_seqno: u8,
     status: u16,
+    caps: ClientCaps,
 ) -> std::io::Result<()> {
     // 1) column_count packet — single length-encoded integer.
     let mut payload = Vec::new();
@@ -1758,17 +1807,22 @@ fn encode_text_result_set(
         write_packet(stream, seq, &buf)?;
         seq = seq.wrapping_add(1);
     }
-    // 3) row packets. CLIENT_DEPRECATE_EOF means we skip the
-    // intermediate EOF marker and just stream rows.
+    // 3) the marker that closes the column definitions. Only a client
+    // that took CLIENT_DEPRECATE_EOF may have it left out; one that did
+    // not is still counting on it to know the rows have started.
+    if !caps.deprecate_eof() {
+        write_packet(stream, seq, &encode_eof_packet(status))?;
+        seq = seq.wrapping_add(1);
+    }
+    // 4) row packets.
     for row in rows {
         let buf = encode_text_row(&row.values, columns);
         write_packet(stream, seq, &buf)?;
         seq = seq.wrapping_add(1);
     }
-    // 4) trailing OK packet (CLIENT_DEPRECATE_EOF replaces the
-    // trailing EOF with OK). status_flags + warnings — the flags
-    // report the transaction state, as MariaDB's terminator does.
-    write_packet(stream, seq, &encode_ok_packet(status))?;
+    // 5) the trailing marker. The flags report the transaction state, as
+    // MariaDB's terminator does.
+    write_packet(stream, seq, &encode_result_terminator(caps, status))?;
     Ok(())
 }
 
@@ -2028,6 +2082,43 @@ pub(crate) fn encode_ok_packet(status: u16) -> Vec<u8> {
     out.extend_from_slice(&status.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // warnings
     out
+}
+
+/// v7.39 (round 504) — EOF packet, protocol-41 shape.
+///   0xfe header + 2-byte warnings(=0) + 2-byte status_flags
+///
+/// Measured off MariaDB 11 answering `SELECT 1` to a client that did not
+/// take CLIENT_DEPRECATE_EOF: `fe 00 00 02 00`, once to close the column
+/// definitions and once to close the rows.
+pub(crate) fn encode_eof_packet(status: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5);
+    out.push(0xfe);
+    out.extend_from_slice(&0u16.to_le_bytes()); // warnings
+    out.extend_from_slice(&status.to_le_bytes());
+    out
+}
+
+/// v7.39 (round 504) — the terminator that CLIENT_DEPRECATE_EOF substitutes
+/// for the trailing EOF: an OK packet whose header is **0xfe**, not 0x00.
+///
+/// The header matters. In the position where this lands a 0x00-headed packet
+/// is a perfectly good ROW whose first column is the empty string, so a
+/// client that took the capability reads the terminator as data and then
+/// runs off the end of the result set. Measured off MariaDB 11 with the
+/// capability taken: `fe 00 00 02 00 00 00`.
+pub(crate) fn encode_ok_eof_packet(status: u16) -> Vec<u8> {
+    let mut out = encode_ok_packet(status);
+    out[0] = 0xfe;
+    out
+}
+
+/// v7.39 (round 504) — the result-set terminator this client can read.
+fn encode_result_terminator(caps: ClientCaps, status: u16) -> Vec<u8> {
+    if caps.deprecate_eof() {
+        encode_ok_eof_packet(status)
+    } else {
+        encode_eof_packet(status)
+    }
 }
 
 // ---- HandshakeV10 packet encode -----------------------------

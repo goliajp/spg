@@ -88,19 +88,23 @@ fn exec(s: &mut TcpStream, sql: &str, ctx: &str) -> usize {
             panic!("[{ctx}] mysql exec failed for {sql:?}: {msg}");
         }
         _ => {
-            // Result set (CLIENT_DEPRECATE_EOF shape): the first
-            // packet is the column count; then exactly N column
-            // defs; then row packets until the trailing OK (0x00,
-            // short). Test values are non-empty so a row packet's
-            // first byte (first cell's lenenc length) is never 0x00.
+            // Result set: the first packet is the column count; then
+            // exactly N column defs; then the marker closing them; then
+            // row packets until the trailing marker.
             let col_count = u64::from(first[0]);
             for _ in 0..col_count {
                 let _ = read_packet(s);
             }
+            // v7.39 (round 504) — this client takes no CLIENT_DEPRECATE_EOF,
+            // so an EOF closes the column definitions and another closes the
+            // rows. SPG used to send neither, having framed against the
+            // capabilities it advertised rather than the ones taken.
+            let (_s, cols_eof) = read_packet(s);
+            assert_eq!(cols_eof[0], 0xfe, "EOF closes the column definitions");
             let mut rows = 0;
             loop {
                 let (_s, p) = read_packet(s);
-                if p[0] == 0x00 && p.len() <= 9 {
+                if p[0] == 0xfe && p.len() <= 9 {
                     return rows;
                 }
                 if p[0] == 0xff {

@@ -197,14 +197,18 @@ fn query_works_over_tls() {
     let (_seq, _cc) = read_packet(&mut tls);
     // column_def
     let (_seq, _col) = read_packet(&mut tls);
+    // v7.39 (round 504) — EOF closing the column definitions; this client
+    // takes no CLIENT_DEPRECATE_EOF.
+    let (_seq, cols_eof) = read_packet(&mut tls);
+    assert_eq!(cols_eof[0], 0xfe, "EOF closes the column definitions");
     // row
     let (_seq, row) = read_packet(&mut tls);
     let n = row[0] as usize; // single-byte lenenc length < 251
     let body = &row[1..1 + n];
     assert_eq!(body, b"tls-roundtrip");
-    // trailing OK
-    let (_seq, ok) = read_packet(&mut tls);
-    assert_eq!(ok[0], 0x00);
+    // trailing EOF
+    let (_seq, eof) = read_packet(&mut tls);
+    assert_eq!(eof[0], 0xfe);
 }
 
 #[test]

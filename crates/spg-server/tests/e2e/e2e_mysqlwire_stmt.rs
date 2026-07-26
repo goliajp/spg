@@ -209,6 +209,9 @@ fn execute_dml_with_int_param_inserts_row() {
     send_query(&mut s, "SELECT id FROM t");
     let (_seq, _cc) = read_packet(&mut s);
     let (_seq, _col) = read_packet(&mut s);
+    // v7.39 (round 504) — EOF closing the column definitions.
+    let (_seq, cols_eof) = read_packet(&mut s);
+    assert_eq!(cols_eof[0], 0xfe, "EOF closes the column definitions");
     let (_seq, row) = read_packet(&mut s);
     let (val, _) = read_lenenc_string(&row, 0);
     assert_eq!(val, b"42");
@@ -230,6 +233,9 @@ fn execute_with_text_param_round_trips() {
     send_query(&mut s, "SELECT s FROM t");
     let (_seq, _cc) = read_packet(&mut s);
     let (_seq, _col) = read_packet(&mut s);
+    // v7.39 (round 504) — EOF closing the column definitions.
+    let (_seq, cols_eof) = read_packet(&mut s);
+    assert_eq!(cols_eof[0], 0xfe, "EOF closes the column definitions");
     let (_seq, row) = read_packet(&mut s);
     let (val, _) = read_lenenc_string(&row, 0);
     assert_eq!(val, b"hello world");
@@ -262,6 +268,9 @@ fn execute_with_null_param_inserts_null() {
     send_query(&mut s, "SELECT id FROM t");
     let (_seq, _cc) = read_packet(&mut s);
     let (_seq, _col) = read_packet(&mut s);
+    // v7.39 (round 504) — EOF closing the column definitions.
+    let (_seq, cols_eof) = read_packet(&mut s);
+    assert_eq!(cols_eof[0], 0xfe, "EOF closes the column definitions");
     let (_seq, row) = read_packet(&mut s);
     assert_eq!(row[0], 0xfb);
     let _ = read_packet(&mut s);

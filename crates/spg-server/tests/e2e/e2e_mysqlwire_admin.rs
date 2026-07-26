@@ -156,8 +156,11 @@ fn com_field_list_returns_column_defs_for_existing_table() {
     let mut col_names = Vec::new();
     loop {
         let (_seq, pkt) = read_packet(&mut s);
-        if pkt[0] == 0x00 {
-            // trailing OK
+        // v7.39 (round 504) — this harness does not take
+        // CLIENT_DEPRECATE_EOF, so COM_FIELD_LIST ends in an EOF packet.
+        // It used to end in an OK because SPG framed against the
+        // capabilities it advertised rather than the ones taken.
+        if pkt[0] == 0xfe && pkt.len() < 9 {
             break;
         }
         // Parse column_def_41 — 5 lenenc strings prefix, name in 5th.
@@ -199,10 +202,13 @@ fn multiple_commands_keep_sequence_aligned() {
     send_query(&mut s, "SELECT 7 AS lucky");
     let (_seq, _cc) = read_packet(&mut s);
     let (_seq, _col) = read_packet(&mut s);
+    let (_seq, cols_eof) = read_packet(&mut s);
+    assert_eq!(cols_eof[0], 0xfe, "EOF closes the column definitions");
     let (_seq, row) = read_packet(&mut s);
     let (val, _) = read_lenenc_string(&row, 0);
     assert_eq!(val, b"7");
-    let (_seq, _trailing) = read_packet(&mut s);
+    let (_seq, trailing) = read_packet(&mut s);
+    assert_eq!(trailing[0], 0xfe, "trailing EOF");
 
     write_packet(&mut s, 0, &[0x0e]);
     let (_seq, ok2) = read_packet(&mut s);
