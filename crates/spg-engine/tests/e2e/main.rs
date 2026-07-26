@@ -100,6 +100,7 @@ mod e2e_temp_persistence_round526;
 mod e2e_unsigned_cast_round527;
 mod e2e_group_by_alias_round528;
 mod e2e_nested_order_distinct_round529;
+mod e2e_correlated_derived_round530;
 mod e2e_unary_plus_round507;
 mod e2e_cardinality_violation;
 mod e2e_casefold;
