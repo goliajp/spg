@@ -7152,7 +7152,21 @@ fn write_bool_chain(f: &mut fmt::Formatter<'_>, e: &Expr, op: BinOp) -> fmt::Res
 #[must_use]
 pub fn pretty_expr(e: &Expr) -> String {
     let mut out = String::new();
-    write_pretty(&mut out, e, PrettyParent::None, false);
+    write_pretty(&mut out, e, PrettyParent::None, false, false);
+    out
+}
+
+/// v7.39 (round 527) — the same deparse, spelling a cast the way MySQL
+/// writes it.
+///
+/// MariaDB names the offending expression in its out-of-range message
+/// and quotes the user's own syntax: `cast(1 as unsigned) - 2`. SPG
+/// answered `1::unsigned - 2` — PG's spelling, in a message going to a
+/// MySQL client, for a cast the client had just written the other way.
+#[must_use]
+pub fn pretty_expr_mysql(e: &Expr) -> String {
+    let mut out = String::new();
+    write_pretty(&mut out, e, PrettyParent::None, false, true);
     out
 }
 
@@ -7317,7 +7331,7 @@ enum PrettyParent {
     Not,
 }
 
-fn write_pretty(out: &mut String, e: &Expr, parent: PrettyParent, is_rhs: bool) {
+fn write_pretty(out: &mut String, e: &Expr, parent: PrettyParent, is_rhs: bool, mysql: bool) {
     let prec = pretty_prec(e);
     let is_unary_sign = matches!(
         e,
@@ -7354,39 +7368,47 @@ fn write_pretty(out: &mut String, e: &Expr, parent: PrettyParent, is_rhs: bool) 
                 | BinOp::Concat => PrettyParent::Arith(prec),
                 _ => PrettyParent::Comparison,
             };
-            write_pretty(out, lhs, child, false);
+            write_pretty(out, lhs, child, false, mysql);
             out.push(' ');
             out.push_str(&alloc::format!("{op}"));
             out.push(' ');
             // AND / OR are associative, so an explicitly right-nested
             // chain still prints as one chain.
             let rhs_is_rhs = !matches!(op, BinOp::And | BinOp::Or);
-            write_pretty(out, rhs, child, rhs_is_rhs);
+            write_pretty(out, rhs, child, rhs_is_rhs, mysql);
         }
         Expr::Unary { op, expr } => match op {
             UnOp::Not => {
                 out.push_str("NOT ");
-                write_pretty(out, expr, PrettyParent::Not, false);
+                write_pretty(out, expr, PrettyParent::Not, false, mysql);
             }
             UnOp::Neg => {
                 out.push_str("- ");
-                write_pretty(out, expr, PrettyParent::Comparison, false);
+                write_pretty(out, expr, PrettyParent::Comparison, false, mysql);
             }
             UnOp::Plus => {
                 out.push_str("+ ");
-                write_pretty(out, expr, PrettyParent::Comparison, false);
+                write_pretty(out, expr, PrettyParent::Comparison, false, mysql);
             }
             UnOp::BitNot => {
                 out.push('~');
-                write_pretty(out, expr, PrettyParent::Comparison, false);
+                write_pretty(out, expr, PrettyParent::Comparison, false, mysql);
             }
         },
         Expr::Cast { expr, target } => {
-            write_pretty(out, expr, PrettyParent::Comparison, false);
-            out.push_str(&alloc::format!("::{target}"));
+            if mysql {
+                // MySQL's own spelling, which is what its error messages
+                // quote back.
+                out.push_str("cast(");
+                write_pretty(out, expr, PrettyParent::None, false, mysql);
+                out.push_str(&alloc::format!(" as {})", target.to_string().to_lowercase()));
+            } else {
+                write_pretty(out, expr, PrettyParent::Comparison, false, mysql);
+                out.push_str(&alloc::format!("::{target}"));
+            }
         }
         Expr::IsNull { expr, negated } => {
-            write_pretty(out, expr, PrettyParent::Comparison, false);
+            write_pretty(out, expr, PrettyParent::Comparison, false, mysql);
             out.push_str(if *negated { " IS NOT NULL" } else { " IS NULL" });
         }
         other => out.push_str(&alloc::format!("{other}")),

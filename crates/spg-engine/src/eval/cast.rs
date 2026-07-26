@@ -271,41 +271,76 @@ fn cast_mysql_binary(v: Value<'static>, name: &str) -> Result<Value<'static>, Ev
 
 /// v7.39 (round 352, M8) — `CAST(x AS SIGNED)` / `CAST(x AS UNSIGNED)`.
 fn cast_mysql_integer(v: Value<'static>, unsigned: bool) -> Result<Value<'static>, EvalError> {
-    let n: f64 = match &v {
-        Value::Null => return Ok(Value::Null),
-        Value::Bool(b) => f64::from(u8::from(*b)),
-        Value::SmallInt(x) => f64::from(*x),
-        Value::Int(x) => f64::from(*x),
-        #[allow(clippy::cast_precision_loss)]
-        Value::BigInt(x) => *x as f64,
-        Value::Float(x) => *x,
-        Value::Real(x) => f64::from(*x),
-        #[allow(clippy::cast_precision_loss)]
-        Value::Numeric { scaled, scale, .. } => {
-            *scaled as f64 / 10_f64.powi(i32::from(*scale))
-        }
-        Value::Text(t) | Value::BpChar(t) => crate::eval::mysql_leading_number(t),
-        other => {
-            return Err(EvalError::TypeMismatch {
-                detail: alloc::format!("cannot cast {:?} to integer", other.data_type()),
-            });
-        }
-    };
-    // Half away from zero, which is what MariaDB does (2.5 → 3, -2.5 → -3).
-    let rounded = if n >= 0.0 { (n + 0.5).floor() } else { (n - 0.5).ceil() };
-    #[allow(clippy::cast_possible_truncation)]
-    let as_i64 = rounded as i64;
-    if unsigned && as_i64 < 0 {
-        // MariaDB wraps through the full u64 range.
-        #[allow(clippy::cast_sign_loss)]
-        let wrapped = as_i64 as u64;
-        return Ok(Value::Numeric {
-            scaled: i128::from(wrapped),
+    // v7.39 (round 527) — an EXACT integer source must not round-trip
+    // through f64. It loses precision above 2^53, and the float→int cast
+    // SATURATES, so `CAST(18446744073709551615 AS UNSIGNED)` answered
+    // 9223372036854775807 — a different number, with nothing to say so.
+    // The value stores, compares and sums correctly at full width
+    // (measured against MariaDB 11); only the cast reduced it.
+    let exact: Option<i128> = match &v {
+        Value::Bool(b) => Some(i128::from(u8::from(*b))),
+        Value::SmallInt(x) => Some(i128::from(*x)),
+        Value::Int(x) => Some(i128::from(*x)),
+        Value::BigInt(x) => Some(i128::from(*x)),
+        Value::Numeric {
+            scaled,
             scale: 0,
             kind: spg_storage::NumericKind::Finite,
+        } => Some(*scaled),
+        _ => None,
+    };
+    let rounded: i128 = match exact {
+        Some(n) => n,
+        None => {
+            let n: f64 = match &v {
+                Value::Null => return Ok(Value::Null),
+                Value::Float(x) => *x,
+                Value::Real(x) => f64::from(*x),
+                #[allow(clippy::cast_precision_loss)]
+                Value::Numeric { scaled, scale, .. } => {
+                    *scaled as f64 / 10_f64.powi(i32::from(*scale))
+                }
+                Value::Text(t) | Value::BpChar(t) => crate::eval::mysql_leading_number(t),
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!("cannot cast {:?} to integer", other.data_type()),
+                    });
+                }
+            };
+            // Half away from zero, which is what MariaDB does
+            // (2.5 → 3, -2.5 → -3).
+            let r = if n >= 0.0 { (n + 0.5).floor() } else { (n - 0.5).ceil() };
+            #[allow(clippy::cast_possible_truncation)]
+            let as_i64 = r as i64;
+            i128::from(as_i64)
+        }
+    };
+    if unsigned {
+        // MariaDB wraps a negative through the full u64 range.
+        let wrapped: u64 = if rounded < 0 {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            {
+                rounded as i64 as u64
+            }
+        } else {
+            u64::try_from(rounded).unwrap_or(u64::MAX)
+        };
+        // Above i64::MAX the value only fits the numeric carrier, which
+        // is the same one a BIGINT UNSIGNED column already uses.
+        return Ok(if wrapped > i64::MAX as u64 {
+            Value::Numeric {
+                scaled: i128::from(wrapped),
+                scale: 0,
+                kind: spg_storage::NumericKind::Finite,
+            }
+        } else {
+            #[allow(clippy::cast_possible_wrap)]
+            Value::BigInt(wrapped as i64)
         });
     }
-    Ok(Value::BigInt(as_i64))
+    Ok(Value::BigInt(
+        i64::try_from(rounded).unwrap_or(if rounded < 0 { i64::MIN } else { i64::MAX }),
+    ))
 }
 
 /// Round a numeric operand (`scaled` × 10^-`scale`) to the nearest
