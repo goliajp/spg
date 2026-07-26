@@ -1871,6 +1871,63 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         // v7.39 (read01 round 57) — the table-privilege gate on the common
         // read core. A superuser session returns from it immediately.
+        // v7.39 (round 529) — resolve an ORDER BY that names an output
+        // ALIAS. The statement-level pass never reached a SELECT nested in
+        // a FROM clause, a CTE or a scalar subquery, so the same query
+        // worked on its own and failed the moment anything wrapped it —
+        // which is what generated SQL does constantly.
+        let aliased;
+        let stmt = if crate::orderby::order_by_names_an_alias(stmt) {
+            let mut s = stmt.clone();
+            crate::orderby::resolve_order_by_position(&mut s);
+            aliased = s;
+            &aliased
+        } else {
+            stmt
+        };
+        // v7.39 (round 529) — DISTINCT ON needs two things it did not have.
+        //
+        // Its keys were evaluated against the PROJECTED row, so a key that
+        // is not in the select list — `SELECT DISTINCT ON (g) v FROM t
+        // ORDER BY g, v DESC`, the canonical "latest row per group" — could
+        // not be read at all and the query failed. PG evaluates them on the
+        // input. They are projected as hidden columns here and stripped
+        // again below, the same way the grouping-set ordering columns
+        // already travel.
+        //
+        // And the dedup ran AFTER the inner statement's LIMIT, so
+        // `… DISTINCT ON (g) … LIMIT 2` on four rows answered ONE row where
+        // PG answers two: the limit had already taken two rows of the same
+        // group before anything deduplicated them. A paginated DISTINCT ON
+        // returned short pages, with no error. The limit is deferred to
+        // after the dedup, which is PG's order.
+        let don_stmt;
+        let (stmt, don_hidden, don_limit) = if stmt.distinct_on.is_empty() {
+            (stmt, 0, (None, None))
+        } else {
+            let mut s = stmt.clone();
+            let hidden = s.distinct_on.len();
+            for (i, e) in stmt.distinct_on.iter().enumerate() {
+                s.items.push(SelectItem::Expr {
+                    expr: e.clone(),
+                    alias: Some(alloc::format!("__distinct_on_{i}")),
+                });
+            }
+            // Only a folded literal is deferred; a placeholder or an
+            // expression keeps the path it has today rather than being
+            // resolved a second way here.
+            let deferrable = matches!(
+                (&s.limit, &s.offset),
+                (None | Some(spg_sql::ast::LimitExpr::Literal(_)), None | Some(spg_sql::ast::LimitExpr::Literal(_)))
+            );
+            let deferred = if deferrable {
+                (s.limit.take(), s.offset.take())
+            } else {
+                (None, None)
+            };
+            don_stmt = s;
+            (&don_stmt, hidden, deferred)
+        };
         self.acl_check_select_as(stmt, as_role)?;
         validate_aggregate_placement(stmt)?;
         validate_locking_clause(stmt)?;
@@ -1892,20 +1949,24 @@ impl Engine {
         let QueryResult::Rows { columns, rows } = result else {
             return Ok(result);
         };
-        let ctx = self.ev_ctx(&columns, None);
+        // The keys are the hidden trailing columns appended above.
+        let key_start = columns.len().saturating_sub(don_hidden);
         let mut seen: alloc::vec::Vec<alloc::vec::Vec<Value<'static>>> = alloc::vec::Vec::new();
         let mut kept: alloc::vec::Vec<Row<'static>> = alloc::vec::Vec::new();
-        for row in rows {
-            let key: alloc::vec::Vec<Value<'static>> = stmt
-                .distinct_on
-                .iter()
-                .map(|e| eval::eval_expr(e, &row, &ctx).map_err(EngineError::Eval))
-                .collect::<Result<_, _>>()?;
-            if !seen.iter().any(|k| k == &key) {
-                seen.push(key);
-                kept.push(row);
+        for mut row in rows {
+            let key: alloc::vec::Vec<Value<'static>> =
+                row.values.get(key_start..).unwrap_or(&[]).to_vec();
+            if seen.iter().any(|k| k == &key) {
+                continue;
             }
+            seen.push(key);
+            row.values.truncate(key_start);
+            kept.push(row);
         }
+        let mut columns = columns;
+        columns.truncate(key_start);
+        // PG limits what DISTINCT ON left, not what fed it.
+        let kept = apply_deferred_limit(kept, &don_limit);
         Ok(QueryResult::Rows {
             columns,
             rows: kept,
@@ -6854,6 +6915,28 @@ pub(crate) fn resolve_projection_column<'a>(
 /// parser to carry per-branch GROUPING() masks into a grouping-set query's
 /// ORDER BY. They must never reach the output. No-op unless such a column is
 /// present, so the common path is untouched.
+/// v7.39 (round 529) — the LIMIT / OFFSET that DISTINCT ON deferred.
+///
+/// PG limits what the dedup LEFT, not what fed it; SPG limited first, so
+/// a `LIMIT 2` that should have answered two groups answered one.
+fn apply_deferred_limit(
+    rows: alloc::vec::Vec<Row<'static>>,
+    deferred: &(Option<spg_sql::ast::LimitExpr>, Option<spg_sql::ast::LimitExpr>),
+) -> alloc::vec::Vec<Row<'static>> {
+    let count = |e: &Option<spg_sql::ast::LimitExpr>| match e {
+        Some(spg_sql::ast::LimitExpr::Literal(n)) => Some(*n as usize),
+        _ => None,
+    };
+    let mut rows = rows;
+    if let Some(off) = count(&deferred.1) {
+        rows = rows.split_off(off.min(rows.len()));
+    }
+    if let Some(lim) = count(&deferred.0) {
+        rows.truncate(lim);
+    }
+    rows
+}
+
 fn strip_synthetic_order_cols(result: QueryResult) -> QueryResult {
     let QueryResult::Rows { columns, rows } = result else {
         return result;
