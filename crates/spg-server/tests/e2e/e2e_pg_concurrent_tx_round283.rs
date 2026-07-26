@@ -474,3 +474,79 @@ fn a_drop_inside_a_transaction_keeps_its_effect_and_spares_the_rest() {
     assert_eq!(query_one(&mut c, "SELECT v FROM keep WHERE id = 1"), Some("99".into()));
     assert!(query_err(&mut c, "SELECT count(*) FROM goes").is_some(), "goes should be gone");
 }
+
+/// v7.39 (round 497) — a sequence's value is not transactional.
+///
+/// PG documents `nextval` as never rolled back, precisely so that two
+/// sessions can never receive the same number. SPG keeps sequences in the
+/// catalog and a transaction works on a catalog CLONE, so both halves
+/// broke — measured over this wire against PG18 (`iso_matrix2`):
+/// `BEGIN; nextval; ROLLBACK; nextval` handed out 2 twice, and a session
+/// inside a transaction and one outside it both received 1. Any SERIAL or
+/// `DEFAULT nextval(…)` column could duplicate under concurrency.
+///
+/// The counter now moves on the committed catalog, and a commit restores
+/// the live counters over the ones its shadow carried from BEGIN.
+#[test]
+fn a_rolled_back_nextval_is_not_handed_out_again() {
+    let (_child, addr) = boot("seq-rollback");
+    let mut a = open(&addr);
+    query_one(&mut a, "CREATE SEQUENCE q");
+    assert_eq!(query_one(&mut a, "SELECT nextval('q')"), Some("1".into()));
+    query_one(&mut a, "BEGIN");
+    assert_eq!(query_one(&mut a, "SELECT nextval('q')"), Some("2".into()));
+    query_one(&mut a, "ROLLBACK");
+    // PG18: 3. Never 2 again.
+    assert_eq!(query_one(&mut a, "SELECT nextval('q')"), Some("3".into()));
+}
+
+#[test]
+fn two_sessions_never_receive_the_same_sequence_value() {
+    let (_child, addr) = boot("seq-dup");
+    let mut a = open(&addr);
+    let mut b = open(&addr);
+    query_one(&mut a, "CREATE SEQUENCE q");
+
+    query_one(&mut a, "BEGIN");
+    let a1 = query_one(&mut a, "SELECT nextval('q')");
+    let b1 = query_one(&mut b, "SELECT nextval('q')");
+    query_one(&mut a, "ROLLBACK");
+    let b2 = query_one(&mut b, "SELECT nextval('q')");
+
+    assert_eq!(a1, Some("1".into()));
+    assert_ne!(a1, b1, "two sessions received the same value");
+    assert_ne!(b1, b2, "a rolled-back value was handed out again");
+    assert_eq!(b1, Some("2".into()));
+    assert_eq!(b2, Some("3".into()));
+}
+
+/// A sequence the transaction CREATES is still transactional — its
+/// DEFINITION rolls back with it, which is also PG.
+#[test]
+fn a_sequence_created_in_a_rolled_back_transaction_does_not_survive() {
+    let (_child, addr) = boot("seq-ddl");
+    let mut a = open(&addr);
+    query_one(&mut a, "BEGIN");
+    query_one(&mut a, "CREATE SEQUENCE made");
+    assert_eq!(query_one(&mut a, "SELECT nextval('made')"), Some("1".into()));
+    query_one(&mut a, "ROLLBACK");
+    assert!(
+        query_err(&mut a, "SELECT nextval('made')").is_some(),
+        "the sequence definition should have rolled back"
+    );
+}
+
+/// And a committed one keeps the value it handed out.
+#[test]
+fn a_sequence_created_and_committed_keeps_its_counter() {
+    let (_child, addr) = boot("seq-ddl-commit");
+    let mut a = open(&addr);
+    query_one(&mut a, "BEGIN");
+    query_one(&mut a, "CREATE SEQUENCE made2");
+    assert_eq!(query_one(&mut a, "SELECT nextval('made2')"), Some("1".into()));
+    assert_eq!(query_one(&mut a, "SELECT nextval('made2')"), Some("2".into()));
+    query_one(&mut a, "COMMIT");
+    assert_eq!(query_one(&mut a, "SELECT nextval('made2')"), Some("3".into()));
+    let mut b = open(&addr);
+    assert_eq!(query_one(&mut b, "SELECT nextval('made2')"), Some("4".into()));
+}

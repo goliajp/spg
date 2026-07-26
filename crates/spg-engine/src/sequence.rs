@@ -529,19 +529,42 @@ impl Engine {
         }
         match op {
             "nextval" => {
-                let v = self
-                    .active_catalog_mut()
-                    .sequence_next_value(&seq_name)
-                    .map_err(EngineError::Storage)?;
+                // v7.39 (round 497) — a sequence's VALUE is not
+                // transactional. PG advances shared state that a rollback
+                // does not give back, precisely so two sessions can never
+                // receive the same number; `nextval` is documented as never
+                // rolled back.
+                //
+                // Going through the transaction's shadow catalog broke both
+                // halves, measured over pgwire against PG18 (`iso_matrix2`):
+                // `BEGIN; nextval; ROLLBACK; nextval` handed out 2 twice,
+                // and a session inside a transaction and one outside it BOTH
+                // received 1. Any SERIAL / `DEFAULT nextval(…)` column could
+                // duplicate under concurrency.
+                //
+                // The committed catalog is the shared state, so that is
+                // where the counter moves. A sequence the transaction itself
+                // CREATED is not there yet and keeps using the shadow — its
+                // definition is still transactional, which is also PG.
+                let v = if self.catalog.has_sequence(&seq_name) {
+                    self.catalog.sequence_next_value(&seq_name)
+                } else {
+                    self.active_catalog_mut().sequence_next_value(&seq_name)
+                }
+                .map_err(EngineError::Storage)?;
                 // Register for lastval().
                 self.last_sequence_used = Some(seq_name.clone());
                 Ok(Value::BigInt(v))
             }
             "currval" => {
-                let v = self
-                    .active_catalog()
-                    .sequence_current_value(&seq_name)
-                    .map_err(EngineError::Storage)?;
+                // Reads the same shared state `nextval` advances, for the
+                // same reason.
+                let v = if self.catalog.has_sequence(&seq_name) {
+                    self.catalog.sequence_current_value(&seq_name)
+                } else {
+                    self.active_catalog().sequence_current_value(&seq_name)
+                }
+                .map_err(EngineError::Storage)?;
                 Ok(Value::BigInt(v))
             }
             "setval" => {
@@ -571,9 +594,14 @@ impl Engine {
                 } else {
                     true
                 };
-                let v = self
-                    .active_catalog_mut()
-                    .sequence_set_value(&seq_name, value, is_called)
+                // Same shared state as `nextval` — PG does not roll setval
+                // back either.
+                let v = if self.catalog.has_sequence(&seq_name) {
+                    self.catalog.sequence_set_value(&seq_name, value, is_called)
+                } else {
+                    self.active_catalog_mut()
+                        .sequence_set_value(&seq_name, value, is_called)
+                }
                     .map_err(EngineError::Storage)?;
                 Ok(Value::BigInt(v))
             }
