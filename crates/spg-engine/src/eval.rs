@@ -292,6 +292,7 @@ impl<'a> EvalContext<'a> {
                 date_order: crate::eval::format::DateOrder::Mdy,
                 interval_style: crate::eval::format::IntervalStyleKind::Postgres,
                 extra_float_digits: 1,
+                bytea_escape: false,
                 mysql: false,
             },
             tz_offset_fn: None,
@@ -436,6 +437,20 @@ impl<'a> EvalContext<'a> {
         self
     }
 
+    /// v7.39 (round 524) — attach a whole session bag at once. Every
+    /// write path needs the same four, and taking them one at a time is
+    /// how three of them ended up with none.
+    #[must_use]
+    pub(crate) fn with_session<'b: 'a>(mut self, s: &'b DmlSession) -> Self {
+        self.session_gucs = Some(&s.gucs);
+        self.users = Some(&s.users);
+        self.render_style = s.render_style;
+        self.tz_offset_fn = s.tz_offset_fn;
+        self.tz_localize_fn = s.tz_localize_fn;
+        self.tz_abbrev_fn = s.tz_abbrev_fn;
+        self
+    }
+
     pub const fn with_session_gucs(
         mut self,
         gucs: &'a alloc::collections::BTreeMap<String, String>,
@@ -541,18 +556,91 @@ pub(crate) fn zone_local_to_utc_with(
 /// column is read in, or `None` when the session is on UTC and no shift
 /// applies.
 #[derive(Debug, Clone)]
-pub(crate) struct SessionZone {
-    pub zone: alloc::string::String,
+pub(crate) struct SessionCoercion {
+    /// The session zone, when it is not UTC. `None` leaves an instant
+    /// where it was.
+    pub zone: Option<alloc::string::String>,
     pub localize: Option<crate::TzLocalizeFn>,
-    /// The session's date order, which the offset detection parses with.
+    /// The session's date order. A written date is ambiguous
+    /// (`01/02/2020`), and this is what resolves it.
     pub order: DateOrder,
 }
 
-impl SessionZone {
-    /// The UTC instant a naive wall-clock reading names in this zone.
+impl SessionCoercion {
+    /// The UTC instant a naive wall-clock reading names in the session
+    /// zone, or `None` when the session is on UTC.
     #[must_use]
     pub(crate) fn wall_to_utc(&self, wall: i64) -> Option<i64> {
-        zone_local_to_utc_with(&self.zone, wall, self.localize)
+        let zone = self.zone.as_ref()?;
+        zone_local_to_utc_with(zone, wall, self.localize)
+    }
+
+    /// v7.39 (round 524) — the session facts an ASSIGNMENT is read
+    /// under, from an evaluation context. `None` when both are the
+    /// defaults and nothing needs re-reading.
+    #[must_use]
+    pub(crate) fn from_ctx(ctx: &EvalContext<'_>) -> Option<Self> {
+        let zone = ctx
+            .session_gucs
+            .and_then(|g| g.get("timezone"))
+            .filter(|z| !z.eq_ignore_ascii_case("utc") && !z.eq_ignore_ascii_case("gmt"))
+            .cloned();
+        let order = ctx.render_style.date_order;
+        if zone.is_none() && order == DateOrder::Mdy {
+            return None;
+        }
+        Some(Self {
+            zone,
+            localize: ctx.tz_localize_fn,
+            order,
+        })
+    }
+}
+
+/// v7.39 (round 524) — the session facts a DML evaluation context needs,
+/// cloned so the row loop can still borrow the engine mutably.
+///
+/// Every write path built a BARE `EvalContext`, so an expression in an
+/// UPDATE's SET or a DELETE's WHERE was evaluated by an engine that knew
+/// nothing about the connection. One value, built once per statement,
+/// and a grep for `dml_session` finds every path that has it.
+pub(crate) struct DmlSession {
+    pub gucs: alloc::collections::BTreeMap<String, String>,
+    pub users: crate::users::UserStore,
+    pub render_style: RenderStyle,
+    pub tz_offset_fn: Option<crate::TzOffsetFn>,
+    pub tz_localize_fn: Option<crate::TzLocalizeFn>,
+    pub tz_abbrev_fn: Option<crate::TzAbbrevFn>,
+}
+
+/// v7.39 (round 524) — read a TEXT value bound for a temporal column
+/// under the session's date order.
+///
+/// `01/02/2020` is February 1st in a DMY session and January 2nd in an
+/// MDY one, and the write path was reading every one of them as MDY: a
+/// `SELECT '01/02/2020'::date` answered PG's value while the same
+/// literal INSERTed stored the day and month swapped. Nothing errors,
+/// and once stored the two readings are indistinguishable.
+#[must_use]
+pub(crate) fn session_read_temporal_text(
+    v: Value<'static>,
+    target: spg_storage::DataType,
+    coercion: Option<&SessionCoercion>,
+) -> Value<'static> {
+    use spg_storage::DataType as D;
+    let Some(c) = coercion else { return v };
+    if c.order == DateOrder::Mdy {
+        return v;
+    }
+    let Value::Text(s) = &v else { return v };
+    match target {
+        D::Date => format::parse_date_literal_ordered(s, c.order).map_or(v, Value::Date),
+        D::Timestamp | D::Timestamptz => {
+            format::parse_timestamp_literal_tz_ordered(s, c.order).map_or(v, |(t, _)| {
+                Value::Timestamp(t)
+            })
+        }
+        _ => v,
     }
 }
 
@@ -2523,6 +2611,10 @@ fn eval_cast_arm(
     // float8out under DateStyle/IntervalStyle/extra_float_digits.
     if matches!(target, CastTarget::Text) {
         match &v {
+            // v7.39 (round 524) — `bytea_out` is a render GUC too.
+            Value::Bytes(b) if ctx.render_style.bytea_escape => {
+                return Ok(Value::text(format::format_bytea_escape(b)));
+            }
             Value::Date(d) => {
                 return Ok(Value::text(format::format_date_styled(
                     *d,

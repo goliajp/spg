@@ -364,7 +364,14 @@ pub fn value_to_text_styled(v: &Value, style: &crate::eval::RenderStyle) -> Stri
         } => crate::eval::format_interval_styled(*months, *days, *micros, style),
         Value::Null => "NULL".into(),
         // v7.10.4 — BYTEA renders as PG hex form.
-        Value::Bytes(b) => format_bytea_hex(b),
+        // v7.39 (round 524) — unless the session asked for `escape`.
+        Value::Bytes(b) => {
+            if style.bytea_escape {
+                crate::eval::format::format_bytea_escape(b)
+            } else {
+                format_bytea_hex(b)
+            }
+        }
         // v7.10.9 — TEXT[] / INT[] / BIGINT[] render PG external form.
         Value::TextArray(items) => format_text_array(items),
         Value::IntArray(items) => format_int_array(items),
