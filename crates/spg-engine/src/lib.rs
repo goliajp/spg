@@ -519,6 +519,21 @@ struct TxState {
     /// against. The per-statement rebase extracts/replays write-sets
     /// only for these (see `maybe_rc_rebase`).
     touched_tables: alloc::collections::BTreeSet<String>,
+    /// v7.39 (round 494) — has anything asked for this shadow catalog
+    /// MUTABLY since BEGIN?
+    ///
+    /// COMMIT installs the shadow over the committed catalog, so a
+    /// transaction that changed nothing must install nothing — otherwise
+    /// it reverts whatever other sessions committed while it was open.
+    /// `touched_tables` cannot answer this: it records DML targets for the
+    /// rebase, and a `SELECT lo_write(…)` classifies read-only while
+    /// mutating (the large-object pins caught exactly that).
+    ///
+    /// Set in `active_catalog_mut`, the single place a `&mut Catalog` is
+    /// handed out. A caller that takes the mutable handle without writing
+    /// merely keeps the old install behaviour, so the flag errs toward
+    /// installing.
+    shadow_dirty: bool,
     /// v7.39 (round 298) — this transaction is in the aborted state.
     ///
     /// Per SLOT. It used to be one flag on the shared `Engine`, guarded
@@ -2434,7 +2449,11 @@ impl Engine {
         let tx = self.current_tx;
         match tx {
             Some(t) => match self.tx_catalogs.get_mut(&t) {
-                Some(s) => &mut s.catalog,
+                Some(s) => {
+                    // v7.39 (round 494) — see `TxState::shadow_dirty`.
+                    s.shadow_dirty = true;
+                    &mut s.catalog
+                }
                 None => &mut self.catalog,
             },
             None => &mut self.catalog,

@@ -290,3 +290,98 @@ fn a_disconnect_mid_transaction_does_not_strand_the_slot() {
     query_one(&mut a, "COMMIT");
     assert_eq!(query_one(&mut a, "SELECT count(*) FROM t"), Some("1".into()));
 }
+
+/// v7.39 (round 494) — a transaction that changed nothing installs nothing.
+///
+/// COMMIT replaces the committed catalog with the transaction's shadow,
+/// and that shadow is a clone taken at BEGIN. Phase E2 folds concurrent
+/// commits back in for READ COMMITTED and Phase E3 merges the write-set
+/// for RR/SERIALIZABLE — but E3 is gated on the transaction having touched
+/// a table, so a READ-ONLY repeatable-read transaction reached the install
+/// and put its stale clone over everything committed since it began.
+///
+/// Measured against PG18 over this same wire: A opens REPEATABLE READ and
+/// reads, B commits an UPDATE, A commits. PG then has B's value for every
+/// session; SPG had the OLD one everywhere — including for B itself and
+/// for connections opened afterwards. B's committed write was gone.
+///
+/// This lives here, next to round 283's slot tests, for the reason that
+/// file already states: the embedded API drives one transaction at a time,
+/// so it cannot pose the question. Round 493 wrote this assertion against
+/// the embedded API, saw it fail with that round's change compiled out,
+/// and withdrew it as a separate question — this is that question.
+#[test]
+fn a_readonly_repeatable_read_commit_does_not_revert_another_connection() {
+    let (_child, addr) = boot("ro-rr");
+    let mut a = open(&addr);
+    let mut b = open(&addr);
+    query_one(&mut a, "CREATE TABLE t (id int primary key, v int)");
+    query_one(&mut a, "INSERT INTO t VALUES (1, 10), (2, 20)");
+
+    query_one(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    assert_eq!(query_one(&mut a, "SELECT v FROM t WHERE id = 1"), Some("10".into()));
+
+    query_one(&mut b, "UPDATE t SET v = 99 WHERE id = 1");
+    query_one(&mut b, "INSERT INTO t VALUES (3, 30)");
+
+    // A's own view stays frozen while it is open — that part always worked,
+    // and it is what makes the clobber below silent.
+    assert_eq!(query_one(&mut a, "SELECT v FROM t WHERE id = 1"), Some("10".into()));
+    assert_eq!(query_one(&mut a, "SELECT count(*) FROM t"), Some("2".into()));
+    query_one(&mut a, "COMMIT");
+
+    // PG18: 99 and 3 rows, for every connection.
+    assert_eq!(query_one(&mut a, "SELECT v FROM t WHERE id = 1"), Some("99".into()));
+    assert_eq!(query_one(&mut a, "SELECT count(*) FROM t"), Some("3".into()));
+    assert_eq!(query_one(&mut b, "SELECT v FROM t WHERE id = 1"), Some("99".into()));
+    let mut c = open(&addr);
+    assert_eq!(query_one(&mut c, "SELECT count(*) FROM t"), Some("3".into()));
+}
+
+/// The same for ROLLBACK, which discards the shadow rather than installing
+/// it — so it was already correct, and stays a witness that the skip did
+/// not change the discarding path.
+#[test]
+fn a_readonly_rollback_leaves_another_connections_commit_alone() {
+    let (_child, addr) = boot("ro-rb");
+    let mut a = open(&addr);
+    let mut b = open(&addr);
+    query_one(&mut a, "CREATE TABLE t (id int primary key, v int)");
+    query_one(&mut a, "INSERT INTO t VALUES (1, 10)");
+    query_one(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    assert_eq!(query_one(&mut a, "SELECT v FROM t WHERE id = 1"), Some("10".into()));
+    query_one(&mut b, "UPDATE t SET v = 77 WHERE id = 1");
+    query_one(&mut a, "ROLLBACK");
+    assert_eq!(query_one(&mut a, "SELECT v FROM t WHERE id = 1"), Some("77".into()));
+}
+
+/// The skip must not swallow a transaction that DID write, nor one whose
+/// only change came through a path the statement classification calls
+/// read-only. `SELECT nextval(…)` is the second kind: the first version of
+/// this fix gated on `touched_tables`, and the large-object pins failed
+/// because `SELECT lo_write(…)` mutates while classifying read-only.
+#[test]
+fn a_transaction_that_did_write_still_installs_its_work() {
+    let (_child, addr) = boot("wrote");
+    let mut a = open(&addr);
+    query_one(&mut a, "CREATE TABLE t (id int primary key, v int)");
+    query_one(&mut a, "INSERT INTO t VALUES (1, 10)");
+    query_one(&mut a, "CREATE SEQUENCE s1");
+
+    query_one(&mut a, "BEGIN");
+    query_one(&mut a, "UPDATE t SET v = 55 WHERE id = 1");
+    query_one(&mut a, "COMMIT");
+    assert_eq!(query_one(&mut a, "SELECT v FROM t WHERE id = 1"), Some("55".into()));
+
+    query_one(&mut a, "BEGIN");
+    query_one(&mut a, "CREATE TABLE made_in_tx (a int)");
+    query_one(&mut a, "COMMIT");
+    query_one(&mut a, "INSERT INTO made_in_tx VALUES (1)");
+    assert_eq!(query_one(&mut a, "SELECT count(*) FROM made_in_tx"), Some("1".into()));
+
+    assert_eq!(query_one(&mut a, "SELECT nextval('s1')"), Some("1".into()));
+    query_one(&mut a, "BEGIN");
+    assert_eq!(query_one(&mut a, "SELECT nextval('s1')"), Some("2".into()));
+    query_one(&mut a, "COMMIT");
+    assert_eq!(query_one(&mut a, "SELECT nextval('s1')"), Some("3".into()));
+}

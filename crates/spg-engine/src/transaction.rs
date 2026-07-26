@@ -439,6 +439,7 @@ impl Engine {
                 savepoints: Vec::new(),
                 cached_snapshot,
                 touched_tables: alloc::collections::BTreeSet::new(),
+                shadow_dirty: false,
                 aborted: false,
                 constraints_deferred: None,
                 constraints_deferred_by_name: alloc::collections::BTreeMap::new(),
@@ -719,7 +720,32 @@ impl Engine {
         // `tx_catalogs` map; from the WAL group commit point of
         // view, this thread is now the leader.
         crate::injection_point!("wal_group_commit_leader_chosen", &tx_id);
-        self.catalog = state.catalog;
+        // v7.39 (round 494) — a transaction that changed nothing installs
+        // nothing.
+        //
+        // COMMIT replaces the committed catalog with this tx's shadow, and
+        // the shadow is a clone taken at BEGIN. Phase E2 folds concurrent
+        // commits back in for READ COMMITTED, and Phase E3 merges the
+        // write-set for RR/SERIALIZABLE — but E3 is gated on the tx having
+        // touched a table, so a READ-ONLY repeatable-read transaction
+        // reached this line and installed its stale clone over everything
+        // committed since it began.
+        //
+        // Measured against PG18 over pgwire: session A opens REPEATABLE
+        // READ and reads; session B commits an UPDATE; A commits. PG has
+        // the new value everywhere afterwards, SPG had the OLD one — for
+        // every session, including B itself and connections opened later.
+        // B's committed write was gone. (Present in the round-490 image
+        // too, so it predates this line of work.)
+        //
+        // The test is `shadow_dirty`, set wherever a `&mut Catalog` is
+        // handed out. The statement classification cannot answer this:
+        // `SELECT lo_write(…)` classifies read-only and mutates, which the
+        // large-object pins caught when this was first written against
+        // `touched_tables`.
+        if state.shadow_dirty {
+            self.catalog = state.catalog;
+        }
         // v7.37.15 Phase C — mark the writer version this tx
         // allocated as committed so subsequent reader snapshots
         // observe the tx's writes. No-op if the registry never
