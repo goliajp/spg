@@ -33,6 +33,16 @@ fn main() {
     let seeded = std::time::Instant::now();
     let sql = match std::env::var("SPG_PROF_SHAPE").as_deref() {
         Ok("scan") => "SELECT g FROM h",
+        // The panel's `big_in`: a 50-literal IN list over the same table.
+        Ok("big_in") => {
+            "SELECT count(*) FROM h WHERE g IN (1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,\
+             31,33,35,37,39,41,43,45,47,49,51,53,55,57,59,61,63,65,67,69,71,73,75,77,79,\
+             81,83,85,87,89,91,93,95,97,99)"
+        }
+        // Same row count, same column, a predicate the round-482 fast
+        // path DOES cover — the contrast that says whether `big_in`'s
+        // cost is the IN set or the machinery around it.
+        Ok("eq") => "SELECT count(*) FROM h WHERE g = 5",
         _ => "SELECT DISTINCT g FROM h ORDER BY g",
     };
     let iters: usize = std::env::var("SPG_PROF_ITERS")
