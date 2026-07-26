@@ -1122,6 +1122,10 @@ fn mysql_unary_arm(
         UnOp::Not if !matches!(v, Value::Bool(_) | Value::Null) => Some(mysql_not(v)),
         // `-'5'` is -5, `-'abc'` is 0.
         UnOp::Neg => mysql_negate_text(op, v),
+        // `+ anything` is that thing: measured on MariaDB 11, `+'x'` is
+        // 'x', `+TRUE` is 1, `+NULL` is NULL. No type check at all, unlike
+        // PG, which refuses every non-numeric operand.
+        UnOp::Plus => Some(Ok(v.clone())),
         // `~5` is the unsigned 64-bit complement; NULL stays NULL (PG path).
         UnOp::BitNot if !matches!(v, Value::Null) => mysql_bit_not(v).map(Ok),
         _ => None,

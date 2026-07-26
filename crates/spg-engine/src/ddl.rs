@@ -5123,6 +5123,7 @@ pub(crate) fn deparse_policy_qual(e: &Expr) -> alloc::string::String {
             match op {
                 UnOp::Not => alloc::format!("(NOT {inner})"),
                 UnOp::Neg => alloc::format!("(-{inner})"),
+                UnOp::Plus => alloc::format!("(+{inner})"),
                 UnOp::BitNot => alloc::format!("(~{inner})"),
             }
         }

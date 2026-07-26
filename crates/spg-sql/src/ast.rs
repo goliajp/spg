@@ -4342,6 +4342,15 @@ pub enum UnOp {
     Neg,
     /// Bitwise NOT `~` on integers.
     BitNot,
+    /// v7.39 (round 507) — unary `+`. SPG had no such operator at all:
+    /// `SELECT +1` parsed only because the lexer reads `+1` as one signed
+    /// literal, so `+ 1`, `+a`, `+(1)` and `1 + +1` were all syntax errors
+    /// while PG18 and MariaDB accept every one of them.
+    ///
+    /// It is not a no-op to drop at parse time — PG refuses it on
+    /// non-numeric operands ("operator does not exist: + boolean"), so the
+    /// operand's type has to be seen at eval.
+    Plus,
 }
 
 // --- Display impls (round-trip-safe) --------------------------------------
@@ -7256,7 +7265,7 @@ fn pretty_prec(e: &Expr) -> u8 {
         },
         Expr::Unary { op, .. } => match op {
             UnOp::Not => 4,
-            UnOp::Neg | UnOp::BitNot => 8,
+            UnOp::Neg | UnOp::BitNot | UnOp::Plus => 8,
         },
         _ => u8::MAX,
     }
@@ -7297,7 +7306,7 @@ fn write_pretty(out: &mut String, e: &Expr, parent: PrettyParent, is_rhs: bool) 
     let is_unary_sign = matches!(
         e,
         Expr::Unary {
-            op: UnOp::Neg | UnOp::BitNot,
+            op: UnOp::Neg | UnOp::BitNot | UnOp::Plus,
             ..
         }
     );
@@ -7345,6 +7354,10 @@ fn write_pretty(out: &mut String, e: &Expr, parent: PrettyParent, is_rhs: bool) 
             }
             UnOp::Neg => {
                 out.push_str("- ");
+                write_pretty(out, expr, PrettyParent::Comparison, false);
+            }
+            UnOp::Plus => {
+                out.push_str("+ ");
                 write_pretty(out, expr, PrettyParent::Comparison, false);
             }
             UnOp::BitNot => {
@@ -7401,6 +7414,7 @@ impl fmt::Display for Expr {
                 UnOp::Not => write!(f, "(NOT {expr})"),
                 // A space after the sign, as PG's deparse writes it.
                 UnOp::Neg => write!(f, "(- {expr})"),
+                UnOp::Plus => write!(f, "(+ {expr})"),
                 UnOp::BitNot => write!(f, "(~{expr})"),
             },
             // The OPERAND carries the parentheses, not the cast:

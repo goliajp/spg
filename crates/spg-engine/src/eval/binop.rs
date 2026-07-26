@@ -103,6 +103,28 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
                 super::strings::pg_typeof_name(&other)
             ),
         }),
+        // v7.39 (round 507) — unary `+` is the identity on a number and
+        // KEEPS its type: measured on PG18, `+1` is integer, `+1.5` is
+        // numeric, `+'2'::bigint` is bigint. It is not a no-op the parser
+        // could have dropped, because PG refuses every other operand —
+        // "operator does not exist: + boolean", and the same for text and
+        // interval, which is why interval is absent here even though unary
+        // MINUS accepts one.
+        (
+            UnOp::Plus,
+            v @ (Value::SmallInt(_)
+            | Value::Int(_)
+            | Value::BigInt(_)
+            | Value::Real(_)
+            | Value::Float(_)
+            | Value::Numeric { .. }),
+        ) => Ok(v),
+        (UnOp::Plus, other) => Err(EvalError::TypeMismatch {
+            detail: format!(
+                "operator does not exist: + {}",
+                super::strings::pg_typeof_name(&other)
+            ),
+        }),
         // v7.38 (read01) — PG `~ int2` is int2, not int4.
         (UnOp::BitNot, Value::SmallInt(n)) => Ok(Value::SmallInt(!n)),
         (UnOp::BitNot, Value::Int(n)) => Ok(Value::Int(!n)),
