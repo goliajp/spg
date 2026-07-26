@@ -104,6 +104,7 @@ mod e2e_correlated_derived_round530;
 mod e2e_create_table_like_round531;
 mod e2e_correlation_into_from_round532;
 mod e2e_update_from_unqualified_round533;
+mod e2e_guc_read_path_round534;
 mod e2e_unary_plus_round507;
 mod e2e_cardinality_violation;
 mod e2e_casefold;

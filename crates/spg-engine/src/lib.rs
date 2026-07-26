@@ -400,6 +400,18 @@ pub type BackendSignalFn = fn(pid: u32, terminate: bool) -> bool;
 /// engine can't read the system zoneinfo directory; spg-tzif is the
 /// std-side implementation). All instants are MICROSECONDS.
 /// UTC offset (µs east) of a zone at a UTC instant; None = unknown zone.
+/// v7.39 (round 534) — the compiled-in default PG18 reports for a
+/// configuration parameter, for the wire's own SHOW shortcut.
+///
+/// The pgwire layer answers `SHOW <name>` from a small canned list
+/// before the statement ever reaches the engine, so it needs the same
+/// inventory the engine reads or the two disagree — which they did:
+/// `SHOW fsync` over the wire returned an empty row.
+#[must_use]
+pub fn pg_guc_boot_value(name: &str) -> Option<&'static str> {
+    crate::guc_catalog::guc_boot_value(name)
+}
+
 pub type TzOffsetFn = fn(&str, i64) -> Option<i64>;
 /// Local wall-clock µs -> UTC µs with PG's DST disambiguation.
 pub type TzLocalizeFn = fn(&str, i64) -> Option<i64>;
