@@ -139,6 +139,26 @@ pub(crate) enum Step {
 
 pub(crate) struct CompiledExpr {
     steps: Vec<Step>,
+    /// Which fast predicate shape this program is — settled once, here,
+    /// instead of re-derived per row. See [`PredShape`].
+    pred_shape: PredShape,
+}
+
+/// v7.39 (round 486) — the shape of a compiled predicate, decided at
+/// compile time.
+///
+/// Round 482 added a `<column> <cmp> <literal>` fast path and this round
+/// added `<column> [NOT] IN (<literals>)`. Both were slice pattern-matches
+/// run PER ROW, so a program that is neither paid for every probe in the
+/// list: adding the second one cost `like_filter` — a shape with no `IN`
+/// anywhere in it — 4.5 %, measured against the previous commit on the same
+/// machine minutes apart. A program's shape does not change between its
+/// rows, so it is settled once and the row loop reads one discriminant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PredShape {
+    Other,
+    ColumnCmpLit,
+    ColumnInSet,
 }
 
 impl CompiledExpr {
@@ -181,6 +201,33 @@ impl CompiledExpr {
             return None;
         }
         Some((*pos, *op, lit))
+    }
+
+    /// v7.39 (round 486) — the sibling shape `<column> [NOT] IN (<literals>)`.
+    ///
+    /// `big_in` is the read panel's worst shape and compiles to exactly two
+    /// steps, `Column` then `InSet`. The round-482 fast path does not cover
+    /// it (three steps, a `Binary`), so it runs the general VM: a `Value`
+    /// built from the cell, popped, and a `Value::Bool` built and popped
+    /// again. Its profile put `drop_glue<Value>` at 20 % and the VM loop at
+    /// 27 %. The set lookup itself wants nothing but a reference to the
+    /// cell.
+    pub(crate) fn as_column_in_set(
+        &self,
+    ) -> Option<(usize, &crate::memoize::InListSet, bool, bool)> {
+        let [
+            Step::Column(pos),
+            Step::InSet {
+                set,
+                has_null,
+                negated,
+                ..
+            },
+        ] = &self.steps[..]
+        else {
+            return None;
+        };
+        Some((*pos, set, *has_null, *negated))
     }
 
     pub(crate) fn as_single_column_length(&self) -> Option<usize> {
@@ -797,7 +844,20 @@ fn is_pure_scalar_function(name: &str) -> bool {
 pub(crate) fn compile_expr(e: &Expr, ctx: &EvalContext<'_>) -> CompiledExpr {
     let mut steps = Vec::new();
     compile_into(e, ctx, &mut steps);
-    CompiledExpr { steps }
+    let mut c = CompiledExpr {
+        steps,
+        pred_shape: PredShape::Other,
+    };
+    // Classified through the very matchers the row loop will use, so the
+    // label and the destructuring cannot disagree.
+    c.pred_shape = if c.as_column_cmp_literal().is_some() {
+        PredShape::ColumnCmpLit
+    } else if c.as_column_in_set().is_some() {
+        PredShape::ColumnInSet
+    } else {
+        PredShape::Other
+    };
+    c
 }
 
 /// Run a compiled program. `stack` is caller-owned scratch
@@ -850,21 +910,43 @@ pub(crate) fn eval_compiled_pred(
     stack: &mut Vec<Value<'static>>,
     mysql: bool,
 ) -> Result<bool, EvalError> {
-    // v7.39 (round 482) — `<column> <cmp> <literal>` compares in place.
-    //
-    // The general path builds three `Value`s a row and drops them; this
-    // one reads both operands by reference and builds only the comparison
-    // result. `apply_binary_by_ref` is the SAME function `Step::Binary`
-    // reaches for first, so the answer is identical by construction rather
-    // than by a second reading of the semantics.
-    if let Some((pos, op, lit)) = c.as_column_cmp_literal() {
-        crate::bump_counter!(STEP_VM_FASTPRED_FIRE);
-        let cell = row.values.get(pos).unwrap_or(&Value::Null);
-        if let Some(res) = super::apply_binary_by_ref(op, cell, lit)? {
-            return crate::eval::predicate_is_true(&res, "WHERE", mysql);
+    // The shape was settled at compile time; the row loop reads one
+    // discriminant instead of re-matching the step list per row.
+    match c.pred_shape {
+        // v7.39 (round 482) — `<column> <cmp> <literal>` compares in place.
+        //
+        // The general path builds three `Value`s a row and drops them;
+        // this one reads both operands by reference and builds only the
+        // comparison result. `apply_binary_by_ref` is the SAME function
+        // `Step::Binary` reaches for first, so the answer is identical by
+        // construction rather than by a second reading of the semantics.
+        PredShape::ColumnCmpLit => {
+            if let Some((pos, op, lit)) = c.as_column_cmp_literal() {
+                crate::bump_counter!(STEP_VM_FASTPRED_FIRE);
+                let cell = row.values.get(pos).unwrap_or(&Value::Null);
+                if let Some(res) = super::apply_binary_by_ref(op, cell, lit)? {
+                    return crate::eval::predicate_is_true(&res, "WHERE", mysql);
+                }
+                // The by-ref form declined (an op that builds an owned
+                // result); fall through rather than answer differently
+                // from the VM.
+            }
         }
-        // The by-ref form declined (an op that builds an owned result);
-        // fall through rather than answer differently from the VM.
+        // v7.39 (round 486) — `<column> [NOT] IN (<literals>)` looks the
+        // cell up in place. Same `in_set_verdict` the `InSet` step calls,
+        // so the answer is identical by construction; a family mismatch
+        // returns None and falls through to the general path, which takes
+        // the step's interpreter fallback.
+        PredShape::ColumnInSet => {
+            if let Some((pos, set, has_null, negated)) = c.as_column_in_set() {
+                let cell = row.values.get(pos).unwrap_or(&Value::Null);
+                if let Some(v) = in_set_verdict(cell, set, has_null, negated) {
+                    crate::bump_counter!(STEP_VM_FASTPRED_FIRE);
+                    return crate::eval::predicate_is_true(&v, "WHERE", mysql);
+                }
+            }
+        }
+        PredShape::Other => {}
     }
     let rowref = crate::join::RowRef::Owned(row);
     let mut local_stack: Vec<Value<'_>> = core::mem::take(stack);
@@ -872,6 +954,52 @@ pub(crate) fn eval_compiled_pred(
         .and_then(|v| crate::eval::predicate_is_true(&v, "WHERE", mysql));
     *stack = recycle_stack(local_stack);
     verdict
+}
+
+/// v7.39 (round 486) — the membership decision `Step::InSet` makes,
+/// restated for the fast predicate below. `None` means the needle's family
+/// does not match the set's, which is the caller's cue to take the
+/// interpreter's coercion path on the whole node.
+///
+/// This is a DELIBERATE DUPLICATE of the `InSet` arm, and the reason is
+/// measured: the first version of this round had the arm call this
+/// function, and that edit alone cost `like_filter` — a shape with no
+/// `IN` anywhere in it — 4.5 %, reproduced against the parent commit on
+/// the same machine minutes apart, and not recovered by `#[inline]`.
+/// Restoring the arm byte-for-byte recovered it. Touching that loop is
+/// expensive in ways the source does not show.
+///
+/// The cost of the duplicate is that the two can drift, so
+/// `e2e_in_set_fast_path_round486` runs every needle × set × negated ×
+/// has-NULL combination down BOTH paths and asserts they agree.
+#[inline]
+fn in_set_verdict(
+    needle: &Value<'_>,
+    set: &crate::memoize::InListSet,
+    has_null: bool,
+    negated: bool,
+) -> Option<Value<'static>> {
+    let contained = match (needle, set) {
+        // Non-empty list + NULL needle → NULL (NOT NULL is still NULL) —
+        // matches the interpreter and eval_with_in_sets.
+        (Value::Null, _) => return Some(Value::Null),
+        (Value::SmallInt(n), crate::memoize::InListSet::Int(s)) => s.contains(&i64::from(*n)),
+        (Value::Int(n), crate::memoize::InListSet::Int(s)) => s.contains(&i64::from(*n)),
+        (Value::BigInt(n), crate::memoize::InListSet::Int(s)) => s.contains(n),
+        (Value::Text(t), crate::memoize::InListSet::Text(s)) => s.contains(t.as_ref()),
+        _ => return None,
+    };
+    let inner = if contained {
+        Value::Bool(true)
+    } else if has_null {
+        Value::Null
+    } else {
+        Value::Bool(false)
+    };
+    Some(match (negated, inner) {
+        (true, Value::Bool(b)) => Value::Bool(!b),
+        (_, v) => v,
+    })
 }
 
 /// Return an emptied stack's allocation with its value lifetime reset.

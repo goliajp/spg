@@ -119,20 +119,29 @@ impl<T> PersistentVec<T> {
     /// the lifetime of `&self`; structural sharing means the borrow is
     /// independent of any other handle that shares the same spine.
     pub fn get(&self, i: usize) -> Option<&T> {
+        let (run, off) = self.run_at(i)?;
+        run.get(off)
+    }
+
+    /// The contiguous run of elements holding index `i`, plus `i`'s offset
+    /// inside it. One trie descent serves the whole run, which is what lets
+    /// `iter` walk a leaf at a time instead of descending per element.
+    ///
+    /// This is `get`'s arithmetic, factored out: the trie region indexes a
+    /// leaf by `i & MASK`, the tail by `i - trie_size`.
+    fn run_at(&self, i: usize) -> Option<(&[T], usize)> {
         if i >= self.len {
             return None;
         }
         let trie_size = self.len - self.tail.len();
         if i >= trie_size {
-            return self.tail.get(i - trie_size);
+            return Some((&self.tail, i - trie_size));
         }
         let mut node: &Arc<Node<T>> = &self.root;
         let mut shift = self.shift;
         loop {
             match &**node {
-                Node::Leaf(elems) => {
-                    return elems.get(i & MASK);
-                }
+                Node::Leaf(elems) => return Some((elems, i & MASK)),
                 Node::Internal(children) => {
                     let sub_idx = (i >> shift) & MASK;
                     node = children.get(sub_idx)?;
@@ -142,12 +151,22 @@ impl<T> PersistentVec<T> {
         }
     }
 
-    /// Sequential iterator. Falls back to repeated `get` (O(N log N) total);
-    /// callers that need a tight inner loop should switch to a hand-rolled
-    /// leaf-batched walk. v4.38 keeps this simple — v4.39 / v4.40 will
-    /// profile and upgrade if iter shows up as the bottleneck.
+    /// Sequential iterator, walking a leaf at a time.
+    ///
+    /// v7.39 (round 486) — this used to call `get` per element, so every
+    /// scan in the engine paid a full trie descent (a chain of `Arc`
+    /// dereferences) for each row it read. The v4.38 comment here said
+    /// "v4.39 / v4.40 will profile and upgrade if iter shows up as the
+    /// bottleneck"; it showed up — `is_row_visible` plus the scan's own
+    /// row reads were 17 % of `big_in`'s profile, both of them descents.
+    /// One descent now serves up to `BRANCH` elements.
     pub fn iter(&self) -> Iter<'_, T> {
-        Iter { pv: self, pos: 0 }
+        Iter {
+            pv: self,
+            pos: 0,
+            run: &[],
+            off: 0,
+        }
     }
 }
 
@@ -407,15 +426,22 @@ fn get_mut_in_trie<T: Clone>(node: &mut Arc<Node<T>>, shift: u32, i: usize) -> O
 pub struct Iter<'a, T> {
     pv: &'a PersistentVec<T>,
     pos: usize,
+    /// The run `pos` currently sits in, and how far into it we are.
+    /// Empty (with `off == 0`) means "descend on the next call".
+    run: &'a [T],
+    off: usize,
 }
 
 impl<'a, T> Iterator for Iter<'a, T> {
     type Item = &'a T;
     fn next(&mut self) -> Option<&'a T> {
-        if self.pos >= self.pv.len {
-            return None;
+        if self.off == self.run.len() {
+            let (run, off) = self.pv.run_at(self.pos)?;
+            self.run = run;
+            self.off = off;
         }
-        let v = self.pv.get(self.pos)?;
+        let v = self.run.get(self.off)?;
+        self.off += 1;
         self.pos += 1;
         Some(v)
     }
@@ -453,6 +479,61 @@ impl<T> PersistentVec<T> {
 )]
 mod tests {
     use super::*;
+
+    /// v7.39 (round 486) — `iter` walks a leaf at a time now instead of
+    /// calling `get` per element. The two must stay indistinguishable, so
+    /// this checks them against each other at every length that puts a
+    /// boundary somewhere interesting: inside the tail, exactly on a leaf
+    /// edge, one past it, and deep enough to need a second trie level.
+    #[test]
+    fn iter_agrees_with_get_at_every_boundary() {
+        for n in [
+            0usize, 1, 2, 31, 32, 33, 63, 64, 65, 1023, 1024, 1025, 1057, 2000,
+        ] {
+            let mut pv: PersistentVec<usize> = PersistentVec::new();
+            for i in 0..n {
+                pv = pv.push(i * 7 + 1);
+            }
+            let by_index: Vec<usize> = (0..n).map(|i| *pv.get(i).unwrap()).collect();
+            let by_iter: Vec<usize> = pv.iter().copied().collect();
+            assert_eq!(by_iter, by_index, "n = {n}");
+            assert_eq!(pv.iter().count(), n, "n = {n}");
+            assert_eq!(pv.iter().len(), n, "ExactSizeIterator, n = {n}");
+        }
+    }
+
+    /// A partially-consumed walk must keep going from where it stopped,
+    /// including across the leaf boundary it is sitting on.
+    #[test]
+    fn iter_resumes_across_a_leaf_boundary() {
+        let mut pv: PersistentVec<usize> = PersistentVec::new();
+        for i in 0..200 {
+            pv = pv.push(i);
+        }
+        let mut it = pv.iter();
+        let head: Vec<usize> = it.by_ref().take(32).copied().collect();
+        assert_eq!(head, (0..32).collect::<Vec<_>>());
+        assert_eq!(it.len(), 168);
+        let tail: Vec<usize> = it.copied().collect();
+        assert_eq!(tail, (32..200).collect::<Vec<_>>());
+    }
+
+    /// The walk reads the handle it was made from, not whatever the
+    /// structural sharing produced later.
+    #[test]
+    fn iter_sees_its_own_handles_contents() {
+        let mut pv: PersistentVec<usize> = PersistentVec::new();
+        for i in 0..40 {
+            pv = pv.push(i);
+        }
+        let older = pv.clone();
+        let newer = pv.push(999).set(0, 111).unwrap();
+        assert_eq!(older.iter().copied().collect::<Vec<_>>(), (0..40).collect::<Vec<_>>());
+        let seen: Vec<usize> = newer.iter().copied().collect();
+        assert_eq!(seen.len(), 41);
+        assert_eq!(seen[0], 111);
+        assert_eq!(seen[40], 999);
+    }
 
     #[test]
     fn empty_vec_is_empty() {

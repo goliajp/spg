@@ -648,6 +648,22 @@ impl Table {
     /// Phase C writers start stamping real `xmin`/`xmax`.
     #[must_use]
     pub fn is_row_visible(&self, idx: usize, snapshot: &crate::snapshot::Snapshot) -> bool {
+        match self.headers.get(idx) {
+            Some(h) => self.header_visible(idx, h, snapshot),
+            None => false,
+        }
+    }
+
+    /// v7.39 (round 486) — the visibility decision once the header is
+    /// already in hand. `scan_visible` walks rows and headers in
+    /// lockstep, so it has the header without paying a second trie
+    /// descent to look it up by index.
+    fn header_visible(
+        &self,
+        idx: usize,
+        h: &crate::row_header::RowHeader,
+        snapshot: &crate::snapshot::Snapshot,
+    ) -> bool {
         // v7.39 (round 297, E3 Phase 1b) — `SKIP LOCKED` rides here so
         // that every row source honours it; see `Snapshot::locked_out`.
         if let Some((rel, set)) = &snapshot.locked_out
@@ -656,10 +672,7 @@ impl Table {
         {
             return false;
         }
-        match self.headers.get(idx) {
-            Some(h) => snapshot.visible(h),
-            None => false,
-        }
+        snapshot.visible(h)
     }
 
     /// v7.37.15 (Phase D) — true iff every row in this table is
@@ -711,10 +724,16 @@ impl Table {
         // LIMIT — reads fewer; the lazy iterator can't report back).
         // Two relaxed atomic adds per SCAN (not per row).
         self.note_seq_scan();
+        // v7.39 (round 486) — headers ride alongside the rows instead of
+        // being looked up by index. `headers.len() == rows.len()` is an
+        // asserted invariant, so the zip drops nothing; an index lookup
+        // costs a trie descent per row, and the walk costs one per leaf.
         self.rows
             .iter()
+            .zip(self.headers.iter())
             .enumerate()
-            .filter(move |(i, _)| self.is_row_visible(*i, snapshot))
+            .filter(move |(i, (_, h))| self.header_visible(*i, h, snapshot))
+            .map(|(i, (r, _))| (i, r))
     }
 
     /// v6.8.0 — exposed for the engine layer to patch
