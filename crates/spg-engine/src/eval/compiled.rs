@@ -147,6 +147,42 @@ impl CompiledExpr {
     /// `Some(pos)` iff this compiled expression is exactly the
     /// single step `ColumnLength { pos }` — i.e. `LENGTH(<column>)`
     /// on a bound text column with no surrounding work.
+    /// v7.39 (round 482) — is this exactly `<column> <cmp> <literal>`?
+    ///
+    /// Rounds 478-481 traced the per-row predicate cost to `Value` churn:
+    /// three steps a row (Column, Lit, Binary) means three `Value`s built
+    /// and destroyed, and `drop_glue<Value>` is an out-of-line call that
+    /// switches on the discriminant even when the value carries no heap.
+    /// Round 481's counter ruled out leftovers on the stack — the churn is
+    /// the VM's ordinary operands.
+    ///
+    /// This shape needs none of them: both operands can be read by
+    /// reference. It covers `g = 5` and `s = '…'`; `LIKE` is its own AST
+    /// node rather than a `BinOp`, so it compiles to a different step and
+    /// is NOT covered here — measured, not assumed.
+    ///
+    /// `BinaryCi` is deliberately not matched: it folds its operands
+    /// first, which is a different comparison. Nor is the mirrored
+    /// `<literal> <cmp> <column>` — flipping the operator is a separate
+    /// judgement and this returns None so it takes the general path.
+    pub(crate) fn as_column_cmp_literal(&self) -> Option<(usize, BinOp, &Value<'static>)> {
+        let [Step::Column(pos), Step::Lit(lit), Step::Binary(op)] = &self.steps[..] else {
+            return None;
+        };
+        if !matches!(
+            op,
+            BinOp::Eq
+                | BinOp::NotEq
+                | BinOp::Lt
+                | BinOp::LtEq
+                | BinOp::Gt
+                | BinOp::GtEq
+        ) {
+            return None;
+        }
+        Some((*pos, *op, lit))
+    }
+
     pub(crate) fn as_single_column_length(&self) -> Option<usize> {
         if self.steps.len() == 1
             && let Step::ColumnLength { pos } = &self.steps[0]
@@ -779,6 +815,22 @@ pub(crate) fn eval_compiled_pred(
     stack: &mut Vec<Value<'static>>,
     mysql: bool,
 ) -> Result<bool, EvalError> {
+    // v7.39 (round 482) — `<column> <cmp> <literal>` compares in place.
+    //
+    // The general path builds three `Value`s a row and drops them; this
+    // one reads both operands by reference and builds only the comparison
+    // result. `apply_binary_by_ref` is the SAME function `Step::Binary`
+    // reaches for first, so the answer is identical by construction rather
+    // than by a second reading of the semantics.
+    if let Some((pos, op, lit)) = c.as_column_cmp_literal() {
+        crate::bump_counter!(STEP_VM_FASTPRED_FIRE);
+        let cell = row.values.get(pos).unwrap_or(&Value::Null);
+        if let Some(res) = super::apply_binary_by_ref(op, cell, lit)? {
+            return crate::eval::predicate_is_true(&res, "WHERE", mysql);
+        }
+        // The by-ref form declined (an op that builds an owned result);
+        // fall through rather than answer differently from the VM.
+    }
     let rowref = crate::join::RowRef::Owned(row);
     let mut local_stack: Vec<Value<'_>> = core::mem::take(stack);
     let verdict = eval_compiled_ref(c, &rowref, ctx, &mut local_stack)
@@ -1343,6 +1395,12 @@ pub static STEP_VM_LIT_HEAP_ALLOC: core::sync::atomic::AtomicU64 =
 /// with a number, so this counts it rather than reasoning about it — the
 /// previous round was spent acting on an inference that turned out to name
 /// an unreachable branch.
+/// v7.39 (round 482) — how often the `<column> <cmp> <literal>` fast
+/// predicate fires, so "is it even reached" is a number and not a guess
+/// (round 480 was spent on a branch that turned out to be unreachable).
+pub static STEP_VM_FASTPRED_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 pub static STEP_VM_STACK_LEFTOVER: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub static STEP_VM_STACK_LEFTOVER_HEAP: core::sync::atomic::AtomicU64 =
