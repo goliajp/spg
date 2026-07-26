@@ -54,6 +54,12 @@ pub struct RenderStyle {
     /// PG default 1: >= 1 means shortest-round-trip output; 0 and
     /// negative trim to 15+n (float8) / 6+n (float4) significant digits.
     pub extra_float_digits: i32,
+    /// v7.39 (round 524) — the session asked for `bytea_output =
+    /// 'escape'`. PG's other bytea form: printable bytes as themselves, a
+    /// backslash doubled, everything else three-digit octal. SPG accepted
+    /// the SET and rendered hex regardless, so a client that asked for
+    /// escape got the form it had just said it did not want.
+    pub bytea_escape: bool,
     /// v7.39 (round 368, M20 P3) — the session is on the MySQL dialect, so
     /// a binary string (`Value::Bytes`, e.g. a `0x…` literal) renders as
     /// its raw bytes read latin-1 (`0x41` → 'A', `CONCAT(0x41,'B')` →
@@ -68,6 +74,7 @@ impl Default for RenderStyle {
             date_order: DateOrder::Mdy,
             interval_style: IntervalStyleKind::Postgres,
             extra_float_digits: 1,
+            bytea_escape: false,
             mysql: false,
         }
     }
@@ -1829,6 +1836,21 @@ pub fn format_interval_array(items: &[Option<spg_storage::IntervalSpan>]) -> Str
 /// v7.10.4 — render a BYTEA payload in PG's hex output format
 /// (`\x` prefix, lowercase hex pairs). Public so the wire layer
 /// can emit the canonical bytea-as-text representation.
+/// v7.39 (round 524) — PG's `escape` bytea form: a printable byte as
+/// itself, a backslash doubled, everything else `\ooo` octal.
+#[must_use]
+pub fn format_bytea_escape(b: &[u8]) -> String {
+    let mut out = String::with_capacity(b.len());
+    for &byte in b {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(byte as char),
+            _ => out.push_str(&alloc::format!("\\{byte:03o}")),
+        }
+    }
+    out
+}
+
 pub fn format_bytea_hex(b: &[u8]) -> String {
     let mut out = String::with_capacity(2 + 2 * b.len());
     out.push_str("\\x");

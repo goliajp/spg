@@ -293,7 +293,9 @@ impl Engine {
         };
         let is_render_guc = matches!(
             key.as_str(),
-            "datestyle" | "intervalstyle" | "extra_float_digits"
+            // v7.39 (round 524) — `bytea_output` joins them: it was
+            // accepted and never read.
+            "datestyle" | "intervalstyle" | "extra_float_digits" | "bytea_output"
         );
         self.session_params.insert(key, normalised);
         if is_render_guc {
@@ -320,6 +322,9 @@ impl Engine {
             && let Ok(n) = efd.trim().parse::<i32>()
         {
             style.extra_float_digits = n;
+        }
+        if let Some(bo) = self.session_param("bytea_output") {
+            style.bytea_escape = bo.trim().eq_ignore_ascii_case("escape");
         }
         self.render_style = style;
     }
@@ -499,22 +504,43 @@ impl Engine {
             .unwrap_or(0)
     }
 
-    /// v7.39 (round 523) — the session zone an assignment into a
-    /// timestamptz column is read in, or `None` when the session is on
-    /// UTC and no shift applies.
+    /// v7.39 (round 524) — the session, cloned for a write path's
+    /// evaluation context. See [`crate::eval::DmlSession`].
+    pub(crate) fn dml_session(&self) -> crate::eval::DmlSession {
+        crate::eval::DmlSession {
+            gucs: self.session_params.clone(),
+            users: self.users.clone(),
+            render_style: self.render_style,
+            tz_offset_fn: self.tz_offset_fn,
+            tz_localize_fn: self.tz_localize_fn,
+            tz_abbrev_fn: self.tz_abbrev_fn,
+        }
+    }
+
+    /// v7.39 (round 523) — the session facts an assignment into a
+    /// column is read under: the zone a naive timestamp names a
+    /// wall-clock reading in, and the order an ambiguous date is read
+    /// with. `None` when both are the defaults.
     ///
     /// The INSERT path evaluates VALUES through a context-free literal
-    /// walker with no `EvalContext`, so it takes the zone as an argument
+    /// walker with no `EvalContext`, so it takes these as an argument
     /// the way it already takes the dialect.
-    pub(crate) fn session_zone_for_assignment(&self) -> Option<crate::eval::SessionZone> {
-        let zone = self.session_params.get("timezone")?;
-        if zone.eq_ignore_ascii_case("utc") || zone.eq_ignore_ascii_case("gmt") {
+    /// v7.39 (round 524) — the date order joined it: the same
+    /// context-free walker read every written date as MDY.
+    pub(crate) fn session_coercion(&self) -> Option<crate::eval::SessionCoercion> {
+        let zone = self
+            .session_params
+            .get("timezone")
+            .filter(|z| !z.eq_ignore_ascii_case("utc") && !z.eq_ignore_ascii_case("gmt"))
+            .cloned();
+        let order = self.render_style.date_order;
+        if zone.is_none() && order == crate::eval::DateOrder::Mdy {
             return None;
         }
-        Some(crate::eval::SessionZone {
-            zone: zone.clone(),
+        Some(crate::eval::SessionCoercion {
+            zone,
             localize: self.tz_localize_fn,
-            order: self.render_style.date_order,
+            order,
         })
     }
 

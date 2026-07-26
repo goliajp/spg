@@ -1136,7 +1136,12 @@ impl Engine {
                         && t.has_cold_rows_fast()
                         && t.count_cold_locators() > 0
                     {
-                        let ctx = eval::EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())));
+                        // v7.39 (round 524) — the cold-row scan evaluates the
+                        // same predicate as the hot path and must read the
+                        // same session.
+                        let cold_sess = self.dml_session();
+                        let ctx = eval::EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())))
+                            .with_session(&cold_sess);
                         for (key, row) in
                             crate::constraints::iter_cold_rows_with_pk_key(self.active_catalog(), t)
                         {
@@ -1238,9 +1243,27 @@ impl Engine {
             ));
         }
         let schema_cols = schema_cols;
+        // v7.39 (round 524) — with the SESSION. This context was bare, so
+        // every expression in an UPDATE's SET and WHERE was evaluated by
+        // an engine that knew nothing about the connection:
+        //
+        //   SELECT current_user                        -> unmei
+        //   UPDATE w SET a = current_user              -> writes `admin`
+        //   UPDATE w SET b = current_setting('app…')   -> writes empty
+        //   UPDATE w SET … WHERE current_setting(…)=x  -> matches nothing
+        //
+        // The last one is the worst: an update gated on a request-context
+        // GUC — the shape RLS policies and multi-tenant code are written
+        // in — silently updated zero rows. Nothing errored in any of them.
+        //
+        // Cloned rather than borrowed because the row loop below needs
+        // `self` mutably; a session bag is small and this is once per
+        // statement.
+        let sess = self.dml_session();
         let ctx = EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())))
             .with_default_text_search_config(ts_cfg.as_deref())
-            .with_catalog(&cat_for_ctx);
+            .with_catalog(&cat_for_ctx)
+            .with_session(&sess);
         // Walk candidate rows, evaluate WHERE then SET
         // expressions. We gather (position, new_values) tuples
         // first and apply them afterwards so the WHERE/RHS
@@ -1365,9 +1388,27 @@ impl Engine {
                     &schema_cols[*pos],
                     Some(&cat_for_ctx),
                 )?;
-                let coerced = coerce_value(v, schema_cols[*pos].ty, &schema_cols[*pos].name, *pos)?;
-                let coerced = crate::conversions::truncate_to_column_fsp(coerced, &schema_cols[*pos]);
-                check_unsigned_range(&coerced, &schema_cols[*pos], *pos)?;
+                // v7.39 (round 524) — an UPDATE assigns under the same
+                // session rules an INSERT does: an ambiguous date is read
+                // in the session's order, and a naive value bound for a
+                // timestamptz column is a wall-clock reading in the
+                // session zone. Round 523 gave INSERT both and left this
+                // path measuring the same way it always had.
+                let sc = crate::eval::SessionCoercion::from_ctx(&ctx);
+                let col = &schema_cols[*pos];
+                let v = crate::eval::session_read_temporal_text(v, col.ty, sc.as_ref());
+                let coerced = coerce_value(v, col.ty, &col.name, *pos)?;
+                let coerced = localize_assignment_to_tstz(
+                    coerced,
+                    col,
+                    expr_names_an_instant(
+                        expr,
+                        sc.as_ref().map_or(crate::eval::DateOrder::Mdy, |c| c.order),
+                    ),
+                    sc.as_ref(),
+                );
+                let coerced = crate::conversions::truncate_to_column_fsp(coerced, col);
+                check_unsigned_range(&coerced, col, *pos)?;
                 new_vals[*pos] = coerced;
             }
             // v7.17.0 Phase 2.1 — apply ON UPDATE overrides for
@@ -2961,7 +3002,12 @@ impl Engine {
                         && t.has_cold_rows_fast()
                         && t.count_cold_locators() > 0
                     {
-                        let ctx = eval::EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())));
+                        // v7.39 (round 524) — the cold-row scan evaluates the
+                        // same predicate as the hot path and must read the
+                        // same session.
+                        let cold_sess = self.dml_session();
+                        let ctx = eval::EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())))
+                            .with_session(&cold_sess);
                         for (key, row) in
                             crate::constraints::iter_cold_rows_with_pk_key(self.active_catalog(), t)
                         {
@@ -3022,9 +3068,12 @@ impl Engine {
             let schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
             // v7.39 (read01 round 54) — carry the catalog (see above).
             let cat_for_ctx = self.active_catalog().clone();
+            // v7.39 (round 524) — with the session, like UPDATE's.
+            let sess = self.dml_session();
             let ctx = EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())))
                 .with_default_text_search_config(ts_cfg.as_deref())
-                .with_catalog(&cat_for_ctx);
+                .with_catalog(&cat_for_ctx)
+                .with_session(&sess);
             // v7.37.16 (gate-on inventory) — visibility gate, same as
             // the main walk below: a tombstoned version must not be
             // re-targeted. No-op under gate-off.
@@ -3074,6 +3123,9 @@ impl Engine {
         } else {
             None
         };
+        // v7.39 (round 524) — with the session: `DELETE … WHERE
+        // current_setting('app.tenant') = …` matched nothing.
+        let sess = self.dml_session();
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -3101,7 +3153,8 @@ impl Engine {
         let schema_cols = schema_cols;
         let ctx = EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())))
             .with_default_text_search_config(ts_cfg.as_deref())
-            .with_catalog(&cat_for_ctx);
+            .with_catalog(&cat_for_ctx)
+            .with_session(&sess);
         let mut positions: Vec<usize> = Vec::new();
         // v7.6.3 — collect every to-delete row's full Value tuple
         // alongside its position, so the FK enforcement pass can
@@ -4235,7 +4288,7 @@ impl Engine {
         let insert_non_strict = insert_mysql && !self.mysql_strict;
         // v7.39 (round 523) — read BEFORE the table borrow: the zone lives
         // in the session params, and `table` borrows self mutably.
-        let session_zone = self.session_zone_for_assignment();
+        let session_zone = self.session_coercion();
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -6087,7 +6140,7 @@ fn localize_assignment_to_tstz(
     v: Value<'static>,
     col: &ColumnSchema,
     src_names_an_instant: bool,
-    zone: Option<&crate::eval::SessionZone>,
+    zone: Option<&crate::eval::SessionCoercion>,
 ) -> Value<'static> {
     if src_names_an_instant || col.ty != DataType::Timestamptz {
         return v;
@@ -6142,7 +6195,7 @@ fn parse_insert_rows(
     // argument like the other session facts above. Without it, `SET
     // TimeZone = 'Asia/Tokyo'` followed by an INSERT of a naive timestamp
     // stored an instant nine hours from the one PG stores.
-    session_zone: Option<&crate::eval::SessionZone>,
+    session_zone: Option<&crate::eval::SessionCoercion>,
 ) -> Result<Vec<Vec<Value<'static>>>, EngineError> {
     use spg_sql::ast::Overriding;
     // v7.39 (round 523) — the session's date order, which the
@@ -6371,6 +6424,7 @@ fn parse_insert_rows(
                 } else {
                     raw
                 };
+                let raw = crate::eval::session_read_temporal_text(raw, col.ty, session_zone);
                 let coerced = coerce_value(raw, col.ty, &col.name, i)?;
                 let coerced = localize_assignment_to_tstz(
                     coerced,
@@ -6458,6 +6512,8 @@ fn parse_insert_rows(
                 } else {
                     raw
                 };
+                let raw = crate::eval::session_read_temporal_text(raw, col.ty, session_zone);
+                let raw = crate::eval::session_read_temporal_text(raw, col.ty, session_zone);
                 let coerced = coerce_value(raw, col.ty, &col.name, i)?;
                 let coerced = localize_assignment_to_tstz(coerced, col, src_is_tstz, session_zone);
                 enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
