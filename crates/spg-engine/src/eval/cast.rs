@@ -71,6 +71,36 @@ fn cast_reg_misc(kind: &str, s: &str) -> Result<Value<'static>, EvalError> {
                 })
             }
         }
+        // v7.39 (round 513) — `regcollation`. PG lowercases an UNQUOTED
+        // identifier before it looks, which is why `'C'::regcollation` is
+        // "collation \"c\" for encoding \"UTF8\" does not exist" there while
+        // `'\"C\"'::regcollation` resolves — measured, and the reason the
+        // quoted form is the one anybody writes. The rendering keeps the
+        // quotes PG puts back on a name that needs them.
+        "regcollation" => {
+            let quoted = bare.starts_with('"') && bare.ends_with('"') && bare.len() >= 2;
+            let name = if quoted {
+                bare[1..bare.len() - 1].to_string()
+            } else {
+                bare.to_ascii_lowercase()
+            };
+            const COLLATIONS: &[&str] = &["C", "POSIX", "default", "ucs_basic"];
+            match COLLATIONS.iter().find(|c| **c == name) {
+                // PG re-quotes anything that is not a plain lowercase word.
+                Some(c) => Ok(Value::text(if c.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_')
+                    && *c != "default"
+                {
+                    (*c).to_string()
+                } else {
+                    alloc::format!("\"{c}\"")
+                })),
+                None => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "collation \"{name}\" for encoding \"UTF8\" does not exist"
+                    ),
+                }),
+            }
+        }
         "regdictionary" => {
             if bare == "simple" || bare.ends_with("_stem") {
                 Ok(Value::text(bare))
@@ -686,7 +716,7 @@ pub fn cast_value_in(
                 let lower_name = name.to_ascii_lowercase();
                 match lower_name.as_str() {
                     "regproc" | "regprocedure" | "regoper" | "regoperator" | "regconfig"
-                    | "regdictionary" => {
+                    | "regdictionary" | "regcollation" => {
                         let s = match &v {
                             Value::Null => return Ok(Value::Null),
                             Value::Text(s) => s.as_ref().trim().to_string(),
@@ -978,6 +1008,9 @@ pub(crate) fn builtin_target_resolves(name: &str, mysql: bool) -> bool {
     if matches!(
         lower.as_str(),
         "tid"
+            | "regcollation"
+            | "regnamespace"
+            | "regrole"
             | "record"
             | "cstring"
             | "anyarray"

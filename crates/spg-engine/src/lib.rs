@@ -1469,6 +1469,14 @@ impl Engine {
         }
     }
 
+    /// v7.39 (round 513) — does this role exist? `'x'::regrole` needs it,
+    /// and roles live on the engine rather than the catalog.
+    #[must_use]
+    pub fn role_exists(&self, name: &str) -> bool {
+        // The engine's default identity exists even before any CREATE USER.
+        self.users.contains(name) || name.eq_ignore_ascii_case("admin")
+    }
+
     /// v7.37.15 (Phase B / C / E) — current per-row visibility
     /// snapshot for in-engine scans. Captures the live writer-
     /// version cursor + active-writer set; readers built from this
