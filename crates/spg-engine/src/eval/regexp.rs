@@ -2199,9 +2199,12 @@ pub(super) fn substring_pattern(text: &str, pat: &str) -> Result<Value<'static>,
 /// v7.17.0 Phase 3.7 — `regexp_split_to_array(s, pat)`. Returns
 /// TEXT[] of the pieces between matches.
 pub(super) fn regexp_split_to_array(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
-    if args.len() != 2 {
+    // v7.39 (round 510) — PG's third argument is the flag string every other
+    // regexp function here already takes; only the two-argument form
+    // existed, so `regexp_split_to_array(s, p, 'i')` was an arity error.
+    if args.len() != 2 && args.len() != 3 {
         return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("regexp_split_to_array() takes 2 args, got {}", args.len()),
+            detail: alloc::format!("regexp_split_to_array() takes 2-3 args, got {}", args.len()),
         });
     }
     let text = text_arg(&args[0])?;
@@ -2212,7 +2215,10 @@ pub(super) fn regexp_split_to_array(args: &[Value<'_>]) -> Result<Value<'static>
     let Some(pat) = pat else {
         return Ok(Value::Null);
     };
-    let node = re_compile(&pat)?;
+    let mut node = re_compile(&pat)?;
+    if flags_have_i(args, 2)? {
+        fold_case(&mut node);
+    }
     let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<Option<String>> = Vec::new();
     let mut piece_start = 0usize;

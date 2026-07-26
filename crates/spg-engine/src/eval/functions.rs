@@ -247,6 +247,86 @@ fn viewdef_detokenize(s: &str) -> String {
     s.replace("count_star()", "count(*)")
 }
 
+/// v7.39 (round 510) — `random(min, max)`: a uniform draw from the CLOSED
+/// range, answering in the operands' own type.
+///
+/// Measured on PG18: `pg_typeof(random(1,1))` is integer, bigint for bigint
+/// operands and numeric for numeric ones; `random(1,1)` is 1, so both ends
+/// are included; and `random(10,1)` is "lower bound must be less than or
+/// equal to upper bound".
+fn random_in_range(lo: &Value<'_>, hi: &Value<'_>) -> Result<Value<'static>, EvalError> {
+    if matches!(lo, Value::Null) || matches!(hi, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let bounds_err = || EvalError::TypeMismatch {
+        detail: "lower bound must be less than or equal to upper bound".into(),
+    };
+    // An inclusive draw over `[a, b]`, taken on the widest integer so the
+    // full bigint range works without overflowing the span.
+    let draw = |a: i64, b: i64| -> Result<i64, EvalError> {
+        if a > b {
+            return Err(bounds_err());
+        }
+        let span = (b as i128) - (a as i128) + 1;
+        let pick = (super::math::prng_next_u64() as u128) % (span as u128);
+        Ok(((a as i128) + pick as i128) as i64)
+    };
+    match (lo, hi) {
+        (Value::SmallInt(a), Value::SmallInt(b)) => {
+            draw(i64::from(*a), i64::from(*b)).map(|v| Value::SmallInt(v as i16))
+        }
+        (Value::Int(a), Value::Int(b)) => draw(i64::from(*a), i64::from(*b))
+            .map(|v| Value::Int(v as i32)),
+        (Value::BigInt(a), Value::BigInt(b)) => draw(*a, *b).map(Value::BigInt),
+        // Mixed integer widths widen to bigint, as arithmetic on them does.
+        (
+            Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_),
+            Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_),
+        ) => {
+            let as_i64 = |v: &Value<'_>| match v {
+                Value::SmallInt(n) => i64::from(*n),
+                Value::Int(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                _ => unreachable!(),
+            };
+            draw(as_i64(lo), as_i64(hi)).map(Value::BigInt)
+        }
+        // Numeric draws on the finer of the two scales, so `random(2.5, 2.5)`
+        // answers 2.5 rather than an integer.
+        (
+            Value::Numeric { scaled: a, scale: sa, kind: ka },
+            Value::Numeric { scaled: b, scale: sb, kind: kb },
+        ) => {
+            use spg_storage::NumericKind as NK;
+            if !matches!(ka, NK::Finite) || !matches!(kb, NK::Finite) {
+                return Err(EvalError::TypeMismatch {
+                    detail: "random() bounds must be finite".into(),
+                });
+            }
+            let scale = (*sa).max(*sb);
+            let up = |v: i128, from: u16| v * 10i128.pow(u32::from(scale - from));
+            let (a, b) = (up(*a, *sa), up(*b, *sb));
+            if a > b {
+                return Err(bounds_err());
+            }
+            let span = (b - a + 1) as u128;
+            let pick = (super::math::prng_next_u64() as u128) % span;
+            Ok(Value::Numeric {
+                scaled: a + pick as i128,
+                scale,
+                kind: NK::Finite,
+            })
+        }
+        (a, b) => Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "random() bounds must be int or numeric, got {:?} and {:?}",
+                a.data_type(),
+                b.data_type()
+            ),
+        }),
+    }
+}
+
 pub(super) fn apply_function(
     name: &str,
     args: &[Value<'_>],
@@ -891,6 +971,35 @@ fn apply_function_dispatch(
         // v7.22 (round-13) — char_length / character_length are the
         // SQL-standard spellings PG accepts everywhere; pg_dump
         // CHECK predicates carry them verbatim.
+        // v7.39 (round 510) — `length(bytea, encoding)` reads the bytes in
+        // the named encoding and counts CHARACTERS, which is why it takes an
+        // encoding at all. SPG stores text as UTF-8 and only accepts UTF-8
+        // here; another encoding name says so rather than counting wrong.
+        "length" if args.len() == 2 => match (&args[0], &args[1]) {
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (Value::Bytes(b), enc) => {
+                let enc_name = crate::eval::value_to_text(enc);
+                if !enc_name.eq_ignore_ascii_case("UTF8")
+                    && !enc_name.eq_ignore_ascii_case("UTF-8")
+                {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!("length(): encoding {enc_name:?} is not supported"),
+                    });
+                }
+                match core::str::from_utf8(b) {
+                    Ok(t) => Ok(Value::Int(t.chars().count() as i32)),
+                    Err(_) => Err(EvalError::TypeMismatch {
+                        detail: "invalid byte sequence for encoding \"UTF8\"".into(),
+                    }),
+                }
+            }
+            (other, _) => Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "length() with an encoding takes bytea, got {:?}",
+                    other.data_type()
+                ),
+            }),
+        },
         "length" | "char_length" | "character_length" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
@@ -3290,6 +3399,29 @@ fn apply_function_dispatch(
                 ("ishorizontal", Value::Lseg(a, b)) => Ok(Value::Bool(a.y == b.y)),
                 (n, v) => Err(EvalError::TypeMismatch {
                     detail: alloc::format!("{n}() not defined for {:?}", v.data_type()),
+                }),
+            }
+        }
+        // v7.39 (round 510) — the two-POINT spellings. PG carries both:
+        // `isvertical(lseg)` and `isvertical(point, point)`, and likewise for
+        // horizontal, parallel and perpendicular over two lsegs. Only the
+        // one-argument forms existed here. Comparisons use PG's geometric
+        // EPSILON, as the one-argument forms and `slope` do.
+        "isvertical" | "ishorizontal" if args.len() == 2 => {
+            const EPS: f64 = 1.0e-6;
+            match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Point(a), Value::Point(b)) => Ok(Value::Bool(if name == "isvertical" {
+                    (a.x - b.x).abs() <= EPS
+                } else {
+                    (a.y - b.y).abs() <= EPS
+                })),
+                (a, b) => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "{name}() takes two points, got {:?} and {:?}",
+                        a.data_type(),
+                        b.data_type()
+                    ),
                 }),
             }
         }
@@ -9357,10 +9489,16 @@ fn apply_function_dispatch(
         // even within the same statement. Backed by a xorshift64*
         // PRNG with a process-static seed; not cryptographically
         // secure (use a cryptographic source for security tokens).
+        // v7.39 (round 510) — PG18 added `random(min, max)`, drawing
+        // uniformly from a CLOSED range and answering in the operands' own
+        // type: integer, bigint or numeric. Only the zero-argument form
+        // existed here, so the two-argument spelling — the one an
+        // application reaches for — was "random() takes 0 args, got 2".
+        "random" if args.len() == 2 => random_in_range(&args[0], &args[1]),
         "random" => {
             if !args.is_empty() {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("random() takes 0 args, got {}", args.len()),
+                    detail: alloc::format!("random() takes 0 or 2 args, got {}", args.len()),
                 });
             }
             Ok(Value::Float(prng_next_f64()))
@@ -10273,16 +10411,42 @@ fn apply_function_dispatch(
         // (`uuidv7_monotonic`) keeps successive UUIDs strictly ordered
         // within a millisecond and across a backward clock step.
         "uuidv7" | "uuid_generate_v7" | "gen_uuid_v7" => {
-            if !args.is_empty() {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("{name}() takes 0 args, got {}", args.len()),
-                });
-            }
+            // v7.39 (round 510) — `uuidv7(shift interval)` offsets the
+            // embedded timestamp, which is how PG18 lets a caller mint an
+            // id ordered as of another moment. A NULL shift is NULL.
+            let shift_us: i64 = match args.len() {
+                0 => 0,
+                1 => match &args[0] {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Interval { months, days, micros } => {
+                        // Months are calendar-relative; PG's own shift is
+                        // applied to a millisecond clock, so approximate the
+                        // month and day parts the same way its interval →
+                        // µs conversion does.
+                        micros
+                            .saturating_add(i64::from(*days) * 86_400_000_000)
+                            .saturating_add(i64::from(*months) * 30 * 86_400_000_000)
+                    }
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "{name}() shift must be an interval, got {:?}",
+                                other.data_type()
+                            ),
+                        });
+                    }
+                },
+                n => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!("{name}() takes 0 or 1 args, got {n}"),
+                    });
+                }
+            };
             const ANCHOR_MS: u64 = 1_577_836_800_000;
             let rand_b = super::math::prng_next_u64();
             let base_ms = match ctx.clock {
-                Some(f) => (f().max(0) as u64) / 1000,
-                None => ANCHOR_MS,
+                Some(f) => ((f().saturating_add(shift_us)).max(0) as u64) / 1000,
+                None => (ANCHOR_MS as i64).saturating_add(shift_us / 1000).max(0) as u64,
             };
             let (ts, counter) = super::math::uuidv7_monotonic(base_ms);
             let mut b = [0u8; 16];
