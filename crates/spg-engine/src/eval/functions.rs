@@ -16849,14 +16849,10 @@ fn apply_function_dispatch(
             )
         }
         "shobj_description" => Ok(Value::Null),
-        // acldefault(objtype, owner_oid) — the default ACL for an
-        // object type, PG text form '{owner=privs/owner}'. SPG's
-        // single-role model maps every oid to 'admin'
-        // (pg_get_userbyid parity). Privilege strings per PG:
-        //   r relation=arwdDxt  s sequence=rwU  f function=X
-        //   d database=CTc     n schema=UC     L language=U
-        //   t tablespace=C     T type=U        F FDW=U
-        //   S server=U
+        // acldefault(objtype, owner_oid) — the ACL an object of that
+        // type has when nobody has granted anything, in PG's text form.
+        // Every privilege string below is a PG18 reading, and the
+        // owner's name comes from the oid, as `pg_get_userbyid` does.
         "acldefault" => {
             if args.len() != 2 {
                 return Err(EvalError::TypeMismatch {
@@ -16866,9 +16862,16 @@ fn apply_function_dispatch(
                     ),
                 });
             }
+            // v7.39 (round 522) — this REJECTED the type it documents.
+            // PG declares the parameter `"char"`, so `acldefault('r'::"char",
+            // 10)` is the canonical call and the only one psql's own
+            // introspection makes; SPG accepted TEXT and errored on a
+            // Char1 with "objtype must be \"char\"", which is what it had
+            // just been handed.
             let objtype = match &args[0] {
                 Value::Null => return Ok(Value::Null),
                 Value::Text(s) => s.as_ref().to_string(),
+                Value::Char1(c) => alloc::string::String::from(char::from(*c)),
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
@@ -16878,20 +16881,45 @@ fn apply_function_dispatch(
                     });
                 }
             };
-            if matches!(args[1], Value::Null) {
-                return Ok(Value::Null);
-            }
-            let privs = match objtype.as_str() {
-                "r" => "arwdDxt",
-                "s" => "rwU",
-                "f" => "X",
-                "d" => "CTc",
-                "n" => "UC",
-                "L" => "U",
-                "t" => "C",
-                "T" => "U",
-                "F" => "U",
-                "S" => "U",
+            let owner_oid = match &args[1] {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => i64::from(*n),
+                Value::BigInt(n) => *n,
+                other => {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "acldefault() owner must be an oid, got {:?}",
+                            other.data_type()
+                        ),
+                    });
+                }
+            };
+            // Measured against PG18 for every object type it accepts.
+            // Two readings the old table had wrong: `L` is a LARGE
+            // OBJECT (`rw`), not a language — the language code is
+            // lowercase `l` — and a relation carries `m` (MAINTAIN),
+            // which PG 17 added and nothing here had.
+            //
+            // The second element is what PUBLIC gets by default, and
+            // four types grant it something. Dropping it made
+            // `acldefault('f', …)` claim an EXECUTE-restricted function
+            // where PG grants execute to the world.
+            let (owner_privs, public_privs) = match objtype.as_str() {
+                "r" => ("arwdDxtm", ""),
+                "s" => ("rwU", ""),
+                "f" => ("X", "X"),
+                "d" => ("CTc", "Tc"),
+                "n" => ("UC", ""),
+                "l" => ("U", "U"),
+                "L" => ("rw", ""),
+                "t" => ("C", ""),
+                "T" => ("U", "U"),
+                "F" => ("U", ""),
+                "S" => ("U", ""),
+                "p" => ("sA", ""),
+                // A column's default is genuinely empty — it inherits
+                // whatever the table grants.
+                "c" => ("", ""),
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
@@ -16900,9 +16928,25 @@ fn apply_function_dispatch(
                     });
                 }
             };
-            Ok(Value::TextArray(alloc::vec![Some(alloc::format!(
-                "admin={privs}/admin"
-            ))]))
+            if owner_privs.is_empty() {
+                return Ok(Value::TextArray(alloc::vec![]));
+            }
+            // An oid that names no role renders as the NUMBER, both as
+            // grantee and as grantor (measured: `acldefault('r', 999)`
+            // → `{999=arwdDxtm/999}`). The old arm ignored the argument
+            // and said `admin` whoever was asked about.
+            let owner = ctx
+                .engine
+                .and_then(|e| e.role_name_for_oid(owner_oid))
+                .unwrap_or_else(|| alloc::format!("{owner_oid}"));
+            let mut items = alloc::vec![];
+            if !public_privs.is_empty() {
+                // PUBLIC is the empty name before the `=`, and it comes
+                // first.
+                items.push(Some(alloc::format!("={public_privs}/{owner}")));
+            }
+            items.push(Some(alloc::format!("{owner}={owner_privs}/{owner}")));
+            Ok(Value::TextArray(items))
         }
         // makeaclitem(grantee_oid, grantor_oid, privileges, grantable)
         // — construct one aclitem in PG's text form. Grantee oid 0 =

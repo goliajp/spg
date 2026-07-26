@@ -763,6 +763,24 @@ fn function_return_shape(
             });
             (ty, true)
         }
+        // v7.39 (round 522) — PG's `date_add` / `date_subtract` are
+        // declared over timestamptz and answer timestamptz; the parser
+        // writes the coercion PG performs, so the first argument carries
+        // the answer. MySQL's DATE_ADD gets no such cast and keeps its
+        // own DATE / DATETIME result.
+        "date_add" | "date_subtract" => {
+            // Only the PG-dialect form is typed here — the one whose
+            // first argument the parser lifted to timestamptz. MySQL's
+            // DATE_ADD gets no such cast and keeps the typing it had.
+            let src = args.first()?;
+            if !matches!(
+                describe_expr(src, schema_cols).map(|s| s.ty),
+                Some(DataType::Timestamptz)
+            ) {
+                return None;
+            }
+            (DataType::Timestamptz, true)
+        }
         "from_unixtime" => {
             if args.len() >= 2 {
                 (DataType::Text, true)

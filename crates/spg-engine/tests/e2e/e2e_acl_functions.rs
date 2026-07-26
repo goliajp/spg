@@ -30,17 +30,24 @@ fn text_array(v: &spg_storage::Value<'_>) -> Vec<Option<String>> {
 #[test]
 fn acldefault_per_object_type() {
     let mut e = Engine::new();
+    // v7.39 (round 522) — these three asserted SPG's own output: no
+    // MAINTAIN privilege, no PUBLIC entry, and `admin` as the owner of
+    // whatever oid was asked about. Every value here is a PG18 reading
+    // with owner oid 10, which SPG publishes as `postgres`.
     assert_eq!(
         text_array(&first(&mut e, "SELECT acldefault('r', 10)")),
-        vec![Some("admin=arwdDxt/admin".to_string())]
+        vec![Some("postgres=arwdDxtm/postgres".to_string())]
     );
     assert_eq!(
         text_array(&first(&mut e, "SELECT acldefault('f', 10)")),
-        vec![Some("admin=X/admin".to_string())]
+        vec![
+            Some("=X/postgres".to_string()),
+            Some("postgres=X/postgres".to_string())
+        ]
     );
     assert_eq!(
         text_array(&first(&mut e, "SELECT acldefault('n', 10)")),
-        vec![Some("admin=UC/admin".to_string())]
+        vec![Some("postgres=UC/postgres".to_string())]
     );
     // Unknown object type errors.
     assert!(e.execute("SELECT acldefault('z', 10)").is_err());

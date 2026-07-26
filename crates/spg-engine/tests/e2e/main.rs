@@ -91,6 +91,8 @@ mod e2e_constant_answers_round518;
 mod e2e_relation_sizes_round519;
 mod e2e_constant_answers_round520;
 mod e2e_expectation_audit_round521;
+mod e2e_recorded_divergences_round522;
+mod e2e_session_in_catalog_scan_round522;
 mod e2e_unary_plus_round507;
 mod e2e_cardinality_violation;
 mod e2e_casefold;

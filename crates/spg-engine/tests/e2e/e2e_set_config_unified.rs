@@ -31,13 +31,18 @@ fn set_config_writes_and_unifies_all_read_paths() {
         scalar(&mut e, "SELECT current_setting('work_mem')").as_deref(),
         Some("128MB")
     );
+    // v7.39 (round 522) — the read paths agree, and PG spells the answer
+    // two ways: SHOW and current_setting give the human form while
+    // `pg_settings.setting` gives the bare count of the row's unit.
+    // Measured: `set_config('work_mem','128MB')` → setting `131072`, kB.
+    // This asserted `128MB` here, which was SPG's own spelling.
     assert_eq!(
         scalar(
             &mut e,
             "SELECT setting FROM pg_settings WHERE name = 'work_mem'"
         )
         .as_deref(),
-        Some("128MB")
+        Some("131072")
     );
     // A custom namespaced GUC set via set_config is visible via SHOW's
     // dotted-name form and current_setting.

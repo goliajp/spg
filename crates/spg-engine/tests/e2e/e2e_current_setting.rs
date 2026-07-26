@@ -248,7 +248,9 @@ fn pg_settings_has_full_17_column_shape() {
             "pending_restart",
         ]
     );
-    // vartype is annotated (work_mem is integer even though shown as "4MB").
+    // v7.39 (round 522) — `vartype` says integer and `setting` reads
+    // `4096`, which is the same claim twice. It used to read `4MB` here,
+    // and the comment recorded the contradiction as if it were intended.
     assert_eq!(
         text(&first(
             &mut e,
@@ -277,7 +279,9 @@ fn pg_settings_has_full_17_column_shape() {
             &mut e,
             "SELECT boot_val FROM pg_settings WHERE name = 'work_mem'"
         )),
-        "4MB"
+        // Raw, in the unit the row names — measured on PG18, where it
+        // stays 4096 across a SET.
+        "4096"
     );
 }
 
