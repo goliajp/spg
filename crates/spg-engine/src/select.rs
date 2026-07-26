@@ -4894,6 +4894,26 @@ impl Engine {
             })
             .collect();
         let any_scalarsq_fast = scalarsq_fast.iter().any(Option::is_some);
+        // v7.39 (round 487) — a projection item that is a bare column
+        // reference binds its position ONCE per query.
+        //
+        // Per row it used to walk `eval_expr_with_correlated` (a memo
+        // lookup for "does this have a subquery", then an un-memoised
+        // `expr_may_use_in_set` tree walk), then `eval_expr`'s dispatch,
+        // then `resolve_column`, which finds the column by scanning the
+        // schema and comparing NAMES. On `SELECT g FROM h` that chain was
+        // 19 % of self time for what is ultimately one cell read.
+        //
+        // `compile_column_pos` is the Step VM's resolver, already
+        // `pub(crate)` and already reused by the aggregate's bind-once
+        // path: it mirrors `resolve_column`'s happy layers and returns
+        // None for anything that would reach an error, an ambiguity, or a
+        // miss, so those still go the interpreter's way and keep its
+        // exact message. A composite column is excluded for the same
+        // reason `compile_into` excludes it — it must be rehydrated from
+        // stored JSON, which is not a cell read.
+        let proj_direct = bind_direct_columns(&projection, &ctx);
+        let any_proj_direct = proj_direct.iter().any(Option::is_some);
         // v7.39 (read01 round 80) — positional ORDER BY over a WILDCARD
         // projection. Statement prep (`resolve_order_by_position`) can only map
         // `ORDER BY 1` onto the first SELECT item when that item is an
@@ -5021,6 +5041,14 @@ impl Engine {
                     // `eval_expr_with_correlated` framework.
                     if any_scalarsq_fast && let Some(fp) = &scalarsq_fast[i] {
                         values.push(self.probe_with_pk_fast_path(fp, row));
+                        continue;
+                    }
+                    // v7.39 (round 487) — bound column: read the cell.
+                    // This is `rehydrate_cell`'s body for a non-composite
+                    // column, which is what the whole chain below reduces
+                    // to once the name has been resolved.
+                    if any_proj_direct && let Some(pos) = proj_direct[i] {
+                        values.push(row.values[pos].clone().into_owned());
                         continue;
                     }
                     // v7.24 (round-16 B) — correlated-aware.
@@ -6667,6 +6695,37 @@ fn strip_synthetic_order_cols(result: QueryResult) -> QueryResult {
         columns: new_cols,
         rows: new_rows,
     }
+}
+
+/// v7.39 (round 487) — bind every projection item that is a bare column
+/// reference to its position, once per query.
+///
+/// `#[inline(never)]` and out of line on purpose. Round 486 established
+/// that adding code inside these scan bodies moves neighbouring hot
+/// functions around under fat LTO: the first version of this had the loop
+/// inline in `run_single_table_scan` and four aggregate shapes that never
+/// touch that function — `full_agg`, `join_agg`, `group_500k`,
+/// `filter_agg` — went up ~5 %, reproduced against the parent commit on
+/// the same machine. Keeping it out of line kept them still.
+#[inline(never)]
+fn bind_direct_columns(
+    projection: &[ProjectedItem],
+    ctx: &eval::EvalContext<'_>,
+) -> Vec<Option<usize>> {
+    projection
+        .iter()
+        .map(|p| match &p.expr {
+            Expr::Column(c) => eval::compile_column_pos(c, ctx).filter(|pos| {
+                // Same exclusion `compile_into` makes: a composite column
+                // has to be rehydrated from stored JSON, which is not a
+                // cell read.
+                ctx.columns
+                    .get(*pos)
+                    .is_none_or(|sc| sc.user_composite_type.is_none())
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(crate) fn build_projection(
