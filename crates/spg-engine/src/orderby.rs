@@ -688,6 +688,37 @@ fn implicit_output_label(e: &Expr) -> Option<&str> {
     }
 }
 
+/// v7.39 (round 529) — does an ORDER BY key name a SELECT-list alias
+/// that has not been substituted yet?
+///
+/// `resolve_order_by_position` runs once per STATEMENT, so a SELECT
+/// nested in a FROM clause, a CTE or a scalar subquery never got it:
+/// `SELECT * FROM (SELECT v AS w FROM t ORDER BY w) z` answered
+/// `column "w" does not exist` while the same SELECT run on its own
+/// worked. Ordinals and real columns were fine either way — only the
+/// alias needed the pass.
+///
+/// The test is deliberately narrow so the nested path pays nothing for
+/// the ordinary query: a statement that has already been resolved no
+/// longer has a bare alias in its ORDER BY, so it answers false.
+#[must_use]
+pub(crate) fn order_by_names_an_alias(s: &SelectStatement) -> bool {
+    s.order_by.iter().any(|o| match &o.expr {
+        Expr::Column(c) if c.qualifier.is_none() => s.items.iter().any(|it| {
+            matches!(
+                it,
+                SelectItem::Expr { expr, alias: Some(a) }
+                    // A SET-returning item is named, not substituted —
+                    // round 80's rule, and re-substituting the expression
+                    // here would undo it and make the sort a no-op again.
+                    if a.eq_ignore_ascii_case(&c.name)
+                        && !crate::select::expr_contains_builtin_srf(expr)
+            )
+        }),
+        _ => false,
+    })
+}
+
 pub(crate) fn resolve_order_by_position(s: &mut SelectStatement) {
     // v6.4.0 — iterate every ORDER BY key. Position references
     // (`ORDER BY 2`) bind to the 1-based projection index;
