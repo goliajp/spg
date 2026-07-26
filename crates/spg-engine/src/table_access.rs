@@ -329,7 +329,13 @@ impl Engine {
         // `pg_class JOIN pg_index … WHERE indrelid = 't'::regclass` errored on
         // "comparison between BigInt and Text" while the same predicate on a
         // bare single-table SELECT worked.
-        let ctx = EvalContext::new(&cols, Some(alias)).with_catalog(self.active_catalog());
+        // v7.39 (round 525) — and the session. A WHERE pushed down to the
+        // scan is the same predicate the caller wrote, so it needs what
+        // the caller's context has.
+        let scan_sess = self.dml_session();
+        let ctx = EvalContext::new(&cols, Some(alias))
+            .with_catalog(self.active_catalog())
+            .with_session(&scan_sess);
         let mut out: Vec<Row<'static>> = Vec::new();
         let push_if =
             |row: &Row<'static>, out: &mut Vec<Row<'static>>| -> Result<(), EngineError> {
@@ -536,7 +542,11 @@ impl Engine {
                 _ => {}
             }
         }
-        let ctx = EvalContext::new(cols, Some(alias)).with_catalog(self.active_catalog());
+        // v7.39 (round 525) — and the session, as above.
+        let scan_sess = self.dml_session();
+        let ctx = EvalContext::new(cols, Some(alias))
+            .with_catalog(self.active_catalog())
+            .with_session(&scan_sess);
         let keep = |row: &Row<'static>| -> Result<bool, EngineError> {
             for (i, p) in preds.iter().enumerate() {
                 // The pred that seeded the index seek is already proven

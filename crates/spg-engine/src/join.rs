@@ -926,7 +926,15 @@ impl Engine {
         // errored on "comparison between BigInt and Text" — while the very
         // same predicate worked on a single-table SELECT (whose ctx does carry
         // the catalog). Same root as round 49's unnest(enum_range(…)).
-        let ctx = EvalContext::new(&combined_schema, None).with_catalog(self.active_catalog());
+        // v7.39 (round 525) — and the SESSION, for the same reason as the
+        // catalog above: a join's WHERE is the same predicate a
+        // single-table SELECT would carry, and `WHERE t =
+        // current_setting('app.tenant')` failed on the joined shape while
+        // working on the unjoined one.
+        let join_sess = self.dml_session();
+        let ctx = EvalContext::new(&combined_schema, None)
+            .with_catalog(self.active_catalog())
+            .with_session(&join_sess);
         if joined.is_empty() {
             // Joinless FROM: the primary rows ARE the combined rows —
             // filter and hand them back without any re-clone.
@@ -2306,7 +2314,15 @@ impl Engine {
         // errored on "comparison between BigInt and Text" — while the very
         // same predicate worked on a single-table SELECT (whose ctx does carry
         // the catalog). Same root as round 49's unnest(enum_range(…)).
-        let ctx = EvalContext::new(&combined_schema, None).with_catalog(self.active_catalog());
+        // v7.39 (round 525) — and the SESSION, for the same reason as the
+        // catalog above: a join's WHERE is the same predicate a
+        // single-table SELECT would carry, and `WHERE t =
+        // current_setting('app.tenant')` failed on the joined shape while
+        // working on the unjoined one.
+        let join_sess = self.dml_session();
+        let ctx = EvalContext::new(&combined_schema, None)
+            .with_catalog(self.active_catalog())
+            .with_session(&join_sess);
         let left_arity = primary_cols.len();
         let mut eq_pairs: Vec<(usize, usize)> = Vec::new();
         let mut residual: Vec<&Expr> = Vec::new();
@@ -2677,7 +2693,15 @@ impl Engine {
         // errored on "comparison between BigInt and Text" — while the very
         // same predicate worked on a single-table SELECT (whose ctx does carry
         // the catalog). Same root as round 49's unnest(enum_range(…)).
-        let ctx = EvalContext::new(&combined_schema, None).with_catalog(self.active_catalog());
+        // v7.39 (round 525) — and the SESSION, for the same reason as the
+        // catalog above: a join's WHERE is the same predicate a
+        // single-table SELECT would carry, and `WHERE t =
+        // current_setting('app.tenant')` failed on the joined shape while
+        // working on the unjoined one.
+        let join_sess = self.dml_session();
+        let ctx = EvalContext::new(&combined_schema, None)
+            .with_catalog(self.active_catalog())
+            .with_session(&join_sess);
         // Hash-joinable left = right equality pairs from ON; anything
         // else stays as a residual conjunct on the candidate row.
         let left_arity = primary_cols.len();

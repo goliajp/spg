@@ -992,7 +992,7 @@ impl Engine {
         // without DEFAULT errors when the table has existing
         // rows — same as PG.
         let fill_value: Value<'static> = if has_default || col_schema.runtime_default.is_some() {
-            resolve_column_default_free(&col_schema, clock)?
+            resolve_column_default_free(&col_schema, clock, None)?
         } else if nullable || row_count == 0 {
             Value::Null
         } else {
@@ -2322,7 +2322,7 @@ impl Engine {
             let col_schema = column_def_to_schema(col_def, self.backslash_escapes)?;
             let fill_value: Value<'static> = if has_default || col_schema.runtime_default.is_some()
             {
-                resolve_column_default_free(&col_schema, clock)?
+                resolve_column_default_free(&col_schema, clock, None)?
             } else if nullable || row_count == 0 {
                 Value::Null
             } else {
@@ -4939,9 +4939,11 @@ fn truncate_ident(name: &mut String) {
 pub(crate) fn resolve_column_default_free(
     col: &ColumnSchema,
     clock_fn: Option<ClockFn>,
+    // v7.39 (round 525) — the session, for a DEFAULT that names one.
+    sess: Option<&crate::eval::DmlSession>,
 ) -> Result<Value<'static>, EngineError> {
     if let Some(rt) = &col.runtime_default {
-        return eval_runtime_default_free(rt, col.ty, clock_fn);
+        return eval_runtime_default_free(rt, col.ty, clock_fn, sess);
     }
     Ok(col.default.clone().unwrap_or(Value::Null))
 }
@@ -4950,6 +4952,7 @@ pub(crate) fn eval_runtime_default_free(
     rt: &str,
     ty: DataType,
     clock_fn: Option<ClockFn>,
+    sess: Option<&crate::eval::DmlSession>,
 ) -> Result<Value<'static>, EngineError> {
     let s = rt.trim().to_ascii_lowercase();
     // v7.17.0 Phase 2.1 — also strip `(N)` precision suffix
@@ -4981,14 +4984,26 @@ pub(crate) fn eval_runtime_default_free(
         // INSERT evaluates the function fresh; the per-row UUID
         // is the storage value, not a cached literal.
         "gen_random_uuid" | "uuid_generate_v4" => Value::Uuid(eval::gen_random_uuid_bytes()),
-        other => {
-            return Err(EngineError::Unsupported(alloc::format!(
-                "runtime DEFAULT expression {other:?} not supported \
-                 (v7.17.0 whitelist: now() / current_timestamp / \
-                 current_date / current_time / localtimestamp / \
-                 localtime / gen_random_uuid() / \
-                 uuid_generate_v4())"
-            )));
+        // v7.39 (round 525) — anything else is EVALUATED, not refused.
+        // PG takes any expression as a DEFAULT; the eight names above are
+        // a fast path that skips a parse per row, and this was the whole
+        // list SPG accepted — `DEFAULT current_setting('app.tenant')`,
+        // `DEFAULT upper(…)`, `DEFAULT 2 * 3` all failed the INSERT.
+        _ => {
+            let expr = spg_sql::parser::parse_expression(rt).map_err(|e| {
+                EngineError::Unsupported(alloc::format!(
+                    "runtime DEFAULT expression {rt:?} does not parse: {e}"
+                ))
+            })?;
+            let no_cols: [ColumnSchema; 0] = [];
+            let mut ctx = eval::EvalContext::new(&no_cols, None);
+            if let Some(sv) = sess {
+                ctx = ctx.with_session(sv);
+            }
+            let row = spg_storage::Row::new(alloc::vec::Vec::new());
+            let v = eval::eval_expr(&expr, &row, &ctx)
+                .map_err(|e| EngineError::Eval(e))?;
+            return coerce_value(v, ty, "DEFAULT", 0);
         }
     };
     coerce_value(v, ty, "DEFAULT", 0)
