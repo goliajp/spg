@@ -91,7 +91,21 @@ pub(crate) fn classify_stmt_for_tx(stmt: &spg_sql::ast::Statement) -> TxStmtClas
         // merged-away rows. Poison until MERGE DELETE is inplace-ified
         // (recorded residual).
         S::Merge(_) => TxStmtClass::Other,
-        S::ShowTables
+        // v7.39 (round 495) — the SET family is SESSION state, not catalog
+        // data, so it cannot invalidate a write-set replay and must not
+        // poison the rebase.
+        //
+        // It used to fall to the catch-all below, and the consequence was
+        // measured: `BEGIN ISOLATION LEVEL REPEATABLE READ; SET …; UPDATE
+        // …; COMMIT` skipped the Phase E3 merge and installed its shadow
+        // wholesale, deleting whatever another session had committed
+        // meanwhile — the round-494 defect reached through a different
+        // gate. PG18 keeps both writes (`iso_matrix` M5).
+        S::SetParameter { .. }
+        | S::SetParameterList(_)
+        | S::SetUserVars(_)
+        | S::SetRole(_)
+        | S::ShowTables
         | S::ShowDatabases
         | S::ShowCreateTable { .. }
         | S::ShowIndexes { .. }

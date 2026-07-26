@@ -385,3 +385,35 @@ fn a_transaction_that_did_write_still_installs_its_work() {
     query_one(&mut a, "COMMIT");
     assert_eq!(query_one(&mut a, "SELECT nextval('s1')"), Some("3".into()));
 }
+
+/// v7.39 (round 495) — `SET` inside a transaction must not cost another
+/// session its committed write.
+///
+/// Round 494 closed the read-only gate into the wholesale shadow install.
+/// The same install has a second gate: `rebase_poisoned`, set by any
+/// statement the classifier does not recognise as DML — and `SET` fell
+/// into that catch-all. So `BEGIN ISOLATION LEVEL REPEATABLE READ; SET …;
+/// UPDATE …; COMMIT` skipped the Phase E3 merge and reverted whatever had
+/// been committed meanwhile. PG18 keeps both writes.
+///
+/// The SET family is session state, not catalog data, so it cannot
+/// invalidate a write-set replay and no longer poisons.
+#[test]
+fn a_set_inside_a_transaction_does_not_revert_another_connection() {
+    let (_child, addr) = boot("set-poison");
+    let mut a = open(&addr);
+    let mut b = open(&addr);
+    query_one(&mut a, "CREATE TABLE t (id int primary key, v int)");
+    query_one(&mut a, "INSERT INTO t VALUES (1, 10), (2, 20)");
+
+    query_one(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    query_one(&mut a, "SET application_name = 'pin'");
+    query_one(&mut a, "UPDATE t SET v = 111 WHERE id = 2");
+    query_one(&mut b, "UPDATE t SET v = 99 WHERE id = 1");
+    query_one(&mut a, "COMMIT");
+
+    // PG18: both writes survive.
+    let mut c = open(&addr);
+    assert_eq!(query_one(&mut c, "SELECT v FROM t WHERE id = 1"), Some("99".into()));
+    assert_eq!(query_one(&mut c, "SELECT v FROM t WHERE id = 2"), Some("111".into()));
+}
