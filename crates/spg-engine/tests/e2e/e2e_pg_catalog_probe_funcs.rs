@@ -31,9 +31,15 @@ fn ddl_reconstruction_funcs_return_null_or_admin() {
         spg_storage::Value::Text(s) => assert_eq!(s.as_ref(), "x"),
         other => panic!("expected 'x', got {other:?}"),
     }
+    // v7.39 (round 520) — this used to expect the CURRENT user, because
+    // `pg_get_userbyid` answered that for every oid: an owner column named
+    // the caller rather than the owner. Oid 10 is the bootstrap superuser,
+    // which `pg_roles` publishes as `postgres` — and the two have to agree,
+    // or a join on `relowner = pg_roles.oid` disagrees with the function
+    // that renders it.
     match first(&mut e, "SELECT pg_get_userbyid(10)") {
-        spg_storage::Value::Text(s) => assert_eq!(s.as_ref(), "admin"),
-        other => panic!("expected admin, got {other:?}"),
+        spg_storage::Value::Text(s) => assert_eq!(s.as_ref(), "postgres"),
+        other => panic!("expected postgres, got {other:?}"),
     }
 }
 
