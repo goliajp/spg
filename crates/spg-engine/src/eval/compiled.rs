@@ -36,6 +36,17 @@ pub(crate) enum Step {
     IsNull {
         negated: bool,
     },
+    /// v7.39 (round 488) — the verdict of an all-`%` LIKE pattern:
+    /// matches every non-NULL operand, and is NULL for a NULL one.
+    ///
+    /// v7.36 collapsed this shape into `IsNull { negated: !negated }`,
+    /// which answers a three-valued question two-valued. `NULL NOT LIKE
+    /// '%'` came out TRUE where PG18 says NULL, so `WHERE s NOT LIKE '%'`
+    /// SELECTED the NULL row (PG selects nothing), and `SELECT s LIKE '%'`
+    /// printed `false` where PG prints NULL. Same collapse, three-valued.
+    AnyTextMatch {
+        negated: bool,
+    },
     /// v7.32 (architecture v2, P1) — `needle [NOT] IN (literals…)`.
     /// The membership SET is a COMPILE PRODUCT, not a runtime cache:
     /// it lives in the step, so there is no "forgot to pass the
@@ -159,6 +170,7 @@ pub(crate) enum PredShape {
     Other,
     ColumnCmpLit,
     ColumnInSet,
+    ColumnLike,
 }
 
 impl CompiledExpr {
@@ -228,6 +240,25 @@ impl CompiledExpr {
             return None;
         };
         Some((*pos, set, *has_null, *negated))
+    }
+
+    /// v7.39 (round 488) — the third two-step shape: `<column> [NOT]
+    /// [I]LIKE '<literal>'`, in either the general matcher's form or the
+    /// unanchored-substring form round 484 added.
+    ///
+    /// `like_filter` is the read panel's worst shape. Rounds 482 and 486
+    /// covered its two siblings; this one still ran the general VM, which
+    /// pushes the cell as a `Value` and pops it again for a matcher that
+    /// only ever wanted a `&str`.
+    pub(crate) fn as_column_like(&self) -> Option<(usize, &Step)> {
+        let [
+            Step::Column(pos),
+            step @ (Step::Like { .. } | Step::LikeSubstring { .. }),
+        ] = &self.steps[..]
+        else {
+            return None;
+        };
+        Some((*pos, step))
     }
 
     pub(crate) fn as_single_column_length(&self) -> Option<usize> {
@@ -467,7 +498,7 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 // NULL semantics that SQL `LIKE` requires.
                 if !pat.is_empty() && pat.chars().all(|c| c == '%') {
                     compile_into(expr, ctx, steps);
-                    steps.push(Step::IsNull { negated: !*negated });
+                    steps.push(Step::AnyTextMatch { negated: *negated });
                     return;
                 }
                 compile_into(expr, ctx, steps);
@@ -854,6 +885,8 @@ pub(crate) fn compile_expr(e: &Expr, ctx: &EvalContext<'_>) -> CompiledExpr {
         PredShape::ColumnCmpLit
     } else if c.as_column_in_set().is_some() {
         PredShape::ColumnInSet
+    } else if c.as_column_like().is_some() {
+        PredShape::ColumnLike
     } else {
         PredShape::Other
     };
@@ -946,6 +979,18 @@ pub(crate) fn eval_compiled_pred(
                 }
             }
         }
+        // v7.39 (round 488) — `<column> [NOT] [I]LIKE '<literal>'` matches
+        // straight off the cell. The matcher wanted a `&str` all along;
+        // the VM was pushing a `Value` and popping it for no other reason.
+        PredShape::ColumnLike => {
+            if let Some((pos, step)) = c.as_column_like() {
+                let cell = row.values.get(pos).unwrap_or(&Value::Null);
+                if let Some(v) = like_verdict(cell, step) {
+                    crate::bump_counter!(STEP_VM_FASTPRED_FIRE);
+                    return crate::eval::predicate_is_true(&v?, "WHERE", mysql);
+                }
+            }
+        }
         PredShape::Other => {}
     }
     let rowref = crate::join::RowRef::Owned(row);
@@ -1000,6 +1045,60 @@ fn in_set_verdict(
         (true, Value::Bool(b)) => Value::Bool(!b),
         (_, v) => v,
     })
+}
+
+/// v7.39 (round 488) — the verdict `Step::Like` / `Step::LikeSubstring`
+/// produce, restated for the fast predicate. `None` means the operand is
+/// not text, which is the caller's cue to fall through to the VM and let
+/// it raise the type error in its own wording.
+///
+/// Both arms already delegate the actual matching to `like_match_str` /
+/// `like_substring_match`, and this calls the SAME two functions — the
+/// only thing restated is the NULL and negation wrapper around them.
+/// Round 486 measured that editing that loop is expensive in ways the
+/// source does not show, so the arms are left exactly as they are, and
+/// `e2e_like_fast_path_round488` runs both paths over the same matrix.
+fn like_verdict(cell: &Value<'_>, step: &Step) -> Option<Result<Value<'static>, EvalError>> {
+    let (text, negated) = match (cell, step) {
+        (Value::Null, _) => return Some(Ok(Value::Null)),
+        (
+            Value::Text(t) | Value::BpChar(t),
+            Step::Like { negated, .. } | Step::LikeSubstring { negated, .. },
+        ) => (t.as_ref(), *negated),
+        _ => return None,
+    };
+    let matched = match step {
+        Step::Like {
+            pattern,
+            case_insensitive,
+            ..
+        } => {
+            let r = if *case_insensitive {
+                like_match_str(&text.to_lowercase(), pattern, 0)
+            } else {
+                like_match_str(text, pattern, 0)
+            };
+            match r {
+                Ok(m) => m,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        Step::LikeSubstring {
+            needle,
+            k_before,
+            m_after,
+            case_insensitive,
+            ..
+        } => {
+            if *case_insensitive {
+                like_substring_match(&text.to_lowercase(), needle, *k_before, *m_after)
+            } else {
+                like_substring_match(text, needle, *k_before, *m_after)
+            }
+        }
+        _ => return None,
+    };
+    Some(Ok(Value::Bool(if negated { !matched } else { matched })))
 }
 
 /// Return an emptied stack's allocation with its value lifetime reset.
@@ -1238,6 +1337,13 @@ where
                 let v = stack.pop().unwrap_or(Value::Null);
                 let is_null = matches!(v, Value::Null);
                 stack.push(Value::Bool(if *negated { !is_null } else { is_null }));
+            }
+            Step::AnyTextMatch { negated } => {
+                let v = stack.pop().unwrap_or(Value::Null);
+                stack.push(match v {
+                    Value::Null => Value::Null,
+                    _ => Value::Bool(!*negated),
+                });
             }
             Step::InSet {
                 set,
