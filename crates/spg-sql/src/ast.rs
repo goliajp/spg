@@ -109,6 +109,19 @@ impl fmt::Display for DiscardTarget {
     }
 }
 
+/// v7.39 (round 535) — which maintenance statement, and therefore what
+/// its target names. Measured on PG18: INDEX / TABLE / CLUSTER name a
+/// relation, SCHEMA names a schema, and SYSTEM / DATABASE name neither
+/// in a way SPG can refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintainKind {
+    ReindexRelation,
+    ReindexSchema,
+    /// `REINDEX SYSTEM` / `REINDEX DATABASE`, and a bare `CLUSTER`.
+    Whole,
+    ClusterRelation,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Statement::Select dominates; Boxing would touch every match site
 pub enum Statement {
@@ -450,6 +463,19 @@ pub enum Statement {
     /// `spg_statistic` with per-column null_frac + n_distinct +
     /// 100-bucket equi-depth histogram.
     Analyze(Option<String>),
+    /// v7.39 (round 535) — `REINDEX { INDEX | TABLE | SCHEMA | DATABASE
+    /// | SYSTEM } [CONCURRENTLY] <name>` and `CLUSTER [VERBOSE]
+    /// [<table> [USING <index>]]`.
+    ///
+    /// SPG has neither index bloat nor a clustering order to rebuild, so
+    /// the work is a no-op — but PG VALIDATES the target, and both were
+    /// swallowed at parse time, so `REINDEX TABLE typo` reported success.
+    /// The name is carried now so the engine can say what PG says.
+    Maintain {
+        kind: MaintainKind,
+        /// `None` for the whole-database forms, which name nothing.
+        target: Option<String>,
+    },
     /// v7.37.17 (17.6 sibling) — `TRUNCATE [TABLE] [ONLY] <name>
     /// [, ...] [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE |
     /// RESTRICT]`. Clears every row from each named table. SPG's
@@ -4519,6 +4545,10 @@ impl Statement {
             // state, and IMMEDIATE can run the deferred checks there and
             // then; writer-path.
             Statement::SetConstraints { .. } => false,
+            // v7.39 (round 535) — REINDEX / CLUSTER rebuild nothing here,
+            // but they name a relation and PG refuses one that is not
+            // there, so they are not read-only in the sense this asks.
+            Statement::Maintain { .. } => false,
             // v7.39 (round 277) — the prepared-statement surface is
             // session state, like SET; writer-path so it lands on the
             // engine that owns the session. EXECUTE may also run a
@@ -4798,6 +4828,16 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => Ok(()),
+            Self::Maintain { kind, target } => {
+                f.write_str(match kind {
+                    crate::ast::MaintainKind::ClusterRelation => "CLUSTER ",
+                    _ => "REINDEX ",
+                })?;
+                if let Some(t) = target {
+                    f.write_str(t)?;
+                }
+                Ok(())
+            }
             Self::SetConstraints { names, deferred } => {
                 f.write_str("SET CONSTRAINTS ")?;
                 if names.is_empty() {

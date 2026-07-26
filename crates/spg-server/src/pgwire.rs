@@ -2598,12 +2598,11 @@ fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse
     // no client reaching SPG over the wire ever got either — the round
     // 169 fix for "a customer's manual reclaim is silently ignored"
     // never actually shipped past pgwire.
-    if ci_starts_with(b, b"cluster") {
-        return Some(CannedResponse::Tag("CLUSTER"));
-    }
-    if ci_starts_with(b, b"reindex") {
-        return Some(CannedResponse::Tag("REINDEX"));
-    }
+    // v7.39 (round 535) — CLUSTER and REINDEX are NOT answered here any
+    // more. Returning the tag from the wire meant the statement never
+    // reached the engine, so `REINDEX TABLE typo` reported success where
+    // PG reports that the relation does not exist. They validate their
+    // target now, which only the engine can do.
     // BEGIN ISOLATION LEVEL READ COMMITTED / SERIALIZABLE etc. —
     // pgbouncer + ORMs often prefix transactions with a level.
     // SPG only has one isolation level; accept the syntactic

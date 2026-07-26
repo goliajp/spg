@@ -2934,9 +2934,14 @@ impl Parser {
             // REINDEX is a strict no-op. Accept the whole statement
             // shape to boundary for pg_dump round-trip compatibility.
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("reindex") => {
+                // v7.39 (round 535) — the target is CARRIED now. SPG has no
+                // index bloat to rebuild, so the work stays a no-op, but PG
+                // validates what it was pointed at and this swallowed the
+                // name at parse time — `REINDEX TABLE typo` reported
+                // success. Measured on PG18: INDEX / TABLE name a relation,
+                // SCHEMA a schema, SYSTEM nothing.
                 self.advance();
-                self.consume_until_statement_boundary();
-                Ok(Statement::Empty)
+                self.parse_reindex_tail()
             }
             // v7.37.17 (17.6 sibling) — VACUUM [(OPTION [, ...])]
             // [FULL] [FREEZE] [VERBOSE] [ANALYZE] [<table> [(cols)]].
@@ -2975,6 +2980,13 @@ impl Parser {
                 let mut table: Option<String> = None;
                 loop {
                     match self.peek() {
+                        // v7.39 (round 535) — `FULL` lexes as a keyword, not
+                        // an identifier, so the loop below broke out on it and
+                        // dropped the table name: `VACUUM FULL nosuch` was
+                        // accepted where `VACUUM nosuch` was refused.
+                        Token::Full => {
+                            self.advance();
+                        }
                         Token::Ident(w) | Token::QuotedIdent(w) => {
                             let wl = w.to_ascii_lowercase();
                             match wl.as_str() {
@@ -3006,9 +3018,11 @@ impl Parser {
             // is segment-frozen, so clustering has no persistent
             // effect. Accept-and-no-op for pg_dump compat.
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("cluster") => {
+                // v7.39 (round 535) — same as REINDEX above: the relation is
+                // carried so the engine can refuse one that does not exist.
+                // A bare `CLUSTER [VERBOSE]` names nothing and is accepted.
                 self.advance();
-                self.consume_until_statement_boundary();
-                Ok(Statement::Empty)
+                self.parse_cluster_tail()
             }
             // v7.39 (round 222) — LISTEN / NOTIFY / UNLISTEN with real
             // delivery (was accept-and-drop since v7.37.17). NOTIFY takes an
@@ -12669,6 +12683,98 @@ impl Parser {
             });
         }
         out
+    }
+
+    /// v7.39 (round 535) — `REINDEX [(opts)] { INDEX | TABLE | SCHEMA |
+    /// DATABASE | SYSTEM } [CONCURRENTLY] [<name>]`.
+    #[inline(never)]
+    fn parse_reindex_tail(&mut self) -> Result<Statement, ParseError> {
+        use crate::ast::MaintainKind;
+        self.skip_paren_option_list();
+        let kind = match self.peek() {
+            // `TABLE` and `INDEX` lex as keywords, not identifiers.
+            Token::Table | Token::Index => {
+                self.advance();
+                MaintainKind::ReindexRelation
+            }
+            Token::Ident(s) | Token::QuotedIdent(s) => match s.to_ascii_lowercase().as_str() {
+                "index" | "table" => {
+                    self.advance();
+                    MaintainKind::ReindexRelation
+                }
+                "schema" => {
+                    self.advance();
+                    MaintainKind::ReindexSchema
+                }
+                "system" | "database" => {
+                    self.advance();
+                    MaintainKind::Whole
+                }
+                // PG requires the object type; anything else is the
+                // caller's problem, not something to swallow.
+                _ => MaintainKind::ReindexRelation,
+            },
+            _ => MaintainKind::Whole,
+        };
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("concurrently")) {
+            self.advance();
+        }
+        let target = self.take_optional_maintain_name();
+        self.consume_until_statement_boundary();
+        Ok(Statement::Maintain { kind, target })
+    }
+
+    /// v7.39 (round 535) — `CLUSTER [VERBOSE] [<table> [USING <index>]]`
+    /// and `CLUSTER [VERBOSE] <index> ON <table>`.
+    #[inline(never)]
+    fn parse_cluster_tail(&mut self) -> Result<Statement, ParseError> {
+        use crate::ast::MaintainKind;
+        self.skip_paren_option_list();
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("verbose")) {
+            self.advance();
+        }
+        let target = self.take_optional_maintain_name();
+        self.consume_until_statement_boundary();
+        Ok(Statement::Maintain {
+            kind: if target.is_some() {
+                MaintainKind::ClusterRelation
+            } else {
+                MaintainKind::Whole
+            },
+            target,
+        })
+    }
+
+    /// The next token as a relation / schema name, when there is one.
+    fn take_optional_maintain_name(&mut self) -> Option<alloc::string::String> {
+        match self.peek() {
+            Token::Ident(_) | Token::QuotedIdent(_) => match self.advance() {
+                Token::Ident(n) | Token::QuotedIdent(n) => Some(n),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// A parenthesised option list, absorbed.
+    fn skip_paren_option_list(&mut self) {
+        if !matches!(self.peek(), Token::LParen) {
+            return;
+        }
+        let mut depth = 0usize;
+        loop {
+            match self.advance() {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                Token::Eof => return,
+                _ => {}
+            }
+        }
     }
 
     /// v7.39 (round 531) — the `LIKE` clause inside a CREATE TABLE
