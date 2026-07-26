@@ -79,6 +79,7 @@ mod rules;
 pub mod scalarsq_streaming;
 mod select;
 pub mod selectivity;
+mod guc_catalog;
 mod sequence;
 mod session;
 mod show;

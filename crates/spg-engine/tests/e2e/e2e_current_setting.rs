@@ -179,9 +179,39 @@ fn set_validates_known_typed_gucs() {
     ] {
         assert!(e.execute(bad).is_err(), "should reject: {bad}");
     }
-    // Unknown GUC still accepted (pg_dump compat).
-    e.execute("SET some_random_guc='whatever'").unwrap();
+    // v7.39 (round 501) — an unknown parameter is now REJECTED, which
+    // reverses what this pin used to assert.
+    //
+    // It asserted acceptance "(pg_dump compat)", and that reasoning was
+    // sound while SPG had no list of PG's parameter names: rejecting
+    // would have refused real ones. SPG now carries all 398 (see
+    // `guc_catalog`), and every `SET` in this repo's dump corpora and
+    // fixtures names either one of them or a SET STATEMENT form
+    // (`SET TRANSACTION` / `SESSION` / `LOCAL`) — checked, not assumed.
+    // So the premise no longer holds, and matching PG18 wins:
+    //
+    //   PG18:  SET nonexistent_knob = 3
+    //          ERROR: unrecognized configuration parameter "nonexistent_knob"
+    //   SPG before round 501: SET  (accepted, and the setting the caller
+    //          believed they had made was never made — round 500)
+    let unknown = e.execute("SET some_random_guc='whatever'");
+    assert!(unknown.is_err(), "unknown GUC should be rejected: {unknown:?}");
+    // A dotted name stays accepted: PG treats it as a customised option
+    // and extensions rely on that.
+    e.execute("SET myapp.thing='whatever'").unwrap();
     e.execute("SET application_name='x'").unwrap();
+
+    // Parameters PG knows but a session cannot change are refused with
+    // PG's own wording, rather than accepted and ignored.
+    for (sql, want) in [
+        ("SET shared_buffers = 100", "without restarting the server"),
+        ("SET block_size = 4096", "cannot be changed"),
+        ("SET autovacuum = off", "cannot be changed now"),
+    ] {
+        let err = e.execute(sql);
+        let msg = format!("{err:?}");
+        assert!(err.is_err() && msg.contains(want), "{sql} -> {msg}");
+    }
 }
 
 #[test]

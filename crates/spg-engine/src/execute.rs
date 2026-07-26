@@ -1642,6 +1642,12 @@ impl Engine {
             // reads `default_text_search_config`. Everything else
             // is a recorded no-op (PG dump compat).
             Statement::SetParameter { name, value, local } => {
+                // v7.39 (round 501) — a name PG18 does not know, or one a
+                // session cannot change, is an error there and was
+                // silently accepted here (round 500).
+                if let Some(msg) = self.reject_unsettable_guc(&name) {
+                    return Err(EngineError::Unsupported(msg));
+                }
                 // v7.38 (read01) — SPG serves the wire as UTF8, so a
                 // non-UTF8 client_encoding can't be honoured (the bytes
                 // stay UTF8). Reject it rather than silently store a value
@@ -1880,6 +1886,12 @@ impl Engine {
             // effect; unknown pairs (including `@VAR` LHS from the
             // mysqldump preamble) are recorded then ignored.
             Statement::SetParameterList(pairs) => {
+                // Same validation as the single form (round 501).
+                for (name, _) in &pairs {
+                    if let Some(msg) = self.reject_unsettable_guc(name) {
+                        return Err(EngineError::Unsupported(msg));
+                    }
+                }
                 for (name, value) in pairs {
                     self.set_session_param(name, value);
                 }
