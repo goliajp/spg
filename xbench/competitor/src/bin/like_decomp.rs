@@ -9,7 +9,16 @@
 //! the parts by measuring shapes that isolate them. Everything here runs on
 //! BOTH engines so each stage is a comparison, not just a SPG number.
 
-#![allow(clippy::doc_markdown, clippy::uninlined_format_args)]
+#![allow(
+    clippy::doc_markdown,
+    clippy::uninlined_format_args,
+    // One linear script: seed both engines, time each stage, print the
+    // table. Splitting it would only move the sequence around.
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::format_push_string,
+    clippy::print_literal
+)]
 
 use spg_bench_competitor::connection_strings;
 use spg_engine::Engine;
