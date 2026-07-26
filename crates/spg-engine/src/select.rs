@@ -4953,6 +4953,17 @@ impl Engine {
         let mut seen_distinct: hashbrown::HashMap<u64, alloc::vec::Vec<usize>> =
             hashbrown::HashMap::new();
         let distinct_hb = hashbrown::DefaultHashBuilder::default();
+        // v7.39 (round 485) — one projection buffer for the whole scan
+        // rather than a fresh `Vec` per input row. A row that survives
+        // the DISTINCT probe takes the buffer with it (`mem::take`) and
+        // the next row allocates a new one; a row that duplicates an
+        // earlier one leaves the buffer — and its capacity — in place.
+        // The round-485 counter says 49 900 of `distinct_proj`'s 50 000
+        // projected rows are duplicates, so that is 49 900 allocate /
+        // free pairs the scan no longer performs. Shapes where every row
+        // survives (plain projection, `DISTINCT` over a unique column)
+        // allocate exactly as often as before.
+        let mut proj_buf: Vec<Value<'static>> = Vec::new();
         // Inline the per-row work in a closure so the indexed and full-
         // scan branches share the body.
         let mut process_row = |row: &Row<'static>, loop_idx: usize| -> Result<(), EngineError> {
@@ -4999,7 +5010,9 @@ impl Engine {
                     tagged.push((order_keys.clone(), out));
                 }
             } else {
-                let mut values: Vec<Value<'static>> = Vec::with_capacity(projection.len());
+                let values = &mut proj_buf;
+                values.clear();
+                values.reserve(projection.len());
                 for (i, p) in projection.iter().enumerate() {
                     // v7.37.x (docker-fair SCALARSQ attack) — pre-
                     // analysed PK-probe fast path. The per-row work is
@@ -5029,16 +5042,21 @@ impl Engine {
                         self.eval_expr_with_correlated(&p.expr, row, &ctx, cancel, memo_arg)?,
                     );
                 }
-                let out = Row::new(values);
+                crate::bump_counter!(crate::select::PROJ_ROW_BUILT);
                 if stmt.distinct {
                     let bucket = seen_distinct
-                        .entry(norm_hash_row(&out, &distinct_hb, ctx.mysql_dialect))
+                        .entry(norm_hash_values(&proj_buf, &distinct_hb, ctx.mysql_dialect))
                         .or_default();
-                    if bucket.iter().any(|&i| row_eq_norm(&tagged[i].1, &out, ctx.mysql_dialect)) {
+                    if bucket
+                        .iter()
+                        .any(|&i| values_eq_norm(&tagged[i].1.values, &proj_buf, ctx.mysql_dialect))
+                    {
+                        crate::bump_counter!(crate::select::DISTINCT_DUP_DROPPED);
                         return Ok(());
                     }
                     bucket.push(tagged.len());
                 }
+                let out = Row::new(core::mem::take(&mut proj_buf));
                 let order_keys = if stmt.distinct && !order_by.is_empty() {
                     build_order_keys(&order_by, row, &ctx)?
                 } else {
@@ -6095,9 +6113,20 @@ fn dedup_by_row<T>(
 ///   (Json, arrays, vectors, geometry, ranges, …) shares one constant
 ///   bucket — degrades to the exact linear scan, never wrong.
 fn norm_hash_row(row: &Row<'static>, bh: &hashbrown::DefaultHashBuilder, mysql: bool) -> u64 {
+    norm_hash_values(&row.values, bh, mysql)
+}
+
+/// v7.39 (round 485) — the same hash over a bare value slice, so the
+/// DISTINCT probe can run against a reused buffer instead of demanding a
+/// `Row` that has to be allocated first (see `values_eq_norm`).
+fn norm_hash_values(
+    values: &[Value<'static>],
+    bh: &hashbrown::DefaultHashBuilder,
+    mysql: bool,
+) -> u64 {
     use core::hash::{BuildHasher, Hash, Hasher};
     let mut h = bh.build_hasher();
-    for v in &row.values {
+    for v in values {
         // v7.39 (round 410) — hash the folded key when the MySQL collation
         // deduplicates a text value, so `row_eq_norm`-equal rows (`'a'` vs
         // `'A'` vs `'a '`) share a hash bucket.
@@ -6298,9 +6327,31 @@ fn mysql_dedup_fold(v: &Value) -> Option<String> {
     }
 }
 
+/// v7.39 (round 485) — how many projected rows the single-table scan
+/// builds, and how many of those the DISTINCT probe throws away again.
+///
+/// The round-485 profile of `SELECT DISTINCT g FROM h ORDER BY g` put
+/// 21 % of all samples in malloc/free called straight from the scan
+/// closure. The closure's one per-row allocation is the projected
+/// `Vec<Value>`, and under DISTINCT most of those are discarded a few
+/// instructions later — but "most" is a guess until it is a number, so
+/// these count it. (Round 480 was spent acting on an inference about a
+/// branch that turned out never to run.)
+pub static PROJ_ROW_BUILT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static DISTINCT_DUP_DROPPED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn row_eq_norm(a: &Row<'static>, b: &Row<'static>, mysql: bool) -> bool {
-    a.values.len() == b.values.len()
-        && a.values.iter().zip(&b.values).all(|(x, y)| {
+    values_eq_norm(&a.values, &b.values, mysql)
+}
+
+/// v7.39 (round 485) — `row_eq_norm` over bare value slices, so the
+/// DISTINCT probe can compare a reused projection buffer against a kept
+/// row without building a `Row` for it.
+pub(crate) fn values_eq_norm(a: &[Value<'static>], b: &[Value<'static>], mysql: bool) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
             if mysql {
                 if let (Some(fx), Some(fy)) = (mysql_dedup_fold(x), mysql_dedup_fold(y)) {
                     return fx == fy;
