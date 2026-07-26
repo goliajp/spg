@@ -3749,11 +3749,19 @@ pub(crate) fn select_is_correlated(s: &SelectStatement) -> bool {
         }
         return qualified;
     };
-    // Lateral / derived FROM entries put scope resolution beyond this
-    // cheap check — defer to execute-and-catch.
-    if from.primary.lateral_subquery.is_some() {
-        return false;
-    }
+    // v7.39 (round 530) — a derived-table FROM entry used to answer "not
+    // correlated" for the WHOLE subquery, on the grounds that its scope
+    // was beyond this cheap check. The direction was backwards. An
+    // uncorrelated subquery is evaluated ONCE and its answer reused for
+    // every outer row, so a wrong "no" is silently wrong:
+    //
+    //   EXISTS(SELECT 1 FROM (SELECT 1 AS id) x WHERE t.id = x.id)
+    //   PG18  true only for the matching row     SPG  true for EVERY row
+    //
+    // A wrong "yes" only costs a re-evaluation. So the derived entry's
+    // alias joins the inner scope like any other name, and the ordinary
+    // scan decides — plus the check below, since a derived body that is
+    // itself correlated reaches outside its own scope.
     let mut inner: Vec<&str> = Vec::new();
     if let Some(a) = &from.primary.alias {
         inner.push(a.as_str());
@@ -3762,9 +3770,6 @@ pub(crate) fn select_is_correlated(s: &SelectStatement) -> bool {
         inner.push(from.primary.name.as_str());
     }
     for j in &from.joins {
-        if j.table.lateral_subquery.is_some() {
-            return false;
-        }
         if let Some(a) = &j.table.alias {
             inner.push(a.as_str());
         }
@@ -3813,6 +3818,21 @@ pub(crate) fn select_is_correlated(s: &SelectStatement) -> bool {
             },
             &mut |_| {},
         );
+    }
+    // A LATERAL body reads the row beside it, and its references never
+    // appear in the expressions above — the visitor drops subquery
+    // bodies. A body correlated against its OWN scope is reaching
+    // further out, which is this statement's scope or beyond; either
+    // way this statement has to be evaluated per row.
+    if !correlated {
+        for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
+            if let Some(body) = &t.lateral_subquery
+                && select_is_correlated(body)
+            {
+                correlated = true;
+                break;
+            }
+        }
     }
     correlated
 }
