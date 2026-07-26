@@ -172,6 +172,28 @@ pub enum Token {
     /// (`vec @@ q` or `q @@ vec`) parses; engine eval normalises
     /// before matching.
     TsMatch,
+    /// v7.39 (round 508) — `@@@`, PG's deprecated spelling of `@@`. Kept
+    /// because `pg_operator` still carries it and old application SQL still
+    /// writes it.
+    TsMatchOld,
+    /// v7.39 (round 508) — `@-@`, "length of" (lseg, path).
+    AtMinusAt,
+    /// v7.39 (round 508) — `?#`, "do these intersect" (box / line / lseg /
+    /// path, in every combination PG defines).
+    Intersects,
+    /// v7.39 (round 508) — `<^` "is strictly below" and `>^` "is strictly
+    /// above" (point, box).
+    IsBelow,
+    IsAbove,
+    /// v7.39 (round 508) — the `text_pattern_ops` comparisons `~<~`, `~<=~`,
+    /// `~>~`, `~>=~`. They compare BYTES, ignoring collation, which is what
+    /// makes them index-usable for LIKE prefixes: `'A' ~<~ 'a'` is true
+    /// where `'A' < 'a'` is false under a non-C collation. pg_dump emits
+    /// them, so a dump of an ordinary database would not restore.
+    PatternLt,
+    PatternLtEq,
+    PatternGt,
+    PatternGtEq,
     L2Distance,
     /// pgvector inner-product operator `<#>` (returns negative dot product
     /// so smaller still means more similar — same semantics as pgvector).
@@ -543,6 +565,11 @@ pub fn tokenize_with_offsets(
                 out.push(Token::GeomHoriz);
                 i += 2;
             }
+            b'?' if peek_eq(bytes, i + 1, b'#') => {
+                // v7.39 (round 508) — `?#` "do these intersect".
+                out.push(Token::Intersects);
+                i += 2;
+            }
             b'?' => single(&mut out, Token::JsonKeyExists, &mut i),
             b'-' => {
                 // Range `-|-` "is adjacent to" — longest match ahead of `->`.
@@ -599,6 +626,14 @@ pub fn tokenize_with_offsets(
                     // (`jsonb @? jsonpath` = jsonb_path_exists).
                     out.push(Token::JsonPathExists);
                     i += 2;
+                } else if peek_eq(bytes, i + 1, b'@') && peek_eq(bytes, i + 2, b'@') {
+                    // v7.39 (round 508) — `@@@`, before `@@`: longest match.
+                    out.push(Token::TsMatchOld);
+                    i += 3;
+                } else if peek_eq(bytes, i + 1, b'-') && peek_eq(bytes, i + 2, b'@') {
+                    // v7.39 (round 508) — `@-@` "length of".
+                    out.push(Token::AtMinusAt);
+                    i += 3;
                 } else if peek_eq(bytes, i + 1, b'@')
                     && !is_session_var_ident_start(bytes.get(i + 2).copied())
                 {
@@ -689,6 +724,10 @@ pub fn tokenize_with_offsets(
                     // v7.17.0 Phase 3.P0-47 — PG INET `<<` strict contained.
                     out.push(Token::InetContainedBy);
                     i += 2;
+                } else if peek_eq(bytes, i + 1, b'^') {
+                    // v7.39 (round 508) — `<^` "is strictly below".
+                    out.push(Token::IsBelow);
+                    i += 2;
                 } else if peek_eq(bytes, i + 1, b'@') {
                     // v7.37.6-A — PG JSONB `<@` contained-by.
                     out.push(Token::JsonContainedBy);
@@ -748,6 +787,28 @@ pub fn tokenize_with_offsets(
                 out.push(Token::GeomSameAs);
                 i += 2;
             }
+            // v7.39 (round 508) — the `text_pattern_ops` comparisons, longest
+            // match first so `~<=~` beats `~<~`.
+            b'~' if peek_eq(bytes, i + 1, b'<') && peek_eq(bytes, i + 2, b'=')
+                && peek_eq(bytes, i + 3, b'~') =>
+            {
+                out.push(Token::PatternLtEq);
+                i += 4;
+            }
+            b'~' if peek_eq(bytes, i + 1, b'>') && peek_eq(bytes, i + 2, b'=')
+                && peek_eq(bytes, i + 3, b'~') =>
+            {
+                out.push(Token::PatternGtEq);
+                i += 4;
+            }
+            b'~' if peek_eq(bytes, i + 1, b'<') && peek_eq(bytes, i + 2, b'~') => {
+                out.push(Token::PatternLt);
+                i += 3;
+            }
+            b'~' if peek_eq(bytes, i + 1, b'>') && peek_eq(bytes, i + 2, b'~') => {
+                out.push(Token::PatternGt);
+                i += 3;
+            }
             b'~' => {
                 single(&mut out, Token::Tilde, &mut i);
             }
@@ -759,7 +820,11 @@ pub fn tokenize_with_offsets(
                 single(&mut out, Token::Caret, &mut i);
             }
             b'>' => {
-                if peek_eq(bytes, i + 1, b'>') && peek_eq(bytes, i + 2, b'=') {
+                if peek_eq(bytes, i + 1, b'^') {
+                    // v7.39 (round 508) — `>^` "is strictly above".
+                    out.push(Token::IsAbove);
+                    i += 2;
+                } else if peek_eq(bytes, i + 1, b'>') && peek_eq(bytes, i + 2, b'=') {
                     // v7.17.0 Phase 3.P0-47 — PG INET `>>=` contains-or-equal.
                     out.push(Token::InetContainsEq);
                     i += 3;

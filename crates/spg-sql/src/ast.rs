@@ -4334,6 +4334,22 @@ pub enum BinOp {
     /// v7.17.0 Phase 3.P0-47 — PG INET / CIDR network overlap `&&`.
     /// True iff either network contains any address of the other.
     InetOverlap,
+    /// v7.39 (round 508) — `?#`, "do these intersect": box/box, line/box,
+    /// line/line, lseg/box, lseg/line, lseg/lseg, path/path.
+    Intersects,
+    /// v7.39 (round 508) — `<^` / `>^`, strictly below / strictly above
+    /// (point, box).
+    IsBelow,
+    IsAbove,
+    /// v7.39 (round 508) — the `text_pattern_ops` comparisons `~<~`, `~<=~`,
+    /// `~>~`, `~>=~`: BYTE order, ignoring collation. `'A' ~<~ 'a'` is true
+    /// where `'A' < 'a'` is false under a non-C collation, which is the
+    /// whole reason the operator family exists — it is what makes a LIKE
+    /// prefix index-usable. pg_dump writes these into index definitions.
+    PatternLt,
+    PatternLtEq,
+    PatternGt,
+    PatternGtEq,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7912,6 +7928,13 @@ impl fmt::Display for BinOp {
             Self::InetContains => ">>",
             Self::InetContainsEq => ">>=",
             Self::InetOverlap => "&&",
+            Self::Intersects => "?#",
+            Self::IsBelow => "<^",
+            Self::IsAbove => ">^",
+            Self::PatternLt => "~<~",
+            Self::PatternLtEq => "~<=~",
+            Self::PatternGt => "~>~",
+            Self::PatternGtEq => "~>=~",
         })
     }
 }

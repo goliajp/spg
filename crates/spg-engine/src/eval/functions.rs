@@ -3210,6 +3210,19 @@ fn apply_function_dispatch(
         },
         // Geometric accessors over box / circle / lseg. (`length(lseg)` is
         // handled in the `length` arm above, which the text form shares.)
+        // v7.39 (round 508) — NULL in, NULL out. These are strict in PG, so
+        // `@@ NULL::box` is NULL there; here the guard below only matched a
+        // real geometric value, so a NULL operand fell through to the
+        // unknown-function arm and the prefix operators that desugar to
+        // these (`@@` center, `?-` ishorizontal, `?|` isvertical) answered
+        // "function center(unknown) does not exist" instead of NULL.
+        "area" | "width" | "height" | "center" | "radius" | "diameter"
+        | "isvertical" | "ishorizontal" | "isclosed" | "isopen"
+        | "pclose" | "popen"
+            if args.len() == 1 && matches!(&args[0], Value::Null) =>
+        {
+            Ok(Value::Null)
+        }
         "area" | "width" | "height" | "center" | "radius" | "diameter"
         | "isvertical" | "ishorizontal" | "isclosed" | "isopen" | "npoints"
         | "pclose" | "popen"
