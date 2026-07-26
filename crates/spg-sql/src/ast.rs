@@ -2797,6 +2797,20 @@ pub struct DmlOrderLimit {
     pub limit: Option<u32>,
 }
 
+/// v7.39 (round 533) — what `UPDATE … FROM src WHERE cond` was lowered
+/// FROM, kept so the engine can finish the job.
+///
+/// The parser rewrites the statement onto correlated subqueries, and it
+/// can only classify a QUALIFIED leaf: deciding whether an unqualified
+/// name belongs to the target or to a source needs their column lists,
+/// which parse time does not have. Carrying the clause lets the engine
+/// — which has the catalog — resolve the rest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateFromSources {
+    pub from: FromClause,
+    pub sub_where: Option<Expr>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateStatement {
     /// v7.37.43-T4.4 — leading `WITH cte AS (…)` clauses on a top-
@@ -2808,6 +2822,9 @@ pub struct UpdateStatement {
     /// bare spelling here (unlike INSERT, which requires AS).
     pub alias: Option<String>,
     pub assignments: Vec<(String, Expr)>,
+    /// v7.39 (round 533) — boxed: round 413 measured that widening this
+    /// struct in place overflows the parser's nesting stack.
+    pub from_sources: Option<alloc::boxed::Box<UpdateFromSources>>,
     pub where_: Option<Expr>,
     /// v7.39 (round 413) — MySQL's `UPDATE … [ORDER BY … [LIMIT n]]`:
     /// mutate the first `limit` rows in the given order. PG has no such

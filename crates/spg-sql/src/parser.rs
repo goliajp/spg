@@ -8330,6 +8330,14 @@ impl Parser {
         // MySQL dialect; a PG session's `UPDATE … ORDER BY …` still errors.
         let update_order_limit = self.parse_mysql_dml_order_limit("UPDATE")?;
         let mut returning = self.parse_optional_returning()?;
+        // v7.39 (round 533) — kept for the engine, which can resolve the
+        // UNQUALIFIED leaves this lowering has to leave alone.
+        let from_sources = from_clause.as_ref().map(|fc| {
+            alloc::boxed::Box::new(crate::ast::UpdateFromSources {
+                from: fc.clone(),
+                sub_where: sub_where.clone(),
+            })
+        });
         let (assignments, where_) = if let Some(fc) = from_clause {
             let names: Vec<String> = core::iter::once(&fc.primary)
                 .chain(fc.joins.iter().map(|j| &j.table))
@@ -8449,6 +8457,7 @@ impl Parser {
             table,
             alias,
             assignments,
+            from_sources,
             where_,
             order_limit: update_order_limit,
             returning,
