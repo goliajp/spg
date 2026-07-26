@@ -125,3 +125,52 @@ fn round482_mysql_truthiness_is_unchanged() {
     assert_eq!(n_rows(&mut e, "SELECT count(*) FROM m WHERE a = 2"), "1");
     assert_eq!(n_rows(&mut e, "SELECT count(*) FROM m WHERE a"), "3");
 }
+
+/// read01 round 483 — the same-variant comparison dispatch.
+///
+/// `compare` walks four guards (Text-vs-typed coercion, NumericBig, BpChar)
+/// before its ordering match. None can fire for a same-variant scalar pair,
+/// so those pairs now answer straight away. These pin that the guards still
+/// do their work for the pairs that DO need them — the failure mode of a
+/// reordering is not the fast case, it is the case that used to fall
+/// through and now does not.
+#[test]
+fn round483_the_guards_the_fast_dispatch_skips_still_fire() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE c (i INT, b BIGINT, s TEXT, ch CHAR(4), n NUMERIC)")
+        .unwrap();
+    e.execute("INSERT INTO c VALUES (5, 5, 'ab', 'ab', 5)")
+        .unwrap();
+
+    // Text-vs-typed still coerces (PG's unknown-literal rule).
+    assert_eq!(n_rows(&mut e, "SELECT count(*) FROM c WHERE i = '5'"), "1");
+    assert_eq!(n_rows(&mut e, "SELECT count(*) FROM c WHERE '5' = i"), "1");
+    assert_eq!(n_rows(&mut e, "SELECT count(*) FROM c WHERE b = '5'"), "1");
+    // bpchar still compares blank-insensitively against text.
+    assert_eq!(n_rows(&mut e, "SELECT count(*) FROM c WHERE ch = 'ab'"), "1");
+    // cross-width integer pairs still compare by value.
+    assert_eq!(n_rows(&mut e, "SELECT count(*) FROM c WHERE i = b"), "1");
+    assert_eq!(n_rows(&mut e, "SELECT count(*) FROM c WHERE i < b"), "0");
+    // numeric against integer.
+    assert_eq!(n_rows(&mut e, "SELECT count(*) FROM c WHERE n = i"), "1");
+    // and the same-variant pairs the dispatch now takes.
+    assert_eq!(n_rows(&mut e, "SELECT count(*) FROM c WHERE s = 'ab'"), "1");
+    assert_eq!(n_rows(&mut e, "SELECT count(*) FROM c WHERE s > 'aa'"), "1");
+    assert_eq!(n_rows(&mut e, "SELECT count(*) FROM c WHERE s < 'aa'"), "0");
+}
+
+#[test]
+fn round483_ordering_is_unchanged_across_the_variants() {
+    // A reordered dispatch that got an ordering backwards would still pass
+    // an equality test; sort the whole column instead.
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE o (i INT, s TEXT, f BOOLEAN)").unwrap();
+    e.execute("INSERT INTO o VALUES (3,'c',true),(1,'a',false),(2,'b',true)")
+        .unwrap();
+    assert_eq!(n_rows(&mut e, "SELECT i FROM o ORDER BY i"), "1;2;3");
+    assert_eq!(n_rows(&mut e, "SELECT s FROM o ORDER BY s DESC"), "c;b;a");
+    assert_eq!(
+        n_rows(&mut e, "SELECT count(*) FROM o WHERE f = true"),
+        "2"
+    );
+}
