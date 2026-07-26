@@ -1993,6 +1993,34 @@ pub enum IndexMethod {
     Gin,
 }
 
+/// v7.39 (round 531) — `LIKE <table> [ {INCLUDING|EXCLUDING} <opt> ]*`
+/// inside a CREATE TABLE column list.
+///
+/// The source table's shape can only be read from the catalog, so the
+/// parser records the clause and the engine expands it. `at` is how many
+/// explicit columns preceded it: PG keeps the written order, so
+/// `CREATE TABLE k (x int, LIKE t)` puts `x` first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LikeSpec {
+    pub source: String,
+    pub at: usize,
+    pub options: LikeOptions,
+}
+
+/// Which properties `LIKE` carries over. A bare `LIKE` copies names,
+/// types and NOT NULL and nothing else — measured on PG18, where a
+/// copied generated column becomes a plain one and a copied identity
+/// column loses its identity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LikeOptions {
+    pub defaults: bool,
+    pub constraints: bool,
+    pub identity: bool,
+    pub generated: bool,
+    pub indexes: bool,
+    pub comments: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateTableStatement {
     /// v7.39 (round 436) — `CREATE TEMPORARY TABLE`. The table lives in the
@@ -2002,6 +2030,9 @@ pub struct CreateTableStatement {
     pub temporary: bool,
     pub name: String,
     pub columns: Vec<ColumnDef>,
+    /// v7.39 (round 531) — the `LIKE` clauses in the column list, in
+    /// the order written. Empty for a table that has none.
+    pub like_specs: Vec<LikeSpec>,
     /// `IF NOT EXISTS` — engine returns `CommandOk` no-op when the
     /// table name already exists, instead of raising `DuplicateTable`.
     pub if_not_exists: bool,

@@ -12662,6 +12662,71 @@ impl Parser {
         out
     }
 
+    /// v7.39 (round 531) — the `LIKE` clause inside a CREATE TABLE
+    /// column list.
+    ///
+    /// PG's option names are COMMENTS / COMPRESSION / CONSTRAINTS /
+    /// DEFAULTS / GENERATED / IDENTITY / INDEXES / STATISTICS / STORAGE
+    /// / ALL. The three that describe physical storage have no meaning
+    /// here, so they parse and change nothing rather than making a
+    /// dump that mentions them fail to load.
+    ///
+    /// `#[inline(never)]` because the CREATE TABLE frame sits on the
+    /// parse chain the nesting sentinel is tuned against.
+    #[inline(never)]
+    fn parse_create_table_like(
+        &mut self,
+        at: usize,
+    ) -> Result<crate::ast::LikeSpec, ParseError> {
+        self.advance(); // LIKE
+        let source = self.expect_ident_like()?;
+        let mut options = crate::ast::LikeOptions::default();
+        loop {
+            let including = match self.peek() {
+                Token::Ident(s) if s.eq_ignore_ascii_case("including") => true,
+                Token::Ident(s) if s.eq_ignore_ascii_case("excluding") => false,
+                _ => break,
+            };
+            self.advance();
+            // `ALL` lexes as its own keyword, not an identifier.
+            let opt = if matches!(self.peek(), Token::All) {
+                self.advance();
+                alloc::string::String::from("all")
+            } else {
+                self.expect_ident_like()?
+            };
+            let set = |o: &mut crate::ast::LikeOptions, on: bool| {
+                o.defaults = on;
+                o.constraints = on;
+                o.identity = on;
+                o.generated = on;
+                o.indexes = on;
+                o.comments = on;
+            };
+            match opt.to_ascii_lowercase().as_str() {
+                "all" => set(&mut options, including),
+                "defaults" => options.defaults = including,
+                "constraints" => options.constraints = including,
+                "identity" => options.identity = including,
+                "generated" => options.generated = including,
+                "indexes" => options.indexes = including,
+                "comments" => options.comments = including,
+                // No storage model to copy into.
+                "storage" | "statistics" | "compression" => {}
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "unrecognized LIKE option {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(crate::ast::LikeSpec {
+            source,
+            at,
+            options,
+        })
+    }
+
     fn parse_create_table_stmt_after_create(&mut self) -> Result<Statement, ParseError> {
         // Caller already consumed CREATE; we're sitting on TABLE.
         debug_assert!(matches!(self.peek(), Token::Table));
@@ -12682,6 +12747,7 @@ impl Parser {
                 temporary: false,
                 name,
                 columns: Vec::new(),
+                like_specs: Vec::new(),
                 if_not_exists,
                 foreign_keys: Vec::new(),
                 table_constraints: Vec::new(),
@@ -12724,6 +12790,7 @@ impl Parser {
         let mut columns = Vec::new();
         let mut foreign_keys: Vec<ForeignKeyConstraint> = Vec::new();
         let mut table_constraints: Vec<crate::ast::TableConstraint> = Vec::new();
+        let mut like_specs: Vec<crate::ast::LikeSpec> = Vec::new();
         loop {
             // v7.6.0 / v7.9.18 — distinguish table-level constraint
             // clauses from column definitions. Constraints start
@@ -12732,6 +12799,11 @@ impl Parser {
             // a column.
             if self.peek_table_level_pk_start() {
                 table_constraints.push(self.parse_table_level_primary_key()?);
+            } else if matches!(self.peek(), Token::Like) {
+                // v7.39 (round 531) — `LIKE <table> [ {INCLUDING|EXCLUDING}
+                // <opt> ]*`. The source table's shape lives in the catalog,
+                // so this records the clause and the engine expands it.
+                like_specs.push(self.parse_create_table_like(columns.len())?);
             } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("exclude")) {
                 // v7.39 (round 210) — bare `EXCLUDE [USING m] (col WITH op, …)`.
                 table_constraints.push(self.parse_table_level_exclude()?);
@@ -12816,7 +12888,10 @@ impl Parser {
                 }
             }
         }
-        if columns.is_empty() {
+        // v7.39 (round 531) — a `LIKE` clause brings its own columns, so
+        // `CREATE TABLE k (LIKE t)` is a complete definition even though
+        // nothing is written between the parentheses.
+        if columns.is_empty() && like_specs.is_empty() {
             return Err(self.err("CREATE TABLE requires at least one column".into()));
         }
         // v7.14.0 — consume MySQL/MariaDB table options after the
@@ -12852,6 +12927,7 @@ impl Parser {
             temporary: false,
             name,
             columns,
+            like_specs,
             if_not_exists,
             foreign_keys,
             table_constraints,

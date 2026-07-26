@@ -2468,7 +2468,7 @@ impl Engine {
 
     pub(crate) fn exec_create_table(
         &mut self,
-        stmt: CreateTableStatement,
+        mut stmt: CreateTableStatement,
     ) -> Result<QueryResult, EngineError> {
         // v7.39 (round 436) — a TEMPORARY table is created under the calling
         // session's namespace prefix and remembered there, so it shadows a
@@ -2535,6 +2535,7 @@ impl Engine {
             .filter(|c| c.is_primary_key)
             .map(|c| c.name.clone())
             .collect();
+        let like_specs = core::mem::take(&mut stmt.like_specs);
         let mut schema = self.build_create_table_schema(
             &table_name,
             stmt.columns,
@@ -2542,6 +2543,11 @@ impl Engine {
             stmt.foreign_keys,
             &inline_pk_columns,
         )?;
+        // v7.39 (round 531) — expand each `LIKE <table>` in the column
+        // list. The source's shape lives in the catalog, so the parser
+        // recorded the clause and it is copied here, at the position it
+        // was written.
+        self.apply_like_specs(&mut schema, &like_specs)?;
         // v7.37.6-B — `CREATE TABLE p (...) PARTITION BY RANGE (key)`:
         // attach the parent role to the freshly-built schema before
         // it lands in the catalog. Key column must be TIMESTAMPTZ
@@ -2912,6 +2918,73 @@ impl Engine {
     /// when checks are off and the parent is absent), and uniqueness /
     /// CHECK constraint translation.
     #[allow(clippy::too_many_lines)]
+    /// v7.39 (round 531) — copy a source table's shape into the new one.
+    ///
+    /// Measured on PG18: a bare `LIKE` copies names, types and NOT NULL
+    /// and nothing else — a copied generated column becomes a plain one
+    /// and a copied identity column loses its identity. Each INCLUDING
+    /// adds one property back, and `INCLUDING ALL` adds them all.
+    fn apply_like_specs(
+        &mut self,
+        schema: &mut spg_storage::TableSchema,
+        specs: &[spg_sql::ast::LikeSpec],
+    ) -> Result<(), EngineError> {
+        // Applied back to front so an earlier spec's insert position is
+        // still the one it was written at.
+        for spec in specs.iter().rev() {
+            let src = self.active_catalog().get(&spec.source).ok_or_else(|| {
+                EngineError::Storage(spg_storage::StorageError::TableNotFound {
+                    name: spec.source.clone(),
+                })
+            })?;
+            let src_schema = src.schema();
+            let o = spec.options;
+            let mut copied: Vec<spg_storage::ColumnSchema> = Vec::new();
+            for c in &src_schema.columns {
+                let mut col = c.clone();
+                if !o.defaults {
+                    col.default = None;
+                    col.default_text = None;
+                    col.runtime_default = None;
+                }
+                if !o.identity {
+                    col.auto_increment = false;
+                    col.identity_always = false;
+                    col.auto_restart = None;
+                }
+                if !o.generated {
+                    col.generated_stored_expr = None;
+                }
+                if !o.comments {
+                    // Comments live in the catalog's comment map, not on
+                    // the column, so there is nothing to clear here; the
+                    // copy below simply does not carry them.
+                }
+                copied.push(col);
+            }
+            let at = spec.at.min(schema.columns.len());
+            for (i, col) in copied.into_iter().enumerate() {
+                schema.columns.insert(at + i, col);
+            }
+            if o.constraints {
+                for chk in &src_schema.checks {
+                    schema.checks.push(chk.clone());
+                }
+            }
+            // INDEXES is accepted by the parser and refused here rather
+            // than silently dropped: a table that reports the right
+            // columns and none of the indexes is the shape that looks
+            // fine until it is slow.
+            if o.indexes && !src.indices().is_empty() {
+                return Err(EngineError::Unsupported(alloc::string::String::from(
+                    "CREATE TABLE … LIKE INCLUDING INDEXES is not supported yet; \
+                     the columns copy, the indexes do not",
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn build_create_table_schema(
         &mut self,
         table_name: &str,
