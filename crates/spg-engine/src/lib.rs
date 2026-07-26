@@ -1477,6 +1477,25 @@ impl Engine {
         self.users.contains(name) || name.eq_ignore_ascii_case("admin")
     }
 
+    /// v7.39 (round 520) — the role an oid names, as `pg_get_userbyid`
+    /// reports it. The numbering is `synth_pg_roles`': base 10, one per
+    /// user in catalog order.
+    #[must_use]
+    pub fn role_name_for_oid(&self, oid: i64) -> Option<String> {
+        // Oid 10 is the bootstrap superuser, which `synth_pg_roles` always
+        // publishes as `postgres`. Following the catalogue rather than the
+        // session is the point: a join on `relowner = pg_roles.oid` and
+        // `pg_get_userbyid(relowner)` have to name the same role.
+        if oid == 10 {
+            return Some(alloc::string::String::from("postgres"));
+        }
+        let idx = usize::try_from(oid - 11).ok()?;
+        self.users
+            .iter()
+            .nth(idx)
+            .map(|(n, _)| alloc::string::String::from(n))
+    }
+
     /// v7.37.15 (Phase B / C / E) — current per-row visibility
     /// snapshot for in-engine scans. Captures the live writer-
     /// version cursor + active-writer set; readers built from this

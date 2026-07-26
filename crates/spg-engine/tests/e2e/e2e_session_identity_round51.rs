@@ -36,12 +36,17 @@ fn row(e: &mut Engine, sql: &str) -> Vec<String> {
 fn embedded_defaults_to_admin() {
     let mut e = Engine::new();
     // No startup packet — the embedded engine keeps the Admin login.
+    //
+    // v7.39 (round 520) — `pg_get_userbyid(10)` used to appear here as a
+    // third way of asking who the session is. It is not one: it names the
+    // role an OID belongs to, and answering the caller for every oid was
+    // the stub round 520 removed. Oid 10 is the bootstrap superuser.
     assert_eq!(
         row(
             &mut e,
             "SELECT current_user, session_user, pg_get_userbyid(10)"
         ),
-        vec!["admin", "admin", "admin"]
+        vec!["admin", "admin", "postgres"]
     );
 }
 
@@ -54,7 +59,7 @@ fn session_user_follows_the_login() {
             &mut e,
             "SELECT current_user, session_user, pg_get_userbyid(10), system_user"
         ),
-        vec!["unmei", "unmei", "unmei", "trust:unmei"]
+        vec!["unmei", "unmei", "postgres", "trust:unmei"]
     );
 }
 

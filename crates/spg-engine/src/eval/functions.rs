@@ -8932,6 +8932,16 @@ fn apply_function_dispatch(
         // are parser-level constructs (special-case in AST). This
         // arm covers only their scalar synonyms if any driver
         // emits them. (xmlconcat has a real implementation above.)
+        // v7.39 (round 520) — `xml(text)` is PG's text-to-xml constructor
+        // and answered NULL for everything, so a value cast through it
+        // vanished. It keeps the text, as `::xml` does.
+        "xml" if args.len() == 1 => match &args[0] {
+            Value::Null => Ok(Value::Null),
+            Value::Xml(x) => Ok(Value::Xml(alloc::borrow::Cow::Owned(x.to_string()))),
+            v => Ok(Value::Xml(alloc::borrow::Cow::Owned(
+                crate::eval::value_to_text(v),
+            ))),
+        },
         "xml" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — replication-slot + subscription
         // + progress-info stat probes emitted by postgres_exporter
@@ -9025,9 +9035,26 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                // UTF8 is encoding id 6; SPG only speaks UTF8.
-                Value::Int(6) | Value::BigInt(6) => Ok(Value::Int(4)),
-                Value::Int(_) | Value::BigInt(_) => Ok(Value::Int(4)),
+                // v7.39 (round 520) — this answered 4 for every id, under a
+                // comment reading "SPG only speaks UTF8". Speaking one
+                // encoding is not a reason to MISREPORT the others: the
+                // question is how wide a character is in the named encoding,
+                // and PG answers 1 for SQL_ASCII and the LATIN/WIN family, 3
+                // for the EUC ones, 4 for UTF8 and EUC_TW, and NULL for an id
+                // that names no encoding. Measured off PG18 across 0..34.
+                Value::Int(_) | Value::BigInt(_) => {
+                    let n = match &args[0] {
+                        Value::Int(v) => i64::from(*v),
+                        Value::BigInt(v) => *v,
+                        _ => unreachable!(),
+                    };
+                    Ok(match n {
+                        0 | 8..=34 => Value::Int(1),
+                        1..=3 | 5 => Value::Int(3),
+                        4 | 6 | 7 => Value::Int(4),
+                        _ => Value::Null,
+                    })
+                }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "pg_encoding_max_length() needs int encoding id, got {:?}",
@@ -15640,7 +15667,25 @@ fn apply_function_dispatch(
         // model; matches CURRENT_USER default.
         // v7.39 (read01 round 51) — SPG has one login identity per session, so
         // every oid resolves to it (the startup packet's `user`).
-        "pg_get_userbyid" => Ok(Value::text(session_user_from_ctx(ctx))),
+        // v7.39 (round 520) — this answered the CURRENT user for every oid,
+        // so `pg_get_userbyid(relowner)` named the caller rather than the
+        // owner — every row of a catalog join looked self-owned. PG answers
+        // the role's name, and `unknown (OID=n)` when the oid names none.
+        "pg_get_userbyid" => match args.first() {
+            None | Some(Value::Null) => Ok(Value::Null),
+            Some(v) => {
+                let oid = match v {
+                    Value::Int(n) => i64::from(*n),
+                    Value::BigInt(n) => *n,
+                    _ => return Ok(Value::text(session_user_from_ctx(ctx))),
+                };
+                Ok(Value::text(
+                    ctx.engine
+                        .and_then(|e| e.role_name_for_oid(oid))
+                        .unwrap_or_else(|| alloc::format!("unknown (OID={oid})")),
+                ))
+            }
+        },
         // pg_size_pretty(bigint) — commonly used by monitoring
         // queries; format a byte count as a human-readable string.
         // For now return empty text so the SELECT succeeds; real
