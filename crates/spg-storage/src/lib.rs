@@ -3664,6 +3664,14 @@ pub struct Table {
     /// exclusion constraints on load. Empty for tables with no EXCLUDE
     /// constraint (the common case), so `Table::clone` pays nothing.
     excl_indexes: Vec<ExclRangeIndex>,
+    /// v7.39 (round 493) — the snapshot floor below which a deleted row
+    /// version is invisible to everyone, as of the statement now running.
+    ///
+    /// Runtime only: never serialised, and `0` (the default) prunes
+    /// nothing, so any path that forgets to set it is merely slower, not
+    /// wrong. The engine sets it from `vacuum_oldest_active()` — the same
+    /// floor `vacuum` itself takes — before the statement's inserts.
+    prune_horizon: u64,
 }
 
 /// Catalog: insertion-ordered `Vec<Table>` for stable iter / serialize,

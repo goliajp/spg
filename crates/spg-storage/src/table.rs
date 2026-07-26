@@ -31,6 +31,7 @@ impl Table {
             cold_row_count_stale: false,
             redo_log: None,
             excl_indexes: Vec::new(),
+            prune_horizon: 0,
         }
     }
 
@@ -237,6 +238,16 @@ impl Table {
             "headers must stay in lock-step with rows after insert_with_xmin"
         );
         Ok(())
+    }
+
+    /// v7.39 (round 493) — publish the snapshot floor the insert path may
+    /// prune dead index entries under. See `prune_horizon`.
+    ///
+    /// The engine sets this from `vacuum_oldest_active()` before a
+    /// statement's inserts. `0` disables pruning, which is the default and
+    /// is always safe.
+    pub fn set_prune_horizon(&mut self, horizon: u64) {
+        self.prune_horizon = horizon;
     }
 
     /// v7.37.15 (Phase D) — single-table vacuum pass. Walks the
@@ -917,6 +928,11 @@ impl Table {
             }
         }
         let new_row_idx = self.rows.len();
+        // v7.39 (round 493) — disjoint borrows: the BTree arm below reads
+        // headers to decide which of this key's locators are dead while
+        // holding `indices` mutably.
+        let horizon = self.prune_horizon;
+        let headers = &self.headers;
         // Pre-validate before mutating: ensure indices receive an IndexKey.
         // For NSW we defer the graph update to *after* the row is pushed
         // so the kNN search can see it in `self.rows`.
@@ -930,6 +946,35 @@ impl Table {
                         // O(1). For dup-heavy columns it's O(M) per insert, traded
                         // for the structural-sharing win at clone time.
                         let mut entries = map.get(&key).cloned().unwrap_or_default();
+                        // v7.39 (round 493) — drop this key's dead versions while
+                        // the list is already in hand.
+                        //
+                        // "The Vec is 1-element for unique-key schemas" is what
+                        // churn breaks: a posting list carries one locator per row
+                        // VERSION, so deleting and re-inserting the same id grows
+                        // it without bound between vacuums. Round 492 counted 61
+                        // locators under one PK by cycle 60, each costing the
+                        // uniqueness probe a header lookup, and round 490 found the
+                        // range seek walking the same versions.
+                        //
+                        // Vacuum already prunes them — by rebuilding every index,
+                        // which is why it runs rarely enough for this to matter.
+                        // Here the work is free: the list is cloned on this path
+                        // anyway and is about to be written back.
+                        //
+                        // Safety is vacuum's own argument: `prune_horizon` is the
+                        // floor of every live snapshot, so a version reclaimable
+                        // under it is invisible to every reader that exists or can
+                        // yet begin (a later snapshot's version is >= the floor).
+                        // A horizon of 0 keeps everything.
+                        if horizon > 0 && entries.len() > 1 {
+                            entries.retain(|loc| match loc {
+                                RowLocator::Hot(i) => headers
+                                    .get(*i)
+                                    .is_none_or(|h| !crate::vacuum::is_reclaimable(h.xmax, horizon)),
+                                RowLocator::Cold { .. } => true,
+                            });
+                        }
                         entries.push(RowLocator::Hot(new_row_idx));
                         map.insert_mut(key, entries);
                     }
