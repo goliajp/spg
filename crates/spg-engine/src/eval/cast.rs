@@ -734,6 +734,12 @@ pub fn cast_value_in(
                     _ => {}
                 }
             }
+            // v7.39 (round 514) — the remaining catalog-shaped types. Each
+            // validates its own text form and keeps it, which is what PG's
+            // input functions do; the wordings below are PG18 readings.
+            if let Some(out) = cast_catalog_scalar(&name, &v)? {
+                return Ok(out);
+            }
             // v7.39 (round 511) — `'(0,1)'::tid`, so a caller can name a row
             // it read a ctid from earlier. PG's text form is the only input
             // shape it has.
@@ -776,6 +782,17 @@ pub fn cast_value_in(
                         | "fdw_handler"
                         | "pg_ddl_command"
                         | "pg_node_tree"
+                        // v7.39 (round 514) — the statistics and GiST
+                        // internal representations. Measured on PG18: a
+                        // VALUE cast is "cannot accept a value of type X"
+                        // and a NULL is NULL, which is the pseudotype
+                        // contract exactly.
+                        | "pg_ndistinct"
+                        | "pg_mcv_list"
+                        | "pg_dependencies"
+                        | "pg_brin_minmax_multi_summary"
+                        | "pg_brin_bloom_summary"
+                        | "gtsvector"
                 ) {
                     // v7.39 (round 509) — a pseudotype is a REAL type name,
                     // so `NULL::anyarray` is NULL on PG, not an error. Only a
@@ -1032,6 +1049,25 @@ pub(crate) fn builtin_target_resolves(name: &str, mysql: bool) -> bool {
             | "fdw_handler"
             | "pg_ddl_command"
             | "pg_node_tree"
+            // v7.39 (round 514) — the statistics and GiST internal
+            // representations. PG answers "cannot accept a value of type X"
+            // for a value and NULL for a NULL, which is exactly the
+            // pseudotype contract above.
+            | "pg_ndistinct"
+            | "pg_mcv_list"
+            | "pg_dependencies"
+            | "pg_brin_minmax_multi_summary"
+            | "pg_brin_bloom_summary"
+            | "gtsvector"
+            | "cid"
+            | "xid"
+            | "oidvector"
+            | "int2vector"
+            | "aclitem"
+            | "refcursor"
+            | "pg_snapshot"
+            | "txid_snapshot"
+            | "jsonpath"
     ) {
         return true;
     }
@@ -1055,6 +1091,105 @@ fn parse_tid_text(t: &str) -> Option<Value<'static>> {
         b.trim().parse::<u32>().ok()?,
         o.trim().parse::<u32>().ok()?,
     ))
+}
+
+/// v7.39 (round 514) — the catalog-shaped scalar types: the ids, the oid
+/// vectors, an ACL item, a cursor name and a transaction snapshot.
+///
+/// `Some` when `name` is one of them, so the caller can fall through to
+/// everything else. Every error wording is a PG18 reading — they differ per
+/// type and per ELEMENT (`::oidvector` complains about `oid`,
+/// `::int2vector` about `smallint`), which is why they are spelled out
+/// rather than shared.
+fn cast_catalog_scalar(
+    name: &str,
+    v: &Value<'_>,
+) -> Result<Option<Value<'static>>, EvalError> {
+    let lower = name.to_ascii_lowercase();
+    if !matches!(
+        lower.as_str(),
+        "cid" | "xid" | "oidvector" | "int2vector" | "aclitem" | "refcursor" | "pg_snapshot"
+            | "txid_snapshot" | "jsonpath"
+    ) {
+        return Ok(None);
+    }
+    let text = match v {
+        Value::Text(t) => t.to_string(),
+        Value::Cid(c) if lower == "cid" => return Ok(Some(Value::Cid(*c))),
+        Value::Xid(x) if lower == "xid" => return Ok(Some(Value::Xid(*x))),
+        Value::SmallInt(n) => alloc::format!("{n}"),
+        Value::Int(n) => alloc::format!("{n}"),
+        Value::BigInt(n) => alloc::format!("{n}"),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "cannot cast type {} to {lower}",
+                    crate::eval::strings::pg_typeof_name(other)
+                ),
+            });
+        }
+    };
+    let t = text.trim();
+    let bad = |ty: &str, what: &str| EvalError::TypeMismatch {
+        detail: alloc::format!("invalid input syntax for type {ty}: \"{what}\""),
+    };
+    let out = match lower.as_str() {
+        "cid" => Value::Cid(t.parse::<u32>().map_err(|_| bad("cid", t))?),
+        "xid" => Value::Xid(t.parse::<u32>().map_err(|_| bad("xid", t))?),
+        // Space-separated element lists, validated element by element and
+        // kept in their own spelling.
+        "oidvector" | "int2vector" => {
+            let elem_ty = if lower == "oidvector" { "oid" } else { "smallint" };
+            for part in t.split_whitespace() {
+                let ok = if elem_ty == "oid" {
+                    part.parse::<u32>().is_ok()
+                } else {
+                    part.parse::<i16>().is_ok()
+                };
+                if !ok {
+                    return Err(bad(elem_ty, part));
+                }
+            }
+            Value::text(t.to_string())
+        }
+        // `grantee=privileges/grantor`, and PG checks the key word first:
+        // anything before the `=` that is not a role name, `group` or
+        // `user` is "unrecognized key word".
+        "aclitem" => {
+            let Some((who, rest)) = t.split_once('=') else {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("unrecognized key word: \"{t}\""),
+                });
+            };
+            if !rest.contains('/') {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("a name must follow the \"/\" sign"),
+                });
+            }
+            let _ = who;
+            Value::text(t.to_string())
+        }
+        // A cursor name is just a name.
+        "refcursor" => Value::text(t.to_string()),
+        // `xmin:xmax:xip_list` — two numbers and a comma-separated tail.
+        "pg_snapshot" | "txid_snapshot" => {
+            let parts: alloc::vec::Vec<&str> = t.splitn(3, ':').collect();
+            let shaped = parts.len() == 3
+                && parts[0].parse::<u64>().is_ok()
+                && parts[1].parse::<u64>().is_ok()
+                && (parts[2].is_empty()
+                    || parts[2].split(',').all(|x| x.parse::<u64>().is_ok()));
+            if !shaped {
+                return Err(bad(&lower, t));
+            }
+            Value::text(t.to_string())
+        }
+        // PG normalises a path on input: `$.a` reads back `$."a"`. The
+        // engine already has the parser its operators use.
+        "jsonpath" => Value::text(crate::json::jsonpath_canonical(t)?),
+        _ => unreachable!("guarded above"),
+    };
+    Ok(Some(out))
 }
 
 fn bit_cast_width(name: &str) -> Option<(u32, bool)> {
