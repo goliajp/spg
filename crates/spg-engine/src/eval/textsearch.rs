@@ -235,10 +235,17 @@ pub(super) fn fts_to_tsvector(
 /// v7.24 (round-16 C) — `setweight(tsvector, "char")`. Relabels
 /// every lexeme with the given PG weight letter (A=3 B=2 C=1 D=0).
 pub(super) fn fts_setweight(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
-    let [vec_arg, weight_arg] = args else {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("setweight expects 2 arguments, got {}", args.len()),
-        });
+    // v7.39 (round 517) — PG's third argument names the lexemes to weight;
+    // the rest keep theirs. Measured: `setweight('cat:1 dog:2','B','{cat}')`
+    // is `'cat':1B 'dog':2`.
+    let (vec_arg, weight_arg, only) = match args {
+        [v, w] => (v, w, None),
+        [v, w, l] => (v, w, Some(l)),
+        _ => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("setweight expects 2 or 3 arguments, got {}", args.len()),
+            });
+        }
     };
     if matches!(vec_arg, Value::Null) || matches!(weight_arg, Value::Null) {
         return Ok(Value::Null);
@@ -270,9 +277,31 @@ pub(super) fn fts_setweight(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
             });
         }
     };
+    // The named set, when there is one. A NULL list weights nothing, which
+    // is what PG's strict-on-the-array behaviour comes to.
+    let selected: Option<alloc::vec::Vec<String>> = match only {
+        None => None,
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(v) => {
+            let t = crate::eval::value_to_text(v);
+            let inner = t.trim().trim_start_matches('{').trim_end_matches('}');
+            Some(
+                inner
+                    .split(',')
+                    .map(|x| x.trim().trim_matches('"').to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect(),
+            )
+        }
+    };
     let mut out = lexemes.clone();
     for lex in &mut out {
-        lex.weight = weight;
+        let hit = selected
+            .as_ref()
+            .is_none_or(|names| names.iter().any(|n| *n == lex.word));
+        if hit {
+            lex.weight = weight;
+        }
     }
     Ok(Value::TsVector(out))
 }

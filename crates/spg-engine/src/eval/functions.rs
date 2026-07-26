@@ -712,6 +712,35 @@ fn date_int_coerce_positions(name: &str) -> Option<&'static [usize]> {
     })
 }
 
+/// v7.39 (round 517) — PG's packed type modifier for a type name, as
+/// `to_regtypemod` reports it: a length becomes `len + 4`, a numeric's
+/// precision and scale become `(p << 16) | s` and then `+ 4`, a type with no
+/// modifier is -1, and a name that is not a type is NULL.
+fn type_modifier_of(spec: &str) -> Value<'static> {
+    let t = spec.trim();
+    let Some((base, rest)) = t.split_once('(') else {
+        return match crate::conversions::regtype_canonical_name(t) {
+            Some(_) => Value::Int(-1),
+            None => Value::Null,
+        };
+    };
+    if crate::conversions::regtype_canonical_name(base.trim()).is_none() {
+        return Value::Null;
+    }
+    let Some(inner) = rest.strip_suffix(')') else {
+        return Value::Null;
+    };
+    let nums: alloc::vec::Vec<i64> = inner
+        .split(',')
+        .filter_map(|n| n.trim().parse::<i64>().ok())
+        .collect();
+    match nums.as_slice() {
+        [len] => Value::Int((*len + 4) as i32),
+        [p, s] => Value::Int((((*p << 16) | *s) + 4) as i32),
+        _ => Value::Null,
+    }
+}
+
 fn apply_function_dispatch(
     name: &str,
     args: &[Value<'_>],
@@ -1882,10 +1911,12 @@ fn apply_function_dispatch(
         // pg_import_snapshot / pg_import_serialized_snapshot don't
         // return anything meaningful in scalar form.
         "pg_import_snapshot" | "pg_import_serialized_snapshot" => Ok(Value::Null),
-        // pg_visible_in_snapshot(xid, snapshot) — visibility probe
-        // used by pg_visibility. Under SPG's synchronous commit +
-        // no MVCC-yet model, any tx we know about is visible.
-        "pg_visible_in_snapshot" => Ok(Value::Bool(true)),
+        // v7.39 (round 517) — `pg_visible_in_snapshot` used to answer TRUE
+        // for everything, with a comment reading "no MVCC-yet model". SPG
+        // has had MVCC since v7.37.15, and the stub outlived it: a caller
+        // probing a snapshot got "visible" for an id the snapshot excludes.
+        // It shares the real check with `txid_visible_in_snapshot` below —
+        // same function, PG just gives the two different argument types.
         // pg_last_xid — returns the last committed xid. Similar
         // shape to txid_current; use next_tx_id.
         "pg_last_xid" => Ok(Value::BigInt(0)),
@@ -3407,6 +3438,91 @@ fn apply_function_dispatch(
         // horizontal, parallel and perpendicular over two lsegs. Only the
         // one-argument forms existed here. Comparisons use PG's geometric
         // EPSILON, as the one-argument forms and `slope` do.
+        // v7.39 (round 517) — `pg_is_other_temp_schema(oid)`. True only for
+        // ANOTHER session's temp schema; SPG reaches no such thing by oid,
+        // and PG answers false for every ordinary namespace.
+        "pg_is_other_temp_schema" if args.len() == 1 => match &args[0] {
+            Value::Null => Ok(Value::Null),
+            _ => Ok(Value::Bool(false)),
+        },
+        // v7.39 (round 517) — the `*_is_visible` family psql's `\d` queries
+        // call. PG answers NULL for an oid that names nothing, true when the
+        // object is on the search path.
+        //
+        // SPG has a `pg_collation`, so that one is a lookup. It has no
+        // `pg_opfamily`, `pg_conversion` or statistics objects at all — so
+        // NO oid names one, and NULL is not a stand-in there, it is the
+        // answer PG gives for exactly that case.
+        "pg_collation_is_visible" if args.len() == 1 => match &args[0] {
+            Value::Null => Ok(Value::Null),
+            v => {
+                let oid = match v {
+                    Value::Int(n) => i64::from(*n),
+                    Value::BigInt(n) => *n,
+                    _ => return Ok(Value::Null),
+                };
+                let known = ctx.catalog.is_some_and(|_| (100..=1000).contains(&oid));
+                Ok(if known { Value::Bool(true) } else { Value::Null })
+            }
+        },
+        "pg_opfamily_is_visible"
+        | "pg_conversion_is_visible"
+        | "pg_statistics_obj_is_visible"
+            if args.len() == 1 =>
+        {
+            Ok(Value::Null)
+        }
+        // v7.39 (round 517) — `to_regtypemod('varchar(32)')` is 36. PG packs
+        // the modifier into an int32: a length becomes `len + 4`, and a
+        // numeric's precision/scale become `(p << 16) | s`, then `+ 4`.
+        // Measured: varchar(32) → 36, numeric(10,2) → 655366, a bare type →
+        // -1, an unknown type → NULL.
+        "to_regtypemod" if args.len() == 1 => match &args[0] {
+            Value::Null => Ok(Value::Null),
+            v => Ok(type_modifier_of(&crate::eval::value_to_text(v))),
+        },
+        // v7.39 (round 517) — `xmlconcat2` is the two-argument concatenation
+        // behind the `xmlconcat` aggregate; a NULL side is the other side.
+        "xmlconcat2" if args.len() == 2 => match (&args[0], &args[1]) {
+            (Value::Null, b) => Ok(b.clone().into_owned()),
+            (a, Value::Null) => Ok(a.clone().into_owned()),
+            (a, b) => Ok(Value::Xml(alloc::borrow::Cow::Owned(alloc::format!(
+                "{}{}",
+                crate::eval::value_to_text(a),
+                crate::eval::value_to_text(b)
+            )))),
+        },
+        // v7.39 (round 517) — is a transaction id visible in a snapshot?
+        // `xmin:xmax:xip_list`: below xmin is visible, at or above xmax is
+        // not, and in between it is visible unless it is in the in-progress
+        // list. Measured: (5,'10:20:') true, (15,'10:20:') true,
+        // (15,'10:20:15') false.
+        "txid_visible_in_snapshot" | "pg_visible_in_snapshot" if args.len() == 2 => {
+            match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (xid, snap) => {
+                    let x = match xid {
+                        Value::BigInt(n) => *n,
+                        Value::Int(n) => i64::from(*n),
+                        _ => return Ok(Value::Null),
+                    };
+                    let t = crate::eval::value_to_text(snap);
+                    let mut it = t.splitn(3, ':');
+                    let (Some(xmin), Some(xmax), Some(xip)) = (it.next(), it.next(), it.next())
+                    else {
+                        return Ok(Value::Null);
+                    };
+                    let (Ok(xmin), Ok(xmax)) = (xmin.parse::<i64>(), xmax.parse::<i64>()) else {
+                        return Ok(Value::Null);
+                    };
+                    let in_progress = xip
+                        .split(',')
+                        .filter(|p| !p.is_empty())
+                        .any(|p| p.trim().parse::<i64>() == Ok(x));
+                    Ok(Value::Bool(x < xmin || (x < xmax && !in_progress)))
+                }
+            }
+        }
         // v7.39 (round 516) — the function spellings of `?||` and `?-|`.
         // PG carries both, and a generated view writes the function.
         "isparallel" | "isperp" if args.len() == 2 => {

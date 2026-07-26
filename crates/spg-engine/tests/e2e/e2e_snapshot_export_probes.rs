@@ -30,12 +30,33 @@ fn snapshot_export_probes_return_null() {
     }
 }
 
+/// v7.39 (round 517) — this used to assert TRUE for
+/// `pg_visible_in_snapshot(1, NULL)`, which was pinning SPG's own stub: the
+/// function answered TRUE for everything, under a comment reading "no
+/// MVCC-yet model". SPG has had MVCC since v7.37.15 and the stub outlived
+/// it, so a caller probing a snapshot got "visible" for an id the snapshot
+/// excludes.
+///
+/// PG18, measured: a NULL snapshot is NULL, and the real check is below
+/// xmin visible, at or above xmax not, in between visible unless the id is
+/// in the in-progress list.
 #[test]
-fn pg_visible_in_snapshot_returns_true() {
+fn pg_visible_in_snapshot_reads_the_snapshot() {
     let mut e = Engine::new();
-    match first(&mut e, "SELECT pg_visible_in_snapshot(1, NULL)") {
-        spg_storage::Value::Bool(true) => {}
-        other => panic!("got {other:?}"),
+    assert!(matches!(
+        first(&mut e, "SELECT pg_visible_in_snapshot(1, NULL)"),
+        spg_storage::Value::Null
+    ));
+    for (sql, want) in [
+        ("SELECT pg_visible_in_snapshot(5, '10:20:')", true),
+        ("SELECT pg_visible_in_snapshot(15, '10:20:')", true),
+        ("SELECT pg_visible_in_snapshot(15, '10:20:15')", false),
+        ("SELECT pg_visible_in_snapshot(25, '10:20:')", false),
+    ] {
+        match first(&mut e, sql) {
+            spg_storage::Value::Bool(b) => assert_eq!(b, want, "{sql}"),
+            other => panic!("{sql}: got {other:?}"),
+        }
     }
 }
 
