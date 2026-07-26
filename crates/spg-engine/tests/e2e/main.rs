@@ -90,6 +90,7 @@ mod e2e_catalog_functions_round517;
 mod e2e_constant_answers_round518;
 mod e2e_relation_sizes_round519;
 mod e2e_constant_answers_round520;
+mod e2e_expectation_audit_round521;
 mod e2e_unary_plus_round507;
 mod e2e_cardinality_violation;
 mod e2e_casefold;

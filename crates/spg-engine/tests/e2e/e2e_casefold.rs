@@ -34,14 +34,14 @@ fn casefold_unicode() {
     // German sharp s: 'ß'.to_lowercase() stays ß in Rust's simple
     // mapping, but 'ẞ' (capital sharp s U+1E9E) folds to ß.
     assert_eq!(text(&first(&mut e, "SELECT casefold('STRAẞE')")), "straße");
-    // Turkish dotted capital İ folds to i + combining dot in full
-    // Unicode lowercase; verify no crash + non-empty.
-    let v = text(&first(&mut e, "SELECT casefold('İSTANBUL')"));
-    assert!(v.starts_with('i'));
-    // Greek sigma: Rust's to_lowercase applies the word-final
-    // sigma rule — trailing Σ becomes ς (final form), interior
-    // Σ becomes σ. This matches full Unicode casing.
-    assert_eq!(text(&first(&mut e, "SELECT casefold('ΣΟΦΟΣ')")), "σοφος");
+    // v7.39 (round 521) — both of these described Rust's `to_lowercase`
+    // rather than PG's `casefold`, and asserted accordingly. Case FOLDING is
+    // position-blind on purpose: its job is to make two spellings of a word
+    // compare equal, so no final-sigma rule applies. Measured on PG18.
+    assert_eq!(text(&first(&mut e, "SELECT casefold('İSTANBUL')")), "istanbul");
+    assert_eq!(text(&first(&mut e, "SELECT casefold('ΣΟΦΟΣ')")), "σοφοσ");
+    // An already-lowered final sigma is left as it is.
+    assert_eq!(text(&first(&mut e, "SELECT casefold('σοφος')")), "σοφος");
 }
 
 #[test]

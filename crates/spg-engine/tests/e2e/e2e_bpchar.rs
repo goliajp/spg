@@ -62,10 +62,14 @@ fn bpchar_semantics() {
 // ── v7.39 bpchar epic — the differential-locked gap set (oracle: PG18.4) ──
 
 #[test]
-fn bpchar_octet_and_bit_length_count_padded() {
+fn bpchar_octet_length_counts_padding_and_bit_length_does_not() {
     let mut e = Engine::new();
+    // v7.39 (round 521) — the two measures disagree, and this asserted they
+    // agreed. Measured on PG18: `octet_length` counts the padding and
+    // `bit_length` does not, which is the same split `length` is on.
     assert_eq!(one(&mut e, "SELECT octet_length('ab'::char(5))"), "5");
-    assert_eq!(one(&mut e, "SELECT bit_length('ab'::char(5))"), "40");
+    assert_eq!(one(&mut e, "SELECT bit_length('ab'::char(5))"), "16");
+    assert_eq!(one(&mut e, "SELECT length('ab'::char(5))"), "2");
 }
 
 #[test]

@@ -43,8 +43,11 @@ fn array_to_json_empty() {
 #[test]
 fn array_to_json_pretty() {
     let mut e = Engine::new();
+    // v7.39 (round 521) — this asserted `[\n 1,\n 2,\n 3\n]`, a reasonable
+    // shape and not PG's: PG opens on the same line as the first element and
+    // closes on the last. Measured.
     let v = first(&mut e, "SELECT array_to_json(ARRAY[1, 2, 3], true)");
-    assert_eq!(as_json(&v), "[\n 1,\n 2,\n 3\n]");
+    assert_eq!(as_json(&v), "[1,\n 2,\n 3]");
 }
 
 #[test]

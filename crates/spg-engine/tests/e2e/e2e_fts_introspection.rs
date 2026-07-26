@@ -16,6 +16,10 @@ fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
 fn text(v: &spg_storage::Value<'_>) -> String {
     match v {
         spg_storage::Value::Text(s) => s.to_string(),
+        // v7.39 (round 521) — `strip` answers a TSVECTOR now, as PG's does.
+        // Rendering it here keeps the assertions reading as the text form
+        // they compare against.
+        spg_storage::Value::TsVector(_) => spg_engine::eval::value_to_text(v),
         other => panic!("expected Text, got {other:?}"),
     }
 }
@@ -30,12 +34,16 @@ fn as_int(v: &spg_storage::Value<'_>) -> i32 {
 #[test]
 fn strip_removes_positions() {
     let mut e = Engine::new();
+    // v7.39 (round 521) — `strip` takes a TSVECTOR and answers one, so an
+    // unknown literal becomes a tsvector on the way in and renders with its
+    // quotes on the way out. This asserted the TEXT form, which reads the
+    // same and is not a tsvector.
     assert_eq!(
         text(&first(&mut e, "SELECT strip('cat:3 dog:7 fish:12')")),
-        "cat dog fish"
+        "'cat' 'dog' 'fish'"
     );
     // Already stripped — unchanged.
-    assert_eq!(text(&first(&mut e, "SELECT strip('cat dog')")), "cat dog");
+    assert_eq!(text(&first(&mut e, "SELECT strip('cat dog')")), "'cat' 'dog'");
 }
 
 #[test]
