@@ -2642,6 +2642,20 @@ pub(crate) fn relation_oid(cat: &Catalog, bare: &str) -> Option<i64> {
 /// the subset here is "every column an external tool actually
 /// reads against SPG" — additional columns land as we observe
 /// new tools query them.
+/// v7.39 (round 526) — the schema an oid names, for `::regnamespace`.
+/// The same three `pg_namespace` publishes, so a join on `relnamespace`
+/// and the cast agree.
+#[must_use]
+pub(crate) fn schema_name_for_oid(oid: i64) -> Option<alloc::string::String> {
+    let name = match oid {
+        11 => "pg_catalog",
+        2200 => "public",
+        13000 => "information_schema",
+        _ => return None,
+    };
+    Some(alloc::string::String::from(name))
+}
+
 pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     use spg_storage::PartitionRole;
     let schema = alloc::vec![
@@ -2690,6 +2704,7 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             continue;
         };
         let Some(t) = cat.get(&tname) else { continue };
+        let is_temp = stored != tname;
         let schema_ref = t.schema();
         // v7.39 (round 338, V64) — a MATERIALIZED VIEW is backed by a real
         // table in SPG, and that showed through: it reported relkind 'r',
@@ -2738,7 +2753,14 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             Value::BigInt(0), // reltoastrelid (SPG no TOAST)
             Value::Bool(has_index),
             Value::Bool(false), // relisshared
-            Value::text("p"),   // relpersistence — 'p' permanent
+            // v7.39 (round 526) — 't' for a TEMPORARY relation. This was
+            // pinned 'p', so every temp table, view and sequence reported
+            // itself permanent: a tool listing temp objects found none,
+            // and one deciding what to dump saw them as dumpable. The
+            // witness is the one the resolver already uses — a temp
+            // relation is stored under a session-prefixed name, so its
+            // stored and listed names differ.
+            Value::text(if is_temp { "t" } else { "p" }),
             Value::text(relkind),
             Value::SmallInt(relnatts),
             Value::SmallInt(i16::try_from(has_checks).unwrap_or(i16::MAX)),
@@ -2772,10 +2794,13 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     // relacl lookups) dead-ended. PG's values, measured: relam 0,
     // relfilenode 0 (a view has no storage), relpages 0, reltuples -1,
     // relhasrules TRUE (the _RETURN rule), relreplident 'n'.
-    for vname in cat.views_all().keys() {
-        let Some(vname) = cat.listed_name(vname) else {
+    for stored in cat.views_all().keys() {
+        let Some(vname) = cat.listed_name(stored) else {
             continue;
         };
+        // v7.39 (round 526) — a temp relation is stored under a
+        // session-prefixed name; that is the same witness the resolver uses.
+        let is_temp = stored != vname;
         let Some(view_oid) = relation_oid(cat, vname) else {
             continue;
         };
@@ -2797,7 +2822,7 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             Value::BigInt(0),
             Value::Bool(false), // relhasindex
             Value::Bool(false),
-            Value::text("p"),
+            Value::text(if is_temp { "t" } else { "p" }),
             Value::text("v"), // relkind — view
             Value::SmallInt(relnatts),
             Value::SmallInt(0),
@@ -2862,10 +2887,12 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     // were missing from pg_class entirely, so `SELECT relacl FROM pg_class WHERE
     // relname = '<seq>'` — the canonical way to read a sequence's privileges —
     // came back empty.
-    for (name, def) in cat.sequences_all() {
-        let Some(name) = cat.listed_name(name) else {
+    for (stored, def) in cat.sequences_all() {
+        let Some(name) = cat.listed_name(stored) else {
             continue;
         };
+        // v7.39 (round 526) — same witness as the table loop.
+        let is_temp = stored != name;
         let Some(seq_oid) = relation_oid(cat, name) else {
             continue;
         };
@@ -2885,7 +2912,7 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             Value::BigInt(0),
             Value::Bool(false), // relhasindex
             Value::Bool(false),
-            Value::text("p"),
+            Value::text(if is_temp { "t" } else { "p" }),
             Value::text("S"), // relkind — SEQUENCE
             Value::SmallInt(3),
             Value::SmallInt(0),
