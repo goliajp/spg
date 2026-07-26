@@ -5353,6 +5353,42 @@ pub(super) fn compare(
     l: &Value<'_>,
     r: &Value<'_>,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.39 (round 483) — same-variant scalars compare straight away.
+    //
+    // Round 482 removed the per-row `Value` churn and `compare` became the
+    // dominant cost: 35.6 % of self time on `g = 5`, with `Value::data_type`
+    // another 4.5 % — both spent on the pre-checks below before reaching
+    // the ordering match at the bottom.
+    //
+    // None of those pre-checks can fire for these pairs. Each is gated on
+    // one side being Text against a TYPED other (Text-vs-Text is explicitly
+    // left alone), on `NumericBig`, or on `BpChar` — all different variants
+    // from the ones matched here. So this is the same answer by the same
+    // arms, reached without walking past four guards that cannot apply.
+    match (l, r) {
+        (Value::Int(a), Value::Int(b)) => {
+            return cmp_result(op, a.cmp(b));
+        }
+        (Value::BigInt(a), Value::BigInt(b)) => {
+            return cmp_result(op, a.cmp(b));
+        }
+        (Value::SmallInt(a), Value::SmallInt(b)) => {
+            return cmp_result(op, a.cmp(b));
+        }
+        (Value::Int(a), Value::BigInt(b)) => {
+            return cmp_result(op, i64::from(*a).cmp(b));
+        }
+        (Value::BigInt(a), Value::Int(b)) => {
+            return cmp_result(op, a.cmp(&i64::from(*b)));
+        }
+        (Value::Text(a), Value::Text(b)) => {
+            return cmp_result(op, a.cmp(b));
+        }
+        (Value::Bool(a), Value::Bool(b)) => {
+            return cmp_result(op, a.cmp(b));
+        }
+        _ => {}
+    }
     // PG implicitly casts an unknown-type string literal to the other
     // operand's type (`i = '5'`, `1 = '1'`, `2 < '10'`). When one side is Text
     // and the other is a typed scalar, coerce the Text to that type first; a
