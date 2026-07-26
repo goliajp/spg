@@ -1866,9 +1866,13 @@ fn apply_function_dispatch(
                 return Ok(Value::Null);
             }
             let pretty = matches!(args.get(1), Some(Value::Bool(true)));
+            // v7.39 (round 521) — PG's pretty form opens on the SAME line
+            // as the first element and closes on the last: `[1,\n 2,\n 3]`.
+            // This wrote `[\n 1,\n 2,\n 3\n]`, which is a reasonable
+            // shape and not PG's.
             let sep = if pretty { ",\n " } else { "," };
-            let opener = if pretty { "[\n " } else { "[" };
-            let closer = if pretty { "\n]" } else { "]" };
+            let opener = "[";
+            let closer = "]";
             let mut out = alloc::string::String::from(opener);
             // v7.39 (read01 round 76) — one shared element menu: this used
             // to carry its own text/int/bigint-only match, so a bool[] or a
@@ -4689,9 +4693,17 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                // v7.39 (bpchar epic) — bit_length = octet_length × 8, on
-                // the PADDED stored form for bpchar.
-                Value::Text(s) | Value::BpChar(s) => {
+                // v7.39 (round 521) — the padding does NOT count. This read
+                // the stored bpchar form, so `bit_length('ab'::char(5))` was
+                // 40 where PG gives 16. Measured: `length` and `bit_length`
+                // both ignore a bpchar's trailing blanks and `octet_length`
+                // does not, which is why only this arm changed.
+                Value::BpChar(s) => {
+                    let bytes = s.trim_end_matches(' ').len();
+                    let bits = bytes.saturating_mul(8);
+                    Ok(Value::Int(i32::try_from(bits).unwrap_or(i32::MAX)))
+                }
+                Value::Text(s) => {
                     let bytes = s.len();
                     let bits = bytes.saturating_mul(8);
                     let n = i32::try_from(bits).unwrap_or(i32::MAX);
@@ -6671,7 +6683,16 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Text(s) => Ok(Value::text(s.to_lowercase())),
+                // v7.39 (round 521) — per CHARACTER, because
+                // `str::to_lowercase` applies Greek's final-sigma rule and
+                // PG's `lower` does not: measured, `lower('ΣΟΦΟΣ')` is
+                // `σοφοσ` there and this answered `σοφος`. Same reason
+                // `casefold` stopped using it.
+                Value::Text(s) => Ok(Value::text(
+                    s.chars()
+                        .flat_map(char::to_lowercase)
+                        .collect::<alloc::string::String>(),
+                )),
                 // PG `lower(anyrange)` returns the lower bound (NULL for an
                 // empty or lower-unbounded range).
                 Value::Range { lower, empty, .. } => Ok(if *empty {
@@ -12507,7 +12528,25 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Text(s) => Ok(Value::text(s.to_lowercase())),
+                // v7.39 (round 521) — case FOLDING is not lowercasing, and
+                // `str::to_lowercase` is the wrong tool twice over. It applies
+                // Greek's final-sigma rule, so `casefold('ΣΟΦΟΣ')` came back
+                // `σοφος` where PG gives `σοφοσ` — folding is position-blind
+                // on purpose, because its whole job is to make two spellings
+                // of the same word compare equal. And it expands `İ` to `i`
+                // plus a combining dot, where PG folds it to plain `i`.
+                // Both measured off PG18.
+                Value::Text(s) => Ok(Value::text(
+                    s.chars()
+                        .flat_map(|c| {
+                            if c == '\u{0130}' {
+                                alloc::vec!['i']
+                            } else {
+                                c.to_lowercase().collect::<alloc::vec::Vec<char>>()
+                            }
+                        })
+                        .collect::<alloc::string::String>(),
+                )),
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "casefold() needs text, got {:?}",
@@ -14519,18 +14558,24 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
+                // v7.39 (round 521) — an unknown literal is a TSVECTOR
+                // here, as it is everywhere else `strip` is declared to take
+                // one. This walked the string and handed back TEXT, so
+                // `strip('cat dog')` answered `cat dog` where PG answers
+                // `'cat' 'dog'` — the same words, but not a tsvector, so
+                // nothing downstream could treat it as one.
                 Value::Text(s) => {
-                    let stripped: alloc::vec::Vec<alloc::string::String> = s
-                        .split_whitespace()
-                        .map(|lexeme| {
-                            // Keep only up to the first ':'.
-                            match lexeme.split_once(':') {
-                                Some((word, _)) => word.into(),
-                                None => lexeme.into(),
-                            }
-                        })
-                        .collect();
-                    Ok(Value::text(stripped.join(" ")))
+                    let lexemes = crate::eval::decode_tsvector_external(s)?;
+                    Ok(Value::TsVector(
+                        lexemes
+                            .into_iter()
+                            .map(|l| spg_storage::TsLexeme {
+                                word: l.word,
+                                positions: alloc::vec::Vec::new(),
+                                weight: 0,
+                            })
+                            .collect(),
+                    ))
                 }
                 // v7.38 (read01 P6.30) — strip a real tsvector value: drop
                 // every lexeme's positions and weight, keeping just the words.
@@ -17187,7 +17232,7 @@ fn apply_function_dispatch(
             })
         }
         // cash_words(money) — spell out an amount in English words,
-        // PG shape: 'One hundred fourteen dollars and six cents'.
+        // PG shape: 'One hundred and fourteen dollars and six cents'.
         // Accepts numeric-ish input (SPG stores money as numeric).
         "cash_words" => {
             if args.len() != 1 {
@@ -17276,8 +17321,20 @@ fn apply_function_dispatch(
                     out.push_str(ONES[(n / 100) as usize]);
                     out.push_str(" hundred");
                     n %= 100;
+                    // v7.39 (round 521) — PG joins the hundreds with "and"
+                    // when what follows is UNDER TWENTY, and with a plain
+                    // space otherwise. Measured across a range, because two
+                    // guesses from single examples were both wrong: first
+                    // "always", which broke 1234 and 1234567, then "only in
+                    // the last group", which broke 1234 again. The real rule
+                    // has nothing to do with the group —
+                    //
+                    //   105 → one hundred AND five      120 → one hundred twenty
+                    //   114 → one hundred AND fourteen  134 → one hundred thirty four
+                    //   1114 → …one hundred AND fourteen
+                    //   114000 → one hundred AND fourteen thousand
                     if n > 0 {
-                        out.push(' ');
+                        out.push_str(if n < 20 { " and " } else { " " });
                     }
                 }
                 if n >= 20 {
