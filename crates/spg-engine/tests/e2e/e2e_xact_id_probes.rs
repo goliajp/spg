@@ -38,11 +38,25 @@ fn pg_current_xact_id_returns_bigint() {
 }
 
 #[test]
-fn snapshot_probes_return_null() {
+fn snapshot_probes_answer_a_snapshot() {
     let mut e = Engine::new();
+    // v7.39 (round 518) — `txid_current_snapshot()` used to be NULL, so a
+    // caller could not read the snapshot it was about to be compared
+    // against. It renders PG's `xmin:xmax:xip_list` now.
+    for f in &["txid_current_snapshot()", "pg_current_snapshot()"] {
+        let sql = format!("SELECT {f}");
+        match first(&mut e, &sql) {
+            spg_storage::Value::Text(t) => {
+                let parts: Vec<&str> = t.split(':').collect();
+                assert_eq!(parts.len(), 3, "{f}: xmin:xmax:xip, got {t}");
+                assert!(parts[0].parse::<u64>().is_ok(), "{f}: {t}");
+                assert!(parts[1].parse::<u64>().is_ok(), "{f}: {t}");
+            }
+            other => panic!("SELECT {f}: got {other:?}"),
+        }
+    }
+    // The accessors over it are still to come.
     for f in &[
-        "txid_current_snapshot()",
-        "pg_current_snapshot()",
         "pg_snapshot_xmin(pg_current_snapshot())",
         "pg_snapshot_xmax(pg_current_snapshot())",
     ] {

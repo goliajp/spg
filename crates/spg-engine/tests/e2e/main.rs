@@ -87,6 +87,7 @@ mod e2e_catalog_types_round514;
 mod e2e_cast_target_names_round515;
 mod e2e_catalog_functions_round516;
 mod e2e_catalog_functions_round517;
+mod e2e_constant_answers_round518;
 mod e2e_unary_plus_round507;
 mod e2e_cardinality_violation;
 mod e2e_casefold;

@@ -23,8 +23,17 @@ fn pg_relation_filepath_and_filenode() {
         spg_storage::Value::Text(s) => assert_eq!(s.as_ref(), "spg://storage"),
         other => panic!("got {other:?}"),
     }
+    // v7.39 (round 518) — this used to assert a constant 0, which is SPG's
+    // old stub rather than PG's answer: PG looks the relation up, and a
+    // name that is not one gives NULL. `'t'` is not a table in this engine.
     match first(&mut e, "SELECT pg_relation_filenode('t')") {
-        spg_storage::Value::BigInt(0) => {}
+        spg_storage::Value::Null => {}
+        other => panic!("got {other:?}"),
+    }
+    // A real relation gets a filenode.
+    e.execute("CREATE TABLE t (a INT)").unwrap();
+    match first(&mut e, "SELECT pg_relation_filenode('t'::regclass)") {
+        spg_storage::Value::BigInt(n) => assert!(n > 0, "got {n}"),
         other => panic!("got {other:?}"),
     }
 }

@@ -741,6 +741,65 @@ fn type_modifier_of(spec: &str) -> Value<'static> {
     }
 }
 
+/// v7.39 (round 518) — PG's encoding table, the subset SPG can name. The
+/// numbers are PG's own `pg_enc` ordinals.
+const PG_ENCODINGS: &[(i32, &str)] = &[
+    (0, "SQL_ASCII"),
+    (1, "EUC_JP"),
+    (2, "EUC_CN"),
+    (3, "EUC_KR"),
+    (4, "EUC_TW"),
+    (5, "EUC_JIS_2004"),
+    (6, "UTF8"),
+    (7, "MULE_INTERNAL"),
+    (8, "LATIN1"),
+    (9, "LATIN2"),
+    (10, "LATIN3"),
+    (11, "LATIN4"),
+    (12, "LATIN5"),
+    (13, "LATIN6"),
+    (14, "LATIN7"),
+    (15, "LATIN8"),
+    (16, "LATIN9"),
+    (17, "LATIN10"),
+    (18, "WIN1256"),
+    (19, "WIN1258"),
+    (20, "WIN866"),
+    (21, "WIN874"),
+    (22, "KOI8R"),
+    (23, "WIN1251"),
+    (24, "WIN1252"),
+    (25, "ISO_8859_5"),
+    (26, "ISO_8859_6"),
+    (27, "ISO_8859_7"),
+    (28, "ISO_8859_8"),
+    (29, "WIN1250"),
+    (30, "WIN1253"),
+    (31, "WIN1254"),
+    (32, "WIN1255"),
+    (33, "WIN1257"),
+    (34, "KOI8U"),
+];
+
+/// v7.39 (round 518) — does this oid name anything SPG carries? The
+/// visibility probes need it: PG looks the object up before answering, and
+/// answers NULL when there is nothing to look at.
+fn oid_names_something(oid: i64, ctx: &EvalContext<'_>) -> bool {
+    if oid <= 0 {
+        return false;
+    }
+    // Built-in type / function / collation oids live below the user band.
+    if oid < 16_384 {
+        return crate::system_catalog::PG_PROC_FUNCS.iter().any(|(o, ..)| *o == oid)
+            || (100..=1000).contains(&oid)
+            // The built-in TYPE oids: PG assigns them all below 10000, and
+            // `pg_type_oid` is the mapping SPG already keeps.
+            || crate::system_catalog::builtin_type_oid_exists(oid);
+    }
+    ctx.catalog
+        .is_some_and(|c| crate::system_catalog::relation_name_for_oid(c, oid).is_some())
+}
+
 fn apply_function_dispatch(
     name: &str,
     args: &[Value<'_>],
@@ -1623,9 +1682,17 @@ fn apply_function_dispatch(
         "pg_index_has_property"
         | "pg_indexam_has_property"
         | "pg_index_column_has_property" => Ok(Value::Bool(true)),
-        // v7.37.17 (17.6 siblings) — schema-visibility probes.
-        // SPG uses a single `public` namespace, so anything the caller
-        // can reference is visible. psql \d + ORMs check these.
+        // v7.37.17 (17.6 siblings) — schema-visibility probes. SPG uses a
+        // single `public` namespace, so anything the caller can reference is
+        // visible. psql \d + ORMs check these.
+        //
+        // v7.39 (round 518) — but "anything the caller can reference" is the
+        // point, and these answered TRUE for an oid that references NOTHING.
+        // PG answers NULL there — it looks the object up first — so a tool
+        // asking about a dropped relation was told it was visible. Found by
+        // the constant-answer sweep: `pg_table_is_visible('pg_class')` and
+        // `pg_table_is_visible(999999)` gave the same answer where PG's
+        // differ.
         "pg_type_is_visible"
         | "pg_table_is_visible"
         | "pg_function_is_visible"
@@ -1634,7 +1701,27 @@ fn apply_function_dispatch(
         | "pg_ts_config_is_visible"
         | "pg_ts_dict_is_visible"
         | "pg_ts_parser_is_visible"
-        | "pg_ts_template_is_visible" => Ok(Value::Bool(true)),
+        | "pg_ts_template_is_visible" => match args.first() {
+            Some(Value::Null) | None => Ok(Value::Null),
+            Some(v) => {
+                let oid = match v {
+                    Value::Int(n) => i64::from(*n),
+                    Value::BigInt(n) => *n,
+                    // A regclass / regproc VALUE only exists because the
+                    // cast that made it resolved the name, so the object is
+                    // there whether or not this engine's oid tables know the
+                    // number — which is what made a first cut answer NULL for
+                    // `pg_table_is_visible('pg_class'::regclass)`. Same for a
+                    // resolved name rendered as text (regconfig et al.).
+                    _ => return Ok(Value::Bool(true)),
+                };
+                Ok(if oid_names_something(oid, ctx) {
+                    Value::Bool(true)
+                } else {
+                    Value::Null
+                })
+            }
+        },
         // pg_get_serial_sequence is already handled above; keep
         // this location as the anchor for the visibility family.
         //
@@ -2088,6 +2175,27 @@ fn apply_function_dispatch(
         // txid_current_snapshot / pg_current_snapshot — full snapshot
         // structure with xmin/xmax/xip_list. Return NULL for the
         // scalar surface until we have a snapshot text type.
+        // v7.39 (round 518) — `txid_current_snapshot()` answered NULL, so a
+        // caller could not read the snapshot it was about to be compared
+        // against. The engine has one; this renders it in PG's
+        // `xmin:xmax:xip_list` form, which is exactly what
+        // `txid_visible_in_snapshot` (round 517) reads back.
+        "txid_current_snapshot" | "pg_current_snapshot" if args.is_empty() => {
+            let Some(engine) = ctx.engine else {
+                return Ok(Value::Null);
+            };
+            let snap = engine.current_snapshot();
+            let xip = snap.in_progress.ids();
+            let xmin = xip.first().copied().unwrap_or(snap.version);
+            Ok(Value::text(alloc::format!(
+                "{xmin}:{}:{}",
+                snap.version,
+                xip.iter()
+                    .map(alloc::string::ToString::to_string)
+                    .collect::<alloc::vec::Vec<_>>()
+                    .join(",")
+            )))
+        }
         "txid_current_snapshot"
         | "pg_current_snapshot"
         | "pg_snapshot_xmin"
@@ -2575,7 +2683,26 @@ fn apply_function_dispatch(
         // would leak the segment store to callers, which is not
         // meaningful outside the engine).
         "pg_relation_filepath" => Ok(Value::text::<String>("spg://storage".into())),
-        "pg_relation_filenode" => Ok(Value::BigInt(0)),
+        // v7.39 (round 518) — was a constant 0, so a dropped relation's oid
+        // reported a filenode. PG answers NULL when the oid names nothing.
+        "pg_relation_filenode" => match args.first() {
+            Some(Value::Null) | None => Ok(Value::Null),
+            Some(v) => {
+                let oid = match v {
+                    Value::Int(n) => i64::from(*n),
+                    Value::BigInt(n) => *n,
+                    // A resolved regclass names a real relation — see the
+                    // visibility probes above.
+                    Value::RegClass(o, _) => return Ok(Value::BigInt(*o)),
+                    _ => return Ok(Value::Null),
+                };
+                Ok(if oid_names_something(oid, ctx) {
+                    Value::BigInt(oid)
+                } else {
+                    Value::Null
+                })
+            }
+        },
         // v7.37.17 (17.6 siblings) — pg_get_backend_memory_contexts()
         // / pg_backend_memory_contexts() — return NULL (no memory
         // context tree exposed today). Monitoring queries typically
@@ -7964,6 +8091,20 @@ fn apply_function_dispatch(
                     ),
                 }),
             }
+        }
+        // v7.39 (round 518) — `age(xid)` is how far back a transaction id
+        // is from the current one; it errored with "age() needs DATE or
+        // TIMESTAMP" because only the temporal overload existed.
+        "age" if args.len() == 1 && matches!(&args[0], Value::Xid(_)) => {
+            let Value::Xid(x) = &args[0] else {
+                unreachable!()
+            };
+            let now = ctx
+                .engine
+                .map_or(u64::from(*x), |e| e.current_snapshot().version);
+            Ok(Value::BigInt(
+                i64::try_from(now.saturating_sub(u64::from(*x))).unwrap_or(i64::MAX),
+            ))
         }
         "age" => age(args),
         // mxid_age(xid) — multixact wraparound distance. SPG has no
@@ -15626,8 +15767,38 @@ fn apply_function_dispatch(
         }
         // pg_encoding_to_char / pg_char_to_encoding — the encoding
         // lookup pair. SPG always speaks UTF8 (encoding id 6).
-        "pg_encoding_to_char" => Ok(Value::text::<String>("UTF8".into())),
-        "pg_char_to_encoding" => Ok(Value::Int(6)),
+        // v7.39 (round 518) — these answered UTF8 and 6 for every input.
+        // PG has a table: 0 is SQL_ASCII, 6 is UTF8, 8 is LATIN1, an unknown
+        // NUMBER is NULL and an unknown NAME is -1 — the two directions do
+        // not fail the same way, which is why both are spelled out.
+        "pg_encoding_to_char" => match args.first() {
+            Some(Value::Null) | None => Ok(Value::Null),
+            Some(v) => {
+                let n = match v {
+                    Value::Int(n) => i64::from(*n),
+                    Value::BigInt(n) => *n,
+                    _ => return Ok(Value::Null),
+                };
+                Ok(PG_ENCODINGS
+                    .iter()
+                    .find(|(id, _)| i64::from(*id) == n)
+                    .map_or(Value::text(String::new()), |(_, name)| {
+                        Value::text((*name).to_string())
+                    }))
+            }
+        },
+        "pg_char_to_encoding" => match args.first() {
+            Some(Value::Null) | None => Ok(Value::Null),
+            Some(v) => {
+                let name = crate::eval::value_to_text(v);
+                Ok(Value::Int(
+                    PG_ENCODINGS
+                        .iter()
+                        .find(|(_, n)| n.eq_ignore_ascii_case(&name))
+                        .map_or(-1, |(id, _)| *id),
+                ))
+            }
+        },
         // has_table_privilege / has_column_privilege / has_schema_privilege:
         // permission probes ORMs emit before generating DDL. SPG
         // is single-user, so grant everything.

@@ -47,9 +47,13 @@ fn visibility_probes_return_true() {
         "pg_ts_parser_is_visible(1)",
         "pg_ts_template_is_visible(1)",
     ] {
+        // v7.39 (round 518) — these used to assert TRUE, which was SPG's
+        // stub rather than PG's answer. PG looks the object up first, and
+        // oid 1 names nothing — so NULL, not "visible". A tool asking about
+        // a dropped relation used to be told it was still there.
         let sql = format!("SELECT {f}");
         match first(&mut e, &sql) {
-            spg_storage::Value::Bool(true) => {}
+            spg_storage::Value::Null => {}
             other => panic!("SELECT {f}: got {other:?}"),
         }
     }

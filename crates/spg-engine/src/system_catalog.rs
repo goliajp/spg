@@ -2526,6 +2526,34 @@ pub(crate) fn function_oid_by_signature(cat: &Catalog, bare: &str, arg_types: &s
 /// Deliberately mirrors `relation_oid`'s walks step for step, in the same
 /// order over the same lists, so the two cannot disagree about which oid
 /// belongs to which relation.
+/// v7.39 (round 518) — is this one of the built-in type oids? The
+/// visibility probes ask before answering, as PG does.
+pub(crate) fn builtin_type_oid_exists(oid: i64) -> bool {
+    [
+        DataType::Bool,
+        DataType::SmallInt,
+        DataType::Int,
+        DataType::BigInt,
+        DataType::Real,
+        DataType::Float,
+        DataType::Numeric {
+            precision: 0,
+            scale: 0,
+        },
+        DataType::Text,
+        DataType::Bytes,
+        DataType::Date,
+        DataType::Timestamp,
+        DataType::Timestamptz,
+        DataType::Interval,
+        DataType::Uuid,
+        DataType::Json,
+        DataType::Jsonb,
+    ]
+    .into_iter()
+    .any(|t| pg_type_oid(t) == oid)
+}
+
 pub(crate) fn relation_name_for_oid(cat: &Catalog, oid: i64) -> Option<String> {
     for (pos, tname) in cat.table_names().iter().enumerate() {
         if OID_TABLE_BASE + pos as i64 == oid {
