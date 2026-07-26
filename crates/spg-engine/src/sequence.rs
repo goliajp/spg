@@ -527,15 +527,20 @@ impl Engine {
         // nextval() in this session. PG errors when nextval hasn't
         // been called yet; SPG matches.
         if op == "lastval" {
+            // v7.39 (round 499) — the value THIS session was last given,
+            // not the sequence's current value. Another session may have
+            // advanced it since, and answering that hands back a number
+            // this session never owned.
             let Some(seq) = self.last_sequence_used.clone() else {
                 return Err(EngineError::Unsupported(
                     "lastval is not yet defined in this session".into(),
                 ));
             };
-            let v = self
-                .active_catalog()
-                .sequence_current_value(&seq)
-                .map_err(EngineError::Storage)?;
+            let Some(&v) = self.seq_currvals.get(&seq) else {
+                return Err(EngineError::Unsupported(
+                    "lastval is not yet defined in this session".into(),
+                ));
+            };
             return Ok(Value::BigInt(v));
         }
         if args.is_empty() {
@@ -620,19 +625,43 @@ impl Engine {
                     self.active_catalog_mut().sequence_next_value(&seq_name)
                 }
                 .map_err(EngineError::Storage)?;
-                // Register for lastval().
+                // Register for lastval() and currval() — both are
+                // session-local (round 499).
                 self.last_sequence_used = Some(seq_name.clone());
+                self.seq_currvals.insert(seq_name.clone(), v);
                 Ok(Value::BigInt(v))
             }
             "currval" => {
-                // Reads the same shared state `nextval` advances, for the
-                // same reason.
-                let v = if self.catalog.has_sequence(&seq_name) {
-                    self.catalog.sequence_current_value(&seq_name)
+                // v7.39 (round 499) — session-local, per PG: the number
+                // THIS session was given, and an error when it has not
+                // called `nextval` on this sequence.
+                //
+                // It deliberately does NOT read the sequence's current
+                // value: another session may have advanced it, and
+                // answering that hands back a number this session never
+                // owned — which a caller then uses as a foreign key.
+                // Measured before this (`iso_session` T1): a connection
+                // that had never called `nextval` got an answer.
+                //
+                // The sequence must still exist, so the lookup runs first
+                // and its error wins — PG reports the missing relation
+                // rather than the session rule.
+                if self.catalog.has_sequence(&seq_name) {
+                    let _ = self
+                        .catalog
+                        .sequence_current_value(&seq_name)
+                        .map_err(EngineError::Storage)?;
                 } else {
-                    self.active_catalog().sequence_current_value(&seq_name)
+                    let _ = self
+                        .active_catalog()
+                        .sequence_current_value(&seq_name)
+                        .map_err(EngineError::Storage)?;
                 }
-                .map_err(EngineError::Storage)?;
+                let Some(&v) = self.seq_currvals.get(&seq_name) else {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "currval of sequence {seq_name:?} is not yet defined in this session"
+                    )));
+                };
                 Ok(Value::BigInt(v))
             }
             "setval" => {

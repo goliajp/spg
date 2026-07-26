@@ -604,3 +604,67 @@ fn lastval_reaches_the_sessions_own_state() {
     assert_eq!(query_one(&mut a, "SELECT nextval('lv')"), Some("2".into()));
     assert_eq!(query_one(&mut a, "SELECT lastval()"), Some("2".into()));
 }
+
+/// v7.39 (round 499) — `currval` and `lastval` are session-local.
+///
+/// PG defines both as answering the number THIS session was given, and
+/// erroring with "not yet defined in this session" when it has not called
+/// `nextval`. Measured before this round (`iso_session` T1/T2): a
+/// connection that had never called `nextval` got an answer, and
+/// `lastval` answered across connections — the tracking lived on the
+/// shared engine instead of in the session bag.
+#[test]
+fn currval_and_lastval_are_not_defined_in_a_session_that_never_called_nextval() {
+    let (_child, addr) = boot("currval-session");
+    let mut a = open(&addr);
+    let mut b = open(&addr);
+    query_one(&mut a, "CREATE SEQUENCE cv");
+
+    assert_eq!(query_one(&mut a, "SELECT nextval('cv')"), Some("1".into()));
+    assert_eq!(query_one(&mut a, "SELECT currval('cv')"), Some("1".into()));
+    assert_eq!(query_one(&mut a, "SELECT lastval()"), Some("1".into()));
+
+    let cv = query_err(&mut b, "SELECT currval('cv')");
+    assert!(
+        cv.as_deref().is_some_and(|e| e.contains("not yet defined in this session")),
+        "B's currval -> {cv:?}"
+    );
+    let lv = query_err(&mut b, "SELECT lastval()");
+    assert!(
+        lv.as_deref().is_some_and(|e| e.contains("not yet defined in this session")),
+        "B's lastval -> {lv:?}"
+    );
+}
+
+/// The number is the one this session was GIVEN, not the sequence's
+/// current value — another session advancing it must not change what this
+/// one reads back. Answering the live value would hand a caller a number
+/// it never owned, which is exactly what it then uses as a foreign key.
+#[test]
+fn currval_keeps_this_sessions_number_after_another_session_advances() {
+    let (_child, addr) = boot("currval-frozen");
+    let mut a = open(&addr);
+    let mut b = open(&addr);
+    query_one(&mut a, "CREATE SEQUENCE cv2");
+
+    assert_eq!(query_one(&mut a, "SELECT nextval('cv2')"), Some("1".into()));
+    // B advances the shared counter.
+    assert_eq!(query_one(&mut b, "SELECT nextval('cv2')"), Some("2".into()));
+    assert_eq!(query_one(&mut b, "SELECT nextval('cv2')"), Some("3".into()));
+    // A still reads its own 1; B reads its own 3.
+    assert_eq!(query_one(&mut a, "SELECT currval('cv2')"), Some("1".into()));
+    assert_eq!(query_one(&mut b, "SELECT currval('cv2')"), Some("3".into()));
+    assert_eq!(query_one(&mut a, "SELECT lastval()"), Some("1".into()));
+}
+
+/// A missing sequence reports the missing relation, not the session rule.
+#[test]
+fn currval_of_a_missing_sequence_reports_the_sequence() {
+    let (_child, addr) = boot("currval-missing");
+    let mut a = open(&addr);
+    let e = query_err(&mut a, "SELECT currval('no_such_seq')");
+    assert!(
+        e.as_deref().is_some_and(|m| !m.contains("not yet defined in this session")),
+        "should name the missing relation -> {e:?}"
+    );
+}

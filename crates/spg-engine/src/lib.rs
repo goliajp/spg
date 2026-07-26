@@ -646,6 +646,23 @@ pub(crate) struct SessionBag {
     /// instead — the same conversion `INSERT IGNORE` uses.
     pub(crate) mysql_strict: bool,
     pub(crate) prepared_statements: BTreeMap<String, PreparedSqlStatement>,
+    /// v7.39 (round 499) — the value `nextval` last returned IN THIS
+    /// SESSION, per sequence, and which sequence that was.
+    ///
+    /// PG defines `currval` and `lastval` as session-local: they answer
+    /// the number THIS session was given, and error with 55000 ("not yet
+    /// defined in this session") when it has not called `nextval`. They
+    /// are deliberately not the sequence's current value — another
+    /// session may have advanced it since, and reading that would hand
+    /// back a number this session never owned, which is what a caller
+    /// then uses as a foreign key.
+    ///
+    /// Measured before this (`iso_session` T1/T2): `currval` answered in
+    /// a connection that had never called `nextval`, and `lastval`
+    /// answered across connections, because the tracking lived on the
+    /// shared engine rather than in the bag.
+    pub(crate) seq_currvals: BTreeMap<String, i64>,
+    pub(crate) last_sequence_used: Option<String>,
     /// v7.39 (round 306) — open large-object descriptors. Per session
     /// from the start, deliberately: r277/r279/r283 each landed a piece
     /// of per-connection state on the process-wide engine first and had
@@ -927,6 +944,9 @@ pub struct Engine {
     /// nextval() in this Engine (session). Backs PG's lastval().
     /// None until the first nextval; PG errors in that state.
     last_sequence_used: Option<String>,
+    /// v7.39 (round 499) — per-session `currval` values; see
+    /// [`SessionBag::seq_currvals`].
+    seq_currvals: alloc::collections::BTreeMap<String, i64>,
     /// v7.39 (round 277) — SQL-level prepared statements, session
     /// scoped exactly as in PG. Keyed by name; each entry keeps the
     /// parsed body (placeholders intact), the declared parameter type
@@ -1344,6 +1364,7 @@ impl Engine {
             sessions: BTreeMap::new(),
             advisory_locks: BTreeMap::new(),
             last_sequence_used: None,
+            seq_currvals: alloc::collections::BTreeMap::new(),
             next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
             aborted_versions: BTreeSet::new(),
@@ -1738,6 +1759,7 @@ impl Engine {
             sessions: BTreeMap::new(),
             advisory_locks: BTreeMap::new(),
             last_sequence_used: None,
+            seq_currvals: alloc::collections::BTreeMap::new(),
             next_tx_id: 1,
             active_writer_versions: BTreeSet::new(),
             aborted_versions: BTreeSet::new(),
@@ -1860,6 +1882,7 @@ impl Engine {
                     sessions: BTreeMap::new(),
                     advisory_locks: BTreeMap::new(),
                     last_sequence_used: None,
+                    seq_currvals: alloc::collections::BTreeMap::new(),
                     next_tx_id: 1,
                     active_writer_versions: BTreeSet::new(),
                     aborted_versions: BTreeSet::new(),
@@ -1974,6 +1997,8 @@ impl Engine {
             temp_tables: core::mem::take(&mut self.temp_tables),
             temp_sequences: core::mem::take(&mut self.temp_sequences),
             temp_views: core::mem::take(&mut self.temp_views),
+            seq_currvals: core::mem::take(&mut self.seq_currvals),
+            last_sequence_used: self.last_sequence_used.take(),
         };
         self.sessions.insert(self.current_session, outgoing);
         let incoming = self.sessions.remove(&id).unwrap_or_default();
@@ -1991,6 +2016,8 @@ impl Engine {
         self.temp_tables = incoming.temp_tables;
         self.temp_sequences = incoming.temp_sequences;
         self.temp_views = incoming.temp_views;
+        self.seq_currvals = incoming.seq_currvals;
+        self.last_sequence_used = incoming.last_sequence_used;
         self.current_session = id;
         // The incoming session's temp namespace must be live before its very
         // first statement resolves a name.
