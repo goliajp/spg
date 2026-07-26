@@ -401,7 +401,7 @@ pub(super) fn resolve_column(
             // Column resolution above wins, so a real column named like the
             // alias is unaffected.
             if c.qualifier.is_none() && ctx.table_alias == Some(c.name.as_str()) {
-                return Ok(whole_row_composite(row, ctx, &c.name));
+                return whole_row_composite(row, ctx, &c.name);
             }
             Err(EvalError::ColumnNotFound {
                 name: c.name.clone(),
@@ -416,7 +416,11 @@ pub(super) fn resolve_column(
 /// schema the columns are `alias.col` composites; keep only this alias's and
 /// strip the prefix so the composite field names match PG's (the base column
 /// names).
-fn whole_row_composite(row: &Row<'_>, ctx: &EvalContext<'_>, alias: &str) -> Value<'static> {
+fn whole_row_composite(
+    row: &Row<'_>,
+    ctx: &EvalContext<'_>,
+    alias: &str,
+) -> Result<Value<'static>, EvalError> {
     let prefix = alloc::format!("{alias}.");
     let joined: Vec<(usize, &str)> = ctx
         .columns
@@ -431,21 +435,27 @@ fn whole_row_composite(row: &Row<'_>, ctx: &EvalContext<'_>, alias: &str) -> Val
     // `(1)`, `(2)`. A one-column TABLE or subquery does NOT collapse — hence the
     // marker, set only where the parser desugared a function item.
     if ctx.columns.len() == 1 && ctx.columns[0].scalar_row_source {
-        return row.values[0].clone().into_owned();
+        return rehydrate_cell(0, row, ctx);
     }
+    // v7.39 (round 487) — each field goes through `rehydrate_cell`, not a
+    // raw cell read. A composite-typed COLUMN inside a whole-row reference
+    // used to come back as the stored JSON: PG18 answers `SELECT t FROM t`
+    // with `(1,10,x,"(1,one)")` and SPG answered
+    // `(1,10,x,"{""a"":1,""b"":""one""}")`. Every other route to a cell
+    // already rehydrated; this one read the row directly and skipped it.
     let fields: Vec<(String, Value<'static>)> = if joined.is_empty() {
         ctx.columns
             .iter()
             .enumerate()
-            .map(|(i, s)| (s.name.clone(), row.values[i].clone().into_owned()))
-            .collect()
+            .map(|(i, s)| Ok((s.name.clone(), rehydrate_cell(i, row, ctx)?)))
+            .collect::<Result<_, EvalError>>()?
     } else {
         joined
             .into_iter()
-            .map(|(i, bare)| (bare.to_string(), row.values[i].clone().into_owned()))
-            .collect()
+            .map(|(i, bare)| Ok((bare.to_string(), rehydrate_cell(i, row, ctx)?)))
+            .collect::<Result<_, EvalError>>()?
     };
-    Value::Composite(fields)
+    Ok(Value::Composite(fields))
 }
 
 /// v7.39 (read01 round 56) — read a cell, rehydrating a composite-typed column
