@@ -1369,7 +1369,7 @@ impl Engine {
                 if matches!(expr, Expr::FunctionCall { name, args }
                     if name == "__column_default" && args.is_empty())
                 {
-                    let v = resolve_column_default_free(&schema_cols[*pos], self.clock)?;
+                    let v = resolve_column_default_free(&schema_cols[*pos], self.clock, Some(&sess))?;
                     new_vals[*pos] = v;
                     continue;
                 }
@@ -1414,7 +1414,7 @@ impl Engine {
             // v7.17.0 Phase 2.1 — apply ON UPDATE overrides for
             // any column the SET clause didn't touch.
             for (pos, src) in &on_update_overrides {
-                let v = eval_runtime_default_free(src, schema_cols[*pos].ty, clock_for_on_update)?;
+                let v = eval_runtime_default_free(src, schema_cols[*pos].ty, clock_for_on_update, Some(&sess))?;
                 new_vals[*pos] = v;
             }
             planned.push((i, new_vals));
@@ -1524,7 +1524,7 @@ impl Engine {
             // pre-write with PG's `DETAIL: Failing row contains (...)`. Before
             // CHECK, matching PG's ordering.
             enforce_not_null(self.active_catalog(), &stmt.table, &new_rows)?;
-            enforce_check_constraints(self.active_catalog(), &stmt.table, &new_rows)?;
+            enforce_check_constraints(self.active_catalog(), &stmt.table, &new_rows, Some(&sess))?;
             // v7.39 (RLS) Phase 2 — UPDATE WITH CHECK on the post-update rows.
             let cols = self
                 .active_catalog()
@@ -2158,6 +2158,8 @@ impl Engine {
         view_check: Option<ViewCheck>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 (round 525) — MERGE's clauses read the session too.
+        let merge_sess = self.dml_session();
         let target_alias = stmt
             .target_alias
             .clone()
@@ -2204,7 +2206,7 @@ impl Engine {
             let cols = t.schema().columns.clone();
             // v7.39 (round 148) — a view-redirected merge only sees the target
             // rows satisfying the view's WHERE (bare base-column predicate).
-            let filter_ctx = EvalContext::new(&cols, None);
+            let filter_ctx = EvalContext::new(&cols, None).with_session(&merge_sess);
             let mut rows: Vec<(usize, Row<'static>)> = Vec::new();
             for (pos, r) in t.scan_visible(&snap) {
                 if let Some(f) = &target_filter
@@ -2261,7 +2263,9 @@ impl Engine {
                 col.nullable,
             ));
         }
-        let combined_ctx = EvalContext::new(&combined_schema, None);
+        // v7.39 (round 525) — MERGE's clauses read the session too: a
+        // `WHEN MATCHED THEN UPDATE SET v = current_setting(…)` failed.
+        let combined_ctx = EvalContext::new(&combined_schema, None).with_session(&merge_sess);
         // Source-only context for WHEN NOT MATCHED actions (no
         // matched target row exists — the source-side qualified
         // columns must still resolve).
@@ -2280,7 +2284,8 @@ impl Engine {
                 col.nullable,
             ));
         }
-        let source_only_ctx = EvalContext::new(&source_only_schema, None);
+        let source_only_ctx =
+            EvalContext::new(&source_only_schema, None).with_session(&merge_sess);
         let target_arity = target_cols.len();
         let source_arity = source_cols.len();
 
@@ -4289,6 +4294,7 @@ impl Engine {
         // v7.39 (round 523) — read BEFORE the table borrow: the zone lives
         // in the session params, and `table` borrows self mutably.
         let session_zone = self.session_coercion();
+        let insert_sess_bag = self.dml_session();
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -4335,6 +4341,7 @@ impl Engine {
             insert_mysql && stmt.mysql_ignore,
             insert_non_strict,
             session_zone.as_ref(),
+            Some(&insert_sess_bag),
         )?;
         // Stage 2 — FK enforcement on the immutable catalog.
         // Non-lexical lifetimes release the mutable borrow on
@@ -4453,7 +4460,9 @@ impl Engine {
             }
         }
         // v7.13.0 — CHECK constraint enforcement (mailrs round-5 G3).
-        enforce_check_constraints(self.active_catalog(), &stmt.table, &all_values)?;
+        // v7.39 (round 525) — with the session: a CHECK may name one.
+        let check_sess = self.dml_session();
+        enforce_check_constraints(self.active_catalog(), &stmt.table, &all_values, Some(&check_sess))?;
         // v7.39 (RLS) Phase 2 — INSERT WITH CHECK: a policy-subject session's
         // new rows must satisfy the combined WITH CHECK predicate.
         self.rls_check_new_rows(
@@ -4828,6 +4837,9 @@ impl Engine {
                         .get(table_name)
                         .and_then(|t| t.rows().get(target_pos).map(|r| r.values.clone()))
                         .unwrap_or_default();
+                    // v7.39 (round 525) — with the session, like every
+                    // other write path.
+                    let oc_sess = self.dml_session();
                     let updated = apply_on_conflict_assignments(
                         self.active_catalog(),
                         table_name,
@@ -4836,6 +4848,7 @@ impl Engine {
                         &values,
                         assignments,
                         where_.as_ref(),
+                        Some(&oc_sess),
                     )?;
                     if let Some(new_row) = updated {
                         pending_updates.push((target_pos, new_row, old_row_vals));
@@ -6196,6 +6209,9 @@ fn parse_insert_rows(
     // TimeZone = 'Asia/Tokyo'` followed by an INSERT of a naive timestamp
     // stored an instant nine hours from the one PG stores.
     session_zone: Option<&crate::eval::SessionCoercion>,
+    // v7.39 (round 525) — and the session itself, for a column DEFAULT
+    // that names one.
+    insert_sess: Option<&crate::eval::DmlSession>,
 ) -> Result<Vec<Vec<Value<'static>>>, EngineError> {
     use spg_sql::ast::Overriding;
     // v7.39 (round 523) — the session's date order, which the
@@ -6350,9 +6366,9 @@ fn parse_insert_rows(
                 let mut raw = match map[i] {
                     Some(j) => match &raw_tuple[j] {
                         Some(v) => v.clone(),
-                        None => resolve_column_default_free(col, clock)?,
+                        None => resolve_column_default_free(col, clock, insert_sess)?,
                     },
-                    None => resolve_column_default_free(col, clock)?,
+                    None => resolve_column_default_free(col, clock, insert_sess)?,
                 };
                 if auto_increment_needs_value(col, &raw, mysql) {
                     let next = match auto_cursors.get(&i) {
@@ -6456,13 +6472,13 @@ fn parse_insert_rows(
                 let mut raw = if i < tuple_len {
                     let e = tuple_iter.next().expect("i < tuple_len has a value");
                     if is_column_default_marker(&e) {
-                        resolve_column_default_free(col, clock)?
+                        resolve_column_default_free(col, clock, insert_sess)?
                     } else {
                         src_is_tstz = expr_names_an_instant(&e, date_order);
                         literal_expr_to_value_in(e, catalog)?
                     }
                 } else {
-                    resolve_column_default_free(col, clock)?
+                    resolve_column_default_free(col, clock, insert_sess)?
                 };
                 if auto_increment_needs_value(col, &raw, mysql) {
                     let next = match auto_cursors.get(&i) {

@@ -95,6 +95,7 @@ mod e2e_recorded_divergences_round522;
 mod e2e_session_in_catalog_scan_round522;
 mod e2e_session_timezone_round523;
 mod e2e_session_in_writes_round524;
+mod e2e_bare_context_sweep_round525;
 mod e2e_unary_plus_round507;
 mod e2e_cardinality_violation;
 mod e2e_casefold;

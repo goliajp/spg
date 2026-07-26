@@ -447,6 +447,9 @@ pub(crate) fn apply_on_conflict_assignments(
     incoming: &[Value<'static>],
     assignments: &[(String, Expr)],
     where_: Option<&Expr>,
+    // v7.39 (round 525) — the session. `ON CONFLICT DO UPDATE SET who =
+    // current_setting('app.tenant')` failed the whole upsert without it.
+    sess: Option<&crate::eval::DmlSession>,
 ) -> Result<Option<Vec<Value<'static>>>, EngineError> {
     let table = catalog.get(table_name).ok_or_else(|| {
         EngineError::Storage(StorageError::TableNotFound {
@@ -467,7 +470,10 @@ pub(crate) fn apply_on_conflict_assignments(
     // expressions refer to the target row by the alias when one is given
     // (PG makes the original name unavailable then), so the alias IS the
     // table qualifier here.
-    let ctx = eval::EvalContext::new(&schema_cols, Some(alias.unwrap_or(table_name)));
+    let mut ctx = eval::EvalContext::new(&schema_cols, Some(alias.unwrap_or(table_name)));
+    if let Some(sv) = sess {
+        ctx = ctx.with_session(sv);
+    }
     // Optional WHERE filter on the conflict row.
     if let Some(w) = where_ {
         let pred = w.clone();
@@ -2182,6 +2188,11 @@ pub(crate) fn enforce_check_constraints(
     catalog: &Catalog,
     table_name: &str,
     rows: &[alloc::vec::Vec<spg_storage::Value<'static>>],
+    // v7.39 (round 525) — the session. A CHECK may name a session
+    // setting, and PG evaluates it in the session that is writing;
+    // without it `CHECK (a = current_setting('app.tenant'))` failed the
+    // INSERT outright with "unrecognized configuration parameter".
+    sess: Option<&crate::eval::DmlSession>,
 ) -> Result<(), EngineError> {
     let table = catalog.get(table_name).ok_or_else(|| {
         EngineError::Storage(StorageError::TableNotFound {
@@ -2228,7 +2239,10 @@ pub(crate) fn enforce_check_constraints(
     if schema.checks.is_empty() && domain_checks_per_col.is_empty() {
         return Ok(());
     }
-    let ctx = eval::EvalContext::new(&schema.columns, None);
+    let mut ctx = eval::EvalContext::new(&schema.columns, None);
+    if let Some(s) = sess {
+        ctx = ctx.with_session(s);
+    }
     let mut parsed: alloc::vec::Vec<(usize, Expr)> = alloc::vec::Vec::new();
     for (i, src) in schema.checks.iter().enumerate() {
         let expr = spg_sql::parser::parse_expression(&src.expr).map_err(|e| {
@@ -2280,7 +2294,10 @@ pub(crate) fn enforce_check_constraints(
                 schema.columns[*col_idx].ty,
                 schema.columns[*col_idx].nullable,
             )];
-            let synth_ctx = eval::EvalContext::new(&synth_cols, None);
+            let mut synth_ctx = eval::EvalContext::new(&synth_cols, None);
+            if let Some(s) = sess {
+                synth_ctx = synth_ctx.with_session(s);
+            }
             let synth_row = spg_storage::Row {
                 values: alloc::vec![cell],
             };
