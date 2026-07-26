@@ -118,6 +118,7 @@ pub(crate) use envelope::{EnvelopeParse, build_envelope, split_envelope};
 use expr_analysis::*;
 use index_access::*;
 pub use join::{ANTI_JOIN_FAST_PATH_FIRED, ANTI_JOIN_FAST_PATH_TRIED};
+pub use constraints::{UNIQ_PROBE_CALLS, UNIQ_PROBE_LOCATORS};
 pub use select::{DISTINCT_DUP_DROPPED, PROJ_DIRECT_FIRE, PROJ_ROW_BUILT, SCAN_PATH_ENTERED};
 pub(crate) use orderby::{
     OrderKey, apply_offset_and_limit, apply_offset_and_limit_tagged, build_order_keys,

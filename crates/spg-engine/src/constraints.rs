@@ -702,6 +702,20 @@ fn uc_probe_index<'t>(
 /// byte-identical with the HashSet path; tombstoned rows are skipped the
 /// same way; Cold locators are skipped because the fold path only ever
 /// scanned hot rows.
+/// v7.39 (round 492) — how many locators the uniqueness probe walks, and
+/// how many probes there are.
+///
+/// The round-491 profile of `delete_reinsert_1k` put this function at
+/// 8.4 % of the connection thread. A BTree index carries one locator per
+/// row VERSION, and this shape deletes and re-inserts the same ids over
+/// and over, so the suspicion is that each probe walks every dead version
+/// under its key. Round 490 fixed exactly that shape of defect on the
+/// seek side — which is why this is a counter and not an assumption.
+pub static UNIQ_PROBE_CALLS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static UNIQ_PROBE_LOCATORS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 fn probe_key_conflict(
     table: &spg_storage::Table,
     idx: &spg_storage::Index,
@@ -710,6 +724,11 @@ fn probe_key_conflict(
     fold: &dyn Fn(&[Value<'static>]) -> Vec<Value<'static>>,
 ) -> Option<usize> {
     let ik = spg_storage::IndexKey::from_value(leading_val)?;
+    crate::bump_counter!(crate::constraints::UNIQ_PROBE_CALLS);
+    crate::bump_counter!(
+        crate::constraints::UNIQ_PROBE_LOCATORS,
+        idx.lookup_eq(&ik).len() as u64
+    );
     for loc in idx.lookup_eq(&ik) {
         let spg_storage::RowLocator::Hot(ri) = loc else {
             continue;
