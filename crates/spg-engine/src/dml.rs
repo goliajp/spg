@@ -817,6 +817,54 @@ impl Engine {
             .map_err(|e| enrich_not_null(e, &table))
     }
 
+    /// v7.39 (round 533) — resolve the UNQUALIFIED assignment leaves that
+    /// `UPDATE … FROM` could not classify at parse time.
+    ///
+    /// A name that is only the SOURCE's becomes the same correlated
+    /// scalar subquery the parser builds for a qualified one. A name
+    /// that is in BOTH is refused with PG's wording. A name that is only
+    /// the target's, or neither, is left exactly as it was — so a
+    /// statement with nothing to resolve is returned untouched and pays
+    /// no clone.
+    fn resolve_update_from_leaves(
+        &self,
+        stmt: &spg_sql::ast::UpdateStatement,
+        target_cols: &[ColumnSchema],
+    ) -> Result<Option<spg_sql::ast::UpdateStatement>, EngineError> {
+        let Some(src) = stmt.from_sources.as_deref() else {
+            return Ok(None);
+        };
+        // The source relations' columns, by the names they are known by.
+        let mut source_cols: Vec<alloc::string::String> = Vec::new();
+        for t in core::iter::once(&src.from.primary).chain(src.from.joins.iter().map(|j| &j.table))
+        {
+            if let Some(tbl) = self.active_catalog().get(&t.name) {
+                for c in &tbl.schema().columns {
+                    source_cols.push(c.name.clone());
+                }
+            }
+        }
+        if source_cols.is_empty() {
+            return Ok(None);
+        }
+        let in_target =
+            |n: &str| target_cols.iter().any(|c| c.name.eq_ignore_ascii_case(n));
+        let in_source = |n: &str| source_cols.iter().any(|c| c.eq_ignore_ascii_case(n));
+        let mut out = stmt.clone();
+        let mut changed = false;
+        for (_, expr) in &mut out.assignments {
+            resolve_unqualified_source_leaf(
+                expr,
+                &in_target,
+                &in_source,
+                &src.from,
+                src.sub_where.as_ref(),
+                &mut changed,
+            )?;
+        }
+        Ok(changed.then_some(out))
+    }
+
     fn exec_update_cancel_inner(
         &mut self,
         stmt: &spg_sql::ast::UpdateStatement,
@@ -1192,6 +1240,29 @@ impl Engine {
             })
         })?;
         let schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
+        // v7.39 (round 533) — finish the `UPDATE … FROM` lowering the
+        // parser could only start. It classifies a QUALIFIED leaf and
+        // leaves everything else in the target's scope, because deciding
+        // an unqualified name needs both column lists:
+        //
+        //   UPDATE a SET v = v + d FROM b WHERE a.id = b.id
+        //   PG18  110, 20      SPG  column "d" does not exist
+        //
+        // And where the name is in BOTH, PG refuses it while SPG quietly
+        // took the target's:
+        //
+        //   UPDATE a SET v = shared FROM b …
+        //   PG18  ERROR: column reference "shared" is ambiguous
+        //   SPG   wrote the target's own value
+        //
+        // Before `targets` below, which borrows the assignments.
+        let resolved = self.resolve_update_from_leaves(stmt, &schema_cols)?;
+        let stmt = resolved.as_ref().unwrap_or(stmt);
+        let table = self.active_catalog().get(&stmt.table).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound {
+                name: stmt.table.clone(),
+            })
+        })?;
         // Resolve each SET target to a column position once, validate
         // up front so a typo'd column doesn't leave a partial mutation
         // behind.
@@ -1243,6 +1314,20 @@ impl Engine {
             ));
         }
         let schema_cols = schema_cols;
+        // v7.39 (round 533) — finish the `UPDATE … FROM` lowering the
+        // parser could only start. It classifies a QUALIFIED leaf and
+        // leaves everything else in the target's scope, because deciding
+        // an unqualified name needs both column lists:
+        //
+        //   UPDATE a SET v = v + d FROM b WHERE a.id = b.id
+        //   PG18  110, 20      SPG  column "d" does not exist
+        //
+        // And where the name is in BOTH, PG refuses it while SPG quietly
+        // took the target's:
+        //
+        //   UPDATE a SET v = shared FROM b …
+        //   PG18  ERROR: column reference "shared" is ambiguous
+        //   SPG   wrote the target's own value
         // v7.39 (round 524) — with the SESSION. This context was bare, so
         // every expression in an UPDATE's SET and WHERE was evaluated by
         // an engine that knew nothing about the connection:
@@ -7163,5 +7248,72 @@ pub(crate) fn rename_rel_in_cte_body(body: &mut spg_sql::ast::CteBody, old: &str
         spg_sql::ast::CteBody::Update(b) => rename_rel_in_update(b, old, new),
         spg_sql::ast::CteBody::Delete(b) => rename_rel_in_delete(b, old, new),
         spg_sql::ast::CteBody::Merge(b) => rename_rel_in_merge(b, old, new),
+    }
+}
+
+/// v7.39 (round 533) — rewrite an unqualified leaf that names a source
+/// column into the correlated subquery the parser builds for a
+/// qualified one.
+fn resolve_unqualified_source_leaf(
+    e: &mut Expr,
+    in_target: &dyn Fn(&str) -> bool,
+    in_source: &dyn Fn(&str) -> bool,
+    from: &spg_sql::ast::FromClause,
+    sub_where: Option<&Expr>,
+    changed: &mut bool,
+) -> Result<(), EngineError> {
+    match e {
+        Expr::Column(c) if c.qualifier.is_none() => {
+            let target = in_target(&c.name);
+            let source = in_source(&c.name);
+            if target && source {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "column reference \"{}\" is ambiguous",
+                    c.name
+                )));
+            }
+            if source {
+                *e = Expr::ScalarSubquery(alloc::boxed::Box::new(
+                    spg_sql::ast::SelectStatement {
+                        locking: None,
+                        ctes: Vec::new(),
+                        distinct: false,
+                        distinct_on: Vec::new(),
+                        items: alloc::vec![spg_sql::ast::SelectItem::Expr {
+                            expr: e.clone(),
+                            alias: None,
+                        }],
+                        from: Some(from.clone()),
+                        where_: sub_where.cloned(),
+                        group_by: None,
+                        group_by_all: false,
+                        having: None,
+                        unions: Vec::new(),
+                        order_by: Vec::new(),
+                        limit: None,
+                        offset: None,
+                        limit_with_ties: false,
+                    },
+                ));
+                *changed = true;
+            }
+            Ok(())
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            resolve_unqualified_source_leaf(lhs, in_target, in_source, from, sub_where, changed)?;
+            resolve_unqualified_source_leaf(rhs, in_target, in_source, from, sub_where, changed)
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => {
+            resolve_unqualified_source_leaf(expr, in_target, in_source, from, sub_where, changed)
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                resolve_unqualified_source_leaf(a, in_target, in_source, from, sub_where, changed)?;
+            }
+            Ok(())
+        }
+        // Anything else keeps the scope it had; a subquery brings its
+        // own FROM and is not this walk's business.
+        _ => Ok(()),
     }
 }
