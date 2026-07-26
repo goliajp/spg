@@ -15,10 +15,7 @@
 //! and a TEXT form would order `(0,10) < (0,2) < (0,9)` — the dedup would
 //! keep the wrong row and delete the right ones.
 //!
-//! NOT DONE, and it fails loudly rather than wrongly: the DML paths do not
-//! materialise `ctid`, so `DELETE … WHERE ctid …` answers "column \"ctid\"
-//! does not exist". The SELECT half of the idiom is exact; the DELETE half
-//! is the next round's. The other five system columns are too.
+//! The DML paths and the other five system columns followed in round 512.
 //!
 //! Every expectation below is a PG18 reading.
 
@@ -131,16 +128,11 @@ fn round511_the_dedup_idiom_selects_correctly() {
     );
 }
 
-/// The write half is not done, and says so rather than answering wrongly.
+/// The write half landed in round 512; see `e2e_system_columns_round512`.
 #[test]
-fn round511_the_dml_paths_do_not_carry_ctid_yet() {
+fn round511_the_dml_paths_carry_ctid() {
     let mut e = engine();
     seed(&mut e, 2, 1);
-    let err = format!("{}", e.execute("DELETE FROM d WHERE ctid = '(0,1)'::tid").unwrap_err());
-    assert!(
-        err.contains("ctid"),
-        "a DELETE on ctid must name the column it cannot resolve, got {err}"
-    );
-    // Nothing was deleted by the attempt.
-    assert_eq!(text(&mut e, "SELECT count(*) FROM d"), "2");
+    e.execute("DELETE FROM d WHERE ctid = '(0,1)'::tid").unwrap();
+    assert_eq!(text(&mut e, "SELECT count(*) FROM d"), "1");
 }

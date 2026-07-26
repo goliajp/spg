@@ -1222,6 +1222,22 @@ impl Engine {
         // `::mood`" — the same SELECT worked. Catalog::clone is a structural
         // Arc bump, so this is cheap and sidesteps the &mut self borrow.
         let cat_for_ctx = self.active_catalog().clone();
+        // v7.39 (round 512) — `UPDATE … WHERE ctid …`, the same hook the
+        // DELETE path takes: the value is the candidate's own position, and
+        // the column joins the schema only when the predicate names it.
+        let wants_ctid = stmt
+            .where_
+            .as_ref()
+            .is_some_and(crate::select::expr_references_ctid);
+        let mut schema_cols = schema_cols;
+        if wants_ctid {
+            schema_cols.push(ColumnSchema::new(
+                alloc::string::String::from(crate::select::CTID_COLUMN),
+                spg_storage::DataType::Text,
+                false,
+            ));
+        }
+        let schema_cols = schema_cols;
         let ctx = EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())))
             .with_default_text_search_config(ts_cfg.as_deref())
             .with_catalog(&cat_for_ctx);
@@ -1295,15 +1311,29 @@ impl Engine {
             let Some(row) = table.rows().get(i) else {
                 continue;
             };
+            // The extended row is for the PREDICATE only. The SET
+            // expressions and the new-row construction below build a row of
+            // the table's own arity, and handing them a row with an extra
+            // column made an `UPDATE … WHERE ctid = …` die on "row arity
+            // mismatch: expected 1 columns, got 2".
+            let with_ctid;
+            let where_row = if wants_ctid {
+                let mut vals = row.values.clone();
+                vals.push(Value::Tid(0, i as u32 + 1));
+                with_ctid = spg_storage::Row::new(vals);
+                &with_ctid
+            } else {
+                row
+            };
             if let Some(w) = &stmt.where_ {
                 // v7.31 (round-28) — correlated subqueries in the
                 // UPDATE WHERE bind to the candidate row, like the
                 // SELECT path; plain predicates keep the cheap
                 // interpreter.
                 let cond = if expr_has_subquery(w) {
-                    self.eval_expr_with_correlated(w, row, &ctx, cancel, None)?
+                    self.eval_expr_with_correlated(w, where_row, &ctx, cancel, None)?
                 } else {
-                    eval::eval_expr(w, row, &ctx)?
+                    eval::eval_expr(w, where_row, &ctx)?
                 };
                 if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                     continue;
@@ -3052,7 +3082,23 @@ impl Engine {
                     name: stmt.table.clone(),
                 })
             })?;
-        let schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
+        // v7.39 (round 512) — `DELETE … WHERE ctid …`, the half of the dedup
+        // idiom round 511 left out. The value comes from the candidate's own
+        // position, which this loop already has; the column joins the schema
+        // only when the predicate names it.
+        let wants_ctid = stmt
+            .where_
+            .as_ref()
+            .is_some_and(crate::select::expr_references_ctid);
+        let mut schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
+        if wants_ctid {
+            schema_cols.push(ColumnSchema::new(
+                alloc::string::String::from(crate::select::CTID_COLUMN),
+                spg_storage::DataType::Text,
+                false,
+            ));
+        }
+        let schema_cols = schema_cols;
         let ctx = EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())))
             .with_default_text_search_config(ts_cfg.as_deref())
             .with_catalog(&cat_for_ctx);
@@ -3117,10 +3163,22 @@ impl Engine {
             let Some(row) = table.rows().get(i) else {
                 continue;
             };
+            // The extended row is for the PREDICATE only — `to_delete_rows`
+            // below feeds RETURNING and the trigger walks, which expect the
+            // table's own arity.
+            let with_ctid;
+            let where_row = if wants_ctid {
+                let mut vals = row.values.clone();
+                vals.push(Value::Tid(0, i as u32 + 1));
+                with_ctid = spg_storage::Row::new(vals);
+                &with_ctid
+            } else {
+                row
+            };
             let keep = if let Some(hits) = &subquery_hits {
                 hits.binary_search(&i).is_err()
             } else if let Some(w) = &stmt.where_ {
-                let cond = eval::eval_expr(w, row, &ctx)?;
+                let cond = eval::eval_expr(w, where_row, &ctx)?;
                 !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)?
             } else {
                 false

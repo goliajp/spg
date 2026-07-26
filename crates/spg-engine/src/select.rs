@@ -3083,17 +3083,27 @@ impl Engine {
         if references_ctid(stmt) {
             let snapshot = self.current_snapshot();
             let mut ext_cols = schema_cols.clone();
-            ext_cols.push(ColumnSchema::new(
-                CTID_COLUMN.to_string(),
-                DataType::Text,
-                false,
-            ));
+            for name in SYSTEM_COLUMNS {
+                ext_cols.push(ColumnSchema::new(name.to_string(), DataType::Text, false));
+            }
+            let table_oid =
+                crate::system_catalog::relation_oid(self.active_catalog(), &primary.name)
+                    .unwrap_or(0);
+            let headers = table.headers();
             let rows: Vec<Row<'static>> = table
                 .scan_visible(&snapshot)
                 .map(|(i, r)| {
                     let mut vals = r.values.clone();
                     // One block, offsets from 1, as PG numbers them.
                     vals.push(Value::Tid(0, i as u32 + 1));
+                    let h = headers.get(i);
+                    vals.push(Value::Xid(h.map_or(0, |h| h.xmin as u32)));
+                    vals.push(Value::Xid(h.map_or(0, |h| h.xmax as u32)));
+                    // SPG keeps no per-statement command ids; PG shows 0 for
+                    // every row a reader can see, which is every row here.
+                    vals.push(Value::Cid(0));
+                    vals.push(Value::Cid(0));
+                    vals.push(Value::BigInt(table_oid));
                     Row::new(vals)
                 })
                 .collect();
@@ -6708,22 +6718,47 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
 /// can have a column called this — which is what lets `*` skip it by name.
 pub(crate) const CTID_COLUMN: &str = "ctid";
 
+/// v7.39 (round 512) — PG's system columns, in the order they are appended.
+/// All six are reserved names there, which is what lets `*` skip them and
+/// lets a scan tell them from a user column without a flag.
+pub(crate) const SYSTEM_COLUMNS: [&str; 6] =
+    ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"];
+
+/// Is this name one of them?
+pub(crate) fn is_system_column(name: &str) -> bool {
+    SYSTEM_COLUMNS.iter().any(|s| name.eq_ignore_ascii_case(s))
+}
+
+/// Where the scan's appended system columns begin, if this schema carries
+/// them: the trailing six, named in order. A catalog view with a column of
+/// its own called `xmin` does not match, which is the point.
+fn system_column_tail_start(cols: &[ColumnSchema]) -> Option<usize> {
+    let start = cols.len().checked_sub(SYSTEM_COLUMNS.len())?;
+    cols[start..]
+        .iter()
+        .zip(SYSTEM_COLUMNS)
+        .all(|(c, name)| c.name.eq_ignore_ascii_case(name))
+        .then_some(start)
+}
+
 /// v7.39 (round 511) — does this statement name `ctid` anywhere it would be
 /// read? Only then is the column materialised.
+pub(crate) fn expr_references_ctid(e: &Expr) -> bool {
+    let mut found = false;
+    crate::expr_analysis::visit_expr_columns_and_subqueries(
+        e,
+        &mut |c| {
+            if is_system_column(&c.name) {
+                found = true;
+            }
+        },
+        &mut |_| {},
+    );
+    found
+}
+
 fn references_ctid(stmt: &SelectStatement) -> bool {
-    fn in_expr(e: &Expr) -> bool {
-        let mut found = false;
-        crate::expr_analysis::visit_expr_columns_and_subqueries(
-            e,
-            &mut |c| {
-                if c.name.eq_ignore_ascii_case(CTID_COLUMN) {
-                    found = true;
-                }
-            },
-            &mut |_| {},
-        );
-        found
-    }
+    let in_expr = expr_references_ctid;
     stmt.items.iter().any(|i| match i {
         SelectItem::Expr { expr, .. } => in_expr(expr),
         _ => false,
@@ -6895,13 +6930,20 @@ pub(crate) fn build_projection(
     for item in items {
         match item {
             SelectItem::Wildcard => {
-                for col in schema_cols {
-                    // v7.39 (round 511) — `*` never expands a system column,
-                    // as PG's does not. `ctid` joins the schema only when the
-                    // statement asked for it, so this matters for the mixed
-                    // shape `SELECT *, ctid FROM t`. Matching by name is safe
-                    // because PG reserves it: no table can carry one.
-                    if col.name.eq_ignore_ascii_case(CTID_COLUMN) {
+                // v7.39 (round 511) — `*` never expands a system column, as
+                // PG's does not. They join the schema only when the statement
+                // asked for them, so this matters for the mixed shape
+                // `SELECT *, ctid FROM t`.
+                //
+                // v7.39 (round 512) — by POSITION, not by name. Matching on
+                // the name alone looked safe because PG reserves them, and it
+                // is not: `pg_replication_slots` genuinely has a column called
+                // `xmin`, and `SELECT * FROM pg_replication_slots` lost it.
+                // Only the trailing six, in the order the scan appends them,
+                // are the synthetic ones.
+                let sys_from = system_column_tail_start(schema_cols);
+                for (idx, col) in schema_cols.iter().enumerate() {
+                    if sys_from.is_some_and(|start| idx >= start) {
                         continue;
                     }
                     out.push(ProjectedItem {
