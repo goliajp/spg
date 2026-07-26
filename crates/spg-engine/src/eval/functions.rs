@@ -3407,6 +3407,49 @@ fn apply_function_dispatch(
         // horizontal, parallel and perpendicular over two lsegs. Only the
         // one-argument forms existed here. Comparisons use PG's geometric
         // EPSILON, as the one-argument forms and `slope` do.
+        // v7.39 (round 516) — the function spellings of `?||` and `?-|`.
+        // PG carries both, and a generated view writes the function.
+        "isparallel" | "isperp" if args.len() == 2 => {
+            match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (a, b) => crate::eval::binop::apply_binary(
+                    if name == "isparallel" {
+                        spg_sql::ast::BinOp::GeomParallel
+                    } else {
+                        spg_sql::ast::BinOp::GeomPerp
+                    },
+                    a.clone().into_owned(),
+                    b.clone().into_owned(),
+                ),
+            }
+        }
+        // v7.39 (round 516) — `to_regcollation` is the regcollation cast
+        // that answers NULL instead of raising when the name resolves to
+        // nothing, like the rest of the `to_reg*` family.
+        "to_regcollation" if args.len() == 1 => match &args[0] {
+            Value::Null => Ok(Value::Null),
+            v => Ok(crate::eval::cast::cast_value(
+                v.clone().into_owned(),
+                spg_sql::ast::CastTarget::Named(alloc::string::String::from("regcollation")),
+            )
+            .unwrap_or(Value::Null)),
+        },
+        // v7.39 (round 516) — is every code point in the string ASSIGNED in
+        // Unicode? Rust's `char` cannot hold a surrogate or a value past
+        // U+10FFFF, so what is left to reject is the noncharacter and
+        // unassigned-plane space PG checks.
+        "unicode_assigned" if args.len() == 1 => match &args[0] {
+            Value::Null => Ok(Value::Null),
+            v => {
+                let t = crate::eval::value_to_text(v);
+                Ok(Value::Bool(t.chars().all(|c| {
+                    let n = c as u32;
+                    // Noncharacters: U+FDD0..U+FDEF and the last two of
+                    // every plane.
+                    !(0xFDD0..=0xFDEF).contains(&n) && (n & 0xFFFE) != 0xFFFE
+                })))
+            }
+        },
         "isvertical" | "ishorizontal" if args.len() == 2 => {
             const EPS: f64 = 1.0e-6;
             match (&args[0], &args[1]) {
@@ -11184,13 +11227,61 @@ fn apply_function_dispatch(
         // internals PG's MAX/MIN aggregates reference in pg_proc —
         // introspecting drivers occasionally call them by name.
         // Same comparison machinery as greatest/least.
+        // v7.39 (round 516) — the catalog names for functions SPG already
+        // has under their user-facing spelling. PG exposes both, and a
+        // catalog query or a generated view can call either.
+        "numeric_ln" if args.len() == 1 => apply_function_dispatch("ln", args, ctx),
+        "numeric_sqrt" if args.len() == 1 => apply_function_dispatch("sqrt", args, ctx),
+        "numeric_exp" if args.len() == 1 => apply_function_dispatch("exp", args, ctx),
+        "numeric_log" if args.len() == 2 => apply_function_dispatch("log", args, ctx),
+        "numeric_div_trunc" if args.len() == 2 => apply_function_dispatch("div", args, ctx),
+        "textlen" if args.len() == 1 => apply_function_dispatch("length", args, ctx),
+        // The aggregate transition functions for `count`: +1 and -1 on a
+        // bigint. NULL in, NULL out.
+        "int8inc" | "int8dec" if args.len() == 1 => match &args[0] {
+            Value::Null => Ok(Value::Null),
+            Value::BigInt(n) => Ok(Value::BigInt(if name == "int8inc" {
+                n.saturating_add(1)
+            } else {
+                n.saturating_sub(1)
+            })),
+            Value::Int(n) => Ok(Value::BigInt(i64::from(*n) + if name == "int8inc" { 1 } else { -1 })),
+            other => Err(EvalError::TypeMismatch {
+                detail: alloc::format!("{name}() takes a bigint, got {:?}", other.data_type()),
+            }),
+        },
+        // `nameconcatoid('abc', 42)` is `abc_42` — PG builds a unique name
+        // by appending the oid, truncating the stem so the result fits a
+        // NAME (63 bytes).
+        "nameconcatoid" if args.len() == 2 => match (&args[0], &args[1]) {
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (a, b) => {
+                let suffix = alloc::format!("_{}", crate::eval::value_to_text(b));
+                let stem = crate::eval::value_to_text(a);
+                let room = 63usize.saturating_sub(suffix.len());
+                let cut = stem
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .chain(core::iter::once(stem.len()))
+                    .take_while(|i| *i <= room)
+                    .last()
+                    .unwrap_or(0);
+                Ok(Value::text(alloc::format!("{}{suffix}", &stem[..cut])))
+            }
+        },
         "greatest" | "least" | "text_larger" | "text_smaller"
         | "bytea_larger" | "bytea_smaller" | "int2larger" | "int2smaller"
         | "int4larger" | "int4smaller" | "int8larger" | "int8smaller"
         | "float4larger" | "float4smaller" | "float8larger"
         | "float8smaller" | "numeric_larger" | "numeric_smaller"
         | "date_larger" | "date_smaller" | "timestamp_larger"
-        | "timestamp_smaller" | "interval_larger" | "interval_smaller" => {
+        | "timestamp_smaller" | "interval_larger" | "interval_smaller"
+        // v7.39 (round 516) — the rest of PG's per-type larger/smaller
+        // catalog functions. They are this arm already: the comparison is
+        // the type's own, and `is_greatest` reads the name's suffix.
+        | "oidlarger" | "oidsmaller" | "network_larger" | "network_smaller"
+        | "bpchar_larger" | "bpchar_smaller" | "tidlarger" | "tidsmaller"
+        | "cashlarger" | "cashsmaller" | "xid8_larger" | "xid8_smaller" => {
             if args.is_empty() {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!("{name}() takes at least 1 arg"),

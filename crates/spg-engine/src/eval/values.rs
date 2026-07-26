@@ -119,7 +119,29 @@ pub(super) fn value_cmp_for_min_max(
         (Value::Tid(b1, o1), Value::Tid(b2, o2)) => b1.cmp(b2).then(o1.cmp(o2)),
         (Value::Xid(a), Value::Xid(b)) => a.cmp(b),
         (Value::Cid(a), Value::Cid(b)) => a.cmp(b),
-        _ => Ordering::Equal,
+        // v7.39 (round 516) — anything with no arm here asks the comparison
+        // the OPERATORS use instead of answering Equal.
+        //
+        // `_ => Equal` is not a neutral default in a min/max comparator: it
+        // silently keeps whichever value arrived first. That is how round
+        // 511's `max(ctid)` answered `(0,1)`, and how `network_larger`
+        // answered the SMALLER address here — inet has a `network_cmp` in
+        // the operator path and had no arm in this one. Delegating means a
+        // type only has to teach the engine its order once.
+        _ => crate::eval::binop::compare(spg_sql::ast::BinOp::Lt, a, b)
+            .ok()
+            .and_then(|v| match v {
+                Value::Bool(true) => Some(Ordering::Less),
+                Value::Bool(false) => {
+                    match crate::eval::binop::compare(spg_sql::ast::BinOp::Gt, a, b) {
+                        Ok(Value::Bool(true)) => Some(Ordering::Greater),
+                        Ok(Value::Bool(false)) => Some(Ordering::Equal),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .unwrap_or(Ordering::Equal),
     }
 }
 
