@@ -793,6 +793,22 @@ pub(crate) fn eval_compiled_pred(
 /// re-labelling its element lifetime cannot dangle.
 #[allow(unsafe_code)] // empty-Vec lifetime relabel; isolated (see SAFETY).
 fn recycle_stack(mut v: Vec<Value<'_>>) -> Vec<Value<'static>> {
+    // v7.39 (round 481) — read before the clear: this is exactly the set of
+    // values the clear is about to drop.
+    crate::bump_counter!(STEP_VM_STACK_LEFTOVER, v.len() as u64);
+    #[cfg(feature = "perf-counters")]
+    {
+        let heap = v
+            .iter()
+            .filter(|x| {
+                matches!(
+                    x,
+                    Value::Text(_) | Value::Bytes(_) | Value::Json(_) | Value::Vector(_)
+                )
+            })
+            .count();
+        crate::bump_counter!(STEP_VM_STACK_LEFTOVER_HEAP, heap as u64);
+    }
     v.clear();
     debug_assert!(v.is_empty());
     // SAFETY: `v` is empty (cleared above) — there are no `Value<'_>`s
@@ -1315,6 +1331,21 @@ pub static STEP_VM_CASE_FIRE: core::sync::atomic::AtomicU64 = core::sync::atomic
 pub static STEP_VM_COLUMN_HEAP_ALLOC: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub static STEP_VM_LIT_HEAP_ALLOC: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// v7.39 (round 481) — how many values the stack still holds when a call
+/// finishes, and how many are heap-bearing.
+///
+/// Round 480 left `drop_glue<Value>` at 16 % of self time with the drops
+/// attributed to the predicate closure, i.e. to the stack rather than to
+/// the returned value (round 479 removed that one). Whether the ops leave
+/// operands behind for the next call's `clear()` to drop is a question
+/// with a number, so this counts it rather than reasoning about it — the
+/// previous round was spent acting on an inference that turned out to name
+/// an unreachable branch.
+pub static STEP_VM_STACK_LEFTOVER: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_STACK_LEFTOVER_HEAP: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
