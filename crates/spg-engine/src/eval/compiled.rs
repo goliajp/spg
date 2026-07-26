@@ -602,10 +602,45 @@ fn like_substring_shape(pat: &[char]) -> Option<(usize, alloc::string::String, u
 
 /// v7.39 — `%[k×_]needle[m×_]%` matcher: walk `str::find` hits of the
 /// literal and accept one with ≥k chars before it and ≥m chars after.
+/// v7.39 (round 484) — find `needle` in `hay` at or after `start`.
+///
+/// `str::find(&str)` runs the two-way algorithm, and its SETUP is the cost:
+/// round 484's profile of `s LIKE '%_05%'` put `StrSearcher::new` at 14.6 %
+/// of self time — rebuilt for every row against a needle that is a compile
+/// -time constant, and only two bytes long here.
+///
+/// An ASCII needle can be scanned as bytes instead: a UTF-8 continuation
+/// byte is always >= 0x80, so an ASCII byte match can never land inside a
+/// multi-byte character and every hit is on a char boundary. A non-ASCII
+/// needle keeps `find`, where that reasoning does not hold.
+fn like_find_from(hay: &str, needle: &str, start: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(start);
+    }
+    if !needle.is_ascii() {
+        return hay[start..].find(needle).map(|rel| start + rel);
+    }
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if h.len() < n.len() {
+        return None;
+    }
+    let last = h.len() - n.len();
+    let mut i = start;
+    while i <= last {
+        let off = h[i..=last].iter().position(|&b| b == n[0])?;
+        let at = i + off;
+        if &h[at..at + n.len()] == n {
+            return Some(at);
+        }
+        i = at + 1;
+    }
+    None
+}
+
 fn like_substring_match(hay: &str, needle: &str, k: usize, m: usize) -> bool {
     let mut start = 0;
-    while let Some(rel) = hay[start..].find(needle) {
-        let off = start + rel;
+    while let Some(off) = like_find_from(hay, needle, start) {
         let before_ok = k == 0 || hay[..off].chars().take(k).count() == k;
         let after_ok = m == 0 || hay[off + needle.len()..].chars().take(m).count() == m;
         if before_ok && after_ok {
