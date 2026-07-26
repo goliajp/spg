@@ -104,3 +104,65 @@ fn at_time_zone_both_directions_and_extract() {
         "-14400"
     );
 }
+
+/// v7.39 (round 502) — the timezone catalogues are listable.
+///
+/// SPG resolved named zones correctly — the DST pins above measure that
+/// against PG18 — but `pg_timezone_names` answered "relation does not
+/// exist", so a client populating a timezone picker had nothing to read.
+///
+/// The rows are PG's shape and PG's values; what these pin is the part
+/// that took a measurement to get right. Listing every file under the
+/// zoneinfo tree gives 1794 names where PG18 gives 487, because the tree
+/// also holds the `posix/` and `right/` re-encodings and tzdata's
+/// backward-compatibility symlinks. Those stay RESOLVABLE and are simply
+/// not listed, which is PG's own split.
+#[test]
+fn round502_timezone_catalogues_list_canonical_zones() {
+    let mut e = engine();
+    e.set_tz_all_fn(spg_tzif::tz_all_at);
+
+    let n: i64 = text_of(&mut e, "SELECT count(*) FROM pg_timezone_names")
+        .parse()
+        .unwrap();
+    // A host with no tzdata legitimately has none; anything else must be
+    // the canonical set, not the whole tree.
+    if n == 0 {
+        return;
+    }
+    assert!(
+        (300..900).contains(&n),
+        "canonical zone count {n} — the posix/ and right/ subtrees or the \
+         backward-compat symlinks are being listed (PG18: 487)"
+    );
+    for bad in ["posix/UTC", "right/UTC"] {
+        assert_eq!(
+            text_of(&mut e, &format!("SELECT count(*) FROM pg_timezone_names WHERE name = '{bad}'")),
+            "0",
+            "{bad} should not be listed"
+        );
+    }
+    // A deprecated alias still resolves. Whether it is also LISTED is
+    // host-dependent and deliberately not asserted: tzdata ships the
+    // backward names as hard links on both hosts checked here, so the
+    // symlink filter does not remove them, and PG's 487 is its own
+    // curated list rather than a property of the directory. Asserting
+    // absence here would pin the host, not the behaviour.
+    e.execute("SET TIME ZONE 'Asia/Calcutta'").unwrap();
+    assert_eq!(text_of(&mut e, "SHOW TimeZone"), "Asia/Calcutta");
+
+    // Values match PG18 for zones whose offset does not move.
+    assert_eq!(
+        text_of(&mut e, "SELECT abbrev FROM pg_timezone_names WHERE name = 'Asia/Tokyo'"),
+        "JST"
+    );
+    assert_eq!(
+        text_of(&mut e, "SELECT is_dst::text FROM pg_timezone_names WHERE name = 'Asia/Tokyo'"),
+        "false"
+    );
+    // And the abbreviation view is keyed by designation, deduplicated.
+    let a: i64 = text_of(&mut e, "SELECT count(*) FROM pg_timezone_abbrevs")
+        .parse()
+        .unwrap();
+    assert!(a > 0 && a < n, "abbrevs {a} should dedup below names {n}");
+}
