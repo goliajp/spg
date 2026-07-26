@@ -2858,11 +2858,38 @@ impl Index {
         hi: core::ops::Bound<&IndexKey>,
         cap: usize,
     ) -> Option<Vec<RowLocator>> {
+        self.lookup_range_capped_by(lo, hi, cap, |_| true)
+    }
+
+    /// v7.39 (round 490) — the same range walk, but the caller decides
+    /// which locators are worth carrying, and the cap counts only those.
+    ///
+    /// A BTree index holds one locator per row VERSION. On a churned table
+    /// the dead versions are still in there: round 490 measured a
+    /// 1000-row range handing back 61 000 locators after 60
+    /// delete-and-reinsert cycles with the background vacuum switched off.
+    /// Every caller then dropped the dead ones — the mutation paths and the
+    /// SELECT range path all test `is_row_visible` and `continue` — but only
+    /// after they had been collected into a `Vec`, sorted, and walked.
+    ///
+    /// Handing the predicate down means the walk keeps ~1000, and the cap
+    /// (which exists so an index walk never costs more than the scan it
+    /// replaces) is once again measured in rows a caller will actually look
+    /// at. Round 461 had to add the dead count to the budget to stop the
+    /// seek being refused outright; with the filter here that compensation
+    /// is no longer needed.
+    pub fn lookup_range_capped_by(
+        &self,
+        lo: core::ops::Bound<&IndexKey>,
+        hi: core::ops::Bound<&IndexKey>,
+        cap: usize,
+        keep: impl Fn(RowLocator) -> bool,
+    ) -> Option<Vec<RowLocator>> {
         match &self.kind {
             IndexKind::BTree(m) => {
                 let mut out: Vec<RowLocator> = Vec::new();
                 for (_, locs) in m.range(lo, hi) {
-                    out.extend(locs.iter().copied());
+                    out.extend(locs.iter().copied().filter(|l| keep(*l)));
                     if out.len() > cap {
                         return None;
                     }

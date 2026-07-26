@@ -1239,10 +1239,22 @@ impl Engine {
         // are unchanged. profile: the bench's `UPDATE … WHERE
         // id = $1` on a 5 000-row table was a ~1.3 ms full scan
         // per statement; with the seek it's ~2 µs.
+        // v7.39 (round 490) — taken BEFORE the seek: the seek now drops
+        // versions this snapshot cannot see, and the loop below skips on
+        // exactly the same test, so the two must agree.
+        let scan_snapshot = self.current_snapshot();
         let seek_positions: Option<Vec<usize>> = stmt
             .where_
             .as_ref()
-            .and_then(|w| try_index_seek_positions(w, &schema_cols, table, stmt.table.as_str()));
+            .and_then(|w| {
+                try_index_seek_positions(
+                    w,
+                    &schema_cols,
+                    table,
+                    stmt.table.as_str(),
+                    &scan_snapshot,
+                )
+            });
         let mut planned: Vec<(usize, Vec<Value<'static>>)> = Vec::new();
         let candidate_positions: Vec<usize> = match &seek_positions {
             Some(list) => list.clone(),
@@ -1270,7 +1282,6 @@ impl Engine {
         // (double-apply → spurious UNIQUE violations, double triggers,
         // doubled affected counts / redo). A no-op under the default
         // gate-off: every hot row is visible.
-        let scan_snapshot = self.current_snapshot();
         for (loop_n, &i) in candidate_positions.iter().enumerate() {
             // v4.5: cooperative cancel checkpoint every 256 rows so
             // a runaway UPDATE without WHERE doesn't drag past the
@@ -3062,7 +3073,15 @@ impl Engine {
         let seek_positions: Option<Vec<usize>> = stmt
             .where_
             .as_ref()
-            .and_then(|w| try_index_seek_positions(w, &schema_cols, table, stmt.table.as_str()));
+            .and_then(|w| {
+                try_index_seek_positions(
+                    w,
+                    &schema_cols,
+                    table,
+                    stmt.table.as_str(),
+                    &scan_snapshot,
+                )
+            });
         let candidate_positions: Vec<usize> = match seek_positions {
             Some(mut list) => {
                 list.sort_unstable();

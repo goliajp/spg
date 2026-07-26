@@ -353,6 +353,7 @@ pub(crate) fn try_index_seek_positions(
     schema_cols: &[ColumnSchema],
     table: &Table,
     table_alias: &str,
+    snapshot: &spg_storage::snapshot::Snapshot,
 ) -> Option<Vec<usize>> {
     // v7.37.16 — two-sided range (BETWEEN) position seek, mirroring the
     // SELECT path's try_range_seek (same parse, same rows/4 selectivity
@@ -362,30 +363,39 @@ pub(crate) fn try_index_seek_positions(
     // caller re-applies the full WHERE per candidate and sorts, exactly
     // as for the equality seek. A cold locator falls through to the
     // legacy paths (the mutation walk operates on hot rows only).
-    // v7.39 (round 461) — the cap's budget is counted in LIVE rows.
+    // v7.39 (round 461 / round 490) — the cap's budget is counted in rows a
+    // caller will actually look at.
     //
     // The cap exists so an index walk never costs more than the scan it
     // replaces: return more than a quarter of the table and the seek is
-    // refused. But the seek hands back one locator per row VERSION, and a
+    // refused. But the index holds one locator per row VERSION, and a
     // churned table's index still carries the dead ones — so the count being
     // compared was inflated by exactly the rows the caller then discards.
     //
     // Measured (round 460): delete-and-reinsert 1000 rows on a 50k table
     // with autovacuum off, and by cycle 20 a 1000-row range returns ~22000
-    // candidates against a cap of 17750, so `lookup_range_capped` refuses
-    // and every DELETE becomes a 71000-row scan. The seek it refused would
-    // have walked 22000 — still three times cheaper than the scan it fell
-    // back to. The knee is visible in the timings as 0.23 ms -> 4.48 ms.
+    // candidates against a cap of 17750, so the seek is refused and every
+    // DELETE becomes a 71000-row scan. Round 461 bought that back by adding
+    // `dead_rows()` to the budget, which stopped the refusal but still
+    // carried every dead version through a `Vec`, a sort, and a per-
+    // candidate visibility test — 61000 of them by cycle 60 (round 490).
     //
-    // Adding `dead_rows()` to the budget keeps the guarantee (the seek still
-    // returns at most a quarter of the LIVE rows plus whatever dead noise
-    // the table is carrying, which is bounded by the table itself) while no
-    // longer spending the budget on versions nobody will look at.
-    let seek_cap = table.rows().len() / 4 + usize::try_from(table.dead_rows()).unwrap_or(0);
+    // The dead versions are now dropped INSIDE the walk, by the same
+    // `is_row_visible` test the caller applies, so the budget is back to its
+    // original meaning and round 461's compensation is unnecessary.
+    let seek_cap = table.rows().len() / 4;
     if let Some((col_pos, lo, hi)) = parse_range_bounds(where_expr, schema_cols, table_alias)
         && let Some(idx) = table.index_on(col_pos)
         && let Some(locators) =
-            idx.lookup_range_capped(bound_as_ref(&lo), bound_as_ref(&hi), seek_cap)
+            idx.lookup_range_capped_by(bound_as_ref(&lo), bound_as_ref(&hi), seek_cap, |l| {
+                match l {
+                    spg_storage::RowLocator::Hot(i) => table.is_row_visible(i, snapshot),
+                    // A cold locator makes the whole seek bail below; keep it
+                    // so that decision is reached rather than silently
+                    // dropping it here.
+                    spg_storage::RowLocator::Cold { .. } => true,
+                }
+            })
     {
         let mut out = Vec::with_capacity(locators.len());
         let mut all_hot = true;
@@ -410,10 +420,10 @@ pub(crate) fn try_index_seek_positions(
         rhs,
     } = where_expr
     {
-        if let Some(p) = try_index_seek_positions(lhs, schema_cols, table, table_alias) {
+        if let Some(p) = try_index_seek_positions(lhs, schema_cols, table, table_alias, snapshot) {
             return Some(p);
         }
-        return try_index_seek_positions(rhs, schema_cols, table, table_alias);
+        return try_index_seek_positions(rhs, schema_cols, table, table_alias, snapshot);
     }
     let Expr::Binary {
         lhs,
@@ -431,7 +441,14 @@ pub(crate) fn try_index_seek_positions(
     let mut out = Vec::with_capacity(locators.len());
     for loc in locators {
         match *loc {
-            spg_storage::RowLocator::Hot(i) => out.push(i),
+            // v7.39 (round 490) — dead versions are dropped here for the
+            // same reason as in the range walk above: the caller tests
+            // exactly this and skips.
+            spg_storage::RowLocator::Hot(i) => {
+                if table.is_row_visible(i, snapshot) {
+                    out.push(i);
+                }
+            }
             spg_storage::RowLocator::Cold { .. } => return None,
         }
     }
@@ -577,14 +594,19 @@ fn try_range_seek<'a>(
     // a safe margin that keeps the clear wins and falls back (→ None → seq scan)
     // otherwise, so no endpoint regresses.
     let cap = table.rows().len() / 4;
-    let locators = idx.lookup_range_capped(bound_as_ref(&lo), bound_as_ref(&hi), cap)?;
+    // v7.39 (round 490) — drop the dead versions inside the walk. This loop
+    // already tested `is_row_visible` and skipped; doing it one level down
+    // means the cap stops counting them too (see `lookup_range_capped_by`).
+    let locators = idx.lookup_range_capped_by(bound_as_ref(&lo), bound_as_ref(&hi), cap, |l| {
+        match l {
+            spg_storage::RowLocator::Hot(i) => table.is_row_visible(i, snapshot),
+            spg_storage::RowLocator::Cold { .. } => true,
+        }
+    })?;
     let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(locators.len());
     for loc in &locators {
         match *loc {
             spg_storage::RowLocator::Hot(i) => {
-                if !table.is_row_visible(i, snapshot) {
-                    continue;
-                }
                 if let Some(row) = table.rows().get(i) {
                     out.push(Cow::Borrowed(row));
                 }
