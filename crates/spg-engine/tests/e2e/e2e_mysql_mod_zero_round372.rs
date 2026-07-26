@@ -59,3 +59,31 @@ fn postgres_session_errors_on_modulo_by_zero() {
     assert!(p.execute("SELECT 10 % 0").is_err());
     assert!(p.execute("SELECT MOD(10, 0)").is_err());
 }
+
+/// v7.39 (round 503) — division and modulo by zero answer NULL in a MySQL
+/// session, and still raise in a PG one.
+///
+/// Measured against MariaDB 11: `SELECT 1/0`, `5 DIV 0` and `5 % 0` are
+/// all NULL — and under the DEFAULT sql_mode too, which contains
+/// `ERROR_FOR_DIVISION_BY_ZERO`. That flag governs WRITES, not the
+/// expression, so the rule here is the dialect's rather than the mode's.
+#[test]
+fn round503_division_by_zero_is_null_in_mysql_and_raises_in_pg() {
+    let mut my = Engine::new();
+    my.set_backslash_escapes(true);
+    for sql in ["SELECT 1/0", "SELECT 5 DIV 0", "SELECT 5 % 0", "SELECT 1.5/0"] {
+        match my.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}")) {
+            QueryResult::Rows { rows, .. } => assert_eq!(
+                spg_engine::eval::value_to_text(&rows[0].values[0]),
+                "NULL",
+                "{sql}"
+            ),
+            other => panic!("{sql} -> {other:?}"),
+        }
+    }
+    // PG raises, and must keep raising.
+    let mut pg = Engine::new();
+    for sql in ["SELECT 1/0", "SELECT 5 % 0"] {
+        assert!(pg.execute(sql).is_err(), "PG should raise: {sql}");
+    }
+}

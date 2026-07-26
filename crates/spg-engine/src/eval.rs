@@ -1672,7 +1672,31 @@ fn apply_binary_mysql_unsigned(
             });
         }
     }
-    apply_binary_in(op, l, r, ctx.mysql_dialect)
+    let out = apply_binary_in(op, l, r, ctx.mysql_dialect);
+    // v7.39 (round 503) — MariaDB answers NULL for division / modulo by
+    // zero; SPG raised.
+    //
+    // Measured against MariaDB 11: `SELECT 1/0`, `SELECT 5 DIV 0` and
+    // `SELECT 5 % 0` are all NULL — and they are NULL under the DEFAULT
+    // sql_mode too, which contains `ERROR_FOR_DIVISION_BY_ZERO`. That flag
+    // governs WRITES, not the expression: the division evaluates to NULL,
+    // and a strict-mode INSERT of that result is what raises 1365.
+    //
+    // The rule is therefore the DIALECT's, not the mode's: in a MySQL
+    // session the expression is NULL. It is deliberately not gated on
+    // `mysql_strict` — an earlier cut of this was, and the gate fired only
+    // because the probe's context happens to carry no engine, which a
+    // later round attaching one would have silently reversed.
+    //
+    // RESIDUAL, recorded rather than faked: MariaDB's strict-mode INSERT
+    // of a division by zero raises 1365 and its non-strict INSERT stores
+    // NULL. SPG's INSERT path evaluates elsewhere and still raises, so it
+    // matches strict and diverges from non-strict. Closing that needs the
+    // expression to know it is in a write, which nothing here carries.
+    if ctx.mysql_dialect && matches!(out, Err(EvalError::DivisionByZero)) {
+        return Ok(Value::Null);
+    }
+    out
 }
 
 /// The integer an operand contributes to the unsigned range check, or
