@@ -759,6 +759,34 @@ pub(crate) fn eval_compiled(
     owned
 }
 
+/// v7.39 (round 479) — evaluate a compiled WHERE and answer the bool,
+/// without ever materialising an owned `Value`.
+///
+/// `eval_compiled` ends in `result.map(Value::into_owned)` because its
+/// contract is to hand back a `Value<'static>`. A predicate does not want
+/// a value at all — it wants one bool — and round 478's profile put
+/// `Value::into_owned` at 5.8 % of self time and `drop_glue<Value>` at
+/// 15.1 %, against 5.5 % for the comparison the predicate exists to
+/// perform. The `into_owned` and the owned value's drop are both pure
+/// overhead on this path.
+///
+/// Everything else is `eval_compiled`'s bridge unchanged: the caller's
+/// stack is moved in (covariant shrink), run, and handed back emptied.
+pub(crate) fn eval_compiled_pred(
+    c: &CompiledExpr,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+    stack: &mut Vec<Value<'static>>,
+    mysql: bool,
+) -> Result<bool, EvalError> {
+    let rowref = crate::join::RowRef::Owned(row);
+    let mut local_stack: Vec<Value<'_>> = core::mem::take(stack);
+    let verdict = eval_compiled_ref(c, &rowref, ctx, &mut local_stack)
+        .and_then(|v| crate::eval::predicate_is_true(&v, "WHERE", mysql));
+    *stack = recycle_stack(local_stack);
+    verdict
+}
+
 /// Return an emptied stack's allocation with its value lifetime reset.
 /// This is the standard "recycle" pattern (cf. the `recycle_vec` crate):
 /// an EMPTY `Vec<Value<'a>>` holds no values, only a raw allocation, so

@@ -4636,9 +4636,21 @@ impl Engine {
          -> Result<bool, EngineError> {
             match (&compiled_where, &stmt.where_) {
                 (Some(cw), _) => {
-                    let cond = eval::eval_compiled(cw, row, &ctx, eval_stack)
-                        .map_err(EngineError::Eval)?;
-                    Ok(crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)?)
+                    // v7.39 (round 479) — the predicate wants a bool, not a
+                    // Value. The owned entry ended in `Value::into_owned`
+                    // and the caller then dropped it, once per row; round
+                    // 478's profile put that pair above the comparison
+                    // itself.
+                    Ok(
+                        eval::compiled::eval_compiled_pred(
+                            cw,
+                            row,
+                            &ctx,
+                            eval_stack,
+                            ctx.mysql_dialect,
+                        )
+                        .map_err(EngineError::Eval)?,
+                    )
                 }
                 (None, Some(w)) => {
                     let cond = self.eval_expr_with_correlated(w, row, &ctx, cancel, Some(memo))?;
