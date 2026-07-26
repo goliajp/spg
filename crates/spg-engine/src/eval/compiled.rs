@@ -1001,23 +1001,27 @@ pub(crate) fn eval_compiled_pred(
     verdict
 }
 
-/// v7.39 (round 486) — the membership decision `Step::InSet` makes,
-/// restated for the fast predicate below. `None` means the needle's family
-/// does not match the set's, which is the caller's cue to take the
-/// interpreter's coercion path on the whole node.
+/// v7.39 (round 486) — the membership decision, shared by `Step::InSet`
+/// and by the fast predicate below so the two cannot drift. `None` means
+/// the needle's family does not match the set's, which is the caller's
+/// cue to take the interpreter's coercion path on the whole node.
 ///
-/// This is a DELIBERATE DUPLICATE of the `InSet` arm, and the reason is
-/// measured: the first version of this round had the arm call this
-/// function, and that edit alone cost `like_filter` — a shape with no
-/// `IN` anywhere in it — 4.5 %, reproduced against the parent commit on
-/// the same machine minutes apart, and not recovered by `#[inline]`.
-/// Restoring the arm byte-for-byte recovered it. Touching that loop is
-/// expensive in ways the source does not show.
+/// v7.39 (round 489) — `#[inline(always)]` is load-bearing, and the
+/// measurement behind it is worth stating because round 486 got it wrong.
+/// Round 486 saw the shared-helper form cost `like_filter` 4.5 % and
+/// concluded "editing this loop is expensive"; it then duplicated the
+/// body into the arm to avoid touching it. Re-measured with the shape
+/// ISOLATED (round 488 found the panel's shapes contaminate each other),
+/// `like_filter` shows no such cost — that reading was its neighbours.
+/// What IS real is `big_in`: +4.6 % with a plain call, separated spreads,
+/// on a shape that takes the fast path and never executes this arm.
+/// `#[inline(always)]` returns it to parity (-0.1 %, overlapping), so the
+/// duplicate bought nothing and is gone.
 ///
-/// The cost of the duplicate is that the two can drift, so
-/// `e2e_in_set_fast_path_round486` runs every needle × set × negated ×
-/// has-NULL combination down BOTH paths and asserts they agree.
-#[inline]
+/// `e2e_in_set_fast_path_round486` still runs every needle × set ×
+/// negated × has-NULL combination down BOTH entry points.
+#[allow(clippy::inline_always)] // measured: see the note above
+#[inline(always)]
 fn in_set_verdict(
     needle: &Value<'_>,
     set: &crate::memoize::InListSet,
@@ -1052,12 +1056,15 @@ fn in_set_verdict(
 /// not text, which is the caller's cue to fall through to the VM and let
 /// it raise the type error in its own wording.
 ///
-/// Both arms already delegate the actual matching to `like_match_str` /
-/// `like_substring_match`, and this calls the SAME two functions — the
-/// only thing restated is the NULL and negation wrapper around them.
-/// Round 486 measured that editing that loop is expensive in ways the
-/// source does not show, so the arms are left exactly as they are, and
-/// `e2e_like_fast_path_round488` runs both paths over the same matrix.
+/// v7.39 (round 489) — the VM arm calls this too, so there is one body
+/// rather than two that can drift. Round 488 kept them separate on round
+/// 486's belief that editing that loop costs unrelated shapes; round 489
+/// re-measured that belief with the shapes isolated and force-inlined the
+/// helper, and the cost is gone (see `in_set_verdict`).
+/// `e2e_like_fast_path_round488` runs both entry points over the same
+/// matrix.
+#[allow(clippy::inline_always)] // measured: see `in_set_verdict`
+#[inline(always)]
 fn like_verdict(cell: &Value<'_>, step: &Step) -> Option<Result<Value<'static>, EvalError>> {
     let (text, negated) = match (cell, step) {
         (Value::Null, _) => return Some(Ok(Value::Null)),
@@ -1352,107 +1359,33 @@ where
                 fallback,
             } => {
                 let needle = stack.pop().unwrap_or(Value::Null);
-                let contained = match (&needle, set) {
-                    // Non-empty list + NULL needle → NULL (NOT NULL
-                    // is still NULL) — matches the interpreter and
-                    // eval_with_in_sets.
-                    (Value::Null, _) => {
-                        stack.push(Value::Null);
-                        continue;
-                    }
-                    (Value::SmallInt(n), crate::memoize::InListSet::Int(s)) => {
-                        s.contains(&i64::from(*n))
-                    }
-                    (Value::Int(n), crate::memoize::InListSet::Int(s)) => {
-                        s.contains(&i64::from(*n))
-                    }
-                    (Value::BigInt(n), crate::memoize::InListSet::Int(s)) => s.contains(n),
-                    (Value::Text(t), crate::memoize::InListSet::Text(s)) => s.contains(t.as_ref()),
+                match in_set_verdict(&needle, set, *has_null, *negated) {
+                    Some(v) => stack.push(v),
                     // Cross-family needle: take the interpreter's
                     // exact coercion / error path on the whole node.
-                    _ => {
-                        stack.push(eval_expr(fallback, &row.as_row(), ctx)?);
-                        continue;
-                    }
-                };
-                let inner = if contained {
-                    Value::Bool(true)
-                } else if *has_null {
-                    Value::Null
-                } else {
-                    Value::Bool(false)
-                };
-                stack.push(match (negated, inner) {
-                    (true, Value::Bool(b)) => Value::Bool(!b),
-                    (_, v) => v,
-                });
-            }
-            Step::Like {
-                pattern,
-                negated,
-                case_insensitive,
-            } => {
-                // v7.37.16 — borrow the popped operand and run the
-                // zero-alloc &str matcher. The old body paid
-                // `.into_owned()` (a String clone of the S2 borrowed
-                // push) plus a `Vec<char>` collect PER ROW — ~90 ns/row
-                // of allocator traffic on a LIKE table scan (heavy.rs
-                // like_filter 2.8× loss vs PG18). ILIKE still lowercases
-                // (Unicode fold needs an owned buffer); plain LIKE is
-                // allocation-free.
-                let v = stack.pop().unwrap_or(Value::Null);
-                match v {
-                    Value::Null => stack.push(Value::Null),
-                    // v7.39 (bpchar epic) — LIKE matches bpchar on its
-                    // PADDED stored form ('ab'::char(5) LIKE 'ab' is
-                    // false, LIKE 'ab   ' is true), per PG's bpchar
-                    // pattern operators.
-                    Value::Text(t) | Value::BpChar(t) => {
-                        let m = if *case_insensitive {
-                            like_match_str(&t.to_lowercase(), pattern, 0)?
-                        } else {
-                            like_match_str(t.as_ref(), pattern, 0)?
-                        };
-                        stack.push(Value::Bool(if *negated { !m } else { m }));
-                    }
-                    other => {
-                        return Err(EvalError::TypeMismatch {
-                            detail: format!(
-                                "LIKE requires text operands, got {:?}",
-                                other.data_type()
-                            ),
-                        });
-                    }
+                    None => stack.push(eval_expr(fallback, &row.as_row(), ctx)?),
                 }
             }
-            Step::LikeSubstring {
-                needle,
-                k_before,
-                m_after,
-                negated,
-                case_insensitive,
-            } => {
-                // v7.39 — `%[k×_]lit[m×_]%`: two-way substring search
-                // over the literal, then verify the wildcard chars fit.
+            step @ (Step::Like { .. } | Step::LikeSubstring { .. }) => {
+                // v7.39 (round 489) — one arm for both pattern steps,
+                // sharing `like_verdict` with the fast predicate.
+                //
+                // The matching itself was already out of line: v7.37.16
+                // borrowed the operand instead of paying `.into_owned()`
+                // plus a per-row `Vec<char>` collect (~90 ns/row of
+                // allocator traffic on a LIKE table scan), and round 484
+                // replaced `str::find`'s two-way searcher — whose SETUP
+                // was 14.6 % of self time, rebuilt every row for a
+                // two-byte constant needle — with an ASCII byte scan.
+                // ILIKE still lowercases; plain LIKE allocates nothing.
                 let v = stack.pop().unwrap_or(Value::Null);
-                match v {
-                    Value::Null => stack.push(Value::Null),
-                    Value::Text(t) | Value::BpChar(t) => {
-                        let lowered;
-                        let hay: &str = if *case_insensitive {
-                            lowered = t.to_lowercase();
-                            &lowered
-                        } else {
-                            t.as_ref()
-                        };
-                        let m = like_substring_match(hay, needle, *k_before, *m_after);
-                        stack.push(Value::Bool(if *negated { !m } else { m }));
-                    }
-                    other => {
+                match like_verdict(&v, step) {
+                    Some(r) => stack.push(r?),
+                    None => {
                         return Err(EvalError::TypeMismatch {
                             detail: format!(
                                 "LIKE requires text operands, got {:?}",
-                                other.data_type()
+                                v.data_type()
                             ),
                         });
                     }
