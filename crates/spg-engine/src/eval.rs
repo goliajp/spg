@@ -1806,7 +1806,7 @@ fn apply_binary_mysql_unsigned(
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
                     "BIGINT UNSIGNED value is out of range in '{}'",
-                    spg_sql::ast::pretty_expr(&Expr::Binary {
+                    spg_sql::ast::pretty_expr_mysql(&Expr::Binary {
                         lhs: alloc::boxed::Box::new(lhs.clone()),
                         op,
                         rhs: alloc::boxed::Box::new(rhs.clone()),
