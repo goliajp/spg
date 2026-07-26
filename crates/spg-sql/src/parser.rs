@@ -13572,6 +13572,14 @@ impl Parser {
             self.advance();
             let op = match self.advance() {
                 Token::InetOverlap => String::from("&&"),
+                Token::Intersects => String::from("?#"),
+                Token::IsBelow => String::from("<^"),
+                Token::IsAbove => String::from(">^"),
+                Token::PatternLt => String::from("~<~"),
+                Token::PatternLtEq => String::from("~<=~"),
+                Token::PatternGt => String::from("~>~"),
+                Token::PatternGtEq => String::from("~>=~"),
+                Token::TsMatchOld => String::from("@@@"),
                 Token::Eq => String::from("="),
                 Token::JsonContains => String::from("@>"),
                 Token::JsonContainedBy => String::from("<@"),
@@ -19605,6 +19613,23 @@ impl Parser {
         Ok(build_center_call(e))
     }
 
+    /// v7.39 (round 508) — a prefix operator that IS a function: `@ x` is
+    /// `abs(x)`, `# p` is `npoints(p)`, `@-@ p` is `length(p)`. Binds like
+    /// unary minus.
+    ///
+    /// `#[inline(never)]` for the same reason as its neighbours: parse_unary
+    /// sits on the recursive frame chain MAX_NEST_DEPTH is tuned against, so
+    /// the Expr-sized local stays out of that frame.
+    #[inline(never)]
+    fn parse_prefix_call(&mut self, name: &str) -> Result<Expr, ParseError> {
+        self.advance();
+        let e = self.parse_expr(9)?;
+        Ok(Expr::FunctionCall {
+            name: alloc::string::String::from(name),
+            args: alloc::vec![e],
+        })
+    }
+
     /// v7.39 (read01 geo_ops.c) — prefix `?|` (vertical) / `?-`
     /// (horizontal). Out-of-line from `parse_unary` (frame budget).
     #[inline(never)]
@@ -19707,6 +19732,15 @@ impl Parser {
             // frame chain that MAX_NEST_DEPTH is tuned against, so no
             // Expr-sized local may live in this frame.
             Token::TsMatch => self.parse_prefix_center(),
+            // v7.39 (round 508) — the prefix operators that are named
+            // functions in disguise: `@ x` is abs, `# p` is npoints, `@-@ p`
+            // is length. Out-of-line for the same nesting-frame reason as
+            // parse_prefix_center — parse_unary sits on the recursive cycle
+            // MAX_NEST_DEPTH is tuned against, so no Expr-sized local may
+            // live in this frame.
+            Token::At => self.parse_prefix_call("abs"),
+            Token::Hash => self.parse_prefix_call("npoints"),
+            Token::AtMinusAt => self.parse_prefix_call("length"),
             // v7.39 (read01 geo_ops.c) — prefix `?|` / `?-`: "is vertical" /
             // "is horizontal" (lseg / line); desugars to the existing
             // isvertical()/ishorizontal() functions. Out-of-line for the
@@ -23917,6 +23951,17 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         Token::InetContains => (BinOp::InetContains, 5),
         Token::InetContainsEq => (BinOp::InetContainsEq, 5),
         Token::InetOverlap => (BinOp::InetOverlap, 5),
+        // v7.39 (round 508) — the geometric and pattern-order predicates
+        // ride the comparison rung, as every other predicate does.
+        Token::Intersects => (BinOp::Intersects, 5),
+        Token::IsBelow => (BinOp::IsBelow, 5),
+        Token::IsAbove => (BinOp::IsAbove, 5),
+        Token::PatternLt => (BinOp::PatternLt, 5),
+        Token::PatternLtEq => (BinOp::PatternLtEq, 5),
+        Token::PatternGt => (BinOp::PatternGt, 5),
+        Token::PatternGtEq => (BinOp::PatternGtEq, 5),
+        // `@@@` is the old spelling of `@@` and means exactly it.
+        Token::TsMatchOld => (BinOp::TsMatch, 5),
         _ => return None,
     };
     Some(pair)

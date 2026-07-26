@@ -23,6 +23,110 @@ use super::{
     parse_date_literal, parse_timestamp_literal, ts_match, tsvector_concat, value_to_text,
 };
 
+/// v7.39 (round 508) — `?#`: do the two shapes meet?
+///
+/// PG defines it over box/box, line/box, line/line, lseg/box, lseg/line,
+/// lseg/lseg and path/path. Every one reduces to the same two questions —
+/// do two segments cross, and do two axis-aligned extents overlap — so the
+/// shapes are reduced to segments (a box to its four sides, a path to its
+/// edges) and tested pairwise.
+fn geom_intersects(l: &Value<'_>, r: &Value<'_>) -> Result<Value<'static>, EvalError> {
+    use spg_storage::Point2D;
+    const EPS: f64 = 1.0e-6;
+
+    fn cross(o: Point2D, a: Point2D, b: Point2D) -> f64 {
+        (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+    }
+    fn on_span(p: Point2D, a: Point2D, b: Point2D) -> bool {
+        p.x >= a.x.min(b.x) - EPS
+            && p.x <= a.x.max(b.x) + EPS
+            && p.y >= a.y.min(b.y) - EPS
+            && p.y <= a.y.max(b.y) + EPS
+    }
+    // Two closed segments meet when their endpoints straddle each other, or
+    // when they are collinear and their spans overlap.
+    fn segs_meet(p1: Point2D, p2: Point2D, q1: Point2D, q2: Point2D) -> bool {
+        let (d1, d2) = (cross(q1, q2, p1), cross(q1, q2, p2));
+        let (d3, d4) = (cross(p1, p2, q1), cross(p1, p2, q2));
+        if ((d1 > EPS && d2 < -EPS) || (d1 < -EPS && d2 > EPS))
+            && ((d3 > EPS && d4 < -EPS) || (d3 < -EPS && d4 > EPS))
+        {
+            return true;
+        }
+        (d1.abs() <= EPS && on_span(p1, q1, q2))
+            || (d2.abs() <= EPS && on_span(p2, q1, q2))
+            || (d3.abs() <= EPS && on_span(q1, p1, p2))
+            || (d4.abs() <= EPS && on_span(q2, p1, p2))
+    }
+
+    // Every shape as the segments that bound it. A LINE is infinite, so it
+    // is represented by a very long segment through its two known points —
+    // enough to reach past any finite operand it is compared with.
+    fn segments(v: &Value<'_>) -> Option<alloc::vec::Vec<(Point2D, Point2D)>> {
+        match v {
+            Value::Lseg(a, b) => Some(alloc::vec![(*a, *b)]),
+            Value::PgBox(a, b) => {
+                let (lo_x, hi_x) = (a.x.min(b.x), a.x.max(b.x));
+                let (lo_y, hi_y) = (a.y.min(b.y), a.y.max(b.y));
+                let c = |x, y| Point2D { x, y };
+                Some(alloc::vec![
+                    (c(lo_x, lo_y), c(hi_x, lo_y)),
+                    (c(hi_x, lo_y), c(hi_x, hi_y)),
+                    (c(hi_x, hi_y), c(lo_x, hi_y)),
+                    (c(lo_x, hi_y), c(lo_x, lo_y)),
+                ])
+            }
+            Value::Path { points, closed } => {
+                if points.len() < 2 {
+                    return Some(alloc::vec![]);
+                }
+                let mut out: alloc::vec::Vec<(Point2D, Point2D)> = points
+                    .windows(2)
+                    .map(|w| (w[0], w[1]))
+                    .collect();
+                if *closed {
+                    out.push((points[points.len() - 1], points[0]));
+                }
+                Some(out)
+            }
+            // `Ax + By + C = 0`, sampled far enough out to behave as the
+            // infinite line it is against any finite operand.
+            Value::Line { a, b, c } => {
+                const FAR: f64 = 1.0e9;
+                if b.abs() > EPS {
+                    let y = |x: f64| (-c - a * x) / b;
+                    Some(alloc::vec![(
+                        Point2D { x: -FAR, y: y(-FAR) },
+                        Point2D { x: FAR, y: y(FAR) },
+                    )])
+                } else if a.abs() > EPS {
+                    let x = -c / a;
+                    Some(alloc::vec![(
+                        Point2D { x, y: -FAR },
+                        Point2D { x, y: FAR },
+                    )])
+                } else {
+                    Some(alloc::vec![])
+                }
+            }
+            _ => None,
+        }
+    }
+
+    match (segments(l), segments(r)) {
+        (Some(ls), Some(rs)) => Ok(Value::Bool(ls.iter().any(|(p1, p2)| {
+            rs.iter().any(|(q1, q2)| segs_meet(*p1, *p2, *q1, *q2))
+        }))),
+        _ => Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "operator ?# not supported for {:?} and {:?}",
+                l.data_type(),
+                r.data_type()
+            ),
+        }),
+    }
+}
+
 pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>, EvalError> {
     match (op, v) {
         (_, Value::Null) => Ok(Value::Null),
@@ -913,6 +1017,64 @@ pub(crate) fn apply_binary(
                 ),
             }),
         },
+        // v7.39 (round 508) — `<^` / `>^`: strictly below / strictly above.
+        // On points that is the y coordinate; on boxes PG compares the two
+        // boxes' vertical extents, so a box is "below" another when its
+        // HIGH y is under the other's LOW y. Measured: `box '((0,0),(1,1))'
+        // <^ box '((0,2),(1,3))'` is true.
+        BinOp::IsBelow | BinOp::IsAbove => {
+            let below = matches!(op, BinOp::IsBelow);
+            let extent = |v: &Value<'_>| -> Option<(f64, f64)> {
+                match v {
+                    Value::Point(p) => Some((p.y, p.y)),
+                    Value::PgBox(a, b) => Some((a.y.min(b.y), a.y.max(b.y))),
+                    _ => None,
+                }
+            };
+            match (extent(&l), extent(&r)) {
+                (Some((llo, lhi)), Some((rlo, rhi))) => Ok(Value::Bool(if below {
+                    lhi < rlo
+                } else {
+                    llo > rhi
+                })),
+                _ => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "operator {} not supported for {:?} and {:?}",
+                        if below { "<^" } else { ">^" },
+                        l.data_type(),
+                        r.data_type()
+                    ),
+                }),
+            }
+        }
+        // v7.39 (round 508) — `?#` "do these intersect". PG defines it for
+        // box/box, line/box, line/line, lseg/box, lseg/line, lseg/lseg and
+        // path/path; the shared reading is "do the two point sets meet".
+        BinOp::Intersects => geom_intersects(&l, &r),
+        // v7.39 (round 508) — the `text_pattern_ops` comparisons. They
+        // compare BYTES and ignore collation, which is exactly what makes
+        // them usable for a LIKE-prefix index: measured on PG18,
+        // `'A' ~<~ 'a'` is true while `'A' < 'a'` is false.
+        BinOp::PatternLt | BinOp::PatternLtEq | BinOp::PatternGt | BinOp::PatternGtEq => {
+            match (&l, &r) {
+                (Value::Text(a), Value::Text(b)) => {
+                    let ord = a.as_bytes().cmp(b.as_bytes());
+                    Ok(Value::Bool(match op {
+                        BinOp::PatternLt => ord.is_lt(),
+                        BinOp::PatternLtEq => ord.is_le(),
+                        BinOp::PatternGt => ord.is_gt(),
+                        _ => ord.is_ge(),
+                    }))
+                }
+                _ => Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "operator {op} not supported for {:?} and {:?}",
+                        l.data_type(),
+                        r.data_type()
+                    ),
+                }),
+            }
+        }
         // v7.39 (read01 geo_ops.c) — geometric predicates. Slopes compare
         // with PG's geometric EPSILON (1e-6): parallel = equal slopes,
         // perpendicular = vertical×horizontal or m1·m2 = -1.
@@ -5904,6 +6066,13 @@ pub(super) fn compare(
         | BinOp::GeomSameAs
         | BinOp::ClosestPoint
         | BinOp::GeomHoriz
+        | BinOp::Intersects
+        | BinOp::IsBelow
+        | BinOp::IsAbove
+        | BinOp::PatternLt
+        | BinOp::PatternLtEq
+        | BinOp::PatternGt
+        | BinOp::PatternGtEq
         | BinOp::Add
         | BinOp::Sub
         | BinOp::Mul
