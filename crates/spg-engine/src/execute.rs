@@ -1610,13 +1610,70 @@ impl Engine {
             )),
             // v6.2.0 — ANALYZE recomputes per-column histograms.
             Statement::Analyze(target) => self.exec_analyze(target.as_deref()),
+            // v7.39 (round 535) — REINDEX / CLUSTER. SPG has neither index
+            // bloat to rebuild nor a clustering order to impose, so the
+            // work is a no-op — but PG VALIDATES the target, and both
+            // statements were swallowed at parse time AND intercepted at
+            // the wire, so `REINDEX TABLE typo` answered `REINDEX`. A
+            // maintenance script that misspells a table was told it
+            // succeeded.
+            Statement::Maintain { kind, target } => {
+                use spg_sql::ast::MaintainKind;
+                match (kind, target.as_deref()) {
+                    (MaintainKind::ReindexRelation | MaintainKind::ClusterRelation, Some(t)) => {
+                        // An INDEX is a relation too — `REINDEX INDEX ix`
+                        // names one, and looking only at tables refused a
+                        // name that is right there.
+                        let is_index = self
+                            .active_catalog()
+                            .table_names()
+                            .iter()
+                            .filter_map(|n| self.active_catalog().get(n))
+                            .any(|tbl| {
+                                tbl.indices().iter().any(|i| i.name.eq_ignore_ascii_case(t))
+                            });
+                        if !is_index && self.active_catalog().get(t).is_none() {
+                            return Err(EngineError::Storage(
+                                spg_storage::StorageError::TableNotFound { name: t.into() },
+                            ));
+                        }
+                    }
+                    (MaintainKind::ReindexSchema, Some(t)) => {
+                        if !spg_storage::is_builtin_schema(t)
+                            && !self.active_catalog().schema_exists(t)
+                        {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "schema \"{t}\" does not exist"
+                            )));
+                        }
+                    }
+                    // `REINDEX SYSTEM` / `REINDEX DATABASE` / a bare
+                    // `CLUSTER` name nothing to check.
+                    _ => {}
+                }
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
             // v7.39 (round 169) — VACUUM does real work under the MVCC
             // gate (tombstoned versions are actual bloat); the pre-MVCC
             // parse-time no-op silently ignored a customer's manual
             // reclaim. Gate-off stays a provable no-op inside vacuum.
             Statement::Vacuum { table, analyze } => {
                 match &table {
-                    Some(t) => self.vacuum_one_table(t),
+                    Some(t) => {
+                        // v7.39 (round 535) — PG refuses a VACUUM whose
+                        // relation does not exist; `vacuum_one_table`
+                        // simply found nothing to do and said nothing,
+                        // so a typo'd table reported success.
+                        if self.active_catalog().get(t).is_none() {
+                            return Err(EngineError::Storage(
+                                spg_storage::StorageError::TableNotFound { name: t.clone() },
+                            ));
+                        }
+                        self.vacuum_one_table(t);
+                    }
                     None => {
                         let _ = self.vacuum_pass(false);
                     }
