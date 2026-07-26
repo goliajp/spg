@@ -4733,12 +4733,28 @@ impl Engine {
                                 continue;
                             }
                             let row = &table.rows()[i];
+                            // v7.39 (round 480) — the parallel full-scan
+                            // shard is the path the aggregate benchmark
+                            // actually takes, and it was still on the OWNED
+                            // entry: round 480's profile attributed 68.7 %
+                            // of `drop_glue<Value>` to this closure, which
+                            // is why round 479's fix to the indexed path
+                            // barely moved the total.
+                            //
+                            // The `matches!(…, Value::Bool(true))` form was
+                            // also a narrower reading than the rest of the
+                            // engine uses — `predicate_is_true` is what
+                            // handles NULL and MySQL truthiness — so the
+                            // bool entry fixes the shape as well as the cost.
                             let pass = match cw {
-                                Some(c) => matches!(
-                                    eval::eval_compiled(c, row, &shard_ctx, &mut stack)
-                                        .map_err(EngineError::Eval)?,
-                                    Value::Bool(true)
-                                ),
+                                Some(c) => eval::compiled::eval_compiled_pred(
+                                    c,
+                                    row,
+                                    &shard_ctx,
+                                    &mut stack,
+                                    shard_ctx.mysql_dialect,
+                                )
+                                .map_err(EngineError::Eval)?,
                                 None => true,
                             };
                             if pass {
