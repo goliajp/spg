@@ -119,6 +119,23 @@ pub(crate) fn numeric_bignum_cmp(a: &Value, b: &Value) -> Option<core::cmp::Orde
 
 pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
     use core::cmp::Ordering;
+    // v7.39 (round 485) — a same-variant scalar answers here, ahead of the
+    // two gates below, which is where DISTINCT and ORDER BY spend a call
+    // per row. Neither gate can fire on these pairs: `numeric_bignum_cmp`
+    // returns None unless a side is `NumericBig`, and the NumericKind rank
+    // block only returns when a side is non-finite, which an integer, a
+    // string, and a boolean never are. Each pair lands on exactly the arm
+    // it lands on today — the same comparison, without first walking past
+    // gates that cannot apply. (Same argument as round 483 made for
+    // `binop::compare`, in the ordering comparator this time.)
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => return x.cmp(y),
+        (Value::BigInt(x), Value::BigInt(y)) => return x.cmp(y),
+        (Value::SmallInt(x), Value::SmallInt(y)) => return x.cmp(y),
+        (Value::Text(x), Value::Text(y)) => return x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => return x.cmp(y),
+        _ => {}
+    }
     // v7.38 (read01, T3.C3) — a NUMERIC beyond i128 orders via exact bignum.
     if let Some(ord) = numeric_bignum_cmp(a, b) {
         return ord;
