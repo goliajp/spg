@@ -1399,6 +1399,8 @@ fn run(
         spg_tzif::tz_canonical,
         spg_tzif::tz_abbrev_at,
     );
+    // v7.39 (round 502) — and the enumerator behind pg_timezone_names.
+    engine.set_tz_all_fn(spg_tzif::tz_all_at);
 
     let audit_log = match &audit_path {
         Some(p) if p.exists() => {

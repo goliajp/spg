@@ -10770,6 +10770,11 @@ impl Parser {
             "pg_subscription",
             "pg_tables",
             "pg_tablespace",
+            // v7.39 (round 502) — the timezone catalogues. SPG resolved
+            // named zones correctly but could not list them, so a client
+            // populating a timezone picker got "relation does not exist".
+            "pg_timezone_abbrevs",
+            "pg_timezone_names",
             "pg_trigger",
             "pg_type",
             "pg_user",

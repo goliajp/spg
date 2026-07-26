@@ -407,6 +407,17 @@ pub type TzLocalizeFn = fn(&str, i64) -> Option<i64>;
 pub type TzCanonFn = fn(&str) -> Option<alloc::string::String>;
 /// Zone designation ("JST", "EDT") at a UTC instant.
 pub type TzAbbrevFn = fn(&str, i64) -> Option<alloc::string::String>;
+/// v7.39 (round 502) — every zone the host knows at a UTC instant, as
+/// `(name, abbrev, utc_offset_secs, is_dst)`.
+///
+/// Backs `pg_timezone_names`. SPG resolved named zones correctly — round
+/// 502 measured DST boundaries byte-identical to PG18 — but could not
+/// LIST them, so a client populating a timezone picker got "relation
+/// pg_timezone_names does not exist". The data was there, only
+/// unlistable. No hook, or a host with no tzdata, yields an empty view
+/// rather than an error: that is what such a host honestly has.
+pub type TzAllFn =
+    fn(i64) -> alloc::vec::Vec<(alloc::string::String, alloc::string::String, i64, bool)>;
 
 /// v7.39 (tz epic) — per-statement snapshot of the session TimeZone,
 /// consumed per-VALUE by the timestamptz renderers (a DST zone's
@@ -1120,6 +1131,8 @@ pub struct Engine {
     pub(crate) tz_localize_fn: Option<TzLocalizeFn>,
     pub(crate) tz_canon_fn: Option<TzCanonFn>,
     pub(crate) tz_abbrev_fn: Option<TzAbbrevFn>,
+    /// v7.39 (round 502) — see [`TzAllFn`].
+    pub(crate) tz_all_fn: Option<TzAllFn>,
     pub(crate) stat_tup_inserted: u64,
     pub(crate) stat_tup_updated: u64,
     pub(crate) stat_tup_deleted: u64,
@@ -1413,6 +1426,7 @@ impl Engine {
             tz_localize_fn: None,
             tz_canon_fn: None,
             tz_abbrev_fn: None,
+            tz_all_fn: None,
             stat_tup_inserted: 0,
             table_write_stats: alloc::collections::BTreeMap::new(),
             commit_epoch: 0,
@@ -1682,6 +1696,22 @@ impl Engine {
         self.tz_abbrev_fn = Some(abbrev);
     }
 
+    /// v7.39 (round 502) — the zone enumerator behind `pg_timezone_names`.
+    /// Separate from `set_tz_fns` so an embedder that already calls that
+    /// one keeps compiling.
+    pub fn set_tz_all_fn(&mut self, all: TzAllFn) {
+        self.tz_all_fn = Some(all);
+    }
+
+    /// Every zone the host knows at `utc_micros`; empty without a hook.
+    pub(crate) fn tz_all_at(
+        &self,
+        utc_micros: i64,
+    ) -> alloc::vec::Vec<(alloc::string::String, alloc::string::String, i64, bool)> {
+        self.tz_all_fn
+            .map_or_else(alloc::vec::Vec::new, |f| f(utc_micros))
+    }
+
     pub fn set_parallel_runner(&mut self, runner: alloc::sync::Arc<dyn ParallelRunner>) {
         self.parallel_runner = ParallelRunnerSlot(Some(runner));
     }
@@ -1807,6 +1837,7 @@ impl Engine {
             tz_localize_fn: None,
             tz_canon_fn: None,
             tz_abbrev_fn: None,
+            tz_all_fn: None,
             stat_tup_inserted: 0,
             table_write_stats: alloc::collections::BTreeMap::new(),
             commit_epoch: 0,
@@ -1930,6 +1961,7 @@ impl Engine {
                     tz_localize_fn: None,
                     tz_canon_fn: None,
                     tz_abbrev_fn: None,
+                    tz_all_fn: None,
                     stat_tup_inserted: 0,
                     table_write_stats: alloc::collections::BTreeMap::new(),
                     commit_epoch: 0,

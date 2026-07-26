@@ -390,6 +390,8 @@ fn engine_with_query_byte_budget(engine: Engine) -> Engine {
         spg_tzif::tz_canonical,
         spg_tzif::tz_abbrev_at,
     );
+    // v7.39 (round 502) — and the enumerator behind pg_timezone_names.
+    engine.set_tz_all_fn(spg_tzif::tz_all_at);
     engine
 }
 

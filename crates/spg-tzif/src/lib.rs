@@ -681,6 +681,58 @@ pub fn tz_abbrev_at(zone: &str, utc_micros: i64) -> Option<String> {
     Some(abbr.to_string())
 }
 
+/// v7.39 (round 502) — every zone the host tzdb knows, with its
+/// designation, UTC offset and DST flag at `utc_micros`.
+///
+/// `pg_timezone_names` is how a client populates a timezone picker, and
+/// SPG answered "relation does not exist" while resolving named zones
+/// correctly — the data was there, only unlistable. Sorted by name so the
+/// view is stable between calls.
+#[must_use]
+pub fn tz_all_at(utc_micros: i64) -> Vec<(String, String, i64, bool)> {
+    let Some(db) = global_db() else {
+        return Vec::new();
+    };
+    let secs = utc_micros.div_euclid(1_000_000);
+    // PG lists the CANONICAL zones only. Measured against PG18: listing
+    // every file under the zoneinfo tree gives 1794 names where PG gives
+    // 487, and the difference is two kinds of entry that are both still
+    // resolvable by name, just not listed:
+    //
+    //   * the `posix/` and `right/` subtrees — 598 each, the same zones
+    //     re-encoded with and without leap seconds;
+    //   * whatever the host ships as symlinks, which on a Debian-family
+    //     tree is part of the backward-compatibility set.
+    //
+    // That gets 1794 down to 447 against PG18's 487. The residual is not
+    // chased: tzdata ships the backward names (`Asia/Calcutta` for
+    // `Asia/Kolkata`) as HARD links on both hosts measured, so no
+    // directory property separates them, and PG's list is curated rather
+    // than derived. Every name stays RESOLVABLE either way — `SET TIME
+    // ZONE 'Asia/Calcutta'` works — so the difference is confined to what
+    // a picker shows.
+    let mut names: Vec<&str> = db
+        .names
+        .values()
+        .map(String::as_str)
+        .filter(|n| !n.starts_with("posix/") && !n.starts_with("right/"))
+        .filter(|n| {
+            std::fs::symlink_metadata(db.root.join(n))
+                .map(|m| !m.file_type().is_symlink())
+                .unwrap_or(true)
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut out = Vec::with_capacity(names.len());
+    for n in names {
+        let Some(z) = db.zone(n) else { continue };
+        let (lt, abbr) = z.type_and_abbr_at_utc(secs);
+        out.push((n.to_string(), abbr.to_string(), lt.utoff_secs, lt.is_dst));
+    }
+    out
+}
+
 /// `TzCanonFn`-shaped: canonical zone spelling.
 pub fn tz_canonical(zone: &str) -> Option<String> {
     global_db()?.canonical(zone).map(String::from)

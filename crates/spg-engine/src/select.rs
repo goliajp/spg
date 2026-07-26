@@ -30,7 +30,8 @@ use crate::{
     synth_information_schema_columns, synth_information_schema_tables, synth_mysql_db,
     synth_mysql_user, synth_pg_attribute, synth_pg_class, synth_pg_constraint, synth_pg_database,
     synth_pg_extension, synth_pg_index_raw, synth_pg_indexes, synth_pg_namespace, synth_pg_proc,
-    synth_pg_roles, synth_pg_sequence, synth_pg_settings, synth_pg_trigger, synth_pg_type,
+    synth_pg_roles, synth_pg_sequence, synth_pg_settings, synth_pg_timezone_abbrevs,
+    synth_pg_timezone_names, synth_pg_trigger, synth_pg_type,
     synth_pg_views, topk_trim, try_gin_jsonb_seek, try_gin_seek, try_index_seek, try_nsw_knn,
     try_pk_walk_top_n, try_trgm_seek, value_is_bigint, value_is_integer, value_to_i64,
 };
@@ -775,6 +776,15 @@ impl Engine {
                 // (mailrs embed round-12).
                 "__spg_pg_extension" => {
                     let (schema, rows) = synth_pg_extension();
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.39 (round 502) — the timezone catalogues.
+                "__spg_pg_timezone_names" => {
+                    let (schema, rows) = synth_pg_timezone_names(self);
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_timezone_abbrevs" => {
+                    let (schema, rows) = synth_pg_timezone_abbrevs(self);
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.17.0 Phase 3.P0-57 — pg_catalog.pg_settings.

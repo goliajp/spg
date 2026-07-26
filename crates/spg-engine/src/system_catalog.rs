@@ -5332,6 +5332,80 @@ pub(crate) fn canonical_gucs() -> &'static [(
     ]
 }
 
+/// v7.39 (round 502) — synthesise `pg_catalog.pg_timezone_names`.
+///
+/// PG's shape is `(name, abbrev, utc_offset interval, is_dst bool)`, and
+/// it is how a client populates a timezone picker. SPG resolved named
+/// zones correctly — round 502 measured `America/New_York` rendering
+/// -05 in January and -04 in July, byte-identical to PG18 — but answered
+/// "relation pg_timezone_names does not exist" when asked to list them.
+///
+/// The offsets are taken at NOW, exactly as PG does: a zone's offset and
+/// DST flag depend on the instant, and PG reports the current one.
+pub(crate) fn synth_pg_timezone_names(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("name", DataType::Text, false),
+        ColumnSchema::new("abbrev", DataType::Text, false),
+        ColumnSchema::new("utc_offset", DataType::Interval, false),
+        ColumnSchema::new("is_dst", DataType::Bool, false),
+    ];
+    // The clock is the engine's, so a test that froze it sees a stable
+    // view; without one, epoch — the offsets barely move either way.
+    let now = engine.clock.map_or(0, |f| f());
+    let rows = engine
+        .tz_all_at(now)
+        .into_iter()
+        .map(|(name, abbrev, off_secs, is_dst)| {
+            Row::new(alloc::vec![
+                Value::text(name),
+                Value::text(abbrev),
+                Value::Interval {
+                    months: 0,
+                    days: 0,
+                    micros: off_secs * 1_000_000,
+                },
+                Value::Bool(is_dst),
+            ])
+        })
+        .collect();
+    (schema, rows)
+}
+
+/// v7.39 (round 502) — `pg_catalog.pg_timezone_abbrevs`, the same data
+/// keyed by designation. PG lists each abbreviation once; zones sharing
+/// one (every US Eastern zone reports `EST`) collapse, so this dedups on
+/// the abbreviation and keeps the first offset seen in name order.
+pub(crate) fn synth_pg_timezone_abbrevs(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("abbrev", DataType::Text, false),
+        ColumnSchema::new("utc_offset", DataType::Interval, false),
+        ColumnSchema::new("is_dst", DataType::Bool, false),
+    ];
+    // The clock is the engine's, so a test that froze it sees a stable
+    // view; without one, epoch — the offsets barely move either way.
+    let now = engine.clock.map_or(0, |f| f());
+    let mut seen: alloc::collections::BTreeMap<alloc::string::String, (i64, bool)> =
+        alloc::collections::BTreeMap::new();
+    for (_, abbrev, off_secs, is_dst) in engine.tz_all_at(now) {
+        seen.entry(abbrev).or_insert((off_secs, is_dst));
+    }
+    let rows = seen
+        .into_iter()
+        .map(|(abbrev, (off_secs, is_dst))| {
+            Row::new(alloc::vec![
+                Value::text(abbrev),
+                Value::Interval {
+                    months: 0,
+                    days: 0,
+                    micros: off_secs * 1_000_000,
+                },
+                Value::Bool(is_dst),
+            ])
+        })
+        .collect();
+    (schema, rows)
+}
+
 /// v7.17.0 Phase 3.P0-57 — synthesise `pg_catalog.pg_settings`. ORM
 /// connection-checkers (sqlx pre-flight, Diesel migrator) and admin
 /// tools read `pg_settings` to discover server-side configuration.
