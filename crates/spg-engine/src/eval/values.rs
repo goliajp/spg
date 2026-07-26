@@ -113,6 +113,10 @@ pub(super) fn value_cmp_for_min_max(
             };
             total(*am, *ad, *au).cmp(&total(*bm, *bd, *bu))
         }
+        // v7.39 (round 511) — a tid orders by block then offset. GREATEST /
+        // LEAST share this comparator with min/max's, and both used to reach
+        // the `_ => Equal` below.
+        (Value::Tid(b1, o1), Value::Tid(b2, o2)) => b1.cmp(b2).then(o1.cmp(o2)),
         _ => Ordering::Equal,
     }
 }
@@ -410,6 +414,8 @@ pub fn value_to_text_styled(v: &Value, style: &crate::eval::RenderStyle) -> Stri
         Value::Macaddr8(b) => crate::conversions::format_macaddr8(b),
         Value::PgLsn(l) => crate::conversions::format_pg_lsn(*l),
         Value::RegClass(_, name) | Value::RegProc(_, name) => name.to_string(),
+        // v7.39 (round 511) — PG renders a tid `(block,offset)`.
+        Value::Tid(b, o) => alloc::format!("({b},{o})"),
         Value::BitString { nbits, bytes } => crate::conversions::format_bit_string(*nbits, bytes),
         Value::Xml(s) => s.to_string(),
         Value::Char1(b) => format!("{}", *b as char),

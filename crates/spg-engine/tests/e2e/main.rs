@@ -80,6 +80,7 @@ mod e2e_nesting_budget_round507;
 mod e2e_operator_surface_round508;
 mod e2e_null_cast_target_round509;
 mod e2e_function_signatures_round510;
+mod e2e_ctid_round511;
 mod e2e_unary_plus_round507;
 mod e2e_cardinality_violation;
 mod e2e_casefold;
