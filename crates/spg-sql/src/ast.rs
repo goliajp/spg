@@ -7131,6 +7131,112 @@ pub fn pretty_expr(e: &Expr) -> String {
     out
 }
 
+/// v7.39 (round 505) — how strongly an expression suggests its own column
+/// name. A cast keeps its argument's name only when that name is STRONG;
+/// otherwise the cast reports the type it casts to.
+///
+/// Deduced from measurement, not from a rulebook. `upper(s)::text` names
+/// itself `upper` on PG18 but `(CASE WHEN a=1 THEN 1 END)::text` names
+/// itself `text` — so `case` and a function name cannot be the same kind of
+/// answer, even though a bare `CASE …` does report `case`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NameStrength {
+    /// Nothing to go on — PG reports `?column?`.
+    None,
+    /// A name, but one a cast overrides: `case`, or a type name.
+    Weak,
+    /// A name a cast keeps: a column, or the function that produced it.
+    Strong,
+}
+
+/// v7.39 (round 505) — the column name PG18 gives a projected expression
+/// that carries no `AS` alias. `None` means `?column?`.
+///
+/// SPG used to print the parsed expression back out, which matched neither
+/// oracle and made name-keyed row access miss on both wires:
+///
+/// | query        | PG18       | SPG (before) |
+/// |--------------|------------|--------------|
+/// | `upper(s)`   | `upper`    | `upper(s)`   |
+/// | `a+b`        | `?column?` | `(a + b)`    |
+/// | `'lit'`      | `?column?` | `'lit'`      |
+/// | `CASE …`     | `case`     | `CASE WHEN (a = 1) THEN …` |
+///
+/// Every rule below is one of those measurements, taken with `\gdesc`
+/// against PG18: a call is named for its function, a cast recurses into its
+/// argument and falls back to the type, a scalar subquery takes the name of
+/// the column it selects, and operators have no name at all.
+#[must_use]
+pub fn figure_column_name(expr: &Expr) -> Option<String> {
+    let (name, _) = figure_name_inner(expr);
+    name
+}
+
+/// The name a function reports, which is not always the name SPG parsed it
+/// under: `count(*)` is held as `count_star` so the star arity survives the
+/// AST, and that internal spelling must not reach a client. PG18 reports
+/// `count`.
+fn canonical_function_name(name: &str) -> String {
+    match name {
+        "count_star" => "count".to_string(),
+        other => other.to_ascii_lowercase(),
+    }
+}
+
+fn figure_name_inner(expr: &Expr) -> (Option<String>, NameStrength) {
+    let strong = |n: String| (Some(n), NameStrength::Strong);
+    match expr {
+        // A column keeps its own name, qualifier and all discarded:
+        // `lbl.a` reports `a`.
+        Expr::Column(c) => strong(c.name.clone()),
+        // Calls are named for the function. This covers the shapes that
+        // only LOOK like syntax — `EXTRACT(year FROM …)` reports
+        // `extract`, `SUBSTRING(x FROM 1 FOR 2)` reports `substring` —
+        // because PG resolves them to functions before naming them.
+        Expr::FunctionCall { name, .. } | Expr::WindowFunction { name, .. } => {
+            strong(canonical_function_name(name))
+        }
+        Expr::AggregateOrdered { call, .. } => figure_name_inner(call),
+        Expr::Extract { .. } => strong("extract".to_string()),
+        Expr::Exists { .. } => strong("exists".to_string()),
+        Expr::Array(_) => strong("array".to_string()),
+        // `(expr).field` is named for the field, as a column would be.
+        Expr::FieldAccess { field, .. } => strong(field.clone()),
+        // A cast prefers its argument's name and settles for the type:
+        // `upper(s)::text` is `upper`, `(a+b)::text` is `text`.
+        Expr::Cast { expr: inner, target } => match figure_name_inner(inner) {
+            (Some(n), NameStrength::Strong) => strong(n),
+            _ => (Some(target.to_string()), NameStrength::Weak),
+        },
+        // A scalar subquery reports whatever its single output column
+        // reports: `(SELECT max(b) …)` is `max`, `(SELECT a+b …)` is not.
+        Expr::ScalarSubquery(sel) => scalar_subquery_name(sel),
+        // `CASE …` names itself, but weakly — a cast around it wins.
+        Expr::Case { .. } => (Some("case".to_string()), NameStrength::Weak),
+        // A literal that carries its own type names itself for that type:
+        // `INTERVAL '1 day'` reports `interval`, while a bare `'1 day'`
+        // reports nothing. Weak, like any other type name.
+        Expr::Literal(Literal::Interval { .. }) => {
+            (Some("interval".to_string()), NameStrength::Weak)
+        }
+        // A wrapper that adds no name of its own.
+        Expr::Variadic(inner) => figure_name_inner(inner),
+        Expr::NamedArg { expr: inner, .. } => figure_name_inner(inner),
+        // Everything else — operators, comparisons, IS NULL, LIKE, IN,
+        // literals, placeholders — reports `?column?`.
+        _ => (None, NameStrength::None),
+    }
+}
+
+/// The name a scalar subquery's single projected column reports.
+fn scalar_subquery_name(sel: &SelectStatement) -> (Option<String>, NameStrength) {
+    match sel.items.as_slice() {
+        [SelectItem::Expr { alias: Some(a), .. }] => (Some(a.clone()), NameStrength::Strong),
+        [SelectItem::Expr { expr, alias: None }] => figure_name_inner(expr),
+        _ => (None, NameStrength::None),
+    }
+}
+
 /// Binding power. Higher binds tighter; 0 means "no enclosing operator".
 fn pretty_prec(e: &Expr) -> u8 {
     match e {

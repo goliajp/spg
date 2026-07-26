@@ -2663,7 +2663,7 @@ impl Engine {
         // Expand + rewrite the projection into flat (output_name, ty, expr)
         // triples against the synthetic schema.
         let expanded = expand_merge_returning_items(items, target_alias, source_alias, target_cols);
-        let projection = build_projection(&expanded, &syn, "")?;
+        let projection = build_projection(&expanded, &syn, "", self.backslash_escapes)?;
         let columns: Vec<ColumnSchema> = projection
             .iter()
             .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))

@@ -291,10 +291,18 @@ impl Engine {
                 SelectItem::Expr { expr, alias } => {
                     let mut e = expr.clone();
                     rewrite_window_to_columns(&mut e, &window_nodes);
-                    SelectItem::Expr {
-                        expr: e,
-                        alias: alias.clone(),
-                    }
+                    // The rewrite swaps the window call for a synthetic
+                    // `__win_N` column, and the projection then reported
+                    // THAT as the column name — `SELECT count(*) OVER ()`
+                    // answered `__win_0`, an internal name, where PG18
+                    // answers `count`. Pin the name while the call the
+                    // column is named for is still in hand.
+                    let alias = if alias.is_none() && e != *expr {
+                        Some(default_output_name(expr, self.backslash_escapes))
+                    } else {
+                        alias.clone()
+                    };
+                    SelectItem::Expr { expr: e, alias }
                 }
             };
             rewritten_items.push(new_item);
@@ -311,7 +319,7 @@ impl Engine {
         // `ORDER BY <enum col>` of a windowed query sorted by TEXT — the
         // window values were right, the row order silently was not.
         let ext_ctx = self.ev_ctx(&ext_cols, alias_opt);
-        let projection = build_projection(&rewritten_items, &ext_cols, alias)?;
+        let projection = build_projection(&rewritten_items, &ext_cols, alias, self.backslash_escapes)?;
         let mut tagged: Vec<(Vec<OrderKey>, Row)> = Vec::with_capacity(n_rows);
         for (i, row) in ext_rows.iter().enumerate() {
             if i.is_multiple_of(256) {
@@ -1477,7 +1485,26 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<(), EngineError> {
         for item in &mut stmt.items {
-            if let SelectItem::Expr { expr, .. } = item {
+            if let SelectItem::Expr { expr, alias } = item {
+                // An UNCORRELATED subquery is replaced by its value right
+                // here, and the shape the column was named for goes with
+                // it: by projection time `SELECT EXISTS(SELECT 1)` is a
+                // boolean literal, so SPG answered `?column?` where PG18
+                // answers `exists`. Only a subquery at the TOP of the item
+                // loses its name this way — one nested inside a call still
+                // reports the call.
+                if alias.is_none()
+                    && matches!(
+                        expr,
+                        Expr::ScalarSubquery(_)
+                            | Expr::Exists { .. }
+                            | Expr::InSubquery { .. }
+                            | Expr::RowInSubquery { .. }
+                            | Expr::RowCmpSubquery { .. }
+                    )
+                {
+                    *alias = Some(default_output_name(expr, self.backslash_escapes));
+                }
                 self.resolve_expr_subqueries(expr, cancel)?;
             }
         }
@@ -1726,7 +1753,12 @@ impl Engine {
                     // VALUES row lowers to) is an EXPRESSION, so it landed
                     // here and the derived table forgot the enum.
                     let (ty, nullable) =
-                        build_projection(core::slice::from_ref(item), schema_cols, table_alias)
+                        build_projection(
+                            core::slice::from_ref(item),
+                            schema_cols,
+                            table_alias,
+                            self.backslash_escapes,
+                        )
                             .ok()
                             .and_then(|p| p.into_iter().next())
                             .map_or((DataType::Text, true), |p| (p.ty, p.nullable));
@@ -2472,7 +2504,7 @@ impl Engine {
             return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
-        let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
+        let projection = build_projection(&stmt.items, &schema_cols, &alias, self.backslash_escapes)?;
         let mut projected_rows: alloc::vec::Vec<Row<'static>> =
             alloc::vec::Vec::with_capacity(filtered.len());
         // v7.19 P5 — Set-Returning-Function in projection
@@ -2700,7 +2732,7 @@ impl Engine {
             return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
-        let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
+        let projection = build_projection(&stmt.items, &schema_cols, &alias, self.backslash_escapes)?;
         let mut projected_rows: alloc::vec::Vec<Row<'static>> =
             alloc::vec::Vec::with_capacity(filtered.len());
         let mut proj_memo = memoize::MemoizeCache::default();
@@ -3055,7 +3087,7 @@ impl Engine {
                 .into_iter()
                 .filter_map(|i| table.rows().get(i).map(Cow::Borrowed))
                 .collect();
-            return materialise_in_order(stmt, schema_cols, alias, &ordered);
+            return materialise_in_order(stmt, schema_cols, alias, &ordered, self.backslash_escapes);
         }
 
         // v7.34.5 — ORDER BY <indexed col> [DESC|ASC] LIMIT N drives
@@ -3075,7 +3107,7 @@ impl Engine {
             self,
             cancel,
         ) {
-            return materialise_in_order(stmt, schema_cols, alias, &walked);
+            return materialise_in_order(stmt, schema_cols, alias, &walked, self.backslash_escapes);
         }
 
         // Index seek: if WHERE is `col = literal` (or commuted) and the
@@ -3752,7 +3784,7 @@ impl Engine {
             return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
-        let projection = build_projection(&stmt.items, &schema_cols, &alias)?;
+        let projection = build_projection(&stmt.items, &schema_cols, &alias, self.backslash_escapes)?;
         let mut projected_rows: alloc::vec::Vec<Row<'static>> =
             alloc::vec::Vec::with_capacity(filtered.len());
         for row in &filtered {
@@ -3973,7 +4005,7 @@ impl Engine {
             return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
-        let projection = build_projection(&stmt.items, &schema_cols, alias)?;
+        let projection = build_projection(&stmt.items, &schema_cols, alias, self.backslash_escapes)?;
         let mut projected_rows: alloc::vec::Vec<Row<'static>> =
             alloc::vec::Vec::with_capacity(filtered.len());
         for row in &filtered {
@@ -4111,7 +4143,7 @@ impl Engine {
             )?;
             return self.finish_agg_result(agg, stmt, CancelToken::none());
         }
-        let projection = build_projection(&stmt.items, &empty_schema, "")?;
+        let projection = build_projection(&stmt.items, &empty_schema, "", self.backslash_escapes)?;
         // `SELECT … WHERE cond` with no FROM — the one conceptual
         // row survives only when the condition is true (previously
         // the WHERE was silently ignored: `SELECT 1 WHERE false`
@@ -4852,7 +4884,7 @@ impl Engine {
         let ctx = self
             .ev_ctx(schema_cols, Some(alias))
             .with_sample_rng(&sample_cell);
-        let projection = build_projection(&stmt.items, schema_cols, alias)?;
+        let projection = build_projection(&stmt.items, schema_cols, alias, self.backslash_escapes)?;
         // v7.19 P5 — single-table SELECT path for SRF
         // `SELECT unnest(arr) FROM t` shape. Detect a top-level
         // unnest in the projection list. When present, the
@@ -5371,7 +5403,7 @@ impl Engine {
         // v7.39 (read01 round 53) — carry the catalog (see join.rs): a
         // `::regclass` / enum cast in a joined projection or HAVING needs it.
         let ctx = EvalContext::new(combined_schema, None).with_catalog(self.active_catalog());
-        let projection = build_projection(&stmt.items, combined_schema, "")?;
+        let projection = build_projection(&stmt.items, combined_schema, "", self.backslash_escapes)?;
         // Every projection item must be a bound qualified column —
         // anything that needs `eval_expr_with_correlated` keeps the
         // materialising path.
@@ -5545,7 +5577,7 @@ impl Engine {
             return self.finish_agg_result(agg, stmt, cancel);
         }
 
-        let projection = build_projection(&stmt.items, combined_schema, "")?;
+        let projection = build_projection(&stmt.items, combined_schema, "", self.backslash_escapes)?;
         // v7.33 (P4 borrow channel, increment 3) — project directly off
         // the deferred row-index tuples instead of materialising an
         // intermediate combined Row per survivor. A bound qualified
@@ -6750,10 +6782,30 @@ fn bind_direct_columns(
         .collect()
 }
 
+/// v7.39 (round 505) — the name an un-aliased projected expression reports.
+///
+/// PG18 names a call for its function and everything else `?column?`;
+/// measured with `\gdesc`. SPG used to print the parsed expression back
+/// out for both dialects, so `SELECT upper(s)` reported `upper(s)` and
+/// name-keyed row access found nothing under `upper`.
+///
+/// The MySQL half is NOT this rule and is deliberately left alone here:
+/// MariaDB echoes the item's SOURCE TEXT verbatim (`a+b`, spacing and all),
+/// which needs the parser to hand over spans the AST does not carry yet.
+/// Until it does, a MySQL session keeps the printed form — closer to what
+/// MariaDB answers than `?column?` would be.
+pub(crate) fn default_output_name(expr: &Expr, mysql: bool) -> String {
+    if mysql {
+        return expr.to_string();
+    }
+    spg_sql::ast::figure_column_name(expr).unwrap_or_else(|| "?column?".to_string())
+}
+
 pub(crate) fn build_projection(
     items: &[SelectItem],
     schema_cols: &[ColumnSchema],
     table_alias: &str,
+    mysql: bool,
 ) -> Result<Vec<ProjectedItem>, EngineError> {
     // v7.39 (round 462) — a join's combined schema qualifies every column
     // `alias.col` so the deferred-join cell lookups resolve by composite
@@ -6858,7 +6910,9 @@ pub(crate) fn build_projection(
                         mysql_fsp: sch.mysql_fsp,
                     });
                 } else if let Some(shape) = describe::describe_expr(expr, schema_cols) {
-                    let output_name = alias.clone().unwrap_or_else(|| expr.to_string());
+                    let output_name = alias
+                        .clone()
+                        .unwrap_or_else(|| default_output_name(expr, mysql));
                     out.push(ProjectedItem {
                         expr: expr.clone(),
                         output_name,
@@ -6874,7 +6928,9 @@ pub(crate) fn build_projection(
                         mysql_fsp: crate::eval::expr_mysql_fsp(expr, schema_cols),
                     });
                 } else {
-                    let output_name = alias.clone().unwrap_or_else(|| expr.to_string());
+                    let output_name = alias
+                        .clone()
+                        .unwrap_or_else(|| default_output_name(expr, mysql));
                     out.push(ProjectedItem {
                         expr: expr.clone(),
                         output_name,
