@@ -5481,21 +5481,17 @@ pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
         let setting = overridden.unwrap_or_else(|| boot.into());
         // v7.39 (GUC knife 2) — PG reports ms-unit time GUCs as the bare
         // number in `setting` with `unit = 'ms'` ("7s" -> 7000 | ms).
-        let is_ms_guc = matches!(
-            name,
-            "statement_timeout"
-                | "lock_timeout"
-                | "idle_in_transaction_session_timeout"
-                | "idle_session_timeout"
-        );
-        let (setting, unit) = if is_ms_guc {
-            match crate::session::parse_pg_duration_ms(&setting) {
-                Some(ms) => (alloc::format!("{ms}"), Value::text("ms")),
-                None => (setting, Value::text("ms")),
-            }
-        } else {
-            (setting, Value::Null)
-        };
+        // v7.39 (round 522) — and MEMORY GUCs the same way: `work_mem`
+        // reads `4096 | kB`, not `4MB`. Reporting the human form while
+        // `vartype` says `integer` contradicts itself — a client that
+        // believes the vartype and parses the setting gets nothing.
+        // `boot_val` / `reset_val` are raw too (measured: they stay
+        // `4096` across a `SET work_mem = '8MB'`).
+        let raw = |v: &str| crate::session::guc_raw_setting(name, v);
+        let unit = crate::session::guc_unit(name)
+            .map_or(Value::Null, |u| Value::text::<String>(u.into()));
+        let setting = raw(&setting).unwrap_or(setting);
+        let boot_raw = raw(boot).unwrap_or_else(|| boot.into());
         rows.push(Row::new(alloc::vec![
             Value::text::<String>(name.into()),
             Value::text(setting),
@@ -5509,8 +5505,8 @@ pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
             Value::Null, // min_val
             Value::Null, // max_val
             Value::Null, // enumvals
-            Value::text::<String>(boot.into()),
-            Value::text::<String>(boot.into()), // reset_val = boot_val
+            Value::text(boot_raw.clone()),
+            Value::text(boot_raw), // reset_val = boot_val
             Value::Null,                        // sourcefile
             Value::Null,                        // sourceline
             Value::Bool(false),                 // pending_restart

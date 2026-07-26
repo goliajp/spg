@@ -261,35 +261,21 @@ impl Engine {
         // renders SHOW/current_setting in the largest whole unit
         // ("250" → "250ms", "5000" → "5s"). Normalise at store time so
         // every read surface agrees.
-        let normalised = if matches!(
-            key.as_str(),
-            "statement_timeout"
-                | "lock_timeout"
-                | "idle_in_transaction_session_timeout"
-                | "idle_session_timeout"
-        ) {
-            match parse_pg_duration_ms(&normalised) {
+        // v7.39 (round 204) — memory GUCs canonicalize to the largest
+        // binary unit at store time, so `SET work_mem = '65536'` and
+        // `= '64MB'` both SHOW `64MB`, matching PG.
+        // v7.39 (round 522) — which parameters those are now comes from
+        // `guc_unit`, the same table `pg_settings` reads.
+        let normalised = match guc_unit(key.as_str()) {
+            Some("ms") => match parse_pg_duration_ms(&normalised) {
                 Some(ms) => render_pg_duration_ms(ms),
                 None => normalised,
-            }
-        } else if matches!(
-            // v7.39 (round 204) — memory GUCs canonicalize to the
-            // largest binary unit at store time, so `SET work_mem =
-            // '65536'` and `= '64MB'` both SHOW `64MB`, matching PG.
-            key.as_str(),
-            "work_mem"
-                | "maintenance_work_mem"
-                | "shared_buffers"
-                | "temp_buffers"
-                | "effective_cache_size"
-                | "wal_buffers"
-        ) {
-            match parse_pg_mem_kb(&normalised) {
+            },
+            Some(_) => match parse_pg_mem_kb(&normalised) {
                 Some(kb) => render_pg_mem_kb(kb),
                 None => normalised,
-            }
-        } else {
-            normalised
+            },
+            None => normalised,
         };
         // v7.39 (GUC knife 3) — datestyle is sticky per category (a bare
         // 'DMY' keeps the current style; 'German' forces DMY); PG stores
@@ -667,6 +653,46 @@ fn render_pg_duration_ms(ms: u64) -> String {
         format!("{}s", ms / 1_000)
     } else {
         format!("{ms}ms")
+    }
+}
+
+/// v7.39 (round 522) — the unit PG counts a GUC in.
+///
+/// PG keeps a parameter's value in TWO forms and they are not the same
+/// string: `pg_settings.setting` is a bare number counting `unit`s
+/// (`work_mem` → `4096`, unit `kB`), while SHOW / `current_setting`
+/// render the human form (`4MB`). Measured on PG18: a value with no
+/// suffix is already in the GUC's unit, so `SET work_mem = 8192` and
+/// `= '8MB'` are the same setting.
+///
+/// One table so the SET-time normaliser and `pg_settings` cannot drift
+/// apart on which parameters carry a unit — round 515 spent a round
+/// re-syncing two copies of a list like this one.
+pub(crate) fn guc_unit(name: &str) -> Option<&'static str> {
+    match name {
+        "statement_timeout"
+        | "lock_timeout"
+        | "idle_in_transaction_session_timeout"
+        | "idle_session_timeout"
+        | "transaction_timeout" => Some("ms"),
+        "work_mem" | "maintenance_work_mem" => Some("kB"),
+        // Counted in BLOCKS, and PG names the block size as the unit.
+        "shared_buffers" | "temp_buffers" | "effective_cache_size" | "wal_buffers" => Some("8kB"),
+        _ => None,
+    }
+}
+
+/// The bare count `pg_settings.setting` reports for a stored value —
+/// the inverse of the human form SHOW renders. `None` when the
+/// parameter has no unit or the value does not parse, and the caller
+/// keeps the string it already had.
+pub(crate) fn guc_raw_setting(name: &str, stored: &str) -> Option<String> {
+    match guc_unit(name)? {
+        "ms" => parse_pg_duration_ms(stored).map(|ms| alloc::format!("{ms}")),
+        "kB" => parse_pg_mem_kb(stored).map(|kb| alloc::format!("{kb}")),
+        // A block count, so the kB reading divides by the block size.
+        "8kB" => parse_pg_mem_kb(stored).map(|kb| alloc::format!("{}", kb / 8)),
+        _ => None,
     }
 }
 

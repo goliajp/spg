@@ -23739,6 +23739,28 @@ impl Parser {
                     filter,
                 });
             }
+            // v7.39 (round 522) — PG declares `date_add` / `date_subtract`
+            // over TIMESTAMPTZ and has no timestamp overload, so a
+            // timestamp argument is coerced on the way in and the answer
+            // is timestamptz — measured: `pg_typeof(date_add(TIMESTAMP
+            // '2020-01-01', INTERVAL '1 hour'))` is `timestamp with time
+            // zone`. SPG answered `timestamp without time zone`, dropping
+            // the offset from every rendering.
+            //
+            // Writing the coercion PG performs makes the existing
+            // argument-driven typing (the one `date_trunc` uses) reach the
+            // right answer, rather than teaching the type layer a second
+            // rule. MySQL's DATE_ADD is a different function that returns
+            // DATE or DATETIME, so this is PG-dialect only.
+            //
+            // Out-of-line because this sits on the RECURSIVE descent
+            // frame: an inline block with locals here costs every nesting
+            // level, and the suite's deep-nesting sentinel overflowed the
+            // 512 KiB parser stack the moment one was added (round 430's
+            // lesson, in the same shape).
+            if !self.mysql_dialect {
+                lift_date_add_arg_to_timestamptz(&first, &mut args);
+            }
             return Ok(Expr::FunctionCall { name: first, args });
         }
         // v7.9.20 — SQL-standard parenless keyword expressions
@@ -23781,6 +23803,41 @@ impl Parser {
             name: first,
         }))
     }
+}
+
+/// v7.39 (round 522) — write the coercion PG's `date_add` /
+/// `date_subtract` signature performs.
+///
+/// PG declares both over TIMESTAMPTZ and has no timestamp overload, so a
+/// timestamp argument is cast on the way in and the answer is
+/// timestamptz — measured: `pg_typeof(date_add(TIMESTAMP '2020-01-01',
+/// INTERVAL '1 hour'))` is `timestamp with time zone`. SPG answered
+/// `timestamp without time zone`, dropping the offset from every
+/// rendering of the result.
+///
+/// Writing the cast the signature implies lets the existing
+/// argument-driven typing (the one `date_trunc` uses) reach the right
+/// answer instead of teaching the type layer a second rule. MySQL's
+/// DATE_ADD is a different function returning DATE or DATETIME, so the
+/// caller applies this in PG dialect only.
+///
+/// A free function, and not a block at the call site, because the caller
+/// is on the recursive-descent frame chain.
+#[inline(never)]
+fn lift_date_add_arg_to_timestamptz(name: &str, args: &mut alloc::vec::Vec<Expr>) {
+    if args.len() != 2
+        || !(name.eq_ignore_ascii_case("date_add") || name.eq_ignore_ascii_case("date_subtract"))
+    {
+        return;
+    }
+    let base = args.remove(0);
+    args.insert(
+        0,
+        Expr::Cast {
+            expr: Box::new(base),
+            target: CastTarget::Timestamptz,
+        },
+    );
 }
 
 /// v6.8.2 — walk an expression tree and return the first column

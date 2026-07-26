@@ -411,6 +411,28 @@ impl Engine {
         if let Some(f) = self.salt_fn {
             temp = temp.with_salt_fn(f);
         }
+        // v7.39 (round 522) — the temp engine holds the materialised
+        // catalog and, until now, nothing of the SESSION. So every
+        // session-scoped answer changed the moment a system view
+        // appeared in the FROM clause: `SELECT current_user` said
+        // `unmei` and `SELECT current_user FROM pg_class` said `admin`;
+        // `current_setting('work_mem')` fell back to the boot default
+        // after a SET; `application_name` read empty. A privilege check
+        // written against a catalog join was reading a different
+        // identity than the same check written without one.
+        //
+        // Carry what a session can be observed through — its parameters
+        // (which is also where the session user lives), the role store
+        // the privilege builtins read, the dialect, and the rendering
+        // settings a timestamp is spelled with.
+        temp.session_params.clone_from(&self.session_params);
+        temp.users.clone_from(&self.users);
+        temp.backslash_escapes = self.backslash_escapes;
+        temp.mysql_strict = self.mysql_strict;
+        temp.render_style = self.render_style;
+        temp.tz_offset_fn = self.tz_offset_fn;
+        temp.tz_localize_fn = self.tz_localize_fn;
+        temp.tz_abbrev_fn = self.tz_abbrev_fn;
         temp.meta_views_materialised = true;
         temp.exec_select_cancel(stmt, cancel)
     }
