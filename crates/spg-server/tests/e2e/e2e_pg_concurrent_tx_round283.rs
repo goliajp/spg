@@ -417,3 +417,60 @@ fn a_set_inside_a_transaction_does_not_revert_another_connection() {
     assert_eq!(query_one(&mut c, "SELECT v FROM t WHERE id = 1"), Some("99".into()));
     assert_eq!(query_one(&mut c, "SELECT v FROM t WHERE id = 2"), Some("111".into()));
 }
+
+/// v7.39 (round 496) — DDL inside a transaction must not cost another
+/// session its committed write.
+///
+/// The last of the three gates into the wholesale shadow install. Phase
+/// E3's row-level merge is gated on the transaction being un-poisoned,
+/// and DDL poisons it — a write-set replay has no notion of a schema
+/// change. So `BEGIN ISOLATION LEVEL REPEATABLE READ; CREATE TABLE …;
+/// COMMIT` installed its BEGIN-time clone and deleted whatever had been
+/// committed meanwhile. PG18 keeps both.
+///
+/// Such a commit now installs only the tables the transaction changed,
+/// recorded by the catalog itself at `get_mut` / `create_table` /
+/// `drop_table` rather than inferred from the statement classifier —
+/// round 494 tried classification for a correctness gate and it was
+/// wrong.
+#[test]
+fn ddl_inside_a_transaction_does_not_revert_another_connection() {
+    let (_child, addr) = boot("ddl-poison");
+    let mut a = open(&addr);
+    let mut b = open(&addr);
+    query_one(&mut a, "CREATE TABLE t (id int primary key, v int)");
+    query_one(&mut a, "INSERT INTO t VALUES (1, 10)");
+
+    query_one(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    query_one(&mut a, "CREATE TABLE made_in_tx (a int)");
+    query_one(&mut b, "UPDATE t SET v = 99 WHERE id = 1");
+    query_one(&mut a, "COMMIT");
+
+    let mut c = open(&addr);
+    // B's write survives...
+    assert_eq!(query_one(&mut c, "SELECT v FROM t WHERE id = 1"), Some("99".into()));
+    // ...and A's DDL landed.
+    query_one(&mut c, "INSERT INTO made_in_tx VALUES (1)");
+    assert_eq!(query_one(&mut c, "SELECT count(*) FROM made_in_tx"), Some("1".into()));
+}
+
+/// A DROP inside the transaction still drops, and still leaves the other
+/// session's unrelated write alone.
+#[test]
+fn a_drop_inside_a_transaction_keeps_its_effect_and_spares_the_rest() {
+    let (_child, addr) = boot("ddl-drop");
+    let mut a = open(&addr);
+    let mut b = open(&addr);
+    query_one(&mut a, "CREATE TABLE keep (id int primary key, v int)");
+    query_one(&mut a, "INSERT INTO keep VALUES (1, 10)");
+    query_one(&mut a, "CREATE TABLE goes (a int)");
+
+    query_one(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    query_one(&mut a, "DROP TABLE goes");
+    query_one(&mut b, "UPDATE keep SET v = 99 WHERE id = 1");
+    query_one(&mut a, "COMMIT");
+
+    let mut c = open(&addr);
+    assert_eq!(query_one(&mut c, "SELECT v FROM keep WHERE id = 1"), Some("99".into()));
+    assert!(query_err(&mut c, "SELECT count(*) FROM goes").is_some(), "goes should be gone");
+}

@@ -449,7 +449,13 @@ impl Engine {
         self.tx_catalogs.insert(
             tx_id,
             TxState {
-                catalog: self.catalog.clone(),
+                // v7.39 (round 496) — the clone inherits the base's dirty
+                // record; clear it so the set means "changed by THIS tx".
+                catalog: {
+                    let mut c = self.catalog.clone();
+                    c.clear_dirty_tables();
+                    c
+                },
                 savepoints: Vec::new(),
                 cached_snapshot,
                 touched_tables: alloc::collections::BTreeSet::new(),
@@ -758,7 +764,42 @@ impl Engine {
         // large-object pins caught when this was first written against
         // `touched_tables`.
         if state.shadow_dirty {
-            self.catalog = state.catalog;
+            // v7.39 (round 496) — a frozen-view tx that could NOT use the
+            // row-level merge installs only the tables it changed, not the
+            // whole catalog.
+            //
+            // Phase E3 merges the write-set for RR/SERIALIZABLE, but it is
+            // gated on the tx being un-poisoned, and DDL poisons — a
+            // write-set replay has no notion of a schema change. So
+            // `BEGIN ISOLATION LEVEL REPEATABLE READ; CREATE TABLE …;
+            // COMMIT` fell through to installing its BEGIN-time clone and
+            // deleted whatever another session had committed meanwhile
+            // (`iso_matrix` M6; PG18 keeps both).
+            //
+            // Restricting the install to `dirty_tables` fixes that whenever
+            // the two sessions worked on different tables, which is the
+            // shape DDL-plus-traffic actually takes. Where they DID touch
+            // the same table this tx still wins it outright — unchanged
+            // from before, and recorded rather than claimed fixed.
+            let table_merge = self.mvcc_inplace
+                && state.cached_snapshot.is_some()
+                && state.rebase_poisoned;
+            if table_merge {
+                let changed: alloc::vec::Vec<String> =
+                    state.catalog.dirty_tables().iter().cloned().collect();
+                let mut fresh = self.catalog.clone();
+                for name in &changed {
+                    match state.catalog.get(name) {
+                        Some(t) => fresh.install_table(name, t.clone()),
+                        None => {
+                            fresh.drop_table(name);
+                        }
+                    }
+                }
+                self.catalog = fresh;
+            } else {
+                self.catalog = state.catalog;
+            }
         }
         // v7.37.15 Phase C — mark the writer version this tx
         // allocated as committed so subsequent reader snapshots

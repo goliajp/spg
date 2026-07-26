@@ -3723,6 +3723,20 @@ pub struct Catalog {
     /// at each of the ~170 engine call sites because `by_name` is private —
     /// this is the ONE place a table name becomes an index.
     temp_prefix: Option<String>,
+    /// v7.39 (round 496) — the names of tables this catalog handle has had
+    /// changed since the set was last cleared.
+    ///
+    /// Runtime only, never serialised. A transaction's shadow catalog
+    /// clears it at BEGIN, so at COMMIT the set is exactly the tables the
+    /// transaction changed — which is what lets a commit that cannot use
+    /// the row-level merge install only those tables instead of the whole
+    /// catalog, leaving another session's concurrent work in place.
+    ///
+    /// Recorded where the change actually happens (`get_mut`,
+    /// `create_table`, `drop_table`) rather than from the statement
+    /// classifier: round 494 tried classification for a correctness gate
+    /// and it was wrong, because `SELECT lo_write(…)` reads as read-only.
+    dirty_tables: alloc::collections::BTreeSet<String>,
     /// v7.37.15 (Phase C.1) — monotonic allocator for stable
     /// [`RelId`](row_header::RelId)s. Pre-incremented on each
     /// `create_table` so real ids start at 1 (0 is `UNASSIGNED`);
@@ -4467,6 +4481,7 @@ impl Catalog {
             tables: Vec::new(),
             by_name: BTreeMap::new(),
             temp_prefix: None,
+            dirty_tables: alloc::collections::BTreeSet::new(),
             next_rel_id: 0,
             cold_segments: Vec::new(),
             functions: BTreeMap::new(),
@@ -5394,7 +5409,9 @@ impl Catalog {
         let idx = self.tables.len();
         let name = schema.name.clone();
         self.tables.push(Table::new(schema));
-        self.by_name.insert(name, idx);
+        self.by_name.insert(name.clone(), idx);
+        // v7.39 (round 496) — see `dirty_tables`.
+        self.dirty_tables.insert(name);
         // v7.37.15 (Phase C.1) — stamp the new relation with a stable,
         // monotonic, never-reused RelId. Pre-increment so ids start at
         // 1 (0 = UNASSIGNED); a later DROP TABLE frees the slot but not
@@ -5444,7 +5461,46 @@ impl Catalog {
 
     pub fn get_mut(&mut self, name: &str) -> Option<&mut Table> {
         let idx = self.resolve_index(name)?;
+        // v7.39 (round 496) — the choke point for changing a table, so the
+        // record is taken here. Over-approximate on purpose: a caller that
+        // takes the handle and writes nothing merely carries that table
+        // through a commit, which is the old behaviour.
+        let recorded = self.tables.get(idx).map(|t| t.schema().name.clone());
+        if let Some(n) = recorded {
+            self.dirty_tables.insert(n);
+        }
         self.tables.get_mut(idx)
+    }
+
+    /// v7.39 (round 496) — the tables changed through this handle since
+    /// [`Self::clear_dirty_tables`]. See `dirty_tables`.
+    #[must_use]
+    pub fn dirty_tables(&self) -> &alloc::collections::BTreeSet<String> {
+        &self.dirty_tables
+    }
+
+    /// v7.39 (round 496) — start a fresh recording window. A transaction's
+    /// shadow calls this at BEGIN so the set means "changed by this tx".
+    pub fn clear_dirty_tables(&mut self) {
+        self.dirty_tables.clear();
+    }
+
+    /// v7.39 (round 496) — put `table` in at `name`, replacing any table
+    /// already there and keeping the rest of the catalog untouched.
+    ///
+    /// The commit-time table-granularity merge needs exactly this: take
+    /// the latest committed catalog, then overwrite only the tables the
+    /// transaction changed.
+    pub fn install_table(&mut self, name: &str, table: Table) {
+        match self.by_name.get(name).copied() {
+            Some(idx) => self.tables[idx] = table,
+            None => {
+                let idx = self.tables.len();
+                self.tables.push(table);
+                self.by_name.insert(name.into(), idx);
+            }
+        }
+        self.dirty_tables.insert(name.into());
     }
 
     /// v7.37.42 (docker-fair SCALARSQ attack) — resolve a table name to
@@ -5898,6 +5954,9 @@ impl Catalog {
         let Some(idx) = self.by_name.remove(&key) else {
             return false;
         };
+        // v7.39 (round 496) — see `dirty_tables`. Recorded under the
+        // RESOLVED key, which is what a commit-time merge looks up.
+        self.dirty_tables.insert(key.clone());
         // swap_remove invalidates the trailing index → rebuild
         // by_name for affected entries.
         self.tables.swap_remove(idx);
