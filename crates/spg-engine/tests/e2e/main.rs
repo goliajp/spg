@@ -76,6 +76,8 @@ mod e2e_bytea_ops;
 mod e2e_bytea_round36;
 mod e2e_column_labels_round505;
 mod e2e_mysql_column_labels_round506;
+mod e2e_nesting_budget_round507;
+mod e2e_unary_plus_round507;
 mod e2e_cardinality_violation;
 mod e2e_casefold;
 mod e2e_cash_words;

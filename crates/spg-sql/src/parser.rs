@@ -692,11 +692,28 @@ struct Parser {
 }
 
 /// Max expr/select parser nesting (parens, subqueries, CASE, …).
-/// Real SQL nests a few dozen levels at the extreme. Each nesting
-/// level costs a parse_expr→parse_unary→parse_atom frame chain —
-/// over 10 KiB in debug builds (parse_atom is a giant match) — so
-/// 64 is the highest budget that stays comfortably inside a 2 MiB
-/// worker stack in BOTH debug and release builds.
+/// Real SQL nests a few dozen levels at the extreme. Each nesting level
+/// costs a parse_expr→parse_unary→parse_atom frame chain, so the budget
+/// exists to turn a deep statement into a catchable parse ERROR: a stack
+/// overflow is an abort, and in the server it does not fail one query, it
+/// takes the process down and every other connection with it.
+///
+/// v7.39 (round 507) — measured, because the figure here used to be a
+/// guess ("over 10 KiB in debug … comfortably inside a 2 MiB worker stack
+/// in BOTH debug and release"), and the debug half of that is wrong by
+/// more than an order of magnitude:
+///
+///   * RELEASE, on a 2 MiB worker stack: every recursive shape reaches
+///     this budget and errors. Verified against a live server for nested
+///     derived tables, parens, calls, CASE, IN-subqueries, scalar
+///     subqueries, NOT and unary minus — the server stayed up through all
+///     of them. This is the contract that matters, and it holds.
+///   * DEBUG: nested derived tables cost roughly 235 KiB of stack PER
+///     LEVEL, so parsing alone aborts around 35 levels on an 8 MiB stack
+///     and executing aborts around 8 inside a test thread. The budget is
+///     simply unreachable there, which is why a deep-nesting test has to
+///     ask for a large stack of its own — see `nesting_budget_errors_at`
+///     in the parser tests.
 const MAX_NEST_DEPTH: usize = 64;
 
 /// v7.39 (read01 geo_ops.c) — prefix `@@` desugar target, out-of-line so
@@ -19660,6 +19677,18 @@ impl Parser {
                 let e = self.parse_expr(9)?;
                 Ok(Expr::Unary {
                     op: UnOp::Neg,
+                    expr: Box::new(e),
+                })
+            }
+            // v7.39 (round 507) — unary `+`, which SPG did not have. `+1`
+            // worked only because the lexer reads it as one signed literal;
+            // `+ 1`, `+a`, `+(1)` and `1 + +1` were syntax errors, and both
+            // PG18 and MariaDB take all of them. Binds like unary minus.
+            Token::Plus => {
+                self.advance();
+                let e = self.parse_expr(9)?;
+                Ok(Expr::Unary {
+                    op: UnOp::Plus,
                     expr: Box::new(e),
                 })
             }
