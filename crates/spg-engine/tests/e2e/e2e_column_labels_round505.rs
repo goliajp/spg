@@ -25,12 +25,10 @@
 //! Nothing in the suite pinned any of this, which is why it could drift
 //! this far from both oracles. Every expectation below is a PG18 reading.
 //!
-//! The MySQL half is a RECORDED RESIDUAL, deliberately not asserted here:
-//! MariaDB echoes the item's SOURCE TEXT verbatim — `SELECT a  +  b`
-//! reports `a  +  b`, spacing and all, and `SELECT 'a'` reports `a` — which
-//! needs the parser to hand over spans the AST does not carry. A MySQL
-//! session therefore keeps the printed form for now, which is closer to
-//! MariaDB's answer than `?column?` would be.
+//! The MySQL half is MariaDB's own rule — the item's SOURCE TEXT verbatim,
+//! `SELECT a  +  b` reporting `a  +  b`, spacing and all — and round 506
+//! closed it from the parser's byte offsets. See
+//! `e2e_mysql_column_labels_round506`.
 
 use spg_engine::{Engine, QueryResult};
 
@@ -199,22 +197,14 @@ fn round505_columns_and_explicit_aliases_are_unchanged() {
     );
 }
 
-/// The rule is PG's, and a MySQL session does not get it: MariaDB has its
-/// own answer (the item's source text), so `?column?` would be wrong there.
-/// What a MySQL session reports today is the printed expression; this pins
-/// only the SPLIT — that the two dialects do not share PG's answer — since
-/// pinning the printed form would be pinning SPG's own output.
+/// The rule is PG's, and a MySQL session does not take it: MariaDB has its
+/// own answer, which round 506 implemented. This pins only that the two
+/// dialects stay apart here; the MariaDB values themselves are pinned in
+/// `e2e_mysql_column_labels_round506`.
 #[test]
 fn round505_the_mysql_dialect_does_not_take_pgs_answer() {
     let mut e = engine();
     e.execute("SET sql_mode='STRICT_TRANS_TABLES'").unwrap();
-    let got = one(&mut e, "SELECT a + b FROM lbl");
-    assert_ne!(
-        got, "?column?",
-        "a MySQL session must not answer PG's placeholder"
-    );
-    assert!(
-        got.contains('a') && got.contains('b'),
-        "a MySQL session names the item after the expression, got {got}"
-    );
+    assert_eq!(one(&mut e, "SELECT a + b FROM lbl"), "a + b");
+    assert_eq!(one(&mut e, "SELECT upper(s) FROM lbl"), "upper(s)");
 }
