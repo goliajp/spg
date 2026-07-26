@@ -2055,6 +2055,51 @@ fn eval_cast_arm(
                 })
             };
         }
+        // v7.39 (round 513) — `regnamespace` and `regrole` resolve against
+        // things that live outside the type table: schemas on the catalog,
+        // roles on the engine. They belong here for the same reason the
+        // relation check above does — this is the arm that can see them.
+        if name.eq_ignore_ascii_case("regnamespace")
+            && let Value::Text(t) = &v
+        {
+            let want = t.trim().trim_matches('"');
+            return if spg_storage::is_builtin_schema(want) || cat.schema_exists(want) {
+                Ok(Value::text(want.to_string()))
+            } else {
+                Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("schema \"{want}\" does not exist"),
+                })
+            };
+        }
+        if name.eq_ignore_ascii_case("regrole")
+            && let Value::Text(t) = &v
+        {
+            let want = t.trim().trim_matches('"').to_string();
+            // PG ships predefined roles that exist whether or not anybody
+            // created them; SPG carries the rest on the engine.
+            const PREDEFINED: &[&str] = &[
+                "pg_read_all_data",
+                "pg_write_all_data",
+                "pg_monitor",
+                "pg_read_all_settings",
+                "pg_read_all_stats",
+                "pg_stat_scan_tables",
+                "pg_signal_backend",
+                "pg_checkpoint",
+                "pg_maintain",
+                "pg_use_reserved_connections",
+                "pg_create_subscription",
+            ];
+            let known = PREDEFINED.iter().any(|r| r.eq_ignore_ascii_case(&want))
+                || ctx.engine.is_some_and(|e| e.role_exists(&want));
+            return if known {
+                Ok(Value::text(want))
+            } else {
+                Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("role \"{want}\" does not exist"),
+                })
+            };
+        }
         // v7.39 (round 509) — the cast target is checked even when the
         // operand is NULL. `cast_value_in` short-circuits a NULL before it
         // looks at the target, so `NULL::nosuchtype` silently answered NULL
