@@ -5817,6 +5817,8 @@ pub(super) fn compare(
         // v7.39 (read01 ruleutils.c) — regclass compares by oid, including
         // against the synth catalogs' plain integer oid columns.
         (Value::Tid(b1, o1), Value::Tid(b2, o2)) => b1.cmp(b2).then(o1.cmp(o2)),
+        (Value::Xid(x), Value::Xid(y)) => x.cmp(y),
+        (Value::Cid(x), Value::Cid(y)) => x.cmp(y),
         (Value::RegClass(a, _), Value::RegClass(b, _)) => a.cmp(b),
         (Value::RegClass(a, _), Value::BigInt(b)) => a.cmp(b),
         (Value::BigInt(a), Value::RegClass(b, _)) => a.cmp(b),

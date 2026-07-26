@@ -117,6 +117,8 @@ pub(super) fn value_cmp_for_min_max(
         // LEAST share this comparator with min/max's, and both used to reach
         // the `_ => Equal` below.
         (Value::Tid(b1, o1), Value::Tid(b2, o2)) => b1.cmp(b2).then(o1.cmp(o2)),
+        (Value::Xid(a), Value::Xid(b)) => a.cmp(b),
+        (Value::Cid(a), Value::Cid(b)) => a.cmp(b),
         _ => Ordering::Equal,
     }
 }
@@ -416,6 +418,9 @@ pub fn value_to_text_styled(v: &Value, style: &crate::eval::RenderStyle) -> Stri
         Value::RegClass(_, name) | Value::RegProc(_, name) => name.to_string(),
         // v7.39 (round 511) — PG renders a tid `(block,offset)`.
         Value::Tid(b, o) => alloc::format!("({b},{o})"),
+        // A transaction / command id renders as its number.
+        Value::Xid(x) => alloc::format!("{x}"),
+        Value::Cid(c) => alloc::format!("{c}"),
         Value::BitString { nbits, bytes } => crate::conversions::format_bit_string(*nbits, bytes),
         Value::Xml(s) => s.to_string(),
         Value::Char1(b) => format!("{}", *b as char),

@@ -1675,7 +1675,8 @@ fn value_body_encoded_len(v: &Value<'_>, _ty: DataType) -> usize {
         // v7.38 (read01, T9) — a composite/record is a transient value
         // (row() → to_json); it is never persisted, so it has no on-disk body.
         Value::Composite(_) => 0,
-        Value::RegClass(..) | Value::RegProc(..) | Value::Tid(..) => 0,
+        Value::RegClass(..) | Value::RegProc(..) | Value::Tid(..) | Value::Xid(_)
+        | Value::Cid(_) => 0,
         Value::Null => 0,
         // v7.37.5 β-P2 — INTERVAL is a 16-byte fixed body:
         // 8 i64 micros + 4 i32 days + 4 i32 months. PG byte-equal
@@ -2362,7 +2363,8 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
         // binary codec encodes it as absent (the text protocol renders it via
         // value_to_text and row_to_json converts it to JSON before storage).
         Value::Composite(_) => out.push(0),
-        Value::RegClass(..) | Value::RegProc(..) | Value::Tid(..) => out.push(0),
+        Value::RegClass(..) | Value::RegProc(..) | Value::Tid(..) | Value::Xid(_)
+        | Value::Cid(_) => out.push(0),
         Value::Null => out.push(0),
         Value::SmallInt(n) => {
             out.push(7);

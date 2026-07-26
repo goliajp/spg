@@ -786,6 +786,18 @@ pub enum Value<'arena> {
     /// — from `pg_get_functiondef('f')` — which PG rejects.
     /// Eval-only (no column storage).
     RegProc(i64, alloc::boxed::Box<str>),
+    /// v7.39 (round 512) — PG `xid` and `cid`, the transaction and command
+    /// ids the `xmin` / `xmax` / `cmin` / `cmax` system columns carry.
+    ///
+    /// Their own types rather than integers, because PG deliberately gives
+    /// them almost no operators: measured on PG18, `xmin + 1` is "operator
+    /// does not exist: xid + integer", `xmin > 0` likewise, `xmin::bigint`
+    /// is "cannot cast type xid to bigint", and there is no `max(xid)`.
+    /// Carrying them as BigInt would quietly allow all four.
+    ///
+    /// Eval-only (no column storage).
+    Xid(u32),
+    Cid(u32),
     /// v7.39 (round 511) — PG `tid`, the physical row identity `ctid`
     /// carries: a block number and a one-based offset inside it, rendered
     /// `(block,offset)`.
@@ -1050,7 +1062,8 @@ impl<'arena> Value<'arena> {
             Self::Composite(_) => None,
             // v7.39 (read01 ruleutils.c) — regclass is eval-only (dual
             // oid+name shape); no column storage type.
-            Self::RegClass(..) | Self::RegProc(..) | Self::Tid(..) => None,
+            Self::RegClass(..) | Self::RegProc(..) | Self::Tid(..) | Self::Xid(_)
+            | Self::Cid(_) => None,
             Self::Null => None,
         }
     }
@@ -1124,6 +1137,8 @@ impl<'arena> Value<'arena> {
             Value::Composite(fields) => Value::Composite(fields),
             Value::RegClass(oid, name) => Value::RegClass(oid, name),
             Value::Tid(b, o) => Value::Tid(b, o),
+            Value::Xid(x) => Value::Xid(x),
+            Value::Cid(c) => Value::Cid(c),
             Value::RegProc(oid, name) => Value::RegProc(oid, name),
             Value::Point(p) => Value::Point(p),
             Value::Lseg(a, b) => Value::Lseg(a, b),
@@ -2259,6 +2274,8 @@ impl IndexKey {
             | Value::MoneyArray(_)
             | Value::Composite(_)
             | Value::Tid(..)
+            | Value::Xid(_)
+            | Value::Cid(_)
             | Value::RegClass(..)
             | Value::RegProc(..) => None,
             // Numeric isn't (yet) indexable — exact-decimal index keys

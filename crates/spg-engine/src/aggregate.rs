@@ -6231,6 +6231,8 @@ fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         // kept whichever row arrived first: `max(ctid)` over twelve rows
         // answered `(0,1)`.
         (Value::Tid(b1, o1), Value::Tid(b2, o2)) => b1.cmp(b2).then(o1.cmp(o2)),
+        (Value::Xid(x), Value::Xid(y)) => x.cmp(y),
+        (Value::Cid(x), Value::Cid(y)) => x.cmp(y),
         (Value::Char1(x), Value::Char1(y)) => x.cmp(y),
         (
             Value::Inet {

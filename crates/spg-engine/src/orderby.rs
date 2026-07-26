@@ -404,6 +404,8 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         // v7.39 (round 511) — a tid orders by block then offset, which is
         // what makes `min(ctid)` pick `(0,2)` out of `(0,2) (0,9) (0,10)`.
         (Value::Tid(b1, o1), Value::Tid(b2, o2)) => b1.cmp(b2).then(o1.cmp(o2)),
+        (Value::Xid(x), Value::Xid(y)) => x.cmp(y),
+        (Value::Cid(x), Value::Cid(y)) => x.cmp(y),
         (Value::RegClass(x, _), Value::RegClass(y, _)) => x.cmp(y),
         (Value::RegClass(x, _), Value::BigInt(y)) => x.cmp(y),
         (Value::BigInt(x), Value::RegClass(y, _)) => x.cmp(y),
