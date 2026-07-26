@@ -24,6 +24,68 @@ use super::{
 /// v7.39 (read01 regproc.c) — the reg* input types SPG carries as text:
 /// resolve the name and return its canonical rendering, with PG's
 /// distinct not-found / ambiguous errors.
+/// v7.39 (round 515) — the type names each family below accepts, declared
+/// ONCE so the value path and the NULL-target check cannot drift apart.
+///
+/// They already had, three times. Round 509 added a check that a cast target
+/// names something, with its own hand-kept list; round 512 then added
+/// `Value::Cid` without registering `cid` there, round 514 found that and
+/// `xid`, and round 515 found six more — `'english'::regconfig` resolved
+/// while `NULL::regconfig` did not. The duplication was the defect, so it
+/// is gone rather than patched a third time.
+pub(crate) const REG_MISC_TYPES: &[&str] = &[
+    "regproc",
+    "regprocedure",
+    "regoper",
+    "regoperator",
+    "regconfig",
+    "regdictionary",
+    "regcollation",
+];
+
+/// The catalog-shaped scalars — see `cast_catalog_scalar`.
+pub(crate) const CATALOG_SCALAR_TYPES: &[&str] = &[
+    "cid",
+    "xid",
+    "oidvector",
+    "int2vector",
+    "aclitem",
+    "refcursor",
+    "pg_snapshot",
+    "txid_snapshot",
+    "jsonpath",
+];
+
+/// The pseudotypes and the statistics / GiST internals: a NULL is NULL, a
+/// value is "cannot accept a value of type X".
+pub(crate) const OPAQUE_TYPES: &[&str] = &[
+    "anyarray",
+    "anyelement",
+    "anyenum",
+    "anyrange",
+    "anymultirange",
+    "anynonarray",
+    "anycompatible",
+    "anycompatiblearray",
+    "anycompatiblenonarray",
+    "anycompatiblerange",
+    "anycompatiblemultirange",
+    "any",
+    "trigger",
+    "event_trigger",
+    "internal",
+    "language_handler",
+    "fdw_handler",
+    "pg_ddl_command",
+    "pg_node_tree",
+    "pg_ndistinct",
+    "pg_mcv_list",
+    "pg_dependencies",
+    "pg_brin_minmax_multi_summary",
+    "pg_brin_bloom_summary",
+    "gtsvector",
+];
+
 fn cast_reg_misc(kind: &str, s: &str) -> Result<Value<'static>, EvalError> {
     let bare = s
         .strip_prefix("pg_catalog.")
@@ -715,8 +777,7 @@ pub fn cast_value_in(
             {
                 let lower_name = name.to_ascii_lowercase();
                 match lower_name.as_str() {
-                    "regproc" | "regprocedure" | "regoper" | "regoperator" | "regconfig"
-                    | "regdictionary" | "regcollation" => {
+                    k if REG_MISC_TYPES.contains(&k) => {
                         let s = match &v {
                             Value::Null => return Ok(Value::Null),
                             Value::Text(s) => s.as_ref().trim().to_string(),
@@ -761,39 +822,7 @@ pub fn cast_value_in(
             // pseudotype hits PG's dummy input functions (0A000).
             {
                 let lower = name.to_ascii_lowercase();
-                if matches!(
-                    lower.as_str(),
-                    "anyarray"
-                        | "anyelement"
-                        | "anyenum"
-                        | "anyrange"
-                        | "anymultirange"
-                        | "anynonarray"
-                        | "anycompatible"
-                        | "anycompatiblearray"
-                        | "anycompatiblenonarray"
-                        | "anycompatiblerange"
-                        | "anycompatiblemultirange"
-                        | "any"
-                        | "trigger"
-                        | "event_trigger"
-                        | "internal"
-                        | "language_handler"
-                        | "fdw_handler"
-                        | "pg_ddl_command"
-                        | "pg_node_tree"
-                        // v7.39 (round 514) — the statistics and GiST
-                        // internal representations. Measured on PG18: a
-                        // VALUE cast is "cannot accept a value of type X"
-                        // and a NULL is NULL, which is the pseudotype
-                        // contract exactly.
-                        | "pg_ndistinct"
-                        | "pg_mcv_list"
-                        | "pg_dependencies"
-                        | "pg_brin_minmax_multi_summary"
-                        | "pg_brin_bloom_summary"
-                        | "gtsvector"
-                ) {
+                if OPAQUE_TYPES.contains(&lower.as_str()) {
                     // v7.39 (round 509) — a pseudotype is a REAL type name,
                     // so `NULL::anyarray` is NULL on PG, not an error. Only a
                     // VALUE hits the dummy input function. Before this the
@@ -1001,9 +1030,14 @@ pub fn cast_value_in(
     }
 }
 
-/// v7.38 (read01, T20) — width of a `bit` cast target: bare `bit` is `bit(1)`,
-/// `bit(N)` is N. `None` for `varbit` / `bit varying` (PG rejects int→varbit) and
-/// any non-bit name.
+/// The scalar type names the `Named` arm resolves without a catalog.
+fn is_known_scalar_name(lower: &str) -> bool {
+    REG_MISC_TYPES.contains(&lower)
+        || CATALOG_SCALAR_TYPES.contains(&lower)
+        || OPAQUE_TYPES.contains(&lower)
+        || matches!(lower, "tid" | "record" | "cstring" | "regnamespace" | "regrole")
+}
+
 /// v7.39 (round 509) — does this name a type at all?
 ///
 /// PG validates the cast TARGET whatever the operand is: `NULL::nosuchtype`
@@ -1022,53 +1056,20 @@ pub(crate) fn builtin_target_resolves(name: &str, mysql: bool) -> bool {
         return true;
     }
     let lower = name.to_ascii_lowercase();
-    if matches!(
-        lower.as_str(),
-        "tid"
-            | "regcollation"
-            | "regnamespace"
-            | "regrole"
-            | "record"
-            | "cstring"
-            | "anyarray"
-            | "anyelement"
-            | "anyenum"
-            | "anyrange"
-            | "anymultirange"
-            | "anynonarray"
-            | "anycompatible"
-            | "anycompatiblearray"
-            | "anycompatiblenonarray"
-            | "anycompatiblerange"
-            | "anycompatiblemultirange"
-            | "any"
-            | "trigger"
-            | "event_trigger"
-            | "internal"
-            | "language_handler"
-            | "fdw_handler"
-            | "pg_ddl_command"
-            | "pg_node_tree"
-            // v7.39 (round 514) — the statistics and GiST internal
-            // representations. PG answers "cannot accept a value of type X"
-            // for a value and NULL for a NULL, which is exactly the
-            // pseudotype contract above.
-            | "pg_ndistinct"
-            | "pg_mcv_list"
-            | "pg_dependencies"
-            | "pg_brin_minmax_multi_summary"
-            | "pg_brin_bloom_summary"
-            | "gtsvector"
-            | "cid"
-            | "xid"
-            | "oidvector"
-            | "int2vector"
-            | "aclitem"
-            | "refcursor"
-            | "pg_snapshot"
-            | "txid_snapshot"
-            | "jsonpath"
-    ) {
+    // The three families, read from the same declarations the value path
+    // dispatches on — see their doc comment for why that matters.
+    if is_known_scalar_name(&lower) {
+        return true;
+    }
+    // v7.39 (round 515) — `<element>[]`, which this parser names
+    // `<element>_array`. PG has an array type for every scalar, so the rule
+    // is the stem's: `NULL::cstring[]`, `NULL::aclitem[]` and
+    // `NULL::"char"[]` all resolve there. A general rule rather than three
+    // entries, because the next scalar added would otherwise need a fourth.
+    if let Some(stem) = lower.strip_suffix("_array")
+        && (is_known_scalar_name(stem)
+            || crate::conversions::type_name_to_data_type(stem).is_some())
+    {
         return true;
     }
     if mysql && matches!(lower.as_str(), "binary" | "signed" | "unsigned") {
@@ -1106,11 +1107,26 @@ fn cast_catalog_scalar(
     v: &Value<'_>,
 ) -> Result<Option<Value<'static>>, EvalError> {
     let lower = name.to_ascii_lowercase();
-    if !matches!(
-        lower.as_str(),
-        "cid" | "xid" | "oidvector" | "int2vector" | "aclitem" | "refcursor" | "pg_snapshot"
-            | "txid_snapshot" | "jsonpath"
-    ) {
+    // v7.39 (round 515) — `<element>[]` runs the element's own check over
+    // each member and keeps the literal, which is what PG does: measured,
+    // `'{a,b}'::aclitem[]` is "unrecognized key word: \"a\"".
+    if let Some(stem) = lower.strip_suffix("_array")
+        && (CATALOG_SCALAR_TYPES.contains(&stem) || OPAQUE_TYPES.contains(&stem))
+    {
+        let Value::Text(t) = v else {
+            return Ok(None);
+        };
+        let body = t.trim();
+        let inner = body
+            .strip_prefix('{')
+            .and_then(|b| b.strip_suffix('}'))
+            .unwrap_or(body);
+        for part in inner.split(',').filter(|p| !p.trim().is_empty()) {
+            cast_catalog_scalar(stem, &Value::text(part.trim().to_string()))?;
+        }
+        return Ok(Some(Value::text(body.to_string())));
+    }
+    if !CATALOG_SCALAR_TYPES.contains(&lower.as_str()) {
         return Ok(None);
     }
     let text = match v {
@@ -1192,6 +1208,9 @@ fn cast_catalog_scalar(
     Ok(Some(out))
 }
 
+/// v7.38 (read01, T20) — width of a `bit` cast target: bare `bit` is `bit(1)`,
+/// `bit(N)` is N. `None` for `varbit` / `bit varying` (PG rejects int→varbit) and
+/// any non-bit name.
 fn bit_cast_width(name: &str) -> Option<(u32, bool)> {
     let lower = name.to_ascii_lowercase();
     let trimmed = lower.trim();
