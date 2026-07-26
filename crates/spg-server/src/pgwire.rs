@@ -2130,10 +2130,18 @@ fn execute_with_role(
     // first non-match without ever building the lowercase copy.
     if is_read {
         let b = sql.as_bytes();
-        if ci_contains(b, b"setval(") || ci_contains(b, b"nextval(") || ci_contains(b, b"currval(")
-            // v7.39 (GUC) — set_config writes the session GUC store, so
-            // it needs the &mut engine path for the same reason.
-            || ci_contains(b, b"set_config(")
+        // v7.39 (round 498) — the needle list moved to the engine, beside
+        // the pre-pass that handles these families.
+        //
+        // It was maintained here by hand and had drifted: it carried the
+        // sequence family and `set_config` but not the advisory locks, the
+        // large objects, or MySQL's lock family. So `SELECT
+        // pg_try_advisory_lock(…)` took the read path, the pre-pass never
+        // ran, and a stub answered TRUE — on two connections at once,
+        // measured against PG18. See `MUTATING_CALL_NEEDLES`.
+        if spg_engine::MUTATING_CALL_NEEDLES
+            .iter()
+            .any(|n| ci_contains(b, n))
             // v7.39 (round 295, E3 Phase 1b) — a SELECT that asks for row
             // locks MUTATES the lock table, so it is not a read. Without
             // this it went to the read-only executor, the locking
@@ -2643,25 +2651,55 @@ fn ci_contains(b: &[u8], needle: &[u8]) -> bool {
 /// (sequence mutation must hit the engine write lock). Anchored on
 /// `s`/`n`/`c` to early-skip non-candidates.
 fn sql_has_sequence_mutator(b: &[u8]) -> bool {
-    if b.len() < 7 {
+    // v7.39 (round 498) — needles and anchors both come from
+    // `spg_engine::MUTATING_CALL_NEEDLES` now.
+    //
+    // This is the OUTERMOST of the three layers that route a SELECT away
+    // from the write path (the round-295 comment above names all three).
+    // It carried its own copy of the list — `setval` / `nextval` /
+    // `currval` / `set_config` — plus an anchor optimisation that only
+    // inspected positions beginning `s`, `n` or `c`. Both had to be
+    // updated for every state-changing function added since, and neither
+    // was: advisory locks start with `p`, large objects and `lastval`
+    // with `l`, MySQL's lock family with `g` / `r` / `i`.
+    //
+    // Measured consequence (`iso_session` T6, over the wire against
+    // PG18): `pg_try_advisory_lock(4981)` answered TRUE on two
+    // connections at once, because the call never reached the registry.
+    // Inside a transaction the same call answered correctly — the write
+    // path was always right; only the routing to it was wrong.
+    //
+    // The anchor table is derived from the needles rather than restated,
+    // so the fast first-byte reject survives without a second list to
+    // keep in step.
+    static ANCHORS: std::sync::OnceLock<[bool; 256]> = std::sync::OnceLock::new();
+    let anchors = ANCHORS.get_or_init(|| {
+        let mut t = [false; 256];
+        for n in spg_engine::MUTATING_CALL_NEEDLES {
+            if let Some(&first) = n.first() {
+                t[(first | 0x20) as usize] = true;
+                t[(first & !0x20) as usize] = true;
+            }
+        }
+        t
+    });
+    let shortest = spg_engine::MUTATING_CALL_NEEDLES
+        .iter()
+        .map(|n| n.len())
+        .min()
+        .unwrap_or(usize::MAX);
+    if b.len() < shortest {
         return false;
     }
-    // v7.39 (GUC) — set_config writes the session GUC store; like the
-    // sequence mutators it must reach the engine write lock so
-    // `try_exec_set_config` can fire.
-    let needles: &[&[u8]] = &[b"setval(", b"nextval(", b"currval(", b"set_config("];
     for i in 0..b.len() {
-        let c = b[i] | 0x20;
-        match c {
-            b's' | b'n' | b'c' => {
-                for needle in needles {
-                    let n = needle.len();
-                    if i + n <= b.len() && b[i..i + n].eq_ignore_ascii_case(needle) {
-                        return true;
-                    }
-                }
+        if !anchors[b[i] as usize] {
+            continue;
+        }
+        for needle in spg_engine::MUTATING_CALL_NEEDLES {
+            let n = needle.len();
+            if i + n <= b.len() && b[i..i + n].eq_ignore_ascii_case(needle) {
+                return true;
             }
-            _ => {}
         }
     }
     false
