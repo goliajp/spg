@@ -677,6 +677,60 @@ fn try_pure_count_star_short_circuit(
     })
 }
 
+/// v7.39 (round 528) — a GROUP BY name that names an output column.
+///
+/// `SELECT date_trunc('day', ts) AS d, count(*) FROM t GROUP BY d` is the
+/// canonical daily rollup, and it answered `column "d" does not exist`.
+/// Both PG and MySQL take a GROUP BY identifier that matches an output
+/// alias and group by the expression behind it; only grouping by a real
+/// column or an ordinal worked here.
+///
+/// Precedence is PG's, measured: an INPUT column of that name WINS.
+/// `SELECT v AS ts … GROUP BY ts` on a table that has a `ts` column
+/// groups by the column, which is why PG then rejects the ungrouped `v` —
+/// so the alias is consulted only when nothing else answers to the name.
+fn resolve_group_by_aliases(
+    keys: Vec<Expr>,
+    stmt: &SelectStatement,
+    schema_cols: &[ColumnSchema],
+) -> Result<Vec<Expr>, EvalError> {
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys {
+        let Expr::Column(c) = &key else {
+            out.push(key);
+            continue;
+        };
+        if c.qualifier.is_some()
+            || schema_cols.iter().any(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+        {
+            out.push(key);
+            continue;
+        }
+        let target = stmt.items.iter().find_map(|it| match it {
+            SelectItem::Expr {
+                expr,
+                alias: Some(a),
+            } if a.eq_ignore_ascii_case(&c.name) => Some(expr),
+            _ => None,
+        });
+        match target {
+            // PG's wording for the one alias that cannot be grouped by.
+            Some(e) if contains_aggregate(e) => {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::string::String::from(
+                        "aggregate functions are not allowed in GROUP BY",
+                    ),
+                });
+            }
+            Some(e) => out.push(e.clone()),
+            // Not an alias either — leave it, so the resolver reports the
+            // missing column as it always did.
+            None => out.push(key),
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn run(
     stmt: &SelectStatement,
     rows: &[RowRef<'_>],
@@ -716,6 +770,8 @@ pub(crate) fn run(
         return Ok(short);
     }
     let group_exprs: Vec<Expr> = stmt.group_by.clone().unwrap_or_default();
+    // v7.39 (round 528) — a GROUP BY name that is only an output ALIAS.
+    let group_exprs = resolve_group_by_aliases(group_exprs, stmt, schema_cols)?;
 
     // v7.39 (round 405) — MySQL's loose GROUP BY: wrap each non-grouped,
     // non-aggregated column in `any_value(col)` so the rest of the pipeline
