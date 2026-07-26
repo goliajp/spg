@@ -2198,6 +2198,30 @@ fn eval_cast_arm(
         // things that live outside the type table: schemas on the catalog,
         // roles on the engine. They belong here for the same reason the
         // relation check above does — this is the arm that can see them.
+        // v7.39 (round 526) — the NUMERIC direction, which is the one a
+        // catalog join uses: `relnamespace::regnamespace` names the
+        // schema a relation lives in, and it errored with "unsupported
+        // cast target" while `'public'::regnamespace` worked. Round 513
+        // added the name direction only, so the half that reads a
+        // catalog was the half missing.
+        if (name.eq_ignore_ascii_case("regnamespace") || name.eq_ignore_ascii_case("regrole"))
+            && let Some(oid) = match &v {
+                Value::Int(n) => Some(i64::from(*n)),
+                Value::BigInt(n) => Some(*n),
+                _ => None,
+            }
+        {
+            let named = if name.eq_ignore_ascii_case("regnamespace") {
+                crate::system_catalog::schema_name_for_oid(oid)
+            } else {
+                ctx.engine.and_then(|e| e.role_name_for_oid(oid))
+            };
+            // PG prints the bare number for an oid that names nothing,
+            // exactly as `regclass` does.
+            return Ok(Value::text(
+                named.unwrap_or_else(|| alloc::format!("{oid}")),
+            ));
+        }
         if name.eq_ignore_ascii_case("regnamespace")
             && let Value::Text(t) = &v
         {
