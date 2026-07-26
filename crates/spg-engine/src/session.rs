@@ -100,6 +100,75 @@ impl Engine {
     /// caller-supplied form so observability paths see what was
     /// requested. Only `default_text_search_config` is consulted by
     /// the engine today.
+    /// v7.39 (round 501) — is `name` a parameter this session may set?
+    ///
+    /// PG18 answers `ERROR: unrecognized configuration parameter "x"` for
+    /// a name it does not know, and refuses the ones a session cannot
+    /// change with a wording that says why. SPG accepted anything —
+    /// round 500 measured `SET nonexistent_knob = 3` answering `SET` — so
+    /// a typo'd parameter name was taken silently and the setting the
+    /// caller believed they had made was never made.
+    ///
+    /// Three kinds of name are accepted beyond PG18's own list, because
+    /// rejecting them would break callers that are not wrong:
+    ///
+    /// * anything containing a dot — PG treats `myapp.thing` as a
+    ///   customised option and accepts it, and extensions rely on that;
+    /// * the MySQL-dialect names SPG honours (`sql_mode`,
+    ///   `foreign_key_checks`, …), which PG has no concept of and which
+    ///   `mysqldump` preambles emit;
+    /// * SPG's own internal keys.
+    ///
+    /// Returns the PG error text, or `None` when the SET may proceed.
+    pub(crate) fn reject_unsettable_guc(&self, name: &str) -> Option<alloc::string::String> {
+        let key = name.to_ascii_lowercase();
+        if key.contains('.')
+            || key.starts_with("__spg")
+            || matches!(
+                key.as_str(),
+                // MySQL dialect — `mysqldump` preambles and MySQL clients.
+                "sql_mode"
+                    | "foreign_key_checks"
+                    | "unique_checks"
+                    | "autocommit"
+                    | "names"
+                    | "character_set_client"
+                    | "character_set_connection"
+                    | "character_set_results"
+                    | "collation_connection"
+                    | "sql_quote_show_create"
+                    | "sql_notes"
+                    | "time_zone"
+                    | "sql_safe_updates"
+                    | "innodb_strict_mode"
+                    | "net_write_timeout"
+                    | "net_read_timeout"
+                    | "wait_timeout"
+                    | "interactive_timeout"
+                    | "max_allowed_packet"
+                    | "group_concat_max_len"
+                    | "old_alter_table"
+                    | "sql_log_bin"
+                    | "session_replication_role"
+            )
+        {
+            return None;
+        }
+        match crate::guc_catalog::guc_context(&key) {
+            None => Some(alloc::format!(
+                "unrecognized configuration parameter \"{key}\""
+            )),
+            // PG's own wording per context, so a client that matches on
+            // the message keeps working.
+            Some("internal") => Some(alloc::format!("parameter \"{key}\" cannot be changed")),
+            Some("postmaster") => Some(alloc::format!(
+                "parameter \"{key}\" cannot be changed without restarting the server"
+            )),
+            Some("sighup") => Some(alloc::format!("parameter \"{key}\" cannot be changed now")),
+            Some(_) => None,
+        }
+    }
+
     pub(crate) fn set_session_param(&mut self, name: String, value: spg_sql::ast::SetValue) {
         let normalised = match value {
             spg_sql::ast::SetValue::String(s) => s,
