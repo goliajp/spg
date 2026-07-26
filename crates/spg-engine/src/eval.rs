@@ -2036,6 +2036,37 @@ fn eval_cast_arm(
             // field resolves into a record rather than staying text.
             return apply_composite_cast_in(v, comp, ctx.catalog);
         }
+        // v7.39 (round 509) — every TABLE also names a row type, and
+        // `jsonb_populate_record(NULL::mytable, …)` is PG's canonical
+        // spelling for "shaped like this table". PG accepts `NULL::mytable`
+        // and refuses `1::mytable` with "cannot cast type integer to
+        // mytable" — the type exists, the conversion does not. This only
+        // ever worked here because a NULL skipped cast resolution entirely;
+        // now that it does not, the row type has to be named explicitly.
+        if cat.get(name.as_str()).is_some() {
+            return if matches!(v, Value::Null) {
+                Ok(Value::Null)
+            } else {
+                Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "cannot cast type {} to {name}",
+                        crate::eval::strings::pg_typeof_name(&v),
+                    ),
+                })
+            };
+        }
+        // v7.39 (round 509) — the cast target is checked even when the
+        // operand is NULL. `cast_value_in` short-circuits a NULL before it
+        // looks at the target, so `NULL::nosuchtype` silently answered NULL
+        // and `pg_typeof(NULL::nosuchtype)` answered `unknown`, while
+        // `1::nosuchtype` errored — the gap was exactly the NULL case, in
+        // both spellings. Everything a catalog can name has been tried by
+        // now; what is left is the builtin table.
+        if matches!(v, Value::Null) && !crate::eval::cast::builtin_target_resolves(name, ctx.mysql_dialect) {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("unsupported cast target `::{name}`"),
+            });
+        }
     }
     // v7.39 (round 285) — `::record`, the anonymous composite type. PG
     // treats it as an IDENTITY cast on anything already composite: the

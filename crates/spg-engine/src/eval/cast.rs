@@ -241,6 +241,20 @@ pub fn cast_value_in(
     target: CastTarget,
     mysql: bool,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.39 (round 509) — PG validates the cast TARGET whatever the operand
+    // is: `NULL::nosuchtype` is an error there, not NULL. This returned early
+    // before ever looking at the target, so a misspelt type name silently
+    // produced NULL and `pg_typeof(NULL::nosuchtype)` answered `unknown`. A
+    // value operand DID error, so the gap was exactly the NULL case, in both
+    // spellings (`::t` and `CAST(… AS t)`).
+    //
+    // Only `Named` can fail to resolve; every other CastTarget is a variant
+    // the parser already settled. So a NULL keeps its short-circuit
+    // everywhere else and a Named target runs the real path, which is the
+    // only thing that knows every name that resolves. Writing a second
+    // resolver to check the name against looked simpler and was wrong: it
+    // missed `::binary` (the MySQL prefix's desugar), a table's row type,
+    // and the pseudotypes, all of which resolve further down this arm.
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
     }
@@ -715,11 +729,21 @@ pub fn cast_value_in(
                         | "fdw_handler"
                         | "pg_ddl_command"
                         | "pg_node_tree"
-                ) && !matches!(v, Value::Null)
-                {
-                    return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!("cannot accept a value of type {lower}"),
-                    });
+                ) {
+                    // v7.39 (round 509) — a pseudotype is a REAL type name,
+                    // so `NULL::anyarray` is NULL on PG, not an error. Only a
+                    // VALUE hits the dummy input function. Before this the
+                    // NULL case fell through to the type table below, which
+                    // does not carry the pseudotypes, and once NULL stopped
+                    // short-circuiting the whole cast it started reporting
+                    // them as unknown types.
+                    return if matches!(v, Value::Null) {
+                        Ok(Value::Null)
+                    } else {
+                        Err(EvalError::TypeMismatch {
+                            detail: alloc::format!("cannot accept a value of type {lower}"),
+                        })
+                    };
                 }
             }
             // v7.39 (read01 pseudotypes.c) — `::cstring` is PG's I/O-form
@@ -916,6 +940,62 @@ pub fn cast_value_in(
 /// v7.38 (read01, T20) — width of a `bit` cast target: bare `bit` is `bit(1)`,
 /// `bit(N)` is N. `None` for `varbit` / `bit varying` (PG rejects int→varbit) and
 /// any non-bit name.
+/// v7.39 (round 509) — does this name a type at all?
+///
+/// PG validates the cast TARGET whatever the operand is: `NULL::nosuchtype`
+/// is an error there, not NULL. `cast_value_in` short-circuits a NULL before
+/// it ever looks at the target, so the check has to happen in the caller —
+/// and `eval_cast_arm` is the caller that has a catalog, which is what
+/// enums, domains, composites and table row types need.
+///
+/// This lists what the `Named` arm below resolves WITHOUT a catalog. Keeping
+/// the two in step is a real hazard: a first cut of this check missed three
+/// live spellings — `::binary` (the MySQL prefix's desugar), a table's row
+/// type, and the pseudotypes — and the e2e suite caught every one. It is the
+/// check on this function.
+pub(crate) fn builtin_target_resolves(name: &str, mysql: bool) -> bool {
+    if name == "__bit_literal" || bit_cast_width(name).is_some() {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "record"
+            | "cstring"
+            | "anyarray"
+            | "anyelement"
+            | "anyenum"
+            | "anyrange"
+            | "anymultirange"
+            | "anynonarray"
+            | "anycompatible"
+            | "anycompatiblearray"
+            | "anycompatiblenonarray"
+            | "anycompatiblerange"
+            | "anycompatiblemultirange"
+            | "any"
+            | "trigger"
+            | "event_trigger"
+            | "internal"
+            | "language_handler"
+            | "fdw_handler"
+            | "pg_ddl_command"
+            | "pg_node_tree"
+    ) {
+        return true;
+    }
+    if mysql && matches!(lower.as_str(), "binary" | "signed" | "unsigned") {
+        return true;
+    }
+    let base = if temporal_typmod(name).is_some() || (mysql && is_bare_temporal_type(name)) {
+        name.split('(').next().unwrap_or(name).trim()
+    } else {
+        name
+    };
+    crate::conversions::type_name_to_data_type(base).is_some()
+        || crate::conversions::numeric_typmod_error(base).is_some()
+}
+
 fn bit_cast_width(name: &str) -> Option<(u32, bool)> {
     let lower = name.to_ascii_lowercase();
     let trimmed = lower.trim();
