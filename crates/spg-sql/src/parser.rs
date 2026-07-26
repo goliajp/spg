@@ -529,7 +529,7 @@ pub fn parse_statement_with(input: &str, backslash_escapes: bool) -> Result<Stat
         .map_err(|e| shape_lex_error(&e, input))?;
     // The same session flag names the dialect for both the lexer and
     // the type mapping.
-    let mut p = Parser::new_with_dialect(tokens, backslash_escapes);
+    let mut p = Parser::new_with_dialect(tokens, backslash_escapes).with_source(input, &offsets);
     let stmt = (|| {
         let stmt = p.parse_one_statement()?;
         if matches!(p.peek(), Token::Semicolon) {
@@ -683,6 +683,12 @@ struct Parser {
     /// Index of the token the last `advance()` returned — see
     /// [`Parser::consumed_pos`].
     last_consumed: usize,
+    /// v7.39 (round 506) — the statement's own text and the byte each token
+    /// starts at, so a MySQL projection item can report the SOURCE TEXT
+    /// MariaDB reports: `SELECT a  +  b` names its column `a  +  b`,
+    /// spacing and all. Only filled for a MySQL session — a PG one names
+    /// columns from the parsed shape and pays nothing for this.
+    src: Option<(String, Vec<usize>)>,
 }
 
 /// Max expr/select parser nesting (parens, subqueries, CASE, …).
@@ -734,7 +740,28 @@ impl Parser {
             pending_sample_preds: Vec::new(),
             suppress_in_tail: false,
             last_consumed: 0,
+            src: None,
         }
+    }
+
+    /// Hand the parser the text it is parsing, for [`Parser::source_span`].
+    fn with_source(mut self, input: &str, offsets: &[usize]) -> Self {
+        if self.mysql_dialect {
+            self.src = Some((input.to_string(), offsets.to_vec()));
+        }
+        self
+    }
+
+    /// The source text spanning tokens `start ..= end`, trimmed.
+    ///
+    /// The offsets are token STARTS, so the span runs to the start of the
+    /// token after `end` and gives back the whitespace between them —
+    /// trimming is what makes `a + b FROM t` end at `b`.
+    fn source_span(&self, start: usize, end: usize) -> Option<&str> {
+        let (text, offsets) = self.src.as_ref()?;
+        let from = *offsets.get(start)?;
+        let to = *offsets.get(end + 1)?;
+        text.get(from..to).map(str::trim_end)
     }
 
     /// v7.30.2 (mailrs round-25 ask 2) — bump the expr/select
@@ -16570,7 +16597,9 @@ impl Parser {
                 return Ok(SelectItem::QualifiedWildcard(q));
             }
         }
+        let start_tok = self.pos;
         let expr = self.parse_expr(0)?;
+        let end_tok = self.consumed_pos();
         // v7.39 (read01 round 69) — `(f(args)).*`: expand the RECORD a
         // multi-column function returns into columns. Marked here and lowered in
         // `parse_bare_select`, where the FROM clause is in hand.
@@ -16587,8 +16616,46 @@ impl Parser {
                 alias: None,
             });
         }
-        let alias = self.parse_optional_alias()?;
+        let alias = match self.parse_optional_alias()? {
+            Some(a) => Some(a),
+            None => self.mysql_item_label(&expr, start_tok, end_tok),
+        };
         Ok(SelectItem::Expr { expr, alias })
+    }
+
+    /// v7.39 (round 506) — the name MariaDB 11 gives a projection item that
+    /// carries no `AS`, filled in here so every downstream path reports it
+    /// without knowing the rule. `None` leaves the item un-aliased, which is
+    /// what a PG session always gets.
+    ///
+    /// Measured against MariaDB 11, three rules and no more:
+    ///
+    /// | item             | label      | why                          |
+    /// |------------------|------------|------------------------------|
+    /// | `lbl.a`          | `a`        | a column reports its name    |
+    /// | `'it''s'`        | `it's`     | a string reports its VALUE   |
+    /// | `a  +  b`        | `a  +  b`  | anything else, source text   |
+    ///
+    /// The third is why this lives in the parser at all: the label is the
+    /// text the client WROTE, down to the spacing, so it cannot be printed
+    /// back out of the parsed shape. `COUNT( * )` names itself `COUNT( * )`.
+    ///
+    /// Comments survive, and that is right: through a `mariadb` CLI both
+    /// servers answer `a  + b` for `SELECT a /* c */ + b`, but that is the
+    /// CLIENT stripping the comment before it sends. Asked over the raw
+    /// protocol, MariaDB answers `a /* c */ + b` — byte for byte what this
+    /// produces.
+    fn mysql_item_label(&self, expr: &Expr, start_tok: usize, end_tok: usize) -> Option<String> {
+        if !self.mysql_dialect {
+            return None;
+        }
+        match expr {
+            // A column already reports its own name downstream; naming it
+            // again here would only re-state the qualifier the label drops.
+            Expr::Column(_) => None,
+            Expr::Literal(Literal::String(v)) => Some(v.clone()),
+            _ => self.source_span(start_tok, end_tok).map(str::to_string),
+        }
     }
 
     /// v7.37.17 (17.6 siblings) — parse `(row), (row), …` after a
