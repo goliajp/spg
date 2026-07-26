@@ -4463,6 +4463,36 @@ fn substitute_in_select(
     for (_, peer) in &mut stmt.unions {
         substitute_in_select(peer, row, ctx, outer_alias);
     }
+    // v7.39 (round 532) — and the FROM clause. A correlated subquery is
+    // run by splicing the outer row's values into it, and that walk
+    // covered every clause EXCEPT this one — so an outer reference
+    // inside a JOIN's ON, or inside a LATERAL body, survived
+    // unsubstituted and died resolving:
+    //
+    //   SELECT (SELECT l.k FROM b, LATERAL (SELECT b.d + a.id AS k) l
+    //           WHERE b.id = a.id) FROM a
+    //   PG18  101, NULL      SPG  missing FROM-clause entry for "a"
+    //
+    // The same reference one clause over — in the subquery's own WHERE
+    // — always worked, which is what made this look like a LATERAL
+    // problem rather than a missing branch of the walk.
+    //
+    // A sibling name inside the FROM (`b.d` above) is not in the outer
+    // schema, so it is left alone; only genuinely outer references are
+    // spliced.
+    if let Some(from) = &mut stmt.from {
+        if let Some(body) = &mut from.primary.lateral_subquery {
+            substitute_in_select(body, row, ctx, outer_alias);
+        }
+        for j in &mut from.joins {
+            if let Some(on) = &mut j.on {
+                substitute_in_expr(on, row, ctx, outer_alias);
+            }
+            if let Some(body) = &mut j.table.lateral_subquery {
+                substitute_in_select(body, row, ctx, outer_alias);
+            }
+        }
+    }
 }
 
 fn substitute_in_expr(e: &mut Expr, row: &Row<'static>, ctx: &EvalContext<'_>, outer_alias: &str) {
