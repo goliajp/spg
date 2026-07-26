@@ -60,6 +60,19 @@ pub(crate) fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
         // "subquery result type None not yet materialisable"; a regclass IS an
         // oid, so it materialises back as the integer the outer comparison wants.
         Value::RegClass(oid, _) | Value::RegProc(oid, _) => Literal::Integer(oid),
+        // v7.39 (round 511) — a tid materialises as the cast of its text
+        // form, which is the only input syntax it has. Without this the
+        // idiom `ctid` exists for — `DELETE … WHERE ctid NOT IN (SELECT
+        // min(ctid) … GROUP BY key)` — died on "subquery result type None
+        // not yet materialisable".
+        Value::Tid(b, o) => {
+            return Ok(Expr::Cast {
+                expr: alloc::boxed::Box::new(Expr::Literal(Literal::String(alloc::format!(
+                    "({b},{o})"
+                )))),
+                target: spg_sql::ast::CastTarget::Named(alloc::string::String::from("tid")),
+            });
+        }
         // v7.37 D.27 — an array-returning scalar subquery (`(SELECT
         // array_agg(...) FROM …)`) materialises through an `Expr::Array` of
         // element literals so the outer query re-evaluates it to the same array.
@@ -168,6 +181,19 @@ pub(crate) fn value_to_literal_expr_permissive(v: Value) -> Result<Expr, EngineE
         // "subquery result type None not yet materialisable"; a regclass IS an
         // oid, so it materialises back as the integer the outer comparison wants.
         Value::RegClass(oid, _) | Value::RegProc(oid, _) => Literal::Integer(oid),
+        // v7.39 (round 511) — a tid materialises as the cast of its text
+        // form, which is the only input syntax it has. Without this the
+        // idiom `ctid` exists for — `DELETE … WHERE ctid NOT IN (SELECT
+        // min(ctid) … GROUP BY key)` — died on "subquery result type None
+        // not yet materialisable".
+        Value::Tid(b, o) => {
+            return Ok(Expr::Cast {
+                expr: alloc::boxed::Box::new(Expr::Literal(Literal::String(alloc::format!(
+                    "({b},{o})"
+                )))),
+                target: spg_sql::ast::CastTarget::Named(alloc::string::String::from("tid")),
+            });
+        }
         Value::Vector(xs) => Literal::Vector(xs.into_owned()),
         // Date / Timestamp / Timestamptz / Numeric round-trip
         // through a TEXT literal that `coerce_value` re-parses

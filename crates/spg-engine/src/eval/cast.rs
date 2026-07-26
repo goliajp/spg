@@ -704,6 +704,23 @@ pub fn cast_value_in(
                     _ => {}
                 }
             }
+            // v7.39 (round 511) — `'(0,1)'::tid`, so a caller can name a row
+            // it read a ctid from earlier. PG's text form is the only input
+            // shape it has.
+            if name.eq_ignore_ascii_case("tid") {
+                return match &v {
+                    Value::Tid(..) => Ok(v),
+                    Value::Text(t) => parse_tid_text(t).ok_or_else(|| EvalError::TypeMismatch {
+                        detail: alloc::format!("invalid input syntax for type tid: \"{t}\""),
+                    }),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "cannot cast type {} to tid",
+                            crate::eval::strings::pg_typeof_name(other)
+                        ),
+                    }),
+                };
+            }
             // v7.39 (read01 pseudotypes.c) — casting a value INTO a
             // pseudotype hits PG's dummy input functions (0A000).
             {
@@ -960,7 +977,8 @@ pub(crate) fn builtin_target_resolves(name: &str, mysql: bool) -> bool {
     let lower = name.to_ascii_lowercase();
     if matches!(
         lower.as_str(),
-        "record"
+        "tid"
+            | "record"
             | "cstring"
             | "anyarray"
             | "anyelement"
@@ -994,6 +1012,16 @@ pub(crate) fn builtin_target_resolves(name: &str, mysql: bool) -> bool {
     };
     crate::conversions::type_name_to_data_type(base).is_some()
         || crate::conversions::numeric_typmod_error(base).is_some()
+}
+
+/// v7.39 (round 511) — PG's `(block,offset)` text form for a tid.
+fn parse_tid_text(t: &str) -> Option<Value<'static>> {
+    let inner = t.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let (b, o) = inner.split_once(',')?;
+    Some(Value::Tid(
+        b.trim().parse::<u32>().ok()?,
+        o.trim().parse::<u32>().ok()?,
+    ))
 }
 
 fn bit_cast_width(name: &str) -> Option<(u32, bool)> {

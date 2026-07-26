@@ -758,6 +758,7 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
         Value::Macaddr8(_) => "macaddr8",
         Value::PgLsn(_) => "pg_lsn",
         Value::RegClass(..) => "regclass",
+        Value::Tid(..) => "tid",
         // v7.39 (round 342, V65) — one carrier, two PG types: a
         // `regprocedure` renders WITH its argument list (`f(integer)`),
         // a `regproc` never does. PG reports them apart, so SPG does.

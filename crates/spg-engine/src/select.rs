@@ -3068,6 +3068,37 @@ impl Engine {
         // The qualifier accepted on column refs is the alias (if any) else the
         // bare table name.
         let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
+        // v7.39 (round 511) — `ctid`, PG's physical row identity. SPG had no
+        // system columns at all: `SELECT ctid FROM t` answered "column
+        // \"ctid\" does not exist", which takes out the dedup idiom every
+        // PG user knows — `DELETE … WHERE ctid NOT IN (SELECT min(ctid) …
+        // GROUP BY key)`.
+        //
+        // The value comes from the row's position, which the scan already
+        // yields; the column is appended to the schema and the rows only
+        // when the statement asks for it, so nothing else pays for it. That
+        // also routes the query down the general path, past the index fast
+        // paths below — they hand back rows without positions, and a ctid
+        // that was sometimes right would be worse than none.
+        if references_ctid(stmt) {
+            let snapshot = self.current_snapshot();
+            let mut ext_cols = schema_cols.clone();
+            ext_cols.push(ColumnSchema::new(
+                CTID_COLUMN.to_string(),
+                DataType::Text,
+                false,
+            ));
+            let rows: Vec<Row<'static>> = table
+                .scan_visible(&snapshot)
+                .map(|(i, r)| {
+                    let mut vals = r.values.clone();
+                    // One block, offsets from 1, as PG numbers them.
+                    vals.push(Value::Tid(0, i as u32 + 1));
+                    Row::new(vals)
+                })
+                .collect();
+            return self.exec_select_over_rows(stmt, rows, ext_cols, alias, cancel);
+        }
         let ctx = self.ev_ctx(schema_cols, Some(alias));
 
         // NSW kNN planner: `ORDER BY col <-> literal LIMIT k` with no
@@ -6673,6 +6704,35 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
 /// Mirrors `resolve_column` in `eval.rs`, but returns a proper
 /// `EngineError` so the projection-build path keeps `UnknownQualifier`
 /// vs `ColumnNotFound` distinct.
+/// PG's name for the physical row identity. It is reserved there — no table
+/// can have a column called this — which is what lets `*` skip it by name.
+pub(crate) const CTID_COLUMN: &str = "ctid";
+
+/// v7.39 (round 511) — does this statement name `ctid` anywhere it would be
+/// read? Only then is the column materialised.
+fn references_ctid(stmt: &SelectStatement) -> bool {
+    fn in_expr(e: &Expr) -> bool {
+        let mut found = false;
+        crate::expr_analysis::visit_expr_columns_and_subqueries(
+            e,
+            &mut |c| {
+                if c.name.eq_ignore_ascii_case(CTID_COLUMN) {
+                    found = true;
+                }
+            },
+            &mut |_| {},
+        );
+        found
+    }
+    stmt.items.iter().any(|i| match i {
+        SelectItem::Expr { expr, .. } => in_expr(expr),
+        _ => false,
+    }) || stmt.where_.as_ref().is_some_and(in_expr)
+        || stmt.order_by.iter().any(|o| in_expr(&o.expr))
+        || stmt.group_by.as_ref().is_some_and(|g| g.iter().any(in_expr))
+        || stmt.having.as_ref().is_some_and(in_expr)
+}
+
 pub(crate) fn resolve_projection_column<'a>(
     c: &ColumnName,
     schema_cols: &'a [ColumnSchema],
@@ -6836,6 +6896,14 @@ pub(crate) fn build_projection(
         match item {
             SelectItem::Wildcard => {
                 for col in schema_cols {
+                    // v7.39 (round 511) — `*` never expands a system column,
+                    // as PG's does not. `ctid` joins the schema only when the
+                    // statement asked for it, so this matters for the mixed
+                    // shape `SELECT *, ctid FROM t`. Matching by name is safe
+                    // because PG reserves it: no table can carry one.
+                    if col.name.eq_ignore_ascii_case(CTID_COLUMN) {
+                        continue;
+                    }
                     out.push(ProjectedItem {
                         expr: Expr::Column(ColumnName {
                             qualifier: None,

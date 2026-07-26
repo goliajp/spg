@@ -6226,6 +6226,11 @@ fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         (Value::Macaddr(x), Value::Macaddr(y)) => x.cmp(y),
         (Value::Macaddr8(x), Value::Macaddr8(y)) => x.cmp(y),
         (Value::PgLsn(x), Value::PgLsn(y)) => x.cmp(y),
+        // v7.39 (round 511) — a tid orders by block then offset. Without
+        // an arm it reached the `_ => Equal` fallback below, and min/max
+        // kept whichever row arrived first: `max(ctid)` over twelve rows
+        // answered `(0,1)`.
+        (Value::Tid(b1, o1), Value::Tid(b2, o2)) => b1.cmp(b2).then(o1.cmp(o2)),
         (Value::Char1(x), Value::Char1(y)) => x.cmp(y),
         (
             Value::Inet {

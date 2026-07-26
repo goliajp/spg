@@ -786,6 +786,19 @@ pub enum Value<'arena> {
     /// — from `pg_get_functiondef('f')` — which PG rejects.
     /// Eval-only (no column storage).
     RegProc(i64, alloc::boxed::Box<str>),
+    /// v7.39 (round 511) — PG `tid`, the physical row identity `ctid`
+    /// carries: a block number and a one-based offset inside it, rendered
+    /// `(block,offset)`.
+    ///
+    /// It is a real type rather than a two-field record because the idiom
+    /// that makes `ctid` worth having — `DELETE … WHERE ctid NOT IN (SELECT
+    /// min(ctid) … GROUP BY key)` — needs `min()` over it, and PG has no
+    /// `min(record)`. Ordering is by block then offset, so `(0,2) < (0,9) <
+    /// (0,10)`; a text form would order those `(0,10) < (0,2) < (0,9)` and
+    /// the dedup would keep the wrong row.
+    ///
+    /// Eval-only (no column storage).
+    Tid(u32, u32),
     /// v7.37.5 ζ-A — PG `bit` / `bit varying`. `nbits` is the
     /// actual bit count; `bytes` is the packed representation
     /// (big-endian within each byte; final byte right-padded
@@ -1037,7 +1050,7 @@ impl<'arena> Value<'arena> {
             Self::Composite(_) => None,
             // v7.39 (read01 ruleutils.c) — regclass is eval-only (dual
             // oid+name shape); no column storage type.
-            Self::RegClass(..) | Self::RegProc(..) => None,
+            Self::RegClass(..) | Self::RegProc(..) | Self::Tid(..) => None,
             Self::Null => None,
         }
     }
@@ -1110,6 +1123,7 @@ impl<'arena> Value<'arena> {
             // v7.38 (read01, T9) — Composite fields are already `Value<'static>`.
             Value::Composite(fields) => Value::Composite(fields),
             Value::RegClass(oid, name) => Value::RegClass(oid, name),
+            Value::Tid(b, o) => Value::Tid(b, o),
             Value::RegProc(oid, name) => Value::RegProc(oid, name),
             Value::Point(p) => Value::Point(p),
             Value::Lseg(a, b) => Value::Lseg(a, b),
@@ -2244,6 +2258,7 @@ impl IndexKey {
             | Value::Char1(_)
             | Value::MoneyArray(_)
             | Value::Composite(_)
+            | Value::Tid(..)
             | Value::RegClass(..)
             | Value::RegProc(..) => None,
             // Numeric isn't (yet) indexable — exact-decimal index keys
