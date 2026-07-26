@@ -12,10 +12,15 @@ symbols invents plausible-looking names out of nothing.)
   prof.py <profile.json.gz> <binary> <needle>   -> callers of frames whose
                                                    name contains <needle>
 """
-import gzip, json, re, subprocess, sys, collections, bisect
+import gzip, json, os, re, subprocess, sys, collections, bisect
 
 prof_path, binary = sys.argv[1], sys.argv[2]
 needle = sys.argv[3] if len(sys.argv) > 3 else None
+# v7.39 (round 491) — a server profile has one thread per background worker
+# plus the connection thread, and mixing them makes idle sleeps look like
+# cost. SPG_PROF_THREAD restricts the aggregate to threads whose name
+# contains the value.
+thread_filter = os.environ.get("SPG_PROF_THREAD")
 BASE = 0x100000000
 OWN_LIB = binary.rsplit("/", 1)[-1]
 
@@ -65,6 +70,8 @@ self_counts = collections.Counter()
 caller_counts = collections.Counter()
 total = 0
 for th in d["threads"]:
+    if thread_filter and thread_filter not in (th.get("name") or ""):
+        continue
     sa = th["stringArray"]
     st_frame = th["stackTable"]["frame"]
     st_prefix = th["stackTable"]["prefix"]
