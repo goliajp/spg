@@ -4914,6 +4914,7 @@ impl Engine {
         // stored JSON, which is not a cell read.
         let proj_direct = bind_direct_columns(&projection, &ctx);
         let any_proj_direct = proj_direct.iter().any(Option::is_some);
+        crate::bump_counter!(crate::select::SCAN_PATH_ENTERED);
         // v7.39 (read01 round 80) — positional ORDER BY over a WILDCARD
         // projection. Statement prep (`resolve_order_by_position`) can only map
         // `ORDER BY 1` onto the first SELECT item when that item is an
@@ -5048,6 +5049,7 @@ impl Engine {
                     // column, which is what the whole chain below reduces
                     // to once the name has been resolved.
                     if any_proj_direct && let Some(pos) = proj_direct[i] {
+                        crate::bump_counter!(crate::select::PROJ_DIRECT_FIRE);
                         values.push(row.values[pos].clone().into_owned());
                         continue;
                     }
@@ -6365,6 +6367,16 @@ fn mysql_dedup_fold(v: &Value) -> Option<String> {
 /// instructions later — but "most" is a guess until it is a number, so
 /// these count it. (Round 480 was spent acting on an inference about a
 /// branch that turned out never to run.)
+/// v7.39 (round 488) — reachability counters for round 487's projection
+/// binding. The interleaved panel says round 487 costs `group_500k` 13 %,
+/// and a never-called-function probe rules out code layout — so the
+/// question is whether that shape reaches this code at all, which is a
+/// number, not an inference.
+pub static SCAN_PATH_ENTERED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static PROJ_DIRECT_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 pub static PROJ_ROW_BUILT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub static DISTINCT_DUP_DROPPED: core::sync::atomic::AtomicU64 =

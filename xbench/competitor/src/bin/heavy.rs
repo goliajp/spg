@@ -43,6 +43,24 @@ const RUNS: usize = 31; // odd → clean median
 /// attack target off it would be picking noise. The methodology's answer to
 /// a band too wide to rank is to widen the sample, not to reason harder
 /// about the numbers.
+/// v7.39 (round 488) — restrict the panel to named shapes.
+///
+/// Every shape runs in ONE process, in a fixed order, so a change that
+/// makes an EARLIER shape faster reaches the later ones in a different
+/// machine state. Round 488 measured round 487 as costing `agg_500k` 9 %
+/// and `group_500k` 13 % — with separated spreads — while a counter said
+/// those two shapes never execute a line of the changed code and a
+/// never-called-function probe ruled out code layout. Isolating a shape
+/// is the only way to tell a real regression from its neighbours'.
+///
+///   SPG_BENCH_SHAPES=agg_500k,group_500k
+fn selected(name: &str) -> bool {
+    match std::env::var("SPG_BENCH_SHAPES") {
+        Ok(list) => list.split(',').any(|w| w.trim() == name),
+        Err(_) => true,
+    }
+}
+
 fn runs() -> usize {
     std::env::var("SPG_BENCH_RUNS")
         .ok()
@@ -172,6 +190,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("| shape        |   SPGE ms |   PG18 ms | SPGE/PG | verdict |");
     println!("|--------------|----------:|----------:|--------:|---------|");
     for (i, (name, _)) in SHAPES.iter().enumerate() {
+        if !selected(name) {
+            continue;
+        }
         let s = spge[i];
         let p = pg[i];
         let ratio = s / p;
@@ -252,7 +273,10 @@ fn bench_spg_embedded() -> Vec<f64> {
     }
     SHAPES
         .iter()
-        .map(|(_, sql)| {
+        .map(|(name, sql)| {
+            if !selected(name) {
+                return f64::NAN;
+            }
             for _ in 0..WARMUP {
                 eng.execute(sql).unwrap();
             }
@@ -324,7 +348,11 @@ async fn bench_pg(pool: &AnyPool) -> Result<Vec<f64>, sqlx::Error> {
     sqlx::query("ANALYZE h5").execute(pool).await?;
 
     let mut out = Vec::with_capacity(SHAPES.len());
-    for (_, sql) in SHAPES {
+    for (name, sql) in SHAPES {
+        if !selected(name) {
+            out.push(f64::NAN);
+            continue;
+        }
         for _ in 0..WARMUP {
             let _ = sqlx::query(sql).fetch_all(pool).await?;
         }
