@@ -182,10 +182,22 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64, mysql: bool) {
             // inject today's midnight as an explicit first argument so the
             // two-arg path computes the correct wall-clock age. An integer
             // literal is the `age(xid)` overload and is left untouched.
-            if args.len() == 1
-                && name.eq_ignore_ascii_case("age")
-                && !matches!(args[0], Expr::Literal(Literal::Integer(_)))
-            {
+            // v7.39 (round 518) — a cast to `xid` is the transaction-id
+            // overload too, and it was not exempt: `age('1'::xid)` got the
+            // midnight argument injected and then failed the temporal path
+            // with "age() needs DATE or TIMESTAMP". Only an INTEGER literal
+            // was being recognised as the other overload.
+            // The index must stay BEHIND the arity check: reading `args[0]`
+            // first panicked the connection thread on a zero-argument call.
+            let is_xid_arg = args.first().is_some_and(|a| {
+                matches!(a, Expr::Literal(Literal::Integer(_)))
+                    || matches!(
+                        a,
+                        Expr::Cast { target: spg_sql::ast::CastTarget::Named(n), .. }
+                            if n.eq_ignore_ascii_case("xid")
+                    )
+            });
+            if args.len() == 1 && name.eq_ignore_ascii_case("age") && !is_xid_arg {
                 let midnight = now.div_euclid(86_400_000_000) * 86_400_000_000;
                 let today = Expr::Cast {
                     expr: alloc::boxed::Box::new(Expr::Literal(Literal::Integer(midnight))),

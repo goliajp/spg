@@ -125,6 +125,13 @@ impl InProgressSet {
         Self { sorted: Vec::new() }
     }
 
+    /// v7.39 (round 518) — the ids, in order. `txid_current_snapshot()`
+    /// renders them as PG's `xip_list`.
+    #[must_use]
+    pub fn ids(&self) -> &[u64] {
+        &self.sorted
+    }
+
     /// True iff `xid` is one of the in-flight transactions.
     /// Binary search; O(log n).
     #[must_use]
