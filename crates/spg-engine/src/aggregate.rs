@@ -1176,6 +1176,32 @@ struct FusedAcc {
     sum_money: i128,
     use_money: bool,
     count: i64,
+    /// v7.39 (round 568/569) — the min/max lane. `min` and `max` were
+    /// the only ordinary aggregates the fused layout did not accept, so
+    /// they fell to the generic per-spec machinery and cost DOUBLE a
+    /// `sum` over the same scan (500k INTs: sum 13.4 ms, min 26.5,
+    /// max 27.6, while PG18 is flat at 8.2 for all three). They also
+    /// missed the shard-parallel scan the fused path runs.
+    extreme: Option<Value<'static>>,
+    /// Which way this accumulator's comparison goes, so a shard merge
+    /// does not need to be told.
+    extreme_max: bool,
+    extreme_mysql: bool,
+}
+
+/// v7.39 (round 569) — a fresh accumulator per op, carrying each one's
+/// comparison direction so `merge_fused` stays a two-argument fold.
+fn fused_accs(ops: &[FusedOp], mysql: bool) -> Vec<FusedAcc> {
+    ops.iter()
+        .map(|op| {
+            let mut a = FusedAcc::default();
+            if let FusedOp::Extreme { max, .. } = op {
+                a.extreme_max = *max;
+                a.extreme_mysql = mysql;
+            }
+            a
+        })
+        .collect()
 }
 
 /// v7.39 (parallel-agg P3) — the fused-op layout shared by the
@@ -1185,6 +1211,8 @@ struct FusedAcc {
 enum FusedOp {
     CountCol(usize),
     AccCol(usize),
+    /// v7.39 (round 569) — min/max over a bound column.
+    Extreme { pos: usize, max: bool },
 }
 
 /// Returns the (spec_src, unique_ops) layout when EVERY aggregate
@@ -1206,6 +1234,10 @@ fn fused_layout(
             && match s.name.as_str() {
                 "count_star" => s.arg.is_none(),
                 "count" | "sum" | "avg" => arg_pos[i].is_some(),
+                // v7.39 (round 569) — an enum argument compares by
+                // catalog member order, which the fused lane does not
+                // carry; those keep the generic path.
+                "min" | "max" => arg_pos[i].is_some() && s.enum_labels.is_none(),
                 _ => false,
             }
     });
@@ -1218,6 +1250,18 @@ fn fused_layout(
         .enumerate()
         .map(|(i, s)| match s.name.as_str() {
             "count_star" => None,
+            "min" | "max" => {
+                let p = arg_pos[i].expect("gated bound");
+                let max = s.name.as_str() == "max";
+                let slot = unique_ops
+                    .iter()
+                    .position(|o| matches!(o, FusedOp::Extreme { pos, max: m } if *pos == p && *m == max))
+                    .unwrap_or_else(|| {
+                        unique_ops.push(FusedOp::Extreme { pos: p, max });
+                        unique_ops.len() - 1
+                    });
+                Some(slot)
+            }
             "count" => {
                 let p = arg_pos[i].expect("gated bound");
                 let slot = unique_ops
@@ -1252,6 +1296,24 @@ fn fused_layout(
 /// deterministic for a given shard count (PG's parallel aggregate
 /// makes the same no-serial-equivalence tradeoff for floats).
 fn merge_fused(a: &mut FusedAcc, b: &FusedAcc) {
+    // v7.39 (round 569) — fold the shard's extreme in the direction this
+    // accumulator was built for.
+    if let Some(be) = &b.extreme {
+        let take = match &a.extreme {
+            None => true,
+            Some(ae) => {
+                let ord = extreme_cmp(None, be, ae, a.extreme_mysql);
+                if a.extreme_max {
+                    ord == core::cmp::Ordering::Greater
+                } else {
+                    ord == core::cmp::Ordering::Less
+                }
+            }
+        };
+        if take {
+            a.extreme = Some(be.clone());
+        }
+    }
     a.count += b.count;
     a.sum_int += b.sum_int;
     a.sum_float += b.sum_float;
@@ -1312,6 +1374,9 @@ fn fill_states_from_fused(
                 state.use_interval = a.use_interval;
                 state.sum_money = a.sum_money;
                 state.use_money = a.use_money;
+                if a.extreme.is_some() {
+                    state.extreme = a.extreme.clone();
+                }
             }
         }
     }
@@ -1375,6 +1440,31 @@ fn sum_add_bignum(
 /// One sum/avg accumulation step — the same variant arms (and the same
 /// error text) as the single-spec fast path's inline match.
 #[inline]
+/// v7.39 (round 569) — one row's contribution to a min/max lane.
+///
+/// The same question `accumulate_groups` asks per spec per row, with
+/// none of the per-spec indexing around it. NULL contributes nothing,
+/// which is PG's rule and the generic path's.
+fn fused_extreme_cell(a: &mut FusedAcc, v: &Value<'_>, max: bool) {
+    if matches!(v, Value::Null) {
+        return;
+    }
+    let take = match &a.extreme {
+        None => true,
+        Some(prev) => {
+            let ord = extreme_cmp(None, v, prev, a.extreme_mysql);
+            if max {
+                ord == core::cmp::Ordering::Greater
+            } else {
+                ord == core::cmp::Ordering::Less
+            }
+        }
+    };
+    if take {
+        a.extreme = Some(v.clone().into_owned());
+    }
+}
+
 fn fused_acc_cell(a: &mut FusedAcc, v: &Value<'_>) -> Result<(), EvalError> {
     match v {
         Value::Null => {}
@@ -1835,7 +1925,7 @@ fn accumulate_groups(
     // - remaining ops run in one tight pass, no update_state.
     // Finalize writes the same AggState fields as the single-spec path.
     if single_anon_group && let Some((spec_src, unique_ops)) = fused_layout(agg_specs, &arg_pos) {
-        let mut accs: Vec<FusedAcc> = (0..unique_ops.len()).map(|_| FusedAcc::default()).collect();
+        let mut accs: Vec<FusedAcc> = fused_accs(&unique_ops, ctx.mysql_dialect);
         // v7.39 (parallel-agg P1) — shard the row scan across the
         // host-injected executor when the input is large enough.
         // Each shard runs the same tight loop over its row range and
@@ -1855,6 +1945,13 @@ fn accumulate_groups(
                             FusedOp::AccCol(p) => {
                                 fused_acc_cell(&mut accs[si], row.get(*p).unwrap_or(&Value::Null))?;
                             }
+                            FusedOp::Extreme { pos, max } => {
+                                fused_extreme_cell(
+                                    &mut accs[si],
+                                    row.get(*pos).unwrap_or(&Value::Null),
+                                    *max,
+                                );
+                            }
                         }
                     }
                 }
@@ -1868,11 +1965,12 @@ fn accumulate_groups(
                 let chunk = rows.len().div_ceil(n_shards);
                 type ShardOut = Result<Vec<FusedAcc>, EvalError>;
                 let ops = &unique_ops;
+                let mysql_for_accs = ctx.mysql_dialect;
                 let results = r.run_shards(n_shards, &|i| {
                     let lo = i * chunk;
                     let hi = ((i + 1) * chunk).min(rows.len());
                     let mut local: Vec<FusedAcc> =
-                        (0..ops.len()).map(|_| FusedAcc::default()).collect();
+                        fused_accs(ops, mysql_for_accs);
                     let out: ShardOut = fused_scan(lo..hi, &mut local).map(|()| local);
                     alloc::boxed::Box::new(out)
                 });
@@ -1922,6 +2020,7 @@ fn accumulate_groups(
         let n_shards = (rows.len() / crate::PARALLEL_MIN_ROWS).clamp(2, 8);
         let chunk = rows.len().div_ceil(n_shards);
         let ops = &unique_ops;
+        let mysql_for_accs = ctx.mysql_dialect;
         let results = r.run_shards(n_shards, &|si| {
             let lo = si * chunk;
             let hi = ((si + 1) * chunk).min(rows.len());
@@ -1947,13 +2046,13 @@ fn accumulate_groups(
                             *m.key_rows.entry(k).or_insert(0) += 1;
                             m.slots.entry(k).or_insert_with(|| {
                                 m.keys.push((k, v.clone().into_owned()));
-                                (0..ops.len()).map(|_| FusedAcc::default()).collect()
+                                fused_accs(ops, mysql_for_accs)
                             })
                         }
                         None => {
                             m.null_rows += 1;
                             m.null_slot.get_or_insert_with(|| {
-                                (0..ops.len()).map(|_| FusedAcc::default()).collect()
+                                fused_accs(ops, mysql_for_accs)
                             })
                         }
                     };
@@ -1967,6 +2066,13 @@ fn accumulate_groups(
                             FusedOp::AccCol(p) => {
                                 fused_acc_cell(&mut slots[oi], row.get(*p).unwrap_or(&Value::Null))
                                     .map_err(Some)?;
+                            }
+                            FusedOp::Extreme { pos, max } => {
+                                fused_extreme_cell(
+                                    &mut slots[oi],
+                                    row.get(*pos).unwrap_or(&Value::Null),
+                                    *max,
+                                );
                             }
                         }
                     }
