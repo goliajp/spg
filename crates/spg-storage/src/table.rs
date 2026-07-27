@@ -733,6 +733,29 @@ impl Table {
             .is_some_and(|h| self.header_visible(idx, h, snapshot))
     }
 
+    /// v7.39 (round 562) — the same question asked many times over
+    /// ascending positions, without descending the header trie for each
+    /// one.
+    ///
+    /// A profile of the server serving a 100k-row index-only range put
+    /// 27% of the connection thread's CPU on the per-row visibility test.
+    /// The headers are a `PersistentVec` — a 32-way trie — so
+    /// `position_visible` is four dependent pointer loads per row. A
+    /// sequential scan never pays that: it walks rows and headers in
+    /// lockstep. An index walk cannot, but its positions arrive in
+    /// ascending order and a leaf holds 32 of them, so keeping the run
+    /// between calls turns 32 descents into one.
+    ///
+    /// A position outside the held run just descends, so an index whose
+    /// order is uncorrelated with position costs what it costs today.
+    #[must_use]
+    pub fn header_runs(&self) -> HeaderRuns<'_> {
+        HeaderRuns {
+            table: self,
+            run: None,
+        }
+    }
+
     /// v7.39 (round 559) — how many rows a snapshot sees, without
     /// touching a single one of them.
     ///
@@ -3103,4 +3126,38 @@ fn recode_vector_cell(
         VecEncoding::Sq8 => Value::Sq8Vector(quantize::quantize(&as_f32)),
         VecEncoding::F16 => Value::HalfVector(halfvec::HalfVector::from_f32_slice(&as_f32)),
     })
+}
+
+/// v7.39 (round 562) — a cursor over `Table`'s row headers that holds
+/// the trie leaf it last descended to.
+///
+/// See `Table::header_runs` for why. Ask about ascending positions and
+/// the descent happens once per 32; ask about scattered ones and it
+/// happens as often as `position_visible` would have done it.
+#[derive(Debug)]
+pub struct HeaderRuns<'a> {
+    table: &'a Table,
+    /// `(start, run)` — `run[i - start]` is the header for position `i`.
+    run: Option<(usize, &'a [crate::row_header::RowHeader])>,
+}
+
+impl HeaderRuns<'_> {
+    /// Is the row at this position visible to the snapshot?
+    ///
+    /// Answers exactly as `Table::position_visible` does — same
+    /// `SKIP LOCKED` handling, same snapshot rules — and the pins in
+    /// `e2e_index_only_scan_round560` hold both to it.
+    pub fn visible(&mut self, idx: usize, snapshot: &crate::snapshot::Snapshot) -> bool {
+        if let Some((start, run)) = self.run
+            && idx >= start
+            && idx - start < run.len()
+        {
+            return self.table.header_visible(idx, &run[idx - start], snapshot);
+        }
+        let Some((start, run)) = self.table.headers.run_containing(idx) else {
+            return false;
+        };
+        self.run = Some((start, run));
+        self.table.header_visible(idx, &run[idx - start], snapshot)
+    }
 }

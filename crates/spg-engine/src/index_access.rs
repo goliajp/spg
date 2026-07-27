@@ -641,15 +641,17 @@ pub(crate) fn try_index_only_range(
     }
     let idx = table.index_on(col_pos)?;
     let entries = idx.range_keyed(bound_as_ref(&lo), bound_as_ref(&hi))?;
-    let mut out: Vec<spg_storage::Value<'static>> = Vec::with_capacity(entries.len());
+    let ty = schema_cols[col_pos].ty;
+    let mut out: Vec<spg_storage::Value<'static>> = Vec::new();
+    let mut headers = table.header_runs();
     for (key, loc) in entries {
         let spg_storage::RowLocator::Hot(i) = loc else {
             return None;
         };
-        if !table.position_visible(i, snapshot) {
+        if !headers.visible(i, snapshot) {
             continue;
         }
-        out.push(value_from_key(&key, schema_cols[col_pos].ty)?);
+        out.push(value_from_key(key, ty)?);
     }
     Some(out)
 }

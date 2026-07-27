@@ -2979,32 +2979,30 @@ impl Index {
     /// `lookup_range_capped_by` throws the KEY away and returns only
     /// locators, so a query whose projection is exactly the indexed
     /// column still goes to the row store for a value the walk already
-    /// had in hand. Measured over pgwire on a 500k table, projecting
-    /// `k` for a 100k-row range:
-    ///
-    ///     PG18  Index Only Scan   3.6 ms      SPG  30 ms
-    ///
-    /// 8x, and it widens with the row count (2x at 1k rows) — the shape
-    /// of paying per row for something the index already knows.
+    /// had in hand — paying per row for something the index knows.
     ///
     /// Uncapped on purpose: an index-only walk touches no row, so the
     /// selectivity ceiling that keeps a seek from being worse than the
     /// scan it replaces does not apply to it.
+    ///
+    /// v7.39 (round 562) — and it does not collect, either. This
+    /// returned a `Vec<(IndexKey, RowLocator)>`: for a 100k-row range,
+    /// 100k key clones into a `Vec::new()` that doubles its way up to
+    /// several MB, all to be walked once and dropped. A profile of the
+    /// server serving that query put 20% of the connection thread's CPU
+    /// on the collect alone, with another 18% in the allocator beside
+    /// it. The caller consumes the pairs in order and needs the key
+    /// only by reference, so it can have the walk itself.
     pub fn range_keyed(
         &self,
         lo: core::ops::Bound<&IndexKey>,
         hi: core::ops::Bound<&IndexKey>,
-    ) -> Option<Vec<(IndexKey, RowLocator)>> {
+    ) -> Option<impl Iterator<Item = (&IndexKey, RowLocator)> + '_> {
         match &self.kind {
-            IndexKind::BTree(m) => {
-                let mut out: Vec<(IndexKey, RowLocator)> = Vec::new();
-                for (k, locs) in m.range(lo, hi) {
-                    for l in locs {
-                        out.push((k.clone(), *l));
-                    }
-                }
-                Some(out)
-            }
+            IndexKind::BTree(m) => Some(
+                m.range(lo, hi)
+                    .flat_map(|(k, locs)| locs.iter().map(move |l| (k, *l))),
+            ),
             IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
