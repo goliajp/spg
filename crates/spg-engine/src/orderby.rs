@@ -1066,11 +1066,37 @@ pub(crate) fn sort_by_keys(tagged: &mut [(Vec<OrderKey>, Row)], descs: &[bool]) 
 /// ever guaranteed. A no-op when `keep == 0` (LIMIT 0 is handled by the
 /// caller's truncation).
 pub(crate) fn topk_trim(tagged: &mut Vec<(Vec<OrderKey>, Row)>, keep: usize, descs: &[bool]) {
+    topk_trim_recycling(tagged, keep, descs, &mut Vec::new(), &mut Vec::new());
+}
+
+/// v7.39 (round 571) — the same trim, handing the dropped rows' value
+/// buffers back to the caller instead of freeing them.
+///
+/// A streaming top-N scan allocates a projection `Vec` per input row
+/// and keeps `keep` of them: on 500k rows with `LIMIT 10`, 499,990 are
+/// built and dropped almost at once, and a profile of that query put a
+/// quarter of the connection thread in the allocator. The accumulator
+/// is bounded at `2 * keep`, so every trim frees `keep` buffers with
+/// their capacity already grown — exactly what the next rows need.
+pub(crate) fn topk_trim_recycling<'a>(
+    tagged: &mut Vec<(Vec<OrderKey>, Row<'a>)>,
+    keep: usize,
+    descs: &[bool],
+    pool: &mut Vec<Vec<Value<'a>>>,
+    key_pool: &mut Vec<Vec<OrderKey>>,
+) {
     if keep > 0 && tagged.len() >= keep.saturating_mul(2) {
-        let cmp =
-            |a: &(Vec<OrderKey>, Row), b: &(Vec<OrderKey>, Row)| cmp_multi_key(&a.0, &b.0, descs);
+        let cmp = |a: &(Vec<OrderKey>, Row<'a>), b: &(Vec<OrderKey>, Row<'a>)| {
+            cmp_multi_key(&a.0, &b.0, descs)
+        };
         tagged.select_nth_unstable_by(keep - 1, cmp);
-        tagged.truncate(keep);
+        for (mut keys, row) in tagged.drain(keep..) {
+            let mut v = row.values;
+            v.clear();
+            pool.push(v);
+            keys.clear();
+            key_pool.push(keys);
+        }
     }
 }
 
@@ -1132,6 +1158,24 @@ pub(crate) fn build_order_keys(
     ctx: &EvalContext,
 ) -> Result<Vec<OrderKey>, EngineError> {
     let mut keys = Vec::with_capacity(order_by.len());
+    build_order_keys_into(order_by, row, ctx, &mut keys)?;
+    Ok(keys)
+}
+
+/// v7.39 (round 571) — the same keys, into a buffer the caller owns.
+///
+/// The streaming top-N scan builds one of these per input row and keeps
+/// `keep` of them, so on 500k rows with `LIMIT 10` it allocated half a
+/// million vectors of one element each. The trim hands the dropped ones
+/// back and they come through here.
+pub(crate) fn build_order_keys_into(
+    order_by: &[OrderBy],
+    row: &Row<'static>,
+    ctx: &EvalContext,
+    keys: &mut Vec<OrderKey>,
+) -> Result<(), EngineError> {
+    keys.clear();
+    keys.reserve(order_by.len());
     for o in order_by {
         let v = eval::eval_expr(&o.expr, row, ctx)?;
         // v7.24 (round-16 A) — explicit NULLS FIRST/LAST. The f64
@@ -1172,7 +1216,7 @@ pub(crate) fn build_order_keys(
             keys.push(value_to_order_key(&v)?);
         }
     }
-    Ok(keys)
+    Ok(())
 }
 
 /// Drop the first `offset` rows then truncate to `limit`. PG / `MySQL`
