@@ -470,7 +470,10 @@ impl Engine {
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 "__spg_pg_class" => {
-                    let (schema, rows) = synth_pg_class(self.active_catalog());
+                    let (schema, rows) = synth_pg_class(
+                        self.active_catalog(),
+                        i64::try_from(self.vacuum_oldest_active()).unwrap_or(i64::MAX),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 "__spg_pg_attribute" => {
@@ -804,6 +807,11 @@ impl Engine {
                 }
                 // pg_catalog.pg_extension — native capability list
                 // (mailrs embed round-12).
+                // v7.39 (round 541) — an empty catalog that exists.
+                "__spg_pg_foreign_table" => {
+                    let (schema, rows) = crate::system_catalog::synth_pg_foreign_table();
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 "__spg_pg_extension" => {
                     let (schema, rows) = synth_pg_extension();
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
@@ -927,6 +935,15 @@ impl Engine {
                 }
                 "__spg_mysql_db" => {
                     let (schema, rows) = synth_mysql_db();
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.39 (round 541) — the catalogs PG has that SPG is
+                // genuinely empty of. Table-driven; see EMPTY_PG_CATALOGS.
+                other
+                    if crate::system_catalog::synth_empty_pg_catalog(other).is_some() =>
+                {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_empty_pg_catalog(other).expect("just checked");
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 _ => {
