@@ -65,19 +65,28 @@ fn replication_origin_probes_return_null() {
 
 #[test]
 fn replication_slot_admin_probes_return_null() {
+    // v7.39 (round 550) — this pinned the NULL. The family answered
+    // NULL from the value dispatch, so a replication setup script ran
+    // clean and created nothing, and dropping a slot that was never
+    // there reported success. Creating, listing and dropping are real
+    // now (see e2e_replication_slots_round550); what stays NULL-free is
+    // the pair SPG genuinely does not do, which REFUSES rather than
+    // answering nothing.
     let mut e = Engine::new();
+    assert!(matches!(
+        first(&mut e, "SELECT pg_create_physical_replication_slot('slot1')"),
+        spg_storage::Value::Text(_)
+    ));
+    e.execute("SELECT pg_drop_replication_slot('slot1')").unwrap();
     for f in &[
-        "pg_create_physical_replication_slot('slot1')",
-        "pg_create_logical_replication_slot('slot2', 'pgoutput')",
         "pg_copy_physical_replication_slot('a', 'b')",
         "pg_copy_logical_replication_slot('a', 'b', true)",
-        "pg_drop_replication_slot('slot1')",
         "pg_replication_slot_advance('slot1', '0/0')",
     ] {
         let sql = format!("SELECT {f}");
         assert!(
-            matches!(first(&mut e, &sql), spg_storage::Value::Null),
-            "SELECT {f} should be NULL"
+            e.execute(&sql).is_err(),
+            "SELECT {f} must refuse, not answer nothing"
         );
     }
 }

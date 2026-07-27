@@ -97,6 +97,11 @@ pub const MUTATING_CALL_NEEDLES: &[&[u8]] = &[
     b"lo_close(",
     b"lo_truncate(",
     b"lo_truncate64(",
+    // Replication slots — round 550. They make and unmake a catalog
+    // record, so they need `&mut` the way the large-object family does.
+    b"pg_create_physical_replication_slot(",
+    b"pg_create_logical_replication_slot(",
+    b"pg_drop_replication_slot(",
 ];
 
 impl Engine {
@@ -192,6 +197,15 @@ impl Engine {
                 // mutate the catalog, and the value dispatch only ever
                 // holds `&EvalContext`. lo_get is read-only but resolves
                 // alongside them so the whole family reads one way.
+                // v7.39 (round 550) — replication slots, for the same
+                // reason. The whole family used to answer NULL from the
+                // value dispatch, so a setup script created nothing and
+                // `pg_drop_replication_slot('nosuchslot')` reported
+                // success.
+                if let Some(v) = self.eval_replication_slot_call(&lc, args)? {
+                    *expr = Expr::Literal(value_to_literal(v));
+                    return Ok(());
+                }
                 if let Some(v) = self.eval_large_object_call(&lc, args)? {
                     // `lo_get` yields bytea, and the AST has no bytes
                     // literal — folding it to a bare literal would hand
@@ -720,6 +734,72 @@ impl Engine {
     /// Offsets are 0-based, which is PG's convention here and NOT the
     /// 1-based one `substring` uses: `lo_get(o,1,3)` over 'Hello' is
     /// 'ell'. Measured, not assumed.
+    /// v7.39 (round 550) — `pg_create_*_replication_slot` /
+    /// `pg_drop_replication_slot`.
+    ///
+    /// PG's own shapes, measured: creating one answers the slot's name
+    /// (a record whose first field is the name), dropping a slot that
+    /// is not there raises `replication slot "x" does not exist`, and
+    /// creating one that already exists raises the matching message.
+    ///
+    /// SPG keeps the RECORD — which is what a setup script and every
+    /// monitoring query read — and `pg_replication_slots.wal_status`
+    /// says `unreserved`, PG's own word for a slot that no longer holds
+    /// WAL back. That is the truthful half; retention is recorded work.
+    pub(crate) fn eval_replication_slot_call(
+        &mut self,
+        lc: &str,
+        args: &[Expr],
+    ) -> Result<Option<spg_storage::Value<'static>>, EngineError> {
+        use spg_storage::Value;
+        if !matches!(
+            lc,
+            "pg_create_physical_replication_slot"
+                | "pg_create_logical_replication_slot"
+                | "pg_drop_replication_slot"
+        ) {
+            return Ok(None);
+        }
+        let text_arg = |i: usize| -> Option<alloc::string::String> {
+            match crate::conversions::literal_expr_to_value_in(
+                args.get(i)?.clone(),
+                Some(self.active_catalog()),
+            ) {
+                Ok(Value::Text(t)) => Some(t.to_string()),
+                _ => None,
+            }
+        };
+        let Some(name) = text_arg(0) else {
+            return Ok(None);
+        };
+        match lc {
+            "pg_drop_replication_slot" => {
+                self.active_catalog_mut()
+                    .drop_replication_slot(&name)
+                    .map_err(EngineError::Unsupported)?;
+                Ok(Some(Value::Null))
+            }
+            _ => {
+                let logical = lc == "pg_create_logical_replication_slot";
+                let plugin = if logical {
+                    text_arg(1).unwrap_or_default()
+                } else {
+                    alloc::string::String::new()
+                };
+                self.active_catalog_mut()
+                    .create_replication_slot(
+                        &name,
+                        &plugin,
+                        if logical { "logical" } else { "physical" },
+                    )
+                    .map_err(EngineError::Unsupported)?;
+                // PG answers the record `(slot_name, lsn)`; the name is
+                // the field every caller reads.
+                Ok(Some(Value::text(name)))
+            }
+        }
+    }
+
     pub(crate) fn eval_large_object_call(
         &mut self,
         lc: &str,

@@ -3917,6 +3917,18 @@ pub struct Catalog {
     /// SET` is `("", r)` and `ALTER ROLE r IN DATABASE d SET` is
     /// `(d, r)`. The value is that scope's parameter list.
     db_role_settings: BTreeMap<(String, String), BTreeMap<String, String>>,
+    /// v7.39 (round 550) — replication slots, by name.
+    ///
+    /// A slot in PG is two things: a named record, and a reservation
+    /// that holds WAL back. SPG keeps the record — which is what every
+    /// setup script and monitoring query reads — and reports
+    /// `wal_status = 'unreserved'`, PG's own word for a slot that no
+    /// longer holds WAL. The whole family used to answer NULL and
+    /// report success, so `pg_drop_replication_slot('nosuchslot')` said
+    /// it worked and a setup script created nothing.
+    ///
+    /// Value: (plugin, slot_type). `plugin` is empty for a physical slot.
+    replication_slots: BTreeMap<String, (String, String)>,
     /// v7.37.42-T2 ζ-B — catalogued user-defined COMPOSITE types
     /// (`CREATE TYPE name AS (field_name field_type, …)`). Columns
     /// reference these by name via
@@ -4577,6 +4589,7 @@ impl Catalog {
             domain_types: BTreeMap::new(),
             comments: BTreeMap::new(),
             db_role_settings: BTreeMap::new(),
+            replication_slots: BTreeMap::new(),
             composite_types: BTreeMap::new(),
             schemas: alloc::collections::BTreeSet::new(),
         }
@@ -5112,6 +5125,42 @@ impl Catalog {
                 }
             }
         }
+    }
+
+    /// v7.39 (round 550) — create a replication slot. `Err` carries
+    /// PG's own message for a duplicate.
+    ///
+    /// # Errors
+    /// When a slot of that name already exists.
+    pub fn create_replication_slot(
+        &mut self,
+        name: &str,
+        plugin: &str,
+        slot_type: &str,
+    ) -> Result<(), String> {
+        if self.replication_slots.contains_key(name) {
+            return Err(alloc::format!("replication slot \"{name}\" already exists"));
+        }
+        self.replication_slots.insert(
+            name.to_string(),
+            (plugin.to_string(), slot_type.to_string()),
+        );
+        Ok(())
+    }
+
+    /// # Errors
+    /// When no slot of that name exists — PG's message, and the case
+    /// that used to report success.
+    pub fn drop_replication_slot(&mut self, name: &str) -> Result<(), String> {
+        if self.replication_slots.remove(name).is_none() {
+            return Err(alloc::format!("replication slot \"{name}\" does not exist"));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn replication_slots(&self) -> &BTreeMap<String, (String, String)> {
+        &self.replication_slots
     }
 
     /// PG's RESET ALL: drops this scope's whole entry, leaving the
@@ -7769,7 +7818,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 85;
+const FILE_VERSION: u8 = 86;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -9012,6 +9061,17 @@ impl Catalog {
                 write_str(&mut out, value);
             }
         }
+        // v7.39 (round 550) — replication slots (FILE_VERSION 86+),
+        // written LAST so a v85 reader stops before them.
+        write_u32(
+            &mut out,
+            u32::try_from(self.replication_slots.len()).expect("≤ 4G slots"),
+        );
+        for (name, (plugin, slot_type)) in &self.replication_slots {
+            write_str(&mut out, name);
+            write_str(&mut out, plugin);
+            write_str(&mut out, slot_type);
+        }
         let crc = spg_crypto::crc32c::crc32c(&out);
         write_u32(&mut out, crc);
         out
@@ -9530,6 +9590,16 @@ impl Catalog {
                 if !m.is_empty() {
                     cat.db_role_settings.insert((db, role), m);
                 }
+            }
+        }
+        // v7.39 (round 550) — replication slots (FILE_VERSION 86+).
+        if version >= 86 {
+            let count = cur.read_u32()? as usize;
+            for _ in 0..count {
+                let name = cur.read_str()?;
+                let plugin = cur.read_str()?;
+                let slot_type = cur.read_str()?;
+                cat.replication_slots.insert(name, (plugin, slot_type));
             }
         }
         // v7.38 (read01 P5.05) — v54+ images end with a CRC32C over every

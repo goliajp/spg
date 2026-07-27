@@ -2211,7 +2211,7 @@ pub(crate) fn synth_pg_publication(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
 ///   * confirmed_flush_lsn (Text)
 ///   * wal_status (Text) — `reserved` / `extended` / `unreserved` / `lost`
 ///   * safe_wal_size (BigInt) — bytes before the slot's WAL is reclaimed
-pub(crate) fn synth_pg_replication_slots(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_replication_slots(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("slot_name", DataType::Text, false),
         ColumnSchema::new("plugin", DataType::Text, true),
@@ -2228,10 +2228,39 @@ pub(crate) fn synth_pg_replication_slots(_cat: &Catalog) -> (Vec<ColumnSchema>, 
         ColumnSchema::new("wal_status", DataType::Text, true),
         ColumnSchema::new("safe_wal_size", DataType::BigInt, true),
     ];
-    // Empty until SPG persists slot state across engine restarts
-    // (21.12 dependency). The shape is stable so dashboards keep
-    // parsing.
-    let rows: Vec<Row<'static>> = Vec::new();
+    // v7.39 (round 550) — the slots the catalog actually holds. This
+    // was pinned empty, and the create/drop functions answered NULL, so
+    // a replication setup script ran clean and made nothing.
+    //
+    // `wal_status` reads `unreserved` — PG's own word for a slot that
+    // no longer holds WAL back, which is the truth here: SPG keeps the
+    // record, not the reservation.
+    let rows: Vec<Row<'static>> = cat
+        .replication_slots()
+        .iter()
+        .map(|(name, (plugin, slot_type))| {
+            Row::new(alloc::vec![
+                Value::text(name.clone()),
+                if plugin.is_empty() {
+                    Value::Null
+                } else {
+                    Value::text(plugin.clone())
+                },
+                Value::text(slot_type.clone()),
+                Value::BigInt(16384),
+                Value::text("spg"),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::text("unreserved"),
+                Value::Null,
+            ])
+        })
+        .collect();
     (schema, rows)
 }
 
