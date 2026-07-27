@@ -723,6 +723,16 @@ impl Table {
     ///
     /// `'a` lifetime on `snapshot` keeps the helper zero-cost in
     /// the hot loop — no Arc bump, no allocation.
+    /// v7.39 (round 560) — is the row at this position visible to the
+    /// snapshot? Exposed so an index-only walk can decide without
+    /// fetching the row it is deciding about.
+    #[must_use]
+    pub fn position_visible(&self, idx: usize, snapshot: &crate::snapshot::Snapshot) -> bool {
+        self.headers
+            .get(idx)
+            .is_some_and(|h| self.header_visible(idx, h, snapshot))
+    }
+
     /// v7.39 (round 559) — how many rows a snapshot sees, without
     /// touching a single one of them.
     ///
