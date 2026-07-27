@@ -2078,14 +2078,21 @@ fn apply_function_dispatch(
         | "pg_replication_origin_xact_reset"
         | "pg_replication_origin_xact_setup"
         | "pg_show_replication_origin_status" => Ok(Value::Null),
-        // Replication-slot admin. These are usually functions that
-        // return SETOF records; scalar-surface NULL is fine.
-        "pg_create_physical_replication_slot"
-        | "pg_create_logical_replication_slot"
-        | "pg_copy_physical_replication_slot"
+        // v7.39 (round 550) — replication-slot admin, for real.
+        //
+        // The whole family answered NULL, with a note saying a
+        // scalar-surface NULL was fine. It was not: a setup script ran
+        // clean and created nothing, and
+        // `pg_drop_replication_slot('nosuchslot')` reported success
+        // where PG raises. The two that MAKE and UNMAKE a slot are
+        // handled by the caller against the catalog (they need &mut);
+        // reaching here means a read-only context, which is an error
+        // rather than a quiet NULL.
+        "pg_copy_physical_replication_slot"
         | "pg_copy_logical_replication_slot"
-        | "pg_drop_replication_slot"
-        | "pg_replication_slot_advance" => Ok(Value::Null),
+        | "pg_replication_slot_advance" => Err(EvalError::TypeMismatch {
+            detail: alloc::format!("{name}() is not supported"),
+        }),
         // Logical-decoding consumers — SETOF change streams +
         // message emission. SPG's replication protocol RFC
         // (MAGIC_SUB/MAGIC_REPL) owns the real semantics; NULL
