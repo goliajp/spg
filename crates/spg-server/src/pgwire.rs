@@ -1650,9 +1650,20 @@ fn run_pg_session(
         state: Arc::clone(state),
         conn: Arc::clone(&conn_state),
     };
-    // RBAC: if there are users in the engine, demand password.
-    // Else (open mode), accept any startup as admin.
-    let has_users = state.engine.read().is_ok_and(|e| !e.users().is_empty());
+    // RBAC: if there are LOGIN roles with credentials, demand a
+    // password. Else (open mode), accept any startup as admin.
+    //
+    // v7.39 (round 548) — this used to read `!e.users().is_empty()`, so
+    // ANY role flipped it — including a `CREATE ROLE devs NOLOGIN`,
+    // which records no password and cannot log in. The operator created
+    // a group role and was locked out of their own database:
+    // `postgres` has no password, so nothing could connect afterwards
+    // and there was no way back through SQL. A role that cannot be
+    // authenticated must not change how anyone else authenticates.
+    let has_users = state
+        .engine
+        .read()
+        .is_ok_and(|e| e.users().iter().any(|(_, r)| r.has_credentials()));
 
     let role = if has_users {
         // v4.8: prefer SCRAM-SHA-256 when the user has stored

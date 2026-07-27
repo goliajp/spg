@@ -399,6 +399,7 @@ mod e2e_pgwire_binary_params;
     clippy::uninlined_format_args
 )]
 mod e2e_pgwire_client_compat;
+mod e2e_pgwire_open_mode_round548;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
