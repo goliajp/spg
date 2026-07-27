@@ -400,6 +400,7 @@ mod e2e_pgwire_binary_params;
 )]
 mod e2e_pgwire_client_compat;
 mod e2e_pgwire_open_mode_round548;
+mod e2e_index_only_stream_round564;
 mod e2e_isolation_leak_round553;
 #[allow(
     clippy::cast_lossless,

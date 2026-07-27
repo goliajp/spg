@@ -630,6 +630,46 @@ pub(crate) fn try_index_only_range(
     snapshot: &spg_storage::snapshot::Snapshot,
     projected: usize,
 ) -> Option<Vec<spg_storage::Value<'static>>> {
+    let mut out: Vec<spg_storage::Value<'static>> = Vec::new();
+    match index_only_range_each(
+        where_expr,
+        schema_cols,
+        table,
+        table_alias,
+        snapshot,
+        projected,
+        &mut |v| {
+            out.push(v);
+            Ok(())
+        },
+    ) {
+        Some(Ok(_)) => Some(out),
+        // The walk only errors on an index that disagrees with its own
+        // schema; this caller has emitted nothing, so it can still fall
+        // back to the ordinary path rather than surface it.
+        Some(Err(_)) | None => None,
+    }
+}
+
+/// v7.39 (round 564) — the walk itself, handing each value to a sink.
+///
+/// `try_index_only_range` collects into a `Vec`; the streaming caller
+/// wants to emit as it goes and must not have to collect first. Both go
+/// through here so the shape rules and the visibility rules have one
+/// copy between them.
+///
+/// `None` means the shape does not apply and NOTHING has been handed to
+/// the sink — the caller may still fall back. `Some(Err(_))` means rows
+/// may already have gone out.
+pub(crate) fn index_only_range_each(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table: &Table,
+    table_alias: &str,
+    snapshot: &spg_storage::snapshot::Snapshot,
+    projected: usize,
+    sink: &mut dyn FnMut(spg_storage::Value<'static>) -> Result<(), EngineError>,
+) -> Option<Result<usize, EngineError>> {
     let (col_pos, lo, hi) = parse_range_bounds(where_expr, schema_cols, table_alias)?;
     if col_pos != projected {
         return None;
@@ -639,21 +679,51 @@ pub(crate) fn try_index_only_range(
     if table.has_cold_rows_fast() {
         return None;
     }
+    let ty = schema_cols[col_pos].ty;
+    // Decided BEFORE the walk, not per row: a streaming caller cannot
+    // take a row back once it has gone out, so "this type does not come
+    // back from its key" has to be a shape rejection, not a discovery
+    // made halfway through.
+    if !key_restores_type(ty) {
+        return None;
+    }
     let idx = table.index_on(col_pos)?;
     let entries = idx.range_keyed(bound_as_ref(&lo), bound_as_ref(&hi))?;
-    let ty = schema_cols[col_pos].ty;
-    let mut out: Vec<spg_storage::Value<'static>> = Vec::new();
     let mut headers = table.header_runs();
+    let mut n = 0usize;
     for (key, loc) in entries {
         let spg_storage::RowLocator::Hot(i) = loc else {
-            return None;
+            return Some(Err(EngineError::Unsupported(
+                "index-only scan met a locator outside the hot tier".into(),
+            )));
         };
         if !headers.visible(i, snapshot) {
             continue;
         }
-        out.push(value_from_key(key, ty)?);
+        // Unreachable given `key_restores_type` above and keys built
+        // from the column's own values — an index that disagrees with
+        // its schema is worth saying so about, not walking past.
+        let Some(v) = value_from_key(key, ty) else {
+            return Some(Err(EngineError::Unsupported(
+                "index-only scan: index key does not restore the column type".into(),
+            )));
+        };
+        if let Err(e) = sink(v) {
+            return Some(Err(e));
+        }
+        n += 1;
     }
-    Some(out)
+    Some(Ok(n))
+}
+
+/// Which declared types an index key comes back as unambiguously.
+///
+/// The pairs `value_from_key` accepts, as a question about the TYPE
+/// alone. A date and a timestamp both key as `IndexKey::Int`, so
+/// neither is here.
+fn key_restores_type(ty: spg_storage::DataType) -> bool {
+    use spg_storage::DataType as T;
+    matches!(ty, T::SmallInt | T::Int | T::BigInt | T::Text | T::Bool | T::Uuid)
 }
 
 fn try_range_seek<'a>(
@@ -1458,5 +1528,39 @@ pub(crate) fn resolve_col_literal_pair(
         | Literal::IntArray(_)
         | Literal::BigIntArray(_) => return None,
     };
+    // v7.39 (round 564) — a string literal means whatever the COLUMN
+    // says it means, and until here it always meant text.
+    //
+    // `WHERE d = '2026-01-02'` on a `DATE` column built an
+    // `IndexKey::Text`, while the rows under that index are keyed
+    // `IndexKey::Int` — days. The seek looked in a key space nothing
+    // lives in and found nothing, so:
+    //
+    //     no index     d = '2026-01-02'   ->  1 row   (PG: 1)
+    //     with index   d = '2026-01-02'   ->  0 rows  (PG: 1)
+    //
+    // Creating an index changed the answer, which is the one thing an
+    // index may never do. Two-sided ranges went the same way; a
+    // one-sided `d > '…'` survived only because it is not seeked at all.
+    // Every string-literal comparison against a date, timestamp, time,
+    // uuid or bool column was affected.
+    //
+    // Only string literals, and only against a non-text column: parsing
+    // a string to its column type is exact or it raises, so a
+    // coercion that succeeds cannot seek to the wrong key. Numeric
+    // coercions are deliberately NOT done here — `WHERE i = 1.5` on an
+    // integer column must not round its way to the rows holding 2.
+    // A coercion that fails means the ordinary path re-raises it.
+    let ty = schema_cols[pos].ty;
+    if matches!(l, Literal::String(_))
+        && !matches!(
+            ty,
+            spg_storage::DataType::Text
+                | spg_storage::DataType::Varchar(_)
+                | spg_storage::DataType::Char(_)
+        )
+    {
+        return Some((pos, crate::conversions::coerce_value(v, ty, &c.name, pos).ok()?));
+    }
     Some((pos, v))
 }
