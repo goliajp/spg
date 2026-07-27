@@ -547,7 +547,27 @@ impl Engine {
         let ctx = EvalContext::new(cols, Some(alias))
             .with_catalog(self.active_catalog())
             .with_session(&scan_sess);
-        let keep = |row: &Row<'static>| -> Result<bool, EngineError> {
+        // v7.39 (round 574) — compile the conjuncts once, as the
+        // single-table scan does.
+        //
+        // This helper feeds the deferred join's side seeds, and it
+        // evaluated every conjunct INTERPRETIVELY for every row. A
+        // profile of `SELECT count(*) FROM a JOIN b ON a.id = b.id
+        // WHERE b.id < 100` put 32% of the connection thread inside
+        // here, with `eval_expr` ~17% of it — 500k interpretive
+        // evaluations to find 100 rows. `run_single_table_scan` has
+        // compiled its WHERE since v7.39 round 479; the join's side
+        // filter never learned to.
+        //
+        // A conjunct that will not compile keeps the interpretive path,
+        // so the answers are the ones this helper already gave.
+        let compiled: Vec<Option<eval::CompiledExpr>> = preds
+            .iter()
+            .map(|p| eval::fully_compilable(p).then(|| eval::compile_expr(p, &ctx)))
+            .collect();
+        let keep = |row: &Row<'static>,
+                    stack: &mut Vec<Value<'static>>|
+         -> Result<bool, EngineError> {
             for (i, p) in preds.iter().enumerate() {
                 // The pred that seeded the index seek is already proven
                 // true for every row in the seeded set; skip the
@@ -557,13 +577,23 @@ impl Engine {
                 if Some(i) == seeded_pred_idx {
                     continue;
                 }
-                let v = eval::eval_expr(p, row, &ctx).map_err(EngineError::Eval)?;
-                if !matches!(v, Value::Bool(true)) {
+                let ok = match &compiled[i] {
+                    Some(cw) => {
+                        eval::compiled::eval_compiled_pred(cw, row, &ctx, stack, ctx.mysql_dialect)
+                            .map_err(EngineError::Eval)?
+                    }
+                    None => {
+                        let v = eval::eval_expr(p, row, &ctx).map_err(EngineError::Eval)?;
+                        matches!(v, Value::Bool(true))
+                    }
+                };
+                if !ok {
                     return Ok(false);
                 }
             }
             Ok(true)
         };
+        let mut eval_stack: Vec<Value<'static>> = Vec::new();
         let mut out: Vec<usize> = Vec::new();
         match seeded {
             Some(ids) => {
@@ -579,7 +609,7 @@ impl Engine {
                         continue;
                     }
                     if let Some(row) = table.rows().get(i)
-                        && keep(row)?
+                        && keep(row, &mut eval_stack)?
                     {
                         out.push(i);
                     }
@@ -589,7 +619,7 @@ impl Engine {
                 // v7.37.15 Phase B — visibility-gated predicate scan.
                 let snap = self.current_snapshot();
                 for (i, row) in table.scan_visible(&snap) {
-                    if keep(row)? {
+                    if keep(row, &mut eval_stack)? {
                         out.push(i);
                     }
                 }
