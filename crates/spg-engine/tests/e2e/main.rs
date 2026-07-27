@@ -108,6 +108,7 @@ mod e2e_guc_read_path_round534;
 mod e2e_maintenance_targets_round535;
 mod e2e_infoschema_matview_round536;
 mod e2e_index_order_round537;
+mod e2e_pg_dump_blockers_round539;
 mod e2e_unary_plus_round507;
 mod e2e_cardinality_violation;
 mod e2e_casefold;

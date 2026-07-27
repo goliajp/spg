@@ -19710,6 +19710,21 @@ impl Parser {
                 None => self.binop_here(self.peek()),
             };
             let Some((op, prec)) = dispatch else {
+                // v7.39 (round 539) — `OPERATOR(pg_catalog.~)` and the rest
+                // of the symbol family. `binop_here` answers None for them
+                // because they lower onto function calls rather than a
+                // BinOp, and the fallback below reads `self.peek()` — the
+                // word OPERATOR, not the operator. `pg_dump` writes every
+                // catalog predicate this way, so its first query failed
+                // and no dump ran:
+                //
+                //   AND c.relname OPERATOR(pg_catalog.~) '^(t)$'
+                //
+                // Collapsing the wrapper to the operator it names puts the
+                // token where the fallback already looks.
+                if let Some((next, op_tok)) = explicit {
+                    self.tokens.splice(self.pos..next, [op_tok]);
+                }
                 if let Some(e) = self.try_symbol_operator(&lhs, min_prec)? {
                     lhs = e;
                     chain_len += 1;
@@ -20796,7 +20811,7 @@ impl Parser {
             // honestly instead.
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("collate")) {
                 self.advance();
-                let cname = match self.advance() {
+                let mut cname = match self.advance() {
                     Token::Ident(s) | Token::QuotedIdent(s) | Token::String(s) => s,
                     other => {
                         return Err(self.err(alloc::format!(
@@ -20804,6 +20819,26 @@ impl Parser {
                         )));
                     }
                 };
+                // v7.39 (round 539) — a SCHEMA-QUALIFIED collation, which
+                // is how `pg_dump` writes the default one:
+                // `… COLLATE pg_catalog.default`. Reading a single token
+                // left the SCHEMA as the name, so the clause was refused
+                // as an unsupported locale collation and no dump ran.
+                if matches!(self.peek(), Token::Dot) {
+                    self.advance();
+                    cname = match self.advance() {
+                        Token::Ident(s) | Token::QuotedIdent(s) | Token::String(s) => s,
+                        // `default` lexes as a KEYWORD, and it is the name
+                        // pg_dump writes — the same trap round 535 hit with
+                        // TABLE / INDEX / FULL.
+                        Token::Default => alloc::string::String::from("default"),
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected collation name after COLLATE, got {other:?}"
+                            )));
+                        }
+                    };
+                }
                 let lc = cname.to_ascii_lowercase();
                 // v7.39 (round 371, M4 P4b) — a per-expression MySQL
                 // collation override. `… COLLATE utf8mb4_bin` (any `_bin`
