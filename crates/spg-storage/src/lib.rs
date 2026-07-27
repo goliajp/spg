@@ -2974,6 +2974,46 @@ impl Index {
         }
     }
 
+    /// v7.39 (round 560) — the index range as (key, locator) pairs.
+    ///
+    /// `lookup_range_capped_by` throws the KEY away and returns only
+    /// locators, so a query whose projection is exactly the indexed
+    /// column still goes to the row store for a value the walk already
+    /// had in hand. Measured over pgwire on a 500k table, projecting
+    /// `k` for a 100k-row range:
+    ///
+    ///     PG18  Index Only Scan   3.6 ms      SPG  30 ms
+    ///
+    /// 8x, and it widens with the row count (2x at 1k rows) — the shape
+    /// of paying per row for something the index already knows.
+    ///
+    /// Uncapped on purpose: an index-only walk touches no row, so the
+    /// selectivity ceiling that keeps a seek from being worse than the
+    /// scan it replaces does not apply to it.
+    pub fn range_keyed(
+        &self,
+        lo: core::ops::Bound<&IndexKey>,
+        hi: core::ops::Bound<&IndexKey>,
+    ) -> Option<Vec<(IndexKey, RowLocator)>> {
+        match &self.kind {
+            IndexKind::BTree(m) => {
+                let mut out: Vec<(IndexKey, RowLocator)> = Vec::new();
+                for (k, locs) in m.range(lo, hi) {
+                    for l in locs {
+                        out.push((k.clone(), *l));
+                    }
+                }
+                Some(out)
+            }
+            IndexKind::Nsw(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::Gin(_)
+            | IndexKind::GinTrgm(_)
+            | IndexKind::GinFulltext(_)
+            | IndexKind::GinJsonb(_) => None,
+        }
+    }
+
     /// v7.12.3 — GIN posting-list lookup. Returns the row locators
     /// whose `tsvector` cell contains `word`. Empty when the word is
     /// absent from the index or this isn't a GIN index.

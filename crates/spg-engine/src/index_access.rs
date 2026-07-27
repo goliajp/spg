@@ -579,6 +579,81 @@ fn bound_as_ref(b: &Bound<IndexKey>) -> Bound<&IndexKey> {
 /// a cold-tier locator (whose key we'd need to resolve the segment row and the
 /// flattened walk doesn't carry). The caller re-applies the full WHERE per row,
 /// so returning a superset is correct.
+/// v7.39 (round 560) — rebuild the column's value from its index key.
+///
+/// `IndexKey::Int` holds an i64 whatever the column was declared as, so
+/// the DECLARED type decides what comes back — `SELECT k` on an INT
+/// column must answer int4, not int8. A type whose key is lossy in the
+/// other direction (a date and a timestamp both key as Int) is not
+/// reconstructible and falls back to reading the row.
+fn value_from_key(
+    key: &spg_storage::IndexKey,
+    declared: spg_storage::DataType,
+) -> Option<spg_storage::Value<'static>> {
+    use spg_storage::{IndexKey as K, Value};
+    Some(match (key, declared) {
+        (K::Int(n), spg_storage::DataType::SmallInt) => Value::SmallInt(i16::try_from(*n).ok()?),
+        (K::Int(n), spg_storage::DataType::Int) => Value::Int(i32::try_from(*n).ok()?),
+        (K::Int(n), spg_storage::DataType::BigInt) => Value::BigInt(*n),
+        (K::Text(t), spg_storage::DataType::Text) => Value::text(t.clone()),
+        (K::Bool(b), spg_storage::DataType::Bool) => Value::Bool(*b),
+        (K::Uuid(u), spg_storage::DataType::Uuid) => Value::Uuid(*u),
+        _ => return None,
+    })
+}
+
+/// v7.39 (round 560) — an index-only range scan.
+///
+/// When the projection needs nothing but the indexed column, the value
+/// is already in the index KEY and the row never has to be read.
+/// `try_range_seek` below throws the key away, keeps the locator and
+/// fetches the row for a value the walk had in hand. Measured over
+/// pgwire on a 500k table, projecting `k` for a 100k-row range:
+///
+///     PG18  Index Only Scan   3.6 ms      SPG  30 ms
+///
+/// 8x, widening with the row count (2x at 1k rows).
+///
+/// PG needs its visibility map for this — a heap tuple carries its own
+/// visibility, so an index entry alone cannot say whether the row is
+/// live, and PG falls back to the heap for any page the map does not
+/// mark all-visible. SPG keeps a header array beside the rows, so the
+/// locator answers it directly and there is no map to be stale.
+///
+/// No selectivity cap: the ceiling on `try_range_seek` exists because
+/// its caller materialises every candidate, which this does not do.
+pub(crate) fn try_index_only_range(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table: &Table,
+    table_alias: &str,
+    snapshot: &spg_storage::snapshot::Snapshot,
+    projected: usize,
+) -> Option<Vec<spg_storage::Value<'static>>> {
+    let (col_pos, lo, hi) = parse_range_bounds(where_expr, schema_cols, table_alias)?;
+    if col_pos != projected {
+        return None;
+    }
+    // A cold-tier locator carries no position to test visibility with,
+    // and its value lives off-heap; anything cold falls back.
+    if table.has_cold_rows_fast() {
+        return None;
+    }
+    let idx = table.index_on(col_pos)?;
+    let entries = idx.range_keyed(bound_as_ref(&lo), bound_as_ref(&hi))?;
+    let mut out: Vec<spg_storage::Value<'static>> = Vec::with_capacity(entries.len());
+    for (key, loc) in entries {
+        let spg_storage::RowLocator::Hot(i) = loc else {
+            return None;
+        };
+        if !table.position_visible(i, snapshot) {
+            continue;
+        }
+        out.push(value_from_key(&key, schema_cols[col_pos].ty)?);
+    }
+    Some(out)
+}
+
 fn try_range_seek<'a>(
     where_expr: &Expr,
     schema_cols: &[ColumnSchema],

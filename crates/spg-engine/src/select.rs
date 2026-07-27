@@ -2002,6 +2002,90 @@ impl Engine {
         }))
     }
 
+    /// v7.39 (round 560) — `SELECT <indexed col> FROM t WHERE <range on
+    /// that col>` served from the index, never reading a row.
+    ///
+    /// Measured over pgwire on a 500k table, a 100k-row range: PG18's
+    /// Index Only Scan 3.6 ms against SPG's 30 ms, widening with the row
+    /// count (2x at 1k). PG needs its visibility map for this — a heap
+    /// tuple carries its own visibility, so an index entry alone cannot
+    /// say whether the row is live, and PG reads the heap for any page
+    /// the map does not mark all-visible. SPG keeps a header array
+    /// beside the rows, so the locator answers it directly and there is
+    /// no map to be stale.
+    fn try_index_only_scan(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<Option<QueryResult>, EngineError> {
+        use spg_sql::ast::SelectItem;
+        if !stmt.ctes.is_empty()
+            || !stmt.unions.is_empty()
+            || stmt.group_by.is_some()
+            || stmt.having.is_some()
+            || stmt.distinct
+            || stmt.locking.is_some()
+            || !stmt.order_by.is_empty()
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+            || stmt.items.len() != 1
+        {
+            return Ok(None);
+        }
+        let (Some(from), Some(where_)) = (&stmt.from, &stmt.where_) else {
+            return Ok(None);
+        };
+        if !from.joins.is_empty()
+            || from.primary.lateral_subquery.is_some()
+            || from.primary.unnest_expr.is_some()
+            || from.primary.generate_series_args.is_some()
+            || from.primary.name.is_empty()
+            || from.primary.name.starts_with("__spg_")
+        {
+            return Ok(None);
+        }
+        if crate::partition::is_partition_parent(self.active_catalog(), &from.primary.name) {
+            return Ok(None);
+        }
+        let SelectItem::Expr { expr, alias } = &stmt.items[0] else {
+            return Ok(None);
+        };
+        let spg_sql::ast::Expr::Column(c) = expr else {
+            return Ok(None);
+        };
+        let alias_name = from.primary.alias.as_deref().unwrap_or(&from.primary.name);
+        if let Some(q) = c.qualifier.as_deref()
+            && !q.eq_ignore_ascii_case(alias_name)
+        {
+            return Ok(None);
+        }
+        let Some(table) = self.active_catalog().get(&from.primary.name) else {
+            return Ok(None);
+        };
+        if table.schema().row_security {
+            return Ok(None);
+        }
+        let cols = &table.schema().columns;
+        let Some(pos) = cols.iter().position(|s| s.name.eq_ignore_ascii_case(&c.name)) else {
+            return Ok(None);
+        };
+        let Some(values) = crate::index_access::try_index_only_range(
+            where_,
+            cols,
+            table,
+            alias_name,
+            &self.current_snapshot(),
+            pos,
+        ) else {
+            return Ok(None);
+        };
+        let name = alias.clone().unwrap_or_else(|| cols[pos].name.clone());
+        let schema = alloc::vec![ColumnSchema::new(name, cols[pos].ty, cols[pos].nullable)];
+        Ok(Some(QueryResult::Rows {
+            columns: schema,
+            rows: values.into_iter().map(|v| Row::new(alloc::vec![v])).collect(),
+        }))
+    }
+
     pub(crate) fn exec_select_cancel_as(
         &self,
         stmt: &SelectStatement,
@@ -2092,6 +2176,11 @@ impl Engine {
         // instead of being refused, because the fast path never reached
         // the check.
         if let Some(r) = self.try_bare_count_star(stmt, as_role)? {
+            return Ok(r);
+        }
+        // v7.39 (round 560) — an index-only range scan. Same placement
+        // reasoning as the count above: after the privilege gate.
+        if let Some(r) = self.try_index_only_scan(stmt)? {
             return Ok(r);
         }
         validate_locking_clause(stmt)?;
