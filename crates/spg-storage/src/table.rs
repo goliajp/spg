@@ -1360,6 +1360,7 @@ impl Table {
             nulls_not_distinct: false,
             descending: false,
             nulls_first: None,
+            collation: None,
             extra_column_positions: Vec::new(),
         });
         Ok(())
@@ -2672,6 +2673,7 @@ impl Table {
             // v7.39 (round 537) — carried through a rebuild like the rest.
             descending: bool,
             nulls_first: Option<bool>,
+            collation: Option<String>,
         }
         let descriptors: Vec<RebuildDesc> = self
             .indices
@@ -2698,6 +2700,7 @@ impl Table {
                     nulls_not_distinct: idx.nulls_not_distinct,
                     descending: idx.descending,
                     nulls_first: idx.nulls_first,
+                    collation: idx.collation.clone(),
                 }
             })
             .collect();
@@ -2715,6 +2718,7 @@ impl Table {
                 nulls_not_distinct,
                 descending,
                 nulls_first,
+                collation,
             } = desc;
             let pre_len = self.indices.len();
             match rebuild_kind {
@@ -2838,6 +2842,7 @@ impl Table {
                 idx.nulls_not_distinct = nulls_not_distinct;
                 idx.descending = descending;
                 idx.nulls_first = nulls_first;
+                idx.collation = collation;
             }
         }
 
@@ -2904,6 +2909,7 @@ impl Table {
                 nulls_not_distinct: false,
                 descending: false,
                 nulls_first: None,
+                collation: None,
                 extra_column_positions: Vec::new(),
             });
             return Ok(());

@@ -14376,6 +14376,7 @@ impl Parser {
         // slot, so we can't save+rewind cleanly — peek-ahead via
         // direct index avoids the mutation.)
         let mut opclass: Option<String> = None;
+        let mut key_collation: Option<String> = None;
         let (column, expression): (String, Option<Expr>) = match self.peek().clone() {
             // Single column with `)` immediately after — fast path.
             // v7.9.29 — also: bare column followed by `,` (the
@@ -14442,6 +14443,25 @@ impl Parser {
                 (s, None)
             }
             Token::Ident(_) | Token::QuotedIdent(_) => {
+                // v7.39 (round 538) — an explicit COLLATE on the key,
+                // read by LOOKAHEAD because `parse_expr` absorbs the
+                // clause as a no-op (SPG orders text by bytes, which is
+                // the C collation, so it changes nothing to honour). PG
+                // still PRINTS it: an explicitly written `"C"` and the
+                // collation a column inherits are different collation
+                // OBJECTS even where they sort identically, which is why
+                // `(a COLLATE "C")` shows on a C-collation database too.
+                if matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::Ident(w)) if w.eq_ignore_ascii_case("collate")
+                ) {
+                    key_collation = match self.tokens.get(self.pos + 2) {
+                        Some(Token::Ident(n) | Token::QuotedIdent(n) | Token::String(n)) => {
+                            Some(n.clone())
+                        }
+                        _ => None,
+                    };
+                }
                 let key_expr = self.parse_expr(0)?;
                 let primary = extract_first_column(&key_expr).ok_or_else(|| {
                     self.err("expression index key must reference at least one column".into())
@@ -14602,6 +14622,7 @@ impl Parser {
         Ok(Statement::CreateIndex(CreateIndexStatement {
             name,
             key_order,
+            key_collation,
             table,
             column,
             nulls_not_distinct,

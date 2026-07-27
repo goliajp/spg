@@ -922,6 +922,22 @@ fn deserialize_indices(
                         last.nulls_first = nulls;
                     }
                 }
+                // v7.39 (round 538) — the key's explicit collation
+                // (FILE_VERSION 84+).
+                if version >= 84 {
+                    let coll = match cur.read_u8()? {
+                        0 => None,
+                        1 => Some(cur.read_str()?),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "index collation tag: unknown byte {other}"
+                            )));
+                        }
+                    };
+                    if let Some(last) = t.indices.last_mut() {
+                        last.collation = coll;
+                    }
+                }
             }
         }
     }

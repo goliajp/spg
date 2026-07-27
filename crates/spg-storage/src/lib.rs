@@ -2349,6 +2349,11 @@ pub struct Index {
     /// rendered.
     pub descending: bool,
     pub nulls_first: Option<bool>,
+    /// v7.39 (round 538) — an explicit `COLLATE` on the key, as written.
+    /// SPG orders text by bytes, so it changes no comparison; PG prints
+    /// it because a named collation and an inherited one are different
+    /// objects even where they sort identically.
+    pub collation: Option<String>,
     /// v7.9.29 — `CREATE UNIQUE INDEX …`. When true the engine
     /// rejects INSERTs whose key already appears in this index
     /// (combined with `partial_predicate` when present — only
@@ -2700,6 +2705,7 @@ impl Index {
             nulls_not_distinct: false,
             descending: false,
             nulls_first: None,
+            collation: None,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2716,6 +2722,7 @@ impl Index {
             nulls_not_distinct: false,
             descending: false,
             nulls_first: None,
+            collation: None,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2735,6 +2742,7 @@ impl Index {
             nulls_not_distinct: false,
             descending: false,
             nulls_first: None,
+            collation: None,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2755,6 +2763,7 @@ impl Index {
             nulls_not_distinct: false,
             descending: false,
             nulls_first: None,
+            collation: None,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2775,6 +2784,7 @@ impl Index {
             nulls_not_distinct: false,
             descending: false,
             nulls_first: None,
+            collation: None,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2796,6 +2806,7 @@ impl Index {
             nulls_not_distinct: false,
             descending: false,
             nulls_first: None,
+            collation: None,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2818,6 +2829,7 @@ impl Index {
             nulls_not_distinct: false,
             descending: false,
             nulls_first: None,
+            collation: None,
             extra_column_positions: Vec::new(),
         }
     }
@@ -7702,7 +7714,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 83;
+const FILE_VERSION: u8 = 84;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7982,6 +7994,15 @@ impl Catalog {
                     Some(true) => 1,
                     Some(false) => 2,
                 });
+                // v7.39 (round 538) — the key's explicit collation
+                // (FILE_VERSION 84+).
+                match &idx.collation {
+                    Some(c) => {
+                        out.push(1);
+                        write_str(&mut out, c);
+                    }
+                    None => out.push(0),
+                }
             }
             // v6.7.2 — per-table hot_tier_bytes Option<u64>.
             // Layout: [u8 has_value][u64 LE value (if has_value)].

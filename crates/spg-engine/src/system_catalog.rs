@@ -5858,6 +5858,21 @@ pub(crate) fn render_indexdef(
     // across all eight spellings). It decorates whichever form the key
     // took — a bare column is stored as an expression here, so applying
     // it to the column list alone would have been dropped again.
+    // v7.39 (round 538) — an explicit COLLATE on the key is printed.
+    //
+    // Measured: PG shows `(a COLLATE "C")` even on a C-collation
+    // database, because a named collation and the one a column inherits
+    // are different OBJECTS even where they sort identically. It stops
+    // showing it only once the COLUMN itself is declared with that same
+    // collation — and `ColumnSchema` keeps a collation ENUM, not the
+    // name it was declared under, so SPG cannot tell that case apart.
+    // Recorded rather than guessed: the rarer spelling over-prints.
+    let collate_prefix = idx
+        .collation
+        .as_ref()
+        .map_or_else(alloc::string::String::new, |c| {
+            alloc::format!(" COLLATE \"{c}\"")
+        });
     let order_suffix = {
         let mut sfx = alloc::string::String::new();
         if idx.descending {
@@ -5871,7 +5886,7 @@ pub(crate) fn render_indexdef(
         sfx
     };
     let cols = core::iter::once(alloc::format!(
-        "{}{order_suffix}",
+        "{}{collate_prefix}{order_suffix}",
         col_at(idx.column_position)
     ))
     .chain(idx.extra_column_positions.iter().map(|&p| col_at(p)))
@@ -5923,11 +5938,11 @@ pub(crate) fn render_indexdef(
     // with `(` — which a function call never does.
     let key = match &idx.expression {
         Some(expr) if expr.starts_with('(') => {
-            alloc::format!("({expr}){order_suffix}")
+            alloc::format!("({expr}){collate_prefix}{order_suffix}")
         }
         // A bare column is stored here as an expression too, so this is
         // the branch a plain `CREATE INDEX i ON t (a DESC)` takes.
-        Some(expr) => alloc::format!("{expr}{order_suffix}"),
+        Some(expr) => alloc::format!("{expr}{collate_prefix}{order_suffix}"),
         None => cols,
     };
     // v7.39 (round 473) — `NULLS NOT DISTINCT` sits after the key list and

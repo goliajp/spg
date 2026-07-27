@@ -77,15 +77,53 @@ fn round537_unique_index_keeps_its_order() {
     assert_eq!(def(&mut e, "u"), "(a DESC)");
 }
 
+/// v7.39 (round 538) — an explicit COLLATE on the key prints, and
+/// prints BEFORE the direction.
+///
+/// Measured: PG shows `(a COLLATE "C")` even on a C-collation database,
+/// because a named collation and the one a column inherits are
+/// different objects even where they sort identically. SPG orders text
+/// by bytes — the C collation — so honouring the clause changes no
+/// comparison; reproducing it is the whole job.
+#[test]
+fn round538_explicit_collate_on_the_key_prints() {
+    let mut e = engine();
+    e.execute(r#"CREATE INDEX cx ON t (c COLLATE "C")"#).unwrap();
+    assert_eq!(def(&mut e, "cx"), r#"(c COLLATE "C")"#);
+    // Before the direction, as PG orders the two.
+    e.execute(r#"CREATE INDEX cy ON t (c COLLATE "C" DESC)"#)
+        .unwrap();
+    assert_eq!(def(&mut e, "cy"), r#"(c COLLATE "C" DESC)"#);
+    // No clause, nothing printed.
+    e.execute("CREATE INDEX cz ON t (c)").unwrap();
+    assert_eq!(def(&mut e, "cz"), "(c)");
+}
+
+/// A locale collation is still refused rather than absorbed — SPG would
+/// sort differently from PG and says so.
+#[test]
+fn round538_locale_collation_is_still_refused() {
+    let mut e = engine();
+    assert!(
+        e.execute(r#"CREATE INDEX bad ON t (c COLLATE "en_US")"#)
+            .is_err()
+    );
+}
+
 /// It survives a reload, which is what the FILE_VERSION bump is for.
 #[test]
 fn round537_index_order_survives_a_round_trip() {
     let mut e = engine();
     e.execute("CREATE INDEX r ON t (a DESC NULLS LAST)").unwrap();
+    e.execute(r#"CREATE INDEX rc ON t (c COLLATE "C" DESC)"#)
+        .unwrap();
     let before = def(&mut e, "r");
+    let before_c = def(&mut e, "rc");
     let snapshot = e.catalog().serialize();
     let mut back =
         Engine::restore(spg_storage::Catalog::deserialize(&snapshot).expect("roundtrip"));
     assert_eq!(def(&mut back, "r"), before);
     assert_eq!(before, "(a DESC NULLS LAST)");
+    assert_eq!(def(&mut back, "rc"), before_c);
+    assert_eq!(before_c, r#"(c COLLATE "C" DESC)"#);
 }
