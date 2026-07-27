@@ -407,6 +407,63 @@ fn split_index_cond<'a>(
     (None, conjuncts)
 }
 
+/// v7.39 (round 551) — the index that actually serves this condition.
+///
+/// `scan_node` named the table's FIRST BTree index whatever the
+/// predicate was, with a comment saying so ("Approximation … single-index
+/// tables are exact"). On a table with a primary key and a secondary
+/// index that is a plain misstatement:
+///
+///     CREATE TABLE e (id INT PRIMARY KEY, k INT);
+///     CREATE INDEX ek ON e (k);
+///     EXPLAIN SELECT * FROM e WHERE k BETWEEN 10 AND 12;
+///     -> Index Scan using e_pkey on e
+///
+/// naming an index on `id` for a condition on `k`, which it cannot
+/// serve. EXPLAIN is what every perf investigation reads first — this
+/// one included — so an instrument that misnames the access path is
+/// worse than one that says nothing.
+///
+/// The column comes from the condition itself; the index is the one
+/// keyed on it.
+fn index_name_for_cond(engine: &Engine, table: &str, alias: &str, cond: &Expr) -> Option<String> {
+    fn column_of<'a>(e: &'a Expr, out: &mut Vec<&'a spg_sql::ast::ColumnName>) {
+        match e {
+            Expr::Column(c) => out.push(c),
+            Expr::Binary { lhs, rhs, .. } => {
+                column_of(lhs, out);
+                column_of(rhs, out);
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => column_of(expr, out),
+            _ => {}
+        }
+    }
+    let mut refs: Vec<&spg_sql::ast::ColumnName> = Vec::new();
+    column_of(cond, &mut refs);
+    let t = engine.active_catalog().get(table)?;
+    let cols = &t.schema().columns;
+    for r in refs {
+        if let Some(q) = &r.qualifier
+            && !q.eq_ignore_ascii_case(alias)
+            && !q.eq_ignore_ascii_case(table)
+        {
+            continue;
+        }
+        let Some(pos) = cols
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&r.name))
+        else {
+            continue;
+        };
+        if let Some(idx) = t.indices().iter().find(|i| {
+            i.column_position == pos && matches!(i.kind, spg_storage::IndexKind::BTree(_))
+        }) {
+            return Some(idx.name.clone());
+        }
+    }
+    None
+}
+
 /// Render a conjunct list the way PG prints a multi-branch Filter:
 /// `((a) AND (b))`, single conjunct as `(a)`.
 fn pg_conjuncts(list: &[&Expr]) -> String {
@@ -502,35 +559,45 @@ fn scan_node(
         .map(|t| est_width(&t.schema().columns))
         .unwrap_or(8);
     if seek.is_some() {
-        // Name the index the way create-table synthesises it: the first
-        // BTree index on the seek column. Approximation: report the
-        // table's first BTree index name (single-index tables — the
-        // common case — are exact).
-        let idx_name = engine
-            .active_catalog()
-            .get(name)
-            .and_then(|t| {
-                t.indices()
-                    .iter()
-                    .find(|i| matches!(i.kind, spg_storage::IndexKind::BTree(_)))
-                    .map(|i| i.name.clone())
+        // v7.39 (round 226) — PG splits the predicate: the indexed conjunct
+        // goes to Index Cond, everything else to a Filter line beneath it.
+        let a = alias.unwrap_or(name);
+        let split = where_.map(|w| split_index_cond(engine, name, a, w));
+        // v7.39 (round 551) — name the index that actually serves the
+        // condition, not the table's first BTree one.
+        let idx_name = split
+            .as_ref()
+            .and_then(|(cond, _)| cond.as_ref().copied())
+            .or(where_)
+            .and_then(|c| index_name_for_cond(engine, name, a, c))
+            .or_else(|| {
+                engine.active_catalog().get(name).and_then(|t| {
+                    t.indices()
+                        .iter()
+                        .find(|i| matches!(i.kind, spg_storage::IndexKind::BTree(_)))
+                        .map(|i| i.name.clone())
+                })
             })
             .unwrap_or_else(|| alloc::format!("{name}_idx"));
         let mut n = PlanNode::new(alloc::format!(
             "Index Scan using {idx_name} on {name}{alias_sfx}"
         ));
-        // v7.39 (round 226) — PG splits the predicate: the indexed conjunct
-        // goes to Index Cond, everything else to a Filter line beneath it.
         if let Some(w) = where_ {
-            let a = alias.unwrap_or(name);
-            let (cond, residual) = split_index_cond(engine, name, a, w);
+            let (cond, residual) = split.expect("computed alongside where_");
             match cond {
-                Some(c) => n.attrs.push(alloc::format!("Index Cond: {}", pg_cond(c))),
+                Some(c) => {
+                    n.attrs.push(alloc::format!("Index Cond: {}", pg_cond(c)));
+                    if !residual.is_empty() {
+                        n.attrs
+                            .push(alloc::format!("Filter: {}", pg_conjuncts(&residual)));
+                    }
+                }
+                // v7.39 (round 551) — the seek took the WHOLE predicate
+                // (a two-sided range is one seek, not two conjuncts), so
+                // there is no residual. This used to print the same
+                // expression twice: once as Index Cond and again as a
+                // Filter, which reads as a re-check that does not happen.
                 None => n.attrs.push(alloc::format!("Index Cond: {}", pg_cond(w))),
-            }
-            if !residual.is_empty() {
-                n.attrs
-                    .push(alloc::format!("Filter: {}", pg_conjuncts(&residual)));
             }
         }
         let rows = est_scan_rows(table_rows, where_, true);
