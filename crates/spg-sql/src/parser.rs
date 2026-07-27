@@ -7636,6 +7636,99 @@ impl Parser {
     /// `is_user` = the statement said USER, which in PG means LOGIN by default.
     /// The legacy SPG `ROLE 'readwrite'` clause (the coarse read/write/admin
     /// wire role) still parses — it is a different axis from the PG attributes.
+    /// v7.39 (round 547) — is this ALTER ROLE / DATABASE one of the
+    /// SET forms? Peeks past the name (and an `IN DATABASE d`) for SET
+    /// or RESET, so the plain attribute forms keep their old path.
+    fn peeks_db_role_setting(&self) -> bool {
+        let mut i = self.pos + 1; // past the object's name
+        let word = |p: usize| -> Option<String> {
+            match self.tokens.get(p) {
+                Some(Token::Ident(s) | Token::QuotedIdent(s)) => Some(s.to_ascii_lowercase()),
+                Some(Token::In) => Some(String::from("in")),
+                _ => None,
+            }
+        };
+        if word(i).as_deref() == Some("in") && word(i + 1).as_deref() == Some("database") {
+            i += 3; // IN DATABASE <name>
+        }
+        matches!(word(i).as_deref(), Some("set" | "reset"))
+    }
+
+    fn parse_db_role_setting(&mut self, is_database: bool) -> Result<Statement, ParseError> {
+        use crate::ast::SetDbRoleSettingStatement;
+        // `ALTER ROLE ALL SET …` — ALL lexes as a KEYWORD, not an
+        // identifier, so the ordinary name reader refuses it. Same trap
+        // as TABLE / INDEX / FULL / DEFAULT before it.
+        let name = if matches!(self.peek(), Token::All) {
+            self.advance();
+            String::from("all")
+        } else {
+            self.expect_ident_or_string()?
+        };
+        // `ALTER ROLE ALL SET …` is PG's every-role scope (oid 0).
+        let all = name.eq_ignore_ascii_case("all");
+        let (mut database, mut role) = if is_database {
+            (Some(name), None)
+        } else if all {
+            (None, None)
+        } else {
+            (None, Some(name))
+        };
+        if matches!(self.peek(), Token::In) {
+            self.advance();
+            self.advance(); // DATABASE
+            database = Some(self.expect_ident_or_string()?);
+        }
+        let resetting = matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("reset"));
+        self.advance(); // SET | RESET
+        if resetting && matches!(self.peek(), Token::All) {
+            self.advance();
+            self.consume_until_statement_boundary();
+            return Ok(Statement::SetDbRoleSetting(Box::new(
+                SetDbRoleSettingStatement {
+                    database,
+                    role,
+                    param: None,
+                    value: None,
+                },
+            )));
+        }
+        let param = self.expect_ident_like()?;
+        let value = if resetting {
+            None
+        } else {
+            // `SET p = v` and PG's `SET p TO v` both. TO lexes as a
+            // KEYWORD, so the ident-only check missed it and consumed
+            // the word itself as the value — the same trap as ALL, one
+            // clause over.
+            if matches!(self.peek(), Token::Eq | Token::To) || self.peek_keyword_ident("to") {
+                self.advance();
+            }
+            Some(self.take_guc_value())
+        };
+        self.consume_until_statement_boundary();
+        Ok(Statement::SetDbRoleSetting(Box::new(
+            SetDbRoleSettingStatement {
+                database,
+                role,
+                param: Some(param),
+                value,
+            },
+        )))
+    }
+
+    /// The remainder of a `SET <p> = …` clause as PG renders it back:
+    /// a quoted literal loses its quotes, a bare word or number does not.
+    fn take_guc_value(&mut self) -> String {
+        match self.advance() {
+            Token::String(s) => s,
+            Token::Integer(n) => format!("{n}"),
+            Token::Float(f) => format!("{f}"),
+            Token::Ident(s) | Token::QuotedIdent(s) => s,
+            other => format!("{other:?}"),
+        }
+    }
+
     fn parse_create_user_after_keyword(&mut self, is_user: bool) -> Result<Statement, ParseError> {
         let name = self.expect_ident_or_string()?;
         if self.peek_keyword_ident("with") {
@@ -9375,6 +9468,18 @@ impl Parser {
             // the DOMAIN keyword, so the name is next.
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("domain") => {
                 return self.parse_alter_domain_after_keyword();
+            }
+            // v7.39 (round 547) — `ALTER ROLE|USER <r> [IN DATABASE <d>]
+            // SET|RESET …` and `ALTER DATABASE <d> SET|RESET …`. These
+            // used to fall into the pg_dump no-op tail below, so a DBA
+            // setting a per-role default was told it worked and nothing
+            // happened. Intercepted here, BEFORE that tail.
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if matches!(s.to_ascii_lowercase().as_str(), "role" | "user" | "database")
+                    && self.peeks_db_role_setting() =>
+            {
+                let is_database = s.eq_ignore_ascii_case("database");
+                return self.parse_db_role_setting(is_database);
             }
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(

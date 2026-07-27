@@ -920,6 +920,11 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         // ELEVENTH appendix this test has caught — which is exactly what
         // it is for.
         const EMPTY_FUNCTION_ATTR_BLOCK: usize = 4;
+        // v7.39 (round 547) — the pg_db_role_setting block (FILE_VERSION
+        // 85), appended last; empty is a u32 zero count. TWELFTH
+        // appendix this test has caught, and it caught this one on the
+        // first run — which is the whole point of it.
+        const EMPTY_DB_ROLE_SETTING_BLOCK: usize = 4;
         full.truncate(
             full.len()
                 - 4
@@ -928,7 +933,8 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
                 - EMPTY_RULE_BLOCK
                 - EMPTY_STATS_EXT_BLOCK
                 - EMPTY_LARGE_OBJECT_BLOCK
-                - EMPTY_FUNCTION_ATTR_BLOCK,
+                - EMPTY_FUNCTION_ATTR_BLOCK
+                - EMPTY_DB_ROLE_SETTING_BLOCK,
         );
         full
     };

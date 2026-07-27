@@ -365,6 +365,33 @@ impl Engine {
         self.render_style
     }
 
+    /// v7.39 (round 547) — apply the GUC defaults `ALTER ROLE … SET` /
+    /// `ALTER DATABASE … SET` recorded, in PG's order of specificity.
+    ///
+    /// Measured on PG18: with all four scopes set, a new session got the
+    /// role-in-database value. So the least specific is applied first and
+    /// the most specific last, each overwriting.
+    pub fn apply_db_role_settings(&mut self, database: &str, role: &str) {
+        let scopes: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> = alloc::vec![
+            (alloc::string::String::new(), alloc::string::String::new()),
+            (alloc::string::String::from(database), alloc::string::String::new()),
+            (alloc::string::String::new(), alloc::string::String::from(role)),
+            (alloc::string::String::from(database), alloc::string::String::from(role)),
+        ];
+        let mut apply: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> =
+            alloc::vec::Vec::new();
+        for key in &scopes {
+            if let Some(params) = self.active_catalog().db_role_settings().get(key) {
+                for (k, v) in params {
+                    apply.push((k.clone(), v.clone()));
+                }
+            }
+        }
+        for (k, v) in apply {
+            let _ = self.execute(&alloc::format!("SET {k} = '{v}'"));
+        }
+    }
+
     /// v7.39 (tz epic) — per-statement session TimeZone snapshot for
     /// the timestamptz renderers. SET already validated the value, so
     /// an unresolvable name here (host lost its tzdb) degrades to UTC.

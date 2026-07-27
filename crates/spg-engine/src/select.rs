@@ -816,6 +816,10 @@ impl Engine {
                 // (mailrs embed round-12).
                 // v7.39 (round 546) — the catalogs SPG has real content
                 // for, from the facts it already holds.
+                "__spg_pg_db_role_setting" => {
+                    let (schema, rows) = crate::system_catalog::synth_pg_db_role_setting(self);
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 "__spg_pg_language" => {
                     let (schema, rows) = crate::system_catalog::synth_pg_language();
                     materialise_meta_view(&mut catalog, view, schema, rows)?;

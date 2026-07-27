@@ -122,9 +122,28 @@ pub enum MaintainKind {
     ClusterRelation,
 }
 
+/// v7.39 (round 547) — see [`Statement::SetDbRoleSetting`]. Boxed in the
+/// enum so the variant costs one pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetDbRoleSettingStatement {
+    pub database: Option<String>,
+    pub role: Option<String>,
+    pub param: Option<String>,
+    pub value: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Statement::Select dominates; Boxing would touch every match site
 pub enum Statement {
+    /// v7.39 (round 547) — `ALTER ROLE … SET/RESET` and
+    /// `ALTER DATABASE … SET/RESET`: the GUC defaults a session picks up
+    /// when it starts. Both used to land in the pg_dump no-op tail, so
+    /// the statement reported success and changed nothing.
+    ///
+    /// `database` / `role` are `None` for PG's oid 0 — `ALTER ROLE ALL`
+    /// sets both to None. `param` is `None` for RESET ALL. `value` is
+    /// `None` for RESET of one parameter.
+    SetDbRoleSetting(Box<SetDbRoleSettingStatement>),
     /// v7.39 (round 288) — `SET CONSTRAINTS { ALL | <name>… }
     /// { DEFERRED | IMMEDIATE }`. `deferred` carries the timing; the
     /// name list is not yet honoured (ALL is what pg_dump emits and
@@ -4566,6 +4585,8 @@ impl Statement {
             // state, and IMMEDIATE can run the deferred checks there and
             // then; writer-path.
             Statement::SetConstraints { .. } => false,
+            // v7.39 (round 547) — records a GUC default in the catalog.
+            Statement::SetDbRoleSetting(_) => false,
             // v7.39 (round 535) — REINDEX / CLUSTER rebuild nothing here,
             // but they name a relation and PG refuses one that is not
             // there, so they are not read-only in the sense this asks.
@@ -4849,6 +4870,22 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => Ok(()),
+            // v7.39 (round 547) — round-trips as PG writes it.
+            Self::SetDbRoleSetting(st) => {
+                match (&st.database, &st.role) {
+                    (Some(d), None) => write!(f, "ALTER DATABASE {d}")?,
+                    (_, Some(r)) => write!(f, "ALTER ROLE {r}")?,
+                    (None, None) => f.write_str("ALTER ROLE ALL")?,
+                }
+                if let (Some(d), Some(_)) = (&st.database, &st.role) {
+                    write!(f, " IN DATABASE {d}")?;
+                }
+                match (&st.param, &st.value) {
+                    (None, _) => f.write_str(" RESET ALL"),
+                    (Some(p), None) => write!(f, " RESET {p}"),
+                    (Some(p), Some(v)) => write!(f, " SET {p} = '{v}'"),
+                }
+            }
             Self::Maintain { kind, target } => {
                 f.write_str(match kind {
                     crate::ast::MaintainKind::ClusterRelation => "CLUSTER ",

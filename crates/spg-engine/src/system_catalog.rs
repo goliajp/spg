@@ -5188,13 +5188,11 @@ pub(crate) fn synth_pg_auth_members(engine: &Engine) -> (Vec<ColumnSchema>, Vec<
 ///
 /// Column names and types are PG18 readings.
 const EMPTY_PG_CATALOGS: &[(&str, &[(&str, DataType)])] = &[
-    // v7.39 (round 546) — three more PG catalogs SPG is genuinely empty
-    // of: it has no ALTER DEFAULT PRIVILEGES, one encoding (so no
-    // conversions between any), and it records no per-role or
-    // per-database GUC settings.
+    // v7.39 (round 546) — two more PG catalogs SPG is genuinely empty
+    // of: it has no ALTER DEFAULT PRIVILEGES and one encoding, so there
+    // are no conversions between any.
     ("pg_default_acl", &[("oid", DataType::BigInt), ("defaclrole", DataType::BigInt), ("defaclnamespace", DataType::BigInt), ("defaclobjtype", DataType::Text), ("defaclacl", DataType::TextArray)]),
     ("pg_conversion", &[("oid", DataType::BigInt), ("conname", DataType::Text), ("connamespace", DataType::BigInt), ("conowner", DataType::BigInt), ("conforencoding", DataType::Int), ("contoencoding", DataType::Int), ("conproc", DataType::BigInt), ("condefault", DataType::Bool)]),
-    ("pg_db_role_setting", &[("setdatabase", DataType::BigInt), ("setrole", DataType::BigInt), ("setconfig", DataType::TextArray)]),
     ("pg_event_trigger", &[("oid", DataType::BigInt), ("evtname", DataType::Text), ("evtevent", DataType::Text), ("evtowner", DataType::BigInt), ("evtfoid", DataType::BigInt), ("evtenabled", DataType::Text), ("evttags", DataType::TextArray)]),
     ("pg_file_settings", &[("sourcefile", DataType::Text), ("sourceline", DataType::Int), ("seqno", DataType::Int), ("name", DataType::Text), ("setting", DataType::Text), ("applied", DataType::Bool), ("error", DataType::Text)]),
     ("pg_foreign_data_wrapper", &[("oid", DataType::BigInt), ("fdwname", DataType::Text), ("fdwowner", DataType::BigInt), ("fdwhandler", DataType::BigInt), ("fdwvalidator", DataType::BigInt), ("fdwacl", DataType::TextArray), ("fdwoptions", DataType::TextArray)]),
@@ -5332,6 +5330,55 @@ pub(crate) fn synth_pg_group(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'st
 /// synth_pg_authid.
 pub(crate) fn synth_pg_shadow(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     synth_pg_user(engine)
+}
+
+/// v7.39 (round 547) — `pg_catalog.pg_db_role_setting`, for real.
+///
+/// Round 546 put this in the empty family on the grounds that SPG
+/// recorded no per-role settings. It did not record them because
+/// `ALTER ROLE … SET` fell into the parser's pg_dump no-op tail — the
+/// statement reported success and changed nothing. It records them now.
+///
+/// PG's keying, measured: setdatabase and setrole are oid 0 for "all",
+/// so `ALTER ROLE ALL SET` is (0, 0), `ALTER DATABASE d SET` is (d, 0),
+/// `ALTER ROLE r SET` is (0, r) and `ALTER ROLE r IN DATABASE d SET` is
+/// (d, r).
+pub(crate) fn synth_pg_db_role_setting(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("setdatabase", DataType::BigInt, false),
+        ColumnSchema::new("setrole", DataType::BigInt, false),
+        ColumnSchema::new("setconfig", DataType::TextArray, true),
+    ];
+    let (_, roles) = synth_pg_roles(engine);
+    let role_oid = |name: &str| -> i64 {
+        roles
+            .iter()
+            .find(|r| matches!(&r.values[0], Value::Text(n) if n.eq_ignore_ascii_case(name)))
+            .and_then(|r| match &r.values[12] {
+                Value::BigInt(o) => Some(*o),
+                _ => None,
+            })
+            .unwrap_or(0)
+    };
+    let rows = engine
+        .active_catalog()
+        .db_role_settings()
+        .iter()
+        .map(|((db, role), params)| {
+            let config: Vec<Option<alloc::string::String>> = params
+                .iter()
+                .map(|(k, v)| Some(alloc::format!("{k}={v}")))
+                .collect();
+            Row::new(alloc::vec![
+                // SPG has one database; its oid is the one pg_database
+                // publishes.
+                Value::BigInt(if db.is_empty() { 0 } else { 16384 }),
+                Value::BigInt(if role.is_empty() { 0 } else { role_oid(role) }),
+                Value::TextArray(config),
+            ])
+        })
+        .collect();
+    (schema, rows)
 }
 
 /// v7.39 (round 546) — `pg_catalog.pg_language`: the languages a
