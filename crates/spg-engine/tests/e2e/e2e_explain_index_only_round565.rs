@@ -28,10 +28,11 @@
 //! wearing the other face, so the pins below include every shape that
 //! must still say `Index Scan`.
 //!
-//! Recorded, not done: PG says `Index Only Scan` for `WHERE k = 5` too.
-//! SPG's fast path is range-only, so its plan says `Index Scan` there —
-//! which is honest about what runs, and a real gap in the path rather
-//! than in EXPLAIN.
+//! Recorded, not done at the time: PG says `Index Only Scan` for
+//! `WHERE k = 5` too, and SPG's fast path was range-only, so its plan
+//! said `Index Scan` there — honest about what ran, and a gap in the
+//! path rather than in EXPLAIN. Round 566 closed the path, so the pin
+//! below now expects the same node PG names.
 
 use spg_engine::{Engine, QueryResult};
 
@@ -102,10 +103,13 @@ fn round565_other_shapes_stay_index_scan() {
         !head(&mut e, "EXPLAIN SELECT id FROM p565 WHERE k BETWEEN 1 AND 100")
             .contains("Index Only Scan")
     );
-    // Equality is not a range, so the fast path declines it.
+    // Equality reached the fast path in round 566 — the degenerate
+    // range — so it names what PG names.
     let eq = head(&mut e, "EXPLAIN SELECT k FROM p565 WHERE k = 5");
-    assert!(eq.contains("Index Scan using p565k on p565"), "{eq}");
-    assert!(!eq.contains("Index Only Scan"), "{eq}");
+    assert!(eq.contains("Index Only Scan using p565k on p565"), "{eq}");
+    // …but reading a different column still fetches the row.
+    let eq_fetch = head(&mut e, "EXPLAIN SELECT id FROM p565 WHERE k = 5");
+    assert!(!eq_fetch.contains("Index Only Scan"), "{eq_fetch}");
     // ORDER BY / LIMIT / DISTINCT are outside the shape.
     for sql in [
         "EXPLAIN SELECT k FROM p565 WHERE k BETWEEN 1 AND 100 ORDER BY k",

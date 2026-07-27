@@ -719,7 +719,7 @@ pub(crate) fn index_only_precheck<'t>(
     Bound<IndexKey>,
     &'t spg_storage::Index,
 )> {
-    let (col_pos, lo, hi) = parse_range_bounds(where_expr, schema_cols, table_alias)?;
+    let (col_pos, lo, hi) = parse_index_only_bounds(where_expr, schema_cols, table_alias)?;
     if col_pos != projected {
         return None;
     }
@@ -738,6 +738,51 @@ pub(crate) fn index_only_precheck<'t>(
     }
     let idx = table.index_on(col_pos)?;
     Some((ty, lo, hi, idx))
+}
+
+/// v7.39 (round 566) — the predicates an index-only scan can serve:
+/// a two-sided range, or an equality, which is the degenerate range
+/// `[k, k]`.
+///
+/// Equality was left out when round 560 built this, and it is the
+/// commoner query. On 500k rows with 50 distinct values, `WHERE g = 7`
+/// returns 10k of them:
+///
+///     SPG  9.5 ms      PG18  4.5 ms      2.1x
+///
+/// — the same loss the range shape carried before round 564, in the
+/// shape people write more often.
+///
+/// The enum guard `parse_range_bounds` applies does not reach here, and
+/// deliberately: it exists because the index orders labels
+/// lexicographically while PG orders them by catalog position, so a
+/// RANGE walk would under-select. Equality does not depend on the
+/// order — its own comment in `try_index_seek_positions` says so.
+fn parse_index_only_bounds(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table_alias: &str,
+) -> Option<(usize, Bound<IndexKey>, Bound<IndexKey>)> {
+    if let Some(r) = parse_range_bounds(where_expr, schema_cols, table_alias) {
+        return Some(r);
+    }
+    let Expr::Binary {
+        lhs,
+        op: BinOp::Eq,
+        rhs,
+    } = where_expr
+    else {
+        return None;
+    };
+    let (col_pos, value) = resolve_col_literal_pair(lhs, rhs, schema_cols, table_alias)
+        .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
+    // `col = NULL` is never true, and an index that stores NULL keys
+    // would happily hand rows back for it.
+    if value.is_null() {
+        return None;
+    }
+    let key = IndexKey::from_value(&value)?;
+    Some((col_pos, Bound::Included(key.clone()), Bound::Included(key)))
 }
 
 /// Which declared types an index key comes back as unambiguously.

@@ -125,6 +125,7 @@ mod e2e_mysqldump_preamble_round554;
 mod e2e_work_mem_verified_round555;
 mod e2e_count_star_round559;
 mod e2e_explain_index_only_round565;
+mod e2e_index_only_equality_round566;
 mod e2e_index_only_runs_round562;
 mod e2e_index_only_scan_round560;
 mod e2e_unary_plus_round507;
