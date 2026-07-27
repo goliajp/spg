@@ -113,6 +113,7 @@ mod e2e_catalog_system_columns_round540;
 mod e2e_pg_catalog_reach_round541;
 mod e2e_pg_catalog_columns_round542;
 mod e2e_pg_catalog_columns_round543;
+mod e2e_cast_gaps_round544;
 mod e2e_unary_plus_round507;
 mod e2e_cardinality_violation;
 mod e2e_casefold;

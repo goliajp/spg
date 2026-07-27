@@ -814,6 +814,12 @@ impl Engine {
                 }
                 // pg_catalog.pg_extension — native capability list
                 // (mailrs embed round-12).
+                // v7.39 (round 544) — pg_cast, probed from the real
+                // cast implementation.
+                "__spg_pg_cast" => {
+                    let (schema, rows) = crate::system_catalog::synth_pg_cast();
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.39 (round 541) — an empty catalog that exists.
                 "__spg_pg_foreign_table" => {
                     let (schema, rows) = crate::system_catalog::synth_pg_foreign_table();
