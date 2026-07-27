@@ -90,7 +90,12 @@ fn main() {
         "INSERT INTO j SELECT gg, gg % 50 FROM generate_series(1, {n}) gg"
     ))
     .unwrap();
-    let sql = "SELECT count(*) FROM j a JOIN j b ON a.id = b.id WHERE a.id < 100 AND b.id < 100";
+    // v7.39 (round 580) — the query is an argument now, so the same
+    // loop can stand behind a profile of any shape.
+    let sql: String = std::env::args().nth(3).unwrap_or_else(|| {
+        "SELECT count(*) FROM j a JOIN j b ON a.id = b.id WHERE a.id < 100 AND b.id < 100".into()
+    });
+    let sql: &str = &sql;
 
     // v7.39 (round 579) — the two entries the two processes use, in one
     // process. `execute` takes `&mut Engine` and is what this probe has
@@ -134,7 +139,7 @@ fn main() {
                     Ok(())
                 })
                 .unwrap();
-                assert_eq!(n, 1, "one row of output");
+                assert!(n >= 1, "the query must return rows");
             }),
         );
         println!("readonly streaming (&Engine, pgwire)  {runs:5} runs, {ms:6.2} ms each");

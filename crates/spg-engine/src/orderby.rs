@@ -1085,7 +1085,18 @@ pub(crate) fn topk_trim_recycling<'a>(
     pool: &mut Vec<Vec<Value<'a>>>,
     key_pool: &mut Vec<Vec<OrderKey>>,
 ) {
-    if keep > 0 && tagged.len() >= keep.saturating_mul(2) {
+    // v7.39 (round 580) — trim on a floor, not on `2k` alone.
+    //
+    // `2 * keep` means a `LIMIT 10` over 500k rows trims fifty thousand
+    // times: each one a `select_nth_unstable_by` over twenty elements
+    // plus a drain and a return to the pool. A profile of that query put
+    // 8.6% of it in the comparator alone, more than any other symbol.
+    // Selecting the same k out of a larger batch costs the same O(n)
+    // per element but pays the call and drain overhead a hundredth as
+    // often; the accumulator stays bounded, just by a bigger constant.
+    const TRIM_FLOOR: usize = 1024;
+    let trigger = keep.saturating_mul(2).max(TRIM_FLOOR);
+    if keep > 0 && tagged.len() >= trigger {
         let cmp = |a: &(Vec<OrderKey>, Row<'a>), b: &(Vec<OrderKey>, Row<'a>)| {
             cmp_multi_key(&a.0, &b.0, descs)
         };

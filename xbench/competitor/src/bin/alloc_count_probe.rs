@@ -144,6 +144,13 @@ fn main() {
             "join, both 20k",
             "SELECT count(*) FROM j a JOIN j b ON a.id = b.id WHERE a.id < 20000 AND b.id < 20000",
         ),
+        // v7.39 (round 580) — the shape that survives round 579's warm
+        // re-measurement as a real loss: ORDER BY + LIMIT at 2.47x.
+        ("order by desc limit 1", "SELECT id FROM j ORDER BY id DESC LIMIT 1"),
+        ("order by desc limit 10", "SELECT id FROM j ORDER BY id DESC LIMIT 10"),
+        ("order by asc limit 10", "SELECT id FROM j ORDER BY id LIMIT 10"),
+        ("order by two keys", "SELECT id FROM j ORDER BY g DESC, id DESC LIMIT 10"),
+        ("max(id), same answer", "SELECT max(id) FROM j"),
     ] {
         let (allocs, bytes, frees, ms) = measure(&mut e, sql);
         #[allow(clippy::cast_precision_loss)]
