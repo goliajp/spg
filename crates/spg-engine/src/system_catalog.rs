@@ -5233,6 +5233,40 @@ pub(crate) fn synth_empty_pg_catalog(
     Some((schema, Vec::new()))
 }
 
+/// v7.39 (round 544) — `pg_catalog.pg_cast`, empty, and why.
+///
+/// PG's pg_cast is a REGISTRY, not a description of what converts. It
+/// lists `bool → text` (a registered function) and does NOT list
+/// `int4 → text`, which PG resolves through the type's I/O functions
+/// without a row. So its content is not derivable from behaviour.
+///
+/// SPG has no registry at all: `cast_value` is one dispatch on the
+/// target type, and there is no CREATE CAST to add to. Listing none is
+/// the accurate answer to the question this catalog asks, and it lets a
+/// tool reading it conclude "no user-defined casts here" rather than
+/// stop, which is what pg_dump did.
+///
+/// This round DID try deriving the rows by probing the real cast
+/// function, and threw the result away: measured against PG18 over the
+/// thirty-seven types SPG catalogues, the probe reported 180 pairs PG
+/// does not list (the I/O family) and missed 31 that it does — some of
+/// those only because the sample value chosen for a type could not
+/// convert, which makes a working cast look absent. A catalog built on
+/// a heuristic is not a catalog. What the comparison DID find — the
+/// conversions PG performs and SPG refused — is fixed in eval/cast.rs
+/// this round.
+pub(crate) fn synth_pg_cast() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("castsource", DataType::BigInt, false),
+        ColumnSchema::new("casttarget", DataType::BigInt, false),
+        ColumnSchema::new("castfunc", DataType::BigInt, false),
+        ColumnSchema::new("castcontext", DataType::Text, false),
+        ColumnSchema::new("castmethod", DataType::Text, false),
+    ];
+    (schema, Vec::new())
+}
+
 /// v7.39 (round 541) — `pg_catalog.pg_foreign_table`, empty.
 ///
 /// `pg_dump` reads it for every relation of kind 'f':

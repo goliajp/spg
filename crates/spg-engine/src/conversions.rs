@@ -3776,6 +3776,39 @@ pub(crate) fn mysql_bytes_for_column(
     }
 }
 
+/// v7.39 (round 544) — `timetz → time` and `interval → time`.
+///
+/// Measured on PG18:
+///
+///     '10:20:30.5'::timetz::time      10:20:30.5   (the zone is dropped,
+///                                                   the wall clock kept)
+///     '25:00:00'::interval::time      01:00:00     (modulo 24 hours)
+///     '-1 hour'::interval::time       23:00:00     (and negatives wrap)
+///     '1 day 02:00:00'::interval::time 02:00:00    (days do not count)
+///
+/// `time → timetz` and `timestamp(tz) → time` are NOT here: the first
+/// needs the session zone to attach, and the second needs to know which
+/// of the two timestamp types the source was — `Value::Timestamp` is
+/// the same variant for both, so answering from the value would be
+/// right for `timestamp` and off by the session offset for
+/// `timestamptz`. An error beats a silent wrong answer.
+fn try_coerce_time_family(
+    v: &Value<'static>,
+    expected: DataType,
+) -> Option<Result<Value<'static>, EngineError>> {
+    const DAY_US: i64 = 86_400_000_000;
+    if expected != DataType::Time {
+        return None;
+    }
+    match v {
+        Value::TimeTz { us, .. } => Some(Ok(Value::Time(*us))),
+        Value::Interval { micros, .. } => {
+            Some(Ok(Value::Time(micros.rem_euclid(DAY_US))))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn coerce_value(
     v: Value<'static>,
     expected: DataType,
@@ -3793,6 +3826,12 @@ pub(crate) fn coerce_value(
         if let Some(res) = try_coerce_json_scalar(s, expected, col_name, position) {
             return res;
         }
+    }
+    // v7.39 (round 544) — the temporal conversions PG performs and SPG
+    // refused outright. Found by comparing a probe of SPG's own cast
+    // function against PG18's pg_cast; see synth_pg_cast's note.
+    if let Some(res) = try_coerce_time_family(&v, expected) {
+        return res;
     }
     // v7.39 (read01 round 54) — `data_type()` is None for the eval-only
     // variants that carry no DataType (RegClass, Composite): they are NOT

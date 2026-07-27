@@ -343,6 +343,35 @@ fn cast_mysql_integer(v: Value<'static>, unsigned: bool) -> Result<Value<'static
     ))
 }
 
+/// v7.39 (round 544) — the integer a bytea's bytes spell: big-endian,
+/// right-aligned into `width` bytes, sign-extended from the leading
+/// byte when the value already fills the width. Measured on PG18:
+/// `'\x05'::bytea::int8` is 5, `'\x'::bytea::int4` is 0,
+/// `'\xffffffff'::bytea::int4` is -1.
+#[inline(never)]
+fn bytea_to_integer(v: &Value<'static>, width: usize) -> Result<Value<'static>, EvalError> {
+    let Value::Bytes(b) = v else {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::string::String::from("expected bytea"),
+        });
+    };
+    if b.len() > width {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!("bytea of {} bytes is too wide for the target", b.len()),
+        });
+    }
+    let negative = b.len() == width && b.first().is_some_and(|f| *f & 0x80 != 0);
+    let mut acc: i64 = if negative { -1 } else { 0 };
+    for byte in b.iter() {
+        acc = (acc << 8) | i64::from(*byte);
+    }
+    Ok(if width == 4 {
+        Value::Int(i32::try_from(acc).unwrap_or(0))
+    } else {
+        Value::BigInt(acc)
+    })
+}
+
 /// Round a numeric operand (`scaled` × 10^-`scale`) to the nearest
 /// integer, half-away-from-zero — PG's `numeric → int` coercion rule.
 fn numeric_round_to_i128(scaled: i128, scale: u16) -> i128 {
@@ -422,6 +451,11 @@ pub fn cast_value_in(
                 Value::Int(i32::try_from(oid).unwrap_or(i32::MAX))
             })
         }
+        // v7.39 (round 544) — bytea reads back as the integer its bytes
+        // spell, big-endian and right-aligned. Measured on PG18:
+        // '\x05'::bytea::int8 is 5, '\x'::bytea::int4 is 0.
+        CastTarget::Int if matches!(v, Value::Bytes(_)) => bytea_to_integer(&v, 4),
+        CastTarget::BigInt if matches!(v, Value::Bytes(_)) => bytea_to_integer(&v, 8),
         CastTarget::Int => cast_numeric_special_reject(&v, "integer")
             .unwrap_or_else(|| cast_numeric_to_int(v)),
         CastTarget::BigInt => cast_numeric_special_reject(&v, "bigint")
@@ -457,7 +491,17 @@ pub fn cast_value_in(
         // v7.9.25 — `expr::INTERVAL`. Currently only TEXT → Interval
         // is supported (the mailrs idiom: `$1::INTERVAL` where the
         // bound param is a string like `'7 days'`).
-        CastTarget::Interval => cast_to_interval(v),
+        // v7.39 (round 544) — a time-of-day IS an interval of that
+        // length. Measured: '10:20:30.123456'::time::interval reads
+        // 10:20:30.123456 on PG18, fractional seconds and all.
+        CastTarget::Interval => match v {
+            Value::Time(us) => Ok(Value::Interval {
+                months: 0,
+                days: 0,
+                micros: us,
+            }),
+            other => cast_to_interval(other),
+        },
         // v7.9.25 — `::json` keeps the input text verbatim (PG's json
         // type preserves whitespace / key order / duplicates).
         CastTarget::Json => match v {
@@ -670,9 +714,16 @@ pub fn cast_value_in(
                     detail: alloc::format!("invalid input syntax for type bytea: {msg}"),
                 }),
             },
+            // v7.39 (round 544) — an integer's two's-complement bytes,
+            // big-endian, at the source type's width. Measured on PG18:
+            // 5::int2 -> \x0005, 5::int4 -> \x00000005,
+            // 5::int8 -> \x0000000000000005, (-1)::int4 -> \xffffffff.
+            Value::SmallInt(n) => Ok(Value::bytes(n.to_be_bytes().to_vec())),
+            Value::Int(n) => Ok(Value::bytes(n.to_be_bytes().to_vec())),
+            Value::BigInt(n) => Ok(Value::bytes(n.to_be_bytes().to_vec())),
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "::bytea only accepts TEXT / bytea inputs, got {:?}",
+                    "::bytea only accepts TEXT / bytea / integer inputs, got {:?}",
                     other.data_type()
                 ),
             }),
