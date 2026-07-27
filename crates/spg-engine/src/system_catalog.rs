@@ -691,6 +691,10 @@ pub(crate) fn synth_information_schema_schemata(
         ColumnSchema::new("sql_path", DataType::Text, true),
     ];
     let rows: Vec<Row<'static>> = alloc::vec![
+        // v7.39 (round 543) — this row carried TEN values against a
+        // seven-column schema. Round 543's width check at
+        // materialise_meta_view is what found it; nothing had, because
+        // a row is an untyped value list.
         Row::new(alloc::vec![
             Value::text("spg"),
             Value::text("public"),
@@ -1199,8 +1203,13 @@ pub(crate) fn synth_pg_statistic_ext(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<R
         ColumnSchema::new("stxname", DataType::Text, false),
         ColumnSchema::new("stxnamespace", DataType::BigInt, false),
         ColumnSchema::new("stxowner", DataType::BigInt, false),
-        ColumnSchema::new("stxkind", DataType::Text, false),
+        // v7.39 (round 543) — PG's order is stxkeys, stxstattarget,
+        // stxkind, stxexprs; SPG had the first two swapped and the
+        // other two missing.
         ColumnSchema::new("stxkeys", DataType::Text, false),
+        ColumnSchema::new("stxstattarget", DataType::SmallInt, true),
+        ColumnSchema::new("stxkind", DataType::Text, false),
+        ColumnSchema::new("stxexprs", DataType::Text, true),
     ];
     // v7.39 (round 280) — one row per catalogued CREATE STATISTICS.
     // The view was shape-stable empty because the statement was
@@ -1215,8 +1224,10 @@ pub(crate) fn synth_pg_statistic_ext(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<R
                 Value::text(st.name.clone()),
                 Value::BigInt(2200),
                 Value::BigInt(0),
-                Value::text(alloc::format!("{{{}}}", st.kinds.join(","))),
                 Value::text(st.columns.join(" ")),
+                Value::Null, // stxstattarget — the default target
+                Value::text(alloc::format!("{{{}}}", st.kinds.join(","))),
+                Value::Null, // stxexprs — SPG has no expression statistics
             ])
         })
         .collect();
@@ -1462,6 +1473,12 @@ pub(crate) fn synth_pg_collation(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("collencoding", DataType::Int, false),
         ColumnSchema::new("collcollate", DataType::Text, true),
         ColumnSchema::new("collctype", DataType::Text, true),
+        // v7.39 (round 543) — PG18 tail columns, measured.
+        // PG18 reads all three NULL for C / POSIX / default —
+        // colllocale carries a name only for an ICU collation.
+        ColumnSchema::new("colllocale", DataType::Text, true),
+        ColumnSchema::new("collicurules", DataType::Text, true),
+        ColumnSchema::new("collversion", DataType::Text, true),
     ];
     // PG hard-codes OIDs 100 = default, 950 = C, 951 = POSIX.
     let rows = alloc::vec![
@@ -1475,6 +1492,9 @@ pub(crate) fn synth_pg_collation(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             Value::Int(-1),
             Value::Null,
             Value::Null,
+            Value::Null, // colllocale
+            Value::Null, // collicurules
+            Value::Null, // collversion
         ]),
         Row::new(alloc::vec![
             Value::BigInt(950),
@@ -1486,6 +1506,9 @@ pub(crate) fn synth_pg_collation(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             Value::Int(-1),
             Value::text("C"),
             Value::text("C"),
+            Value::Null,
+            Value::Null,
+            Value::Null,
         ]),
         Row::new(alloc::vec![
             Value::BigInt(951),
@@ -1497,6 +1520,9 @@ pub(crate) fn synth_pg_collation(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             Value::Int(-1),
             Value::text("POSIX"),
             Value::text("POSIX"),
+            Value::Null,
+            Value::Null,
+            Value::Null,
         ]),
     ];
     (schema, rows)
@@ -2129,6 +2155,9 @@ pub(crate) fn synth_pg_publication(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("pubdelete", DataType::Bool, false),
         ColumnSchema::new("pubtruncate", DataType::Bool, false),
         ColumnSchema::new("pubviaroot", DataType::Bool, false),
+        // v7.39 (round 543) — PG18's generated-column mode. Measured on
+        // a fresh `CREATE PUBLICATION … FOR ALL TABLES`: 'n' (none).
+        ColumnSchema::new("pubgencols", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     // Synthetic OID band — pubs land above the table OID band
@@ -2147,6 +2176,7 @@ pub(crate) fn synth_pg_publication(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
             Value::Bool(true),  // pubdelete
             Value::Bool(true),  // pubtruncate
             Value::Bool(false), // pubviaroot
+            Value::text("n"),   // pubgencols
         ]));
     }
     (schema, rows)
@@ -3097,6 +3127,15 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         // v7.39 (read01 round 59) — column-level privileges. NULL until a
         // `GRANT SELECT (col)` lands; a column grant never touches relacl.
         ColumnSchema::new("attacl", DataType::Text, true),
+        // v7.39 (round 543) — PG18's tail. They land here rather than at
+        // PG's positions because SPG's pg_attribute order already
+        // differs from PG's (attstattarget sits fourth where PG keeps it
+        // twenty-first); reordering the whole thing is its own change.
+        ColumnSchema::new("attcompression", DataType::Text, false),
+        ColumnSchema::new("atthasmissing", DataType::Bool, false),
+        ColumnSchema::new("attoptions", DataType::Text, true),
+        ColumnSchema::new("attfdwoptions", DataType::Text, true),
+        ColumnSchema::new("attmissingval", DataType::Text, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut attrelid: i64 = 16384;
@@ -3172,6 +3211,14 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Int(0),      // attinhcount
                 Value::BigInt(0),   // attcollation — 0 (default)
                 crate::acl::render_acl_list(&col.acl).map_or(Value::Null, Value::text),
+                // v7.39 (round 543) — PG18's tail, measured on a plain
+                // table: attcompression empty, atthasmissing false,
+                // the rest NULL.
+                Value::text(""),    // attcompression
+                Value::Bool(false), // atthasmissing
+                Value::Null,        // attoptions
+                Value::Null,        // attfdwoptions
+                Value::Null,        // attmissingval
             ]));
         }
         attrelid = attrelid.saturating_add(1);
@@ -3223,6 +3270,14 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Int(0),
                 Value::BigInt(0),
                 Value::Null, // attacl
+                // v7.39 (round 543) — PG18's tail, measured on a plain
+                // table: attcompression empty, atthasmissing false,
+                // the rest NULL.
+                Value::text(""),    // attcompression
+                Value::Bool(false), // atthasmissing
+                Value::Null,        // attoptions
+                Value::Null,        // attfdwoptions
+                Value::Null,        // attmissingval
             ]));
         }
     }
@@ -3326,6 +3381,20 @@ pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         ColumnSchema::new("typsubscript", DataType::Text, false),
         ColumnSchema::new("typelem", DataType::BigInt, false),
         ColumnSchema::new("typarray", DataType::BigInt, false),
+        // v7.39 (round 543) — PG names the type's I/O functions here.
+        // SPG's I/O is built into the engine and is not a catalogued
+        // function, so there is no pg_proc row to point at; naming one
+        // would leave `pg_type JOIN pg_proc ON proname = typinput::text`
+        // dangling. 0 is the value PG itself uses for a type with no
+        // such function — which is what typmodin/typmodout/typanalyze
+        // read on PG for int4 and text, measured.
+        ColumnSchema::new("typinput", DataType::BigInt, false),
+        ColumnSchema::new("typoutput", DataType::BigInt, false),
+        ColumnSchema::new("typreceive", DataType::BigInt, false),
+        ColumnSchema::new("typsend", DataType::BigInt, false),
+        ColumnSchema::new("typmodin", DataType::BigInt, false),
+        ColumnSchema::new("typmodout", DataType::BigInt, false),
+        ColumnSchema::new("typanalyze", DataType::BigInt, false),
         ColumnSchema::new("typalign", DataType::Text, false),
         ColumnSchema::new("typstorage", DataType::Text, false),
         ColumnSchema::new("typnotnull", DataType::Bool, false),
@@ -3333,6 +3402,10 @@ pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         ColumnSchema::new("typtypmod", DataType::Int, false),
         ColumnSchema::new("typndims", DataType::Int, false),
         ColumnSchema::new("typcollation", DataType::BigInt, false),
+        // PG's last three; `pg_dump` selects typacl by name.
+        ColumnSchema::new("typdefaultbin", DataType::Text, true),
+        ColumnSchema::new("typdefault", DataType::Text, true),
+        ColumnSchema::new("typacl", DataType::Text, true),
     ];
     // (oid, name, len, type, cat, elem, array_oid). PG OID
     // numbers come straight from `pg_type.dat`.
@@ -3461,6 +3534,15 @@ pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             Value::text::<String>(subscript.into()), // typsubscript
             Value::BigInt(elem),
             Value::BigInt(arr),
+            // round 543 — the seven I/O-function oids, all 0: SPG's I/O
+            // is not a catalogued function, so there is nothing to name.
+            Value::BigInt(0), // typinput
+            Value::BigInt(0), // typoutput
+            Value::BigInt(0), // typreceive
+            Value::BigInt(0), // typsend
+            Value::BigInt(0), // typmodin
+            Value::BigInt(0), // typmodout
+            Value::BigInt(0), // typanalyze
             Value::text::<String>(typalign.into()),
             Value::text::<String>(typstorage.into()),
             Value::Bool(false), // typnotnull — base types are nullable
@@ -3468,6 +3550,9 @@ pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             Value::Int(-1),     // typtypmod
             Value::Int(0),      // typndims
             Value::BigInt(0),   // typcollation — 0 (default)
+            Value::Null,        // typdefaultbin
+            Value::Null,        // typdefault
+            Value::Null,        // typacl — PG's default: no explicit grant
         ])
     };
     for &(oid, name, len, ty, cat, elem, arr) in scalars {
@@ -3644,6 +3729,8 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
         ColumnSchema::new("procost", DataType::Float, false),
         ColumnSchema::new("prorows", DataType::Float, false),
         ColumnSchema::new("provariadic", DataType::BigInt, false),
+        // v7.39 (round 543) — a planner-support function; SPG has none.
+        ColumnSchema::new("prosupport", DataType::BigInt, false),
         ColumnSchema::new("prokind", DataType::Text, false),
         ColumnSchema::new("prosecdef", DataType::Bool, false),
         ColumnSchema::new("proleakproof", DataType::Bool, false),
@@ -3655,7 +3742,18 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
         ColumnSchema::new("pronargdefaults", DataType::SmallInt, false),
         ColumnSchema::new("prorettype", DataType::BigInt, false),
         ColumnSchema::new("proargtypes", DataType::Text, false),
+        ColumnSchema::new("proallargtypes", DataType::Text, true),
+        ColumnSchema::new("proargmodes", DataType::Text, true),
+        // The one of these five SPG really has: CREATE FUNCTION names
+        // its parameters, and every client that offers named-argument
+        // calls reads them from here.
+        ColumnSchema::new("proargnames", DataType::TextArray, true),
+        ColumnSchema::new("proargdefaults", DataType::Text, true),
+        ColumnSchema::new("protrftypes", DataType::Text, true),
         ColumnSchema::new("prosrc", DataType::Text, false),
+        ColumnSchema::new("probin", DataType::Text, true),
+        ColumnSchema::new("prosqlbody", DataType::Text, true),
+        ColumnSchema::new("proconfig", DataType::TextArray, true),
         // v7.39 (read01 round 61) — the function ACL. NULL means PG's default:
         // PUBLIC may EXECUTE.
         ColumnSchema::new("proacl", DataType::Text, true),
@@ -3714,6 +3812,7 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             Value::Float(1.0), // procost
             Value::Float(prorows),
             Value::BigInt(0), // provariadic
+            Value::BigInt(0), // prosupport
             Value::text::<String>(kind.into()),
             Value::Bool(false),       // prosecdef
             Value::Bool(false),       // proleakproof
@@ -3725,8 +3824,16 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             Value::SmallInt(0), // pronargdefaults
             Value::BigInt(rettype),
             Value::text(argtypes),
+            Value::Null, // proallargtypes
+            Value::Null, // proargmodes
+            Value::Null, // proargnames — a builtin's are not catalogued
+            Value::Null, // proargdefaults
+            Value::Null, // protrftypes
             Value::text::<String>(name.into()), // prosrc
-            Value::Null,                        // proacl — a builtin's is never set
+            Value::Null, // probin
+            Value::Null, // prosqlbody
+            Value::Null, // proconfig
+            Value::Null, // proacl — a builtin's is never set
         ]));
     }
     // v7.39 (read01 round 61) — and one row per USER-DEFINED function. They were
@@ -3757,6 +3864,7 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             Value::Float(def.cost.unwrap_or(100.0)),
             Value::Float(def.rows.unwrap_or(0.0)),
             Value::BigInt(0),
+            Value::BigInt(0), // prosupport
             Value::text("f"), // prokind — a normal function
             Value::Bool(def.security_definer),
             Value::Bool(def.leakproof),
@@ -3772,7 +3880,18 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             Value::SmallInt(0),
             Value::BigInt(0),
             Value::text(alloc::string::String::new()),
+            Value::Null, // proallargtypes
+            Value::Null, // proargmodes
+            // v7.39 (round 543) — the declared parameter NAMES, which
+            // CREATE FUNCTION records and every named-argument caller
+            // reads from here.
+            declared_arg_names(&def.args_repr),
+            Value::Null, // proargdefaults
+            Value::Null, // protrftypes
             Value::text(def.body.clone()), // prosrc — the real body
+            Value::Null, // probin
+            Value::Null, // prosqlbody
+            Value::Null, // proconfig
             crate::acl::render_acl_list(&def.acl).map_or(Value::Null, Value::text),
         ]));
     }
@@ -4463,6 +4582,9 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("contype", DataType::Text, false),
         ColumnSchema::new("condeferrable", DataType::Bool, false),
         ColumnSchema::new("condeferred", DataType::Bool, false),
+        // v7.39 (round 543) — PG18's NOT ENFORCED support. SPG enforces
+        // every constraint it accepts, so this is always true.
+        ColumnSchema::new("conenforced", DataType::Bool, false),
         ColumnSchema::new("convalidated", DataType::Bool, false),
         ColumnSchema::new("conrelid", DataType::BigInt, false),
         ColumnSchema::new("contypid", DataType::BigInt, false),
@@ -4475,8 +4597,24 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("conislocal", DataType::Bool, false),
         ColumnSchema::new("coninhcount", DataType::Int, false),
         ColumnSchema::new("connoinherit", DataType::Bool, false),
+        // v7.39 (round 543) — WITHOUT OVERLAPS; SPG has no temporal
+        // constraints.
+        ColumnSchema::new("conperiod", DataType::Bool, false),
         ColumnSchema::new("conkey", DataType::Text, false),
         ColumnSchema::new("confkey", DataType::Text, false),
+        // The three operator arrays a foreign key records, the ON DELETE
+        // SET column list and the exclusion operators — NULL here; SPG
+        // has no pg_operator to name oids from.
+        ColumnSchema::new("conpfeqop", DataType::Text, true),
+        ColumnSchema::new("conppeqop", DataType::Text, true),
+        ColumnSchema::new("conffeqop", DataType::Text, true),
+        ColumnSchema::new("confdelsetcols", DataType::Text, true),
+        ColumnSchema::new("conexclop", DataType::Text, true),
+        // conbin is what a tool tests to know a constraint is a CHECK.
+        // Measured on PG18: non-NULL for contype 'c', NULL for every
+        // other kind. SPG keeps the written expression, the same choice
+        // pg_attrdef.adbin already makes here.
+        ColumnSchema::new("conbin", DataType::Text, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     // Build the same name → oid map pg_class uses (start at 16384).
@@ -4528,7 +4666,8 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::BigInt(2200),
                 Value::text::<String>(kind.into()),
                 Value::Bool(false), // condeferrable
-                Value::Bool(false), // condeferred
+                Value::Bool(false),
+                Value::Bool(true) /* conenforced */, // condeferred
                 Value::Bool(true),  // convalidated
                 Value::BigInt(conrelid),
                 Value::BigInt(0),  // contypid
@@ -4540,9 +4679,16 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text(" "),  // confmatchtype
                 Value::Bool(true), // conislocal
                 Value::Int(0),     // coninhcount
-                Value::Bool(true), // connoinherit
+                Value::Bool(true),
+                Value::Bool(false) /* conperiod */, // connoinherit
                 Value::text(conkey_display),
                 Value::text(String::new()),
+                Value::Null /* conpfeqop */,
+                Value::Null /* conppeqop */,
+                Value::Null /* conffeqop */,
+                Value::Null /* confdelsetcols */,
+                Value::Null /* conexclop */,
+                Value::Null /* conbin */,
             ]));
         }
         // Single-column unique indices that don't have a UC entry.
@@ -4571,6 +4717,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text::<String>(kind.into()),
                 Value::Bool(false),
                 Value::Bool(false),
+                Value::Bool(true) /* conenforced */,
                 Value::Bool(true),
                 Value::BigInt(conrelid),
                 Value::BigInt(0),
@@ -4583,8 +4730,15 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Bool(true),
                 Value::Int(0),
                 Value::Bool(true),
+                Value::Bool(false) /* conperiod */,
                 Value::text(conkey_display),
                 Value::text(String::new()),
+                Value::Null /* conpfeqop */,
+                Value::Null /* conppeqop */,
+                Value::Null /* conffeqop */,
+                Value::Null /* confdelsetcols */,
+                Value::Null /* conexclop */,
+                Value::Null /* conbin */,
             ]));
         }
         // Foreign keys.
@@ -4608,6 +4762,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text("f"),
                 Value::Bool(false),
                 Value::Bool(false),
+                Value::Bool(true) /* conenforced */,
                 Value::Bool(true),
                 Value::BigInt(conrelid),
                 Value::BigInt(0),
@@ -4620,14 +4775,21 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Bool(true),
                 Value::Int(0),
                 Value::Bool(true),
+                Value::Bool(false) /* conperiod */,
                 Value::text(conkey),
                 Value::text(confkey),
+                Value::Null /* conpfeqop */,
+                Value::Null /* conppeqop */,
+                Value::Null /* conffeqop */,
+                Value::Null /* confdelsetcols */,
+                Value::Null /* conexclop */,
+                Value::Null /* conbin */,
             ]));
         }
         // v7.37 U5 — CHECK constraints (contype 'c'). Previously
         // omitted, so pg_constraint enumeration missed every CHECK.
         let check_names = pg_check_connames(t, tname, &t.schema().checks);
-        for conname in check_names {
+        for (conname, check_src) in check_names.into_iter().zip(t.schema().checks.iter()) {
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(next_con_oid()),
                 Value::text(conname),
@@ -4635,6 +4797,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text("c"),
                 Value::Bool(false),
                 Value::Bool(false),
+                Value::Bool(true) /* conenforced */,
                 Value::Bool(true),
                 Value::BigInt(conrelid),
                 Value::BigInt(0),
@@ -4647,8 +4810,15 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Bool(true),
                 Value::Int(0),
                 Value::Bool(true),
+                Value::Bool(false) /* conperiod */,
                 Value::text(String::new()),
                 Value::text(String::new()),
+                Value::Null /* conpfeqop */,
+                Value::Null /* conppeqop */,
+                Value::Null /* conffeqop */,
+                Value::Null /* confdelsetcols */,
+                Value::Null /* conexclop */,
+                Value::text(check_src.expr.clone()) /* conbin */,
             ]));
         }
         // v7.39 (round 210, EXCLUDE Phase 1) — exclusion constraints
@@ -4667,6 +4837,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text("x"),
                 Value::Bool(false),
                 Value::Bool(false),
+                Value::Bool(true) /* conenforced */,
                 Value::Bool(true),
                 Value::BigInt(conrelid),
                 Value::BigInt(0),
@@ -4679,8 +4850,15 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Bool(true),
                 Value::Int(0),
                 Value::Bool(true),
+                Value::Bool(false) /* conperiod */,
                 Value::text(conkey_display),
                 Value::text(String::new()),
+                Value::Null /* conpfeqop */,
+                Value::Null /* conppeqop */,
+                Value::Null /* conffeqop */,
+                Value::Null /* confdelsetcols */,
+                Value::Null /* conexclop */,
+                Value::Null /* conbin */,
             ]));
         }
         // v7.37 U6 — NOT NULL constraints (contype 'n', PG 18). PG
@@ -4707,6 +4885,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text("n"),
                 Value::Bool(false),
                 Value::Bool(false),
+                Value::Bool(true) /* conenforced */,
                 Value::Bool(true),
                 Value::BigInt(conrelid),
                 Value::BigInt(0),
@@ -4719,8 +4898,15 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Bool(true),
                 Value::Int(0),
                 Value::Bool(true),
+                Value::Bool(false) /* conperiod */,
                 Value::text(conkey_display),
                 Value::text(String::new()),
+                Value::Null /* conpfeqop */,
+                Value::Null /* conppeqop */,
+                Value::Null /* conffeqop */,
+                Value::Null /* confdelsetcols */,
+                Value::Null /* conexclop */,
+                Value::Null /* conbin */,
             ]));
         }
     }
@@ -4945,6 +5131,10 @@ pub(crate) fn synth_pg_auth_members(engine: &Engine) -> (Vec<ColumnSchema>, Vec<
         ColumnSchema::new("member", DataType::BigInt, false),
         ColumnSchema::new("grantor", DataType::BigInt, false),
         ColumnSchema::new("admin_option", DataType::Bool, false),
+        // v7.39 (round 543) — PG16+ split these out of admin_option.
+        // Measured true/true for a plain GRANT <role> TO <member>.
+        ColumnSchema::new("inherit_option", DataType::Bool, false),
+        ColumnSchema::new("set_option", DataType::Bool, false),
     ];
     // Same oid assignment as synth_pg_roles: 11, 12, … in name order.
     let oid_of = |name: &str| -> i64 {
@@ -4962,6 +5152,8 @@ pub(crate) fn synth_pg_auth_members(engine: &Engine) -> (Vec<ColumnSchema>, Vec<
             Value::BigInt(oid_of(member)),
             Value::BigInt(10), // grantor — the bootstrap superuser
             Value::Bool(false),
+            Value::Bool(true), // inherit_option
+            Value::Bool(true), // set_option
         ]));
     }
     (schema, rows)
@@ -5222,6 +5414,29 @@ fn canonical_arg_list(args_repr: &str) -> alloc::string::String {
 /// dropped: `"(a INT, b TEXT)"` → `"integer,text"`. That is the form
 /// `regprocedure` renders and compares by, and PG prints it without a
 /// space after the comma (`g(integer,text)`, measured on 18.4).
+/// v7.39 (round 543) — the parameter NAMES out of the stored display
+/// form, for `pg_proc.proargnames`. NULL when the function takes none,
+/// as PG's is.
+fn declared_arg_names(args_repr: &str) -> Value<'static> {
+    let inner = args_repr.trim().trim_start_matches('(').trim_end_matches(')');
+    if inner.trim().is_empty() {
+        return Value::Null;
+    }
+    let names: Vec<Option<alloc::string::String>> = inner
+        .split(',')
+        .map(|part| {
+            let part = part.trim();
+            part.split_once(char::is_whitespace)
+                .map(|(n, _)| alloc::string::String::from(n))
+        })
+        .collect();
+    if names.iter().any(Option::is_none) {
+        // A positional signature (`(integer, text)`) names nothing.
+        return Value::Null;
+    }
+    Value::TextArray(names)
+}
+
 pub(crate) fn canonical_arg_types(args_repr: &str) -> alloc::string::String {
     let inner = args_repr.trim().trim_start_matches('(').trim_end_matches(')');
     if inner.trim().is_empty() {
@@ -6485,6 +6700,14 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         ColumnSchema::new("indcollation", DataType::Text, false),
         ColumnSchema::new("indclass", DataType::Text, false),
         ColumnSchema::new("indoption", DataType::Text, false),
+        // v7.39 (round 543) — PG's last two, and the two a tool tests to
+        // tell an expression index from a plain one and a partial index
+        // from a whole one. Measured: both NULL for a plain index,
+        // both non-NULL for `ON t ((a+1)) WHERE b <> ''`. SPG keeps the
+        // written text rather than PG's node tree, which is the same
+        // choice pg_attrdef.adbin already makes here.
+        ColumnSchema::new("indexprs", DataType::Text, true),
+        ColumnSchema::new("indpred", DataType::Text, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut idx_oid: i64 = 100_000;
@@ -6559,6 +6782,12 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::text(indcollation),
                 Value::text(indclass),
                 Value::text(indoption),
+                idx.expression
+                    .clone()
+                    .map_or(Value::Null, Value::text), // indexprs
+                idx.partial_predicate
+                    .clone()
+                    .map_or(Value::Null, Value::text), // indpred
             ]));
         }
     }
@@ -6826,6 +7055,19 @@ pub(crate) fn materialise_meta_view(
     mut columns: Vec<ColumnSchema>,
     rows: Vec<Row<'static>>,
 ) -> Result<(), EngineError> {
+    // v7.39 (round 543) — a synth that widens its SCHEMA and forgets a
+    // row builder compiles cleanly, because a row is an untyped value
+    // list. Round 542 shipped that mistake twice before a probe caught
+    // it; this catches it at the one place every catalog passes through.
+    debug_assert!(
+        rows.iter().all(|r| r.values.len() == columns.len()),
+        "{name}: {} columns but a row has {}",
+        columns.len(),
+        rows.iter()
+            .map(|r| r.values.len())
+            .find(|n| *n != columns.len())
+            .unwrap_or(0)
+    );
     retype_identifier_columns(name, &mut columns);
     apply_information_schema_domains(name, &mut columns);
     // v7.39 (round 540) — every catalog relation carries the system

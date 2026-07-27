@@ -58,7 +58,10 @@ fn pg_proc_emits_pg_canonical_columns() {
 fn pg_proc_provolatile_v_for_now_random_current_timestamp() {
     let mut e = Engine::new();
     let rs = rows(&mut e, "SELECT * FROM pg_catalog.pg_proc");
-    // Position: 1=proname, 13=provolatile. (current_timestamp is a
+    // v7.39 (round 543) — PG18's positions. prosupport landed at 8,
+    // where PG keeps it, and five more before prosrc; these indices
+    // were reading SPG's narrower layout.
+    // Position: 1=proname, 14=provolatile. (current_timestamp is a
     // parser keyword in PG, not a pg_proc row.)
     let volatile_names = ["now", "random", "gen_random_uuid"];
     for name in &volatile_names {
@@ -67,9 +70,9 @@ fn pg_proc_provolatile_v_for_now_random_current_timestamp() {
             .find(|r| matches!(&r[1], Value::Text(s) if s.as_ref() == *name))
             .unwrap_or_else(|| panic!("missing pg_proc row for {name}"));
         assert!(
-            matches!(&row[13], Value::Text(s) if s.as_ref() == "v"),
+            matches!(&row[14], Value::Text(s) if s.as_ref() == "v"),
             "provolatile for {name} should be 'v', got {:?}",
-            row[13]
+            row[14]
         );
     }
 }
@@ -86,9 +89,9 @@ fn pg_proc_provolatile_i_for_pure_scalars() {
             .find(|r| matches!(&r[1], Value::Text(s) if s.as_ref() == *name))
             .unwrap_or_else(|| panic!("missing pg_proc row for {name}"));
         assert!(
-            matches!(&row[13], Value::Text(s) if s.as_ref() == "i"),
+            matches!(&row[14], Value::Text(s) if s.as_ref() == "i"),
             "provolatile for {name} should be 'i', got {:?}",
-            row[13]
+            row[14]
         );
     }
 }
@@ -112,10 +115,10 @@ fn pg_proc_prolang_is_12_for_internal_builtins() {
 fn pg_proc_prosrc_carries_function_name() {
     let mut e = Engine::new();
     let rs = rows(&mut e, "SELECT * FROM pg_catalog.pg_proc");
-    // Position 1 = proname, 19 = prosrc. SPG synthesises prosrc
+    // Position 1 = proname, 25 = prosrc. SPG synthesises prosrc
     // as the function name itself (the engine's dispatch key).
     for row in &rs {
-        match (&row[1], &row[19]) {
+        match (&row[1], &row[25]) {
             (Value::Text(a), Value::Text(b)) => assert_eq!(a, b, "prosrc == proname"),
             _ => panic!("proname / prosrc wrong type"),
         }
