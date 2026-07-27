@@ -670,24 +670,8 @@ pub(crate) fn index_only_range_each(
     projected: usize,
     sink: &mut dyn FnMut(spg_storage::Value<'static>) -> Result<(), EngineError>,
 ) -> Option<Result<usize, EngineError>> {
-    let (col_pos, lo, hi) = parse_range_bounds(where_expr, schema_cols, table_alias)?;
-    if col_pos != projected {
-        return None;
-    }
-    // A cold-tier locator carries no position to test visibility with,
-    // and its value lives off-heap; anything cold falls back.
-    if table.has_cold_rows_fast() {
-        return None;
-    }
-    let ty = schema_cols[col_pos].ty;
-    // Decided BEFORE the walk, not per row: a streaming caller cannot
-    // take a row back once it has gone out, so "this type does not come
-    // back from its key" has to be a shape rejection, not a discovery
-    // made halfway through.
-    if !key_restores_type(ty) {
-        return None;
-    }
-    let idx = table.index_on(col_pos)?;
+    let (ty, lo, hi, idx) =
+        index_only_precheck(where_expr, schema_cols, table, table_alias, projected)?;
     let entries = idx.range_keyed(bound_as_ref(&lo), bound_as_ref(&hi))?;
     let mut headers = table.header_runs();
     let mut n = 0usize;
@@ -714,6 +698,46 @@ pub(crate) fn index_only_range_each(
         n += 1;
     }
     Some(Ok(n))
+}
+
+/// v7.39 (round 565) — everything decidable about this scan before it
+/// walks: the shape of the predicate, the tier, the type, the index.
+///
+/// Split out because EXPLAIN has to answer the same question and must
+/// not answer it from its own copy of the rules. Round 564 named the
+/// path in the executor and left EXPLAIN calling it `Index Scan`, so a
+/// reader comparing two plans that run 2x apart saw one plan.
+pub(crate) fn index_only_precheck<'t>(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table: &'t Table,
+    table_alias: &str,
+    projected: usize,
+) -> Option<(
+    spg_storage::DataType,
+    Bound<IndexKey>,
+    Bound<IndexKey>,
+    &'t spg_storage::Index,
+)> {
+    let (col_pos, lo, hi) = parse_range_bounds(where_expr, schema_cols, table_alias)?;
+    if col_pos != projected {
+        return None;
+    }
+    // A cold-tier locator carries no position to test visibility with,
+    // and its value lives off-heap; anything cold falls back.
+    if table.has_cold_rows_fast() {
+        return None;
+    }
+    let ty = schema_cols[col_pos].ty;
+    // Decided BEFORE the walk, not per row: a streaming caller cannot
+    // take a row back once it has gone out, so "this type does not come
+    // back from its key" has to be a shape rejection, not a discovery
+    // made halfway through.
+    if !key_restores_type(ty) {
+        return None;
+    }
+    let idx = table.index_on(col_pos)?;
+    Some((ty, lo, hi, idx))
 }
 
 /// Which declared types an index key comes back as unambiguously.
