@@ -1601,6 +1601,11 @@ fn run_pg_session(
         if !startup_db.is_empty() {
             let _ = e.execute(&format!("SET spg.database = '{startup_db}'"));
         }
+        // v7.39 (round 547) — the GUC defaults `ALTER ROLE … SET` and
+        // `ALTER DATABASE … SET` recorded, applied in PG's order of
+        // specificity. Last, so they land on top of the identity and
+        // database this connection just seeded.
+        e.apply_db_role_settings(&startup_db, &user);
     }
 
     // v7.39 (read01 pgstatfuncs.c) — stamp this connection's pid into the

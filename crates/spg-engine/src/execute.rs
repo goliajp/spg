@@ -1230,6 +1230,45 @@ impl Engine {
             self.exec_commit()?;
         }
         let result = match stmt {
+            // v7.39 (round 547) — `ALTER ROLE … SET/RESET` and
+            // `ALTER DATABASE … SET/RESET`. These reported success and
+            // changed nothing: both fell into the parser's pg_dump
+            // no-op tail, so a DBA setting a per-role default got no
+            // effect and no error.
+            Statement::SetDbRoleSetting(st) => {
+                // PG refuses a scope that names something absent.
+                if let Some(role) = &st.role
+                    && !self.users.iter().any(|(n, _)| n.eq_ignore_ascii_case(role))
+                    && !role.eq_ignore_ascii_case("postgres")
+                {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "role \"{role}\" does not exist"
+                    )));
+                }
+                if let Some(db) = &st.database {
+                    let current = self
+                        .session_params
+                        .get("spg.database")
+                        .cloned()
+                        .unwrap_or_else(|| alloc::string::String::from("spg"));
+                    if !db.eq_ignore_ascii_case(&current) {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "database \"{db}\" does not exist"
+                        )));
+                    }
+                }
+                let db = st.database.clone().unwrap_or_default();
+                let role = st.role.clone().unwrap_or_default();
+                let cat = self.active_catalog_mut();
+                match (&st.param, &st.value) {
+                    (None, _) => cat.reset_db_role_settings(&db, &role),
+                    (Some(p), v) => cat.set_db_role_setting(&db, &role, p, v.as_deref()),
+                }
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: true,
+                })
+            }
             // v7.39 (round 430) — MySQL USER variables. The value is an
             // arbitrary expression, evaluated against an empty row (a
             // user-variable assignment is a statement, not a per-row thing),

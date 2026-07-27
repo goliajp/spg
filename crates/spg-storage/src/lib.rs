@@ -3907,6 +3907,16 @@ pub struct Catalog {
     /// deserialise with an empty map. Read back by obj_description /
     /// col_description and the pg_description view.
     comments: BTreeMap<String, String>,
+    /// v7.39 (round 547) — PG's `pg_db_role_setting`: the GUC defaults
+    /// `ALTER ROLE … SET` / `ALTER DATABASE … SET` record, applied when
+    /// a session starts.
+    ///
+    /// Keyed exactly as PG keys it — `(database, role)` where an empty
+    /// name is PG's oid 0, meaning "all". So `ALTER ROLE ALL SET` is
+    /// `("", "")`, `ALTER DATABASE d SET` is `(d, "")`, `ALTER ROLE r
+    /// SET` is `("", r)` and `ALTER ROLE r IN DATABASE d SET` is
+    /// `(d, r)`. The value is that scope's parameter list.
+    db_role_settings: BTreeMap<(String, String), BTreeMap<String, String>>,
     /// v7.37.42-T2 ζ-B — catalogued user-defined COMPOSITE types
     /// (`CREATE TYPE name AS (field_name field_type, …)`). Columns
     /// reference these by name via
@@ -4566,6 +4576,7 @@ impl Catalog {
             enum_types: BTreeMap::new(),
             domain_types: BTreeMap::new(),
             comments: BTreeMap::new(),
+            db_role_settings: BTreeMap::new(),
             composite_types: BTreeMap::new(),
             schemas: alloc::collections::BTreeSet::new(),
         }
@@ -5072,6 +5083,50 @@ impl Catalog {
     #[must_use]
     pub fn comment(&self, key: &str) -> Option<&str> {
         self.comments.get(key).map(String::as_str)
+    }
+
+    /// v7.39 (round 547) — record a GUC default for a scope. An empty
+    /// database or role name is PG's oid 0 ("all"). `None` value
+    /// removes just that parameter, as PG's RESET does.
+    pub fn set_db_role_setting(
+        &mut self,
+        database: &str,
+        role: &str,
+        param: &str,
+        value: Option<&str>,
+    ) {
+        let key = (database.to_string(), role.to_string());
+        match value {
+            Some(v) => {
+                self.db_role_settings
+                    .entry(key)
+                    .or_default()
+                    .insert(param.to_ascii_lowercase(), v.to_string());
+            }
+            None => {
+                if let Some(m) = self.db_role_settings.get_mut(&key) {
+                    m.remove(&param.to_ascii_lowercase());
+                    if m.is_empty() {
+                        self.db_role_settings.remove(&key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// PG's RESET ALL: drops this scope's whole entry, leaving the
+    /// other scopes alone — measured on PG18, where `ALTER ROLE r RESET
+    /// ALL` left the ALL, the database and the role-in-database rows.
+    pub fn reset_db_role_settings(&mut self, database: &str, role: &str) {
+        self.db_role_settings
+            .remove(&(database.to_string(), role.to_string()));
+    }
+
+    #[must_use]
+    pub const fn db_role_settings(
+        &self,
+    ) -> &BTreeMap<(String, String), BTreeMap<String, String>> {
+        &self.db_role_settings
     }
 
     /// v7.39 (read01 round 50) — every `(key, text)` pair, for the
@@ -7714,7 +7769,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 84;
+const FILE_VERSION: u8 = 85;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -8940,6 +8995,23 @@ impl Catalog {
         // v7.38 (read01 P5.05) — CRC32C trailer over the whole image so a
         // corrupted snapshot is rejected on load. FILE_VERSION is >= the
         // trailer version, so this always runs for freshly-written images.
+        // v7.39 (round 547) — pg_db_role_setting (FILE_VERSION 85+),
+        // catalog-wide and written LAST so a v84 reader stops before it.
+        // Layout: [u32 scopes] then [str database][str role][u32 params]
+        // then [str name][str value] per param.
+        write_u32(
+            &mut out,
+            u32::try_from(self.db_role_settings.len()).expect("≤ 4G scopes"),
+        );
+        for ((db, role), params) in &self.db_role_settings {
+            write_str(&mut out, db);
+            write_str(&mut out, role);
+            write_u32(&mut out, u32::try_from(params.len()).expect("≤ 4G params"));
+            for (name, value) in params {
+                write_str(&mut out, name);
+                write_str(&mut out, value);
+            }
+        }
         let crc = spg_crypto::crc32c::crc32c(&out);
         write_u32(&mut out, crc);
         out
@@ -9438,6 +9510,25 @@ impl Catalog {
                     f.parallel = parallel;
                     f.cost = (!cost.is_nan()).then_some(cost);
                     f.rows = (!rows.is_nan()).then_some(rows);
+                }
+            }
+        }
+        // v7.39 (round 547) — pg_db_role_setting (FILE_VERSION 85+).
+        // Pre-85 images stop before it and carry no GUC defaults.
+        if version >= 85 {
+            let scopes = cur.read_u32()? as usize;
+            for _ in 0..scopes {
+                let db = cur.read_str()?;
+                let role = cur.read_str()?;
+                let params = cur.read_u32()? as usize;
+                let mut m: BTreeMap<String, String> = BTreeMap::new();
+                for _ in 0..params {
+                    let name = cur.read_str()?;
+                    let value = cur.read_str()?;
+                    m.insert(name, value);
+                }
+                if !m.is_empty() {
+                    cat.db_role_settings.insert((db, role), m);
                 }
             }
         }
