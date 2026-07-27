@@ -2192,6 +2192,7 @@ impl Engine {
         if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name) {
             idx.descending = stmt.key_order.descending;
             idx.nulls_first = stmt.key_order.nulls_first;
+            idx.collation.clone_from(&stmt.key_collation);
         }
         if stmt.is_unique {
             if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name) {

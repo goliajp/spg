@@ -1950,6 +1950,11 @@ pub struct CreateIndexStatement {
     /// v7.39 (round 537) — the leading key column's ordering clause,
     /// which is the column SPG indexes.
     pub key_order: IndexColumnOrder,
+    /// v7.39 (round 538) — an explicit `COLLATE` on that key, as
+    /// written. SPG orders text by bytes, so honouring it changes
+    /// nothing; PG prints it, because an explicitly named collation and
+    /// the one a column inherits are different objects.
+    pub key_collation: Option<String>,
     pub table: String,
     pub column: String,
     /// v7.39 (read01 round 52) — `CREATE UNIQUE INDEX … NULLS NOT DISTINCT`
