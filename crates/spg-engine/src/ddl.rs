@@ -2186,6 +2186,13 @@ impl Engine {
                 idx.extra_column_positions = extra_positions;
             }
         }
+        // v7.39 (round 537) — the key column's ordering clause, as
+        // written. It changes no lookup; `indexdef` reproduces the DDL,
+        // and dropping it made `(a DESC NULLS LAST)` read back as `(a)`.
+        if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name) {
+            idx.descending = stmt.key_order.descending;
+            idx.nulls_first = stmt.key_order.nulls_first;
+        }
         if stmt.is_unique {
             if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name) {
                 idx.is_unique = true;
