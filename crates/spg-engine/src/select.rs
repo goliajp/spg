@@ -5512,6 +5512,14 @@ impl Engine {
         // survives (plain projection, `DISTINCT` over a unique column)
         // allocate exactly as often as before.
         let mut proj_buf: Vec<Value<'static>> = Vec::new();
+        // v7.39 (round 571) — buffers handed back by the top-N trim.
+        // Round 485 made the scan share ONE projection buffer, but a
+        // surviving row takes it (`mem::take`) and without DISTINCT
+        // almost every row survives, so the next one starts from zero
+        // capacity and allocates. The trim drops `keep` rows at a time
+        // and their buffers come back here instead of being freed.
+        let mut proj_pool: Vec<Vec<Value<'static>>> = Vec::new();
+        let mut key_pool: Vec<Vec<crate::orderby::OrderKey>> = Vec::new();
         // Inline the per-row work in a closure so the indexed and full-
         // scan branches share the body.
         let mut process_row = |row: &Row<'static>, loop_idx: usize| -> Result<(), EngineError> {
@@ -5536,7 +5544,9 @@ impl Engine {
             let order_keys = if order_by.is_empty() || stmt.distinct {
                 Vec::new()
             } else {
-                build_order_keys(&order_by, row, &ctx)?
+                let mut buf = key_pool.pop().unwrap_or_default();
+                crate::orderby::build_order_keys_into(&order_by, row, &ctx, &mut buf)?;
+                buf
             };
             if srf_position.is_some() {
                 let order_keys = if stmt.distinct && !order_by.is_empty() {
@@ -5613,7 +5623,10 @@ impl Engine {
                     }
                     bucket.push(tagged.len());
                 }
-                let out = Row::new(core::mem::take(&mut proj_buf));
+                let out = Row::new(core::mem::replace(
+                    &mut proj_buf,
+                    proj_pool.pop().unwrap_or_default(),
+                ));
                 let order_keys = if stmt.distinct && !order_by.is_empty() {
                     build_order_keys(&order_by, row, &ctx)?
                 } else {
@@ -5624,7 +5637,13 @@ impl Engine {
             }
             // Streaming top-N: bound the accumulator to O(keep) rows.
             if let Some((k, descs)) = &topk_stream {
-                topk_trim(&mut tagged, *k, descs);
+                crate::orderby::topk_trim_recycling(
+                    &mut tagged,
+                    *k,
+                    descs,
+                    &mut proj_pool,
+                    &mut key_pool,
+                );
             }
             Ok(())
         };
