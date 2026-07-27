@@ -2490,6 +2490,8 @@ pub(crate) const OID_SEQ_BASE: i64 = 300_000;
 /// v7.39 (round 342, V65) — user functions, keyed by signature the way
 /// `pg_proc` iterates them.
 pub(crate) const OID_FUNC_BASE: i64 = 400_000;
+/// v7.39 (round 542) — pg_trigger row oids.
+pub(crate) const OID_TRIGGER_BASE: i64 = 600_000;
 
 /// Resolve a function NAME to the oid `pg_proc` gives it. `None` when no
 /// function has that name, or when the name is overloaded — an overload
@@ -3538,26 +3540,88 @@ pub(crate) const INFORMATION_SCHEMA_DOMAIN_OID_BASE: i64 = 13_500;
 /// 'O'/'D') plus pragmatic text columns PG keeps relational
 /// (relname, timing, events, function) so health checks don't need
 /// oid joins.
+/// v7.39 (round 542) — PG18's nineteen columns.
+///
+/// This published `relname`, `timing`, `events` and `function` — the
+/// column names of `information_schema.triggers`, not pg_catalog's. So
+/// the catalog existed under the right name with somebody else's
+/// columns, and every pg_catalog trigger query failed with "column
+/// does not exist" rather than returning nothing: the author reads
+/// that as their SQL being wrong.
+///
+/// `tgtype` is PG's bitmask, and the whole point of the column — it is
+/// how a tool learns BEFORE-vs-AFTER and which events fire without
+/// parsing text. Measured on PG18: 1 ROW, 2 BEFORE, 4 INSERT,
+/// 8 DELETE, 16 UPDATE, 32 TRUNCATE, 64 INSTEAD OF; a
+/// `BEFORE INSERT … FOR EACH ROW` reads 7.
 pub(crate) fn synth_pg_trigger(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("tgrelid", DataType::BigInt, false),
+        ColumnSchema::new("tgparentid", DataType::BigInt, false),
         ColumnSchema::new("tgname", DataType::Text, false),
-        ColumnSchema::new("relname", DataType::Text, false),
+        ColumnSchema::new("tgfoid", DataType::BigInt, false),
+        ColumnSchema::new("tgtype", DataType::SmallInt, false),
         ColumnSchema::new("tgenabled", DataType::Text, false),
-        ColumnSchema::new("timing", DataType::Text, false),
-        ColumnSchema::new("events", DataType::Text, false),
-        ColumnSchema::new("function", DataType::Text, false),
+        ColumnSchema::new("tgisinternal", DataType::Bool, false),
+        ColumnSchema::new("tgconstrrelid", DataType::BigInt, false),
+        ColumnSchema::new("tgconstrindid", DataType::BigInt, false),
+        ColumnSchema::new("tgconstraint", DataType::BigInt, false),
+        ColumnSchema::new("tgdeferrable", DataType::Bool, false),
+        ColumnSchema::new("tginitdeferred", DataType::Bool, false),
+        ColumnSchema::new("tgnargs", DataType::SmallInt, false),
+        ColumnSchema::new("tgattr", DataType::Text, true),
+        ColumnSchema::new("tgargs", DataType::Text, true),
+        ColumnSchema::new("tgqual", DataType::Text, true),
+        ColumnSchema::new("tgoldtable", DataType::Text, true),
+        ColumnSchema::new("tgnewtable", DataType::Text, true),
     ];
+    let mut oid = OID_TRIGGER_BASE;
     let rows: Vec<Row<'static>> = cat
         .triggers()
         .iter()
         .map(|t| {
+            oid += 1;
+            let mut tgtype: i16 = 0;
+            if !t.timing.eq_ignore_ascii_case("INSTEAD OF") {
+                // SPG's triggers are row-level; PG sets bit 1 for those.
+                tgtype |= 1;
+            }
+            if t.timing.eq_ignore_ascii_case("BEFORE") {
+                tgtype |= 2;
+            }
+            if t.timing.eq_ignore_ascii_case("INSTEAD OF") {
+                tgtype |= 64;
+            }
+            for ev in &t.events {
+                tgtype |= match ev.to_ascii_uppercase().as_str() {
+                    "INSERT" => 4,
+                    "DELETE" => 8,
+                    "UPDATE" => 16,
+                    "TRUNCATE" => 32,
+                    _ => 0,
+                };
+            }
             Row::new(alloc::vec![
+                Value::BigInt(oid),
+                Value::BigInt(relation_oid(cat, &t.table).unwrap_or(0)),
+                Value::BigInt(0), // tgparentid — SPG has no partition-cloned triggers
                 Value::text(t.name.clone()),
-                Value::text(t.table.clone()),
+                Value::BigInt(function_oid(cat, &t.function).unwrap_or(0)),
+                Value::SmallInt(tgtype),
                 Value::text(if t.enabled { "O" } else { "D" }),
-                Value::text(t.timing.clone()),
-                Value::text(t.events.join(" OR ")),
-                Value::text(t.function.clone()),
+                Value::Bool(false), // tgisinternal
+                Value::BigInt(0),   // tgconstrrelid
+                Value::BigInt(0),   // tgconstrindid
+                Value::BigInt(0),   // tgconstraint
+                Value::Bool(false), // tgdeferrable
+                Value::Bool(false), // tginitdeferred
+                Value::SmallInt(0), // tgnargs — SPG's triggers take none
+                Value::text(""),    // tgattr — empty int2vector, as PG prints it
+                Value::text("\\x"), // tgargs — empty bytea, as PG prints it
+                Value::Null,        // tgqual — no WHEN clause
+                Value::Null,        // tgoldtable
+                Value::Null,        // tgnewtable
             ])
         })
         .collect();
@@ -4746,13 +4810,33 @@ pub(crate) fn synth_pg_database(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
 /// pg_roles is a view over pg_authid showing all roles. SPG ships
 /// one row per declared user from the engine's UserStore so admin
 /// tool startup screens can populate.
+/// v7.39 (round 541 sweep, round 542) — PG18's thirteen columns, in
+/// PG's order.
+///
+/// `oid` is LAST in PG's pg_roles, not first, and eight columns were
+/// missing. SPG records three role attributes (superuser, inherit,
+/// canlogin); it ACCEPTS the rest of PG's options and does not store
+/// them, so it reports what it will actually enforce. A superuser
+/// bypasses every one of those checks, which is why PG reports them
+/// true for one.
+///
+/// rolpassword reads `********` for everybody, as PG's does — the view
+/// exists so that the hash does NOT leave the catalog.
 pub(crate) fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("rolname", DataType::Text, false),
         ColumnSchema::new("rolsuper", DataType::Bool, false),
         ColumnSchema::new("rolinherit", DataType::Bool, false),
+        ColumnSchema::new("rolcreaterole", DataType::Bool, false),
+        ColumnSchema::new("rolcreatedb", DataType::Bool, false),
         ColumnSchema::new("rolcanlogin", DataType::Bool, false),
+        ColumnSchema::new("rolreplication", DataType::Bool, false),
+        ColumnSchema::new("rolconnlimit", DataType::Int, false),
+        ColumnSchema::new("rolpassword", DataType::Text, true),
+        ColumnSchema::new("rolvaliduntil", DataType::Timestamptz, true),
+        ColumnSchema::new("rolbypassrls", DataType::Bool, false),
+        ColumnSchema::new("rolconfig", DataType::TextArray, true),
+        ColumnSchema::new("oid", DataType::BigInt, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let oid: i64 = 10;
@@ -4760,31 +4844,93 @@ pub(crate) fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'st
     // be hard-coded (`false, true, true`) because SPG had no role attributes;
     // a `CREATE ROLE devs NOLOGIN` would still have reported rolcanlogin=true.
     for (i, (name, rec)) in engine.users.iter().enumerate() {
-        rows.push(Row::new(alloc::vec![
-            Value::BigInt(oid + (i as i64) + 1),
-            Value::text(name.to_string()),
-            Value::Bool(rec.superuser),
-            Value::Bool(rec.inherit),
-            Value::Bool(rec.can_login),
-        ]));
+        rows.push(pg_roles_row(
+            oid + (i as i64) + 1,
+            name,
+            rec.superuser,
+            rec.inherit,
+            rec.can_login,
+        ));
     }
     // Always include `postgres` as the bootstrap superuser if not
     // already present — admin tools probe for it.
     if !rows
         .iter()
-        .any(|r| matches!(&r.values[1], Value::Text(s) if s == "postgres"))
+        .any(|r| matches!(&r.values[0], Value::Text(s) if s == "postgres"))
     {
-        rows.insert(
-            0,
-            Row::new(alloc::vec![
-                Value::BigInt(10),
-                Value::text("postgres"),
-                Value::Bool(true),
-                Value::Bool(true),
-                Value::Bool(true),
-            ]),
-        );
+        rows.insert(0, pg_roles_row(10, "postgres", true, true, true));
     }
+    (schema, rows)
+}
+
+/// One pg_roles row, so pg_user cannot drift from it.
+fn pg_roles_row(
+    oid: i64,
+    name: &str,
+    superuser: bool,
+    inherit: bool,
+    can_login: bool,
+) -> Row<'static> {
+    Row::new(alloc::vec![
+        Value::text(alloc::string::String::from(name)),
+        Value::Bool(superuser),
+        Value::Bool(inherit),
+        // SPG does not record these four; a superuser bypasses the
+        // checks they gate, which is why PG reports them true for one.
+        Value::Bool(superuser), // rolcreaterole
+        Value::Bool(superuser), // rolcreatedb
+        Value::Bool(can_login),
+        Value::Bool(superuser), // rolreplication
+        Value::Int(-1),         // rolconnlimit — unlimited
+        Value::text("********"),
+        Value::Null, // rolvaliduntil
+        Value::Bool(superuser),
+        Value::Null, // rolconfig
+        Value::BigInt(oid),
+    ])
+}
+
+/// v7.39 (round 542) — `pg_catalog.pg_user`.
+///
+/// SPG published pg_roles' columns under this name, so PG's own
+/// spelling of the most ordinary question there is —
+/// `SELECT usename FROM pg_user` — failed with "column does not
+/// exist". PG's pg_user is a DIFFERENT view over the same roles: only
+/// the ones that can log in, with `use*` names.
+///
+/// Derived from synth_pg_roles' rows so the two cannot disagree.
+pub(crate) fn synth_pg_user(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("usename", DataType::Text, false),
+        ColumnSchema::new("usesysid", DataType::BigInt, false),
+        ColumnSchema::new("usecreatedb", DataType::Bool, false),
+        ColumnSchema::new("usesuper", DataType::Bool, false),
+        ColumnSchema::new("userepl", DataType::Bool, false),
+        ColumnSchema::new("usebypassrls", DataType::Bool, false),
+        ColumnSchema::new("passwd", DataType::Text, true),
+        ColumnSchema::new("valuntil", DataType::Timestamptz, true),
+        ColumnSchema::new("useconfig", DataType::TextArray, true),
+    ];
+    // pg_roles positions: 0 rolname, 1 rolsuper, 4 rolcreatedb,
+    // 5 rolcanlogin, 6 rolreplication, 10 rolbypassrls, 12 oid.
+    let (_, roles) = synth_pg_roles(engine);
+    let rows = roles
+        .into_iter()
+        .filter(|r| matches!(r.values[5], Value::Bool(true)))
+        .map(|r| {
+            Row::new(alloc::vec![
+                r.values[0].clone(),
+                r.values[12].clone(),
+                r.values[4].clone(),
+                r.values[1].clone(),
+                r.values[6].clone(),
+                r.values[10].clone(),
+                Value::text("********"),
+                Value::Null,
+                Value::Null,
+            ])
+        })
+        .collect();
     (schema, rows)
 }
 
@@ -5365,6 +5511,8 @@ pub(crate) fn synth_pg_views(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Text, false),
         ColumnSchema::new("viewname", DataType::Text, false),
+        // v7.39 (round 542) — PG's third column, which SPG omitted.
+        ColumnSchema::new("viewowner", DataType::Text, false),
         ColumnSchema::new("definition", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
@@ -5375,7 +5523,52 @@ pub(crate) fn synth_pg_views(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         rows.push(Row::new(alloc::vec![
             Value::text("public"),
             Value::text(name.to_string()),
+            Value::text(CATALOG_OWNER),
             Value::text(def.body.clone()),
+        ]));
+    }
+    (schema, rows)
+}
+
+/// The name behind the owner oid every catalog synth reports (10).
+/// One constant, so pg_views.viewowner, pg_matviews.matviewowner and
+/// pg_class.relowner cannot name different people.
+pub(crate) const CATALOG_OWNER: &str = "postgres";
+
+/// v7.39 (round 542) — `pg_catalog.pg_matviews`, with rows.
+///
+/// It shared pg_views' SCHEMA and was pinned empty, with the note "SPG
+/// has no materialised view surface yet". That stopped being true in
+/// round 338, when pg_class began reporting relkind 'm' — so a tool
+/// listing materialized views the canonical way found none of them, and
+/// its column was `viewname` where PG's is `matviewname`.
+pub(crate) fn synth_pg_matviews(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("schemaname", DataType::Text, false),
+        ColumnSchema::new("matviewname", DataType::Text, false),
+        ColumnSchema::new("matviewowner", DataType::Text, false),
+        ColumnSchema::new("tablespace", DataType::Text, true),
+        ColumnSchema::new("hasindexes", DataType::Bool, false),
+        ColumnSchema::new("ispopulated", DataType::Bool, false),
+        ColumnSchema::new("definition", DataType::Text, false),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for stored in cat.table_names() {
+        let Some(name) = cat.listed_name(&stored).map(alloc::string::String::from) else {
+            continue;
+        };
+        let Some(t) = cat.get(&name) else { continue };
+        let Some(body) = cat.materialized_views().get(&name) else {
+            continue;
+        };
+        rows.push(Row::new(alloc::vec![
+            Value::text("public"),
+            Value::text(name.clone()),
+            Value::text(CATALOG_OWNER),
+            Value::Null,
+            Value::Bool(!t.indices().is_empty()),
+            Value::Bool(true),
+            Value::text(body.clone()),
         ]));
     }
     (schema, rows)
@@ -6234,6 +6427,9 @@ pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
         ColumnSchema::new("schemaname", DataType::Text, false),
         ColumnSchema::new("tablename", DataType::Text, false),
         ColumnSchema::new("indexname", DataType::Text, false),
+        // v7.39 (round 542) — PG's fourth column: NULL means the
+        // database default tablespace, which is the only one SPG has.
+        ColumnSchema::new("tablespace", DataType::Text, true),
         ColumnSchema::new("indexdef", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
@@ -6245,6 +6441,7 @@ pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
                 Value::text("public"),
                 Value::text(tname.clone()),
                 Value::text(idx.name.clone()),
+                Value::Null, // tablespace — the default one
                 Value::text(indexdef),
             ]));
         }
