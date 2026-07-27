@@ -723,6 +723,32 @@ impl Table {
     ///
     /// `'a` lifetime on `snapshot` keeps the helper zero-cost in
     /// the hot loop — no Arc bump, no allocation.
+    /// v7.39 (round 559) — how many rows a snapshot sees, without
+    /// touching a single one of them.
+    ///
+    /// `count(*)` already short-circuits to `rows.len()` in the
+    /// aggregate layer, so the O(1) part was never the problem: the cost
+    /// is UPSTREAM, materialising every visible row so that layer can
+    /// take its length. `scan_visible` zips the row trie with the
+    /// headers, and a count needs only the headers.
+    ///
+    /// Measured over pgwire on 500k rows, `SELECT count(*)`:
+    ///
+    ///     PG18 (2 parallel workers)   8.2 ms
+    ///     PG18 (parallelism off)     10.3 ms
+    ///     SPG                        16.5 ms   = 33 ns/row
+    ///
+    /// — 1.6x slower than a single-threaded PG on the commonest
+    /// aggregate there is, which no ledger entry recorded.
+    pub fn count_visible(&self, snapshot: &crate::snapshot::Snapshot) -> usize {
+        self.note_seq_scan();
+        self.headers
+            .iter()
+            .enumerate()
+            .filter(|(i, h)| self.header_visible(*i, h, snapshot))
+            .count()
+    }
+
     pub fn scan_visible<'a, 'b>(
         &'a self,
         snapshot: &'b crate::snapshot::Snapshot,

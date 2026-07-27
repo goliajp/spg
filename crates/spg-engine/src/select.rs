@@ -1929,12 +1929,101 @@ impl Engine {
     /// function's OWNER: that is the entire point of the form, and without
     /// it every definer function failed with "permission denied" on the
     /// very table it exists to expose.
+    /// v7.39 (round 559) — see the call site. `None` for anything but
+    /// the bare shape, so every other query keeps its old path.
+    fn try_bare_count_star(
+        &self,
+        stmt: &SelectStatement,
+        as_role: Option<&str>,
+    ) -> Result<Option<QueryResult>, EngineError> {
+        use spg_sql::ast::SelectItem;
+        if as_role.is_some()
+            || !stmt.ctes.is_empty()
+            || !stmt.unions.is_empty()
+            || stmt.where_.is_some()
+            || stmt.group_by.is_some()
+            || stmt.having.is_some()
+            || stmt.distinct
+            || !stmt.order_by.is_empty()
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+            || stmt.items.len() != 1
+        {
+            return Ok(None);
+        }
+        let Some(from) = &stmt.from else {
+            return Ok(None);
+        };
+        if !from.joins.is_empty()
+            || stmt.locking.is_some()
+            || from.primary.lateral_subquery.is_some()
+            || from.primary.unnest_expr.is_some()
+            || from.primary.generate_series_args.is_some()
+            || from.primary.name.is_empty()
+            || from.primary.name.starts_with("__spg_")
+        {
+            return Ok(None);
+        }
+        // A partition PARENT holds no rows of its own — they live in the
+        // children — so its header count is 0 and the ordinary path has
+        // to fan out. Caught by the partition conformance cases.
+        if crate::partition::is_partition_parent(self.active_catalog(), &from.primary.name) {
+            return Ok(None);
+        }
+        let SelectItem::Expr { expr, alias } = &stmt.items[0] else {
+            return Ok(None);
+        };
+        let spg_sql::ast::Expr::FunctionCall { name, args } = expr else {
+            return Ok(None);
+        };
+        if !name.eq_ignore_ascii_case("count_star") || !args.is_empty() {
+            return Ok(None);
+        }
+        // A row-security policy filters rows, so the header count is not
+        // the answer; the ordinary path applies the policy.
+        let Some(table) = self.active_catalog().get(&from.primary.name) else {
+            return Ok(None);
+        };
+        if table.schema().row_security {
+            return Ok(None);
+        }
+        // Rows frozen to the cold tier are not in `headers`, so the
+        // header count would miss them. Caught by the cold-tier e2e.
+        if table.has_cold_rows_fast() {
+            return Ok(None);
+        }
+        let n = table.count_visible(&self.current_snapshot());
+        let col = alias.clone().unwrap_or_else(|| String::from("count"));
+        Ok(Some(QueryResult::Rows {
+            columns: alloc::vec![ColumnSchema::new(col, DataType::BigInt, false)],
+            rows: alloc::vec![Row::new(alloc::vec![Value::BigInt(
+                i64::try_from(n).unwrap_or(i64::MAX)
+            )])],
+        }))
+    }
+
     pub(crate) fn exec_select_cancel_as(
         &self,
         stmt: &SelectStatement,
         cancel: CancelToken<'_>,
         as_role: Option<&str>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 (round 559) — `SELECT count(*) FROM t` without touching
+        // a row.
+        //
+        // The aggregate layer already short-circuits this to
+        // `rows.len()`, so the O(1) part was never the problem — the
+        // cost is UPSTREAM, materialising every visible row so that
+        // layer can take its length. Measured over pgwire on 500k rows:
+        // PG18 8.2 ms with two parallel workers, 10.3 ms with
+        // parallelism off, SPG 16.5 ms — 1.6x slower than a
+        // single-threaded PG on the commonest aggregate there is, and no
+        // ledger entry recorded it.
+        //
+        // Counting visible HEADERS needs no row at all. PG cannot do
+        // this: its visibility lives in the heap tuples themselves, so
+        // it has to read them (that is why its own count(*) is a full
+        // scan, parallel or not).
         // v7.39 (read01 round 57) — the table-privilege gate on the common
         // read core. A superuser session returns from it immediately.
         // v7.39 (round 529) — resolve an ORDER BY that names an output
@@ -1996,6 +2085,15 @@ impl Engine {
         };
         self.acl_check_select_as(stmt, as_role)?;
         validate_aggregate_placement(stmt)?;
+        // v7.39 (round 559) — the bare `count(*)` fast path, AFTER the
+        // privilege gate above. Placed before it at first, and the
+        // security-definer e2e caught it immediately: a SECURITY INVOKER
+        // function whose body is `SELECT count(*) FROM t` answered
+        // instead of being refused, because the fast path never reached
+        // the check.
+        if let Some(r) = self.try_bare_count_star(stmt, as_role)? {
+            return Ok(r);
+        }
         validate_locking_clause(stmt)?;
         let result = self.exec_select_cancel_inner(stmt, cancel)?;
         // v7.39 (round 135) — drop the synthetic `__grp_ord_*` ordering columns
