@@ -343,6 +343,14 @@ impl Engine {
         {
             return Ok(n);
         }
+        // v7.39 (round 564) — an index-only range emits straight through.
+        // Below, the materialising path builds a `Vec<Row>` and this
+        // function walks it once to borrow each cell back out; a profile
+        // at 50k rows put a fifth of the connection thread's CPU on
+        // building and dropping that vector alone.
+        if let Some(n) = self.try_index_only_stream(s, &mut emit)? {
+            return Ok(n);
+        }
         let QueryResult::Rows { columns, rows } = self.exec_select_cancel(s, cancel)? else {
             return Err(EngineError::Unsupported(
                 "streaming SELECT got a non-Rows result".into(),
