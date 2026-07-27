@@ -20125,6 +20125,24 @@ impl Parser {
             }
             Token::Minus => {
                 self.advance();
+                // v7.39 (round 549) — fold the sign into an integer
+                // literal that only fits once it is negative.
+                //
+                // `9223372036854775808` is one past i64::MAX, so the
+                // lexer hands it over as a NUMERIC and `-` on a numeric
+                // stays numeric. PG folds the sign first, so
+                // `-9223372036854775808` is a bigint there — and
+                // `-9223372036854775808 - 1` raises "bigint out of
+                // range" where SPG quietly answered
+                // -9223372036854775809, a value no bigint can hold.
+                // The arithmetic itself was already checked; only the
+                // literal's type was wrong.
+                if let Token::Numeric(lit) = self.peek()
+                    && let Ok(folded) = alloc::format!("-{lit}").parse::<i64>()
+                {
+                    self.advance();
+                    return Ok(Expr::Literal(Literal::Integer(folded)));
+                }
                 // Unary minus binds tighter than `*`/`/` (now at prec 7 after
                 // `<->` slotted into 5 and arithmetic shifted up).
                 let e = self.parse_expr(9)?;
