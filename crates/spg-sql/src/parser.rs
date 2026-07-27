@@ -714,6 +714,123 @@ struct Parser {
 ///     simply unreachable there, which is why a deep-nesting test has to
 ///     ask for a large stack of its own — see `nesting_budget_errors_at`
 ///     in the parser tests.
+/// v7.39 (round 541) — the pg_catalog relations SPG synthesises, in
+/// one place.
+///
+/// There were two copies of this fact: a curated list, used for BARE
+/// names, and — in `try_peek_meta_qualified` — no list at all, which
+/// rewrote `pg_catalog.<anything>` to `__spg_pg_<anything>` and left
+/// the engine to complain about a view it could not materialise. So
+/// writing the schema qualifier CHANGED THE ANSWER: `pg_stat_activity`
+/// had rows, `pg_catalog.pg_stat_activity` was an error.
+///
+/// PG puts `pg_catalog` at the implicit front of every search_path, so
+/// the two spellings name the same relation and must resolve the same
+/// way. Names NOT here (`pg_stat_activity`, `pg_locks`,
+/// `pg_stat_statements`, `pg_statio_user_tables`) route through the
+/// meta_view_result path under their own names and must not be
+/// rewritten; a name that is neither reaches the ordinary resolver,
+/// which reports that the relation does not exist — PG's answer.
+const SYNTHESISED_PG_CATALOGS: &[&str] = &[
+        "pg_am",
+        "pg_attrdef",
+        "pg_attribute",
+        "pg_class",
+        "pg_collation",
+        "pg_constraint",
+        "pg_database",
+        "pg_depend",
+        // v7.39 (read01 round 50) — COMMENT ON store, PG's pg_description.
+        "pg_description",
+        "pg_enum",
+        "pg_extension",
+    // v7.39 (round 541) — pg_dump reads it for every relation of kind
+    // 'f'. SPG has no foreign tables, so it is empty, which is also
+    // what PG reports on a database that has none.
+    "pg_foreign_table",
+    // v7.39 (round 541) — the empty-by-truth family; see
+    // EMPTY_PG_CATALOGS in spg-engine::system_catalog.
+    "pg_event_trigger",
+    "pg_file_settings",
+    "pg_foreign_data_wrapper",
+    "pg_foreign_server",
+    "pg_hba_file_rules",
+    "pg_ident_file_mappings",
+    "pg_init_privs",
+    "pg_parameter_acl",
+    "pg_prepared_xacts",
+    "pg_publication_namespace",
+    "pg_publication_rel",
+    "pg_publication_tables",
+    "pg_replication_origin",
+    "pg_replication_origin_status",
+    "pg_seclabel",
+    "pg_seclabels",
+    "pg_shdepend",
+    "pg_shdescription",
+    "pg_shmem_allocations",
+    "pg_shmem_allocations_numa",
+    "pg_shseclabel",
+    "pg_statistic_ext_data",
+    "pg_stats_ext",
+    "pg_stats_ext_exprs",
+    "pg_subscription_rel",
+    "pg_transform",
+    "pg_user_mapping",
+    "pg_user_mappings",
+        "pg_index",
+        "pg_indexes",
+        "pg_inherits",
+        "pg_matviews",
+        "pg_namespace",
+        "pg_policies",
+        "pg_policy",
+        "pg_proc",
+        "pg_publication",
+        "pg_replication_slots",
+        "pg_roles",
+        // v7.39 (round 143) — the rewrite-rule listing view.
+        // v7.39 (round 312) — and the rule catalogue itself, which
+        // `pg_get_ruledef(oid)` resolves against.
+        "pg_rewrite",
+        "pg_rules",
+        "pg_sequence",
+        "pg_settings",
+        "pg_stat_archiver",
+        "pg_stat_bgwriter",
+        "pg_stat_checkpointer",
+        "pg_stat_database",
+        "pg_stat_io",
+        "pg_stat_progress_analyze",
+        "pg_auth_members",
+        "pg_stat_progress_create_index",
+        "pg_stat_progress_vacuum",
+        "pg_stat_replication",
+        "pg_stat_slru",
+        "pg_stat_subscription_stats",
+        "pg_stat_user_functions",
+        "pg_stat_user_indexes",
+        "pg_stat_user_tables",
+        "pg_stat_wal",
+        "pg_prepared_statements",
+        "pg_largeobject",
+        "pg_largeobject_metadata",
+        "pg_statistic",
+        "pg_statistic_ext",
+        "pg_subscription",
+        "pg_tables",
+        "pg_tablespace",
+        // v7.39 (round 502) — the timezone catalogues. SPG resolved
+        // named zones correctly but could not list them, so a client
+        // populating a timezone picker got "relation does not exist".
+        "pg_timezone_abbrevs",
+        "pg_timezone_names",
+        "pg_trigger",
+        "pg_type",
+        "pg_user",
+        "pg_views",
+];
+
 const MAX_NEST_DEPTH: usize = 64;
 
 /// v7.39 (read01 geo_ops.c) — prefix `@@` desugar target, out-of-line so
@@ -10748,11 +10865,24 @@ impl Parser {
         let (prefix, normalised) = if schema.eq_ignore_ascii_case("information_schema") {
             ("__spg_info_", tbl.to_ascii_lowercase())
         } else if schema.eq_ignore_ascii_case("pg_catalog") {
-            let bare = tbl
-                .to_ascii_lowercase()
+            // v7.39 (round 541) — only the catalogs SPG actually
+            // synthesises are rewritten, which is what the BARE path
+            // has always checked. Anything else keeps its own name and
+            // takes the ordinary route: `pg_stat_activity` and friends
+            // resolve through meta_view_result, and a name that is no
+            // catalog at all gets PG's "relation does not exist"
+            // instead of a message about a view SPG cannot materialise.
+            let lowered = tbl.to_ascii_lowercase();
+            if !SYNTHESISED_PG_CATALOGS.contains(&lowered.as_str()) {
+                self.advance(); // schema
+                self.advance(); // dot
+                self.advance(); // tbl
+                return Some(lowered);
+            }
+            let bare = lowered
                 .strip_prefix("pg_")
                 .map(alloc::string::String::from)
-                .unwrap_or_else(|| tbl.to_ascii_lowercase());
+                .unwrap_or(lowered);
             ("__spg_pg_", bare)
         } else if schema.eq_ignore_ascii_case("mysql") {
             // v7.17.0 Phase 3.P0-65 — MySQL system schema
@@ -10782,71 +10912,7 @@ impl Parser {
         // through the meta_view_result path instead, and already resolve
         // bare — they must NOT be listed here or the __spg_ rewrite would
         // mis-target them.)
-        const PG_META_TABLES: &[&str] = &[
-            "pg_am",
-            "pg_attrdef",
-            "pg_attribute",
-            "pg_class",
-            "pg_collation",
-            "pg_constraint",
-            "pg_database",
-            "pg_depend",
-            // v7.39 (read01 round 50) — COMMENT ON store, PG's pg_description.
-            "pg_description",
-            "pg_enum",
-            "pg_extension",
-            "pg_index",
-            "pg_indexes",
-            "pg_inherits",
-            "pg_matviews",
-            "pg_namespace",
-            "pg_policies",
-            "pg_policy",
-            "pg_proc",
-            "pg_publication",
-            "pg_replication_slots",
-            "pg_roles",
-            // v7.39 (round 143) — the rewrite-rule listing view.
-            // v7.39 (round 312) — and the rule catalogue itself, which
-            // `pg_get_ruledef(oid)` resolves against.
-            "pg_rewrite",
-            "pg_rules",
-            "pg_sequence",
-            "pg_settings",
-            "pg_stat_archiver",
-            "pg_stat_bgwriter",
-            "pg_stat_checkpointer",
-            "pg_stat_database",
-            "pg_stat_io",
-            "pg_stat_progress_analyze",
-            "pg_auth_members",
-            "pg_stat_progress_create_index",
-            "pg_stat_progress_vacuum",
-            "pg_stat_replication",
-            "pg_stat_slru",
-            "pg_stat_subscription_stats",
-            "pg_stat_user_functions",
-            "pg_stat_user_indexes",
-            "pg_stat_user_tables",
-            "pg_stat_wal",
-            "pg_prepared_statements",
-            "pg_largeobject",
-            "pg_largeobject_metadata",
-            "pg_statistic",
-            "pg_statistic_ext",
-            "pg_subscription",
-            "pg_tables",
-            "pg_tablespace",
-            // v7.39 (round 502) — the timezone catalogues. SPG resolved
-            // named zones correctly but could not list them, so a client
-            // populating a timezone picker got "relation does not exist".
-            "pg_timezone_abbrevs",
-            "pg_timezone_names",
-            "pg_trigger",
-            "pg_type",
-            "pg_user",
-            "pg_views",
-        ];
+        const PG_META_TABLES: &[&str] = SYNTHESISED_PG_CATALOGS;
         let name = match self.tokens.get(self.pos) {
             Some(Token::Ident(s)) => s.to_ascii_lowercase(),
             _ => return None,

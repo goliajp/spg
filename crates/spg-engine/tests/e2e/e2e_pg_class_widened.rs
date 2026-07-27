@@ -53,7 +53,10 @@ fn pg_class_relkind_p_for_partition_parent() {
         .unwrap();
     e.execute("CREATE TABLE plain (id INT)").unwrap();
     let rs = rows(&mut e, "SELECT * FROM pg_catalog.pg_class");
-    // Position 1 = relname, position 16 = relkind, position 26 = relispartition.
+    // v7.39 (round 541) — PG18's own positions. relallfrozen landed
+    // after relallvisible, where PG keeps it, which moved everything
+    // below it down one; these indices were pinning SPG's old layout.
+    // Position 1 = relname, position 17 = relkind, position 27 = relispartition.
     let by_name = |needle: &str| {
         rs.iter()
             .find(|r| matches!(&r[1], Value::Text(s) if s.as_ref() == needle))
@@ -61,22 +64,22 @@ fn pg_class_relkind_p_for_partition_parent() {
     };
     let cust = by_name("cust");
     assert!(
-        matches!(&cust[16], Value::Text(s) if s.as_ref() == "p"),
+        matches!(&cust[17], Value::Text(s) if s.as_ref() == "p"),
         "parent relkind"
     );
     assert!(
-        matches!(cust[26], Value::Bool(false)),
+        matches!(cust[27], Value::Bool(false)),
         "parent is not a partition"
     );
     let apac = by_name("cust_apac");
-    assert!(matches!(apac[26], Value::Bool(true)), "apac is a partition");
+    assert!(matches!(apac[27], Value::Bool(true)), "apac is a partition");
     let plain = by_name("plain");
     assert!(
-        matches!(&plain[16], Value::Text(s) if s.as_ref() == "r"),
+        matches!(&plain[17], Value::Text(s) if s.as_ref() == "r"),
         "plain table relkind"
     );
     assert!(
-        matches!(plain[26], Value::Bool(false)),
+        matches!(plain[27], Value::Bool(false)),
         "plain not a partition"
     );
 }
@@ -110,15 +113,15 @@ fn pg_class_relhasindex_after_create_index() {
         .iter()
         .find(|r| matches!(&r[1], Value::Text(s) if s.as_ref() == "t"))
         .unwrap();
-    // Position 13 = relhasindex.
-    assert!(matches!(t1[13], Value::Bool(false)), "no index yet");
+    // Position 14 = relhasindex (round 541: was 13).
+    assert!(matches!(t1[14], Value::Bool(false)), "no index yet");
     e.execute("CREATE INDEX ix_t_name ON t(name)").unwrap();
     let r2 = rows(&mut e, "SELECT * FROM pg_catalog.pg_class");
     let t2 = r2
         .iter()
         .find(|r| matches!(&r[1], Value::Text(s) if s.as_ref() == "t"))
         .unwrap();
-    assert!(matches!(t2[13], Value::Bool(true)), "has index");
+    assert!(matches!(t2[14], Value::Bool(true)), "has index");
 }
 
 // read01 — a pg_catalog view referenced only inside a subquery must

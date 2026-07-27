@@ -2664,7 +2664,10 @@ pub(crate) fn schema_name_for_oid(oid: i64) -> Option<alloc::string::String> {
     Some(alloc::string::String::from(name))
 }
 
-pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_class(
+    cat: &Catalog,
+    frozen_xid: i64,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     use spg_storage::PartitionRole;
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
@@ -2700,7 +2703,22 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         // hard-coded the NULL, because GRANT was a no-op).
         ColumnSchema::new("relacl", DataType::Text, true),
     ];
+    // v7.39 (round 541) — the six PG18 columns pg_class did not publish.
+    //
+    // `pg_dump`'s main relation query selects relfrozenxid, relminmxid
+    // and reloptions by name and stopped on the first one missing. The
+    // six are spliced in ONCE, at PG's own positions, rather than
+    // threaded through each of the four row-building loops below —
+    // twelve positional insertions into untyped value lists is how a
+    // column ends up one slot out.
+    let mut schema = schema;
+    splice_pg_class_v18_schema(&mut schema);
     let mut rows: Vec<Row<'static>> = Vec::new();
+    // relname -> reloptions, for the views that carry a check option.
+    // PG stores it there and pg_dump reads it back out to decide
+    // whether to write WITH LOCAL/CASCADED CHECK OPTION.
+    let mut view_reloptions: alloc::collections::BTreeMap<alloc::string::String, &'static str> =
+        alloc::collections::BTreeMap::new();
     // PG starts user-relation OIDs above 16384.
     // v7.39 (round 437) — walk the RAW list so an OID stays tied to a
     // table's catalog position, which is exactly what `relation_oid`
@@ -2814,6 +2832,28 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         };
         let relnatts = i16::try_from(crate::describe::describe_view_columns(cat, vname).len())
             .unwrap_or(i16::MAX);
+        // v7.39 (round 541) — a view's WITH CHECK OPTION lives in
+        // reloptions in PG, and that is where pg_dump reads it back
+        // from. SPG stored the option (information_schema.views
+        // reported it) but pg_class never published it, so a dump lost
+        // the clause.
+        if let Some(v) = cat.views_all().get(stored) {
+            match v.check_option {
+                1 => {
+                    view_reloptions.insert(
+                        alloc::string::String::from(vname),
+                        "check_option=local",
+                    );
+                }
+                2 => {
+                    view_reloptions.insert(
+                        alloc::string::String::from(vname),
+                        "check_option=cascaded",
+                    );
+                }
+                _ => {}
+            }
+        }
         rows.push(Row::new(alloc::vec![
             Value::BigInt(view_oid),
             Value::text(vname.to_string()),
@@ -2935,7 +2975,93 @@ pub(crate) fn synth_pg_class(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
             crate::acl::render_acl_list(&def.acl).map_or(Value::Null, Value::text),
         ]));
     }
+    for row in &mut rows {
+        splice_pg_class_v18_row(row, frozen_xid, &view_reloptions);
+    }
     (schema, rows)
+}
+
+/// v7.39 (round 541) — where PG18 keeps the six, and what they hold.
+///
+/// Measured, per relkind:
+///
+///     table       relfrozenxid <xid>  relminmxid 1
+///     sequence    relfrozenxid 0      relminmxid 0
+///     index       relfrozenxid 0      relminmxid 0
+///     view        relfrozenxid 0      relminmxid 0
+///
+/// — a cutoff exists only where there is heap storage to freeze.
+/// relallfrozen and relrewrite read 0 throughout; relpartbound is NULL
+/// for everything that is not a partition.
+///
+/// SPG has no per-relation freeze cutoff, so the value it reports is
+/// the database-wide one `pg_database.datfrozenxid` already publishes —
+/// read from the same place, so the two cannot drift apart.
+const PG_CLASS_RELALLVISIBLE: usize = 11;
+const PG_CLASS_RELKIND: usize = 16;
+const PG_CLASS_RELISPARTITION: usize = 26;
+
+fn splice_pg_class_v18_schema(schema: &mut Vec<ColumnSchema>) {
+    // v7.39 (round 541) — a REAL text[]. pg_dump does
+    // `array_remove(c.reloptions, 'check_option=local')` and
+    // `'check_option=local' = ANY (c.reloptions)`; a text column
+    // holding `{check_option=local}` LOOKS right when printed and
+    // fails both.
+    schema.push(ColumnSchema::new("reloptions", DataType::TextArray, true));
+    schema.push(ColumnSchema::new("relpartbound", DataType::Text, true));
+    schema.insert(
+        PG_CLASS_RELISPARTITION + 1,
+        ColumnSchema::new("relminmxid", DataType::BigInt, false),
+    );
+    schema.insert(
+        PG_CLASS_RELISPARTITION + 1,
+        ColumnSchema::new("relfrozenxid", DataType::BigInt, false),
+    );
+    schema.insert(
+        PG_CLASS_RELISPARTITION + 1,
+        ColumnSchema::new("relrewrite", DataType::BigInt, false),
+    );
+    schema.insert(
+        PG_CLASS_RELALLVISIBLE + 1,
+        ColumnSchema::new("relallfrozen", DataType::Int, false),
+    );
+}
+
+fn splice_pg_class_v18_row(
+    row: &mut Row<'static>,
+    frozen_xid: i64,
+    view_reloptions: &alloc::collections::BTreeMap<alloc::string::String, &'static str>,
+) {
+    let relkind = match row.values.get(PG_CLASS_RELKIND) {
+        Some(Value::Text(k)) => k.to_string(),
+        _ => alloc::string::String::new(),
+    };
+    let relname = match row.values.get(1) {
+        Some(Value::Text(n)) => n.to_string(),
+        _ => alloc::string::String::new(),
+    };
+    // Only a relation with heap storage has a freeze cutoff.
+    let (frozen, minmxid) = if relkind == "r" || relkind == "m" {
+        (frozen_xid, 1)
+    } else {
+        (0, 0)
+    };
+    let reloptions = view_reloptions
+        .get(&relname)
+        .filter(|_| relkind == "v" || relkind == "m")
+        .map_or(Value::Null, |o| {
+            Value::TextArray(alloc::vec![Some(alloc::string::String::from(*o))])
+        });
+    row.values.push(reloptions);
+    row.values.push(Value::Null); // relpartbound
+    row.values
+        .insert(PG_CLASS_RELISPARTITION + 1, Value::BigInt(minmxid));
+    row.values
+        .insert(PG_CLASS_RELISPARTITION + 1, Value::BigInt(frozen));
+    row.values
+        .insert(PG_CLASS_RELISPARTITION + 1, Value::BigInt(0)); // relrewrite
+    row.values
+        .insert(PG_CLASS_RELALLVISIBLE + 1, Value::Int(0)); // relallfrozen
 }
 
 /// v7.16.2 + v7.37.24 (24.8b) — synthesise `pg_catalog.pg_attribute`.
@@ -4698,6 +4824,99 @@ pub(crate) fn synth_pg_auth_members(engine: &Engine) -> (Vec<ColumnSchema>, Vec<
 /// v7.17.0 Phase 3.P0-56 — synthesise `pg_catalog.pg_views`. PG's
 /// pg_views is a view listing every catalog view; SPG ships one
 /// row per declared view + its definition text.
+/// v7.39 (round 541) — the pg_catalog relations that exist in PG and
+/// are genuinely EMPTY in SPG.
+///
+/// Sweeping PG18's 144 pg_catalog relations against SPG found 69 that
+/// SPG does not have at all. That is not the same as having none of a
+/// thing: a catalog that exists and returns no rows lets a tool
+/// conclude "no foreign tables here"; a catalog that does not exist
+/// stops it. `pg_dump` demonstrated both, one query at a time.
+///
+/// These twenty-eight are empty because the feature behind them is
+/// absent from SPG by design — no foreign-data wrappers, no security
+/// labels, no prepared transactions, no shared-memory segments, no
+/// configuration FILES to report rules from. Publishing them empty is
+/// the honest answer, and it is PG's answer on a database that has
+/// none of those either.
+///
+/// The rest of the 69 (pg_language, pg_operator, pg_opclass,
+/// pg_opfamily, pg_range, pg_sequences, pg_partitioned_table,
+/// pg_group, pg_shadow, the pg_ts_* family, and the pg_stat_* /
+/// pg_statio_* all/sys variants) would NOT be empty — SPG has
+/// sequences, partitions, ranges, roles, full-text search and
+/// statistics. Stubbing those empty would be a lie, so they are
+/// recorded as work rather than filled in here.
+///
+/// Column names and types are PG18 readings.
+const EMPTY_PG_CATALOGS: &[(&str, &[(&str, DataType)])] = &[
+    ("pg_event_trigger", &[("oid", DataType::BigInt), ("evtname", DataType::Text), ("evtevent", DataType::Text), ("evtowner", DataType::BigInt), ("evtfoid", DataType::BigInt), ("evtenabled", DataType::Text), ("evttags", DataType::TextArray)]),
+    ("pg_file_settings", &[("sourcefile", DataType::Text), ("sourceline", DataType::Int), ("seqno", DataType::Int), ("name", DataType::Text), ("setting", DataType::Text), ("applied", DataType::Bool), ("error", DataType::Text)]),
+    ("pg_foreign_data_wrapper", &[("oid", DataType::BigInt), ("fdwname", DataType::Text), ("fdwowner", DataType::BigInt), ("fdwhandler", DataType::BigInt), ("fdwvalidator", DataType::BigInt), ("fdwacl", DataType::TextArray), ("fdwoptions", DataType::TextArray)]),
+    ("pg_foreign_server", &[("oid", DataType::BigInt), ("srvname", DataType::Text), ("srvowner", DataType::BigInt), ("srvfdw", DataType::BigInt), ("srvtype", DataType::Text), ("srvversion", DataType::Text), ("srvacl", DataType::TextArray), ("srvoptions", DataType::TextArray)]),
+    ("pg_hba_file_rules", &[("rule_number", DataType::Int), ("file_name", DataType::Text), ("line_number", DataType::Int), ("type", DataType::Text), ("database", DataType::TextArray), ("user_name", DataType::TextArray), ("address", DataType::Text), ("netmask", DataType::Text), ("auth_method", DataType::Text), ("options", DataType::TextArray), ("error", DataType::Text)]),
+    ("pg_ident_file_mappings", &[("map_number", DataType::Int), ("file_name", DataType::Text), ("line_number", DataType::Int), ("map_name", DataType::Text), ("sys_name", DataType::Text), ("pg_username", DataType::Text), ("error", DataType::Text)]),
+    ("pg_init_privs", &[("objoid", DataType::BigInt), ("classoid", DataType::BigInt), ("objsubid", DataType::Int), ("privtype", DataType::Text), ("initprivs", DataType::TextArray)]),
+    ("pg_parameter_acl", &[("oid", DataType::BigInt), ("parname", DataType::Text), ("paracl", DataType::TextArray)]),
+    ("pg_prepared_xacts", &[("transaction", DataType::BigInt), ("gid", DataType::Text), ("prepared", DataType::Timestamptz), ("owner", DataType::Text), ("database", DataType::Text)]),
+    ("pg_publication_namespace", &[("oid", DataType::BigInt), ("pnpubid", DataType::BigInt), ("pnnspid", DataType::BigInt)]),
+    ("pg_publication_rel", &[("oid", DataType::BigInt), ("prpubid", DataType::BigInt), ("prrelid", DataType::BigInt), ("prqual", DataType::Text), ("prattrs", DataType::Text)]),
+    ("pg_publication_tables", &[("pubname", DataType::Text), ("schemaname", DataType::Text), ("tablename", DataType::Text), ("attnames", DataType::TextArray), ("rowfilter", DataType::Text)]),
+    ("pg_replication_origin", &[("roident", DataType::BigInt), ("roname", DataType::Text)]),
+    ("pg_replication_origin_status", &[("local_id", DataType::BigInt), ("external_id", DataType::Text), ("remote_lsn", DataType::Text), ("local_lsn", DataType::Text)]),
+    ("pg_seclabel", &[("objoid", DataType::BigInt), ("classoid", DataType::BigInt), ("objsubid", DataType::Int), ("provider", DataType::Text), ("label", DataType::Text)]),
+    ("pg_seclabels", &[("objoid", DataType::BigInt), ("classoid", DataType::BigInt), ("objsubid", DataType::Int), ("objtype", DataType::Text), ("objnamespace", DataType::BigInt), ("objname", DataType::Text), ("provider", DataType::Text), ("label", DataType::Text)]),
+    ("pg_shdepend", &[("dbid", DataType::BigInt), ("classid", DataType::BigInt), ("objid", DataType::BigInt), ("objsubid", DataType::Int), ("refclassid", DataType::BigInt), ("refobjid", DataType::BigInt), ("deptype", DataType::Text)]),
+    ("pg_shdescription", &[("objoid", DataType::BigInt), ("classoid", DataType::BigInt), ("description", DataType::Text)]),
+    ("pg_shmem_allocations", &[("name", DataType::Text), ("off", DataType::BigInt), ("size", DataType::BigInt), ("allocated_size", DataType::BigInt)]),
+    ("pg_shmem_allocations_numa", &[("name", DataType::Text), ("numa_node", DataType::Int), ("size", DataType::BigInt)]),
+    ("pg_shseclabel", &[("objoid", DataType::BigInt), ("classoid", DataType::BigInt), ("provider", DataType::Text), ("label", DataType::Text)]),
+    ("pg_statistic_ext_data", &[("stxoid", DataType::BigInt), ("stxdinherit", DataType::Bool), ("stxdndistinct", DataType::Text), ("stxddependencies", DataType::Text), ("stxdmcv", DataType::Text), ("stxdexpr", DataType::TextArray)]),
+    ("pg_stats_ext", &[("schemaname", DataType::Text), ("tablename", DataType::Text), ("statistics_schemaname", DataType::Text), ("statistics_name", DataType::Text), ("statistics_owner", DataType::Text), ("attnames", DataType::TextArray), ("exprs", DataType::TextArray), ("kinds", DataType::TextArray), ("inherited", DataType::Bool), ("n_distinct", DataType::Text), ("dependencies", DataType::Text), ("most_common_vals", DataType::TextArray), ("most_common_val_nulls", DataType::BoolArray), ("most_common_freqs", DataType::FloatArray), ("most_common_base_freqs", DataType::FloatArray)]),
+    ("pg_stats_ext_exprs", &[("schemaname", DataType::Text), ("tablename", DataType::Text), ("statistics_schemaname", DataType::Text), ("statistics_name", DataType::Text), ("statistics_owner", DataType::Text), ("expr", DataType::Text), ("inherited", DataType::Bool), ("null_frac", DataType::Float), ("avg_width", DataType::Int), ("n_distinct", DataType::Float), ("most_common_vals", DataType::TextArray), ("most_common_freqs", DataType::FloatArray), ("histogram_bounds", DataType::TextArray), ("correlation", DataType::Float), ("most_common_elems", DataType::TextArray), ("most_common_elem_freqs", DataType::FloatArray), ("elem_count_histogram", DataType::FloatArray)]),
+    ("pg_subscription_rel", &[("srsubid", DataType::BigInt), ("srrelid", DataType::BigInt), ("srsubstate", DataType::Text), ("srsublsn", DataType::Text)]),
+    ("pg_transform", &[("oid", DataType::BigInt), ("trftype", DataType::BigInt), ("trflang", DataType::BigInt), ("trffromsql", DataType::Text), ("trftosql", DataType::Text)]),
+    ("pg_user_mapping", &[("oid", DataType::BigInt), ("umuser", DataType::BigInt), ("umserver", DataType::BigInt), ("umoptions", DataType::TextArray)]),
+    ("pg_user_mappings", &[("umid", DataType::BigInt), ("srvid", DataType::BigInt), ("srvname", DataType::Text), ("umuser", DataType::BigInt), ("usename", DataType::Text), ("umoptions", DataType::TextArray)]),
+];
+
+/// Look up an empty catalog by its `__spg_pg_`-rewritten name.
+pub(crate) fn synth_empty_pg_catalog(
+    view: &str,
+) -> Option<(Vec<ColumnSchema>, Vec<Row<'static>>)> {
+    let bare = view.strip_prefix("__spg_pg_")?;
+    let (_, cols) = EMPTY_PG_CATALOGS
+        .iter()
+        .find(|(name, _)| name.strip_prefix("pg_") == Some(bare))?;
+    let schema = cols
+        .iter()
+        .map(|(n, t)| ColumnSchema::new(*n, *t, true))
+        .collect();
+    Some((schema, Vec::new()))
+}
+
+/// v7.39 (round 541) — `pg_catalog.pg_foreign_table`, empty.
+///
+/// `pg_dump` reads it for every relation of kind 'f':
+///
+///     CASE WHEN c.relkind = 'f'
+///          THEN (SELECT ftserver FROM pg_catalog.pg_foreign_table
+///                WHERE ftrelid = c.oid)
+///          ELSE 0 END AS foreignserver
+///
+/// SPG has no foreign tables, so the answer is no rows — which is also
+/// what PG reports on a database that has none. A catalog that exists
+/// and is empty and a catalog that does not exist are different things
+/// to a tool: the second stops it.
+pub(crate) fn synth_pg_foreign_table() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("ftrelid", DataType::BigInt, false),
+        ColumnSchema::new("ftserver", DataType::BigInt, false),
+        ColumnSchema::new("ftoptions", DataType::TextArray, true),
+    ];
+    (schema, Vec::new())
+}
+
 /// Synthesise `pg_catalog.pg_extension`. SPG ships its "extension"
 /// surfaces natively (vector, pg_trgm, plpgsql-shaped DO blocks), so
 /// the table lists those as installed — `SELECT … FROM pg_extension

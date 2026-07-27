@@ -110,6 +110,7 @@ mod e2e_infoschema_matview_round536;
 mod e2e_index_order_round537;
 mod e2e_pg_dump_blockers_round539;
 mod e2e_catalog_system_columns_round540;
+mod e2e_pg_catalog_reach_round541;
 mod e2e_unary_plus_round507;
 mod e2e_cardinality_violation;
 mod e2e_casefold;
