@@ -333,6 +333,14 @@ pub(crate) fn synth_information_schema_columns(
     }
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.visible_table_names() {
+        // v7.39 (round 536) — a MATERIALIZED VIEW is not in this view.
+        // PG omits them from information_schema entirely (they are not in
+        // the SQL standard), and `information_schema.tables` here already
+        // did — so SPG listed a relation that had columns and no table
+        // row, disagreeing with PG and with itself.
+        if cat.materialized_views().contains_key(&tname) {
+            continue;
+        }
         let Some(t) = cat.get(&tname) else { continue };
         for (i, col) in t.schema().columns.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
