@@ -30,6 +30,59 @@ pub(crate) enum TxStmtClass {
 
 /// Classify for the RC rebase. SELECTs with data-modifying CTEs count
 /// as DML against each CTE target (PG runs them in the same tx).
+/// v7.39 (round 552) — the tables a statement READS.
+///
+/// SPG's SERIALIZABLE was Snapshot Isolation: it caught two
+/// transactions writing the same row (first-committer-wins, PG's
+/// message and PG's outcome) and did NOT catch write skew, where each
+/// reads what the other writes and both commit. Measured, the classic
+/// case destroyed its invariant —
+///
+///     both doctors go off call, each having seen the other on call
+///     PG18  T2 aborts 40001, one stays on call     SPG  both commit, none does
+///
+/// — an outcome no serial order can produce. Detecting it needs the
+/// READ set, which nothing recorded.
+pub(crate) fn read_tables_of(stmt: &spg_sql::ast::Statement) -> Vec<String> {
+    use spg_sql::ast::Statement as S;
+    fn from_select(sel: &spg_sql::ast::SelectStatement, out: &mut Vec<String>) {
+        if let Some(from) = &sel.from {
+            for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
+                if !t.name.is_empty() {
+                    out.push(t.name.clone());
+                }
+                if let Some(body) = &t.lateral_subquery {
+                    from_select(body, out);
+                }
+            }
+        }
+        for (_, peer) in &sel.unions {
+            from_select(peer, out);
+        }
+        for c in &sel.ctes {
+            if let spg_sql::ast::CteBody::Select(b) = &c.body {
+                from_select(b, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    match stmt {
+        S::Select(sel) => from_select(sel, &mut out),
+        // A write reads what it filters on, and PG's SIREAD covers that
+        // too — an UPDATE … WHERE is a read of the rows it scanned.
+        S::Update(u) => out.push(u.table.clone()),
+        S::Delete(d) => out.push(d.table.clone()),
+        S::Insert(i) => {
+            if let Some(sel) = &i.select_source {
+                from_select(sel, &mut out);
+            }
+        }
+        _ => {}
+    }
+    out.retain(|t| !t.starts_with("__spg_"));
+    out
+}
+
 pub(crate) fn classify_stmt_for_tx(stmt: &spg_sql::ast::Statement) -> TxStmtClass {
     use spg_sql::ast::{CteBody, Statement as S};
     let cte_targets = |ctes: &[spg_sql::ast::Cte]| -> Option<Vec<String>> {
@@ -376,6 +429,48 @@ impl Engine {
     /// v7.37.17 (Phase E2) — post-dispatch bookkeeping for the RC
     /// rebase: count the statement and record its DML targets (or the
     /// DDL poison flag) on the open tx.
+    /// v7.39 (round 552) — remember what a SERIALIZABLE tx has read.
+    /// Only that level pays for it; RR and RC keep their old paths.
+    pub(crate) fn record_tx_reads(&mut self, tables: Vec<String>) {
+        let Some(tx_id) = self.current_tx else { return };
+        if tables.is_empty() {
+            return;
+        }
+        if let Some(st) = self.tx_catalogs.get_mut(&tx_id)
+            && st.serializable
+        {
+            for t in tables {
+                st.read_tables.insert(t);
+            }
+        }
+    }
+
+    /// The read/write antidependency Snapshot Isolation cannot see.
+    ///
+    /// PG's message, measured: `could not serialize access due to
+    /// read/write dependencies among transactions`. PG adds a DETAIL
+    /// naming the pivot; SPG's check is coarser than PG's pivot
+    /// analysis — it aborts on the antidependency itself — so it says
+    /// what it actually found rather than borrowing a reason code it
+    /// did not compute.
+    fn serializable_read_conflict(&self, tx_id: crate::TxId) -> Option<String> {
+        let st = self.tx_catalogs.get(&tx_id)?;
+        if !st.serializable {
+            return None;
+        }
+        let floor = st.begin_commit_seq;
+        for t in &st.read_tables {
+            if self.table_last_commit.get(t).is_some_and(|v| *v > floor) {
+                return Some(alloc::format!(
+                    "could not serialize access due to read/write dependencies \
+                     among transactions: {t:?} was written by a concurrent \
+                     transaction after this one read it"
+                ));
+            }
+        }
+        None
+    }
+
     pub(crate) fn record_tx_stmt(&mut self, class: &TxStmtClass) {
         let Some(tx_id) = self.current_tx else { return };
         let Some(st) = self.tx_catalogs.get_mut(&tx_id) else {
@@ -459,6 +554,10 @@ impl Engine {
                 savepoints: Vec::new(),
                 cached_snapshot,
                 touched_tables: alloc::collections::BTreeSet::new(),
+                read_tables: alloc::collections::BTreeSet::new(),
+                serializable: self.current_isolation_level
+                    == spg_sql::ast::IsolationLevel::Serializable,
+                begin_commit_seq: self.commit_seq,
                 shadow_dirty: false,
                 aborted: false,
                 constraints_deferred: None,
@@ -519,6 +618,16 @@ impl Engine {
         // fires once the slot is taken — see below).
         crate::injection_point!("tx_commit_walgroup_leader_switch", &self.current_tx);
         let tx_id = self.current_tx.ok_or(EngineError::NoActiveTransaction)?;
+        // v7.39 (round 552) — the read/write antidependency. SPG's
+        // SERIALIZABLE was Snapshot Isolation: the write-write check
+        // below caught two transactions touching the same row, and
+        // nothing caught write skew, where each reads what the other
+        // writes and both commit. A failed COMMIT ends the tx, as PG's
+        // does.
+        if let Some(msg) = self.serializable_read_conflict(tx_id) {
+            let _ = self.exec_rollback();
+            return Err(EngineError::SerializationFailure(msg));
+        }
         // v7.37.17 (Phase E3) — RR/SER commit-merge + write-write
         // conflict detection. A frozen-view tx COMMIT used to install
         // its shadow over the committed catalog wholesale, silently
@@ -818,6 +927,7 @@ impl Engine {
             // v7.37.15 Phase C.4 — release the tx's row locks. No-op
             // until the in-place write path (C.3) starts acquiring.
             self.release_tx_locks(v);
+
         }
         // All savepoints become permanent at COMMIT and the stack
         // resets for the next TX (`state.savepoints` is discarded with
@@ -828,6 +938,15 @@ impl Engine {
         // v7.39 (read01 round 118, B3) — a transaction's isolation level is
         // scoped to the block; PG reverts to the default at COMMIT/ROLLBACK.
         self.current_isolation_level = spg_sql::ast::IsolationLevel::ReadCommitted;
+        // v7.39 (round 552) — bump the commit sequence and stamp every
+        // table this tx wrote, so a concurrent SERIALIZABLE reader can
+        // tell that what it read has changed since. Commit order is what
+        // matters: a tx that began first can commit last.
+        self.commit_seq = self.commit_seq.saturating_add(1);
+        let seq = self.commit_seq;
+        for t in &state.touched_tables {
+            self.table_last_commit.insert(t.clone(), seq);
+        }
         // v7.39 (pg_stat knife A) — one committed transaction.
         self.xact_commit
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);

@@ -314,10 +314,21 @@ impl fmt::Display for EngineError {
                 f.write_str("more than one row returned by a subquery used as an expression")
             }
             Self::SerializationFailure(detail) => {
-                write!(
-                    f,
-                    "could not serialize access due to concurrent update: {detail}"
-                )
+                // v7.39 (round 552) — PG has TWO wordings under 40001 and
+                // they mean different things: "concurrent update" for a
+                // write-write conflict, "read/write dependencies among
+                // transactions" for the antidependency a SERIALIZABLE
+                // transaction hits. A detail that already carries PG's
+                // own sentence is passed through rather than nested
+                // inside the other one.
+                if detail.starts_with("could not serialize access") {
+                    f.write_str(detail)
+                } else {
+                    write!(
+                        f,
+                        "could not serialize access due to concurrent update: {detail}"
+                    )
+                }
             }
             Self::WriteRequired => {
                 f.write_str("statement requires a write lock (use execute, not execute_readonly)")
@@ -544,6 +555,27 @@ struct TxState {
     /// against. The per-statement rebase extracts/replays write-sets
     /// only for these (see `maybe_rc_rebase`).
     touched_tables: alloc::collections::BTreeSet<String>,
+    /// v7.39 (round 552) — tables this tx has READ. PG's SIREAD locks,
+    /// at table granularity: the coarse end of the same idea, and what
+    /// PG itself falls back to when its per-tuple lock memory runs out.
+    ///
+    /// A SERIALIZABLE tx aborts at COMMIT if any table it read was
+    /// written by a transaction that committed after its snapshot —
+    /// the read/write antidependency SI cannot see. Coarse granularity
+    /// means SPG aborts some transactions PG would let through; it
+    /// never lets through one PG would abort.
+    read_tables: alloc::collections::BTreeSet<String>,
+    /// v7.39 (round 552) — was THIS transaction opened SERIALIZABLE?
+    ///
+    /// `Engine::current_isolation_level` is one field for the whole
+    /// engine, not part of the per-session bag, so with two connections
+    /// open one transaction's COMMIT resets it under the other's feet —
+    /// the shared-engine leak rounds 279 and 283 chased through session
+    /// state and advisory locks. The level a transaction runs at has to
+    /// live on the transaction.
+    serializable: bool,
+    /// The engine's commit sequence when this tx began.
+    begin_commit_seq: u64,
     /// v7.39 (round 494) — has anything asked for this shadow catalog
     /// MUTABLY since BEGIN?
     ///
@@ -853,6 +885,13 @@ pub struct Engine {
     /// model unchanged). v4.42 will let dispatch hold multiple entries
     /// concurrently for group commit + engine MVCC.
     tx_catalogs: BTreeMap<TxId, TxState>,
+    /// v7.39 (round 552) — the COMMIT SEQUENCE at which each table was
+    /// last written. Commit order, not begin order: a transaction that
+    /// began first can commit last, so the writer version allocated at
+    /// BEGIN cannot answer "did this change after I read it".
+    table_last_commit: BTreeMap<String, u64>,
+    /// Monotonic, bumped once per successful COMMIT.
+    commit_seq: u64,
     /// Which slot the next exec_* call should mutate. Set by
     /// `execute_in(sql, tx_id)` at the entry point; legacy `execute(sql)`
     /// sets it to `IMPLICIT_TX`. None when no TX is in flight (read /
@@ -1380,6 +1419,8 @@ impl Engine {
             catalog: Catalog::new(),
             parallel_runner: ParallelRunnerSlot::default(),
             tx_catalogs: BTreeMap::new(),
+            table_last_commit: BTreeMap::new(),
+            commit_seq: 0,
             current_tx: None,
             backslash_escapes: false,
             mysql_strict: true,
@@ -1819,6 +1860,8 @@ impl Engine {
             catalog,
             parallel_runner: ParallelRunnerSlot::default(),
             tx_catalogs: BTreeMap::new(),
+            table_last_commit: BTreeMap::new(),
+            commit_seq: 0,
             current_tx: None,
             backslash_escapes: false,
             mysql_strict: true,
@@ -1943,6 +1986,8 @@ impl Engine {
                     catalog,
                     parallel_runner: ParallelRunnerSlot::default(),
                     tx_catalogs: BTreeMap::new(),
+                    table_last_commit: BTreeMap::new(),
+            commit_seq: 0,
                     current_tx: None,
                     backslash_escapes: false,
             mysql_strict: true,

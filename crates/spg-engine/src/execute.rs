@@ -1138,9 +1138,13 @@ impl Engine {
             // in-statement 23505 after the lock wait).
             self.maybe_rc_rebase()?;
         }
+        // v7.39 (round 552) — what a SERIALIZABLE tx READ, taken before
+        // the statement is consumed, recorded after it succeeds.
+        let read_tables = crate::transaction::read_tables_of(&stmt);
         let result = self.dispatch_stmt_inner(stmt, cancel);
         if result.is_ok() {
             self.record_tx_stmt(&tx_class);
+            self.record_tx_reads(read_tables);
         }
         // v7.39 (round 298) — the witness is THIS connection's slot.
         // `in_transaction()` is true whenever ANY connection holds a

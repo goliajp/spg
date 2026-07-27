@@ -120,6 +120,7 @@ mod e2e_db_role_setting_round547;
 mod e2e_ledger_phase2_recheck_round549;
 mod e2e_replication_slots_round550;
 mod e2e_explain_names_the_index_round551;
+mod e2e_write_skew_round552;
 mod e2e_unary_plus_round507;
 mod e2e_cardinality_violation;
 mod e2e_casefold;
