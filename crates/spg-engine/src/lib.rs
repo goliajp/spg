@@ -719,6 +719,25 @@ pub(crate) struct SessionBag {
     /// shared engine rather than in the bag.
     pub(crate) seq_currvals: BTreeMap<String, i64>,
     pub(crate) last_sequence_used: Option<String>,
+    /// v7.39 (round 553) — the isolation level THIS connection is
+    /// running at.
+    ///
+    /// It lived on the shared engine, so it leaked both ways between
+    /// connections. Measured over pgwire against PG18: connection B
+    /// opened a plain BEGIN and `SHOW transaction_isolation` answered
+    /// `serializable` — A's level; and A, still inside its SERIALIZABLE
+    /// block, then read `read committed`, because B's COMMIT reset the
+    /// field under it. PG answers `read committed` and `serializable`
+    /// throughout. So a transaction that asked for SERIALIZABLE ran at
+    /// READ COMMITTED and one that asked for nothing ran at
+    /// SERIALIZABLE, purely because another connection was busy.
+    ///
+    /// Round 552 saw the same field give way and worked around it by
+    /// putting the level on the TRANSACTION; this puts the session's
+    /// own copy where the rest of its state already lives — the place
+    /// r306's comment says every piece of per-connection state belongs
+    /// so it never gets a process-wide version to regress from.
+    pub(crate) isolation_level: spg_sql::ast::IsolationLevel,
     /// v7.39 (round 306) — open large-object descriptors. Per session
     /// from the start, deliberately: r277/r279/r283 each landed a piece
     /// of per-connection state on the process-wide engine first and had
@@ -2116,6 +2135,7 @@ impl Engine {
             temp_views: core::mem::take(&mut self.temp_views),
             seq_currvals: core::mem::take(&mut self.seq_currvals),
             last_sequence_used: self.last_sequence_used.take(),
+            isolation_level: self.current_isolation_level,
         };
         self.sessions.insert(self.current_session, outgoing);
         let incoming = self.sessions.remove(&id).unwrap_or_default();
@@ -2135,6 +2155,7 @@ impl Engine {
         self.temp_views = incoming.temp_views;
         self.seq_currvals = incoming.seq_currvals;
         self.last_sequence_used = incoming.last_sequence_used;
+        self.current_isolation_level = incoming.isolation_level;
         self.current_session = id;
         // The incoming session's temp namespace must be live before its very
         // first statement resolves a name.
