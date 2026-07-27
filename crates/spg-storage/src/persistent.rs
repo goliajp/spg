@@ -139,6 +139,21 @@ impl<T> PersistentVec<T> {
         Some((i - off, run))
     }
 
+    /// v7.39 (round 567) — a cursor that holds the run it last descended
+    /// to, for a caller reading many elements by ascending index.
+    ///
+    /// Indexing is `O(log₃₂ N)` — four dependent loads over 500k
+    /// elements — and a scan that reads every row pays it every row. A
+    /// leaf holds 32, so keeping it between reads makes that one descent
+    /// per 32. Ask for a scattered index and it descends, exactly as
+    /// `get` would.
+    pub const fn run_cursor(&self) -> RunCursor<'_, T> {
+        RunCursor {
+            vec: self,
+            run: None,
+        }
+    }
+
     /// The contiguous run of elements holding index `i`, plus `i`'s offset
     /// inside it. One trie descent serves the whole run, which is what lets
     /// `iter` walk a leaf at a time instead of descending per element.
@@ -876,5 +891,28 @@ mod tests {
             assert_eq!(a.get(i as usize), Some(&i));
         }
         assert_eq!(a.len(), 200);
+    }
+}
+
+/// v7.39 (round 567) — see [`PersistentVec::run_cursor`].
+#[derive(Debug)]
+pub struct RunCursor<'a, T> {
+    vec: &'a PersistentVec<T>,
+    /// `(start, run)` — `run[i - start]` is element `i`.
+    run: Option<(usize, &'a [T])>,
+}
+
+impl<'a, T> RunCursor<'a, T> {
+    /// Element `i`, descending only when it falls outside the held run.
+    pub fn get(&mut self, i: usize) -> Option<&'a T> {
+        if let Some((start, run)) = self.run
+            && i >= start
+            && i - start < run.len()
+        {
+            return run.get(i - start);
+        }
+        let (start, run) = self.vec.run_containing(i)?;
+        self.run = Some((start, run));
+        run.get(i - start)
     }
 }

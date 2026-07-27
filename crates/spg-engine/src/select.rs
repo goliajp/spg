@@ -5282,20 +5282,30 @@ impl Engine {
                     })();
                     alloc::boxed::Box::new(out)
                 });
+                // v7.39 (round 567) — `rows()` is a 32-way trie, so
+                // indexing it is four dependent loads and a scan that
+                // reads every row paid them every row. A profile of
+                // `SELECT sum(id)` over 500k rows put 37.8% of the
+                // connection thread's CPU on THIS ONE LINE. The cursor
+                // holds the leaf, making that one descent per 32.
+                let mut rows_cur = table.rows().run_cursor();
                 for boxed in results {
                     let shard = boxed
                         .downcast::<ShardOut>()
                         .expect("runner echoes the closure's box");
                     for i in (*shard)? {
-                        filtered.push(&table.rows()[i]);
+                        if let Some(row) = rows_cur.get(i) {
+                            filtered.push(row);
+                        }
                     }
                 }
             } else {
+                let mut rows_cur = table.rows().run_cursor();
                 for i in 0..n {
                     if !table.is_row_visible(i, &scan_snapshot) {
                         continue;
                     }
-                    let row = &table.rows()[i];
+                    let Some(row) = rows_cur.get(i) else { continue };
                     if !row_passes_where(row, &mut eval_stack, &mut memo)? {
                         continue;
                     }
