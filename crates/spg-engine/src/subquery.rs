@@ -462,7 +462,7 @@ impl Engine {
                     return Ok(());
                 }
                 let mut s = (**inner).clone();
-                substitute_outer_columns(&mut s, row, ctx);
+                substitute_outer_columns(&mut s, row, ctx, self.active_catalog());
                 let r = self.exec_select_cancel(&s, cancel)?;
                 let QueryResult::Rows { columns, rows, .. } = r else {
                     return Err(EngineError::Unsupported(
@@ -525,7 +525,7 @@ impl Engine {
                     }
                 }
                 let mut s = (**subquery).clone();
-                substitute_outer_columns(&mut s, row, ctx);
+                substitute_outer_columns(&mut s, row, ctx, self.active_catalog());
                 let r = self.exec_select_cancel(&s, cancel)?;
                 let exists = matches!(r, QueryResult::Rows { rows, .. } if !rows.is_empty());
                 let bit = if *negated { !exists } else { exists };
@@ -539,7 +539,7 @@ impl Engine {
                 self.resolve_correlated_in_expr(lhs, row, ctx, cancel, memo.as_deref_mut())?;
                 let lhs_val = eval::eval_expr(lhs, row, ctx).map_err(EngineError::Eval)?;
                 let mut s = (**subquery).clone();
-                substitute_outer_columns(&mut s, row, ctx);
+                substitute_outer_columns(&mut s, row, ctx, self.active_catalog());
                 let r = self.exec_select_cancel(&s, cancel)?;
                 let QueryResult::Rows { columns, rows, .. } = r else {
                     return Err(EngineError::Unsupported(
@@ -606,7 +606,7 @@ impl Engine {
                     .map(|el| eval::eval_expr(el, row, ctx).map_err(EngineError::Eval))
                     .collect::<Result<_, _>>()?;
                 let mut s = (**subquery).clone();
-                substitute_outer_columns(&mut s, row, ctx);
+                substitute_outer_columns(&mut s, row, ctx, self.active_catalog());
                 let r = self.exec_select_cancel(&s, cancel)?;
                 let QueryResult::Rows { columns, rows, .. } = r else {
                     return Err(EngineError::Unsupported(
@@ -658,7 +658,7 @@ impl Engine {
                     self.resolve_correlated_in_expr(el, row, ctx, cancel, memo.as_deref_mut())?;
                 }
                 let mut s = (**subquery).clone();
-                substitute_outer_columns(&mut s, row, ctx);
+                substitute_outer_columns(&mut s, row, ctx, self.active_catalog());
                 let r = self.exec_select_cancel(&s, cancel)?;
                 let QueryResult::Rows {
                     columns, mut rows, ..
@@ -744,7 +744,7 @@ impl Engine {
                 // values and materialise all rows into an ARRAY.
                 if let Expr::ScalarSubquery(inner) = array.as_mut() {
                     let mut s = (**inner).clone();
-                    substitute_outer_columns(&mut s, row, ctx);
+                    substitute_outer_columns(&mut s, row, ctx, self.active_catalog());
                     **array = self.materialize_quantified_rows(&s, cancel)?;
                 } else {
                     self.resolve_correlated_in_expr(array, row, ctx, cancel, memo.as_deref_mut())?;
@@ -3728,6 +3728,143 @@ fn scalar_subquery_empty_default(inner: &SelectStatement) -> Value<'static> {
     }
 }
 
+/// v7.39 (round 545) — does this qualifier name that relation?
+///
+/// A catalog reference is rewritten to a synthetic name before it
+/// reaches the engine (`pg_type` becomes `__spg_pg_type`), and the
+/// rewrite happens in the FROM clause but not in the QUALIFIER a
+/// correlated reference writes:
+///
+///     SELECT typname, (SELECT typarray FROM pg_type te
+///                      WHERE te.oid = pg_type.typelem) FROM pg_type
+///     PG18  answers      SPG  missing FROM-clause entry for "pg_type"
+///
+/// which is how pg_dump asks whether a type is an array type. The
+/// written name and the rewritten one are the same relation.
+fn relation_name_matches(qualifier: &str, relation: &str) -> bool {
+    if qualifier.eq_ignore_ascii_case(relation) {
+        return true;
+    }
+    let rewritten = if let Some(bare) = qualifier
+        .to_ascii_lowercase()
+        .strip_prefix("pg_")
+        .map(alloc::string::String::from)
+    {
+        alloc::format!("__spg_pg_{bare}")
+    } else {
+        alloc::format!("__spg_info_{}", qualifier.to_ascii_lowercase())
+    };
+    rewritten.eq_ignore_ascii_case(relation)
+}
+
+/// v7.39 (round 545) — the column names this statement's own FROM
+/// scope makes visible, or `None` when they cannot all be determined.
+///
+/// SQL resolves an unqualified name innermost-first and walks OUTWARD
+/// when it is not there. SPG only ever looked inward, so every
+/// correlated subquery written the ordinary way failed outright:
+///
+///     SELECT v, (SELECT w FROM ob WHERE bid = aid) FROM oa
+///     PG18  x|B1, y|B2       SPG  ERROR: column "aid" does not exist
+///
+/// Only the qualified spelling (`oa.aid`) worked — which is why the gap
+/// survived: the catalog queries and the tests that exercised
+/// correlation all wrote the qualifier.
+///
+/// A name in BOTH scopes belongs to the inner one, as in PG, so this
+/// set is what decides — and it has to be COMPLETE to decide anything.
+/// A FROM entry whose columns this cannot enumerate (a CTE, a view, a
+/// set-returning function) makes the whole answer `None`, and a `None`
+/// leaves bare names alone rather than guessing they are outer. Naming
+/// an inner column as outer would splice the wrong row's value in,
+/// which is silently wrong; leaving it alone is the behaviour that was
+/// already there.
+fn inner_scope_column_names(
+    s: &SelectStatement,
+    cat: &spg_storage::Catalog,
+) -> Option<alloc::collections::BTreeSet<alloc::string::String>> {
+    use spg_sql::ast::SelectItem;
+    fn add_table(
+        t: &spg_sql::ast::TableRef,
+        cat: &spg_storage::Catalog,
+        names: &mut alloc::collections::BTreeSet<alloc::string::String>,
+    ) -> bool {
+        if let Some(body) = &t.lateral_subquery {
+            // A derived body publishes its own items; a `*` among them
+            // republishes whatever it selected from, so recurse.
+            //
+            // A body with NO items is a VALUES list, whose column names
+            // live in the alias rather than the statement — unknowable
+            // here, and an empty set would read as "the inner scope
+            // supplies nothing", which is the opposite of the truth.
+            if body.items.is_empty() {
+                return false;
+            }
+            for item in &body.items {
+                match item {
+                    SelectItem::Expr { alias: Some(a), .. } => {
+                        names.insert(a.to_ascii_lowercase());
+                    }
+                    SelectItem::Expr {
+                        expr: Expr::Column(c),
+                        ..
+                    } => {
+                        names.insert(c.name.to_ascii_lowercase());
+                    }
+                    SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                        let Some(inner) = inner_scope_column_names(body, cat) else {
+                            return false;
+                        };
+                        names.extend(inner);
+                    }
+                    SelectItem::Expr { .. } => return false,
+                }
+            }
+            return true;
+        }
+        if t.unnest_expr.is_some() || t.generate_series_args.is_some() || t.name.is_empty() {
+            return false;
+        }
+        let Some(tbl) = cat.get(&t.name) else {
+            // A CTE, a view, or a name this catalog does not hold.
+            return false;
+        };
+        for col in &tbl.schema().columns {
+            names.insert(col.name.to_ascii_lowercase());
+        }
+        true
+    }
+    let mut names: alloc::collections::BTreeSet<alloc::string::String> =
+        alloc::collections::BTreeSet::new();
+    let from = s.from.as_ref()?;
+    if !add_table(&from.primary, cat, &mut names) {
+        return None;
+    }
+    for j in &from.joins {
+        if !add_table(&j.table, cat, &mut names) {
+            return None;
+        }
+    }
+    // The statement's own output aliases are in scope for ORDER BY /
+    // HAVING and must not be mistaken for outer references.
+    for item in &s.items {
+        if let SelectItem::Expr { alias: Some(a), .. } = item {
+            names.insert(a.to_ascii_lowercase());
+        }
+    }
+    // A CTE the statement defines is inner too, and its columns are not
+    // in the catalog — so a WITH makes the answer unknowable here.
+    if !s.ctes.is_empty() {
+        return None;
+    }
+    Some(names)
+}
+
+/// Is this bare name one the engine generated rather than the user?
+fn is_synthetic_column_name(n: &str) -> bool {
+    n.starts_with("__grp_") || n.starts_with("__agg_") || n.starts_with("__spg_")
+}
+
 pub(crate) fn select_is_correlated(s: &SelectStatement) -> bool {
     use spg_sql::ast::SelectItem;
     let Some(from) = &s.from else {
@@ -3806,12 +3943,24 @@ pub(crate) fn select_is_correlated(s: &SelectStatement) -> bool {
         exprs.push(&o.expr);
     }
     let mut correlated = false;
+    // v7.39 (round 545) — an UNQUALIFIED name that this statement's own
+    // scope does not supply is an outer reference, which is how SQL
+    // scoping works and how almost everyone writes a correlated
+    // subquery. Only the qualified spelling was recognised before.
     for e in exprs {
         visit_expr_columns_and_subqueries(
             e,
+            // v7.39 (round 545) — this stays the QUALIFIED-only test it
+            // has always been. Teaching it about bare outer references
+            // was tried and reverted: the runtime already routes such a
+            // subquery to the per-row path (the pre-resolver hands it
+            // back unreplaced), and claiming correlation up front pushed
+            // shapes onto a path they are not resolved on —
+            // `SELECT pg_typeof((SELECT count(*) FROM (VALUES (1)) b(y)))`
+            // came back "subquery reached row eval". Nine tests said so.
             &mut |c| {
                 if let Some(q) = &c.qualifier
-                    && !inner.iter().any(|a| a.eq_ignore_ascii_case(q))
+                    && !inner.iter().any(|a| relation_name_matches(q, a))
                 {
                     correlated = true;
                 }
@@ -4424,7 +4573,12 @@ fn eval_with_in_sets(
     }
 }
 
-fn substitute_outer_columns(stmt: &mut SelectStatement, row: &Row<'static>, ctx: &EvalContext<'_>) {
+fn substitute_outer_columns(
+    stmt: &mut SelectStatement,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+    cat: &spg_storage::Catalog,
+) {
     // v7.24 (round-16 B) — joined outer contexts carry no single
     // table alias; their schemas use composite "alias.column" names
     // instead. Pass an unmatchable alias and let the composite
@@ -4432,7 +4586,7 @@ fn substitute_outer_columns(stmt: &mut SelectStatement, row: &Row<'static>, ctx:
     // under a JOIN previously skipped substitution entirely and
     // died with "unknown table qualifier").
     let outer_alias = ctx.table_alias.unwrap_or("");
-    substitute_in_select(stmt, row, ctx, outer_alias);
+    substitute_in_select(stmt, row, ctx, outer_alias, cat);
 }
 
 fn substitute_in_select(
@@ -4440,28 +4594,33 @@ fn substitute_in_select(
     row: &Row<'static>,
     ctx: &EvalContext<'_>,
     outer_alias: &str,
+    cat: &spg_storage::Catalog,
 ) {
+    // v7.39 (round 545) — what this statement's own scope supplies. A
+    // bare name it does NOT supply is an outer reference and gets
+    // spliced; one it does belongs to the inner relation, as in PG.
+    let visible = inner_scope_column_names(stmt, cat);
     for item in &mut stmt.items {
         if let SelectItem::Expr { expr, .. } = item {
-            substitute_in_expr(expr, row, ctx, outer_alias);
+            substitute_in_expr(expr, row, ctx, outer_alias, cat, visible.as_ref());
         }
     }
     if let Some(w) = &mut stmt.where_ {
-        substitute_in_expr(w, row, ctx, outer_alias);
+        substitute_in_expr(w, row, ctx, outer_alias, cat, visible.as_ref());
     }
     if let Some(gs) = &mut stmt.group_by {
         for g in gs {
-            substitute_in_expr(g, row, ctx, outer_alias);
+            substitute_in_expr(g, row, ctx, outer_alias, cat, visible.as_ref());
         }
     }
     if let Some(h) = &mut stmt.having {
-        substitute_in_expr(h, row, ctx, outer_alias);
+        substitute_in_expr(h, row, ctx, outer_alias, cat, visible.as_ref());
     }
     for o in &mut stmt.order_by {
-        substitute_in_expr(&mut o.expr, row, ctx, outer_alias);
+        substitute_in_expr(&mut o.expr, row, ctx, outer_alias, cat, visible.as_ref());
     }
     for (_, peer) in &mut stmt.unions {
-        substitute_in_select(peer, row, ctx, outer_alias);
+        substitute_in_select(peer, row, ctx, outer_alias, cat);
     }
     // v7.39 (round 532) — and the FROM clause. A correlated subquery is
     // run by splicing the outer row's values into it, and that walk
@@ -4482,20 +4641,27 @@ fn substitute_in_select(
     // spliced.
     if let Some(from) = &mut stmt.from {
         if let Some(body) = &mut from.primary.lateral_subquery {
-            substitute_in_select(body, row, ctx, outer_alias);
+            substitute_in_select(body, row, ctx, outer_alias, cat);
         }
         for j in &mut from.joins {
             if let Some(on) = &mut j.on {
-                substitute_in_expr(on, row, ctx, outer_alias);
+                substitute_in_expr(on, row, ctx, outer_alias, cat, visible.as_ref());
             }
             if let Some(body) = &mut j.table.lateral_subquery {
-                substitute_in_select(body, row, ctx, outer_alias);
+                substitute_in_select(body, row, ctx, outer_alias, cat);
             }
         }
     }
 }
 
-fn substitute_in_expr(e: &mut Expr, row: &Row<'static>, ctx: &EvalContext<'_>, outer_alias: &str) {
+fn substitute_in_expr(
+    e: &mut Expr,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+    outer_alias: &str,
+    cat: &spg_storage::Catalog,
+    visible: Option<&alloc::collections::BTreeSet<alloc::string::String>>,
+) {
     // v7.25.2 (round-19 A) — bare synthetic columns. The aggregate
     // rewriter replaces group-key references INSIDE subquery bodies
     // with `__grp_N` so a correlated subquery in a GROUP BY select
@@ -4512,13 +4678,34 @@ fn substitute_in_expr(e: &mut Expr, row: &Row<'static>, ctx: &EvalContext<'_>, o
             return;
         }
     }
+    // v7.39 (round 545) — a bare name this statement's own scope does
+    // not supply is an outer reference. SQL resolves innermost-first
+    // and walks outward; SPG only ever looked inward, so the ordinary
+    // spelling of a correlated subquery — `WHERE bid = aid` — died with
+    // "column does not exist" while `WHERE bid = oa.aid` worked.
+    if let Expr::Column(c) = e
+        && c.qualifier.is_none()
+        && c.name != "*"
+        && !is_synthetic_column_name(&c.name.to_ascii_lowercase())
+        && visible.is_some_and(|v| !v.contains(&c.name.to_ascii_lowercase()))
+        && let Some(idx) = ctx
+            .columns
+            .iter()
+            .position(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+    {
+        let v = row.values.get(idx).cloned().unwrap_or(Value::Null);
+        if let Ok(lit) = value_to_literal_expr(v) {
+            *e = lit;
+            return;
+        }
+    }
     if let Expr::Column(c) = e
         && let Some(qual) = &c.qualifier
     {
         // Look up the column's index in the outer schema: plain name
         // when the qualifier is the outer table's alias, composite
         // "alias.column" for joined outer schemas (v7.24).
-        let idx = if !outer_alias.is_empty() && qual.eq_ignore_ascii_case(outer_alias) {
+        let idx = if !outer_alias.is_empty() && relation_name_matches(qual, outer_alias) {
             ctx.columns
                 .iter()
                 .position(|sc| sc.name.eq_ignore_ascii_case(&c.name))
@@ -4540,35 +4727,35 @@ fn substitute_in_expr(e: &mut Expr, row: &Row<'static>, ctx: &EvalContext<'_>, o
         }
     }
     match e {
-        Expr::NamedArg { expr, .. } => substitute_in_expr(expr, row, ctx, outer_alias),
-        Expr::Variadic(expr) => substitute_in_expr(expr, row, ctx, outer_alias),
+        Expr::NamedArg { expr, .. } => substitute_in_expr(expr, row, ctx, outer_alias, cat, visible),
+        Expr::Variadic(expr) => substitute_in_expr(expr, row, ctx, outer_alias, cat, visible),
         Expr::AggregateOrdered { call, order_by, .. } => {
-            substitute_in_expr(call, row, ctx, outer_alias);
+            substitute_in_expr(call, row, ctx, outer_alias, cat, visible);
             for o in order_by.iter_mut() {
-                substitute_in_expr(&mut o.expr, row, ctx, outer_alias);
+                substitute_in_expr(&mut o.expr, row, ctx, outer_alias, cat, visible);
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
-            substitute_in_expr(lhs, row, ctx, outer_alias);
-            substitute_in_expr(rhs, row, ctx, outer_alias);
+            substitute_in_expr(lhs, row, ctx, outer_alias, cat, visible);
+            substitute_in_expr(rhs, row, ctx, outer_alias, cat, visible);
         }
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
-            substitute_in_expr(expr, row, ctx, outer_alias);
+            substitute_in_expr(expr, row, ctx, outer_alias, cat, visible);
         }
         Expr::Like { expr, pattern, .. } => {
-            substitute_in_expr(expr, row, ctx, outer_alias);
-            substitute_in_expr(pattern, row, ctx, outer_alias);
+            substitute_in_expr(expr, row, ctx, outer_alias, cat, visible);
+            substitute_in_expr(pattern, row, ctx, outer_alias, cat, visible);
         }
         Expr::FunctionCall { args, .. } => {
             for a in args {
-                substitute_in_expr(a, row, ctx, outer_alias);
+                substitute_in_expr(a, row, ctx, outer_alias, cat, visible);
             }
         }
-        Expr::Extract { source, .. } => substitute_in_expr(source, row, ctx, outer_alias),
+        Expr::Extract { source, .. } => substitute_in_expr(source, row, ctx, outer_alias, cat, visible),
         Expr::WindowFunction {
             args,
             partition_by,
@@ -4576,18 +4763,18 @@ fn substitute_in_expr(e: &mut Expr, row: &Row<'static>, ctx: &EvalContext<'_>, o
             ..
         } => {
             for a in args {
-                substitute_in_expr(a, row, ctx, outer_alias);
+                substitute_in_expr(a, row, ctx, outer_alias, cat, visible);
             }
             for p in partition_by {
-                substitute_in_expr(p, row, ctx, outer_alias);
+                substitute_in_expr(p, row, ctx, outer_alias, cat, visible);
             }
             for (o, _, _) in order_by {
-                substitute_in_expr(o, row, ctx, outer_alias);
+                substitute_in_expr(o, row, ctx, outer_alias, cat, visible);
             }
         }
-        Expr::ScalarSubquery(s) => substitute_in_select(s, row, ctx, outer_alias),
+        Expr::ScalarSubquery(s) => substitute_in_select(s, row, ctx, outer_alias, cat),
         Expr::Exists { subquery, .. } | Expr::InSubquery { subquery, .. } => {
-            substitute_in_select(subquery, row, ctx, outer_alias);
+            substitute_in_select(subquery, row, ctx, outer_alias, cat);
         }
         Expr::RowInSubquery {
             row: row_exprs,
@@ -4595,9 +4782,9 @@ fn substitute_in_expr(e: &mut Expr, row: &Row<'static>, ctx: &EvalContext<'_>, o
             ..
         } => {
             for el in row_exprs.iter_mut() {
-                substitute_in_expr(el, row, ctx, outer_alias);
+                substitute_in_expr(el, row, ctx, outer_alias, cat, visible);
             }
-            substitute_in_select(subquery, row, ctx, outer_alias);
+            substitute_in_select(subquery, row, ctx, outer_alias, cat);
         }
         Expr::RowCmpSubquery {
             row: row_exprs,
@@ -4605,37 +4792,37 @@ fn substitute_in_expr(e: &mut Expr, row: &Row<'static>, ctx: &EvalContext<'_>, o
             ..
         } => {
             for el in row_exprs.iter_mut() {
-                substitute_in_expr(el, row, ctx, outer_alias);
+                substitute_in_expr(el, row, ctx, outer_alias, cat, visible);
             }
-            substitute_in_select(subquery, row, ctx, outer_alias);
+            substitute_in_select(subquery, row, ctx, outer_alias, cat);
         }
         Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => {}
         Expr::Array(items) => {
             for elem in items {
-                substitute_in_expr(elem, row, ctx, outer_alias);
+                substitute_in_expr(elem, row, ctx, outer_alias, cat, visible);
             }
         }
         Expr::ArraySubscript { target, index } => {
-            substitute_in_expr(target, row, ctx, outer_alias);
-            substitute_in_expr(index, row, ctx, outer_alias);
+            substitute_in_expr(target, row, ctx, outer_alias, cat, visible);
+            substitute_in_expr(index, row, ctx, outer_alias, cat, visible);
         }
         Expr::ArraySlice { target, lo, hi } => {
-            substitute_in_expr(target, row, ctx, outer_alias);
+            substitute_in_expr(target, row, ctx, outer_alias, cat, visible);
             if let Some(l) = lo {
-                substitute_in_expr(l, row, ctx, outer_alias);
+                substitute_in_expr(l, row, ctx, outer_alias, cat, visible);
             }
             if let Some(h) = hi {
-                substitute_in_expr(h, row, ctx, outer_alias);
+                substitute_in_expr(h, row, ctx, outer_alias, cat, visible);
             }
         }
         Expr::AnyAll { expr, array, .. } => {
-            substitute_in_expr(expr, row, ctx, outer_alias);
-            substitute_in_expr(array, row, ctx, outer_alias);
+            substitute_in_expr(expr, row, ctx, outer_alias, cat, visible);
+            substitute_in_expr(array, row, ctx, outer_alias, cat, visible);
         }
         Expr::InList { expr, list, .. } => {
-            substitute_in_expr(expr, row, ctx, outer_alias);
+            substitute_in_expr(expr, row, ctx, outer_alias, cat, visible);
             for item in list {
-                substitute_in_expr(item, row, ctx, outer_alias);
+                substitute_in_expr(item, row, ctx, outer_alias, cat, visible);
             }
         }
         Expr::Case {
@@ -4644,14 +4831,14 @@ fn substitute_in_expr(e: &mut Expr, row: &Row<'static>, ctx: &EvalContext<'_>, o
             else_branch,
         } => {
             if let Some(o) = operand {
-                substitute_in_expr(o, row, ctx, outer_alias);
+                substitute_in_expr(o, row, ctx, outer_alias, cat, visible);
             }
             for (w, t) in branches {
-                substitute_in_expr(w, row, ctx, outer_alias);
-                substitute_in_expr(t, row, ctx, outer_alias);
+                substitute_in_expr(w, row, ctx, outer_alias, cat, visible);
+                substitute_in_expr(t, row, ctx, outer_alias, cat, visible);
             }
             if let Some(e) = else_branch {
-                substitute_in_expr(e, row, ctx, outer_alias);
+                substitute_in_expr(e, row, ctx, outer_alias, cat, visible);
             }
         }
     }
