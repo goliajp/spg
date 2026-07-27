@@ -639,6 +639,40 @@ fn child_cost(n: &PlanNode) -> (f64, f64, u64, u64) {
 /// is left un-annotated rather than given a fabricated figure — SPG has
 /// no per-node timer and this renderer will not invent one. Documented
 /// divergence from PG, which instruments every node.
+/// v7.39 (round 555) — which sort SPG really runs, under ANALYZE only.
+///
+/// `ORDER BY … LIMIT k` takes the streaming top-N trim, which bounds
+/// live memory to O(k) instead of materialising every projected row.
+/// Measured on a 600k-row table: the LIMIT 5 sort added 0 MB of
+/// residency where the same sort without a LIMIT added 28. The bound
+/// was real and INVISIBLE — the node said only "Sort", so a reader
+/// could not tell it from the unbounded one, and EXPLAIN is where they
+/// would look.
+///
+/// PG prints this line under ANALYZE and not under a plain EXPLAIN,
+/// because it is a measured runtime fact rather than a plan property;
+/// this follows it. No Memory figure beside it: PG measures its sort's
+/// peak and SPG does not meter one, and a number that was not measured
+/// is worse than none.
+fn annotate_sort_method(node: &mut PlanNode, has_limit: bool) {
+    if node.head == "Sort"
+        && !node.attrs.iter().any(|a| a.starts_with("Sort Method:"))
+        && let Some(pos) = node.attrs.iter().position(|a| a.starts_with("Sort Key:"))
+    {
+        node.attrs.insert(
+            pos + 1,
+            alloc::string::String::from(if has_limit {
+                "Sort Method: top-N heapsort"
+            } else {
+                "Sort Method: quicksort"
+            }),
+        );
+    }
+    for c in &mut node.children {
+        annotate_sort_method(c, has_limit);
+    }
+}
+
 fn fill_actuals(
     node: &mut PlanNode,
     is_top: bool,
@@ -1486,6 +1520,7 @@ impl Engine {
             };
             if let Some(tree) = &mut plan_tree {
                 fill_actuals(tree, true, self, row_count as u64, elapsed_ms, &deltas);
+                annotate_sort_method(tree, sel.limit.is_some());
                 lines.clear();
                 render_costed(tree, !e.costs_off, &mut lines);
             }
