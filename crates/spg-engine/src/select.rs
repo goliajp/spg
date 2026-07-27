@@ -768,8 +768,15 @@ impl Engine {
                     let (schema, rows) = synth_pg_database(self);
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
-                "__spg_pg_roles" | "__spg_pg_user" => {
+                "__spg_pg_roles" => {
                     let (schema, rows) = synth_pg_roles(self);
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.39 (round 542) — pg_user is a DIFFERENT view over the
+                // same roles, with PG's own `use*` column names. It used to
+                // publish pg_roles' columns under this name.
+                "__spg_pg_user" => {
+                    let (schema, rows) = crate::system_catalog::synth_pg_user(self);
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.39 (read01 round 58) — role membership.
@@ -798,12 +805,12 @@ impl Engine {
                         crate::system_catalog::synth_pg_rewrite(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
-                // v7.17.0 Phase 3.P0-56 — pg_catalog.pg_matviews.
-                // SPG has no materialised view surface yet so the
-                // table shares pg_views's schema but stays empty.
+                // v7.39 (round 542) — pg_catalog.pg_matviews, with rows
+                // and PG's own column names.
                 "__spg_pg_matviews" => {
-                    let (schema, _) = synth_pg_views(self.active_catalog());
-                    materialise_meta_view(&mut catalog, view, schema, Vec::new())?;
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_matviews(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // pg_catalog.pg_extension — native capability list
                 // (mailrs embed round-12).

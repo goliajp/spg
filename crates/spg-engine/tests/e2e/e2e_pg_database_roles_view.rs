@@ -42,10 +42,19 @@ fn pg_roles_includes_postgres_superuser() {
 
 #[test]
 fn pg_user_alias_returns_same_shape() {
+    // v7.39 (round 542) — this asked pg_user for `rolname`, which is
+    // pg_roles' column. PG's pg_user is a different view over the same
+    // roles, and the name it publishes is `usename`; the assertion was
+    // pinning SPG's divergence in place.
     let mut e = Engine::new();
     let r = rows(
-        e.execute("SELECT rolname FROM pg_catalog.pg_user WHERE rolname = 'postgres'")
+        e.execute("SELECT usename FROM pg_catalog.pg_user WHERE usename = 'postgres'")
             .unwrap(),
     );
     assert_eq!(r.len(), 1);
+    // And the old spelling is gone, as it is in PG.
+    assert!(
+        e.execute("SELECT rolname FROM pg_user").is_err(),
+        "pg_user must not answer pg_roles' column name"
+    );
 }
