@@ -662,14 +662,45 @@ impl Engine {
                 // yielded only the first value per left row instead of the
                 // full product. Only genuinely correlated laterals (which
                 // reference an outer column) need per-left-row evaluation.
-                if is_constant_values_derived(inner_box) {
+                // v7.39 (round 572) — …and that is what this now asks.
+                //
+                // The gate was `is_constant_values_derived`, which only
+                // recognises a literal VALUES list, so an ordinary
+                // uncorrelated derived table — `JOIN (SELECT … FROM t
+                // WHERE …) b ON …`, as common a shape as SQL has — was
+                // re-executed once per LEFT ROW. Measured on a 500k
+                // table:
+                //
+                //     derived table alone                34.7 ms
+                //     … as a join peer, 500 rows      8,552 ms
+                //     … 2000 rows                    32,610 ms
+                //     … 20000 rows                  >120,000 ms (cancelled)
+                //     PG18, the 20000-row form           15.8 ms
+                //
+                // Linear in the LEFT side because the inner SELECT ran
+                // again for each of its rows. `select_is_correlated` is
+                // built to be wrong in the safe direction — its own
+                // comment says a wrong "yes" costs only a
+                // re-evaluation, while a wrong "no" is silently wrong —
+                // so it is exactly the question to ask here.
+                if is_constant_values_derived(inner_box)
+                    || (derived_is_plain_table_select(inner_box, self.active_catalog())
+                        && !crate::subquery::select_is_correlated(inner_box))
+                {
                     let pidx = from
                         .joins
                         .iter()
                         .position(|jj| core::ptr::eq(jj, j))
                         .unwrap_or(0);
-                    let (mut rows, cols) =
+                    let (mut rows, mut cols) =
                         self.materialise_table_ref_filtered(&j.table, &peer_preds[pidx])?;
+                    // `AS y(a, b)` renames positionally here exactly as
+                    // it does on the per-left-row path below.
+                    for (i, new_name) in j.table.unnest_column_aliases.iter().enumerate() {
+                        if let Some(col) = cols.get_mut(i) {
+                            col.name = new_name.clone();
+                        }
+                    }
                     if let Some(needed) = needed {
                         Self::null_out_unreferenced(&mut rows, &cols, &a, needed);
                     }
@@ -2952,6 +2983,38 @@ fn expr_is_constant(e: &Expr) -> bool {
 /// expressions. Such a table references nothing outer, so it is safe to
 /// materialise once and cross-join — unlike a correlated lateral (e.g.
 /// `generate_series(1, outer.col)`), which must stay per-left-row.
+/// v7.39 (round 572) — is this derived table a plain SELECT over stored
+/// tables, with nothing set-returning in its FROM?
+///
+/// `select_is_correlated` answers about columns in the projection, the
+/// WHERE and the nested subqueries. It does NOT see an outer reference
+/// carried in a set-returning function's ARGUMENTS — `LATERAL
+/// generate_series(1, lo.n)` and `LATERAL unnest(t.arr)` parse into a
+/// synthesised SELECT whose correlation lives in `generate_series_args`
+/// / `unnest_expr`, and it reports those as uncorrelated. Fifteen
+/// lateral e2e tests said so the moment the gate widened.
+///
+/// So the eager path asks this first: every FROM item must be a named
+/// stored table. An SRF anywhere keeps the per-left-row evaluation it
+/// needs.
+fn derived_is_plain_table_select(s: &SelectStatement, cat: &crate::Catalog) -> bool {
+    let Some(from) = &s.from else {
+        return false;
+    };
+    let plain = |t: &spg_sql::ast::TableRef| {
+        t.unnest_expr.is_none()
+            && t.generate_series_args.is_none()
+            && t.lateral_subquery.is_none()
+            // A set-returning FUNCTION reads as a named FROM item —
+            // `LATERAL f(t.col)`, `jsonb_each_text(t.j)`, `json_table(…)`
+            // all put the function's name here and their correlation in
+            // the arguments. Resolving the name against the catalog is
+            // what tells a stored table from one of those.
+            && cat.get(&t.name).is_some()
+    };
+    plain(&from.primary) && from.joins.iter().all(|j| plain(&j.table))
+}
+
 fn is_constant_values_derived(s: &SelectStatement) -> bool {
     use spg_sql::ast::SelectItem;
     let peer_ok = |p: &SelectStatement| -> bool {
