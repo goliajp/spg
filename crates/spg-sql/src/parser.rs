@@ -14238,10 +14238,23 @@ impl Parser {
         }
     }
 
-    fn consume_optional_index_column_qualifiers(&mut self) {
+    /// v7.39 (round 537) — the per-column ordering clause, REPORTED now
+    /// rather than discarded.
+    ///
+    /// SPG's index does not scan in a direction — column ordering is
+    /// intrinsic to the storage — but `pg_indexes.indexdef` is a
+    /// reproduction of the DDL, and dropping the clause meant
+    /// `CREATE INDEX i ON t (a DESC NULLS LAST)` read back as `(a)`. A
+    /// dump lost it, and a schema diff saw drift on every run.
+    fn consume_optional_index_column_qualifiers(&mut self) -> crate::ast::IndexColumnOrder {
+        let mut order = crate::ast::IndexColumnOrder::default();
         loop {
             match self.peek() {
-                Token::Asc | Token::Desc => {
+                Token::Asc => {
+                    self.advance();
+                }
+                Token::Desc => {
+                    order.descending = true;
                     self.advance();
                 }
                 Token::Ident(s) if s.eq_ignore_ascii_case("nulls") => {
@@ -14252,7 +14265,10 @@ impl Parser {
                             || k.eq_ignore_ascii_case("last")
                     ) {
                         self.advance();
-                        self.advance();
+                        order.nulls_first = Some(matches!(
+                            self.advance(),
+                            Token::Ident(k) if k.eq_ignore_ascii_case("first")
+                        ));
                     } else {
                         break;
                     }
@@ -14260,6 +14276,7 @@ impl Parser {
                 _ => break,
             }
         }
+        order
     }
 
     fn parse_create_index_stmt_after_create(
@@ -14460,12 +14477,13 @@ impl Parser {
         // to the storage). v7.10 will widen to genuine composite
         // index keys.
         let mut extra_columns: Vec<String> = Vec::new();
-        // The leading column may also have ASC/DESC after it.
-        self.consume_optional_index_column_qualifiers();
+        // The leading column may also have ASC/DESC after it — and that
+        // one is the column SPG indexes, so its clause is kept.
+        let key_order = self.consume_optional_index_column_qualifiers();
         while matches!(self.peek(), Token::Comma) {
             self.advance();
             let extra = self.expect_ident_like()?;
-            self.consume_optional_index_column_qualifiers();
+            let _ = self.consume_optional_index_column_qualifiers();
             extra_columns.push(extra);
         }
         if !matches!(self.peek(), Token::RParen) {
@@ -14583,6 +14601,7 @@ impl Parser {
         }
         Ok(Statement::CreateIndex(CreateIndexStatement {
             name,
+            key_order,
             table,
             column,
             nulls_not_distinct,

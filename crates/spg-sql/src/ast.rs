@@ -1931,9 +1931,25 @@ pub enum TriggerForEach {
     Statement,
 }
 
+/// v7.39 (round 537) — a `CREATE INDEX` key column's ordering clause.
+///
+/// SPG's index does not scan in a direction, but `indexdef` reproduces
+/// the DDL and dropping this made `(a DESC NULLS LAST)` read back as
+/// `(a)`. `nulls_first` is `None` when the statement did not say, in
+/// which case PG's default applies — LAST for ascending, FIRST for
+/// descending, and neither is rendered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IndexColumnOrder {
+    pub descending: bool,
+    pub nulls_first: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateIndexStatement {
     pub name: String,
+    /// v7.39 (round 537) — the leading key column's ordering clause,
+    /// which is the column SPG indexes.
+    pub key_order: IndexColumnOrder,
     pub table: String,
     pub column: String,
     /// v7.39 (read01 round 52) — `CREATE UNIQUE INDEX … NULLS NOT DISTINCT`

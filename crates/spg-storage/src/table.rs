@@ -1358,6 +1358,8 @@ impl Table {
             expression: None,
             is_unique: false,
             nulls_not_distinct: false,
+            descending: false,
+            nulls_first: None,
             extra_column_positions: Vec::new(),
         });
         Ok(())
@@ -2667,6 +2669,9 @@ impl Table {
             expression: Option<String>,
             included_columns: Vec<usize>,
             nulls_not_distinct: bool,
+            // v7.39 (round 537) — carried through a rebuild like the rest.
+            descending: bool,
+            nulls_first: Option<bool>,
         }
         let descriptors: Vec<RebuildDesc> = self
             .indices
@@ -2691,6 +2696,8 @@ impl Table {
                     expression: idx.expression.clone(),
                     included_columns: idx.included_columns.clone(),
                     nulls_not_distinct: idx.nulls_not_distinct,
+                    descending: idx.descending,
+                    nulls_first: idx.nulls_first,
                 }
             })
             .collect();
@@ -2706,6 +2713,8 @@ impl Table {
                 expression,
                 included_columns,
                 nulls_not_distinct,
+                descending,
+                nulls_first,
             } = desc;
             let pre_len = self.indices.len();
             match rebuild_kind {
@@ -2827,6 +2836,8 @@ impl Table {
                 idx.expression = expression;
                 idx.included_columns = included_columns;
                 idx.nulls_not_distinct = nulls_not_distinct;
+                idx.descending = descending;
+                idx.nulls_first = nulls_first;
             }
         }
 
@@ -2891,6 +2902,8 @@ impl Table {
                 expression: None,
                 is_unique: false,
                 nulls_not_distinct: false,
+                descending: false,
+                nulls_first: None,
                 extra_column_positions: Vec::new(),
             });
             return Ok(());

@@ -5852,11 +5852,31 @@ pub(crate) fn render_indexdef(
     };
     let mut positions = alloc::vec![idx.column_position];
     positions.extend(idx.extra_column_positions.iter().copied());
-    let cols = positions
-        .iter()
-        .map(|&p| col_at(p))
-        .collect::<Vec<_>>()
-        .join(", ");
+    // v7.39 (round 537) — the leading key's ordering clause. PG prints
+    // only what is NOT the default, and the nulls default flips with the
+    // direction: LAST for ascending, FIRST for descending (measured
+    // across all eight spellings). It decorates whichever form the key
+    // took — a bare column is stored as an expression here, so applying
+    // it to the column list alone would have been dropped again.
+    let order_suffix = {
+        let mut sfx = alloc::string::String::new();
+        if idx.descending {
+            sfx.push_str(" DESC");
+        }
+        if let Some(nf) = idx.nulls_first
+            && nf != idx.descending
+        {
+            sfx.push_str(if nf { " NULLS FIRST" } else { " NULLS LAST" });
+        }
+        sfx
+    };
+    let cols = core::iter::once(alloc::format!(
+        "{}{order_suffix}",
+        col_at(idx.column_position)
+    ))
+    .chain(idx.extra_column_positions.iter().map(|&p| col_at(p)))
+    .collect::<Vec<_>>()
+    .join(", ");
     // v7.39 (read01 round 83) — an index prints UNIQUE only when it is the one
     // that ENFORCES a uniqueness constraint, not merely when its columns happen
     // to match one. PG: `CREATE INDEX idx ON t(a)` over a table that also has
@@ -5902,8 +5922,12 @@ pub(crate) fn render_indexdef(
     // pair (`(a + b)`), so add the outer pair exactly when the stored form opens
     // with `(` — which a function call never does.
     let key = match &idx.expression {
-        Some(expr) if expr.starts_with('(') => alloc::format!("({expr})"),
-        Some(expr) => expr.clone(),
+        Some(expr) if expr.starts_with('(') => {
+            alloc::format!("({expr}){order_suffix}")
+        }
+        // A bare column is stored here as an expression too, so this is
+        // the branch a plain `CREATE INDEX i ON t (a DESC)` takes.
+        Some(expr) => alloc::format!("{expr}{order_suffix}"),
         None => cols,
     };
     // v7.39 (round 473) — `NULLS NOT DISTINCT` sits after the key list and

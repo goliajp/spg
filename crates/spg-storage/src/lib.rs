@@ -2338,6 +2338,17 @@ pub struct Index {
     /// Persisted in the index appendix (FILE_VERSION 62+); older catalogs
     /// deserialise with `false`.
     pub nulls_not_distinct: bool,
+    /// v7.39 (round 537) — the key column's ordering clause, as written.
+    ///
+    /// SPG's index does not scan in a direction, so this changes no
+    /// lookup; `pg_indexes.indexdef` is a reproduction of the DDL and
+    /// dropping the clause made `CREATE INDEX i ON t (a DESC NULLS
+    /// LAST)` read back as `(a)` — a dump lost it and a schema diff saw
+    /// drift every run. `nulls_first` is `None` when the statement did
+    /// not say, in which case PG's default applies and neither word is
+    /// rendered.
+    pub descending: bool,
+    pub nulls_first: Option<bool>,
     /// v7.9.29 — `CREATE UNIQUE INDEX …`. When true the engine
     /// rejects INSERTs whose key already appears in this index
     /// (combined with `partial_predicate` when present — only
@@ -2687,6 +2698,8 @@ impl Index {
             expression: None,
             is_unique: false,
             nulls_not_distinct: false,
+            descending: false,
+            nulls_first: None,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2701,6 +2714,8 @@ impl Index {
             expression: None,
             is_unique: false,
             nulls_not_distinct: false,
+            descending: false,
+            nulls_first: None,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2718,6 +2733,8 @@ impl Index {
             expression: None,
             is_unique: false,
             nulls_not_distinct: false,
+            descending: false,
+            nulls_first: None,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2736,6 +2753,8 @@ impl Index {
             expression: None,
             is_unique: false,
             nulls_not_distinct: false,
+            descending: false,
+            nulls_first: None,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2754,6 +2773,8 @@ impl Index {
             expression: None,
             is_unique: false,
             nulls_not_distinct: false,
+            descending: false,
+            nulls_first: None,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2773,6 +2794,8 @@ impl Index {
             expression: None,
             is_unique: false,
             nulls_not_distinct: false,
+            descending: false,
+            nulls_first: None,
             extra_column_positions: Vec::new(),
         }
     }
@@ -2793,6 +2816,8 @@ impl Index {
             expression: None,
             is_unique: false,
             nulls_not_distinct: false,
+            descending: false,
+            nulls_first: None,
             extra_column_positions: Vec::new(),
         }
     }
@@ -7677,7 +7702,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 82;
+const FILE_VERSION: u8 = 83;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -7949,6 +7974,14 @@ impl Catalog {
                 // layout above is untouched; v61-and-below readers stop before
                 // this byte and default the flag to false (NULLS DISTINCT).
                 out.push(u8::from(idx.nulls_not_distinct));
+                // v7.39 (round 537) — the key column's ordering clause
+                // (FILE_VERSION 83+).
+                out.push(u8::from(idx.descending));
+                out.push(match idx.nulls_first {
+                    None => 0,
+                    Some(true) => 1,
+                    Some(false) => 2,
+                });
             }
             // v6.7.2 — per-table hot_tier_bytes Option<u64>.
             // Layout: [u8 has_value][u64 LE value (if has_value)].

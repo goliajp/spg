@@ -901,6 +901,27 @@ fn deserialize_indices(
                         last.nulls_not_distinct = nnd;
                     }
                 }
+                // v7.39 (round 537) — the key column's ordering clause
+                // (FILE_VERSION 83+). v82-and-below leave it ascending
+                // with PG's default nulls placement, which is what those
+                // snapshots recorded.
+                if version >= 83 {
+                    let desc = cur.read_u8()? != 0;
+                    let nulls = match cur.read_u8()? {
+                        0 => None,
+                        1 => Some(true),
+                        2 => Some(false),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "index nulls-order tag: unknown byte {other}"
+                            )));
+                        }
+                    };
+                    if let Some(last) = t.indices.last_mut() {
+                        last.descending = desc;
+                        last.nulls_first = nulls;
+                    }
+                }
             }
         }
     }
