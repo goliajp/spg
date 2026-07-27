@@ -8192,7 +8192,31 @@ impl Parser {
     #[inline(never)]
     fn parse_set_user_vars(&mut self) -> Result<Statement, ParseError> {
         let mut assigns: Vec<(String, Expr)> = Vec::new();
+        let mut settings: Vec<(String, Expr)> = Vec::new();
         loop {
+            // v7.39 (round 554) — a plain NAME here is a session
+            // setting, not a user variable. mysqldump writes the two in
+            // one statement — `SET @OLD_SQL_MODE=@@SQL_MODE,
+            // SQL_MODE='NO_AUTO_VALUE_ON_ZERO'` saves a value and
+            // changes it — and this refused the mixture outright, so no
+            // dump could be restored past its preamble.
+            if let Token::Ident(name) | Token::QuotedIdent(name) = self.peek().clone() {
+                self.advance();
+                if !matches!(self.peek(), Token::Eq | Token::ColonEq) {
+                    return Err(self.err(alloc::format!(
+                        "expected `=` after {name}, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let value = self.parse_expr(0)?;
+                settings.push((name.to_ascii_lowercase(), value));
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
             let Token::SessionVar(raw) = self.peek().clone() else {
                 return Err(self.err(alloc::format!(
                     "expected a user variable after SET, got {:?}",
@@ -8220,7 +8244,7 @@ impl Parser {
             }
             break;
         }
-        Ok(Statement::SetUserVars(assigns))
+        Ok(Statement::SetUserVars(assigns, settings))
     }
 
     fn parse_update_after_keyword(&mut self) -> Result<Statement, ParseError> {

@@ -156,7 +156,7 @@ pub(crate) fn classify_stmt_for_tx(stmt: &spg_sql::ast::Statement) -> TxStmtClas
         // gate. PG18 keeps both writes (`iso_matrix` M5).
         S::SetParameter { .. }
         | S::SetParameterList(_)
-        | S::SetUserVars(_)
+        | S::SetUserVars(..)
         | S::SetRole(_)
         | S::ShowTables
         | S::ShowDatabases
