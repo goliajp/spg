@@ -15109,6 +15109,29 @@ fn apply_function_dispatch(
                 "transaction_isolation" | "tx_isolation" => "READ-COMMITTED",
                 "lower_case_table_names" => "0",
                 "have_ssl" => "YES",
+                // v7.39 (round 554) — the rest of what a mysqldump
+                // preamble reads back before it changes anything.
+                //
+                // The dump-compat gate had been blocked on this machine
+                // for rounds by a local Gatekeeper hang; run on the
+                // testbed it went straight through and reported 14
+                // failing fixtures with ONE cause — every MySQL and
+                // MariaDB dump stops at its fifth line:
+                //
+                //     /*!40103 SET @OLD_TIME_ZONE=@@TIME_ZONE */;
+                //     ERROR: Unknown system variable 'time_zone'
+                //
+                // so no mysqldump could be restored at all. MariaDB 11
+                // readings: time_zone SYSTEM, system_time_zone UTC,
+                // unique_checks 1, foreign_key_checks 1, sql_notes 1,
+                // note_verbosity `basic,explain`,
+                // sql_quote_show_create 1, innodb_stats_on_metadata 0.
+                "time_zone" => "SYSTEM",
+                "system_time_zone" => "UTC",
+                "unique_checks" | "foreign_key_checks" | "sql_notes"
+                | "sql_quote_show_create" => "1",
+                "note_verbosity" => "basic,explain",
+                "innodb_stats_on_metadata" => "0",
                 _ => {
                     // Fall through to the PG GUC inventory, so
                     // `@@server_version` and friends still answer — but

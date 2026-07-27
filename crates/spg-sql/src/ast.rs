@@ -555,7 +555,14 @@ pub enum Statement {
     /// the same node: `SET @x = 5` silently landed in the session-parameter
     /// store where nothing could read it back, and `SELECT @x` failed with
     /// "Unknown system variable".
-    SetUserVars(Vec<(String, Expr)>),
+    /// v7.39 (round 554) — `SET @a = …, SETTING = …`.
+    ///
+    /// `settings` is the trailing half a mysqldump preamble writes:
+    /// `SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO'`
+    /// saves a value and changes it in one statement. The parser used
+    /// to refuse the mixture outright, so no mysqldump could be
+    /// restored past its preamble.
+    SetUserVars(Vec<(String, Expr)>, Vec<(String, Expr)>),
     /// v7.38 轴 4 — `SET [SESSION] TRANSACTION ISOLATION LEVEL …`
     /// (plus optional READ ONLY / READ WRITE / DEFERRABLE clauses
     /// silently accepted). PG-standard surface for picking an
@@ -4675,7 +4682,7 @@ impl Statement {
             | Statement::CompactColdSegments
             | Statement::SetParameter { .. }
             | Statement::SetParameterList(_)
-            | Statement::SetUserVars(_)
+            | Statement::SetUserVars(..)
             | Statement::SetTransaction { .. }
             | Statement::ShowParameter(_)
             | Statement::ResetParameter(_)
@@ -5395,7 +5402,7 @@ impl fmt::Display for Statement {
                 f.write_str(name)
             }
             Self::ShowParameter(name) => write!(f, "SHOW {name}"),
-            Self::SetUserVars(assigns) => {
+            Self::SetUserVars(assigns, _) => {
                 f.write_str("SET ")?;
                 for (i, (name, value)) in assigns.iter().enumerate() {
                     if i > 0 {

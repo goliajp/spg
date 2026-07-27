@@ -1285,7 +1285,7 @@ impl Engine {
             // `SET @r = 1, @s = @r + 1` leaves @s at 101, i.e. @r's OLD
             // value. (Separate statements do chain, as you would expect.)
             // So: evaluate them all, THEN apply them all.
-            Statement::SetUserVars(assigns) => {
+            Statement::SetUserVars(assigns, settings) => {
                 let mut resolved: Vec<(String, spg_storage::Value<'static>)> =
                     Vec::with_capacity(assigns.len());
                 for (name, mut expr) in assigns {
@@ -1304,6 +1304,21 @@ impl Engine {
                 }
                 for (name, value) in resolved {
                     self.user_vars.insert(name, value);
+                }
+                // v7.39 (round 554) — the session settings written in
+                // the same statement, applied after the saves. Routed
+                // through the ordinary SET path so `SQL_MODE` still
+                // flips strictness and the rest land where a plain
+                // `SET x = y` puts them.
+                for (name, value) in settings {
+                    let rendered = match crate::conversions::literal_expr_to_value_in(
+                        value.clone(),
+                        Some(self.active_catalog()),
+                    ) {
+                        Ok(v) => crate::eval::value_to_text(&v),
+                        Err(_) => alloc::format!("{value}"),
+                    };
+                    let _ = self.execute(&alloc::format!("SET {name} = '{rendered}'"));
                 }
                 Ok(QueryResult::CommandOk {
                     affected: 0,
