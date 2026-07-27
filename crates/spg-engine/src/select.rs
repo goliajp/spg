@@ -814,6 +814,38 @@ impl Engine {
                 }
                 // pg_catalog.pg_extension — native capability list
                 // (mailrs embed round-12).
+                // v7.39 (round 546) — the catalogs SPG has real content
+                // for, from the facts it already holds.
+                "__spg_pg_language" => {
+                    let (schema, rows) = crate::system_catalog::synth_pg_language();
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_sequences" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_sequences(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_range" => {
+                    let (schema, rows) = crate::system_catalog::synth_pg_range();
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_partitioned_table" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_partitioned_table(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_authid" => {
+                    let (schema, rows) = crate::system_catalog::synth_pg_authid(self);
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_group" => {
+                    let (schema, rows) = crate::system_catalog::synth_pg_group(self);
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_shadow" => {
+                    let (schema, rows) = crate::system_catalog::synth_pg_shadow(self);
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.39 (round 544) — pg_cast, probed from the real
                 // cast implementation.
                 "__spg_pg_cast" => {
