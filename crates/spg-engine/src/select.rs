@@ -5650,6 +5650,11 @@ impl Engine {
                 emitted = emitted.saturating_add(1);
             }
         } else {
+            // v7.39 (round 570) — the row store is a 32-way trie, so
+            // indexing it is four dependent loads. Round 567 measured
+            // -18% on the aggregate scan from holding the leaf between
+            // rows; this is the same loop for the projecting scan.
+            let mut rows_cur = table.rows().run_cursor();
             for i in 0..table.row_count() {
                 if let Some(cap) = early_cap
                     && emitted >= cap
@@ -5661,7 +5666,8 @@ impl Engine {
                 if !table.is_row_visible(i, &scan_snapshot) {
                     continue;
                 }
-                process_row(&table.rows()[i], i)?;
+                let Some(row) = rows_cur.get(i) else { continue };
+                process_row(row, i)?;
                 emitted = emitted.saturating_add(1);
             }
             // v7.35.1 (mailrs prod #6 follow-up) — fold cold-tier
