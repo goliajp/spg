@@ -75,6 +75,41 @@ pub(crate) enum JoinSrc<'a> {
     },
 }
 
+/// v7.39 (round 576) — a hash-join bucket that does not allocate for the
+/// row it usually holds.
+///
+/// The build side of an FK-to-PK join is unique, so nearly every bucket
+/// holds exactly one row — and each one was its own `Vec`. A counting
+/// allocator put the cost at ONE allocation per peer row: a 200k-row
+/// self-join made 200,127 allocations where a single-table scan of the
+/// same table makes 47, and it made them whether the query wanted
+/// 200,000 rows or 100. That is the allocator's 28% round 575 could not
+/// name, and the reason the join does not get cheaper when a predicate
+/// narrows it.
+///
+/// The first row lives inline; a second one promotes to a `Vec`.
+#[derive(Debug)]
+enum Bucket {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl Bucket {
+    fn push(&mut self, ri: usize) {
+        match self {
+            Self::One(first) => *self = Self::Many(alloc::vec![*first, ri]),
+            Self::Many(v) => v.push(ri),
+        }
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::One(x) => core::slice::from_ref(x),
+            Self::Many(v) => v.as_slice(),
+        }
+    }
+}
+
 impl JoinSrc<'_> {
     pub(crate) fn get(&self, i: usize) -> Option<&Row<'static>> {
         match self {
@@ -1384,9 +1419,9 @@ impl Engine {
                     )
                 )
             };
-        let mut table: hashbrown::HashMap<String, Vec<usize>> =
+        let mut table: hashbrown::HashMap<String, Bucket> =
             hashbrown::HashMap::with_capacity(if int_keyed { 0 } else { n_rights });
-        let mut int_table: hashbrown::HashMap<i64, Vec<usize>> =
+        let mut int_table: hashbrown::HashMap<i64, Bucket> =
             hashbrown::HashMap::with_capacity(if int_keyed { n_rights } else { 0 });
         let mut keybuf: Vec<&Value> = Vec::with_capacity(eq_pairs.len());
         // v7.31 (perf 3e) — scratch key buffer: build inserts allocate
@@ -1417,10 +1452,12 @@ impl Engine {
                 // (two allocs); pre-sizing to 1 cuts those to one.
                 // For the NOTEX 12.5 k-row build side this saves
                 // ~12.5 k × ~100 ns ≈ 1.25 ms per query.
-                int_table
-                    .entry(key)
-                    .or_insert_with(|| Vec::with_capacity(1))
-                    .push(ri);
+                match int_table.entry(key) {
+                    hashbrown::hash_map::Entry::Occupied(mut o) => o.get_mut().push(ri),
+                    hashbrown::hash_map::Entry::Vacant(v) => {
+                        v.insert(Bucket::One(ri));
+                    }
+                }
                 continue;
             }
             keybuf.clear();
@@ -1431,10 +1468,12 @@ impl Engine {
                 }
             }
             aggregate::encode_key_refs_into(&keybuf, &mut keystr);
-            table
-                .entry_ref(keystr.as_str())
-                .or_insert_with(|| Vec::with_capacity(1))
-                .push(ri);
+            match table.get_mut(keystr.as_str()) {
+                Some(b) => b.push(ri),
+                None => {
+                    table.insert(keystr.clone(), Bucket::One(ri));
+                }
+            }
         }
         let mut next: Vec<usize> = Vec::new();
         // v7.37.16 — RIGHT / FULL OUTER: track which peer (build-side)
@@ -1479,7 +1518,7 @@ impl Engine {
                 }
                 None
             };
-            let cands_opt: Option<&Vec<usize>> = if left_has_null {
+            let cands_opt: Option<&Bucket> = if left_has_null {
                 None
             } else if int_keyed {
                 int_table.get(&int_probe_key.unwrap())
@@ -1487,7 +1526,7 @@ impl Engine {
                 table.get(keystr.as_str())
             };
             if let Some(cands) = cands_opt {
-                for &ri in cands {
+                for &ri in cands.as_slice() {
                     let keep = if residual.is_empty() {
                         true
                     } else {

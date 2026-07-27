@@ -126,6 +126,7 @@ mod e2e_work_mem_verified_round555;
 mod e2e_count_star_round559;
 mod e2e_explain_index_only_round565;
 mod e2e_derived_join_round572;
+mod e2e_join_bucket_round576;
 mod e2e_join_side_filter_round574;
 mod e2e_fused_extremes_round569;
 mod e2e_topk_recycle_round571;
