@@ -6834,6 +6834,46 @@ fn system_column_tail_start(cols: &[ColumnSchema]) -> Option<usize> {
         .then_some(start)
 }
 
+/// v7.39 (round 540) — which positions `*` must skip.
+///
+/// The rule stays round 512's — the synthetic columns are the trailing
+/// six of a relation's block, matched by POSITION so a genuine `xmin`
+/// column is not lost — but a JOINED schema names its columns
+/// `alias.column` and lays the peers out end to end, so a peer's six sit
+/// in the MIDDLE of the whole list. Grouping by qualifier first puts the
+/// "trailing six" test back on the block it was written for.
+fn synthetic_system_positions(cols: &[ColumnSchema]) -> alloc::vec::Vec<bool> {
+    let mut skip = alloc::vec![false; cols.len()];
+    fn qualifier(n: &str) -> Option<&str> {
+        n.rsplit_once('.').map(|(q, _)| q)
+    }
+    fn bare(n: &str) -> &str {
+        n.rsplit('.').next().unwrap_or(n)
+    }
+    let mut i = 0;
+    while i < cols.len() {
+        let q = qualifier(&cols[i].name);
+        let mut end = i;
+        while end < cols.len() && qualifier(&cols[end].name) == q {
+            end += 1;
+        }
+        if let Some(start) = (end - i)
+            .checked_sub(SYSTEM_COLUMNS.len())
+            .map(|off| i + off)
+            && cols[start..end]
+                .iter()
+                .zip(SYSTEM_COLUMNS)
+                .all(|(c, name)| bare(&c.name).eq_ignore_ascii_case(name))
+        {
+            for s in skip.iter_mut().take(end).skip(start) {
+                *s = true;
+            }
+        }
+        i = end;
+    }
+    skip
+}
+
 /// v7.39 (round 511) — does this statement name `ctid` anywhere it would be
 /// read? Only then is the column materialised.
 pub(crate) fn expr_references_ctid(e: &Expr) -> bool {
@@ -7056,9 +7096,9 @@ pub(crate) fn build_projection(
                 // `xmin`, and `SELECT * FROM pg_replication_slots` lost it.
                 // Only the trailing six, in the order the scan appends them,
                 // are the synthetic ones.
-                let sys_from = system_column_tail_start(schema_cols);
+                let sys_skip = synthetic_system_positions(schema_cols);
                 for (idx, col) in schema_cols.iter().enumerate() {
-                    if sys_from.is_some_and(|start| idx >= start) {
+                    if sys_skip[idx] {
                         continue;
                     }
                     out.push(ProjectedItem {

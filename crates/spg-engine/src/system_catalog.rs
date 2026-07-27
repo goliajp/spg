@@ -6379,6 +6379,31 @@ fn apply_information_schema_domains(view: &str, columns: &mut [ColumnSchema]) {
     }
 }
 
+/// v7.39 (round 540) — the oid a catalog relation reports as its
+/// `tableoid`. The synthetic name is the internal one (`__spg_pg_class`);
+/// PG's oid for the relation it stands for is what a caller expects.
+fn relation_oid_for_meta_view(name: &str) -> i64 {
+    let bare = name
+        .strip_prefix("__spg_pg_")
+        .map(|b| alloc::format!("pg_{b}"))
+        .or_else(|| name.strip_prefix("__spg_info_").map(alloc::string::String::from))
+        .unwrap_or_else(|| alloc::string::String::from(name));
+    // The well-known oids PG assigns its catalogs; anything else — an
+    // information_schema view, a pg_stat_* view — has no fixed oid and
+    // reports 0, which is what a relation with no entry reports.
+    match bare.as_str() {
+        "pg_type" => 1247,
+        "pg_attribute" => 1249,
+        "pg_proc" => 1255,
+        "pg_class" => 1259,
+        "pg_database" => 1262,
+        "pg_constraint" => 2606,
+        "pg_index" => 2610,
+        "pg_namespace" => 2615,
+        _ => 0,
+    }
+}
+
 pub(crate) fn materialise_meta_view(
     catalog: &mut Catalog,
     name: &str,
@@ -6387,12 +6412,45 @@ pub(crate) fn materialise_meta_view(
 ) -> Result<(), EngineError> {
     retype_identifier_columns(name, &mut columns);
     apply_information_schema_domains(name, &mut columns);
+    // v7.39 (round 540) — every catalog relation carries the system
+    // columns, as PG's do.
+    //
+    // Round 512 materialised them for a user table on the bare-select
+    // scan, which is not where a catalog is read from: a synthesized
+    // view becomes a real relation here, and the join path builds its
+    // schema from that relation's columns. So `SELECT x.tableoid FROM
+    // pg_extension x` answered and the same reference through a JOIN
+    // said the column does not exist — which is where `pg_dump` stopped,
+    // its extension query being exactly that shape.
+    //
+    // Appending them once, here, is what makes them resolve wherever the
+    // relation is read. `*` skips the trailing six by POSITION (round
+    // 512's rule, so a genuine `xmin` column is not lost), and that skip
+    // now sees them through a join's `alias.column` naming too.
+    let sys_start = columns.len();
+    for sys in crate::select::SYSTEM_COLUMNS {
+        columns.push(ColumnSchema::new(
+            alloc::string::String::from(sys),
+            DataType::Text,
+            false,
+        ));
+    }
+    let view_oid = relation_oid_for_meta_view(name);
     let schema = TableSchema::new(name.to_string(), columns);
     catalog.create_table(schema).map_err(EngineError::Storage)?;
     let table = catalog
         .get_mut(name)
         .expect("just-created meta view must exist");
-    for row in rows {
+    for (i, mut row) in rows.into_iter().enumerate() {
+        row.values.truncate(sys_start);
+        // One block, offsets from 1, as PG numbers them; a catalog row
+        // is frozen, which is what PG reports for one too.
+        row.values.push(Value::text(alloc::format!("(0,{})", i + 1)));
+        row.values.push(Value::text("2")); // xmin — FrozenTransactionId
+        row.values.push(Value::text("0")); // cmin
+        row.values.push(Value::text("0")); // xmax
+        row.values.push(Value::text("0")); // cmax
+        row.values.push(Value::text(alloc::format!("{view_oid}")));
         table.insert(row).map_err(EngineError::Storage)?;
     }
     Ok(())
