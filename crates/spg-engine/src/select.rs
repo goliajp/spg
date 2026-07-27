@@ -2020,7 +2020,7 @@ impl Engine {
     /// starts drifting; the answer here is the single copy. Returns the
     /// table, the alias the predicate is written against, the projected
     /// column's position, and the name the single output column takes.
-    fn index_only_shape<'s>(
+    pub(crate) fn index_only_shape<'s>(
         &'s self,
         stmt: &'s SelectStatement,
     ) -> Option<(&'s spg_storage::Table, &'s str, usize, String)> {
@@ -2073,6 +2073,30 @@ impl Engine {
         let pos = cols.iter().position(|s| s.name.eq_ignore_ascii_case(&c.name))?;
         let out = alias.clone().unwrap_or_else(|| cols[pos].name.clone());
         Some((table, alias_name, pos, out))
+    }
+
+    /// v7.39 (round 565) — would this statement be answered out of the
+    /// index alone?
+    ///
+    /// EXPLAIN has to name the node the executor will actually run, and
+    /// the only honest way to know is to ask the same two questions the
+    /// executor asks: the statement's shape, and everything decidable
+    /// about the scan before it walks. Neither is re-stated here.
+    pub(crate) fn stmt_takes_index_only_scan(&self, stmt: &SelectStatement) -> bool {
+        let Some((table, alias_name, pos, _)) = self.index_only_shape(stmt) else {
+            return false;
+        };
+        let Some(where_) = stmt.where_.as_ref() else {
+            return false;
+        };
+        crate::index_access::index_only_precheck(
+            where_,
+            &table.schema().columns,
+            table,
+            alias_name,
+            pos,
+        )
+        .is_some()
     }
 
     fn try_index_only_scan(

@@ -491,6 +491,7 @@ fn scan_node(
     alias: Option<&str>,
     where_: Option<&Expr>,
     cte_names: &[String],
+    index_only: bool,
 ) -> PlanNode {
     let alias_sfx = match alias {
         Some(a) if a != name => alloc::format!(" {a}"),
@@ -558,7 +559,12 @@ fn scan_node(
         .get(name)
         .map(|t| est_width(&t.schema().columns))
         .unwrap_or(8);
-    if seek.is_some() {
+    // v7.39 (round 565) — `try_index_seek` carries a selectivity ceiling
+    // (a seek that reads most of the table is worse than the scan it
+    // replaces). The index-only walk has none by design — it touches no
+    // row — so a wide range over a small table takes it while this gate
+    // said Seq Scan. The node has to follow the executor, not the gate.
+    if seek.is_some() || index_only {
         // v7.39 (round 226) — PG splits the predicate: the indexed conjunct
         // goes to Index Cond, everything else to a Filter line beneath it.
         let a = alias.unwrap_or(name);
@@ -579,8 +585,19 @@ fn scan_node(
                 })
             })
             .unwrap_or_else(|| alloc::format!("{name}_idx"));
+        // v7.39 (round 565) — PG distinguishes the scan that reads rows
+        // from the one that answers out of the index, and so does the
+        // executor: round 560 added the second and round 564 measured
+        // them 2x apart at 50k rows. EXPLAIN called both "Index Scan",
+        // so the two plans read identically to anyone comparing them —
+        // and EXPLAIN is the first thing a performance question opens.
+        let verb = if index_only {
+            "Index Only Scan using"
+        } else {
+            "Index Scan using"
+        };
         let mut n = PlanNode::new(alloc::format!(
-            "Index Scan using {idx_name} on {name}{alias_sfx}"
+            "{verb} {idx_name} on {name}{alias_sfx}"
         ));
         if let Some(w) = where_ {
             let (cond, residual) = split.expect("computed alongside where_");
@@ -689,6 +706,7 @@ fn fill_actuals(
             Some((r.split_whitespace().next().unwrap_or(r), false))
         } else if let Some(r) = head
             .strip_prefix("Index Scan using ")
+            .or_else(|| head.strip_prefix("Index Only Scan using "))
             .and_then(|r| r.split_once(" on ").map(|(_, t)| t))
         {
             Some((r.split_whitespace().next().unwrap_or(r), false))
@@ -704,6 +722,16 @@ fn fill_actuals(
             .get(t)
             .map(|tb| (tb.rows().len() as u64).saturating_sub(tb.dead_rows()))
     };
+    // v7.39 (round 565) — PG prints this under ANALYZE and not under a
+    // plain EXPLAIN, because it is a counter, not a plan property. Zero
+    // is the measured truth here rather than a placeholder: the path
+    // this node names never reads a row, which is the whole reason the
+    // node has a different name.
+    if head.starts_with("Index Only Scan using ")
+        && !node.attrs.iter().any(|a| a.starts_with("Heap Fetches:"))
+    {
+        node.attrs.push(String::from("Heap Fetches: 0"));
+    }
     if is_top {
         node.actual = Some((elapsed_ms, result_rows));
         // When the top node IS a Seq Scan carrying the filter, both numbers
@@ -787,6 +815,13 @@ fn node_props(node: &PlanNode, with_costs: bool, parent_rel: Option<&str>) -> Ve
     let head = node.head.as_str();
     let (node_type, rel, idx) = if let Some(rest) = head.strip_prefix("Seq Scan on ") {
         ("Seq Scan", Some(rest.split_whitespace().next().unwrap_or(rest)), None)
+    } else if let Some(rest) = head.strip_prefix("Index Only Scan using ") {
+        let (i, r) = rest.split_once(" on ").unwrap_or((rest, ""));
+        (
+            "Index Only Scan",
+            Some(r.split_whitespace().next().unwrap_or(r)),
+            Some(i),
+        )
     } else if let Some(rest) = head.strip_prefix("Index Scan using ") {
         let (i, r) = rest.split_once(" on ").unwrap_or((rest, ""));
         ("Index Scan", Some(r.split_whitespace().next().unwrap_or(r)), Some(i))
@@ -1042,18 +1077,13 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
                 from.primary.alias.as_deref(),
                 stmt.where_.as_ref(),
                 &cte_names,
+                engine.stmt_takes_index_only_scan(stmt),
             );
             // Fold joins left-deep: equality ON -> Hash Join (right side
             // wrapped in a Hash node, like PG); anything else ->
             // Nested Loop with a Join Filter.
             for j in &from.joins {
-                let right = scan_node(
-                    engine,
-                    &j.table.name,
-                    j.table.alias.as_deref(),
-                    None,
-                    &cte_names,
-                );
+                let right = scan_node(engine, &j.table.name, j.table.alias.as_deref(), None, &cte_names, false);
                 let (verb, hashable) = match j.kind {
                     spg_sql::ast::JoinKind::Inner => ("", true),
                     spg_sql::ast::JoinKind::Left => (" Left", true),
@@ -1325,14 +1355,14 @@ impl Engine {
             }
             spg_sql::ast::Statement::Update(u) => {
                 let mut root = PlanNode::new(alloc::format!("Update on {}", u.table));
-                let child = scan_node(self, &u.table, None, u.where_.as_ref(), &[]);
+                let child = scan_node(self, &u.table, None, u.where_.as_ref(), &[], false);
                 root.cost = child.cost.map(|(cs, ct, _, _)| (cs, ct, 0, 0));
                 root.children.push(child);
                 Some(root)
             }
             spg_sql::ast::Statement::Delete(d) => {
                 let mut root = PlanNode::new(alloc::format!("Delete on {}", d.table));
-                let child = scan_node(self, &d.table, None, d.where_.as_ref(), &[]);
+                let child = scan_node(self, &d.table, None, d.where_.as_ref(), &[], false);
                 root.cost = child.cost.map(|(cs, ct, _, _)| (cs, ct, 0, 0));
                 root.children.push(child);
                 Some(root)
