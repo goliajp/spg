@@ -30,6 +30,41 @@
 //! executor path this query actually takes — the build-side filter this
 //! round added was correct code that never ran, and the round did not
 //! establish where it should have gone instead.
+//!
+//! ---
+//!
+//! v7.39 (round 574) answered that: `exec_joined_select` ->
+//! `build_joined_filtered_rows` -> `filter_table_indices`, which
+//! evaluated every conjunct interpretively per row. Compiling it, as the
+//! single-table scan does, took `WHERE b.id < 100` from 77.7 to 69.9 ms.
+//!
+//! v7.39 (round 575) profiled what is left, on the shape where SPG has
+//! the least to do — both sides cut to 100 rows out of 500k. Connection
+//! thread: SPG 67%, ALLOCATOR 28.1%, kernel 4.4%. Inside SPG the largest
+//! symbol is `JoinSrc::get` at 14% self time, whose `Stored` arm is a
+//! `PersistentVec` descent.
+//!
+//! That reads exactly like rounds 562, 567 and 570 — hold the trie leaf
+//! across an ascending walk — and the hash build's `0..n_rights` loop is
+//! ascending. The same cursor was applied. It did NOT repeat:
+//!
+//!     both sides 100   69.77 -> 64.42 ms   lower in 2 of 3
+//!     peer side 100    62.22 -> 63.91      no
+//!     no predicate     77.39 -> 81.74      SLOWER in 3 of 3
+//!
+//! The no-predicate case builds the LARGEST hash, 500k rows, so it is
+//! exactly where holding the leaf should pay most, and it regressed in
+//! every batch. Reverted. The 14% on `JoinSrc::get` is therefore not the
+//! descent it looks like.
+//!
+//! The allocator's 28% splits about evenly between allocation and drop
+//! (`__rust_alloc` 13.6%, `drop_glue` 14.2%). Its caller could not be
+//! named from this profile: the allocator stubs are inlined into the
+//! binary and the frames samply returns here carry raw addresses rather
+//! than symbols, so walking past them by name matched nothing. Naming
+//! that 28% needs a different instrument — a counter at the suspected
+//! sites, or an allocation profiler — and that is the next round's first
+//! step, before any further code.
 
 use spg_engine::Engine;
 use std::time::Instant;
