@@ -37,6 +37,60 @@
 //! Not bisected for a better threshold: the hypothesis was that the
 //! overlap was worth having, and the measurement says it is not. Where
 //! the ~21 ms actually goes is still unnamed.
+//!
+//! ---
+//!
+//! v7.39 (round 563) — the curve, which says the three rounds before it
+//! were all measured in the wrong place.
+//!
+//! Rounds 561, 562 and the first half of 563 each attacked this path at
+//! 100k or 400k rows out and each landed at about 3%. That is not three
+//! coincidences. Measuring the whole range instead of two points
+//! (medians of 3, same client for both engines):
+//!
+//!     rows out       SPG        PG18      ratio
+//!            1     0.240 ms   0.647 ms    0.37x  WIN
+//!          100     0.297      0.657       0.45x  WIN
+//!         1000     0.635      0.735       0.86x  WIN
+//!        10000     3.36       1.72        1.95x  LOSS
+//!        50000    13.96       6.56        2.13x  LOSS
+//!       100000    23.58      13.00        1.81x  LOSS
+//!       200000    40.04      25.27        1.58x  LOSS
+//!       400000    54.55      50.77        1.07x  ~tied
+//!
+//! PG's marginal cost is flat at 121-129 ns/row for the whole range.
+//! SPG's FALLS — 303 ns/row at the bottom, 73 at the top — and a
+//! marginal cost that falls with size is a ceiling above it, not an
+//! engine getting better. At 400k both engines sit near 50 ms because
+//! the CLIENT bounds them, so "1.07x tied" is not a comparison of
+//! servers, and every attack measured up there was measured against a
+//! number that could not move.
+//!
+//! The loss is 10k-100k rows, it peaks near 2.1x, and SPG WINS below
+//! 1000. That is where the next attack has to be measured.
+//!
+//! What it is not:
+//!
+//!   * not the row encoding — round 561 attacked it and refuted itself;
+//!   * not the B-tree's branching factor. `persistent_btree.rs` has
+//!     `ORDER = 8` (7 entries a node, depth 7 over 500k) against PG's
+//!     ~370-entry pages, and it is a TRADITIONAL B-tree, not a B+ tree,
+//!     so entries live at every level and a range scan weaves up and
+//!     down instead of walking a leaf chain. That argument predicts a
+//!     lot. Measured, ORDER 32 is worth ~6% at 50k rows and ~6% of
+//!     server CPU at 400k — and the const was chosen for WRITE cost, so
+//!     the write panel decides it:
+//!
+//!         insert_100k    116.0 -> 112.8      update_wide  74.2 -> 71.6
+//!         update_narrow   76.7 ->  76.8      insert_10k   74.6 -> 78.6
+//!         delete_range    68.7 ->  74.6      <- both runs, no overlap
+//!
+//!     6% of read for 8.6% of delete_range is a trade, not a win.
+//!     REVERTED at `ORDER = 8`, with the numbers here so the next
+//!     person does not re-run the experiment blind.
+//!
+//! So the 2x is still unnamed — but it is now known to live between 10k
+//! and 100k rows, and to be neither of the two things already tried.
 use spg_engine::Engine;
 use std::time::Instant;
 
