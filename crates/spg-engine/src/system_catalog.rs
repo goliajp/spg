@@ -5188,6 +5188,13 @@ pub(crate) fn synth_pg_auth_members(engine: &Engine) -> (Vec<ColumnSchema>, Vec<
 ///
 /// Column names and types are PG18 readings.
 const EMPTY_PG_CATALOGS: &[(&str, &[(&str, DataType)])] = &[
+    // v7.39 (round 546) — three more PG catalogs SPG is genuinely empty
+    // of: it has no ALTER DEFAULT PRIVILEGES, one encoding (so no
+    // conversions between any), and it records no per-role or
+    // per-database GUC settings.
+    ("pg_default_acl", &[("oid", DataType::BigInt), ("defaclrole", DataType::BigInt), ("defaclnamespace", DataType::BigInt), ("defaclobjtype", DataType::Text), ("defaclacl", DataType::TextArray)]),
+    ("pg_conversion", &[("oid", DataType::BigInt), ("conname", DataType::Text), ("connamespace", DataType::BigInt), ("conowner", DataType::BigInt), ("conforencoding", DataType::Int), ("contoencoding", DataType::Int), ("conproc", DataType::BigInt), ("condefault", DataType::Bool)]),
+    ("pg_db_role_setting", &[("setdatabase", DataType::BigInt), ("setrole", DataType::BigInt), ("setconfig", DataType::TextArray)]),
     ("pg_event_trigger", &[("oid", DataType::BigInt), ("evtname", DataType::Text), ("evtevent", DataType::Text), ("evtowner", DataType::BigInt), ("evtfoid", DataType::BigInt), ("evtenabled", DataType::Text), ("evttags", DataType::TextArray)]),
     ("pg_file_settings", &[("sourcefile", DataType::Text), ("sourceline", DataType::Int), ("seqno", DataType::Int), ("name", DataType::Text), ("setting", DataType::Text), ("applied", DataType::Bool), ("error", DataType::Text)]),
     ("pg_foreign_data_wrapper", &[("oid", DataType::BigInt), ("fdwname", DataType::Text), ("fdwowner", DataType::BigInt), ("fdwhandler", DataType::BigInt), ("fdwvalidator", DataType::BigInt), ("fdwacl", DataType::TextArray), ("fdwoptions", DataType::TextArray)]),
@@ -5231,6 +5238,305 @@ pub(crate) fn synth_empty_pg_catalog(
         .map(|(n, t)| ColumnSchema::new(*n, *t, true))
         .collect();
     Some((schema, Vec::new()))
+}
+
+/// v7.39 (round 546) — the three role views PG derives from pg_authid,
+/// all built from synth_pg_roles' rows so none of them can drift.
+///
+/// `pg_authid` is where PG keeps the password hash; `pg_shadow` is the
+/// same for login roles. **SPG masks both** — it reports `********`,
+/// as pg_roles does. PG guards the real hash with catalog-level
+/// privileges that SPG does not have, so publishing a SCRAM verifier
+/// here would put it within reach of any session. That is a deliberate
+/// divergence, recorded rather than silently taken.
+pub(crate) fn synth_pg_authid(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("rolname", DataType::Text, false),
+        ColumnSchema::new("rolsuper", DataType::Bool, false),
+        ColumnSchema::new("rolinherit", DataType::Bool, false),
+        ColumnSchema::new("rolcreaterole", DataType::Bool, false),
+        ColumnSchema::new("rolcreatedb", DataType::Bool, false),
+        ColumnSchema::new("rolcanlogin", DataType::Bool, false),
+        ColumnSchema::new("rolreplication", DataType::Bool, false),
+        ColumnSchema::new("rolbypassrls", DataType::Bool, false),
+        ColumnSchema::new("rolconnlimit", DataType::Int, false),
+        ColumnSchema::new("rolpassword", DataType::Text, true),
+        ColumnSchema::new("rolvaliduntil", DataType::Timestamptz, true),
+    ];
+    // pg_roles positions: 0 rolname, 1 rolsuper, 2 rolinherit,
+    // 3 rolcreaterole, 4 rolcreatedb, 5 rolcanlogin, 6 rolreplication,
+    // 7 rolconnlimit, 8 rolpassword, 9 rolvaliduntil, 10 rolbypassrls,
+    // 12 oid.
+    let (_, roles) = synth_pg_roles(engine);
+    let rows = roles
+        .into_iter()
+        .map(|r| {
+            Row::new(alloc::vec![
+                r.values[12].clone(),
+                r.values[0].clone(),
+                r.values[1].clone(),
+                r.values[2].clone(),
+                r.values[3].clone(),
+                r.values[4].clone(),
+                r.values[5].clone(),
+                r.values[6].clone(),
+                r.values[10].clone(),
+                r.values[7].clone(),
+                r.values[8].clone(),
+                r.values[9].clone(),
+            ])
+        })
+        .collect();
+    (schema, rows)
+}
+
+/// `pg_group` — a role and the oids of its members.
+pub(crate) fn synth_pg_group(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("groname", DataType::Text, false),
+        ColumnSchema::new("grosysid", DataType::BigInt, false),
+        ColumnSchema::new("grolist", DataType::TextArray, true),
+    ];
+    let (_, members) = synth_pg_auth_members(engine);
+    let (_, roles) = synth_pg_roles(engine);
+    let rows = roles
+        .into_iter()
+        .map(|r| {
+            let oid = match &r.values[12] {
+                Value::BigInt(o) => *o,
+                _ => 0,
+            };
+            // pg_auth_members positions: 1 roleid, 2 member.
+            let list: Vec<Option<alloc::string::String>> = members
+                .iter()
+                .filter(|m| matches!(&m.values[1], Value::BigInt(o) if *o == oid))
+                .map(|m| Some(alloc::format!("{}", crate::eval::value_to_text(&m.values[2]))))
+                .collect();
+            Row::new(alloc::vec![
+                r.values[0].clone(),
+                Value::BigInt(oid),
+                if list.is_empty() {
+                    Value::Null
+                } else {
+                    Value::TextArray(list)
+                },
+            ])
+        })
+        .collect();
+    (schema, rows)
+}
+
+/// `pg_shadow` — pg_user's columns, for the login roles, with the
+/// password column PG reserves for superusers. Masked here; see
+/// synth_pg_authid.
+pub(crate) fn synth_pg_shadow(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    synth_pg_user(engine)
+}
+
+/// v7.39 (round 546) — `pg_catalog.pg_language`: the languages a
+/// CREATE FUNCTION here can actually name.
+///
+/// PG ships four (internal, c, sql, plpgsql); SPG runs three of them —
+/// its builtins report prolang 12 (internal), and it executes `sql` and
+/// `plpgsql` bodies. `c` is not listed: SPG cannot load a shared
+/// object, and a row here would claim it could.
+///
+/// PG's oids, measured: internal 12, c 13, sql 14, plpgsql 13647.
+/// lanispl is true only for a loadable language; lanpltrusted is true
+/// for sql and plpgsql. The three handler oids are 0 — those functions
+/// are not catalogued here, the same reasoning round 543 applied to
+/// pg_type's typinput.
+pub(crate) fn synth_pg_language() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("lanname", DataType::Text, false),
+        ColumnSchema::new("lanowner", DataType::BigInt, false),
+        ColumnSchema::new("lanispl", DataType::Bool, false),
+        ColumnSchema::new("lanpltrusted", DataType::Bool, false),
+        ColumnSchema::new("lanplcallfoid", DataType::BigInt, false),
+        ColumnSchema::new("laninline", DataType::BigInt, false),
+        ColumnSchema::new("lanvalidator", DataType::BigInt, false),
+        ColumnSchema::new("lanacl", DataType::Text, true),
+    ];
+    let row = |oid: i64, name: &'static str, ispl: bool, trusted: bool| {
+        Row::new(alloc::vec![
+            Value::BigInt(oid),
+            Value::text(name),
+            Value::BigInt(10),
+            Value::Bool(ispl),
+            Value::Bool(trusted),
+            Value::BigInt(0),
+            Value::BigInt(0),
+            Value::BigInt(0),
+            Value::Null,
+        ])
+    };
+    let rows = alloc::vec![
+        row(12, "internal", false, false),
+        row(14, "sql", false, true),
+        row(13647, "plpgsql", true, true),
+    ];
+    (schema, rows)
+}
+
+/// v7.39 (round 546) — `pg_catalog.pg_sequences`, the listing view.
+///
+/// SPG had the raw `pg_sequence` catalog and not the view every tool
+/// and every human actually reads, so `SELECT * FROM pg_sequences` —
+/// the ordinary way to see what a schema's sequences are set to — said
+/// the relation did not exist. Derived from the same SequenceDef rows
+/// pg_sequence publishes, so the two cannot disagree.
+///
+/// Measured on PG18 for `CREATE SEQUENCE s`: last_value is NULL until
+/// the sequence has been called.
+pub(crate) fn synth_pg_sequences(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("schemaname", DataType::Text, false),
+        ColumnSchema::new("sequencename", DataType::Text, false),
+        ColumnSchema::new("sequenceowner", DataType::Text, false),
+        ColumnSchema::new("data_type", DataType::Text, false),
+        ColumnSchema::new("start_value", DataType::BigInt, false),
+        ColumnSchema::new("min_value", DataType::BigInt, false),
+        ColumnSchema::new("max_value", DataType::BigInt, false),
+        ColumnSchema::new("increment_by", DataType::BigInt, false),
+        ColumnSchema::new("cycle", DataType::Bool, false),
+        ColumnSchema::new("cache_size", DataType::BigInt, false),
+        ColumnSchema::new("last_value", DataType::BigInt, true),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for (stored, def) in cat.sequences_all() {
+        let Some(name) = cat.listed_name(stored) else {
+            continue;
+        };
+        rows.push(Row::new(alloc::vec![
+            Value::text("public"),
+            Value::text(alloc::string::String::from(name)),
+            Value::text(
+                def.owner
+                    .clone()
+                    .unwrap_or_else(|| alloc::string::String::from(CATALOG_OWNER)),
+            ),
+            Value::text("bigint"),
+            Value::BigInt(def.start),
+            Value::BigInt(def.min_value),
+            Value::BigInt(def.max_value),
+            Value::BigInt(def.increment),
+            Value::Bool(def.cycle),
+            Value::BigInt(def.cache),
+            // NULL until the sequence has been called, as PG's is.
+            if def.is_called {
+                Value::BigInt(def.last_value)
+            } else {
+                Value::Null
+            },
+        ]));
+    }
+    (schema, rows)
+}
+
+/// v7.39 (round 546) — `pg_catalog.pg_range`.
+///
+/// SPG has the same six range types PG18 ships, so this is exact.
+/// The three function columns and rngsubopc read 0: SPG has no
+/// pg_operator / pg_opclass to name, and no multirange types, which is
+/// what rngmultitypid would point at.
+pub(crate) fn synth_pg_range() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("rngtypid", DataType::BigInt, false),
+        ColumnSchema::new("rngsubtype", DataType::BigInt, false),
+        ColumnSchema::new("rngmultitypid", DataType::BigInt, false),
+        ColumnSchema::new("rngcollation", DataType::BigInt, false),
+        ColumnSchema::new("rngsubopc", DataType::BigInt, false),
+        ColumnSchema::new("rngcanonical", DataType::BigInt, false),
+        ColumnSchema::new("rngsubdiff", DataType::BigInt, false),
+    ];
+    // (range oid, subtype oid) — PG's own numbers, the ones pg_type
+    // already publishes here.
+    const RANGES: &[(i64, i64)] = &[
+        (3904, 23),   // int4range  -> int4
+        (3926, 20),   // int8range  -> int8
+        (3906, 1700), // numrange   -> numeric
+        (3908, 1114), // tsrange    -> timestamp
+        (3910, 1184), // tstzrange  -> timestamptz
+        (3912, 1082), // daterange  -> date
+    ];
+    let rows = RANGES
+        .iter()
+        .map(|(rng, sub)| {
+            Row::new(alloc::vec![
+                Value::BigInt(*rng),
+                Value::BigInt(*sub),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+            ])
+        })
+        .collect();
+    (schema, rows)
+}
+
+/// v7.39 (round 546) — `pg_catalog.pg_partitioned_table`: one row per
+/// partition PARENT.
+///
+/// SPG has declarative partitioning, so this is real. partstrat is
+/// PG's single char — 'r' range, 'l' list, 'h' hash — and partattrs is
+/// the int2vector of key positions, 1-based as PG's attnums are.
+pub(crate) fn synth_pg_partitioned_table(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    use spg_storage::{PartitionKind, PartitionRole};
+    let schema = alloc::vec![
+        ColumnSchema::new("partrelid", DataType::BigInt, false),
+        ColumnSchema::new("partstrat", DataType::Text, false),
+        ColumnSchema::new("partnatts", DataType::SmallInt, false),
+        ColumnSchema::new("partdefid", DataType::BigInt, false),
+        ColumnSchema::new("partattrs", DataType::Text, false),
+        ColumnSchema::new("partclass", DataType::Text, false),
+        ColumnSchema::new("partcollation", DataType::Text, false),
+        ColumnSchema::new("partexprs", DataType::Text, true),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for tname in cat.visible_table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        let Some(PartitionRole::Parent {
+            kind,
+            key_column_positions,
+            ..
+        }) = &t.schema().partition_role
+        else {
+            continue;
+        };
+        let Some(oid) = relation_oid(cat, &tname) else {
+            continue;
+        };
+        let strat = match kind {
+            PartitionKind::Range => "r",
+            PartitionKind::List => "l",
+            PartitionKind::Hash => "h",
+        };
+        let attrs = key_column_positions
+            .iter()
+            .map(|p| alloc::format!("{}", p + 1))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let zeros = key_column_positions
+            .iter()
+            .map(|_| alloc::string::String::from("0"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(oid),
+            Value::text(strat),
+            Value::SmallInt(i16::try_from(key_column_positions.len()).unwrap_or(1)),
+            Value::BigInt(0), // partdefid — no DEFAULT partition recorded
+            Value::text(attrs),
+            Value::text(zeros.clone()),
+            Value::text(zeros),
+            Value::Null, // partexprs — SPG partitions on columns, not expressions
+        ]));
+    }
+    (schema, rows)
 }
 
 /// v7.39 (round 544) — `pg_catalog.pg_cast`, empty, and why.
