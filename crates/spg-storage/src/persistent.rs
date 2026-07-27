@@ -123,6 +123,22 @@ impl<T> PersistentVec<T> {
         run.get(off)
     }
 
+    /// v7.39 (round 562) — the contiguous run holding `i`, with the index
+    /// `i` sits at inside it, so a caller reading ascending indices can
+    /// keep the run and descend once per leaf instead of once per element.
+    ///
+    /// This is what `iter` already does; `run_at`'s own comment says so.
+    /// It was private, so a caller that reads BY INDEX — an index-only
+    /// scan checking one header per matching row — had no way to say it,
+    /// and paid a descent per row for elements 32 to a leaf.
+    ///
+    /// Returns `(start, run)`: `run[i - start]` is element `i`, and the
+    /// run covers `start .. start + run.len()`.
+    pub fn run_containing(&self, i: usize) -> Option<(usize, &[T])> {
+        let (run, off) = self.run_at(i)?;
+        Some((i - off, run))
+    }
+
     /// The contiguous run of elements holding index `i`, plus `i`'s offset
     /// inside it. One trie descent serves the whole run, which is what lets
     /// `iter` walk a leaf at a time instead of descending per element.
