@@ -13,7 +13,38 @@
 //! the query touches says which structure it is — one allocation per
 //! scanned row, per matched pair, or per query — without needing a
 //! symbol at all.
-
+//!
+//! ---
+//!
+//! v7.39 (round 577) used it to compare the engine against the server,
+//! and found the gap is not where round 576 left it. Same SQL, same
+//! table shape (two INT columns, 500k rows a side):
+//!
+//!                        engine here   server, EXPLAIN ANALYZE   wire total   PG18
+//!     join, both 100        19.0 ms          41.4-43.0             42.75      11.9
+//!     join, no predicate    33.4             56.1-59.9             59.83      54.1
+//!     single scan, count     6.0             10.8-15.7             16.48       7.1
+//!     SELECT 1                 -                 -                  0.146      0.305
+//!
+//! The wire adds essentially nothing — a trivial query costs 0.146 ms
+//! there, which BEATS PG's 0.305 — and `EXPLAIN ANALYZE`, which never
+//! leaves the server, already carries the whole gap. Server CPU confirms
+//! it: 20 joins cost 0.97 s of process CPU, 48.5 ms each, against 19.0
+//! ms of single-threaded work in this probe. So the server's engine does
+//! about 2.5x the CPU of the embedded engine for the same query.
+//!
+//! Three candidates were eliminated by measurement, not by reading:
+//!
+//!   * the wire — `EXPLAIN ANALYZE` (server-side, no client) reports the
+//!     full time, and a trivial query is 0.146 ms;
+//!   * the parallel runner — `SPG_PARALLEL=0` moves the join not at all
+//!     (44.6 -> 44.4), and the join turns out not to use it, though the
+//!     single scan does (14.6 on, 21.8 off);
+//!   * MVCC freezing — `VACUUM FREEZE` on the table changes nothing
+//!     (48.2 -> 47.7).
+//!
+//! What the server's engine does that `Engine::execute` does not is the
+//! next round's question, and it is now a narrow one.
 // A counting allocator is the one thing that cannot be written without
 // `unsafe`: `GlobalAlloc` is an unsafe trait and every method forwards
 // to `System`. Confined to this probe binary; nothing in the engine or
