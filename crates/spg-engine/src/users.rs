@@ -107,6 +107,18 @@ pub struct UserRecord {
     /// membership (that is PG's rule: only privileges flow, not attributes) —
     /// a member of a superuser role must `SET ROLE` to it to act as one.
     pub can_login: bool,
+    /// v7.39 (round 548) — was a password actually DECLARED for this
+    /// role?
+    ///
+    /// A bare `CREATE ROLE devs` gets an unguessable credential derived
+    /// from its own salt (so no record ever carries an empty password),
+    /// which made "has a hash" useless for telling a real account from
+    /// a group role. The wire's open-vs-authenticated decision needs
+    /// that distinction: it used to arm on ANY role existing, so
+    /// creating a NOLOGIN group role locked the operator out of their
+    /// own database — `postgres` has no password, so nothing could
+    /// connect afterwards and there was no way back through SQL.
+    pub password_declared: bool,
     /// `INHERIT` (the default): this role automatically holds the privileges of
     /// every role it is a member of. `NOINHERIT` means it must `SET ROLE` to
     /// them explicitly.
@@ -134,6 +146,19 @@ impl UserRecord {
     pub fn verify(&self, password: &str) -> bool {
         let candidate = derive_hash(&self.salt, password);
         constant_time_eq(&candidate, &self.hash)
+    }
+
+    /// v7.39 (round 548) — can this role be authenticated at all?
+    ///
+    /// A `CREATE ROLE devs NOLOGIN` records no password and cannot log
+    /// in. It used to count toward "this server has users, so demand a
+    /// password from everybody", which locked the operator out of their
+    /// own database: `postgres` has no password, so after creating a
+    /// group role nothing could connect and there was no way back
+    /// through SQL.
+    #[must_use]
+    pub fn has_credentials(&self) -> bool {
+        self.can_login && self.password_declared
     }
 
     pub const fn scram(&self) -> Option<&ScramSecrets> {
@@ -353,6 +378,10 @@ impl UserStore {
                 // CREATE USER is PG's `CREATE ROLE … LOGIN`; the caller
                 // overrides these for a bare `CREATE ROLE`.
                 can_login: true,
+                // v7.39 (round 548) — a password reached this far, so
+                // one was declared. The bare `CREATE ROLE` path
+                // substitutes an unguessable one and clears this after.
+                password_declared: true,
                 inherit: true,
                 superuser: matches!(role, Role::Admin),
             },
@@ -367,6 +396,14 @@ impl UserStore {
             r.can_login = can_login;
             r.inherit = inherit;
             r.superuser = superuser;
+        }
+    }
+
+    /// v7.39 (round 548) — record whether the caller actually declared
+    /// a password (see [`UserRecord::password_declared`]).
+    pub fn set_password_declared(&mut self, name: &str, declared: bool) {
+        if let Some(r) = self.users.get_mut(name) {
+            r.password_declared = declared;
         }
     }
 
@@ -588,6 +625,8 @@ const CACHING_SHA2_FORMAT_MARKER: u8 = 0xfd;
 /// attributes (login / inherit / superuser) per user and a trailing role
 /// MEMBERSHIP block. Writer always emits v5; reader understands v1 … v5.
 const ROLE_ATTRS_FORMAT_MARKER: u8 = 0xfc;
+/// v7.39 (round 548) — v6: v5 plus a `password_declared` byte per user.
+const PASSWORD_DECLARED_FORMAT_MARKER: u8 = 0xfb;
 
 pub(crate) fn serialize_users(store: &UserStore) -> Vec<u8> {
     let per_user_floor = 2 + 16 + 1 + SALT_LEN + HASH_LEN + 1 + 1;
@@ -595,7 +634,7 @@ pub(crate) fn serialize_users(store: &UserStore) -> Vec<u8> {
     // v7.17.0 Phase 3.P0-72 — bump on-disk format to v4 so the
     // per-user `caching_sha2_password` hash trails the
     // mysql_native block.
-    out.push(ROLE_ATTRS_FORMAT_MARKER);
+    out.push(PASSWORD_DECLARED_FORMAT_MARKER);
     out.extend_from_slice(
         &u32::try_from(store.users.len())
             .expect("≤ 4G users")
@@ -640,6 +679,8 @@ pub(crate) fn serialize_users(store: &UserStore) -> Vec<u8> {
         out.push(u8::from(rec.can_login));
         out.push(u8::from(rec.inherit));
         out.push(u8::from(rec.superuser));
+        // v6 — round 548.
+        out.push(u8::from(rec.password_declared));
     }
     // v5 — the membership block, at the tail so a v4 reader stops before it.
     let pairs: Vec<(&str, &str)> = store.all_memberships().collect();
@@ -704,20 +745,24 @@ pub(crate) fn deserialize_users(buf: &[u8]) -> Result<UserStore, UserDeserialize
         mysql_native_present_inline,
         caching_sha2_present_inline,
         role_attrs_inline,
-    ) = if !buf.is_empty() && buf[0] == ROLE_ATTRS_FORMAT_MARKER {
+        password_declared_inline,
+    ) = if !buf.is_empty() && buf[0] == PASSWORD_DECLARED_FORMAT_MARKER {
         p += 1;
-        (true, true, true, true)
+        (true, true, true, true, true)
+    } else if !buf.is_empty() && buf[0] == ROLE_ATTRS_FORMAT_MARKER {
+        p += 1;
+        (true, true, true, true, false)
     } else if !buf.is_empty() && buf[0] == CACHING_SHA2_FORMAT_MARKER {
         p += 1;
-        (true, true, true, false)
+        (true, true, true, false, false)
     } else if !buf.is_empty() && buf[0] == MYSQL_NATIVE_FORMAT_MARKER {
         p += 1;
-        (true, true, false, false)
+        (true, true, false, false, false)
     } else if !buf.is_empty() && buf[0] == SCRAM_FORMAT_MARKER {
         p += 1;
-        (true, false, false, false)
+        (true, false, false, false, false)
     } else {
-        (false, false, false, false)
+        (false, false, false, false, false)
     };
     let count_bytes = take(&mut p, 4, buf)?;
     let count = u32::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
@@ -796,6 +841,16 @@ pub(crate) fn deserialize_users(buf: &[u8]) -> Result<UserStore, UserDeserialize
         } else {
             (true, true, matches!(role, Role::Admin))
         };
+        // v6 (round 548). An older image did not record it; infer from
+        // what it DID record — a role that can log in was created with a
+        // password, a NOLOGIN group role was not. That is the reading
+        // that unlocks an operator already stuck behind the old rule
+        // while leaving a real account guarded.
+        let password_declared = if password_declared_inline {
+            take(&mut p, 1, buf)?[0] == 1
+        } else {
+            can_login
+        };
         store.users.insert(
             name,
             UserRecord {
@@ -806,6 +861,7 @@ pub(crate) fn deserialize_users(buf: &[u8]) -> Result<UserStore, UserDeserialize
                 mysql_native,
                 caching_sha2,
                 can_login,
+                password_declared,
                 inherit,
                 superuser,
             },
@@ -1002,9 +1058,12 @@ mod tests {
         // v7.39 (read01 round 58): writer flipped to the v5 marker (0xfc) —
         // per-user role attributes plus a trailing membership block, which for
         // an empty store is a zero u32 count.
+        // v7.39 (round 548): and to the v6 marker (0xfb), which adds a
+        // per-user `password_declared` byte. An empty store's bytes are
+        // unchanged apart from the marker.
         let s = UserStore::new();
         let bytes = serialize_users(&s);
-        assert_eq!(bytes, [0xfc, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(bytes, [0xfb, 0, 0, 0, 0, 0, 0, 0, 0]);
         let s2 = deserialize_users(&bytes).unwrap();
         assert!(s2.is_empty());
     }
@@ -1073,7 +1132,7 @@ mod p0_71_tests {
         s.create("alice", "wonderland", Role::Admin, [4u8; SALT_LEN])
             .unwrap();
         let bytes = serialize_users(&s);
-        assert_eq!(bytes[0], 0xfc, "v5 marker advertised");
+        assert_eq!(bytes[0], 0xfb, "v6 marker advertised (round 548)");
         let s2 = deserialize_users(&bytes).unwrap();
         let r1 = s.get("alice").unwrap();
         let r2 = s2.get("alice").unwrap();

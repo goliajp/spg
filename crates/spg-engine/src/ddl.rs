@@ -3559,6 +3559,13 @@ impl Engine {
         // PG's attribute defaults: LOGIN iff spelled CREATE USER, INHERIT, and
         // NOSUPERUSER — but SPG's own coarse `ROLE 'admin'` still means
         // superuser, which is how the existing admin account keeps working.
+        // v7.39 (round 548) — remember whether a password was DECLARED,
+        // not just whether the record ended up with one: the branch
+        // above substitutes an unguessable credential for a bare
+        // CREATE ROLE, and the wire's open-vs-authenticated decision
+        // has to tell the two apart.
+        self.users
+            .set_password_declared(&s.name, !s.password.is_empty());
         self.users.set_attributes(
             &s.name,
             s.login.unwrap_or(s.is_user),
