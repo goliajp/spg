@@ -1,20 +1,29 @@
 //! v7.39 (round 560) — an index-only range scan.
 //!
 //! Phase 5's B2. Measuring it first found another loss no ledger entry
-//! recorded: over pgwire on a 500k table, projecting the indexed column
-//! for a 100k-row range —
+//! recorded — the shape of paying per row for something the index
+//! already knows: the range walk holds the KEY, throws it away, keeps
+//! the locator, and reads the row for a value it had in hand.
 //!
-//!     PG18  Index Only Scan   3.6 ms      SPG  30 ms
+//! Serving the value from the key instead, on a 500k table over pgwire,
+//! a 100k-row range (medians, interleaved):
 //!
-//! 8×, widening with the row count (2× at 1k rows). The shape of paying
-//! per row for something the index already knows: the range walk holds
-//! the KEY, throws it away, keeps the locator, and reads the row for a
-//! value it had in hand.
+//!     SPG  reading the row   38.7 ms      PG18  17.0 ms
+//!     SPG  from the key      24.4 ms      PG18  13.2 ms   (Index Only Scan)
+//!     one row               0.28 ms             0.58 ms
 //!
-//! Serving the value from the key takes it to 18 ms. PG is still ahead
-//! at 3.6, and the remainder is not this path: what is left is one
-//! `Row` allocation per output row, which every executor shape pays.
+//! 14 ms saved, and the fixed cost was already SPG's. What remains at
+//! 100k rows is 1.85×, and it is not this path — round 561 measured the
+//! engine doing the whole scan in 3.08 ms, so the rest is wire-side.
 //! Recorded rather than claimed closed.
+//!
+//! The figures above REPLACE the ones this file first carried ("PG 3.6
+//! ms vs SPG 30 ms, 8×"). Those were taken with the two servers on
+//! unequal client paths — PG over container loopback, SPG through
+//! Docker's host NAT — which on a 1.2 MB result is most of what was
+//! being compared. Both sides run through the same client here. A
+//! recorded number that was never comparable is the measurement form of
+//! a test that pins its own answer.
 //!
 //! Why PG needs a visibility map for this and SPG does not: a heap
 //! tuple carries its own visibility, so an index entry alone cannot say
