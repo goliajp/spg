@@ -4704,11 +4704,28 @@ pub(crate) fn synth_pg_auth_members(engine: &Engine) -> (Vec<ColumnSchema>, Vec<
 /// WHERE extname = 'vector'` probes from PG clients (mailrs embed
 /// round-12) answer truthfully about capability presence.
 pub(crate) fn synth_pg_extension() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    // v7.39 (round 539) — PG18's full eight columns, in its order.
+    //
+    // Four were missing and `extnamespace` was the schema's NAME where
+    // PG has its OID, which is what `pg_dump` joins on — so its very
+    // first catalog query failed and no dump ran at all:
+    //
+    //   SELECT x.tableoid, x.oid, x.extname, n.nspname, x.extrelocatable,
+    //          x.extversion, x.extconfig, x.extcondition
+    //   FROM pg_extension x JOIN pg_namespace n ON n.oid = x.extnamespace
+    //
+    // Values measured on PG18 for an installed extension: owner 10,
+    // namespace 11 (pg_catalog), not relocatable, and NULL for both
+    // array columns.
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("extname", DataType::Text, false),
+        ColumnSchema::new("extowner", DataType::BigInt, false),
+        ColumnSchema::new("extnamespace", DataType::BigInt, false),
+        ColumnSchema::new("extrelocatable", DataType::Bool, false),
         ColumnSchema::new("extversion", DataType::Text, false),
-        ColumnSchema::new("extnamespace", DataType::Text, false),
+        ColumnSchema::new("extconfig", DataType::TextArray, true),
+        ColumnSchema::new("extcondition", DataType::TextArray, true),
     ];
     let exts: &[(&str, &str)] = &[("plpgsql", "1.0"), ("vector", "0.8.0"), ("pg_trgm", "1.6")];
     let rows = exts
@@ -4718,8 +4735,12 @@ pub(crate) fn synth_pg_extension() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
             Row::new(alloc::vec![
                 Value::BigInt(16384 + i as i64),
                 Value::text::<String>((*name).into()),
+                Value::BigInt(10),
+                Value::BigInt(11),
+                Value::Bool(false),
                 Value::text::<String>((*ver).into()),
-                Value::text("pg_catalog"),
+                Value::Null,
+                Value::Null,
             ])
         })
         .collect();
