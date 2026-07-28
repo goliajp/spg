@@ -98,6 +98,43 @@
 //! the remaining gap lives, and a client that connects, asks one
 //! question and leaves pays all of it.
 //!
+//! ---
+//!
+//! v7.39 (round 584) followed round 583's instruction — profile the
+//! FIRST query specifically — and the instruction turned out to be
+//! unusable as written. Four things came out of it:
+//!
+//!   * the cold/warm profile diff is CONTAMINATED. Profiling a server
+//!     driven by 25 connect / one query / disconnect clients puts 37% of
+//!     the connection thread in `run_pg_session` and rustls
+//!     (`stream.rs`, `conn.rs`) against 0.8% warm — but that is the TLS
+//!     handshake, which happens BEFORE the first statement and is not in
+//!     what psql reports. A profile of the whole thread cannot be
+//!     subtracted from a warm one to isolate statement work.
+//!   * TLS is not the penalty anyway. With `PGSSLMODE=disable` the first
+//!     query still costs 14.2 ms against a steady state of about 2.
+//!   * the steady state is BIMODAL, and it is the parallel runner. Over
+//!     30 samples of `count(*) … WHERE id < 100` on 500k rows:
+//!
+//!         parallel on   min 1.52  p25 1.59  median 1.99  p90 7.01  max 10.25
+//!         parallel off  min 6.23  p25 6.41  median 6.53  p90 7.55  max  8.92
+//!
+//!     Sharding is a 3.3x win at the median with a tail near a tenth of
+//!     the time that lands at about serial speed. That is a distribution
+//!     worth knowing, not a defect — an earlier reading in this round
+//!     called it "parallel's bad case is worse than serial", which the
+//!     distribution does not support.
+//!   * so round 583's "16.80, 11.77, 3.03, 5.74, 2.05" was not a
+//!     settling curve. It was one cold sample followed by draws from a
+//!     bimodal distribution. The direction of that round's conclusions
+//!     survives — the first query is far above the maximum of the steady
+//!     distribution, on both modes and both table sizes — but the shape
+//!     of the curve was read into noise.
+//!
+//! The cold penalty itself is still unnamed, and is larger without
+//! sharding: first query 31.4 ms against a steady 6.5 serial, 14.7
+//! against 2.0 parallel.
+//!
 //! One near-miss worth keeping: the first server profile this round took
 //! was of a `release-dbg` binary built in round 575, BEFORE round 576's
 //! bucket fix, and it still showed the allocator at 37%. That is exactly
