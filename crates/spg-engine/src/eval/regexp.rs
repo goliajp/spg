@@ -2440,6 +2440,47 @@ pub(super) fn regexp_substr(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
 /// v7.37.17 (17.6 siblings) — PG 15+ `regexp_like(source, pattern
 /// [, flags])` returns TRUE if the pattern matches anywhere in
 /// source; FALSE otherwise.
+/// v7.39 (round 594) — a pattern compiled once instead of once per row.
+///
+/// `s ~ 'pat'` lowers to `regexp_like(s, 'pat')`, and that function parsed
+/// the pattern into a tree for EVERY row it was asked about: 500k rows cost
+/// 350 ms against PG18's 34.5, the same 10x whether the pattern was anchored,
+/// unanchored, case-insensitive, negated, or spelled `regexp_like` — which is
+/// what a per-row compile looks like. PG keeps a cache of compiled patterns
+/// for the same reason.
+///
+/// SPG has somewhere better to put it than a cache: the compiled-predicate
+/// program, where `Step::Like` already keeps its pattern as a compile
+/// product. No cache means no "forgot to pass the memo" failure mode.
+#[derive(Debug, Clone)]
+pub(crate) struct CompiledRe {
+    node: ReNode,
+    /// Set when the whole pattern is an anchored dot-run, so a match is a
+    /// length test — the `checkmatchall` shortcut, decided at compile time.
+    matchall: Option<(usize, Option<usize>)>,
+}
+
+pub(crate) fn compile_re(pat: &str, case_insensitive: bool) -> Result<CompiledRe, EvalError> {
+    let mut node = re_compile(pat)?;
+    if case_insensitive {
+        fold_case(&mut node);
+    }
+    let matchall = matchall_length_bounds(&node);
+    Ok(CompiledRe { node, matchall })
+}
+
+/// The body `regexp_like` runs per row, minus the compile.
+pub(crate) fn compiled_is_match(re: &CompiledRe, text: &str) -> Result<bool, EvalError> {
+    let chars: Vec<char> = text.chars().collect();
+    if let Some((min, max)) = re.matchall {
+        let len = chars.len();
+        if (len as u64) <= MATCHALL_SAFE_LEN {
+            return Ok(min <= len && max.is_none_or(|mx| len <= mx));
+        }
+    }
+    Ok(re_find(&re.node, &chars, 0)?.is_some())
+}
+
 pub(super) fn regexp_like(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(EvalError::TypeMismatch {

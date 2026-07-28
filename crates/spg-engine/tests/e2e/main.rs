@@ -131,6 +131,7 @@ mod e2e_join_side_filter_round574;
 mod e2e_fused_extremes_round569;
 mod e2e_order_key_bound_round582;
 mod e2e_ansi89_join_round588;
+mod e2e_regex_compiled_round594;
 mod e2e_window_bound_keys_round593;
 mod e2e_window_rowbuf_round592;
 mod e2e_setop_index_round591;

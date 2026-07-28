@@ -76,6 +76,19 @@ pub(crate) enum Step {
     /// try-every-suffix backtracking (per-position `_`+literal walk),
     /// scan with `str::find` (two-way, sublinear) over the literal and
     /// verify the `k` leading / `m` trailing wildcard chars have room.
+    /// v7.39 (round 594) — `text ~ '<literal pattern>'` and its `~*` /
+    /// `regexp_like(...)` spellings. `regexp_like` parsed the pattern into a
+    /// tree for EVERY row: 500k rows cost 350 ms against PG18's 34.5, the
+    /// same 10x whichever way the match was spelled. The pattern is a
+    /// compile product here, exactly as `Step::Like`'s is — PG solves the
+    /// same problem with a cache; a compile product cannot be forgotten.
+    Regex {
+        re: crate::eval::CompiledRe,
+        /// The whole call, for an operand that is not text: the interpreter
+        /// owns whatever coercion or error that is, and this step must not
+        /// invent one. Same escape `Step::InSet` takes, evaluated cold.
+        fallback: Expr,
+    },
     LikeSubstring {
         needle: alloc::string::String,
         k_before: usize,
@@ -528,6 +541,32 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             _ => steps.push(Step::Subtree(e.clone())),
             }
         },
+        // v7.39 (round 594) — a literal-pattern regex compiles here instead
+        // of once per row. `s ~ 'p'` and `s ~* 'p'` both lower to
+        // `regexp_like`, so this one shape covers the operators too. A
+        // pattern that is not a literal (or flags that are not) stays on the
+        // interpreter, which still has to compile per row: the pattern can
+        // differ row to row.
+        Expr::FunctionCall { name, args }
+            if name.eq_ignore_ascii_case("regexp_like")
+                && matches!(args.len(), 2 | 3)
+                && regex_literal_parts(args.as_slice()).is_some()
+                && fully_compilable(&args[0]) =>
+        {
+            let (pat, ci) = regex_literal_parts(args.as_slice()).expect("checked above");
+            match crate::eval::compile_re(pat, ci) {
+                Ok(re) => {
+                    compile_into(&args[0], ctx, steps);
+                    steps.push(Step::Regex {
+                        re,
+                        fallback: e.clone(),
+                    });
+                }
+                // An invalid pattern is an error the interpreter words; let
+                // it keep raising it, in its own wording.
+                Err(_) => steps.push(Step::Subtree(e.clone())),
+            }
+        }
         // v7.36 — PURE scalar function call: emit args then a
         // single Function step that pops them. `fully_compilable`
         // gates the whitelist + recurses into args, so this branch
@@ -768,6 +807,18 @@ pub(crate) fn fully_compilable(e: &Expr) -> bool {
         // outside (NOW, RANDOM, sequence accessors, EXTRACT-with-
         // context-dependent fields, etc.) stays on Subtree where
         // the interpreter has the full ctx.
+        // v7.39 (round 594) — a `regexp_like` with a LITERAL pattern is
+        // compilable even though the function is not on the pure list: the
+        // pattern becomes a compile product (`Step::Regex`) rather than an
+        // argument the step would have to re-parse per row. A non-literal
+        // pattern stays off, because then it really can differ row to row.
+        Expr::FunctionCall { name, args }
+            if name.eq_ignore_ascii_case("regexp_like")
+                && matches!(args.len(), 2 | 3)
+                && regex_literal_parts(args.as_slice()).is_some() =>
+        {
+            fully_compilable(&args[0])
+        }
         Expr::FunctionCall { name, args } => {
             is_pure_scalar_function(name) && args.iter().all(fully_compilable)
         }
@@ -1049,6 +1100,32 @@ fn in_set_verdict(
         (true, Value::Bool(b)) => Value::Bool(!b),
         (_, v) => v,
     })
+}
+
+/// v7.39 (round 594) — the literal pattern and case flag of a `regexp_like`
+/// call, when both are literals. `None` keeps the call on the interpreter.
+fn regex_literal_parts(args: &[Expr]) -> Option<(&str, bool)> {
+    let Expr::Literal(spg_sql::ast::Literal::String(pat)) = &args[1] else {
+        return None;
+    };
+    let ci = match args.get(2) {
+        None => false,
+        Some(Expr::Literal(spg_sql::ast::Literal::String(f))) => f.contains('i'),
+        Some(_) => return None,
+    };
+    Some((pat.as_str(), ci))
+}
+
+/// The verdict `Step::Regex` produces. `None` means the operand is not text,
+/// which is the caller's cue to fall through to the interpreter for its own
+/// coercion and wording.
+fn regex_verdict(cell: &Value<'_>, re: &crate::eval::CompiledRe) -> Option<Result<Value<'static>, EvalError>> {
+    let text = match cell {
+        Value::Null => return Some(Ok(Value::Null)),
+        Value::Text(t) | Value::BpChar(t) => t.as_ref(),
+        _ => return None,
+    };
+    Some(crate::eval::compiled_is_match(re, text).map(Value::Bool))
 }
 
 /// v7.39 (round 488) — the verdict `Step::Like` / `Step::LikeSubstring`
@@ -1363,6 +1440,15 @@ where
                     Some(v) => stack.push(v),
                     // Cross-family needle: take the interpreter's
                     // exact coercion / error path on the whole node.
+                    None => stack.push(eval_expr(fallback, &row.as_row(), ctx)?),
+                }
+            }
+            Step::Regex { re, fallback } => {
+                let v = stack.pop().unwrap_or(Value::Null);
+                match regex_verdict(&v, re) {
+                    Some(r) => stack.push(r?),
+                    // Not text: the interpreter's coercion and wording, on
+                    // the whole node, exactly as `Step::InSet` does.
                     None => stack.push(eval_expr(fallback, &row.as_row(), ctx)?),
                 }
             }
