@@ -6177,6 +6177,59 @@ pub(crate) fn encode_key_refs(vals: &[&Value]) -> String {
 /// only when a map actually has to take ownership (vacant insert).
 /// v7.39 (round 590) — append ONE value's encoding, for the join key that
 /// mixes stored cells with computed ones and so cannot clear as it goes.
+/// v7.39 (round 590, moved here round 593+) — one component of a key with a COMPUTED side.
+///
+/// The whole requirement is that two values SQL calls equal encode the same,
+/// or the join silently loses rows. Across the numeric family that is not
+/// free: `5` as INT, `5` as BIGINT, `5.0` as double and `5.00` as NUMERIC all
+/// compare equal and would otherwise carry four different tags, so they are
+/// all rendered as one canonical decimal. A non-integral value can never
+/// equal an integer, so it simply renders as itself; NaN equals nothing and
+/// any encoding will do. Everything outside the numeric family keeps the
+/// encoder the column-to-column path already uses.
+pub(crate) fn push_canonical_key(out: &mut String, v: &Value) {
+    use core::fmt::Write;
+    match v {
+        Value::SmallInt(n) => {
+            let _ = write!(out, "n{n}|");
+        }
+        Value::Int(n) => {
+            let _ = write!(out, "n{n}|");
+        }
+        Value::BigInt(n) => {
+            let _ = write!(out, "n{n}|");
+        }
+        // `-0.0` prints with its sign but equals `0`.
+        Value::Float(f) if *f == 0.0 => out.push_str("n0|"),
+        Value::Float(f) => {
+            let _ = write!(out, "n{f}|");
+        }
+        Value::Numeric { .. } => {
+            let t = crate::eval::value_to_text(v);
+            let t = if t.contains('.') {
+                t.trim_end_matches('0').trim_end_matches('.')
+            } else {
+                t.as_str()
+            };
+            let _ = write!(out, "n{t}|");
+        }
+        _ => encode_one_into(out, v),
+    }
+}
+
+
+/// v7.39 (round 596) — a whole key encoded the canonical way, for the two
+/// sides of a decorrelated EXISTS: the set is built from the inner column's
+/// values and probed with the outer EXPRESSION's, and those need not share a
+/// numeric width for `=` to call them equal.
+pub(crate) fn encode_canonical_key(vals: &[Value<'_>]) -> String {
+    let mut out = String::new();
+    for v in vals {
+        push_canonical_key(&mut out, v);
+    }
+    out
+}
+
 pub(crate) fn encode_one_into(out: &mut String, v: &Value) {
     encode_one_raw(out, v);
 }

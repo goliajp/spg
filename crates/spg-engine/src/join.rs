@@ -622,46 +622,6 @@ fn keep_mask(
 /// peer with no ON. The returned residual refs borrow the underlying ON
 /// expressions (not the `peer` itself, since `peer.on` is a `Copy`
 /// reference), so the caller can still mutate `peer` afterwards.
-/// v7.39 (round 590) — one component of a hash key that has a COMPUTED side.
-///
-/// The whole requirement is that two values SQL calls equal encode the same,
-/// or the join silently loses rows. Across the numeric family that is not
-/// free: `5` as INT, `5` as BIGINT, `5.0` as double and `5.00` as NUMERIC all
-/// compare equal and would otherwise carry four different tags, so they are
-/// all rendered as one canonical decimal. A non-integral value can never
-/// equal an integer, so it simply renders as itself; NaN equals nothing and
-/// any encoding will do. Everything outside the numeric family keeps the
-/// encoder the column-to-column path already uses.
-fn push_key_value(out: &mut String, v: &Value) {
-    use core::fmt::Write;
-    match v {
-        Value::SmallInt(n) => {
-            let _ = write!(out, "n{n}|");
-        }
-        Value::Int(n) => {
-            let _ = write!(out, "n{n}|");
-        }
-        Value::BigInt(n) => {
-            let _ = write!(out, "n{n}|");
-        }
-        // `-0.0` prints with its sign but equals `0`.
-        Value::Float(f) if *f == 0.0 => out.push_str("n0|"),
-        Value::Float(f) => {
-            let _ = write!(out, "n{f}|");
-        }
-        Value::Numeric { .. } => {
-            let t = crate::eval::value_to_text(v);
-            let t = if t.contains('.') {
-                t.trim_end_matches('0').trim_end_matches('.')
-            } else {
-                t.as_str()
-            };
-            let _ = write!(out, "n{t}|");
-        }
-        _ => aggregate::encode_one_into(out, v),
-    }
-}
-
 fn extract_join_keys<'a>(
     peer: &JoinedPeer<'a>,
     combined_schema: &[ColumnSchema],
@@ -1680,7 +1640,7 @@ impl Engine {
                 if matches!(v, Value::Null) {
                     continue 'build;
                 }
-                push_key_value(&mut keystr, &v);
+                aggregate::push_canonical_key(&mut keystr, &v);
             }
             match table.get_mut(keystr.as_str()) {
                 Some(b) => b.push(ri),
@@ -1731,7 +1691,7 @@ impl Engine {
                     aggregate::encode_key_refs_into(&probebuf, &mut keystr);
                     for (lpos, _) in eq_exprs {
                         match tuple_value(&pipe.sources, &pipe.offsets, tuple, *lpos) {
-                            Some(v) if !matches!(v, Value::Null) => push_key_value(&mut keystr, v),
+                            Some(v) if !matches!(v, Value::Null) => aggregate::push_canonical_key(&mut keystr, v),
                             _ => {
                                 left_has_null = true;
                                 break;
