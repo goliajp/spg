@@ -344,6 +344,93 @@ fn render_pg_tree(node: &PlanNode, depth: usize, out: &mut Vec<String>) {
 
 /// Render an expression the way PG's deparser does at the plan level —
 /// wrapped in one set of parentheses unless it already is.
+/// v7.39 (round 588) — the top-level WHERE conjuncts that could be equi-join
+/// keys, under the executor's own rule: `<col> = <col>` with two different
+/// qualifiers, and only while no outer join is in the chain.
+fn where_equi_join_conds<'w>(
+    from: &spg_sql::ast::FromClause,
+    where_: Option<&'w Expr>,
+) -> alloc::vec::Vec<&'w Expr> {
+    let Some(w) = where_ else {
+        return alloc::vec::Vec::new();
+    };
+    if !from.joins.iter().all(|j| {
+        matches!(
+            j.kind,
+            spg_sql::ast::JoinKind::Inner | spg_sql::ast::JoinKind::Cross
+        )
+    }) {
+        return alloc::vec::Vec::new();
+    }
+    crate::reorder::split_and_conjunctions(w)
+        .into_iter()
+        .filter(|sub| equi_quals(sub).is_some())
+        .collect()
+}
+
+/// The two qualifiers of a `<qual>.<col> = <qual>.<col>` conjunct.
+fn equi_quals(sub: &Expr) -> Option<(&str, &str)> {
+    let Expr::Binary {
+        lhs,
+        op: spg_sql::ast::BinOp::Eq,
+        rhs,
+    } = sub
+    else {
+        return None;
+    };
+    let (Expr::Column(a), Expr::Column(b)) = (lhs.as_ref(), rhs.as_ref()) else {
+        return None;
+    };
+    let (Some(qa), Some(qb)) = (a.qualifier.as_deref(), b.qualifier.as_deref()) else {
+        return None;
+    };
+    (!qa.eq_ignore_ascii_case(qb)).then_some((qa, qb))
+}
+
+/// The WHERE conjunct that joins peer `jidx` to something already joined —
+/// the primary or an earlier peer — if there is one.
+fn promoted_key_for<'w>(
+    from: &spg_sql::ast::FromClause,
+    jidx: usize,
+    candidates: &[&'w Expr],
+) -> Option<&'w Expr> {
+    let rel = |t: &spg_sql::ast::TableRef| {
+        t.alias.clone().unwrap_or_else(|| t.name.clone())
+    };
+    let peer = rel(&from.joins[jidx].table);
+    let mut left: alloc::vec::Vec<String> = alloc::vec![rel(&from.primary)];
+    left.extend(from.joins[..jidx].iter().map(|j| rel(&j.table)));
+    candidates.iter().copied().find(|sub| {
+        equi_quals(sub).is_some_and(|(qa, qb)| {
+            let names = |q: &str| left.iter().any(|l| l.eq_ignore_ascii_case(q));
+            (qa.eq_ignore_ascii_case(&peer) && names(qb))
+                || (qb.eq_ignore_ascii_case(&peer) && names(qa))
+        })
+    })
+}
+
+/// The WHERE with a set of conjuncts removed, for a scan node whose Filter
+/// line should no longer claim a condition the join itself now enforces.
+fn without_conjuncts(where_: Option<&Expr>, drop: &[&Expr]) -> Option<Expr> {
+    if drop.is_empty() {
+        return None;
+    }
+    let w = where_?;
+    let dropped: alloc::collections::BTreeSet<usize> = drop
+        .iter()
+        .map(|e| core::ptr::from_ref::<Expr>(*e) as usize)
+        .collect();
+    crate::reorder::split_and_conjunctions(w)
+        .into_iter()
+        .filter(|c| !dropped.contains(&(core::ptr::from_ref::<Expr>(c) as usize)))
+        .cloned()
+        .reduce(|a, b| Expr::Binary {
+            lhs: alloc::boxed::Box::new(a),
+            op: spg_sql::ast::BinOp::And,
+            rhs: alloc::boxed::Box::new(b),
+        })
+}
+
 fn pg_cond(e: &Expr) -> String {
     let s = alloc::format!("{e}");
     if s.starts_with('(') && s.ends_with(')') {
@@ -1071,35 +1158,60 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
             r
         }
         Some(from) => {
+            // v7.39 (round 588) — the executor now takes an equi-join key out
+            // of the WHERE clause when the ON clause has none, so
+            // `FROM a, b WHERE a.id = b.id` really does hash. Ask the same
+            // question here, by qualifier, or EXPLAIN would keep naming a
+            // Nested Loop that no longer runs — and a promoted conjunct is
+            // the join's condition now, so it leaves the scan's Filter line.
+            let where_eq = where_equi_join_conds(from, stmt.where_.as_ref());
+            let promoted_all: alloc::vec::Vec<&Expr> = (0..from.joins.len())
+                .filter(|&i| {
+                    !from.joins[i].on.as_ref().is_some_and(|on| {
+                        matches!(on, Expr::Binary { op, .. } if matches!(op, spg_sql::ast::BinOp::Eq))
+                    })
+                })
+                .filter_map(|i| promoted_key_for(from, i, &where_eq))
+                .collect();
+            let scan_where = without_conjuncts(stmt.where_.as_ref(), &promoted_all);
             let mut left = scan_node(
                 engine,
                 &from.primary.name,
                 from.primary.alias.as_deref(),
-                stmt.where_.as_ref(),
+                scan_where.as_ref().or(if promoted_all.is_empty() {
+                    stmt.where_.as_ref()
+                } else {
+                    None
+                }),
                 &cte_names,
                 engine.stmt_takes_index_only_scan(stmt),
             );
             // Fold joins left-deep: equality ON -> Hash Join (right side
             // wrapped in a Hash node, like PG); anything else ->
             // Nested Loop with a Join Filter.
-            for j in &from.joins {
+            for (jidx, j) in from.joins.iter().enumerate() {
                 let right = scan_node(engine, &j.table.name, j.table.alias.as_deref(), None, &cte_names, false);
                 let (verb, hashable) = match j.kind {
                     spg_sql::ast::JoinKind::Inner => ("", true),
                     spg_sql::ast::JoinKind::Left => (" Left", true),
                     spg_sql::ast::JoinKind::Right => (" Right", true),
                     spg_sql::ast::JoinKind::FullOuter => (" Full", true),
-                    spg_sql::ast::JoinKind::Cross => ("", false),
+                    spg_sql::ast::JoinKind::Cross => ("", true),
                 };
                 let is_eq_join = j
                     .on
                     .as_ref()
                     .is_some_and(|on| matches!(on, Expr::Binary { op, .. } if matches!(op, spg_sql::ast::BinOp::Eq)));
-                let mut jn = if is_eq_join && hashable {
+                let promoted = if is_eq_join {
+                    None
+                } else {
+                    promoted_key_for(from, jidx, &where_eq)
+                };
+                let mut jn = if (is_eq_join || promoted.is_some()) && hashable {
                     let mut jn = PlanNode::new(alloc::format!("Hash Join{verb}"));
                     // PG spells it "Hash Left Join", verb before "Join".
                     jn.head = alloc::format!("Hash{verb} Join");
-                    if let Some(on) = &j.on {
+                    if let Some(on) = j.on.as_ref().or(promoted) {
                         jn.attrs.push(alloc::format!("Hash Cond: {}", pg_cond(on)));
                     }
                     let mut hash = PlanNode::new(String::from("Hash"));

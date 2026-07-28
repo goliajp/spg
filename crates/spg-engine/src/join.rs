@@ -631,34 +631,84 @@ fn extract_join_keys<'a>(
     let mut residual: Vec<&Expr> = Vec::new();
     if let (Some(on_expr), None) = (peer.on, peer.lateral) {
         for sub in reorder::split_and_conjunctions(on_expr) {
-            let mut matched = None;
-            if let Expr::Binary {
-                lhs,
-                op: spg_sql::ast::BinOp::Eq,
-                rhs,
-            } = sub
-                && let (Expr::Column(a), Expr::Column(b)) = (lhs.as_ref(), rhs.as_ref())
-            {
-                let left_slice = &combined_schema[..consumed_cols];
-                if let (Some(l), Some(r)) = (
-                    Engine::composite_col_pos(left_slice, a),
-                    Engine::peer_col_pos(&peer.alias, &peer.cols, b),
-                ) {
-                    matched = Some((l, r));
-                } else if let (Some(l), Some(r)) = (
-                    Engine::composite_col_pos(left_slice, b),
-                    Engine::peer_col_pos(&peer.alias, &peer.cols, a),
-                ) {
-                    matched = Some((l, r));
-                }
-            }
-            match matched {
+            match match_equi_pair(sub, peer, combined_schema, consumed_cols) {
                 Some(pair) => eq_pairs.push(pair),
                 None => residual.push(sub),
             }
         }
     }
     (eq_pairs, residual)
+}
+
+/// One conjunct as an equi-join key for `peer`: `<left>.<col> = <peer>.<col>`
+/// in either order, where the left side resolves inside the part of the
+/// combined row already joined. `None` when it is anything else.
+fn match_equi_pair(
+    sub: &Expr,
+    peer: &JoinedPeer<'_>,
+    combined_schema: &[ColumnSchema],
+    consumed_cols: usize,
+) -> Option<(usize, usize)> {
+    let Expr::Binary {
+        lhs,
+        op: spg_sql::ast::BinOp::Eq,
+        rhs,
+    } = sub
+    else {
+        return None;
+    };
+    let (Expr::Column(a), Expr::Column(b)) = (lhs.as_ref(), rhs.as_ref()) else {
+        return None;
+    };
+    let left_slice = &combined_schema[..consumed_cols];
+    if let (Some(l), Some(r)) = (
+        Engine::composite_col_pos(left_slice, a),
+        Engine::peer_col_pos(&peer.alias, &peer.cols, b),
+    ) {
+        return Some((l, r));
+    }
+    if let (Some(l), Some(r)) = (
+        Engine::composite_col_pos(left_slice, b),
+        Engine::peer_col_pos(&peer.alias, &peer.cols, a),
+    ) {
+        return Some((l, r));
+    }
+    None
+}
+
+/// v7.39 (round 588) — the WHERE conjuncts that could be equi-join keys.
+///
+/// `FROM a, b WHERE a.id = b.id` is the ANSI-89 spelling of
+/// `FROM a JOIN b ON a.id = b.id` and means exactly the same join, but the
+/// equality arrives in the WHERE clause: `analyze_join_pushdown` cannot place
+/// it on either relation (its two qualifiers name two), and
+/// `extract_join_keys` only ever read the ON clause. The peer was left with
+/// no key at all and fell to the nested-loop stage, which crosses the ENTIRE
+/// peer against every surviving left row.
+///
+/// The rewrite is only sound while every relation in the chain is
+/// non-nullable — under an outer join a WHERE equality filters AFTER the
+/// NULL-filling and is not the same thing as a join condition — so one outer
+/// join anywhere gives up on the whole statement.
+fn where_equi_candidates<'w>(from: &FromClause, where_: Option<&'w Expr>) -> Vec<&'w Expr> {
+    let Some(w) = where_ else { return Vec::new() };
+    if !from
+        .joins
+        .iter()
+        .all(|j| matches!(j.kind, JoinKind::Inner | JoinKind::Cross))
+    {
+        return Vec::new();
+    }
+    reorder::split_and_conjunctions(w)
+        .into_iter()
+        .filter(|sub| {
+            matches!(
+                sub,
+                Expr::Binary { lhs, op: spg_sql::ast::BinOp::Eq, rhs }
+                    if matches!((lhs.as_ref(), rhs.as_ref()), (Expr::Column(_), Expr::Column(_)))
+            )
+        })
+        .collect()
 }
 
 impl Engine {
@@ -899,27 +949,14 @@ impl Engine {
         // only that to the survivor filter. Identity is by `Expr` pointer
         // (analyze_join_pushdown gave us borrows into `where_`'s conjunct
         // set, so the pointers match exactly).
-        let pushed_set: alloc::collections::BTreeSet<usize> = primary_preds
+        // v7.39 (round 588) — the set grows during the peer loop below: a
+        // WHERE equality promoted to a peer's join key is enforced BY the
+        // join and must not be re-applied per survivor either.
+        let mut pushed_set: alloc::collections::BTreeSet<usize> = primary_preds
             .iter()
             .chain(peer_preds.iter().flat_map(|v| v.iter()))
             .map(|e| core::ptr::from_ref::<Expr>(*e) as usize)
             .collect();
-        let residual_where_owned: Option<Expr> = where_.and_then(|w| {
-            let kept: Vec<Expr> = reorder::split_and_conjunctions(w)
-                .into_iter()
-                .filter(|c| !pushed_set.contains(&(core::ptr::from_ref::<Expr>(c) as usize)))
-                .cloned()
-                .collect();
-            if kept.is_empty() {
-                None
-            } else {
-                kept.into_iter().reduce(|a, b| Expr::Binary {
-                    lhs: alloc::boxed::Box::new(a),
-                    op: spg_sql::ast::BinOp::And,
-                    rhs: alloc::boxed::Box::new(b),
-                })
-            }
-        });
         let from = swapped_from.as_ref().unwrap_or(from);
         let primary_alias = from
             .primary
@@ -1067,6 +1104,7 @@ impl Engine {
                 (JoinSrc::Owned(primary_rows), None, (0..n).collect())
             }
         };
+        let where_equi = where_equi_candidates(from, where_);
         let mut pipe = JoinPipeline::new(primary_source, primary_mask, primary_width, working);
         for peer in &mut joined {
             if pipe.rows() > MAX_JOIN_INTERMEDIATE_ROWS {
@@ -1077,8 +1115,23 @@ impl Engine {
             }
             let right_arity = peer.cols.len();
             let peer_mask = keep_mask(needed, &peer.cols, &peer.alias);
-            let (eq_pairs, residual) =
+            let (mut eq_pairs, residual) =
                 extract_join_keys(peer, &combined_schema, pipe.consumed_cols);
+            // v7.39 (round 588) — an ANSI-89 join writes its condition in the
+            // WHERE clause. Give the peer those keys too, so `FROM a, b WHERE
+            // a.id = b.id` hashes exactly like `FROM a JOIN b ON a.id = b.id`
+            // instead of crossing all of `b` against every row of `a`.
+            if peer.lateral.is_none() && matches!(peer.kind, JoinKind::Inner | JoinKind::Cross) {
+                for cand in &where_equi {
+                    if let Some(pair) =
+                        match_equi_pair(cand, peer, &combined_schema, pipe.consumed_cols)
+                        && !eq_pairs.contains(&pair)
+                    {
+                        eq_pairs.push(pair);
+                        pushed_set.insert(core::ptr::from_ref::<Expr>(*cand) as usize);
+                    }
+                }
+            }
             // v7.33 — a deferred peer's pushed WHERE conjuncts ride as extra
             // residual so the INL / hash stages drop non-matching (left,
             // right) pairs in place (the eager path used to pre-filter the
@@ -1123,6 +1176,23 @@ impl Engine {
                 budget,
             )?;
         }
+        // v7.39 (round 588) — built here rather than before the loop because
+        // `pushed_set` only learns about promoted equi-keys as each peer is
+        // planned. A conjunct that failed to promote is still in the set's
+        // complement and is still enforced, so a shape this does not
+        // recognise keeps the old, correct behaviour.
+        let residual_where_owned: Option<Expr> = where_.and_then(|w| {
+            let kept: Vec<Expr> = reorder::split_and_conjunctions(w)
+                .into_iter()
+                .filter(|c| !pushed_set.contains(&(core::ptr::from_ref::<Expr>(c) as usize)))
+                .cloned()
+                .collect();
+            kept.into_iter().reduce(|a, b| Expr::Binary {
+                lhs: alloc::boxed::Box::new(a),
+                op: spg_sql::ast::BinOp::And,
+                rhs: alloc::boxed::Box::new(b),
+            })
+        });
         let survivors =
             self.filter_join_survivors(&pipe, residual_where_owned.as_ref(), &ctx, cancel, budget)?;
         Ok(DeferredJoin {
@@ -3399,7 +3469,12 @@ fn analyze_join_pushdown<'w>(
                 continue;
             }
             for (i, j) in from.joins.iter().enumerate() {
-                if matches!(j.kind, JoinKind::Inner)
+                // v7.39 (round 588) — a comma join parses as `Cross`, and a
+                // cross peer is exactly as non-nullable as an inner one, so a
+                // single-relation WHERE conjunct belongs on its scan just the
+                // same. Without this the `b` of `FROM a, b WHERE … b.id < 100`
+                // was scanned whole.
+                if matches!(j.kind, JoinKind::Inner | JoinKind::Cross)
                     && j.table.lateral_subquery.is_none()
                     && q0.eq_ignore_ascii_case(
                         j.table.alias.as_deref().unwrap_or(j.table.name.as_str()),
