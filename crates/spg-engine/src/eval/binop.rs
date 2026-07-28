@@ -2586,7 +2586,7 @@ fn bit_concat(an: u32, ab: &[u8], bn: u32, bb: &[u8]) -> (u32, alloc::vec::Vec<u
     (total, out)
 }
 
-fn text_concat(l: &Value<'static>, r: &Value<'static>) -> Value<'static> {
+fn text_concat<'a>(l: &'a Value<'static>, r: &'a Value<'static>) -> Value<'static> {
     // v7.38 (read01, T11) — bpchar concatenates with its trailing blanks
     // removed (`'ab'::char(4) || 'x'` = `abx`).
     if matches!(l, Value::BpChar(_)) || matches!(r, Value::BpChar(_)) {
@@ -2769,9 +2769,47 @@ fn text_concat(l: &Value<'static>, r: &Value<'static>) -> Value<'static> {
         }
         _ => {}
     }
-    let a = value_to_text(l);
-    let b = value_to_text(r);
-    Value::text(a + &b)
+    // v7.39 (round 608) — `s || 'x'` allocated five times a row over 200k
+    // rows where `upper(s)`, which also builds a new string, allocated one.
+    // Two of those were `value_to_text` copying operands that already WERE
+    // their text, and a third was the concatenation growing into them.
+    // Borrow what is already text, and size the result once.
+    let borrow = |v: &'a Value<'static>| -> Option<&'a str> {
+        match v {
+            Value::Text(s) | Value::Json(s) => Some(s.as_ref()),
+            _ => None,
+        }
+    };
+    match (borrow(l), borrow(r)) {
+        (Some(a), Some(b)) => {
+            let mut out = alloc::string::String::with_capacity(a.len() + b.len());
+            out.push_str(a);
+            out.push_str(b);
+            Value::text(out)
+        }
+        (Some(a), None) => {
+            let b = value_to_text(r);
+            let mut out = alloc::string::String::with_capacity(a.len() + b.len());
+            out.push_str(a);
+            out.push_str(&b);
+            Value::text(out)
+        }
+        (None, Some(b)) => {
+            let a = value_to_text(l);
+            let mut out = alloc::string::String::with_capacity(a.len() + b.len());
+            out.push_str(&a);
+            out.push_str(b);
+            Value::text(out)
+        }
+        (None, None) => {
+            let a = value_to_text(l);
+            let b = value_to_text(r);
+            let mut out = alloc::string::String::with_capacity(a.len() + b.len());
+            out.push_str(&a);
+            out.push_str(&b);
+            Value::text(out)
+        }
+    }
 }
 
 /// pgvector inner-product `<#>`. Returns the *negative* dot product so
