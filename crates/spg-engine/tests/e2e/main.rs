@@ -133,6 +133,7 @@ mod e2e_order_key_bound_round582;
 mod e2e_any_all_array_round597;
 mod e2e_cast_array_any_round604;
 mod e2e_computed_only_join_round606;
+mod e2e_named_cast_round607;
 mod e2e_const_fold_round605;
 mod e2e_jsonb_canonical_round603;
 mod e2e_srf_order_by_round600;

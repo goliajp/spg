@@ -397,6 +397,21 @@ pub fn cast_value_in(
     target: CastTarget,
     mysql: bool,
 ) -> Result<Value<'static>, EvalError> {
+    cast_value_ref_in(v, &target, mysql)
+}
+
+/// v7.39 (round 607) — the same dispatch, taking the target by REFERENCE.
+///
+/// `eval_cast_arm` cloned the target for every row. For the settled variants
+/// that clone is free, which is why `id::FLOAT` allocated nothing a row while
+/// `id::REAL` — the same conversion under a name the parser leaves as
+/// `Named(String)` — allocated one just to hand the name over, and seven more
+/// re-deriving its lowercase form inside.
+pub fn cast_value_ref_in(
+    v: Value<'static>,
+    target: &CastTarget,
+    mysql: bool,
+) -> Result<Value<'static>, EvalError> {
     // v7.39 (round 509) — PG validates the cast TARGET whatever the operand
     // is: `NULL::nosuchtype` is an error there, not NULL. This returned early
     // before ever looking at the target, so a misspelt type name silently
@@ -738,7 +753,7 @@ pub fn cast_value_in(
             // bits of its two's-complement representation (PG; int→varbit is
             // rejected there, so only fixed-length `bit` is handled here).
             if matches!(v, Value::Int(_) | Value::BigInt(_) | Value::SmallInt(_)) {
-                if let Some(width) = bit_cast_width(&name) {
+                if let Some(width) = bit_cast_width(name) {
                     return int_to_bit_string(v, width.0);
                 }
             }
@@ -764,7 +779,7 @@ pub fn cast_value_in(
             // n (PG's bit() cast, unlike the input-time exact-length rule).
             let bit_src: Option<Value<'static>> = match &v {
                 Value::BitString { .. } => Some(v.clone()),
-                Value::Text(s) if bit_cast_width(&name).is_some() => {
+                Value::Text(s) if bit_cast_width(name).is_some() => {
                     match crate::conversions::parse_bit_string_text(s) {
                         Some((nb, by)) => Some(Value::bit_string(nb, by)),
                         None => {
@@ -785,7 +800,7 @@ pub fn cast_value_in(
                 _ => None,
             };
             if let Some(Value::BitString { nbits, bytes }) = &bit_src {
-                if let Some((width, pads)) = bit_cast_width(&name) {
+                if let Some((width, pads)) = bit_cast_width(name) {
                     // varbit truncates but never pads.
                     if !pads && *nbits <= width {
                         return Ok(Value::BitString {
@@ -860,31 +875,32 @@ pub fn cast_value_in(
             // SPG carries them as their canonical text rendering; name
             // resolution runs against the static pg_proc table / the FTS
             // configuration list.
+            // v7.39 (round 607) — matched against the static list rather than
+            // through an owned lowercase copy. The copy was built for every
+            // row and thrown away on every row that is not one of these.
+            if let Some(lower_name) = REG_MISC_TYPES
+                .iter()
+                .copied()
+                .find(|k| name.eq_ignore_ascii_case(k))
             {
-                let lower_name = name.to_ascii_lowercase();
-                match lower_name.as_str() {
-                    k if REG_MISC_TYPES.contains(&k) => {
-                        let s = match &v {
-                            Value::Null => return Ok(Value::Null),
-                            Value::Text(s) => s.as_ref().trim().to_string(),
-                            other => {
-                                return Err(EvalError::TypeMismatch {
-                                    detail: alloc::format!(
-                                        "::{lower_name} accepts TEXT, got {:?}",
-                                        other.data_type()
-                                    ),
-                                });
-                            }
-                        };
-                        return cast_reg_misc(&lower_name, &s);
+                let s = match &v {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Text(s) => s.as_ref().trim().to_string(),
+                    other => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "::{lower_name} accepts TEXT, got {:?}",
+                                other.data_type()
+                            ),
+                        });
                     }
-                    _ => {}
-                }
+                };
+                return cast_reg_misc(lower_name, &s);
             }
             // v7.39 (round 514) — the remaining catalog-shaped types. Each
             // validates its own text form and keeps it, which is what PG's
             // input functions do; the wordings below are PG18 readings.
-            if let Some(out) = cast_catalog_scalar(&name, &v)? {
+            if let Some(out) = cast_catalog_scalar(name, &v)? {
                 return Ok(out);
             }
             // v7.39 (round 511) — `'(0,1)'::tid`, so a caller can name a row
@@ -906,24 +922,25 @@ pub fn cast_value_in(
             }
             // v7.39 (read01 pseudotypes.c) — casting a value INTO a
             // pseudotype hits PG's dummy input functions (0A000).
+            if let Some(lower) = OPAQUE_TYPES
+                .iter()
+                .copied()
+                .find(|k| name.eq_ignore_ascii_case(k))
             {
-                let lower = name.to_ascii_lowercase();
-                if OPAQUE_TYPES.contains(&lower.as_str()) {
-                    // v7.39 (round 509) — a pseudotype is a REAL type name,
-                    // so `NULL::anyarray` is NULL on PG, not an error. Only a
-                    // VALUE hits the dummy input function. Before this the
-                    // NULL case fell through to the type table below, which
-                    // does not carry the pseudotypes, and once NULL stopped
-                    // short-circuiting the whole cast it started reporting
-                    // them as unknown types.
-                    return if matches!(v, Value::Null) {
-                        Ok(Value::Null)
-                    } else {
-                        Err(EvalError::TypeMismatch {
-                            detail: alloc::format!("cannot accept a value of type {lower}"),
-                        })
-                    };
-                }
+                // v7.39 (round 509) — a pseudotype is a REAL type name,
+                // so `NULL::anyarray` is NULL on PG, not an error. Only a
+                // VALUE hits the dummy input function. Before this the
+                // NULL case fell through to the type table below, which
+                // does not carry the pseudotypes, and once NULL stopped
+                // short-circuiting the whole cast it started reporting
+                // them as unknown types.
+                return if matches!(v, Value::Null) {
+                    Ok(Value::Null)
+                } else {
+                    Err(EvalError::TypeMismatch {
+                        detail: alloc::format!("cannot accept a value of type {lower}"),
+                    })
+                };
             }
             // v7.39 (read01 pseudotypes.c) — `::cstring` is PG's I/O-form
             // pseudotype: text in, text out (cstring_in/out are identity).
@@ -1010,7 +1027,7 @@ pub fn cast_value_in(
             // which `compare_is_case_insensitive` now refuses to fold.
             if mysql && (name.eq_ignore_ascii_case("binary") || name.to_ascii_lowercase().starts_with("binary("))
             {
-                return cast_mysql_binary(v, &name);
+                return cast_mysql_binary(v, name);
             }
             // v7.39 (round 352, M8) — MySQL's SIGNED / UNSIGNED targets.
             // Measured on MariaDB 11: a string gives its LEADING number
@@ -1028,11 +1045,11 @@ pub fn cast_value_in(
             // fractional precision 0, so `CAST(x AS DATETIME)` drops the
             // fraction (measured on MariaDB 11). PG's `::timestamp` keeps
             // every microsecond, so the default is dialect-gated.
-            let temporal_prec = temporal_typmod(&name)
-                .or_else(|| (mysql && is_bare_temporal_type(&name)).then_some(0));
+            let temporal_prec = temporal_typmod(name)
+                .or_else(|| (mysql && is_bare_temporal_type(name)).then_some(0));
             let resolve_name: alloc::borrow::Cow<'_, str> = if temporal_prec.is_some() {
                 alloc::borrow::Cow::Owned(
-                    name.split('(').next().unwrap_or(&name).trim().to_string(),
+                    name.split('(').next().unwrap_or(name).trim().to_string(),
                 )
             } else {
                 alloc::borrow::Cow::Borrowed(name.as_str())
@@ -1141,10 +1158,15 @@ pub(crate) fn builtin_target_resolves(name: &str, mysql: bool) -> bool {
     if name == "__bit_literal" || bit_cast_width(name).is_some() {
         return true;
     }
-    let lower = name.to_ascii_lowercase();
+    crate::conversions::with_lower_name(name, |lower| {
+        builtin_target_resolves_lower(name, lower, mysql)
+    })
+}
+
+fn builtin_target_resolves_lower(name: &str, lower: &str, mysql: bool) -> bool {
     // The three families, read from the same declarations the value path
     // dispatches on — see their doc comment for why that matters.
-    if is_known_scalar_name(&lower) {
+    if is_known_scalar_name(lower) {
         return true;
     }
     // v7.39 (round 515) — `<element>[]`, which this parser names
@@ -1158,7 +1180,7 @@ pub(crate) fn builtin_target_resolves(name: &str, mysql: bool) -> bool {
     {
         return true;
     }
-    if mysql && matches!(lower.as_str(), "binary" | "signed" | "unsigned") {
+    if mysql && matches!(lower, "binary" | "signed" | "unsigned") {
         return true;
     }
     let base = if temporal_typmod(name).is_some() || (mysql && is_bare_temporal_type(name)) {
@@ -1192,7 +1214,13 @@ fn cast_catalog_scalar(
     name: &str,
     v: &Value<'_>,
 ) -> Result<Option<Value<'static>>, EvalError> {
-    let lower = name.to_ascii_lowercase();
+    crate::conversions::with_lower_name(name, |lower| cast_catalog_scalar_lower(lower, v))
+}
+
+fn cast_catalog_scalar_lower(
+    lower: &str,
+    v: &Value<'_>,
+) -> Result<Option<Value<'static>>, EvalError> {
     // v7.39 (round 515) — `<element>[]` runs the element's own check over
     // each member and keeps the literal, which is what PG does: measured,
     // `'{a,b}'::aclitem[]` is "unrecognized key word: \"a\"".
@@ -1212,7 +1240,7 @@ fn cast_catalog_scalar(
         }
         return Ok(Some(Value::text(body.to_string())));
     }
-    if !CATALOG_SCALAR_TYPES.contains(&lower.as_str()) {
+    if !CATALOG_SCALAR_TYPES.contains(&lower) {
         return Ok(None);
     }
     let text = match v {
@@ -1235,7 +1263,7 @@ fn cast_catalog_scalar(
     let bad = |ty: &str, what: &str| EvalError::TypeMismatch {
         detail: alloc::format!("invalid input syntax for type {ty}: \"{what}\""),
     };
-    let out = match lower.as_str() {
+    let out = match lower {
         "cid" => Value::Cid(t.parse::<u32>().map_err(|_| bad("cid", t))?),
         "xid" => Value::Xid(t.parse::<u32>().map_err(|_| bad("xid", t))?),
         // Space-separated element lists, validated element by element and
@@ -1282,7 +1310,7 @@ fn cast_catalog_scalar(
                 && (parts[2].is_empty()
                     || parts[2].split(',').all(|x| x.parse::<u64>().is_ok()));
             if !shaped {
-                return Err(bad(&lower, t));
+                return Err(bad(lower, t));
             }
             Value::text(t.to_string())
         }
@@ -1298,7 +1326,10 @@ fn cast_catalog_scalar(
 /// `bit(N)` is N. `None` for `varbit` / `bit varying` (PG rejects int→varbit) and
 /// any non-bit name.
 fn bit_cast_width(name: &str) -> Option<(u32, bool)> {
-    let lower = name.to_ascii_lowercase();
+    crate::conversions::with_lower_name(name, bit_cast_width_lower)
+}
+
+fn bit_cast_width_lower(lower: &str) -> Option<(u32, bool)> {
     let trimmed = lower.trim();
     if trimmed == "bit" {
         return Some((1, true));
@@ -1353,20 +1384,20 @@ fn int_to_bit_string(v: Value<'static>, width: u32) -> Result<Value<'static>, Ev
 /// `time(3)` / `timestamp(0)` / `timestamptz(2)`; `None` for any non-temporal
 /// type or a bare temporal type with no `(N)`.
 fn temporal_typmod(name: &str) -> Option<u8> {
-    let lower = name.to_ascii_lowercase();
-    let (base, rest) = lower.split_once('(')?;
-    if !matches!(
-        base.trim(),
-        "time" | "timetz" | "timestamp" | "timestamptz" | "datetime"
-    ) {
-        return None;
-    }
-    let digits: alloc::string::String = rest
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    digits.parse::<u8>().ok()
+    crate::conversions::with_lower_name(name, |lower| {
+        let (base, rest) = lower.split_once('(')?;
+        if !matches!(
+            base.trim(),
+            "time" | "timetz" | "timestamp" | "timestamptz" | "datetime"
+        ) {
+            return None;
+        }
+        let digits = rest.trim_start();
+        let end = digits
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(digits.len());
+        digits[..end].parse::<u8>().ok()
+    })
 }
 
 /// Round a TIME / TIMESTAMP value's microsecond field to `prec` fractional-
@@ -1404,10 +1435,10 @@ fn round_temporal_to_precision(v: Value<'static>, prec: u8, truncate: bool) -> V
 /// MySQL gives those fractional precision ZERO — `CAST(x AS DATETIME)` drops
 /// the fraction entirely — where PG's `::timestamp` keeps full microseconds.
 fn is_bare_temporal_type(name: &str) -> bool {
-    matches!(
-        name.trim().to_ascii_lowercase().as_str(),
-        "time" | "timestamp" | "datetime"
-    )
+    let t = name.trim();
+    ["time", "timestamp", "datetime"]
+        .iter()
+        .any(|k| t.eq_ignore_ascii_case(k))
 }
 
 fn cast_to_int_array(v: Value) -> Result<Value, EvalError> {

@@ -2345,7 +2345,35 @@ pub(crate) fn numeric_typmod_error(name: &str) -> Option<alloc::string::String> 
 /// `None` for genuinely-unknown idents so the caller can surface
 /// the existing "unsupported cast target" error.
 pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
-    let n = name.trim().to_ascii_lowercase();
+    with_lower_name(name.trim(), type_name_to_data_type_lower)
+}
+
+/// v7.39 (round 607) — lowercase a type NAME without allocating.
+///
+/// A cast's target is fixed for the whole statement, but every helper that
+/// reads it rebuilt its lowercase form for EVERY ROW. `id::REAL` cost 8
+/// allocations a row where `id::FLOAT` — the same conversion, spelled with a
+/// name the parser settles into a `CastTarget` variant instead of `Named` —
+/// cost none, and ran 7.5 ms against 44.6 over 200k rows. Type names are
+/// short, so the stack buffer covers every spelling that resolves; a longer
+/// one still answers correctly through the owned path.
+///
+/// Only ASCII `A-Z` bytes change, and those never appear inside a multi-byte
+/// UTF-8 sequence, so lowercasing in place leaves the slice valid UTF-8.
+pub(crate) fn with_lower_name<R>(name: &str, f: impl FnOnce(&str) -> R) -> R {
+    const CAP: usize = 64;
+    if name.len() <= CAP {
+        let mut buf = [0u8; CAP];
+        buf[..name.len()].copy_from_slice(name.as_bytes());
+        buf[..name.len()].make_ascii_lowercase();
+        if let Ok(s) = core::str::from_utf8(&buf[..name.len()]) {
+            return f(s);
+        }
+    }
+    f(&name.to_ascii_lowercase())
+}
+
+fn type_name_to_data_type_lower(n: &str) -> Option<DataType> {
     // v7.37.5 ship triage — `numeric(p,s)` precision/scale params:
     // peel them off and route to a precision-bearing DataType.
     if let Some((head, paren)) = n.split_once('(')
@@ -2355,14 +2383,17 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
         // (`numeric(1000,999)`) failed to parse and `unwrap_or(0)`
         // turned it into the UNCONSTRAINED type, so the cast silently
         // did nothing at all rather than reporting anything.
-        let wide: alloc::vec::Vec<Option<i32>> = args
-            .split(',')
-            .map(|s| s.trim().parse::<i32>().ok())
-            .collect();
-        let nums: alloc::vec::Vec<u8> = wide
-            .iter()
-            .map(|n| n.and_then(|v| u8::try_from(v).ok()).unwrap_or(0))
-            .collect();
+        // v7.39 (round 607) — a fixed pair rather than two Vecs. No typmod
+        // this resolves has a third argument, and both were built for every
+        // row a `numeric(p,s)` cast touched.
+        let mut wide: [Option<i32>; 2] = [None, None];
+        for (slot, s) in wide.iter_mut().zip(args.split(',')) {
+            *slot = s.trim().parse::<i32>().ok();
+        }
+        let nums: [u8; 2] = [
+            wide[0].and_then(|v| u8::try_from(v).ok()).unwrap_or(0),
+            wide[1].and_then(|v| u8::try_from(v).ok()).unwrap_or(0),
+        ];
         match head {
             // v7.39 (round 281) — `bit(3)` / `varbit(3)` as cast targets.
             "bit" => {
@@ -2398,7 +2429,7 @@ pub(crate) fn type_name_to_data_type(name: &str) -> Option<DataType> {
             _ => {}
         }
     }
-    Some(match n.as_str() {
+    Some(match n {
         "smallint" | "int2" => DataType::SmallInt,
         "numeric" | "decimal" => DataType::Numeric {
             precision: 0,
