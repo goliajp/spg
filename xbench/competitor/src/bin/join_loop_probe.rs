@@ -66,6 +66,38 @@
 //! is a cold reading. The losses that survive warm are ORDER BY + LIMIT
 //! and the filtered join.
 //!
+//! ---
+//!
+//! v7.39 (round 583) characterised the cold penalty round 579 found.
+//! Five properties, each measured:
+//!
+//!   * it is PER CONNECTION and PER TABLE, paid once. In one session,
+//!     `count(*) … WHERE id < 100` runs 16.80, 11.77, 3.03, 5.74, 2.05
+//!     ms; a DIFFERENT shape over the same table then starts at 3.81 and
+//!     settles at 2.65. A new connection pays it again.
+//!   * it is proportional to the table. On 1000 rows the first query is
+//!     0.317 ms against a steady 0.19; on 500,000 it is 12.37 against
+//!     1.92 — about 20 ns a row. `SELECT 1` pays nothing (0.21).
+//!   * it is not lazy decoding from disk. A table CREATED in the session
+//!     and never reloaded pays the same 15.65 ms as one loaded from the
+//!     data directory (16.43).
+//!   * it is not per query shape — see the first point.
+//!   * it is NOT the CPU cache. Scanning three other 500k-row tables in
+//!     the same session, 1.5M rows and ~12 MB through the caches, does
+//!     not bring it back: the table returns at 1.73, 1.72, 2.06.
+//!
+//! So it is per-connection lazy state, keyed by table, built on first
+//! touch and proportional to the rows. It is not in the obvious places —
+//! there is no per-connection table cache to grep for — so naming it
+//! wants a profile of the FIRST query specifically: a loop of
+//! connect / one query / disconnect would put the cold path in most of
+//! the samples, where a steady-state loop hides it entirely.
+//!
+//! Worth keeping beside it: once warm, SPG is 2-3x FASTER than PG on
+//! these shapes (2.0-2.8 ms against 5.9-7.8). The cold path is where
+//! the remaining gap lives, and a client that connects, asks one
+//! question and leaves pays all of it.
+//!
 //! One near-miss worth keeping: the first server profile this round took
 //! was of a `release-dbg` binary built in round 575, BEFORE round 576's
 //! bucket fix, and it still showed the allocator at 37%. That is exactly
