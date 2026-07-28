@@ -328,6 +328,35 @@ pub(crate) fn compute_window_partition(
             // whole-partition for unordered).
             let eff = effective_frame(frame, ordered)?;
             let exclude = frame_exclusion(frame)?;
+            // v7.39 (round 589) — the two commonest frames start at the
+            // partition's first row and end at the current row or its last,
+            // so the frame only ever GROWS as `i` advances. Recomputing the
+            // aggregate from the start for every row made both O(partition²):
+            // `sum(x) OVER (PARTITION BY g)` over 500k rows in 50 partitions
+            // took 36.6 SECONDS where PG takes 7.65 ms, and the classic
+            // running total `sum(x) OVER (ORDER BY t)` took 1.46 s over
+            // 20k rows against PG's 1.10 ms. Carry the accumulators across
+            // rows and extend them only over the rows that just entered.
+            // Any other frame shape, or any EXCLUDE (which can drop a row
+            // that is already in the accumulator), keeps the recompute path.
+            let incremental = matches!(eff.1, FrameBound::UnboundedPreceding)
+                && matches!(
+                    eff.2,
+                    FrameBound::CurrentRow | FrameBound::UnboundedFollowing
+                )
+                && matches!(exclude, FrameExclusion::NoOthers);
+            let mut sum: f64 = 0.0;
+            let mut num_scaled: i128 = 0;
+            let mut num_scale: u16 = 0;
+            let mut use_numeric = false;
+            let mut int_sum: i128 = 0;
+            let mut all_int = true;
+            let mut count: i64 = 0;
+            let mut min_val: Option<Value<'static>> = None;
+            let mut max_val: Option<Value<'static>> = None;
+            let mut row_count: i64 = 0;
+            // The first row of the frame not yet folded into the above.
+            let mut next_j: usize = 0;
             #[allow(clippy::needless_range_loop)]
             for i in 0..slice.len() {
                 let (lo, hi) = frame_bounds_for_row(&eff, i, slice)?;
@@ -339,30 +368,23 @@ pub(crate) fn compute_window_partition(
                     } else {
                         (0, 0)
                     };
-                let mut sum: f64 = 0.0;
-                // v7.37.16 — exact NUMERIC accumulator for sum/avg over a
-                // Numeric frame (was deferred → NULL). Only written when a
-                // Numeric cell appears; the f64 path stays untouched.
-                let mut num_scaled: i128 = 0;
-                let mut num_scale: u16 = 0;
-                let mut use_numeric = false;
-                // v7.38 (read01 sweep) — sum() over integer inputs returns
-                // BIGINT (PG), not double. Accumulate integers exactly and only
-                // fall back to the f64 path if a non-integer value appears.
-                let mut int_sum: i128 = 0;
-                let mut all_int = true;
-                let mut count: i64 = 0;
-                // min/max compare the *actual* Value via value_cmp so
-                // they work on TEXT / DATE / NUMERIC (not just f64) and
-                // preserve the column type. The old f64-only path
-                // returned NULL for `max(text_col)` / `min(numeric_col)`
-                // (value_to_f64 → None) — a silent divergence from PG,
-                // which orders text lexically and numerics exactly.
-                let mut min_val: Option<Value<'static>> = None;
-                let mut max_val: Option<Value<'static>> = None;
-                let mut row_count: i64 = 0;
+                // Rows already folded in stay folded in for a growing
+                // frame; every other shape starts this row from nothing.
+                if !incremental {
+                    sum = 0.0;
+                    num_scaled = 0;
+                    num_scale = 0;
+                    use_numeric = false;
+                    int_sum = 0;
+                    all_int = true;
+                    count = 0;
+                    min_val = None;
+                    max_val = None;
+                    row_count = 0;
+                    next_j = lo;
+                }
                 if lo <= hi {
-                    for j in lo..=hi {
+                    for j in next_j..=hi {
                         // EXCLUDE {CURRENT ROW | GROUP | TIES} drops the current
                         // row and/or its peer group from the aggregate frame.
                         if frame_row_excluded(exclude, j, i, peer_start, peer_end) {
@@ -423,6 +445,7 @@ pub(crate) fn compute_window_partition(
                             }
                         }
                     }
+                    next_j = next_j.max(hi + 1);
                 }
                 let value = match lower.as_str() {
                     "count_star" => Value::BigInt(row_count),
@@ -477,8 +500,8 @@ pub(crate) fn compute_window_partition(
                             Value::Float(sum / count as f64)
                         }
                     }
-                    "min" => min_val.unwrap_or(Value::Null),
-                    "max" => max_val.unwrap_or(Value::Null),
+                    "min" => min_val.clone().unwrap_or(Value::Null),
+                    "max" => max_val.clone().unwrap_or(Value::Null),
                     _ => unreachable!(),
                 };
                 let (_, _, idx) = &slice[i];
