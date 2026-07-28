@@ -61,9 +61,36 @@
 //! not the CPU cache, and absent from this probe, whose process-wide
 //! allocator was warmed by building the table.
 //!
-//! Confirming it means pooling or pre-warming the per-statement arenas
-//! across connections and seeing the first query fall to the steady
-//! number. That is the next round.
+//! v7.39 (round 587) tested that and killed it, then killed its
+//! successor:
+//!
+//!   * the arenas are NOT per connection. Every `bumpalo::Bump` in the
+//!     wire path is `Bump::new()` inside the statement handler, so the
+//!     second statement builds one too and would pay the same growth.
+//!     Checked before writing the pool, which is the only reason no
+//!     pool was written.
+//!   * it is not thread-local allocator warmth either — the successor
+//!     hypothesis, and a good fit: per connection is per thread, a new
+//!     thread has cold magazines, and it would explain why the penalty
+//!     is LARGER with sharding off (the runner threads are long-lived
+//!     and already warm). A fresh thread in this probe running the same
+//!     query pays nothing: 6.05, 6.54, 6.33, 6.17, 6.16, 6.13 against a
+//!     steady 6.16.
+//!
+//! Five rounds — 583 through 587 — have not named it. What they have
+//! established, all by measurement, is a long list of what it is not:
+//! not the wire, not TLS, not the parallel runner, not MVCC freezing,
+//! not the resident working set, not the data, not lazy decoding from
+//! disk, not per query shape, not per table, not the CPU cache, not the
+//! engine, not the per-statement arenas, and not thread-local allocator
+//! warmth. It is per connection, it sits inside the executor call, it is
+//! proportional to the first statement's working set, and it is larger
+//! when sharding is off.
+//!
+//! That list is worth more than another round of guessing. The line
+//! stops here and the ledger keeps it; picking it up again wants an
+//! instrument that can attribute time inside one 10 ms event, which
+//! sampling at 4 kHz cannot.
 
 use spg_engine::Engine;
 use std::time::Instant;
@@ -112,6 +139,45 @@ fn main() {
         v[v.len() / 2],
         v[v.len() - 1]
     );
+
+    // v7.39 (round 587) — the same query on a FRESH THREAD.
+    //
+    // The server pays its penalty once per connection, and a connection
+    // is a thread. If the cost is thread-local allocator warmth — new
+    // thread, cold magazines, first large allocation pays for fresh
+    // spans — then a thread spawned here pays it too, with no server,
+    // no socket and no session in sight. The main thread above cannot
+    // show it: building the table warmed its magazines.
+    std::thread::scope(|sc| {
+        sc.spawn(|| {
+            let e = &e;
+            print!("FRESH THREAD, first six:");
+            for _ in 0..6 {
+                let t = Instant::now();
+                let mut n = 0usize;
+                e.execute_readonly_select_streaming(
+                    &sql,
+                    spg_engine::CancelToken::none(),
+                    |item| {
+                        if matches!(item, spg_engine::StreamItem::Row(_)) {
+                            n += 1;
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                print!("  {:.2}", ms(t));
+            }
+            println!();
+        });
+    });
+    print!("main thread again, three:");
+    for _ in 0..3 {
+        let t = Instant::now();
+        e.execute(&sql).unwrap();
+        print!("  {:.2}", ms(t));
+    }
+    println!();
 
     // A SECOND table of the same size, first touched now — if the cost
     // is per table rather than per process, this pays it again.
