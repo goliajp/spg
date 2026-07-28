@@ -131,6 +131,7 @@ mod e2e_join_side_filter_round574;
 mod e2e_fused_extremes_round569;
 mod e2e_order_key_bound_round582;
 mod e2e_any_all_array_round597;
+mod e2e_cast_array_any_round604;
 mod e2e_jsonb_canonical_round603;
 mod e2e_srf_order_by_round600;
 mod e2e_srf_plan_round599;
