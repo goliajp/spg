@@ -448,6 +448,21 @@ pub(crate) struct AggState {
     stddev_saw_float: bool,
     stddev_sum: Option<spg_storage::bignum::BigNumeric>,
     stddev_sum_sq: Option<spg_storage::bignum::BigNumeric>,
+    /// v7.39 (round 615) — the same exact Σx / Σx², accumulated in `i128`
+    /// while every input is an integer and neither sum has overflowed.
+    ///
+    /// The `BigNumeric` pair above is exact and is what the finaliser wants,
+    /// but reaching it cost NINE allocations a row on a plain INTEGER column
+    /// — a boxed value per input, its square, and a fresh box for each of
+    /// the two running totals — where `sum` and `avg` over the same column
+    /// cost none. `i128` holds the same integers exactly: an `int4` squares
+    /// to at most 4.6e18, so the running Σx² has room for 3.7e19 rows before
+    /// it can overflow, and a `bigint` input that does overflow falls back
+    /// below with nothing lost — the pair is folded into the BigNumeric
+    /// accumulator first, so the total is the one it would have had.
+    stddev_i_sum: i128,
+    stddev_i_sum_sq: i128,
+    stddev_i_spent: bool,
     /// v7.32 (round-29) — running accumulator for bit_and / bit_or /
     /// bit_xor. `None` until the first non-NULL input → SQL NULL.
     bit_acc: Option<i64>,
@@ -3963,6 +3978,51 @@ fn first_ordered_array_agg(e: &Expr) -> Option<(&Expr, &[spg_sql::ast::OrderBy],
     Some((&args[0], order_by, filter.as_deref()))
 }
 
+/// v7.39 (round 615) — the exact pair the finaliser reads: the BigNumeric
+/// accumulator combined with whatever the i128 one still holds. Read-only,
+/// because finalisation only borrows the state.
+fn stddev_exact_pair(
+    st: &AggState,
+) -> Option<(
+    spg_storage::bignum::BigNumeric,
+    spg_storage::bignum::BigNumeric,
+)> {
+    use spg_storage::bignum::BigNumeric as BN;
+    let fast = (!st.stddev_i_spent && (st.stddev_i_sum != 0 || st.stddev_i_sum_sq != 0))
+        .then(|| (BN::from_i128(st.stddev_i_sum, 0), BN::from_i128(st.stddev_i_sum_sq, 0)));
+    match (st.stddev_sum.as_ref(), st.stddev_sum_sq.as_ref(), fast) {
+        (Some(s), Some(sq), Some((fs, fsq))) => Some((s.add(&fs), sq.add(&fsq))),
+        (Some(s), Some(sq), None) => Some((s.clone(), sq.clone())),
+        (None, None, Some(pair)) => Some(pair),
+        _ => None,
+    }
+}
+
+/// v7.39 (round 615) — fold the i128 Σx / Σx² into the exact BigNumeric
+/// pair and retire the fast accumulator. Called once when an input needs the
+/// slow path, and once at finalisation; both are idempotent because the fast
+/// pair is zeroed as it is spent.
+fn spend_stddev_i128(st: &mut AggState) {
+    if st.stddev_i_spent {
+        return;
+    }
+    st.stddev_i_spent = true;
+    if st.stddev_i_sum == 0 && st.stddev_i_sum_sq == 0 {
+        // Nothing accumulated: leave the pair as it was (None means "no
+        // exact input yet", which the finaliser reads).
+        return;
+    }
+    use spg_storage::bignum::BigNumeric as BN;
+    let sum = BN::from_i128(st.stddev_i_sum, 0);
+    let sum_sq = BN::from_i128(st.stddev_i_sum_sq, 0);
+    st.stddev_sum = Some(st.stddev_sum.as_ref().map_or(sum.clone(), |s| s.add(&sum)));
+    st.stddev_sum_sq = Some(
+        st.stddev_sum_sq
+            .as_ref()
+            .map_or(sum_sq.clone(), |s| s.add(&sum_sq)),
+    );
+}
+
 fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
     match e {
         Expr::NamedArg { expr, .. } => collect_aggregates(expr, out),
@@ -4488,21 +4548,52 @@ pub(crate) fn update_state(
             // v7.38 (read01) — keep an exact NUMERIC Σx / Σx² alongside the f64
             // pair for as long as every input is exact; a float input abandons it.
             if !st.stddev_saw_float {
-                match crate::eval::binop::value_to_bignum(v) {
-                    Some(b) => {
-                        let sq = b.mul(&b);
-                        st.stddev_sum = Some(
-                            st.stddev_sum
-                                .as_ref()
-                                .map_or_else(|| b.clone(), |s| s.add(&b)),
-                        );
-                        st.stddev_sum_sq = Some(
-                            st.stddev_sum_sq
-                                .as_ref()
-                                .map_or_else(|| sq.clone(), |s| s.add(&sq)),
-                        );
+                // v7.39 (round 615) — an integer input stays in i128, which is
+                // exact and allocates nothing. Anything else, or an overflow,
+                // spends the fast accumulator into the BigNumeric pair and
+                // takes the old path from there.
+                let as_int = match v {
+                    Value::SmallInt(n) => Some(i128::from(*n)),
+                    Value::Int(n) => Some(i128::from(*n)),
+                    Value::BigInt(n) => Some(i128::from(*n)),
+                    _ => None,
+                };
+                let folded = if st.stddev_i_spent {
+                    None
+                } else if let Some(x) = as_int {
+                    match (
+                        st.stddev_i_sum.checked_add(x),
+                        x.checked_mul(x)
+                            .and_then(|xx| st.stddev_i_sum_sq.checked_add(xx)),
+                    ) {
+                        (Some(s), Some(sq)) => {
+                            st.stddev_i_sum = s;
+                            st.stddev_i_sum_sq = sq;
+                            Some(())
+                        }
+                        _ => None,
                     }
-                    None => st.stddev_saw_float = true,
+                } else {
+                    None
+                };
+                if folded.is_none() {
+                    spend_stddev_i128(st);
+                    match crate::eval::binop::value_to_bignum(v) {
+                        Some(b) => {
+                            let sq = b.mul(&b);
+                            st.stddev_sum = Some(
+                                st.stddev_sum
+                                    .as_ref()
+                                    .map_or_else(|| b.clone(), |s| s.add(&b)),
+                            );
+                            st.stddev_sum_sq = Some(
+                                st.stddev_sum_sq
+                                    .as_ref()
+                                    .map_or_else(|| sq.clone(), |s| s.add(&sq)),
+                            );
+                        }
+                        None => st.stddev_saw_float = true,
+                    }
                 }
             }
             let Some(x) = agg_value_to_f64(v) else {
@@ -4867,9 +4958,10 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
             // display scale, and stddev is its numeric sqrt. Falls through to the
             // f64 path (a double result, PG's float8 overload) on a float input.
             if !st.stddev_saw_float {
-                if let (Some(sum), Some(sum_sq)) =
-                    (st.stddev_sum.as_ref(), st.stddev_sum_sq.as_ref())
-                {
+                // v7.39 (round 615) — fold whatever the i128 accumulator holds
+                // into the exact pair, once, here.
+                if let Some((sum, sum_sq)) = stddev_exact_pair(st) {
+                    let (sum, sum_sq) = (&sum, &sum_sq);
                     use spg_storage::bignum::BigNumeric as BN;
                     let nb = BN::from_i128(i128::from(n), 0);
                     let numerator = nb.mul(sum_sq).sub(&sum.mul(sum));

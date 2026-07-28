@@ -141,6 +141,7 @@ mod e2e_format_minmax_round611;
 mod e2e_concat_borrow_round612;
 mod e2e_plain_cast_round613;
 mod e2e_int_arith_round614;
+mod e2e_stddev_exact_round615;
 mod e2e_const_fold_round605;
 mod e2e_jsonb_canonical_round603;
 mod e2e_srf_order_by_round600;
