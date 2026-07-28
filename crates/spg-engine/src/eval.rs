@@ -3176,8 +3176,7 @@ fn eval_function_call_positional(
             None
         };
         if let Some(construct) = construct {
-            let refs: Vec<&Expr> = args.iter().collect();
-            unify_branch_types_static(construct, &refs, ctx)?;
+            unify_branch_types_static(construct, args.iter(), ctx)?;
         }
     }
     // v7.39 (read01 utils/adt, enum.c) — the enum introspection
@@ -3401,14 +3400,47 @@ fn eval_function_call_positional(
     // instead of `12:00:00`. Only kicks in when the picked value is a
     // bare Text and a non-text cast-target sibling exists.
     if name.eq_ignore_ascii_case("coalesce") && !args.is_empty() {
-        let evaluated: Result<Vec<Value<'static>>, _> =
-            args.iter().map(|a| eval_expr(a, row, ctx)).collect();
-        let evaluated = evaluated?;
-        let result = evaluated
-            .iter()
-            .find(|v| !matches!(v, Value::Null))
-            .cloned()
-            .unwrap_or(Value::Null);
+        // v7.39 (round 609) — PG's COALESCE does not evaluate a branch past
+        // the first non-NULL one. This evaluated every branch into a `Vec`
+        // and so RAISED errors PG never raises: `coalesce(1, 1/0)`,
+        // `coalesce(NULL, 2, 1/0)` and `coalesce(1, NULL, 1/0)` all failed
+        // with "division by zero" where PG answers 1, 2 and 1.
+        //
+        // A branch after the pick is still READ for its type — that is what
+        // decides the result's, and `COALESCE(1, 2.5)` is numeric in both
+        // engines — but its error is discarded, because PG never runs it and
+        // so never reports it. A branch that fails contributes no type,
+        // which is the same as SPG having no declared type to widen to.
+        //
+        // The two `Vec`s this replaces cost two allocations a row even for
+        // `coalesce(id, 0)` over a plain INTEGER column, where the answer
+        // needs none.
+        let mut result: Option<Value<'static>> = None;
+        let mut tbuf = [spg_storage::DataType::Int; 8];
+        let mut ntypes = 0usize;
+        let mut spill: Vec<spg_storage::DataType> = Vec::new();
+        for a in args {
+            let v = if result.is_none() {
+                eval_expr(a, row, ctx)?
+            } else {
+                match eval_expr(a, row, ctx) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                }
+            };
+            if let Some(t) = v.data_type() {
+                if ntypes < tbuf.len() {
+                    tbuf[ntypes] = t;
+                    ntypes += 1;
+                } else {
+                    spill.push(t);
+                }
+            }
+            if result.is_none() && !matches!(v, Value::Null) {
+                result = Some(v);
+            }
+        }
+        let result = result.unwrap_or(Value::Null);
         if matches!(result, Value::Text(_)) {
             if let Some(target) = args.iter().find_map(coalesce_type_hint) {
                 return crate::eval::cast::cast_value(result, target);
@@ -3416,8 +3448,11 @@ fn eval_function_call_positional(
         }
         // v7.38 (read01) — otherwise widen the picked value to the PG
         // common type of all branches (COALESCE(1, 2.5) → numeric).
-        let types: Vec<spg_storage::DataType> =
-            evaluated.iter().filter_map(Value::data_type).collect();
+        if spill.is_empty() {
+            return Ok(widen_to_common(result, &tbuf[..ntypes]));
+        }
+        let mut types: Vec<spg_storage::DataType> = tbuf[..ntypes].to_vec();
+        types.append(&mut spill);
         return Ok(widen_to_common(result, &types));
     }
     let evaluated: Result<Vec<Value<'static>>, _> =
@@ -3636,7 +3671,7 @@ fn eval_case_arm(
             results.push(e);
         }
         results.extend(branches.iter().map(|(_, r)| r));
-        unify_branch_types_static("CASE", &results, ctx)?;
+        unify_branch_types_static("CASE", results, ctx)?;
     }
     let operand_value = match operand {
         Some(o) => Some(eval_expr(o, row, ctx)?),
@@ -5441,9 +5476,11 @@ fn require_in_list_comparable(
 /// type instead of its value. Same rule and wording as the value-driven
 /// ARRAY path below; an untyped literal is converted here (a literal has no
 /// side effects) so a value that will not convert is reported as PG does.
-pub(crate) fn unify_branch_types_static(
+/// v7.39 (round 609) — takes anything that yields the branches, so the
+/// COALESCE caller no longer builds a `Vec<&Expr>` of them for every row.
+pub(crate) fn unify_branch_types_static<'e>(
     construct: &str,
-    branches: &[&Expr],
+    branches: impl IntoIterator<Item = &'e Expr> + Clone,
     ctx: &EvalContext<'_>,
 ) -> Result<(), EvalError> {
     use spg_storage::DataType;
@@ -5455,7 +5492,7 @@ pub(crate) fn unify_branch_types_static(
         )
     };
     let mut resolved: Option<DataType> = None;
-    for e in branches {
+    for e in branches.clone() {
         if untyped(e) {
             continue;
         }
@@ -5474,7 +5511,7 @@ pub(crate) fn unify_branch_types_static(
         if !known {
             continue;
         }
-        let Some(ty) = crate::describe::describe_expr(e, ctx.columns).map(|s| s.ty) else {
+        let Some(ty) = crate::describe::describe_expr_type(e, ctx.columns) else {
             continue;
         };
         match resolved {

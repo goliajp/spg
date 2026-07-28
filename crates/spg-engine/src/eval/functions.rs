@@ -12061,9 +12061,20 @@ fn apply_function_dispatch(
                     } else {
                         // v7.38 (read01) — the NULLIF result is PG's common
                         // type of both args (`NULLIF(1, 2.5)` → numeric 1).
-                        let types: alloc::vec::Vec<spg_storage::DataType> =
-                            [a, b].iter().filter_map(|v| v.data_type()).collect();
-                        Ok(super::widen_to_common(a.clone().into_owned(), &types))
+                        // v7.39 (round 609) — a two-element stack buffer.
+                        // The Vec this replaces was built for every row.
+                        let mut tbuf = [spg_storage::DataType::Int; 2];
+                        let mut n = 0usize;
+                        for v in [a, b] {
+                            if let Some(t) = v.data_type() {
+                                tbuf[n] = t;
+                                n += 1;
+                            }
+                        }
+                        Ok(super::widen_to_common(
+                            a.clone().into_owned(),
+                            &tbuf[..n],
+                        ))
                     }
                 }
             }

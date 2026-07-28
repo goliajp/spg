@@ -329,34 +329,9 @@ pub(crate) fn common_type(types: &[DataType]) -> Option<DataType> {
     None
 }
 
-pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
-    match e {
-        Expr::Column(c) => {
-            // Mirror resolve_projection_column's lookup: bare name first,
-            // then qualified-prefix match.
-            let bare = schema_cols.iter().find(|s| s.name == c.name);
-            if let Some(col) = bare {
-                return Some(ExprShape {
-                    name: c.name.clone(),
-                    ty: col.ty,
-                    nullable: col.nullable,
-                });
-            }
-            let suffix = alloc::format!(".{}", c.name);
-            let mut matches = schema_cols.iter().filter(|s| s.name.ends_with(&suffix));
-            let first = matches.next()?;
-            if matches.next().is_some() {
-                // ambiguous — bail (describe should not assume an
-                // arbitrary tiebreak)
-                return None;
-            }
-            Some(ExprShape {
-                name: c.name.clone(),
-                ty: first.ty,
-                nullable: first.nullable,
-            })
-        }
-        Expr::Literal(lit) => {
+/// v7.39 (round 609) — a literal's type and nullability, split out so the
+/// type-only entry point below reads it without building a shape name.
+fn literal_type(lit: &spg_sql::ast::Literal) -> Option<(DataType, bool)> {
             use spg_sql::ast::Literal as L;
             let (ty, nullable) = match lit {
                 L::Null => (DataType::Text, true),
@@ -400,6 +375,58 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                 L::Bool(_) => (DataType::Bool, false),
                 L::Vector(_) | L::Interval { .. } => return None,
             };
+    Some((ty, nullable))
+}
+
+/// v7.39 (round 609) — the TYPE alone, without building the shape's name.
+///
+/// `unify_branch_types_static` runs for every row of a COALESCE / GREATEST /
+/// LEAST and only ever reads `.ty`, but `describe_expr` clones a column's
+/// name (or writes "?column?") to hand it back: two allocations a row for
+/// `coalesce(id, 0)`, whose answer needs none.
+pub(crate) fn describe_expr_type(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<DataType> {
+    match e {
+        Expr::Column(c) => {
+            // The same lookup `describe_expr` does, minus the name clone.
+            if let Some(col) = schema_cols.iter().find(|s| s.name == c.name) {
+                return Some(col.ty);
+            }
+            describe_expr(e, schema_cols).map(|s| s.ty)
+        }
+        Expr::Literal(lit) => literal_type(lit).map(|(ty, _)| ty),
+        _ => describe_expr(e, schema_cols).map(|s| s.ty),
+    }
+}
+
+pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
+    match e {
+        Expr::Column(c) => {
+            // Mirror resolve_projection_column's lookup: bare name first,
+            // then qualified-prefix match.
+            let bare = schema_cols.iter().find(|s| s.name == c.name);
+            if let Some(col) = bare {
+                return Some(ExprShape {
+                    name: c.name.clone(),
+                    ty: col.ty,
+                    nullable: col.nullable,
+                });
+            }
+            let suffix = alloc::format!(".{}", c.name);
+            let mut matches = schema_cols.iter().filter(|s| s.name.ends_with(&suffix));
+            let first = matches.next()?;
+            if matches.next().is_some() {
+                // ambiguous — bail (describe should not assume an
+                // arbitrary tiebreak)
+                return None;
+            }
+            Some(ExprShape {
+                name: c.name.clone(),
+                ty: first.ty,
+                nullable: first.nullable,
+            })
+        }
+        Expr::Literal(lit) => {
+            let (ty, nullable) = literal_type(lit)?;
             Some(ExprShape {
                 name: "?column?".to_string(),
                 ty,
