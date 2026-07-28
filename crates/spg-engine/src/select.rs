@@ -5448,6 +5448,12 @@ impl Engine {
         // v7.39 (read01 round 67) — every SRF in the target list, in lockstep.
         let srf_idxs = self.srf_target_idxs(&projection);
         let srf_position = srf_idxs.first().copied();
+        // v7.39 (round 599) — the SRF analysis is per QUERY, not per row.
+        let mut srf_plan = if srf_position.is_some() {
+            Some(build_srf_plan(self, &projection, &srf_idxs, &ctx)?)
+        } else {
+            None
+        };
 
         // Materialise the filter pass into `(order_key, projected_row)`
         // tuples. The order key is `None` when there's no ORDER BY clause.
@@ -5680,7 +5686,8 @@ impl Engine {
                 } else {
                     order_keys
                 };
-                for out in expand_srf_row(self, &projection, &srf_idxs, row, &ctx)? {
+                let plan = srf_plan.as_mut().expect("srf_position implies a plan");
+                for out in expand_srf_row_with(self, plan, &projection, row, &ctx)? {
                     if stmt.distinct {
                         let bucket = seen_distinct
                             .entry(norm_hash_row(&out, &distinct_hb, ctx.mysql_dialect))
@@ -9758,16 +9765,37 @@ pub(crate) fn expr_contains_builtin_srf(e: &spg_sql::ast::Expr) -> bool {
     found
 }
 
-fn expand_srf_row(
+/// v7.39 (round 599) — everything about a target-list SRF that does not
+/// depend on the row.
+///
+/// `expand_srf_row` derived all of this again for EVERY input row: it cloned
+/// each SRF-bearing projection expression, walked and rewrote the tree,
+/// formatted a `__srf_N` name per node, and copied the whole column schema.
+/// A counting allocator put the path at 24 allocations per input row for a
+/// single-element `unnest`, against 0 for the same scan without one — 211 MB
+/// where the plain scan took 4.3 — and the shape held whatever the array
+/// contained, which is what invariant work looks like.
+struct SrfPlan {
+    /// The lifted SRF calls, in slot order.
+    nodes: alloc::vec::Vec<spg_sql::ast::Expr>,
+    /// Per projection position, the expression with its SRF calls replaced
+    /// by `__srf_N` column references. `None` means the item has none.
+    rewritten: alloc::vec::Vec<Option<spg_sql::ast::Expr>>,
+    /// The input schema followed by one column per slot. Only the slots'
+    /// TYPES vary per row, and they are patched in place.
+    ext_cols: alloc::vec::Vec<ColumnSchema>,
+    base_cols: usize,
+}
+
+fn build_srf_plan(
     engine: &Engine,
     projection: &[ProjectedItem],
     srf_idxs: &[usize],
-    row: &Row<'static>,
     ctx: &EvalContext<'_>,
-) -> Result<Vec<Row<'static>>, EngineError> {
+) -> Result<SrfPlan, EngineError> {
     // Lift every SRF node out of every item that contains one.
     let mut nodes: Vec<spg_sql::ast::Expr> = Vec::new();
-    let mut rewritten: Vec<(usize, spg_sql::ast::Expr)> = Vec::with_capacity(srf_idxs.len());
+    let mut rewritten: Vec<Option<spg_sql::ast::Expr>> = alloc::vec![None; projection.len()];
     let mut reject: Option<EngineError> = None;
     for &i in srf_idxs {
         let mut e = projection[i].expr.clone();
@@ -9806,28 +9834,51 @@ fn expand_srf_row(
             });
             true
         });
-        rewritten.push((i, e));
+        rewritten[i] = Some(e);
     }
     if let Some(err) = reject {
         return Err(err);
     }
-    let mut lists: Vec<Vec<Value<'static>>> = Vec::with_capacity(nodes.len());
-    for n in &nodes {
+    let base_cols = ctx.columns.len();
+    let mut ext_cols: Vec<ColumnSchema> = ctx.columns.to_vec();
+    for slot in 0..nodes.len() {
+        ext_cols.push(ColumnSchema::new(
+            alloc::format!("__srf_{slot}"),
+            DataType::Text,
+            true,
+        ));
+    }
+    Ok(SrfPlan {
+        nodes,
+        rewritten,
+        ext_cols,
+        base_cols,
+    })
+}
+
+/// One input row expanded through a plan built once for the whole scan.
+fn expand_srf_row_with(
+    engine: &Engine,
+    plan: &mut SrfPlan,
+    projection: &[ProjectedItem],
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Vec<Row<'static>>, EngineError> {
+    let mut lists: Vec<Vec<Value<'static>>> = Vec::with_capacity(plan.nodes.len());
+    for n in &plan.nodes {
         lists.push(engine.srf_values(n, row, ctx)?);
     }
     let n_rows = lists.iter().map(Vec::len).max().unwrap_or(0);
-    // The input row extended with one column per lifted SRF. Original column
-    // indices are untouched, so every other reference still resolves.
-    let mut ext_cols: Vec<ColumnSchema> = ctx.columns.to_vec();
+    // Only the slots' element types depend on the row; the names and the
+    // input schema around them do not.
     for (slot, list) in lists.iter().enumerate() {
-        let ty = list
+        plan.ext_cols[plan.base_cols + slot].ty = list
             .iter()
             .find_map(|v| v.data_type())
             .unwrap_or(DataType::Text);
-        ext_cols.push(ColumnSchema::new(alloc::format!("__srf_{slot}"), ty, true));
     }
     let mut ext_ctx = ctx.clone();
-    ext_ctx.columns = &ext_cols;
+    ext_ctx.columns = &plan.ext_cols;
     let mut out = Vec::with_capacity(n_rows);
     for k in 0..n_rows {
         let mut ext_vals = row.values.clone();
@@ -9838,15 +9889,24 @@ fn expand_srf_row(
         let ext_row = Row::new(ext_vals);
         let mut vals = Vec::with_capacity(projection.len());
         for (i, p) in projection.iter().enumerate() {
-            let expr = rewritten
-                .iter()
-                .find(|(j, _)| *j == i)
-                .map_or(&p.expr, |(_, e)| e);
+            let expr = plan.rewritten[i].as_ref().unwrap_or(&p.expr);
             vals.push(eval::eval_expr(expr, &ext_row, &ext_ctx).map_err(EngineError::Eval)?);
         }
         out.push(Row::new(vals));
     }
     Ok(out)
+}
+
+/// The one-shot spelling, for the callers that expand a single row.
+fn expand_srf_row(
+    engine: &Engine,
+    projection: &[ProjectedItem],
+    srf_idxs: &[usize],
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Vec<Row<'static>>, EngineError> {
+    let mut plan = build_srf_plan(engine, projection, srf_idxs, ctx)?;
+    expand_srf_row_with(engine, &mut plan, projection, row, ctx)
 }
 
 impl Engine {
