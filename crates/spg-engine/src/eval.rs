@@ -44,7 +44,6 @@ pub(crate) use binop::{
     add_interval_to_micros, and_3vl, apply_binary, apply_binary_by_ref, apply_binary_interval,
 };
 use binop::{apply_binary_in, apply_unary, compare, pow10_i128};
-use cast::cast_value_in;
 pub use cast::{cast_to_vector, cast_value, parse_vector_text};
 pub(crate) use compiled::{
     CompiledExpr, compile_column_pos, compile_expr, eval_compiled, eval_compiled_ref,
@@ -2678,7 +2677,7 @@ fn eval_cast_arm(
             _ => {}
         }
     }
-    cast_value_in(v, target.clone(), ctx.mysql_dialect)
+    crate::eval::cast::cast_value_ref_in(v, target, ctx.mysql_dialect)
 }
 
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
