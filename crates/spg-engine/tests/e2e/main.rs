@@ -129,6 +129,7 @@ mod e2e_derived_join_round572;
 mod e2e_join_bucket_round576;
 mod e2e_join_side_filter_round574;
 mod e2e_fused_extremes_round569;
+mod e2e_topk_boundary_round581;
 mod e2e_topk_floor_round580;
 mod e2e_topk_recycle_round571;
 mod e2e_index_only_equality_round566;

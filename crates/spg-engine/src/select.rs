@@ -5520,6 +5520,24 @@ impl Engine {
         // and their buffers come back here instead of being freed.
         let mut proj_pool: Vec<Vec<Value<'static>>> = Vec::new();
         let mut key_pool: Vec<Vec<crate::orderby::OrderKey>> = Vec::new();
+        // v7.39 (round 581) — the worst row the accumulator is currently
+        // keeping. Anything that loses to it cannot reach the answer, so
+        // it is dropped before its projection is ever built.
+        let mut topk_boundary: Option<Vec<crate::orderby::OrderKey>> = None;
+        // v7.39 (round 581) — and it stops asking when the answer is
+        // always "keep".
+        //
+        // The check earns its place only on rows it rejects. Over
+        // ascending ids, `ORDER BY id DESC` never rejects one — every
+        // row beats the current worst — so the comparison is pure
+        // overhead there, measured at +5.5% in three batches out of
+        // three. After a window of rows it looks at what it has
+        // actually rejected and switches itself off if the shape is not
+        // paying. The answers do not depend on it either way.
+        const BOUNDARY_WINDOW: u32 = 8192;
+        let mut boundary_checks: u32 = 0;
+        let mut boundary_rejects: u32 = 0;
+        let mut boundary_check_on = true;
         // Inline the per-row work in a closure so the indexed and full-
         // scan branches share the body.
         let mut process_row = |row: &Row<'static>, loop_idx: usize| -> Result<(), EngineError> {
@@ -5546,6 +5564,36 @@ impl Engine {
             } else {
                 let mut buf = key_pool.pop().unwrap_or_default();
                 crate::orderby::build_order_keys_into(&order_by, row, &ctx, &mut buf)?;
+                // v7.39 (round 581) — reject before projecting.
+                //
+                // `ORDER BY g DESC, id DESC LIMIT 10` over 500k rows with
+                // 50 distinct `g` decides nearly every row on the FIRST
+                // key, and PG answers it FASTER than the single-key form
+                // (7.4 ms against 10.4) because a rejected row costs it
+                // one comparison. SPG built both keys AND the projected
+                // row for all 500k before throwing them away. The keys
+                // are needed to compare; the projection is not.
+                if boundary_check_on
+                    && let Some((_, descs)) = &topk_stream
+                    && let Some(b) = &topk_boundary
+                {
+                    boundary_checks += 1;
+                    let loses = crate::orderby::cmp_multi_key(&buf, b, descs)
+                        == core::cmp::Ordering::Greater;
+                    if loses {
+                        boundary_rejects += 1;
+                    }
+                    if boundary_checks == BOUNDARY_WINDOW {
+                        // Keep asking only if it has been rejecting at
+                        // least a quarter of what it saw.
+                        boundary_check_on = boundary_rejects.saturating_mul(4) >= boundary_checks;
+                    }
+                    if loses {
+                        buf.clear();
+                        key_pool.push(buf);
+                        return Ok(());
+                    }
+                }
                 buf
             };
             if srf_position.is_some() {
@@ -5643,6 +5691,7 @@ impl Engine {
                     descs,
                     &mut proj_pool,
                     &mut key_pool,
+                    &mut topk_boundary,
                 );
             }
             Ok(())
