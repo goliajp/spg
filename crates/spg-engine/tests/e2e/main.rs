@@ -130,6 +130,7 @@ mod e2e_join_bucket_round576;
 mod e2e_join_side_filter_round574;
 mod e2e_fused_extremes_round569;
 mod e2e_order_key_bound_round582;
+mod e2e_any_all_array_round597;
 mod e2e_ansi89_join_round588;
 mod e2e_correlated_exists_round596;
 mod e2e_date_compiled_round595;

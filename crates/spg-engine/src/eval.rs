@@ -3498,6 +3498,22 @@ fn eval_any_all_arm(
 ) -> Result<Value<'static>, EvalError> {
     let lhs = eval_expr(expr, row, ctx)?;
     let arr = eval_expr(array, row, ctx)?;
+    any_all_over(lhs, arr, op, is_any)
+}
+
+/// v7.39 (round 597) — the ANY/ALL comparison with both sides already in
+/// hand. Split out so a CONSTANT right-hand array can be built once at
+/// compile time instead of once per row: `WHERE id = ANY (ARRAY[1..10])`
+/// rebuilt the array for all 500k rows and cost 268 ms against PG18's 8.3,
+/// rising to 494 ms at twenty elements, while the equivalent
+/// `id IN (1..10)` took 2.3. The body below is unchanged; it never touched
+/// `row`.
+pub(crate) fn any_all_over(
+    lhs: Value<'static>,
+    arr: Value<'static>,
+    op: &BinOp,
+    is_any: bool,
+) -> Result<Value<'static>, EvalError> {
     if matches!(arr, Value::Null) {
         return Ok(Value::Null);
     }

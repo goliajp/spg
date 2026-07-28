@@ -82,6 +82,17 @@ pub(crate) enum Step {
     /// same 10x whichever way the match was spelled. The pattern is a
     /// compile product here, exactly as `Step::Like`'s is — PG solves the
     /// same problem with a cache; a compile product cannot be forgotten.
+    /// v7.39 (round 597) — `<expr> <op> ANY/ALL (<constant array>)`. The
+    /// array is a compile PRODUCT: it used to be rebuilt for every row, and
+    /// `WHERE id = ANY (ARRAY[1..10])` cost 268 ms over 500k rows against
+    /// PG18's 8.3 — 494 at twenty elements — where the equivalent
+    /// `id IN (1..10)` took 2.3. A non-constant right-hand side keeps the
+    /// interpreter, which has to rebuild it: there it really can differ.
+    AnyAll {
+        op: spg_sql::ast::BinOp,
+        is_any: bool,
+        arr: Value<'static>,
+    },
     /// v7.39 (round 595) — `EXTRACT(<field> FROM <expr>)`. The field is a
     /// keyword, not a value, so it rides in the step; the source is the
     /// preceding sub-program and this pops it. `fallback` carries the whole
@@ -612,6 +623,58 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 n_args: args.len(),
             });
         }
+        // v7.39 (round 597) — `x = ANY (ARRAY[literals])` is `x IN (…)` and
+        // `x <> ALL (…)` is `x NOT IN (…)`, down to the three-valued
+        // treatment of a NULL element, so they take the membership set the
+        // IN list already builds at compile time: 40.9 ms for a ten-element
+        // array against 2.1 for the IN spelling of the same question. Folding
+        // the array (below) alone left the per-row cost growing with the
+        // array's length; a set does not.
+        Expr::AnyAll {
+            expr,
+            op,
+            array,
+            is_any,
+        } if !ctx.mysql_dialect
+            && ((matches!(op, spg_sql::ast::BinOp::Eq) && *is_any)
+                || (matches!(op, spg_sql::ast::BinOp::NotEq) && !*is_any))
+            && array_literal_items(array).is_some_and(|it| {
+                !it.is_empty() && crate::build_in_list_set(it).is_some()
+            })
+            && fully_compilable(expr) =>
+        {
+            let items = array_literal_items(array).expect("checked above");
+            let entry = crate::build_in_list_set(items).expect("checked above");
+            compile_into(expr, ctx, steps);
+            steps.push(Step::InSet {
+                set: entry.set,
+                has_null: entry.has_null,
+                negated: !*is_any,
+                fallback: e.clone(),
+            });
+        }
+        // v7.39 (round 597) — any other ANY/ALL whose right-hand array is
+        // constant: build it once here rather than per row.
+        Expr::AnyAll {
+            expr,
+            op,
+            array,
+            is_any,
+        } if constant_expr(array) => {
+            match eval_expr(array, &Row::new(alloc::vec::Vec::new()), ctx) {
+                Ok(arr) => {
+                    compile_into(expr, ctx, steps);
+                    steps.push(Step::AnyAll {
+                        op: *op,
+                        is_any: *is_any,
+                        arr,
+                    });
+                }
+                // A constant that does not evaluate is the interpreter's
+                // error to raise, per row, in its own wording.
+                Err(_) => steps.push(Step::Subtree(e.clone())),
+            }
+        }
         // v7.39 (round 595) — EXTRACT over a compilable source. One
         // non-compilable node used to disqualify the WHOLE predicate, so
         // `WHERE extract(year FROM t) = 2020` interpreted the column read
@@ -849,6 +912,7 @@ pub(crate) fn fully_compilable(e: &Expr) -> bool {
         // v7.39 (read01 ruleutils.c) — regclass / user-named casts
         // need the catalog (dual-shape resolve, domain/enum/composite
         // hooks); they stay Subtree so eval's pre-hook runs.
+        Expr::AnyAll { expr, array, .. } if constant_expr(array) => fully_compilable(expr),
         Expr::Extract { source, .. } => fully_compilable(source),
         Expr::Cast { expr, target } => {
             !matches!(
@@ -1143,6 +1207,30 @@ fn in_set_verdict(
         (true, Value::Bool(b)) => Value::Bool(!b),
         (_, v) => v,
     })
+}
+
+/// v7.39 (round 597) — the literal elements of an `ARRAY[…]` constructor.
+/// `None` for any other right-hand side, including the `'{1,2}'::int[]`
+/// spelling, whose elements live inside a string rather than the tree.
+fn array_literal_items(e: &Expr) -> Option<&[Expr]> {
+    match e {
+        Expr::Array(items) if items.iter().all(constant_expr) => Some(items.as_slice()),
+        _ => None,
+    }
+}
+
+/// v7.39 (round 597) — an expression whose value cannot depend on the row.
+/// An allowlist of node kinds, for the reason rounds 590 and 596 recorded:
+/// asking "does it mention a column" would admit a node the walk did not
+/// know about, and a function whose volatility SPG cannot look up.
+fn constant_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(_) => true,
+        Expr::Array(items) => items.iter().all(constant_expr),
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => constant_expr(expr),
+        Expr::Binary { lhs, rhs, .. } => constant_expr(lhs) && constant_expr(rhs),
+        _ => false,
+    }
 }
 
 /// v7.39 (round 595) — the source sub-expression of the EXTRACT node a
@@ -1495,6 +1583,10 @@ where
                     // exact coercion / error path on the whole node.
                     None => stack.push(eval_expr(fallback, &row.as_row(), ctx)?),
                 }
+            }
+            Step::AnyAll { op, is_any, arr } => {
+                let lhs = stack.pop().unwrap_or(Value::Null).into_owned();
+                stack.push(crate::eval::any_all_over(lhs, arr.clone(), op, *is_any)?);
             }
             Step::Extract { field, fallback } => {
                 let v = stack.pop().unwrap_or(Value::Null).into_owned();
