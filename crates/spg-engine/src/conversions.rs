@@ -5742,7 +5742,7 @@ pub(crate) fn coerce_value(
         }
         _ => None,
     };
-    coerced.ok_or(EngineError::Storage(StorageError::TypeMismatch {
+    coerced.ok_or_else(|| EngineError::Storage(StorageError::TypeMismatch {
         column: col_name.into(),
         expected,
         actual,

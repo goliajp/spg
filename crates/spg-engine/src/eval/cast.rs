@@ -2198,7 +2198,7 @@ pub fn cast_to_vector(v: Value) -> Result<Value<'static>, EvalError> {
         Value::Vector(v) => Ok(Value::vector(v.into_owned())),
         Value::Text(s) => parse_vector_text(&s)
             .map(Value::vector)
-            .ok_or(EvalError::TypeMismatch {
+            .ok_or_else(|| EvalError::TypeMismatch {
                 detail: format!("cannot parse {s:?} as a vector literal"),
             }),
         other => Err(EvalError::TypeMismatch {
