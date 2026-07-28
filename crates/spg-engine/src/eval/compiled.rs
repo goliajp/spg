@@ -82,6 +82,15 @@ pub(crate) enum Step {
     /// same 10x whichever way the match was spelled. The pattern is a
     /// compile product here, exactly as `Step::Like`'s is — PG solves the
     /// same problem with a cache; a compile product cannot be forgotten.
+    /// v7.39 (round 595) — `EXTRACT(<field> FROM <expr>)`. The field is a
+    /// keyword, not a value, so it rides in the step; the source is the
+    /// preceding sub-program and this pops it. `fallback` carries the whole
+    /// node because the extraction's error wording names the source's
+    /// declared type, which only the node knows.
+    Extract {
+        field: spg_sql::ast::ExtractField,
+        fallback: Expr,
+    },
     Regex {
         re: crate::eval::CompiledRe,
         /// The whole call, for an operand that is not text: the interpreter
@@ -603,6 +612,18 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 n_args: args.len(),
             });
         }
+        // v7.39 (round 595) — EXTRACT over a compilable source. One
+        // non-compilable node used to disqualify the WHOLE predicate, so
+        // `WHERE extract(year FROM t) = 2020` interpreted the column read
+        // and the comparison as well: 81.7 ms on 500k rows against PG18's
+        // 14.5, where a compiled comparison on the same column is 13.1.
+        Expr::Extract { field, source } => {
+            compile_into(source, ctx, steps);
+            steps.push(Step::Extract {
+                field: field.clone(),
+                fallback: e.clone(),
+            });
+        }
         Expr::Cast { expr, target } => {
             // v7.39 (read01 ruleutils.c) — catalog-dependent casts run
             // through eval's pre-hook (regclass dual-shape, domain/enum/
@@ -828,6 +849,7 @@ pub(crate) fn fully_compilable(e: &Expr) -> bool {
         // v7.39 (read01 ruleutils.c) — regclass / user-named casts
         // need the catalog (dual-shape resolve, domain/enum/composite
         // hooks); they stay Subtree so eval's pre-hook runs.
+        Expr::Extract { source, .. } => fully_compilable(source),
         Expr::Cast { expr, target } => {
             !matches!(
                 target,
@@ -858,6 +880,26 @@ pub(crate) fn fully_compilable(e: &Expr) -> bool {
     }
 }
 
+/// v7.39 (round 595) — functions that are NOT context-free but ARE fixed for
+/// the whole statement: they read the session's time zone, DateStyle or
+/// lc_time out of the `EvalContext`, and `Step::Function` hands that context
+/// to `apply_function_lower` exactly as the interpreter would.
+///
+/// Keeping them off the compiled path cost the whole predicate, not just the
+/// call: one non-compilable node disqualifies the entire WHERE, so
+/// `WHERE date_trunc('day', t) = TIMESTAMP '…'` interpreted the column read
+/// and the comparison too — 153.8 ms over 500k rows against PG18's 9.7,
+/// where a compiled comparison on the same column is 13.1.
+///
+/// `now` / `random` / sequence accessors stay off: they are not fixed for
+/// the statement in the way these are.
+fn is_session_deterministic_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "date_trunc" | "date_part" | "to_char" | "age"
+    )
+}
+
 /// v7.36 — PURE scalar function whitelist for `Step::Function`.
 /// "Pure" means: deterministic, context-independent, no side
 /// effects. Aggregate names (sum / count / max / …) are filtered
@@ -867,60 +909,61 @@ pub(crate) fn fully_compilable(e: &Expr) -> bool {
 /// deterministic. EXTRACT is excluded because the field kind is
 /// parsed off the Expr tree, not an arg.
 fn is_pure_scalar_function(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        // string length + slicing
-        "length"
-            | "char_length"
-            | "character_length"
-            | "octet_length"
-            | "upper"
-            | "lower"
-            | "trim"
-            | "ltrim"
-            | "rtrim"
-            | "btrim"
-            | "left"
-            | "right"
-            | "substring"
-            | "substr"
-            | "replace"
-            | "position"
-            | "strpos"
-            | "concat"
-            | "concat_ws"
-            | "reverse"
-            | "repeat"
-            | "lpad"
-            | "rpad"
-            | "split_part"
-            // null/conditional
-            | "coalesce"
-            | "nullif"
-            | "greatest"
-            | "least"
-            | "ifnull"
-            | "isnull"
-            | "nvl"
-            // numeric
-            | "abs"
-            | "ceil"
-            | "ceiling"
-            | "floor"
-            | "round"
-            | "trunc"
-            | "sqrt"
-            | "power"
-            | "pow"
-            | "mod"
-            | "sign"
-            | "log"
-            | "log10"
-            | "exp"
-            | "ln"
-            // boolean / cast helpers
-            | "cast"
-    )
+    is_session_deterministic_function(name)
+        || matches!(
+            name.to_ascii_lowercase().as_str(),
+            // string length + slicing
+            "length"
+                | "char_length"
+                | "character_length"
+                | "octet_length"
+                | "upper"
+                | "lower"
+                | "trim"
+                | "ltrim"
+                | "rtrim"
+                | "btrim"
+                | "left"
+                | "right"
+                | "substring"
+                | "substr"
+                | "replace"
+                | "position"
+                | "strpos"
+                | "concat"
+                | "concat_ws"
+                | "reverse"
+                | "repeat"
+                | "lpad"
+                | "rpad"
+                | "split_part"
+                // null/conditional
+                | "coalesce"
+                | "nullif"
+                | "greatest"
+                | "least"
+                | "ifnull"
+                | "isnull"
+                | "nvl"
+                // numeric
+                | "abs"
+                | "ceil"
+                | "ceiling"
+                | "floor"
+                | "round"
+                | "trunc"
+                | "sqrt"
+                | "power"
+                | "pow"
+                | "mod"
+                | "sign"
+                | "log"
+                | "log10"
+                | "exp"
+                | "ln"
+                // boolean / cast helpers
+                | "cast"
+        )
 }
 
 pub(crate) fn compile_expr(e: &Expr, ctx: &EvalContext<'_>) -> CompiledExpr {
@@ -1100,6 +1143,16 @@ fn in_set_verdict(
         (true, Value::Bool(b)) => Value::Bool(!b),
         (_, v) => v,
     })
+}
+
+/// v7.39 (round 595) — the source sub-expression of the EXTRACT node a
+/// `Step::Extract` was compiled from. Only its declared TYPE is read, for
+/// the error wording; the value came off the stack.
+fn source_of_extract(node: &Expr) -> &Expr {
+    match node {
+        Expr::Extract { source, .. } => source,
+        other => other,
+    }
 }
 
 /// v7.39 (round 594) — the literal pattern and case flag of a `regexp_like`
@@ -1442,6 +1495,15 @@ where
                     // exact coercion / error path on the whole node.
                     None => stack.push(eval_expr(fallback, &row.as_row(), ctx)?),
                 }
+            }
+            Step::Extract { field, fallback } => {
+                let v = stack.pop().unwrap_or(Value::Null).into_owned();
+                stack.push(crate::eval::extract_from_value(
+                    field,
+                    v,
+                    source_of_extract(fallback),
+                    ctx,
+                )?);
             }
             Step::Regex { re, fallback } => {
                 let v = stack.pop().unwrap_or(Value::Null);

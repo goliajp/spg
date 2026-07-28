@@ -3884,6 +3884,21 @@ fn eval_extract_arm(
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     let v = eval_expr(source, row, ctx)?;
+    extract_from_value(field, v, source, ctx)
+}
+
+/// v7.39 (round 595) — the field extraction, with the source value already
+/// in hand. Split out so the compiled-predicate program can pop the source
+/// off its stack instead of handing the whole node back to the interpreter:
+/// one non-compilable node used to disqualify the entire WHERE, and
+/// `WHERE extract(year FROM t) = 2020` was interpreting the column read and
+/// the comparison too. The body below is unchanged; it never touched `row`.
+pub(crate) fn extract_from_value(
+    field: &spg_sql::ast::ExtractField,
+    v: Value<'static>,
+    source: &Expr,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
     // v7.39 (round 382) — MySQL coerces a date/time STRING to its temporal
     // value for EXTRACT (`EXTRACT(YEAR FROM '2020-05-15')` is 2020, and the
     // time fields read a `'... HH:MM:SS'` string); PG needs a typed source.
