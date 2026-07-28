@@ -1533,36 +1533,56 @@ impl Engine {
                 seen.insert(encode_row_key(r));
             }
         }
+        // v7.39 (round 598) — the engine and its catalog are built ONCE.
+        // Each iteration used to clone the catalog, create the CTE table,
+        // and construct a whole `Engine` — which initialises 82 fields — to
+        // hold that round's working set. A counting allocator put the loop
+        // at 63 allocations and 104 kB per iteration, or 1 GB for a
+        // 10,000-row recursive CTE, and none of it varied with how much
+        // else was in the catalog: the per-round rebuild WAS the cost. The
+        // table is emptied and refilled instead.
+        let mut iter_catalog = base_catalog.clone();
+        let schema = TableSchema::new(cte.name.clone(), columns.clone());
+        iter_catalog
+            .create_table(schema)
+            .map_err(EngineError::Storage)?;
+        let mut iter_engine = Engine::restore(iter_catalog);
+        if let Some(c) = self.clock {
+            iter_engine = iter_engine.with_clock(c);
+        }
+        if let Some(f) = self.salt_fn {
+            iter_engine = iter_engine.with_salt_fn(f);
+        }
+        // The recursive terms are cloned once too — the clone stripped the
+        // CTE list off each of them, per term per iteration.
+        let recursive_terms: Vec<SelectStatement> = union_terms
+            .iter()
+            .map(|(_, t)| {
+                let mut t = t.clone();
+                t.ctes = Vec::new();
+                t
+            })
+            .collect();
         for iter in 0..MAX_ITERATIONS {
             cancel.check()?;
             if working_set.is_empty() {
                 break;
             }
-            // Build a fresh catalog: base + CTE bound to working_set.
-            let mut iter_catalog = base_catalog.clone();
-            let schema = TableSchema::new(cte.name.clone(), columns.clone());
-            iter_catalog
-                .create_table(schema)
-                .map_err(EngineError::Storage)?;
             {
-                let table = iter_catalog.get_mut(&cte.name).expect("just-created");
+                // Truncated rather than dropped and recreated: the table's
+                // own structure is what dropping it throws away, and it is
+                // identical every round.
+                let cat = iter_engine.base_catalog_mut();
+                let table = cat.get_mut(&cte.name).expect("created above");
+                table.truncate();
                 for row in &working_set {
                     table.insert(row.clone()).map_err(EngineError::Storage)?;
                 }
             }
-            let mut iter_engine = Engine::restore(iter_catalog);
-            if let Some(c) = self.clock {
-                iter_engine = iter_engine.with_clock(c);
-            }
-            if let Some(f) = self.salt_fn {
-                iter_engine = iter_engine.with_salt_fn(f);
-            }
             // Run each recursive term in sequence and collect new rows.
             let mut next_set: Vec<Row<'static>> = Vec::new();
-            for (_, term) in &union_terms {
-                let mut term = term.clone();
-                term.ctes = Vec::new();
-                let r = iter_engine.exec_select_cancel(&term, cancel)?;
+            for term in &recursive_terms {
+                let r = iter_engine.exec_select_cancel(term, cancel)?;
                 let QueryResult::Rows {
                     columns: rc,
                     rows: rs,
