@@ -31,6 +31,39 @@
 //! is expected: this probe installs no parallel runner. Note that the
 //! server's penalty is LARGEST with sharding OFF — 31.4 against a steady
 //! 6.5 — so it is not the shard threads spinning up.
+//!
+//! ---
+//!
+//! v7.39 (round 586) put a clock inside the server's statement path,
+//! temporarily, and split it:
+//!
+//!     first query   prologue 2003 us   executor 10434 us   total 12437
+//!     second               5                    1508             1513
+//!     third                2                    1735             1738
+//!
+//! Two costs, not one. The prologue — parse and prepared-statement
+//! setup — is 2 ms once per connection and does NOT scale with rows.
+//! The rest, 10.4 ms of it, is inside the executor call itself.
+//!
+//! And it is PER CONNECTION, not per table. In one connection: table A
+//! costs 15.18 ms, then 1.76, and a table B never queried on that
+//! connection costs 2.07 — no penalty at all. Reversed, the same. Round
+//! 583 recorded "per connection AND per table"; the per-table half was
+//! never tested, because that round's second shape used the same table.
+//! It is wrong and the ledger says so.
+//!
+//! So: the first statement on a connection pays a first-touch cost on
+//! memory that statement needs, proportional to its working set —
+//! 0.13 ms for a 1000-row table, 10 ms for 500,000 — and later
+//! statements on the same connection reuse it. That fits every property
+//! measured: per connection, proportional to the query rather than the
+//! table, nothing lasting in RSS (the arenas die with the connection),
+//! not the CPU cache, and absent from this probe, whose process-wide
+//! allocator was warmed by building the table.
+//!
+//! Confirming it means pooling or pre-warming the per-statement arenas
+//! across connections and seeing the first query fall to the steady
+//! number. That is the next round.
 
 use spg_engine::Engine;
 use std::time::Instant;
