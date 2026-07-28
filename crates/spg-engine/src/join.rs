@@ -1233,7 +1233,17 @@ impl Engine {
             )? {
                 continue;
             }
-            if !eq_pairs.is_empty() && peer.lateral.is_none() {
+            // v7.39 (round 606) — a COMPUTED key on its own is still a key.
+            // Round 590 taught the hash stage to take `eq_exprs`, but the
+            // gate here only ever asked about `eq_pairs`, so the machinery
+            // was reachable only when a plain `col = col` conjunct sat
+            // beside it. `ON a.id = b.id + 1` alone — the ordinary
+            // previous-row / offset-by-one join, and the anti-join
+            // `LEFT JOIN … ON a.id = b.id + 1 WHERE b.id IS NULL` — fell
+            // through to the nested loop and crossed the whole peer against
+            // every left row: quadratic, 701 ms at 2k rows and past 20
+            // SECONDS at 20k where PG holds 0.4-2.7 ms.
+            if (!eq_pairs.is_empty() || !eq_exprs.is_empty()) && peer.lateral.is_none() {
                 self.join_stage_hash(
                     &mut pipe,
                     peer,
