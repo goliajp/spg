@@ -622,22 +622,144 @@ fn keep_mask(
 /// peer with no ON. The returned residual refs borrow the underlying ON
 /// expressions (not the `peer` itself, since `peer.on` is a `Copy`
 /// reference), so the caller can still mutate `peer` afterwards.
+/// v7.39 (round 590) — one component of a hash key that has a COMPUTED side.
+///
+/// The whole requirement is that two values SQL calls equal encode the same,
+/// or the join silently loses rows. Across the numeric family that is not
+/// free: `5` as INT, `5` as BIGINT, `5.0` as double and `5.00` as NUMERIC all
+/// compare equal and would otherwise carry four different tags, so they are
+/// all rendered as one canonical decimal. A non-integral value can never
+/// equal an integer, so it simply renders as itself; NaN equals nothing and
+/// any encoding will do. Everything outside the numeric family keeps the
+/// encoder the column-to-column path already uses.
+fn push_key_value(out: &mut String, v: &Value) {
+    use core::fmt::Write;
+    match v {
+        Value::SmallInt(n) => {
+            let _ = write!(out, "n{n}|");
+        }
+        Value::Int(n) => {
+            let _ = write!(out, "n{n}|");
+        }
+        Value::BigInt(n) => {
+            let _ = write!(out, "n{n}|");
+        }
+        // `-0.0` prints with its sign but equals `0`.
+        Value::Float(f) if *f == 0.0 => out.push_str("n0|"),
+        Value::Float(f) => {
+            let _ = write!(out, "n{f}|");
+        }
+        Value::Numeric { .. } => {
+            let t = crate::eval::value_to_text(v);
+            let t = if t.contains('.') {
+                t.trim_end_matches('0').trim_end_matches('.')
+            } else {
+                t.as_str()
+            };
+            let _ = write!(out, "n{t}|");
+        }
+        _ => aggregate::encode_one_into(out, v),
+    }
+}
+
 fn extract_join_keys<'a>(
     peer: &JoinedPeer<'a>,
     combined_schema: &[ColumnSchema],
     consumed_cols: usize,
-) -> (Vec<(usize, usize)>, Vec<&'a Expr>) {
+) -> (Vec<(usize, usize)>, Vec<(usize, &'a Expr)>, Vec<&'a Expr>) {
     let mut eq_pairs: Vec<(usize, usize)> = Vec::new();
+    let mut eq_exprs: Vec<(usize, &Expr)> = Vec::new();
     let mut residual: Vec<&Expr> = Vec::new();
     if let (Some(on_expr), None) = (peer.on, peer.lateral) {
         for sub in reorder::split_and_conjunctions(on_expr) {
-            match match_equi_pair(sub, peer, combined_schema, consumed_cols) {
-                Some(pair) => eq_pairs.push(pair),
-                None => residual.push(sub),
+            if let Some(pair) = match_equi_pair(sub, peer, combined_schema, consumed_cols) {
+                eq_pairs.push(pair);
+                continue;
             }
+            // v7.39 (round 590) — an equality whose peer side is COMPUTED is
+            // still a join key. `ON a.g = b.g AND a.id = b.id + 1` used to
+            // hash on `g` alone and test the second conjunct on every
+            // candidate pair, so the work was (probe rows x bucket size):
+            // over 20k rows the cost ran 22.5 ms at one row a bucket, 686 ms
+            // at 200, and past 25 SECONDS at 20,000, where PG holds 4-11 ms
+            // by hashing on both. The conjunct stays in `residual` as well,
+            // so the join's answer never depends on the key encoding.
+            if let Some(pair) = match_equi_expr(sub, peer, combined_schema, consumed_cols) {
+                eq_exprs.push(pair);
+                residual.push(sub);
+                continue;
+            }
+            residual.push(sub);
         }
     }
-    (eq_pairs, residual)
+    (eq_pairs, eq_exprs, residual)
+}
+
+/// One conjunct as `<left column> = <expression over the peer alone>`, in
+/// either order. The left side has to be a plain column of the part of the
+/// row already joined, because the probe reads cells and does not
+/// materialise a row to evaluate against.
+fn match_equi_expr<'a>(
+    sub: &'a Expr,
+    peer: &JoinedPeer<'_>,
+    combined_schema: &[ColumnSchema],
+    consumed_cols: usize,
+) -> Option<(usize, &'a Expr)> {
+    let Expr::Binary {
+        lhs,
+        op: spg_sql::ast::BinOp::Eq,
+        rhs,
+    } = sub
+    else {
+        return None;
+    };
+    let left_slice = &combined_schema[..consumed_cols];
+    for (a, b) in [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())] {
+        if let Expr::Column(c) = a
+            && let Some(l) = Engine::composite_col_pos(left_slice, c)
+            && !matches!(b, Expr::Column(_))
+            && peer_only_key_expr(b, peer)
+            && expr_mentions_a_column(b)
+        {
+            return Some((l, b));
+        }
+    }
+    None
+}
+
+/// Can this expression be computed from one peer row, with the same answer
+/// every time? Deliberately an allowlist of node kinds rather than a walk
+/// that asks what an expression references: a node the walk did not know
+/// about, or a function whose volatility SPG cannot look up, would both be
+/// silently admitted. Columns, literals, casts, unary and arithmetic only —
+/// which leaves `ON a.k = lower(b.k)` on the old path, recorded and not done.
+fn peer_only_key_expr(e: &Expr, peer: &JoinedPeer<'_>) -> bool {
+    use spg_sql::ast::BinOp;
+    match e {
+        Expr::Column(c) => Engine::peer_col_pos(&peer.alias, &peer.cols, c).is_some(),
+        Expr::Literal(_) => true,
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => peer_only_key_expr(expr, peer),
+        Expr::Binary { lhs, op, rhs } => {
+            matches!(
+                op,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::IntDiv | BinOp::Mod
+            ) && peer_only_key_expr(lhs, peer)
+                && peer_only_key_expr(rhs, peer)
+        }
+        _ => false,
+    }
+}
+
+/// A key made only of constants would be a filter, not a join key.
+fn expr_mentions_a_column(e: &Expr) -> bool {
+    match e {
+        Expr::Column(_) => true,
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => expr_mentions_a_column(expr),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_mentions_a_column(lhs) || expr_mentions_a_column(rhs)
+        }
+        _ => false,
+    }
 }
 
 /// One conjunct as an equi-join key for `peer`: `<left>.<col> = <peer>.<col>`
@@ -1115,7 +1237,7 @@ impl Engine {
             }
             let right_arity = peer.cols.len();
             let peer_mask = keep_mask(needed, &peer.cols, &peer.alias);
-            let (mut eq_pairs, residual) =
+            let (mut eq_pairs, eq_exprs, residual) =
                 extract_join_keys(peer, &combined_schema, pipe.consumed_cols);
             // v7.39 (round 588) — an ANSI-89 join writes its condition in the
             // WHERE clause. Give the peer those keys too, so `FROM a, b WHERE
@@ -1156,6 +1278,7 @@ impl Engine {
                     &mut pipe,
                     peer,
                     &eq_pairs,
+                    &eq_exprs,
                     &residual,
                     &peer_mask,
                     right_arity,
@@ -1402,6 +1525,7 @@ impl Engine {
         pipe: &mut JoinPipeline<'a>,
         peer: &mut JoinedPeer<'p>,
         eq_pairs: &[(usize, usize)],
+        eq_exprs: &[(usize, &Expr)],
         residual: &[&Expr],
         peer_mask: &Option<Vec<bool>>,
         right_arity: usize,
@@ -1471,7 +1595,8 @@ impl Engine {
         // entirely; the hash key is the i64 itself. For count_messages
         // / inbox / contacts / list_categories the eq_pair is
         // `(messages.mailbox_id, mailboxes.id)` both BigInt.
-        let int_keyed = eq_pairs.len() == 1
+        let int_keyed = eq_exprs.is_empty()
+            && eq_pairs.len() == 1
             && matches!(
                 combined_schema[eq_pairs[0].0].ty,
                 spg_storage::DataType::BigInt
@@ -1493,6 +1618,14 @@ impl Engine {
             hashbrown::HashMap::with_capacity(if int_keyed { 0 } else { n_rights });
         let mut int_table: hashbrown::HashMap<i64, Bucket> =
             hashbrown::HashMap::with_capacity(if int_keyed { n_rights } else { 0 });
+        // v7.39 (round 590) — a key expression names the peer's own columns
+        // and is evaluated against one peer row, so it resolves against the
+        // PEER's schema, not the combined one the residual uses.
+        let peer_ctx = EvalContext {
+            columns: &peer.cols,
+            table_alias: Some(peer.alias.as_str()),
+            ..ctx.clone()
+        };
         let mut keybuf: Vec<&Value> = Vec::with_capacity(eq_pairs.len());
         // v7.31 (perf 3e) — scratch key buffer: build inserts allocate
         // only on vacant, probes never allocate.
@@ -1538,6 +1671,17 @@ impl Engine {
                 }
             }
             aggregate::encode_key_refs_into(&keybuf, &mut keystr);
+            // v7.39 (round 590) — then the computed components, in the order
+            // the probe will read them. A NULL never matches under `=`, so a
+            // row whose key expression is NULL joins nothing and is left out
+            // of the table entirely.
+            for (_, e) in eq_exprs {
+                let v = eval::eval_expr(e, right, &peer_ctx).map_err(EngineError::Eval)?;
+                if matches!(v, Value::Null) {
+                    continue 'build;
+                }
+                push_key_value(&mut keystr, &v);
+            }
             match table.get_mut(keystr.as_str()) {
                 Some(b) => b.push(ri),
                 None => {
@@ -1585,6 +1729,15 @@ impl Engine {
                 }
                 if !left_has_null {
                     aggregate::encode_key_refs_into(&probebuf, &mut keystr);
+                    for (lpos, _) in eq_exprs {
+                        match tuple_value(&pipe.sources, &pipe.offsets, tuple, *lpos) {
+                            Some(v) if !matches!(v, Value::Null) => push_key_value(&mut keystr, v),
+                            _ => {
+                                left_has_null = true;
+                                break;
+                            }
+                        }
+                    }
                 }
                 None
             };

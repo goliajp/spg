@@ -6175,6 +6175,12 @@ pub(crate) fn encode_key_refs(vals: &[&Value]) -> String {
 /// probe) ran 24k+ String allocations per query through the
 /// allocator just to LOOK UP a map; the scratch form allocates
 /// only when a map actually has to take ownership (vacant insert).
+/// v7.39 (round 590) — append ONE value's encoding, for the join key that
+/// mixes stored cells with computed ones and so cannot clear as it goes.
+pub(crate) fn encode_one_into(out: &mut String, v: &Value) {
+    encode_one_raw(out, v);
+}
+
 pub(crate) fn encode_key_refs_into(vals: &[&Value], out: &mut String) {
     encode_key_refs_into_in(vals, out, false);
 }
