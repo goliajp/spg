@@ -180,6 +180,13 @@ impl Engine {
                 collect_window_nodes(expr, &mut window_nodes);
             }
         }
+        // v7.39 (round 592) — and from ORDER BY, which may name a window the
+        // select list never mentions. The order-key builder below rewrites
+        // window calls to `__win_N` columns, and a call that was never
+        // collected has no column to become.
+        for o in &stmt.order_by {
+            collect_window_nodes(&o.expr, &mut window_nodes);
+        }
 
         // 3) For each window, compute per-row value.
         // Index: same order as window_nodes; for row i, win_vals[w][i].
@@ -273,15 +280,6 @@ impl Engine {
                 true,
             ));
         }
-        // 5) Build extended rows: each row gets its window values appended.
-        let mut ext_rows: Vec<Row<'static>> = Vec::with_capacity(n_rows);
-        for i in 0..n_rows {
-            let mut values = filtered[i].values.clone();
-            for w in 0..window_nodes.len() {
-                values.push(win_vals[w][i].clone());
-            }
-            ext_rows.push(Row::new(values));
-        }
         // 6) Rewrite the projection: WindowFunction nodes → Column(__win_N).
         let mut rewritten_items: Vec<SelectItem> = Vec::with_capacity(stmt.items.len());
         for item in &stmt.items {
@@ -319,12 +317,34 @@ impl Engine {
         // `ORDER BY <enum col>` of a windowed query sorted by TEXT — the
         // window values were right, the row order silently was not.
         let ext_ctx = self.ev_ctx(&ext_cols, alias_opt);
-        let projection = build_projection(&rewritten_items, &ext_cols, alias, self.backslash_escapes)?;
+        let projection = build_projection_hiding_tail(
+            &rewritten_items,
+            &ext_cols,
+            alias,
+            self.backslash_escapes,
+            window_nodes.len(),
+        )?;
         let mut tagged: Vec<(Vec<OrderKey>, Row)> = Vec::with_capacity(n_rows);
-        for (i, row) in ext_rows.iter().enumerate() {
+        // v7.39 (round 592) — the extended row (input columns plus the window
+        // values) used to be materialised for EVERY input row and kept until
+        // the projection had run: the input values cloned into a fresh Vec,
+        // then grown once to take the window columns. A counting allocator put
+        // the window path at 4 allocations a row where a plain derived table
+        // takes 1, and named all four — the input row, the clone, the growth,
+        // and the projected row. Only the last has to exist afterwards, so the
+        // extended row is one buffer refilled per row.
+        let mut ext_row: Row<'static> =
+            Row::new(Vec::with_capacity(schema_cols.len() + window_nodes.len()));
+        for i in 0..n_rows {
             if i.is_multiple_of(256) {
                 cancel.check()?;
             }
+            ext_row.values.clear();
+            ext_row.values.extend(filtered[i].values.iter().cloned());
+            for w in 0..window_nodes.len() {
+                ext_row.values.push(win_vals[w][i].clone());
+            }
+            let row = &ext_row;
             let mut values = Vec::with_capacity(projection.len());
             for p in &projection {
                 values.push(eval::eval_expr(&p.expr, row, &ext_ctx)?);
@@ -7573,6 +7593,31 @@ pub(crate) fn build_projection(
     table_alias: &str,
     mysql: bool,
 ) -> Result<Vec<ProjectedItem>, EngineError> {
+    build_projection_hiding_tail(items, schema_cols, table_alias, mysql, 0)
+}
+
+/// v7.39 (round 592) — `build_projection` with the last `hidden_tail` columns
+/// invisible to `*`.
+///
+/// The windowed-SELECT path appends a synthetic `__win_N` column per window
+/// function so the rewritten projection can reference the computed values as
+/// ordinary columns. `*` then expanded them too, and
+/// `SELECT wr.*, row_number() OVER (ORDER BY id) FROM wr` came back with an
+/// EXTRA column — the internal name's value, repeated. A wrong answer, and a
+/// silent one: the row simply had one more field than the client asked for.
+///
+/// Hidden by POSITION rather than by name, for the reason round 512 recorded
+/// about the system columns: a name test looks safe until a real column
+/// happens to carry the name. These are appended last, so the count is what
+/// identifies them.
+pub(crate) fn build_projection_hiding_tail(
+    items: &[SelectItem],
+    schema_cols: &[ColumnSchema],
+    table_alias: &str,
+    mysql: bool,
+    hidden_tail: usize,
+) -> Result<Vec<ProjectedItem>, EngineError> {
+    let visible = schema_cols.len().saturating_sub(hidden_tail);
     // v7.39 (round 462) — a join's combined schema qualifies every column
     // `alias.col` so the deferred-join cell lookups resolve by composite
     // name. That is an internal convention, and `*` was handing it to the
@@ -7614,7 +7659,7 @@ pub(crate) fn build_projection(
                 // are the synthetic ones.
                 let sys_skip = synthetic_system_positions(schema_cols);
                 for (idx, col) in schema_cols.iter().enumerate() {
-                    if sys_skip[idx] {
+                    if sys_skip[idx] || idx >= visible {
                         continue;
                     }
                     out.push(ProjectedItem {
@@ -7640,7 +7685,7 @@ pub(crate) fn build_projection(
                 let prefix = alloc::format!("{q}.");
                 let single_table = !table_alias.is_empty() && q == table_alias;
                 let mut matched = 0usize;
-                for col in schema_cols {
+                for col in &schema_cols[..visible] {
                     let belongs =
                         col.name.starts_with(&prefix) || (single_table && !col.name.contains('.'));
                     if !belongs {
