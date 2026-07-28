@@ -138,6 +138,7 @@ mod e2e_string_borrow_round608;
 mod e2e_coalesce_shortcircuit_round609;
 mod e2e_string_slice_round610;
 mod e2e_format_minmax_round611;
+mod e2e_concat_borrow_round612;
 mod e2e_const_fold_round605;
 mod e2e_jsonb_canonical_round603;
 mod e2e_srf_order_by_round600;
