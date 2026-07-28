@@ -205,12 +205,33 @@ impl Engine {
                 unreachable!("collect_window_nodes pushes only WindowFunction");
             };
             // Compute (partition_key, order_key, original_index) for each row.
+            // v7.39 (round 593) — a key that is a plain column sits at the same
+            // position in every row, but was resolved BY NAME for each one. A
+            // per-library profile of `lag(id) OVER (ORDER BY id)` put
+            // `resolve_column` at 5.8% of the query on its own, with
+            // `rehydrate_cell` and the `eval_expr` dispatch behind it. Resolve
+            // once; anything that is not a plain column keeps the resolver.
+            let p_bound: Vec<Option<usize>> = partition_by
+                .iter()
+                .map(|e| crate::orderby::bound_column_position(e, schema_cols, alias_opt))
+                .collect();
+            let o_bound: Vec<Option<usize>> = order_by
+                .iter()
+                .map(|(e, _, _)| crate::orderby::bound_column_position(e, schema_cols, alias_opt))
+                .collect();
+            let arg_bound = args
+                .first()
+                .and_then(|a| crate::orderby::bound_column_position(a, schema_cols, alias_opt));
             let mut indexed: Vec<(Vec<Value<'static>>, Vec<(Value, bool, Option<bool>)>, usize)> =
                 Vec::with_capacity(n_rows);
             for (i, row) in filtered.iter().enumerate() {
                 let pkey: Vec<Value<'static>> = partition_by
                     .iter()
-                    .map(|p| eval::eval_expr(p, row, &ctx))
+                    .enumerate()
+                    .map(|(k, p)| match p_bound[k].and_then(|pos| row.values.get(pos)) {
+                        Some(v) => Ok(v.clone()),
+                        None => eval::eval_expr(p, row, &ctx),
+                    })
                     .collect::<Result<_, _>>()?;
                 // v7.39 (read01 round 54) — a window's ORDER BY over an enum
                 // column must sort by MEMBER order (enumsortorder), not the
@@ -221,14 +242,17 @@ impl Engine {
                 // (Closes the enum-order knife's recorded window residual.)
                 let okey: Vec<(Value, bool, Option<bool>)> = order_by
                     .iter()
-                    .map(|(e, desc, nf)| {
-                        eval::eval_expr(e, row, &ctx).map(|v| {
-                            let v = match crate::orderby::enum_order_ordinal(e, &v, &ctx) {
-                                Some(ord) => Value::Float(ord),
-                                None => v,
-                            };
-                            (v, *desc, *nf)
-                        })
+                    .enumerate()
+                    .map(|(k, (e, desc, nf))| -> Result<_, EngineError> {
+                        let v = match o_bound[k].and_then(|pos| row.values.get(pos)) {
+                            Some(v) => v.clone(),
+                            None => eval::eval_expr(e, row, &ctx)?,
+                        };
+                        let v = match crate::orderby::enum_order_ordinal(e, &v, &ctx) {
+                            Some(ord) => Value::Float(ord),
+                            None => v,
+                        };
+                        Ok((v, *desc, *nf))
                     })
                     .collect::<Result<_, _>>()?;
                 indexed.push((pkey, okey, i));
@@ -257,6 +281,7 @@ impl Engine {
                 compute_window_partition(
                     name,
                     args,
+                    arg_bound,
                     !order_by.is_empty(),
                     frame.as_ref(),
                     *null_treatment,

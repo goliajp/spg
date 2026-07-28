@@ -1212,28 +1212,48 @@ pub(crate) fn order_by_bound_positions(
 ) -> Vec<Option<usize>> {
     order_by
         .iter()
-        .map(|o| {
-            let Expr::Column(c) = &o.expr else {
-                return None;
-            };
-            if let Some(q) = c.qualifier.as_deref()
-                && !alias.is_some_and(|a| q.eq_ignore_ascii_case(a))
-            {
-                return None;
-            }
-            // An ambiguous bare name must keep the resolver's own rules.
-            let mut hit = None;
-            for (i, s) in schema_cols.iter().enumerate() {
-                if s.name.eq_ignore_ascii_case(&c.name) {
-                    if hit.is_some() {
-                        return None;
-                    }
-                    hit = Some(i);
-                }
-            }
-            hit
-        })
+        .map(|o| bound_column_position(&o.expr, schema_cols, alias))
         .collect()
+}
+
+/// v7.39 (round 593) — the cell an expression reads, when it reads exactly
+/// one and the position is the same for every row. `None` keeps the caller on
+/// the resolver, which is what anything else needs.
+///
+/// Round 582 established this for the top-level ORDER BY; the window pipeline
+/// resolves its partition and order keys by NAME once per row, which a
+/// per-library profile puts at 5.8% of a `lag()` query in `resolve_column`
+/// alone, with `rehydrate_cell` and the `eval_expr` dispatch behind it.
+pub(crate) fn bound_column_position(
+    expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    alias: Option<&str>,
+) -> Option<usize> {
+    let Expr::Column(c) = expr else {
+        return None;
+    };
+    if let Some(q) = c.qualifier.as_deref()
+        && !alias.is_some_and(|a| q.eq_ignore_ascii_case(a))
+    {
+        return None;
+    }
+    // An ambiguous bare name must keep the resolver's own rules.
+    let mut hit = None;
+    for (i, s) in schema_cols.iter().enumerate() {
+        if s.name.eq_ignore_ascii_case(&c.name) {
+            if hit.is_some() {
+                return None;
+            }
+            hit = Some(i);
+        }
+    }
+    // A composite column is stored as JSON and rebuilt by `rehydrate_cell`
+    // on the way out, so reading its cell raw would compare the wrong thing.
+    let i = hit?;
+    if schema_cols[i].user_composite_type.is_some() {
+        return None;
+    }
+    Some(i)
 }
 
 pub(crate) fn build_order_keys_into(

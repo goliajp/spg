@@ -251,9 +251,28 @@ pub(crate) const fn value_to_i64(v: &Value) -> i64 {
     clippy::type_complexity,
     clippy::match_same_arms
 )]
+/// v7.39 (round 593) — a window function's argument, read from its cell when
+/// the caller could bind one and evaluated otherwise. The bound path skips
+/// the by-name resolve that ran once per row per partition.
+fn bound_arg(
+    arg: &Expr,
+    bound: Option<usize>,
+    row: &Row<'static>,
+    ctx: &EvalContext,
+) -> Result<Value<'static>, crate::EvalError> {
+    match bound.and_then(|p| row.values.get(p)) {
+        Some(v) => Ok(v.clone()),
+        None => eval::eval_expr(arg, row, ctx),
+    }
+}
+
 pub(crate) fn compute_window_partition(
     name: &str,
     args: &[Expr],
+    // v7.39 (round 593) — the cell `args[0]` reads when it is a plain
+    // column, resolved once by the caller instead of by name for every row
+    // of every partition.
+    arg_bound: Option<usize>,
     ordered: bool,
     frame: Option<&WindowFrame>,
     null_treatment: spg_sql::ast::NullTreatment,
@@ -325,7 +344,7 @@ pub(crate) fn compute_window_partition(
             } else {
                 slice
                     .iter()
-                    .map(|(_, _, idx)| eval::eval_expr(&args[0], filtered_rows[*idx], ctx))
+                    .map(|(_, _, idx)| bound_arg(&args[0], arg_bound, filtered_rows[*idx], ctx))
                     .collect::<Result<_, _>>()
                     .map_err(EngineError::Eval)?
             };
@@ -547,7 +566,7 @@ pub(crate) fn compute_window_partition(
             };
             let values: Vec<Value<'static>> = slice
                 .iter()
-                .map(|(_, _, idx)| eval::eval_expr(&args[0], filtered_rows[*idx], ctx))
+                .map(|(_, _, idx)| bound_arg(&args[0], arg_bound, filtered_rows[*idx], ctx))
                 .collect::<Result<_, _>>()
                 .map_err(EngineError::Eval)?;
             let n = slice.len();
@@ -605,7 +624,7 @@ pub(crate) fn compute_window_partition(
             }
             let values: Vec<Value<'static>> = slice
                 .iter()
-                .map(|(_, _, idx)| eval::eval_expr(&args[0], filtered_rows[*idx], ctx))
+                .map(|(_, _, idx)| bound_arg(&args[0], arg_bound, filtered_rows[*idx], ctx))
                 .collect::<Result<_, _>>()
                 .map_err(EngineError::Eval)?;
             let nth: usize = if lower == "nth_value" {
