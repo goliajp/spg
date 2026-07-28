@@ -27,15 +27,38 @@
 //! `wal_writer_delay` default, the documented loss window for
 //! `synchronous_commit = off`. The original v5.4.1 default was
 //! 200 µs ("the fsync cost is the same at any cadence; only the
-//! window changes") — that reasoning missed the DUTY CYCLE: an
-//! fsync takes ~5-8 ms on APFS, so a 200 µs interval means the
-//! WAL file is being fsynced essentially 100% of the time, and
+//! window changes") — that reasoning missed the DUTY CYCLE: a
+//! commit barrier costs milliseconds, so a 200 µs interval means
+//! the WAL file is being synced essentially 100% of the time, and
 //! every concurrent client `append_wal` write_all on the same
-//! file stalls behind the in-flight fsync (~1-3 ms per statement
+//! file stalls behind the in-flight sync (~1-3 ms per statement
 //! — the r175/r176 wire-panel tax, root-caused via the interval
 //! discriminator). At 200 ms the duty cycle drops to a few
 //! percent and the window matches what PG customers already
 //! accept for async commit.
+//!
+//! v7.39 (round 601) — the number in that reasoning was wrong and
+//! is corrected here, because it is the kind of figure a later
+//! round would tune against. `fsync` on this APFS host costs
+//! **0.041 ms**, not 5-8: measured by appending 512 bytes and
+//! syncing, fifty times, in the server's own data directory.
+//! macOS `fsync(2)` does not force the drive's cache — that is
+//! what `F_FULLFSYNC` is for, and `sync_data` does not ask for it.
+//!
+//! The duty-cycle argument survives the correction (a sync every
+//! 200 µs still serialises writers behind the WAL mutex), but the
+//! cost of a durable commit does NOT come from the sync call. On
+//! the same host, one autocommit `UPDATE … WHERE id = 1`:
+//!
+//!     SPG_SYNCHRONOUS_COMMIT=on    4.91 ms
+//!     SPG_SYNCHRONOUS_COMMIT=off   0.19 ms
+//!     the fsync it performs        0.04 ms
+//!     the same UPDATE as a read    0.14 ms
+//!
+//! and the 4.9 ms does not move with the database's size (3.92 ms
+//! against a 2-row table, 200k rows, and 600k rows alike). So it
+//! is a fixed cost inside the durable-commit path that is not the
+//! sync, and naming it is unfinished work — see the ledger.
 
 use std::env;
 use std::sync::Arc;
