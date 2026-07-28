@@ -623,6 +623,21 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 n_args: args.len(),
             });
         }
+        // v7.39 (round 605) — a CONSTANT subexpression is evaluated once here
+        // rather than for every row. `WHERE id < ('500')::INT` cost two
+        // allocations a row against none for `WHERE id < 500`, and the same
+        // gap is much wider in a projection. A literal is already a `Lit`
+        // step, so this is only about the shapes built OUT of literals.
+        //
+        // An error stays where it was: if the fold does not evaluate, the
+        // expression compiles as before and raises per row, in the
+        // interpreter's own wording.
+        e if !matches!(e, Expr::Literal(_)) && constant_expr(e) => {
+            match eval_expr(e, &Row::new(alloc::vec::Vec::new()), ctx) {
+                Ok(v) => steps.push(Step::Lit(v)),
+                Err(_) => steps.push(Step::Subtree(e.clone())),
+            }
+        }
         // v7.39 (round 597) — `x = ANY (ARRAY[literals])` is `x IN (…)` and
         // `x <> ALL (…)` is `x NOT IN (…)`, down to the three-valued
         // treatment of a NULL element, so they take the membership set the
@@ -1290,6 +1305,20 @@ fn array_literal_items(e: &Expr) -> Option<&[Expr]> {
         Expr::Array(items) if items.iter().all(constant_expr) => Some(items.as_slice()),
         _ => None,
     }
+}
+
+/// v7.39 (round 605) — the value of a projection item that cannot depend on
+/// the row, evaluated once. `None` for anything that depends on a row, or
+/// that fails to evaluate — the latter so its error still comes from the row
+/// loop, in the interpreter's own wording, rather than from planning.
+pub(crate) fn constant_projection_value(
+    e: &Expr,
+    ctx: &EvalContext<'_>,
+) -> Option<Value<'static>> {
+    if matches!(e, Expr::Literal(_)) || !constant_expr(e) {
+        return None;
+    }
+    eval_expr(e, &Row::new(alloc::vec::Vec::new()), ctx).ok()
 }
 
 /// v7.39 (round 597) — an expression whose value cannot depend on the row.
