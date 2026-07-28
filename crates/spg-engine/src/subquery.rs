@@ -510,15 +510,16 @@ impl Engine {
                             Vec::with_capacity(outer_cols.len());
                         let mut any_null = false;
                         for oc in outer_cols {
-                            let v = eval::eval_expr(&Expr::Column(oc.clone()), row, ctx)
-                                .map_err(EngineError::Eval)?;
+                            // v7.39 (round 596) — an expression now, evaluated
+                            // directly rather than rebuilt as a column node.
+                            let v = eval::eval_expr(oc, row, ctx).map_err(EngineError::Eval)?;
                             if matches!(v, Value::Null) {
                                 any_null = true;
                             }
                             key_vals.push(v);
                         }
                         // NULL key component → never matches → not present.
-                        let present = !any_null && set.contains(&aggregate::encode_key(&key_vals));
+                        let present = !any_null && set.contains(&aggregate::encode_canonical_key(&key_vals));
                         let bit = if *negated { !present } else { present };
                         *e = Expr::Literal(Literal::Bool(bit));
                         return Ok(());
@@ -1471,8 +1472,40 @@ impl Engine {
             return Ok(None);
         };
         let conjuncts = reorder::split_and_conjunctions(w);
+        // v7.39 (round 596) — the outer side of a correlation may be an
+        // EXPRESSION over outer columns, not only a bare column. Deliberately
+        // an allowlist of node kinds rather than "does it only mention outer
+        // columns": a node the walk did not know about, or a function whose
+        // volatility SPG cannot look up, would both be admitted silently, and
+        // a volatile key would probe the wrong bucket. Same rule round 590
+        // used for the computed JOIN key.
+        let outer_only_key = |e: &Expr| -> bool {
+            fn shape(e: &Expr, is_outer: &dyn Fn(&spg_sql::ast::ColumnName) -> bool) -> bool {
+                use spg_sql::ast::BinOp as B;
+                match e {
+                    Expr::Column(c) => is_outer(c),
+                    Expr::Literal(_) => true,
+                    Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => shape(expr, is_outer),
+                    Expr::Binary { lhs, op, rhs } => {
+                        matches!(op, B::Add | B::Sub | B::Mul | B::Div | B::IntDiv | B::Mod)
+                            && shape(lhs, is_outer)
+                            && shape(rhs, is_outer)
+                    }
+                    _ => false,
+                }
+            }
+            fn mentions_column(e: &Expr) -> bool {
+                match e {
+                    Expr::Column(_) => true,
+                    Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => mentions_column(expr),
+                    Expr::Binary { lhs, rhs, .. } => mentions_column(lhs) || mentions_column(rhs),
+                    _ => false,
+                }
+            }
+            shape(e, &is_outer) && mentions_column(e)
+        };
         let mut inner_keys: Vec<spg_sql::ast::ColumnName> = Vec::new();
-        let mut outer_cols: Vec<spg_sql::ast::ColumnName> = Vec::new();
+        let mut outer_cols: Vec<Expr> = Vec::new();
         let mut rest: Vec<&Expr> = Vec::new();
         for c in conjuncts {
             if let Expr::Binary {
@@ -1480,14 +1513,15 @@ impl Engine {
                 op: BinOp::Eq,
                 rhs,
             } = c
-                && let (Expr::Column(a), Expr::Column(b)) = (lhs.as_ref(), rhs.as_ref())
             {
-                let pair = if is_inner(a) && is_outer(b) {
-                    Some((a.clone(), b.clone()))
-                } else if is_inner(b) && is_outer(a) {
-                    Some((b.clone(), a.clone()))
-                } else {
-                    None
+                let pair = match (lhs.as_ref(), rhs.as_ref()) {
+                    (Expr::Column(a), other) if is_inner(a) && outer_only_key(other) => {
+                        Some((a.clone(), other.clone()))
+                    }
+                    (other, Expr::Column(b)) if is_inner(b) && outer_only_key(other) => {
+                        Some((b.clone(), other.clone()))
+                    }
+                    _ => None,
                 };
                 if let Some((ic, oc)) = pair {
                     inner_keys.push(ic);
@@ -1542,7 +1576,7 @@ impl Engine {
             if keys.iter().any(|v| matches!(v, Value::Null)) {
                 continue;
             }
-            set.insert(aggregate::encode_key(keys));
+            set.insert(aggregate::encode_canonical_key(keys));
         }
         Ok(Some((outer_cols, set)))
     }
@@ -4331,14 +4365,16 @@ fn splice_planned_exists(
             let mut key_vals: Vec<Value<'static>> = Vec::with_capacity(outer_cols.len());
             let mut any_null = false;
             for oc in outer_cols {
-                let v = eval::eval_expr(&Expr::Column(oc.clone()), row, ctx)
-                    .map_err(EngineError::Eval)?;
+                // v7.39 (round 596) — the outer side is an expression now, so
+                // this evaluates it directly instead of rebuilding a column
+                // node per outer row (which allocated, per row per key).
+                let v = eval::eval_expr(oc, row, ctx).map_err(EngineError::Eval)?;
                 if matches!(v, Value::Null) {
                     any_null = true;
                 }
                 key_vals.push(v);
             }
-            let present = !any_null && set.contains(&aggregate::encode_key(&key_vals));
+            let present = !any_null && set.contains(&aggregate::encode_canonical_key(&key_vals));
             let bit = if *negated { !present } else { present };
             *e = Expr::Literal(Literal::Bool(bit));
             Ok(true)

@@ -145,8 +145,14 @@ pub type ExprPlan = (
 /// built in ONE scan. An outer row's EXISTS reduces to a membership
 /// test, turning O(outer x inner-exec) per-row work into O(scan + outer
 /// lookups) - PG's Hash Semi/Anti Join.
+/// v7.39 (round 596) — the outer side is an EXPRESSION, not just a column.
+/// `EXISTS (SELECT 1 FROM b WHERE b.id = a.id + 1)` correlates just as
+/// exactly as `b.id = a.id` does, but only the column shape decorrelated, so
+/// the expression shape ran the subquery once per outer row: O(n²), and
+/// measured at 427 ms / 1.6 s / 6.4 s / >25 s as the table went 2k / 4k / 8k
+/// / 16k, where the column shape stays linear (0.5 / 0.9 / 1.5 / 3.2 ms).
 pub type ExistsSet = (
-    alloc::vec::Vec<spg_sql::ast::ColumnName>,
+    alloc::vec::Vec<spg_sql::ast::Expr>,
     alloc::collections::BTreeSet<String>,
 );
 
