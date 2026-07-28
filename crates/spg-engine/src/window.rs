@@ -27,7 +27,13 @@ pub(crate) fn select_has_window(stmt: &SelectStatement) -> bool {
             return true;
         }
     }
-    false
+    // v7.39 (round 592) — a window function can appear in ORDER BY without
+    // being selected: `SELECT id FROM t ORDER BY row_number() OVER (…)` is a
+    // query PG answers. Only the select list was consulted, so the statement
+    // took the ordinary path and the call reached row eval, where it produced
+    // the internal "engine rewrite bug" message — the same leak round 229
+    // closed for WHERE and HAVING, from the other direction.
+    stmt.order_by.iter().any(|o| expr_has_window(&o.expr))
 }
 
 /// v7.39 (round 229) — PG forbids window functions in WHERE and HAVING:

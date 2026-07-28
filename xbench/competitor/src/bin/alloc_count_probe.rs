@@ -120,6 +120,18 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(200_000);
     let mut e = seed(n);
+    // v7.39 (round 592) — an ad-hoc query as argv[2], so a shape can be
+    // counted without editing the list below.
+    if let Some(sql) = std::env::args().nth(2) {
+        let (allocs, bytes, frees, ms) = measure(&mut e, &sql);
+        #[allow(clippy::cast_precision_loss)]
+        let per_row = allocs as f64 / n as f64;
+        println!(
+            "{n} rows | {allocs} allocs | {frees} frees | {:.1} MB | {ms:.1} ms | {per_row:.2}/row",
+            bytes as f64 / 1_048_576.0
+        );
+        return;
+    }
     println!("{n} rows a side\n");
     println!("| query                      |    allocs |    frees |      MB |     ms | allocs/row |");
     println!("|----------------------------|----------:|---------:|--------:|-------:|-----------:|");
