@@ -5527,6 +5527,14 @@ impl Engine {
         // back in input order. The projection is built by now, so the Nth output
         // column is known — resolve against it.
         let order_by = resolve_positional_order_by(&stmt.order_by, &projection);
+        // v7.39 (round 600) — the ORDER BY of an SRF query is decided on the
+        // EXPANDED rows, so a key naming a select-list item reads that item.
+        let srf_order_cols: Vec<Option<usize>> = if srf_position.is_some() {
+            srf_order_output_cols(&order_by, &projection)
+        } else {
+            Vec::new()
+        };
+        let srf_key_bound: Vec<Option<usize>> = (0..order_by.len()).map(Some).collect();
         // v7.37.x (docker-fair SCALARSQ attack) — early-limit gate for
         // the no-ORDER-BY-no-DISTINCT-no-TIES-no-SRF-no-WHERE shape.
         // Hoisted above the closure so the projection-eval path can
@@ -5637,7 +5645,12 @@ impl Engine {
             }
             // Under DISTINCT the keys are built AFTER the dup probe
             // (survivors only); the non-distinct order is unchanged.
-            let order_keys = if order_by.is_empty() || stmt.distinct {
+            // v7.39 (round 600) — an SRF query's keys are built per EXPANDED
+            // row further down, and building them here would evaluate the
+            // ORDER BY against the INPUT row: a key naming the SRF's own
+            // output became a scalar call to it, which is where
+            // "function unnest(integer[]) does not exist" came from.
+            let order_keys = if order_by.is_empty() || stmt.distinct || srf_position.is_some() {
                 Vec::new()
             } else {
                 let mut buf = key_pool.pop().unwrap_or_default();
@@ -5681,11 +5694,6 @@ impl Engine {
                 buf
             };
             if srf_position.is_some() {
-                let order_keys = if stmt.distinct && !order_by.is_empty() {
-                    build_order_keys(&order_by, row, &ctx)?
-                } else {
-                    order_keys
-                };
                 let plan = srf_plan.as_mut().expect("srf_position implies a plan");
                 for out in expand_srf_row_with(self, plan, &projection, row, &ctx)? {
                     if stmt.distinct {
@@ -5698,7 +5706,35 @@ impl Engine {
                         bucket.push(tagged.len());
                     }
                     budget.charge(approx_row_bytes(&out))?;
-                    tagged.push((order_keys.clone(), out));
+                    // The keys come from THIS expanded row: a key naming a
+                    // select-list item reads its value, anything else is
+                    // still evaluated against the input row.
+                    let keys = if order_by.is_empty() {
+                        Vec::new()
+                    } else {
+                        let mut kv: Vec<Value<'static>> = Vec::with_capacity(order_by.len());
+                        for (k, ob) in order_by.iter().enumerate() {
+                            kv.push(match srf_order_cols.get(k).copied().flatten() {
+                                Some(p) => out.values.get(p).cloned().unwrap_or(Value::Null),
+                                None => eval::eval_expr(&ob.expr, row, &ctx)
+                                    .map_err(EngineError::Eval)?,
+                            });
+                        }
+                        // Packed by the same code every other ORDER BY uses,
+                        // so DESC / NULLS FIRST / the MySQL rule are not
+                        // restated here.
+                        let key_row = Row::new(kv);
+                        let mut buf = Vec::new();
+                        crate::orderby::build_order_keys_bound(
+                            &order_by,
+                            &srf_key_bound,
+                            &key_row,
+                            &ctx,
+                            &mut buf,
+                        )?;
+                        buf
+                    };
+                    tagged.push((keys, out));
                 }
             } else {
                 let values = &mut proj_buf;
@@ -9898,6 +9934,69 @@ fn expand_srf_row_with(
 }
 
 /// The one-shot spelling, for the callers that expand a single row.
+/// v7.39 (round 600) — which output column each ORDER BY key names, for a
+/// query whose target list contains a set-returning function.
+///
+/// The keys used to be built from the INPUT row, before the SRF expanded, so
+/// anything that named the SRF's own output was evaluated as a scalar call:
+/// `SELECT unnest(ARRAY[g,id]) v FROM sr ORDER BY v` answered
+/// "function unnest(integer[]) does not exist", and so did the spellings that
+/// repeat the call or reach it through `ORDER BY 1`. Where it did not error
+/// it silently did nothing — `SELECT DISTINCT unnest(…) … ORDER BY 1` came
+/// back in input order. PG sorts AFTER the expansion, so a key that names a
+/// select-list item reads that item's value out of the expanded row.
+///
+/// `None` keeps the key on the input row, which is where an ORDER BY naming
+/// a column the query does not project has to be evaluated.
+fn srf_order_output_cols(
+    order_by: &[spg_sql::ast::OrderBy],
+    projection: &[ProjectedItem],
+) -> Vec<Option<usize>> {
+    order_by
+        .iter()
+        .map(|ob| {
+            // A positive ordinal is the Nth output column, directly.
+            // `resolve_positional_order_by` deliberately leaves an ordinal
+            // pointing at a set-returning item alone — copying the call into
+            // ORDER BY would have made the key "the whole set" back when keys
+            // came from the input row. Reading the expanded row's column is
+            // what it should have meant, and is what this does.
+            if let Expr::Literal(spg_sql::ast::Literal::Integer(n)) = &ob.expr
+                && *n >= 1
+                && let Ok(idx) = usize::try_from(*n - 1)
+                && idx < projection.len()
+            {
+                return Some(idx);
+            }
+            // An unqualified name matching exactly one output name. SQL
+            // resolves ORDER BY against the select list first, so this wins
+            // over an input column of the same name — which is the whole
+            // point of `SELECT g AS id … ORDER BY id`.
+            if let Expr::Column(c) = &ob.expr
+                && c.qualifier.is_none()
+            {
+                let mut hit = None;
+                for (i, p) in projection.iter().enumerate() {
+                    if p.output_name.eq_ignore_ascii_case(&c.name) {
+                        if hit.is_some() {
+                            hit = None;
+                            break;
+                        }
+                        hit = Some(i);
+                    }
+                }
+                if hit.is_some() {
+                    return hit;
+                }
+            }
+            // Or the same expression as a select-list item — which is what
+            // `ORDER BY 1` becomes once `resolve_positional_order_by` has
+            // run, and what a repeated `ORDER BY unnest(…)` is.
+            projection.iter().position(|p| p.expr == ob.expr)
+        })
+        .collect()
+}
+
 fn expand_srf_row(
     engine: &Engine,
     projection: &[ProjectedItem],
