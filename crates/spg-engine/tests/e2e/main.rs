@@ -130,6 +130,7 @@ mod e2e_join_bucket_round576;
 mod e2e_join_side_filter_round574;
 mod e2e_fused_extremes_round569;
 mod e2e_order_key_bound_round582;
+mod e2e_ansi89_join_round588;
 mod e2e_topk_boundary_round581;
 mod e2e_topk_floor_round580;
 mod e2e_topk_recycle_round571;
