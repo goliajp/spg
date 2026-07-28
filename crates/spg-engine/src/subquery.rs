@@ -287,6 +287,29 @@ impl Engine {
             // planned EXISTS set, or both — anything that lets us skip
             // the per-row `expr.clone()` + `resolve_correlated_in_expr`
             // dispatch for the corresponding subquery class.
+            // v7.39 (round 616) — the predicate that IS a single EXISTS needs
+            // no tree at all.
+            //
+            // The splice below replaces the EXISTS node with a boolean, and to
+            // do that it CLONES the whole expression for every outer row —
+            // which, for an `Expr::Exists`, clones the entire subquery AST
+            // with it. Measured over 100k rows,
+            // `WHERE EXISTS (… b.id = a.id + 1)` cost 18 allocations a row
+            // against 1 for the uncorrelated-key form, and 64.3 ms against
+            // 12.2. When the whole predicate is that node there is nothing to
+            // splice into: read the verdict and hand it back. Taken here,
+            // before the plan is cloned out of the memo, so the row loop does
+            // not copy that either. `NOT EXISTS (…)` arrives as a `Not` over
+            // the node rather than as `negated`, so both spellings are read.
+            if !m.expr_plans.contains_key(&key)
+                && let Some((negated, wrapped_in_not)) = bare_exists_shape(expr)
+                && let Some(plan) = m.exists_plans.get(&key)
+                && plan.len() == 1
+                && let Some(Some(es)) = plan.first()
+            {
+                let bit = planned_exists_bit(es, negated, row, ctx)?;
+                return Ok(Value::Bool(if wrapped_in_not { !bit } else { bit }));
+            }
             let scalar_ready = m
                 .expr_plans
                 .get(&key)
@@ -4340,6 +4363,49 @@ pub(crate) fn collect_exists_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a Selec
         _ => {}
     }
 }
+/// v7.39 (round 616) — `EXISTS (…)` or `NOT EXISTS (…)` and nothing else.
+/// Returns the node's own `negated` flag and whether a `NOT` wraps it.
+fn bare_exists_shape(e: &Expr) -> Option<(bool, bool)> {
+    match e {
+        Expr::Exists { negated, .. } => Some((*negated, false)),
+        Expr::Unary {
+            op: spg_sql::ast::UnOp::Not,
+            expr: inner,
+        } => match inner.as_ref() {
+            Expr::Exists { negated, .. } => Some((*negated, true)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// v7.39 (round 616) — the verdict a planned EXISTS gives for one outer row.
+///
+/// Split out of the splice so the shape that IS a single EXISTS can be
+/// answered without cloning anything: see the caller.
+fn planned_exists_bit(
+    es: &memoize::ExistsSet,
+    negated: bool,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<bool, EngineError> {
+    let (outer_cols, set) = es;
+    let mut key_vals: Vec<Value<'static>> = Vec::with_capacity(outer_cols.len());
+    let mut any_null = false;
+    for oc in outer_cols {
+        // v7.39 (round 596) — the outer side is an expression now, so this
+        // evaluates it directly instead of rebuilding a column node per
+        // outer row (which allocated, per row per key).
+        let v = eval::eval_expr(oc, row, ctx).map_err(EngineError::Eval)?;
+        if matches!(v, Value::Null) {
+            any_null = true;
+        }
+        key_vals.push(v);
+    }
+    let present = !any_null && set.contains(&aggregate::encode_canonical_key(&key_vals));
+    Ok(if negated { !present } else { present })
+}
+
 
 /// v7.34.2 — per-row splice for the planned EXISTS sets. Walks the
 /// (cloned) host expression in the SAME pre-order as
@@ -4361,21 +4427,7 @@ fn splice_planned_exists(
                 return Ok(false);
             };
             *idx += 1;
-            let (outer_cols, set) = es.as_ref();
-            let mut key_vals: Vec<Value<'static>> = Vec::with_capacity(outer_cols.len());
-            let mut any_null = false;
-            for oc in outer_cols {
-                // v7.39 (round 596) — the outer side is an expression now, so
-                // this evaluates it directly instead of rebuilding a column
-                // node per outer row (which allocated, per row per key).
-                let v = eval::eval_expr(oc, row, ctx).map_err(EngineError::Eval)?;
-                if matches!(v, Value::Null) {
-                    any_null = true;
-                }
-                key_vals.push(v);
-            }
-            let present = !any_null && set.contains(&aggregate::encode_canonical_key(&key_vals));
-            let bit = if *negated { !present } else { present };
+            let bit = planned_exists_bit(es, *negated, row, ctx)?;
             *e = Expr::Literal(Literal::Bool(bit));
             Ok(true)
         }
