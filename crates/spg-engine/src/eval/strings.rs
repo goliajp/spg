@@ -541,8 +541,13 @@ pub(super) fn format_string(
             detail: "format() takes at least 1 arg (format string)".into(),
         });
     }
-    let fmt = match &args[0] {
-        Value::Text(s) => s.clone(),
+    // v7.39 (round 611) — `format('%s/%s', s, id)` allocated TEN times a row
+    // over 200k rows to build one string: the format string was cloned, each
+    // conversion spec built two `String`s just to hold its digits, each
+    // argument was cloned out of the slice, and each was then rendered into
+    // another owned `String`. Only the result has to be built.
+    let fmt: &str = match &args[0] {
+        Value::Text(s) => s.as_ref(),
         Value::Null => return Ok(Value::Null),
         other => {
             return Err(EvalError::TypeMismatch {
@@ -554,7 +559,10 @@ pub(super) fn format_string(
         }
     };
     let arg_values = &args[1..];
-    let mut out = String::new();
+    // Sized from the format string plus a little for the substitutions: an
+    // empty `String` reallocated its way up through 8 / 16 / 32 bytes for
+    // every row.
+    let mut out = String::with_capacity(fmt.len() + 16 * arg_values.len().max(1));
     let mut chars = fmt.chars().peekable();
     // Position cursor — next implicit arg picked when no `n$`
     // prefix is given. PG's format uses a 1-based cursor that
@@ -565,13 +573,23 @@ pub(super) fn format_string(
             out.push(c);
             continue;
         }
-        // Parse optional `n$` position prefix.
+        // Parse optional `n$` position prefix. Accumulated as a number
+        // rather than buffered as text: the digits are either the position or
+        // the width, and both are read back as one.
         let mut explicit_pos: Option<usize> = None;
-        // Buffer the digits so we can roll back if no `$` follows.
-        let mut digit_buf = String::new();
+        let mut digits: usize = 0;
+        let mut ndigits = 0usize;
+        let mut digits_overflowed = false;
         while let Some(&d) = chars.peek() {
             if d.is_ascii_digit() {
-                digit_buf.push(d);
+                match digits
+                    .checked_mul(10)
+                    .and_then(|n| n.checked_add(d as usize - '0' as usize))
+                {
+                    Some(n) => digits = n,
+                    None => digits_overflowed = true,
+                }
+                ndigits += 1;
                 chars.next();
             } else {
                 break;
@@ -579,19 +597,19 @@ pub(super) fn format_string(
         }
         // PG conversion spec: `% [n$] [-] [width] type`. The pre-`$` digits are
         // the arg position; otherwise they are the field width.
-        let mut width_digits = String::new();
-        if !digit_buf.is_empty() && matches!(chars.peek(), Some(&'$')) {
+        let mut have_width = false;
+        let mut width_digits: usize = 0;
+        if ndigits > 0 && matches!(chars.peek(), Some(&'$')) {
             chars.next(); // consume `$`
-            explicit_pos =
-                Some(
-                    digit_buf
-                        .parse::<usize>()
-                        .map_err(|_| EvalError::TypeMismatch {
-                            detail: format!("format(): invalid arg position {digit_buf:?}"),
-                        })?,
-                );
-        } else {
-            width_digits = digit_buf.clone();
+            if digits_overflowed {
+                return Err(EvalError::TypeMismatch {
+                    detail: String::from("format(): invalid arg position"),
+                });
+            }
+            explicit_pos = Some(digits);
+        } else if ndigits > 0 {
+            have_width = true;
+            width_digits = if digits_overflowed { 0 } else { digits };
         }
         // `-` flag (left-justify) then width — but only when the width wasn't
         // already captured as the pre-`$` digits above. The width may be a
@@ -599,7 +617,7 @@ pub(super) fn format_string(
         // `format('%*s', 5, 'x')` right-pads 'x' to width 5).
         let mut left_justify = false;
         let mut width_from_arg = false;
-        if width_digits.is_empty() {
+        if !have_width {
             if matches!(chars.peek(), Some(&'-')) {
                 chars.next();
                 left_justify = true;
@@ -610,7 +628,9 @@ pub(super) fn format_string(
             } else {
                 while let Some(&d) = chars.peek() {
                     if d.is_ascii_digit() {
-                        width_digits.push(d);
+                        width_digits = width_digits
+                            .saturating_mul(10)
+                            .saturating_add(d as usize - '0' as usize);
                         chars.next();
                     } else {
                         break;
@@ -621,15 +641,12 @@ pub(super) fn format_string(
         let width: usize = if width_from_arg {
             // The `*` consumes one implicit argument as the width. PG: a
             // negative width means left-justify with the absolute width.
-            let w_arg = arg_values
-                .get(implicit_cursor)
-                .cloned()
-                .unwrap_or(Value::Null);
+            let w_arg = arg_values.get(implicit_cursor);
             implicit_cursor += 1;
             let w = match w_arg {
-                Value::SmallInt(n) => i64::from(n),
-                Value::Int(n) => i64::from(n),
-                Value::BigInt(n) => n,
+                Some(Value::SmallInt(n)) => i64::from(*n),
+                Some(Value::Int(n)) => i64::from(*n),
+                Some(Value::BigInt(n)) => *n,
                 _ => 0,
             };
             if w < 0 {
@@ -639,7 +656,7 @@ pub(super) fn format_string(
             let uw = w.unsigned_abs() as usize;
             uw
         } else {
-            width_digits.parse().unwrap_or(0)
+            width_digits
         };
         // Specifier character.
         let spec = match chars.next() {
@@ -662,26 +679,31 @@ pub(super) fn format_string(
                 i
             }
         };
-        let arg = arg_values.get(arg_index).cloned().unwrap_or(Value::Null);
+        let arg = arg_values.get(arg_index);
         // Build the converted text for this conversion, then apply the field
         // width (minimum width; PG never truncates, pads with spaces).
-        let converted: String = match spec {
+        let converted: alloc::borrow::Cow<'_, str> = match spec {
             's' => match arg {
-                Value::Null => String::new(), // PG: NULL renders as empty for %s.
-                v => value_to_format_text_styled(&v, style),
+                // PG: NULL renders as empty for %s.
+                None | Some(Value::Null) => alloc::borrow::Cow::Borrowed(""),
+                // Already the text it renders as, so no copy is needed.
+                Some(Value::Text(s)) => alloc::borrow::Cow::Borrowed(s.as_ref()),
+                Some(v) => alloc::borrow::Cow::Owned(value_to_format_text_styled(v, style)),
             },
             'I' => match arg {
-                Value::Null => {
+                None | Some(Value::Null) => {
                     return Err(EvalError::TypeMismatch {
                         detail: "format(): NULL is not a valid identifier (%I)".into(),
                     });
                 }
-                v => pg_quote_ident(&value_to_format_text_styled(&v, style)),
+                Some(v) => alloc::borrow::Cow::Owned(pg_quote_ident(
+                    &value_to_format_text_styled(v, style),
+                )),
             },
             'L' => match arg {
-                Value::Null => "NULL".into(),
-                v => {
-                    let s = value_to_format_text_styled(&v, style);
+                None | Some(Value::Null) => alloc::borrow::Cow::Borrowed("NULL"),
+                Some(v) => {
+                    let s = value_to_format_text_styled(v, style);
                     let mut q = String::with_capacity(s.len() + 2);
                     q.push('\'');
                     for ch in s.chars() {
@@ -691,7 +713,7 @@ pub(super) fn format_string(
                         q.push(ch);
                     }
                     q.push('\'');
-                    q
+                    alloc::borrow::Cow::Owned(q)
                 }
             },
             other => {
