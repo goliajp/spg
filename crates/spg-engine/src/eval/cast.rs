@@ -744,6 +744,13 @@ pub fn cast_value_ref_in(
             }),
         },
         CastTarget::Named(name) => {
+            // v7.39 (round 613) — a plain scalar spelling goes straight to
+            // the tail. See `PLAIN_NAMED_TARGETS` for why that is the same
+            // thing as walking the arm, and the pin for the check that says
+            // so mechanically.
+            if let Some(dt) = plain_named_target(name) {
+                return finish_named_cast(v, dt, name, None, mysql);
+            }
             // v7.38 (read01) — a temporal type with a fractional-seconds
             // precision (`time(3)`, `timestamp(0)`, `timestamptz(2)`) rounds the
             // sub-second field to that many digits, like PG. Resolve against the
@@ -1071,66 +1078,166 @@ pub fn cast_value_ref_in(
                             }),
                     }
                 })?;
-            // PG semantics: any value casts to varchar(n) / char(n) through
-            // its text representation (`99::char(2)` → '99'), and an EXPLICIT
-            // cast truncates to n characters — only column assignment errors on
-            // overflow. Stringify a non-text source first, then truncate up
-            // front so the coerce path's length contract never fires here.
-            let v = match (&dt, v) {
-                // v7.38 (read01) — an explicit cast to TEXT stringifies any
-                // value (`text(42)` → '42'), matching `42::text`. (coerce_value
-                // deliberately rejects a bare INT→TEXT so INSERT stays strict.)
-                (spg_storage::DataType::Text, v) => match v {
-                    Value::Text(s) => Value::Text(s),
-                    // v7.39 (read01 inet family) — inet/cidr ::text carries
-                    // the mask even at full length (cast-path form).
-                    Value::Inet { family, bits, addr } | Value::Cidr { family, bits, addr } => {
-                        Value::text(crate::conversions::format_inet_full(family, bits, &addr))
-                    }
-                    other => Value::text(value_to_text(&other)),
-                },
-                (spg_storage::DataType::Varchar(n) | spg_storage::DataType::Char(n), v) => {
-                    // v7.37 D.36 — previously only `Value::Text` was handled, so
-                    // `99::char(2)` reached coerce_value as an INT and hit a
-                    // CHAR/INT storage type-mismatch.
-                    // v7.39 (bpchar epic) — a bpchar source enters through its
-                    // text cast (trailing blanks stripped): `::varchar` keeps
-                    // the stripped form, `::char(m)` re-pads in coerce_value.
-                    let s = match v {
-                        Value::Text(s) => s.into_owned(),
-                        Value::BpChar(s) => s.trim_end_matches(' ').to_string(),
-                        other => value_to_text(&other),
-                    };
-                    let s = if *n > 0 && s.chars().count() > *n as usize {
-                        s.chars()
-                            .take(*n as usize)
-                            .collect::<alloc::string::String>()
-                    } else {
-                        s
-                    };
-                    Value::text(s)
-                }
-                (_, v) => v,
-            };
-            let coerced =
-                crate::conversions::coerce_value(v, dt, &resolve_name, 0).map_err(|e| match e {
-                    // v7.39 (read01 round 113) — pass an already-classed engine
-                    // error through unchanged. Re-stringifying via Display would
-                    // double the "eval: type mismatch: " class prefix (the wire
-                    // strips only the outermost one), leaking it into the message
-                    // — visible now that jsonb → numeric casts error with PG's
-                    // exact "cannot cast jsonb string to type numeric" wording.
-                    crate::EngineError::Eval(ev) => ev,
-                    other => EvalError::TypeMismatch {
-                        detail: alloc::format!("{other}"),
-                    },
-                })?;
-            Ok(match temporal_prec {
-                Some(prec) => round_temporal_to_precision(coerced, prec, mysql),
-                None => coerced,
-            })
+            finish_named_cast(v, dt, &resolve_name, temporal_prec, mysql)
         }
     }
+}
+
+/// v7.39 (round 613) — the tail of the `Named` arm: stringify for the text
+/// targets, coerce, and round a temporal precision. Split out so the fast
+/// path below reaches exactly this code rather than a copy of it.
+fn finish_named_cast(
+    v: Value<'static>,
+    dt: spg_storage::DataType,
+    resolve_name: &str,
+    temporal_prec: Option<u8>,
+    mysql: bool,
+) -> Result<Value<'static>, EvalError> {
+    // PG semantics: any value casts to varchar(n) / char(n) through its text
+    // representation (`99::char(2)` → '99'), and an EXPLICIT cast truncates
+    // to n characters — only column assignment errors on overflow. Stringify
+    // a non-text source first, then truncate up front so the coerce path's
+    // length contract never fires here.
+    let v = match (&dt, v) {
+        // v7.38 (read01) — an explicit cast to TEXT stringifies any
+        // value (`text(42)` → '42'), matching `42::text`. (coerce_value
+        // deliberately rejects a bare INT→TEXT so INSERT stays strict.)
+        (spg_storage::DataType::Text, v) => match v {
+            Value::Text(s) => Value::Text(s),
+            // v7.39 (read01 inet family) — inet/cidr ::text carries
+            // the mask even at full length (cast-path form).
+            Value::Inet { family, bits, addr } | Value::Cidr { family, bits, addr } => {
+                Value::text(crate::conversions::format_inet_full(family, bits, &addr))
+            }
+            other => Value::text(value_to_text(&other)),
+        },
+        (spg_storage::DataType::Varchar(n) | spg_storage::DataType::Char(n), v) => {
+            // v7.37 D.36 — previously only `Value::Text` was handled, so
+            // `99::char(2)` reached coerce_value as an INT and hit a
+            // CHAR/INT storage type-mismatch.
+            // v7.39 (bpchar epic) — a bpchar source enters through its
+            // text cast (trailing blanks stripped): `::varchar` keeps
+            // the stripped form, `::char(m)` re-pads in coerce_value.
+            let s = match v {
+                Value::Text(s) => s.into_owned(),
+                Value::BpChar(s) => s.trim_end_matches(' ').to_string(),
+                other => value_to_text(&other),
+            };
+            let s = if *n > 0 && s.chars().count() > *n as usize {
+                s.chars()
+                    .take(*n as usize)
+                    .collect::<alloc::string::String>()
+            } else {
+                s
+            };
+            Value::text(s)
+        }
+        (_, v) => v,
+    };
+    let coerced =
+        crate::conversions::coerce_value(v, dt, resolve_name, 0).map_err(|e| match e {
+            // v7.39 (read01 round 113) — pass an already-classed engine
+            // error through unchanged. Re-stringifying via Display would
+            // double the "eval: type mismatch: " class prefix (the wire
+            // strips only the outermost one), leaking it into the message
+            // — visible now that jsonb → numeric casts error with PG's
+            // exact "cannot cast jsonb string to type numeric" wording.
+            crate::EngineError::Eval(ev) => ev,
+            other => EvalError::TypeMismatch {
+                detail: alloc::format!("{other}"),
+            },
+        })?;
+    Ok(match temporal_prec {
+        Some(prec) => round_temporal_to_precision(coerced, prec, mysql),
+        None => coerced,
+    })
+}
+
+/// v7.39 (round 613) — the plain scalar spellings, with the type each one
+/// resolves to.
+///
+/// Round 612 measured the `Named` arm re-deriving everything for every row:
+/// `s::VARCHAR` cost 30.6 ms over 200k rows where `s::TEXT` — the identical
+/// conversion, under a spelling the parser settles into a `CastTarget`
+/// variant — cost 11.2, and probes split the difference across the whole arm
+/// rather than any one place in it. These names reach the tail directly.
+///
+/// Both halves of that shortcut are checked mechanically by the pin, not by
+/// eye: every entry's type is asserted to equal `type_name_to_data_type`'s
+/// answer, and every entry is asserted absent from each arm above the
+/// resolve (the reg-misc / catalog-scalar / opaque lists, `tid`, `xid`,
+/// `xid8`, `jsonpath`, the MySQL `binary` / `signed` / `unsigned` names, and
+/// the bit and temporal spellings). A name that grows a special case has to
+/// leave this table, and the pin says so.
+const PLAIN_NAMED_TARGETS: &[(&str, spg_storage::DataType)] = &[
+    ("text", spg_storage::DataType::Text),
+    ("varchar", spg_storage::DataType::Varchar(0)),
+    ("character varying", spg_storage::DataType::Varchar(0)),
+    (
+        "numeric",
+        spg_storage::DataType::Numeric {
+            precision: 0,
+            scale: 0,
+        },
+    ),
+    (
+        "decimal",
+        spg_storage::DataType::Numeric {
+            precision: 0,
+            scale: 0,
+        },
+    ),
+    ("real", spg_storage::DataType::Real),
+    ("float4", spg_storage::DataType::Real),
+    ("float8", spg_storage::DataType::Float),
+    ("double precision", spg_storage::DataType::Float),
+    ("int2", spg_storage::DataType::SmallInt),
+    ("smallint", spg_storage::DataType::SmallInt),
+    ("int4", spg_storage::DataType::Int),
+    ("integer", spg_storage::DataType::Int),
+    ("int8", spg_storage::DataType::BigInt),
+    ("bool", spg_storage::DataType::Bool),
+    ("boolean", spg_storage::DataType::Bool),
+    ("date", spg_storage::DataType::Date),
+    ("bytea", spg_storage::DataType::Bytes),
+    ("uuid", spg_storage::DataType::Uuid),
+];
+
+/// v7.39 (round 613) — the heads that may carry a typmod and are still
+/// plain: `varchar(20)`, `char(4)`, `numeric(10,2)`. The type comes from
+/// `type_name_to_data_type` over the WHOLE name, so the typmod is parsed
+/// exactly where it always was; only the walk down the arm is skipped. The
+/// pin checks each head against every arm above the resolve, and that none
+/// of them is a bit or temporal spelling.
+pub(crate) const PLAIN_NAMED_HEADS: &[&str] = &[
+    "varchar",
+    "character varying",
+    "char",
+    "character",
+    "bpchar",
+    "numeric",
+    "decimal",
+];
+
+/// The type a plain scalar spelling resolves to, or `None` when the name
+/// needs the whole arm.
+pub(crate) fn plain_named_target(name: &str) -> Option<spg_storage::DataType> {
+    if let Some(dt) = PLAIN_NAMED_TARGETS
+        .iter()
+        .find(|(k, _)| name.eq_ignore_ascii_case(k))
+        .map(|(_, dt)| *dt)
+    {
+        return Some(dt);
+    }
+    let head = name.split('(').next()?.trim();
+    if name.len() == head.len()
+        || !PLAIN_NAMED_HEADS
+            .iter()
+            .any(|k| head.eq_ignore_ascii_case(k))
+    {
+        return None;
+    }
+    crate::conversions::type_name_to_data_type(name)
 }
 
 /// The scalar type names the `Named` arm resolves without a catalog.
@@ -2114,4 +2221,109 @@ pub fn parse_vector_text(s: &str) -> Option<Vec<f32>> {
         out.push(f);
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod round613_plain_named_targets {
+    use super::*;
+
+    /// v7.39 (round 613) — the shortcut is only equivalent to walking the
+    /// arm while these hold. Checked here rather than by eye, so a name that
+    /// grows a special case above the resolve fails the gate instead of
+    /// silently taking the wrong path.
+    fn assert_no_arm_above_the_resolve_claims(name: &str) {
+        assert!(
+            !REG_MISC_TYPES.iter().any(|k| name.eq_ignore_ascii_case(k)),
+            "{name} is a reg-misc type"
+        );
+        assert!(
+            !CATALOG_SCALAR_TYPES
+                .iter()
+                .any(|k| name.eq_ignore_ascii_case(k)),
+            "{name} is a catalog scalar"
+        );
+        assert!(
+            !OPAQUE_TYPES.iter().any(|k| name.eq_ignore_ascii_case(k)),
+            "{name} is a pseudotype"
+        );
+        for special in [
+            "__bit_literal",
+            "tid",
+            "xid",
+            "xid8",
+            "jsonpath",
+            "binary",
+            "signed",
+            "unsigned",
+        ] {
+            assert!(
+                !name.eq_ignore_ascii_case(special),
+                "{name} has its own arm ({special})"
+            );
+        }
+        assert!(bit_cast_width(name).is_none(), "{name} is a bit spelling");
+        assert!(
+            temporal_typmod(name).is_none(),
+            "{name} carries a temporal precision"
+        );
+        assert!(
+            !is_bare_temporal_type(name),
+            "{name} is a bare temporal type"
+        );
+        assert!(
+            matches!(
+                cast_catalog_scalar(name, &Value::text("x")),
+                Ok(None)
+            ),
+            "{name} is claimed by the catalog-scalar arm"
+        );
+    }
+
+    #[test]
+    fn every_plain_target_resolves_to_the_type_the_table_claims() {
+        for (name, dt) in PLAIN_NAMED_TARGETS {
+            assert_eq!(
+                crate::conversions::type_name_to_data_type(name),
+                Some(*dt),
+                "{name} does not resolve to the type the table gives it"
+            );
+            assert_eq!(plain_named_target(name), Some(*dt));
+            // The spelling is matched without regard to case.
+            assert_eq!(plain_named_target(&name.to_uppercase()), Some(*dt));
+            assert_no_arm_above_the_resolve_claims(name);
+        }
+    }
+
+    #[test]
+    fn every_typmod_head_is_plain_and_resolves_through_the_type_table() {
+        for head in PLAIN_NAMED_HEADS {
+            assert_no_arm_above_the_resolve_claims(head);
+            for spelled in [alloc::format!("{head}(4)"), alloc::format!("{head}(10,2)")] {
+                assert_no_arm_above_the_resolve_claims(&spelled);
+                assert_eq!(
+                    plain_named_target(&spelled),
+                    crate::conversions::type_name_to_data_type(&spelled),
+                    "{spelled} takes a different type through the shortcut"
+                );
+            }
+            // A bare head with no typmod only shortcuts when it is in the
+            // exact table; the head list alone must not claim it.
+            let bare = plain_named_target(head);
+            let exact = PLAIN_NAMED_TARGETS
+                .iter()
+                .find(|(k, _)| head.eq_ignore_ascii_case(k))
+                .map(|(_, dt)| *dt);
+            assert_eq!(bare, exact, "{head} bare");
+        }
+    }
+
+    #[test]
+    fn a_name_with_its_own_arm_is_not_shortcut() {
+        for name in [
+            "regproc", "aclitem", "anyarray", "tid", "xid", "jsonpath", "bit", "bit(4)",
+            "timestamp", "timestamp(2)", "time(3)", "nosuchtype", "int4range",
+        ] {
+            assert_eq!(plain_named_target(name), None, "{name} was shortcut");
+        }
+    }
 }

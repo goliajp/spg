@@ -20805,6 +20805,18 @@ impl Parser {
                         self.advance();
                         name = alloc::string::String::from("varbit");
                     }
+                    // v7.39 (round 613) — `::character varying` is the same
+                    // two-word shape and had no fold, so the `varying` was
+                    // left behind and the cast became a bare `character`,
+                    // which is `char(1)`: `'ab'::CHARACTER VARYING` answered
+                    // `a` where PG answers `ab`. Silently, and for a spelling
+                    // pg_dump writes.
+                    if name.eq_ignore_ascii_case("character")
+                        && matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("varying"))
+                    {
+                        self.advance();
+                        name = alloc::string::String::from("varchar");
+                    }
                     if matches!(self.peek(), Token::LParen) {
                         let mut buf = alloc::string::String::from("(");
                         let mut depth = 0usize;
