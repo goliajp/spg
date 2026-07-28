@@ -5515,6 +5515,19 @@ impl Engine {
         // stored JSON, which is not a cell read.
         let proj_direct = bind_direct_columns(&projection, &ctx);
         let any_proj_direct = proj_direct.iter().any(Option::is_some);
+        // v7.39 (round 605) — a projection item that cannot depend on the row
+        // is evaluated once. `SELECT ('{"a":1}')::JSONB FROM j` cost TEN
+        // allocations a row against one for a plain column, `'abc' || 'def'`
+        // six and `upper('abc')` five, all of them producing the same value
+        // 50,000 times. An item that fails to evaluate is left alone, so its
+        // error still comes from the row loop in the interpreter's wording.
+        let proj_const: Vec<Option<Value<'static>>> = projection
+            .iter()
+            .map(|p| {
+                crate::eval::compiled::constant_projection_value(&p.expr, &ctx)
+            })
+            .collect();
+        let any_proj_const = proj_const.iter().any(Option::is_some);
         crate::bump_counter!(crate::select::SCAN_PATH_ENTERED);
         // v7.39 (read01 round 80) — positional ORDER BY over a WILDCARD
         // projection. Statement prep (`resolve_order_by_position`) can only map
@@ -5748,6 +5761,11 @@ impl Engine {
                     // `eval_expr_with_correlated` framework.
                     if any_scalarsq_fast && let Some(fp) = &scalarsq_fast[i] {
                         values.push(self.probe_with_pk_fast_path(fp, row));
+                        continue;
+                    }
+                    // v7.39 (round 605) — the same value every row.
+                    if any_proj_const && let Some(v) = &proj_const[i] {
+                        values.push(v.clone());
                         continue;
                     }
                     // v7.39 (round 487) — bound column: read the cell.
