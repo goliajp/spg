@@ -3220,7 +3220,7 @@ fn apply_function_dispatch(
                         return x
                             .log_base(&base)
                             .map(crate::eval::binop::bignum_to_value)
-                            .ok_or(EvalError::DivisionByZero);
+                            .ok_or_else(|| EvalError::DivisionByZero);
                     }
                 }
                 let b = value_to_f64(&args[0]).ok_or_else(|| EvalError::TypeMismatch {
@@ -9198,7 +9198,7 @@ fn apply_function_dispatch(
                         ),
                     }
                 })?;
-                let ch = char::from_u32(code).ok_or(EvalError::TypeMismatch {
+                let ch = char::from_u32(code).ok_or_else(|| EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "unistr(): {code:#x} is not a valid Unicode scalar"
                     ),

@@ -133,14 +133,14 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
         (UnOp::Neg, Value::Int(n)) => {
             n.checked_neg()
                 .map(Value::Int)
-                .ok_or(EvalError::TypeMismatch {
+                .ok_or_else(|| EvalError::TypeMismatch {
                     detail: "integer overflow on unary -".into(),
                 })
         }
         (UnOp::Neg, Value::BigInt(n)) => {
             n.checked_neg()
                 .map(Value::BigInt)
-                .ok_or(EvalError::TypeMismatch {
+                .ok_or_else(|| EvalError::TypeMismatch {
                     detail: "bigint out of range".into(),
                 })
         }
@@ -151,7 +151,7 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
         (UnOp::Neg, Value::SmallInt(n)) => {
             n.checked_neg()
                 .map(Value::SmallInt)
-                .ok_or(EvalError::TypeMismatch {
+                .ok_or_else(|| EvalError::TypeMismatch {
                     detail: "smallint overflow on unary -".into(),
                 })
         }
@@ -172,7 +172,7 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
                         scale,
                         kind: NK::Finite,
                     })
-                    .ok_or(EvalError::TypeMismatch {
+                    .ok_or_else(|| EvalError::TypeMismatch {
                         detail: "numeric overflow on unary -".into(),
                     }),
                 // v7.38 (read01, T6.P3) — -(NaN)=NaN, -(±Inf)=∓Inf.
@@ -357,6 +357,44 @@ pub(crate) fn apply_binary_by_ref(
             _ => return Ok(None),
         }
     }
+    // v7.39 (round 614) — integer arithmetic answered here rather than by
+    // falling through to the owning path.
+    //
+    // `apply_binary_by_ref` used to decline every arithmetic operator, so
+    // `id + 1` popped both operands owned and then walked `apply_binary`'s
+    // whole guard chain — inet, pg_lsn, range, multirange, calendar, the
+    // unknown-literal coercion — none of which can match two integers,
+    // before reaching the `arith` call at the bottom. Measured over 500k
+    // rows on a two-INT table: `WHERE id > 5`, which never enters this path
+    // at all, cost 18.1 ms and `WHERE id + 1 > 5` cost 71.9 — for one
+    // addition. The dispatch below is the SAME `arith` / `div_op` /
+    // `mod_op` / `int_div_op` the bottom of `apply_binary` calls, with the
+    // same arguments, so the answer (and every overflow and divide-by-zero
+    // error) is identical by construction rather than by a second reading.
+    let int_operand = |v: &Value<'_>| match v {
+        Value::SmallInt(n) => Some(Value::SmallInt(*n)),
+        Value::Int(n) => Some(Value::Int(*n)),
+        Value::BigInt(n) => Some(Value::BigInt(*n)),
+        _ => None,
+    };
+    if matches!(
+        op,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::IntDiv | BinOp::Mod
+    ) && let (Some(a), Some(b)) = (int_operand(l), int_operand(r))
+    {
+        return match op {
+            BinOp::Add => arith(a, b, i64::checked_add, |x, y| x + y, "+"),
+            BinOp::Sub => arith(a, b, i64::checked_sub, |x, y| x - y, "-"),
+            BinOp::Mul => arith(a, b, i64::checked_mul, |x, y| x * y, "*"),
+            BinOp::Div => div_op(a, b),
+            BinOp::IntDiv => int_div_op(&a, &b),
+            BinOp::Mod => mod_op(a, b),
+            _ => unreachable!("guarded by the matches! above"),
+        }
+        .map(Some);
+    }
+
+
     match op {
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             Ok(Some(compare(op, l, r)?))
@@ -1680,7 +1718,7 @@ fn apply_binary_calendar(
             // PG: timestamp - timestamp -> interval, justified to hours (every
             // 24h of the microsecond delta becomes one day). 30h -> `1 day
             // 06:00:00`, not a raw microsecond count.
-            let delta = a.checked_sub(*b).ok_or(EvalError::TypeMismatch {
+            let delta = a.checked_sub(*b).ok_or_else(|| EvalError::TypeMismatch {
                 detail: "interval out of range".into(),
             })?;
             const DAY_US: i64 = 86_400_000_000;
@@ -1719,7 +1757,7 @@ fn apply_binary_calendar(
             let micros = i64::from(*d)
                 .checked_mul(86_400_000_000)
                 .and_then(|day_us| day_us.checked_add(*t))
-                .ok_or(EvalError::TypeMismatch {
+                .ok_or_else(|| EvalError::TypeMismatch {
                     detail: "DATE + TIME overflows TIMESTAMP range".into(),
                 })?;
             return Ok(Some(Value::Timestamp(micros)));
@@ -1753,6 +1791,7 @@ fn apply_binary_calendar(
         }
         _ => {}
     }
+
     Ok(None)
 }
 
@@ -1811,7 +1850,7 @@ pub(crate) fn apply_binary_interval(
     };
     let signed_months = i64::from(*rhs_months) * sign;
     let signed_days = i64::from(*rhs_days) * sign;
-    let signed_micros = rhs_us.checked_mul(sign).ok_or(EvalError::TypeMismatch {
+    let signed_micros = rhs_us.checked_mul(sign).ok_or_else(|| EvalError::TypeMismatch {
         detail: "INTERVAL micros overflows on negation".into(),
     })?;
     match lhs {
@@ -1822,7 +1861,7 @@ pub(crate) fn apply_binary_interval(
             const DAY_US: i64 = 86_400_000_000;
             let shifted = t
                 .checked_add(signed_micros)
-                .ok_or(EvalError::TypeMismatch {
+                .ok_or_else(|| EvalError::TypeMismatch {
                     detail: "TIME ± INTERVAL overflows i64 microseconds".into(),
                 })?;
             Ok(Some(Value::Time(shifted.rem_euclid(DAY_US))))
@@ -1841,7 +1880,7 @@ pub(crate) fn apply_binary_interval(
             let base =
                 i64::from(*d)
                     .checked_mul(86_400_000_000)
-                    .ok_or(EvalError::TypeMismatch {
+                    .ok_or_else(|| EvalError::TypeMismatch {
                         detail: "DATE → TIMESTAMP lift overflows for INTERVAL math".into(),
                     })?;
             Ok(Some(Value::Timestamp(add_interval_to_micros(
@@ -1859,18 +1898,18 @@ pub(crate) fn apply_binary_interval(
             let new_months = i64::from(*lhs_months)
                 .checked_add(signed_months)
                 .and_then(|n| i32::try_from(n).ok())
-                .ok_or(EvalError::TypeMismatch {
+                .ok_or_else(|| EvalError::TypeMismatch {
                     detail: "INTERVAL ± INTERVAL months overflows i32".into(),
                 })?;
             let raw_days =
                 i64::from(*lhs_days)
                     .checked_add(signed_days)
-                    .ok_or(EvalError::TypeMismatch {
+                    .ok_or_else(|| EvalError::TypeMismatch {
                         detail: "INTERVAL ± INTERVAL days overflows i64".into(),
                     })?;
             let raw_micros = lhs_us
                 .checked_add(signed_micros)
-                .ok_or(EvalError::TypeMismatch {
+                .ok_or_else(|| EvalError::TypeMismatch {
                     detail: "INTERVAL ± INTERVAL micros overflows i64".into(),
                 })?;
             // v7.38 (read01) — PG interval arithmetic is PURELY component-wise:
@@ -1976,21 +2015,21 @@ pub(crate) fn add_interval_to_micros(
         out = i64::from(shifted_days)
             .checked_mul(MICROS_PER_DAY)
             .and_then(|n| n.checked_add(day_micros))
-            .ok_or(EvalError::TypeMismatch {
+            .ok_or_else(|| EvalError::TypeMismatch {
                 detail: "TIMESTAMP ± INTERVAL months overflows i64 microseconds".into(),
             })?;
     }
     if days != 0 {
         let day_micros = days
             .checked_mul(MICROS_PER_DAY)
-            .ok_or(EvalError::TypeMismatch {
+            .ok_or_else(|| EvalError::TypeMismatch {
                 detail: "INTERVAL days overflows i64 microseconds".into(),
             })?;
-        out = out.checked_add(day_micros).ok_or(EvalError::TypeMismatch {
+        out = out.checked_add(day_micros).ok_or_else(|| EvalError::TypeMismatch {
             detail: "TIMESTAMP ± INTERVAL days overflows i64".into(),
         })?;
     }
-    let out = out.checked_add(micros).ok_or(EvalError::TypeMismatch {
+    let out = out.checked_add(micros).ok_or_else(|| EvalError::TypeMismatch {
         detail: "timestamp out of range".into(),
     })?;
     // v7.39 (read01 timestamp.c) — PG's lower bound (4714-11-24 BC,
@@ -2421,10 +2460,10 @@ fn apply_binary_numeric(
             // take the truncated remainder (sign of the dividend). Result keeps
             // that scale. 12.5 % 5 -> 125 % 50 = 25 @scale1 = 2.5.
             let target_scale = sa.max(sb);
-            let lhs = rescale(a, sa, target_scale).ok_or(EvalError::TypeMismatch {
+            let lhs = rescale(a, sa, target_scale).ok_or_else(|| EvalError::TypeMismatch {
                 detail: "NUMERIC overflow on rescale".into(),
             })?;
-            let rhs = rescale(b, sb, target_scale).ok_or(EvalError::TypeMismatch {
+            let rhs = rescale(b, sb, target_scale).ok_or_else(|| EvalError::TypeMismatch {
                 detail: "NUMERIC overflow on rescale".into(),
             })?;
             if rhs == 0 {
@@ -2470,10 +2509,10 @@ fn apply_binary_numeric(
         }
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             let target_scale = sa.max(sb);
-            let lhs = rescale(a, sa, target_scale).ok_or(EvalError::TypeMismatch {
+            let lhs = rescale(a, sa, target_scale).ok_or_else(|| EvalError::TypeMismatch {
                 detail: "NUMERIC overflow on rescale".into(),
             })?;
-            let rhs = rescale(b, sb, target_scale).ok_or(EvalError::TypeMismatch {
+            let rhs = rescale(b, sb, target_scale).ok_or_else(|| EvalError::TypeMismatch {
                 detail: "NUMERIC overflow on rescale".into(),
             })?;
             Ok(Value::Bool(cmp_to_bool(op, lhs.cmp(&rhs))))
@@ -3105,7 +3144,7 @@ fn arith(
     // mixed with int4/int8), and a result outside int2 is "smallint out of
     // range", not a silent widen. Handle the both-small case before widening.
     if let (Value::SmallInt(a), Value::SmallInt(b)) = (&l, &r) {
-        let res = int_op(i64::from(*a), i64::from(*b)).ok_or(EvalError::TypeMismatch {
+        let res = int_op(i64::from(*a), i64::from(*b)).ok_or_else(|| EvalError::TypeMismatch {
             detail: format!("smallint overflow on {op_name}"),
         })?;
         return small_int_result(res);
@@ -3126,7 +3165,7 @@ fn arith(
             // "integer out of range", NOT a silent widening to bigint. This
             // matches SPG's own `::int` cast, which already errors on
             // overflow — the arithmetic path must agree.
-            let result = int_op(i64::from(a), i64::from(b)).ok_or(EvalError::TypeMismatch {
+            let result = int_op(i64::from(a), i64::from(b)).ok_or_else(|| EvalError::TypeMismatch {
                 detail: format!("integer overflow on {op_name}"),
             })?;
             let small = i32::try_from(result).map_err(|_| EvalError::TypeMismatch {
@@ -3139,19 +3178,19 @@ fn arith(
         // `int - bigint` (and `bigint / int` computed `int / bigint`). Split
         // so each side keeps its place for the non-commutative ops.
         (Value::Int(a), Value::BigInt(b)) => {
-            let result = int_op(i64::from(a), b).ok_or(EvalError::TypeMismatch {
+            let result = int_op(i64::from(a), b).ok_or_else(|| EvalError::TypeMismatch {
                 detail: alloc::string::String::from("bigint out of range"),
             })?;
             Ok(Value::BigInt(result))
         }
         (Value::BigInt(a), Value::Int(b)) => {
-            let result = int_op(a, i64::from(b)).ok_or(EvalError::TypeMismatch {
+            let result = int_op(a, i64::from(b)).ok_or_else(|| EvalError::TypeMismatch {
                 detail: alloc::string::String::from("bigint out of range"),
             })?;
             Ok(Value::BigInt(result))
         }
         (Value::BigInt(a), Value::BigInt(b)) => {
-            let result = int_op(a, b).ok_or(EvalError::TypeMismatch {
+            let result = int_op(a, b).ok_or_else(|| EvalError::TypeMismatch {
                 detail: alloc::string::String::from("bigint out of range"),
             })?;
             Ok(Value::BigInt(result))
