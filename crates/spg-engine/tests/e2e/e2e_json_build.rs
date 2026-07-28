@@ -21,8 +21,10 @@
 //! `func.json_build_object` all compile down to these.
 //!
 //! Invariants pinned:
-//!   * to_json(NULL)       → Value::Json("null") (PG: returns json
-//!     literal 'null', not SQL NULL).
+//!   * to_json(NULL::int)  → SQL NULL. These functions are STRICT;
+//!     the header used to claim the opposite and round 603 checked it
+//!     against live PG18. A JSON `null` VALUE still passes through,
+//!     and a NULL inside a builder is still the JSON `null`.
 //!   * to_json(text)       → quoted JSON string (escapes honoured).
 //!   * to_json(json)       → pass-through (already-valid JSON text).
 //!   * json_build_object   — odd-length args → error; NULL key →
@@ -106,10 +108,43 @@ fn to_json_bool_renders_lowercase() {
 }
 
 #[test]
-fn to_json_null_renders_json_null_literal() {
-    // PG: SELECT to_json(NULL::int) → 'null'::json (NOT SQL NULL).
+fn to_json_of_null_is_sql_null() {
+    // v7.39 (round 603) — this test used to assert the opposite, with the
+    // comment "PG: SELECT to_json(NULL::int) → 'null'::json (NOT SQL NULL)".
+    // That is not what PG does. Asked live, PG18 answers:
+    //
+    //     SELECT to_json(NULL::int) IS NULL     →  t
+    //     SELECT to_jsonb(NULL::int) IS NULL    →  t
+    //     SELECT to_json(NULL)                  →  ERROR: could not
+    //                                              determine polymorphic type
+    //     SELECT to_jsonb('null'::json)::TEXT   →  null
+    //     SELECT jsonb_build_object('a', NULL)  →  {"a": null}
+    //
+    // The functions are STRICT: a NULL argument gives a NULL result. A JSON
+    // `null` VALUE is a different thing and still passes through, and a NULL
+    // inside a builder is still the JSON `null` — both below.
+    //
+    // SPG has no polymorphic type resolution, so the untyped spelling PG
+    // rejects is answered rather than refused; that lesser divergence is in
+    // the ledger.
     let mut e = Engine::new();
-    assert_eq!(json_text(one_cell(&mut e, "SELECT to_json(NULL)")), "null");
+    assert!(matches!(
+        one_cell(&mut e, "SELECT to_json(NULL::INT)"),
+        Value::Null
+    ));
+    assert!(matches!(
+        one_cell(&mut e, "SELECT to_jsonb(NULL::INT)"),
+        Value::Null
+    ));
+    assert_eq!(
+        json_text(one_cell(&mut e, "SELECT to_jsonb('null'::JSON)")),
+        "null",
+        "a JSON null VALUE is not a NULL argument"
+    );
+    assert_eq!(
+        json_text(one_cell(&mut e, "SELECT jsonb_build_object('a', NULL)")),
+        r#"{"a": null}"#
+    );
 }
 
 #[test]

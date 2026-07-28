@@ -32,11 +32,18 @@ SELECT to_json(false)
 ----
 false
 
-# NULL → JSON literal 'null', NOT SQL NULL.
+# STRICT: a NULL argument gives a NULL result. This case used to assert the
+# opposite, with the comment "NULL -> JSON literal 'null', NOT SQL NULL".
+# Round 603 asked PG18 and it answers otherwise: to_json(NULL::int) IS NULL
+# is true, and the UNTYPED spelling to_json(NULL) PG rejects outright
+# ("could not determine polymorphic type"). The typed spelling is the one PG
+# defines, so it is the one pinned here. A JSON null VALUE is a different
+# thing -- see the pass-through case below -- and a NULL inside a builder is
+# still the JSON null, which the json_build_object case pins.
 query T
-SELECT to_json(NULL)
+SELECT to_json(NULL::INT)
 ----
-null
+NULL
 
 # Json input passes through verbatim.
 query T

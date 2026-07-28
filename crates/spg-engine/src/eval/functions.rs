@@ -12883,6 +12883,22 @@ fn apply_function_dispatch(
                     detail: alloc::format!("{name}() takes 1 arg, got {}", args.len()),
                 });
             }
+            // v7.39 (round 603) — PG's to_json / to_jsonb / row_to_json /
+            // row_to_jsonb are STRICT: a NULL argument gives a NULL result,
+            // not the JSON scalar `null`. SPG answered `null` for every one
+            // of them, so `SELECT to_jsonb(NULL::int) IS NULL` came back
+            // false where PG says true.
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            // v7.39 (round 603) — a simple scalar's canonical jsonb is not
+            // in doubt, so it skips the format-then-reparse round trip.
+            if !is_row
+                && name == "to_jsonb"
+                && let Some(v) = crate::json::to_jsonb_scalar(&args[0])
+            {
+                return Ok(v);
+            }
             // Json input passes through verbatim — PG identity.
             let out = if let Value::Json(s) = &args[0] {
                 Value::json(s.clone())
@@ -13037,9 +13053,10 @@ fn apply_function_dispatch(
                 }),
             }
         }
-        "jsonb_build_object" => {
-            crate::json::build_object(args).map(crate::json::canonicalize_value)
-        }
+        "jsonb_build_object" => match crate::json::build_object_canonical(args) {
+            Some(v) => Ok(v),
+            None => crate::json::build_object(args).map(crate::json::canonicalize_value),
+        },
         "json_build_object" => crate::json::build_object(args),
         // Catalog function forms of the ? / ?| / ?& / @> / <@
         // operators — same helpers the operators use.
