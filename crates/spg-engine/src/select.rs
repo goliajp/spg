@@ -5524,6 +5524,10 @@ impl Engine {
         // keeping. Anything that loses to it cannot reach the answer, so
         // it is dropped before its projection is ever built.
         let mut topk_boundary: Option<Vec<crate::orderby::OrderKey>> = None;
+        // v7.39 (round 582) — resolve each ORDER BY column once, not
+        // once per row. See `order_by_bound_positions`.
+        let order_bound =
+            crate::orderby::order_by_bound_positions(&order_by, schema_cols, Some(alias));
         // v7.39 (round 581) — and it stops asking when the answer is
         // always "keep".
         //
@@ -5563,7 +5567,13 @@ impl Engine {
                 Vec::new()
             } else {
                 let mut buf = key_pool.pop().unwrap_or_default();
-                crate::orderby::build_order_keys_into(&order_by, row, &ctx, &mut buf)?;
+                crate::orderby::build_order_keys_bound(
+                    &order_by,
+                    &order_bound,
+                    row,
+                    &ctx,
+                    &mut buf,
+                )?;
                 // v7.39 (round 581) — reject before projecting.
                 //
                 // `ORDER BY g DESC, id DESC LIMIT 10` over 500k rows with
