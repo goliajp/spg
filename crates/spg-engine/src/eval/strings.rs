@@ -884,6 +884,19 @@ pub(super) fn value_to_format_text(v: &Value) -> String {
 /// `strpos(s, '234')` returns an INTEGER and still allocated 5.5 times a row
 /// over 200k rows, against 1 for `upper(s)` (which allocates only its
 /// result) and none for `length(s)`. Two of those were the operand copies.
+/// v7.39 (round 612) — the styled render, borrowing when the value already
+/// is the text it renders as. `concat` / `concat_ws` rendered every argument
+/// into an owned `String` only to push it into the answer and drop it.
+pub(super) fn value_to_format_text_styled_ref<'a>(
+    v: &'a Value<'a>,
+    style: &super::format::RenderStyle,
+) -> alloc::borrow::Cow<'a, str> {
+    match v {
+        Value::Text(s) | Value::Json(s) => alloc::borrow::Cow::Borrowed(s.as_ref()),
+        other => alloc::borrow::Cow::Owned(value_to_format_text_styled(other, style)),
+    }
+}
+
 pub(super) fn value_to_format_text_ref<'a>(v: &'a Value<'a>) -> alloc::borrow::Cow<'a, str> {
     match v {
         Value::Text(s) | Value::Json(s) => alloc::borrow::Cow::Borrowed(s.as_ref()),

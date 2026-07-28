@@ -35,6 +35,19 @@ pub(super) fn apply_function_lower(
 /// v7.39 (RLS) — the effective session role from the eval context (the
 /// `SET ROLE` override in `session_gucs`, else the Admin login). Drives
 /// `current_user` / `current_role` / `user`.
+/// v7.39 (round 612) — a size for the concatenation, so the output is not
+/// grown from zero for every row. A text argument contributes its length; a
+/// rendered one a small constant.
+fn concat_capacity_hint(args: &[Value<'_>]) -> usize {
+    args.iter()
+        .map(|v| match v {
+            Value::Text(s) | Value::Json(s) => s.len(),
+            Value::Null => 0,
+            _ => 12,
+        })
+        .sum()
+}
+
 fn current_role_from_ctx(ctx: &EvalContext<'_>) -> alloc::string::String {
     ctx.session_gucs
         .and_then(|g| g.get(crate::session::CURRENT_ROLE_KEY))
@@ -9708,12 +9721,14 @@ fn apply_function_dispatch(
             if ctx.mysql_dialect && args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
-            let mut out = String::new();
+            // v7.39 (round 612) — sized once, and a text argument is pushed
+            // straight in rather than rendered into an owned copy first.
+            let mut out = String::with_capacity(concat_capacity_hint(args));
             for v in args {
                 if matches!(v, Value::Null) {
                     continue;
                 }
-                out.push_str(&super::strings::value_to_format_text_styled(
+                out.push_str(&super::strings::value_to_format_text_styled_ref(
                     v,
                     &ctx.render_style,
                 ));
@@ -12863,11 +12878,14 @@ fn apply_function_dispatch(
                 });
             }
             // NULL separator poisons the result.
-            let sep = match &args[0] {
-                Value::Null => return Ok(Value::Null),
-                v => super::strings::value_to_format_text_styled(v, &ctx.render_style),
-            };
-            let mut out = String::new();
+            if matches!(&args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let sep = super::strings::value_to_format_text_styled_ref(&args[0], &ctx.render_style);
+            // v7.39 (round 612) — see `concat`.
+            let mut out = String::with_capacity(
+                concat_capacity_hint(&args[1..]) + sep.len() * args.len(),
+            );
             let mut first = true;
             for v in &args[1..] {
                 if matches!(v, Value::Null) {
@@ -12878,7 +12896,7 @@ fn apply_function_dispatch(
                 } else {
                     out.push_str(&sep);
                 }
-                out.push_str(&super::strings::value_to_format_text_styled(
+                out.push_str(&super::strings::value_to_format_text_styled_ref(
                     v,
                     &ctx.render_style,
                 ));
