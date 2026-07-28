@@ -78,7 +78,11 @@ pub(super) fn string_left_right(
     if args.iter().any(|v| matches!(v, Value::Null)) {
         return Ok(Value::Null);
     }
-    let s = value_to_format_text(&args[0]);
+    // v7.39 (round 610) — `left(s, 5)` allocated 5.5 times a row over 200k
+    // rows to hand back five characters: a copy of the operand, a `Vec<char>`
+    // of it (four bytes a character), and then the result collected out of
+    // that vector. The operand is borrowed now and the answer is one slice.
+    let s = value_to_format_text_ref(&args[0]);
     let n = match &args[1] {
         Value::SmallInt(x) => i64::from(*x),
         Value::Int(x) => i64::from(*x),
@@ -92,8 +96,13 @@ pub(super) fn string_left_right(
             });
         }
     };
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len() as i64;
+    // The character count is still needed for every case except a positive
+    // `left`, which stops at the nth character without knowing the total.
+    let len = if is_left && n > 0 {
+        i64::MAX
+    } else {
+        s.chars().count() as i64
+    };
     // v7.39 (round 395) — MySQL LEFT/RIGHT with a negative length is the
     // empty string (`LEFT('abc', -1)` is ''), where PG drops the last /
     // first |k| chars (`left('abc', -1)` is 'ab').
@@ -120,7 +129,24 @@ pub(super) fn string_left_right(
     if start >= end {
         return Ok(Value::text(String::new()));
     }
-    Ok(Value::text(chars[start..end].iter().collect::<String>()))
+    // Character indices to byte offsets, in one walk.
+    let mut byte_start = s.len();
+    let mut byte_end = s.len();
+    for (nth, (byte, _)) in s.char_indices().enumerate() {
+        if nth == start {
+            byte_start = byte;
+        }
+        if nth == end {
+            byte_end = byte;
+            break;
+        }
+    }
+    if byte_start >= byte_end {
+        return Ok(Value::text(String::new()));
+    }
+    Ok(Value::text(alloc::string::String::from(
+        &s[byte_start..byte_end],
+    )))
 }
 
 /// PG `lpad` / `rpad` shared implementation. Length is the
