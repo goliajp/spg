@@ -6292,18 +6292,32 @@ fn apply_function_dispatch(
             match &args[0] {
                 Value::Text(s) => {
                     // PG counts in characters (codepoints) for TEXT.
-                    let chars: Vec<char> = s.chars().collect();
+                    // v7.39 (round 610) — walked as byte offsets rather than
+                    // collected into a `Vec<char>` and re-collected out of it:
+                    // that vector cost four bytes a character of the WHOLE
+                    // input to hand back a slice of it.
                     let skip = (effective_start - 1) as usize;
-                    if skip >= chars.len() {
+                    let mut byte_start: Option<usize> = None;
+                    let mut byte_end = s.len();
+                    let stop = effective_length.map(|n| skip.saturating_add(n as usize));
+                    for (nth, (byte, _)) in s.char_indices().enumerate() {
+                        if nth == skip {
+                            byte_start = Some(byte);
+                        }
+                        if Some(nth) == stop {
+                            byte_end = byte;
+                            break;
+                        }
+                    }
+                    let Some(byte_start) = byte_start else {
+                        return Ok(Value::text(String::new()));
+                    };
+                    if byte_start >= byte_end {
                         return Ok(Value::text(String::new()));
                     }
-                    let take = match effective_length {
-                        Some(n) => (n as usize).min(chars.len() - skip),
-                        None => chars.len() - skip,
-                    };
-                    Ok(Value::text(
-                        chars[skip..skip + take].iter().collect::<String>(),
-                    ))
+                    Ok(Value::text(alloc::string::String::from(
+                        &s[byte_start..byte_end],
+                    )))
                 }
                 Value::Bytes(b) => {
                     let skip = (effective_start - 1) as usize;

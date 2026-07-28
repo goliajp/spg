@@ -136,6 +136,7 @@ mod e2e_computed_only_join_round606;
 mod e2e_named_cast_round607;
 mod e2e_string_borrow_round608;
 mod e2e_coalesce_shortcircuit_round609;
+mod e2e_string_slice_round610;
 mod e2e_const_fold_round605;
 mod e2e_jsonb_canonical_round603;
 mod e2e_srf_order_by_round600;
