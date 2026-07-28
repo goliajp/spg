@@ -11623,49 +11623,113 @@ fn apply_function_dispatch(
             {
                 return Ok(Value::Null);
             }
-            let non_null_refs: alloc::vec::Vec<&Value> =
-                args.iter().filter(|v| !matches!(v, Value::Null)).collect();
-            if non_null_refs.is_empty() {
-                return Ok(Value::Null);
-            }
             // PG coerces every GREATEST/LEAST arg to a common type; an
             // unknown-type string literal takes a sibling typed arg's type.
             // Without this, `greatest(time, '14:00')` compared Time vs Text,
             // fell to the value_cmp fallback, and kept the first arg.
-            let target = non_null_refs.iter().find_map(|v| match v.data_type() {
+            let target = args.iter().find_map(|v| match v.data_type() {
                 Some(spg_storage::DataType::Text) | None => None,
                 dt => dt,
             });
-            let non_null: alloc::vec::Vec<Value<'static>> = non_null_refs
-                .iter()
-                .map(|v| {
-                    if let (Value::Text(s), Some(dt)) = (v, target) {
-                        crate::conversions::coerce_value(Value::text(s.as_ref()), dt, "", 0)
-                            .unwrap_or_else(|_| (*v).clone().into_owned())
-                    } else {
-                        (*v).clone().into_owned()
-                    }
-                })
-                .collect();
             let is_greatest = name.eq_ignore_ascii_case("greatest")
                 || name.ends_with("larger");
-            let mut best: Value<'static> = non_null[0].clone();
-            for v in &non_null[1..] {
-                let ord = value_cmp_for_min_max(&best, v, ctx.mysql_dialect);
-                let take = if is_greatest {
-                    ord == core::cmp::Ordering::Less
+            // v7.39 (round 610-series) — `least(id, 0)` over a plain INTEGER
+            // column allocated FOUR times a row: a `Vec` of references to the
+            // non-NULL args, a second `Vec` holding an owned clone of every
+            // one of them, and a `Vec` of their types — for an answer that is
+            // one of the arguments. Nothing needs the heap unless a text
+            // argument has to be coerced to a sibling's type, so that case
+            // keeps the owned pass and everything else compares in place and
+            // clones the winner alone.
+            let coercing = target.is_some()
+                && args
+                    .iter()
+                    .any(|v| matches!(v, Value::Text(_)));
+            let mut tbuf = [spg_storage::DataType::Int; 8];
+            let mut ntypes = 0usize;
+            let mut spill: alloc::vec::Vec<spg_storage::DataType> = alloc::vec::Vec::new();
+            let mut note_type = |t: spg_storage::DataType,
+                                 ntypes: &mut usize,
+                                 tbuf: &mut [spg_storage::DataType; 8],
+                                 spill: &mut alloc::vec::Vec<spg_storage::DataType>| {
+                if *ntypes < tbuf.len() {
+                    tbuf[*ntypes] = t;
+                    *ntypes += 1;
                 } else {
-                    ord == core::cmp::Ordering::Greater
-                };
-                if take {
-                    best = v.clone();
+                    spill.push(t);
                 }
-            }
+            };
+            let best: Value<'static> = if coercing {
+                let non_null: alloc::vec::Vec<Value<'static>> = args
+                    .iter()
+                    .filter(|v| !matches!(v, Value::Null))
+                    .map(|v| {
+                        if let (Value::Text(s), Some(dt)) = (v, target) {
+                            crate::conversions::coerce_value(Value::text(s.as_ref()), dt, "", 0)
+                                .unwrap_or_else(|_| v.clone().into_owned())
+                        } else {
+                            v.clone().into_owned()
+                        }
+                    })
+                    .collect();
+                if non_null.is_empty() {
+                    return Ok(Value::Null);
+                }
+                for v in &non_null {
+                    if let Some(t) = v.data_type() {
+                        note_type(t, &mut ntypes, &mut tbuf, &mut spill);
+                    }
+                }
+                let mut best = non_null[0].clone();
+                for v in &non_null[1..] {
+                    let ord = value_cmp_for_min_max(&best, v, ctx.mysql_dialect);
+                    let take = if is_greatest {
+                        ord == core::cmp::Ordering::Less
+                    } else {
+                        ord == core::cmp::Ordering::Greater
+                    };
+                    if take {
+                        best = v.clone();
+                    }
+                }
+                best
+            } else {
+                let mut best: Option<&Value> = None;
+                for v in args {
+                    if matches!(v, Value::Null) {
+                        continue;
+                    }
+                    if let Some(t) = v.data_type() {
+                        note_type(t, &mut ntypes, &mut tbuf, &mut spill);
+                    }
+                    match best {
+                        None => best = Some(v),
+                        Some(b) => {
+                            let ord = value_cmp_for_min_max(b, v, ctx.mysql_dialect);
+                            let take = if is_greatest {
+                                ord == core::cmp::Ordering::Less
+                            } else {
+                                ord == core::cmp::Ordering::Greater
+                            };
+                            if take {
+                                best = Some(v);
+                            }
+                        }
+                    }
+                }
+                let Some(best) = best else {
+                    return Ok(Value::Null);
+                };
+                best.clone().into_owned()
+            };
             // v7.38 (read01) — widen the winner to the PG common type of all
             // args so `GREATEST(3, 2.5)` is numeric 3, not integer 3 (matching
             // `pg_typeof` and downstream numeric division).
-            let types: alloc::vec::Vec<spg_storage::DataType> =
-                non_null.iter().filter_map(Value::data_type).collect();
+            if spill.is_empty() {
+                return Ok(super::widen_to_common(best, &tbuf[..ntypes]));
+            }
+            let mut types: alloc::vec::Vec<spg_storage::DataType> = tbuf[..ntypes].to_vec();
+            types.append(&mut spill);
             Ok(super::widen_to_common(best, &types))
         }
         // MySQL `ifnull(a, b)` — alias for coalesce(a, b).
