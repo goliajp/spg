@@ -1066,7 +1066,7 @@ pub(crate) fn sort_by_keys(tagged: &mut [(Vec<OrderKey>, Row)], descs: &[bool]) 
 /// ever guaranteed. A no-op when `keep == 0` (LIMIT 0 is handled by the
 /// caller's truncation).
 pub(crate) fn topk_trim(tagged: &mut Vec<(Vec<OrderKey>, Row)>, keep: usize, descs: &[bool]) {
-    topk_trim_recycling(tagged, keep, descs, &mut Vec::new(), &mut Vec::new());
+    topk_trim_recycling(tagged, keep, descs, &mut Vec::new(), &mut Vec::new(), &mut None);
 }
 
 /// v7.39 (round 571) — the same trim, handing the dropped rows' value
@@ -1084,6 +1084,7 @@ pub(crate) fn topk_trim_recycling<'a>(
     descs: &[bool],
     pool: &mut Vec<Vec<Value<'a>>>,
     key_pool: &mut Vec<Vec<OrderKey>>,
+    boundary: &mut Option<Vec<OrderKey>>,
 ) {
     // v7.39 (round 580) — trim on a floor, not on `2k` alone.
     //
@@ -1107,6 +1108,20 @@ pub(crate) fn topk_trim_recycling<'a>(
             pool.push(v);
             keys.clear();
             key_pool.push(keys);
+        }
+        // v7.39 (round 581) — the worst row still kept is a floor on the
+        // answer: the final k-th best can only be better than it, so a
+        // row that loses to it can never enter the top k and does not
+        // need to be built at all. `select_nth_unstable_by` has just put
+        // that row at `keep - 1`.
+        if let Some((keys, _)) = tagged.get(keep - 1) {
+            match boundary {
+                Some(b) => {
+                    b.clear();
+                    b.extend_from_slice(keys);
+                }
+                None => *boundary = Some(keys.clone()),
+            }
         }
     }
 }
