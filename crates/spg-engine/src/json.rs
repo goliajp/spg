@@ -204,6 +204,76 @@ pub fn canonicalize_jsonb(src: &str) -> Result<String, ParseError> {
 /// `||` / `-` / `#-` operators, …) in line with PG, which always emits
 /// canonical jsonb from them. The `json_*` siblings stay verbatim.
 #[must_use]
+/// v7.39 (round 603) — the `JsonValue` a scalar becomes, when it becomes one
+/// simply.
+///
+/// `to_jsonb(5)` used to format the value into JSON text and then hand that
+/// text to `canonicalize_value`, which PARSES it and serialises it again —
+/// ten allocations a row for an integer, against one for the same projection
+/// without it, and `jsonb_build_object('a', id)` eighteen. The canonical
+/// form of these scalars is not in doubt, so they skip the round trip. `None`
+/// sends the caller down the text-then-reparse path, which is what anything
+/// richer (NUMERIC, dates, arrays, composites, already-JSON values) needs.
+fn simple_scalar_json(v: &Value<'_>) -> Option<JsonValue> {
+    Some(match v {
+        Value::Null => JsonValue::Null,
+        Value::Bool(b) => JsonValue::Bool(*b),
+        Value::SmallInt(n) => JsonValue::NumberText(alloc::format!("{n}")),
+        Value::Int(n) => JsonValue::NumberText(alloc::format!("{n}")),
+        Value::BigInt(n) => JsonValue::NumberText(alloc::format!("{n}")),
+        Value::Text(s) | Value::BpChar(s) => JsonValue::String(s.to_string()),
+        _ => return None,
+    })
+}
+
+/// v7.39 (round 603) — `to_jsonb` over a scalar, without the round trip.
+/// `None` when the argument is not one of the simple kinds.
+pub(crate) fn to_jsonb_scalar(v: &Value<'_>) -> Option<Value<'static>> {
+    // An integer's canonical jsonb IS its decimal spelling, and a bool's and
+    // NULL's are their keywords, so those need no `JsonValue` at all — which
+    // is the difference between two allocations and five.
+    match v {
+        Value::Null => return Some(Value::json(String::from("null"))),
+        Value::Bool(b) => {
+            return Some(Value::json(String::from(if *b { "true" } else { "false" })));
+        }
+        Value::SmallInt(n) => return Some(Value::json(alloc::format!("{n}"))),
+        Value::Int(n) => return Some(Value::json(alloc::format!("{n}"))),
+        Value::BigInt(n) => return Some(Value::json(alloc::format!("{n}"))),
+        _ => {}
+    }
+    simple_scalar_json(v).map(|jv| Value::json(json_canonical_string(&jv)))
+}
+
+/// v7.39 (round 603) — `jsonb_build_object` built directly as a value and
+/// serialised canonically once, instead of writing `json_build_object`'s
+/// spacing and re-parsing it to get jsonb's. The ordering, the last-wins
+/// duplicate rule and the number canonicalisation all still come from
+/// `write_json_canonical`, so this changes when the parse happens and
+/// nothing about what it produces. `None` when any argument is richer than
+/// the simple kinds.
+pub(crate) fn build_object_canonical(args: &[Value<'_>]) -> Option<Value<'static>> {
+    if !args.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut entries: alloc::vec::Vec<(String, JsonValue)> =
+        alloc::vec::Vec::with_capacity(args.len() / 2);
+    for pair in args.chunks_exact(2) {
+        // A NULL key is an error the text path words; leave it there.
+        let key = match &pair[0] {
+            Value::Text(s) | Value::BpChar(s) => s.to_string(),
+            Value::SmallInt(n) => alloc::format!("{n}"),
+            Value::Int(n) => alloc::format!("{n}"),
+            Value::BigInt(n) => alloc::format!("{n}"),
+            _ => return None,
+        };
+        entries.push((key, simple_scalar_json(&pair[1])?));
+    }
+    Some(Value::json(json_canonical_string(&JsonValue::Object(
+        entries,
+    ))))
+}
+
 pub fn canonicalize_value(v: Value<'static>) -> Value<'static> {
     match v {
         Value::Json(s) => {
