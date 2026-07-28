@@ -664,6 +664,24 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             match eval_expr(array, &Row::new(alloc::vec::Vec::new()), ctx) {
                 Ok(arr) => {
                     compile_into(expr, ctx, steps);
+                    // v7.39 (round 604) — with the array in hand, an equality
+                    // ANY / inequality ALL is a membership test whatever the
+                    // spelling: `'{1,2,3}'::int[]` keeps its elements inside a
+                    // string, so round 597's literal-list route could not see
+                    // them, but they are values now.
+                    if !ctx.mysql_dialect
+                        && ((matches!(op, spg_sql::ast::BinOp::Eq) && *is_any)
+                            || (matches!(op, spg_sql::ast::BinOp::NotEq) && !*is_any))
+                        && let Some(entry) = value_array_in_list_set(&arr)
+                    {
+                        steps.push(Step::InSet {
+                            set: entry.set,
+                            has_null: entry.has_null,
+                            negated: !*is_any,
+                            fallback: e.clone(),
+                        });
+                        return;
+                    }
                     steps.push(Step::AnyAll {
                         op: *op,
                         is_any: *is_any,
@@ -1207,6 +1225,61 @@ fn in_set_verdict(
         (true, Value::Bool(b)) => Value::Bool(!b),
         (_, v) => v,
     })
+}
+
+/// v7.39 (round 604) — the membership set of an ALREADY-EVALUATED constant
+/// array.
+///
+/// Round 597 gave `x = ANY (ARRAY[1,2,3])` the same set an IN list builds,
+/// which took it from 268 ms over 500k rows to 1.93. It could not do the
+/// same for `x = ANY ('{1,2,3}'::int[])`, because it built the set from AST
+/// literals and that spelling keeps its elements inside a string: the array
+/// was folded once but every row still walked it, and the shape stayed at
+/// 43.49 ms against PG18's 9.37. The array has been evaluated by the time
+/// this is asked, so the elements are right there.
+///
+/// The families are the ones `build_in_list_set` accepts, for the same
+/// reason: an integer set answers `Int = BigInt` correctly across widths,
+/// and a text set compares verbatim. Anything else — a mixed array, floats,
+/// NUMERIC, dates — returns `None` and keeps the folded-array walk.
+fn value_array_in_list_set(arr: &Value<'_>) -> Option<crate::memoize::InListSetEntry> {
+    let len = crate::eval::values::array_len(arr)?;
+    if len == 0 {
+        return None;
+    }
+    let mut ints: hashbrown::HashSet<i64> = hashbrown::HashSet::with_capacity(len);
+    let mut texts: hashbrown::HashSet<alloc::string::String> =
+        hashbrown::HashSet::with_capacity(len);
+    let mut has_null = false;
+    for i in 0..len {
+        match crate::eval::values::array_element_at(arr, i) {
+            None | Some(Value::Null) => has_null = true,
+            Some(Value::SmallInt(n)) => {
+                ints.insert(i64::from(n));
+            }
+            Some(Value::Int(n)) => {
+                ints.insert(i64::from(n));
+            }
+            Some(Value::BigInt(n)) => {
+                ints.insert(n);
+            }
+            Some(Value::Text(s) | Value::BpChar(s)) => {
+                texts.insert(s.into_owned());
+            }
+            _ => return None,
+        }
+        if !ints.is_empty() && !texts.is_empty() {
+            return None;
+        }
+    }
+    let set = if !ints.is_empty() {
+        crate::memoize::InListSet::Int(ints)
+    } else if !texts.is_empty() {
+        crate::memoize::InListSet::Text(texts)
+    } else {
+        return None;
+    };
+    Some(crate::memoize::InListSetEntry { set, has_null })
 }
 
 /// v7.39 (round 597) — the literal elements of an `ARRAY[…]` constructor.

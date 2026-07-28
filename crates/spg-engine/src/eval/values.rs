@@ -462,7 +462,7 @@ pub fn value_to_text_styled(v: &Value, style: &crate::eval::RenderStyle) -> Stri
 /// array. Element-type-agnostic — every PG array element type is covered
 /// so count-only callers (array_length / array_upper / array_lower /
 /// array_ndims / array_dims / cardinality) stay uniform.
-pub(super) fn array_len(v: &Value) -> Option<usize> {
+pub(crate) fn array_len(v: &Value) -> Option<usize> {
     match v {
         Value::TextArray(items)
         | Value::VarcharArray(items)
@@ -536,7 +536,7 @@ pub(super) fn array_2d_dims(v: &Value) -> Option<(usize, usize)> {
 /// single per-type element menu shared by array subscript and
 /// array_position / array_positions, which previously only matched
 /// Text/Int/BigInt arrays and errored on every other element type.
-pub(super) fn array_element_at(v: &Value, pos: usize) -> Option<Value<'static>> {
+pub(crate) fn array_element_at(v: &Value, pos: usize) -> Option<Value<'static>> {
     use alloc::borrow::Cow;
     macro_rules! nth {
         ($items:expr, $map:expr) => {
