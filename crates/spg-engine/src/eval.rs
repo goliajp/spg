@@ -77,7 +77,7 @@ pub(crate) use math::{f64_ceil, f64_floor, f64_sqrt};
 use math::{
     f64_exp, f64_ln, f64_powi, f64_round_half_away, f64_trunc, prng_next_f64, prng_next_u64,
 };
-pub(crate) use regexp::{regex_is_match, regexp_matches_rows};
+pub(crate) use regexp::{CompiledRe, compile_re, compiled_is_match, regex_is_match, regexp_matches_rows};
 use regexp::{regexp_matches, regexp_replace, regexp_split_to_array};
 use resolve::{
     collation_fold_for_compare, compare_is_case_insensitive, composite_eq, eval_expr_cow,
