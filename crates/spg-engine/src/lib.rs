@@ -2601,6 +2601,19 @@ impl Engine {
         }
     }
 
+    /// v7.39 (round 598) — mutable access to the base catalog, for the
+    /// recursive-CTE loop.
+    ///
+    /// It built a whole `Engine` per iteration to hold the working set:
+    /// `Engine::restore` initialises 82 fields, and a counting allocator put
+    /// the loop at 63 allocations and 104 kB PER ITERATION — 1 GB for a
+    /// 10,000-row recursive CTE, none of it dependent on how much else was
+    /// in the catalog. One engine, whose CTE table is refilled each round,
+    /// needs this.
+    pub(crate) fn base_catalog_mut(&mut self) -> &mut Catalog {
+        &mut self.catalog
+    }
+
     pub(crate) fn active_catalog(&self) -> &Catalog {
         match self.current_tx {
             Some(t) => self
