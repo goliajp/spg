@@ -13,7 +13,7 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use spg_sql::ast::{ColumnName, Expr, Literal, OrderBy, SelectItem, SelectStatement};
-use spg_storage::{Row, Value};
+use spg_storage::{ColumnSchema, Row, Value};
 
 use crate::conversions::{
     format_bigint_2d_text, format_hstore_str, format_int_2d_text, format_range_str,
@@ -1194,16 +1194,84 @@ pub(crate) fn build_order_keys(
 /// `keep` of them, so on 500k rows with `LIMIT 10` it allocated half a
 /// million vectors of one element each. The trim hands the dropped ones
 /// back and they come through here.
+/// v7.39 (round 582) — which ORDER BY keys are a bare column, and where
+/// that column sits.
+///
+/// `build_order_keys_into` evaluated every key INTERPRETIVELY for every
+/// row, and a profile of `ORDER BY g DESC, id DESC LIMIT 10` over 500k
+/// rows put 8% of the query in `resolve_column` alone — resolving the
+/// same two names, by string, half a million times each. The position
+/// does not change between rows.
+///
+/// `None` for a key that is not a bare column of this relation; those
+/// keep the interpretive path.
+pub(crate) fn order_by_bound_positions(
+    order_by: &[OrderBy],
+    schema_cols: &[ColumnSchema],
+    alias: Option<&str>,
+) -> Vec<Option<usize>> {
+    order_by
+        .iter()
+        .map(|o| {
+            let Expr::Column(c) = &o.expr else {
+                return None;
+            };
+            if let Some(q) = c.qualifier.as_deref()
+                && !alias.is_some_and(|a| q.eq_ignore_ascii_case(a))
+            {
+                return None;
+            }
+            // An ambiguous bare name must keep the resolver's own rules.
+            let mut hit = None;
+            for (i, s) in schema_cols.iter().enumerate() {
+                if s.name.eq_ignore_ascii_case(&c.name) {
+                    if hit.is_some() {
+                        return None;
+                    }
+                    hit = Some(i);
+                }
+            }
+            hit
+        })
+        .collect()
+}
+
 pub(crate) fn build_order_keys_into(
     order_by: &[OrderBy],
     row: &Row<'static>,
     ctx: &EvalContext,
     keys: &mut Vec<OrderKey>,
 ) -> Result<(), EngineError> {
+    build_order_keys_bound(order_by, &[], row, ctx, keys)
+}
+
+/// The same, reading a bound key's cell instead of evaluating it.
+/// `bound` may be shorter than `order_by`; a missing or `None` entry
+/// falls back to the interpretive path, so the keys are the ones
+/// `build_order_keys_into` would have produced.
+pub(crate) fn build_order_keys_bound(
+    order_by: &[OrderBy],
+    bound: &[Option<usize>],
+    row: &Row<'static>,
+    ctx: &EvalContext,
+    keys: &mut Vec<OrderKey>,
+) -> Result<(), EngineError> {
     keys.clear();
     keys.reserve(order_by.len());
-    for o in order_by {
-        let v = eval::eval_expr(&o.expr, row, ctx)?;
+    for (i, o) in order_by.iter().enumerate() {
+        let borrowed: Option<&Value<'static>> =
+            bound.get(i).copied().flatten().and_then(|p| row.values.get(p));
+        let owned: Value<'static>;
+        // Borrowed when the key is a bound column, owned when it had to
+        // be evaluated — either way the body below only reads it, so
+        // neither path pays a clone.
+        let v: &Value<'static> = match borrowed {
+            Some(v) => v,
+            None => {
+                owned = eval::eval_expr(&o.expr, row, ctx)?;
+                &owned
+            }
+        };
         // v7.24 (round-16 A) — explicit NULLS FIRST/LAST. The f64
         // packing sorts ascending THEN applies the per-key DESC
         // reverse, so a NULL must land at +INF exactly when the
@@ -1222,7 +1290,7 @@ pub(crate) fn build_order_keys_into(
             } else {
                 OrderKey::NullSmall
             });
-        } else if let Some(ord) = enum_order_ordinal(&o.expr, &v, ctx) {
+        } else if let Some(ord) = enum_order_ordinal(&o.expr, v, ctx) {
             // Enum columns sort by declaration order (enumsortorder), not
             // the label text: `ORDER BY mood` puts 'sad' < 'ok' < 'happy'
             // when that is the CREATE TYPE order, not alphabetical.
@@ -1233,13 +1301,13 @@ pub(crate) fn build_order_keys_into(
             // text, so `apple`/`Apple` sort adjacent and `Zebra` after
             // `Mango`. The precomputed key must fold to match
             // `order_by_value_cmp_in`; a byte key would sort by ASCII case.
-            let s = match &v {
+            let s = match v {
                 Value::Text(s) | Value::BpChar(s) => s.as_ref(),
                 _ => unreachable!("guarded by matches! above"),
             };
             keys.push(OrderKey::Text(spg_storage::mysql_compare_fold(s)));
         } else {
-            keys.push(value_to_order_key(&v)?);
+            keys.push(value_to_order_key(v)?);
         }
     }
     Ok(())
