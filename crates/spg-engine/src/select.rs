@@ -2620,21 +2620,25 @@ impl Engine {
                     rows = dedup_rows(rows, mysql);
                 }
                 // v7.37.17 (17.6 siblings) — PG set semantics.
+                // v7.39 (round 591) — all four ask the same question of the
+                // right side, and all four used to answer it by scanning it
+                // once per left row. `PeerIndex` buckets it by the hash
+                // DISTINCT already uses, so the answer is a lookup.
                 // INTERSECT: distinct rows present on both sides.
                 UnionKind::Intersect => {
+                    let idx = PeerIndex::build(&peer_rows, mysql);
                     rows = dedup_rows(rows, mysql)
                         .into_iter()
-                        .filter(|r| peer_rows.iter().any(|p| row_eq_norm(p, r, mysql)))
+                        .filter(|r| idx.contains(r))
                         .collect();
                 }
                 // INTERSECT ALL: multiset intersection — each row
                 // keeps min(left count, right count) occurrences.
                 UnionKind::IntersectAll => {
-                    let mut peer_pool = peer_rows;
+                    let mut idx = PeerIndex::build(&peer_rows, mysql);
                     let mut kept: Vec<Row<'static>> = Vec::new();
                     for r in rows {
-                        if let Some(pos) = peer_pool.iter().position(|p| row_eq_norm(p, &r, mysql)) {
-                            peer_pool.swap_remove(pos);
+                        if idx.take_one(&r) {
                             kept.push(r);
                         }
                     }
@@ -2642,20 +2646,19 @@ impl Engine {
                 }
                 // EXCEPT: distinct left rows absent from the right.
                 UnionKind::Except => {
+                    let idx = PeerIndex::build(&peer_rows, mysql);
                     rows = dedup_rows(rows, mysql)
                         .into_iter()
-                        .filter(|r| !peer_rows.iter().any(|p| row_eq_norm(p, r, mysql)))
+                        .filter(|r| !idx.contains(r))
                         .collect();
                 }
                 // EXCEPT ALL: multiset subtraction — each right
                 // occurrence cancels one left occurrence.
                 UnionKind::ExceptAll => {
-                    let mut peer_pool = peer_rows;
+                    let mut idx = PeerIndex::build(&peer_rows, mysql);
                     let mut kept: Vec<Row<'static>> = Vec::new();
                     for r in rows {
-                        if let Some(pos) = peer_pool.iter().position(|p| row_eq_norm(p, &r, mysql)) {
-                            peer_pool.swap_remove(pos);
-                        } else {
+                        if !idx.take_one(&r) {
                             kept.push(r);
                         }
                     }
@@ -6688,6 +6691,74 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
         offset: stmt.offset.clone(),
         limit_with_ties: stmt.limit_with_ties,
     })
+}
+
+/// v7.39 (round 591) — the right-hand side of a set operation, bucketed for
+/// membership.
+///
+/// INTERSECT, EXCEPT and their ALL forms all ask "is this left row over
+/// there?", and all four answered by scanning the whole right side once per
+/// left row. The cost was (left rows x right rows), which is why
+/// `500k INTERSECT 1000` took 1.67 s while the same two inputs the other way
+/// round took 20 ms: a left row that MATCHES stops the scan early, and a left
+/// row that does not pays for all of it. Over 100k left rows, raising the
+/// right side from 100 to 10,000 took 35 ms to 2848.
+///
+/// This is the shape round 485 already solved for DISTINCT, and it reuses
+/// that machinery: bucket by `norm_hash_row`, whose only guarantee is the one
+/// needed here — rows `row_eq_norm` calls equal hash the same — and settle
+/// every bucket with the exact comparator, so a collision costs time and
+/// never an answer.
+struct PeerIndex<'r> {
+    bh: hashbrown::DefaultHashBuilder,
+    buckets: hashbrown::HashMap<u64, Vec<usize>>,
+    rows: &'r [Row<'static>],
+    mysql: bool,
+}
+
+impl<'r> PeerIndex<'r> {
+    fn build(rows: &'r [Row<'static>], mysql: bool) -> Self {
+        // ONE hasher for the whole pass: the default builder is seeded per
+        // instance, so a fresh one per row would put equal rows in different
+        // buckets.
+        let bh = hashbrown::DefaultHashBuilder::default();
+        let mut buckets: hashbrown::HashMap<u64, Vec<usize>> =
+            hashbrown::HashMap::with_capacity(rows.len());
+        for (i, r) in rows.iter().enumerate() {
+            buckets.entry(norm_hash_row(r, &bh, mysql)).or_default().push(i);
+        }
+        Self {
+            bh,
+            buckets,
+            rows,
+            mysql,
+        }
+    }
+
+    fn contains(&self, r: &Row<'static>) -> bool {
+        let h = norm_hash_row(r, &self.bh, self.mysql);
+        self.buckets.get(&h).is_some_and(|b| {
+            b.iter()
+                .any(|&i| row_eq_norm(&self.rows[i], r, self.mysql))
+        })
+    }
+
+    /// Remove ONE occurrence, so the multiset forms cancel row for row the
+    /// way the pool they replaced did.
+    fn take_one(&mut self, r: &Row<'static>) -> bool {
+        let h = norm_hash_row(r, &self.bh, self.mysql);
+        let Some(b) = self.buckets.get_mut(&h) else {
+            return false;
+        };
+        let Some(pos) = b
+            .iter()
+            .position(|&i| row_eq_norm(&self.rows[i], r, self.mysql))
+        else {
+            return false;
+        };
+        b.swap_remove(pos);
+        true
+    }
 }
 
 fn dedup_rows(rows: Vec<Row<'static>>, mysql: bool) -> Vec<Row<'static>> {
