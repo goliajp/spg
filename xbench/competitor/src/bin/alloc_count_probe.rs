@@ -87,9 +87,11 @@ static A: Counting = Counting;
 
 fn seed(n: i64) -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE j (id INT, g INT)").unwrap();
+    // v7.39 (round 608) — a TEXT column too, so a string function can be
+    // counted the same way an arithmetic one already could.
+    e.execute("CREATE TABLE j (id INT, g INT, s TEXT)").unwrap();
     e.execute(&format!(
-        "INSERT INTO j SELECT gg, gg % 50 FROM generate_series(1, {n}) gg"
+        "INSERT INTO j SELECT gg, gg % 50, 'row' || gg FROM generate_series(1, {n}) gg"
     ))
     .unwrap();
     e

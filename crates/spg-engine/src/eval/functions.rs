@@ -12505,22 +12505,27 @@ fn apply_function_dispatch(
                 }
                 return Ok(Value::Int(0));
             }
-            let haystack = value_to_format_text(&args[0]);
-            let needle = value_to_format_text(&args[1]);
+            // v7.39 (round 608) — search the bytes and convert the hit's byte
+            // offset to a CHARACTER offset, which is what PG reports. The two
+            // `Vec<char>` this replaces cost four bytes per character of both
+            // operands, on top of copying each operand into a `String` first:
+            // a function that returns an integer allocated 5.5 times a row.
+            // `str::find` only ever reports a char-boundary offset, so the
+            // prefix count below is exact for multi-byte text too.
+            let haystack = crate::eval::strings::value_to_format_text_ref(&args[0]);
+            let needle = crate::eval::strings::value_to_format_text_ref(&args[1]);
             if needle.is_empty() {
                 return Ok(Value::Int(1));
             }
-            let h_chars: Vec<char> = haystack.chars().collect();
-            let n_chars: Vec<char> = needle.chars().collect();
-            if n_chars.len() > h_chars.len() {
-                return Ok(Value::Int(0));
-            }
-            for i in 0..=h_chars.len() - n_chars.len() {
-                if h_chars[i..i + n_chars.len()] == n_chars[..] {
-                    return Ok(Value::Int(i32::try_from(i + 1).unwrap_or(i32::MAX)));
+            match haystack.find(needle.as_ref()) {
+                Some(byte_off) => {
+                    let chars_before = haystack[..byte_off].chars().count();
+                    Ok(Value::Int(
+                        i32::try_from(chars_before + 1).unwrap_or(i32::MAX),
+                    ))
                 }
+                None => Ok(Value::Int(0)),
             }
-            Ok(Value::Int(0))
         }
         // v7.37.17 (17.6 siblings) — PG 18 casefold(text): Unicode
         // case folding for caseless matching. Rust's char-level
@@ -12650,8 +12655,9 @@ fn apply_function_dispatch(
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
-            let s = value_to_format_text(&args[0]);
-            let delim = value_to_format_text(&args[1]);
+            // v7.39 (round 608) — borrowed: both are only read.
+            let s = crate::eval::strings::value_to_format_text_ref(&args[0]);
+            let delim = crate::eval::strings::value_to_format_text_ref(&args[1]);
             let n = match &args[2] {
                 Value::SmallInt(x) => i64::from(*x),
                 Value::Int(x) => i64::from(*x),
@@ -12674,7 +12680,7 @@ fn apply_function_dispatch(
             // whole string is field 1 (or -1); other fields are ''.
             if delim.is_empty() {
                 return Ok(Value::text(if n == 1 || n == -1 {
-                    s.clone()
+                    s.clone().into_owned()
                 } else {
                     String::new()
                 }));
@@ -12744,17 +12750,19 @@ fn apply_function_dispatch(
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
             }
-            let s = value_to_format_text(&args[0]);
-            let from = value_to_format_text(&args[1]);
-            let to = value_to_format_text(&args[2]);
+            // v7.39 (round 608) — borrowed: `String::replace` builds the one
+            // new string, and the three operands are only read.
+            let s = crate::eval::strings::value_to_format_text_ref(&args[0]);
+            let from = crate::eval::strings::value_to_format_text_ref(&args[1]);
+            let to = crate::eval::strings::value_to_format_text_ref(&args[2]);
             if from.is_empty() {
-                return Ok(Value::text(s));
+                return Ok(Value::text(s.into_owned()));
             }
             // std `String::replace` matches PG semantics exactly:
             // non-overlapping, left-to-right, no re-scan of
             // inserted text. Sealed test surface verifies the
             // edge cases independently.
-            Ok(Value::text(s.replace(&from[..], &to)))
+            Ok(Value::text(s.replace(from.as_ref(), to.as_ref())))
         }
         "trim" | "btrim" => string_trim(args, TrimSide::Both, "trim"),
         "ltrim" => string_trim(args, TrimSide::Left, "ltrim"),

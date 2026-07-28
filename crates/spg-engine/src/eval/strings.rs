@@ -143,7 +143,11 @@ pub(super) fn string_pad(
     if args.iter().any(|v| matches!(v, Value::Null)) {
         return Ok(Value::Null);
     }
-    let s = value_to_format_text(&args[0]);
+    // v7.39 (round 608) — `lpad(s, 12, '0')` allocated 7.5 times a row over
+    // 200k rows: a copy of each text operand, a `Vec<char>` of each (four
+    // bytes a character), a padding string, and then the concatenation
+    // growing into it. The result is the only string this has to build.
+    let s = value_to_format_text_ref(&args[0]);
     let target = match &args[1] {
         Value::SmallInt(x) => i64::from(*x),
         Value::Int(x) => i64::from(*x),
@@ -157,35 +161,36 @@ pub(super) fn string_pad(
             });
         }
     };
-    let fill = if args.len() == 3 {
-        value_to_format_text(&args[2])
+    let fill: alloc::borrow::Cow<'_, str> = if args.len() == 3 {
+        value_to_format_text_ref(&args[2])
     } else {
-        String::from(" ")
+        alloc::borrow::Cow::Borrowed(" ")
     };
     if target <= 0 {
         return Ok(Value::text(String::new()));
     }
     let target = target as usize;
-    let s_chars: Vec<char> = s.chars().collect();
-    if s_chars.len() >= target {
+    let s_len = s.chars().count();
+    if s_len >= target {
         // Truncate from the right (PG keeps LEFT side for both
         // lpad and rpad).
-        return Ok(Value::text(s_chars[..target].iter().collect::<String>()));
+        let end = s.char_indices().nth(target).map_or(s.len(), |(i, _)| i);
+        return Ok(Value::text(alloc::string::String::from(&s[..end])));
     }
     if fill.is_empty() {
-        return Ok(Value::text(s));
+        return Ok(Value::text(s.into_owned()));
     }
-    let pad_needed = target - s_chars.len();
-    let fill_chars: Vec<char> = fill.chars().collect();
-    let mut padding = String::with_capacity(pad_needed * 4);
-    for i in 0..pad_needed {
-        padding.push(fill_chars[i % fill_chars.len()]);
-    }
+    let pad_needed = target - s_len;
+    // The fill cycles, exactly as indexing it modulo its length did.
+    let mut out = String::with_capacity(s.len() + pad_needed * 4);
     if is_left {
-        Ok(Value::text(padding + &s))
+        out.extend(fill.chars().cycle().take(pad_needed));
+        out.push_str(&s);
     } else {
-        Ok(Value::text(s + &padding))
+        out.push_str(&s);
+        out.extend(fill.chars().cycle().take(pad_needed));
     }
+    Ok(Value::text(out))
 }
 
 /// PG `trim` / `ltrim` / `rtrim` / `btrim` shared implementation.
@@ -821,6 +826,22 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
 
 pub(super) fn value_to_format_text(v: &Value) -> String {
     value_to_format_text_styled(v, &super::format::RenderStyle::default())
+}
+
+/// v7.39 (round 608) — the same rendering, BORROWING when the value already
+/// is the text it renders as.
+///
+/// Every string function reached its operands through the owning form, so a
+/// `TEXT` column was copied into a fresh `String` before anything read it —
+/// `strpos(s, '234')` returns an INTEGER and still allocated 5.5 times a row
+/// over 200k rows, against 1 for `upper(s)` (which allocates only its
+/// result) and none for `length(s)`. Two of those were the operand copies.
+pub(super) fn value_to_format_text_ref<'a>(v: &'a Value<'a>) -> alloc::borrow::Cow<'a, str> {
+    match v {
+        Value::Text(s) | Value::Json(s) => alloc::borrow::Cow::Borrowed(s.as_ref()),
+        // BpChar renders with its declared padding here, as it did before.
+        other => alloc::borrow::Cow::Owned(value_to_format_text(other)),
+    }
 }
 
 /// v7.39 (GUC knife 4) — the styled variant: concat / concat_ws /
