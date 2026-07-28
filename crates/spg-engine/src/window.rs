@@ -55,6 +55,12 @@ pub(crate) fn reject_window_in_row_clauses(stmt: &SelectStatement) -> Result<(),
     Ok(())
 }
 
+/// v7.39 (round 618) — read by the recursive-CTE term planner, which must
+/// refuse a term carrying a window function.
+pub(crate) fn expr_has_window_pub(e: &Expr) -> bool {
+    expr_has_window(e)
+}
+
 fn expr_has_window(e: &Expr) -> bool {
     match e {
         Expr::NamedArg { expr, .. } => expr_has_window(expr),

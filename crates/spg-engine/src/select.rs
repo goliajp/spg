@@ -36,6 +36,100 @@ use crate::{
     try_pk_walk_top_n, try_trgm_seek, value_is_bigint, value_is_integer, value_to_i64,
 };
 
+
+/// v7.39 (round 618) — a recursive term that can be run over the working set
+/// directly, instead of through a whole query execution per round.
+///
+/// PG plans the recursive term ONCE and re-scans a worktable each iteration.
+/// SPG emptied and refilled a real table and then called `exec_select_cancel`
+/// — FROM resolution, schema build, predicate compilation, projection build
+/// and result materialisation — for every round. Measured with the counting
+/// allocator on `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r
+/// WHERE n < N)`: about 40 allocations and 99 kB PER ROUND while the working
+/// set is one row, or 1.98 GB at N = 20000.
+///
+/// This is the shape that covers the ordinary recursive term: read the CTE,
+/// filter it, project it. Anything else — a join, an aggregate, a window, a
+/// subquery, DISTINCT, GROUP BY, ORDER BY, LIMIT, a locking clause, a
+/// non-table source — returns `None` and keeps the general path, so the
+/// answers it gives are the ones that path gave.
+struct RecursiveTermPlan<'t> {
+    items: Vec<&'t Expr>,
+    where_: Option<&'t Expr>,
+    alias: String,
+}
+
+fn plan_recursive_term<'t>(
+    t: &'t SelectStatement,
+    cte_name: &str,
+    ncols: usize,
+) -> Option<RecursiveTermPlan<'t>> {
+    if !t.unions.is_empty()
+        || !t.ctes.is_empty()
+        || t.distinct
+        || !t.distinct_on.is_empty()
+        || t.group_by.is_some()
+        || t.group_by_all
+        || t.having.is_some()
+        || !t.order_by.is_empty()
+        || t.limit.is_some()
+        || t.offset.is_some()
+        || t.limit_with_ties
+        || t.locking.is_some()
+    {
+        return None;
+    }
+    let from = t.from.as_ref()?;
+    if !from.joins.is_empty() {
+        return None;
+    }
+    let p = &from.primary;
+    if !p.name.eq_ignore_ascii_case(cte_name)
+        || p.as_of_segment.is_some()
+        || p.unnest_expr.is_some()
+        || !p.unnest_column_aliases.is_empty()
+        || p.with_ordinality
+        || p.generate_series_args.is_some()
+        || p.lateral_subquery.is_some()
+        || p.jsonb_each_text_arg.is_some()
+        || p.table_fn_call.is_some()
+    {
+        return None;
+    }
+    let unsupported = |e: &Expr| {
+        crate::aggregate::contains_aggregate(e)
+            || crate::subquery::expr_has_subquery(e)
+            || crate::window::expr_has_window_pub(e)
+    };
+    let mut items: Vec<&Expr> = Vec::with_capacity(t.items.len());
+    for it in &t.items {
+        match it {
+            SelectItem::Expr { expr, .. } => {
+                if unsupported(expr) {
+                    return None;
+                }
+                items.push(expr);
+            }
+            // `*` would have to be expanded against the CTE's own schema;
+            // the general path already does that, so leave it there.
+            _ => return None,
+        }
+    }
+    if items.len() != ncols {
+        return None;
+    }
+    if let Some(w) = &t.where_
+        && unsupported(w)
+    {
+        return None;
+    }
+    Some(RecursiveTermPlan {
+        items,
+        where_: t.where_.as_ref(),
+        alias: p.alias.clone().unwrap_or_else(|| p.name.clone()),
+    })
+}
+
 impl Engine {
     /// v4.12 window executor. Implements `ROW_NUMBER` / `RANK` /
     /// `DENSE_RANK` and the partition-aware aggregates `SUM` /
@@ -1563,10 +1657,67 @@ impl Engine {
                 t
             })
             .collect();
+        // v7.39 (round 618) — plan every recursive term once. Taken only if
+        // ALL of them plan, so a query never runs half on each path.
+        let term_plans: Option<Vec<RecursiveTermPlan<'_>>> = recursive_terms
+            .iter()
+            .map(|t| plan_recursive_term(t, &cte.name, columns.len()))
+            .collect();
+        let fast_ctx = term_plans.as_ref().map(|plans| {
+            let alias = plans[0].alias.clone();
+            (alias, ())
+        });
         for iter in 0..MAX_ITERATIONS {
             cancel.check()?;
             if working_set.is_empty() {
                 break;
+            }
+            if let (Some(plans), Some((_, ()))) = (term_plans.as_ref(), fast_ctx.as_ref()) {
+                // The worktable IS the working set: no table to empty and
+                // refill, and no query execution per round.
+                let mut next_set: Vec<Row<'static>> = Vec::new();
+                for plan in plans {
+                    let ctx = self.ev_ctx(&columns, Some(&plan.alias));
+                    for row in &working_set {
+                        cancel.check()?;
+                        if let Some(w) = plan.where_ {
+                            let v = eval::eval_expr(w, row, &ctx).map_err(EngineError::Eval)?;
+                            if !matches!(v, Value::Bool(true)) {
+                                continue;
+                            }
+                        }
+                        let mut vals: Vec<Value<'static>> = Vec::with_capacity(plan.items.len());
+                        for it in &plan.items {
+                            vals.push(eval::eval_expr(it, row, &ctx).map_err(EngineError::Eval)?);
+                        }
+                        let out = Row::new(vals);
+                        if !all_union_all {
+                            let key = encode_row_key(&out);
+                            if !seen.insert(key) {
+                                continue;
+                            }
+                        }
+                        next_set.push(out);
+                    }
+                }
+                if next_set.is_empty() {
+                    break;
+                }
+                all_rows.extend(next_set.iter().cloned());
+                working_set = next_set;
+                if all_rows.len() > MAX_TOTAL_ROWS {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "WITH RECURSIVE {:?}: produced more than {MAX_TOTAL_ROWS} rows — likely runaway recursion",
+                        cte.name
+                    )));
+                }
+                if iter + 1 == MAX_ITERATIONS {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "WITH RECURSIVE {:?}: exceeded {MAX_ITERATIONS} iterations",
+                        cte.name
+                    )));
+                }
+                continue;
             }
             {
                 // Truncated rather than dropped and recreated: the table's
