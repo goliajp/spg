@@ -1942,8 +1942,13 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "justify_days() needs interval, got {:?}",
-                        other.data_type()
+                        // v7.39 (round 621) — PG's type name, not a Rust
+                        // Debug of an internal enum: this said `got Some(Text)`.
+                        "justify_days() needs interval, got {}",
+                        other.data_type().map_or_else(
+                            || alloc::string::String::from("unknown"),
+                            crate::conversions::pg_type_name_for_error,
+                        )
                     ),
                 }),
             }
@@ -1970,8 +1975,13 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "justify_hours() needs interval, got {:?}",
-                        other.data_type()
+                        // v7.39 (round 621) — PG's type name, not a Rust
+                        // Debug of an internal enum: this said `got Some(Text)`.
+                        "justify_hours() needs interval, got {}",
+                        other.data_type().map_or_else(
+                            || alloc::string::String::from("unknown"),
+                            crate::conversions::pg_type_name_for_error,
+                        )
                     ),
                 }),
             }
@@ -2001,8 +2011,13 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "justify_interval() needs interval, got {:?}",
-                        other.data_type()
+                        // v7.39 (round 621) — PG's type name, not a Rust
+                        // Debug of an internal enum: this said `got Some(Text)`.
+                        "justify_interval() needs interval, got {}",
+                        other.data_type().map_or_else(
+                            || alloc::string::String::from("unknown"),
+                            crate::conversions::pg_type_name_for_error,
+                        )
                     ),
                 }),
             }

@@ -157,6 +157,7 @@ mod e2e_const_fold_round605;
 mod e2e_jsonb_canonical_round603;
 mod e2e_srf_order_by_round600;
 mod e2e_srf_order_by_round621;
+mod e2e_interval_literal_arg_round621;
 mod e2e_regtype_arrays_round621;
 mod e2e_srf_over_aggregate_round621;
 mod e2e_srf_over_sources_round621;
