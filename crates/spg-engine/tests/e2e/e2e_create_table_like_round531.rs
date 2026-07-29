@@ -143,17 +143,32 @@ fn round531_generated_and_identity_need_their_option() {
     assert_eq!(rows(&mut e, "SELECT c FROM g2"), vec!["10"]);
 }
 
-/// An option that cannot be honoured is refused rather than dropped —
-/// a table reporting the right columns and none of the indexes is the
-/// shape that looks fine until it is slow.
+/// v7.39 (round 621) — INCLUDING INDEXES copies them now. This pin used to
+/// assert the refusal (round 531's honest stand-in: refusing beats a table
+/// that reports the right columns and none of the indexes). The refusal took
+/// `INCLUDING ALL` down with it, which is what schema tools write, so the
+/// restore stopped instead. The copies are rebuilt through the ordinary
+/// CREATE INDEX path and named by the auto-namer against the NEW table.
 #[test]
-fn round531_including_indexes_is_refused_not_ignored() {
+fn round621_including_indexes_copies_them() {
     let mut e = engine();
-    let err = e
-        .execute("CREATE TABLE k4 (LIKE src INCLUDING INDEXES)")
-        .expect_err("INDEXES is not supported yet");
+    e.execute("CREATE INDEX src_b ON src(b)").unwrap();
+    e.execute("CREATE UNIQUE INDEX src_a ON src(a)").unwrap();
+    e.execute("CREATE TABLE k4 (LIKE src INCLUDING INDEXES)").unwrap();
+    assert_eq!(
+        rows(&mut e, "SELECT count(*) FROM pg_indexes WHERE tablename = 'k4'"),
+        vec!["3"],
+        "the PK's index, the plain one and the unique one all copy"
+    );
+    // The unique one still enforces on the copy.
+    e.execute("INSERT INTO k4 (id, a, b) VALUES (1, 'x', 1)").unwrap();
     assert!(
-        format!("{err}").contains("INCLUDING INDEXES"),
-        "message was {err}"
+        e.execute("INSERT INTO k4 (id, a, b) VALUES (2, 'x', 2)").is_err(),
+        "the copied UNIQUE index is a real constraint, not a name"
+    );
+    // And the source keeps its own names — no collision between the two.
+    assert_eq!(
+        rows(&mut e, "SELECT count(*) FROM pg_indexes WHERE tablename = 'src'"),
+        vec!["3"]
     );
 }
