@@ -3636,7 +3636,43 @@ fn eval_function_call_positional(
         }
         return Ok(best.cloned().unwrap_or(Value::Null));
     }
+    // v7.39 (round 621) — an unadorned string literal takes the type the
+    // function's parameter asks for. `justify_interval('36 hours')` is answered
+    // by PG and was refused here, and so were `justify_days('35 days')` and
+    // `justify_hours('27 hours')` — the spelling everyone writes, since typing
+    // `INTERVAL` in front of the literal is exactly what PG saves you from.
+    //
+    // Only a LITERAL is resolved, which is the same boundary round 620 drew for
+    // the boolean connectives: `justify_interval(t)` over a TEXT column stays
+    // refused, because PG refuses it too (no such overload). The arg ASTs are
+    // needed to tell those apart, so this cannot live in the value-level
+    // dispatch — the same reason the enum witness above sits here.
+    if let Some(want) = unknown_literal_param_type(name) {
+        let mut coerced = evaluated;
+        for (i, a) in args.iter().enumerate() {
+            if is_unknown_string_literal(a)
+                && let Some(slot) = coerced.get_mut(i)
+            {
+                *slot = cast::cast_value_in(core::mem::replace(slot, Value::Null), want.clone(), false)?;
+            }
+        }
+        return apply_function(name, &coerced, ctx);
+    }
     apply_function(name, &evaluated, ctx)
+}
+
+/// v7.39 (round 621) — the parameter type a bare string literal resolves to.
+///
+/// PG resolves an `unknown` literal to whatever the chosen overload declares.
+/// SPG has no overload resolution to hang that on, so the functions whose only
+/// parameter is unambiguous are listed. `None` leaves the argument alone.
+fn unknown_literal_param_type(name: &str) -> Option<spg_sql::ast::CastTarget> {
+    match name.to_ascii_lowercase().as_str() {
+        "justify_days" | "justify_hours" | "justify_interval" => {
+            Some(spg_sql::ast::CastTarget::Interval)
+        }
+        _ => None,
+    }
 }
 
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
