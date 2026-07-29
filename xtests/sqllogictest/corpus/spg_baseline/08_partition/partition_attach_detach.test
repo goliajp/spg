@@ -34,13 +34,31 @@ SELECT COUNT(*) FROM p
 ----
 0
 
-# Re-ATTACH a non-empty child is rejected (16.3 empty-child gate).
+# v7.39 (round 621) — re-attaching a NON-EMPTY child scans its rows (16.3.b)
+# instead of demanding emptiness. Both rows carry 'jp'/'kr', which the bound
+# takes, so the attach succeeds where the old gate refused it — this case
+# asserted the gate until the scan landed.
+statement ok
+ALTER TABLE p ATTACH PARTITION c_apac FOR VALUES IN ('jp', 'kr')
+
+query I
+SELECT COUNT(*) FROM p
+----
+2
+
+# And a row the bound does NOT take blocks the attach, before any role is
+# installed.
+statement ok
+ALTER TABLE p DETACH PARTITION c_apac
+
+statement ok
+INSERT INTO c_apac VALUES (3, 'us')
+
 statement error
 ALTER TABLE p ATTACH PARTITION c_apac FOR VALUES IN ('jp', 'kr')
 
-# DELETE from c_apac to make it empty, then ATTACH succeeds.
 statement ok
-DELETE FROM c_apac
+DELETE FROM c_apac WHERE region = 'us'
 
 statement ok
 ALTER TABLE p ATTACH PARTITION c_apac FOR VALUES IN ('jp', 'kr')

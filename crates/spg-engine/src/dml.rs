@@ -865,6 +865,219 @@ impl Engine {
         Ok(changed.then_some(out))
     }
 
+    /// v7.39 (round 621) — a partition-parent UPDATE that touches the key
+    /// column, done as PG does it: the row moves to the partition its new key
+    /// belongs to. See the call site for the shape and the failure contract.
+    fn exec_partition_key_update(
+        &mut self,
+        stmt: &spg_sql::ast::UpdateStatement,
+        _key_cols: &[String],
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        use spg_sql::ast::{DeleteStatement, InsertStatement, Overriding, SelectItem};
+        let parent = stmt.table.clone();
+        let children = crate::partition::children_of_parent(self.active_catalog(), &parent);
+        // Phase 1 — capture EVERY child's victims before reinserting any.
+        // Interleaving the two was the first cut, and it double-moved rows: a
+        // child processed later saw the rows an earlier child had just routed
+        // into it, deleted them again, and RETURNING reported the row twice.
+        let mut captured: Vec<(String, Vec<ColumnSchema>, Vec<Row<'static>>)> = Vec::new();
+        let mut total: usize = 0;
+        for child in children {
+            let del = DeleteStatement {
+                ctes: Vec::new(),
+                table: child.clone(),
+                alias: None,
+                where_: stmt.where_.clone(),
+                order_limit: None,
+                returning: Some(alloc::vec![SelectItem::Wildcard]),
+            };
+            let (pre_cols, pre_rows) = match self.exec_delete_cancel(&del, cancel)? {
+                QueryResult::Rows { columns, rows } => (columns, rows),
+                _ => continue,
+            };
+            if pre_rows.is_empty() {
+                continue;
+            }
+            total += pre_rows.len();
+            captured.push((child, pre_cols, pre_rows));
+        }
+        // Phase 2 — post-images from the PRE-image (PG's rule: `SET v = v +
+        // 100` reads the old v), then one reinsert through the parent's
+        // routing. On any failure every child's pre-images go back first.
+        let mut moved_rows: Vec<Row<'static>> = Vec::new();
+        let mut columns_seen: Option<Vec<ColumnSchema>> = None;
+        let mut all_pre: Vec<(String, Vec<String>, Vec<Vec<Expr>>)> = Vec::new();
+        let mut all_post: Vec<Vec<Expr>> = Vec::new();
+        let mut post_col_names: Vec<String> = Vec::new();
+        let mut result = Ok(());
+        'children: for (child, pre_cols, pre_rows) in &captured {
+            let ctx = self.ev_ctx(pre_cols, Some(child));
+            let mut corr_memo = crate::memoize::MemoizeCache::default();
+            let mut pre_tuples: Vec<Vec<Expr>> = Vec::with_capacity(pre_rows.len());
+            for row in pre_rows {
+                let mut pre_t = Vec::with_capacity(pre_cols.len());
+                let mut post_t = Vec::with_capacity(pre_cols.len());
+                for (i, col) in pre_cols.iter().enumerate() {
+                    let old = row.values.get(i).cloned().unwrap_or(Value::Null);
+                    match crate::substitute::value_to_literal_expr_permissive(old.clone()) {
+                        Ok(e) => pre_t.push(e),
+                        Err(e) => {
+                            result = Err(e);
+                            pre_tuples.push(pre_t);
+                            all_pre.push((
+                                child.clone(),
+                                pre_cols.iter().map(|c| c.name.clone()).collect(),
+                                pre_tuples,
+                            ));
+                            break 'children;
+                        }
+                    }
+                    let assigned = stmt
+                        .assignments
+                        .iter()
+                        .find(|(c, _)| c.eq_ignore_ascii_case(&col.name));
+                    let new_v = match assigned {
+                        Some((_, expr)) => match self.eval_expr_with_correlated(
+                            expr,
+                            row,
+                            &ctx,
+                            cancel,
+                            Some(&mut corr_memo),
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                result = Err(e);
+                                pre_tuples.push(pre_t);
+                                all_pre.push((
+                                    child.clone(),
+                                    pre_cols.iter().map(|c| c.name.clone()).collect(),
+                                    pre_tuples,
+                                ));
+                                break 'children;
+                            }
+                        },
+                        None => old,
+                    };
+                    match crate::substitute::value_to_literal_expr_permissive(new_v) {
+                        Ok(e) => post_t.push(e),
+                        Err(e) => {
+                            result = Err(e);
+                            pre_tuples.push(pre_t);
+                            all_pre.push((
+                                child.clone(),
+                                pre_cols.iter().map(|c| c.name.clone()).collect(),
+                                pre_tuples,
+                            ));
+                            break 'children;
+                        }
+                    }
+                }
+                if stmt.returning.is_some() {
+                    let vals: Vec<Value<'static>> = post_t
+                        .iter()
+                        .map(|e| literal_expr_to_value(e.clone()).unwrap_or(Value::Null))
+                        .collect();
+                    moved_rows.push(Row::new(vals));
+                }
+                pre_tuples.push(pre_t);
+                all_post.push(post_t);
+            }
+            if post_col_names.is_empty() {
+                post_col_names = pre_cols.iter().map(|c| c.name.clone()).collect();
+            }
+            all_pre.push((
+                child.clone(),
+                pre_cols.iter().map(|c| c.name.clone()).collect(),
+                pre_tuples,
+            ));
+            if columns_seen.is_none() {
+                columns_seen = Some(pre_cols.clone());
+            }
+        }
+        let outcome = match result {
+            Ok(()) if !all_post.is_empty() => self
+                .exec_insert(InsertStatement {
+                    ctes: Vec::new(),
+                    table: parent.clone(),
+                    alias: None,
+                    columns: Some(post_col_names),
+                    rows: all_post,
+                    select_source: None,
+                    on_conflict: None,
+                    returning: None,
+                    overriding: Overriding::None,
+                    mysql_ignore: false,
+                })
+                .map(|_| ()),
+            other => other,
+        };
+        if let Err(e) = outcome {
+            for (child, names, tuples) in all_pre {
+                if tuples.is_empty() {
+                    continue;
+                }
+                let _ = self.exec_insert(InsertStatement {
+                    ctes: Vec::new(),
+                    table: child,
+                    alias: None,
+                    columns: Some(names),
+                    rows: tuples,
+                    select_source: None,
+                    on_conflict: None,
+                    returning: None,
+                    overriding: Overriding::None,
+                    mysql_ignore: false,
+                });
+            }
+            return Err(e);
+        }
+        if let (Some(ret), Some(cols)) = (&stmt.returning, columns_seen) {
+            let ctx = self.ev_ctx(&cols, Some(&parent));
+            let mut out_rows = Vec::with_capacity(moved_rows.len());
+            let mut out_cols: Vec<ColumnSchema> = Vec::new();
+            for row in &moved_rows {
+                let mut vals = Vec::new();
+                let mut names: Vec<ColumnSchema> = Vec::new();
+                for item in ret {
+                    match item {
+                        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                            for (i, c) in cols.iter().enumerate() {
+                                vals.push(row.values.get(i).cloned().unwrap_or(Value::Null));
+                                names.push(c.clone());
+                            }
+                        }
+                        SelectItem::Expr { expr, alias } => {
+                            let v = eval::eval_expr(expr, row, &ctx).map_err(EngineError::Eval)?;
+                            let name = match alias {
+                                Some(a) => a.clone(),
+                                None => crate::select::default_output_name(expr, false),
+                            };
+                            names.push(ColumnSchema::new(
+                                name,
+                                v.data_type().unwrap_or(spg_storage::DataType::Text),
+                                true,
+                            ));
+                            vals.push(v);
+                        }
+                    }
+                }
+                if out_cols.is_empty() {
+                    out_cols = names;
+                }
+                out_rows.push(Row::new(vals));
+            }
+            return Ok(QueryResult::Rows {
+                columns: out_cols,
+                rows: out_rows,
+            });
+        }
+        Ok(QueryResult::CommandOk {
+            affected: total,
+            modified_catalog: false,
+        })
+    }
+
     fn exec_update_cancel_inner(
         &mut self,
         stmt: &spg_sql::ast::UpdateStatement,
@@ -1069,13 +1282,25 @@ impl Engine {
                 .iter()
                 .any(|(col, _)| key_cols.iter().any(|k| k.eq_ignore_ascii_case(col)));
             if touches_key {
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "UPDATE on partition parent {:?} that changes a partition-key \
-                     column may move a row across partitions (row movement is a \
-                     focused follow-up) — UPDATE the child partition directly, or \
-                     use DELETE + INSERT",
-                    stmt.table
-                )));
+                // v7.39 (round 621) — row movement. A key-touching parent
+                // UPDATE used to be refused (the honest stand-in: fanning it
+                // out in place leaves a row in the wrong partition, which is
+                // silent-wrong). PG moves the row, so an ordinary
+                // `UPDATE pm SET v = 120` — measured: the row lands in the
+                // partition its new key belongs to, and a key no partition
+                // takes raises `no partition of relation … found for row`.
+                //
+                // Implemented as capture + reinsert, through machinery that
+                // already exists: each child's victims are taken with
+                // `DELETE … RETURNING *` (one statement, so the pre-image and
+                // the removal cannot disagree), the SET list is evaluated
+                // against the PRE-image (PG's rule — `SET v = v + 100` reads
+                // the old v), and the post-images go back through the
+                // parent's own INSERT routing, which places each row or
+                // raises PG's error. If that insert fails, the pre-images are
+                // put back into the child they came from before the error
+                // propagates, so a failed statement does not eat rows.
+                return self.exec_partition_key_update(stmt, &key_cols, cancel);
             }
             let children = crate::partition::children_of_parent(self.active_catalog(), &stmt.table);
             let mut total_affected = 0usize;
@@ -5116,9 +5341,9 @@ impl Engine {
                         .or_else(|| default_child.clone())
                         .ok_or_else(|| {
                             EngineError::Unsupported(alloc::format!(
-                                "no partition of relation {parent_name:?} found for \
-                                 row with partition key value (no Range child matches \
-                                 and there is no DEFAULT partition)"
+                                // v7.39 (round 621) — PG's exact wording, which the row-movement
+                                // differential reads.
+                                "no partition of relation {parent_name:?} found for row"
                             ))
                         })?
                 }
@@ -5131,9 +5356,9 @@ impl Engine {
                     .or_else(|| default_child.clone())
                     .ok_or_else(|| {
                         EngineError::Unsupported(alloc::format!(
-                            "no partition of relation {parent_name:?} found for \
-                             row with partition key value (no LIST child matches \
-                             and there is no DEFAULT partition)"
+                            // v7.39 (round 621) — PG's exact wording, which the row-movement
+                                // differential reads.
+                                "no partition of relation {parent_name:?} found for row"
                         ))
                     })?,
                 // v7.37.16 (16.2) — HASH routing: hash(key) mod
@@ -5148,9 +5373,9 @@ impl Engine {
                         .or_else(|| default_child.clone())
                         .ok_or_else(|| {
                             EngineError::Unsupported(alloc::format!(
-                                "no partition of relation {parent_name:?} found for \
-                                 row with partition key value (no HASH child matches \
-                                 and there is no DEFAULT partition)"
+                                // v7.39 (round 621) — PG's exact wording, which the row-movement
+                                // differential reads.
+                                "no partition of relation {parent_name:?} found for row"
                             ))
                         })?
                 }

@@ -714,18 +714,54 @@ impl Engine {
         // Count *visible* rows: under in-place MVCC a DELETE leaves a
         // tombstoned physical row behind, which must not fail the
         // empty-child gate (legacy path removed it physically).
+        // v7.39 (round 621) — 16.3.b, the row scan the gate above promised.
+        //
+        // The pessimistic "child must be empty" gate refused the ordinary
+        // migration — build a table, load it, attach it — that partitioned
+        // setups are adopted FOR. PG scans the rows; now so does this. Every
+        // visible row's key must satisfy the new bound, and one that does not
+        // raises PG's wording (`partition constraint of relation … is violated
+        // by some row`) BEFORE the role is installed, so a failed attach
+        // changes nothing.
+        let key_pos = {
+            let parent = self.active_catalog().get(parent_name);
+            match parent.and_then(|p| p.schema().partition_role.as_ref()) {
+                Some(spg_storage::PartitionRole::Parent {
+                    key_column_positions,
+                    ..
+                }) => key_column_positions.first().copied().unwrap_or(0),
+                _ => 0,
+            }
+        };
         let snap = self.current_snapshot();
-        let child_row_count = self
-            .active_catalog()
-            .get(&child_name)
-            .map(|t| t.scan_visible(&snap).count())
-            .unwrap_or(0);
-        if child_row_count > 0 {
-            return Err(EngineError::Unsupported(alloc::format!(
-                "ATTACH PARTITION: {child_name:?} has {child_row_count} existing rows; \
-                 v7.37.16 (16.3) requires the child to be empty before attach. \
-                 Row-scan validation lands in 16.3.b"
-            )));
+        if let Some(t) = self.active_catalog().get(&child_name) {
+            for (_, row) in t.scan_visible(&snap) {
+                let key = row.values.get(key_pos).cloned().unwrap_or(Value::Null);
+                let fits = match &role {
+                    PartitionRole::Range { lower, upper, .. } => {
+                        crate::partition::value_to_bound(&key)
+                            .is_some_and(|b| crate::partition::value_in_range(&b, lower, upper))
+                    }
+                    PartitionRole::List { values, .. } => {
+                        values.iter().any(|b| b.equals_value(&key))
+                    }
+                    PartitionRole::Hash {
+                        modulus, remainder, ..
+                    } => {
+                        crate::partition::pg_compatible_hash(&key)
+                            .rem_euclid(u64::from(*modulus))
+                            == u64::from(*remainder)
+                    }
+                    // A DEFAULT partition takes whatever no sibling claims, so
+                    // any existing row satisfies it.
+                    PartitionRole::Default { .. } | PartitionRole::Parent { .. } => true,
+                };
+                if !fits {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "partition constraint of relation {child_name:?} is violated by some row"
+                    )));
+                }
+            }
         }
         // Install role.
         let child = self

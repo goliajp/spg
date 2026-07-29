@@ -106,22 +106,40 @@ fn attach_rejects_layout_mismatch() {
     );
 }
 
+/// v7.39 (round 621) — 16.3.b: the rows are scanned, not refused. This pin
+/// asserted the pessimistic empty-child gate until the scan landed; a child
+/// whose rows all satisfy the bound attaches (that is the migration the
+/// feature exists for), and one violating row raises PG's wording before the
+/// role is installed.
 #[test]
-fn attach_rejects_non_empty_child() {
+fn attach_scans_a_non_empty_child() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE p (id BIGINT, region TEXT) PARTITION BY LIST (region)")
         .unwrap();
     e.execute("CREATE TABLE c (id BIGINT, region TEXT)")
         .unwrap();
     e.execute("INSERT INTO c VALUES (1, 'jp')").unwrap();
+    e.execute("ALTER TABLE p ATTACH PARTITION c FOR VALUES IN ('jp')")
+        .expect("every row satisfies the bound, so the attach goes through");
+    match e.execute("SELECT count(*) FROM p").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(format!("{:?}", rows[0].values[0]), "BigInt(1)")
+        }
+        other => panic!("{other:?}"),
+    }
+    // And the violating shape, which is what the scan is FOR.
+    e.execute("CREATE TABLE c2 (id BIGINT, region TEXT)").unwrap();
+    e.execute("INSERT INTO c2 VALUES (2, 'us'), (3, 'jp')").unwrap();
     let err = e
-        .execute("ALTER TABLE p ATTACH PARTITION c FOR VALUES IN ('jp')")
+        .execute("ALTER TABLE p ATTACH PARTITION c2 FOR VALUES IN ('us')")
         .unwrap_err();
-    let msg = format!("{err:?}");
     assert!(
-        msg.contains("existing rows") || msg.contains("empty"),
-        "expected non-empty-child rejection: {msg}"
+        format!("{err}").contains("partition constraint of relation"),
+        "PG's wording for the row that does not fit: {err}"
     );
+    // A failed attach installed nothing: c2 is still standalone.
+    e.execute("INSERT INTO c2 VALUES (4, 'anything')")
+        .expect("no partition role means no bound to violate");
 }
 
 #[test]
@@ -221,16 +239,17 @@ fn attach_then_detach_round_trip_preserves_standalone_inserts() {
         .unwrap();
     e.execute("INSERT INTO p VALUES (1, 'jp')").unwrap();
     e.execute("ALTER TABLE p DETACH PARTITION c").unwrap();
-    // Round-trip back through ATTACH — c has rows so this should
-    // be rejected (consistent with the 16.3 empty-child gate).
-    let err = e
-        .execute("ALTER TABLE p ATTACH PARTITION c FOR VALUES IN ('jp')")
-        .unwrap_err();
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("existing rows") || msg.contains("empty"),
-        "expected non-empty-child rejection on re-attach: {msg}"
-    );
+    // v7.39 (round 621) — the round trip closes now: the detached child's
+    // rows all carry 'jp', so re-attaching under the same bound scans clean
+    // and succeeds. This used to assert the empty-child refusal.
+    e.execute("ALTER TABLE p ATTACH PARTITION c FOR VALUES IN ('jp')")
+        .expect("re-attach after detach, rows intact");
+    match e.execute("SELECT count(*) FROM p").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(format!("{:?}", rows[0].values[0]), "BigInt(1)")
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]

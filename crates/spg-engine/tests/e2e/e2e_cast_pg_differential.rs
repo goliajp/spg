@@ -4353,16 +4353,23 @@ fn update_on_partition_parent_nonkey() {
         ),
         "1:X,2:X,3:X"
     );
-    // key-touching UPDATE on the parent is rejected honestly (not silently misfiled)
-    assert!(e.execute("UPDATE t SET g = 17 WHERE id = 1").is_err());
-    // the rejected UPDATE left the data untouched
+    // v7.39 (round 621) — a key-touching UPDATE moves the row now (this pin
+    // asserted the honest refusal until row movement landed). g=17 belongs to
+    // t_hi, so row 1 crosses from t_lo.
+    e.execute("UPDATE t SET g = 17 WHERE id = 1").unwrap();
     assert_eq!(
         g(
             &mut e,
             "SELECT string_agg(id||':'||g,',' ORDER BY id) FROM t"
         ),
-        "1:5,2:15,3:8"
+        "1:17,2:15,3:8"
     );
+    assert_eq!(
+        g(&mut e, "SELECT string_agg(id::text,',' ORDER BY id) FROM t_hi"),
+        "1,2",
+        "the row is IN the destination partition, not merely reporting the value"
+    );
+    assert_eq!(g(&mut e, "SELECT string_agg(id::text,',') FROM t_lo"), "3");
 }
 
 /// v7.37 D.49 — jsonb_array_length / json_array_length accept a TEXT arg (PG
