@@ -31,7 +31,7 @@ use crate::{
     synth_mysql_user, synth_pg_attribute, synth_pg_class, synth_pg_constraint, synth_pg_database,
     synth_pg_extension, synth_pg_index_raw, synth_pg_indexes, synth_pg_namespace, synth_pg_proc,
     synth_pg_roles, synth_pg_sequence, synth_pg_settings, synth_pg_timezone_abbrevs,
-    synth_pg_timezone_names, synth_pg_trigger, synth_pg_type,
+    synth_pg_operator, synth_pg_timezone_names, synth_pg_trigger, synth_pg_type,
     synth_pg_views, topk_trim, try_gin_jsonb_seek, try_gin_seek, try_index_seek, try_nsw_knn,
     try_pk_walk_top_n, try_trgm_seek, value_is_bigint, value_is_integer, value_to_i64,
 };
@@ -623,6 +623,12 @@ impl Engine {
                 // sqlx / SQLAlchemy / Diesel / pgAdmin lookups.
                 "__spg_pg_type" => {
                     let (schema, rows) = synth_pg_type(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // v7.39 (round 621) — pg_catalog.pg_operator, which did not
+                // exist at all.
+                "__spg_pg_operator" => {
+                    let (schema, rows) = synth_pg_operator(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.17.0 Phase 3.P0-51 — pg_catalog.pg_proc for

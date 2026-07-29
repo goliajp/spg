@@ -3510,6 +3510,140 @@ pub(crate) const ARRAY_TYPE_OIDS: &[(i64, &str, i64)] = &[
         (3645, "_tsquery", 3615),
     ];
 
+/// v7.39 (round 621) — synthesise `pg_catalog.pg_operator`.
+///
+/// The relation did not exist, so `SELECT … FROM pg_operator` answered
+/// `relation "pg_operator" does not exist` — the answer PG gives for a name it
+/// has never heard of, for one of its own catalogs. psql's `\do` reads it, and
+/// so does anything asking "what does `=` mean between these two types".
+///
+/// The rows are the operators SPG actually implements, over the types it
+/// implements them for — not PG's full 74-name table. Listing what is there is
+/// the honest surface; claiming rows SPG cannot honour would be worse than the
+/// missing relation, because a client would believe them.
+///
+/// `oprcode` and the selectivity estimators are 0 throughout: SPG's operators
+/// are not catalogued functions, so there is nothing to name, which is the
+/// same choice `pg_type`'s seven I/O-function OIDs made in round 543.
+pub(crate) fn synth_pg_operator(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oprname", DataType::Text, false),
+        ColumnSchema::new("oprnamespace", DataType::BigInt, false),
+        ColumnSchema::new("oprowner", DataType::BigInt, false),
+        ColumnSchema::new("oprkind", DataType::Text, false),
+        ColumnSchema::new("oprcanmerge", DataType::Bool, false),
+        ColumnSchema::new("oprcanhash", DataType::Bool, false),
+        ColumnSchema::new("oprleft", DataType::BigInt, false),
+        ColumnSchema::new("oprright", DataType::BigInt, false),
+        ColumnSchema::new("oprresult", DataType::BigInt, false),
+        ColumnSchema::new("oprcom", DataType::BigInt, false),
+        ColumnSchema::new("oprnegate", DataType::BigInt, false),
+        ColumnSchema::new("oprcode", DataType::BigInt, false),
+        ColumnSchema::new("oprrest", DataType::BigInt, false),
+        ColumnSchema::new("oprjoin", DataType::BigInt, false),
+    ];
+    // The types the comparison and arithmetic families are emitted over.
+    const CMP_TYPES: &[i64] = &[
+        16,   // bool
+        20,   // int8
+        21,   // int2
+        23,   // int4
+        25,   // text
+        700,  // float4
+        701,  // float8
+        1042, // bpchar
+        1043, // varchar
+        1082, // date
+        1114, // timestamp
+        1184, // timestamptz
+        1186, // interval
+        1700, // numeric
+        2950, // uuid
+        17,   // bytea
+    ];
+    const NUM_TYPES: &[i64] = &[20, 21, 23, 700, 701, 1700];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    let mut oid: i64 = 70_000;
+    let mut push = |rows: &mut Vec<Row<'static>>,
+                    oid: &mut i64,
+                    name: &str,
+                    kind: &str,
+                    left: i64,
+                    right: i64,
+                    result: i64,
+                    canmerge: bool,
+                    canhash: bool| {
+        *oid += 1;
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(*oid),
+            Value::text::<String>(name.into()),
+            Value::BigInt(11), // oprnamespace — pg_catalog
+            Value::BigInt(10), // oprowner
+            Value::text::<String>(kind.into()),
+            Value::Bool(canmerge),
+            Value::Bool(canhash),
+            Value::BigInt(left),
+            Value::BigInt(right),
+            Value::BigInt(result),
+            Value::BigInt(0), // oprcom
+            Value::BigInt(0), // oprnegate
+            Value::BigInt(0), // oprcode — not a catalogued function here
+            Value::BigInt(0), // oprrest
+            Value::BigInt(0), // oprjoin
+        ]));
+    };
+    for &t in CMP_TYPES {
+        // `=` and `<>` merge and hash; the ordering four do neither.
+        push(&mut rows, &mut oid, "=", "b", t, t, 16, true, true);
+        push(&mut rows, &mut oid, "<>", "b", t, t, 16, false, false);
+        for op in ["<", "<=", ">", ">="] {
+            push(&mut rows, &mut oid, op, "b", t, t, 16, false, false);
+        }
+    }
+    for &t in NUM_TYPES {
+        for op in ["+", "-", "*", "/"] {
+            push(&mut rows, &mut oid, op, "b", t, t, t, false, false);
+        }
+        // Unary minus, which is where `oprkind` stops being 'b'.
+        push(&mut rows, &mut oid, "-", "l", 0, t, t, false, false);
+    }
+    for &t in &[20i64, 21, 23] {
+        push(&mut rows, &mut oid, "%", "b", t, t, t, false, false);
+    }
+    // Text and pattern matching.
+    push(&mut rows, &mut oid, "||", "b", 25, 25, 25, false, false);
+    push(&mut rows, &mut oid, "~~", "b", 25, 25, 16, false, false);
+    push(&mut rows, &mut oid, "!~~", "b", 25, 25, 16, false, false);
+    push(&mut rows, &mut oid, "~~*", "b", 25, 25, 16, false, false);
+    push(&mut rows, &mut oid, "!~~*", "b", 25, 25, 16, false, false);
+    push(&mut rows, &mut oid, "~", "b", 25, 25, 16, false, false);
+    push(&mut rows, &mut oid, "!~", "b", 25, 25, 16, false, false);
+    push(&mut rows, &mut oid, "~*", "b", 25, 25, 16, false, false);
+    push(&mut rows, &mut oid, "!~*", "b", 25, 25, 16, false, false);
+    // JSON / JSONB accessors and containment.
+    for &j in &[114i64, 3802] {
+        push(&mut rows, &mut oid, "->", "b", j, 25, j, false, false);
+        push(&mut rows, &mut oid, "->>", "b", j, 25, 25, false, false);
+        push(&mut rows, &mut oid, "#>", "b", j, 1009, j, false, false);
+        push(&mut rows, &mut oid, "#>>", "b", j, 1009, 25, false, false);
+    }
+    push(&mut rows, &mut oid, "@>", "b", 3802, 3802, 16, false, false);
+    push(&mut rows, &mut oid, "<@", "b", 3802, 3802, 16, false, false);
+    push(&mut rows, &mut oid, "?", "b", 3802, 25, 16, false, false);
+    // Array containment and overlap.
+    push(&mut rows, &mut oid, "@>", "b", 1007, 1007, 16, false, false);
+    push(&mut rows, &mut oid, "<@", "b", 1007, 1007, 16, false, false);
+    push(&mut rows, &mut oid, "&&", "b", 1007, 1007, 16, false, false);
+    // Bitwise, over the integer types.
+    for &t in &[20i64, 21, 23] {
+        for op in ["&", "|", "#"] {
+            push(&mut rows, &mut oid, op, "b", t, t, t, false, false);
+        }
+    }
+    (schema, rows)
+}
+
 /// v7.17.0 Phase 3.P0-50 — synthesise `pg_catalog.pg_type`. The
 /// returned rows cover every built-in scalar / array type sqlx,
 /// SQLAlchemy, Diesel and pgAdmin look up at compile / connect
