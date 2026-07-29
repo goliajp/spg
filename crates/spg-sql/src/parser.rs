@@ -136,6 +136,7 @@ fn is_dump_noise_statement(lc: &str) -> bool {
 fn unreserved_keyword_text(tok: &Token) -> Option<String> {
     let s = match tok {
         // PG keyword class: unreserved or col_name.
+        //
         Token::Release => "release",
         Token::Savepoint => "savepoint",
         Token::Show => "show",
@@ -1774,6 +1775,26 @@ impl Parser {
             }
         }
         seq
+    }
+
+    /// v7.39 (round 621) — is the next token the keyword `BY`?
+    ///
+    /// `pg_get_keywords()` classes `by` as `U` (unreserved), so it is a legal
+    /// column, table and alias name — and SPG lexed it into a dedicated
+    /// `Token::By`, which made it unusable as a name ANYWHERE. Of the seven
+    /// two-letter keywords the lexer knew, this was the only one PG leaves
+    /// unreserved (`as`, `in`, `on`, `or`, `to` are reserved and `is` is `T`).
+    ///
+    /// The token is gone; the three clauses that own the word — GROUP BY,
+    /// ORDER BY, PARTITION BY — and the handful of other places that expect it
+    /// ask this instead. Adding it to the unreserved-identifier table was not
+    /// enough on its own: identifier positions that match the token shape
+    /// directly (an index's column list, a table alias) never consult that
+    /// table, so `CREATE INDEX … ON t(by)` and `FROM t AS by` still failed.
+    /// Not lexing it as a keyword closes the whole class rather than the two
+    /// positions that happened to be noticed.
+    fn peek_is_by(&self) -> bool {
+        matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("by"))
     }
 
     fn expect_ident_like(&mut self) -> Result<String, ParseError> {
@@ -5484,7 +5505,7 @@ impl Parser {
                 "increment" => {
                     self.advance();
                     // Optional BY.
-                    if matches!(self.peek(), Token::By) {
+                    if self.peek_is_by() {
                         self.advance();
                     }
                     opts.increment = Some(self.expect_signed_int()?);
@@ -5545,11 +5566,7 @@ impl Parser {
                 }
                 "owned" => {
                     self.advance();
-                    // BY is a reserved Token::By; accept either form.
                     match self.peek() {
-                        Token::By => {
-                            self.advance();
-                        }
                         Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("by") => {
                             self.advance();
                         }
@@ -9118,7 +9135,7 @@ impl Parser {
             // to fire for target rows no source row matches.
             let mut matched = matched;
             if matches!(matched, crate::ast::MergeMatched::NotMatched)
-                && matches!(self.peek(), Token::By)
+                && self.peek_is_by()
             {
                 self.advance();
                 match self.peek() {
@@ -11203,7 +11220,7 @@ impl Parser {
             return Ok(Vec::new());
         }
         self.advance();
-        if !matches!(self.peek(), Token::By) {
+        if !self.peek_is_by() {
             return Err(self.err(format!("expected BY after ORDER, got {:?}", self.peek())));
         }
         self.advance();
@@ -12443,7 +12460,7 @@ impl Parser {
         let mut mysql_rollup = false;
         let group_by = if matches!(self.peek(), Token::Group) {
             self.advance();
-            if !matches!(self.peek(), Token::By) {
+            if !self.peek_is_by() {
                 return Err(self.err(format!("expected BY after GROUP, got {:?}", self.peek())));
             }
             self.advance();
@@ -13233,7 +13250,7 @@ impl Parser {
         // verifies the column type is TIMESTAMPTZ.
         let partition_by = if matches!(self.peek(), Token::Partition) {
             self.advance(); // PARTITION
-            if !matches!(self.peek(), Token::By) {
+            if !self.peek_is_by() {
                 return Err(self.err(format!(
                     "expected BY after PARTITION, got {:?}",
                     self.peek()
@@ -15800,8 +15817,7 @@ impl Parser {
                         self.advance();
                         saw_generated_always = true;
                     }
-                    // `BY` is a reserved keyword token (GROUP BY).
-                    Token::By => {
+                    Token::Ident(b) | Token::QuotedIdent(b) if b.eq_ignore_ascii_case("by") => {
                         self.advance();
                         if !matches!(self.peek(), Token::Default) {
                             return Err(self.err(alloc::format!(
@@ -21993,7 +22009,7 @@ impl Parser {
             )));
         }
         self.advance();
-        if !matches!(self.peek(), Token::By) {
+        if !self.peek_is_by() {
             return Err(self.err(format!(
                 "expected BY after SEARCH … FIRST, got {:?}",
                 self.peek()
@@ -23139,7 +23155,7 @@ impl Parser {
             )));
         }
         self.advance(); // ORDER
-        if !matches!(self.peek(), Token::By) {
+        if !self.peek_is_by() {
             return Err(self.err(format!("expected BY after ORDER, got {:?}", self.peek())));
         }
         self.advance(); // BY
@@ -23241,7 +23257,7 @@ impl Parser {
         };
         if is_partition_kw {
             self.advance();
-            if !matches!(self.peek(), Token::By) {
+            if !self.peek_is_by() {
                 return Err(self.err(format!(
                     "expected BY after PARTITION, got {:?}",
                     self.peek()
@@ -23260,7 +23276,7 @@ impl Parser {
         // ORDER BY ?
         if matches!(self.peek(), Token::Order) {
             self.advance();
-            if !matches!(self.peek(), Token::By) {
+            if !self.peek_is_by() {
                 return Err(self.err(format!("expected BY after ORDER, got {:?}", self.peek())));
             }
             self.advance();
@@ -24088,7 +24104,7 @@ impl Parser {
                     // LAST)`. Keys close the argument list.
                     if matches!(self.peek(), Token::Order) {
                         self.advance();
-                        if !matches!(self.peek(), Token::By) {
+                        if !self.peek_is_by() {
                             return Err(self.err(format!(
                                 "expected BY after ORDER in aggregate args, got {:?}",
                                 self.peek()
