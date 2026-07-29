@@ -1071,11 +1071,13 @@ pub fn cast_value_ref_in(
                     // v7.39 (round 272) — a numeric typmod outside PG's
                     // bounds gets PG's own wording rather than being
                     // reported as an unknown type.
+                    // v7.39 (round 620) — and an unknown one is PG's
+                    // wording, which also earns it PG's SQLSTATE (42704
+                    // UNDEFINED_OBJECT; `unsupported cast target` fell
+                    // through to the generic 42000).
                     EvalError::TypeMismatch {
                         detail: crate::conversions::numeric_typmod_error(&resolve_name)
-                            .unwrap_or_else(|| {
-                                alloc::format!("unsupported cast target `::{name}`")
-                            }),
+                            .unwrap_or_else(|| unknown_type_error_text(name)),
                     }
                 })?;
             finish_named_cast(v, dt, &resolve_name, temporal_prec, mysql)
@@ -1261,6 +1263,17 @@ fn is_known_scalar_name(lower: &str) -> bool {
 /// live spellings — `::binary` (the MySQL prefix's desugar), a table's row
 /// type, and the pseudotypes — and the e2e suite caught every one. It is the
 /// check on this function.
+/// v7.39 (round 620) — PG's wording for a cast target that names no type.
+///
+/// SPG said ``unsupported cast target `::nosuchtype` ``, which reads as "SPG
+/// has not got round to that one" when what happened is that no such type
+/// exists anywhere. PG says `type "nosuchtype" does not exist`, and because
+/// the wire classifies by message text, saying it also moves the code off the
+/// generic 42000 onto 42704 UNDEFINED_OBJECT.
+pub(crate) fn unknown_type_error_text(name: &str) -> alloc::string::String {
+    alloc::format!("type \"{name}\" does not exist")
+}
+
 pub(crate) fn builtin_target_resolves(name: &str, mysql: bool) -> bool {
     if name == "__bit_literal" || bit_cast_width(name).is_some() {
         return true;
