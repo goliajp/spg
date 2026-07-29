@@ -159,6 +159,7 @@ mod e2e_srf_order_by_round600;
 mod e2e_srf_order_by_round621;
 mod e2e_interval_literal_arg_round621;
 mod e2e_deferrable_trailer_round621;
+mod e2e_partition_row_movement_round621;
 mod e2e_pg_operator_round621;
 mod e2e_syntax_gaps_round621;
 mod e2e_user_types_in_pg_type_round621;
