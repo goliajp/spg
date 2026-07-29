@@ -804,29 +804,31 @@ pub(crate) fn run(
         }
         _ => true,
     });
-    let fd_on_primary_key = grouped_by_primary_key(stmt, &group_exprs, schema_cols, catalog);
-    if group_keys_all_resolve
-        && !engine.is_some_and(|e| e.backslash_escapes)
-        && !fd_on_primary_key
-    {
+    let licensed = qualifiers_grouped_by_primary_key(stmt, &group_exprs, schema_cols, catalog);
+    let fd_on_primary_key = !licensed.is_empty();
+    if group_keys_all_resolve && !engine.is_some_and(|e| e.backslash_escapes) {
         let offender = stmt
             .items
             .iter()
             .find_map(|it| match it {
                 SelectItem::Expr { expr, .. } => {
-                    first_ungrouped_column(expr, &group_exprs, schema_cols)
+                    first_ungrouped_column(expr, &group_exprs, schema_cols, &licensed)
                 }
                 _ => None,
             })
             .or_else(|| {
                 stmt.order_by
                     .iter()
-                    .find_map(|o| first_ungrouped_column(&o.expr, &group_exprs, schema_cols))
+                    .find_map(|o| {
+                        first_ungrouped_column(&o.expr, &group_exprs, schema_cols, &licensed)
+                    })
             })
             .or_else(|| {
                 stmt.having
                     .as_ref()
-                    .and_then(|h| first_ungrouped_column(h, &group_exprs, schema_cols))
+                    .and_then(|h| {
+                        first_ungrouped_column(h, &group_exprs, schema_cols, &licensed)
+                    })
             });
         if let Some(c) = offender {
             // PG qualifies the column with the alias when there is one, and
@@ -859,23 +861,26 @@ pub(crate) fn run(
     // exist`. Grouping by a primary key means one input row per group, so
     // "any value in the group" IS the value — the identical rewrite, reached
     // for a different and much narrower reason.
+    let mysql_loose = engine.is_some_and(|e| e.backslash_escapes);
     let loose_stmt;
-    let stmt = if (engine.is_some_and(|e| e.backslash_escapes) || fd_on_primary_key)
-        && !group_exprs.is_empty()
-    {
+    let stmt = if (mysql_loose || fd_on_primary_key) && !group_exprs.is_empty() {
+        // The dialect claims every ungrouped column; the functional dependency
+        // claims only what a grouped primary key determines.
+        let claim: Option<&[alloc::string::String]> =
+            if mysql_loose { None } else { Some(&licensed) };
         let mut s = stmt.clone();
         for item in &mut s.items {
             if let SelectItem::Expr { expr, .. } = item {
                 let taken = core::mem::replace(expr, Expr::Literal(spg_sql::ast::Literal::Null));
-                *expr = wrap_loose_group_columns(taken, &group_exprs, schema_cols);
+                *expr = wrap_loose_group_columns(taken, &group_exprs, schema_cols, claim);
             }
         }
         for o in &mut s.order_by {
             let taken = core::mem::replace(&mut o.expr, Expr::Literal(spg_sql::ast::Literal::Null));
-            o.expr = wrap_loose_group_columns(taken, &group_exprs, schema_cols);
+            o.expr = wrap_loose_group_columns(taken, &group_exprs, schema_cols, claim);
         }
         if let Some(h) = s.having.take() {
-            s.having = Some(wrap_loose_group_columns(h, &group_exprs, schema_cols));
+            s.having = Some(wrap_loose_group_columns(h, &group_exprs, schema_cols, claim));
         }
         loose_stmt = s;
         &loose_stmt
@@ -5659,16 +5664,16 @@ fn first_ungrouped_column<'a>(
     e: &'a Expr,
     group_exprs: &[Expr],
     columns: &[ColumnSchema],
+    licensed: &[alloc::string::String],
 ) -> Option<&'a spg_sql::ast::ColumnName> {
     if group_exprs.iter().any(|g| g == e) {
         return None;
     }
-    let rec = |x: &'a Expr| first_ungrouped_column(x, group_exprs, columns);
+    let rec = |x: &'a Expr| first_ungrouped_column(x, group_exprs, columns, licensed);
     match e {
-        Expr::Column(c) => columns
-            .iter()
-            .any(|col| col.name.eq_ignore_ascii_case(&c.name))
-            .then_some(c),
+        Expr::Column(c) => (column_ref_is_input(c, columns)
+            && !column_is_key_determined(c, licensed))
+        .then_some(c),
         // An aggregate's arguments are exactly what does not need grouping.
         Expr::FunctionCall { name, .. } if is_aggregate_name(&name.to_ascii_lowercase()) => None,
         Expr::AggregateOrdered { .. } => None,
@@ -5699,55 +5704,96 @@ fn first_ungrouped_column<'a>(
     }
 }
 
-/// v7.39 (round 620) — grouping by a primary key licenses every other column
-/// of that table.
+/// v7.39 (round 620) — does this column reference name an INPUT column?
+///
+/// A joined schema names its columns `a.s`; a single-table one names them `s`
+/// and answers to the active alias. Matching only the bare name — which the
+/// first cut of round 620 did — makes every qualified reference in a join
+/// invisible to both the check and the rewrite below, which is how they
+/// reached evaluation and came back `missing FROM-clause entry for table "a"`.
+fn column_ref_is_input(c: &spg_sql::ast::ColumnName, columns: &[ColumnSchema]) -> bool {
+    if let Some(q) = &c.qualifier {
+        let composite = alloc::format!("{q}.{}", c.name);
+        if columns.iter().any(|col| col.name.eq_ignore_ascii_case(&composite)) {
+            return true;
+        }
+    }
+    columns.iter().any(|col| col.name.eq_ignore_ascii_case(&c.name))
+}
+
+/// v7.39 (round 620) — the qualifiers whose PRIMARY KEY is wholly present in
+/// the GROUP BY list, which licenses every OTHER column of those tables.
 ///
 /// `SELECT s, count(*) FROM dc GROUP BY id` where `id` is the primary key is
 /// answered by PG and was REFUSED here — a query that runs on PG and fails on
-/// SPG, which is worse than the wording. One row per `id` means `s` has
+/// SPG, which is worse than any wording. One row per `id` means `s` has
 /// exactly one value in the group, so there is nothing ambiguous to resolve;
 /// the rule is the SQL standard's functional dependency, and PG applies it for
 /// a base table's primary key.
 ///
-/// Only the single-base-table FROM qualifies here. A join would need the
-/// dependency to be traced across it, which is a wider question than the one
-/// this closes.
-fn grouped_by_primary_key(
+/// Every FROM entry is considered separately, so a join licenses the side
+/// whose key is grouped and not the other: `SELECT a.s, b.t … JOIN … GROUP BY
+/// a.id` answers `a.s` and still refuses `b.t`, which is what PG does.
+///
+/// The empty string stands for the unqualified single-table case.
+fn qualifiers_grouped_by_primary_key(
     stmt: &SelectStatement,
     group_exprs: &[Expr],
     columns: &[ColumnSchema],
     catalog: Option<&spg_storage::Catalog>,
-) -> bool {
-    let Some(from) = stmt.from.as_ref() else {
-        return false;
+) -> Vec<alloc::string::String> {
+    let (Some(from), Some(cat)) = (stmt.from.as_ref(), catalog) else {
+        return Vec::new();
     };
-    if !from.joins.is_empty() || from.primary.unnest_expr.is_some() {
-        return false;
-    }
-    let Some(cat) = catalog else { return false };
-    let Some(table) = cat.get(&from.primary.name) else {
-        return false;
-    };
-    let schema = table.schema();
-    let pk = schema
-        .uniqueness_constraints
-        .iter()
-        .find(|u| u.is_primary_key && !u.columns.is_empty());
-    let Some(pk) = pk else { return false };
-    pk.columns.iter().all(|&pos| {
-        let Some(name) = schema.columns.get(pos).map(|c| &c.name) else {
-            return false;
+    let mut out = Vec::new();
+    let refs = core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table));
+    let single = from.joins.is_empty();
+    for tr in refs {
+        if tr.unnest_expr.is_some() {
+            continue;
+        }
+        let Some(table) = cat.get(&tr.name) else { continue };
+        let schema = table.schema();
+        let Some(pk) = schema
+            .uniqueness_constraints
+            .iter()
+            .find(|u| u.is_primary_key && !u.columns.is_empty())
+        else {
+            continue;
         };
-        // The key column has to be grouped by as itself — as a bare column of
-        // this table, qualified or not — for the dependency to hold.
-        group_exprs.iter().any(|g| match g {
-            Expr::Column(c) => {
-                c.name.eq_ignore_ascii_case(name)
-                    && columns.iter().any(|col| col.name.eq_ignore_ascii_case(name))
+        let qual = tr.alias.as_deref().unwrap_or(tr.name.as_str());
+        let all_keys_grouped = pk.columns.iter().all(|&pos| {
+            let Some(name) = schema.columns.get(pos).map(|c| &c.name) else {
+                return false;
+            };
+            // The key column has to be grouped by AS ITSELF, and as this
+            // table's: an unqualified spelling only counts when there is one
+            // table for it to mean.
+            group_exprs.iter().any(|g| match g {
+                Expr::Column(c) if c.name.eq_ignore_ascii_case(name) => {
+                    let belongs = match &c.qualifier {
+                        Some(q) => q.eq_ignore_ascii_case(qual),
+                        None => single,
+                    };
+                    belongs && column_ref_is_input(c, columns)
+                }
+                _ => false,
+            })
+        });
+        if all_keys_grouped {
+            out.push(alloc::string::String::from(qual));
+            if single {
+                out.push(alloc::string::String::new());
             }
-            _ => false,
-        })
-    })
+        }
+    }
+    out
+}
+
+/// True when this column reference is licensed by one of those keys.
+fn column_is_key_determined(c: &spg_sql::ast::ColumnName, licensed: &[alloc::string::String]) -> bool {
+    let q = c.qualifier.as_deref().unwrap_or("");
+    licensed.iter().any(|l| l.eq_ignore_ascii_case(q))
 }
 
 /// v7.39 (round 405) — MySQL's loose GROUP BY: a non-aggregated column
@@ -5758,14 +5804,25 @@ fn grouped_by_primary_key(
 /// descended into (its inner columns are already fine); a non-aggregate
 /// function's argument columns are wrapped individually
 /// (`UPPER(name)` → `UPPER(any_value(name))`).
-fn wrap_loose_group_columns(e: Expr, group_exprs: &[Expr], columns: &[ColumnSchema]) -> Expr {
+fn wrap_loose_group_columns(
+    e: Expr,
+    group_exprs: &[Expr],
+    columns: &[ColumnSchema],
+    // v7.39 (round 620) — `None` wraps every ungrouped column, which is what
+    // MySQL's loose GROUP BY means. `Some(quals)` wraps only the columns a
+    // grouped primary key determines, so a join licenses the side whose key is
+    // grouped and leaves the other to be refused.
+    licensed: Option<&[alloc::string::String]>,
+) -> Expr {
     if group_exprs.iter().any(|g| *g == e) {
         return e;
     }
-    let wrap = |x: Expr| wrap_loose_group_columns(x, group_exprs, columns);
+    let wrap = |x: Expr| wrap_loose_group_columns(x, group_exprs, columns, licensed);
     match e {
         Expr::Column(c) => {
-            if columns.iter().any(|col| col.name.eq_ignore_ascii_case(&c.name)) {
+            let claimed = column_ref_is_input(&c, columns)
+                && licensed.is_none_or(|l| column_is_key_determined(&c, l));
+            if claimed {
                 Expr::FunctionCall {
                     name: String::from("any_value"),
                     args: alloc::vec![Expr::Column(c)],
