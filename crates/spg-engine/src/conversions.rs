@@ -1151,6 +1151,12 @@ fn parse_hhmm_offset_secs(off: &str) -> Option<i32> {
 /// resolve half of regtype input. Mirrors the scalar map format_type
 /// renders; extend both together.
 pub(crate) fn regtype_name_to_oid(name: &str) -> Option<i64> {
+    // v7.39 (round 621) — `integer[]` resolves to its array OID. Without this
+    // `'integer[]'::regtype` was refused as `invalid input syntax for type
+    // oid`, the mirror of the OID-to-name gap above.
+    if let Some(base) = name.trim().strip_suffix("[]") {
+        return array_oid_for_element(regtype_name_to_oid(base)?);
+    }
     Some(match name.trim() {
         "bool" | "boolean" => 16,
         "bytea" => 17,
@@ -3245,6 +3251,30 @@ pub(crate) fn array_oid_element(oid: i64) -> Option<i64> {
         3807 => 3802, // _jsonb
         _ => return None,
     })
+}
+
+/// v7.39 (round 621) — the OID of an ARRAY reads back as `<element>[]`.
+///
+/// `1007::regtype` rendered the number `1007` instead of `integer[]`, so a
+/// column-type query — `atttypid::regtype`, the shape this cast exists for —
+/// told an ORM the type of every array column was a bare number. The scalar
+/// OIDs were all there; only the array half was missing, from both directions.
+pub(crate) fn regtype_oid_to_name_owned(oid: i64) -> Option<alloc::string::String> {
+    if let Some(scalar) = regtype_oid_to_name(oid) {
+        return Some(alloc::string::String::from(scalar));
+    }
+    let (_, _, elem) = crate::system_catalog::ARRAY_TYPE_OIDS
+        .iter()
+        .find(|(arr, _, _)| *arr == oid)?;
+    Some(alloc::format!("{}[]", regtype_oid_to_name(*elem)?))
+}
+
+/// The array OID whose element is `elem`, for the reverse direction.
+pub(crate) fn array_oid_for_element(elem: i64) -> Option<i64> {
+    crate::system_catalog::ARRAY_TYPE_OIDS
+        .iter()
+        .find(|(_, _, e)| *e == elem)
+        .map(|(arr, _, _)| *arr)
 }
 
 pub(crate) fn regtype_oid_to_name(oid: i64) -> Option<&'static str> {
