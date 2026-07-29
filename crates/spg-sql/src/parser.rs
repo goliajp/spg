@@ -795,6 +795,8 @@ const SYNTHESISED_PG_CATALOGS: &[&str] = &[
         "pg_inherits",
         "pg_matviews",
         "pg_namespace",
+        // v7.39 (round 621)
+        "pg_operator",
         "pg_policies",
         "pg_policy",
         "pg_proc",
