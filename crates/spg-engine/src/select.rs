@@ -3180,12 +3180,10 @@ impl Engine {
         // the same query was already right.
         let mut src_of_row: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
         if !srf_idxs.is_empty() {
-            for (i, row) in filtered.iter().enumerate() {
-                let expanded =
-                    expand_srf_row(self, &projection, &srf_idxs, row, &scan_ctx)?;
-                src_of_row.extend(core::iter::repeat_n(i, expanded.len()));
-                projected_rows.extend(expanded);
-            }
+            let (rows, src) =
+                expand_projection_srfs(self, &projection, &srf_idxs, &filtered, &scan_ctx)?;
+            projected_rows = rows;
+            src_of_row = src;
         } else {
             // v7.24 (round-16 B) — select-list subqueries resolve
             // per row (correlated-aware; plain exprs take the fast
@@ -3245,14 +3243,8 @@ impl Engine {
                     let keys: Result<Vec<Value<'static>>, EngineError> = order_by
                         .iter()
                         .zip(out_cols.iter())
-                        .map(|(ob, oc)| match oc {
-                            Some(idx) => Ok(out
-                                .values
-                                .get(*idx)
-                                .cloned()
-                                .unwrap_or(Value::Null)),
-                            None => eval::eval_expr(&ob.expr, &filtered[src], &scan_ctx)
-                                .map_err(EngineError::Eval),
+                        .map(|(ob, oc)| {
+                            srf_order_key(ob, *oc, out, &filtered[src], &scan_ctx)
                         })
                         .collect();
                     Ok((k, keys?))
@@ -3409,22 +3401,32 @@ impl Engine {
         }
         // Projection.
         let projection = build_projection(&stmt.items, &schema_cols, &alias, self.backslash_escapes)?;
+        // v7.39 (round 621) — and here, for the same reason.
+        let srf_idxs = self.srf_target_idxs(&projection);
+        let mut src_of_row: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
         let mut projected_rows: alloc::vec::Vec<Row<'static>> =
             alloc::vec::Vec::with_capacity(filtered.len());
         let mut proj_memo = memoize::MemoizeCache::default();
-        for row in &filtered {
-            let mut vals = alloc::vec::Vec::with_capacity(projection.len());
-            for p in &projection {
-                // v7.24 (round-16 B) — correlated-aware.
-                vals.push(self.eval_expr_with_correlated(
-                    &p.expr,
-                    row,
-                    &scan_ctx,
-                    cancel,
-                    Some(&mut proj_memo),
-                )?);
+        if !srf_idxs.is_empty() {
+            let (rows, src) =
+                expand_projection_srfs(self, &projection, &srf_idxs, &filtered, &scan_ctx)?;
+            projected_rows = rows;
+            src_of_row = src;
+        } else {
+            for row in &filtered {
+                let mut vals = alloc::vec::Vec::with_capacity(projection.len());
+                for p in &projection {
+                    // v7.24 (round-16 B) — correlated-aware.
+                    vals.push(self.eval_expr_with_correlated(
+                        &p.expr,
+                        row,
+                        &scan_ctx,
+                        cancel,
+                        Some(&mut proj_memo),
+                    )?);
+                }
+                projected_rows.push(Row::new(vals));
             }
-            projected_rows.push(Row::new(vals));
         }
         let columns: alloc::vec::Vec<ColumnSchema> = projection
             .iter()
@@ -3440,19 +3442,28 @@ impl Engine {
             })
             .collect();
         // ORDER BY against the source schema.
-        if !stmt.order_by.is_empty() {
-            let mut indexed: alloc::vec::Vec<(usize, Vec<Value<'static>>)> = filtered
+        // v7.39 (round 621) — one entry per OUTPUT row (a target-list SRF makes
+        // more of them than there were inputs), and a positional key means the
+        // Nth OUTPUT column, which is what `resolve_positional_order_by` does
+        // and what the other two synthetic-source tails already did.
+        let order_by = resolve_positional_order_by(&stmt.order_by, &projection);
+        if !order_by.is_empty() {
+            let out_cols = if srf_idxs.is_empty() {
+                alloc::vec![None; order_by.len()]
+            } else {
+                srf_order_output_cols(&order_by, &projection)
+            };
+            let mut indexed: alloc::vec::Vec<(usize, Vec<Value<'static>>)> = projected_rows
                 .iter()
                 .enumerate()
-                .map(|(i, r)| -> Result<_, EngineError> {
-                    let keys: Result<Vec<Value<'static>>, EngineError> = stmt
-                        .order_by
+                .map(|(k, out)| -> Result<_, EngineError> {
+                    let r = &filtered[src_of_row.get(k).copied().unwrap_or(k)];
+                    let keys: Result<Vec<Value<'static>>, EngineError> = order_by
                         .iter()
-                        .map(|ob| {
-                            eval::eval_expr(&ob.expr, r, &scan_ctx).map_err(EngineError::Eval)
-                        })
+                        .zip(out_cols.iter())
+                        .map(|(ob, oc)| srf_order_key(ob, *oc, out, r, &scan_ctx))
                         .collect();
-                    Ok((i, keys?))
+                    Ok((k, keys?))
                 })
                 .collect::<Result<_, _>>()?;
             indexed.sort_by(|a, b| {
@@ -4723,21 +4734,35 @@ impl Engine {
         }
         // Projection.
         let projection = build_projection(&stmt.items, &schema_cols, alias, self.backslash_escapes)?;
+        // v7.39 (round 621) — a target-list SRF expands here too. This tail
+        // serves VALUES, a derived table and `ROWS FROM (…)`, and knew nothing
+        // about them: `SELECT unnest(ARRAY[1,2]), x FROM (VALUES (3),(4)) v(x)`
+        // answered `function unnest(integer[]) does not exist` for a query PG
+        // answers.
+        let srf_idxs = self.srf_target_idxs(&projection);
+        let mut src_of_row: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
         let mut projected_rows: alloc::vec::Vec<Row<'static>> =
             alloc::vec::Vec::with_capacity(filtered.len());
-        for row in &filtered {
-            let mut vals = alloc::vec::Vec::with_capacity(projection.len());
-            for p in &projection {
-                let v = self.eval_expr_with_correlated(
-                    &p.expr,
-                    row,
-                    &scan_ctx,
-                    cancel,
-                    Some(&mut corr_memo.borrow_mut()),
-                )?;
-                vals.push(v);
+        if !srf_idxs.is_empty() {
+            let (rows, src) =
+                expand_projection_srfs(self, &projection, &srf_idxs, &filtered, &scan_ctx)?;
+            projected_rows = rows;
+            src_of_row = src;
+        } else {
+            for row in &filtered {
+                let mut vals = alloc::vec::Vec::with_capacity(projection.len());
+                for p in &projection {
+                    let v = self.eval_expr_with_correlated(
+                        &p.expr,
+                        row,
+                        &scan_ctx,
+                        cancel,
+                        Some(&mut corr_memo.borrow_mut()),
+                    )?;
+                    vals.push(v);
+                }
+                projected_rows.push(Row::new(vals));
             }
-            projected_rows.push(Row::new(vals));
         }
         let columns: alloc::vec::Vec<ColumnSchema> = projection
             .iter()
@@ -4762,21 +4787,29 @@ impl Engine {
         // landing on this executor) came back in input order.
         let order_by = resolve_positional_order_by(&stmt.order_by, &projection);
         if !order_by.is_empty() {
-            let mut indexed: alloc::vec::Vec<(usize, Vec<Value<'static>>)> = filtered
+            // v7.39 (round 621) — one entry per OUTPUT row, since a target-list
+            // SRF makes more of them than there were inputs.
+            let out_cols = if srf_idxs.is_empty() {
+                alloc::vec![None; order_by.len()]
+            } else {
+                srf_order_output_cols(&order_by, &projection)
+            };
+            let mut indexed: alloc::vec::Vec<(usize, Vec<Value<'static>>)> = projected_rows
                 .iter()
                 .enumerate()
-                .map(|(i, r)| -> Result<_, EngineError> {
+                .map(|(k, out)| -> Result<_, EngineError> {
+                    let r = &filtered[src_of_row.get(k).copied().unwrap_or(k)];
                     let keys: Result<Vec<Value<'static>>, EngineError> = order_by
                         .iter()
-                        .map(|ob| {
+                        .zip(out_cols.iter())
+                        .map(|(ob, oc)| {
                             // v7.39 (read01 round 54) — this path builds its
                             // sort keys itself instead of going through
                             // `build_order_keys`, so it skipped the enum-ordinal
                             // substitution: an OUTER `ORDER BY <enum col>` over
                             // a DERIVED TABLE sorted by the label TEXT, not by
                             // member order. Silently wrong rows, not an error.
-                            let v = eval::eval_expr(&ob.expr, r, &scan_ctx)
-                                .map_err(EngineError::Eval)?;
+                            let v = srf_order_key(ob, *oc, out, r, &scan_ctx)?;
                             Ok(
                                 match crate::orderby::enum_order_ordinal(&ob.expr, &v, &scan_ctx) {
                                     Some(ord) => Value::Float(ord),
@@ -4785,7 +4818,7 @@ impl Engine {
                             )
                         })
                         .collect();
-                    Ok((i, keys?))
+                    Ok((k, keys?))
                 })
                 .collect::<Result<_, _>>()?;
             indexed.sort_by(|a, b| {
@@ -10085,6 +10118,52 @@ fn build_srf_plan(
 }
 
 /// One input row expanded through a plan built once for the whole scan.
+/// v7.39 (round 621) — expand a projection whose target list contains
+/// set-returning items, remembering which INPUT row each output row came from.
+///
+/// The three materialised-source tails — `FROM unnest(…)`, `FROM
+/// generate_series(…)`, and the one that serves VALUES / a derived table /
+/// `ROWS FROM (…)` — are near-copies of each other, and only the first knew
+/// about target-list SRFs. So `SELECT unnest(ARRAY[1,2]), x FROM (VALUES (3),(4))
+/// v(x)` answered `function unnest(integer[]) does not exist` on all the
+/// others, for a query PG answers. Sharing the expansion is the point: a
+/// fourth copy would have been the fourth place to forget.
+fn expand_projection_srfs(
+    engine: &Engine,
+    projection: &[ProjectedItem],
+    srf_idxs: &[usize],
+    filtered: &[Row<'static>],
+    ctx: &EvalContext<'_>,
+) -> Result<(alloc::vec::Vec<Row<'static>>, alloc::vec::Vec<usize>), EngineError> {
+    let mut out = alloc::vec::Vec::with_capacity(filtered.len());
+    let mut src = alloc::vec::Vec::with_capacity(filtered.len());
+    for (i, row) in filtered.iter().enumerate() {
+        let expanded = expand_srf_row(engine, projection, srf_idxs, row, ctx)?;
+        src.extend(core::iter::repeat_n(i, expanded.len()));
+        out.extend(expanded);
+    }
+    Ok((out, src))
+}
+
+/// v7.39 (round 621) — one ORDER BY key, read from wherever it lives.
+///
+/// A key that names a select-list item reads it out of the EXPANDED row,
+/// because PG sorts after the expansion. A key that names a source column the
+/// query does not project is evaluated against the input row that output row
+/// came from. `out_col` is `srf_order_output_cols`'s verdict for this key.
+fn srf_order_key(
+    ob: &spg_sql::ast::OrderBy,
+    out_col: Option<usize>,
+    out: &Row<'static>,
+    src: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EngineError> {
+    match out_col {
+        Some(i) => Ok(out.values.get(i).cloned().unwrap_or(Value::Null)),
+        None => eval::eval_expr(&ob.expr, src, ctx).map_err(EngineError::Eval),
+    }
+}
+
 fn expand_srf_row_with(
     engine: &Engine,
     plan: &mut SrfPlan,
