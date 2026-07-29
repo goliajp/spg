@@ -13936,6 +13936,9 @@ impl Parser {
         self.advance(); // PRIMARY
         self.advance(); // KEY
         let columns = self.parse_paren_ident_list("PRIMARY KEY")?;
+        // v7.39 (round 621) — the deferrability trailer, consumed and enforced
+        // immediately (see the column-level arm for the reasoning).
+        self.consume_optional_deferrable_clauses()?;
         Ok(crate::ast::TableConstraint::PrimaryKey {
             name: None,
             columns,
@@ -13964,6 +13967,7 @@ impl Parser {
             }
         }
         let columns = self.parse_paren_ident_list("UNIQUE")?;
+        self.consume_optional_deferrable_clauses()?;
         Ok(crate::ast::TableConstraint::Unique {
             name: None,
             columns,
@@ -16010,6 +16014,16 @@ impl Parser {
                 default = Some(self.parse_expr(0)?);
                 continue;
             }
+            // v7.39 (round 621) — `NOT DEFERRABLE` shares this arm's leading
+            // token with NOT NULL and sits EARLIER in the loop than the
+            // deferrability arm, so without the lookahead it was reported as
+            // "NOT NULL specified twice" (or "expected NULL after NOT").
+            if matches!(self.peek(), Token::Not)
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("deferrable"))
+            {
+                self.consume_optional_deferrable_clauses()?;
+                continue;
+            }
             if matches!(self.peek(), Token::Not) {
                 if nullability_seen {
                     return Err(self.err("NOT NULL specified twice".into()));
@@ -16057,6 +16071,21 @@ impl Parser {
             // (mailrs F1). Implies `NOT NULL`. The engine creates
             // a BTree index for the PK column at CREATE TABLE time
             // so FK parent-side index lookups resolve.
+            // v7.39 (round 621) — `[NOT] DEFERRABLE [INITIALLY {DEFERRED |
+            // IMMEDIATE}]` after an inline PK / UNIQUE / REFERENCES. Every
+            // spelling was a parse error, so a pg_dump carrying one stopped
+            // mid-restore. The clauses are consumed by the same helper the FK
+            // path has used since round 288 and recorded nowhere: SPG enforces
+            // the constraint IMMEDIATELY either way, which fails earlier than
+            // PG inside a transaction that violates-then-repairs — a refusal,
+            // not a wrong answer. True deferral is the open remainder of F08.
+            if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("deferrable") || s.eq_ignore_ascii_case("initially"))
+                || (matches!(self.peek(), Token::Not)
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("deferrable")))
+            {
+                self.consume_optional_deferrable_clauses()?;
+                continue;
+            }
             if let Token::Ident(s) = self.peek()
                 && s.eq_ignore_ascii_case("primary")
             {
