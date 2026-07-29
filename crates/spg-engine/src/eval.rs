@@ -1303,10 +1303,45 @@ fn coerce_unknown_literal_to_bool(e: &Expr) -> Result<Value<'static>, EvalError>
     )
 }
 
-/// v7.39 (round 620) — `AND` / `OR` with an unknown literal on either side.
+/// v7.39 (round 621) — a literal that is plainly not a boolean, and the PG
+/// type name for it. `NULL` and a bare string literal are deliberately absent:
+/// neither carries a type of its own, and a boolean connective is a context
+/// that gives them one.
+fn non_boolean_literal_type(e: &Expr) -> Option<&'static str> {
+    use spg_sql::ast::Literal as L;
+    match e {
+        Expr::Literal(L::Integer(_)) => Some("integer"),
+        Expr::Literal(L::Float(_)) => Some("double precision"),
+        Expr::Literal(L::Numeric { .. } | L::NumericBig(_)) => Some("numeric"),
+        _ => None,
+    }
+}
+
+/// v7.39 (round 621) — `AND` / `OR`, evaluated the way PG evaluates them.
+///
+/// Round 620 handled the unknown literal here; round 621 adds the part that
+/// makes `WHERE x <> 0 AND 1/x > 0` work at all. SPG evaluated both sides
+/// always, so the guard idiom — the whole reason that predicate is written
+/// that way — raised on the very rows the guard exists to exclude. Measured
+/// against PG: `false AND (1/0 = 0)` answers `f`, `true OR (1/0 = 0)` answers
+/// `t`, and a filter guarded that way returns its rows.
+///
+/// PG affords that AND still refuses `false AND 1`, because the two happen at
+/// different times: the operand types are checked during ANALYSIS, before any
+/// evaluation, and the short circuit is a RUN-TIME decision. Both parts are
+/// here — the right-hand operand's type is read statically (it is the side
+/// that may go unevaluated), and only a type that is definitively known and
+/// definitively not boolean is refused. An unknown type is left alone, so a
+/// shape the describer cannot type keeps the old behaviour rather than
+/// earning a spurious error.
+///
+/// Order is PG's too, and it is strictly left-first: `(1/0 = 0) AND false`
+/// raises on both, because the left is evaluated before anything can decide
+/// that it did not need to be.
+///
 /// Out-of-line so it costs `eval_expr` no frame (the round-305 frame cliff).
 #[inline(never)]
-fn eval_connective_over_unknown_literal(
+fn eval_connective(
     lhs: &Expr,
     op: BinOp,
     rhs: &Expr,
@@ -1321,7 +1356,42 @@ fn eval_connective_over_unknown_literal(
         }
     };
     let l = side(lhs)?;
-    let r = side(rhs)?;
+    // The analysis-time half: refuse a right-hand operand that is plainly not
+    // boolean, whether or not the short circuit would reach it.
+    //
+    // Only a LITERAL is read this way. The first cut asked
+    // `describe_expr_type` for any expression's type, and it answers
+    // confidently and wrongly for shapes that matter here — `NULL` comes back
+    // as text, so `true AND NULL` earned a type error; and a MATCH … AGAINST
+    // folds internally into an OR over tsvector operands, so full-text search
+    // stopped working. Three existing pins caught all of it. A literal cannot
+    // be misread, and it is what PG's own refusals in this area are about.
+    if let Some(ty) = non_boolean_literal_type(rhs) {
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "argument of {} must be type boolean, not type {ty}",
+                if matches!(op, BinOp::And) { "AND" } else { "OR" },
+            ),
+        });
+    }
+    // Resolving an unknown literal belongs to the same half — it is a
+    // coercion PG performs while analysing, so `false AND 'a'` says
+    // `invalid input syntax for type boolean: "a"` rather than answering `f`.
+    let rhs_resolved = if is_unknown_string_literal(rhs) {
+        Some(coerce_unknown_literal_to_bool(rhs)?)
+    } else {
+        None
+    };
+    // The run-time half.
+    match (op, &l) {
+        (BinOp::And, Value::Bool(false)) => return Ok(Value::Bool(false)),
+        (BinOp::Or, Value::Bool(true)) => return Ok(Value::Bool(true)),
+        _ => {}
+    }
+    let r = match rhs_resolved {
+        Some(v) => v,
+        None => side(rhs)?,
+    };
     if matches!(op, BinOp::And) {
         and_3vl(l, r)
     } else {
@@ -4418,14 +4488,11 @@ pub fn eval_expr(
         {
             eval_mysql_connective(lhs, *op, rhs, row, ctx)
         }
-        // v7.39 (round 620) — the same unknown-literal resolution for the
-        // two-sided connectives. Placed AFTER the MySQL arm so the dialect
-        // keeps its own reading of them.
-        Expr::Binary { lhs, op, rhs }
-            if matches!(op, BinOp::And | BinOp::Or)
-                && (is_unknown_string_literal(lhs) || is_unknown_string_literal(rhs)) =>
-        {
-            eval_connective_over_unknown_literal(lhs, *op, rhs, row, ctx)
+        // v7.39 (round 620/621) — the unknown-literal resolution and the
+        // short circuit, both out of line. Placed AFTER the MySQL arm so the
+        // dialect keeps its own reading of these connectives.
+        Expr::Binary { lhs, op, rhs } if matches!(op, BinOp::And | BinOp::Or) => {
+            eval_connective(lhs, *op, rhs, row, ctx)
         }
         Expr::Binary { lhs, op, rhs } => {
             // v7.32 (P4 borrow channel) — comparison fast path. A pure
