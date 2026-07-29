@@ -1001,6 +1001,27 @@ fn literal_text_pattern(pattern: &Expr) -> Option<&str> {
 /// memo-dependent nodes (InList set fast path — round-25) rebuild
 /// per row there. Measured: compiling a search WHERE with an
 /// InList subtree regressed 634 ms → 18.7 s.
+/// v7.39 (round 621) — is this cast an identity on THIS value?
+///
+/// `s::TEXT` over a text cell changes nothing, and neither does an unbounded
+/// `::VARCHAR`; the compiled path used to clone the cell anyway. Only the
+/// pairs that provably change nothing are listed — a bounded VARCHAR(n) must
+/// still check its length, numerics their range — so an unlisted pair merely
+/// keeps the owned path, never a wrong answer.
+fn cast_is_identity_for(v: &Value<'_>, target: &spg_sql::ast::CastTarget) -> bool {
+    match (v, target) {
+        (Value::Text(_), spg_sql::ast::CastTarget::Text) => true,
+        (Value::Text(_), spg_sql::ast::CastTarget::Named(n)) => {
+            n.eq_ignore_ascii_case("text") || n.eq_ignore_ascii_case("varchar")
+        }
+        (Value::Int(_), spg_sql::ast::CastTarget::Int) => true,
+        (Value::BigInt(_), spg_sql::ast::CastTarget::BigInt) => true,
+        (Value::Float(_), spg_sql::ast::CastTarget::Float) => true,
+        (Value::Bool(_), spg_sql::ast::CastTarget::Bool) => true,
+        _ => false,
+    }
+}
+
 pub(crate) fn fully_compilable(e: &Expr) -> bool {
     match e {
         Expr::Literal(_) | Expr::Column(_) => true,
@@ -1931,8 +1952,27 @@ where
             }
             Step::Cast { target } => {
                 crate::bump_counter!(STEP_VM_CAST_FIRE);
-                let v = stack.pop().unwrap_or(Value::Null).into_owned();
-                stack.push(super::cast::cast_value(v, target.clone())?);
+                // v7.39 (round 621) — two allocations a row lived on this one
+                // line: `into_owned()` cloned a borrowed text cell just to
+                // hand it to the cast, and `target.clone()` re-built the
+                // target (a String, for the Named form) EVERY row even though
+                // it is a compile product. `count(s::TEXT)` — a cast that
+                // changes nothing — measured 2.00 allocs/row and 12 ms where
+                // `count(s)` measures 0.00 and 2.8 ms.
+                //
+                // A cast that is an identity on the value it was given hands
+                // the borrowed value straight back; everything else takes the
+                // owned path, with the target passed by reference.
+                let v = stack.pop().unwrap_or(Value::Null);
+                if cast_is_identity_for(&v, target) {
+                    stack.push(v);
+                } else {
+                    stack.push(super::cast::cast_value_ref_in(
+                        v.into_owned(),
+                        target,
+                        ctx.mysql_dialect,
+                    )?);
+                }
             }
             Step::Case {
                 operand,
