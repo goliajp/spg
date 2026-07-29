@@ -224,7 +224,10 @@ pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
         DataType::Timestamp => "timestamp without time zone",
         DataType::Timestamptz => "timestamp with time zone",
         DataType::Interval => "interval",
-        DataType::Json => "jsonb",
+        // v7.39 (round 620) — a `json` column is `json`. `Jsonb` is its own
+        // variant right below, so reporting both as jsonb was not a catch-all
+        // falling through; it named the wrong type outright.
+        DataType::Json => "json",
         DataType::Jsonb => "jsonb",
         DataType::Bytes => "bytea",
         DataType::Uuid => "uuid",
@@ -443,7 +446,13 @@ fn info_column_row(
             DataType::Bool => "bool",
             DataType::Text => "text",
             DataType::Bytes => "bytea",
-            DataType::Json => "jsonb",
+            // v7.39 (round 620) — `Jsonb` is its OWN variant beside `Json`,
+            // and this table only had the latter, so every JSONB column
+            // reported itself as `text` here while `pg_attribute.atttypid`
+            // said 3802 right next to it. Two mappings for the same question,
+            // disagreeing. And `json` is `json`, not `jsonb`.
+            DataType::Json => "json",
+            DataType::Jsonb => "jsonb",
             DataType::Uuid => "uuid",
             DataType::Date => "date",
             DataType::Timestamp => "timestamp",
@@ -471,6 +480,10 @@ fn info_column_row(
             DataType::TimestampArray => "_timestamp",
             DataType::TimestamptzArray => "_timestamptz",
             DataType::UuidArray => "_uuid",
+            // v7.39 (round 620) — two more element types whose arrays fell
+            // into the text catch-all and named themselves `text`.
+            DataType::BytesArray => "_bytea",
+            DataType::JsonArray => "_json",
             _ => "text",
         };
         // v7.39 (round 248) — datetime_precision: PG reports 6 for the
@@ -3221,7 +3234,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::SmallInt(typlen),
                 Value::SmallInt(attnum),
                 Value::Int(attndims),
-                Value::Int(-1), // atttypmod — -1 = no modifier
+                Value::Int(pg_atttypmod(col.ty)),
                 Value::Bool(typlen > 0 && typlen <= 8),
                 Value::text(attstorage),
                 Value::text(attalign),
@@ -3327,6 +3340,30 @@ const fn pg_type_len(ty: DataType) -> i16 {
 
 /// PG type OID lookup for the SPG DataType set. Used by
 /// `synth_pg_attribute`'s `atttypid` column.
+/// v7.39 (round 620) — PG's packed type modifier, which was hard-coded to
+/// `-1` (no modifier) for every column. `format_type` reads it to spell the
+/// length back out, so `character varying(8)` came out as bare `text` and
+/// `numeric(10,2)` as bare `numeric` — the declared precision was simply not
+/// reachable through the catalog.
+///
+/// The packing is PG's, measured against it: a length-carrying character type
+/// stores `n + 4` (`varchar(8)` -> 12, `char(4)` -> 8, `char(1)` -> 5), and
+/// numeric packs both halves, `((precision << 16) | scale) + 4`
+/// (`numeric(10,2)` -> 655366). Everything else has no modifier.
+fn pg_atttypmod(ty: DataType) -> i32 {
+    match ty {
+        DataType::Varchar(n) | DataType::Char(n) => {
+            i32::try_from(n).map_or(-1, |n| n.saturating_add(4))
+        }
+        DataType::Numeric { precision, scale } => {
+            let p = i32::from(precision);
+            let s = i32::from(scale);
+            ((p << 16) | s).saturating_add(4)
+        }
+        _ => -1,
+    }
+}
+
 fn pg_type_oid(ty: DataType) -> i64 {
     match ty {
         DataType::Bool => 16,
@@ -3338,8 +3375,24 @@ fn pg_type_oid(ty: DataType) -> i64 {
         DataType::SmallInt => 21,
         DataType::Int => 23,
         DataType::BigInt => 20,
-        DataType::Text | DataType::Varchar(_) | DataType::Char(_) => 25,
+        DataType::Text => 25,
+        // v7.39 (round 620) — a declared `varchar(n)` / `char(n)` reported
+        // itself as plain text HERE while `information_schema.columns` (fixed
+        // in round 248) reported it correctly two queries away. Both OIDs have
+        // been in `pg_type` all along. SPG stores these as text with a length
+        // limit, but the column WAS declared as what it was declared as, and
+        // that is what introspection — and anything that regenerates DDL from
+        // it — has to be told.
+        DataType::Varchar(_) => 1043,
+        DataType::Char(_) => 1042,
         DataType::Float => 701,
+        // v7.39 (round 620) — `real` fell into the catch-all and every REAL
+        // column's `pg_attribute.atttypid` was 0. A zero type OID does not
+        // join to `pg_type`, so the column DISAPPEARED from the standard
+        // introspection query, and `format_type` had nothing to name it with
+        // and answered `???`. float4's OID has been in `pg_type` all along;
+        // only the column-to-OID direction was missing it.
+        DataType::Real => 700,
         DataType::Numeric { .. } => 1700,
         DataType::Date => 1082,
         DataType::Time => 1083,
