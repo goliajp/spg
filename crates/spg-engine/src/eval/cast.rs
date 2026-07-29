@@ -599,9 +599,9 @@ pub fn cast_value_ref_in(
                     _ => unreachable!(),
                 };
                 if matches!(target, CastTarget::RegType)
-                    && let Some(name) = crate::conversions::regtype_oid_to_name(n)
+                    && let Some(name) = crate::conversions::regtype_oid_to_name_owned(n)
                 {
-                    Ok(Value::text::<String>(name.into()))
+                    Ok(Value::text(name))
                 } else {
                     Ok(Value::text(alloc::format!("{n}")))
                 }

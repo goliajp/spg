@@ -3425,6 +3425,47 @@ fn pg_type_oid(ty: DataType) -> i64 {
     }
 }
 
+/// v7.39 (round 621) — the array types, as `(array oid, typname, element oid)`.
+///
+/// Hoisted out of `synth_pg_type` because `::regtype` needs the same knowledge
+/// and did not have it: `1007::regtype` rendered `1007` instead of
+/// `integer[]`, and `'integer[]'::regtype` was refused outright, while
+/// `format_type(1007,-1)` — a third place that knows — answered correctly. One
+/// table, three readers.
+pub(crate) const ARRAY_TYPE_OIDS: &[(i64, &str, i64)] = &[
+        (1000, "_bool", 16),
+        (1001, "_bytea", 17),
+        (1002, "_char", 18),
+        (1003, "_name", 19),
+        (1016, "_int8", 20),
+        (1005, "_int2", 21),
+        (1007, "_int4", 23),
+        (1008, "_regproc", 24),
+        (1009, "_text", 25),
+        (1028, "_oid", 26),
+        (199, "_json", 114),
+        (143, "_xml", 142),
+        (1021, "_float4", 700),
+        (1022, "_float8", 701),
+        (651, "_cidr", 650),
+        (1041, "_inet", 869),
+        (1040, "_macaddr", 829),
+        (1014, "_bpchar", 1042),
+        (1015, "_varchar", 1043),
+        (1182, "_date", 1082),
+        (1183, "_time", 1083),
+        (1115, "_timestamp", 1114),
+        (1185, "_timestamptz", 1184),
+        (1187, "_interval", 1186),
+        (1270, "_timetz", 1266),
+        (1231, "_numeric", 1700),
+        (791, "_money", 790),
+        (2951, "_uuid", 2950),
+        (3807, "_jsonb", 3802),
+        (3643, "_tsvector", 3614),
+        (3645, "_tsquery", 3615),
+    ];
+
 /// v7.17.0 Phase 3.P0-50 — synthesise `pg_catalog.pg_type`. The
 /// returned rows cover every built-in scalar / array type sqlx,
 /// SQLAlchemy, Diesel and pgAdmin look up at compile / connect
@@ -3539,39 +3580,7 @@ pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     ];
     // Array companion types share the typelem / typcategory='A'.
     // We emit just the array OIDs the scalars reference.
-    let arrays: &[(i64, &str, i64)] = &[
-        (1000, "_bool", 16),
-        (1001, "_bytea", 17),
-        (1002, "_char", 18),
-        (1003, "_name", 19),
-        (1016, "_int8", 20),
-        (1005, "_int2", 21),
-        (1007, "_int4", 23),
-        (1008, "_regproc", 24),
-        (1009, "_text", 25),
-        (1028, "_oid", 26),
-        (199, "_json", 114),
-        (143, "_xml", 142),
-        (1021, "_float4", 700),
-        (1022, "_float8", 701),
-        (651, "_cidr", 650),
-        (1041, "_inet", 869),
-        (1040, "_macaddr", 829),
-        (1014, "_bpchar", 1042),
-        (1015, "_varchar", 1043),
-        (1182, "_date", 1082),
-        (1183, "_time", 1083),
-        (1115, "_timestamp", 1114),
-        (1185, "_timestamptz", 1184),
-        (1187, "_interval", 1186),
-        (1270, "_timetz", 1266),
-        (1231, "_numeric", 1700),
-        (791, "_money", 790),
-        (2951, "_uuid", 2950),
-        (3807, "_jsonb", 3802),
-        (3643, "_tsvector", 3614),
-        (3645, "_tsquery", 3615),
-    ];
+    let arrays: &[(i64, &str, i64)] = ARRAY_TYPE_OIDS;
     let mut rows: Vec<Row<'static>> = Vec::with_capacity(scalars.len() + arrays.len());
     // Build a row from PG's type-attribute conventions:
     //   typbyval        — fixed-width ∈ {1,2,4,8} (PG SQL_pass-by-value)
