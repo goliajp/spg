@@ -157,6 +157,7 @@ mod e2e_const_fold_round605;
 mod e2e_jsonb_canonical_round603;
 mod e2e_srf_order_by_round600;
 mod e2e_srf_order_by_round621;
+mod e2e_srf_over_sources_round621;
 mod e2e_srf_plan_round599;
 mod e2e_recursive_cte_round598;
 mod e2e_ansi89_join_round588;
