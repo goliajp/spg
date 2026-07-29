@@ -16935,7 +16935,25 @@ fn apply_function_dispatch(
             }
             // PG's deparse names (SQL-standard spellings, not the
             // internal typname) — shared with the `::regtype` cast.
-            let Some(base) = crate::conversions::regtype_oid_to_name(oid) else {
+            // v7.39 (round 621) — a user-defined type is named by its own
+            // name. Round 621 put enums, composites and domains into
+            // `pg_type`; this reader had to learn them too, or
+            // `format_type(t.oid, -1)` over `pg_type` answered `???` for a row
+            // `pg_type` had just started returning. Owned, not leaked: this
+            // runs once per row of whatever is being described.
+            let Some(base) = crate::conversions::regtype_oid_to_name(oid)
+                .map(alloc::string::String::from)
+                .or_else(|| {
+                    ctx.catalog.and_then(|cat| {
+                        let (e, c, d) = crate::system_catalog::user_type_oids(cat);
+                        e.into_iter()
+                            .chain(c)
+                            .chain(d)
+                            .find(|(_, o)| *o == oid)
+                            .map(|(n, _)| n)
+                    })
+                })
+            else {
                 return Ok(Value::text::<String>("???".into()));
             };
             let rendered = if typmod >= 0 && matches!(oid, 1560 | 1562) {
@@ -16955,7 +16973,7 @@ fn apply_function_dispatch(
                             packed & 0xFFFF
                         )
                     }
-                    _ => base.into(),
+                    _ => base.clone(),
                 }
             } else if typmod >= 0
                 && matches!(oid, 1083 | 1114 | 1184 | 1266)
