@@ -1088,12 +1088,15 @@ fn eq_ci(input: &[u8], lower: &[u8]) -> bool {
 
 #[inline]
 fn kw_len2(b: &[u8]) -> Option<Token> {
-    // 7 keywords: as, by, in, is, on, or, to
+    // v7.39 (round 621) — 6 keywords: as, in, is, on, or, to.
+    //
+    // `by` used to be here, and lexing it made it unusable as a name: a
+    // `by` column could not be created, read, written, indexed or aliased.
+    // `pg_get_keywords()` classes it `U` (unreserved) — alone among these
+    // seven — so it is an ordinary identifier, and the clauses that own the
+    // word (GROUP BY, ORDER BY, PARTITION BY) recognise it as one.
     if eq_ci(b, b"as") {
         return Some(Token::As);
-    }
-    if eq_ci(b, b"by") {
-        return Some(Token::By);
     }
     if eq_ci(b, b"in") {
         return Some(Token::In);
@@ -2077,7 +2080,12 @@ mod tests {
     fn order_by_limit_are_keywords() {
         assert_eq!(
             lex("ORDER BY LIMIT"),
-            vec![Token::Order, Token::By, Token::Limit, Token::Eof]
+            vec![
+                Token::Order,
+                Token::Ident("by".into()),
+                Token::Limit,
+                Token::Eof,
+            ]
         );
     }
 
