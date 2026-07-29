@@ -9,9 +9,20 @@ CREATE TABLE b (id INT NOT NULL, name TEXT NOT NULL)
 statement ok
 CREATE TABLE c (id BIGINT NOT NULL, ratio FLOAT, ok BOOL)
 
-# CREATE TABLE with no columns is a parse error.
-statement error
+# v7.39 (round 621) — a table with NO columns is legal, and this case used to
+# assert the opposite. Measured against live PG18: it creates the table, and
+# `INSERT ... DEFAULT VALUES` puts a row in it. The expectation here was SPG's
+# own refusal written down as if it were the rule.
+statement ok
 CREATE TABLE empty ()
+
+statement ok
+INSERT INTO empty DEFAULT VALUES
+
+query I
+SELECT count(*) FROM empty
+----
+1
 
 # Duplicate table name is a runtime error.
 statement ok

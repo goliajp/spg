@@ -1797,6 +1797,18 @@ impl Parser {
         matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("by"))
     }
 
+    /// v7.39 (round 621) — the optional `CASCADE` / `RESTRICT` trailer a DROP
+    /// takes. Accepted and dropped: SPG tracks no dependents to cascade to,
+    /// which is what `DROP TABLE` and `DROP INDEX` have done since v7.14.
+    fn consume_drop_behaviour(&mut self) {
+        if matches!(
+            self.peek(),
+            Token::Ident(s) if s.eq_ignore_ascii_case("cascade") || s.eq_ignore_ascii_case("restrict")
+        ) {
+            self.advance();
+        }
+    }
+
     fn expect_ident_like(&mut self) -> Result<String, ParseError> {
         let first = match self.advance() {
             Token::Ident(s) | Token::QuotedIdent(s) => s,
@@ -2748,6 +2760,14 @@ impl Parser {
                         } else {
                             None
                         };
+                        // v7.39 (round 621) — the `CASCADE` / `RESTRICT`
+                        // trailer, which `DROP TABLE` and `DROP INDEX` have
+                        // accepted since v7.14 and this one refused outright.
+                        // pg_dump writes it, so refusing was a parse error in
+                        // the middle of a restore. SPG drops the function
+                        // either way — it tracks no dependents to cascade to —
+                        // which is the same reading the other two give it.
+                        self.consume_drop_behaviour();
                         Ok(Statement::DropFunction {
                             name,
                             args,
@@ -13130,6 +13150,15 @@ impl Parser {
         let mut table_constraints: Vec<crate::ast::TableConstraint> = Vec::new();
         let mut like_specs: Vec<crate::ast::LikeSpec> = Vec::new();
         loop {
+            // v7.39 (round 621) — `CREATE TABLE c () INHERITS (p)`, the empty
+            // column list. It is how a child that adds nothing of its own is
+            // written, and this loop demanded at least one entry: `syntax
+            // error at or near ")"`. The child takes the parent's columns,
+            // which the INHERITS clause already arranges.
+            if columns.is_empty() && matches!(self.peek(), Token::RParen) {
+                self.advance();
+                break;
+            }
             // v7.6.0 / v7.9.18 — distinguish table-level constraint
             // clauses from column definitions. Constraints start
             // with `CONSTRAINT <name> …`, `FOREIGN KEY (…)`,
@@ -13229,9 +13258,12 @@ impl Parser {
         // v7.39 (round 531) — a `LIKE` clause brings its own columns, so
         // `CREATE TABLE k (LIKE t)` is a complete definition even though
         // nothing is written between the parentheses.
-        if columns.is_empty() && like_specs.is_empty() {
-            return Err(self.err("CREATE TABLE requires at least one column".into()));
-        }
+        // v7.39 (round 621) — a table with NO columns is legal: PG creates it
+        // and `INSERT … DEFAULT VALUES` puts a row in it. This refused, so the
+        // empty parentheses were a parse error in their own right — quite apart
+        // from `CREATE TABLE c () INHERITS (p)`, which needs table inheritance
+        // SPG does not have (filed separately).
+        let _ = &like_specs;
         // v7.14.0 — consume MySQL/MariaDB table options after the
         // closing `)`. mysqldump emits things like
         // `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -17216,6 +17248,21 @@ impl Parser {
     }
 
     fn parse_table_ref(&mut self) -> Result<TableRef, ParseError> {
+        // v7.39 (round 621) — `FROM ONLY <table>`, which excludes a table's
+        // inheritance children. It was read as a table NAMED `only`, so the
+        // query failed on `relation "only" does not exist`. SPG's inheritance
+        // children are separate relations that a plain scan does not descend
+        // into, so ONLY already describes what the scan does; the keyword is
+        // absorbed. `TRUNCATE ONLY` has taken it as a no-op since v7.14 for
+        // the same reason.
+        if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("only"))
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Ident(_) | Token::QuotedIdent(_))
+            )
+        {
+            self.advance();
+        }
         // `LATERAL generate_series(...)` / `LATERAL unnest(...)` —
         // for these SRFs the keyword is noise at parse time: the
         // join executor already substitutes outer-column references
