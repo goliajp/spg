@@ -2395,10 +2395,9 @@ pub(crate) fn synth_pg_enum(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
     // OIDs start at 60_000. Keeps them disjoint from pg_type's
     // user-space scalar OID band (which lives above 16384 but
     // below the 50_000 mark we land enum types into).
-    let mut typid: i64 = 50_000;
     let mut label_oid: i64 = 60_000;
-    for (_name, def) in cat.enum_types() {
-        typid = typid.saturating_add(1);
+    let (enum_oids, _, _) = user_type_oids(cat);
+    for ((_name, def), (_, typid)) in cat.enum_types().iter().zip(enum_oids) {
         for (i, label) in def.labels.iter().enumerate() {
             label_oid = label_oid.saturating_add(1);
             rows.push(Row::new(alloc::vec![
@@ -3432,6 +3431,51 @@ fn pg_type_oid(ty: DataType) -> i64 {
 /// `integer[]`, and `'integer[]'::regtype` was refused outright, while
 /// `format_type(1007,-1)` — a third place that knows — answered correctly. One
 /// table, three readers.
+/// v7.39 (round 621) — the OID a user-defined type gets, in one place.
+///
+/// `pg_enum` assigned enum OIDs by counting from 50_000 in catalog order, and
+/// `pg_type` did not list user types at all — so `pg_enum JOIN pg_type` came
+/// back empty and `SELECT typname FROM pg_type WHERE typtype = 'e'` found
+/// nothing, for a type that casts and reports itself correctly everywhere
+/// else. Deriving the same OIDs twice by iteration order is how those two
+/// would drift apart again, so both read this.
+///
+/// The bands are disjoint by construction: enums from 50_001, composites from
+/// 54_001, domains from 58_001, and `pg_enum`'s per-label OIDs from 60_001.
+/// The OID of a domain's base type, for `pg_type.typbasetype`.
+fn pg_type_oid_for_domain_base(d: &spg_storage::DomainDef) -> Option<i64> {
+    let oid = pg_type_oid(d.base_type);
+    (oid != 0).then_some(oid)
+}
+
+pub(crate) fn user_type_oids(
+    cat: &Catalog,
+) -> (
+    alloc::vec::Vec<(alloc::string::String, i64)>,
+    alloc::vec::Vec<(alloc::string::String, i64)>,
+    alloc::vec::Vec<(alloc::string::String, i64)>,
+) {
+    let enums = cat
+        .enum_types()
+        .keys()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), 50_001 + i as i64))
+        .collect();
+    let composites = cat
+        .composite_types()
+        .keys()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), 54_001 + i as i64))
+        .collect();
+    let domains = cat
+        .domain_types()
+        .keys()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), 58_001 + i as i64))
+        .collect();
+    (enums, composites, domains)
+}
+
 pub(crate) const ARRAY_TYPE_OIDS: &[(i64, &str, i64)] = &[
         (1000, "_bool", 16),
         (1001, "_bytea", 17),
@@ -3482,7 +3526,7 @@ pub(crate) const ARRAY_TYPE_OIDS: &[(i64, &str, i64)] = &[
 /// Other pg_type columns (typowner, typinput/typoutput, etc.)
 /// land in follow-up work — sqlx encoders don't query them at
 /// connect time.
-pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     // v7.37.24 (24.7) — widened from 8 to 16 PG-canonical columns.
     // ORMs / monitoring tools query typbyval / typispreferred /
     // typdelim / typisdefined to decide encoding strategies; the
@@ -3691,6 +3735,40 @@ pub(crate) fn synth_pg_type(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         }
         rows.push(row);
     }
+    // v7.39 (round 621) — the user-defined types. `pg_enum` listed an enum's
+    // labels while `pg_type` did not list the enum, so the standard
+    // `pg_enum JOIN pg_type` came back empty and `WHERE typtype = 'e'` found
+    // nothing — for a type that casts, compares and reports itself correctly
+    // everywhere else. Composites and domains were absent for the same reason.
+    //
+    // `typbasetype` carries the domain's base OID, which is what tells a
+    // client the domain is over an integer; a composite's `typrelid` stays 0
+    // because SPG does not give one a backing relation.
+    let (enum_oids, composite_oids, domain_oids) = user_type_oids(cat);
+    for (name, oid) in enum_oids {
+        rows.push(build_row(oid, &name, 4, "e", "E", 0, 0, "-"));
+    }
+    for (name, oid) in composite_oids {
+        rows.push(build_row(oid, &name, -1, "c", "C", 0, 0, "-"));
+    }
+    for (name, oid) in domain_oids {
+        let base = cat
+            .domain_types()
+            .get(&name)
+            .and_then(|d| pg_type_oid_for_domain_base(d))
+            .unwrap_or(0);
+        let mut r = build_row(oid, &name, -1, "d", "N", 0, 0, "-");
+        // Found by NAME, not by a counted index: the first cut wrote to
+        // position 20 and landed on `typmodout`, so the domain reported a base
+        // of 0 and the test said so.
+        if let Some(i) = schema.iter().position(|c| c.name == "typbasetype")
+            && let Some(slot) = r.values.get_mut(i)
+        {
+            *slot = Value::BigInt(base);
+        }
+        rows.push(r);
+    }
+
     (schema, rows)
 }
 
