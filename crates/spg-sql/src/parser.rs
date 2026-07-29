@@ -15121,7 +15121,20 @@ impl Parser {
             }
             "name" => ColumnTypeName::Name,
             "bool" | "boolean" => ColumnTypeName::Bool,
-            "varchar" => ColumnTypeName::Varchar(self.parse_paren_size("VARCHAR")?),
+            // v7.39 (round 620) — an UNBOUNDED `varchar` is the same type as
+            // an unbounded `character varying`, which the arm below has always
+            // read as text. Only the short spelling demanded a length, so
+            // `CREATE TABLE t (x VARCHAR)` — as ordinary a line of DDL as
+            // there is — failed on `VARCHAR type requires (N)` while the long
+            // spelling of the same thing was accepted. The same asymmetry
+            // round 613 closed on the CAST side, here on the DDL side.
+            "varchar" => {
+                if matches!(self.peek(), Token::LParen) {
+                    ColumnTypeName::Varchar(self.parse_paren_size("VARCHAR")?)
+                } else {
+                    ColumnTypeName::Text
+                }
+            }
             // v7.39 (bpchar epic) — bare `char` = char(1), same as bare
             // `character` below (SQL standard).
             "char" => {
