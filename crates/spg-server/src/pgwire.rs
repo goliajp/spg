@@ -6930,8 +6930,22 @@ fn send_command_complete_select_count(out: &mut Vec<u8>, n: usize) -> std::io::R
 /// (PG's order). Called on every simple-query path, unconditionally, so a
 /// failed statement can't leak its notices into the next one.
 fn drain_notices(state: &ServerState, wbuf: &mut Vec<u8>) -> std::io::Result<()> {
-    let notices = match state.engine.write() {
-        Ok(mut e) => e.take_notices(),
+    // v7.39 (round 621) — `client_min_messages` decides which of these the
+    // client is told about. It used to decide nothing: the GUC was validated
+    // on the way in and never read, so `SET client_min_messages = warning`
+    // left every `DROP … IF EXISTS` notice coming.
+    let (notices, warning_reaches) = match state.engine.write() {
+        Ok(mut e) => {
+            let kept: Vec<_> = e
+                .take_notices()
+                .into_iter()
+                .filter(|n| e.notice_severity_reaches_client(n.severity))
+                .collect();
+            (
+                kept,
+                e.notice_severity_reaches_client(spg_engine::NoticeSeverity::Warning),
+            )
+        }
         Err(_) => return Ok(()),
     };
     for n in &notices {
@@ -6942,7 +6956,9 @@ fn drain_notices(state: &ServerState, wbuf: &mut Vec<u8>) -> std::io::Result<()>
     // is not a live connection). The engine has no registry, so the
     // warning is produced where the fact is known and drained here.
     for w in crate::take_host_warnings() {
-        send_notice(wbuf, spg_engine::NoticeSeverity::Warning, &w)?;
+        if warning_reaches {
+            send_notice(wbuf, spg_engine::NoticeSeverity::Warning, &w)?;
+        }
     }
     Ok(())
 }
