@@ -2555,7 +2555,8 @@ impl Engine {
         // list. The source's shape lives in the catalog, so the parser
         // recorded the clause and it is copied here, at the position it
         // was written.
-        self.apply_like_specs(&mut schema, &like_specs)?;
+        let mut like_indexes: Vec<CreateIndexStatement> = Vec::new();
+        self.apply_like_specs(&mut schema, &like_specs, &mut like_indexes)?;
         // v7.37.6-B — `CREATE TABLE p (...) PARTITION BY RANGE (key)`:
         // attach the parent role to the freshly-built schema before
         // it lands in the catalog. Key column must be TIMESTAMPTZ
@@ -2614,6 +2615,12 @@ impl Engine {
             });
         }
         self.active_catalog_mut().create_table(schema)?;
+        // v7.39 (round 621) — the indexes an `INCLUDING INDEXES` asked for,
+        // created once the table they sit on exists.
+        for mut ci in like_indexes {
+            ci.table = table_name.clone();
+            self.exec_create_index(ci)?;
+        }
         self.install_implicit_indexes(&table_name, &inline_pk_columns, &stmt.table_constraints)?;
         self.install_excl_range_indexes(&table_name);
         Ok(QueryResult::CommandOk {
@@ -2932,10 +2939,12 @@ impl Engine {
     /// and nothing else — a copied generated column becomes a plain one
     /// and a copied identity column loses its identity. Each INCLUDING
     /// adds one property back, and `INCLUDING ALL` adds them all.
+    #[allow(clippy::too_many_lines)]
     fn apply_like_specs(
         &mut self,
         schema: &mut spg_storage::TableSchema,
         specs: &[spg_sql::ast::LikeSpec],
+        out_indexes: &mut Vec<CreateIndexStatement>,
     ) -> Result<(), EngineError> {
         // Applied back to front so an earlier spec's insert position is
         // still the one it was written at.
@@ -2979,15 +2988,41 @@ impl Engine {
                     schema.checks.push(chk.clone());
                 }
             }
-            // INDEXES is accepted by the parser and refused here rather
-            // than silently dropped: a table that reports the right
-            // columns and none of the indexes is the shape that looks
-            // fine until it is slow.
-            if o.indexes && !src.indices().is_empty() {
-                return Err(EngineError::Unsupported(alloc::string::String::from(
-                    "CREATE TABLE … LIKE INCLUDING INDEXES is not supported yet; \
-                     the columns copy, the indexes do not",
-                )));
+            // v7.39 (round 621) — INCLUDING INDEXES copies them.
+            //
+            // Round 531 refused it rather than dropping them silently, and the
+            // reason it gave was right: "a table that reports the right columns
+            // and none of the indexes is the shape that looks fine until it is
+            // slow". But refusing takes `INCLUDING ALL` down with it, which is
+            // what schema tools write, so the restore stopped instead.
+            //
+            // The index is rebuilt from its own definition rather than copied
+            // as a structure, so it goes through the same path a written-out
+            // CREATE INDEX takes. PG names the copies after the new table and
+            // lets the auto-namer resolve collisions, which is what an empty
+            // name asks for here.
+            if o.indexes {
+                for idx in src.indices() {
+                    let Some(col) = src_schema.columns.get(idx.column_position) else {
+                        continue;
+                    };
+                    out_indexes.push(CreateIndexStatement {
+                        name: String::new(),
+                        key_order: spg_sql::ast::IndexColumnOrder::default(),
+                        key_collation: None,
+                        table: String::new(),
+                        column: col.name.clone(),
+                        nulls_not_distinct: idx.nulls_not_distinct,
+                        method: spg_sql::ast::IndexMethod::BTree,
+                        if_not_exists: false,
+                        included_columns: Vec::new(),
+                        partial_predicate: None,
+                        expression: None,
+                        extra_columns: Vec::new(),
+                        is_unique: idx.is_unique,
+                        opclass: None,
+                    });
+                }
             }
         }
         Ok(())
