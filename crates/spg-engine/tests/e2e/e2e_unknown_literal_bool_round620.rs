@@ -93,17 +93,11 @@ fn round620_both_sides_and_the_null_rules() {
     assert_eq!(one(&mut e, "SELECT 'false' AND NULL"), "false");
     assert_eq!(one(&mut e, "SELECT 'true' OR NULL"), "true");
     assert_eq!(one(&mut e, "SELECT 'false' OR NULL"), "NULL");
-    // Measured and NOT closed (checklist C07): PG answers `f` for
-    // `false AND (1/0 = 0)` and `t` for `true OR (1/0 = 0)`; SPG evaluates
-    // both sides and raises. That predates this round — `false AND (1/0=0)`,
-    // with no literal in sight, raises too — and closing it is not a matter of
-    // reordering: round 238 type-checks BOTH operands up front precisely
-    // because PG rejects `1 OR true`, and PG can do both only because it
-    // type-checks during analysis and short-circuits at run time.
-    assert!(
-        e.execute("SELECT 'false' AND (1/0 = 0)").is_err(),
-        "recording where this stands, not endorsing it"
-    );
+    // Round 621 closed the short circuit (checklist C07), and it composes
+    // with the resolution this file is about: the literal becomes false, and
+    // false decides.
+    assert_eq!(one(&mut e, "SELECT 'false' AND (1/0 = 0)"), "false");
+    assert_eq!(one(&mut e, "SELECT 'true' OR (1/0 = 0)"), "true");
 }
 
 /// What must NOT be resolved, and what the failure says.

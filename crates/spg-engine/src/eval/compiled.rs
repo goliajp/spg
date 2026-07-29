@@ -26,8 +26,27 @@ pub(crate) enum Step {
     /// Pre-converted literal.
     Lit(Value<'static>),
     /// Pops rhs then lhs, pushes the op result. Eager both-sides
-    /// evaluation — same as the interpreter (no short-circuit).
+    /// evaluation — same as the interpreter for every op EXCEPT the two
+    /// boolean connectives, which take `Connective` below.
     Binary(BinOp),
+    /// v7.39 (round 621) — `AND` / `OR`, short-circuiting.
+    ///
+    /// The VM is a stack machine, so both operands were pushed before the
+    /// `Binary` step could look at either: `WHERE x <> 0 AND 1/x > 0` divided
+    /// by zero on exactly the rows the guard exists to exclude. The
+    /// interpreter's arm was fixed first and this path still failed, which is
+    /// the second time a connective has been fixed in one evaluator and not
+    /// the other (round 346's MySQL reading was the first — its comment is
+    /// three screens down).
+    ///
+    /// Rather than turn the hottest loop in the engine into an indexed one
+    /// with jumps, the right operand is its OWN program, run only when the
+    /// left does not decide. Nesting depth is the AND-nesting depth of the
+    /// predicate.
+    Connective {
+        op: BinOp,
+        rhs: Vec<Step>,
+    },
     /// Comparison whose operands referenced a CaseInsensitive
     /// column: ASCII-fold Text operands first (decided at compile
     /// time; the interpreter re-decides per row).
@@ -354,6 +373,51 @@ pub(crate) fn compile_column_pos(c: &ColumnName, ctx: &EvalContext<'_>) -> Optio
     first.map(|(i, _)| i)
 }
 
+/// v7.39 (round 621) — can evaluating this raise at RUN time?
+///
+/// The errors a short circuit spares are the run-time ones: a division, an
+/// overflow, a cast that will not parse, a function that refuses its input.
+/// A type mismatch is not among them — PG raises those while ANALYSING, so it
+/// raises them whether or not the operand would have been evaluated, and so
+/// does SPG. That is why a predicate built only from columns, literals,
+/// comparisons and the boolean shapes over them needs no short circuit: there
+/// is nothing for it to spare.
+///
+/// Unrecognised shapes answer `true`, so a new kind of expression short
+/// circuits (correct, slightly slower) rather than silently not.
+fn can_raise_at_run_time(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(_) | Expr::Column(_) => false,
+        Expr::Binary { op, lhs, rhs } => {
+            !matches!(
+                op,
+                BinOp::Eq
+                    | BinOp::NotEq
+                    | BinOp::Lt
+                    | BinOp::LtEq
+                    | BinOp::Gt
+                    | BinOp::GtEq
+                    | BinOp::And
+                    | BinOp::Or
+            ) || can_raise_at_run_time(lhs)
+                || can_raise_at_run_time(rhs)
+        }
+        Expr::Unary { op, expr } => {
+            !matches!(op, UnOp::Not) || can_raise_at_run_time(expr)
+        }
+        Expr::IsNull { expr, .. } | Expr::BoolTest { expr, .. } => can_raise_at_run_time(expr),
+        Expr::Like {
+            expr,
+            pattern,
+            ..
+        } => can_raise_at_run_time(expr) || can_raise_at_run_time(pattern),
+        Expr::InList { expr, list, .. } => {
+            can_raise_at_run_time(expr) || list.iter().any(can_raise_at_run_time)
+        }
+        _ => true,
+    }
+}
+
 fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
     match e {
         Expr::Literal(l) => steps.push(Step::Lit(literal_to_value(l))),
@@ -421,6 +485,41 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                     || crate::eval::expr_inline_enum_variants(rhs, ctx.columns).is_some())
             {
                 steps.push(Step::Subtree(e.clone()));
+                return;
+            }
+            // v7.39 (round 621) — the boolean connectives short-circuit, so
+            // the right operand compiles to its own program. The shapes whose
+            // right operand is a literal go to the interpreter instead: those
+            // carry PG's analysis-time half (a non-boolean literal is refused
+            // even when the short circuit would not reach it, and an unknown
+            // string literal is resolved), which is decided there and is not
+            // worth a second implementation for how rare they are in a
+            // compiled predicate.
+            if matches!(op, BinOp::And | BinOp::Or) {
+                if matches!(rhs.as_ref(), Expr::Literal(_)) {
+                    steps.push(Step::Subtree(e.clone()));
+                    return;
+                }
+                // A right operand that cannot fail has nothing to be spared,
+                // so it keeps the eager step and its inline cost. `WHERE g
+                // BETWEEN 10 AND 20` is `g >= 10 AND g <= 20`, the commonest
+                // conjunctive predicate there is, and paying a nested program
+                // per row for it measured +42% to +60% on the panel — a real
+                // regression, reproduced, for a short circuit that can never
+                // change an answer.
+                if !can_raise_at_run_time(rhs) {
+                    compile_into(lhs, ctx, steps);
+                    compile_into(rhs, ctx, steps);
+                    steps.push(Step::Binary(*op));
+                    return;
+                }
+                compile_into(lhs, ctx, steps);
+                let mut rhs_steps = Vec::new();
+                compile_into(rhs, ctx, &mut rhs_steps);
+                steps.push(Step::Connective {
+                    op: *op,
+                    rhs: rhs_steps,
+                });
                 return;
             }
             let cmp = matches!(
@@ -1632,6 +1731,26 @@ where
                 }
                 let r = stack.pop().unwrap_or(Value::Null).into_owned();
                 let l = stack.pop().unwrap_or(Value::Null).into_owned();
+                stack.push(apply_binary(*op, l, r)?);
+            }
+            Step::Connective { op, rhs } => {
+                crate::bump_counter!(STEP_VM_BINARY_FIRE);
+                let l = stack.pop().unwrap_or(Value::Null).into_owned();
+                // The left decides, or it does not. A NULL decides nothing:
+                // NULL AND false is false, so the right side is still needed.
+                match (op, &l) {
+                    (BinOp::And, Value::Bool(false)) => {
+                        stack.push(Value::Bool(false));
+                        continue;
+                    }
+                    (BinOp::Or, Value::Bool(true)) => {
+                        stack.push(Value::Bool(true));
+                        continue;
+                    }
+                    _ => {}
+                }
+                run_compiled_steps(rhs, row, ctx, stack)?;
+                let r = stack.pop().unwrap_or(Value::Null).into_owned();
                 stack.push(apply_binary(*op, l, r)?);
             }
             Step::BinaryCi(op) => {
