@@ -3171,15 +3171,20 @@ impl Engine {
         // v7.39 (read01 round 67) — EVERY set-returning item expands, in lockstep
         // (see `expand_srf_row`); a user `RETURNS SETOF` function counts too.
         let srf_idxs = self.srf_target_idxs(&projection);
+        // v7.39 (round 621) — which input row each output row came from. An
+        // SRF turns one input row into many, and the ORDER BY below used to
+        // index the EXPANDED rows by the INPUT row's position: the result was
+        // silently truncated to the input row count and left unsorted, so
+        // `SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y ORDER BY 1`
+        // answered three of its six rows, in no order. Without the ORDER BY
+        // the same query was already right.
+        let mut src_of_row: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
         if !srf_idxs.is_empty() {
-            for row in &filtered {
-                projected_rows.extend(expand_srf_row(
-                    self,
-                    &projection,
-                    &srf_idxs,
-                    row,
-                    &scan_ctx,
-                )?);
+            for (i, row) in filtered.iter().enumerate() {
+                let expanded =
+                    expand_srf_row(self, &projection, &srf_idxs, row, &scan_ctx)?;
+                src_of_row.extend(core::iter::repeat_n(i, expanded.len()));
+                projected_rows.extend(expanded);
             }
         } else {
             // v7.24 (round-16 B) — select-list subqueries resolve
@@ -3222,17 +3227,35 @@ impl Engine {
         // key for every row, so the sort ran and changed nothing.
         let order_by = resolve_positional_order_by(&stmt.order_by, &projection);
         if !order_by.is_empty() {
-            let mut indexed: alloc::vec::Vec<(usize, Vec<Value<'static>>)> = filtered
+            // v7.39 (round 621) — one entry per OUTPUT row, not per input row.
+            // A key that names a select-list item reads it out of the expanded
+            // row (PG sorts AFTER the expansion); one that names a source
+            // column the query does not project is evaluated on the input row
+            // it came from, which is what `srf_order_output_cols` decides.
+            let out_cols = if srf_idxs.is_empty() {
+                alloc::vec![None; order_by.len()]
+            } else {
+                srf_order_output_cols(&order_by, &projection)
+            };
+            let mut indexed: alloc::vec::Vec<(usize, Vec<Value<'static>>)> = projected_rows
                 .iter()
                 .enumerate()
-                .map(|(i, r)| -> Result<_, EngineError> {
+                .map(|(k, out)| -> Result<_, EngineError> {
+                    let src = src_of_row.get(k).copied().unwrap_or(k);
                     let keys: Result<Vec<Value<'static>>, EngineError> = order_by
                         .iter()
-                        .map(|ob| {
-                            eval::eval_expr(&ob.expr, r, &scan_ctx).map_err(EngineError::Eval)
+                        .zip(out_cols.iter())
+                        .map(|(ob, oc)| match oc {
+                            Some(idx) => Ok(out
+                                .values
+                                .get(*idx)
+                                .cloned()
+                                .unwrap_or(Value::Null)),
+                            None => eval::eval_expr(&ob.expr, &filtered[src], &scan_ctx)
+                                .map_err(EngineError::Eval),
                         })
                         .collect();
-                    Ok((i, keys?))
+                    Ok((k, keys?))
                 })
                 .collect::<Result<_, _>>()?;
             indexed.sort_by(|a, b| {
