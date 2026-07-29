@@ -1279,6 +1279,56 @@ fn text_as_temporal(t: &str) -> Option<Value<'static>> {
         .or_else(|| parse_date_literal(t).map(Value::Date))
 }
 
+/// v7.39 (round 620) — an unadorned string literal, which is what PG calls
+/// `unknown`: a value whose type the context gets to choose. `''::TEXT` is
+/// not one, and neither is a text column.
+fn is_unknown_string_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Literal(spg_sql::ast::Literal::String(_)))
+}
+
+/// v7.39 (round 620) — resolve such a literal to boolean, which is what a
+/// boolean connective asks of it. An unparseable one is PG's input-syntax
+/// error (22P02), not a type complaint: `'a' AND true` says
+/// `invalid input syntax for type boolean: "a"`, exactly as `'a'::BOOLEAN`
+/// does — same failure, same words, because it is the same coercion.
+#[inline(never)]
+fn coerce_unknown_literal_to_bool(e: &Expr) -> Result<Value<'static>, EvalError> {
+    let Expr::Literal(spg_sql::ast::Literal::String(s)) = e else {
+        unreachable!("guarded by is_unknown_string_literal")
+    };
+    cast::cast_value_in(
+        Value::Text(s.clone().into()),
+        spg_sql::ast::CastTarget::Bool,
+        false,
+    )
+}
+
+/// v7.39 (round 620) — `AND` / `OR` with an unknown literal on either side.
+/// Out-of-line so it costs `eval_expr` no frame (the round-305 frame cliff).
+#[inline(never)]
+fn eval_connective_over_unknown_literal(
+    lhs: &Expr,
+    op: BinOp,
+    rhs: &Expr,
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let side = |e: &Expr| -> Result<Value<'static>, EvalError> {
+        if is_unknown_string_literal(e) {
+            coerce_unknown_literal_to_bool(e)
+        } else {
+            eval_expr(e, row, ctx)
+        }
+    };
+    let l = side(lhs)?;
+    let r = side(rhs)?;
+    if matches!(op, BinOp::And) {
+        and_3vl(l, r)
+    } else {
+        apply_binary(op, l, r)
+    }
+}
+
 /// v7.39 (round 346, M1) — the MySQL reading of `AND` / `OR`, out-of-line
 /// so it costs `eval_expr` no frame (see the round-305 frame cliff).
 #[inline(never)]
@@ -2271,7 +2321,7 @@ fn eval_cast_arm(
         // now; what is left is the builtin table.
         if matches!(v, Value::Null) && !crate::eval::cast::builtin_target_resolves(name, ctx.mysql_dialect) {
             return Err(EvalError::TypeMismatch {
-                detail: alloc::format!("unsupported cast target `::{name}`"),
+                detail: cast::unknown_type_error_text(name),
             });
         }
     }
@@ -4327,6 +4377,22 @@ pub fn eval_expr(
                     bound: u16::try_from(ctx.params.len()).unwrap_or(u16::MAX),
                 })
         }
+        // v7.39 (round 620) — an unadorned string literal carries PG's
+        // `unknown` type, and a boolean connective is a context that resolves
+        // it TO boolean. `'true' AND true`, `'f' OR false` and `NOT 'a'` are
+        // answered by PG (`t`, `f`, and the input-syntax error respectively)
+        // and were all refused here with `argument of … must be type boolean,
+        // not type text` — the message PG reserves for an operand that really
+        // IS text (`''::TEXT AND true`), which stays refused. Out-of-line and
+        // behind a literal-shaped guard: this is the recursive frame the
+        // 768 KiB stack budget is tuned against.
+        Expr::Unary {
+            op: spg_sql::ast::UnOp::Not,
+            expr,
+        } if !ctx.mysql_dialect && is_unknown_string_literal(expr) => apply_unary(
+            spg_sql::ast::UnOp::Not,
+            coerce_unknown_literal_to_bool(expr)?,
+        ),
         Expr::Unary { op, expr } => {
             let v = eval_expr(expr, row, ctx)?;
             // The MySQL-specific unary readings (NOT any truth value, `-`/`~`
@@ -4351,6 +4417,15 @@ pub fn eval_expr(
             if ctx.mysql_dialect && matches!(op, BinOp::And | BinOp::Or | BinOp::LogicalXor) =>
         {
             eval_mysql_connective(lhs, *op, rhs, row, ctx)
+        }
+        // v7.39 (round 620) — the same unknown-literal resolution for the
+        // two-sided connectives. Placed AFTER the MySQL arm so the dialect
+        // keeps its own reading of them.
+        Expr::Binary { lhs, op, rhs }
+            if matches!(op, BinOp::And | BinOp::Or)
+                && (is_unknown_string_literal(lhs) || is_unknown_string_literal(rhs)) =>
+        {
+            eval_connective_over_unknown_literal(lhs, *op, rhs, row, ctx)
         }
         Expr::Binary { lhs, op, rhs } => {
             // v7.32 (P4 borrow channel) — comparison fast path. A pure

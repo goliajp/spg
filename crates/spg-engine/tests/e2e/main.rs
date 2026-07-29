@@ -146,6 +146,7 @@ mod e2e_exists_noclone_round616;
 mod e2e_recursive_worktable_round618;
 mod e2e_jsonb_canonical_round619;
 mod e2e_group_by_strict_round620;
+mod e2e_unknown_literal_bool_round620;
 mod e2e_scalar_subquery_null_key_round620;
 mod e2e_const_fold_round605;
 mod e2e_jsonb_canonical_round603;

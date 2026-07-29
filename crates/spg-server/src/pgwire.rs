@@ -4361,6 +4361,12 @@ pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         if msg.contains("must appear in the GROUP BY clause") {
             return ("42803", msg);
         }
+        // v7.39 (round 620) — a cast target that names no type is PG's 42704
+        // UNDEFINED_OBJECT. It used to reach the wire as the generic 42000,
+        // under SPG's own wording.
+        if msg.contains("does not exist") && msg.starts_with("type \"") {
+            return ("42704", msg);
+        }
         // v7.39 (round 244) — sequence-range errors: a setval outside the
         // range is 22003 NUMERIC_VALUE_OUT_OF_RANGE, the CREATE SEQUENCE
         // option refusals 22023.
