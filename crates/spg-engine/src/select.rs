@@ -8799,7 +8799,7 @@ fn is_top_level_unnest(expr: &spg_sql::ast::Expr) -> bool {
 /// `to_ascii_lowercase`) because `top_level_srf_output` classifies once per
 /// source row.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SrfKind {
+pub(crate) enum SrfKind {
     Unnest,
     /// v7.39 (read01 round 67) — `generate_series(a, b[, step])` in the target
     /// list. It used to be handled ONLY by the parser's lift into FROM, so a
@@ -8824,7 +8824,7 @@ fn name_is(name: &str, names: &[&str]) -> bool {
     names.iter().any(|n| name.eq_ignore_ascii_case(n))
 }
 
-fn top_level_srf_kind(expr: &spg_sql::ast::Expr) -> Option<SrfKind> {
+pub(crate) fn top_level_srf_kind(expr: &spg_sql::ast::Expr) -> Option<SrfKind> {
     let spg_sql::ast::Expr::FunctionCall { name, args } = expr else {
         return None;
     };
@@ -8878,7 +8878,7 @@ fn top_level_srf_kind(expr: &spg_sql::ast::Expr) -> Option<SrfKind> {
 /// for `unnest(arr)`, or the 1-based subscripts `1..=length` for
 /// `generate_subscripts(arr, 1)` (a non-1 dimension over a 1-D array yields no
 /// rows, as in PG).
-fn top_level_srf_output(
+pub(crate) fn top_level_srf_output(
     expr: &spg_sql::ast::Expr,
     row: &Row<'static>,
     ctx: &EvalContext<'_>,

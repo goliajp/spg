@@ -3759,6 +3759,19 @@ fn project_groups(
                 .map(|e| eval::compile_expr(e, &synth_ctx))
         })
         .collect();
+    // v7.39 (round 621) — which items are set-returning, after the rewrite
+    // (so `unnest(array_agg(x))` is seen as the SRF it is, over a synthetic
+    // aggregate column). Only the builtin SRFs are recognised here; a user
+    // `RETURNS SETOF` function inside an aggregate query keeps the old error,
+    // because running its body needs the executor and this is not it.
+    let srf_items: Vec<bool> = items_rewritten
+        .iter()
+        .map(|r| {
+            r.as_ref()
+                .is_some_and(|e| crate::select::top_level_srf_kind(e).is_some())
+        })
+        .collect();
+    let any_srf = srf_items.iter().any(|b| *b);
     let mut kept_synth: Vec<Row<'static>> = Vec::new();
     let mut out_rows: Vec<Row<'static>> = Vec::new();
     let mut stack: Vec<Value<'static>> = Vec::new();
@@ -3792,6 +3805,12 @@ fn project_groups(
                 values.push(Value::Null);
                 continue;
             }
+            // v7.39 (round 621) — a SET-RETURNING item is collected as its
+            // whole list; the rows it makes are built after the loop.
+            if srf_items[i] {
+                values.push(Value::Null);
+                continue;
+            }
             values.push(if let Some(cc) = &items_compiled[i] {
                 eval::eval_compiled(cc, &srow, &synth_ctx, &mut stack)?
             } else {
@@ -3802,6 +3821,46 @@ fn project_groups(
                     _ => eval::eval_expr(rewritten, &srow, &synth_ctx)?,
                 }
             });
+        }
+        if any_srf {
+            // v7.39 (round 621) — the aggregate's own output row is what a
+            // target-list SRF expands over. `SELECT unnest(ARRAY[1,2]),
+            // count(*) FROM t` answered `function unnest(integer[]) does not
+            // exist`, because this projection evaluates each item scalarly and
+            // there is exactly one row per group to put it in. PG answers two
+            // rows, both carrying the same count — and the shape that matters
+            // most is `unnest(array_agg(x))`, where the SRF's ARGUMENT is the
+            // aggregate.
+            //
+            // Several SRFs in one list expand in LOCKSTEP with the shorter
+            // padded to NULL, which is round 67's rule for every other path.
+            let mut lists: Vec<Vec<Value<'static>>> = Vec::with_capacity(items_rewritten.len());
+            for (i, rewritten) in items_rewritten.iter().enumerate() {
+                match (srf_items[i], rewritten) {
+                    (true, Some(r)) => {
+                        lists.push(crate::select::top_level_srf_output(r, &srow, &synth_ctx)
+                            .map_err(|e| match e {
+                                crate::EngineError::Eval(ev) => ev,
+                                other => EvalError::TypeMismatch {
+                                    detail: alloc::format!("{other}"),
+                                },
+                            })?);
+                    }
+                    _ => lists.push(Vec::new()),
+                }
+            }
+            let n = lists.iter().map(Vec::len).max().unwrap_or(0);
+            for k in 0..n {
+                let mut vals = values.clone();
+                for (i, list) in lists.iter().enumerate() {
+                    if srf_items[i] && let Some(slot) = vals.get_mut(i) {
+                        *slot = list.get(k).cloned().unwrap_or(Value::Null);
+                    }
+                }
+                kept_synth.push(srow.clone());
+                out_rows.push(Row::new(vals));
+            }
+            continue;
         }
         kept_synth.push(srow);
         out_rows.push(Row::new(values));
