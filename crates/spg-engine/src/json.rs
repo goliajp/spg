@@ -193,7 +193,9 @@ fn write_json_string(s: &str, out: &mut String) {
 /// runs through this.
 pub fn canonicalize_jsonb(src: &str) -> Result<String, ParseError> {
     let v = parse(src)?;
-    let mut out = String::new();
+    // v7.39 (round 619) — the canonical form is the source plus the spaces
+    // after `:` and `,`; sizing for that keeps the writer off the allocator.
+    let mut out = String::with_capacity(src.len() + src.len() / 4 + 8);
     write_json_canonical(&v, &mut out);
     Ok(out)
 }
@@ -497,6 +499,28 @@ fn write_json_canonical(v: &JsonValue, out: &mut String) {
             out.push(']');
         }
         JsonValue::Object(entries) => {
+            // v7.39 (round 619) — one entry needs neither dedup nor sort, and
+            // the `Vec` those need was built for every object on every row.
+            if entries.len() <= 1 {
+                out.push('{');
+                if let Some((k, val)) = entries.first() {
+                    write_json_string(k, out);
+                    out.push_str(": ");
+                    write_json_canonical(val, out);
+                }
+                out.push('}');
+                return;
+            }
+            write_object_general(entries, out);
+        }
+    }
+}
+
+/// v7.39 (round 619) — the dedup-and-sort object writer. Split out so the
+/// one-entry shortcut above can be checked against it directly.
+fn write_object_general(entries: &[(String, JsonValue)], out: &mut String) {
+    {
+        {
             // Duplicate keys collapse last-wins (keep the final value),
             // preserving first-seen order only until the stable sort.
             let mut deduped: Vec<(&String, &JsonValue)> = Vec::new();
@@ -530,7 +554,28 @@ fn write_json_canonical(v: &JsonValue, out: &mut String) {
 /// plain decimal with the exponent applied, `-0` normalised to `0`, and
 /// the input's fractional scale preserved. Digits are manipulated as
 /// strings so arbitrarily large numbers round-trip without overflow.
-fn canon_json_number(lexeme: &str) -> String {
+/// v7.39 (round 619) — a plain integer lexeme is ALREADY the canonical form,
+/// so it is handed back borrowed instead of rebuilt.
+///
+/// The slow body below is unchanged and still decides every other shape; the
+/// two are asserted to agree over a generated set in this module's tests, so
+/// the shortcut is checked mechanically rather than by reading. Canonicalising
+/// `{"a":123}` allocated a `String` here for every number, on every row.
+fn canon_json_number(lexeme: &str) -> alloc::borrow::Cow<'_, str> {
+    let body = lexeme.strip_prefix('-').unwrap_or(lexeme);
+    if !body.is_empty()
+        && body.bytes().all(|b| b.is_ascii_digit())
+        // A leading zero is only canonical when the whole integer IS zero.
+        && (body == "0" || !body.starts_with('0'))
+        // `-0` canonicalises to `0`, so it is not a pass-through.
+        && !(lexeme.starts_with('-') && body == "0")
+    {
+        return alloc::borrow::Cow::Borrowed(lexeme);
+    }
+    alloc::borrow::Cow::Owned(canon_json_number_slow(lexeme))
+}
+
+fn canon_json_number_slow(lexeme: &str) -> String {
     let neg = lexeme.starts_with('-');
     let body = lexeme.trim_start_matches(['-', '+']);
     // Split into mantissa (int '.' frac) and exponent.
@@ -1016,7 +1061,7 @@ fn numeric_eq_key(lexeme: &str) -> String {
     if c.contains('.') {
         c.trim_end_matches('0').trim_end_matches('.').to_string()
     } else {
-        c
+        c.into_owned()
     }
 }
 
@@ -4619,4 +4664,59 @@ pub fn mysql_json_value(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
 /// modification against one: there is nowhere for a path to point.
 fn is_json_scalar(v: &JsonValue) -> bool {
     !matches!(v, JsonValue::Object(_) | JsonValue::Array(_))
+}
+
+#[cfg(test)]
+mod round619_number_fast_path {
+    use super::*;
+
+    /// v7.39 (round 619) — the borrowed shortcut has to be the same string
+    /// the full canonicaliser builds, for every lexeme either might see.
+    /// Checked over a generated set rather than by reading the two.
+    #[test]
+    fn fast_path_agrees_with_the_full_canonicaliser() {
+        let mut cases: Vec<String> = Vec::new();
+        for sign in ["", "-"] {
+            for body in [
+                "0", "1", "7", "10", "123", "0123", "00", "000", "9223372036854775807",
+                "170141183460469231731687303715884105727", "1.0", "1.5", "0.5", ".5", "1.",
+                "1e3", "1E3", "1e-3", "1.5e2", "1.50", "100", "0.0", "0.00", "10.010",
+                "1e0", "1e+3", "0e0", "12345678901234567890.12345678901234567890",
+            ] {
+                cases.push(alloc::format!("{sign}{body}"));
+            }
+        }
+        for c in &cases {
+            assert_eq!(
+                canon_json_number(c).as_ref(),
+                canon_json_number_slow(c).as_str(),
+                "lexeme {c:?} canonicalises differently through the shortcut"
+            );
+        }
+    }
+
+    /// The single-entry object writer has to spell what the sorting one does.
+    #[test]
+    fn one_entry_object_writes_what_the_general_writer_writes() {
+        for src in [
+            r#"{"a":1}"#,
+            r#"{"":1}"#,
+            r#"{"a":{"b":2}}"#,
+            r#"{"a":[1,2,3]}"#,
+            r#"{"a\"b":"c\\d"}"#,
+            r#"{"日本":"語"}"#,
+            r#"{"a":null}"#,
+            r#"{}"#,
+        ] {
+            let JsonValue::Object(entries) = parse(src).expect("valid json") else {
+                panic!("{src} is not an object");
+            };
+            let mut fast = String::new();
+            write_json_canonical(&JsonValue::Object(entries.clone()), &mut fast);
+            let mut general = String::new();
+            write_object_general(&entries, &mut general);
+            assert_eq!(fast, general, "{src}");
+        }
+    }
+
 }
