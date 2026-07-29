@@ -788,13 +788,81 @@ pub(crate) fn run(
     // v7.39 (round 528) — a GROUP BY name that is only an output ALIAS.
     let group_exprs = resolve_group_by_aliases(group_exprs, stmt, schema_cols)?;
 
+    // v7.39 (round 620) — PG's strict rule, checked BEFORE the pipeline so the
+    // diagnosis names what is actually wrong. Skipped under the MySQL dialect,
+    // which licenses exactly what this rejects (the loose rewrite below), and
+    // skipped when the grouping is by a primary key, which licenses every other
+    // column of that table.
+    // A GROUP BY name that resolves to nothing is reported as the missing
+    // column it is, ahead of this rule — measured against PG, which answers
+    // `column "nosuch" does not exist` for `SELECT v FROM t GROUP BY nosuch`
+    // rather than complaining that `v` is ungrouped.
+    let group_keys_all_resolve = group_exprs.iter().all(|g| match g {
+        Expr::Column(c) => {
+            c.qualifier.is_some()
+                || schema_cols.iter().any(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+        }
+        _ => true,
+    });
+    let fd_on_primary_key = grouped_by_primary_key(stmt, &group_exprs, schema_cols, catalog);
+    if group_keys_all_resolve
+        && !engine.is_some_and(|e| e.backslash_escapes)
+        && !fd_on_primary_key
+    {
+        let offender = stmt
+            .items
+            .iter()
+            .find_map(|it| match it {
+                SelectItem::Expr { expr, .. } => {
+                    first_ungrouped_column(expr, &group_exprs, schema_cols)
+                }
+                _ => None,
+            })
+            .or_else(|| {
+                stmt.order_by
+                    .iter()
+                    .find_map(|o| first_ungrouped_column(&o.expr, &group_exprs, schema_cols))
+            })
+            .or_else(|| {
+                stmt.having
+                    .as_ref()
+                    .and_then(|h| first_ungrouped_column(h, &group_exprs, schema_cols))
+            });
+        if let Some(c) = offender {
+            // PG qualifies the column with the alias when there is one, and
+            // with the table name otherwise.
+            let qual = c
+                .qualifier
+                .as_deref()
+                .or(table_alias)
+                .or_else(|| stmt.from.as_ref().map(|f| f.primary.name.as_str()))
+                .unwrap_or("");
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "column \"{qual}.{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                    c.name
+                ),
+            });
+        }
+    }
+
     // v7.39 (round 405) — MySQL's loose GROUP BY: wrap each non-grouped,
     // non-aggregated column in `any_value(col)` so the rest of the pipeline
     // treats it as an aggregate (first-seen value per group). Only under the
     // dialect and only when there is an explicit GROUP BY; PG keeps the
     // strict "must appear in GROUP BY / be aggregated" rule.
+    //
+    // v7.39 (round 620) — the same rewrite serves PG's functional dependency.
+    // Letting the ungrouped column PAST the check above is not enough: the
+    // grouped row carries only the keys and the aggregates, so `s` still has
+    // nowhere to be read from and the query failed on `column "s" does not
+    // exist`. Grouping by a primary key means one input row per group, so
+    // "any value in the group" IS the value — the identical rewrite, reached
+    // for a different and much narrower reason.
     let loose_stmt;
-    let stmt = if engine.is_some_and(|e| e.backslash_escapes) && !group_exprs.is_empty() {
+    let stmt = if (engine.is_some_and(|e| e.backslash_escapes) || fd_on_primary_key)
+        && !group_exprs.is_empty()
+    {
         let mut s = stmt.clone();
         for item in &mut s.items {
             if let SelectItem::Expr { expr, .. } = item {
@@ -5571,6 +5639,115 @@ fn agg_or_group_type(e: &Expr, synth: &[ColumnSchema]) -> DataType {
     crate::describe::describe_expr(e, synth)
         .map(|shape| shape.ty)
         .unwrap_or(DataType::Text)
+}
+
+/// v7.39 (round 620) — PG's strict GROUP BY rule, and the diagnosis it earns.
+///
+/// `SELECT id, count(*) FROM dc` answered `column "id" does not exist`. The
+/// column plainly exists; what it is not is grouped. The message came out that
+/// way because there was no rule at all — the grouped row carries only the
+/// grouping keys and the aggregates, so the reference simply failed to resolve
+/// at evaluation time, and the resolver said the only thing it knew. A user
+/// reading it goes looking for a typo or a missing table.
+///
+/// Returns the first bare column reference that is a real input column, is not
+/// covered by a grouping expression, and is not inside an aggregate. Variants
+/// this walker does not descend into are left alone, so an uncovered nesting
+/// keeps the old behaviour rather than inventing an error: under-reporting is
+/// the status quo, over-reporting would break queries that run today.
+fn first_ungrouped_column<'a>(
+    e: &'a Expr,
+    group_exprs: &[Expr],
+    columns: &[ColumnSchema],
+) -> Option<&'a spg_sql::ast::ColumnName> {
+    if group_exprs.iter().any(|g| g == e) {
+        return None;
+    }
+    let rec = |x: &'a Expr| first_ungrouped_column(x, group_exprs, columns);
+    match e {
+        Expr::Column(c) => columns
+            .iter()
+            .any(|col| col.name.eq_ignore_ascii_case(&c.name))
+            .then_some(c),
+        // An aggregate's arguments are exactly what does not need grouping.
+        Expr::FunctionCall { name, .. } if is_aggregate_name(&name.to_ascii_lowercase()) => None,
+        Expr::AggregateOrdered { .. } => None,
+        // A subquery carries its own scope and its own rules.
+        Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => None,
+        Expr::FunctionCall { args, .. } => args.iter().find_map(rec),
+        Expr::Binary { lhs, rhs, .. } => rec(lhs).or_else(|| rec(rhs)),
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::BoolTest { expr, .. } => rec(expr),
+        Expr::Like { expr, pattern, .. } => rec(expr).or_else(|| rec(pattern)),
+        Expr::InList { expr, list, .. } => rec(expr).or_else(|| list.iter().find_map(rec)),
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => operand
+            .as_deref()
+            .and_then(rec)
+            .or_else(|| {
+                branches
+                    .iter()
+                    .find_map(|(w, t)| rec(w).or_else(|| rec(t)))
+            })
+            .or_else(|| else_branch.as_deref().and_then(rec)),
+        _ => None,
+    }
+}
+
+/// v7.39 (round 620) — grouping by a primary key licenses every other column
+/// of that table.
+///
+/// `SELECT s, count(*) FROM dc GROUP BY id` where `id` is the primary key is
+/// answered by PG and was REFUSED here — a query that runs on PG and fails on
+/// SPG, which is worse than the wording. One row per `id` means `s` has
+/// exactly one value in the group, so there is nothing ambiguous to resolve;
+/// the rule is the SQL standard's functional dependency, and PG applies it for
+/// a base table's primary key.
+///
+/// Only the single-base-table FROM qualifies here. A join would need the
+/// dependency to be traced across it, which is a wider question than the one
+/// this closes.
+fn grouped_by_primary_key(
+    stmt: &SelectStatement,
+    group_exprs: &[Expr],
+    columns: &[ColumnSchema],
+    catalog: Option<&spg_storage::Catalog>,
+) -> bool {
+    let Some(from) = stmt.from.as_ref() else {
+        return false;
+    };
+    if !from.joins.is_empty() || from.primary.unnest_expr.is_some() {
+        return false;
+    }
+    let Some(cat) = catalog else { return false };
+    let Some(table) = cat.get(&from.primary.name) else {
+        return false;
+    };
+    let schema = table.schema();
+    let pk = schema
+        .uniqueness_constraints
+        .iter()
+        .find(|u| u.is_primary_key && !u.columns.is_empty());
+    let Some(pk) = pk else { return false };
+    pk.columns.iter().all(|&pos| {
+        let Some(name) = schema.columns.get(pos).map(|c| &c.name) else {
+            return false;
+        };
+        // The key column has to be grouped by as itself — as a bare column of
+        // this table, qualified or not — for the dependency to hold.
+        group_exprs.iter().any(|g| match g {
+            Expr::Column(c) => {
+                c.name.eq_ignore_ascii_case(name)
+                    && columns.iter().any(|col| col.name.eq_ignore_ascii_case(name))
+            }
+            _ => false,
+        })
+    })
 }
 
 /// v7.39 (round 405) — MySQL's loose GROUP BY: a non-aggregated column
