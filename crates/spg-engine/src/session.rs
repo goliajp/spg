@@ -505,6 +505,49 @@ impl Engine {
         parse_pg_duration_ms(raw).filter(|ms| *ms > 0)
     }
 
+    /// v7.39 (round 621) — does a message of this severity reach the client?
+    ///
+    /// `client_min_messages` was validated on the way in and then never read,
+    /// so `SET client_min_messages = warning` — and even `= error` — left the
+    /// NOTICEs coming. Every `DROP … IF EXISTS` on a name that is not there
+    /// said so, which is why the standing differential corpus could not use
+    /// the GUC to quieten its own setup and carried the asymmetry in eighteen
+    /// of its files.
+    ///
+    /// PG's order, ascending: debug5 < debug4 < debug3 < debug2 < debug1 <
+    /// log < notice < warning < error < fatal < panic. A message is sent when
+    /// its own severity is at least the setting. Anything above `warning`
+    /// suppresses both of the severities SPG raises.
+    #[must_use]
+    pub fn notice_severity_reaches_client(&self, severity: crate::NoticeSeverity) -> bool {
+        fn rank(s: &str) -> u8 {
+            match s {
+                "debug5" => 0,
+                "debug4" => 1,
+                "debug3" => 2,
+                "debug2" => 3,
+                "debug1" => 4,
+                "log" => 5,
+                "notice" => 6,
+                "warning" => 7,
+                "error" => 8,
+                "fatal" => 9,
+                "panic" => 10,
+                // Not one of PG's levels — SET would have refused it, so this
+                // is the default rather than a silent drop.
+                _ => 6,
+            }
+        }
+        let setting = self
+            .session_param("client_min_messages")
+            .map_or(6, |v| rank(&v.trim().to_ascii_lowercase()));
+        let own = match severity {
+            crate::NoticeSeverity::Notice => 6,
+            crate::NoticeSeverity::Warning => 7,
+        };
+        own >= setting
+    }
+
     /// v7.12.1 — build an `EvalContext` chained with the session's
     /// `default_text_search_config`. Engine-internal callers use
     /// this instead of `EvalContext::new` so the FTS function
@@ -918,6 +961,53 @@ mod tests {
                 SetValue::String("1500ms".into()),
             );
             assert_eq!(e.session_statement_timeout_ms(), Some(1500));
+        }
+
+        /// v7.39 (round 621) — `client_min_messages` decided nothing: the GUC
+        /// was validated on the way in (round 204) and then never read, so
+        /// `SET client_min_messages = warning` — and even `= error` — left
+        /// every `DROP … IF EXISTS` notice coming.
+        ///
+        /// The wire half of this was checked against live PG18 over seven
+        /// shapes and matches byte for byte; what is pinned here is the
+        /// decision itself, which is the part that can drift.
+        #[test]
+        fn client_min_messages_gates_by_pg_severity_order() {
+            use crate::NoticeSeverity::{Notice, Warning};
+            let mut e = Engine::new();
+            // The default is `notice`: both severities reach the client.
+            assert!(e.notice_severity_reaches_client(Notice));
+            assert!(e.notice_severity_reaches_client(Warning));
+
+            e.execute("SET client_min_messages = warning").unwrap();
+            assert!(!e.notice_severity_reaches_client(Notice));
+            assert!(e.notice_severity_reaches_client(Warning));
+
+            for above in ["error", "fatal", "panic"] {
+                e.execute(&alloc::format!("SET client_min_messages = {above}"))
+                    .unwrap();
+                assert!(!e.notice_severity_reaches_client(Notice), "{above}");
+                assert!(!e.notice_severity_reaches_client(Warning), "{above}");
+            }
+
+            // Everything at or below `notice` lets both through — PG's order
+            // is debug5 < … < log < notice < warning < error < fatal < panic.
+            for below in ["notice", "log", "debug1", "debug5"] {
+                e.execute(&alloc::format!("SET client_min_messages = {below}"))
+                    .unwrap();
+                assert!(e.notice_severity_reaches_client(Notice), "{below}");
+                assert!(e.notice_severity_reaches_client(Warning), "{below}");
+            }
+
+            // Case is not the caller's problem, and RESET is the road back.
+            e.execute("SET client_min_messages = WARNING").unwrap();
+            assert!(!e.notice_severity_reaches_client(Notice));
+            e.execute("RESET client_min_messages").unwrap();
+            assert!(e.notice_severity_reaches_client(Notice));
+
+            // And an out-of-domain value is still refused rather than
+            // silently taken as some default.
+            assert!(e.execute("SET client_min_messages = bogus_zz").is_err());
         }
     }
 }
