@@ -444,13 +444,19 @@ impl Engine {
                         // GroupMap omits keys whose inner-table partition
                         // was empty; treat such misses as the per-
                         // aggregate empty-default.
-                        let v = if matches!(key_v, Value::Null) {
-                            Value::Null
-                        } else {
-                            map.get(&aggregate::encode_key(core::slice::from_ref(&key_v)))
-                                .cloned()
-                                .unwrap_or_else(|| empty_default.clone())
-                        };
+                        //
+                        // v7.39 (round 620) — and a NULL correlation key is
+                        // one of those misses, not a NULL answer. `b.g =
+                        // NULL` matches nothing, so the subquery runs over an
+                        // EMPTY set and the aggregate's own empty-set value
+                        // decides it: `count` answers 0. A NULL key cannot
+                        // collide with a real group either, because the map
+                        // builder skips NULL keys when it groups the inner
+                        // rows.
+                        let v = map
+                            .get(&aggregate::encode_key(core::slice::from_ref(&key_v)))
+                            .cloned()
+                            .unwrap_or_else(|| empty_default.clone());
                         *e = value_to_literal_expr(v)?;
                         return Ok(());
                     }
@@ -4206,13 +4212,23 @@ fn splice_planned_subqueries(
             let (outer_col, map, empty_default) = gm.as_ref();
             let key_v = eval::eval_expr(&Expr::Column(outer_col.clone()), row, ctx)
                 .map_err(EngineError::Eval)?;
-            let v = if matches!(key_v, Value::Null) {
-                Value::Null
-            } else {
-                map.get(&aggregate::encode_key(core::slice::from_ref(&key_v)))
-                    .cloned()
-                    .unwrap_or_else(|| empty_default.clone())
-            };
+            // v7.39 (round 620) — a NULL correlation key gives an EMPTY result
+            // set, not a NULL result.
+            //
+            // `b.g = NULL` matches nothing, so the subquery runs over no rows —
+            // which is the same situation as a non-NULL key that is absent from
+            // the map, and the aggregate's own empty-set value decides it:
+            // `count` answers 0, everything else answers NULL. This branch
+            // answered NULL for every aggregate, so
+            // `(SELECT count(*) FROM b WHERE b.g = a.g)` came back NULL on the
+            // rows whose `a.g` is NULL where PG answers 0 — silently, and only
+            // for the count family, which is why it survived: `sum` / `min` /
+            // `array_agg` / `string_agg` / `bool_and` all have NULL as their
+            // empty-set value and were right by accident.
+            let v = map
+                .get(&aggregate::encode_key(core::slice::from_ref(&key_v)))
+                .cloned()
+                .unwrap_or_else(|| empty_default.clone());
             *e = value_to_literal_expr(v)?;
             Ok(true)
         }
