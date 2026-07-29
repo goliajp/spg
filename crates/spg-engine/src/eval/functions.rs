@@ -17739,6 +17739,37 @@ fn apply_function_dispatch(
             let n = args.iter().filter(|v| matches!(v, Value::Null)).count();
             Ok(Value::Int(n as i32))
         }
+        // v7.39 (round 621) — `overlaps(s1, e1, s2, e2)`, the function
+        // spelling of `(s1, e1) OVERLAPS (s2, e2)`. The operator form has
+        // worked since the parser lowers it; the function form answered
+        // `function overlaps(date, date, date, date) does not exist`, and it is
+        // the spelling that survives a tool generating SQL from a function
+        // catalogue.
+        //
+        // Same rule as the lowering: normalise each pair so start <= end (PG
+        // takes the endpoints in either order), then the periods share a point
+        // when `s1 < e2 AND s2 < e1` — half-open, so touching endpoints do not
+        // overlap. A NULL anywhere makes it NULL.
+        "overlaps" if args.len() == 4 => {
+            if args.iter().any(Value::is_null) {
+                return Ok(Value::Null);
+            }
+            let ord = |a: &Value<'_>, b: &Value<'_>| crate::orderby::value_cmp(a, b);
+            let (s1, e1) = if ord(&args[0], &args[1]) == core::cmp::Ordering::Greater {
+                (&args[1], &args[0])
+            } else {
+                (&args[0], &args[1])
+            };
+            let (s2, e2) = if ord(&args[2], &args[3]) == core::cmp::Ordering::Greater {
+                (&args[3], &args[2])
+            } else {
+                (&args[2], &args[3])
+            };
+            Ok(Value::Bool(
+                ord(s1, e2) == core::cmp::Ordering::Less
+                    && ord(s2, e1) == core::cmp::Ordering::Less,
+            ))
+        }
         "num_nonnulls" => {
             let n = args.iter().filter(|v| !matches!(v, Value::Null)).count();
             Ok(Value::Int(n as i32))

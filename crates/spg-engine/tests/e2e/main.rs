@@ -158,6 +158,7 @@ mod e2e_jsonb_canonical_round603;
 mod e2e_srf_order_by_round600;
 mod e2e_srf_order_by_round621;
 mod e2e_interval_literal_arg_round621;
+mod e2e_syntax_gaps_round621;
 mod e2e_user_types_in_pg_type_round621;
 mod e2e_regtype_arrays_round621;
 mod e2e_srf_over_aggregate_round621;
