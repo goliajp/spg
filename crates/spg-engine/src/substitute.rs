@@ -147,10 +147,68 @@ pub(crate) fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
 
 /// v7.13.0 — wider helper used by `INSERT … SELECT` (mailrs
 /// round-5 G4). Covers the most common `Value` variants. Types
+/// v7.39 (round 621) — an array's elements as expressions, so the value can
+/// go back as the `ARRAY[…]` it came from.
+///
+/// Going through the TEXT form and a cast — the road UUID and BYTEA take —
+/// does not work here, and two cuts of it proved so: neither the internal
+/// spelling (`'{1,2}'::int4[]`) nor the SQL one (`::integer[]`) resolves when
+/// the target is CONSTRUCTED as `CastTarget::Named`, even though
+/// `SELECT '{1,2}'::integer[]` typed by hand is fine — the parser does not
+/// produce a `Named` for those. Rebuilding the literal sidesteps the question:
+/// `ARRAY[1,2]` is what the row was written with in the first place.
+///
+/// Each element goes back through this same function, so a NULL element stays
+/// NULL and an element type that cannot be materialised still says so rather
+/// than being quietly dropped.
+fn array_elements(v: &Value) -> Option<alloc::vec::Vec<Expr>> {
+    fn build<T, F>(xs: &[Option<T>], f: F) -> Option<alloc::vec::Vec<Expr>>
+    where
+        F: Fn(&T) -> Value<'static>,
+    {
+        xs.iter()
+            .map(|x| match x {
+                None => Ok(Expr::Literal(Literal::Null)),
+                Some(e) => value_to_literal_expr_permissive(f(e)),
+            })
+            .collect::<Result<alloc::vec::Vec<_>, _>>()
+            .ok()
+    }
+    match v {
+        Value::IntArray(xs) => build(xs, |n| Value::Int(*n)),
+        Value::BigIntArray(xs) => build(xs, |n| Value::BigInt(*n)),
+        Value::SmallIntArray(xs) => build(xs, |n| Value::SmallInt(*n)),
+        Value::FloatArray(xs) => build(xs, |n| Value::Float(*n)),
+        Value::BoolArray(xs) => build(xs, |b| Value::Bool(*b)),
+        Value::TextArray(xs) => build(xs, |s| Value::text(s.clone())),
+        Value::NumericArray(xs) => build(xs, |(scaled, scale)| Value::Numeric {
+            scaled: *scaled,
+            scale: *scale,
+            kind: spg_storage::NumericKind::Finite,
+        }),
+        Value::DateArray(xs) => build(xs, |d| Value::Date(*d)),
+        Value::TimestampArray(xs) => build(xs, |t| Value::Timestamp(*t)),
+        Value::UuidArray(xs) => build(xs, |u| Value::Uuid(*u)),
+        _ => None,
+    }
+}
+
 /// that need lossy textual round-trip (BYTEA, arrays, ts*)
 /// surface as an Unsupported error so the caller can add a cast
 /// in the inner SELECT.
 pub(crate) fn value_to_literal_expr_permissive(v: Value) -> Result<Expr, EngineError> {
+    // v7.39 (round 621) — an ARRAY goes back through its own text form, cast
+    // to its own type: the road Tid, UUID and BYTEA already take.
+    //
+    // Without it `INSERT INTO b SELECT * FROM a` failed outright whenever `a`
+    // had an array column, for EVERY array type — so array data could not be
+    // moved between tables at all, and neither could `CREATE TABLE … AS
+    // SELECT` carry one. The error told the caller to "add an explicit CAST in
+    // the inner SELECT"; the cast did not help either, because the value still
+    // arrived here as an array on its way back to a literal.
+    if let Some(elems) = array_elements(&v) {
+        return Ok(Expr::Array(elems));
+    }
     let lit = match v {
         Value::Null => Literal::Null,
         // v7.39 (round 189) — a bare Literal::Integer re-types to INT

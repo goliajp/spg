@@ -146,6 +146,7 @@ mod e2e_exists_noclone_round616;
 mod e2e_recursive_worktable_round618;
 mod e2e_jsonb_canonical_round619;
 mod e2e_catalog_column_types_round620;
+mod e2e_array_insert_select_round621;
 mod e2e_connective_shortcircuit_round621;
 mod e2e_join_group_by_key_round621;
 mod e2e_group_by_strict_round620;
