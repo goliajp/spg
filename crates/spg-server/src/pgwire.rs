@@ -4354,6 +4354,13 @@ pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         if msg.contains("arguments to GROUPING must be grouping expressions") {
             return ("42803", msg);
         }
+        // v7.39 (round 620) — an ungrouped column is the same class. It used
+        // to reach the wire as 42703 UNDEFINED_COLUMN, because the engine
+        // reported it as a column that does not exist; now it says what it is,
+        // and the code says so too.
+        if msg.contains("must appear in the GROUP BY clause") {
+            return ("42803", msg);
+        }
         // v7.39 (round 244) — sequence-range errors: a setval outside the
         // range is 22003 NUMERIC_VALUE_OUT_OF_RANGE, the CREATE SEQUENCE
         // option refusals 22023.

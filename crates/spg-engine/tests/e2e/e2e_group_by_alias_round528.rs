@@ -96,15 +96,21 @@ fn round528_having_over_an_aliased_group() {
 
 /// An INPUT column of that name WINS — measured: on a table that has a
 /// `ts` column, `SELECT v AS ts … GROUP BY ts` groups by the COLUMN, so
-/// PG then rejects the ungrouped `v`. Both refuse it; the wording still
-/// differs and is recorded rather than faked.
+/// PG then rejects the ungrouped `v`.
+///
+/// v7.39 (round 620) — the wording is PG's now. This pin used to record that
+/// both refused it and said different things; the second half of that is no
+/// longer true, so it asserts the message instead of merely `is_err`.
 #[test]
 fn round528_an_input_column_outranks_the_alias() {
     let mut e = engine();
+    let err = e
+        .execute("SELECT v AS ts, count(*) FROM ga GROUP BY ts")
+        .expect_err("grouping by the input column leaves v ungrouped");
     assert!(
-        e.execute("SELECT v AS ts, count(*) FROM ga GROUP BY ts")
-            .is_err(),
-        "grouping by the input column leaves v ungrouped"
+        format!("{err}")
+            .contains(r#"column "ga.v" must appear in the GROUP BY clause"#),
+        "message was {err}"
     );
     // And a name that is neither is still a missing column.
     let err = e
