@@ -29,6 +29,25 @@ pub(crate) enum Step {
     /// evaluation — same as the interpreter for every op EXCEPT the two
     /// boolean connectives, which take `Connective` below.
     Binary(BinOp),
+    /// v7.39 (round 621) — COALESCE and NULLIF as steps on the borrowed
+    /// stack, because they are control flow wearing a function's name.
+    ///
+    /// Through `Step::Function` each had to return `Value<'static>`, which
+    /// forces a clone of a borrowed text argument; and the coalesce arm also
+    /// built a `Vec<DataType>` EVERY row for the numeric widening that
+    /// `COALESCE(1, 2.5)` needs. Measured: `count(coalesce(s,'z'))` at 3.00
+    /// allocations a row, `count(nullif(s,'row1'))` at 2.00, their chain at
+    /// 5.00 — all of it for values that end up borrowed from the row anyway.
+    ///
+    /// On the stack, the chosen argument is handed back AS IS. The widening
+    /// survives by inspection: only when the non-null arguments carry MIXED
+    /// numeric-family types does the step fall to the owned function arm,
+    /// which still does what it always did — same answers, paid only by the
+    /// mixed shapes that need it.
+    Coalesce {
+        n_args: usize,
+    },
+    NullIf,
     /// v7.39 (round 621) — `AND` / `OR`, short-circuiting.
     ///
     /// The VM is a stack machine, so both operands were pushed before the
@@ -716,6 +735,18 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             }
             for a in args {
                 compile_into(a, ctx, steps);
+            }
+            // v7.39 (round 621) — COALESCE / NULLIF compile to their own
+            // steps (see the variants) so the chosen argument stays borrowed.
+            // The arguments are already on the stack from the loop above — a
+            // first cut recompiled them here and doubled them.
+            if name.eq_ignore_ascii_case("coalesce") && !args.is_empty() {
+                steps.push(Step::Coalesce { n_args: args.len() });
+                return;
+            }
+            if name.eq_ignore_ascii_case("nullif") && args.len() == 2 {
+                steps.push(Step::NullIf);
+                return;
             }
             steps.push(Step::Function {
                 name_lower: lower,
@@ -1949,6 +1980,81 @@ where
                     super::functions::apply_function_lower(name_lower, &stack[start..], ctx)?;
                 stack.truncate(start);
                 stack.push(result);
+            }
+            Step::Coalesce { n_args } => {
+                let start = stack.len().saturating_sub(*n_args);
+                // The widening `COALESCE(1, 2.5)` needs only exists when the
+                // non-null arguments carry MIXED types; inspected by ref, and
+                // the mixed shapes fall to the owned arm that always did it.
+                let mut mixed = false;
+                let mut seen: Option<spg_storage::DataType> = None;
+                for v in &stack[start..] {
+                    if let Some(t) = v.data_type() {
+                        match seen {
+                            None => seen = Some(t),
+                            Some(prev) if prev != t => {
+                                mixed = true;
+                                break;
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
+                if mixed {
+                    let result =
+                        super::functions::apply_function_lower("coalesce", &stack[start..], ctx)?;
+                    stack.truncate(start);
+                    stack.push(result);
+                } else {
+                    let chosen = stack[start..]
+                        .iter()
+                        .position(|v| !matches!(v, Value::Null));
+                    match chosen {
+                        Some(k) => {
+                            let v = stack.swap_remove(start + k);
+                            stack.truncate(start);
+                            stack.push(v);
+                        }
+                        None => {
+                            stack.truncate(start);
+                            stack.push(Value::Null);
+                        }
+                    }
+                }
+            }
+            Step::NullIf => {
+                let n = stack.len();
+                // NULLIF is `=` under the hood and keeps round 238's refusal
+                // of incomparable operands; both reads are by reference.
+                let verdict = match (&stack[n - 2], &stack[n - 1]) {
+                    (Value::Null, _) => Some(true),
+                    (_, Value::Null) => Some(false),
+                    (a, b) => {
+                        super::binop::require_comparable(spg_sql::ast::BinOp::Eq, a, b)?;
+                        match super::apply_binary_by_ref(spg_sql::ast::BinOp::Eq, a, b)? {
+                            Some(Value::Bool(eq)) => Some(eq),
+                            _ => None,
+                        }
+                    }
+                };
+                match verdict {
+                    Some(true) => {
+                        stack.truncate(n - 2);
+                        stack.push(Value::Null);
+                    }
+                    Some(false) => {
+                        let a = stack.swap_remove(n - 2);
+                        stack.truncate(n - 2);
+                        stack.push(a);
+                    }
+                    // The by-ref compare could not decide — the owned arm can.
+                    None => {
+                        let result =
+                            super::functions::apply_function_lower("nullif", &stack[n - 2..], ctx)?;
+                        stack.truncate(n - 2);
+                        stack.push(result);
+                    }
+                }
             }
             Step::Cast { target } => {
                 crate::bump_counter!(STEP_VM_CAST_FIRE);
