@@ -1286,23 +1286,85 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
     // Peel a leading / trailing run of letters outside the template
     // alphabet and re-attach it around the rendered body. (Literals in the
     // MIDDLE of the picture remain a recorded residual.)
-    let template_letter = |c: char| {
-        matches!(
-            c.to_ascii_uppercase(),
-            'S' | 'L' | 'D' | 'G' | 'V' | 'E' | 'R' | 'N' | 'T' | 'H' | 'P' | 'M' | 'I' | 'F'
-        )
+    // v7.39 (round 627/628, F33) — whether a letter is part of the picture
+    // is a question about the POSITION, not the character.
+    //
+    // The predicate this replaces asked it per character, with `E R N T H P
+    // M I F` in the template alphabet because they appear inside `EEEE`
+    // `RN` `TH` `PL`/`PR` `MI` `FM`. But PG matches keywords left to right,
+    // longest first: a lone `M` is a literal and `MI` is the minus column,
+    // a lone `P` is a literal and `PL` is the plus column. Asking per
+    // character cannot tell them apart, so every one of those letters was
+    // swallowed on its own — `to_char(1,'MON')` answered a single space
+    // where PG answers `MON`, and `to_char(1,'HH')` likewise. Measured over
+    // the alphabet in both placements, 56 of 104 shapes differed.
+    //
+    // Recorded and still open: `B` and `C` are picture elements in PG
+    // (consumed, producing nothing) and are literals here, so
+    // `to_char(1,'abc')` is `abc` where PG says `a`. Adding them to the
+    // scanner without teaching the body renderer what they mean would move
+    // the wrong answer rather than remove it.
+    let keyword_len_at = |rest: &str| -> Option<usize> {
+        const KW4: [&str; 1] = ["EEEE"];
+        const KW2: [&str; 7] = ["FM", "PL", "PR", "RN", "TH", "SG", "MI"];
+        if rest.len() >= 4 && KW4.iter().any(|k| rest[..4].eq_ignore_ascii_case(k)) {
+            return Some(4);
+        }
+        if rest.len() >= 2 && KW2.iter().any(|k| rest[..2].eq_ignore_ascii_case(k)) {
+            return Some(2);
+        }
+        match rest.chars().next() {
+            Some(c) if matches!(c.to_ascii_uppercase(), 'S' | 'L' | 'D' | 'G' | 'V') => Some(1),
+            Some(c) if c.is_ascii_digit() || matches!(c, '.' | ',' | '$' | '%') => Some(1),
+            _ => None,
+        }
     };
-    let lit_prefix_len = pat
-        .chars()
-        .take_while(|c| c.is_ascii_alphabetic() && !template_letter(*c))
-        .map(char::len_utf8)
-        .sum::<usize>();
-    let lit_suffix_len = pat
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_alphabetic() && !template_letter(*c))
-        .map(char::len_utf8)
-        .sum::<usize>();
+    // One left-to-right pass, longest match first, recording where the
+    // picture's first element begins and where its last one ends. Asking
+    // "does a keyword START here" while walking BACKWARDS is not the same
+    // question and gets `MI` wrong (the `I` looks like a literal), which is
+    // how the first cut of this scanner turned `MI` `RN` and `EEEE` into
+    // echoed text.
+    let mut first_kw: Option<usize> = None;
+    let mut last_kw_end = 0usize;
+    let mut scan = 0usize;
+    while scan < pat.len() {
+        if let Some(len) = keyword_len_at(&pat[scan..]) {
+            if first_kw.is_none() {
+                first_kw = Some(scan);
+            }
+            last_kw_end = scan + len;
+            scan += len;
+        } else {
+            scan += pat[scan..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    let Some(first_kw) = first_kw else {
+        // No picture element at all: PG echoes the pattern.
+        return String::from(pat);
+    };
+    let mut lit_prefix_len = 0usize;
+    while lit_prefix_len < first_kw {
+        let Some(c) = pat[lit_prefix_len..].chars().next() else {
+            break;
+        };
+        if !c.is_ascii_alphabetic() {
+            break;
+        }
+        lit_prefix_len += c.len_utf8();
+    }
+    let mut lit_suffix_start = pat.len();
+    while lit_suffix_start > last_kw_end {
+        let prev = pat[..lit_suffix_start]
+            .chars()
+            .next_back()
+            .expect("non-empty");
+        if !prev.is_ascii_alphabetic() {
+            break;
+        }
+        lit_suffix_start -= prev.len_utf8();
+    }
+    let lit_suffix_len = pat.len() - lit_suffix_start;
     // v7.39 (round 626, S05b/F29) — a pattern that is ALL literal.
     //
     // `to_char(1, 'YYYY')` panicked: every letter of `YYYY` is a literal in
@@ -1382,6 +1444,13 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
     // v7.39 (read01 formatting.c) — the currency symbol comes from the
     // locale: in the C locale PG's L is a single SPACE, while a literal
     // `$` in the picture stays a dollar sign.
+    // v7.39 (round 628) — VERIFIED, after a round that changed it and had
+    // to change it back. The bench oracle runs `lc_monetary = en_US.utf8`
+    // and answers `$ 1` for `to_char(1,'L9')`; the SAME PG with
+    // `SET lc_monetary = 'C'` answers `  1`. SPG reports `lc_monetary = C`,
+    // so the space is what agrees with the locale it advertises. Measuring
+    // the oracle without reading the GUC the feature depends on is how the
+    // wrong conclusion got drawn.
     let has_locale_currency = pat.starts_with(['L', 'l']);
     let has_lit_currency = !has_locale_currency && pat.starts_with('$');
     if has_locale_currency || has_lit_currency {
@@ -1527,6 +1596,16 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
             for _ in 0..frac_digits {
                 out.push('#');
             }
+        }
+        // v7.39 (round 628, F33) — the currency column belongs to the
+        // picture, not to the value, so an overflowed body still carries
+        // it: PG answers `$ #` for `to_char(1234.5,'L9')` under en_US and
+        // `  #` under C. This return skipped the insertion at the end of
+        // the function entirely, dropping the column either way.
+        if has_locale_currency {
+            out.insert(0, ' ');
+        } else if has_lit_currency {
+            out.insert(0, '$');
         }
         return out;
     }

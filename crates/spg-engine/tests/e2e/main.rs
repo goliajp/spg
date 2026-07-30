@@ -150,6 +150,7 @@ mod e2e_catalog_self_describing_round623;
 mod e2e_coercion_strictness_round625;
 mod e2e_aggregate_signatures_round626;
 mod e2e_signature_denials_round627;
+mod e2e_to_char_templates_round628;
 mod e2e_catalog_column_types_round620;
 mod e2e_array_insert_select_round621;
 mod e2e_by_is_an_identifier_round621;
