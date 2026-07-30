@@ -1604,6 +1604,20 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
     } else {
         alloc::format!("{int_part}").len()
     };
+    // v7.39 (round 630, F33) — DIAGNOSED, not fixed, and the attempt is
+    // recorded because the obvious form of it is wrong.
+    //
+    // `to_char(1,'MI')` takes this branch — one integer digit against zero
+    // slots — and returns from inside it, before the sign columns are
+    // applied at the end of the function, so the sign is lost: PG answers
+    // ` ` and `-` for the two signs, SPG answers nothing for either, and
+    // `PL` the same. Simply exempting a slotless picture from the branch
+    // makes it WORSE (measured): the body renderer then prints the digits
+    // that have no slots to sit in, so `to_char(1,'B')` answered `1`.
+    //
+    // The fix is to let a slotless picture reach the tail with an empty
+    // body rather than return from here, which means restructuring the
+    // tail — its own change, not a condition on this line.
     if int_digit_len > int_slots {
         let mut core = String::new();
         core.push_str(sign_str);
