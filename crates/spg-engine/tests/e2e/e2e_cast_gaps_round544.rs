@@ -128,7 +128,11 @@ fn round544_bytea_to_integer() {
 #[test]
 fn round544_pg_cast_is_an_empty_registry() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT count(*) FROM pg_cast"), "0");
+    // v7.39 (round 635) — it is not empty any more. The registry carries
+    // the 129 casts PG registers between SPG's base types, each one probed
+    // against the engine in rounds 633/634 before being published. The
+    // column list below is what this test was really guarding.
+    assert_eq!(one(&mut e, "SELECT count(*) FROM pg_cast"), "129");
     assert_eq!(
         match e.execute("SELECT * FROM pg_catalog.pg_cast").unwrap() {
             QueryResult::Rows { columns, .. } =>
