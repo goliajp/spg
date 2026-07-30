@@ -1314,7 +1314,17 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
             return Some(2);
         }
         match rest.chars().next() {
-            Some(c) if matches!(c.to_ascii_uppercase(), 'S' | 'L' | 'D' | 'G' | 'V') => Some(1),
+            // v7.39 (round 629, F33) — `B` and `C` are picture elements, not
+            // literals. PG consumes both: `C` is the ISO currency code,
+            // empty in the C locale, and `B` blanks the integer digits when
+            // the value is zero. SPG's blanking already agreed with PG —
+            // `to_char(0,'B9999.99')` produced the right five spaces — it
+            // simply echoed the `B` in front of them, because the literal
+            // peel claimed it. Measured: `[B    0]` vs PG `[    0]`,
+            // `[C 1234]` and `[ 1234C]` vs PG `[ 1234]` for both.
+            Some(c) if matches!(c.to_ascii_uppercase(), 'S' | 'L' | 'D' | 'G' | 'V' | 'B' | 'C') => {
+                Some(1)
+            }
             Some(c) if c.is_ascii_digit() || matches!(c, '.' | ',' | '$' | '%') => Some(1),
             _ => None,
         }
@@ -1513,7 +1523,21 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
     // column (PG keeps a slot for the sign in fixed width). MI / SG and a
     // trailing `S` position the sign at the end, so PG drops the reserved
     // leading column (`PL` and `$` keep it).
-    let sign_col = usize::from(!(has_mi || has_sg || has_trailing_s));
+    // v7.39 (round 629, F33) — a picture with NO digit slots gets no sign
+    // column either. PG answers `to_char(1,'L')` with a single space (the
+    // `L` itself in the C locale) and `to_char(1,'B')` with nothing; SPG
+    // answered two spaces and one, the extra being a column reserved for a
+    // sign that has no number to sit beside. All twenty of the
+    // single-letter shapes still differing came from this one place.
+    //
+    // A decimal separator counts as a numeric field even with no slots
+    // around it: PG answers `to_char(1,'D')` with ` .`, so dropping the
+    // column on `int_slots == 0 && frac_digits == 0` alone took that with
+    // it (and `DAY`, whose `D` is the separator).
+    let sign_col = usize::from(
+        !(has_mi || has_sg || has_trailing_s)
+            && (int_slots > 0 || frac_digits > 0 || has_decimal),
+    );
     let int_field_width = int_pat
         .chars()
         .filter(|c| is_slot(*c) || is_group(*c))
