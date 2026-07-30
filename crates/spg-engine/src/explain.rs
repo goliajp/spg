@@ -501,10 +501,12 @@ fn split_index_cond<'a>(
 /// tables are exact"). On a table with a primary key and a secondary
 /// index that is a plain misstatement:
 ///
+/// ```text
 ///     CREATE TABLE e (id INT PRIMARY KEY, k INT);
 ///     CREATE INDEX ek ON e (k);
 ///     EXPLAIN SELECT * FROM e WHERE k BETWEEN 10 AND 12;
 ///     -> Index Scan using e_pkey on e
+/// ```
 ///
 /// naming an index on `id` for a condition on `k`, which it cannot
 /// serve. EXPLAIN is what every perf investigation reads first — this

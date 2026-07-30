@@ -1930,8 +1930,8 @@ pub(crate) fn apply_binary_interval(
         }
         _ => Err(EvalError::TypeMismatch {
             detail: format!(
-                "operator {op:?} not defined for {:?} and INTERVAL",
-                lhs.data_type()
+                "operator {op:?} not defined for {} and INTERVAL",
+                crate::conversions::pg_type_name_for_error_opt(lhs.data_type())
             ),
         }),
     }
@@ -2429,10 +2429,10 @@ fn apply_binary_numeric(
     }
     // Promote integer ↔ numeric to a shared scale (max of both sides).
     let (a, sa) = numeric_or_widen(&l).ok_or_else(|| EvalError::TypeMismatch {
-        detail: format!("NUMERIC op against non-numeric {:?}", l.data_type()),
+        detail: format!("NUMERIC op against non-numeric {}", crate::conversions::pg_type_name_for_error_opt(l.data_type())),
     })?;
     let (b, sb) = numeric_or_widen(&r).ok_or_else(|| EvalError::TypeMismatch {
-        detail: format!("NUMERIC op against non-numeric {:?}", r.data_type()),
+        detail: format!("NUMERIC op against non-numeric {}", crate::conversions::pg_type_name_for_error_opt(r.data_type())),
     })?;
     match op {
         BinOp::Add | BinOp::Sub => {
@@ -3550,7 +3550,7 @@ fn as_f64(v: &Value<'_>) -> Result<f64, EvalError> {
                 detail: "value out of range: overflow".into(),
             }),
         other => Err(EvalError::TypeMismatch {
-            detail: format!("cannot convert {:?} to FLOAT", other.data_type()),
+            detail: format!("cannot convert {} to FLOAT", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
         }),
     }
 }

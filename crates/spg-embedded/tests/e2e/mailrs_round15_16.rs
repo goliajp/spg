@@ -251,14 +251,20 @@ fn pg_trigger_reports_registration_and_enabled_state() {
     .unwrap();
     db.execute("CREATE TRIGGER tr BEFORE INSERT OR UPDATE ON m FOR EACH ROW EXECUTE FUNCTION f()")
         .unwrap();
+    // v7.39 (round 622) — this read `relname`, `events` and `function` off
+    // pg_trigger, three columns SPG invented and PG has never had. The
+    // catalog now carries PG18's nineteen and only those, so the query has
+    // to be PG's: the relation comes from a join to pg_class. Checked
+    // against live PG18, which answers `tr|m|O` and then `D`, exactly this.
     let r = rows_of(
         &mut db,
-        "SELECT tgname, relname, tgenabled, events, function FROM pg_trigger",
+        "SELECT t.tgname, c.relname, t.tgenabled FROM pg_trigger t \
+         JOIN pg_class c ON c.oid = t.tgrelid WHERE t.tgname = 'tr'",
     );
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::text("tr"));
+    assert_eq!(r[0][1], Value::text("m"));
     assert_eq!(r[0][2], Value::text("O"));
-    assert_eq!(r[0][3], Value::text("INSERT OR UPDATE"));
     db.execute("ALTER TABLE m DISABLE TRIGGER tr").unwrap();
     let r = rows_of(
         &mut db,

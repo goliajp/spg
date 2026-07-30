@@ -1627,7 +1627,7 @@ fn fused_acc_cell(a: &mut FusedAcc, v: &Value<'_>) -> Result<(), EvalError> {
         }
         other => {
             return Err(EvalError::TypeMismatch {
-                detail: format!("sum/avg need numeric, got {:?}", other.data_type()),
+                detail: format!("sum/avg need numeric, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
             });
         }
     }
@@ -2380,7 +2380,7 @@ fn accumulate_groups(
                     }
                     other => {
                         return Err(EvalError::TypeMismatch {
-                            detail: format!("sum/avg need numeric, got {:?}", other.data_type()),
+                            detail: format!("sum/avg need numeric, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                         });
                     }
                 }
@@ -2410,7 +2410,7 @@ fn accumulate_groups(
                     }
                     other => {
                         return Err(EvalError::TypeMismatch {
-                            detail: format!("length() needs text, got {:?}", other.data_type()),
+                            detail: format!("length() needs text, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                         });
                     }
                 };
@@ -2489,7 +2489,7 @@ fn accumulate_groups(
                     }
                     other => {
                         return Err(EvalError::TypeMismatch {
-                            detail: format!("sum/avg need numeric, got {:?}", other.data_type()),
+                            detail: format!("sum/avg need numeric, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                         });
                     }
                 }
@@ -4487,7 +4487,7 @@ pub(crate) fn update_state(
                 }
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!("sum/avg need numeric, got {:?}", other.data_type()),
+                        detail: format!("sum/avg need numeric, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                     });
                 }
             }
@@ -4527,7 +4527,7 @@ pub(crate) fn update_state(
             } = v
             else {
                 return Err(EvalError::TypeMismatch {
-                    detail: format!("range_agg requires a range value, got {:?}", v.data_type()),
+                    detail: format!("range_agg requires a range value, got {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
                 });
             };
             // Initialise the accumulator on first sight (even for
@@ -4555,8 +4555,8 @@ pub(crate) fn update_state(
             if !matches!(v, Value::Range { .. }) {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "range_intersect_agg requires a range value, got {:?}",
-                        v.data_type()
+                        "range_intersect_agg requires a range value, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(v.data_type())
                     ),
                 });
             }
@@ -4621,7 +4621,7 @@ pub(crate) fn update_state(
                 st.count += 1;
             } else {
                 return Err(EvalError::TypeMismatch {
-                    detail: format!("string_agg requires text value, got {:?}", v.data_type()),
+                    detail: format!("string_agg requires text value, got {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
                 });
             }
         }
@@ -4648,7 +4648,7 @@ pub(crate) fn update_state(
                 Value::Bool(b) => *b,
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!("bool_and requires bool, got {:?}", other.data_type()),
+                        detail: format!("bool_and requires bool, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                     });
                 }
             };
@@ -4664,7 +4664,7 @@ pub(crate) fn update_state(
                 Value::Bool(b) => *b,
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!("bool_or requires bool, got {:?}", other.data_type()),
+                        detail: format!("bool_or requires bool, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                     });
                 }
             };
@@ -4730,7 +4730,7 @@ pub(crate) fn update_state(
             }
             let Some(x) = agg_value_to_f64(v) else {
                 return Err(EvalError::TypeMismatch {
-                    detail: format!("{name} needs numeric, got {:?}", v.data_type()),
+                    detail: format!("{name} needs numeric, got {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
                 });
             };
             st.count += 1;
@@ -4748,7 +4748,7 @@ pub(crate) fn update_state(
                 Value::BigInt(n) => *n,
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!("{name} needs integer, got {:?}", other.data_type()),
+                        detail: format!("{name} needs integer, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                     });
                 }
             };
@@ -5390,8 +5390,8 @@ fn finalize_ordered_set(
                         agg_value_to_f64(v)
                             .ok_or_else(|| EvalError::TypeMismatch {
                                 detail: format!(
-                                    "percentile fraction must be numeric, got {:?}",
-                                    v.data_type()
+                                    "percentile fraction must be numeric, got {}",
+                                    crate::conversions::pg_type_name_for_error_opt(v.data_type())
                                 ),
                             })
                             .and_then(check_fraction),

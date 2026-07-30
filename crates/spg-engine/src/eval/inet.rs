@@ -638,8 +638,8 @@ pub(super) fn inet_op_bool_result(
             }),
             _ => Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "inet operator requires INET/CIDR/TEXT operands, got {:?}",
-                    v.data_type()
+                    "inet operator requires INET/CIDR/TEXT operands, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(v.data_type())
                 ),
             }),
         }
@@ -692,8 +692,11 @@ pub(super) fn mysql_inet_ntoa(args: &[Value<'_>]) -> Result<Value<'static>, Eval
         _ => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "inet_ntoa() takes one integer arg, got {:?}",
-                    args.first().map(|a| a.data_type())
+                    "inet_ntoa() takes one integer arg, got {}",
+                    args.first().map_or_else(
+                        || alloc::string::String::from("no arguments"),
+                        |a| crate::conversions::pg_type_name_for_error_opt(a.data_type()),
+                    )
                 ),
             });
         }
@@ -794,8 +797,11 @@ pub(super) fn mysql_inet6_ntoa(args: &[Value<'_>]) -> Result<Value<'static>, Eva
         _ => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "inet6_ntoa() takes one binary arg, got {:?}",
-                    args.first().map(|a| a.data_type())
+                    "inet6_ntoa() takes one binary arg, got {}",
+                    args.first().map_or_else(
+                        || alloc::string::String::from("no arguments"),
+                        |a| crate::conversions::pg_type_name_for_error_opt(a.data_type()),
+                    )
                 ),
             });
         }

@@ -303,7 +303,7 @@ fn cast_mysql_integer(v: Value<'static>, unsigned: bool) -> Result<Value<'static
                 Value::Text(t) | Value::BpChar(t) => crate::eval::mysql_leading_number(t),
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!("cannot cast {:?} to integer", other.data_type()),
+                        detail: alloc::format!("cannot cast {} to integer", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                     });
                 }
             };
@@ -524,8 +524,8 @@ pub fn cast_value_ref_in(
             Value::Text(s) => Ok(Value::json(s)),
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "::json only accepts TEXT-shape inputs, got {:?}",
-                    other.data_type()
+                    "::json only accepts TEXT-shape inputs, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             }),
         },
@@ -546,8 +546,8 @@ pub fn cast_value_ref_in(
             },
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "::jsonb only accepts TEXT-shape inputs, got {:?}",
-                    other.data_type()
+                    "::jsonb only accepts TEXT-shape inputs, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             }),
         },
@@ -608,8 +608,8 @@ pub fn cast_value_ref_in(
             }
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "::regtype / ::regclass accepts TEXT (name) or integer (oid), got {:?}",
-                    other.data_type()
+                    "::regtype / ::regclass accepts TEXT (name) or integer (oid), got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             }),
         },
@@ -661,8 +661,8 @@ pub fn cast_value_ref_in(
             )),
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "::TEXT[] only accepts TEXT / array inputs, got {:?}",
-                    other.data_type()
+                    "::TEXT[] only accepts TEXT / array inputs, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             }),
         },
@@ -682,8 +682,8 @@ pub fn cast_value_ref_in(
             Value::Text(s) => decode_tsvector_external(&s).map(Value::TsVector),
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "::tsvector only accepts TEXT / tsvector inputs, got {:?}",
-                    other.data_type()
+                    "::tsvector only accepts TEXT / tsvector inputs, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             }),
         },
@@ -692,8 +692,8 @@ pub fn cast_value_ref_in(
             Value::Text(s) => decode_tsquery_external(&s).map(Value::TsQuery),
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "::tsquery only accepts TEXT / tsquery inputs, got {:?}",
-                    other.data_type()
+                    "::tsquery only accepts TEXT / tsquery inputs, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             }),
         },
@@ -711,8 +711,8 @@ pub fn cast_value_ref_in(
             },
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "::uuid only accepts TEXT / uuid inputs, got {:?}",
-                    other.data_type()
+                    "::uuid only accepts TEXT / uuid inputs, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             }),
         },
@@ -738,8 +738,8 @@ pub fn cast_value_ref_in(
             Value::BigInt(n) => Ok(Value::bytes(n.to_be_bytes().to_vec())),
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "::bytea only accepts TEXT / bytea / integer inputs, got {:?}",
-                    other.data_type()
+                    "::bytea only accepts TEXT / bytea / integer inputs, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             }),
         },
@@ -777,7 +777,7 @@ pub fn cast_value_ref_in(
                     },
                     Value::BitString { .. } => Ok(v),
                     other => Err(EvalError::TypeMismatch {
-                        detail: alloc::format!("cannot cast {:?} to bit", other.data_type()),
+                        detail: alloc::format!("cannot cast {} to bit", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                     }),
                 };
             }
@@ -896,8 +896,8 @@ pub fn cast_value_ref_in(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "::{lower_name} accepts TEXT, got {:?}",
-                                other.data_type()
+                                "::{lower_name} accepts TEXT, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -978,7 +978,7 @@ pub fn cast_value_ref_in(
                     }
                     other => {
                         return Err(EvalError::TypeMismatch {
-                            detail: alloc::format!("cannot cast {:?} to {name}", other.data_type()),
+                            detail: alloc::format!("cannot cast {} to {name}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                         });
                     }
                 });
@@ -1021,7 +1021,7 @@ pub fn cast_value_ref_in(
                     Value::Null => Ok(Value::Null),
                     Value::Text(s) => Ok(Value::text(crate::json::jsonpath_canonical(s.as_ref())?)),
                     other => Err(EvalError::TypeMismatch {
-                        detail: alloc::format!("cannot cast {:?} to jsonpath", other.data_type()),
+                        detail: alloc::format!("cannot cast {} to jsonpath", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                     }),
                 };
             }
@@ -1145,6 +1145,39 @@ fn finish_named_cast(
             // — visible now that jsonb → numeric casts error with PG's
             // exact "cannot cast jsonb string to type numeric" wording.
             crate::EngineError::Eval(ev) => ev,
+            // v7.39 (round 622, S05a) — `coerce_value` is the INSERT-time
+            // COLUMN coercion, and a cast borrows it. Its rejection is
+            // phrased for a column, so `SELECT 1::INET` answered
+            //
+            //   type mismatch in column "inet" (position 0): expected INET,
+            //   got INT
+            //
+            // naming a column that does not exist, at a position that means
+            // nothing, in the storage layer's own vocabulary. PG says
+            // `cannot cast type integer to inet`. The column phrasing stays
+            // where it belongs — an INSERT still says which column — and a
+            // failed cast now says what it failed to cast, like every other
+            // arm in this file already did.
+            //
+            // The two type names come off the error itself, which already
+            // carries them as `DataType`. Naming them BEFORE the call — the
+            // obvious way to write this, since the value and the target both
+            // move into it — costs two `String`s on every SUCCESSFUL cast,
+            // and the panel caught exactly that: `id::NUMERIC` 23.75 ->
+            // 55.48 ms, `id::REAL` 21.55 -> 50.48. This is the same eager
+            // error construction round 614 removed from 28 call sites,
+            // rebuilt by hand a round later.
+            crate::EngineError::Storage(spg_storage::StorageError::TypeMismatch {
+                expected,
+                actual,
+                ..
+            }) => EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "cannot cast {} to {}",
+                    crate::conversions::pg_type_name_for_error(actual),
+                    crate::conversions::pg_type_name_for_error(expected)
+                ),
+            },
             other => EvalError::TypeMismatch {
                 detail: alloc::format!("{other}"),
             },
@@ -1607,7 +1640,7 @@ fn cast_to_int_array(v: Value) -> Result<Value, EvalError> {
             Ok(Value::IntArray(out))
         }
         other => Err(EvalError::TypeMismatch {
-            detail: alloc::format!("::INT[] does not accept {:?}", other.data_type()),
+            detail: alloc::format!("::INT[] does not accept {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
         }),
     }
 }
@@ -1644,7 +1677,7 @@ fn cast_to_bigint_array(v: Value) -> Result<Value, EvalError> {
             Ok(Value::BigIntArray(out))
         }
         other => Err(EvalError::TypeMismatch {
-            detail: alloc::format!("::BIGINT[] does not accept {:?}", other.data_type()),
+            detail: alloc::format!("::BIGINT[] does not accept {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
         }),
     }
 }
@@ -1831,8 +1864,8 @@ fn cast_to_interval(v: Value) -> Result<Value, EvalError> {
         }
         other => Err(EvalError::TypeMismatch {
             detail: alloc::format!(
-                "::INTERVAL only accepts TEXT-shape inputs, got {:?}",
-                other.data_type()
+                "::INTERVAL only accepts TEXT-shape inputs, got {}",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
             ),
         }),
     }
@@ -1894,7 +1927,7 @@ fn cast_to_date(v: Value) -> Result<Value, EvalError> {
             })
         }
         other => Err(EvalError::TypeMismatch {
-            detail: format!("cannot cast {:?} to DATE", other.data_type()),
+            detail: format!("cannot cast {} to DATE", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
         }),
     }
 }
@@ -1928,7 +1961,7 @@ fn cast_to_timestamp(v: Value) -> Result<Value, EvalError> {
             })
         }
         other => Err(EvalError::TypeMismatch {
-            detail: format!("cannot cast {:?} to TIMESTAMP", other.data_type()),
+            detail: format!("cannot cast {} to TIMESTAMP", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
         }),
     }
 }
@@ -2043,7 +2076,7 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
             crate::conversions::JsonbScalar::Null => Ok(Value::Null),
         },
         other => Err(EvalError::TypeMismatch {
-            detail: format!("cannot cast {:?} to int", other.data_type()),
+            detail: format!("cannot cast {} to int", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
         }),
     }
 }
@@ -2107,7 +2140,7 @@ fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
             crate::conversions::JsonbScalar::Null => Ok(Value::Null),
         },
         other => Err(EvalError::TypeMismatch {
-            detail: format!("cannot cast {:?} to bigint", other.data_type()),
+            detail: format!("cannot cast {} to bigint", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
         }),
     }
 }
@@ -2161,7 +2194,7 @@ fn cast_numeric_to_float(v: Value) -> Result<Value, EvalError> {
             }
         }
         other => Err(EvalError::TypeMismatch {
-            detail: format!("cannot cast {:?} to float", other.data_type()),
+            detail: format!("cannot cast {} to float", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
         }),
     }
 }
@@ -2198,7 +2231,7 @@ fn cast_to_bool(v: Value) -> Result<Value, EvalError> {
             crate::conversions::JsonbScalar::Null => Ok(Value::Null),
         },
         other => Err(EvalError::TypeMismatch {
-            detail: format!("cannot cast {:?} to bool", other.data_type()),
+            detail: format!("cannot cast {} to bool", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
         }),
     }
 }
@@ -2215,7 +2248,7 @@ pub fn cast_to_vector(v: Value) -> Result<Value<'static>, EvalError> {
                 detail: format!("cannot parse {s:?} as a vector literal"),
             }),
         other => Err(EvalError::TypeMismatch {
-            detail: format!("::vector requires text input, got {:?}", other.data_type()),
+            detail: format!("::vector requires text input, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
         }),
     }
 }

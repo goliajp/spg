@@ -1936,8 +1936,8 @@ where
                     None => {
                         return Err(EvalError::TypeMismatch {
                             detail: format!(
-                                "LIKE requires text operands, got {:?}",
-                                v.data_type()
+                                "LIKE requires text operands, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(v.data_type())
                             ),
                         });
                     }
@@ -1974,8 +1974,8 @@ where
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: format!(
-                                "length() needs text or bytea, got {:?}",
-                                other.data_type()
+                                "length() needs text or bytea, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -1995,8 +1995,8 @@ where
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: format!(
-                                "octet_length() needs text or bytea, got {:?}",
-                                other.data_type()
+                                "octet_length() needs text or bytea, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }

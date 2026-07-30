@@ -38,8 +38,10 @@ pub(crate) enum TxStmtClass {
 /// reads what the other writes and both commit. Measured, the classic
 /// case destroyed its invariant —
 ///
+/// ```text
 ///     both doctors go off call, each having seen the other on call
 ///     PG18  T2 aborts 40001, one stays on call     SPG  both commit, none does
+/// ```
 ///
 /// — an outcome no serial order can produce. Detecting it needs the
 /// READ set, which nothing recorded.

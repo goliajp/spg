@@ -137,8 +137,8 @@ pub(crate) fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
         }
         other => {
             return Err(EngineError::Unsupported(alloc::format!(
-                "subquery result type {:?} not yet materialisable; cast to text or integer in the inner SELECT",
-                other.data_type()
+                "subquery result type {} not yet materialisable; cast to text or integer in the inner SELECT",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
             )));
         }
     };
@@ -290,9 +290,9 @@ pub(crate) fn value_to_literal_expr_permissive(v: Value) -> Result<Expr, EngineE
         }
         other => {
             return Err(EngineError::Unsupported(alloc::format!(
-                "INSERT … SELECT cannot materialise value of type {:?}; \
+                "INSERT … SELECT cannot materialise value of type {}; \
                  add an explicit CAST in the inner SELECT",
-                other.data_type()
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
             )));
         }
     };

@@ -2517,8 +2517,8 @@ pub(crate) fn enforce_fk_inserts(
                 let parent_col = fk.parent_columns[0];
                 let key = spg_storage::IndexKey::from_value(v).ok_or_else(|| {
                     EngineError::Unsupported(alloc::format!(
-                        "FOREIGN KEY column value of type {:?} is not index-eligible",
-                        v.data_type()
+                        "FOREIGN KEY column value of type {} is not index-eligible",
+                        crate::conversions::pg_type_name_for_error_opt(v.data_type())
                     ))
                 })?;
                 let present_committed = parent.indices().iter().any(|idx| {

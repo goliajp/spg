@@ -409,8 +409,8 @@ impl Engine {
             Value::SmallInt(n) => i64::from(n),
             other => {
                 return Err(crate::EngineError::Unsupported(alloc::format!(
-                    "KILL expects a connection id, got {:?}",
-                    other.data_type()
+                    "KILL expects a connection id, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 )));
             }
         };
