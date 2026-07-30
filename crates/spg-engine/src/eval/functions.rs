@@ -7520,6 +7520,14 @@ fn apply_function_dispatch(
                     Value::Timestamp(us) => {
                         Ok(Some(us.rem_euclid(86_400_000_000)))
                     }
+                    // v7.39 (round 636) — an actual TIME value. Text and
+                    // timestamp were accepted and `Value::Time` was not, so
+                    // `microsecond(TIME '01:02:03.456789')` answered
+                    // "needs time, got time without time zone" — a sentence
+                    // that argues with itself. Found by pinning the four
+                    // crashes this round fixed.
+                    Value::Time(us) => Ok(Some(*us)),
+                    Value::TimeTz { us, .. } => Ok(Some(*us)),
                     other => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
                             "{what}: needs time, got {}",
@@ -7530,12 +7538,26 @@ fn apply_function_dispatch(
             };
             match name {
                 "time_to_sec" => {
-                    let Some(us) = time_arg(&args[0], "time_to_sec()")? else {
+                    // v7.39 (round 636) — see `microsecond`: indexing args[0]
+                    // with no arity check took the server down on a zero-arg
+                    // call.
+                    let Some(first) = args.first() else {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "time_to_sec() takes 1 arg, got 0".into(),
+                        });
+                    };
+                    let Some(us) = time_arg(first, "time_to_sec()")? else {
                         return Ok(Value::Null);
                     };
                     Ok(Value::BigInt(us.div_euclid(1_000_000)))
                 }
                 "sec_to_time" => {
+                    // v7.39 (round 636) — same class.
+                    if args.is_empty() {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "sec_to_time() takes 1 arg, got 0".into(),
+                        });
+                    }
                     let secs = match &args[0] {
                         Value::Null => return Ok(Value::Null),
                         Value::Int(n) => i64::from(*n),
@@ -7646,6 +7668,19 @@ fn apply_function_dispatch(
                     Ok(Value::text(format_time_us(result)))
                 }
                 "microsecond" => {
+                    // v7.39 (round 636) — `SELECT microsecond()` indexed
+                    // args[0] with no arity check and panicked, taking the
+                    // whole server down, not just the connection. Same class
+                    // as round 626's to_char crash: a user-reachable index
+                    // out of bounds.
+                    if args.len() != 1 {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "microsecond() takes 1 arg, got {}",
+                                args.len()
+                            ),
+                        });
+                    }
                     let Some(us) = time_arg(&args[0], "microsecond()")? else {
                         return Ok(Value::Null);
                     };
@@ -17132,7 +17167,13 @@ fn apply_function_dispatch(
             let Some(cat) = ctx.catalog else {
                 return Ok(Value::Null);
             };
-            let Some(name) = regclass_name_of(&args[0]) else {
+            // v7.39 (round 636) — same class: a zero-arg call panicked here.
+            let Some(first) = args.first() else {
+                return Err(EvalError::TypeMismatch {
+                    detail: "obj_description() takes 1 or 2 args, got 0".into(),
+                });
+            };
+            let Some(name) = regclass_name_of(first) else {
                 return Ok(Value::Null);
             };
             // The catalog arg ('pg_class') distinguishes relations from other
