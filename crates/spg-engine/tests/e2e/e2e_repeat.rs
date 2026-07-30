@@ -135,7 +135,12 @@ fn repeat_n_non_integer_errors() {
 #[test]
 fn repeat_numeric_input_coerced() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT repeat(7, 3)"), "777");
+    // v7.39 (round 625) — PG has no `repeat(integer, integer)`.
+    let m = e
+        .execute("SELECT repeat(7, 3)")
+        .expect_err("PG has no repeat(integer, integer)")
+        .to_string();
+    assert!(m.contains("function repeat(integer, integer) does not exist"), "{m}");
 }
 
 #[test]

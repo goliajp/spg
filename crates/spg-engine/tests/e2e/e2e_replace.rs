@@ -212,7 +212,12 @@ fn replace_too_many_args_errors() {
 #[test]
 fn replace_numeric_args_coerced_to_text() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT replace(12321, '2', 'X')"), "1X3X1");
+    // v7.39 (round 625) — PG has no `replace(integer, …)`.
+    let m = e
+        .execute("SELECT replace(12321, '2', 'X')")
+        .expect_err("PG has no replace(integer, text, text)")
+        .to_string();
+    assert!(m.contains("function replace(integer, text, text) does not exist"), "{m}");
 }
 
 // ── COLUMN-LEVEL ─────────────────────────────────────────────────

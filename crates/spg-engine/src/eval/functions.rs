@@ -813,6 +813,91 @@ fn oid_names_something(oid: i64, ctx: &EvalContext<'_>) -> bool {
         .is_some_and(|c| crate::system_catalog::relation_name_for_oid(c, oid).is_some())
 }
 
+/// v7.39 (round 625, S05b/F29) — the string functions that took ANY value
+/// and stringified it.
+///
+/// `btrim(1)` answered `1`. PG has no `btrim(integer)`, so it says the
+/// function does not exist — and that is not pedantry: a query that meant to
+/// trim a text column and got handed an integer one silently produced a
+/// number where the author expected trimmed text. Enumerated over fourteen
+/// functions x eight non-text types, SPG accepted **112** calls PG rejects.
+///
+/// Only the FIRST argument is checked, which is where the string goes in
+/// every one of them, and only in PG dialect: MariaDB accepts every one of
+/// these (`LTRIM(1)` -> `1`, `LPAD(1,5,0)` -> `00001`, measured), and SPG is
+/// a drop-in for both.
+///
+/// The other half of the family — upper, lower, md5, initcap, reverse,
+/// ascii, length — already refused, which is why this list is not simply
+/// "the string functions".
+const TEXT_FIRST_ARG_FNS: &[&str] = &[
+    "btrim",
+    "left",
+    "lpad",
+    "ltrim",
+    "quote_ident",
+    "repeat",
+    "replace",
+    "right",
+    "rpad",
+    "rtrim",
+    "split_part",
+    "strpos",
+    "translate",
+    "trim",
+];
+
+fn reject_non_text_first_arg(name: &str, args: &[Value<'_>]) -> Result<(), EvalError> {
+    let Some(first) = args.first() else {
+        return Ok(());
+    };
+    // NULL carries no type — PG resolves `btrim(NULL)` through unknown and
+    // answers NULL, so it must reach the arm that does.
+    if matches!(first, Value::Text(_) | Value::Null) {
+        return Ok(());
+    }
+    // v7.39 (round 625) — some of them have a bytea overload in PG and the
+    // rest do not, measured: `btrim(bytea, bytea)`, `ltrim`, `rtrim` and
+    // `trim(bytea FROM bytea)` all answer, while `left(bytea, integer)`,
+    // `repeat`, `replace` and `split_part` say the function does not exist.
+    // All four bytea forms are TWO-argument; the one-argument `btrim(bytea)`
+    // PG rejects like the rest. The first cut of this guard refused every
+    // one and took the working bytea forms with it.
+    //
+    // `strpos` is here for a different reason: PG's bytea entry point is
+    // `position(bytea IN bytea)`, which SPG desugars to strpos, so refusing
+    // bytea here would break a shape that works. The cost is that a direct
+    // `strpos(bytea, bytea)` — which PG refuses — is accepted; refusing a
+    // working `position` to catch that would be the worse trade.
+    const BYTEA_TWO_ARG: &[&str] = &["btrim", "ltrim", "rtrim", "trim"];
+    if matches!(first, Value::Bytes(_)) && args.len() == 2 && BYTEA_TWO_ARG.contains(&name) {
+        return Ok(());
+    }
+    // `position(x IN y)` is PG's entry point for the non-text haystacks —
+    // bytea, bit and bit varying all answer — and SPG desugars it to strpos,
+    // so the type reaching this guard is the haystack's. Refusing them here
+    // would break `position(B'11' IN B'0110')`, which works and which the
+    // cast differential pins. The cost is that a DIRECT `strpos(bytea,
+    // bytea)` is accepted where PG refuses it; the desugaring has already
+    // lost which spelling was written.
+    if name == "strpos"
+        && args.len() == 2
+        && matches!(first, Value::Bytes(_) | Value::BitString { .. })
+    {
+        return Ok(());
+    }
+    let types = args
+        .iter()
+        .map(|a| crate::conversions::pg_type_name_for_error_opt(a.data_type()))
+        .collect::<alloc::vec::Vec<_>>()
+        .join(", ");
+    // PG resolves `trim` to `pg_catalog.btrim` and names it that way.
+    let shown = if name == "trim" { "pg_catalog.btrim" } else { name };
+    Err(EvalError::TypeMismatch {
+        detail: alloc::format!("function {shown}({types}) does not exist"),
+    })
+}
+
 fn apply_function_dispatch(
     name: &str,
     args: &[Value<'_>],
@@ -879,6 +964,11 @@ fn apply_function_dispatch(
             })
             .collect();
         return apply_function_dispatch(name, &stripped, ctx);
+    }
+    // v7.39 (round 625, S05b/F29) — after the bpchar normalisation above, so
+    // a CHAR(n) argument is already Text and still passes.
+    if !ctx.mysql_dialect && TEXT_FIRST_ARG_FNS.contains(&name) {
+        reject_non_text_first_arg(name, args)?;
     }
     // v7.39 (round 254) — NUMERIC specials (NaN / ±Infinity) reach the
     // scalar math family through one shared table instead of each arm

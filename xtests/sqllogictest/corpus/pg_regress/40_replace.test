@@ -68,11 +68,9 @@ SELECT replace('hello', 'l', NULL)
 ----
 NULL
 
-# Numeric coercion.
-query T
+# v7.39 (round 625) — PG has no replace(integer, …).
+statement error
 SELECT replace(12321, '2', 'X')
-----
-1X3X1
 
 # Realistic: normalise a path / slug.
 statement ok

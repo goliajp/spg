@@ -273,9 +273,15 @@ fn ltrim_no_args_errors() {
 
 #[test]
 fn trim_numeric_input_coerced_to_text() {
-    // PG: trim(42) → '42' (no spaces to strip, same text form).
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT trim(42)"), "42");
+    // v7.39 (round 625) — the comment above claimed "PG: trim(42) -> '42'".
+    // PG does not: it resolves trim to pg_catalog.btrim and says the
+    // function does not exist. The claim was never checked.
+    let m = e
+        .execute("SELECT trim(42)")
+        .expect_err("PG rejects trim(integer)")
+        .to_string();
+    assert!(m.contains("function pg_catalog.btrim(integer) does not exist"), "{m}");
 }
 
 // ── INSIDE WHERE / INSERT ────────────────────────────────────────

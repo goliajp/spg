@@ -41,10 +41,9 @@ SELECT repeat('日本', 3)
 ----
 日本日本日本
 
-query T
+# v7.39 (round 625) — PG has no repeat(integer, integer).
+statement error
 SELECT repeat(7, 3)
-----
-777
 
 query T
 SELECT repeat(NULL, 3)
