@@ -146,6 +146,7 @@ mod e2e_exists_noclone_round616;
 mod e2e_recursive_worktable_round618;
 mod e2e_jsonb_canonical_round619;
 mod e2e_error_surface_round622;
+mod e2e_catalog_self_describing_round623;
 mod e2e_catalog_column_types_round620;
 mod e2e_array_insert_select_round621;
 mod e2e_by_is_an_identifier_round621;

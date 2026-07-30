@@ -118,13 +118,32 @@ fn pg_class_returns_user_tables() {
     send_query(&mut s, "CREATE TABLE beta (id INT NOT NULL)");
     let _ = read_until_ready(&mut s);
 
-    // pg_class should now show two rows.
-    let (msgs, n) = run_query_count_rows(&mut s, "SELECT relname FROM pg_catalog.pg_class");
+    // v7.39 (round 623) — this counted an UNFILTERED
+    // `SELECT relname FROM pg_class` and asserted exactly 2, which was only
+    // true because SPG's catalogs did not describe themselves. On PG that
+    // query answers hundreds of rows; it is the namespace filter that makes
+    // it two, and every tool that wants "the user's tables" writes it.
+    let (msgs, n) = run_query_count_rows(
+        &mut s,
+        "SELECT c.relname FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'public' AND c.relkind = 'r'",
+    );
     assert!(
         msgs.iter().any(|m| m.ty == b'T'),
         "expected RowDescription in pg_class response"
     );
     assert_eq!(n, 2, "expected 2 user tables in pg_class");
+    // …and the catalogs are in pg_catalog, which is what keeps them out of
+    // the query above.
+    let (_, n) = run_query_count_rows(
+        &mut s,
+        "SELECT c.relname FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'pg_catalog' AND c.relname IN \
+         ('pg_class', 'pg_attribute', 'pg_type', 'pg_proc', 'pg_namespace')",
+    );
+    assert_eq!(n, 5, "the catalogs must describe themselves");
 }
 
 #[test]
