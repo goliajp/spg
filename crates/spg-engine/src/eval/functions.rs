@@ -847,6 +847,39 @@ const TEXT_FIRST_ARG_FNS: &[&str] = &[
     "trim",
 ];
 
+/// v7.39 (round 627, S05b/F29) — `char_length` is not `length`.
+///
+/// They share an arm here, and PG does not share the signatures: `length`
+/// takes bytea and bit strings (it counts octets / bits), `char_length`
+/// takes only the character types. SPG answered `char_length(bytea)`,
+/// `char_length(B'01')`, `char_length(varbit)` and `char_length(tsvector)`
+/// — four measured shapes PG refuses while it accepts every one of them
+/// under `length`. A deny list of what PG was measured to refuse, so the
+/// character types it does take cannot be caught by it.
+fn reject_non_character_length_arg(name: &str, args: &[Value<'_>]) -> Result<(), EvalError> {
+    let Some(first) = args.first() else {
+        return Ok(());
+    };
+    let denied = matches!(
+        first.data_type(),
+        Some(
+            spg_storage::DataType::Bytes
+                | spg_storage::DataType::Bit(_)
+                | spg_storage::DataType::BitVarying(_)
+                | spg_storage::DataType::TsVector
+        )
+    );
+    if !denied {
+        return Ok(());
+    }
+    Err(EvalError::TypeMismatch {
+        detail: alloc::format!(
+            "function {name}({}) does not exist",
+            crate::conversions::pg_type_name_for_error_opt(first.data_type())
+        ),
+    })
+}
+
 fn reject_non_text_first_arg(name: &str, args: &[Value<'_>]) -> Result<(), EvalError> {
     let Some(first) = args.first() else {
         return Ok(());
@@ -969,6 +1002,9 @@ fn apply_function_dispatch(
     // a CHAR(n) argument is already Text and still passes.
     if !ctx.mysql_dialect && TEXT_FIRST_ARG_FNS.contains(&name) {
         reject_non_text_first_arg(name, args)?;
+    }
+    if !ctx.mysql_dialect && matches!(name, "char_length" | "character_length") {
+        reject_non_character_length_arg(name, args)?;
     }
     // v7.39 (round 254) — NUMERIC specials (NaN / ±Infinity) reach the
     // scalar math family through one shared table instead of each arm
