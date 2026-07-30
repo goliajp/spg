@@ -854,10 +854,18 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             // v7.39 (read01 ruleutils.c) — catalog-dependent casts run
             // through eval's pre-hook (regclass dual-shape, domain/enum/
             // composite named types).
-            if matches!(
-                target,
-                spg_sql::ast::CastTarget::RegClass | spg_sql::ast::CastTarget::Named(_)
-            ) {
+            // v7.39 (round 621) — the varchar/char FAMILY is catalog-free, so
+            // it stays on the compiled path; the blanket Named -> Subtree rule
+            // sent `s::VARCHAR(20)` to the interpreter, which pays two
+            // allocations a row. Everything else Named (domains, enums,
+            // composites, regtypes) still needs the interpreter's catalog.
+            let named_text_family = match target {
+                spg_sql::ast::CastTarget::Named(n) => named_varchar_family(n),
+                _ => false,
+            };
+            if matches!(target, spg_sql::ast::CastTarget::RegClass)
+                || (matches!(target, spg_sql::ast::CastTarget::Named(_)) && !named_text_family)
+            {
                 steps.push(Step::Subtree(e.clone()));
                 return;
             }
@@ -870,7 +878,7 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             // it (every cast inside an aggregate argument, and every cast
             // over an aggregate result: `string_agg(x::text, ',')`,
             // `min(x)::text`). Keep this one shape on Subtree.
-            if matches!(target, spg_sql::ast::CastTarget::Text)
+            if (matches!(target, spg_sql::ast::CastTarget::Text) || named_text_family)
                 && crate::describe::describe_expr(expr, ctx.columns)
                     .is_some_and(|s| matches!(s.ty, spg_storage::DataType::Timestamptz))
             {
@@ -1039,11 +1047,37 @@ fn literal_text_pattern(pattern: &Expr) -> Option<&str> {
 /// pairs that provably change nothing are listed — a bounded VARCHAR(n) must
 /// still check its length, numerics their range — so an unlisted pair merely
 /// keeps the owned path, never a wrong answer.
+/// The catalog-free varchar/char family, in the canonical `name(p)` spelling
+/// the parser produces. Only these Named targets stay on the compiled path.
+fn named_varchar_family(n: &str) -> bool {
+    let base = n.split('(').next().unwrap_or(n);
+    base.eq_ignore_ascii_case("varchar")
+        || base.eq_ignore_ascii_case("text")
+        || base.eq_ignore_ascii_case("char")
+        || base.eq_ignore_ascii_case("bpchar")
+        || base.eq_ignore_ascii_case("character")
+}
+
+/// `varchar(k)`'s k, when the name carries one.
+fn varchar_limit(n: &str) -> Option<usize> {
+    let base = n.split('(').next().unwrap_or(n);
+    if !base.eq_ignore_ascii_case("varchar") {
+        return None;
+    }
+    let inner = n.split('(').nth(1)?.strip_suffix(')')?;
+    inner.trim().parse().ok()
+}
+
 fn cast_is_identity_for(v: &Value<'_>, target: &spg_sql::ast::CastTarget) -> bool {
     match (v, target) {
         (Value::Text(_), spg_sql::ast::CastTarget::Text) => true,
-        (Value::Text(_), spg_sql::ast::CastTarget::Named(n)) => {
-            n.eq_ignore_ascii_case("text") || n.eq_ignore_ascii_case("varchar")
+        (Value::Text(t), spg_sql::ast::CastTarget::Named(n)) => {
+            // Unbounded text and varchar change nothing. A BOUNDED varchar is
+            // an identity exactly when the text is within its limit — VARCHAR
+            // truncates and never pads. CHAR(n) pads, so it is never one.
+            n.eq_ignore_ascii_case("text")
+                || n.eq_ignore_ascii_case("varchar")
+                || varchar_limit(n).is_some_and(|k| t.chars().take(k + 1).count() <= k)
         }
         (Value::Int(_), spg_sql::ast::CastTarget::Int) => true,
         (Value::BigInt(_), spg_sql::ast::CastTarget::BigInt) => true,
@@ -1099,10 +1133,15 @@ pub(crate) fn fully_compilable(e: &Expr) -> bool {
         Expr::AnyAll { expr, array, .. } if constant_expr(array) => fully_compilable(expr),
         Expr::Extract { source, .. } => fully_compilable(source),
         Expr::Cast { expr, target } => {
-            !matches!(
-                target,
-                spg_sql::ast::CastTarget::RegClass | spg_sql::ast::CastTarget::Named(_)
-            ) && fully_compilable(expr)
+            // v7.39 (round 621) — the varchar/char family is catalog-free and
+            // compiles (the compile arm gates it the same way); other Named
+            // targets still need eval's catalog pre-hooks.
+            let target_ok = match target {
+                spg_sql::ast::CastTarget::RegClass => false,
+                spg_sql::ast::CastTarget::Named(n) => named_varchar_family(n),
+                _ => true,
+            };
+            target_ok && fully_compilable(expr)
         }
         // v7.37.5-A2b — `CASE [operand] WHEN x THEN y … ELSE z END`
         // when every sub-expression is itself fully-compilable. Hot
