@@ -1303,6 +1303,21 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
         .take_while(|c| c.is_ascii_alphabetic() && !template_letter(*c))
         .map(char::len_utf8)
         .sum::<usize>();
+    // v7.39 (round 626, S05b/F29) — a pattern that is ALL literal.
+    //
+    // `to_char(1, 'YYYY')` panicked: every letter of `YYYY` is a literal in
+    // the NUMERIC templates, so the prefix scan claimed all four bytes and
+    // the suffix scan claimed all four too, leaving `&pat[4..0]` — "byte
+    // range starts at 4 but ends at 0". It killed the connection, which is
+    // what a client sending a date template to a number would have got.
+    //
+    // PG echoes such a pattern verbatim: `to_char(1,'YYYY')` is `YYYY`,
+    // `to_char(1.5,'xyz')` is `xyz`, `to_char(1,'MON')` is `MON`. There is
+    // no numeric body to render between a prefix and a suffix that are the
+    // same four characters.
+    if lit_prefix_len >= pat.len() {
+        return String::from(pat);
+    }
     if lit_prefix_len > 0 || lit_suffix_len > 0 {
         let prefix = &pat[..lit_prefix_len];
         let suffix = &pat[pat.len() - lit_suffix_len..];
