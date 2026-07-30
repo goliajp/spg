@@ -2737,12 +2737,11 @@ pub(crate) fn schema_name_for_oid(oid: i64) -> Option<alloc::string::String> {
     Some(alloc::string::String::from(name))
 }
 
-pub(crate) fn synth_pg_class(
-    cat: &Catalog,
-    frozen_xid: i64,
-) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    use spg_storage::PartitionRole;
-    let schema = alloc::vec![
+/// v7.39 (round 623, S05b) — pg_class's own columns, hoisted for the same
+/// reason as [`pg_attribute_schema`]: pg_class is one of the relations
+/// pg_class now lists.
+fn pg_class_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("relname", DataType::Text, false),
         ColumnSchema::new("relnamespace", DataType::BigInt, false),
@@ -2775,7 +2774,15 @@ pub(crate) fn synth_pg_class(
         // array on the first GRANT. SPG now does the same for real (round 51
         // hard-coded the NULL, because GRANT was a no-op).
         ColumnSchema::new("relacl", DataType::Text, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_class(
+    cat: &Catalog,
+    frozen_xid: i64,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    use spg_storage::PartitionRole;
+    let schema = pg_class_schema();
     // v7.39 (round 541) — the six PG18 columns pg_class did not publish.
     //
     // `pg_dump`'s main relation query selects relfrozenxid, relminmxid
@@ -3048,6 +3055,52 @@ pub(crate) fn synth_pg_class(
             crate::acl::render_acl_list(&def.acl).map_or(Value::Null, Value::text),
         ]));
     }
+    // v7.39 (round 623, S05b) — the catalogs themselves.
+    //
+    // `SELECT count(*) FROM pg_class WHERE relname = 'pg_class'` answered 0.
+    // SPG's catalogs were invisible to the catalogs, so a tool asking what
+    // relations exist saw the user's tables and nothing that would let it
+    // ask about the catalogs it was about to query.
+    //
+    // `relnamespace` is pg_catalog's oid, which is what keeps them OUT of
+    // everything that lists user relations: every such query filters on the
+    // namespace (pg_dump, psql \dt, and SPG's own pg_tables all do), and a
+    // catalog landing in `public` would show up as a table the user owns.
+    // relkind 'r' and relpersistence 'p', as PG reports for its own.
+    for (name, oid) in CATALOG_RELATIONS {
+        let relnatts = catalog_relation_columns(name, cat)
+            .map_or(0, |c| i16::try_from(c.len()).unwrap_or(i16::MAX));
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(*oid),
+            Value::text((*name).to_string()),
+            Value::BigInt(11), // relnamespace — pg_catalog
+            Value::BigInt(0),  // reltype
+            Value::BigInt(0),  // reloftype
+            Value::BigInt(10), // relowner
+            Value::BigInt(2),  // relam — heap
+            Value::BigInt(*oid),
+            Value::BigInt(0),
+            Value::Int(0),      // relpages
+            Value::Float(-1.0), // reltuples — never analysed
+            Value::Int(0),
+            Value::BigInt(0),
+            Value::Bool(false), // relhasindex
+            Value::Bool(false), // relisshared
+            Value::text("p"),
+            Value::text("r"), // relkind
+            Value::SmallInt(relnatts),
+            Value::SmallInt(0),
+            Value::Bool(false), // relhasrules
+            Value::Bool(false), // relhastriggers
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(true), // relispopulated
+            Value::text("n"),
+            Value::Bool(false), // relispartition
+            Value::Null,        // relacl
+        ]));
+    }
     for row in &mut rows {
         splice_pg_class_v18_row(row, frozen_xid, &view_reloptions);
     }
@@ -3146,8 +3199,65 @@ fn splice_pg_class_v18_row(
 /// + array dimensions + collation. Tools doing
 /// `SELECT * FROM pg_attribute WHERE attrelid = …::regclass`
 /// see the same shape they'd see against PG.
-pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// v7.39 (round 623, S05b) — the six system columns PG lists in
+/// `pg_attribute` for EVERY relation, at negative attnums.
+///
+/// `attnum < 0` is how a tool tells a system column from a user one, and
+/// SPG's pg_attribute had no negative attnums at all — for any relation.
+/// PG answers ten rows for `pg_namespace` (four of its own plus these six);
+/// SPG answered four.
+///
+/// Read off PG18 (`WHERE attrelid = 'pg_namespace'::regclass AND attnum < 0`):
+/// the numbering is ctid -1, xmin -2, cmin -3, xmax -4, cmax -5, tableoid -6
+/// — which is NOT the order `select::SYSTEM_COLUMNS` uses, so it is spelled
+/// out rather than derived from it.
+const PG_SYSTEM_ATTRIBUTES: &[(&str, i16, i64, i16, bool, &str)] = &[
+    // name, attnum, atttypid, attlen, attbyval, attalign
+    ("ctid", -1, 27, 6, false, "s"),
+    ("xmin", -2, 28, 4, true, "i"),
+    ("cmin", -3, 29, 4, true, "i"),
+    ("xmax", -4, 28, 4, true, "i"),
+    ("cmax", -5, 29, 4, true, "i"),
+    ("tableoid", -6, 26, 4, true, "i"),
+];
+
+fn push_system_attributes(rows: &mut Vec<Row<'static>>, attrelid: i64) {
+    for (name, attnum, typid, attlen, byval, align) in PG_SYSTEM_ATTRIBUTES {
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(attrelid),
+            Value::text((*name).to_string()),
+            Value::BigInt(*typid),
+            Value::Int(0),
+            Value::SmallInt(*attlen),
+            Value::SmallInt(*attnum),
+            Value::Int(0),
+            Value::Int(-1),
+            Value::Bool(*byval),
+            Value::text("p"),
+            Value::text((*align).to_string()),
+            Value::Bool(true),  // attnotnull — PG marks all six NOT NULL
+            Value::Bool(false), // atthasdef
+            Value::text(""),
+            Value::text(""),
+            Value::Bool(false), // attisdropped
+            Value::Bool(true),  // attislocal
+            Value::Int(0),
+            Value::BigInt(0),
+            Value::Null,
+            Value::text(""),
+            Value::Bool(false),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ]));
+    }
+}
+
+/// v7.39 (round 623, S05b) — pg_attribute's own columns, hoisted so the
+/// relation can describe ITSELF without `catalog_relation_columns` calling
+/// back into the synth that calls it.
+fn pg_attribute_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("attrelid", DataType::BigInt, false),
         ColumnSchema::new("attname", DataType::Text, false),
         ColumnSchema::new("atttypid", DataType::BigInt, false),
@@ -3179,7 +3289,11 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         ColumnSchema::new("attoptions", DataType::Text, true),
         ColumnSchema::new("attfdwoptions", DataType::Text, true),
         ColumnSchema::new("attmissingval", DataType::Text, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_attribute_schema();
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut attrelid: i64 = 16384;
     for tname in cat.visible_table_names() {
@@ -3264,6 +3378,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Null,        // attmissingval
             ]));
         }
+        push_system_attributes(&mut rows, attrelid);
         attrelid = attrelid.saturating_add(1);
     }
     // v7.39 (round 338, V64) — a view's columns. pg_attribute was
@@ -3323,6 +3438,54 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Null,        // attmissingval
             ]));
         }
+    }
+    // v7.39 (round 623, S05b) — the catalogs' OWN columns.
+    //
+    // This loop walked the user's relations only, so `pg_attribute` could
+    // not answer what columns `pg_class` has — the question a tool asks
+    // BEFORE it queries pg_class. PG has 2584 such rows; SPG had none.
+    //
+    // The types are what the relation actually publishes, read off the
+    // synth's schema, so a column added to a catalog shows up here without
+    // anyone remembering to. `attnotnull` follows the schema's own
+    // nullability; the rest is what a plain column reports.
+    for (name, oid) in CATALOG_RELATIONS {
+        let Some(cols) = catalog_relation_columns(name, cat) else {
+            continue;
+        };
+        for (i, col) in cols.iter().enumerate() {
+            #[allow(clippy::cast_possible_wrap)]
+            let attnum = (i + 1) as i16;
+            let typlen: i16 = pg_type_len(col.ty);
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(*oid),
+                Value::text(col.name.clone()),
+                Value::BigInt(pg_type_oid(col.ty)),
+                Value::Int(-1),
+                Value::SmallInt(typlen),
+                Value::SmallInt(attnum),
+                Value::Int(0),
+                Value::Int(pg_atttypmod(col.ty)),
+                Value::Bool(typlen > 0 && typlen <= 8),
+                Value::text(if typlen > 0 { "p" } else { "x" }),
+                Value::text("i"),
+                Value::Bool(!col.nullable),
+                Value::Bool(false), // atthasdef
+                Value::text(""),    // attidentity
+                Value::text(""),    // attgenerated
+                Value::Bool(false), // attisdropped
+                Value::Bool(true),  // attislocal
+                Value::Int(0),      // attinhcount
+                Value::BigInt(0),   // attcollation
+                Value::Null,        // attacl
+                Value::text(""),    // attcompression
+                Value::Bool(false), // atthasmissing
+                Value::Null,        // attoptions
+                Value::Null,        // attfdwoptions
+                Value::Null,        // attmissingval
+            ]));
+        }
+        push_system_attributes(&mut rows, *oid);
     }
     (schema, rows)
 }
@@ -7721,6 +7884,84 @@ fn apply_information_schema_domains(view: &str, columns: &mut [ColumnSchema]) {
 /// v7.39 (round 540) — the oid a catalog relation reports as its
 /// `tableoid`. The synthetic name is the internal one (`__spg_pg_class`);
 /// PG's oid for the relation it stands for is what a caller expects.
+/// v7.39 (round 623, S05b) — the catalogs SPG publishes, and the oid PG
+/// gives each one.
+///
+/// SPG's catalogs did not describe THEMSELVES. `SELECT count(*) FROM
+/// pg_class WHERE relname = 'pg_class'` answered 0 where PG answers 1, and
+/// `pg_attribute` had 2584 rows' worth of PG catalog columns and none of
+/// SPG's — so "what columns does pg_class have", which is how a tool learns
+/// what it may select, came back empty.
+///
+/// The oids are PG's own, read off PG18 (`pg_class.oid` for each name).
+/// They are a contract, not an implementation detail: `'pg_type'::regclass`
+/// answering 1247 is something any client can observe, and a stable catalog
+/// oid is what makes a cached lookup keep working. Only the relkind 'r'
+/// catalogs are listed — PG's `pg_stat_*` / `pg_tables` / `pg_policies` are
+/// VIEWS created by initdb, and their oids sit in the 12000s and vary by
+/// build, so there is nothing there to match.
+pub(crate) const CATALOG_RELATIONS: &[(&str, i64)] = &[
+    ("pg_am", 2601),
+    ("pg_attrdef", 2604),
+    ("pg_attribute", 1249),
+    ("pg_cast", 2605),
+    ("pg_class", 1259),
+    ("pg_collation", 3456),
+    ("pg_constraint", 2606),
+    ("pg_depend", 2608),
+    ("pg_enum", 3501),
+    ("pg_index", 2610),
+    ("pg_inherits", 2611),
+    ("pg_largeobject", 2613),
+    ("pg_largeobject_metadata", 2995),
+    ("pg_namespace", 2615),
+    ("pg_operator", 2617),
+    ("pg_policy", 3256),
+    ("pg_proc", 1255),
+    ("pg_statistic", 2619),
+    ("pg_statistic_ext", 3381),
+    ("pg_tablespace", 1213),
+    ("pg_trigger", 2620),
+    ("pg_type", 1247),
+];
+
+/// The columns one of those relations has.
+///
+/// Taken from the synth itself rather than written out again here: a second
+/// copy of twenty-two column lists would drift from the relations it claims
+/// to describe the first time one of them gains a column, and drift is
+/// exactly the failure this is meant to fix. The rows the synths build on
+/// the way are discarded — `pg_attribute` is introspection, not a hot path,
+/// and every one of these is either fixed-size or O(tables), which is what
+/// `pg_attribute` itself already costs.
+fn catalog_relation_columns(name: &str, cat: &Catalog) -> Option<Vec<ColumnSchema>> {
+    Some(match name {
+        "pg_am" => synth_pg_am(cat).0,
+        "pg_attrdef" => synth_pg_attrdef(cat).0,
+        "pg_attribute" => pg_attribute_schema(),
+        "pg_cast" => synth_pg_cast().0,
+        "pg_class" => { let mut c = pg_class_schema(); splice_pg_class_v18_schema(&mut c); c }
+        "pg_collation" => synth_pg_collation(cat).0,
+        "pg_constraint" => synth_pg_constraint(cat).0,
+        "pg_depend" => synth_pg_depend(cat).0,
+        "pg_enum" => synth_pg_enum(cat).0,
+        "pg_index" => synth_pg_index_raw(cat).0,
+        "pg_inherits" => synth_pg_inherits(cat).0,
+        "pg_largeobject" => synth_pg_largeobject(cat).0,
+        "pg_largeobject_metadata" => synth_pg_largeobject_metadata(cat).0,
+        "pg_namespace" => synth_pg_namespace(cat).0,
+        "pg_operator" => synth_pg_operator(cat).0,
+        "pg_policy" => synth_pg_policy(cat).0,
+        "pg_proc" => synth_pg_proc(cat).0,
+        "pg_statistic" => synth_pg_statistic(cat).0,
+        "pg_statistic_ext" => synth_pg_statistic_ext(cat).0,
+        "pg_tablespace" => synth_pg_tablespace(cat).0,
+        "pg_trigger" => synth_pg_trigger(cat).0,
+        "pg_type" => synth_pg_type(cat).0,
+        _ => return None,
+    })
+}
+
 fn relation_oid_for_meta_view(name: &str) -> i64 {
     let bare = name
         .strip_prefix("__spg_pg_")
