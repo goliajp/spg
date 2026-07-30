@@ -1534,10 +1534,14 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
     // around it: PG answers `to_char(1,'D')` with ` .`, so dropping the
     // column on `int_slots == 0 && frac_digits == 0` alone took that with
     // it (and `DAY`, whose `D` is the separator).
-    let sign_col = usize::from(
-        !(has_mi || has_sg || has_trailing_s)
-            && (int_slots > 0 || frac_digits > 0 || has_decimal),
-    );
+    // v7.39 (round 631, F33) — does this picture ask for a number at all?
+    //
+    // Digit slots, or a decimal separator, which is a numeric field even
+    // with no slots around it. A picture that asks for none — `MI`, `PL`,
+    // `L`, `B` on their own — prints no digits, reserves no sign column,
+    // and is not an overflow when the value has digits that will not fit.
+    let has_numeric_field = int_slots > 0 || frac_digits > 0 || has_decimal;
+    let sign_col = usize::from(!(has_mi || has_sg || has_trailing_s) && has_numeric_field);
     let int_field_width = int_pat
         .chars()
         .filter(|c| is_slot(*c) || is_group(*c))
@@ -1587,7 +1591,14 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
     let int_part = scaled / pow;
     let frac_part = scaled % pow;
     let value_is_zero = scaled == 0;
-    let sign_str: &str = if has_pr || trailing_sign {
+    let sign_str: &str = if has_pl && neg && has_numeric_field {
+        // v7.39 (round 631, F33) — `PL` is a PLUS column, not a sign
+        // column: it shows `+` for a non-negative value and a blank for a
+        // negative one, and the minus goes to the leading position. PG
+        // answers `-1 ` for `to_char(-1,'9PL')`; SPG answered ` 1-`,
+        // treating PL like `SG`. Measured with and without digit slots.
+        "-"
+    } else if has_pr || trailing_sign {
         // PR and the trailing sign modes render the sign as a post-pass below.
         ""
     } else if neg {
@@ -1604,21 +1615,16 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
     } else {
         alloc::format!("{int_part}").len()
     };
-    // v7.39 (round 630, F33) — DIAGNOSED, not fixed, and the attempt is
-    // recorded because the obvious form of it is wrong.
+    // v7.39 (round 630 diagnosed, 631 fixed) — a picture with no numeric
+    // field is not an overflow, it is a picture that prints no number.
     //
-    // `to_char(1,'MI')` takes this branch — one integer digit against zero
-    // slots — and returns from inside it, before the sign columns are
-    // applied at the end of the function, so the sign is lost: PG answers
-    // ` ` and `-` for the two signs, SPG answers nothing for either, and
-    // `PL` the same. Simply exempting a slotless picture from the branch
-    // makes it WORSE (measured): the body renderer then prints the digits
-    // that have no slots to sit in, so `to_char(1,'B')` answered `1`.
-    //
-    // The fix is to let a slotless picture reach the tail with an empty
-    // body rather than return from here, which means restructuring the
-    // tail — its own change, not a condition on this line.
-    if int_digit_len > int_slots {
+    // `to_char(1,'MI')` used to take this branch — one integer digit
+    // against zero slots — and return from inside it, before the sign
+    // columns are applied at the end of the function, so the sign was
+    // lost: PG answers ` ` and `-` for the two signs and SPG answered
+    // nothing for either. Exempting the branch alone is NOT the fix and
+    // was measured to be worse; the body has to go empty at the same time.
+    if has_numeric_field && int_digit_len > int_slots {
         let mut core = String::new();
         core.push_str(sign_str);
         for _ in 0..int_slots {
@@ -1649,7 +1655,14 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
     }
 
     // --- Integer body (significant digits, no leading blanks). ---
-    let mut body = if int_part == 0 {
+    //
+    // v7.39 (round 631) — with no numeric field there are no digits to
+    // render. Round 630 exempted the overflow branch WITHOUT this and the
+    // digits came out with nothing to sit in: `to_char(1,'B')` answered
+    // `1`. Both halves are needed, which is why they land together.
+    let mut body = if !has_numeric_field {
+        String::new()
+    } else if int_part == 0 {
         // Show a "0" unless it is a leading zero being blanked: a
         // '9' units slot with a decimal point (PG shows `.50`), and
         // in fixed width a whole-zero value is likewise blanked.
@@ -1697,7 +1710,10 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
             out.push_str(&fs);
         }
     }
-    if has_pr {
+    // v7.39 (round 631) — `PR` on a picture with no numeric field prints
+    // nothing: PG answers the empty string for `to_char(1,'PR')` and for
+    // the negative too, where SPG produced ` ` and `<>`.
+    if has_pr && has_numeric_field {
         if neg {
             // Consume the reserved sign column with `<` and append `>`.
             let trimmed = out.trim_start();
@@ -1714,7 +1730,14 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
         } else if !fill_mode {
             out.push(' ');
         }
-    } else if has_pl || has_sg || has_trailing_s {
+    } else if has_pl {
+        // The plus column: `+` when non-negative, blank when the minus
+        // already went to the leading position.
+        out.push(if neg { ' ' } else { '+' });
+    } else if has_sg || (has_trailing_s && has_numeric_field) {
+        // v7.39 (round 631) — a lone trailing `S` prints nothing: PG
+        // answers the empty string for `to_char(1,'S')`, while `SG` alone
+        // does print its sign (`+` / `-`). Measured both ways.
         out.push(if neg { '-' } else { '+' });
     }
     if has_dollar {
