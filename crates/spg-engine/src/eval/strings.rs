@@ -1116,6 +1116,13 @@ fn to_char_v_scale(n: f64, before: &str, after: &str, fill_mode: bool) -> String
     // digit slot renders `#` and the pattern's literal characters (spaces
     // in `V99 999`) stay put, exactly as the plain path already did. SPG
     // used to print the scaled number full-width.
+    // v7.39 (round 632, F33) — no digit slots on either side of the `V`
+    // means no number and no sign column, the same rule the main path
+    // learned in round 631. A lone `V` answered a space; PG answers
+    // nothing. Whatever literals the picture carries still come through.
+    if total_slots == 0 {
+        return alloc::format!("{before}{after}");
+    }
     let digits = alloc::format!("{scaled}").len();
     if digits > total_slots {
         let mut out = String::new();
@@ -1627,8 +1634,28 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
     if has_numeric_field && int_digit_len > int_slots {
         let mut core = String::new();
         core.push_str(sign_str);
-        for _ in 0..int_slots {
-            core.push('#');
+        if has_group {
+            // v7.39 (round 632) — the separators keep their places in an
+            // overflowed field too: PG answers ` #,#` for
+            // `to_char(1234.5,'9G9')`, not `  ##`.
+            let mut seen_slot = false;
+            for c in int_pat.chars() {
+                match c {
+                    '9' | '0' => {
+                        core.push('#');
+                        seen_slot = true;
+                    }
+                    // A separator with no slot to its LEFT is not between
+                    // two groups: PG answers `  #` for `to_char(x,'G9')`,
+                    // not ` ,#`.
+                    ',' | 'G' | 'g' => core.push(if seen_slot { ',' } else { ' ' }),
+                    _ => {}
+                }
+            }
+        } else {
+            for _ in 0..int_slots {
+                core.push('#');
+            }
         }
         let mut out = if fill_mode {
             core
@@ -1683,12 +1710,15 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
     while !body.is_empty() && body.chars().count() < zero_pad {
         body.insert(0, '0');
     }
-    if has_group && body.chars().count() > 3 {
-        body = group_thousands(&body);
-    }
-
     // --- Assemble sign + body, then pad / trim per mode. ---
-    let mut out = if fill_mode {
+    let mut out = if has_group {
+        let field = render_positional_groups(int_pat, &body);
+        if fill_mode {
+            alloc::format!("{sign_str}{}", field.trim_start())
+        } else {
+            left_pad_spaces(&alloc::format!("{sign_str}{field}"), int_field_width)
+        }
+    } else if fill_mode {
         alloc::format!("{sign_str}{body}")
     } else {
         left_pad_spaces(&alloc::format!("{sign_str}{body}"), int_field_width)
@@ -1818,6 +1848,35 @@ fn zone_hours(zone: Option<(&str, i64)>) -> String {
 fn zone_minutes(zone: Option<(&str, i64)>) -> String {
     let secs = zone.map_or(0, |(_, off)| off / 1_000_000);
     alloc::format!("{:02}", (secs.abs() / 60) % 60)
+}
+
+/// v7.39 (round 632, F33) — a group separator goes where the PICTURE puts
+/// it, not every three digits.
+///
+/// PG fills the digit slots from the right and emits each separator in the
+/// picture as `,` when digits are still to be placed to its left, and as a
+/// blank when they are not. Grouping every three digits agrees only when
+/// the separator happens to sit on a thousands boundary, which is why
+/// `9G999` matched and `9G9` did not: PG answers ` 1,2` for
+/// `to_char(12,'9G9')` and SPG answered `  12`. Measured across
+/// `9G9` `9G99` `9G999` `99G99` and their FM forms.
+fn render_positional_groups(int_pat: &str, digits: &str) -> String {
+    let mut rev: alloc::vec::Vec<char> = alloc::vec::Vec::new();
+    let mut left = digits.chars().rev();
+    let mut pending: Option<char> = left.next();
+    for c in int_pat.chars().rev() {
+        match c {
+            '9' | '0' => {
+                rev.push(pending.unwrap_or(' '));
+                if pending.is_some() {
+                    pending = left.next();
+                }
+            }
+            ',' | 'G' | 'g' => rev.push(if pending.is_some() { ',' } else { ' ' }),
+            other => rev.push(other),
+        }
+    }
+    rev.iter().rev().collect()
 }
 
 fn group_thousands(int_str: &str) -> String {
