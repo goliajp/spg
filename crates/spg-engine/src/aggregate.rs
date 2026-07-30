@@ -1533,9 +1533,22 @@ fn sum_add_bignum(
 /// The same question `accumulate_groups` asks per spec per row, with
 /// none of the per-spec indexing around it. NULL contributes nothing,
 /// which is PG's rule and the generic path's.
-fn fused_extreme_cell(a: &mut FusedAcc, v: &Value<'_>, max: bool) {
+fn fused_extreme_cell(a: &mut FusedAcc, v: &Value<'_>, max: bool) -> Result<(), EvalError> {
     if matches!(v, Value::Null) {
-        return;
+        return Ok(());
+    }
+    // v7.39 (round 626) — the FOURTH place this comparison is made. The
+    // deny list went onto the dispatched arm and the two inlined grouped
+    // copies first, and `SELECT min(bool_col) FROM t` — no GROUP BY — still
+    // answered, because it lands here.
+    if !a.extreme_mysql && min_max_unsupported_type(v) {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "function {}({}) does not exist",
+                if max { "max" } else { "min" },
+                crate::conversions::pg_type_name_for_error_opt(v.data_type())
+            ),
+        });
     }
     let take = match &a.extreme {
         None => true,
@@ -1551,6 +1564,35 @@ fn fused_extreme_cell(a: &mut FusedAcc, v: &Value<'_>, max: bool) {
     if take {
         a.extreme = Some(v.clone().into_owned());
     }
+    Ok(())
+}
+
+/// v7.39 (round 626, S05b/F29) — the types PG has no `min`/`max` for.
+///
+/// A DENY list, not an allow list, and every entry measured: PG accepts
+/// min/max over int2 int4 int8 numeric float4 float8 money text varchar
+/// bpchar name date time timetz timestamp timestamptz interval bytea inet
+/// cidr and the array types, and refuses exactly these. Writing the allow
+/// list instead is how round 625's first cut of the string guard managed to
+/// refuse five overloads PG actually has; a deny list of measured
+/// rejections cannot over-refuse.
+fn min_max_unsupported_type(v: &Value<'_>) -> bool {
+    matches!(
+        v.data_type(),
+        Some(
+            spg_storage::DataType::Bool
+                | spg_storage::DataType::Uuid
+                | spg_storage::DataType::Macaddr
+                | spg_storage::DataType::Macaddr8
+                | spg_storage::DataType::Json
+                | spg_storage::DataType::Jsonb
+                | spg_storage::DataType::Bit(_)
+                | spg_storage::DataType::BitVarying(_)
+                | spg_storage::DataType::Xml
+                | spg_storage::DataType::TsVector
+                | spg_storage::DataType::TsQuery
+        )
+    )
 }
 
 fn fused_acc_cell(a: &mut FusedAcc, v: &Value<'_>) -> Result<(), EvalError> {
@@ -2038,7 +2080,7 @@ fn accumulate_groups(
                                     &mut accs[si],
                                     row.get(*pos).unwrap_or(&Value::Null),
                                     *max,
-                                );
+                                )?;
                             }
                         }
                     }
@@ -2160,7 +2202,8 @@ fn accumulate_groups(
                                     &mut slots[oi],
                                     row.get(*pos).unwrap_or(&Value::Null),
                                     *max,
-                                );
+                                )
+                                .map_err(Some)?;
                             }
                         }
                     }
@@ -2769,6 +2812,21 @@ fn accumulate_groups(
                 match spec.kind {
                     AggKind::Max => {
                         if !matches!(arg_ref, Value::Null) {
+                            // v7.39 (round 626) — the same deny list the
+                            // dispatched path applies. These inlined copies
+                            // exist for speed and are where `min(TRUE)`
+                            // actually lands, so a guard placed only on the
+                            // dispatched arm never fires.
+                            if !ctx.mysql_dialect && min_max_unsupported_type(arg_ref) {
+                                return Err(EvalError::TypeMismatch {
+                                    detail: format!(
+                                        "function max({}) does not exist",
+                                        crate::conversions::pg_type_name_for_error_opt(
+                                            arg_ref.data_type()
+                                        )
+                                    ),
+                                });
+                            }
                             let st = &mut entry.1[i];
                             let upd = match &st.extreme {
                                 None => true,
@@ -2784,6 +2842,17 @@ fn accumulate_groups(
                     }
                     AggKind::Min => {
                         if !matches!(arg_ref, Value::Null) {
+                            // v7.39 (round 626) — see the Max arm above.
+                            if !ctx.mysql_dialect && min_max_unsupported_type(arg_ref) {
+                                return Err(EvalError::TypeMismatch {
+                                    detail: format!(
+                                        "function min({}) does not exist",
+                                        crate::conversions::pg_type_name_for_error_opt(
+                                            arg_ref.data_type()
+                                        )
+                                    ),
+                                });
+                            }
                             let st = &mut entry.1[i];
                             let upd = match &st.extreme {
                                 None => true,
@@ -3150,6 +3219,21 @@ fn accumulate_groups(
                 match spec.kind {
                     AggKind::Max => {
                         if !matches!(arg_ref, Value::Null) {
+                            // v7.39 (round 626) — the same deny list the
+                            // dispatched path applies. These inlined copies
+                            // exist for speed and are where `min(TRUE)`
+                            // actually lands, so a guard placed only on the
+                            // dispatched arm never fires.
+                            if !ctx.mysql_dialect && min_max_unsupported_type(arg_ref) {
+                                return Err(EvalError::TypeMismatch {
+                                    detail: format!(
+                                        "function max({}) does not exist",
+                                        crate::conversions::pg_type_name_for_error_opt(
+                                            arg_ref.data_type()
+                                        )
+                                    ),
+                                });
+                            }
                             let st = &mut entry.1[i];
                             let upd = match &st.extreme {
                                 None => true,
@@ -3165,6 +3249,17 @@ fn accumulate_groups(
                     }
                     AggKind::Min => {
                         if !matches!(arg_ref, Value::Null) {
+                            // v7.39 (round 626) — see the Max arm above.
+                            if !ctx.mysql_dialect && min_max_unsupported_type(arg_ref) {
+                                return Err(EvalError::TypeMismatch {
+                                    detail: format!(
+                                        "function min({}) does not exist",
+                                        crate::conversions::pg_type_name_for_error_opt(
+                                            arg_ref.data_type()
+                                        )
+                                    ),
+                                });
+                            }
                             let st = &mut entry.1[i];
                             let upd = match &st.extreme {
                                 None => true,
@@ -4422,6 +4517,13 @@ pub(crate) fn update_state(
             }
             st.count += 1;
             match v {
+                // v7.39 (round 626, S05b/F29) — SMALLINT. This arm was
+                // missing HERE while the three other sum accumulators had
+                // it, so `SELECT sum(x)` over a SMALLINT column answered
+                // "sum/avg need numeric, got smallint" — an ordinary query
+                // against an ordinary column type. PG sums it to bigint,
+                // which is what `sum_int` already produces.
+                Value::SmallInt(n) => st.sum_int += i64::from(*n),
                 Value::Int(n) => st.sum_int += i64::from(*n),
                 // v7.38 (read01, T4) — BIGINT sums as exact NUMERIC (PG).
                 Value::BigInt(n) => {
@@ -4495,6 +4597,14 @@ pub(crate) fn update_state(
         AggKind::Min => {
             if is_null {
                 return Ok(());
+            }
+            if !mysql && min_max_unsupported_type(v) {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "function min({}) does not exist",
+                        crate::conversions::pg_type_name_for_error_opt(v.data_type())
+                    ),
+                });
             }
             match &st.extreme {
                 None => st.extreme = Some(v.clone().into_owned()),
@@ -4571,6 +4681,14 @@ pub(crate) fn update_state(
             if is_null {
                 return Ok(());
             }
+            if !mysql && min_max_unsupported_type(v) {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "function max({}) does not exist",
+                        crate::conversions::pg_type_name_for_error_opt(v.data_type())
+                    ),
+                });
+            }
             match &st.extreme {
                 None => st.extreme = Some(v.clone().into_owned()),
                 Some(cur) => {
@@ -4602,6 +4720,12 @@ pub(crate) fn update_state(
             // string_agg(v::text, sep)).
             let rendered: Option<Value<'static>> = match v {
                 Value::Text(s) => Some(Value::text(s.clone())),
+                // v7.39 (round 626, S05b/F29) — CHAR(n). PG aggregates a
+                // bpchar column (`string_agg(c, ',')` -> text) and SPG said
+                // "string_agg requires text value, got character". The text
+                // form of a bpchar drops its padding, which is what PG's
+                // own bpchar->text cast does.
+                Value::BpChar(s) => Some(Value::text(s.trim_end_matches(' ').to_string())),
                 // v7.39 (read01 round 111) — xmlagg feeds xml values through this
                 // shared StringAgg path; render the fragment's text (it joins
                 // separator-less into the concatenated document).
