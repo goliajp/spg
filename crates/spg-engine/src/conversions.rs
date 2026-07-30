@@ -4392,6 +4392,17 @@ pub(crate) fn coerce_value(
         // v7.17.0 Phase 3.P0-34 — Text → TIMETZ. Mandatory
         // signed offset suffix; missing offset is a hard error
         // (SPG has no session TZ wired into eval, unlike PG).
+        // v7.39 (round 634) — a time or a timestamp reaching `::TIMETZ`.
+        // PG registers time -> timetz as IMPLICIT and timestamptz -> timetz
+        // as an assignment cast; SPG answered "cannot cast time without
+        // time zone to USER-DEFINED", the target having fallen through to
+        // the user-type lookup. The session offset is zero here, which is
+        // what SPG's timetz values already carry.
+        (Value::Time(t), DataType::TimeTz) => Some(Value::TimeTz { us: t, offset_secs: 0 }),
+        (Value::Timestamp(t), DataType::TimeTz) => Some(Value::TimeTz {
+            us: t.rem_euclid(86_400_000_000),
+            offset_secs: 0,
+        }),
         (Value::Text(s), DataType::TimeTz) => match parse_timetz_str(&s) {
             Some((us, offset_secs)) => Some(Value::TimeTz { us, offset_secs }),
             None => {
@@ -4673,6 +4684,58 @@ pub(crate) fn coerce_value(
                 }));
             }
             Some(Value::xml(s))
+        }
+        // v7.39 (round 634) — the bpchar forms of two casts the Text arms
+        // above already have. `'ab'::CHAR(4)::"char"` answered "cannot cast
+        // character to \"char\"" and `::XML` likewise, while the same value
+        // as TEXT worked: the cast path never normalises a bpchar the way
+        // the function dispatch does. PG answers `a` and `ab` — the text
+        // form of a bpchar drops its padding.
+        (Value::BpChar(s), DataType::Char1) => {
+            Some(Value::Char1(s.as_bytes().first().copied().unwrap_or(0)))
+        }
+        (Value::BpChar(s), DataType::Xml) => {
+            let stripped = s.trim_end_matches(' ');
+            if !xml_content_is_well_formed(stripped) {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!("invalid XML content: {stripped:?}"),
+                }));
+            }
+            Some(Value::xml(alloc::string::String::from(stripped)))
+        }
+        // v7.39 (round 634) — bytea to an integer reads the bytes
+        // BIG-ENDIAN, all of them, and errors when the result does not fit.
+        // Measured on PG: `'\x3132'` is 12594, a single `'\x31'` is 49, an
+        // empty bytea is 0, and three bytes into a smallint is
+        // "smallint out of range".
+        (Value::Bytes(b), DataType::SmallInt | DataType::Int | DataType::BigInt) => {
+            let mut acc: i128 = 0;
+            for byte in b.iter() {
+                acc = acc.saturating_mul(256).saturating_add(i128::from(*byte));
+            }
+            let (fits, made) = match expected {
+                DataType::SmallInt => (
+                    i16::try_from(acc).is_ok(),
+                    i16::try_from(acc).map(Value::SmallInt).ok(),
+                ),
+                DataType::Int => (
+                    i32::try_from(acc).is_ok(),
+                    i32::try_from(acc).map(Value::Int).ok(),
+                ),
+                _ => (
+                    i64::try_from(acc).is_ok(),
+                    i64::try_from(acc).map(Value::BigInt).ok(),
+                ),
+            };
+            if !fits {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "{} out of range",
+                        pg_type_name_for_error(expected)
+                    ),
+                }));
+            }
+            made
         }
         // v7.39 (read01 char.c) — an integer coerces to "char" by its
         // low byte (65::"char" = 'A'; PG's i2char/int4char).
