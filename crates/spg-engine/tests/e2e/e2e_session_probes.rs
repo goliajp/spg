@@ -72,13 +72,25 @@ fn txid_current_if_assigned_is_null_without_an_id() {
 #[test]
 fn event_trigger_readers_return_null() {
     let mut e = Engine::new();
+    // v7.39 (round 637) — the four event-trigger readers REFUSE a call made
+    // outside an event trigger, each naming the trigger kind it needs, as
+    // PG does. A tool reading NULL concluded there were no DDL commands;
+    // PG tells it the question cannot be asked here.
     for f in &[
-        "pg_listening_channels()",
         "pg_event_trigger_ddl_commands()",
         "pg_event_trigger_dropped_objects()",
         "pg_event_trigger_table_rewrite_oid()",
         "pg_event_trigger_table_rewrite_reason()",
     ] {
+        let sql = format!("SELECT {f}");
+        let m = e.execute(&sql).expect_err("PG refuses this outside a trigger").to_string();
+        assert!(
+            m.contains("can only be called in") && m.contains("event trigger"),
+            "SELECT {f}: said {m:?}"
+        );
+    }
+    // pg_listening_channels has no such context requirement in PG.
+    for f in &["pg_listening_channels()"] {
         let sql = format!("SELECT {f}");
         assert!(
             matches!(first(&mut e, &sql), spg_storage::Value::Null),

@@ -71,9 +71,23 @@ fn import_system_collations_zero() {
 #[test]
 fn trigger_fn_names_and_binary_upgrade_return_null() {
     let mut e = Engine::new();
+    // v7.39 (round 637) — the two trigger functions REFUSE a scalar call
+    // now, as PG does ("not fired by trigger manager" / "must be called as
+    // trigger"). The binary-upgrade setters keep answering NULL: PG has no
+    // such functions at all, so there is nothing to match, and the NULL is
+    // what keeps a pg_upgrade-generated dump moving.
     for f in &[
         "suppress_redundant_updates_trigger()",
         "tsvector_update_trigger()",
+    ] {
+        let sql = format!("SELECT {f}");
+        let m = e.execute(&sql).expect_err("PG refuses a scalar call").to_string();
+        assert!(
+            m.contains("trigger"),
+            "SELECT {f}: wanted a trigger-manager rejection, said {m:?}"
+        );
+    }
+    for f in &[
         "pg_nextoid(1259, 1, 2662)",
         "binary_upgrade_set_next_pg_type_oid(16384)",
         "binary_upgrade_create_empty_extension('x', 'public', false, '1.0', NULL, NULL, NULL)",

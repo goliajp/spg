@@ -2281,9 +2281,24 @@ fn apply_function_dispatch(
         // Trigger-function names that appear in CREATE TRIGGER
         // statements from pg_dump. Calling them directly as scalars
         // (some ORMs probe existence this way) returns NULL.
-        "suppress_redundant_updates_trigger"
-        | "tsvector_update_trigger"
-        | "tsvector_update_trigger_column" => Ok(Value::Null),
+        // v7.39 (round 637) — PG REFUSES these when they are called as a
+        // scalar, and says which manager should have called them. The NULL
+        // here was for ORM existence probes, but an ORM probing PG gets the
+        // error, so the error is what matching PG means. Messages measured:
+        //
+        //   tsvector_update_trigger: not fired by trigger manager
+        //   suppress_redundant_updates_trigger: must be called as trigger
+        //
+        // (`tsvector_update_trigger_column` reports under the first name in
+        // PG too, which is why both spell it the same way.)
+        "tsvector_update_trigger" | "tsvector_update_trigger_column" => {
+            Err(EvalError::TypeMismatch {
+                detail: "tsvector_update_trigger: not fired by trigger manager".into(),
+            })
+        }
+        "suppress_redundant_updates_trigger" => Err(EvalError::TypeMismatch {
+            detail: "suppress_redundant_updates_trigger: must be called as trigger".into(),
+        }),
         // pg_nextoid(rel, col, index) — binary-upgrade-only oid
         // allocator; binary_upgrade_* setters are pg_upgrade
         // internals. NULL keeps pg_upgrade-generated dumps moving.
@@ -16917,13 +16932,30 @@ fn apply_function_dispatch(
         // pg_listening_channels() — LISTEN registrations (SRF).
         // Scalar surface: NULL (no channels).
         "pg_listening_channels" => Ok(Value::Null),
-        // Event-trigger context readers — only meaningful inside a
-        // running event trigger; PG errors outside that context,
-        // SPG returns NULL to stay parse-through for tooling.
-        "pg_event_trigger_ddl_commands"
-        | "pg_event_trigger_dropped_objects"
-        | "pg_event_trigger_table_rewrite_oid"
-        | "pg_event_trigger_table_rewrite_reason" => Ok(Value::Null),
+        // Event-trigger context readers — only meaningful inside a running
+        // event trigger.
+        //
+        // v7.39 (round 637) — they used to answer NULL "to stay
+        // parse-through for tooling", which the comment said outright while
+        // noting PG errors. A tool reading NULL concludes there were no DDL
+        // commands; PG tells it the question cannot be asked here. Each
+        // message names the trigger kind it needs, measured from PG18.
+        "pg_event_trigger_ddl_commands" => Err(EvalError::TypeMismatch {
+            detail: "pg_event_trigger_ddl_commands() can only be called in an event trigger function"
+                .into(),
+        }),
+        "pg_event_trigger_dropped_objects" => Err(EvalError::TypeMismatch {
+            detail: "pg_event_trigger_dropped_objects() can only be called in a sql_drop event trigger function"
+                .into(),
+        }),
+        "pg_event_trigger_table_rewrite_oid" => Err(EvalError::TypeMismatch {
+            detail: "pg_event_trigger_table_rewrite_oid() can only be called in a table_rewrite event trigger function"
+                .into(),
+        }),
+        "pg_event_trigger_table_rewrite_reason" => Err(EvalError::TypeMismatch {
+            detail: "pg_event_trigger_table_rewrite_reason() can only be called in a table_rewrite event trigger function"
+                .into(),
+        }),
         // v7.39 (round 318, V51) — pg_cancel_backend / pg_terminate_backend
         // really signal the named connection through the host's registry.
         // They used to return `true` unconditionally WITHOUT doing anything,
@@ -17149,7 +17181,7 @@ fn apply_function_dispatch(
                     None => alloc::format!("{base}({typmod})"),
                 }
             } else {
-                base.into()
+                base
             };
             Ok(Value::text(if is_array {
                 alloc::format!("{rendered}[]")
