@@ -159,6 +159,7 @@ mod e2e_cast_matrix_round634;
 mod e2e_pg_cast_round635;
 mod e2e_zero_arg_crashes_round636;
 mod e2e_trigger_context_round637;
+mod e2e_pg_proc_round638;
 mod e2e_catalog_column_types_round620;
 mod e2e_array_insert_select_round621;
 mod e2e_by_is_an_identifier_round621;
