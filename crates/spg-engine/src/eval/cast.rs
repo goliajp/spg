@@ -2010,6 +2010,13 @@ fn cast_numeric_special_reject(v: &Value, target: &str) -> Option<Result<Value<'
 
 fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
     match v {
+        // v7.39 (round 633) — SMALLINT. `1::SMALLINT::INT` answered
+        // "cannot cast smallint to int": the arm was simply absent, next to
+        // the Int and BigInt ones. Widening a smallint is about as ordinary
+        // as a cast gets, and PG has it registered as an IMPLICIT cast.
+        // Same omission shape as the sum accumulator missing SmallInt in
+        // round 626 — a variant list written out by hand, one entry short.
+        Value::SmallInt(n) => Ok(Value::Int(i32::from(n))),
         Value::Int(n) => Ok(Value::Int(n)),
         Value::BigInt(n) => i32::try_from(n)
             .map(Value::Int)
@@ -2084,6 +2091,8 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
 fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
     match v {
         Value::Int(n) => Ok(Value::BigInt(i64::from(n))),
+        // v7.39 (round 633) — SMALLINT, missing here for the same reason.
+        Value::SmallInt(n) => Ok(Value::BigInt(i64::from(n))),
         Value::BigInt(n) => Ok(Value::BigInt(n)),
         // PG rounds (half-to-even) coercing a real number to bigint, and errors
         // on a non-finite or out-of-range value rather than saturating.

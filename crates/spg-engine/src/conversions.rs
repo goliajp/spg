@@ -5476,6 +5476,17 @@ pub(crate) fn coerce_value(
             let days = t.div_euclid(86_400_000_000);
             i32::try_from(days).ok().map(Value::Date)
         }
+        // v7.39 (round 633) — the time of day out of a timestamp.
+        //
+        // `TIMESTAMP '2020-01-02 03:04:05'::TIME` answered "cannot cast
+        // timestamp without time zone to time without time zone"; PG
+        // answers `03:04:05`, and has the cast registered as an assignment
+        // one. `rem_euclid` rather than `%` so a pre-epoch timestamp gives
+        // a time in [0, 24h) instead of a negative one. A timestamptz value
+        // is carried in the same variant, so it comes through here too.
+        (Value::Timestamp(t), DataType::Time) => {
+            Some(Value::Time(t.rem_euclid(86_400_000_000)))
+        }
         // v7.39 (read01 numeric.c) — a NumericBig is already an unconstrained
         // NUMERIC ('…0.5::numeric' where the mantissa exceeds i128); pass it
         // through. A declared numeric(p, s) still falls to the typed error.
