@@ -97,11 +97,11 @@ SELECT ltrim(NULL)
 ----
 NULL
 
-# Numeric input coerced.
-query T
+# v7.39 (round 625) — PG has no trim(integer): it resolves trim to
+# pg_catalog.btrim and says the function does not exist. This asserted SPG's
+# own coercion as if it were PG's behaviour.
+statement error
 SELECT trim(42)
-----
-42
 
 # Realistic SELECT shape — strip whitespace from user input.
 statement ok

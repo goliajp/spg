@@ -4397,7 +4397,19 @@ fn eval_bool_test_arm(
     let hit = match (value, &v) {
         // IS UNKNOWN — the input is NULL.
         (None, Value::Null) => true,
-        (None, _) => false,
+        // v7.39 (round 625) — and PG rejects a non-boolean here too:
+        // `argument of IS UNKNOWN must be type boolean`. MySQL has no
+        // IS UNKNOWN, so there is no dialect branch.
+        (None, Value::Bool(_)) => false,
+        (None, other) => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "argument of IS {}UNKNOWN must be type boolean, not type {}",
+                    if negated { "NOT " } else { "" },
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                ),
+            });
+        }
         (Some(_), Value::Null) => false,
         (Some(want), Value::Bool(b)) => *b == want,
         // v7.39 (round 397) — MySQL reads a non-boolean as a truth value
@@ -4405,8 +4417,23 @@ fn eval_bool_test_arm(
         // `'abc' IS TRUE` is 0). PG rejects a non-boolean at parse time, so
         // this only fires under the dialect; a NULL is already handled.
         (Some(want), other) if ctx.mysql_dialect => mysql_truthy(other) == want,
-        // A non-boolean input on PG: the test simply cannot hold.
-        (Some(_), _) => false,
+        // v7.39 (round 625, S05b/F29) — on PG a non-boolean is REJECTED, and
+        // the comment above said so while the arm below answered `false`
+        // anyway. `1 IS TRUE` came back false, which reads as "the test was
+        // run and did not hold" rather than "you cannot ask this of an
+        // integer" — the wrong answer for every non-boolean type, eight of
+        // them measured. PG's own sentence, which names the operator and the
+        // type it got.
+        (Some(_), other) => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "argument of IS {}{} must be type boolean, not type {}",
+                    if negated { "NOT " } else { "" },
+                    if value == Some(true) { "TRUE" } else { "FALSE" },
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                ),
+            });
+        }
     };
     Ok(Value::Bool(hit != negated))
 }

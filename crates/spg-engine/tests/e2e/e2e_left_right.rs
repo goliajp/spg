@@ -231,7 +231,15 @@ fn left_n_non_integer_errors() {
 #[test]
 fn left_numeric_input_coerced() {
     let mut e = Engine::new();
-    assert_eq!(text(&mut e, "SELECT left(12345, 3)"), "123");
+    // v7.39 (round 625) — this asserted SPG's own coercion. PG has no
+    // `left(integer, integer)`; it says so. (MariaDB does accept it, which
+    // is why the guard is PG-dialect only — pinned in
+    // e2e_coercion_strictness_round625.)
+    let m = e
+        .execute("SELECT left(12345, 3)")
+        .expect_err("PG has no left(integer, integer)")
+        .to_string();
+    assert!(m.contains("function left(integer, integer) does not exist"), "{m}");
 }
 
 // ── INTEGRATION ─────────────────────────────────────────────────

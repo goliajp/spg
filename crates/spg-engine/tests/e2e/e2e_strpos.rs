@@ -196,7 +196,12 @@ fn strpos_arg_order_differs_from_position() {
 fn strpos_numeric_args_coerced() {
     let mut e = Engine::new();
     // strpos('12345', '3') → position 3.
-    assert_eq!(int(&mut e, "SELECT strpos(12345, '3')"), 3);
+    // v7.39 (round 625) — PG has no `strpos(integer, …)`.
+    let m = e
+        .execute("SELECT strpos(12345, '3')")
+        .expect_err("PG has no strpos(integer, text)")
+        .to_string();
+    assert!(m.contains("function strpos(integer, text) does not exist"), "{m}");
 }
 
 // ── COLUMN / WHERE / INSERT ──────────────────────────────────────
