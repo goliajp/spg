@@ -893,6 +893,15 @@ pub fn cast_value_ref_in(
                 let s = match &v {
                     Value::Null => return Ok(Value::Null),
                     Value::Text(s) => s.as_ref().trim().to_string(),
+                    // v7.39 (round 634) — an OID reaches these types too.
+                    // PG registers int2/int4/int8/oid -> regproc as IMPLICIT
+                    // casts and renders an oid with no matching entry as the
+                    // number itself: `1::INT::REGPROC` is `1`, and
+                    // `1247::OID::REGPROC` is `1247`. SPG refused the whole
+                    // integer family with "accepts TEXT".
+                    Value::SmallInt(n) => return Ok(Value::text(n.to_string())),
+                    Value::Int(n) => return Ok(Value::text(n.to_string())),
+                    Value::BigInt(n) => return Ok(Value::text(n.to_string())),
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
