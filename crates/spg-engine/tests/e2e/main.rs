@@ -156,6 +156,7 @@ mod e2e_to_char_signs_round631;
 mod e2e_to_char_grouping_round632;
 mod e2e_cast_gaps_round633;
 mod e2e_cast_matrix_round634;
+mod e2e_pg_cast_round635;
 mod e2e_catalog_column_types_round620;
 mod e2e_array_insert_select_round621;
 mod e2e_by_is_an_identifier_round621;

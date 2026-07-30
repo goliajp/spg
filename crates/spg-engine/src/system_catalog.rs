@@ -2557,6 +2557,9 @@ pub(crate) fn synth_information_schema_table_constraints(
 pub(crate) const OID_TABLE_BASE: i64 = 16384;
 pub(crate) const OID_VIEW_BASE: i64 = 32768;
 pub(crate) const OID_INDEX_BASE: i64 = 100_000;
+/// v7.39 (round 635) — pg_cast rows need an oid of their own. Above the
+/// index range so it cannot collide with a relation's.
+pub(crate) const OID_CAST_BASE: i64 = 200_000;
 pub(crate) const OID_SEQ_BASE: i64 = 300_000;
 /// v7.39 (round 342, V65) — user functions, keyed by signature the way
 /// `pg_proc` iterates them.
@@ -3895,6 +3898,13 @@ pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
         (701, "float8", 8, "b", "N", 0, 1022),
         (650, "cidr", -1, "b", "I", 0, 651),
         (869, "inet", -1, "b", "I", 0, 1041),
+        // v7.39 (round 635) — the bit-string types. SPG has had the VALUES
+        // since the bit family shipped; pg_type never listed the TYPES, so
+        // the canonical `pg_cast JOIN pg_type` lost its eight bit rows to
+        // the join even though the cast table carried them. Read off PG18:
+        // category V, variable length, array oids 1561 / 1563.
+        (1560, "bit", -1, "b", "V", 0, 1561),
+        (1562, "varbit", -1, "b", "V", 0, 1563),
         (829, "macaddr", 6, "b", "U", 0, 1040),
         (1042, "bpchar", -1, "b", "S", 0, 1014),
         (1043, "varchar", -1, "b", "S", 0, 1015),
@@ -6085,7 +6095,166 @@ pub(crate) fn synth_pg_cast() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
         ColumnSchema::new("castcontext", DataType::Text, false),
         ColumnSchema::new("castmethod", DataType::Text, false),
     ];
-    (schema, Vec::new())
+    // v7.39 (round 635, F18) — the casts SPG performs, with PG's context
+    // and method for each.
+    //
+    // The table was not written from PG's source: it is PG's registered
+    // casts restricted to the 33 base types SPG has, and rounds 633 and 634
+    // then PROBED every one of them against the engine, closing the 23 it
+    // could not do. So each row here is a conversion the engine was
+    // measured to perform, which is why the catalog can be published at all
+    // — an earlier cut was held back rather than claim conversions the
+    // engine refuses.
+    //
+    // `castsource` / `casttarget` are PG's own type oids, which is what
+    // SPG's pg_type already reports, so a join against it resolves.
+    // `castfunc` is 0 throughout: PG names an implementation function per
+    // row and SPG has no pg_proc entry for one, and a client reads the
+    // context and the method rather than the function. Recorded as a
+    // divergence rather than invented.
+    const CASTS: &[(i64, i64, &str, &str)] = &[
+    (16, 23, "e", "f"), // bool -> int4
+    (16, 25, "a", "f"), // bool -> text
+    (16, 1042, "a", "f"), // bool -> bpchar
+    (16, 1043, "a", "f"), // bool -> varchar
+    (17, 20, "e", "f"), // bytea -> int8
+    (17, 21, "e", "f"), // bytea -> int2
+    (17, 23, "e", "f"), // bytea -> int4
+    (18, 23, "e", "f"), // char -> int4
+    (18, 25, "i", "f"), // char -> text
+    (18, 1042, "a", "f"), // char -> bpchar
+    (18, 1043, "a", "f"), // char -> varchar
+    (19, 25, "i", "f"), // name -> text
+    (19, 1042, "a", "f"), // name -> bpchar
+    (19, 1043, "a", "f"), // name -> varchar
+    (20, 17, "e", "f"), // int8 -> bytea
+    (20, 21, "a", "f"), // int8 -> int2
+    (20, 23, "a", "f"), // int8 -> int4
+    (20, 24, "i", "f"), // int8 -> regproc
+    (20, 26, "i", "f"), // int8 -> oid
+    (20, 700, "i", "f"), // int8 -> float4
+    (20, 701, "i", "f"), // int8 -> float8
+    (20, 790, "a", "f"), // int8 -> money
+    (20, 1560, "e", "f"), // int8 -> bit
+    (20, 1700, "i", "f"), // int8 -> numeric
+    (21, 17, "e", "f"), // int2 -> bytea
+    (21, 20, "i", "f"), // int2 -> int8
+    (21, 23, "i", "f"), // int2 -> int4
+    (21, 24, "i", "f"), // int2 -> regproc
+    (21, 26, "i", "f"), // int2 -> oid
+    (21, 700, "i", "f"), // int2 -> float4
+    (21, 701, "i", "f"), // int2 -> float8
+    (21, 1700, "i", "f"), // int2 -> numeric
+    (23, 16, "e", "f"), // int4 -> bool
+    (23, 17, "e", "f"), // int4 -> bytea
+    (23, 18, "e", "f"), // int4 -> char
+    (23, 20, "i", "f"), // int4 -> int8
+    (23, 21, "a", "f"), // int4 -> int2
+    (23, 24, "i", "b"), // int4 -> regproc
+    (23, 26, "i", "b"), // int4 -> oid
+    (23, 700, "i", "f"), // int4 -> float4
+    (23, 701, "i", "f"), // int4 -> float8
+    (23, 790, "a", "f"), // int4 -> money
+    (23, 1560, "e", "f"), // int4 -> bit
+    (23, 1700, "i", "f"), // int4 -> numeric
+    (24, 20, "a", "f"), // regproc -> int8
+    (24, 23, "a", "b"), // regproc -> int4
+    (24, 26, "i", "b"), // regproc -> oid
+    (25, 18, "a", "f"), // text -> char
+    (25, 19, "i", "f"), // text -> name
+    (25, 142, "e", "f"), // text -> xml
+    (25, 1042, "i", "b"), // text -> bpchar
+    (25, 1043, "i", "b"), // text -> varchar
+    (26, 20, "a", "f"), // oid -> int8
+    (26, 23, "a", "b"), // oid -> int4
+    (26, 24, "i", "b"), // oid -> regproc
+    (114, 3802, "a", "i"), // json -> jsonb
+    (142, 25, "a", "b"), // xml -> text
+    (142, 1042, "a", "b"), // xml -> bpchar
+    (142, 1043, "a", "b"), // xml -> varchar
+    (650, 25, "a", "f"), // cidr -> text
+    (650, 869, "i", "b"), // cidr -> inet
+    (650, 1042, "a", "f"), // cidr -> bpchar
+    (650, 1043, "a", "f"), // cidr -> varchar
+    (700, 20, "a", "f"), // float4 -> int8
+    (700, 21, "a", "f"), // float4 -> int2
+    (700, 23, "a", "f"), // float4 -> int4
+    (700, 701, "i", "f"), // float4 -> float8
+    (700, 1700, "a", "f"), // float4 -> numeric
+    (701, 20, "a", "f"), // float8 -> int8
+    (701, 21, "a", "f"), // float8 -> int2
+    (701, 23, "a", "f"), // float8 -> int4
+    (701, 700, "a", "f"), // float8 -> float4
+    (701, 1700, "a", "f"), // float8 -> numeric
+    (790, 1700, "a", "f"), // money -> numeric
+    (869, 25, "a", "f"), // inet -> text
+    (869, 650, "a", "f"), // inet -> cidr
+    (869, 1042, "a", "f"), // inet -> bpchar
+    (869, 1043, "a", "f"), // inet -> varchar
+    (1042, 18, "a", "f"), // bpchar -> char
+    (1042, 19, "i", "f"), // bpchar -> name
+    (1042, 25, "i", "f"), // bpchar -> text
+    (1042, 142, "e", "f"), // bpchar -> xml
+    (1042, 1042, "i", "f"), // bpchar -> bpchar
+    (1042, 1043, "i", "f"), // bpchar -> varchar
+    (1043, 18, "a", "f"), // varchar -> char
+    (1043, 19, "i", "f"), // varchar -> name
+    (1043, 25, "i", "b"), // varchar -> text
+    (1043, 142, "e", "f"), // varchar -> xml
+    (1043, 1042, "i", "b"), // varchar -> bpchar
+    (1043, 1043, "i", "f"), // varchar -> varchar
+    (1082, 1114, "i", "f"), // date -> timestamp
+    (1082, 1184, "i", "f"), // date -> timestamptz
+    (1083, 1083, "i", "f"), // time -> time
+    (1083, 1186, "i", "f"), // time -> interval
+    (1083, 1266, "i", "f"), // time -> timetz
+    (1114, 1082, "a", "f"), // timestamp -> date
+    (1114, 1083, "a", "f"), // timestamp -> time
+    (1114, 1114, "i", "f"), // timestamp -> timestamp
+    (1114, 1184, "i", "f"), // timestamp -> timestamptz
+    (1184, 1082, "a", "f"), // timestamptz -> date
+    (1184, 1083, "a", "f"), // timestamptz -> time
+    (1184, 1114, "a", "f"), // timestamptz -> timestamp
+    (1184, 1184, "i", "f"), // timestamptz -> timestamptz
+    (1184, 1266, "a", "f"), // timestamptz -> timetz
+    (1186, 1083, "a", "f"), // interval -> time
+    (1186, 1186, "i", "f"), // interval -> interval
+    (1266, 1083, "a", "f"), // timetz -> time
+    (1266, 1266, "i", "f"), // timetz -> timetz
+    (1560, 20, "e", "f"), // bit -> int8
+    (1560, 23, "e", "f"), // bit -> int4
+    (1560, 1560, "i", "f"), // bit -> bit
+    (1560, 1562, "i", "b"), // bit -> varbit
+    (1562, 1560, "i", "b"), // varbit -> bit
+    (1562, 1562, "i", "f"), // varbit -> varbit
+    (1700, 20, "a", "f"), // numeric -> int8
+    (1700, 21, "a", "f"), // numeric -> int2
+    (1700, 23, "a", "f"), // numeric -> int4
+    (1700, 700, "i", "f"), // numeric -> float4
+    (1700, 701, "i", "f"), // numeric -> float8
+    (1700, 790, "a", "f"), // numeric -> money
+    (1700, 1700, "i", "f"), // numeric -> numeric
+    (3802, 16, "e", "f"), // jsonb -> bool
+    (3802, 20, "e", "f"), // jsonb -> int8
+    (3802, 21, "e", "f"), // jsonb -> int2
+    (3802, 23, "e", "f"), // jsonb -> int4
+    (3802, 114, "a", "i"), // jsonb -> json
+    (3802, 700, "e", "f"), // jsonb -> float4
+    (3802, 701, "e", "f"), // jsonb -> float8
+    (3802, 1700, "e", "f"), // jsonb -> numeric
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::with_capacity(CASTS.len());
+    for (i, (src, tgt, ctx, meth)) in CASTS.iter().enumerate() {
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(OID_CAST_BASE + i as i64),
+            Value::BigInt(*src),
+            Value::BigInt(*tgt),
+            Value::BigInt(0),
+            Value::text((*ctx).to_string()),
+            Value::text((*meth).to_string()),
+        ]));
+    }
+    (schema, rows)
 }
 
 /// v7.39 (round 541) — `pg_catalog.pg_foreign_table`, empty.
