@@ -3798,9 +3798,11 @@ fn scalar_subquery_empty_default(inner: &SelectStatement) -> Value<'static> {
 /// rewrite happens in the FROM clause but not in the QUALIFIER a
 /// correlated reference writes:
 ///
+/// ```text
 ///     SELECT typname, (SELECT typarray FROM pg_type te
 ///                      WHERE te.oid = pg_type.typelem) FROM pg_type
 ///     PG18  answers      SPG  missing FROM-clause entry for "pg_type"
+/// ```
 ///
 /// which is how pg_dump asks whether a type is an array type. The
 /// written name and the rewritten one are the same relation.
@@ -3827,8 +3829,10 @@ fn relation_name_matches(qualifier: &str, relation: &str) -> bool {
 /// when it is not there. SPG only ever looked inward, so every
 /// correlated subquery written the ordinary way failed outright:
 ///
+/// ```text
 ///     SELECT v, (SELECT w FROM ob WHERE bid = aid) FROM oa
 ///     PG18  x|B1, y|B2       SPG  ERROR: column "aid" does not exist
+/// ```
 ///
 /// Only the qualified spelling (`oa.aid`) worked — which is why the gap
 /// survived: the catalog queries and the tests that exercised

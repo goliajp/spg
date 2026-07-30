@@ -1661,8 +1661,8 @@ fn apply_composite_cast_in(
         }
         other => Err(EvalError::TypeMismatch {
             detail: alloc::format!(
-                "cannot cast {:?} to composite type \"{}\"",
-                other.data_type(),
+                "cannot cast {} to composite type \"{}\"",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type()),
                 comp.name
             ),
         }),
@@ -1761,7 +1761,7 @@ fn apply_enum_cast<'a>(
             }
         }
         other => Err(EvalError::TypeMismatch {
-            detail: alloc::format!("cannot cast {:?} to enum {name}", other.data_type()),
+            detail: alloc::format!("cannot cast {} to enum {name}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
         }),
     }
 }
@@ -2160,8 +2160,8 @@ fn apply_one_subscript(
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "array subscript must be integer, got {:?}",
-                    other.data_type()
+                    "array subscript must be integer, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -2175,8 +2175,8 @@ fn apply_one_subscript(
         None if array_len(&target_v).is_some() => Ok(Value::Null),
         None => Err(EvalError::TypeMismatch {
             detail: format!(
-                "subscript target must be an array, got {:?}",
-                target_v.data_type()
+                "subscript target must be an array, got {}",
+                crate::conversions::pg_type_name_for_error_opt(target_v.data_type())
             ),
         }),
     }
@@ -2205,8 +2205,8 @@ fn eval_matrix_subscript(
             other => {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "array subscript must be integer, got {:?}",
-                        other.data_type()
+                        "array subscript must be integer, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 });
             }
@@ -3734,8 +3734,8 @@ pub(crate) fn any_all_over(
     let Some(len) = array_len(&arr) else {
         return Err(EvalError::TypeMismatch {
             detail: format!(
-                "ANY/ALL right-hand side must be an array, got {:?}",
-                arr.data_type()
+                "ANY/ALL right-hand side must be an array, got {}",
+                crate::conversions::pg_type_name_for_error_opt(arr.data_type())
             ),
         });
     };
@@ -3775,8 +3775,8 @@ pub(crate) fn any_all_over(
             Ok(other) => {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "ANY/ALL comparison didn't return Bool: {:?}",
-                        other.data_type()
+                        "ANY/ALL comparison didn't return Bool: {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 });
             }
@@ -3924,8 +3924,8 @@ fn eval_array_slice_arm(
                 Value::SmallInt(n) => Ok(Some(i64::from(n))),
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "array slice bound must be integer, got {:?}",
-                        other.data_type()
+                        "array slice bound must be integer, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             },
@@ -3952,7 +3952,7 @@ fn eval_array_slice_arm(
             Ok(Value::BigIntArray(items[s..e].to_vec()))
         }
         other => Err(EvalError::TypeMismatch {
-            detail: format!("slice target must be an array, got {:?}", other.data_type()),
+            detail: format!("slice target must be an array, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
         }),
     }
 }
@@ -4006,8 +4006,8 @@ fn eval_in_list_arm(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "IN comparison didn't return Bool: {:?}",
-                            other.data_type()
+                            "IN comparison didn't return Bool: {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -4048,7 +4048,7 @@ fn eval_like_arm(
         (Value::Text(a) | Value::BpChar(a), Value::Text(b) | Value::BpChar(b)) => (a, b),
         (Value::Text(_) | Value::BpChar(_), other) | (other, _) => {
             return Err(EvalError::TypeMismatch {
-                detail: format!("LIKE requires text operands, got {:?}", other.data_type()),
+                detail: format!("LIKE requires text operands, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
             });
         }
     };
@@ -4955,8 +4955,8 @@ fn fn_string_to_array(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
         Some(other) => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "string_to_array null_string must be text, got {:?}",
-                    other.data_type()
+                    "string_to_array null_string must be text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -4966,7 +4966,7 @@ fn fn_string_to_array(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
         Value::Text(t) => t,
         other => {
             return Err(EvalError::TypeMismatch {
-                detail: alloc::format!("string_to_array expects text, got {:?}", other.data_type()),
+                detail: alloc::format!("string_to_array expects text, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
             });
         }
     };
@@ -4992,8 +4992,8 @@ fn fn_string_to_array(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "string_to_array delimiter must be text, got {:?}",
-                    other.data_type()
+                    "string_to_array delimiter must be text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -5026,8 +5026,8 @@ fn text_arg(v: &Value) -> Result<Option<String>, EvalError> {
         Value::Null => Ok(None),
         other => Err(EvalError::TypeMismatch {
             detail: alloc::format!(
-                "regex function expects TEXT arg, got {:?}",
-                other.data_type()
+                "regex function expects TEXT arg, got {}",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
             ),
         }),
     }

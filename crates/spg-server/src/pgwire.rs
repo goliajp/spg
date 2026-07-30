@@ -4777,6 +4777,33 @@ pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // signature (PG 42883 undefined_function).
         } else if msg.contains("function") && msg.contains("does not exist") {
             "42883"
+        // v7.39 (round 622, S05a) — a value of the wrong type reaching a
+        // function, an operator or a cast was classified 42000, which is the
+        // CLASS code and carries no information: a client dispatching on
+        // SQLSTATE — which is the entire point of SQLSTATE — could not tell
+        // "no such function" from a syntax error. Only the handful of
+        // messages that happen to spell PG's own sentence (the arm above)
+        // ever reached 42883.
+        //
+        // Measured against PG18 over 37 wrong-type shapes — calls,
+        // aggregates, operators, subscripts, json accessors and casts — PG
+        // answers exactly three codes: 42846 CANNOT_COERCE for a cast with
+        // no path, 22023 for a jsonb value that cannot become the target,
+        // and 42883 UNDEFINED_FUNCTION for everything else, since to PG
+        // every one of them is "no candidate matches this call". The
+        // input-syntax family (22P02 / 22007) is already answered by its
+        // own rules above and does not reach here.
+        } else if matches!(
+            e,
+            EngineError::Eval(spg_engine::eval::EvalError::TypeMismatch { .. })
+        ) {
+            if msg.contains("cannot cast jsonb") {
+                "22023"
+            } else if msg.contains("cannot cast") {
+                "42846"
+            } else {
+                "42883"
+            }
         } else {
             "42000"
         };
@@ -4799,6 +4826,54 @@ mod engine_error_sqlstate_tests {
 
     fn code(msg: &str) -> &'static str {
         engine_error_to_wire(&EngineError::Unsupported(msg.to_string())).0
+    }
+
+    /// v7.39 (round 622) — the same, for a value that reached something of
+    /// the wrong type. The classification of THIS one is by variant, not by
+    /// message, so it needs its own constructor.
+    fn tm_code(detail: &str) -> &'static str {
+        engine_error_to_wire(&EngineError::Eval(
+            spg_engine::eval::EvalError::TypeMismatch {
+                detail: detail.to_string(),
+            },
+        ))
+        .0
+    }
+
+    /// v7.39 (round 622, S05a) — every wrong-argument-type error answered
+    /// `42000`, the CLASS code, which tells a client nothing: "no such
+    /// function" and "syntax error" arrived indistinguishable. Only the few
+    /// messages that happened to spell PG's own sentence reached 42883.
+    ///
+    /// PG18, measured over 25 wrong-type shapes, answers three codes, and
+    /// these are the boundaries between them.
+    #[test]
+    fn round622_wrong_argument_type_is_42883_not_the_class_code() {
+        // Calls, aggregates and operators — PG: no candidate matches.
+        assert_eq!(tm_code("upper() needs text, got integer"), "42883");
+        assert_eq!(tm_code("sum/avg need numeric, got text"), "42883");
+        assert_eq!(tm_code("LIKE requires text operands, got integer"), "42883");
+        assert_eq!(
+            tm_code("unnest() expects an array argument, got integer"),
+            "42883"
+        );
+        assert_eq!(
+            tm_code("date_trunc() needs DATE or TIMESTAMP, got integer"),
+            "42883"
+        );
+        // A cast with no path is PG's 42846 CANNOT_COERCE — a different
+        // code, and the reason the arm is not a blanket 42883.
+        assert_eq!(tm_code("cannot cast integer to inet"), "42846");
+        assert_eq!(tm_code("cannot cast integer[] to int"), "42846");
+        // …except from jsonb, which PG puts at 22023.
+        assert_eq!(tm_code("cannot cast jsonb object to type integer"), "22023");
+        // The message-matched rules still win where they applied before:
+        // these two already spelled PG's sentence and must not change.
+        assert_eq!(code("function length(boolean) does not exist"), "42883");
+        assert_eq!(code("operator does not exist: text + integer"), "42883");
+        // And an unrelated `Unsupported` is untouched — the new arm is
+        // reached only by the type-mismatch variant.
+        assert_eq!(code("syntax error near \"FROM\""), "42000");
     }
 
     #[test]

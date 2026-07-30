@@ -674,8 +674,8 @@ fn execute_stmts(
                         other => Err(TriggerError::UnsupportedConstruct {
                             function: ctx.function.into(),
                             detail: alloc::format!(
-                                "FOR <var> IN start..end: bounds must be integer, got {:?}",
-                                other.data_type()
+                                "FOR <var> IN start..end: bounds must be integer, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         }),
                     }
@@ -797,8 +797,8 @@ fn execute_stmts(
                         return Err(TriggerError::UnsupportedConstruct {
                             function: ctx.function.into(),
                             detail: alloc::format!(
-                                "FOR IN EXECUTE: expression must evaluate to TEXT, got {:?}",
-                                other.data_type()
+                                "FOR IN EXECUTE: expression must evaluate to TEXT, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -938,8 +938,8 @@ fn execute_stmts(
                     return Err(TriggerError::UnsupportedConstruct {
                         function: ctx.function.into(),
                         detail: alloc::format!(
-                            "RETURN QUERY EXECUTE needs a text SQL string, got {:?}",
-                            sql_val.data_type()
+                            "RETURN QUERY EXECUTE needs a text SQL string, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(sql_val.data_type())
                         ),
                     });
                 };
@@ -980,8 +980,8 @@ fn execute_stmts(
                         return Err(TriggerError::UnsupportedConstruct {
                             function: ctx.function.into(),
                             detail: alloc::format!(
-                                "EXECUTE <expr>: expression must evaluate to TEXT, got {:?}",
-                                other.data_type()
+                                "EXECUTE <expr>: expression must evaluate to TEXT, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }

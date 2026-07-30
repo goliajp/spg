@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use spg_sql::ast::{Expr, TableRef};
 use spg_storage::{ColumnSchema, DataType, Row, StorageError, Table, Value};
 
-use crate::eval::{self, EvalContext};
+use crate::eval::{self, EvalContext, EvalError};
 use crate::{Engine, EngineError};
 
 impl Engine {
@@ -136,10 +136,18 @@ impl Engine {
                             .collect(),
                     ),
                     other => {
-                        return Err(EngineError::Unsupported(alloc::format!(
-                            "unnest() expects an array argument, got {:?}",
-                            other.data_type()
-                        )));
+                        // v7.39 (round 622, S05a) — a `TypeMismatch`, not an
+                        // `Unsupported`: unnest IS supported, this value is
+                        // the wrong type for it. The third site already
+                        // spelled it that way, so the same user-visible
+                        // sentence carried two SQLSTATEs depending on which
+                        // of the three raised it. PG answers 42883 for all.
+                        return Err(EngineError::Eval(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "unnest() expects an array argument, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                            ),
+                        }));
                     }
                 };
             let alias = tref.alias.clone().unwrap_or_else(|| "unnest".to_string());

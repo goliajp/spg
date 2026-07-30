@@ -506,7 +506,7 @@ fn substring_position_arg(v: &Value<'_>, mysql: bool, what: &str) -> Result<i64,
         return Ok(mysql_leading_int(&text));
     }
     Err(EvalError::TypeMismatch {
-        detail: format!("substring() {what} must be integer, got {:?}", v.data_type()),
+        detail: format!("substring() {what} must be integer, got {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
     })
 }
 
@@ -969,8 +969,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "nextval() argument must be TEXT, got {:?}",
-                            other.data_type()
+                            "nextval() argument must be TEXT, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -995,8 +995,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "currval() argument must be TEXT, got {:?}",
-                            other.data_type()
+                            "currval() argument must be TEXT, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -1021,8 +1021,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "setval() name argument must be TEXT, got {:?}",
-                            other.data_type()
+                            "setval() name argument must be TEXT, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -1035,8 +1035,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "setval() value argument must be integer, got {:?}",
-                            other.data_type()
+                            "setval() value argument must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -1048,8 +1048,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: format!(
-                                "setval() is_called argument must be BOOL, got {:?}",
-                                other.data_type()
+                                "setval() is_called argument must be BOOL, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -1096,8 +1096,8 @@ fn apply_function_dispatch(
             }
             (other, _) => Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "length() with an encoding takes bytea, got {:?}",
-                    other.data_type()
+                    "length() with an encoding takes bytea, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             }),
         },
@@ -1227,8 +1227,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "octet_length() needs text or bytea, got {:?}",
-                        other.data_type()
+                        "octet_length() needs text or bytea, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -1334,8 +1334,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "overlay(): source must be text, got {:?}",
-                            other.data_type()
+                            "overlay(): source must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -1345,8 +1345,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "overlay(): replacement must be text, got {:?}",
-                            other.data_type()
+                            "overlay(): replacement must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -1358,8 +1358,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "overlay(): start must be integer, got {:?}",
-                            other.data_type()
+                            "overlay(): start must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -1378,8 +1378,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "overlay(): length must be integer, got {:?}",
-                                other.data_type()
+                                "overlay(): length must be integer, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -1423,8 +1423,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "get_byte(): needs bytea, got {:?}",
-                            other.data_type()
+                            "get_byte(): needs bytea, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -1487,8 +1487,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "get_bit(): needs bytea, got {:?}",
-                            other.data_type()
+                            "get_bit(): needs bytea, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -1532,8 +1532,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "set_byte(): needs bytea, got {:?}",
-                            other.data_type()
+                            "set_byte(): needs bytea, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -1632,8 +1632,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "set_bit(): needs bytea, got {:?}",
-                            other.data_type()
+                            "set_bit(): needs bytea, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -1895,8 +1895,8 @@ fn apply_function_dispatch(
             let Some(elems) = crate::eval::values::array_elements(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "array_to_json(): needs array, got {:?}",
-                        args[0].data_type()
+                        "array_to_json(): needs array, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
                     ),
                 });
             };
@@ -2262,8 +2262,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "{name}(): argument must be a transaction id, got {:?}",
-                            other.data_type()
+                            "{name}(): argument must be a transaction id, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -2343,8 +2343,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "{name}() needs jsonb, got {:?}",
-                        other.data_type()
+                        "{name}() needs jsonb, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -2461,8 +2461,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "{name}() needs jsonb, got {:?}",
-                        other.data_type()
+                        "{name}() needs jsonb, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -2545,8 +2545,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "jsonb_pretty() needs jsonb, got {:?}",
-                        other.data_type()
+                        "jsonb_pretty() needs jsonb, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -2585,8 +2585,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "{name}() needs jsonb/json, got {:?}",
-                        other.data_type()
+                        "{name}() needs jsonb/json, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -2632,8 +2632,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "{name}() needs jsonb/json, got {:?}",
-                        other.data_type()
+                        "{name}() needs jsonb/json, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -2855,8 +2855,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "factorial() needs integer, got {:?}",
-                            other.data_type()
+                            "factorial() needs integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -3002,8 +3002,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "char() needs integer args, got {:?}",
-                                other.data_type()
+                                "char() needs integer args, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -3035,8 +3035,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "chr() needs integer, got {:?}",
-                            other.data_type()
+                            "chr() needs integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -3074,8 +3074,8 @@ fn apply_function_dispatch(
                 Value::Char1(b) => Ok(Value::Int(i32::from(*b))),
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "ascii() needs text, got {:?}",
-                        other.data_type()
+                        "ascii() needs text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -3115,8 +3115,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "initcap() needs text, got {:?}",
-                        other.data_type()
+                        "initcap() needs text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -3157,7 +3157,7 @@ fn apply_function_dispatch(
                 }
                 v => {
                     let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
-                        detail: alloc::format!("ln() needs numeric, got {:?}", v.data_type()),
+                        detail: alloc::format!("ln() needs numeric, got {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
                     })?;
                     if x == 0.0 {
                         return Err(EvalError::TypeMismatch {
@@ -3195,7 +3195,7 @@ fn apply_function_dispatch(
                     }
                     v => {
                         let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
-                            detail: alloc::format!("{name}() needs numeric, got {:?}", v.data_type()),
+                            detail: alloc::format!("{name}() needs numeric, got {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
                         })?;
                         if x == 0.0 {
                             return Err(EvalError::TypeMismatch {
@@ -3274,7 +3274,7 @@ fn apply_function_dispatch(
                 }
                 v => {
                     let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
-                        detail: alloc::format!("exp() needs numeric, got {:?}", v.data_type()),
+                        detail: alloc::format!("exp() needs numeric, got {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
                     })?;
                     Ok(Value::Float(f64_exp(x)))
                 }
@@ -3290,7 +3290,7 @@ fn apply_function_dispatch(
                 Value::Null => Ok(Value::Null),
                 v => {
                     let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
-                        detail: alloc::format!("cbrt() needs numeric, got {:?}", v.data_type()),
+                        detail: alloc::format!("cbrt() needs numeric, got {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
                     })?;
                     // libm::cbrt is the accurate C-libm cube root PG
                     // itself calls — it round-trips perfect cubes
@@ -3325,7 +3325,7 @@ fn apply_function_dispatch(
                 y: (a.y + b.y) / 2.0,
             })),
             v => Err(EvalError::TypeMismatch {
-                detail: alloc::format!("point() not defined for {:?}", v.data_type()),
+                detail: alloc::format!("point() not defined for {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
             }),
         },
         "point" => {
@@ -3442,7 +3442,7 @@ fn apply_function_dispatch(
             Value::Null => Ok(Value::Null),
             Value::PgBox(ur, ll) => Ok(Value::Lseg(*ur, *ll)),
             v => Err(EvalError::TypeMismatch {
-                detail: alloc::format!("diagonal() not defined for {:?}", v.data_type()),
+                detail: alloc::format!("diagonal() not defined for {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
             }),
         },
         // bound_box(box, box) — the smallest box enclosing both.
@@ -3511,7 +3511,7 @@ fn apply_function_dispatch(
                 i32::try_from(points.len()).unwrap_or(i32::MAX),
             )),
             v => Err(EvalError::TypeMismatch {
-                detail: alloc::format!("npoints() not defined for {:?}", v.data_type()),
+                detail: alloc::format!("npoints() not defined for {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
             }),
         },
         // Geometric accessors over box / circle / lseg. (`length(lseg)` is
@@ -3595,7 +3595,7 @@ fn apply_function_dispatch(
                 ("isvertical", Value::Lseg(a, b)) => Ok(Value::Bool(a.x == b.x)),
                 ("ishorizontal", Value::Lseg(a, b)) => Ok(Value::Bool(a.y == b.y)),
                 (n, v) => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("{n}() not defined for {:?}", v.data_type()),
+                    detail: alloc::format!("{n}() not defined for {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
                 }),
             }
         }
@@ -3790,8 +3790,8 @@ fn apply_function_dispatch(
                     Value::BigInt(n) => Ok(*n),
                     other => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "gcd/lcm need integer inputs, got {:?}",
-                            other.data_type()
+                            "gcd/lcm need integer inputs, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 }
@@ -3838,8 +3838,8 @@ fn apply_function_dispatch(
                     Value::BigInt(n) => Ok(*n),
                     other => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "lcm() needs integer inputs, got {:?}",
-                            other.data_type()
+                            "lcm() needs integer inputs, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 }
@@ -3884,8 +3884,8 @@ fn apply_function_dispatch(
                 v => {
                     let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "radians() needs numeric, got {:?}",
-                            v.data_type()
+                            "radians() needs numeric, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(v.data_type())
                         ),
                     })?;
                     Ok(Value::Float(x * core::f64::consts::PI / 180.0))
@@ -3903,8 +3903,8 @@ fn apply_function_dispatch(
                 v => {
                     let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "degrees() needs numeric, got {:?}",
-                            v.data_type()
+                            "degrees() needs numeric, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(v.data_type())
                         ),
                     })?;
                     Ok(Value::Float(x * 180.0 / core::f64::consts::PI))
@@ -3924,7 +3924,7 @@ fn apply_function_dispatch(
                 Value::Int(n) => Ok(Value::text(alloc::format!("{:x}", *n as u32))),
                 Value::BigInt(n) => Ok(Value::text(alloc::format!("{:x}", *n as u64))),
                 other => Err(EvalError::TypeMismatch {
-                    detail: format!("to_hex() needs int/bigint, got {:?}", other.data_type()),
+                    detail: format!("to_hex() needs int/bigint, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                 }),
             }
         }
@@ -3951,7 +3951,7 @@ fn apply_function_dispatch(
                     alloc::format!("{:b}", *n as u64)
                 })),
                 other => Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() needs int/bigint, got {:?}", other.data_type()),
+                    detail: format!("{name}() needs int/bigint, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                 }),
             }
         }
@@ -3980,8 +3980,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "gen_random_bytes(): needs integer, got {:?}",
-                            other.data_type()
+                            "gen_random_bytes(): needs integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -4050,8 +4050,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "gen_salt(): type must be text, got {:?}",
-                            other.data_type()
+                            "gen_salt(): type must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -4231,8 +4231,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "hmac(): data must be text or bytea, got {:?}",
-                            other.data_type()
+                            "hmac(): data must be text or bytea, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -4243,8 +4243,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "hmac(): key must be text or bytea, got {:?}",
-                            other.data_type()
+                            "hmac(): key must be text or bytea, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -4254,8 +4254,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "hmac(): type must be text, got {:?}",
-                            other.data_type()
+                            "hmac(): type must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -4340,8 +4340,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "digest(): data must be text or bytea, got {:?}",
-                            other.data_type()
+                            "digest(): data must be text or bytea, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -4351,8 +4351,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "digest(): type must be text, got {:?}",
-                            other.data_type()
+                            "digest(): type must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -4422,8 +4422,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "md5() needs text or bytea, got {:?}",
-                            other.data_type()
+                            "md5() needs text or bytea, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -4469,8 +4469,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "to_base64() needs text or bytea, got {:?}",
-                        other.data_type()
+                        "to_base64() needs text or bytea, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -4500,8 +4500,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "from_base64() needs text, got {:?}",
-                        other.data_type()
+                        "from_base64() needs text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -4523,8 +4523,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "sha() needs text or bytea, got {:?}",
-                            other.data_type()
+                            "sha() needs text or bytea, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -4553,8 +4553,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "sha2() needs text or bytea, got {:?}",
-                            other.data_type()
+                            "sha2() needs text or bytea, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -4566,8 +4566,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "sha2() bits must be integer, got {:?}",
-                            other.data_type()
+                            "sha2() bits must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -4617,7 +4617,7 @@ fn apply_function_dispatch(
                 }
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!("sha1() needs text or bytea, got {:?}", other.data_type()),
+                        detail: format!("sha1() needs text or bytea, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                     });
                 }
             };
@@ -4649,8 +4649,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "{name}() needs text or bytea, got {:?}",
-                            other.data_type()
+                            "{name}() needs text or bytea, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -4711,8 +4711,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "bit_count() needs integer, bit or bytea, got {:?}",
-                        other.data_type()
+                        "bit_count() needs integer, bit or bytea, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -4758,8 +4758,8 @@ fn apply_function_dispatch(
                 Value::Char1(_) => Ok(Value::Int(8)),
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "bit_length() needs text or bytea, got {:?}",
-                        other.data_type()
+                        "bit_length() needs text or bytea, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -4793,8 +4793,8 @@ fn apply_function_dispatch(
             let Some(len) = array_len(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "cardinality() arg must be an array, got {:?}",
-                        args[0].data_type()
+                        "cardinality() arg must be an array, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
                     ),
                 });
             };
@@ -4817,8 +4817,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "array_fill(): dimensions must be int[], got {:?}",
-                            other.data_type()
+                            "array_fill(): dimensions must be int[], got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -4844,8 +4844,8 @@ fn apply_function_dispatch(
                     )),
                     other => Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "array_fill(): unsupported 2-D element type {:?}",
-                            other.data_type()
+                            "array_fill(): unsupported 2-D element type {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 };
@@ -4869,8 +4869,8 @@ fn apply_function_dispatch(
                 Value::Text(s) => Ok(Value::TextArray(alloc::vec![Some(s.to_string()); n])),
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "array_fill(): unsupported element type {:?}",
-                        other.data_type()
+                        "array_fill(): unsupported element type {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -4891,8 +4891,8 @@ fn apply_function_dispatch(
                 _ => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "array_length() second arg must be integer, got {:?}",
-                            args[1].data_type()
+                            "array_length() second arg must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(args[1].data_type())
                         ),
                     });
                 }
@@ -4908,8 +4908,8 @@ fn apply_function_dispatch(
             let Some(len) = array_len(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "array_length() first arg must be an array, got {:?}",
-                        args[0].data_type()
+                        "array_length() first arg must be an array, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
                     ),
                 });
             };
@@ -4945,8 +4945,8 @@ fn apply_function_dispatch(
                 _ => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "{name}() second arg must be integer, got {:?}",
-                            args[1].data_type()
+                            "{name}() second arg must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(args[1].data_type())
                         ),
                     });
                 }
@@ -4964,8 +4964,8 @@ fn apply_function_dispatch(
             let Some(len) = array_len(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "{name}() first arg must be an array, got {:?}",
-                        args[0].data_type()
+                        "{name}() first arg must be an array, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
                     ),
                 });
             };
@@ -4997,8 +4997,8 @@ fn apply_function_dispatch(
                     Some(_) => Ok(Value::Int(1)),
                     None => Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "array_ndims() needs array, got {:?}",
-                            other.data_type()
+                            "array_ndims() needs array, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 },
@@ -5020,8 +5020,8 @@ fn apply_function_dispatch(
             let Some(len) = array_len(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "array_dims() needs array, got {:?}",
-                        args[0].data_type()
+                        "array_dims() needs array, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
                     ),
                 });
             };
@@ -5063,8 +5063,8 @@ fn apply_function_dispatch(
                         other => {
                             return Err(EvalError::TypeMismatch {
                                 detail: format!(
-                                    "array_position() start must be an integer, got {:?}",
-                                    other.data_type()
+                                    "array_position() start must be an integer, got {}",
+                                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                                 ),
                             });
                         }
@@ -5088,8 +5088,8 @@ fn apply_function_dispatch(
             let Some(len) = array_len(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "array_position() first arg must be an array, got {:?}",
-                        args[0].data_type()
+                        "array_position() first arg must be an array, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
                     ),
                 });
             };
@@ -5148,8 +5148,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "array_reverse() needs array, got {:?}",
-                        other.data_type()
+                        "array_reverse() needs array, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -5173,8 +5173,8 @@ fn apply_function_dispatch(
                     Some(Value::Bool(b)) => Ok(Some(*b)),
                     Some(other) => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "array_sort() flag must be boolean, got {:?}",
-                            other.data_type()
+                            "array_sort() flag must be boolean, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 }
@@ -5226,8 +5226,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "array_sort() needs array, got {:?}",
-                        other.data_type()
+                        "array_sort() needs array, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -5276,8 +5276,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "array_shuffle() needs array, got {:?}",
-                        other.data_type()
+                        "array_shuffle() needs array, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -5302,8 +5302,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "array_sample(): n must be integer, got {:?}",
-                            other.data_type()
+                            "array_sample(): n must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -5361,8 +5361,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "array_sample() needs array, got {:?}",
-                        other.data_type()
+                        "array_sample() needs array, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -5387,8 +5387,8 @@ fn apply_function_dispatch(
             let Some(len) = array_len(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "array_remove() first arg must be an array, got {:?}",
-                        args[0].data_type()
+                        "array_remove() first arg must be an array, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
                     ),
                 });
             };
@@ -5403,8 +5403,8 @@ fn apply_function_dispatch(
             }
             array_rebuild(&args[0], &kept).ok_or_else(|| EvalError::TypeMismatch {
                 detail: format!(
-                    "array_remove(): value of type {:?} does not fit the array's element type",
-                    args[1].data_type()
+                    "array_remove(): value of type {} does not fit the array's element type",
+                    crate::conversions::pg_type_name_for_error_opt(args[1].data_type())
                 ),
             })
         }
@@ -5424,8 +5424,8 @@ fn apply_function_dispatch(
             let Some(len) = array_len(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "array_replace() first arg must be an array, got {:?}",
-                        args[0].data_type()
+                        "array_replace() first arg must be an array, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
                     ),
                 });
             };
@@ -5440,8 +5440,8 @@ fn apply_function_dispatch(
             }
             array_rebuild(&args[0], &out).ok_or_else(|| EvalError::TypeMismatch {
                 detail: format!(
-                    "array_replace(): value of type {:?} does not fit the array's element type",
-                    args[2].data_type()
+                    "array_replace(): value of type {} does not fit the array's element type",
+                    crate::conversions::pg_type_name_for_error_opt(args[2].data_type())
                 ),
             })
         }
@@ -5457,8 +5457,8 @@ fn apply_function_dispatch(
             let Some(len) = array_len(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "array_positions() first arg must be an array, got {:?}",
-                        args[0].data_type()
+                        "array_positions() first arg must be an array, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
                     ),
                 });
             };
@@ -5508,8 +5508,8 @@ fn apply_function_dispatch(
                     Value::BigInt(n) => Ok(Some(*n)),
                     other => Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "array subscript must be integer, got {:?}",
-                            other.data_type()
+                            "array subscript must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 }
@@ -5519,8 +5519,8 @@ fn apply_function_dispatch(
             let Some(src_len) = array_len(src) else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "slice assignment needs an array source, got {:?}",
-                        src.data_type()
+                        "slice assignment needs an array source, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(src.data_type())
                     ),
                 });
             };
@@ -5567,7 +5567,7 @@ fn apply_function_dispatch(
                 }
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!("array subscript must be integer, got {:?}", other.data_type()),
+                        detail: format!("array subscript must be integer, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                     });
                 }
             };
@@ -5608,7 +5608,7 @@ fn apply_function_dispatch(
                         Value::Null => None,
                         Value::Text(s) => Some(s.to_string()),
                         other => return Err(EvalError::TypeMismatch {
-                            detail: format!("cannot assign {:?} to a text[] element", other.data_type()),
+                            detail: format!("cannot assign {} to a text[] element", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                         }),
                     };
                     Ok(Value::TextArray(out))
@@ -5619,7 +5619,7 @@ fn apply_function_dispatch(
                         out.resize(pos + 1, None);
                     }
                     out[pos] = as_i32(val).ok_or_else(|| EvalError::TypeMismatch {
-                        detail: format!("cannot assign {:?} to an int[] element", val.data_type()),
+                        detail: format!("cannot assign {} to an int[] element", crate::conversions::pg_type_name_for_error_opt(val.data_type())),
                     })?;
                     Ok(Value::IntArray(out))
                 }
@@ -5629,7 +5629,7 @@ fn apply_function_dispatch(
                         out.resize(pos + 1, None);
                     }
                     out[pos] = as_i64(val).ok_or_else(|| EvalError::TypeMismatch {
-                        detail: format!("cannot assign {:?} to a bigint[] element", val.data_type()),
+                        detail: format!("cannot assign {} to a bigint[] element", crate::conversions::pg_type_name_for_error_opt(val.data_type())),
                     })?;
                     Ok(Value::BigIntArray(out))
                 }
@@ -5653,12 +5653,12 @@ fn apply_function_dispatch(
                         }
                         Value::Null => Ok(Value::Null),
                         other => Err(EvalError::TypeMismatch {
-                            detail: format!("cannot infer array type for element {:?}", other.data_type()),
+                            detail: format!("cannot infer array type for element {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                         }),
                     }
                 }
                 other => Err(EvalError::TypeMismatch {
-                    detail: format!("array element assignment target must be an array, got {:?}", other.data_type()),
+                    detail: format!("array element assignment target must be an array, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                 }),
             }
         }
@@ -5729,8 +5729,8 @@ fn apply_function_dispatch(
                     Value::BigInt(n) => Ok(push_bigint(&[], Some(*n))),
                     other => Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "{name}(): unsupported element type {:?}",
-                            other.data_type()
+                            "{name}(): unsupported element type {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 },
@@ -5739,8 +5739,8 @@ fn apply_function_dispatch(
                     Value::Text(s) => Ok(push_text(items, Some(s.to_string()))),
                     other => Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "{name}(): element type {:?} doesn't match TextArray",
-                            other.data_type()
+                            "{name}(): element type {} doesn't match TextArray",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 },
@@ -5748,8 +5748,8 @@ fn apply_function_dispatch(
                     Some(el) => Ok(push_int(items, el)),
                     None => Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "{name}(): element type {:?} doesn't match IntArray",
-                            el_v.data_type()
+                            "{name}(): element type {} doesn't match IntArray",
+                            crate::conversions::pg_type_name_for_error_opt(el_v.data_type())
                         ),
                     }),
                 },
@@ -5757,15 +5757,15 @@ fn apply_function_dispatch(
                     Some(el) => Ok(push_bigint(items, el)),
                     None => Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "{name}(): element type {:?} doesn't match BigIntArray",
-                            el_v.data_type()
+                            "{name}(): element type {} doesn't match BigIntArray",
+                            crate::conversions::pg_type_name_for_error_opt(el_v.data_type())
                         ),
                     }),
                 },
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "{name}() array arg must be an array, got {:?}",
-                        other.data_type()
+                        "{name}() array arg must be an array, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -5869,8 +5869,8 @@ fn apply_function_dispatch(
                 Some(other) => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "{name}() bounds must be text, got {:?}",
-                            other.data_type()
+                            "{name}() bounds must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -5932,8 +5932,8 @@ fn apply_function_dispatch(
                     (_, other) => {
                         return Err(EvalError::TypeMismatch {
                             detail: format!(
-                                "{name}(): bound type {:?} doesn't match the range",
-                                other.data_type()
+                                "{name}(): bound type {} doesn't match the range",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -6039,8 +6039,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: format!(
-                                "{name}() arguments must be ranges, got {:?}",
-                                other.data_type()
+                                "{name}() arguments must be ranges, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -6077,8 +6077,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "generate_subscripts() first arg must be an array, got {:?}",
-                            other.data_type()
+                            "generate_subscripts() first arg must be an array, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -6090,8 +6090,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "generate_subscripts() dim must be integer, got {:?}",
-                            other.data_type()
+                            "generate_subscripts() dim must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -6102,8 +6102,8 @@ fn apply_function_dispatch(
                 Some(other) => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "generate_subscripts() reverse must be boolean, got {:?}",
-                            other.data_type()
+                            "generate_subscripts() reverse must be boolean, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -6137,8 +6137,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "trim_array() second arg must be integer, got {:?}",
-                            other.data_type()
+                            "trim_array() second arg must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -6150,8 +6150,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "trim_array() first arg must be an array, got {:?}",
-                            other.data_type()
+                            "trim_array() first arg must be an array, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -6304,8 +6304,8 @@ fn apply_function_dispatch(
                             other => {
                                 return Err(EvalError::TypeMismatch {
                                     detail: format!(
-                                        "substring() needs text or bytea, got {:?}",
-                                        other.data_type()
+                                        "substring() needs text or bytea, got {}",
+                                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                                     ),
                                 });
                             }
@@ -6387,8 +6387,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "substring() needs text or bytea, got {:?}",
-                        other.data_type()
+                        "substring() needs text or bytea, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -6485,8 +6485,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "hex() needs int/text/bytea, got {:?}",
-                        other.data_type()
+                        "hex() needs int/text/bytea, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -6520,8 +6520,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "unhex() needs text, got {:?}",
-                        other.data_type()
+                        "unhex() needs text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -6545,8 +6545,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "conv() needs text/int, got {:?}",
-                            other.data_type()
+                            "conv() needs text/int, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -6626,8 +6626,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "{name}() needs integer, got {:?}",
-                            other.data_type()
+                            "{name}() needs integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -6690,8 +6690,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "ord() needs text, got {:?}",
-                        other.data_type()
+                        "ord() needs text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -6720,7 +6720,7 @@ fn apply_function_dispatch(
                     .and_then(|s| s.upper.as_ref())
                     .map_or(Value::Null, |v| (**v).clone())),
                 other => Err(EvalError::TypeMismatch {
-                    detail: format!("upper() needs text, got {:?}", other.data_type()),
+                    detail: format!("upper() needs text, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                 }),
             }
         }
@@ -6756,7 +6756,7 @@ fn apply_function_dispatch(
                     .and_then(|s| s.lower.as_ref())
                     .map_or(Value::Null, |v| (**v).clone())),
                 other => Err(EvalError::TypeMismatch {
-                    detail: format!("lower() needs text, got {:?}", other.data_type()),
+                    detail: format!("lower() needs text, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                 }),
             }
         }
@@ -6798,7 +6798,7 @@ fn apply_function_dispatch(
                     scale: *scale,
                  kind: spg_storage::NumericKind::Finite }),
                 other => Err(EvalError::TypeMismatch {
-                    detail: format!("abs() needs numeric, got {:?}", other.data_type()),
+                    detail: format!("abs() needs numeric, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                 }),
             }
         }
@@ -6851,8 +6851,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "date_bin(): stride must be interval, got {:?}",
-                            other.data_type()
+                            "date_bin(): stride must be interval, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -6879,8 +6879,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "date_bin(): ts must be timestamp, got {:?}",
-                            other.data_type()
+                            "date_bin(): ts must be timestamp, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -6891,8 +6891,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "date_bin(): origin must be timestamp, got {:?}",
-                            other.data_type()
+                            "date_bin(): origin must be timestamp, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -6939,8 +6939,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "{name}() needs date, got {:?}",
-                            other.data_type()
+                            "{name}() needs date, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -7017,8 +7017,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "quote() needs text, got {:?}",
-                        other.data_type()
+                        "quote() needs text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -7044,8 +7044,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "export_set() bits must be integer, got {:?}",
-                            other.data_type()
+                            "export_set() bits must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -7055,8 +7055,8 @@ fn apply_function_dispatch(
                     Value::Text(s) => Ok(s.as_ref().into()),
                     other => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "export_set() {what} must be text, got {:?}",
-                            other.data_type()
+                            "export_set() {what} must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 }
@@ -7075,8 +7075,8 @@ fn apply_function_dispatch(
                 Some(other) => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "export_set() n_bits must be integer, got {:?}",
-                            other.data_type()
+                            "export_set() n_bits must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -7110,8 +7110,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "make_set() bits must be integer, got {:?}",
-                            other.data_type()
+                            "make_set() bits must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -7152,8 +7152,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "{name}() needs date, got {:?}",
-                            other.data_type()
+                            "{name}() needs date, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -7221,8 +7221,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "{name}() needs time, got {:?}",
-                            other.data_type()
+                            "{name}() needs time, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -7318,8 +7318,8 @@ fn apply_function_dispatch(
             let Some(base) = mysql_datetime_us(&args[0]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "timestamp(): first argument must be a date or datetime, got {:?}",
-                        args[0].data_type()
+                        "timestamp(): first argument must be a date or datetime, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
                     ),
                 });
             };
@@ -7327,8 +7327,8 @@ fn apply_function_dispatch(
             let Some(offset) = mysql_time_operand_us(&args[1]) else {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "timestamp(): second argument must be a time, got {:?}",
-                        args[1].data_type()
+                        "timestamp(): second argument must be a time, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(args[1].data_type())
                     ),
                 });
             };
@@ -7396,8 +7396,8 @@ fn apply_function_dispatch(
                     }
                     other => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "{what}: needs time, got {:?}",
-                            other.data_type()
+                            "{what}: needs time, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 }
@@ -7418,8 +7418,8 @@ fn apply_function_dispatch(
                         other => {
                             return Err(EvalError::TypeMismatch {
                                 detail: alloc::format!(
-                                    "sec_to_time() needs integer, got {:?}",
-                                    other.data_type()
+                                    "sec_to_time() needs integer, got {}",
+                                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                                 ),
                             });
                         }
@@ -7553,8 +7553,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "{name}() needs date, got {:?}",
-                            other.data_type()
+                            "{name}() needs date, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -7601,8 +7601,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "from_days() needs integer, got {:?}",
-                        other.data_type()
+                        "from_days() needs integer, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -7667,8 +7667,8 @@ fn apply_function_dispatch(
                         }),
                     other => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "datediff() needs dates, got {:?}",
-                            other.data_type()
+                            "datediff() needs dates, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 }
@@ -7717,8 +7717,8 @@ fn apply_function_dispatch(
                 Value::Interval { .. } => Ok(Value::Bool(true)),
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "isfinite() needs date/timestamp/interval, got {:?}",
-                        other.data_type()
+                        "isfinite() needs date/timestamp/interval, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -7741,8 +7741,8 @@ fn apply_function_dispatch(
                     Value::BigInt(n) => Ok(*n),
                     other => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "make_date(): needs int, got {:?}",
-                            other.data_type()
+                            "make_date(): needs int, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 }
@@ -7872,8 +7872,8 @@ fn apply_function_dispatch(
                     Value::BigInt(n) => Ok(*n),
                     other => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "make_timestamp(): needs int, got {:?}",
-                            other.data_type()
+                            "make_timestamp(): needs int, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 }
@@ -7976,8 +7976,8 @@ fn apply_function_dispatch(
                     }
                     Some(other) => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "make_interval(): needs numeric, got {:?}",
-                            other.data_type()
+                            "make_interval(): needs numeric, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 }
@@ -8114,8 +8114,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "{name}() second arg must be days or interval, got {:?}",
-                            other.data_type()
+                            "{name}() second arg must be days or interval, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -8206,8 +8206,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "to_number(): needs text, got {:?}",
-                            other.data_type()
+                            "to_number(): needs text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -8309,8 +8309,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "soundex(): needs text, got {:?}",
-                            other.data_type()
+                            "soundex(): needs text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -8376,8 +8376,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "difference(): needs text, got {:?}",
-                                other.data_type()
+                                "difference(): needs text, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -8458,8 +8458,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "levenshtein(): needs text, got {:?}",
-                            other.data_type()
+                            "levenshtein(): needs text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -8470,8 +8470,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "levenshtein(): needs text, got {:?}",
-                            other.data_type()
+                            "levenshtein(): needs text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -8542,8 +8542,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "pg_bytes_pretty(): needs numeric, got {:?}",
-                            other.data_type()
+                            "pg_bytes_pretty(): needs numeric, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -8607,8 +8607,8 @@ fn apply_function_dispatch(
                 Value::BigInt(n) => Ok(Value::Int(*n as i32)),
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "hashint4() needs integer, got {:?}",
-                        other.data_type()
+                        "hashint4() needs integer, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -8631,8 +8631,8 @@ fn apply_function_dispatch(
                 Value::SmallInt(n) => Ok(Value::Int(*n as i32)),
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "hashint8() needs integer, got {:?}",
-                        other.data_type()
+                        "hashint8() needs integer, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -8656,8 +8656,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "hashtext() needs text, got {:?}",
-                        other.data_type()
+                        "hashtext() needs text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -8680,8 +8680,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "hashbytea() needs bytea, got {:?}",
-                        other.data_type()
+                        "hashbytea() needs bytea, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -8716,8 +8716,8 @@ fn apply_function_dispatch(
                 Value::BigInt(n) => Ok(Value::text(alloc::format!("{n}"))),
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "regclass_to_text(): needs text or int, got {:?}",
-                        other.data_type()
+                        "regclass_to_text(): needs text or int, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -8747,8 +8747,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "xmlcomment(): needs text, got {:?}",
-                        other.data_type()
+                        "xmlcomment(): needs text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -8788,8 +8788,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "xml_is_well_formed(): needs text, got {:?}",
-                        other.data_type()
+                        "xml_is_well_formed(): needs text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -8825,8 +8825,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "xmltext(): needs text, got {:?}",
-                        other.data_type()
+                        "xmltext(): needs text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -8964,8 +8964,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "xmlconcat(): needs xml text, got {:?}",
-                                other.data_type()
+                                "xmlconcat(): needs xml text, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -9127,8 +9127,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "pg_encoding_max_length() needs int encoding id, got {:?}",
-                        other.data_type()
+                        "pg_encoding_max_length() needs int encoding id, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -9155,8 +9155,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "unistr(): needs text, got {:?}",
-                            other.data_type()
+                            "unistr(): needs text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -9303,8 +9303,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "parse_ident(): needs text, got {:?}",
-                            other.data_type()
+                            "parse_ident(): needs text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -9429,8 +9429,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "pg_size_bytes() needs text, got {:?}",
-                            other.data_type()
+                            "pg_size_bytes() needs text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -9584,8 +9584,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "to_timestamp(): needs numeric epoch, got {:?}",
-                        other.data_type()
+                        "to_timestamp(): needs numeric epoch, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -9649,8 +9649,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "format() decimals must be integer, got {:?}",
-                            other.data_type()
+                            "format() decimals must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -9972,8 +9972,8 @@ fn apply_function_dispatch(
                 }
                 Some(other) => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "rand() seed must be integer, got {:?}",
-                        other.data_type()
+                        "rand() seed must be integer, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -10142,8 +10142,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "{name}() needs numeric, got {:?}",
-                            other.data_type()
+                            "{name}() needs numeric, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -10188,8 +10188,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "cot() needs numeric, got {:?}",
-                            other.data_type()
+                            "cot() needs numeric, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -10213,8 +10213,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "log2() needs numeric, got {:?}",
-                            other.data_type()
+                            "log2() needs numeric, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -10249,8 +10249,8 @@ fn apply_function_dispatch(
                     }
                     other => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "atan2(): needs numeric, got {:?}",
-                            other.data_type()
+                            "atan2(): needs numeric, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 }
@@ -10284,8 +10284,8 @@ fn apply_function_dispatch(
                         }
                         other => Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "atan2d(): needs numeric, got {:?}",
-                                other.data_type()
+                                "atan2d(): needs numeric, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         }),
                     }
@@ -10311,8 +10311,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "{name}() needs numeric, got {:?}",
-                            other.data_type()
+                            "{name}() needs numeric, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -10525,8 +10525,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "setseed() needs numeric, got {:?}",
-                            other.data_type()
+                            "setseed() needs numeric, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -10579,8 +10579,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "random_normal(): mean must be numeric, got {:?}",
-                                other.data_type()
+                                "random_normal(): mean must be numeric, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -10601,8 +10601,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "random_normal(): stddev must be numeric, got {:?}",
-                                other.data_type()
+                                "random_normal(): stddev must be numeric, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -10723,8 +10723,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "uuid_generate_v5(): namespace must be uuid, got {:?}",
-                            other.data_type()
+                            "uuid_generate_v5(): namespace must be uuid, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -10735,8 +10735,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "uuid_generate_v5(): name must be text, got {:?}",
-                            other.data_type()
+                            "uuid_generate_v5(): name must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -10768,8 +10768,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "uuid_generate_v3(): namespace must be uuid, got {:?}",
-                            other.data_type()
+                            "uuid_generate_v3(): namespace must be uuid, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -10780,8 +10780,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "uuid_generate_v3(): name must be text, got {:?}",
-                            other.data_type()
+                            "uuid_generate_v3(): name must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -10829,8 +10829,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "{name}() shift must be an interval, got {:?}",
-                                other.data_type()
+                                "{name}() shift must be an interval, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -10886,8 +10886,8 @@ fn apply_function_dispatch(
                 Value::Uuid(b) => Ok(Value::Int(i32::from(b[6] >> 4))),
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "uuid_extract_version() needs uuid, got {:?}",
-                        other.data_type()
+                        "uuid_extract_version() needs uuid, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -10920,8 +10920,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "uuid_extract_timestamp() needs uuid, got {:?}",
-                        other.data_type()
+                        "uuid_extract_timestamp() needs uuid, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -10958,7 +10958,7 @@ fn apply_function_dispatch(
                     kind: spg_storage::NumericKind::Finite,
                 }),
                 other => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("sign() needs numeric, got {:?}", other.data_type()),
+                    detail: alloc::format!("sign() needs numeric, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                 }),
             }
         }
@@ -10993,7 +10993,7 @@ fn apply_function_dispatch(
                 }
                 v => {
                     let x = value_to_f64(v).ok_or_else(|| EvalError::TypeMismatch {
-                        detail: alloc::format!("sqrt() needs numeric, got {:?}", v.data_type()),
+                        detail: alloc::format!("sqrt() needs numeric, got {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
                     })?;
                     if x < 0.0 {
                         return Err(EvalError::TypeMismatch {
@@ -11440,8 +11440,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "{name}() needs numeric, got {:?}",
-                            other.data_type()
+                            "{name}() needs numeric, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -11524,7 +11524,7 @@ fn apply_function_dispatch(
                     Value::Int(x) => Ok(i64::from(*x)),
                     Value::BigInt(x) => Ok(*x),
                     other => Err(EvalError::TypeMismatch {
-                        detail: alloc::format!("mod() needs integer, got {:?}", other.data_type()),
+                        detail: alloc::format!("mod() needs integer, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                     }),
                 }
             };
@@ -11603,7 +11603,7 @@ fn apply_function_dispatch(
             })),
             Value::Int(n) => Ok(Value::BigInt(i64::from(*n) + if name == "int8inc" { 1 } else { -1 })),
             other => Err(EvalError::TypeMismatch {
-                detail: alloc::format!("{name}() takes a bigint, got {:?}", other.data_type()),
+                detail: alloc::format!("{name}() takes a bigint, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
             }),
         },
         // `nameconcatoid('abc', 42)` is `abc_42` — PG builds a unique name
@@ -11799,8 +11799,8 @@ fn apply_function_dispatch(
                 Some(other) => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "locate() pos must be integer, got {:?}",
-                            other.data_type()
+                            "locate() pos must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -11879,8 +11879,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "substring_index() count must be integer, got {:?}",
-                            other.data_type()
+                            "substring_index() count must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -11973,8 +11973,8 @@ fn apply_function_dispatch(
                     None => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "elt() index must be integer, got {:?}",
-                                other.data_type()
+                                "elt() index must be integer, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -11982,8 +11982,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "elt() index must be integer, got {:?}",
-                            other.data_type()
+                            "elt() index must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -12040,8 +12040,8 @@ fn apply_function_dispatch(
             }
             Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "field() needs text, got {:?}",
-                    args[0].data_type()
+                    "field() needs text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
                 ),
             })
         }
@@ -12084,8 +12084,8 @@ fn apply_function_dispatch(
                 Some(other) => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "space() needs integer, got {:?}",
-                            other.data_type()
+                            "space() needs integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -12217,8 +12217,8 @@ fn apply_function_dispatch(
                     }
                     other => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "trunc() needs numeric, got {:?}",
-                            other.data_type()
+                            "trunc() needs numeric, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 },
@@ -12237,8 +12237,8 @@ fn apply_function_dispatch(
                         other => {
                             return Err(EvalError::TypeMismatch {
                                 detail: alloc::format!(
-                                    "trunc(): scale must be integer, got {:?}",
-                                    other.data_type()
+                                    "trunc(): scale must be integer, got {}",
+                                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                                 ),
                             });
                         }
@@ -12319,8 +12319,8 @@ fn apply_function_dispatch(
                         other => {
                             return Err(EvalError::TypeMismatch {
                                 detail: alloc::format!(
-                                    "trunc() needs numeric x, got {:?}",
-                                    other.data_type()
+                                    "trunc() needs numeric x, got {}",
+                                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                                 ),
                             });
                         }
@@ -12371,8 +12371,8 @@ fn apply_function_dispatch(
                     }
                     other => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "round() needs numeric, got {:?}",
-                            other.data_type()
+                            "round() needs numeric, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 },
@@ -12391,8 +12391,8 @@ fn apply_function_dispatch(
                         other => {
                             return Err(EvalError::TypeMismatch {
                                 detail: alloc::format!(
-                                    "round(): scale must be integer, got {:?}",
-                                    other.data_type()
+                                    "round(): scale must be integer, got {}",
+                                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                                 ),
                             });
                         }
@@ -12486,8 +12486,8 @@ fn apply_function_dispatch(
                         other => {
                             return Err(EvalError::TypeMismatch {
                                 detail: alloc::format!(
-                                    "round() needs numeric x, got {:?}",
-                                    other.data_type()
+                                    "round() needs numeric x, got {}",
+                                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                                 ),
                             });
                         }
@@ -12537,7 +12537,7 @@ fn apply_function_dispatch(
                      kind: spg_storage::NumericKind::Finite })
                 }
                 other => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("ceil() needs numeric, got {:?}", other.data_type()),
+                    detail: alloc::format!("ceil() needs numeric, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                 }),
             }
         }
@@ -12567,7 +12567,7 @@ fn apply_function_dispatch(
                      kind: spg_storage::NumericKind::Finite })
                 }
                 other => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("floor() needs numeric, got {:?}", other.data_type()),
+                    detail: alloc::format!("floor() needs numeric, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                 }),
             }
         }
@@ -12680,8 +12680,8 @@ fn apply_function_dispatch(
                 )),
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "casefold() needs text, got {:?}",
-                        other.data_type()
+                        "casefold() needs text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -12711,8 +12711,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "reverse() needs text, got {:?}",
-                        other.data_type()
+                        "reverse() needs text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -12734,8 +12734,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "repeat(): n must be integer, got {:?}",
-                            other.data_type()
+                            "repeat(): n must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -12784,8 +12784,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "split_part(): n must be integer, got {:?}",
-                            other.data_type()
+                            "split_part(): n must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -13104,8 +13104,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "pg_basetype() needs regtype, got {:?}",
-                        other.data_type()
+                        "pg_basetype() needs regtype, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -13177,8 +13177,8 @@ fn apply_function_dispatch(
                 Value::Text(s) => Ok(Value::text(s.to_string())),
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "json_serialize() needs json, got {:?}",
-                        other.data_type()
+                        "json_serialize() needs json, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -13276,8 +13276,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "{name}() index must be integer, got {:?}",
-                                other.data_type()
+                                "{name}() index must be integer, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -13288,8 +13288,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "{name}() key must be text, got {:?}",
-                                other.data_type()
+                                "{name}() key must be text, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -13332,8 +13332,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "{name}(): path elements must be text, got {:?}",
-                                other.data_type()
+                                "{name}(): path elements must be text, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -13404,8 +13404,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "json_object(): needs text[], got {:?}",
-                                other.data_type()
+                                "json_object(): needs text[], got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -13599,8 +13599,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "json_type() needs json, got {:?}",
-                        other.data_type()
+                        "json_type() needs json, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -13630,8 +13630,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "json_length() needs json, got {:?}",
-                        other.data_type()
+                        "json_length() needs json, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -13678,8 +13678,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "json_keys() needs json, got {:?}",
-                        other.data_type()
+                        "json_keys() needs json, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -13715,8 +13715,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "json_depth() needs json, got {:?}",
-                        other.data_type()
+                        "json_depth() needs json, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -13750,8 +13750,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "json_quote() needs text, got {:?}",
-                        other.data_type()
+                        "json_quote() needs text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -13784,8 +13784,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "json_unquote() needs json, got {:?}",
-                        other.data_type()
+                        "json_unquote() needs json, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -13807,8 +13807,8 @@ fn apply_function_dispatch(
                 Value::Json(s) | Value::Text(s) => Ok(Value::Int(s.len() as i32)),
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "json_storage_size() needs json, got {:?}",
-                        other.data_type()
+                        "json_storage_size() needs json, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -13856,8 +13856,8 @@ fn apply_function_dispatch(
                 Some(other) => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "jsonb_set_lax() treatment must be text, got {:?}",
-                            other.data_type()
+                            "jsonb_set_lax() treatment must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -13918,8 +13918,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "{name}() needs json, got {:?}",
-                            other.data_type()
+                            "{name}() needs json, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -13931,8 +13931,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "{name}() filter must be json, got {:?}",
-                            other.data_type()
+                            "{name}() filter must be json, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -14057,8 +14057,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "{name}() config arg must be text, got {:?}",
-                                other.data_type()
+                                "{name}() config arg must be text, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -14132,8 +14132,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "collations are not supported by type {:?}",
-                        other.data_type()
+                        "collations are not supported by type {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -14393,8 +14393,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "convert_from(): needs bytea, got {:?}",
-                            other.data_type()
+                            "convert_from(): needs bytea, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -14404,8 +14404,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "convert_from(): encoding must be text, got {:?}",
-                            other.data_type()
+                            "convert_from(): encoding must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -14474,8 +14474,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "convert_to(): needs text, got {:?}",
-                            other.data_type()
+                            "convert_to(): needs text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -14485,8 +14485,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "convert_to(): encoding must be text, got {:?}",
-                            other.data_type()
+                            "convert_to(): encoding must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -14550,8 +14550,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "convert(): needs bytea, got {:?}",
-                            other.data_type()
+                            "convert(): needs bytea, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -14561,8 +14561,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "convert(): source encoding must be text, got {:?}",
-                            other.data_type()
+                            "convert(): source encoding must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -14572,8 +14572,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "convert(): destination encoding must be text, got {:?}",
-                            other.data_type()
+                            "convert(): destination encoding must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -14629,8 +14629,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "array_to_string(): delimiter must be text, got {:?}",
-                            other.data_type()
+                            "array_to_string(): delimiter must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -14641,8 +14641,8 @@ fn apply_function_dispatch(
                 Some(other) => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "array_to_string(): null_string must be text, got {:?}",
-                            other.data_type()
+                            "array_to_string(): null_string must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -14658,8 +14658,8 @@ fn apply_function_dispatch(
             let Some(len) = array_len(arr0) else {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "array_to_string(): first arg must be array, got {:?}",
-                        args[0].data_type()
+                        "array_to_string(): first arg must be array, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
                     ),
                 });
             };
@@ -14746,8 +14746,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "strip() needs tsvector text, got {:?}",
-                        other.data_type()
+                        "strip() needs tsvector text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -14774,8 +14774,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "tsvector_length() needs tsvector text, got {:?}",
-                        other.data_type()
+                        "tsvector_length() needs tsvector text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -14803,8 +14803,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "numnode() needs tsquery text, got {:?}",
-                        other.data_type()
+                        "numnode() needs tsquery text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -14839,8 +14839,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "querytree() needs tsquery text, got {:?}",
-                        other.data_type()
+                        "querytree() needs tsquery text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -14868,8 +14868,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "ts_delete() needs lexeme text or text[], got {:?}",
-                            other.data_type()
+                            "ts_delete() needs lexeme text or text[], got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -14901,8 +14901,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "ts_delete() needs tsvector text, got {:?}",
-                        other.data_type()
+                        "ts_delete() needs tsvector text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -14926,8 +14926,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "ts_filter() needs tsvector text, got {:?}",
-                            other.data_type()
+                            "ts_filter() needs tsvector text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -14948,8 +14948,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "ts_filter() needs weight char[], got {:?}",
-                            other.data_type()
+                            "ts_filter() needs weight char[], got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -15020,8 +15020,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "tsvector_to_array() needs tsvector text, got {:?}",
-                        other.data_type()
+                        "tsvector_to_array() needs tsvector text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -15072,8 +15072,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "array_to_tsvector() needs text[], got {:?}",
-                        other.data_type()
+                        "array_to_tsvector() needs text[], got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -15146,8 +15146,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "tsquery_phrase() needs tsquery, got {:?}",
-                                other.data_type()
+                                "tsquery_phrase() needs tsquery, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -15165,8 +15165,8 @@ fn apply_function_dispatch(
                 Some(other) => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "tsquery_phrase() distance must be integer, got {:?}",
-                            other.data_type()
+                            "tsquery_phrase() distance must be integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -15318,8 +15318,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "current_setting(): needs text, got {:?}",
-                            other.data_type()
+                            "current_setting(): needs text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -15737,8 +15737,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "pg_get_serial_sequence(): table must be text, got {:?}",
-                            other.data_type()
+                            "pg_get_serial_sequence(): table must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -15749,8 +15749,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "pg_get_serial_sequence(): column must be text, got {:?}",
-                            other.data_type()
+                            "pg_get_serial_sequence(): column must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -15951,8 +15951,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "pg_size_pretty(): needs numeric, got {:?}",
-                            other.data_type()
+                            "pg_size_pretty(): needs numeric, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -16734,8 +16734,8 @@ fn apply_function_dispatch(
                 Some(other) => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "current_schemas() takes a BOOL, got {:?}",
-                            other.data_type()
+                            "current_schemas() takes a BOOL, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -17079,8 +17079,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "acldefault() objtype must be \"char\", got {:?}",
-                            other.data_type()
+                            "acldefault() objtype must be \"char\", got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -17092,8 +17092,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "acldefault() owner must be an oid, got {:?}",
-                            other.data_type()
+                            "acldefault() owner must be an oid, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -17180,8 +17180,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "makeaclitem() privileges must be text, got {:?}",
-                            other.data_type()
+                            "makeaclitem() privileges must be text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -17411,8 +17411,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "{name}() needs text, got {:?}",
-                            other.data_type()
+                            "{name}() needs text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -17547,8 +17547,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "cash_words() needs money/numeric, got {:?}",
-                            other.data_type()
+                            "cash_words() needs money/numeric, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -17667,8 +17667,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "scale() needs numeric, got {:?}",
-                        other.data_type()
+                        "scale() needs numeric, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -17697,8 +17697,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "min_scale() needs numeric, got {:?}",
-                        other.data_type()
+                        "min_scale() needs numeric, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -17725,8 +17725,8 @@ fn apply_function_dispatch(
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "trim_scale() needs numeric, got {:?}",
-                        other.data_type()
+                        "trim_scale() needs numeric, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 }),
             }
@@ -17790,8 +17790,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "pg_lsn_*(): args must be text, got {:?}",
-                                other.data_type()
+                                "pg_lsn_*(): args must be text, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -17849,8 +17849,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "pg_lsn_hash(): needs text, got {:?}",
-                            other.data_type()
+                            "pg_lsn_hash(): needs text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -18035,8 +18035,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "crc32() needs text or bytea, got {:?}",
-                            other.data_type()
+                            "crc32() needs text or bytea, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -18064,8 +18064,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "crc32c() needs text or bytea, got {:?}",
-                            other.data_type()
+                            "crc32c() needs text or bytea, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -18197,8 +18197,8 @@ fn apply_function_dispatch(
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "pg_wal_lsn_diff(): args must be text, got {:?}",
-                                other.data_type()
+                                "pg_wal_lsn_diff(): args must be text, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });
                     }
@@ -18425,8 +18425,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "{name}() needs range text, got {:?}",
-                            other.data_type()
+                            "{name}() needs range text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -18503,8 +18503,8 @@ fn apply_function_dispatch(
                     }
                     other => Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "range_merge() single-argument form needs a multirange, got {:?}",
-                            other.data_type()
+                            "range_merge() single-argument form needs a multirange, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }),
                 };
@@ -18614,8 +18614,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "pg_partition_root() arg must be TEXT, got {:?}",
-                            other.data_type()
+                            "pg_partition_root() arg must be TEXT, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -18648,8 +18648,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "pg_partition_ancestors() arg must be TEXT, got {:?}",
-                            other.data_type()
+                            "pg_partition_ancestors() arg must be TEXT, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -18694,8 +18694,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "{name}() arg must be TEXT, got {:?}",
-                            other.data_type()
+                            "{name}() arg must be TEXT, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -18724,8 +18724,8 @@ fn apply_function_dispatch(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "{name}() arg must be TEXT, got {:?}",
-                            other.data_type()
+                            "{name}() arg must be TEXT, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
                 }
@@ -18807,7 +18807,7 @@ fn apply_function_dispatch(
                 Value::Text(s) => s.as_ref(),
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!("similarity() needs text, got {:?}", other.data_type()),
+                        detail: format!("similarity() needs text, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                     });
                 }
             };
@@ -18815,7 +18815,7 @@ fn apply_function_dispatch(
                 Value::Text(s) => s.as_ref(),
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!("similarity() needs text, got {:?}", other.data_type()),
+                        detail: format!("similarity() needs text, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                     });
                 }
             };
@@ -18836,7 +18836,7 @@ fn apply_function_dispatch(
                 Value::Text(s) => s.as_ref(),
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!("show_trgm() needs text, got {:?}", other.data_type()),
+                        detail: format!("show_trgm() needs text, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                     });
                 }
             };
@@ -19407,9 +19407,9 @@ fn expect_text_arg<'a>(
         Value::Text(s) => Ok(s.as_ref()),
         other => Err(EvalError::TypeMismatch {
             detail: format!(
-                "{fn_name} argument {} must be TEXT, got {:?}",
+                "{fn_name} argument {} must be TEXT, got {}",
                 idx + 1,
-                other.data_type()
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
             ),
         }),
     }
@@ -19442,8 +19442,8 @@ fn array_search_match(elem: &Value, needle: &Value) -> Result<bool, EvalError> {
             Value::Null => Ok(false),
             other => Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "array element comparison didn't return Bool: {:?}",
-                    other.data_type()
+                    "array element comparison didn't return Bool: {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             }),
         },

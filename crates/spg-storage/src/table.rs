@@ -767,9 +767,11 @@ impl Table {
     ///
     /// Measured over pgwire on 500k rows, `SELECT count(*)`:
     ///
+    /// ```text
     ///     PG18 (2 parallel workers)   8.2 ms
     ///     PG18 (parallelism off)     10.3 ms
     ///     SPG                        16.5 ms   = 33 ns/row
+    /// ```
     ///
     /// — 1.6x slower than a single-threaded PG on the commonest
     /// aggregate there is, which no ledger entry recorded.

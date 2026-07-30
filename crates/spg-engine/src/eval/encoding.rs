@@ -32,7 +32,7 @@ pub(super) fn encode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
         Value::Text(s) => s.as_bytes(),
         other => {
             return Err(EvalError::TypeMismatch {
-                detail: format!("encode() expects bytea / text, got {:?}", other.data_type()),
+                detail: format!("encode() expects bytea / text, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
             });
         }
     };
@@ -40,7 +40,7 @@ pub(super) fn encode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
         Value::Text(s) => s.to_ascii_lowercase(),
         other => {
             return Err(EvalError::TypeMismatch {
-                detail: format!("encode() format must be text, got {:?}", other.data_type()),
+                detail: format!("encode() format must be text, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
             });
         }
     };
@@ -79,7 +79,7 @@ pub(super) fn decode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
         Value::Text(s) => s.as_ref(),
         other => {
             return Err(EvalError::TypeMismatch {
-                detail: format!("decode() expects text, got {:?}", other.data_type()),
+                detail: format!("decode() expects text, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
             });
         }
     };
@@ -87,7 +87,7 @@ pub(super) fn decode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
         Value::Text(s) => s.to_ascii_lowercase(),
         other => {
             return Err(EvalError::TypeMismatch {
-                detail: format!("decode() format must be text, got {:?}", other.data_type()),
+                detail: format!("decode() format must be text, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
             });
         }
     };

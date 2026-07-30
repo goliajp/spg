@@ -90,8 +90,8 @@ pub(super) fn string_left_right(
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "{fn_name}(): n must be integer, got {:?}",
-                    other.data_type()
+                    "{fn_name}(): n must be integer, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -181,8 +181,8 @@ pub(super) fn string_pad(
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "{fn_name}(): length must be integer, got {:?}",
-                    other.data_type()
+                    "{fn_name}(): length must be integer, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -552,8 +552,8 @@ pub(super) fn format_string(
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "format(): first arg must be text, got {:?}",
-                    other.data_type()
+                    "format(): first arg must be text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -1702,8 +1702,8 @@ pub(super) fn to_char_in_zone(
     let Value::Text(fmt) = &args[1] else {
         return Err(EvalError::TypeMismatch {
             detail: format!(
-                "to_char() needs a text format, got {:?}",
-                args[1].data_type()
+                "to_char() needs a text format, got {}",
+                crate::conversions::pg_type_name_for_error_opt(args[1].data_type())
             ),
         });
     };
@@ -1748,8 +1748,8 @@ pub(super) fn to_char_in_zone(
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "to_char() needs a number, DATE or TIMESTAMP, got {:?}",
-                    other.data_type()
+                    "to_char() needs a number, DATE or TIMESTAMP, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }

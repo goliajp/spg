@@ -610,7 +610,9 @@ fn value_from_key(
 /// fetches the row for a value the walk had in hand. Measured over
 /// pgwire on a 500k table, projecting `k` for a 100k-row range:
 ///
+/// ```text
 ///     PG18  Index Only Scan   3.6 ms      SPG  30 ms
+/// ```
 ///
 /// 8x, widening with the row count (2x at 1k rows).
 ///
@@ -748,7 +750,9 @@ pub(crate) fn index_only_precheck<'t>(
 /// commoner query. On 500k rows with 50 distinct values, `WHERE g = 7`
 /// returns 10k of them:
 ///
+/// ```text
 ///     SPG  9.5 ms      PG18  4.5 ms      2.1x
+/// ```
 ///
 /// — the same loss the range shape carried before round 564, in the
 /// shape people write more often.

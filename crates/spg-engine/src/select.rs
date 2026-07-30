@@ -3046,10 +3046,14 @@ impl Engine {
                             (DataType::Range(kind), rows)
                         }
                         other => {
-                            return Err(EngineError::Unsupported(alloc::format!(
-                                "unnest() expects an array argument, got {:?}",
-                                other.data_type()
-                            )));
+                            // v7.39 (round 622, S05a) — see table_access.rs:
+                            // the same sentence, and it is a type mismatch.
+                            return Err(EngineError::Eval(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "unnest() expects an array argument, got {}",
+                                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                                ),
+                            }));
                         }
                     };
                 (alloc::vec![elem_dtype], rows)
@@ -3989,8 +3993,8 @@ impl Engine {
                     Value::Json(s) | Value::Text(s) => s.as_ref().to_string(),
                     other => {
                         return Err(EngineError::Unsupported(alloc::format!(
-                            "JSON_TABLE document must be json/text, got {:?}",
-                            other.data_type()
+                            "JSON_TABLE document must be json/text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         )));
                     }
                 };
@@ -8408,8 +8412,8 @@ pub(crate) fn unnest_zip_rows(
             ),
             other => {
                 return Err(EngineError::Unsupported(alloc::format!(
-                    "unnest() expects array arguments, got {:?}",
-                    other.data_type()
+                    "unnest() expects array arguments, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 )));
             }
         };
@@ -8524,8 +8528,8 @@ pub(crate) fn generate_series_from_values(
                 other => {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "generate_series(timestamp, timestamp, …): \
-                         step must be INTERVAL, got {:?}",
-                        other.data_type()
+                         step must be INTERVAL, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     )));
                 }
             };
@@ -8651,11 +8655,12 @@ pub(crate) fn generate_series_from_values(
         }
         _ => Err(EngineError::Unsupported(alloc::format!(
             "generate_series(): v7.17 supports integer or (timestamp, timestamp, interval) \
-             argument shapes; got {:?}",
+             argument shapes; got {}",
             arg_values
                 .iter()
-                .map(|v| v.data_type())
+                .map(|v| crate::conversions::pg_type_name_for_error_opt(v.data_type()))
                 .collect::<alloc::vec::Vec<_>>()
+                .join(", ")
         ))),
     }
 }
@@ -9049,8 +9054,8 @@ pub(crate) fn array_value_to_elements(v: &Value) -> Result<Vec<Value<'static>>, 
             .collect()),
         other => Err(EngineError::Eval(EvalError::TypeMismatch {
             detail: alloc::format!(
-                "unnest() expects an array argument, got {:?}",
-                other.data_type()
+                "unnest() expects an array argument, got {}",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
             ),
         })),
     }
@@ -9405,12 +9410,39 @@ impl Engine {
             let _ = parent_name;
             return Ok(None);
         }
+        // v7.39 (round 622, S05a) — the system columns of the CHILD the row
+        // actually lives in.
+        //
+        // The parent is read through a synthetic CTE, so a `tableoid` on it
+        // resolved against that CTE: every row of every child reported
+        // `__spg_partition_pm`, an internal name no user ever typed, where
+        // PG reports `pm_a` / `pm_b`. That is not only a leak — it silently
+        // empties `WHERE tableoid::regclass::TEXT = 'pm_a'`, which is how
+        // one asks "which partition is this row in", answering 0 rows where
+        // PG answers 1. `ctid` had the same shape: it numbered the CTE's
+        // output, so rows in different children got distinct ctids instead
+        // of each child's own physical position.
+        //
+        // Naming them in the term is what carries them: the child scan
+        // materialises its own six because the statement now references
+        // them, and they land in SYSTEM_COLUMNS order right after the user
+        // columns — the exact layout the positional `*` skip already
+        // expects. Only done when the outer statement asks for one, so a
+        // plain `SELECT * FROM parent` scans exactly what it scanned.
+        let carry_sys = references_ctid(outer);
         let mut body = alloc::string::String::new();
         for (i, child_name) in kept.iter().enumerate() {
             if i > 0 {
                 body.push_str(" UNION ALL ");
             }
-            body.push_str("SELECT * FROM ");
+            body.push_str("SELECT *");
+            if carry_sys {
+                for sys in SYSTEM_COLUMNS {
+                    body.push_str(", ");
+                    body.push_str(sys);
+                }
+            }
+            body.push_str(" FROM ");
             body.push_str(&quote_ident_for_sql(child_name));
         }
         parse_select_or_corrupt(&body).map(Some)

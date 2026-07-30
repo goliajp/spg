@@ -199,19 +199,33 @@ fn savepoint_rollback_shapes_the_replayed_transaction() {
     );
 }
 
+/// v7.39 (round 622) — this asserted that nesting ERRORS, which was SPG's
+/// own behaviour written down as a rule. PG does not error: a `BEGIN` inside
+/// a transaction warns "there is already a transaction in progress" and is a
+/// no-op, and the later extra `COMMIT` warns "there is no transaction in
+/// progress". The engine matches that now, byte for byte —
+///
+/// ```text
+///     BEGIN; INSERT 1; BEGIN; INSERT 2; COMMIT; COMMIT; SELECT count(*)
+///     PG18  WARNING, WARNING, 2        SPG  WARNING, WARNING, 2
+/// ```
+///
+/// — so the rule this test encoded is gone, and what replaces it is the
+/// consequence a caller has to know: the INNER commit ends the OUTER
+/// transaction, so work after it is no longer covered.
 #[test]
-fn nested_with_transaction_surfaces_engine_error() {
+fn nested_with_transaction_follows_pg_and_does_not_error() {
     let mut db = Database::open_in_memory();
     db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
     let result: Result<(), EngineError> = db.with_transaction(|tx| {
         tx.execute("INSERT INTO t VALUES (1)")?;
-        // Inner with_transaction calls BEGIN; engine rejects
-        // nested begin and bubbles up.
         tx.with_transaction(|inner| {
             inner.execute("INSERT INTO t VALUES (2)")?;
             Ok::<_, EngineError>(())
         })?;
         Ok(())
     });
-    assert!(result.is_err(), "nested transactions must surface error");
+    assert!(result.is_ok(), "PG does not reject a nested BEGIN: {result:?}");
+    let got = db.query("SELECT id FROM t ORDER BY id").unwrap();
+    assert_eq!(got.len(), 2, "both rows are committed, as in PG");
 }

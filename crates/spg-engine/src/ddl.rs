@@ -5397,8 +5397,8 @@ pub(crate) fn canonicalize_set_value(
             Ok(Value::text(out))
         }
         other => Err(EngineError::Unsupported(alloc::format!(
-            "column {col_name:?}: SET-typed column expects TEXT, got {:?}",
-            other.data_type()
+            "column {col_name:?}: SET-typed column expects TEXT, got {}",
+            crate::conversions::pg_type_name_for_error_opt(other.data_type())
         ))),
     }
 }
@@ -5422,8 +5422,8 @@ pub(crate) fn enforce_enum_label(
                 }
             }
             other => Err(EngineError::Unsupported(alloc::format!(
-                "column {col_name:?}: enum-typed column expects TEXT, got {:?}",
-                other.data_type()
+                "column {col_name:?}: enum-typed column expects TEXT, got {}",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
             ))),
         }
     } else {

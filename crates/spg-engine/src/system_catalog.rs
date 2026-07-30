@@ -3058,10 +3058,12 @@ pub(crate) fn synth_pg_class(
 ///
 /// Measured, per relkind:
 ///
+/// ```text
 ///     table       relfrozenxid <xid>  relminmxid 1
 ///     sequence    relfrozenxid 0      relminmxid 0
 ///     index       relfrozenxid 0      relminmxid 0
 ///     view        relfrozenxid 0      relminmxid 0
+/// ```
 ///
 /// — a cutoff exists only where there is heap storage to freeze.
 /// relallfrozen and relrewrite read 0 throughout; relpartbound is NULL
@@ -5927,10 +5929,12 @@ pub(crate) fn synth_pg_cast() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
 ///
 /// `pg_dump` reads it for every relation of kind 'f':
 ///
+/// ```text
 ///     CASE WHEN c.relkind = 'f'
 ///          THEN (SELECT ftserver FROM pg_catalog.pg_foreign_table
 ///                WHERE ftrelid = c.oid)
 ///          ELSE 0 END AS foreignserver
+/// ```
 ///
 /// SPG has no foreign tables, so the answer is no rows — which is also
 /// what PG reports on a database that has none. A catalog that exists

@@ -3841,11 +3841,13 @@ pub(crate) fn mysql_bytes_for_column(
 ///
 /// Measured on PG18:
 ///
+/// ```text
 ///     '10:20:30.5'::timetz::time      10:20:30.5   (the zone is dropped,
 ///                                                   the wall clock kept)
 ///     '25:00:00'::interval::time      01:00:00     (modulo 24 hours)
 ///     '-1 hour'::interval::time       23:00:00     (and negatives wrap)
 ///     '1 day 02:00:00'::interval::time 02:00:00    (days do not count)
+/// ```
 ///
 /// `time → timetz` and `timestamp(tz) → time` are NOT here: the first
 /// needs the session zone to attach, and the second needs to know which
@@ -5832,6 +5834,21 @@ pub(crate) fn types_unify(a: DataType, b: DataType) -> bool {
 /// `information_schema.columns.data_type`, where every array is the
 /// pseudo-name `ARRAY`; an error message names the real thing
 /// (`integer[]`).
+/// v7.39 (round 622, S05a) — the `Option<DataType>` form, which is what
+/// `Value::data_type()` returns and therefore what every "got X" error had.
+///
+/// Those errors printed it with `{:?}`, so a user asking for `upper(1)` was
+/// told the argument was `Some(Int)` — Rust's Debug for an Option wrapping an
+/// internal enum. 421 sites did this. `None` is the eval-only variants that
+/// carry no storage type (RegClass, Composite); PG calls an untyped value
+/// `unknown`, and that is what it becomes here.
+pub(crate) fn pg_type_name_for_error_opt(t: Option<DataType>) -> alloc::string::String {
+    match t {
+        Some(t) => pg_type_name_for_error(t),
+        None => alloc::string::String::from("unknown"),
+    }
+}
+
 pub(crate) fn pg_type_name_for_error(t: DataType) -> alloc::string::String {
     use spg_storage::DataType as D;
     let elem = match t {

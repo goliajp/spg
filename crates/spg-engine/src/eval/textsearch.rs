@@ -137,8 +137,8 @@ fn parse_rank_args(name: &str, args: &[Value<'_>]) -> Result<RankArgs, EvalError
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "{name}() vector arg must be tsvector, got {:?}",
-                    other.data_type()
+                    "{name}() vector arg must be tsvector, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -149,8 +149,8 @@ fn parse_rank_args(name: &str, args: &[Value<'_>]) -> Result<RankArgs, EvalError
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "{name}() query arg must be tsquery, got {:?}",
-                    other.data_type()
+                    "{name}() query arg must be tsquery, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -253,16 +253,16 @@ pub(super) fn fts_setweight(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
     let Value::TsVector(lexemes) = vec_arg else {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!(
-                "setweight expects a tsvector, got {:?}",
-                vec_arg.data_type()
+                "setweight expects a tsvector, got {}",
+                crate::conversions::pg_type_name_for_error_opt(vec_arg.data_type())
             ),
         });
     };
     let Value::Text(w) = weight_arg else {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!(
-                "setweight expects a weight letter, got {:?}",
-                weight_arg.data_type()
+                "setweight expects a weight letter, got {}",
+                crate::conversions::pg_type_name_for_error_opt(weight_arg.data_type())
             ),
         });
     };
@@ -393,8 +393,8 @@ fn parse_fts_args(
         Some(other) => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "{name}() config arg must be text, got {:?}",
-                    other.data_type()
+                    "{name}() config arg must be text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -405,8 +405,8 @@ fn parse_fts_args(
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "{name}() text arg must be text, got {:?}",
-                    other.data_type()
+                    "{name}() text arg must be text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -970,8 +970,8 @@ pub(super) fn fts_ts_headline(
         Some(other) => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "ts_headline() config must be text, got {:?}",
-                    other.data_type()
+                    "ts_headline() config must be text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -981,8 +981,8 @@ pub(super) fn fts_ts_headline(
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "ts_headline() document must be text, got {:?}",
-                    other.data_type()
+                    "ts_headline() document must be text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -995,8 +995,8 @@ pub(super) fn fts_ts_headline(
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "ts_headline() query must be tsquery, got {:?}",
-                    other.data_type()
+                    "ts_headline() query must be tsquery, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -1019,8 +1019,8 @@ pub(super) fn fts_ts_headline(
             other => {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(
-                        "ts_headline() options must be text, got {:?}",
-                        other.data_type()
+                        "ts_headline() options must be text, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 });
             }
@@ -1508,8 +1508,8 @@ pub(super) fn fts_ts_rewrite(
             Value::Text(s) => crate::fts::to_tsquery(config, s),
             other => Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "ts_rewrite() {which} must be tsquery, got {:?}",
-                    other.data_type()
+                    "ts_rewrite() {which} must be tsquery, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             }),
         }
@@ -1582,8 +1582,8 @@ pub(super) fn fts_tsquery_bool(
             Value::Text(s) => crate::fts::to_tsquery(config, s),
             other => Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "tsquery_{op}() arguments must be tsquery, got {:?}",
-                    other.data_type()
+                    "tsquery_{op}() arguments must be tsquery, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             }),
         }

@@ -275,8 +275,8 @@ pub(super) fn extract_field(
         _ => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "EXTRACT requires DATE / TIMESTAMP / INTERVAL, got {:?}",
-                    v.data_type()
+                    "EXTRACT requires DATE / TIMESTAMP / INTERVAL, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(v.data_type())
                 ),
             });
         }
@@ -463,8 +463,8 @@ pub(super) fn date_part(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
     let Value::Text(field_name) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             detail: format!(
-                "date_part() needs a text field, got {:?}",
-                args[0].data_type()
+                "date_part() needs a text field, got {}",
+                crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
             ),
         });
     };
@@ -580,7 +580,7 @@ pub(super) fn age(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             Value::Timestamp(t) => Ok(*t),
             Value::Date(d) => Ok(i64::from(*d) * 86_400_000_000),
             other => Err(EvalError::TypeMismatch {
-                detail: format!("age() needs DATE or TIMESTAMP, got {:?}", other.data_type()),
+                detail: format!("age() needs DATE or TIMESTAMP, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
             }),
         }
     };
@@ -688,8 +688,8 @@ pub(super) fn date_format_mysql(args: &[Value<'_>]) -> Result<Value<'static>, Ev
     let Value::Text(fmt) = &args[1] else {
         return Err(EvalError::TypeMismatch {
             detail: format!(
-                "date_format() needs a text format, got {:?}",
-                args[1].data_type()
+                "date_format() needs a text format, got {}",
+                crate::conversions::pg_type_name_for_error_opt(args[1].data_type())
             ),
         });
     };
@@ -717,8 +717,8 @@ pub(super) fn date_format_mysql(args: &[Value<'_>]) -> Result<Value<'static>, Ev
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "date_format() needs DATE or TIMESTAMP, got {:?}",
-                    other.data_type()
+                    "date_format() needs DATE or TIMESTAMP, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -1069,8 +1069,8 @@ pub(super) fn unix_timestamp_of(args: &[Value<'_>]) -> Result<Value<'static>, Ev
         }
         other => Err(EvalError::TypeMismatch {
             detail: format!(
-                "unix_timestamp() needs DATE or TIMESTAMP, got {:?}",
-                other.data_type()
+                "unix_timestamp() needs DATE or TIMESTAMP, got {}",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
             ),
         }),
     }
@@ -1130,8 +1130,8 @@ pub(super) fn from_unixtime(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "from_unixtime() needs a numeric epoch second count, got {:?}",
-                    other.data_type()
+                    "from_unixtime() needs a numeric epoch second count, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -1162,8 +1162,8 @@ pub(super) fn date_trunc(
         let Value::Text(zone) = &args[2] else {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "date_trunc() zone must be text, got {:?}",
-                    args[2].data_type()
+                    "date_trunc() zone must be text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(args[2].data_type())
                 ),
             });
         };
@@ -1193,8 +1193,8 @@ pub(super) fn date_trunc(
     let Value::Text(unit) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             detail: format!(
-                "date_trunc() needs a text unit, got {:?}",
-                args[0].data_type()
+                "date_trunc() needs a text unit, got {}",
+                crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
             ),
         });
     };
@@ -1264,8 +1264,8 @@ pub(super) fn date_trunc(
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "date_trunc() needs DATE or TIMESTAMP, got {:?}",
-                    other.data_type()
+                    "date_trunc() needs DATE or TIMESTAMP, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -1596,8 +1596,8 @@ pub(super) fn time_format_mysql(args: &[Value<'_>]) -> Result<Value<'static>, Ev
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "time_format() needs TIME text or TIMESTAMP, got {:?}",
-                    other.data_type()
+                    "time_format() needs TIME text or TIMESTAMP, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -1635,8 +1635,8 @@ fn ts_of(v: &Value<'_>, fn_name: &str) -> Result<i64, EvalError> {
         }),
         other => Err(EvalError::TypeMismatch {
             detail: format!(
-                "{fn_name}() needs DATE or TIMESTAMP, got {:?}",
-                other.data_type()
+                "{fn_name}() needs DATE or TIMESTAMP, got {}",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
             ),
         }),
     }
@@ -1727,8 +1727,8 @@ pub(super) fn timestampadd_mysql(args: &[Value<'_>]) -> Result<Value<'static>, E
     let Value::Text(unit) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             detail: format!(
-                "timestampadd() unit must be a keyword, got {:?}",
-                args[0].data_type()
+                "timestampadd() unit must be a keyword, got {}",
+                crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
             ),
         });
     };
@@ -1739,8 +1739,8 @@ pub(super) fn timestampadd_mysql(args: &[Value<'_>]) -> Result<Value<'static>, E
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: format!(
-                    "timestampadd() count must be integer, got {:?}",
-                    other.data_type()
+                    "timestampadd() count must be integer, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -1778,8 +1778,8 @@ pub(super) fn timestampdiff_mysql(args: &[Value<'_>]) -> Result<Value<'static>, 
     let Value::Text(unit) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             detail: format!(
-                "timestampdiff() unit must be a keyword, got {:?}",
-                args[0].data_type()
+                "timestampdiff() unit must be a keyword, got {}",
+                crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
             ),
         });
     };
@@ -1893,8 +1893,8 @@ pub(super) fn timezone_pg(
     let Value::Text(zone) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             detail: format!(
-                "timezone() zone must be text, got {:?}",
-                args[0].data_type()
+                "timezone() zone must be text, got {}",
+                crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
             ),
         });
     };
@@ -1947,8 +1947,8 @@ fn timetz_at_zone(
     let Value::Text(zone) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             detail: format!(
-                "timezone() zone must be text, got {:?}",
-                args[0].data_type()
+                "timezone() zone must be text, got {}",
+                crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
             ),
         });
     };

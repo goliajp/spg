@@ -652,8 +652,8 @@ pub fn each_rows(
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "{fn_name}: argument must be JSON / JSONB, got {:?}",
-                    other.data_type()
+                    "{fn_name}: argument must be JSON / JSONB, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -713,8 +713,8 @@ pub fn array_element_rows(
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "{fn_name}: argument must be JSON / JSONB, got {:?}",
-                    other.data_type()
+                    "{fn_name}: argument must be JSON / JSONB, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -765,8 +765,8 @@ pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'stati
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "JSON path walk: left side must be JSON or TEXT, got {:?}",
-                    other.data_type()
+                    "JSON path walk: left side must be JSON or TEXT, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -777,8 +777,8 @@ pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'stati
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "JSON path walk: right side must be TEXT, got {:?}",
-                    other.data_type()
+                    "JSON path walk: right side must be TEXT, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -829,8 +829,8 @@ pub fn key_exists(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError>
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "JSON ?: left side must be JSON or TEXT, got {:?}",
-                    other.data_type()
+                    "JSON ?: left side must be JSON or TEXT, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -841,8 +841,8 @@ pub fn key_exists(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError>
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "JSON ?: right side must be TEXT, got {:?}",
-                    other.data_type()
+                    "JSON ?: right side must be TEXT, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -873,8 +873,8 @@ fn collect_keys(v: &Value) -> Result<Option<Vec<String>>, EvalError> {
         Value::Text(s) => Ok(Some(alloc::vec![s.to_string()])),
         other => Err(EvalError::TypeMismatch {
             detail: alloc::format!(
-                "JSON ?|/?&: right side must be TEXT[] or TEXT, got {:?}",
-                other.data_type()
+                "JSON ?|/?&: right side must be TEXT[] or TEXT, got {}",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
             ),
         }),
     }
@@ -889,8 +889,8 @@ pub fn keys_any(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "JSON ?|: left side must be JSON or TEXT, got {:?}",
-                    other.data_type()
+                    "JSON ?|: left side must be JSON or TEXT, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -913,8 +913,8 @@ pub fn keys_all(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "JSON ?&: left side must be JSON or TEXT, got {:?}",
-                    other.data_type()
+                    "JSON ?&: left side must be JSON or TEXT, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -935,8 +935,8 @@ pub fn contains(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "JSON @>: left side must be JSON or TEXT, got {:?}",
-                    other.data_type()
+                    "JSON @>: left side must be JSON or TEXT, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -947,8 +947,8 @@ pub fn contains(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "JSON @>: right side must be JSON or TEXT, got {:?}",
-                    other.data_type()
+                    "JSON @>: right side must be JSON or TEXT, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -989,8 +989,8 @@ pub fn equals(lhs: &Value, rhs: &Value) -> Result<bool, EvalError> {
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "jsonb =: left side must be JSON or TEXT, got {:?}",
-                    other.data_type()
+                    "jsonb =: left side must be JSON or TEXT, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -1000,8 +1000,8 @@ pub fn equals(lhs: &Value, rhs: &Value) -> Result<bool, EvalError> {
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "jsonb =: right side must be JSON or TEXT, got {:?}",
-                    other.data_type()
+                    "jsonb =: right side must be JSON or TEXT, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -1125,8 +1125,8 @@ pub fn path_get(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'static
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "JSON path operator: left side must be JSON or TEXT, got {:?}",
-                    other.data_type()
+                    "JSON path operator: left side must be JSON or TEXT, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -2466,7 +2466,7 @@ pub fn parse_path_vars(v: &Value) -> Result<Option<JsonValue>, EvalError> {
             Ok(Some(parsed))
         }
         other => Err(EvalError::TypeMismatch {
-            detail: alloc::format!("jsonpath vars must be jsonb, got {:?}", other.data_type()),
+            detail: alloc::format!("jsonpath vars must be jsonb, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
         }),
     }
 }
@@ -3108,8 +3108,8 @@ pub fn set(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
         Some(other) => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "jsonb_set() create_missing must be BOOL, got {:?}",
-                    other.data_type()
+                    "jsonb_set() create_missing must be BOOL, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -3299,8 +3299,8 @@ pub fn insert(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
         Some(other) => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "jsonb_insert() insert_after must be BOOL, got {:?}",
-                    other.data_type()
+                    "jsonb_insert() insert_after must be BOOL, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -3408,8 +3408,8 @@ fn json_text_arg<'a>(v: &'a Value, fname: &str, role: &str) -> Result<&'a str, E
         Value::Json(s) | Value::Text(s) => Ok(s.as_ref()),
         other => Err(EvalError::TypeMismatch {
             detail: alloc::format!(
-                "{fname}() {role} must be JSON or TEXT, got {:?}",
-                other.data_type()
+                "{fname}() {role} must be JSON or TEXT, got {}",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
             ),
         }),
     }
@@ -3424,8 +3424,8 @@ fn path_text_arg(v: &Value, fname: &str) -> Result<Vec<String>, EvalError> {
             .collect()),
         other => Err(EvalError::TypeMismatch {
             detail: alloc::format!(
-                "{fname}() path must be TEXT[] or TEXT, got {:?}",
-                other.data_type()
+                "{fname}() path must be TEXT[] or TEXT, got {}",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
             ),
         }),
     }
@@ -3739,8 +3739,8 @@ pub fn mysql_json_extract(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "json_extract() document must be json, got {:?}",
-                    other.data_type()
+                    "json_extract() document must be json, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -3753,8 +3753,8 @@ pub fn mysql_json_extract(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
         let Value::Text(p) = path_v else {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "json_extract() paths must be text, got {:?}",
-                    path_v.data_type()
+                    "json_extract() paths must be text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(path_v.data_type())
                 ),
             });
         };
@@ -3801,8 +3801,8 @@ pub fn mysql_json_contains_path(args: &[Value<'_>]) -> Result<Value<'static>, Ev
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "json_contains_path() document must be json, got {:?}",
-                    other.data_type()
+                    "json_contains_path() document must be json, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -3827,8 +3827,8 @@ pub fn mysql_json_contains_path(args: &[Value<'_>]) -> Result<Value<'static>, Ev
         let Value::Text(p) = path_v else {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "json_contains_path() paths must be text, got {:?}",
-                    path_v.data_type()
+                    "json_contains_path() paths must be text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(path_v.data_type())
                 ),
             });
         };
@@ -3957,8 +3957,8 @@ fn mysql_json_mutate(
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "{fn_name}() document must be json, got {:?}",
-                    other.data_type()
+                    "{fn_name}() document must be json, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -3973,8 +3973,8 @@ fn mysql_json_mutate(
             }
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "{fn_name}() paths must be text, got {:?}",
-                    pair[0].data_type()
+                    "{fn_name}() paths must be text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(pair[0].data_type())
                 ),
             });
         };
@@ -4024,8 +4024,8 @@ pub fn mysql_json_remove(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "json_remove() document must be json, got {:?}",
-                    other.data_type()
+                    "json_remove() document must be json, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -4066,8 +4066,8 @@ pub fn mysql_json_remove(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
         let Value::Text(p) = path_v else {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "json_remove() paths must be text, got {:?}",
-                    path_v.data_type()
+                    "json_remove() paths must be text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(path_v.data_type())
                 ),
             });
         };
@@ -4127,8 +4127,8 @@ fn mysql_doc_and_pairs<'a>(
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "{fn_name}() document must be json, got {:?}",
-                    other.data_type()
+                    "{fn_name}() document must be json, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -4150,8 +4150,8 @@ pub fn mysql_json_array_append(args: &[Value<'_>]) -> Result<Value<'static>, Eva
         let Value::Text(p) = &pair[0] else {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "json_array_append() paths must be text, got {:?}",
-                    pair[0].data_type()
+                    "json_array_append() paths must be text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(pair[0].data_type())
                 ),
             });
         };
@@ -4183,8 +4183,8 @@ pub fn mysql_json_array_insert(args: &[Value<'_>]) -> Result<Value<'static>, Eva
         let Value::Text(p) = &pair[0] else {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "json_array_insert() paths must be text, got {:?}",
-                    pair[0].data_type()
+                    "json_array_insert() paths must be text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(pair[0].data_type())
                 ),
             });
         };
@@ -4257,8 +4257,8 @@ pub fn mysql_json_contains(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
             }),
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "json_contains() {which} must be json, got {:?}",
-                    other.data_type()
+                    "json_contains() {which} must be json, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             }),
         }
@@ -4274,8 +4274,8 @@ pub fn mysql_json_contains(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
         Some(other) => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "json_contains() path must be text, got {:?}",
-                    other.data_type()
+                    "json_contains() path must be text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -4365,8 +4365,8 @@ fn mysql_json_merge(
             other => {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "{fn_name}() arguments must be json, got {:?}",
-                        other.data_type()
+                        "{fn_name}() arguments must be json, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
                     ),
                 });
             }
@@ -4415,8 +4415,8 @@ pub fn mysql_json_overlaps(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
             }),
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "json_overlaps() arguments must be json, got {:?}",
-                    other.data_type()
+                    "json_overlaps() arguments must be json, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             }),
         }
@@ -4504,8 +4504,8 @@ pub fn mysql_json_search(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "json_search() document must be json, got {:?}",
-                    other.data_type()
+                    "json_search() document must be json, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -4527,8 +4527,8 @@ pub fn mysql_json_search(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
     let Value::Text(pattern) = &args[2] else {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!(
-                "json_search() pattern must be text, got {:?}",
-                args[2].data_type()
+                "json_search() pattern must be text, got {}",
+                crate::conversions::pg_type_name_for_error_opt(args[2].data_type())
             ),
         });
     };
@@ -4588,8 +4588,8 @@ pub fn mysql_json_search(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
             Value::Text(p) => Ok(p.to_string()),
             other => Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "json_search() paths must be text, got {:?}",
-                    other.data_type()
+                    "json_search() paths must be text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             }),
         })
@@ -4634,8 +4634,8 @@ pub fn mysql_json_value(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
         other => {
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
-                    "json_value() document must be json, got {:?}",
-                    other.data_type()
+                    "json_value() document must be json, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
                 ),
             });
         }
@@ -4646,8 +4646,8 @@ pub fn mysql_json_value(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
     let Value::Text(p) = &args[1] else {
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!(
-                "json_value() path must be text, got {:?}",
-                args[1].data_type()
+                "json_value() path must be text, got {}",
+                crate::conversions::pg_type_name_for_error_opt(args[1].data_type())
             ),
         });
     };
