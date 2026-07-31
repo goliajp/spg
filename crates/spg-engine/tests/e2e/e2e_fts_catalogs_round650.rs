@@ -171,17 +171,31 @@ fn round650_the_new_catalogs_are_reachable_every_way() {
             &mut e,
             "SELECT relname FROM pg_class WHERE relname LIKE 'pg_ts%' ORDER BY relname"
         ),
-        vec!["pg_ts_config", "pg_ts_dict", "pg_ts_parser", "pg_ts_template"]
+        vec![
+            "pg_ts_config",
+            // v7.39 (round 651) — the token-type model arrived, so this
+            // one is publishable and published.
+            "pg_ts_config_map",
+            "pg_ts_dict",
+            "pg_ts_parser",
+            "pg_ts_template"
+        ]
     );
 }
 
-/// What is still missing, pinned so the gap is visible.
+/// The pin that flipped. Round 650 recorded the token-type model as
+/// absent and refused to stub these; round 651 built it, and both
+/// answer from the same `TokenType` the tokenizer uses.
 #[test]
-fn round650_the_token_type_model_is_still_absent() {
+fn round651_the_token_type_model_arrived() {
     let mut e = Engine::new();
-    assert!(
-        e.execute("SELECT count(*) FROM pg_ts_config_map").is_err(),
-        "publishing it empty would be a lie: SPG's configs DO map tokens"
+    assert_eq!(
+        one(&mut e, "SELECT count(*) FROM pg_ts_config_map"),
+        "38",
+        "nineteen mapped types per configuration, two configurations"
     );
-    assert!(e.execute("SELECT count(*) FROM ts_token_type('default')").is_err());
+    assert_eq!(
+        one(&mut e, "SELECT count(*) FROM ts_token_type('default')"),
+        "23"
+    );
 }

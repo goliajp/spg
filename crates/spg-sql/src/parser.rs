@@ -798,6 +798,7 @@ const SYNTHESISED_PG_CATALOGS: &[&str] = &[
         // token types to dictionaries and SPG has no token-type model,
         // the same gap that leaves `ts_token_type` / `ts_debug` unbuilt.
         "pg_ts_config",
+        "pg_ts_config_map",
         "pg_ts_dict",
         "pg_ts_parser",
         "pg_ts_template",

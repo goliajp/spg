@@ -1571,6 +1571,7 @@ pub(crate) fn regclass_name_to_oid(cat: &spg_storage::Catalog, bare: &str) -> Op
         // hand-kept subset of `CATALOG_RELATIONS`, which is why adding a
         // catalog there was not enough for `'pg_ts_config'::regclass`.
         "pg_ts_config" => 3602,
+        "pg_ts_config_map" => 3603,
         "pg_ts_dict" => 3600,
         "pg_ts_parser" => 3601,
         "pg_ts_template" => 3764,

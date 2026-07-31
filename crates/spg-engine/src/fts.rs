@@ -54,18 +54,28 @@ impl TsConfig {
 pub fn to_tsvector(config: TsConfig, text: &str) -> Vec<TsLexeme> {
     let mut out: Vec<TsLexeme> = Vec::new();
     let mut position: u16 = 0;
-    for token in tokenize(text) {
-        let lex = match config {
-            TsConfig::Simple => token,
-            TsConfig::English => {
-                if is_english_stopword(&token) {
+    // v7.39 (round 651) — the TOKEN's type picks the dictionary, which
+    // is what `pg_ts_config_map` records. Two things fall out that the
+    // config alone could not give: a tag or an entity maps to nothing
+    // and so never reaches the index, and a number under the `english`
+    // configuration goes to `simple` rather than through the stemmer.
+    let english = matches!(config, TsConfig::English);
+    for token in tokenize_typed(text) {
+        let Some(dict) = token.ty.dictionary(english) else {
+            continue;
+        };
+        let folded = token.text.to_lowercase();
+        let lex = match dict {
+            TsDict::Simple => folded,
+            TsDict::EnglishStem => {
+                if is_english_stopword(&folded) {
                     // PG drops stopwords from the vector but
                     // still increments position so phrase
                     // distances stay meaningful.
                     position = position.saturating_add(1);
                     continue;
                 }
-                porter_stem(&token)
+                porter_stem(&folded)
             }
         };
         if lex.is_empty() {
@@ -278,14 +288,19 @@ fn stem_tsquery_in_place(ast: &mut TsQueryAst, config: TsConfig) {
 
 fn collect_lexemes(config: TsConfig, text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for token in tokenize(text) {
-        match config {
-            TsConfig::Simple => out.push(token),
-            TsConfig::English => {
-                if is_english_stopword(&token) {
+    let english = matches!(config, TsConfig::English);
+    for token in tokenize_typed(text) {
+        let Some(dict) = token.ty.dictionary(english) else {
+            continue;
+        };
+        let folded = token.text.to_lowercase();
+        match dict {
+            TsDict::Simple => out.push(folded),
+            TsDict::EnglishStem => {
+                if is_english_stopword(&folded) {
                     continue;
                 }
-                let stemmed = porter_stem(&token);
+                let stemmed = porter_stem(&folded);
                 if !stemmed.is_empty() {
                     out.push(stemmed);
                 }
@@ -351,15 +366,20 @@ fn fold_phrase(lexs: &[String]) -> TsQueryAst {
 fn collect_lexemes_positioned(config: TsConfig, text: &str) -> Vec<(String, u16)> {
     let mut out: Vec<(String, u16)> = Vec::new();
     let mut position: u16 = 0;
-    for token in tokenize(text) {
-        let lex = match config {
-            TsConfig::Simple => token,
-            TsConfig::English => {
-                if is_english_stopword(&token) {
+    let english = matches!(config, TsConfig::English);
+    for token in tokenize_typed(text) {
+        let Some(dict) = token.ty.dictionary(english) else {
+            continue;
+        };
+        let folded = token.text.to_lowercase();
+        let lex = match dict {
+            TsDict::Simple => folded,
+            TsDict::EnglishStem => {
+                if is_english_stopword(&folded) {
                     position = position.saturating_add(1);
                     continue;
                 }
-                porter_stem(&token)
+                porter_stem(&folded)
             }
         };
         if lex.is_empty() {
@@ -788,22 +808,398 @@ fn sqrt_approx(x: f32) -> f32 {
 /// Tokenise on Unicode word boundaries — anything that is not an
 /// alphanumeric scalar value (or `_`) splits the token. Lowercases
 /// each emitted token.
-pub fn tokenize(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    for c in text.chars() {
-        if c.is_alphanumeric() || c == '_' {
-            for lc in c.to_lowercase() {
-                cur.push(lc);
-            }
-        } else if !cur.is_empty() {
-            out.push(core::mem::take(&mut cur));
+/// v7.39 (round 651) — PG's token types, as `ts_token_type('default')`
+/// publishes them. Only the ones SPG's parser actually produces are
+/// here; the numbering is PG's so `pg_ts_config_map.maptokentype` and
+/// `ts_debug.alias` agree with it.
+///
+/// The four PG does NOT map to any dictionary — blank(12), tag(13),
+/// protocol(14), entity(23) — are recognised precisely so they can be
+/// DROPPED. That is the difference between indexing `<b>x</b>` as `x`,
+/// which PG does, and as `b`, `x`, `b`, which SPG did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenType {
+    AsciiWord = 1,
+    Word = 2,
+    NumWord = 3,
+    Email = 4,
+    Url = 5,
+    Host = 6,
+    SFloat = 7,
+    Version = 8,
+    HwordNumPart = 9,
+    HwordPart = 10,
+    HwordAsciiPart = 11,
+    Blank = 12,
+    Tag = 13,
+    Protocol = 14,
+    NumHword = 15,
+    AsciiHword = 16,
+    Hword = 17,
+    UrlPath = 18,
+    File = 19,
+    Float = 20,
+    Int = 21,
+    Uint = 22,
+    Entity = 23,
+}
+
+impl TokenType {
+    /// PG's `alias` column.
+    pub const fn alias(self) -> &'static str {
+        match self {
+            Self::AsciiWord => "asciiword",
+            Self::Word => "word",
+            Self::NumWord => "numword",
+            Self::Email => "email",
+            Self::Url => "url",
+            Self::Host => "host",
+            Self::SFloat => "sfloat",
+            Self::Version => "version",
+            Self::HwordNumPart => "hword_numpart",
+            Self::HwordPart => "hword_part",
+            Self::HwordAsciiPart => "hword_asciipart",
+            Self::Blank => "blank",
+            Self::Tag => "tag",
+            Self::Protocol => "protocol",
+            Self::NumHword => "numhword",
+            Self::AsciiHword => "asciihword",
+            Self::Hword => "hword",
+            Self::UrlPath => "url_path",
+            Self::File => "file",
+            Self::Float => "float",
+            Self::Int => "int",
+            Self::Uint => "uint",
+            Self::Entity => "entity",
         }
     }
-    if !cur.is_empty() {
-        out.push(cur);
+
+    /// PG's `description` column, verbatim.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::AsciiWord => "Word, all ASCII",
+            Self::Word => "Word, all letters",
+            Self::NumWord => "Word, letters and digits",
+            Self::Email => "Email address",
+            Self::Url => "URL",
+            Self::Host => "Host",
+            Self::SFloat => "Scientific notation",
+            Self::Version => "Version number",
+            Self::HwordNumPart => "Hyphenated word part, letters and digits",
+            Self::HwordPart => "Hyphenated word part, all letters",
+            Self::HwordAsciiPart => "Hyphenated word part, all ASCII",
+            Self::Blank => "Space symbols",
+            Self::Tag => "XML tag",
+            Self::Protocol => "Protocol head",
+            Self::NumHword => "Hyphenated word, letters and digits",
+            Self::AsciiHword => "Hyphenated word, all ASCII",
+            Self::Hword => "Hyphenated word, all letters",
+            Self::UrlPath => "URL path",
+            Self::File => "File or path name",
+            Self::Float => "Decimal notation",
+            Self::Int => "Signed integer",
+            Self::Uint => "Unsigned integer",
+            Self::Entity => "XML entity",
+        }
+    }
+
+    /// Which dictionary a configuration sends this token to, or `None`
+    /// when the configuration maps it to nothing and the token produces
+    /// no lexeme at all. Read off PG18's `pg_ts_config_map`: the same
+    /// nineteen types are mapped by both `simple` and `english`, and
+    /// the four that are not are blank, tag, protocol and entity.
+    pub const fn dictionary(self, english: bool) -> Option<TsDict> {
+        match self {
+            Self::Blank | Self::Tag | Self::Protocol | Self::Entity => None,
+            // The stemmer only ever sees words; everything with digits,
+            // punctuation or structure goes to `simple` even under the
+            // english configuration — measured, and the reason
+            // `to_tsvector('english', '42')` is `42` and not a stem.
+            Self::AsciiWord
+            | Self::Word
+            | Self::HwordPart
+            | Self::HwordAsciiPart
+            | Self::AsciiHword
+            | Self::Hword
+                if english =>
+            {
+                Some(TsDict::EnglishStem)
+            }
+            _ => Some(TsDict::Simple),
+        }
+    }
+}
+
+/// The two dictionaries SPG has (round 650).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TsDict {
+    Simple,
+    EnglishStem,
+}
+
+/// v7.39 (round 651) — a typed token, PG-shaped.
+#[derive(Debug, Clone)]
+pub struct Token {
+    pub text: String,
+    pub ty: TokenType,
+}
+
+/// The old tokenizer, kept for callers that want bare words.
+pub fn tokenize(text: &str) -> Vec<String> {
+    tokenize_typed(text)
+        .into_iter()
+        .filter(|t| t.ty.dictionary(false).is_some())
+        .map(|t| t.text)
+        .collect()
+}
+
+/// v7.39 (round 651) — split `text` the way PG's default parser does.
+///
+/// What this replaces was sixteen lines: "split on anything that is not
+/// alphanumeric". Measured against PG across its 23 token types, that
+/// agreed on FOUR — asciiword, word, numword and uint — and differed on
+/// thirteen. `user@example.com` indexed as `user`, `example`, `com` so a
+/// search for the address found nothing; `3.14` became `3` and `14`;
+/// `-42` lost its sign; and `<b>x</b>` put the tag name `b` INTO the
+/// index, twice. That last one is not a near-miss, it is markup
+/// polluting the search results.
+///
+/// Recognised here, longest-shape-first because the shapes nest (an
+/// email contains a host, a url contains a host and a path):
+/// tag, entity, url/protocol, email, file, host, version, sfloat,
+/// float, signed int, hyphenated word (compound AND parts, as PG emits
+/// both), and finally plain words and unsigned integers.
+pub fn tokenize_typed(text: &str) -> Vec<Token> {
+    let b: Vec<char> = text.chars().collect();
+    let mut out: Vec<Token> = Vec::new();
+    let mut i = 0usize;
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    while i < b.len() {
+        let c = b[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        // `<...>` — an XML tag. PG emits it as a `tag` token, which no
+        // configuration maps, so nothing of it reaches the index.
+        if c == '<'
+            && let Some(end) = (i + 1..b.len()).find(|&j| b[j] == '>')
+        {
+            out.push(Token {
+                text: b[i..=end].iter().collect(),
+                ty: TokenType::Tag,
+            });
+            i = end + 1;
+            continue;
+        }
+        // `&name;` / `&#123;` — an XML entity, likewise unmapped.
+        if c == '&'
+            && let Some(end) = (i + 1..b.len().min(i + 12)).find(|&j| b[j] == ';')
+            && end > i + 1
+        {
+            out.push(Token {
+                text: b[i..=end].iter().collect(),
+                ty: TokenType::Entity,
+            });
+            i = end + 1;
+            continue;
+        }
+        // A leading `/` belongs to the path it starts: PG's `file` token
+        // for `/usr/local/bin` keeps it, and a token that drops it is a
+        // different string to search for.
+        let leading_slash = c == '/' && i + 1 < b.len() && is_word(b[i + 1]);
+        if is_word(c)
+            || leading_slash
+            || (c == '-' && i + 1 < b.len() && b[i + 1].is_ascii_digit())
+        {
+            let start = i;
+            // A signed integer only counts as one at the start of a run.
+            let signed = c == '-';
+            if signed || leading_slash {
+                i += 1;
+            }
+            while i < b.len() && (is_word(b[i]) || matches!(b[i], '.' | '@' | '/' | '-' | ':')) {
+                // Stop before a trailing separator that is really
+                // punctuation: `end.` / `a/b,` — the separator has to be
+                // followed by more of the token.
+                if matches!(b[i], '.' | '@' | '/' | '-' | ':')
+                    && (i + 1 >= b.len() || !(is_word(b[i + 1]) || b[i + 1] == '/'))
+                {
+                    break;
+                }
+                i += 1;
+            }
+            let raw: String = b[start..i].iter().collect();
+            classify_into(&raw, signed, &mut out);
+            continue;
+        }
+        i += 1;
     }
     out
+}
+
+/// Assign a PG token type to one raw run, emitting the sub-parts PG
+/// emits alongside a compound.
+/// The original text for a run whose lowercased form is `lower`. Equal
+/// lengths is the common case (ASCII); when a fold changed the byte
+/// length the lowercased form is the honest fallback — `ts_debug`'s
+/// `token` column would otherwise slice mid-character.
+fn raw_of<'a>(raw: &'a str, lower: &'a impl AsRef<str>) -> &'a str {
+    let lower = lower.as_ref();
+    if raw.len() == lower.len() { raw } else { lower }
+}
+
+/// Same, for the part of a run after an optional `proto://` head.
+fn raw_tail<'a>(raw: &'a str, body: &'a str) -> &'a str {
+    if raw.len() >= body.len() && raw.is_char_boundary(raw.len() - body.len()) {
+        let t = &raw[raw.len() - body.len()..];
+        if t.len() == body.len() { t } else { body }
+    } else {
+        body
+    }
+}
+
+fn classify_into(raw: &str, signed: bool, out: &mut Vec<Token>) {
+    // Classification reads the lowercased form; what is PUSHED is the
+    // original, so the two never disagree about which token this is
+    // while still reporting what was written.
+    let lower = raw.to_lowercase();
+    let _ = &lower;
+    // v7.39 (round 651) — the token keeps the text the PARSER saw.
+    // Lowercasing is the DICTIONARY's job, which is why `ts_debug`'s
+    // `token` column shows `The` while its `lexemes` shows `{}`.
+    let push = |out: &mut Vec<Token>, t: &str, ty: TokenType| {
+        if !t.is_empty() {
+            out.push(Token {
+                text: alloc::string::String::from(t),
+                ty,
+            });
+        }
+    };
+    let ascii = lower.is_ascii();
+    let has_alpha = lower.chars().any(char::is_alphabetic);
+    let has_digit = lower.chars().any(|c| c.is_ascii_digit());
+
+    // A `proto://` head is its own token and maps to nothing; what
+    // follows is judged on its own, exactly as the same string without
+    // the head would be.
+    let mut body = lower.as_str();
+    if let Some(pos) = lower.find("://") {
+        push(out, &alloc::format!("{}://", &lower[..pos]), TokenType::Protocol);
+        body = &lower[pos + 3..];
+    }
+    // url vs file, and the discriminator is measured rather than
+    // guessed. `ts_debug` on PG18: `http://example.com/a/b` gives url +
+    // host + url_path, `http://x.y/z` gives a single `file`, and
+    // `http://x.co/z` gives url again — so what decides it is whether
+    // the part before the first `/` looks like a HOST, and a one-letter
+    // last label does not. An earlier version of this function emitted
+    // host and path for every URL because the type list says those
+    // types exist; that put `x.y` and `/z` into the index where PG has
+    // neither.
+    if body.contains('/') {
+        let (head, path) = match body.find('/') {
+            Some(p) => body.split_at(p),
+            None => (body, ""),
+        };
+        let host_like = head
+            .rsplit_once('.')
+            .is_some_and(|(pre, tld)| {
+                !pre.is_empty() && tld.len() >= 2 && tld.chars().all(char::is_alphabetic)
+            });
+        if host_like && !head.is_empty() {
+            push(out, raw_tail(raw, body), TokenType::Url);
+            push(out, &raw_tail(raw, body)[..head.len()], TokenType::Host);
+            push(out, &raw_tail(raw, body)[head.len()..], TokenType::UrlPath);
+        } else {
+            push(out, raw_tail(raw, body), TokenType::File);
+        }
+        return;
+    }
+    let lower = alloc::string::String::from(body);
+    let lower = lower.as_str();
+    // email: one `@`, something either side, a dot on the right
+    if let Some(at) = lower.find('@')
+        && at > 0
+        && lower[at + 1..].contains('.')
+        && !lower[at + 1..].contains('@')
+    {
+        push(out, raw_of(raw, &lower), TokenType::Email);
+        return;
+    }
+    // hyphenated word: PG emits the compound AND each part
+    if lower.contains('-') && has_alpha {
+        let compound = if has_digit {
+            TokenType::NumHword
+        } else if ascii {
+            TokenType::AsciiHword
+        } else {
+            TokenType::Hword
+        };
+        push(out, raw_of(raw, &lower), compound);
+        for (part, raw_part) in lower.split('-').zip(raw_of(raw, &lower).split('-')) {
+            if part.is_empty() {
+                continue;
+            }
+            let pty = if part.chars().any(|c| c.is_ascii_digit()) {
+                TokenType::HwordNumPart
+            } else if part.is_ascii() {
+                TokenType::HwordAsciiPart
+            } else {
+                TokenType::HwordPart
+            };
+            push(out, raw_part, pty);
+        }
+        return;
+    }
+    if lower.contains('.') {
+        let dots = lower.matches('.').count();
+        let numeric = lower.chars().all(|c| c.is_ascii_digit() || c == '.');
+        if numeric && dots >= 2 {
+            push(out, raw_of(raw, &lower), TokenType::Version);
+            return;
+        }
+        if numeric && dots == 1 {
+            push(out, raw_of(raw, &lower), TokenType::Float);
+            return;
+        }
+        // `1.5e10` — scientific notation
+        if dots == 1
+            && has_digit
+            && lower
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.' || c == 'e' || c == '+' || c == '-')
+        {
+            push(out, raw_of(raw, &lower), TokenType::SFloat);
+            return;
+        }
+        if has_alpha {
+            push(out, raw_of(raw, &lower), TokenType::Host);
+            return;
+        }
+        push(out, raw_of(raw, &lower), TokenType::Version);
+        return;
+    }
+    if !has_alpha && has_digit {
+        push(
+            out,
+            raw_of(raw, &lower),
+            if signed {
+                TokenType::Int
+            } else {
+                TokenType::Uint
+            },
+        );
+        return;
+    }
+    let ty = if has_digit {
+        TokenType::NumWord
+    } else if ascii {
+        TokenType::AsciiWord
+    } else {
+        TokenType::Word
+    };
+    push(out, raw_of(raw, &lower), ty);
 }
 
 enum WebToken {
