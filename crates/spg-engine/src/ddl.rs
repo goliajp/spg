@@ -2437,21 +2437,37 @@ impl Engine {
         if_exists: bool,
     ) -> Result<QueryResult, EngineError> {
         for name in names {
-            // v7.37.6-B(sentori Epic 2 P0)— refuse to DROP a
-            // partition parent that still has live children. PG
-            // requires explicit CASCADE for this; v7.37.6-B doesn't
-            // wire CASCADE through here yet, so surface a clear
-            // error instead of silently leaking orphans.
-            if crate::partition::is_partition_parent(self.active_catalog(), &name) {
-                let kids = crate::partition::children_of_parent(self.active_catalog(), &name);
-                if !kids.is_empty() {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "DROP TABLE {name:?}: partition parent still has {} child \
-                         partition(s) (e.g. {:?}); drop the children first \
-                         (CASCADE is a v7.37.6 follow-up)",
-                        kids.len(),
-                        kids[0]
-                    )));
+            // v7.39 (round 642) — dropping a partition parent drops its
+            // partitions with it.
+            //
+            // v7.37.6-B refused instead, on the premise that PG needs an
+            // explicit CASCADE here. Measured on PG18, it does not: a
+            // plain `DROP TABLE pp` takes pp and every partition, and so
+            // does the CASCADE spelling. The refusal made the parent
+            // undroppable by either spelling — `DROP TABLE IF EXISTS pp
+            // CASCADE` at the head of a script failed, and every
+            // statement after it failed on the leftovers.
+            //
+            // Depth-first: a partition may itself be partitioned, and
+            // its children have to go before it does.
+            let mut to_drop = alloc::vec::Vec::new();
+            let mut frontier = alloc::vec![name.clone()];
+            while let Some(cur) = frontier.pop() {
+                for kid in crate::partition::children_of_parent(self.active_catalog(), &cur) {
+                    frontier.push(kid.clone());
+                    to_drop.push(kid);
+                }
+            }
+            // Deepest first, so no parent is removed while a child of it
+            // is still listed.
+            for kid in to_drop.into_iter().rev() {
+                let kid_was_temp = self.temp_tables.contains(&kid);
+                if self.active_catalog_mut().drop_table(&kid) {
+                    if kid_was_temp {
+                        self.temp_tables.remove(&kid);
+                        self.refresh_temp_prefix();
+                    }
+                    self.table_write_stats.remove(&kid);
                 }
             }
             // v7.39 (round 436) — if this was one of the session's TEMPORARY

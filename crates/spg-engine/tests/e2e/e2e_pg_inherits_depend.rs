@@ -41,16 +41,18 @@ fn pg_inherits_lists_partition_children() {
     let rs = rows(&mut e, "SELECT * FROM pg_catalog.pg_inherits");
     // Two partition children → two rows.
     assert_eq!(rs.len(), 2, "got {rs:?}");
-    // inhseqno at position 2 should run 1, 2.
-    let mut seqs: Vec<i32> = rs
+    // v7.39 (round 642) — inhseqno is the PARENT's position in the
+    // CHILD's parent list, not the child's index among its siblings.
+    // This asserted 1, 2. Measured on PG18: two partitions of one parent
+    // both read 1, and only a child of two parents gets 1 and 2.
+    let seqs: Vec<i32> = rs
         .iter()
         .filter_map(|r| match r[2] {
             Value::Int(n) => Some(n),
             _ => None,
         })
         .collect();
-    seqs.sort();
-    assert_eq!(seqs, vec![1, 2]);
+    assert_eq!(seqs, vec![1, 1]);
 }
 
 #[test]

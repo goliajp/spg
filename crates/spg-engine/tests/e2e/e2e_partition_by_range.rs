@@ -304,18 +304,30 @@ fn partition_key_must_be_supported_type_at_v7_37_16() {
     );
 }
 
-/// Dropping a partition parent with live children fails with a
-/// clear pointer to one of the children. CASCADE is a follow-up.
+/// Dropping a partition parent takes its partitions with it.
+///
+/// v7.39 (round 642) — this test used to assert the opposite, that the
+/// drop is REFUSED and "CASCADE is a follow-up". Measured on PG18: a
+/// plain `DROP TABLE` removes the parent and every partition, no CASCADE
+/// involved, and the CASCADE spelling does the same. The assertion was
+/// pinning SPG's own gap as if it were the rule, and the gap made a
+/// partitioned table undroppable by any spelling.
 #[test]
-fn drop_parent_with_children_rejected() {
+fn drop_parent_takes_its_children() {
     let mut e = fresh_parent_with_children();
-    let err = e
-        .execute("DROP TABLE events_partitioned")
-        .expect_err("expected drop guard");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("partition parent") && msg.contains("events_partitioned"),
-        "unexpected drop error: {msg}"
+    e.execute("DROP TABLE events_partitioned")
+        .expect("a partition parent drops with its partitions, as it does on PG");
+    let rs = match e
+        .execute("SELECT count(*) FROM pg_class WHERE relname LIKE 'events_partitioned%'")
+        .unwrap()
+    {
+        spg_engine::QueryResult::Rows { rows, .. } => rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        spg_engine::eval::value_to_text(&rs[0].values[0]),
+        "0",
+        "parent and partitions must all be gone"
     );
 }
 

@@ -909,12 +909,19 @@ pub(crate) fn synth_pg_stat_progress_analyze(
 /// PG-canonical columns:
 ///   * inhrelid (BigInt) — child OID
 ///   * inhparent (BigInt) — parent OID
-///   * inhseqno (Int) — 1-based order within parent
+///   * inhseqno (Int) — the parent's position in the CHILD's parent
+///     list, NOT the child's index among its siblings. v7.39 (round
+///     642) — SPG numbered siblings, so the second partition of one
+///     parent read 2 where PG reads 1. Measured both ways: a child of
+///     two parents gets 1 and 2 on PG, and two partitions of one parent
+///     both get 1. A partition has exactly one parent, so the answer
+///     here is always 1.
 ///   * inhdetachpending (Bool) — false in SPG (DETACH is atomic)
 ///
-/// SPG declarative partitioning (v7.37.6-B + v7.37.16) is the
-/// only inheritance source; legacy CREATE TABLE … INHERITS
-/// (v7.37.18 (18.9) accept-and-no-op) doesn't materialise here.
+/// SPG declarative partitioning (v7.37.6-B + v7.37.16) is the only
+/// inheritance source. `CREATE TABLE … INHERITS` is a parse error, not
+/// an accept-and-no-op — this comment said otherwise until round 642
+/// measured it.
 pub(crate) fn synth_pg_inherits(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     use spg_storage::PartitionRole;
     let schema = alloc::vec![
@@ -932,10 +939,6 @@ pub(crate) fn synth_pg_inherits(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
         oid = oid.saturating_add(1);
     }
     let mut rows: Vec<Row<'static>> = Vec::new();
-    // Track per-parent seqno so each child gets a unique 1-based
-    // index — matches PG's pg_inherits.inhseqno semantics.
-    let mut per_parent_seq: alloc::collections::BTreeMap<i64, i32> =
-        alloc::collections::BTreeMap::new();
     for cname in cat.visible_table_names() {
         let Some(c) = cat.get(&cname) else { continue };
         let parent_name = match &c.schema().partition_role {
@@ -951,14 +954,12 @@ pub(crate) fn synth_pg_inherits(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
         let Some(&parent_oid) = by_name.get(&parent_name) else {
             continue;
         };
-        let seq = per_parent_seq
-            .entry(parent_oid)
-            .and_modify(|n| *n += 1)
-            .or_insert(1);
         rows.push(Row::new(alloc::vec![
             Value::BigInt(child_oid),
             Value::BigInt(parent_oid),
-            Value::Int(*seq),
+            // Always 1: a partition has exactly one parent, and this
+            // column counts parents, not siblings.
+            Value::Int(1),
             Value::Bool(false),
         ]));
     }
@@ -2804,6 +2805,27 @@ pub(crate) fn synth_pg_class(
     // whether to write WITH LOCAL/CASCADED CHECK OPTION.
     let mut view_reloptions: alloc::collections::BTreeMap<alloc::string::String, &'static str> =
         alloc::collections::BTreeMap::new();
+    // v7.39 (round 642) — `relhassubclass` was hardcoded false, so a
+    // PARTITIONED parent reported that it had no children while
+    // `pg_inherits` listed them two queries away. PG reads true for a
+    // partitioned parent and for an inheritance parent alike, measured.
+    // Collected once for the whole scan rather than asked per row: the
+    // question is "does any relation name this one as its parent", and
+    // answering it inside the loop would walk the catalog per relation.
+    let parents_with_children: alloc::collections::BTreeSet<alloc::string::String> = cat
+        .visible_table_names()
+        .iter()
+        .filter_map(|n| cat.get(n))
+        .filter_map(|c| match &c.schema().partition_role {
+            Some(PartitionRole::Range { parent_name, .. })
+            | Some(PartitionRole::List { parent_name, .. })
+            | Some(PartitionRole::Hash { parent_name, .. })
+            | Some(PartitionRole::Default { parent_name }) => {
+                Some(parent_name.to_ascii_lowercase())
+            }
+            _ => None,
+        })
+        .collect();
     // PG starts user-relation OIDs above 16384.
     // v7.39 (round 437) — walk the RAW list so an OID stays tied to a
     // table's catalog position, which is exactly what `relation_oid`
@@ -2887,7 +2909,7 @@ pub(crate) fn synth_pg_class(
                         .any(|r| r.table.eq_ignore_ascii_case(&tname)),
             ),
             Value::Bool(has_triggers),
-            Value::Bool(false),                         // relhassubclass
+            Value::Bool(parents_with_children.contains(&tname.to_ascii_lowercase())),
             Value::Bool(schema_ref.row_security),       // relrowsecurity (v7.39 RLS)
             Value::Bool(schema_ref.force_row_security), // relforcerowsecurity
             Value::Bool(true),                          // relispopulated
