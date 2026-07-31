@@ -23,9 +23,8 @@
 //! 413 measured widening it in place overflowing the parser's nesting
 //! stack — that is its own unit of work:
 //!
-//!   * `UPDATE ONLY t` and `DELETE FROM ONLY t` are still parse errors
-//!     (`relation "only" does not exist`). PG accepts both; on a
-//!     partitioned parent they match no rows, since it has none.
+//!   * `UPDATE ONLY t` and `DELETE FROM ONLY t` — closed in round 646,
+//!     which added the field this round said it needed.
 //!   * `TRUNCATE ONLY <partitioned>` is silently accepted as a no-op.
 //!     PG refuses it: "cannot truncate only a partitioned table". The
 //!     row outcome agrees; the refusal does not.
@@ -106,18 +105,15 @@ fn round644_only_on_a_childless_table_changes_nothing() {
     assert_eq!(one(&mut e, "SELECT count(*) FROM po1"), "1");
 }
 
-/// What ONLY does not yet reach, pinned so the gap is visible and the
-/// pin flips when it closes.
+/// The pin that flipped. Round 644 recorded these as parse errors and
+/// said the fix needed a field on a DML statement struct; round 646 added
+/// it. On a partition parent, which holds no rows, both are a way of
+/// asking for nothing — which is what PG answers too.
 #[test]
-fn round644_only_is_still_a_parse_error_on_dml() {
+fn round646_only_reaches_dml_now() {
     let mut e = seeded();
-    for sql in ["UPDATE ONLY po SET v = 'z'", "DELETE FROM ONLY po"] {
-        let err = e
-            .execute(sql)
-            .expect_err("PG accepts this; when SPG does, fix this test");
-        assert!(
-            err.to_string().contains("only"),
-            "{sql}: unexpected message {err}"
-        );
-    }
+    e.execute("UPDATE ONLY po SET v = 'z'").unwrap();
+    assert_eq!(one(&mut e, "SELECT count(*) FROM po WHERE v = 'z'"), "0");
+    e.execute("DELETE FROM ONLY po").unwrap();
+    assert_eq!(one(&mut e, "SELECT count(*) FROM po"), "2");
 }

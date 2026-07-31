@@ -8287,6 +8287,22 @@ impl Parser {
     }
 
     fn parse_update_after_keyword(&mut self) -> Result<Statement, ParseError> {
+        // v7.39 (round 646) — `UPDATE ONLY t SET …`. Read as a table
+        // NAMED `only` until now, which failed on `relation "only" does
+        // not exist`. The lookahead is what keeps a table actually
+        // called `only` working: the keyword is only a keyword when a
+        // TABLE NAME follows it — and `SET` arrives as an identifier
+        // here, so `UPDATE only SET a = 2` would otherwise take `SET`
+        // for the table and die on the `=`. Measured by the pin.
+        let only = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+            if s.eq_ignore_ascii_case("only"))
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Ident(n) | Token::QuotedIdent(n)) if !n.eq_ignore_ascii_case("set")
+            );
+        if only {
+            self.advance();
+        }
         let table = self.expect_ident_like()?;
         // v7.39 (round 241) — `UPDATE t [AS] alias SET …`. PG allows the
         // bare spelling; a bare identifier that is the SET keyword itself
@@ -8753,6 +8769,7 @@ impl Parser {
         Ok(Statement::Update(crate::ast::UpdateStatement {
             ctes: Vec::new(),
             table,
+            only,
             alias,
             assignments,
             from_sources,
@@ -8840,6 +8857,17 @@ impl Parser {
             return Err(self.err(format!("expected FROM after DELETE, got {:?}", self.peek())));
         }
         self.advance();
+        // v7.39 (round 646) — `DELETE FROM ONLY t`, same shape and same
+        // lookahead as the UPDATE spelling.
+        let only = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+            if s.eq_ignore_ascii_case("only"))
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Ident(_) | Token::QuotedIdent(_))
+            );
+        if only {
+            self.advance();
+        }
         let table = self.expect_ident_like()?;
         // v7.39 (round 241) — `DELETE FROM t [AS] alias …`. The bare
         // spelling must not swallow the clause keywords that can follow
@@ -9035,6 +9063,7 @@ impl Parser {
         Ok(Statement::Delete(crate::ast::DeleteStatement {
             ctes: Vec::new(),
             table,
+            only,
             alias,
             where_,
             order_limit: delete_order_limit,

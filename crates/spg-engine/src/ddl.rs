@@ -2682,6 +2682,38 @@ impl Engine {
                 }
             }
             schema.columns = merged;
+            // v7.39 (round 646) — CHECK constraints inherit too. Measured
+            // on PG18: a child of a table with `CHECK (a > 0)` gets its
+            // own `contype = 'c'` row. PRIMARY KEY and UNIQUE do NOT —
+            // the same probe reads 0 for `contype = 'p'` — so only the
+            // checks are copied.
+            //
+            // A constraint the child already declares by the same name is
+            // left alone; PG merges the two rather than carrying both.
+            for parent in &stmt.inherits {
+                let Some(p) = self.active_catalog().get(parent) else {
+                    continue;
+                };
+                // The NAME travels with the constraint. An unnamed CHECK
+                // is auto-named per table, so copying it as-is would give
+                // the child `<child>_a_check` where PG reports the
+                // parent's `<parent>_a_check` — measured in the violation
+                // message, which is where a user meets the name. Resolve
+                // the parent's name once and carry it explicitly.
+                let names = crate::system_catalog::pg_check_connames(p, parent, &p.schema().checks);
+                for (chk, name) in p.schema().checks.iter().zip(names) {
+                    let dup = schema.checks.iter().any(|c| match (&c.name, &chk.name) {
+                        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                        _ => c.expr == chk.expr,
+                    });
+                    if !dup {
+                        schema.checks.push(spg_storage::CheckConstraint {
+                            name: Some(name),
+                            expr: chk.expr.clone(),
+                        });
+                    }
+                }
+            }
             schema.partition_role = Some(spg_storage::PartitionRole::Inherits {
                 parent_names: stmt.inherits.clone(),
             });

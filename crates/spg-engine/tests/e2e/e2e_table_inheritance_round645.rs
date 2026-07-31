@@ -23,16 +23,9 @@
 //! A child may add columns of its own, so the union's terms name the
 //! PARENT's columns rather than `*`.
 //!
-//! NOT done, and refused rather than answered wrongly: `UPDATE` and
-//! `DELETE` through an inheritance parent. Fanning out to the children
-//! is only half the statement — the parent's own rows are the other
-//! half — and running the ordinary single-table body would quietly miss
-//! every child row. PG applies both through the parent; until SPG does,
-//! it says so. A wall beats a silent wrong answer.
-//!
-//! Also measured and still open: CHECK constraints do not inherit (PG
-//! gives the child its own `contype = 'c'` row; NOT NULL and DEFAULT do
-//! come across here).
+//! Round 645 refused `UPDATE` and `DELETE` through an inheritance
+//! parent rather than answer half of them; round 646 does the fan-out
+//! and CHECK inheritance. See `e2e_inheritance_dml_round646`.
 
 use spg_engine::{Engine, QueryResult};
 
@@ -160,25 +153,6 @@ fn round645_dropping_the_parent_errors_and_the_child_survives() {
         ),
         "2"
     );
-}
-
-/// Refused rather than answered wrongly — see the module note.
-#[test]
-fn round645_dml_through_the_parent_is_refused_not_half_applied() {
-    let mut e = family();
-    for sql in ["UPDATE par SET b = 'u'", "DELETE FROM par"] {
-        let err = e.execute(sql).expect_err("must not half-apply");
-        assert!(
-            err.to_string().contains("inheritance parent"),
-            "{sql}: got {err}"
-        );
-    }
-    // Nothing moved.
-    assert_eq!(one(&mut e, "SELECT count(*) FROM par"), "2");
-    assert_eq!(one(&mut e, "SELECT b FROM ch"), "d");
-    // Targeting the child directly works, which is what the message says.
-    e.execute("UPDATE ch SET b = 'u'").unwrap();
-    assert_eq!(one(&mut e, "SELECT b FROM ch"), "u");
 }
 
 #[test]

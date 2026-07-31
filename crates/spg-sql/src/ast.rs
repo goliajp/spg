@@ -2903,6 +2903,20 @@ pub struct UpdateStatement {
     /// level UPDATE. Empty for a plain UPDATE.
     pub ctes: Vec<Cte>,
     pub table: String,
+    /// v7.39 (round 646) — `UPDATE ONLY t` / `DELETE FROM ONLY t`: apply
+    /// to `t`'s own rows and not to anything that descends from it.
+    ///
+    /// Round 644 taught the FROM clause the keyword and left DML behind
+    /// because it needed a field here, and this struct carries a warning
+    /// that round 413 measured widening it in place overflowing the
+    /// parser's nesting stack. That warning was about `from_sources`, a
+    /// struct wide enough to need boxing; a `bool` lands in the padding
+    /// already present — same as `CreateTableStatement::temporary`.
+    ///
+    /// It also earns its keep beyond the spelling: the inheritance
+    /// fan-out needs a way to say "the parent's own rows" as a
+    /// statement, or running one on the parent recurses forever.
+    pub only: bool,
     /// v7.39 (round 241) — `UPDATE t [AS] alias SET …`: the name the
     /// statement's expressions refer to the target row by. PG allows the
     /// bare spelling here (unlike INSERT, which requires AS).
@@ -2934,6 +2948,20 @@ pub struct DeleteStatement {
     /// level DELETE. Empty for a plain DELETE.
     pub ctes: Vec<Cte>,
     pub table: String,
+    /// v7.39 (round 646) — `DELETE FROM ONLY t`, the sibling of `UpdateStatement::only`: apply
+    /// to `t`'s own rows and not to anything that descends from it.
+    ///
+    /// Round 644 taught the FROM clause the keyword and left DML behind
+    /// because it needed a field here, and this struct carries a warning
+    /// that round 413 measured widening it in place overflowing the
+    /// parser's nesting stack. That warning was about `from_sources`, a
+    /// struct wide enough to need boxing; a `bool` lands in the padding
+    /// already present — same as `CreateTableStatement::temporary`.
+    ///
+    /// It also earns its keep beyond the spelling: the inheritance
+    /// fan-out needs a way to say "the parent's own rows" as a
+    /// statement, or running one on the parent recurses forever.
+    pub only: bool,
     /// v7.39 (round 241) — `DELETE FROM t [AS] alias USING …`: the name
     /// the WHERE / RETURNING expressions refer to the target row by.
     pub alias: Option<String>,

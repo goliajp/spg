@@ -887,6 +887,7 @@ impl Engine {
             let del = DeleteStatement {
                 ctes: Vec::new(),
                 table: child.clone(),
+                only: false,
                 alias: None,
                 where_: stmt.where_.clone(),
                 order_limit: None,
@@ -1259,28 +1260,29 @@ impl Engine {
         // focused follow-up. Until then, reject a key-touching parent UPDATE
         // honestly rather than fan it out in place and leave a row in the wrong
         // partition (silent-wrong). A non-key UPDATE is always safe to fan out.
-        // v7.39 (round 645) — an INHERITANCE parent is refused here, on
-        // purpose, until the fan-out lands.
-        //
-        // A partition parent holds no rows, so fanning out to the
-        // children IS the whole statement. An inheritance parent holds
-        // its own rows as well, so the correct answer is "the parent AND
-        // every child" — and running only the ordinary single-table body
-        // would quietly miss every child row. PG updates and deletes
-        // through the parent; SPG will too, and until then it says so
-        // rather than answering wrongly.
-        if crate::partition::has_inheritance_children(self.active_catalog(), &stmt.table) {
-            let kids = crate::partition::children_of_parent(self.active_catalog(), &stmt.table);
-            return Err(EngineError::Unsupported(alloc::format!(
-                "UPDATE through an inheritance parent is not supported yet: {:?} has \
-                 {} inheriting child(ren) (e.g. {:?}), and applying this to the parent \
-                 alone would silently miss their rows. Target the child directly.",
-                stmt.table,
-                kids.len(),
-                kids.first().map_or("?", |k| k.as_str())
-            )));
-        }
-        if crate::partition::is_partition_parent(self.active_catalog(), &stmt.table) {
+        // v7.39 (round 646) — an INHERITANCE parent fans out to its
+        // children AND to itself; see the DELETE twin for why `only` is
+        // what makes the parent expressible without recursing. There is
+        // no partition key here, so the row-movement branch below cannot
+        // apply: nothing moves between an inheritance parent and a child.
+        // The extra test lives INSIDE the branch, not beside it. Round
+        // 646 first wrote `let inherit_fanout = …` at the top of this
+        // function — one statement, evaluated on every UPDATE and DELETE
+        // — and `SELECT count(*) FROM d WHERE g BETWEEN 10 AND 20` went
+        // 5.9 ms to 97 ms, reproduced outside the panel. Nothing about
+        // that query comes near here. Rounds 641, 643 and 644 met the
+        // same wall from their own directions; what a function's BODY
+        // holds is a codegen decision, and the cold side of a branch is
+        // not the body.
+        if !stmt.only
+            && (crate::partition::is_partition_parent(self.active_catalog(), &stmt.table)
+                || crate::partition::has_inheritance_children(
+                    self.active_catalog(),
+                    &stmt.table,
+                ))
+        {
+            let inherit_fanout =
+                !crate::partition::is_partition_parent(self.active_catalog(), &stmt.table);
             let key_cols: Vec<String> = {
                 let parent = self.active_catalog().get(&stmt.table).ok_or_else(|| {
                     EngineError::Storage(StorageError::TableNotFound {
@@ -1323,12 +1325,19 @@ impl Engine {
                 // propagates, so a failed statement does not eat rows.
                 return self.exec_partition_key_update(stmt, &key_cols, cancel);
             }
-            let children = crate::partition::children_of_parent(self.active_catalog(), &stmt.table);
+            let mut children =
+                crate::partition::children_of_parent(self.active_catalog(), &stmt.table);
+            if inherit_fanout {
+                children.push(stmt.table.clone());
+            }
             let mut total_affected = 0usize;
             let mut ret_columns: Option<Vec<ColumnSchema>> = None;
             let mut ret_rows: Vec<Row<'static>> = Vec::new();
             for child in children {
                 let mut child_stmt = stmt.clone();
+                // The parent's own term carries ONLY, which is what
+                // stops the recursive call re-entering this fan-out.
+                child_stmt.only = child == stmt.table;
                 child_stmt.table = child;
                 match self.exec_update_cancel(&child_stmt, cancel)? {
                     QueryResult::CommandOk { affected, .. } => total_affected += affected,
@@ -3237,34 +3246,45 @@ impl Engine {
         // would otherwise silently affect nothing. Each child DELETE re-evaluates
         // the same WHERE against that child's rows (and recurses for sub-partitions,
         // since a child is not itself a parent unless further partitioned).
-        // v7.39 (round 645) — an INHERITANCE parent is refused here, on
-        // purpose, until the fan-out lands.
+        // v7.39 (round 646) — an INHERITANCE parent fans out the same way,
+        // plus itself. Round 645 refused this rather than answer half of
+        // it; what makes the parent expressible as a term is `only`,
+        // which arrived with this round — without it, running the
+        // statement on the parent re-enters this fan-out forever.
         //
-        // A partition parent holds no rows, so fanning out to the
-        // children IS the whole statement. An inheritance parent holds
-        // its own rows as well, so the correct answer is "the parent AND
-        // every child" — and running only the ordinary single-table body
-        // would quietly miss every child row. PG updates and deletes
-        // through the parent; SPG will too, and until then it says so
-        // rather than answering wrongly.
-        if crate::partition::has_inheritance_children(self.active_catalog(), &stmt.table) {
-            let kids = crate::partition::children_of_parent(self.active_catalog(), &stmt.table);
-            return Err(EngineError::Unsupported(alloc::format!(
-                "DELETE through an inheritance parent is not supported yet: {:?} has \
-                 {} inheriting child(ren) (e.g. {:?}), and applying this to the parent \
-                 alone would silently miss their rows. Target the child directly.",
-                stmt.table,
-                kids.len(),
-                kids.first().map_or("?", |k| k.as_str())
-            )));
-        }
-        if crate::partition::is_partition_parent(self.active_catalog(), &stmt.table) {
-            let children = crate::partition::children_of_parent(self.active_catalog(), &stmt.table);
+        // `ONLY` on the incoming statement means the caller asked for
+        // the parent alone, so neither parent descends.
+        // The extra test lives INSIDE the branch, not beside it. Round
+        // 646 first wrote `let inherit_fanout = …` at the top of this
+        // function — one statement, evaluated on every UPDATE and DELETE
+        // — and `SELECT count(*) FROM d WHERE g BETWEEN 10 AND 20` went
+        // 5.9 ms to 97 ms, reproduced outside the panel. Nothing about
+        // that query comes near here. Rounds 641, 643 and 644 met the
+        // same wall from their own directions; what a function's BODY
+        // holds is a codegen decision, and the cold side of a branch is
+        // not the body.
+        if !stmt.only
+            && (crate::partition::is_partition_parent(self.active_catalog(), &stmt.table)
+                || crate::partition::has_inheritance_children(
+                    self.active_catalog(),
+                    &stmt.table,
+                ))
+        {
+            let inherit_fanout =
+                !crate::partition::is_partition_parent(self.active_catalog(), &stmt.table);
+            let mut children =
+                crate::partition::children_of_parent(self.active_catalog(), &stmt.table);
+            if inherit_fanout {
+                // The parent's own rows are a term too — as ONLY, so the
+                // recursive call stops here.
+                children.push(stmt.table.clone());
+            }
             let mut total_affected = 0usize;
             let mut ret_columns: Option<Vec<ColumnSchema>> = None;
             let mut ret_rows: Vec<Row<'static>> = Vec::new();
             for child in children {
                 let mut child_stmt = stmt.clone();
+                child_stmt.only = child == stmt.table;
                 child_stmt.table = child;
                 match self.exec_delete_cancel(&child_stmt, cancel)? {
                     QueryResult::CommandOk { affected, .. } => total_affected += affected,
