@@ -754,7 +754,11 @@ impl Engine {
                     }
                     // A DEFAULT partition takes whatever no sibling claims, so
                     // any existing row satisfies it.
-                    PartitionRole::Default { .. } | PartitionRole::Parent { .. } => true,
+                    // v7.39 (round 645) — an inheritance child has no key
+                    // constraint at all: nothing it holds can fail to fit.
+                    PartitionRole::Default { .. }
+                    | PartitionRole::Parent { .. }
+                    | PartitionRole::Inherits { .. } => true,
                 };
                 if !fits {
                     return Err(EngineError::Unsupported(alloc::format!(
@@ -2448,6 +2452,20 @@ impl Engine {
             // CASCADE` at the head of a script failed, and every
             // statement after it failed on the leftovers.
             //
+            // v7.39 (round 645) — inheritance is the other way round.
+            // Measured on PG18: `DROP TABLE <inheritance parent>` with a
+            // child is "cannot drop table par because other objects
+            // depend on it / table ch depends on table par", and the
+            // child survives. Only a PARTITION parent takes its children
+            // with it.
+            if crate::partition::has_inheritance_children(self.active_catalog(), &name) {
+                let kids = crate::partition::children_of_parent(self.active_catalog(), &name);
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "cannot drop table {name} because other objects depend on it\n\
+                     DETAIL:  table {} depends on table {name}",
+                    kids.first().map_or("?", |k| k.as_str())
+                )));
+            }
             // Depth-first: a partition may itself be partitioned, and
             // its children have to go before it does.
             let mut to_drop = alloc::vec::Vec::new();
@@ -2609,6 +2627,65 @@ impl Engine {
         // was written.
         let mut like_indexes: Vec<CreateIndexStatement> = Vec::new();
         self.apply_like_specs(&mut schema, &like_specs, &mut like_indexes)?;
+        // v7.39 (round 645) — `INHERITS (p1, p2)`. Each parent's columns
+        // land BEFORE the child's own, in the order the parents were
+        // written, which is the order PG uses and the order
+        // `pg_inherits.inhseqno` numbers them in.
+        //
+        // NOT NULL, DEFAULT and CHECK come with a column; PRIMARY KEY
+        // and UNIQUE do not — measured on PG18, a child of a table with
+        // a primary key has no `contype = 'p'` row of its own.
+        //
+        // A name the child also declares is not duplicated: PG merges
+        // the two, keeping one column, and requires the types to agree.
+        if !stmt.inherits.is_empty() {
+            let mut merged: Vec<spg_storage::ColumnSchema> = Vec::new();
+            for parent in &stmt.inherits {
+                let Some(p) = self.active_catalog().get(parent) else {
+                    return Err(EngineError::Storage(
+                        spg_storage::StorageError::TableNotFound {
+                            name: parent.clone(),
+                        },
+                    ));
+                };
+                for col in &p.schema().columns {
+                    if merged
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(&col.name))
+                    {
+                        continue;
+                    }
+                    if let Some(own) = schema
+                        .columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(&col.name))
+                        && own.ty != col.ty
+                    {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "column \"{}\" inherited from \"{parent}\" has type {}                              but the child declares {}",
+                            col.name,
+                            crate::conversions::pg_type_name_for_error(col.ty),
+                            crate::conversions::pg_type_name_for_error(own.ty)
+                        )));
+                    }
+                    merged.push(col.clone());
+                }
+            }
+            // The child's own columns follow, minus any the parents
+            // already supplied.
+            for col in &schema.columns {
+                if !merged
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(&col.name))
+                {
+                    merged.push(col.clone());
+                }
+            }
+            schema.columns = merged;
+            schema.partition_role = Some(spg_storage::PartitionRole::Inherits {
+                parent_names: stmt.inherits.clone(),
+            });
+        }
         // v7.37.6-B — `CREATE TABLE p (...) PARTITION BY RANGE (key)`:
         // attach the parent role to the freshly-built schema before
         // it lands in the catalog. Key column must be TIMESTAMPTZ

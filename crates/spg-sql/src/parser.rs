@@ -13111,6 +13111,7 @@ impl Parser {
                 name,
                 columns: Vec::new(),
                 like_specs: Vec::new(),
+                inherits: Vec::new(),
                 if_not_exists,
                 foreign_keys: Vec::new(),
                 table_constraints: Vec::new(),
@@ -13269,6 +13270,37 @@ impl Parser {
         // from `CREATE TABLE c () INHERITS (p)`, which needs table inheritance
         // SPG does not have (filed separately).
         let _ = &like_specs;
+        // v7.39 (round 645) — `INHERITS (p1, p2)`, PG table inheritance.
+        // It sits between the column list and the MySQL table options,
+        // and it was a syntax error until this round.
+        let mut inherits: Vec<String> = Vec::new();
+        if matches!(self.peek(), Token::Ident(k) | Token::QuotedIdent(k)
+            if k.eq_ignore_ascii_case("inherits"))
+        {
+            self.advance();
+            if !matches!(self.peek(), Token::LParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ( after INHERITS, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            loop {
+                inherits.push(self.expect_ident_like()?);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ) closing INHERITS, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+        }
         // v7.14.0 — consume MySQL/MariaDB table options after the
         // closing `)`. mysqldump emits things like
         // `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -13303,6 +13335,7 @@ impl Parser {
             name,
             columns,
             like_specs,
+            inherits,
             if_not_exists,
             foreign_keys,
             table_constraints,

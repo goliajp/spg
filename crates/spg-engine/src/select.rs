@@ -2189,7 +2189,14 @@ impl Engine {
         // A partition PARENT holds no rows of its own — they live in the
         // children — so its header count is 0 and the ordinary path has
         // to fan out. Caught by the partition conformance cases.
-        if crate::partition::is_partition_parent(self.active_catalog(), &from.primary.name) {
+        //
+        // v7.39 (round 645) — and an INHERITANCE parent holds only SOME
+        // of them, which is worse: its header count is a real number,
+        // just not the answer. `SELECT count(*) FROM par` returned 1
+        // where PG returns 2, because this shortcut fired before the
+        // fan-out could. The question is "does anything descend from
+        // this", not "was it declared a partition parent".
+        if crate::partition::has_children(self.active_catalog(), &from.primary.name) {
             return Ok(None);
         }
         let SelectItem::Expr { expr, alias } = &stmt.items[0] else {
@@ -2272,7 +2279,9 @@ impl Engine {
         {
             return None;
         }
-        if crate::partition::is_partition_parent(self.active_catalog(), &from.primary.name) {
+        // v7.39 (round 645) — see the note on the sibling shortcut above:
+        // an inheritance parent's own header count is not the answer.
+        if crate::partition::has_children(self.active_catalog(), &from.primary.name) {
             return None;
         }
         let SelectItem::Expr { expr, alias } = &stmt.items[0] else {
@@ -9314,6 +9323,53 @@ impl Engine {
                 kind,
                 ..
             }) => (*key_column_positions.first().unwrap_or(&0), *kind),
+            // v7.39 (round 645) — an INHERITANCE parent, which has no
+            // role of its own: the relationship is recorded only in the
+            // children. Three things differ from a partition parent and
+            // all three are in this body.
+            //
+            //   * The parent HOLDS ROWS, so it is a term of the union —
+            //     `FROM ONLY`, or expanding it would recurse.
+            //   * There is no partition key, so there is nothing to
+            //     prune: every child is a term.
+            //   * A child may declare columns of its own, so the terms
+            //     name the PARENT's columns rather than `*`. PG's
+            //     `SELECT * FROM parent` returns the parent's shape.
+            //
+            // Answered from this match rather than a branch before it —
+            // round 644 measured what an extra early return beside an
+            // existing test costs in this file.
+            _ if crate::partition::has_inheritance_children(cat, parent_name) => {
+                let cols = parent
+                    .schema()
+                    .columns
+                    .iter()
+                    .map(|c| quote_ident_for_sql(&c.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let carry_sys = references_ctid(outer);
+                let sys = if carry_sys {
+                    let mut t = alloc::string::String::new();
+                    for s in SYSTEM_COLUMNS {
+                        t.push_str(", ");
+                        t.push_str(s);
+                    }
+                    t
+                } else {
+                    alloc::string::String::new()
+                };
+                let mut body = alloc::format!(
+                    "SELECT {cols}{sys} FROM ONLY {}",
+                    quote_ident_for_sql(parent_name)
+                );
+                for child in crate::partition::children_of_parent(cat, parent_name) {
+                    body.push_str(&alloc::format!(
+                        " UNION ALL SELECT {cols}{sys} FROM {}",
+                        quote_ident_for_sql(&child)
+                    ));
+                }
+                return parse_select_or_corrupt(&body).map(Some);
+            }
             _ => {
                 return Err(EngineError::Unsupported(alloc::format!(
                     "partition expansion: {parent_name:?} is not a parent"
@@ -9502,7 +9558,7 @@ fn collect_partition_parent_refs(
     // other two directions — adding to a hot function and taking away
     // from a cold one. What goes in a body near the row loop is a
     // codegen decision whatever its shape.
-    if !t.only && crate::partition::is_partition_parent(cat, &t.name) {
+    if !t.only && crate::partition::has_children(cat, &t.name) {
         out.push(t.name.clone());
     }
 }

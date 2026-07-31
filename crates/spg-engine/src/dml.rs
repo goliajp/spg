@@ -1259,6 +1259,27 @@ impl Engine {
         // focused follow-up. Until then, reject a key-touching parent UPDATE
         // honestly rather than fan it out in place and leave a row in the wrong
         // partition (silent-wrong). A non-key UPDATE is always safe to fan out.
+        // v7.39 (round 645) — an INHERITANCE parent is refused here, on
+        // purpose, until the fan-out lands.
+        //
+        // A partition parent holds no rows, so fanning out to the
+        // children IS the whole statement. An inheritance parent holds
+        // its own rows as well, so the correct answer is "the parent AND
+        // every child" — and running only the ordinary single-table body
+        // would quietly miss every child row. PG updates and deletes
+        // through the parent; SPG will too, and until then it says so
+        // rather than answering wrongly.
+        if crate::partition::has_inheritance_children(self.active_catalog(), &stmt.table) {
+            let kids = crate::partition::children_of_parent(self.active_catalog(), &stmt.table);
+            return Err(EngineError::Unsupported(alloc::format!(
+                "UPDATE through an inheritance parent is not supported yet: {:?} has \
+                 {} inheriting child(ren) (e.g. {:?}), and applying this to the parent \
+                 alone would silently miss their rows. Target the child directly.",
+                stmt.table,
+                kids.len(),
+                kids.first().map_or("?", |k| k.as_str())
+            )));
+        }
         if crate::partition::is_partition_parent(self.active_catalog(), &stmt.table) {
             let key_cols: Vec<String> = {
                 let parent = self.active_catalog().get(&stmt.table).ok_or_else(|| {
@@ -3216,6 +3237,27 @@ impl Engine {
         // would otherwise silently affect nothing. Each child DELETE re-evaluates
         // the same WHERE against that child's rows (and recurses for sub-partitions,
         // since a child is not itself a parent unless further partitioned).
+        // v7.39 (round 645) — an INHERITANCE parent is refused here, on
+        // purpose, until the fan-out lands.
+        //
+        // A partition parent holds no rows, so fanning out to the
+        // children IS the whole statement. An inheritance parent holds
+        // its own rows as well, so the correct answer is "the parent AND
+        // every child" — and running only the ordinary single-table body
+        // would quietly miss every child row. PG updates and deletes
+        // through the parent; SPG will too, and until then it says so
+        // rather than answering wrongly.
+        if crate::partition::has_inheritance_children(self.active_catalog(), &stmt.table) {
+            let kids = crate::partition::children_of_parent(self.active_catalog(), &stmt.table);
+            return Err(EngineError::Unsupported(alloc::format!(
+                "DELETE through an inheritance parent is not supported yet: {:?} has \
+                 {} inheriting child(ren) (e.g. {:?}), and applying this to the parent \
+                 alone would silently miss their rows. Target the child directly.",
+                stmt.table,
+                kids.len(),
+                kids.first().map_or("?", |k| k.as_str())
+            )));
+        }
         if crate::partition::is_partition_parent(self.active_catalog(), &stmt.table) {
             let children = crate::partition::children_of_parent(self.active_catalog(), &stmt.table);
             let mut total_affected = 0usize;

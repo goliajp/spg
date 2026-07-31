@@ -17,6 +17,35 @@ use crate::EngineError;
 use crate::conversions::literal_expr_to_value;
 
 /// True when `table_name`'s schema carries `PartitionRole::Parent`.
+/// v7.39 (round 645) — is this relation the parent of anything, by
+/// either mechanism?
+///
+/// A declarative partition parent says so in its OWN schema. An
+/// inheritance parent does not: it is an ordinary table, and the only
+/// record of the relationship lives in the children. So this asks the
+/// children, and it is the question the FROM-clause fan-out actually
+/// wants — `is_partition_parent` answers a narrower one.
+pub(crate) fn has_children(catalog: &Catalog, table_name: &str) -> bool {
+    is_partition_parent(catalog, table_name)
+        || !children_of_parent(catalog, table_name).is_empty()
+}
+
+/// v7.39 (round 645) — does this relation have INHERITANCE children
+/// specifically? They differ from partitions in three ways that the
+/// engine has to keep apart: the parent holds rows of its own, an
+/// INSERT into it does not route, and dropping it without CASCADE is an
+/// error rather than a cascade.
+pub(crate) fn has_inheritance_children(catalog: &Catalog, table_name: &str) -> bool {
+    children_of_parent(catalog, table_name).iter().any(|c| {
+        catalog.get(c).is_some_and(|t| {
+            matches!(
+                t.schema().partition_role,
+                Some(PartitionRole::Inherits { .. })
+            )
+        })
+    })
+}
+
 pub(crate) fn is_partition_parent(catalog: &Catalog, table_name: &str) -> bool {
     catalog
         .get(table_name)
@@ -44,6 +73,13 @@ pub(crate) fn children_of_parent(catalog: &Catalog, parent: &str) -> Vec<String>
             | Some(PartitionRole::List { parent_name, .. })
             | Some(PartitionRole::Hash { parent_name, .. })
                 if parent_name == parent =>
+            {
+                out.push(name);
+            }
+            // v7.39 (round 645) — an inheritance child names one or more
+            // parents; it is a child of each of them.
+            Some(PartitionRole::Inherits { parent_names })
+                if parent_names.iter().any(|p| p == parent) =>
             {
                 out.push(name);
             }
