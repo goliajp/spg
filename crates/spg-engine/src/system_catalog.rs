@@ -921,6 +921,140 @@ pub(crate) fn synth_pg_stat_progress_analyze(
 /// SPG declarative partitioning (v7.37.6-B + v7.37.16) is the only
 /// inheritance source. `CREATE TABLE … INHERITS` is a parse error, not
 /// an accept-and-no-op — this comment said otherwise until round 642
+/// v7.39 (round 650) — the text-search catalogs SPG can fill honestly.
+///
+/// `EMPTY_PG_CATALOGS`'s own comment says the `pg_ts_*` family "would
+/// NOT be empty — SPG has full-text search. Stubbing those empty would
+/// be a lie, so they are recorded as work rather than filled in here."
+/// This is that work.
+///
+/// What SPG actually has is two configurations and two dictionaries —
+/// its own error says so: `text search config not implemented: "french"
+/// (supported: simple, english)`. PG ships thirty of each; listing
+/// thirty here would claim support the engine does not have, the lesson
+/// round 639 paid for on `pg_type`. Oids, column names and the
+/// `dictinitoption` text are PG18 readings for exactly these rows.
+///
+/// `pg_ts_config_map` is NOT here, and not in the empty list either: it
+/// maps token types to dictionaries, and SPG has no token-type model —
+/// the same gap that leaves `ts_token_type` and `ts_debug` unbuilt.
+/// Publishing it empty would be the lie the comment warns about; the
+/// three of them are one piece of work.
+pub(crate) fn synth_pg_ts_config(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("cfgname", DataType::Name, false),
+        ColumnSchema::new("cfgnamespace", DataType::BigInt, false),
+        ColumnSchema::new("cfgowner", DataType::BigInt, false),
+        ColumnSchema::new("cfgparser", DataType::BigInt, false),
+    ];
+    let rows = alloc::vec![
+        Row::new(alloc::vec![
+            Value::BigInt(3748),
+            Value::text("simple"),
+            Value::BigInt(11),
+            Value::BigInt(10),
+            Value::BigInt(3722),
+        ]),
+        Row::new(alloc::vec![
+            Value::BigInt(13248),
+            Value::text("english"),
+            Value::BigInt(11),
+            Value::BigInt(10),
+            Value::BigInt(3722),
+        ]),
+    ];
+    (schema, rows)
+}
+
+pub(crate) fn synth_pg_ts_dict(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("dictname", DataType::Name, false),
+        ColumnSchema::new("dictnamespace", DataType::BigInt, false),
+        ColumnSchema::new("dictowner", DataType::BigInt, false),
+        ColumnSchema::new("dicttemplate", DataType::BigInt, false),
+        ColumnSchema::new("dictinitoption", DataType::Text, true),
+    ];
+    let rows = alloc::vec![
+        Row::new(alloc::vec![
+            Value::BigInt(3765),
+            Value::text("simple"),
+            Value::BigInt(11),
+            Value::BigInt(10),
+            Value::BigInt(3727),
+            Value::Null,
+        ]),
+        Row::new(alloc::vec![
+            Value::BigInt(13247),
+            Value::text("english_stem"),
+            Value::BigInt(11),
+            Value::BigInt(10),
+            Value::BigInt(13234),
+            Value::text("language = 'english', stopwords = 'english'"),
+        ]),
+    ];
+    (schema, rows)
+}
+
+pub(crate) fn synth_pg_ts_parser(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("prsname", DataType::Name, false),
+        ColumnSchema::new("prsnamespace", DataType::BigInt, false),
+        ColumnSchema::new("prsstart", DataType::BigInt, false),
+        ColumnSchema::new("prstoken", DataType::BigInt, false),
+        ColumnSchema::new("prsend", DataType::BigInt, false),
+        ColumnSchema::new("prsheadline", DataType::BigInt, false),
+        ColumnSchema::new("prslextype", DataType::BigInt, false),
+    ];
+    // One parser, as PG has. The five function oids are 0 for the same
+    // reason `pg_type`'s I/O oids are: SPG's parser is built into the
+    // engine and is not a catalogued function, so naming one would
+    // leave `pg_ts_parser JOIN pg_proc` dangling.
+    let rows = alloc::vec![Row::new(alloc::vec![
+        Value::BigInt(3722),
+        Value::text("default"),
+        Value::BigInt(11),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+        Value::BigInt(0),
+    ])];
+    (schema, rows)
+}
+
+pub(crate) fn synth_pg_ts_template(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("tmplname", DataType::Name, false),
+        ColumnSchema::new("tmplnamespace", DataType::BigInt, false),
+        ColumnSchema::new("tmplinit", DataType::BigInt, false),
+        ColumnSchema::new("tmpllexize", DataType::BigInt, false),
+    ];
+    // The two templates the two dictionaries point at. PG also ships
+    // synonym, ispell and thesaurus; SPG implements none of them, and
+    // `pg_ts_dict.dicttemplate` would have nothing to reference.
+    let rows = alloc::vec![
+        Row::new(alloc::vec![
+            Value::BigInt(3727),
+            Value::text("simple"),
+            Value::BigInt(11),
+            Value::BigInt(0),
+            Value::BigInt(0),
+        ]),
+        Row::new(alloc::vec![
+            Value::BigInt(13234),
+            Value::text("snowball"),
+            Value::BigInt(11),
+            Value::BigInt(0),
+            Value::BigInt(0),
+        ]),
+    ];
+    (schema, rows)
+}
+
 /// measured it.
 pub(crate) fn synth_pg_inherits(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     use spg_storage::PartitionRole;
@@ -8681,6 +8815,10 @@ pub(crate) const CATALOG_RELATIONS: &[(&str, i64)] = &[
     ("pg_enum", 3501),
     ("pg_index", 2610),
     ("pg_inherits", 2611),
+    ("pg_ts_config", 3602),
+    ("pg_ts_dict", 3600),
+    ("pg_ts_parser", 3601),
+    ("pg_ts_template", 3764),
     ("pg_largeobject", 2613),
     ("pg_largeobject_metadata", 2995),
     ("pg_namespace", 2615),
@@ -8716,6 +8854,10 @@ fn catalog_relation_columns(name: &str, cat: &Catalog) -> Option<Vec<ColumnSchem
         "pg_enum" => synth_pg_enum(cat).0,
         "pg_index" => synth_pg_index_raw(cat).0,
         "pg_inherits" => synth_pg_inherits(cat).0,
+        "pg_ts_config" => synth_pg_ts_config(cat).0,
+        "pg_ts_dict" => synth_pg_ts_dict(cat).0,
+        "pg_ts_parser" => synth_pg_ts_parser(cat).0,
+        "pg_ts_template" => synth_pg_ts_template(cat).0,
         "pg_largeobject" => synth_pg_largeobject(cat).0,
         "pg_largeobject_metadata" => synth_pg_largeobject_metadata(cat).0,
         "pg_namespace" => synth_pg_namespace(cat).0,

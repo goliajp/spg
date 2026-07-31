@@ -836,6 +836,28 @@ impl Engine {
                         crate::system_catalog::synth_pg_inherits(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.39 (round 650) — the text-search catalogs, filled
+                // with what SPG actually has rather than PG's thirty.
+                "__spg_pg_ts_config" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_ts_config(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_ts_dict" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_ts_dict(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_ts_parser" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_ts_parser(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_ts_template" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_ts_template(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.37.24 (24.17) — pg_catalog.pg_depend
                 // (dependency graph; shape-stable empty since
                 // SPG's drop enforcement is per-kind, not per-object).

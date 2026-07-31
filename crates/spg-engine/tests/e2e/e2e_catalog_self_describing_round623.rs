@@ -157,7 +157,13 @@ fn round623_pg_attribute_describes_the_catalogs() {
              JOIN pg_attribute a ON a.attrelid = c.oid \
              WHERE n.nspname = 'pg_catalog') q"
         ),
-        vec!["22"]
+        // v7.39 (round 650) — 22 to 26 with the four text-search
+        // catalogs. This number is SUPPOSED to move when a catalog is
+        // added: that is what makes it catch one that was published
+        // without being self-described. Registering a catalog takes four
+        // separate lists, and this pin is the one that notices when the
+        // `pg_attribute` half was missed.
+        vec!["26"]
     );
 }
 

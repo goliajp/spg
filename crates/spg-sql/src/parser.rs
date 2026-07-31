@@ -793,6 +793,14 @@ const SYNTHESISED_PG_CATALOGS: &[&str] = &[
         "pg_index",
         "pg_indexes",
         "pg_inherits",
+        // v7.39 (round 650) — the text-search catalogs SPG can fill
+        // honestly. `pg_ts_config_map` is deliberately NOT here: it maps
+        // token types to dictionaries and SPG has no token-type model,
+        // the same gap that leaves `ts_token_type` / `ts_debug` unbuilt.
+        "pg_ts_config",
+        "pg_ts_dict",
+        "pg_ts_parser",
+        "pg_ts_template",
         "pg_matviews",
         "pg_namespace",
         // v7.39 (round 621)
