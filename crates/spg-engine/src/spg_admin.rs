@@ -559,6 +559,14 @@ impl Engine {
             };
             let row_count = t.rows().len() as i64;
             let (parent, role_str, bound) = match role {
+                // v7.39 (round 645) — an inheritance child reports every
+                // parent it names; the diagnostic view lists the first,
+                // which is the only one single inheritance ever has.
+                PartitionRole::Inherits { parent_names } => (
+                    parent_names.first().cloned().unwrap_or_default(),
+                    alloc::string::String::from("Inherits"),
+                    alloc::format!("INHERITS ({})", parent_names.join(", ")),
+                ),
                 PartitionRole::Parent { kind, .. } => {
                     let kind_str = match kind {
                         spg_storage::PartitionKind::Range => "RANGE",

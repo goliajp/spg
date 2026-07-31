@@ -2106,6 +2106,11 @@ pub struct CreateTableStatement {
     /// v7.39 (round 531) — the `LIKE` clauses in the column list, in
     /// the order written. Empty for a table that has none.
     pub like_specs: Vec<LikeSpec>,
+    /// v7.39 (round 645) — `CREATE TABLE c (…) INHERITS (p1, p2)`.
+    /// Empty for a table that inherits from nothing. Order matters:
+    /// the child takes each parent's columns in this order before its
+    /// own, and a parent's position here is its `pg_inherits.inhseqno`.
+    pub inherits: Vec<String>,
     /// `IF NOT EXISTS` — engine returns `CommandOk` no-op when the
     /// table name already exists, instead of raising `DuplicateTable`.
     pub if_not_exists: bool,

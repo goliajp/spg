@@ -1940,6 +1940,14 @@ pub enum PartitionRole {
         parent_name: String,
         values: Vec<PartitionBound>,
     },
+    /// v7.39 (round 645) — PG 表继承的 CHILD:`CREATE TABLE c (…)
+    /// INHERITS (p1, p2)`。跟分区 child 的三个本质区别(实测 PG18):
+    ///   * 父表**自己有行**(分区父表永远空),所以父表的联合体要含自身;
+    ///   * `INSERT INTO 父表` **不路由**到 child(分区会路由);
+    ///   * `DROP TABLE 父表` 不带 CASCADE **报错**(分区父表连子表一起删)。
+    /// 多父继承合法,故 `parent_names` 是 Vec;`pg_inherits.inhseqno`
+    /// 正是父表在这个列表里的位置(1-based)。
+    Inherits { parent_names: Vec<String> },
     /// v7.37.16 (16.2) — HASH child:行属于本 child iff
     /// `pg_compatible_hash(key) mod modulus == remainder`。
     /// PG 强制 `0 ≤ remainder < modulus`;parser/DDL 层先 gate。

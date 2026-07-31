@@ -3078,6 +3078,15 @@ pub(crate) fn write_partition_role(out: &mut Vec<u8>, role: Option<&crate::Parti
             out.extend_from_slice(&modulus.to_le_bytes());
             out.extend_from_slice(&remainder.to_le_bytes());
         }
+        // v7.39 (round 645) — tag 6: inheritance child. Names only; the
+        // parent's position in this list IS pg_inherits.inhseqno.
+        Some(PartitionRole::Inherits { parent_names }) => {
+            out.push(6);
+            out.extend_from_slice(&(parent_names.len() as u16).to_le_bytes());
+            for n in parent_names {
+                write_str(out, n);
+            }
+        }
     }
 }
 
@@ -3191,6 +3200,15 @@ pub(crate) fn read_partition_role(
                 modulus,
                 remainder,
             }))
+        }
+        // v7.39 (round 645) — tag 6: inheritance child.
+        6 => {
+            let n = cur.read_u16()? as usize;
+            let mut parent_names = Vec::with_capacity(n);
+            for _ in 0..n {
+                parent_names.push(cur.read_str()?);
+            }
+            Ok(Some(PartitionRole::Inherits { parent_names }))
         }
         other => Err(StorageError::Corrupt(format!(
             "partition_role: unknown role tag {other}"

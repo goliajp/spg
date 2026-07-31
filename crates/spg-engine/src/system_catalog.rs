@@ -941,6 +941,26 @@ pub(crate) fn synth_pg_inherits(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
     let mut rows: Vec<Row<'static>> = Vec::new();
     for cname in cat.visible_table_names() {
         let Some(c) = cat.get(&cname) else { continue };
+        // v7.39 (round 645) — an inheritance child names one or more
+        // parents, and a parent's POSITION in that list is exactly what
+        // inhseqno means. This is the only shape where it is not 1.
+        if let Some(PartitionRole::Inherits { parent_names }) = &c.schema().partition_role {
+            let Some(&child_oid) = by_name.get(&cname) else {
+                continue;
+            };
+            for (i, pname) in parent_names.iter().enumerate() {
+                let Some(&parent_oid) = by_name.get(pname) else {
+                    continue;
+                };
+                rows.push(Row::new(alloc::vec![
+                    Value::BigInt(child_oid),
+                    Value::BigInt(parent_oid),
+                    Value::Int(i as i32 + 1),
+                    Value::Bool(false),
+                ]));
+            }
+            continue;
+        }
         let parent_name = match &c.schema().partition_role {
             Some(PartitionRole::Range { parent_name, .. })
             | Some(PartitionRole::List { parent_name, .. })
@@ -2816,14 +2836,20 @@ pub(crate) fn synth_pg_class(
         .visible_table_names()
         .iter()
         .filter_map(|n| cat.get(n))
-        .filter_map(|c| match &c.schema().partition_role {
+        .flat_map(|c| match &c.schema().partition_role {
             Some(PartitionRole::Range { parent_name, .. })
             | Some(PartitionRole::List { parent_name, .. })
             | Some(PartitionRole::Hash { parent_name, .. })
             | Some(PartitionRole::Default { parent_name }) => {
-                Some(parent_name.to_ascii_lowercase())
+                alloc::vec![parent_name.to_ascii_lowercase()]
             }
-            _ => None,
+            // v7.39 (round 645) — an inheritance child makes every
+            // parent it names a parent.
+            Some(PartitionRole::Inherits { parent_names }) => parent_names
+                .iter()
+                .map(|p| p.to_ascii_lowercase())
+                .collect::<alloc::vec::Vec<_>>(),
+            _ => alloc::vec::Vec::new(),
         })
         .collect();
     // PG starts user-relation OIDs above 16384.
