@@ -917,73 +917,10 @@ impl Table {
                 // and downstream comparisons (RegClass vs BigInt oid) handle it.
                 continue;
             };
-            // Vector columns require both that the value's variant be Vector
-            // *and* its dimension match. `actual == col.ty` already encodes
-            // both because DataType::Vector carries the dim.
-            //
-            // VARCHAR(n) / CHAR(n) are storage-equivalent to TEXT — the
-            // length / padding contract is enforced upstream by
-            // `coerce_value`. Accept a `Text` value into either.
-            //
-            // NUMERIC's `Value::Numeric` carries its actual scale but the
-            // column declares the *expected* scale (a scale-rescaled
-            // Value::Numeric is produced upstream by `coerce_value`); the
-            // structural check here only verifies "value is Numeric and
-            // its scale equals the column scale".
-            let compatible = actual == col.ty
-                || matches!(
-                    (actual, col.ty),
-                    (
-                        DataType::Text,
-                        // v7.39 (round 291) — a NAME column stores a
-                        // Value::Text (the type identity is the schema's,
-                        // not the value's), so the two must be compatible
-                        // in both directions.
-                        DataType::Varchar(_)
-                            | DataType::Char(_)
-                            | DataType::Name
-                            | DataType::Json
-                            | DataType::Jsonb
-                    ) | (DataType::Name, DataType::Text)
-                        // v7.39 (round 640) — same arrangement one type
-                        // family over: an XID column stores the
-                        // Value::BigInt a transaction id has always been.
-                        | (DataType::BigInt, DataType::Xid | DataType::Xid8)
-                        | (DataType::Xid | DataType::Xid8, DataType::BigInt)
-                        | (DataType::Json | DataType::Jsonb, DataType::Text)
-                        | (DataType::Json, DataType::Jsonb)
-                        | (DataType::Jsonb, DataType::Json)
-                        | (DataType::Timestamp, DataType::Timestamptz)
-                        | (DataType::Timestamptz, DataType::Timestamp)
-                        // v7.37.5 ship triage — BIT / VARBIT share the
-                        // BitString storage shape; INET / CIDR likewise.
-                        // v7.39 (round 281) — the two now carry a
-                        // length, so a same-family pair with different
-                        // typmods must still compare compatible here.
-                        // The length contract is enforced at coercion,
-                        // not by this storage-shape check.
-                        | (DataType::Bit(_), DataType::BitVarying(_))
-                        | (DataType::BitVarying(_), DataType::Bit(_))
-                        | (DataType::Bit(_), DataType::Bit(_))
-                        | (DataType::BitVarying(_), DataType::BitVarying(_))
-                        | (DataType::Inet, DataType::Cidr)
-                        | (DataType::Cidr, DataType::Inet)
-                )
-                || matches!(
-                    (actual, col.ty),
-                    (
-                        DataType::Numeric { scale: a, .. },
-                        DataType::Numeric { precision: bp, scale: b },
-                    // v7.38 (read01 sweep) — an unconstrained `numeric` column
-                    // (the precision-0/scale-0 sentinel) stores a value at its
-                    // own natural scale, so accept any Numeric scale there; a
-                    // declared `numeric(p,s)` still requires the rescaled value.
-                    // v7.39 (round 273) — a NEGATIVE declared scale stores
-                    // the value at display scale 0 (it was rounded to a
-                    // multiple of 10^|s|), so the two scales legitimately
-                    // differ there.
-                    ) if a == b || (bp == 0 && b == 0) || (b < 0 && a == 0)
-                );
+            // A Vector column needs the variant AND the dimension to
+            // agree, which the equality inside `column_accepts` already
+            // encodes because DataType::Vector carries the dim.
+            let compatible = column_accepts(actual, col.ty);
             if !compatible {
                 return Err(StorageError::TypeMismatch {
                     column: col.name.clone(),
@@ -2438,48 +2375,7 @@ impl Table {
                 // and downstream comparisons (RegClass vs BigInt oid) handle it.
                 continue;
             };
-            let compatible = actual == col.ty
-                || matches!(
-                    (actual, col.ty),
-                    (
-                        DataType::Text,
-                        DataType::Varchar(_) | DataType::Char(_) | DataType::Json | DataType::Jsonb
-                    ) | (DataType::BigInt, DataType::Xid | DataType::Xid8)
-                        | (DataType::Xid | DataType::Xid8, DataType::BigInt)
-                        | (DataType::Json | DataType::Jsonb, DataType::Text)
-                        | (DataType::Json, DataType::Jsonb)
-                        | (DataType::Jsonb, DataType::Json)
-                        | (DataType::Timestamp, DataType::Timestamptz)
-                        | (DataType::Timestamptz, DataType::Timestamp)
-                        // v7.37.5 ship triage — BIT / VARBIT share the
-                        // BitString storage shape; INET / CIDR likewise.
-                        // v7.39 (round 281) — the two now carry a
-                        // length, so a same-family pair with different
-                        // typmods must still compare compatible here.
-                        // The length contract is enforced at coercion,
-                        // not by this storage-shape check.
-                        | (DataType::Bit(_), DataType::BitVarying(_))
-                        | (DataType::BitVarying(_), DataType::Bit(_))
-                        | (DataType::Bit(_), DataType::Bit(_))
-                        | (DataType::BitVarying(_), DataType::BitVarying(_))
-                        | (DataType::Inet, DataType::Cidr)
-                        | (DataType::Cidr, DataType::Inet)
-                )
-                || matches!(
-                    (actual, col.ty),
-                    (
-                        DataType::Numeric { scale: a, .. },
-                        DataType::Numeric { precision: bp, scale: b },
-                    // v7.38 (read01 sweep) — an unconstrained `numeric` column
-                    // (the precision-0/scale-0 sentinel) stores a value at its
-                    // own natural scale, so accept any Numeric scale there; a
-                    // declared `numeric(p,s)` still requires the rescaled value.
-                    // v7.39 (round 273) — a NEGATIVE declared scale stores
-                    // the value at display scale 0 (it was rounded to a
-                    // multiple of 10^|s|), so the two scales legitimately
-                    // differ there.
-                    ) if a == b || (bp == 0 && b == 0) || (b < 0 && a == 0)
-                );
+            let compatible = column_accepts(actual, col.ty);
             if !compatible {
                 return Err(StorageError::TypeMismatch {
                     column: col.name.clone(),
@@ -3045,6 +2941,91 @@ impl Table {
 /// handling, the cross-type compatibility map: TEXT ↔ VARCHAR/CHAR/
 /// JSON/JSONB, TIMESTAMP ↔ TIMESTAMPTZ, BIT ↔ VARBIT, INET ↔ CIDR,
 /// NUMERIC scale match).
+/// v7.39 (round 642/643) — does a value of type `actual` belong in a
+/// column declared `declared`?
+///
+/// This existed in THREE copies — insert, update and the standalone
+/// row validator — and they had drifted apart in three independent
+/// places: only insert accepted the `name` pairs, only insert and
+/// update accepted a bit-to-bit pair with differing typmods, and only
+/// update accepted a NEGATIVE declared numeric scale. Each omission was
+/// a hole waiting for a value to reach that path; none was a deliberate
+/// tightening, so the union below is the rule and all three now ask it.
+///
+/// Measured before converging: every shape the three disagreed about
+/// answers identically to PG18 today, so this fixes nothing observable.
+/// What it fixes is the next type — adding `xid` in round 640 meant
+/// remembering to patch three places, and forgetting one would have
+/// half-wired it.
+///
+/// The rule itself: a pair is compatible when the value's storage shape
+/// is what the column stores. Length and precision contracts are NOT
+/// checked here — they belong to coercion, which runs first.
+/// `#[inline]` is not decoration. Extracting this matrix out of its
+/// three call sites — a change with no semantic content at all — cost
+/// `SELECT count(*) FROM d WHERE g BETWEEN 10 AND 20` **23x**, 5.8 ms
+/// to 133 ms over 500 000 rows, reproducibly and outside the panel.
+/// None of the three callers is on a scan path; taking the matrix out
+/// of them was enough to move whatever else in this module the row loop
+/// depends on being inlined. Round 641 learned the same thing about
+/// `eval::binop::compare`. A refactor that reads as pure structure is
+/// still a codegen change.
+#[inline]
+fn column_accepts(actual: DataType, declared: DataType) -> bool {
+    if actual == declared {
+        return true;
+    }
+    if matches!(
+        (actual, declared),
+        // A NAME column stores a Value::Text: the type identity is the
+        // schema's and a value can never be one, so both directions.
+        (
+            DataType::Text,
+            DataType::Varchar(_)
+                | DataType::Char(_)
+                | DataType::Name
+                | DataType::Json
+                | DataType::Jsonb
+        ) | (DataType::Name, DataType::Text)
+            // An XID column stores the Value::BigInt a transaction id
+            // has always been; xid8 has no value of its own at all.
+            | (DataType::BigInt, DataType::Xid | DataType::Xid8)
+            | (DataType::Xid | DataType::Xid8, DataType::BigInt)
+            | (DataType::Json | DataType::Jsonb, DataType::Text)
+            | (DataType::Json, DataType::Jsonb)
+            | (DataType::Jsonb, DataType::Json)
+            | (DataType::Timestamp, DataType::Timestamptz)
+            | (DataType::Timestamptz, DataType::Timestamp)
+            // BIT / VARBIT share the BitString storage shape; INET /
+            // CIDR likewise. Same-family pairs with different typmods
+            // are compatible HERE — the length contract is coercion's.
+            | (DataType::Bit(_), DataType::BitVarying(_))
+            | (DataType::BitVarying(_), DataType::Bit(_))
+            | (DataType::Bit(_), DataType::Bit(_))
+            | (DataType::BitVarying(_), DataType::BitVarying(_))
+            | (DataType::Inet, DataType::Cidr)
+            | (DataType::Cidr, DataType::Inet)
+    ) {
+        return true;
+    }
+    // NUMERIC carries its own scale in the value while the column
+    // declares the expected one. An unconstrained `numeric` (the
+    // precision-0/scale-0 sentinel) takes any scale; a declared
+    // `numeric(p,s)` needs the rescaled value; and a NEGATIVE declared
+    // scale stores at display scale 0, having been rounded to a
+    // multiple of 10^|s|.
+    matches!(
+        (actual, declared),
+        (
+            DataType::Numeric { scale: a, .. },
+            DataType::Numeric {
+                precision: bp,
+                scale: b,
+            },
+        ) if a == b || (bp == 0 && b == 0) || (b < 0 && a == 0)
+    )
+}
+
 fn validate_row_against_schema(
     values: &[Value<'static>],
     schema: &TableSchema,
@@ -3063,34 +3044,7 @@ fn validate_row_against_schema(
             // See above: an eval-only untyped value is accepted, not a panic.
             continue;
         };
-        let compatible = actual == col.ty
-            || matches!(
-                (actual, col.ty),
-                (
-                    DataType::Text,
-                    DataType::Varchar(_) | DataType::Char(_) | DataType::Json | DataType::Jsonb
-                ) | (DataType::BigInt, DataType::Xid | DataType::Xid8)
-                    | (DataType::Xid | DataType::Xid8, DataType::BigInt)
-                    | (DataType::Json | DataType::Jsonb, DataType::Text)
-                    | (DataType::Json, DataType::Jsonb)
-                    | (DataType::Jsonb, DataType::Json)
-                    | (DataType::Timestamp, DataType::Timestamptz)
-                    | (DataType::Timestamptz, DataType::Timestamp)
-                    | (DataType::Bit(_), DataType::BitVarying(_))
-                    | (DataType::BitVarying(_), DataType::Bit(_))
-                    | (DataType::Inet, DataType::Cidr)
-                    | (DataType::Cidr, DataType::Inet)
-            )
-            || matches!(
-                (actual, col.ty),
-                (
-                    DataType::Numeric { scale: a, .. },
-                    DataType::Numeric { precision: bp, scale: b },
-                // v7.39 (read01 numeric.c) — same unconstrained-numeric
-                // acceptance as the insert-path check (a NumericBig VALUES
-                // cell carries its own natural scale).
-                ) if a == b || (bp == 0 && b == 0)
-            );
+        let compatible = column_accepts(actual, col.ty);
         if !compatible {
             return Err(StorageError::TypeMismatch {
                 column: col.name.clone(),
