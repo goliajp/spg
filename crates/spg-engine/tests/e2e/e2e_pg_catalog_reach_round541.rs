@@ -156,12 +156,18 @@ fn round541_pg_class_has_pg18s_columns() {
 #[test]
 fn round541_frozen_xid_only_where_there_is_storage() {
     let mut e = engine();
+    // v7.39 (round 640) — this read used to be `relfrozenxid > 0`, which
+    // PG refuses: "operator does not exist: xid > integer". It passed
+    // only because SPG typed the column bigint, so the assertion was
+    // pinning SPG's own gap as if it were the rule. `<> '0'::xid` is the
+    // same question in the operators the type actually has, and both
+    // engines answer it.
     let read = |e: &mut Engine, name: &str| {
         rows(
             e,
             &format!(
                 "SELECT relkind, relallfrozen, relrewrite, \
-                 relfrozenxid > 0, relminmxid FROM pg_class WHERE relname = '{name}'"
+                 relfrozenxid <> '0'::xid, relminmxid FROM pg_class WHERE relname = '{name}'"
             ),
         )
     };

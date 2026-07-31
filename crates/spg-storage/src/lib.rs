@@ -159,6 +159,31 @@ pub enum DataType {
     /// its own type identity — `pg_typeof('abc'::name)` is `name`, and
     /// `CREATE TABLE t (a name)` is legal SQL that SPG rejected.
     Name,
+    /// v7.39 (round 640) — PG's `xid`: a transaction id. [`Value::Xid`]
+    /// has existed since round 512, so a `'5'::xid` literal already knew
+    /// what it was; this is the DECLARED half, which nothing had. Without
+    /// it `pg_typeof(NULL::xid)` answered `bigint`, `pg_type` could not
+    /// list oid 28 — leaving the 48 `pg_attribute` rows that describe
+    /// `xmin` / `xmax` pointing at a type no catalog carried — and
+    /// `CREATE TABLE t (a xid)` was refused as an unknown type.
+    ///
+    /// On disk it is the 8-byte body its BIGINT sibling writes, and it
+    /// reads back as a `Value::Xid`, so a stored column and a literal are
+    /// the same thing to everything downstream.
+    ///
+    /// What is NOT yet true of the identity: PG gives `xid` equality and
+    /// hashing and no ordering operator at all, so `min` / `max` /
+    /// `count(DISTINCT …)` / `<=` all error there and all answer here.
+    /// Measured, not assumed — and left for the operator surface rather
+    /// than claimed by this comment.
+    Xid,
+    /// v7.39 (round 640) — PG's `xid8`: the same transaction id, 64 bits
+    /// wide and monotonic. Unlike [`DataType::Xid`] it has no value of
+    /// its own; a cell is a `Value::BigInt` and only the declared type
+    /// witnesses it. That is enough for `pg_typeof`, the catalogs and
+    /// the wire OID, and not enough to refuse a bigint where PG refuses
+    /// one. `pg_current_xact_id()` returns this type on PG.
+    Xid8,
     /// `INTERVAL` — calendar-aware span (months + microseconds). v2.11
     /// supports INTERVAL only as a runtime intermediate (literals,
     /// arithmetic results); on-disk encoding is rejected so this branch
@@ -448,6 +473,8 @@ impl fmt::Display for DataType {
             Self::SmallInt => f.write_str("SMALLINT"),
             Self::Int => f.write_str("INT"),
             Self::BigInt => f.write_str("BIGINT"),
+            Self::Xid => f.write_str("XID"),
+            Self::Xid8 => f.write_str("XID8"),
             Self::Float => f.write_str("FLOAT"),
             Self::Real => f.write_str("REAL"),
             Self::Text => f.write_str("TEXT"),
@@ -1062,8 +1089,13 @@ impl<'arena> Value<'arena> {
             Self::Composite(_) => None,
             // v7.39 (read01 ruleutils.c) — regclass is eval-only (dual
             // oid+name shape); no column storage type.
-            Self::RegClass(..) | Self::RegProc(..) | Self::Tid(..) | Self::Xid(_)
-            | Self::Cid(_) => None,
+            // v7.39 (round 640) — `xid` became a column type, so its value
+            // has a DataType to answer with. `cid` and `tid` are equally
+            // legal column types on PG (measured: `CREATE TABLE t (a cid,
+            // b tid)` is accepted), but SPG's grammar has no keyword for
+            // them yet; they stay eval-only rather than half-declared.
+            Self::Xid(_) => Some(DataType::Xid),
+            Self::RegClass(..) | Self::RegProc(..) | Self::Tid(..) | Self::Cid(_) => None,
             Self::Null => None,
         }
     }

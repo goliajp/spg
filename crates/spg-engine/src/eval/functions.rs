@@ -8341,15 +8341,29 @@ fn apply_function_dispatch(
         // v7.39 (round 518) — `age(xid)` is how far back a transaction id
         // is from the current one; it errored with "age() needs DATE or
         // TIMESTAMP" because only the temporal overload existed.
-        "age" if args.len() == 1 && matches!(&args[0], Value::Xid(_)) => {
-            let Value::Xid(x) = &args[0] else {
+        // v7.39 (round 640) — …and the two-arg shape, because the clock
+        // rewrite turns a one-arg `age(x)` into `age(midnight, x)` unless
+        // it can tell from the SYNTAX that x is a transaction id. It
+        // recognised an integer literal and an `::xid` cast and nothing
+        // else, so `age(relfrozenxid)` — the call the overload exists
+        // for — was rewritten into the temporal path and failed there.
+        // Deciding from the VALUE costs nothing and covers every
+        // expression that produces one; PG's real two-arg `age` takes two
+        // timestamps, so a trailing xid cannot be anything else.
+        "age" if (args.len() == 1 && matches!(&args[0], Value::Xid(_)))
+            || (args.len() == 2 && matches!(&args[1], Value::Xid(_))) =>
+        {
+            let Some(Value::Xid(x)) = args.last() else {
                 unreachable!()
             };
             let now = ctx
                 .engine
                 .map_or(u64::from(*x), |e| e.current_snapshot().version);
-            Ok(Value::BigInt(
-                i64::try_from(now.saturating_sub(u64::from(*x))).unwrap_or(i64::MAX),
+            // v7.39 (round 640) — `integer`, which is what PG's age(xid)
+            // returns; SPG answered bigint. The distance cannot exceed
+            // the 32-bit id space anyway.
+            Ok(Value::Int(
+                i32::try_from(now.saturating_sub(u64::from(*x))).unwrap_or(i32::MAX),
             ))
         }
         "age" => age(args),

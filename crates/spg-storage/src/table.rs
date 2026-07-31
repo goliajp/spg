@@ -945,6 +945,11 @@ impl Table {
                             | DataType::Json
                             | DataType::Jsonb
                     ) | (DataType::Name, DataType::Text)
+                        // v7.39 (round 640) — same arrangement one type
+                        // family over: an XID column stores the
+                        // Value::BigInt a transaction id has always been.
+                        | (DataType::BigInt, DataType::Xid | DataType::Xid8)
+                        | (DataType::Xid | DataType::Xid8, DataType::BigInt)
                         | (DataType::Json | DataType::Jsonb, DataType::Text)
                         | (DataType::Json, DataType::Jsonb)
                         | (DataType::Jsonb, DataType::Json)
@@ -2439,7 +2444,9 @@ impl Table {
                     (
                         DataType::Text,
                         DataType::Varchar(_) | DataType::Char(_) | DataType::Json | DataType::Jsonb
-                    ) | (DataType::Json | DataType::Jsonb, DataType::Text)
+                    ) | (DataType::BigInt, DataType::Xid | DataType::Xid8)
+                        | (DataType::Xid | DataType::Xid8, DataType::BigInt)
+                        | (DataType::Json | DataType::Jsonb, DataType::Text)
                         | (DataType::Json, DataType::Jsonb)
                         | (DataType::Jsonb, DataType::Json)
                         | (DataType::Timestamp, DataType::Timestamptz)
@@ -3062,7 +3069,9 @@ fn validate_row_against_schema(
                 (
                     DataType::Text,
                     DataType::Varchar(_) | DataType::Char(_) | DataType::Json | DataType::Jsonb
-                ) | (DataType::Json | DataType::Jsonb, DataType::Text)
+                ) | (DataType::BigInt, DataType::Xid | DataType::Xid8)
+                    | (DataType::Xid | DataType::Xid8, DataType::BigInt)
+                    | (DataType::Json | DataType::Jsonb, DataType::Text)
                     | (DataType::Json, DataType::Jsonb)
                     | (DataType::Jsonb, DataType::Json)
                     | (DataType::Timestamp, DataType::Timestamptz)

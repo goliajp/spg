@@ -2568,6 +2568,12 @@ pub enum ColumnTypeName {
     /// catalogs use. `CREATE TABLE t (a name)` is legal SQL that SPG
     /// answered `type "name" does not exist` to.
     Name,
+    /// v7.39 (round 640) — PG's transaction-id types. `xid` is the
+    /// 32-bit wrapping counter the row header carries; `xid8` is the
+    /// 64-bit monotonic one. `CREATE TABLE t (a xid)` is legal SQL that
+    /// SPG answered `type "xid" does not exist` to.
+    Xid,
+    Xid8,
     SmallInt,
     Int,
     BigInt,
@@ -2765,6 +2771,8 @@ impl fmt::Display for ColumnTypeName {
             Self::Real => f.write_str("REAL"),
             Self::Text => f.write_str("TEXT"),
             Self::Name => f.write_str("name"),
+            Self::Xid => f.write_str("xid"),
+            Self::Xid8 => f.write_str("xid8"),
             Self::Varchar(n) => write!(f, "VARCHAR({n})"),
             Self::Char(n) => write!(f, "CHAR({n})"),
             Self::Bool => f.write_str("BOOL"),
