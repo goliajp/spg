@@ -3545,13 +3545,13 @@ fn coerce_untyped_value(
     match (&v, expected) {
         // A regclass IS an oid — it coerces to any integer width, and to text
         // through its relation name.
-        (Value::RegClass(oid, _) | Value::RegProc(oid, _), DataType::BigInt) => {
+        (Value::RegClass(oid, _) | Value::RegProc(oid, _) | Value::RegType(oid, _), DataType::BigInt) => {
             Ok(Value::BigInt(*oid))
         }
-        (Value::RegClass(oid, _) | Value::RegProc(oid, _), DataType::Int) => {
+        (Value::RegClass(oid, _) | Value::RegProc(oid, _) | Value::RegType(oid, _), DataType::Int) => {
             Ok(Value::Int(i32::try_from(*oid).unwrap_or(i32::MAX)))
         }
-        (Value::RegClass(_, name) | Value::RegProc(_, name), DataType::Text) => {
+        (Value::RegClass(_, name) | Value::RegProc(_, name) | Value::RegType(_, name), DataType::Text) => {
             Ok(Value::text(alloc::string::String::from(name.as_ref())))
         }
         // v7.39 (read01 round 55) — SPG stores a composite-typed column as

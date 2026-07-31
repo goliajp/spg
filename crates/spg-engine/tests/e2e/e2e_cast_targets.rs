@@ -117,7 +117,14 @@ fn regtype_text_in_text_out() {
         panic!()
     };
     // v7.39 (read01 regproc.c) — regtype canonicalizes ('int4' → 'integer').
-    assert_eq!(rows[0].values[0], Value::text("integer"));
+    // v7.39 (round 648) — assert the RENDERED value, the way the
+    // regclass test below already does. This compared the Value variant
+    // and so pinned `Text("integer")` — the very shape that was the
+    // defect: a regtype with no oid half could not cast on to one.
+    assert_eq!(
+        spg_engine::eval::value_to_text(&rows[0].values[0]),
+        "integer"
+    );
 }
 
 #[test]

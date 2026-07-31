@@ -169,6 +169,7 @@ mod e2e_only_in_from_round644;
 mod e2e_table_inheritance_round645;
 mod e2e_inheritance_dml_round646;
 mod e2e_inherit_alter_truncate_round647;
+mod e2e_regtype_oid_round648;
 mod e2e_catalog_column_types_round620;
 mod e2e_array_insert_select_round621;
 mod e2e_by_is_an_identifier_round621;

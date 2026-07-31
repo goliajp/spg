@@ -1722,7 +1722,7 @@ fn value_body_encoded_len(v: &Value<'_>, _ty: DataType) -> usize {
         // v7.39 (round 640) — an `xid` column persists the 8-byte body
         // its BIGINT sibling does.
         Value::Xid(_) => 8,
-        Value::RegClass(..) | Value::RegProc(..) | Value::Tid(..) | Value::Cid(_) => 0,
+        Value::RegClass(..) | Value::RegProc(..) | Value::RegType(..) | Value::Tid(..) | Value::Cid(_) => 0,
         Value::Null => 0,
         // v7.37.5 β-P2 — INTERVAL is a 16-byte fixed body:
         // 8 i64 micros + 4 i32 days + 4 i32 months. PG byte-equal
@@ -2413,7 +2413,7 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
         // binary codec encodes it as absent (the text protocol renders it via
         // value_to_text and row_to_json converts it to JSON before storage).
         Value::Composite(_) => out.push(0),
-        Value::RegClass(..) | Value::RegProc(..) | Value::Tid(..) | Value::Xid(_)
+        Value::RegClass(..) | Value::RegProc(..) | Value::RegType(..) | Value::Tid(..) | Value::Xid(_)
         | Value::Cid(_) => out.push(0),
         Value::Null => out.push(0),
         Value::SmallInt(n) => {

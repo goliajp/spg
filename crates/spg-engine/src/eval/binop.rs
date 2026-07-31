@@ -5969,23 +5969,47 @@ pub(super) fn compare(
         (Value::Tid(b1, o1), Value::Tid(b2, o2)) => b1.cmp(b2).then(o1.cmp(o2)),
         (Value::Xid(x), Value::Xid(y)) => x.cmp(y),
         (Value::Cid(x), Value::Cid(y)) => x.cmp(y),
-        (Value::RegClass(a, _), Value::RegClass(b, _)) => a.cmp(b),
-        (Value::RegClass(a, _), Value::BigInt(b)) => a.cmp(b),
-        (Value::BigInt(a), Value::RegClass(b, _)) => a.cmp(b),
-        (Value::RegClass(a, _), Value::Int(b)) => a.cmp(&i64::from(*b)),
-        (Value::Int(a), Value::RegClass(b, _)) => i64::from(*a).cmp(b),
-        // v7.39 (round 342, V65) — regproc joins on oid the same way:
-        // `pg_proc.oid = 'f'::regproc` is the point of carrying it.
-        (Value::RegProc(a, _), Value::RegProc(b, _)) => a.cmp(b),
-        (Value::RegProc(a, _), Value::BigInt(b)) => a.cmp(b),
-        (Value::BigInt(a), Value::RegProc(b, _)) => a.cmp(b),
-        (Value::RegProc(a, _), Value::Int(b)) => a.cmp(&i64::from(*b)),
-        (Value::Int(a), Value::RegProc(b, _)) => i64::from(*a).cmp(b),
+        // v7.39 (round 342, V65 / round 648) — the reg family compares on
+        // its oid half: `pg_proc.oid = 'f'::regproc` is the point of
+        // carrying it, and regclass and regtype join the same way.
+        //
+        // Written as ONE arm per shape rather than one per type. Round
+        // 648 first added seven arms of its own for regtype and measured
+        // `stddev(id)` and `count(DISTINCT g)` 17-30 % slower — nothing
+        // in either goes near a reg value. Collapsing all three types
+        // into each shape leaves FEWER arms here than before regtype
+        // existed. Rounds 641/643/644/646 met the same wall; this is the
+        // fifth face of it, and the first where the cost came from arm
+        // COUNT rather than from a statement or a branch.
+        (
+            Value::RegClass(a, _) | Value::RegProc(a, _) | Value::RegType(a, _),
+            Value::RegClass(b, _) | Value::RegProc(b, _) | Value::RegType(b, _),
+        ) => a.cmp(b),
+        (
+            Value::RegClass(a, _) | Value::RegProc(a, _) | Value::RegType(a, _),
+            Value::BigInt(b),
+        ) => a.cmp(b),
+        (
+            Value::BigInt(a),
+            Value::RegClass(b, _) | Value::RegProc(b, _) | Value::RegType(b, _),
+        ) => a.cmp(b),
+        (
+            Value::RegClass(a, _) | Value::RegProc(a, _) | Value::RegType(a, _),
+            Value::Int(b),
+        ) => a.cmp(&i64::from(*b)),
+        (
+            Value::Int(a),
+            Value::RegClass(b, _) | Value::RegProc(b, _) | Value::RegType(b, _),
+        ) => i64::from(*a).cmp(b),
         // Text form compares by name (the pre-dual-shape contract).
-        (Value::RegClass(_, a), Value::Text(b)) => a.as_ref().cmp(b.as_ref()),
-        (Value::Text(a), Value::RegClass(_, b)) => a.as_ref().cmp(b.as_ref()),
-        (Value::RegProc(_, a), Value::Text(b)) => a.as_ref().cmp(b.as_ref()),
-        (Value::Text(a), Value::RegProc(_, b)) => a.as_ref().cmp(b.as_ref()),
+        (
+            Value::RegClass(_, a) | Value::RegProc(_, a) | Value::RegType(_, a),
+            Value::Text(b),
+        ) => a.as_ref().cmp(b.as_ref()),
+        (
+            Value::Text(a),
+            Value::RegClass(_, b) | Value::RegProc(_, b) | Value::RegType(_, b),
+        ) => a.as_ref().cmp(b.as_ref()),
         // v7.37.17 — same-type array `=` / `<>` / `<` / `<=` / `>` /
         // `>=` for the remaining Ord-element array variants. PG's
         // `array_cmp` total order = element-wise (`cmp_array`); uuid is
