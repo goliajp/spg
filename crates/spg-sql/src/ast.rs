@@ -508,6 +508,15 @@ pub enum Statement {
         tables: Vec<String>,
         restart_identity: bool,
         cascade: bool,
+        /// v7.39 (round 647) — `TRUNCATE ONLY t`. Absorbed as a no-op
+        /// since v7.14 on the reasoning that SPG's children are separate
+        /// relations a truncate does not descend into. Same reasoning
+        /// round 621 applied to `FROM ONLY`, and it stopped being true
+        /// for the same reason: measured, `TRUNCATE <inheritance parent>`
+        /// leaves the children's rows where PG empties them, and
+        /// `TRUNCATE ONLY <partitioned parent>` is silently accepted
+        /// where PG refuses it outright.
+        only: bool,
     },
     /// v6.7.3 — `COMPACT COLD SEGMENTS`. Walks every user table's
     /// BTree-cold indices and merges small cold-tier segments
@@ -1092,6 +1101,14 @@ pub struct AlterTableStatement {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum AlterTableTarget {
+    /// v7.39 (round 647) — `ALTER TABLE c INHERIT p` / `NO INHERIT p`.
+    ///
+    /// Both were accepted-and-ignored since v7.37.18, on the reasoning
+    /// that SPG has no PG-style inheritance. Round 645 gave it one, and
+    /// the reasoning went stale: `NO INHERIT` reported success while the
+    /// child stayed attached, which is the worst kind of answer — the
+    /// statement says it worked and the catalog disagrees.
+    Inherit { parent: String, detach: bool },
     /// Per-table hot-tier byte budget override. The freezer
     /// reads this before falling back to `SPG_HOT_TIER_BYTES`.
     SetHotTierBytes(u64),
@@ -5184,8 +5201,12 @@ impl fmt::Display for Statement {
                 tables,
                 restart_identity,
                 cascade,
+                only,
             } => {
                 f.write_str("TRUNCATE TABLE ")?;
+                if *only {
+                    f.write_str("ONLY ")?;
+                }
                 for (i, t) in tables.iter().enumerate() {
                     if i > 0 {
                         f.write_str(", ")?;
@@ -6311,6 +6332,13 @@ impl fmt::Display for CreateTableStatement {
 
 fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Result {
     match t {
+        AlterTableTarget::Inherit { parent, detach } => {
+            if *detach {
+                write!(f, "NO INHERIT {parent}")
+            } else {
+                write!(f, "INHERIT {parent}")
+            }
+        }
         AlterTableTarget::SetHotTierBytes(n) => {
             write!(f, "SET hot_tier_bytes = {n}")
         }

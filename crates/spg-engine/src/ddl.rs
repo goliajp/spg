@@ -132,6 +132,12 @@ impl Engine {
         use spg_sql::ast::AlterTableTarget as T;
         let tbl = table_name_outer;
         match target {
+            // v7.39 (round 647) — attach or detach an inheritance child.
+            // Accepted-and-ignored since v7.37.18, whose reasoning ("SPG
+            // doesn't support PG-style inheritance") round 645 made
+            // false. `NO INHERIT` reporting success while the child
+            // stayed attached is the worst shape a statement can have.
+            T::Inherit { parent, detach } => self.alter_inherit(tbl, &parent, detach),
             T::SetHotTierBytes(n) => self.alter_set_hot_tier_bytes(tbl, n),
             T::AddForeignKey(fk) => self.alter_add_foreign_key(tbl, fk),
             T::DropForeignKey { name, if_exists } => {
@@ -839,6 +845,73 @@ impl Engine {
             .get_mut(&child_name)
             .expect("child existed above");
         child.schema_mut().partition_role = None;
+        Ok(())
+    }
+
+    /// v7.39 (round 647) — `ALTER TABLE c INHERIT p` / `NO INHERIT p`.
+    ///
+    /// Measured on PG18: after `NO INHERIT`, the parent stops seeing the
+    /// child's rows, `pg_inherits` loses the row, and the child keeps
+    /// everything it had. `INHERIT` puts it back. Neither moves a row.
+    ///
+    /// A child of several parents keeps the others; the parent list is
+    /// ordered, and dropping one from the middle leaves the rest in
+    /// place — which is also what makes `pg_inherits.inhseqno` keep
+    /// meaning what it means.
+    fn alter_inherit(
+        &mut self,
+        child: &str,
+        parent: &str,
+        detach: bool,
+    ) -> Result<(), EngineError> {
+        use spg_storage::PartitionRole;
+        if self.active_catalog().get(parent).is_none() {
+            return Err(EngineError::Storage(
+                spg_storage::StorageError::TableNotFound {
+                    name: parent.to_string(),
+                },
+            ));
+        }
+        let Some(t) = self.active_catalog_mut().get_mut(child) else {
+            return Err(EngineError::Storage(
+                spg_storage::StorageError::TableNotFound {
+                    name: child.to_string(),
+                },
+            ));
+        };
+        let current = match &t.schema().partition_role {
+            Some(PartitionRole::Inherits { parent_names }) => parent_names.clone(),
+            Some(_) => {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "{child:?} is a partition, not an inheritance child"
+                )));
+            }
+            None => Vec::new(),
+        };
+        let mut names = current;
+        if detach {
+            let before = names.len();
+            names.retain(|p| !p.eq_ignore_ascii_case(parent));
+            if names.len() == before {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "relation {child:?} is not a child of relation {parent:?}"
+                )));
+            }
+        } else {
+            if names.iter().any(|p| p.eq_ignore_ascii_case(parent)) {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "relation {child:?} would be inherited from {parent:?} more than once"
+                )));
+            }
+            names.push(parent.to_string());
+        }
+        t.schema_mut().partition_role = if names.is_empty() {
+            None
+        } else {
+            Some(PartitionRole::Inherits {
+                parent_names: names,
+            })
+        };
         Ok(())
     }
 

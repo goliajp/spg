@@ -240,13 +240,45 @@ impl Engine {
         &mut self,
         tables: &[String],
         _restart_identity: bool,
+        only: bool,
     ) -> Result<QueryResult, EngineError> {
         // RESTART IDENTITY is parsed but not honored yet — the
         // SequenceDef doesn't expose a restart primitive on the
         // storage side today. Accepted-and-no-op for pg_dump compat;
         // real sequence reset lands with the sequence-lifecycle epic.
+        //
+        // v7.39 (round 647) — `ONLY` and the descent it turns off.
+        // Measured on PG18: a plain TRUNCATE of a parent empties its
+        // children too; `TRUNCATE ONLY <inheritance parent>` empties the
+        // parent alone; and `TRUNCATE ONLY <partitioned parent>` is not
+        // a no-op but an error, because a partitioned parent holds
+        // nothing and the spelling can only mean a mistake.
+        //
+        // The whole expansion sits inside this branch rather than beside
+        // it — rounds 641/643/644/646 each measured what an extra test
+        // in a function's body costs when the row loop is downstream.
+        let mut targets: Vec<String> = tables.to_vec();
+        if !tables.is_empty() {
+            for name in tables {
+                if only {
+                    if crate::partition::is_partition_parent(self.active_catalog(), name) {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "cannot truncate only a partitioned table"
+                        )));
+                    }
+                    continue;
+                }
+                let mut frontier = alloc::vec![name.clone()];
+                while let Some(cur) = frontier.pop() {
+                    for kid in crate::partition::children_of_parent(self.active_catalog(), &cur) {
+                        frontier.push(kid.clone());
+                        targets.push(kid);
+                    }
+                }
+            }
+        }
         let mut affected: usize = 0;
-        for name in tables {
+        for name in &targets {
             let cat = self.active_catalog_mut();
             let Some(t) = cat.get_mut(name) else {
                 // v7.39 (read01 round 50) — PG says "relation" for TRUNCATE
