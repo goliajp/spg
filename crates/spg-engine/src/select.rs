@@ -838,6 +838,11 @@ impl Engine {
                 }
                 // v7.39 (round 650) — the text-search catalogs, filled
                 // with what SPG actually has rather than PG's thirty.
+                "__spg_pg_ts_config_map" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_ts_config_map(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 "__spg_pg_ts_config" => {
                     let (schema, rows) =
                         crate::system_catalog::synth_pg_ts_config(self.active_catalog());
@@ -4348,6 +4353,123 @@ impl Engine {
                 } else {
                     alloc::vec::Vec::new()
                 };
+                Ok((rows, cols))
+            }
+            // v7.39 (round 651) — `ts_debug(config, text)`: what the parser
+            // saw, what each token was called, which dictionary took it
+            // and what came out. It is a projection of the same tokenizer
+            // and the same map the indexer uses, so it cannot describe a
+            // pipeline other than the one that runs.
+            "ts_debug" => {
+                use crate::fts::{TokenType, TsDict};
+                let cols = alloc::vec![
+                    ColumnSchema::new("alias".to_string(), DataType::Text, false),
+                    ColumnSchema::new("description".to_string(), DataType::Text, false),
+                    ColumnSchema::new("token".to_string(), DataType::Text, false),
+                    ColumnSchema::new("dictionaries".to_string(), DataType::TextArray, false),
+                    ColumnSchema::new("dictionary".to_string(), DataType::Text, true),
+                    ColumnSchema::new("lexemes".to_string(), DataType::TextArray, true),
+                ];
+                // PG's one-arg form uses the session configuration; the
+                // two-arg form names one.
+                let (cfg_name, text) = match (&arg0, args.get(1)) {
+                    (Some(Value::Text(c)), Some(t)) => {
+                        let v = eval::eval_expr(t, &dummy_row, &ctx).map_err(EngineError::Eval)?;
+                        (c.to_string(), crate::eval::value_to_text(&v))
+                    }
+                    (Some(v), None) => (
+                        alloc::string::String::from("english"),
+                        crate::eval::value_to_text(v),
+                    ),
+                    _ => return Ok((alloc::vec::Vec::new(), cols)),
+                };
+                let english = match cfg_name
+                    .trim()
+                    .trim_start_matches("pg_catalog.")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "english" => true,
+                    "simple" => false,
+                    other => {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "text search configuration \"{other}\" does not exist"
+                        )));
+                    }
+                };
+                let rows = crate::fts::tokenize_typed(&text)
+                    .into_iter()
+                    .map(|tok| {
+                        let dict = tok.ty.dictionary(english);
+                        let dname = dict.map(|d| match d {
+                            TsDict::Simple => "simple",
+                            TsDict::EnglishStem => "english_stem",
+                        });
+                        let folded = tok.text.to_lowercase();
+                        let lexemes = dict.map(|d| match d {
+                            TsDict::Simple => alloc::vec![Some(folded.clone())],
+                            TsDict::EnglishStem => {
+                                if crate::fts::is_english_stopword(&folded) {
+                                    alloc::vec::Vec::new()
+                                } else {
+                                    alloc::vec![Some(crate::fts::porter_stem(&folded))]
+                                }
+                            }
+                        });
+                        Row::new(alloc::vec![
+                            Value::text(tok.ty.alias()),
+                            Value::text(tok.ty.description()),
+                            Value::text(tok.text),
+                            Value::TextArray(
+                                dname
+                                    .map(|n| alloc::vec![Some(alloc::string::String::from(n))])
+                                    .unwrap_or_default(),
+                            ),
+                            dname.map_or(Value::Null, Value::text),
+                            lexemes.map_or(Value::Null, Value::TextArray),
+                        ])
+                    })
+                    .collect();
+                let _ = TokenType::AsciiWord;
+                Ok((rows, cols))
+            }
+            // v7.39 (round 651) — `ts_token_type('default')`, the list the
+            // parser actually produces. It is a projection of the
+            // `TokenType` enum the tokenizer and `pg_ts_config_map` both
+            // read, so the three cannot disagree about what a token is.
+            "ts_token_type" => {
+                use crate::fts::TokenType as T;
+                let cols = alloc::vec![
+                    ColumnSchema::new("tokid".to_string(), DataType::Int, false),
+                    ColumnSchema::new("alias".to_string(), DataType::Text, false),
+                    ColumnSchema::new("description".to_string(), DataType::Text, false),
+                ];
+                // PG takes the parser by name or oid; SPG has the one.
+                if let Some(Value::Text(p)) = &arg0
+                    && !p.eq_ignore_ascii_case("default")
+                    && !p.eq_ignore_ascii_case("pg_catalog.default")
+                {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "text search parser \"{p}\" does not exist"
+                    )));
+                }
+                const TYPES: &[T] = &[
+                    T::AsciiWord, T::Word, T::NumWord, T::Email, T::Url, T::Host,
+                    T::SFloat, T::Version, T::HwordNumPart, T::HwordPart,
+                    T::HwordAsciiPart, T::Blank, T::Tag, T::Protocol, T::NumHword,
+                    T::AsciiHword, T::Hword, T::UrlPath, T::File, T::Float,
+                    T::Int, T::Uint, T::Entity,
+                ];
+                let rows = TYPES
+                    .iter()
+                    .map(|t| {
+                        Row::new(alloc::vec![
+                            Value::Int(*t as i32),
+                            Value::text(t.alias()),
+                            Value::text(t.description()),
+                        ])
+                    })
+                    .collect();
                 Ok((rows, cols))
             }
             // v7.39 (read01 round 65) — a set-returning USER function in FROM

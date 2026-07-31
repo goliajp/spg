@@ -939,6 +939,73 @@ pub(crate) fn synth_pg_stat_progress_analyze(
 /// maps token types to dictionaries, and SPG has no token-type model —
 /// the same gap that leaves `ts_token_type` and `ts_debug` unbuilt.
 /// Publishing it empty would be the lie the comment warns about; the
+/// v7.39 (round 651) — `pg_ts_config_map`, now that there is a
+/// token-type model to map FROM.
+///
+/// Round 650 left this out on purpose: it maps token types to
+/// dictionaries and SPG had no token types, so publishing it — empty or
+/// full — would have been a claim rather than a fact. The typed
+/// tokenizer this round makes it a fact, and the rows are generated
+/// from the same `TokenType::dictionary` the indexer calls, so the
+/// catalog cannot drift from what the engine does.
+///
+/// PG maps nineteen of its twenty-three types per configuration; the
+/// four it leaves out — blank, tag, protocol, entity — are exactly the
+/// ones that produce no lexeme, which is why `<b>x</b>` indexes as `x`.
+pub(crate) fn synth_pg_ts_config_map(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    use crate::fts::{TokenType, TsDict};
+    let schema = alloc::vec![
+        ColumnSchema::new("mapcfg", DataType::BigInt, false),
+        ColumnSchema::new("maptokentype", DataType::Int, false),
+        ColumnSchema::new("mapseqno", DataType::Int, false),
+        ColumnSchema::new("mapdict", DataType::BigInt, false),
+    ];
+    const TYPES: &[TokenType] = &[
+        TokenType::AsciiWord,
+        TokenType::Word,
+        TokenType::NumWord,
+        TokenType::Email,
+        TokenType::Url,
+        TokenType::Host,
+        TokenType::SFloat,
+        TokenType::Version,
+        TokenType::HwordNumPart,
+        TokenType::HwordPart,
+        TokenType::HwordAsciiPart,
+        TokenType::Blank,
+        TokenType::Tag,
+        TokenType::Protocol,
+        TokenType::NumHword,
+        TokenType::AsciiHword,
+        TokenType::Hword,
+        TokenType::UrlPath,
+        TokenType::File,
+        TokenType::Float,
+        TokenType::Int,
+        TokenType::Uint,
+        TokenType::Entity,
+    ];
+    let mut rows = Vec::new();
+    // (config oid, is-english) — PG's own oids, as round 650 published.
+    for (cfg_oid, english) in [(3748i64, false), (13248i64, true)] {
+        for t in TYPES {
+            let Some(dict) = t.dictionary(english) else {
+                continue;
+            };
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(cfg_oid),
+                Value::Int(*t as i32),
+                Value::Int(1),
+                Value::BigInt(match dict {
+                    TsDict::Simple => 3765,
+                    TsDict::EnglishStem => 13247,
+                }),
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
 /// three of them are one piece of work.
 pub(crate) fn synth_pg_ts_config(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
@@ -8816,6 +8883,7 @@ pub(crate) const CATALOG_RELATIONS: &[(&str, i64)] = &[
     ("pg_index", 2610),
     ("pg_inherits", 2611),
     ("pg_ts_config", 3602),
+    ("pg_ts_config_map", 3603),
     ("pg_ts_dict", 3600),
     ("pg_ts_parser", 3601),
     ("pg_ts_template", 3764),
@@ -8855,6 +8923,7 @@ fn catalog_relation_columns(name: &str, cat: &Catalog) -> Option<Vec<ColumnSchem
         "pg_index" => synth_pg_index_raw(cat).0,
         "pg_inherits" => synth_pg_inherits(cat).0,
         "pg_ts_config" => synth_pg_ts_config(cat).0,
+        "pg_ts_config_map" => synth_pg_ts_config_map(cat).0,
         "pg_ts_dict" => synth_pg_ts_dict(cat).0,
         "pg_ts_parser" => synth_pg_ts_parser(cat).0,
         "pg_ts_template" => synth_pg_ts_template(cat).0,

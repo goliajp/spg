@@ -163,7 +163,7 @@ fn round623_pg_attribute_describes_the_catalogs() {
         // without being self-described. Registering a catalog takes four
         // separate lists, and this pin is the one that notices when the
         // `pg_attribute` half was missed.
-        vec!["26"]
+        vec!["27"]
     );
 }
 
