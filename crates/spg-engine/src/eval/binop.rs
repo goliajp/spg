@@ -5609,6 +5609,51 @@ fn no_such_operator(op: BinOp, a: &Value<'_>, b: &Value<'_>) -> EvalError {
     }
 }
 
+/// v7.39 (round 641) — a transaction id has EQUALITY and nothing else.
+///
+/// Measured on PG18: `xid = xid`, `xid <> xid`, `xid = integer` and
+/// `xid <> integer` all answer; `xid < xid`, `<=`, `>`, `>=` and
+/// `xid < integer` are all "operator does not exist". The counter wraps,
+/// so `<` between two ids does not mean what it reads like — PG declines
+/// rather than answer wrongly, and SPG answered all four.
+///
+/// The integer pair is asymmetric, deliberately: PG has `xideqint4` and
+/// no commutator, so `1 = '1'::xid` is an error there too. Matching that
+/// is not pedantry — a query written the reversed way works here and
+/// breaks on the database SPG stands in for.
+///
+/// An unknown-typed literal reads through the type's input function on
+/// either side: `'1'::xid = '1'` and `'1' = '1'::xid` both answer on PG,
+/// so a Text operand coerces rather than being refused. SPG models an
+/// unknown literal as Text and cannot tell it from a real `::text`,
+/// which PG DOES refuse; that gap is the unknown-type model's, not this
+/// rule's.
+///
+/// `#[cold]` and out of line on purpose — see the call site.
+#[cold]
+#[inline(never)]
+fn xid_compare(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Result<Value<'static>, EvalError> {
+    if l.is_null() || r.is_null() {
+        return Ok(Value::Null);
+    }
+    let as_i64 = |v: &Value<'_>| -> Option<i64> {
+        match v {
+            Value::Xid(x) => Some(i64::from(*x)),
+            Value::SmallInt(n) => Some(i64::from(*n)),
+            Value::Int(n) => Some(i64::from(*n)),
+            Value::BigInt(n) => Some(*n),
+            Value::Text(s) => s.parse::<i64>().ok(),
+            _ => None,
+        }
+    };
+    let equality = matches!(op, BinOp::Eq | BinOp::NotEq);
+    let integer_on_left = matches!(l, Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_));
+    match (equality, integer_on_left, as_i64(l), as_i64(r)) {
+        (true, false, Some(a), Some(b)) => cmp_result(op, a.cmp(&b)),
+        _ => Err(no_such_operator(op, l, r)),
+    }
+}
+
 pub(super) fn compare(
     op: BinOp,
     l: &Value<'_>,
@@ -5648,8 +5693,36 @@ pub(super) fn compare(
         (Value::Bool(a), Value::Bool(b)) => {
             return cmp_result(op, a.cmp(b));
         }
+        // v7.39 (round 641) — a transaction id has equality and no
+        // ordering; `xid_compare` holds the rule and the reasons.
+        //
+        // It is dispatched from THIS match rather than a test of its
+        // own below, and that is a measured decision, not tidiness.
+        // Written as `if matches!(l, Xid) || matches!(r, Xid)` after
+        // the match, `count(DISTINCT g)` — which has no xid anywhere —
+        // went 6.9 ms to 8.7 ms: two extra discriminant tests on every
+        // one of 500 000 rows. Here the switch is already happening
+        // and the arm is free. An even earlier version put the whole
+        // rule inline and cost `WHERE g BETWEEN 10 AND 20` 17x, by
+        // growing `compare` past what the row loop can inline.
+        (Value::Xid(_), _) | (_, Value::Xid(_)) => return xid_compare(op, l, r),
         _ => {}
     }
+    // v7.39 (round 641) — a transaction id has EQUALITY and nothing else.
+    // Measured on PG18: `xid = xid`, `xid <> xid`, `xid = integer` and
+    // `xid <> integer` all answer; `xid < xid`, `<=`, `>`, `>=` and
+    // `xid < integer` are all "operator does not exist". The reason is
+    // that the counter wraps, so `<` between two ids does not mean what
+    // it reads like — PG declines rather than answer wrongly, and SPG
+    // answered all four.
+    //
+    // The pair is asymmetric, and deliberately: PG has `xideqint4` but
+    // no commutator, so `1 = '1'::xid` is an error there too. Matching
+    // that is not pedantry — a query that relies on the reversed
+    // spelling works here and breaks on the database SPG stands in for.
+    //
+    // Placed AFTER the same-variant fast path above, which cannot match
+    // an Xid, so an integer comparison never pays for this.
     // PG implicitly casts an unknown-type string literal to the other
     // operand's type (`i = '5'`, `1 = '1'`, `2 < '10'`). When one side is Text
     // and the other is a typed scalar, coerce the Text to that type first; a

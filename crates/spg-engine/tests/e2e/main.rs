@@ -162,6 +162,7 @@ mod e2e_trigger_context_round637;
 mod e2e_pg_proc_round638;
 mod e2e_pg_operator_round639;
 mod e2e_xid_type_round640;
+mod e2e_xid_operators_round641;
 mod e2e_catalog_column_types_round620;
 mod e2e_array_insert_select_round621;
 mod e2e_by_is_an_identifier_round621;

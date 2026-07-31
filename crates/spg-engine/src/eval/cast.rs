@@ -1409,6 +1409,21 @@ fn cast_catalog_scalar_lower(
         Value::Text(t) => t.to_string(),
         Value::Cid(c) if lower == "cid" => return Ok(Some(Value::Cid(*c))),
         Value::Xid(x) if lower == "xid" => return Ok(Some(Value::Xid(*x))),
+        // v7.39 (round 641) — PG has no cast between an integer and a
+        // transaction id in either direction: `5::xid` is "cannot cast
+        // type integer to xid" and `'5'::xid::int` is the mirror of it,
+        // measured. The unknown-literal spelling `'5'::xid` is a
+        // different thing — that is the type's input function, and it is
+        // the Text arm above. Only `xid` is carved out here; `cid`,
+        // `oid` and the vector types keep taking an integer.
+        Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) if lower == "xid" => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "cannot cast type {} to xid",
+                    crate::eval::strings::pg_typeof_name(v)
+                ),
+            });
+        }
         Value::SmallInt(n) => alloc::format!("{n}"),
         Value::Int(n) => alloc::format!("{n}"),
         Value::BigInt(n) => alloc::format!("{n}"),
