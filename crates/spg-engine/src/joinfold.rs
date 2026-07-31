@@ -767,6 +767,7 @@ impl Engine {
         let primary = spg_sql::ast::TableRef {
             name: table_name.to_string(),
             alias: Some(alias.to_string()),
+            only: false,
             as_of_segment: None,
             unnest_expr: None,
             unnest_column_aliases: Vec::new(),

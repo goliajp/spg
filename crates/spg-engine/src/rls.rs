@@ -313,6 +313,7 @@ fn bare_table_ref(name: String) -> TableRef {
     TableRef {
         name,
         alias: None,
+        only: false,
         as_of_segment: None,
         unnest_expr: None,
         unnest_column_aliases: Vec::new(),

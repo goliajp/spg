@@ -6980,6 +6980,7 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
     let derived = TableRef {
         name: "__aggwin".into(),
         alias: Some("__aggwin".into()),
+        only: false,
         as_of_segment: None,
         unnest_expr: None,
         unnest_column_aliases: Vec::new(),
@@ -9462,7 +9463,14 @@ fn rewrite_partition_parent_table_ref(
     if t.lateral_subquery.is_some() || t.unnest_expr.is_some() || t.generate_series_args.is_some() {
         return;
     }
-    if !parents.iter().any(|p| p == &t.name) {
+    // v7.39 (round 644) — an ONLY reference stays pointed at the parent
+    // itself. The rewrite is keyed on the NAME, so in
+    // `FROM ONLY po a JOIN po b` the un-qualified `b` put `po` on the
+    // parent list and this then rewrote BOTH — including the one that
+    // asked not to descend. PG answers 0 for that join; SPG answered 2.
+    // Folded into the existing test — see the note in
+    // `collect_partition_parent_refs` for what a separate one cost.
+    if t.only || !parents.iter().any(|p| p == &t.name) {
         return;
     }
     if t.alias.is_none() {
@@ -9482,7 +9490,19 @@ fn collect_partition_parent_refs(
     if t.lateral_subquery.is_some() || t.unnest_expr.is_some() || t.generate_series_args.is_some() {
         return;
     }
-    if crate::partition::is_partition_parent(cat, &t.name) {
+    // v7.39 (round 644) — `FROM ONLY <parent>` scans the parent alone.
+    // The keyword used to be absorbed at parse time, so this fanned out
+    // anyway and `SELECT count(*) FROM ONLY <partitioned parent>`
+    // answered 2 where PG answers 0.
+    //
+    // Folded into the existing test rather than given an early return of
+    // its own: as two extra lines in this function's body it cost
+    // `WHERE g BETWEEN 10 AND 20` **26x**, 5.9 ms to 155 ms, measured
+    // outside the panel. Rounds 641 and 643 met the same wall from the
+    // other two directions — adding to a hot function and taking away
+    // from a cold one. What goes in a body near the row loop is a
+    // codegen decision whatever its shape.
+    if !t.only && crate::partition::is_partition_parent(cat, &t.name) {
         out.push(t.name.clone());
     }
 }
@@ -10582,6 +10602,7 @@ fn bare_table_ref_named(name: &str) -> TableRef {
     TableRef {
         name: name.to_string(),
         alias: None,
+        only: false,
         as_of_segment: None,
         unnest_expr: None,
         unnest_column_aliases: alloc::vec::Vec::new(),
