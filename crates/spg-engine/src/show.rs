@@ -619,6 +619,8 @@ fn render_data_type(ty: DataType) -> String {
         DataType::Real => "REAL".into(),
         DataType::Text => "TEXT".into(),
         DataType::Name => "NAME".into(),
+        DataType::Xid => "XID".into(),
+        DataType::Xid8 => "XID8".into(),
         DataType::Varchar(n) => alloc::format!("VARCHAR({n})"),
         DataType::Char(n) => alloc::format!("CHAR({n})"),
         DataType::Bool => "BOOL".into(),

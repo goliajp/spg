@@ -15175,6 +15175,8 @@ impl Parser {
                 ColumnTypeName::Bytes
             }
             "name" => ColumnTypeName::Name,
+            "xid" => ColumnTypeName::Xid,
+            "xid8" => ColumnTypeName::Xid8,
             "bool" | "boolean" => ColumnTypeName::Bool,
             // v7.39 (round 620) — an UNBOUNDED `varchar` is the same type as
             // an unbounded `character varying`, which the arm below has always

@@ -1064,6 +1064,11 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // TEXT; only the type identity is new, so no existing byte
         // moves and no old image needs migrating.
         DataType::Name => out.push(72),
+        // v7.39 (round 640) — tags 73 / 74. Both store the i64 a BIGINT
+        // stores; the tag is what tells a reader which identity the
+        // column was declared with.
+        DataType::Xid => out.push(73),
+        DataType::Xid8 => out.push(74),
         DataType::Bool => out.push(5),
         DataType::Vector { dim, encoding } => match encoding {
             // Tag 6: pre-v6 F32 vector. Layout unchanged; pre-v6
@@ -1249,6 +1254,8 @@ impl Cursor<'_> {
             3 => Ok(DataType::Float),
             4 => Ok(DataType::Text),
             72 => Ok(DataType::Name),
+            73 => Ok(DataType::Xid),
+            74 => Ok(DataType::Xid8),
             5 => Ok(DataType::Bool),
             6 => Ok(DataType::Vector {
                 dim: self.read_u32()?,
@@ -1712,8 +1719,10 @@ fn value_body_encoded_len(v: &Value<'_>, _ty: DataType) -> usize {
         // v7.38 (read01, T9) — a composite/record is a transient value
         // (row() → to_json); it is never persisted, so it has no on-disk body.
         Value::Composite(_) => 0,
-        Value::RegClass(..) | Value::RegProc(..) | Value::Tid(..) | Value::Xid(_)
-        | Value::Cid(_) => 0,
+        // v7.39 (round 640) — an `xid` column persists the 8-byte body
+        // its BIGINT sibling does.
+        Value::Xid(_) => 8,
+        Value::RegClass(..) | Value::RegProc(..) | Value::Tid(..) | Value::Cid(_) => 0,
         Value::Null => 0,
         // v7.37.5 β-P2 — INTERVAL is a 16-byte fixed body:
         // 8 i64 micros + 4 i32 days + 4 i32 months. PG byte-equal
@@ -1801,7 +1810,11 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
     match (v, ty) {
         (Value::SmallInt(n), DataType::SmallInt) => out.extend_from_slice(&n.to_le_bytes()),
         (Value::Int(n), DataType::Int) => out.extend_from_slice(&n.to_le_bytes()),
-        (Value::BigInt(n), DataType::BigInt) => out.extend_from_slice(&n.to_le_bytes()),
+        // v7.39 (round 640) — xid / xid8 share the BIGINT body.
+        (Value::BigInt(n), DataType::BigInt | DataType::Xid | DataType::Xid8) => {
+            out.extend_from_slice(&n.to_le_bytes())
+        }
+        (Value::Xid(x), DataType::Xid) => out.extend_from_slice(&i64::from(*x).to_le_bytes()),
         (Value::Float(x), DataType::Float) => out.extend_from_slice(&x.to_le_bytes()),
         (Value::Real(x), DataType::Real) => out.extend_from_slice(&x.to_le_bytes()),
         (Value::Bool(b), DataType::Bool) => out.push(u8::from(*b)),
@@ -3433,7 +3446,12 @@ impl<'a> Cursor<'a> {
                 Ok(Value::SmallInt(i16::from_le_bytes([s[0], s[1]])))
             }
             DataType::Int => Ok(Value::Int(self.read_i32()?)),
-            DataType::BigInt => Ok(Value::BigInt(self.read_i64()?)),
+            // v7.39 (round 640) — xid8 rides in a BigInt cell; so does
+            // xid, but it reads back as the Value::Xid round 512 already
+            // gave the type, so a stored column and a `'5'::xid` literal
+            // are the same thing to everything downstream.
+            DataType::BigInt | DataType::Xid8 => Ok(Value::BigInt(self.read_i64()?)),
+            DataType::Xid => Ok(Value::Xid(self.read_i64()? as u32)),
             DataType::Float => Ok(Value::Float(self.read_f64()?)),
             DataType::Real => Ok(Value::Real(self.read_f32()?)),
             DataType::Bool => Ok(Value::Bool(self.read_u8()? != 0)),

@@ -7875,6 +7875,9 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         // reporting text (25) here would make every catalog column
         // introspect as text, which is what ORMs key off.
         DataType::Name => 19,
+        // v7.39 (round 640) — a transaction id introspects as one.
+        DataType::Xid => 28,
+        DataType::Xid8 => 5069,
         DataType::SmallInt => 21,
         DataType::Int => 23,
         DataType::BigInt => 20,

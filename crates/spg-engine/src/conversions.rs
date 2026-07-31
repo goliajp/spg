@@ -1192,6 +1192,14 @@ pub(crate) fn regtype_name_to_oid(name: &str) -> Option<i64> {
         "regtype" => 2206,
         "regclass" => 2205,
         "regproc" => 24,
+        // v7.39 (round 640) — `'xid'::regtype` answered `type "xid" does
+        // not exist` while `NULL::xid` resolved, because the two go
+        // through different tables. Same three row-header types
+        // `pg_attribute` names.
+        "xid" => 28,
+        "xid8" => 5069,
+        "tid" => 27,
+        "cid" => 29,
         _ => return None,
     })
 }
@@ -2450,8 +2458,12 @@ fn type_name_to_data_type_lower(n: &str) -> Option<DataType> {
         "pg_lsn" => DataType::PgLsn,
         // v7.39 (read01 varbit.c) — the B'...' literal's internal target.
         "__bit_literal" => DataType::BitVarying(0),
-        // v7.39 (read01 xid8funcs.c) — xid/xid8 carried as bigint.
-        "xid" | "xid8" => DataType::BigInt,
+        // v7.39 (round 640) — a transaction id has its own identity now.
+        // The name used to resolve to `bigint`, which is why
+        // `pg_typeof(NULL::xid)` said so, `pg_type` could not list oid
+        // 28, and `CREATE TABLE t (a xid)` was an unknown type.
+        "xid" => DataType::Xid,
+        "xid8" => DataType::Xid8,
         "bit" => DataType::Bit(0),
         "varbit" | "bit varying" => DataType::BitVarying(0),
         "xml" => DataType::Xml,
@@ -2551,6 +2563,8 @@ pub(crate) const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Real => DataType::Real,
         ColumnTypeName::Text => DataType::Text,
         ColumnTypeName::Name => DataType::Name,
+        ColumnTypeName::Xid => DataType::Xid,
+        ColumnTypeName::Xid8 => DataType::Xid8,
         ColumnTypeName::Varchar(n) => DataType::Varchar(n),
         ColumnTypeName::Char(n) => DataType::Char(n),
         ColumnTypeName::Bool => DataType::Bool,
@@ -3289,6 +3303,11 @@ pub(crate) fn regtype_oid_to_name(oid: i64) -> Option<&'static str> {
         23 => "integer",
         25 => "text",
         26 => "oid",
+        // v7.39 (round 640) — the row-header types.
+        27 => "tid",
+        28 => "xid",
+        29 => "cid",
+        5069 => "xid8",
         114 => "json",
         142 => "xml",
         650 => "cidr",
@@ -4189,6 +4208,26 @@ pub(crate) fn coerce_value(
         (Value::Text(s), DataType::BigInt) => Some(Value::BigInt(
             parse_pg_int(&s).ok_or_else(|| invalid_input_syntax("bigint", &s))?,
         )),
+        // v7.39 (round 640) — `INSERT INTO t(x) VALUES ('11')` into an
+        // `xid` column, which is how PG takes one: the literal is
+        // unknown-typed and the column's input function reads it. An
+        // INTEGER in the same place is refused by both engines — PG
+        // has no int-to-xid cast at all, measured.
+        (Value::Text(s), DataType::Xid) => Some(Value::Xid(
+            s.parse::<u32>()
+                .map_err(|_| invalid_input_syntax("xid", &s))?,
+        )),
+        (Value::Xid(x), DataType::Xid) => Some(Value::Xid(x)),
+        (Value::Text(s), DataType::Xid8) => Some(Value::BigInt(
+            parse_pg_int(&s).ok_or_else(|| invalid_input_syntax("xid8", &s))?,
+        )),
+        // `'16'::xid8` evaluates to a BigInt — xid8 has a declared-type
+        // identity but no value of its own, the way `xid` has
+        // `Value::Xid`. The consequence is that SPG accepts a bigint
+        // where PG refuses one ("column is of type xid8 but expression
+        // is of type bigint"); closing that needs a `Value::Xid8`, which
+        // is its own unit of work.
+        (Value::BigInt(n), DataType::Xid8) => Some(Value::BigInt(n)),
         (Value::Text(s), DataType::Float) => {
             // v7.39 (round 270) — a numeric-looking text outside the
             // double range is "out of range", not "invalid input

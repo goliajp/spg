@@ -3510,6 +3510,29 @@ fn eval_function_call_positional(
         {
             return Ok(Value::text(n));
         }
+        // v7.39 (round 640) — a NON-null cell normally answers from the
+        // value, which is right for every type whose identity the value
+        // carries. `xid8` has no value of its own — a cell is a
+        // `Value::BigInt` — so it can only ever say "bigint" unless the
+        // schema is asked. `xid` is listed with it because a cell that
+        // reached here as a plain integer (a synthesised catalog row
+        // that has not been converted) should still name its column's
+        // type rather than the storage it arrived in.
+        //
+        // Only those two: this is not a general "prefer the declared
+        // type" switch. Where the value knows its own identity it is the
+        // better witness, because an expression's static shape is an
+        // approximation and its result is the fact.
+        if !matches!(v, Value::Null)
+            && let Some(shape) = crate::describe::describe_expr(&args[0], ctx.columns)
+            && matches!(
+                shape.ty,
+                spg_storage::DataType::Xid | spg_storage::DataType::Xid8
+            )
+            && let Some(n) = pg_typeof_name_for_datatype(shape.ty)
+        {
+            return Ok(Value::text(n));
+        }
         return apply_function(name, &[v], ctx);
     }
     // v7.37 D.1 — COALESCE result-type coercion. PG gives COALESCE the
@@ -4882,6 +4905,8 @@ pub(crate) fn pg_typeof_name_for_datatype(t: spg_storage::DataType) -> Option<&'
         D::Timestamp => "timestamp without time zone",
         D::Timestamptz => "timestamp with time zone",
         D::Name => "name",
+        D::Xid => "xid",
+        D::Xid8 => "xid8",
         D::Uuid => "uuid",
         D::Interval => "interval",
         _ => return None,

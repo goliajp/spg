@@ -210,6 +210,8 @@ pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
     let s = match ty {
         DataType::Int => "integer",
         DataType::BigInt => "bigint",
+        DataType::Xid => "xid",
+        DataType::Xid8 => "xid8",
         DataType::SmallInt => "smallint",
         DataType::Float => "double precision",
         DataType::Real => "real",
@@ -3146,7 +3148,7 @@ fn splice_pg_class_v18_schema(schema: &mut Vec<ColumnSchema>) {
     );
     schema.insert(
         PG_CLASS_RELISPARTITION + 1,
-        ColumnSchema::new("relfrozenxid", DataType::BigInt, false),
+        ColumnSchema::new("relfrozenxid", DataType::Xid, false),
     );
     schema.insert(
         PG_CLASS_RELISPARTITION + 1,
@@ -3187,8 +3189,15 @@ fn splice_pg_class_v18_row(
     row.values.push(Value::Null); // relpartbound
     row.values
         .insert(PG_CLASS_RELISPARTITION + 1, Value::BigInt(minmxid));
-    row.values
-        .insert(PG_CLASS_RELISPARTITION + 1, Value::BigInt(frozen));
+    // v7.39 (round 640) — relfrozenxid is an `xid`, and now says so.
+    // Typing the column was not enough: the cell has to carry the value
+    // identity too, or `age(relfrozenxid)` still reads a bigint and
+    // answers "age() needs DATE or TIMESTAMP" — which is exactly what
+    // it did, and why round 627's age guard had to be reverted.
+    row.values.insert(
+        PG_CLASS_RELISPARTITION + 1,
+        Value::Xid(u32::try_from(frozen).unwrap_or(u32::MAX)),
+    );
     row.values
         .insert(PG_CLASS_RELISPARTITION + 1, Value::BigInt(0)); // relrewrite
     row.values
@@ -3539,6 +3548,10 @@ fn pg_type_oid(ty: DataType) -> i64 {
         // catch-all mapped it to text (25) and `format_type` then had
         // no way back to the name.
         DataType::Name => 19,
+        // v7.39 (round 640) — without these two, `pg_attribute.atttypid`
+        // read 0 for an `xid` column and `format_type` answered `???`.
+        DataType::Xid => 28,
+        DataType::Xid8 => 5069,
         DataType::SmallInt => 21,
         DataType::Int => 23,
         DataType::BigInt => 20,
@@ -4080,6 +4093,19 @@ pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
         (24, "regproc", 4, "b", "N", 0, 1008),
         (25, "text", -1, "b", "S", 0, 1009),
         (26, "oid", 4, "b", "N", 0, 1028),
+        // v7.39 (round 640) — the four types the row header is made of.
+        // `pg_attribute` has described `ctid` / `xmin` / `cmin` / `xmax`
+        // / `cmax` since round 623 and typed them 27 / 28 / 29, but
+        // `pg_type` listed none of the three: 120 of SPG's own catalog
+        // rows pointed at types nothing carried, and PG has exactly one
+        // such row (a dropped column, atttypid 0). xid8 joins them
+        // because `NULL::xid8` now resolves to a type of its own.
+        // Measured off PG18; typarray is 0 rather than PG's 1010 / 1011
+        // / 1012 / 271 — see the typarray note in `build_row`.
+        (27, "tid", 6, "b", "U", 0, 0),
+        (28, "xid", 4, "b", "U", 0, 0),
+        (29, "cid", 4, "b", "U", 0, 0),
+        (5069, "xid8", 8, "b", "U", 0, 0),
         (114, "json", -1, "b", "U", 0, 199),
         (142, "xml", -1, "b", "U", 0, 143),
         (700, "float4", 4, "b", "N", 0, 1021),
@@ -4098,18 +4124,18 @@ pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
         // always returned anyelement / anyarray and pg_type never listed
         // either. Read off PG18; the pseudo-types are typtype 'p' and the
         // multiranges 'm', which is how a client tells them apart.
-        (2206, "regtype", 4, "b", "N", 0, 2211),
-        (2249, "record", -1, "p", "P", 0, 2287),
+        (2206, "regtype", 4, "b", "N", 0, 0),
+        (2249, "record", -1, "p", "P", 0, 0),
         (2277, "anyarray", -1, "p", "P", 0, 0),
         (2283, "anyelement", 4, "p", "P", 0, 0),
-        (4451, "int4multirange", -1, "m", "R", 0, 6150),
-        (4532, "nummultirange", -1, "m", "R", 0, 6151),
-        (4533, "tsmultirange", -1, "m", "R", 0, 6152),
-        (4534, "tstzmultirange", -1, "m", "R", 0, 6153),
-        (4535, "datemultirange", -1, "m", "R", 0, 6155),
-        (4536, "int8multirange", -1, "m", "R", 0, 6157),
-        (1560, "bit", -1, "b", "V", 0, 1561),
-        (1562, "varbit", -1, "b", "V", 0, 1563),
+        (4451, "int4multirange", -1, "m", "R", 0, 0),
+        (4532, "nummultirange", -1, "m", "R", 0, 0),
+        (4533, "tsmultirange", -1, "m", "R", 0, 0),
+        (4534, "tstzmultirange", -1, "m", "R", 0, 0),
+        (4535, "datemultirange", -1, "m", "R", 0, 0),
+        (4536, "int8multirange", -1, "m", "R", 0, 0),
+        (1560, "bit", -1, "b", "V", 0, 0),
+        (1562, "varbit", -1, "b", "V", 0, 0),
         (829, "macaddr", 6, "b", "U", 0, 1040),
         (1042, "bpchar", -1, "b", "S", 0, 1014),
         (1043, "varchar", -1, "b", "S", 0, 1015),
@@ -4129,12 +4155,12 @@ pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
         // v7.39 (pg_type reconcile) — these two were transposed; PG18:
         // 3908 = tsrange, 3910 = tstzrange (the wire layer already
         // encoded them correctly, so only the catalog disagreed).
-        (3908, "tsrange", -1, "r", "R", 0, 3909),
-        (3910, "tstzrange", -1, "r", "R", 0, 3911),
-        (3904, "int4range", -1, "r", "R", 0, 3905),
-        (3926, "int8range", -1, "r", "R", 0, 3927),
-        (3906, "numrange", -1, "r", "R", 0, 3907),
-        (3912, "daterange", -1, "r", "R", 0, 3913),
+        (3908, "tsrange", -1, "r", "R", 0, 0),
+        (3910, "tstzrange", -1, "r", "R", 0, 0),
+        (3904, "int4range", -1, "r", "R", 0, 0),
+        (3926, "int8range", -1, "r", "R", 0, 0),
+        (3906, "numrange", -1, "r", "R", 0, 0),
+        (3912, "daterange", -1, "r", "R", 0, 0),
     ];
     // Array companion types share the typelem / typcategory='A'.
     // We emit just the array OIDs the scalars reference.
@@ -4158,11 +4184,19 @@ pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
                      arr: i64,
                      subscript: &str|
      -> Row<'static> {
-        let typbyval = len > 0 && len <= 8;
+        // v7.39 (round 640) — `tid` is 6 bytes, which is neither a width
+        // a value can be passed in a register at nor one the 1/2/4/8
+        // ladder below has a rung for. PG measures it typbyval false,
+        // typalign 's'; the derivation would have said true and 'd'.
+        // The rule is width-based, not a list of names: an odd width
+        // is by-reference and aligns to its largest even divisor.
+        let odd_width = len > 0 && !matches!(len, 1 | 2 | 4 | 8);
+        let typbyval = len > 0 && len <= 8 && !odd_width;
         let typalign = match len {
             1 => "c",
             2 => "s",
             4 => "i",
+            _ if odd_width => "s",
             _ => "d",
         };
         let typstorage = if len > 0 { "p" } else { "x" };
@@ -4182,6 +4216,15 @@ pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             Value::BigInt(0),                        // typrelid (composite-type table OID)
             Value::text::<String>(subscript.into()), // typsubscript
             Value::BigInt(elem),
+            // v7.39 (round 640) — typarray names the type's array type,
+            // and PG's invariant is that it resolves: zero dangling
+            // pointers there, measured. SPG had 16 — `bit` naming 1561,
+            // `int4range` naming 3905, one for every type rounds 635 and
+            // 638 added — because it listed the scalar and not the array,
+            // and it does not HAVE the array (`pg_typeof(NULL::bit[])`
+            // is `unknown`). Naming a type nothing carries is the false
+            // claim; 0 is what PG itself writes for a type with no array
+            // type. The real number comes back when the array type does.
             Value::BigInt(arr),
             // round 543 — the seven I/O-function oids, all 0: SPG's I/O
             // is not a catalogued function, so there is nothing to name.
@@ -5934,7 +5977,7 @@ pub(crate) fn synth_pg_database(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("datallowconn", DataType::Bool, false),
         ColumnSchema::new("dathasloginevt", DataType::Bool, false),
         ColumnSchema::new("datconnlimit", DataType::Int, false),
-        ColumnSchema::new("datfrozenxid", DataType::BigInt, false),
+        ColumnSchema::new("datfrozenxid", DataType::Xid, false),
         ColumnSchema::new("datminmxid", DataType::BigInt, false),
         ColumnSchema::new("dattablespace", DataType::BigInt, false),
         ColumnSchema::new("datcollate", DataType::Text, false),
@@ -5965,7 +6008,8 @@ pub(crate) fn synth_pg_database(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
         Value::Int(-1),     // datconnlimit — unlimited
         // The real MVCC floor, not a placeholder: this is the number a
         // wraparound monitor is watching, and SPG has one to give.
-        Value::BigInt(i64::try_from(engine.vacuum_oldest_active()).unwrap_or(i64::MAX)),
+        // v7.39 (round 640) — an `xid`, same as pg_class.relfrozenxid.
+        Value::Xid(u32::try_from(engine.vacuum_oldest_active()).unwrap_or(u32::MAX)),
         Value::BigInt(1), // datminmxid — SPG has no multixact
         Value::BigInt(1663), // dattablespace — pg_default
         Value::text("C"),
