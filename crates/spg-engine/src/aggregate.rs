@@ -1591,6 +1591,13 @@ fn min_max_unsupported_type(v: &Value<'_>) -> bool {
                 | spg_storage::DataType::Xml
                 | spg_storage::DataType::TsVector
                 | spg_storage::DataType::TsQuery
+                // v7.39 (round 641) — a transaction id has no ordering
+                // operator, so PG has no `min(xid)` / `max(xid)` either:
+                // "function min(xid) does not exist", measured. SPG
+                // answered, because a Value::Xid carries a u32 that
+                // compares perfectly well — which is exactly the trap
+                // the type exists to avoid.
+                | spg_storage::DataType::Xid
         )
     )
 }

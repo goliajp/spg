@@ -11833,6 +11833,18 @@ fn apply_function_dispatch(
                     detail: alloc::format!("{name}() takes at least 1 arg"),
                 });
             }
+            // v7.39 (round 641) — GREATEST / LEAST need an ordering, and a
+            // transaction id has none: PG answers "could not identify a
+            // comparison function for type xid". It has to be refused HERE
+            // rather than by dropping xid's arm from the shared comparator,
+            // because that comparator swallows a failed comparison into
+            // `Ordering::Equal` — which would turn the refusal into a
+            // silently wrong answer, the exact failure round 511 fixed.
+            if args.iter().any(|v| matches!(v, Value::Xid(_))) {
+                return Err(EvalError::TypeMismatch {
+                    detail: "could not identify a comparison function for type xid".into(),
+                });
+            }
             // v7.39 (round 400) — MySQL GREATEST/LEAST return NULL if ANY
             // argument is NULL; PG ignores NULLs and returns the greatest /
             // least non-null one. The internal `*_larger` / `*_smaller`
