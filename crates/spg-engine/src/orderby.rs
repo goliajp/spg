@@ -117,6 +117,29 @@ pub(crate) fn numeric_bignum_cmp(a: &Value, b: &Value) -> Option<core::cmp::Orde
     }
 }
 
+/// v7.39 (round 643, F32) — there are FOUR value comparators in the
+/// engine: this one, `eval::values::value_cmp` (GREATEST / LEAST),
+/// `aggregate::value_cmp` (min / max) and the ordering match inside
+/// `eval::binop::compare` (the operators). They cover different variant
+/// sets and that looks like drift, but converging them is not a
+/// mechanical merge: **each has a different fallback**, and the
+/// fallback is what covers the variants the arm list omits.
+///
+/// This one falls back to comparing `format!("{:?}")` of the two
+/// values. `eval::values::value_cmp` delegates to the operator
+/// comparison instead. `aggregate::value_cmp` has its own.
+///
+/// Round 643 probed the difference — UUID / bytea / macaddr / time /
+/// money / inet under both ORDER BY and min/max, plus a TIME pair
+/// constructed specifically to break a Debug-string ordering
+/// (3_600_000_000 against 32_400_000_000, where string order and
+/// numeric order disagree) — and SPG matched PG18 on every one. ORDER
+/// BY extracts a numeric key before reaching here, which is why.
+///
+/// So the drift is latent, and a union would CHANGE behaviour on the
+/// paths where a fallback currently answers. If this is converged, the
+/// shape is a shared `Option<Ordering>` core with each caller keeping
+/// its own fallback — not one function with the union of the arms.
 pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     // v7.39 (round 485) — a same-variant scalar answers here, ahead of the
