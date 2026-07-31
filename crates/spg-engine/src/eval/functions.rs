@@ -15312,8 +15312,38 @@ fn apply_function_dispatch(
             match (&args[0], &args[1]) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                 (Value::Text(dict), Value::Text(token)) => {
+                    // v7.39 (round 650) — resolve the DICTIONARY by name
+                    // instead of sniffing for a substring.
+                    //
+                    // `dict.contains("english")` meant every name SPG does
+                    // not have behaved like `simple`: `ts_lexize(
+                    // 'french_stem', 'renards')` answered `{renards}` where
+                    // PG stems it to `{renard}`, and `ts_lexize(
+                    // 'nosuchdict', 'x')` answered `{x}` where PG raises
+                    // 42704. A silent wrong answer for every dictionary in
+                    // PG's catalog that SPG has not implemented.
+                    //
+                    // The accepted set is measured, not assumed: PG takes
+                    // `simple` and `english_stem`, case-insensitively and
+                    // with an optional `pg_catalog.` qualifier, and
+                    // REFUSES `english` — that is a configuration name, not
+                    // a dictionary. SPG has exactly these two.
+                    let key = dict
+                        .trim()
+                        .trim_start_matches("pg_catalog.")
+                        .to_ascii_lowercase();
+                    let is_english = match key.as_str() {
+                        "english_stem" => true,
+                        "simple" => false,
+                        _ => {
+                            return Err(EvalError::TypeMismatch {
+                                detail: alloc::format!(
+                                    "text search dictionary \"{dict}\" does not exist"
+                                ),
+                            });
+                        }
+                    };
                     let lower = token.to_lowercase();
-                    let is_english = dict.to_lowercase().contains("english");
                     if is_english {
                         if lower.is_empty() || crate::fts::is_english_stopword(&lower) {
                             return Ok(Value::TextArray(alloc::vec::Vec::new()));

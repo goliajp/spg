@@ -1567,6 +1567,13 @@ pub(crate) fn regclass_name_to_oid(cat: &spg_storage::Catalog, bare: &str) -> Op
         "pg_constraint" => 2606,
         "pg_index" => 2610,
         "pg_namespace" => 2615,
+        // v7.39 (round 650) — the text-search catalogs. This list is a
+        // hand-kept subset of `CATALOG_RELATIONS`, which is why adding a
+        // catalog there was not enough for `'pg_ts_config'::regclass`.
+        "pg_ts_config" => 3602,
+        "pg_ts_dict" => 3600,
+        "pg_ts_parser" => 3601,
+        "pg_ts_template" => 3764,
         _ => return None,
     })
 }
