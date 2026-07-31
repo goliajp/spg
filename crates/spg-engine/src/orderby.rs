@@ -435,9 +435,15 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
         // v7.39 (round 342, V65) — regproc compares by oid, same as
         // regclass, so `ORDER BY 'f'::regproc` and a join against
         // `pg_proc.oid` both behave.
-        (Value::RegProc(x, _), Value::RegProc(y, _)) => x.cmp(y),
-        (Value::RegProc(x, _), Value::BigInt(y)) => x.cmp(y),
-        (Value::BigInt(x), Value::RegProc(y, _)) => x.cmp(y),
+        // v7.39 (round 648) — one arm per shape, all three reg types in
+        // it; see the note in `eval::binop`'s comparator for what a
+        // per-type arm cost.
+        (
+            Value::RegProc(x, _) | Value::RegType(x, _),
+            Value::RegProc(y, _) | Value::RegType(y, _),
+        ) => x.cmp(y),
+        (Value::RegProc(x, _) | Value::RegType(x, _), Value::BigInt(y)) => x.cmp(y),
+        (Value::BigInt(x), Value::RegProc(y, _) | Value::RegType(y, _)) => x.cmp(y),
         // v7.39 (read01 orderedsetaggs.c, found via interval percentile) —
         // INTERVAL had no arm and fell to the debug-string fallback, which
         // ordered by the decimal rendering of `micros` (so 4h < 1h < 2h) —

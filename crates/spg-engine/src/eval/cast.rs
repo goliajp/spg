@@ -441,7 +441,9 @@ pub fn cast_value_ref_in(
             // (unlike the padded wire display).
             Value::BpChar(s) => s.trim_end_matches(' ').to_string(),
             // v7.39 (read01 ruleutils.c) — regclass::text is the name.
-            Value::RegClass(_, name) | Value::RegProc(_, name) => name.to_string(),
+            Value::RegClass(_, name) | Value::RegProc(_, name) | Value::RegType(_, name) => {
+                name.to_string()
+            }
             _ => value_to_text(&v),
         })),
         // v7.39 (round 254) — the integer targets refuse a NUMERIC special
@@ -455,9 +457,10 @@ pub fn cast_value_ref_in(
         // value's storage DataType, which these two deliberately do not
         // have, and the message leaked that `None` to the client.
         CastTarget::BigInt | CastTarget::Int
-            if matches!(v, Value::RegClass(..) | Value::RegProc(..)) =>
+            if matches!(v, Value::RegClass(..) | Value::RegProc(..) | Value::RegType(..)) =>
         {
-            let (Value::RegClass(oid, _) | Value::RegProc(oid, _)) = v else {
+            let (Value::RegClass(oid, _) | Value::RegProc(oid, _) | Value::RegType(oid, _)) = v
+            else {
                 unreachable!("guarded above")
             };
             Ok(if matches!(target, CastTarget::BigInt) {
@@ -579,8 +582,21 @@ pub fn cast_value_ref_in(
                 // name ('int4' → 'integer') and rejects unknown types
                 // (PG 42704).
                 if matches!(target, CastTarget::RegType) {
+                    // v7.39 (round 648) — carry the OID as well as the
+                    // name, the way `::regclass` and `::regproc` already
+                    // do. As a plain Text this rendered correctly and
+                    // then failed everything downstream: `'text'::regtype
+                    // ::oid` parsed the NAME as a number and answered
+                    // `invalid input syntax for type oid: "text"` where
+                    // PG answers 25, and `pg_typeof` said `text`.
                     return match crate::conversions::regtype_canonical_name(&bare) {
-                        Some(c) => Ok(Value::text(c)),
+                        Some(c) => {
+                            let oid = crate::conversions::regtype_name_to_oid(
+                                &c.to_ascii_lowercase(),
+                            )
+                            .unwrap_or(0);
+                            Ok(Value::RegType(oid, c.into_boxed_str()))
+                        }
                         None => Err(EvalError::TypeMismatch {
                             detail: alloc::format!("type \"{s}\" does not exist"),
                         }),
@@ -601,7 +617,7 @@ pub fn cast_value_ref_in(
                 if matches!(target, CastTarget::RegType)
                     && let Some(name) = crate::conversions::regtype_oid_to_name_owned(n)
                 {
-                    Ok(Value::text(name))
+                    Ok(Value::RegType(n, name.into_boxed_str()))
                 } else {
                     Ok(Value::text(alloc::format!("{n}")))
                 }

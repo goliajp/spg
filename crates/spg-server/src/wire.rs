@@ -348,7 +348,9 @@ fn value_to_wire(v: &Value) -> WireValue {
         Value::Macaddr(m) => WireValue::Text(spg_engine::format_macaddr(m)),
         Value::Macaddr8(m) => WireValue::Text(spg_engine::format_macaddr8(m)),
         Value::PgLsn(l) => WireValue::Text(spg_engine::format_pg_lsn(*l)),
-        Value::RegClass(_, name) | Value::RegProc(_, name) => WireValue::Text(name.to_string()),
+        Value::RegClass(_, name) | Value::RegProc(_, name) | Value::RegType(_, name) => {
+            WireValue::Text(name.to_string())
+        }
         Value::BitString { nbits, bytes } => {
             WireValue::Text(spg_engine::format_bit_string(*nbits, bytes))
         }

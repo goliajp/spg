@@ -13281,7 +13281,15 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Text(s) => {
+                // v7.39 (round 648) — a regtype arrives as `Value::RegType`
+                // now, carrying its oid alongside the name. Everything
+                // below wants the name, which is the half it always had.
+                Value::Text(_) | Value::RegType(..) => {
+                    let s = match &args[0] {
+                        Value::Text(s) => s.as_ref(),
+                        Value::RegType(_, n) => n.as_ref(),
+                        _ => unreachable!(),
+                    };
                     let name = s.trim().to_ascii_lowercase();
                     if let Some(dom) = ctx
                         .catalog
@@ -17056,8 +17064,13 @@ fn apply_function_dispatch(
                 Some(Value::Int(n)) => i64::from(*n),
                 Some(Value::BigInt(n)) => *n,
                 Some(Value::SmallInt(n)) => i64::from(*n),
-                // SPG's `::regtype` yields the type NAME (no OID space),
-                // so format_type('int4'::regtype, …) arrives as Text.
+                // v7.39 (round 648) — a regtype carries its oid now, so
+                // there is nothing to look up. The comment here used to
+                // say SPG's `::regtype` yields the type NAME because it
+                // has no OID space; it has one.
+                Some(Value::RegType(oid, _)) => *oid,
+                // A bare name still arrives as Text — `format_type` takes
+                // one from a catalog column as readily as from a cast.
                 // Map the internal / SQL spelling back to an OID and reuse
                 // the OID path (which also renders the typmod).
                 Some(Value::Text(s)) => {

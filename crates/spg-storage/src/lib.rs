@@ -813,6 +813,17 @@ pub enum Value<'arena> {
     /// — from `pg_get_functiondef('f')` — which PG rejects.
     /// Eval-only (no column storage).
     RegProc(i64, alloc::boxed::Box<str>),
+    /// v7.39 (round 648) — PG `regtype`: an OID-typed TYPE reference
+    /// that renders as the type name. The third of the shape
+    /// [`Value::RegClass`] and [`Value::RegProc`] carry, and the one
+    /// that was missing it: `::regtype` produced a plain `Value::Text`
+    /// holding the canonical name, so `'text'::regtype::oid` tried to
+    /// parse the NAME as a number and answered `invalid input syntax
+    /// for type oid: "text"` where PG answers 25. `pg_typeof` on one
+    /// said `text` rather than `regtype` for the same reason.
+    ///
+    /// Eval-only (no column storage).
+    RegType(i64, alloc::boxed::Box<str>),
     /// v7.39 (round 512) — PG `xid` and `cid`, the transaction and command
     /// ids the `xmin` / `xmax` / `cmin` / `cmax` system columns carry.
     ///
@@ -1095,7 +1106,7 @@ impl<'arena> Value<'arena> {
             // b tid)` is accepted), but SPG's grammar has no keyword for
             // them yet; they stay eval-only rather than half-declared.
             Self::Xid(_) => Some(DataType::Xid),
-            Self::RegClass(..) | Self::RegProc(..) | Self::Tid(..) | Self::Cid(_) => None,
+            Self::RegClass(..) | Self::RegProc(..) | Self::RegType(..) | Self::Tid(..) | Self::Cid(_) => None,
             Self::Null => None,
         }
     }
@@ -1172,6 +1183,7 @@ impl<'arena> Value<'arena> {
             Value::Xid(x) => Value::Xid(x),
             Value::Cid(c) => Value::Cid(c),
             Value::RegProc(oid, name) => Value::RegProc(oid, name),
+            Value::RegType(oid, name) => Value::RegType(oid, name),
             Value::Point(p) => Value::Point(p),
             Value::Lseg(a, b) => Value::Lseg(a, b),
             Value::Path { points, closed } => Value::Path { points, closed },
@@ -2317,7 +2329,8 @@ impl IndexKey {
             | Value::Xid(_)
             | Value::Cid(_)
             | Value::RegClass(..)
-            | Value::RegProc(..) => None,
+            | Value::RegProc(..)
+            | Value::RegType(..) => None,
             // Numeric isn't (yet) indexable — exact-decimal index keys
             // would need a stable scale-normalised representation.
             // Interval isn't index-eligible either (and can't reach this

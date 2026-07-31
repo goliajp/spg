@@ -445,6 +445,7 @@ pub fn value_to_text_styled(v: &Value, style: &crate::eval::RenderStyle) -> Stri
         Value::Macaddr8(b) => crate::conversions::format_macaddr8(b),
         Value::PgLsn(l) => crate::conversions::format_pg_lsn(*l),
         Value::RegClass(_, name) | Value::RegProc(_, name) => name.to_string(),
+        Value::RegType(_, name) => name.to_string(),
         // v7.39 (round 511) — PG renders a tid `(block,offset)`.
         Value::Tid(b, o) => alloc::format!("({b},{o})"),
         // A transaction / command id renders as its number.

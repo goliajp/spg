@@ -817,6 +817,9 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
         // v7.39 (round 342, V65) — one carrier, two PG types: a
         // `regprocedure` renders WITH its argument list (`f(integer)`),
         // a `regproc` never does. PG reports them apart, so SPG does.
+        // v7.39 (round 648) — `pg_typeof('text'::regtype)` said `text`
+        // while the value was a plain Text; PG says `regtype`.
+        Value::RegType(..) => "regtype",
         Value::RegProc(_, name) => {
             if name.contains('(') {
                 "regprocedure"
