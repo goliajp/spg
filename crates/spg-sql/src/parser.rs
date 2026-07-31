@@ -12152,6 +12152,7 @@ impl Parser {
                         primary: TableRef {
                             name: "subquery".to_string(),
                             alias: None,
+                            only: false,
                             as_of_segment: None,
                             unnest_expr: None,
                             unnest_column_aliases: Vec::new(),
@@ -12291,6 +12292,7 @@ impl Parser {
             let fn_ref = TableRef {
                 name: inner_name.clone(),
                 alias: None,
+                only: false,
                 as_of_segment: None,
                 unnest_expr: None,
                 unnest_column_aliases: Vec::new(),
@@ -12417,6 +12419,7 @@ impl Parser {
                         TableRef {
                             name: colname.clone(),
                             alias: Some(colname.clone()),
+                            only: false,
                             as_of_segment: None,
                             unnest_expr: unnest,
                             unnest_column_aliases: alloc::vec![colname.clone()],
@@ -17281,19 +17284,25 @@ impl Parser {
     }
 
     fn parse_table_ref(&mut self) -> Result<TableRef, ParseError> {
-        // v7.39 (round 621) — `FROM ONLY <table>`, which excludes a table's
-        // inheritance children. It was read as a table NAMED `only`, so the
-        // query failed on `relation "only" does not exist`. SPG's inheritance
-        // children are separate relations that a plain scan does not descend
-        // into, so ONLY already describes what the scan does; the keyword is
-        // absorbed. `TRUNCATE ONLY` has taken it as a no-op since v7.14 for
-        // the same reason.
+        // v7.39 (round 621) — `FROM ONLY <table>` excludes a table's
+        // children. It was read as a table NAMED `only`, so the query
+        // failed on `relation "only" does not exist`.
+        //
+        // v7.39 (round 644) — and it is no longer a no-op. Round 621
+        // absorbed the keyword, reasoning that SPG's children are
+        // separate relations a plain scan does not descend into, so ONLY
+        // already described the scan. That stopped being true when a
+        // partition parent started unioning its children: measured,
+        // `SELECT count(*) FROM ONLY <partitioned parent>` answered 2
+        // where PG answers 0. The flag is carried now.
+        let mut only = false;
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("only"))
             && matches!(
                 self.tokens.get(self.pos + 1),
                 Some(Token::Ident(_) | Token::QuotedIdent(_))
             )
         {
+            only = true;
             self.advance();
         }
         // `LATERAL generate_series(...)` / `LATERAL unnest(...)` —
@@ -17389,6 +17398,7 @@ impl Parser {
                     primary: TableRef {
                         name: srf_alias.clone(),
                         alias: Some(srf_alias.clone()),
+                        only: false,
                         as_of_segment: None,
                         unnest_expr: None,
                         unnest_column_aliases: Vec::new(),
@@ -17416,6 +17426,7 @@ impl Parser {
             return Ok(TableRef {
                 name: alias.clone(),
                 alias: Some(alias),
+                only: false,
                 as_of_segment: None,
                 unnest_expr: None,
                 unnest_column_aliases: Vec::new(),
@@ -17471,6 +17482,7 @@ impl Parser {
             return Ok(TableRef {
                 name,
                 alias: alias_ident,
+                only: false,
                 as_of_segment: None,
                 unnest_expr: None,
                 unnest_column_aliases: column_aliases,
@@ -17530,6 +17542,7 @@ impl Parser {
             return Ok(TableRef {
                 name,
                 alias: alias_ident,
+                only: false,
                 as_of_segment: None,
                 unnest_expr: None,
                 unnest_column_aliases: column_aliases,
@@ -17572,6 +17585,7 @@ impl Parser {
             return Ok(TableRef {
                 name,
                 alias: alias_ident,
+                only: false,
                 as_of_segment: None,
                 unnest_expr: None,
                 unnest_column_aliases: column_aliases,
@@ -17614,6 +17628,7 @@ impl Parser {
             return Ok(TableRef {
                 name,
                 alias: alias_ident,
+                only: false,
                 as_of_segment: None,
                 unnest_expr: None,
                 // `AS t(k, v)` renames key/value positionally, same as the
@@ -17712,6 +17727,7 @@ impl Parser {
             return Ok(TableRef {
                 name: table_alias.clone(),
                 alias: Some(table_alias),
+                only: false,
                 as_of_segment: None,
                 unnest_expr: None,
                 unnest_column_aliases: column_aliases,
@@ -17810,6 +17826,7 @@ impl Parser {
             let tref = TableRef {
                 name,
                 alias: alias_ident,
+                only: false,
                 as_of_segment: None,
                 unnest_expr: Some(Box::new(expr)),
                 unnest_column_aliases: srf_cols,
@@ -17952,6 +17969,7 @@ impl Parser {
                 let tref = TableRef {
                     name,
                     alias: alias_ident,
+                    only: false,
                     as_of_segment: None,
                     unnest_expr: None,
                     unnest_column_aliases,
@@ -17982,6 +18000,7 @@ impl Parser {
             let tref = TableRef {
                 name,
                 alias: alias_ident,
+                only: false,
                 as_of_segment: None,
                 unnest_expr: Some(Box::new(expr)),
                 unnest_column_aliases,
@@ -18039,6 +18058,7 @@ impl Parser {
             let tref = TableRef {
                 name,
                 alias: alias_ident,
+                only: false,
                 as_of_segment: None,
                 unnest_expr: Some(Box::new(expr)),
                 unnest_column_aliases,
@@ -18156,6 +18176,7 @@ impl Parser {
             let tref = TableRef {
                 name,
                 alias: alias_ident,
+                only: false,
                 as_of_segment: None,
                 unnest_expr: None,
                 unnest_column_aliases: column_aliases,
@@ -18316,6 +18337,7 @@ impl Parser {
         Ok(TableRef {
             name,
             alias,
+            only,
             as_of_segment,
             unnest_expr: None,
             unnest_column_aliases: Vec::new(),
@@ -18427,6 +18449,7 @@ impl Parser {
         TableRef {
             name,
             alias,
+            only: false,
             as_of_segment: None,
             unnest_expr: None,
             unnest_column_aliases: Vec::new(),
@@ -18589,6 +18612,7 @@ impl Parser {
                 primary: TableRef {
                     name: tname,
                     alias: None,
+                    only: false,
                     as_of_segment: None,
                     unnest_expr: None,
                     unnest_column_aliases: Vec::new(),
@@ -18673,6 +18697,7 @@ impl Parser {
                 return Ok(TableRef {
                     name: alias.clone(),
                     alias: Some(alias),
+                    only: false,
                     as_of_segment: None,
                     unnest_expr: None,
                     unnest_column_aliases: Vec::new(),
@@ -18757,6 +18782,7 @@ impl Parser {
                 primary: TableRef {
                     name: "value".to_string(),
                     alias: None,
+                    only: false,
                     as_of_segment: None,
                     unnest_expr: Some(Box::new(Expr::FunctionCall {
                         name: elem_fn.to_string(),
@@ -18797,6 +18823,7 @@ impl Parser {
         Ok(TableRef {
             name: alias.clone(),
             alias: Some(alias),
+            only: false,
             as_of_segment: None,
             unnest_expr: None,
             unnest_column_aliases: Vec::new(),
@@ -18865,6 +18892,7 @@ impl Parser {
         Ok(TableRef {
             name,
             alias: alias_ident,
+            only: false,
             as_of_segment: None,
             unnest_expr: None,
             unnest_column_aliases,
@@ -18933,6 +18961,7 @@ impl Parser {
         Ok(TableRef {
             name,
             alias: alias_ident,
+            only: false,
             as_of_segment: None,
             unnest_expr: None,
             unnest_column_aliases: Vec::new(),

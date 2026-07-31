@@ -2192,6 +2192,7 @@ impl Engine {
             table: TableRef {
                 name: cte_name.clone(),
                 alias: None,
+                only: false,
                 as_of_segment: None,
                 unnest_expr: None,
                 unnest_column_aliases: Vec::new(),
@@ -2474,6 +2475,7 @@ impl Engine {
             table: TableRef {
                 name: inner_table,
                 alias: Some(fresh.clone()),
+                only: false,
                 as_of_segment: None,
                 unnest_expr: None,
                 unnest_column_aliases: Vec::new(),
@@ -3008,6 +3010,7 @@ impl Engine {
             table: TableRef {
                 name: inner_table,
                 alias: Some(fresh.clone()),
+                only: false,
                 as_of_segment: None,
                 unnest_expr: None,
                 unnest_column_aliases: Vec::new(),

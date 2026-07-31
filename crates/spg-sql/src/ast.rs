@@ -3573,6 +3573,16 @@ pub enum SelectItem {
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
+    /// v7.39 (round 644) — `FROM ONLY t`: do not descend into `t`'s
+    /// children.
+    ///
+    /// The keyword used to be absorbed at parse time, on the reasoning
+    /// that SPG's inheritance children are separate relations a plain
+    /// scan does not descend into — so ONLY already described what the
+    /// scan did. That stopped being true when a partition parent
+    /// started unioning its children: measured, `SELECT count(*) FROM
+    /// ONLY <partitioned parent>` answered 2 where PG answers 0.
+    pub only: bool,
     /// v6.10.2 — `AS OF SEGMENT '<id>'` cold-tier time-travel.
     /// When `Some(id)`, the scan restricts to rows that live in
     /// segment `<id>` only — useful for forensic inspection of a
@@ -8250,6 +8260,7 @@ mod tests {
                 primary: TableRef {
                     name: "users".into(),
                     alias: None,
+                    only: false,
                     as_of_segment: None,
                     unnest_expr: None,
                     unnest_column_aliases: Vec::new(),
