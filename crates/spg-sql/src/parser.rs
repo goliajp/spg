@@ -3047,11 +3047,17 @@ impl Parser {
                 {
                     self.advance();
                 }
-                // Optional ONLY qualifier (skip partitions). SPG's
-                // declarative partitions are always truncated
-                // together, so it's an accepted no-op.
-                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("only"))
-                {
+                // v7.39 (round 647) — `TRUNCATE ONLY t` is carried now,
+                // not absorbed. The lookahead keeps a table genuinely
+                // called `only` working: the keyword is a keyword only
+                // when a name follows it.
+                let only = matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("only"))
+                    && matches!(
+                        self.tokens.get(self.pos + 1),
+                        Some(Token::Ident(_) | Token::QuotedIdent(_))
+                    );
+                if only {
                     self.advance();
                 }
                 // Table names (comma-separated).
@@ -3096,6 +3102,7 @@ impl Parser {
                     tables,
                     restart_identity,
                     cascade,
+                    only,
                 })
             }
             // v7.37.17 (17.6 sibling) — REINDEX [(OPTION [, ...])]
@@ -9796,18 +9803,21 @@ impl Parser {
                      WITHOUT CLUSTER / WITHOUT OIDS / REPLICA IDENTITY / (storage_params)"
                 )))
             }
-            // v7.37.18 (18.9) — ALTER TABLE INHERIT / NO INHERIT.
-            // SPG doesn't support PG-style inheritance (declarative
-            // partitioning v7.37.16 covers the common case); accept
-            // and ignore.
+            // v7.39 (round 647) — `ALTER TABLE c INHERIT p`. Carried now,
+            // not ignored: round 645 gave SPG the inheritance the
+            // v7.37.18 no-op said it did not have.
             Token::Ident(s) if s.eq_ignore_ascii_case("inherit") => {
                 self.advance();
+                let parent = self.expect_ident_like()?;
                 self.consume_until_statement_boundary();
-                Ok(Vec::new())
+                Ok(alloc::vec![crate::ast::AlterTableTarget::Inherit {
+                    parent,
+                    detach: false
+                }])
             }
-            // `NO INHERIT <parent>` — accept-and-no-op. Guarded to NOT match
-            // `NO FORCE ROW LEVEL SECURITY`, which has its own RLS arm below
-            // (v7.39). Without the guard this swallowed NO FORCE as a no-op.
+            // `NO INHERIT <parent>`. Guarded to NOT match `NO FORCE ROW
+            // LEVEL SECURITY`, which has its own RLS arm below — without
+            // the guard this swallowed NO FORCE as a no-op.
             Token::Ident(s)
                 if s.eq_ignore_ascii_case("no")
                     && !matches!(
@@ -9816,6 +9826,17 @@ impl Parser {
                     ) =>
             {
                 self.advance();
+                if matches!(self.peek(), Token::Ident(k) | Token::QuotedIdent(k)
+                    if k.eq_ignore_ascii_case("inherit"))
+                {
+                    self.advance();
+                    let parent = self.expect_ident_like()?;
+                    self.consume_until_statement_boundary();
+                    return Ok(alloc::vec![crate::ast::AlterTableTarget::Inherit {
+                        parent,
+                        detach: true
+                    }]);
+                }
                 self.consume_until_statement_boundary();
                 Ok(Vec::new())
             }
