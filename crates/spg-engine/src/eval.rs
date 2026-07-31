@@ -3571,7 +3571,19 @@ fn eval_function_call_positional(
                     Err(_) => continue,
                 }
             };
-            if let Some(t) = v.data_type() {
+            // v7.39 (round 649) — a NULL branch still has a TYPE, and PG
+            // resolves COALESCE's result from the branches' declared
+            // types, not from the values that survive. `Value::Null` has
+            // no `data_type()`, so `coalesce(1::int, NULL::float8)`
+            // collected only `integer` and answered integer where PG
+            // answers double precision. Ask the expression when the
+            // value cannot say — inside the arm that already runs, and
+            // only on the NULL that would otherwise contribute nothing.
+            let branch_ty = match v.data_type() {
+                Some(t) => Some(t),
+                None => crate::describe::describe_expr(a, ctx.columns).map(|sh| sh.ty),
+            };
+            if let Some(t) = branch_ty {
                 if ntypes < tbuf.len() {
                     tbuf[ntypes] = t;
                     ntypes += 1;
@@ -4798,6 +4810,12 @@ pub(crate) fn widen_value_to(v: Value<'static>, common: spg_storage::DataType) -
             | DT::Int
             | DT::BigInt
             | DT::Numeric { .. }
+            // v7.39 (round 649) — `real` was absent here too, so even once
+            // `common_type` learned to rank it, the value was handed back
+            // unwidened: `coalesce(1::int, 1::real)` stayed integer where
+            // PG says real. Two lists, one ladder — the gap had to be
+            // closed in both.
+            | DT::Real
             | DT::Float
             | DT::Date
             | DT::Time

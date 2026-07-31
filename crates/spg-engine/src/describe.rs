@@ -272,6 +272,13 @@ pub(crate) fn numeric_rank(t: DataType) -> Option<u8> {
         DataType::Int => Some(2),
         DataType::BigInt => Some(3),
         DataType::Numeric { .. } => Some(4),
+        // v7.39 (round 649) — rank 5 was left empty for `real` and never
+        // filled, so any sibling set containing one failed the
+        // "all numeric" test and fell through untouched. Measured:
+        // `coalesce(1::real, 1.5::float8)` answered `real` where PG says
+        // `double precision`, and `coalesce(1::int, 1::real)` answered
+        // `integer` where PG says `real`.
+        DataType::Real => Some(5),
         DataType::Float => Some(6),
         _ => None,
     }
