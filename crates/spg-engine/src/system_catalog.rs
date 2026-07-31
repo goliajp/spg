@@ -3780,6 +3780,194 @@ pub(crate) fn synth_pg_operator(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         push(&mut rows, &mut oid, "%", "b", t, t, t, false, false);
     }
     // Text and pattern matching.
+    // v7.39 (round 639) — the combinations the loops above do not produce.
+    //
+    // The generator emits same-type comparisons over one type list and
+    // same-type arithmetic over another, which leaves out everything
+    // cross-type (`date + interval`, `int2 * int4`) and every type not in
+    // those lists (time, json, jsonb, inet). Measured: SPG EVALUATES 301 of
+    // the 308 operator combinations PG evaluates over these types, and
+    // pg_operator listed 132 of them. These are the other 169, each one
+    // probed against the engine before being listed, with PG's own
+    // `oprresult` for the result type.
+    //
+    // Not listed, and measured as unsupported: `bytea ~~ bytea`,
+    // `bytea !~~ bytea`, `text @@ text`, and the four bpchar pattern
+    // operators `~<~ ~<=~ ~>~ ~>=~`.
+    const EXTRA_OPS: &[(&str, i64, i64, i64)] = &[
+        ("!~", 1042, 25, 16), // bpchar !~ text -> bool
+        ("!~*", 1042, 25, 16), // bpchar !~* text -> bool
+        ("!~~", 1042, 25, 16), // bpchar !~~ text -> bool
+        ("!~~*", 1042, 25, 16), // bpchar !~~* text -> bool
+        ("%", 1700, 1700, 1700), // numeric % numeric -> numeric
+        ("&", 869, 869, 869), // inet & inet -> inet
+        ("&&", 869, 869, 16), // inet && inet -> bool
+        ("*", 700, 701, 701), // float4 * float8 -> float8
+        ("*", 701, 700, 701), // float8 * float4 -> float8
+        ("*", 701, 1186, 1186), // float8 * interval -> interval
+        ("*", 21, 23, 23), // int2 * int4 -> int4
+        ("*", 21, 20, 20), // int2 * int8 -> int8
+        ("*", 23, 21, 23), // int4 * int2 -> int4
+        ("*", 23, 20, 20), // int4 * int8 -> int8
+        ("*", 20, 21, 20), // int8 * int2 -> int8
+        ("*", 20, 23, 20), // int8 * int4 -> int8
+        ("*", 1186, 701, 1186), // interval * float8 -> interval
+        ("+", 1082, 23, 1082), // date + int4 -> date
+        ("+", 1082, 1186, 1114), // date + interval -> timestamp
+        ("+", 1082, 1083, 1114), // date + time -> timestamp
+        ("+", 700, 701, 701), // float4 + float8 -> float8
+        ("+", 701, 700, 701), // float8 + float4 -> float8
+        ("+", 869, 20, 869), // inet + int8 -> inet
+        ("+", 21, 23, 23), // int2 + int4 -> int4
+        ("+", 21, 20, 20), // int2 + int8 -> int8
+        ("+", 23, 1082, 1082), // int4 + date -> date
+        ("+", 23, 21, 23), // int4 + int2 -> int4
+        ("+", 23, 20, 20), // int4 + int8 -> int8
+        ("+", 20, 869, 869), // int8 + inet -> inet
+        ("+", 20, 21, 20), // int8 + int2 -> int8
+        ("+", 20, 23, 20), // int8 + int4 -> int8
+        ("+", 1186, 1082, 1114), // interval + date -> timestamp
+        ("+", 1186, 1186, 1186), // interval + interval -> interval
+        ("+", 1186, 1083, 1083), // interval + time -> time
+        ("+", 1186, 1114, 1114), // interval + timestamp -> timestamp
+        ("+", 1083, 1082, 1114), // time + date -> timestamp
+        ("+", 1083, 1186, 1083), // time + interval -> time
+        ("+", 1114, 1186, 1114), // timestamp + interval -> timestamp
+        ("-", 1082, 1082, 23), // date - date -> int4
+        ("-", 1082, 23, 1082), // date - int4 -> date
+        ("-", 1082, 1186, 1114), // date - interval -> timestamp
+        ("-", 700, 701, 701), // float4 - float8 -> float8
+        ("-", 701, 700, 701), // float8 - float4 -> float8
+        ("-", 869, 869, 20), // inet - inet -> int8
+        ("-", 869, 20, 869), // inet - int8 -> inet
+        ("-", 21, 23, 23), // int2 - int4 -> int4
+        ("-", 21, 20, 20), // int2 - int8 -> int8
+        ("-", 23, 21, 23), // int4 - int2 -> int4
+        ("-", 23, 20, 20), // int4 - int8 -> int8
+        ("-", 20, 21, 20), // int8 - int2 -> int8
+        ("-", 20, 23, 20), // int8 - int4 -> int8
+        ("-", 1186, 1186, 1186), // interval - interval -> interval
+        ("-", 3802, 25, 3802), // jsonb - text -> jsonb
+        ("-", 1083, 1186, 1083), // time - interval -> time
+        ("-", 1083, 1083, 1186), // time - time -> interval
+        ("-", 1114, 1186, 1114), // timestamp - interval -> timestamp
+        ("-", 1114, 1114, 1186), // timestamp - timestamp -> interval
+        ("->", 114, 23, 114), // json -> int4 -> json
+        ("->", 3802, 23, 3802), // jsonb -> int4 -> jsonb
+        ("->>", 114, 23, 25), // json ->> int4 -> text
+        ("->>", 3802, 23, 25), // jsonb ->> int4 -> text
+        ("/", 700, 701, 701), // float4 / float8 -> float8
+        ("/", 701, 700, 701), // float8 / float4 -> float8
+        ("/", 21, 23, 23), // int2 / int4 -> int4
+        ("/", 21, 20, 20), // int2 / int8 -> int8
+        ("/", 23, 21, 23), // int4 / int2 -> int4
+        ("/", 23, 20, 20), // int4 / int8 -> int8
+        ("/", 20, 21, 20), // int8 / int2 -> int8
+        ("/", 20, 23, 20), // int8 / int4 -> int8
+        ("/", 1186, 701, 1186), // interval / float8 -> interval
+        ("<", 1082, 1114, 16), // date < timestamp -> bool
+        ("<", 700, 701, 16), // float4 < float8 -> bool
+        ("<", 701, 700, 16), // float8 < float4 -> bool
+        ("<", 869, 869, 16), // inet < inet -> bool
+        ("<", 21, 23, 16), // int2 < int4 -> bool
+        ("<", 21, 20, 16), // int2 < int8 -> bool
+        ("<", 23, 21, 16), // int4 < int2 -> bool
+        ("<", 23, 20, 16), // int4 < int8 -> bool
+        ("<", 20, 21, 16), // int8 < int2 -> bool
+        ("<", 20, 23, 16), // int8 < int4 -> bool
+        ("<", 3802, 3802, 16), // jsonb < jsonb -> bool
+        ("<", 1083, 1083, 16), // time < time -> bool
+        ("<", 1114, 1082, 16), // timestamp < date -> bool
+        ("<<", 869, 869, 16), // inet << inet -> bool
+        ("<<", 21, 23, 21), // int2 << int4 -> int2
+        ("<<", 23, 23, 23), // int4 << int4 -> int4
+        ("<<", 20, 23, 20), // int8 << int4 -> int8
+        ("<<=", 869, 869, 16), // inet <<= inet -> bool
+        ("<=", 1082, 1114, 16), // date <= timestamp -> bool
+        ("<=", 700, 701, 16), // float4 <= float8 -> bool
+        ("<=", 701, 700, 16), // float8 <= float4 -> bool
+        ("<=", 869, 869, 16), // inet <= inet -> bool
+        ("<=", 21, 23, 16), // int2 <= int4 -> bool
+        ("<=", 21, 20, 16), // int2 <= int8 -> bool
+        ("<=", 23, 21, 16), // int4 <= int2 -> bool
+        ("<=", 23, 20, 16), // int4 <= int8 -> bool
+        ("<=", 20, 21, 16), // int8 <= int2 -> bool
+        ("<=", 20, 23, 16), // int8 <= int4 -> bool
+        ("<=", 3802, 3802, 16), // jsonb <= jsonb -> bool
+        ("<=", 1083, 1083, 16), // time <= time -> bool
+        ("<=", 1114, 1082, 16), // timestamp <= date -> bool
+        ("<>", 1082, 1114, 16), // date <> timestamp -> bool
+        ("<>", 700, 701, 16), // float4 <> float8 -> bool
+        ("<>", 701, 700, 16), // float8 <> float4 -> bool
+        ("<>", 869, 869, 16), // inet <> inet -> bool
+        ("<>", 21, 23, 16), // int2 <> int4 -> bool
+        ("<>", 21, 20, 16), // int2 <> int8 -> bool
+        ("<>", 23, 21, 16), // int4 <> int2 -> bool
+        ("<>", 23, 20, 16), // int4 <> int8 -> bool
+        ("<>", 20, 21, 16), // int8 <> int2 -> bool
+        ("<>", 20, 23, 16), // int8 <> int4 -> bool
+        ("<>", 3802, 3802, 16), // jsonb <> jsonb -> bool
+        ("<>", 1083, 1083, 16), // time <> time -> bool
+        ("<>", 1114, 1082, 16), // timestamp <> date -> bool
+        ("=", 1082, 1114, 16), // date = timestamp -> bool
+        ("=", 700, 701, 16), // float4 = float8 -> bool
+        ("=", 701, 700, 16), // float8 = float4 -> bool
+        ("=", 869, 869, 16), // inet = inet -> bool
+        ("=", 21, 23, 16), // int2 = int4 -> bool
+        ("=", 21, 20, 16), // int2 = int8 -> bool
+        ("=", 23, 21, 16), // int4 = int2 -> bool
+        ("=", 23, 20, 16), // int4 = int8 -> bool
+        ("=", 20, 21, 16), // int8 = int2 -> bool
+        ("=", 20, 23, 16), // int8 = int4 -> bool
+        ("=", 3802, 3802, 16), // jsonb = jsonb -> bool
+        ("=", 1083, 1083, 16), // time = time -> bool
+        ("=", 1114, 1082, 16), // timestamp = date -> bool
+        (">", 1082, 1114, 16), // date > timestamp -> bool
+        (">", 700, 701, 16), // float4 > float8 -> bool
+        (">", 701, 700, 16), // float8 > float4 -> bool
+        (">", 869, 869, 16), // inet > inet -> bool
+        (">", 21, 23, 16), // int2 > int4 -> bool
+        (">", 21, 20, 16), // int2 > int8 -> bool
+        (">", 23, 21, 16), // int4 > int2 -> bool
+        (">", 23, 20, 16), // int4 > int8 -> bool
+        (">", 20, 21, 16), // int8 > int2 -> bool
+        (">", 20, 23, 16), // int8 > int4 -> bool
+        (">", 3802, 3802, 16), // jsonb > jsonb -> bool
+        (">", 1083, 1083, 16), // time > time -> bool
+        (">", 1114, 1082, 16), // timestamp > date -> bool
+        (">=", 1082, 1114, 16), // date >= timestamp -> bool
+        (">=", 700, 701, 16), // float4 >= float8 -> bool
+        (">=", 701, 700, 16), // float8 >= float4 -> bool
+        (">=", 869, 869, 16), // inet >= inet -> bool
+        (">=", 21, 23, 16), // int2 >= int4 -> bool
+        (">=", 21, 20, 16), // int2 >= int8 -> bool
+        (">=", 23, 21, 16), // int4 >= int2 -> bool
+        (">=", 23, 20, 16), // int4 >= int8 -> bool
+        (">=", 20, 21, 16), // int8 >= int2 -> bool
+        (">=", 20, 23, 16), // int8 >= int4 -> bool
+        (">=", 3802, 3802, 16), // jsonb >= jsonb -> bool
+        (">=", 1083, 1083, 16), // time >= time -> bool
+        (">=", 1114, 1082, 16), // timestamp >= date -> bool
+        (">>", 869, 869, 16), // inet >> inet -> bool
+        (">>", 21, 23, 21), // int2 >> int4 -> int2
+        (">>", 23, 23, 23), // int4 >> int4 -> int4
+        (">>", 20, 23, 20), // int8 >> int4 -> int8
+        (">>=", 869, 869, 16), // inet >>= inet -> bool
+        ("^", 701, 701, 701), // float8 ^ float8 -> float8
+        ("^", 1700, 1700, 1700), // numeric ^ numeric -> numeric
+        ("^@", 25, 25, 16), // text ^@ text -> bool
+        ("~", 1042, 25, 16), // bpchar ~ text -> bool
+        ("~*", 1042, 25, 16), // bpchar ~* text -> bool
+        ("~<=~", 25, 25, 16), // text ~<=~ text -> bool
+        ("~<~", 25, 25, 16), // text ~<~ text -> bool
+        ("~>=~", 25, 25, 16), // text ~>=~ text -> bool
+        ("~>~", 25, 25, 16), // text ~>~ text -> bool
+        ("~~", 1042, 25, 16), // bpchar ~~ text -> bool
+        ("~~*", 1042, 25, 16), // bpchar ~~* text -> bool
+    ];
+    for (name, l, r, res) in EXTRA_OPS {
+        push(&mut rows, &mut oid, name, "b", *l, *r, *res, false, false);
+    }
     push(&mut rows, &mut oid, "||", "b", 25, 25, 25, false, false);
     push(&mut rows, &mut oid, "~~", "b", 25, 25, 16, false, false);
     push(&mut rows, &mut oid, "!~~", "b", 25, 25, 16, false, false);
