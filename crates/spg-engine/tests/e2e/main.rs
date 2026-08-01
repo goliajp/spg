@@ -175,6 +175,7 @@ mod e2e_fts_catalogs_round650;
 mod e2e_not_valid_round652;
 mod e2e_pg_proc_round653;
 mod e2e_scan_memory_round656;
+mod e2e_c09_round662;
 mod e2e_spg_catalog_round661;
 mod e2e_tokenizer_round651;
 mod e2e_catalog_column_types_round620;

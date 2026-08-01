@@ -955,6 +955,21 @@ fn numeric_value_for_to_char(v: &Value) -> Option<f64> {
         #[allow(clippy::cast_precision_loss)]
         Value::BigInt(n) => Some(*n as f64),
         Value::Float(x) => Some(*x),
+        // v7.39 (round 662) — `real` (float4). `float8` was here and its
+        // single-precision sibling was not, so `to_char(1.5::real, '9.9')`
+        // answered "needs a number, DATE or TIMESTAMP, got real" where PG
+        // renders ` 1.5`. C09 measured it as a missing overload; it is one
+        // arm of one match.
+        //
+        // The route matters, and PG's is `real -> numeric`, NOT
+        // `real -> float8`: asked directly, `12345.678::real::numeric` is
+        // `12345.7` while `12345.678::real::float8` is `12345.677734375`,
+        // so the two paths format as `12345.7` and `12345.68`. Going
+        // through `f64::from` — the obvious spelling — takes the wrong one.
+        // Six significant digits — PG's `FLT_DIG`, the same rule the
+        // `real -> numeric` cast follows (round 662 fixed that too; this
+        // overload is what exposed it).
+        Value::Real(x) => alloc::format!("{x:.5e}").parse::<f64>().ok(),
         #[allow(clippy::cast_precision_loss)]
         Value::Numeric { scaled, scale, .. } => Some(
             crate::eval::format_numeric(*scaled, *scale)

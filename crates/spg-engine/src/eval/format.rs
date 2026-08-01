@@ -1196,6 +1196,38 @@ fn parse_timestamp_parts(s: &str, order: DateOrder) -> Option<(i32, i64, Option<
         Some(i) => (&trimmed[..i], Some(&trimmed[i + 1..])),
         None => (trimmed, None),
     };
+    // v7.39 (round 662) — a date may carry the zone directly, with no time
+    // between them: PG reads `'2020-01-01+00'::timestamptz` as midnight in
+    // that zone. SPG had no split point there — the scan above looks for a
+    // space or a `T` — so the whole string went to the date parser and came
+    // back `invalid input syntax`. The zone cannot simply be scanned for,
+    // because an ISO date is full of hyphens; the split is accepted only
+    // when the prefix parses as a date AND the suffix as a zone.
+    if time_part.is_none() && parse_date_literal_ordered(date_part, order).is_none() {
+        if let Some(rest) = date_part.strip_suffix(['Z', 'z']) {
+            if let Some(d) = parse_date_literal_ordered(rest, order) {
+                return Some((d, 0, Some(0)));
+            }
+        }
+        // Only `+`. PG REFUSES `'2020-01-01-05'` — measured — because a
+        // trailing `-05` cannot be told apart from the date's own hyphens,
+        // and it would rather reject than guess. The first version here
+        // accepted it and answered `2020-01-01 05:00:00+00`, i.e. invented
+        // an instant PG declines to name.
+        for (i, c) in date_part.char_indices().rev() {
+            if c != '+' {
+                continue;
+            }
+            let (head, tail) = date_part.split_at(i);
+            let (Some(d), Some(off)) = (
+                parse_date_literal_ordered(head, order),
+                parse_tz_offset_suffix(tail, c == '+'),
+            ) else {
+                continue;
+            };
+            return Some((d, 0, Some(off)));
+        }
+    }
     let mut days = parse_date_literal_ordered(date_part, order)?;
     if era_bc {
         let (y, m, d) = civil_from_days(days);
