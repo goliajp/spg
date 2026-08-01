@@ -121,7 +121,33 @@ fn main() -> ExitCode {
     println!("\nreport.json -> {}", report_json.display());
     println!("report.md   -> {}", report_md.display());
 
-    ExitCode::SUCCESS
+    // v7.39 (round 664) — this used to return SUCCESS unconditionally, so a
+    // failing conformance test left no trace an automated caller could see.
+    // `scripts/gate.sh` runs this under `set -euo pipefail` and trusted the
+    // status; a stale assertion added in r661 therefore rode through THREE
+    // green gate runs. The per-corpus lines above did print `fail=1`, but
+    // only the last corpus is visible to anything that tails the output.
+    //
+    // So: one total line that cannot scroll away, every failing file named,
+    // and a non-zero status.
+    let pass: usize = groups.iter().map(|g| g.pass).sum();
+    let fail: usize = groups.iter().map(|g| g.fail).sum();
+    let skip: usize = groups.iter().map(|g| g.skip).sum();
+    println!("\nTOTAL          pass={pass} fail={fail} skip={skip}");
+
+    if fail == 0 {
+        return ExitCode::SUCCESS;
+    }
+    println!("\nFAILING FILES:");
+    for g in &groups {
+        for f in g.files.iter().filter(|f| f.fail > 0) {
+            println!("  {}/{} — {} failing", g.name, f.file, f.fail);
+            for r in &f.fail_reasons {
+                println!("      {r}");
+            }
+        }
+    }
+    ExitCode::FAILURE
 }
 
 #[derive(Debug, Clone)]
