@@ -159,6 +159,36 @@ impl Engine {
                 using,
             } => self.alter_column_type(tbl, column, new_type, using),
             T::AddTableConstraint(tc) => self.alter_add_table_constraint(tbl, tc),
+            T::ValidateConstraint { name } => self.alter_validate_constraint(tbl, &name),
+            // v7.39 (round 652) — SPG is single-owner and has no
+            // clustered storage, so both of these remain no-ops once the
+            // name checks out. What was missing was the check.
+            T::OwnerTo { role } => {
+                if self.role_exists(&role) {
+                    Ok(())
+                } else {
+                    Err(EngineError::Unsupported(alloc::format!(
+                        "role \"{role}\" does not exist"
+                    )))
+                }
+            }
+            T::ClusterOn { index } => {
+                let Some(index) = index else { return Ok(()) };
+                let table = self.active_catalog().get(tbl).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+                })?;
+                if table
+                    .indices()
+                    .iter()
+                    .any(|i| i.name.eq_ignore_ascii_case(&index))
+                {
+                    Ok(())
+                } else {
+                    Err(EngineError::Unsupported(alloc::format!(
+                        "index \"{index}\" for table \"{tbl}\" does not exist"
+                    )))
+                }
+            }
             T::DropColumn {
                 column,
                 if_exists,
@@ -893,8 +923,13 @@ impl Engine {
             let before = names.len();
             names.retain(|p| !p.eq_ignore_ascii_case(parent));
             if names.len() == before {
+                // v7.39 (round 652) — PG names the PARENT first:
+                // `relation "parent" is not a parent of relation "child"`.
+                // SPG had the two the other way round, so a client
+                // matching on the message read the wrong relation as the
+                // one at fault.
                 return Err(EngineError::Unsupported(alloc::format!(
-                    "relation {child:?} is not a child of relation {parent:?}"
+                    "relation {parent:?} is not a parent of relation {child:?}"
                 )));
             }
         } else {
@@ -1236,6 +1271,34 @@ impl Engine {
         Ok(())
     }
 
+    /// v7.39 (round 652) — `ALTER TABLE … VALIDATE CONSTRAINT <name>`.
+    /// Scans the rows against a CHECK added `NOT VALID`; on success the
+    /// constraint becomes validated and `pg_constraint.convalidated`
+    /// flips, which is what makes the next pg_dump stop emitting the
+    /// `NOT VALID` suffix. Validating an already-valid constraint is a
+    /// no-op, as in PG.
+    fn alter_validate_constraint(&mut self, tbl: &str, name: &str) -> Result<(), EngineError> {
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let names = crate::system_catalog::pg_check_connames(table, tbl, &table.schema().checks);
+        let Some(idx) = names.iter().position(|n| n.eq_ignore_ascii_case(name)) else {
+            // PG names the relation it looked in. A constraint that is
+            // not a CHECK lands here too — SPG has no unvalidated shape
+            // for the others, so there is nothing this could validate.
+            return Err(EngineError::Unsupported(alloc::format!(
+                "constraint \"{name}\" of relation \"{tbl}\" does not exist"
+            )));
+        };
+        if table.schema().checks[idx].validated {
+            return Ok(());
+        }
+        let src = table.schema().checks[idx].expr.clone();
+        crate::constraints::validate_check_against_existing_rows(table, tbl, name, &src)?;
+        table.schema_mut().checks[idx].validated = true;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn alter_add_table_constraint(
         &mut self,
@@ -1351,13 +1414,43 @@ impl Engine {
                     }
                 }
             }
-            spg_sql::ast::TableConstraint::Check { expr, .. } => {
+            spg_sql::ast::TableConstraint::Check {
+                expr, not_valid, ..
+            } => {
+                let src = alloc::format!("{expr}");
+                // v7.39 (round 652) — PG scans the rows already in the
+                // table unless the user wrote NOT VALID, and refuses the
+                // whole ALTER if any of them violates the predicate. SPG
+                // used to skip that scan unconditionally, so it accepted
+                // constraints PG rejects and left the table holding rows
+                // that contradict its own declared CHECK — with every
+                // reader, pg_dump included, believing otherwise.
+                if !not_valid {
+                    // The name PG puts in the message is the one the
+                    // constraint would end up with, dedup suffix included,
+                    // so ask for the whole prospective list and take the
+                    // entry the new one occupies.
+                    let mut prospective = table.schema().checks.clone();
+                    prospective.push(spg_storage::CheckConstraint {
+                        name: con_name.clone(),
+                        expr: src.clone(),
+                        validated: true,
+                    });
+                    let conname =
+                        crate::system_catalog::pg_check_connames(table, tbl, &prospective)
+                            .pop()
+                            .unwrap_or_else(|| alloc::format!("{tbl}_check"));
+                    crate::constraints::validate_check_against_existing_rows(
+                        table, tbl, &conname, &src,
+                    )?;
+                }
                 table
                     .schema_mut()
                     .checks
                     .push(spg_storage::CheckConstraint {
                         name: con_name.clone(),
-                        expr: alloc::format!("{expr}"),
+                        expr: src,
+                        validated: !not_valid,
                     });
             }
             spg_sql::ast::TableConstraint::Index { name, columns } => {
@@ -1866,6 +1959,9 @@ impl Engine {
             new_checks.push(spg_storage::CheckConstraint {
                 name: chk.name,
                 expr: rewrite_column_in_source(&chk.expr, &old, &new)?,
+                // Renaming a column does not re-scan the rows, so it cannot
+                // turn an unvalidated constraint into a valid one.
+                validated: chk.validated,
             });
         }
         table.schema_mut().checks = new_checks;
@@ -2774,15 +2870,18 @@ impl Engine {
                 // message, which is where a user meets the name. Resolve
                 // the parent's name once and carry it explicitly.
                 let names = crate::system_catalog::pg_check_connames(p, parent, &p.schema().checks);
-                for (chk, name) in p.schema().checks.iter().zip(names) {
+                for (ci, (chk, name)) in p.schema().checks.iter().zip(names).enumerate() {
                     let dup = schema.checks.iter().any(|c| match (&c.name, &chk.name) {
                         (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
                         _ => c.expr == chk.expr,
                     });
                     if !dup {
+                        // A child copies the parent's constraint, validation
+                        // state and all.
                         schema.checks.push(spg_storage::CheckConstraint {
                             name: Some(name),
                             expr: chk.expr.clone(),
+                            validated: chk.validated,
                         });
                     }
                 }
@@ -3429,12 +3528,16 @@ impl Engine {
                     columns,
                     nulls_not_distinct,
                 } => (false, columns.clone(), *nulls_not_distinct, name.clone()),
-                spg_sql::ast::TableConstraint::Check { name, expr } => {
+                spg_sql::ast::TableConstraint::Check { name, expr, .. } => {
                     // v7.13.0 — collect CHECK predicate sources;
                     // they get attached to the schema below.
+                    // A CREATE TABLE CHECK has no rows to grandfather; the
+                    // parser refuses NOT VALID there, as PG does, so every
+                    // one of these is validated and none needs a mark.
                     check_exprs.push(spg_storage::CheckConstraint {
                         name: name.clone(),
                         expr: alloc::format!("{expr}"),
+                        validated: true,
                     });
                     continue;
                 }

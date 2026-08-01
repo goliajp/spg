@@ -15902,10 +15902,18 @@ fn apply_function_dispatch(
                     // as text, so it is re-parsed and re-rendered; when
                     // it will not parse the plain text stands, which is
                     // never wrong, only more parenthesised.
+                    // v7.39 (round 652) — PG appends NOT VALID to the
+                    // deparse of an unvalidated constraint, in both the
+                    // plain and the pretty form. That suffix is how
+                    // pg_dump reproduces one: dropping it would emit a
+                    // constraint the restore then validates, and the
+                    // restore of a dump PG itself produced would fail on
+                    // the very rows PG grandfathered in.
+                    let suffix = if pred.validated { "" } else { " NOT VALID" };
                     if pretty {
                         if let Ok(ast) = spg_sql::parser::parse_expression(inner) {
                             return Ok(Value::text(alloc::format!(
-                                "CHECK ({})",
+                                "CHECK ({}){suffix}",
                                 spg_sql::ast::pretty_expr(&ast)
                             )));
                         }
@@ -15915,7 +15923,7 @@ fn apply_function_dispatch(
                     } else {
                         alloc::format!("({inner})")
                     };
-                    return Ok(Value::text(alloc::format!("CHECK ({body})")));
+                    return Ok(Value::text(alloc::format!("CHECK ({body}){suffix}")));
                 }
                 // v7.39 (round 210, EXCLUDE Phase 1) — exclusion constraints.
                 // PG deparses `EXCLUDE USING <am> (<col> WITH <op>[, …])`

@@ -6639,7 +6639,11 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Bool(false),
                 Value::Bool(false),
                 Value::Bool(true) /* conenforced */,
-                Value::Bool(true),
+                // v7.39 (round 652) — convalidated. `f` for a CHECK added
+                // NOT VALID: the rows already in the table were never
+                // scanned against it. pg_dump reads this column to decide
+                // whether to re-emit the suffix.
+                Value::Bool(check_src.validated),
                 Value::BigInt(conrelid),
                 Value::BigInt(0),
                 Value::BigInt(0),

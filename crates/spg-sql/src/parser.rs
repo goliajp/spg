@@ -9849,23 +9849,45 @@ impl Parser {
                 self.consume_until_statement_boundary();
                 Ok(Vec::new())
             }
-            // v7.37.18 (18.10) — ALTER TABLE OWNER TO <user>. SPG
-            // is single-owner; accept-and-no-op.
+            // v7.37.18 (18.10) — ALTER TABLE OWNER TO <user>. SPG is
+            // single-owner, so there is still nothing to record.
+            //
+            // v7.39 (round 652) — but the name now reaches the engine,
+            // which refuses a role that does not exist as PG does. The
+            // no-op was swallowing the whole statement, so a dump naming
+            // a role this server never heard of restored clean and left
+            // the table owned by whoever ran the restore.
             Token::Ident(s) if s.eq_ignore_ascii_case("owner") => {
                 self.advance();
                 if matches!(self.peek(), Token::To) {
                     self.advance();
                 }
-                let _ = self.expect_ident_like().ok();
-                Ok(Vec::new())
+                let role = self.expect_ident_like()?;
+                Ok(alloc::vec![crate::ast::AlterTableTarget::OwnerTo {
+                    role
+                }])
             }
             // v7.37.18 (18.13) — ALTER TABLE CLUSTER ON <index>.
-            // PG sets a hint; SPG doesn't have clustered storage.
-            // Accept-and-no-op.
+            // PG sets a hint; SPG doesn't have clustered storage, so the
+            // hint itself stays a no-op.
+            //
+            // v7.39 (round 652) — the index name is checked now. PG
+            // errors on one that does not exist, and swallowing that let
+            // a typo'd CLUSTER ON pass silently.
             Token::Ident(s) if s.eq_ignore_ascii_case("cluster") => {
                 self.advance();
-                self.consume_until_statement_boundary();
-                Ok(Vec::new())
+                // `ON` is a reserved token, not an ident.
+                if !matches!(self.peek(), Token::On) {
+                    return Err(self.err(alloc::format!(
+                        "expected ON after CLUSTER, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let index = self.expect_ident_like()?;
+                Ok(alloc::vec![crate::ast::AlterTableTarget::ClusterOn {
+                    index: Some(index)
+                }])
             }
             // v7.39 (read01 round 49) — ALTER TABLE REPLICA IDENTITY
             // { DEFAULT | FULL | NOTHING | USING INDEX <name> }. PG records
@@ -9877,14 +9899,23 @@ impl Parser {
                 self.consume_until_statement_boundary();
                 Ok(Vec::new())
             }
-            // v7.37.18 (18.15) — ALTER TABLE VALIDATE CONSTRAINT
-            // <name>. SPG validates inline at ADD CONSTRAINT time
-            // (no NOT VALID / VALIDATE separation), so VALIDATE is
-            // an accept-and-no-op for pg_dump round-trip.
+            // v7.37.18 (18.15) — ALTER TABLE VALIDATE CONSTRAINT <name>.
+            //
+            // v7.39 (round 652) — it used to consume the statement and
+            // return nothing, on the stated theory that SPG validated at
+            // ADD CONSTRAINT time so there was never anything left to
+            // validate. Measured against PG18, ADD CONSTRAINT did not
+            // scan the existing rows at all — the comment described a
+            // property SPG did not have, which is why nobody looked. Both
+            // halves are real now: ADD scans unless told NOT VALID, and
+            // this scans what NOT VALID skipped.
             Token::Ident(s) if s.eq_ignore_ascii_case("validate") => {
                 self.advance();
-                self.consume_until_statement_boundary();
-                Ok(Vec::new())
+                self.expect_keyword_ident("constraint")?;
+                let name = self.expect_ident_like()?;
+                Ok(alloc::vec![
+                    crate::ast::AlterTableTarget::ValidateConstraint { name }
+                ])
             }
             // v7.37.18 (18.18) — RESET ( option [, …] ). Inverse of
             // SET (option = value, …). PG uses it to clear per-table
@@ -10045,11 +10076,13 @@ impl Parser {
                         if matches!(self.peek(), Token::RParen) {
                             self.advance();
                         }
+                        let not_valid = self.parse_not_valid_suffix();
                         return Ok(alloc::vec![
                             crate::ast::AlterTableTarget::AddTableConstraint(
                                 crate::ast::TableConstraint::Check {
                                     name: Some(con_name),
-                                    expr
+                                    expr,
+                                    not_valid,
                                 }
                             )
                         ]);
@@ -10102,6 +10135,27 @@ impl Parser {
                         let uc = self.parse_table_level_unique()?;
                         return Ok(alloc::vec![
                             crate::ast::AlterTableTarget::AddTableConstraint(uc)
+                        ]);
+                    }
+                    // v7.39 (round 652) — bare ADD CHECK (no CONSTRAINT
+                    // prefix). The other three bare forms were here and
+                    // this one was not, so it fell through to the column
+                    // path and came back as "unexpected reserved keyword
+                    // 'check' at start of column definition".
+                    _ if self.peek_table_level_check_start() => {
+                        let chk = self.parse_table_level_check()?;
+                        let not_valid = self.parse_not_valid_suffix();
+                        let crate::ast::TableConstraint::Check { expr, .. } = chk else {
+                            unreachable!("parse_table_level_check returns Check")
+                        };
+                        return Ok(alloc::vec![
+                            crate::ast::AlterTableTarget::AddTableConstraint(
+                                crate::ast::TableConstraint::Check {
+                                    name: None,
+                                    expr,
+                                    not_valid,
+                                }
+                            )
                         ]);
                     }
                     // v7.39 (round 211) — bare ADD EXCLUDE (no CONSTRAINT prefix).
@@ -13298,6 +13352,7 @@ impl Parser {
                     table_constraints.push(crate::ast::TableConstraint::Check {
                         name: None,
                         expr: check_expr,
+                        not_valid: false,
                     });
                 }
                 columns.push(col);
@@ -14076,6 +14131,24 @@ impl Parser {
     /// v7.39 (round 210) — `EXCLUDE [USING <method>] ( <col> WITH <op>
     /// [, <col> WITH <op>]* ) [WHERE (...)]`. The operator is read as a
     /// standalone token spelling (`&&`, `=`, `@>`, `<@`, `&<`, `&>`).
+    /// v7.39 (round 652) — the optional `NOT VALID` suffix on a
+    /// constraint added by ALTER TABLE. `NOT` alone is not enough to
+    /// commit: `NOT` starts no other suffix here, but reading both
+    /// tokens before advancing keeps the caller's error message intact
+    /// if someone writes `NOT NULL` by mistake.
+    fn parse_not_valid_suffix(&mut self) -> bool {
+        if !matches!(self.peek(), Token::Not) {
+            return false;
+        }
+        if !matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("valid"))
+        {
+            return false;
+        }
+        self.advance();
+        self.advance();
+        true
+    }
+
     fn parse_table_level_exclude(
         &mut self,
     ) -> Result<crate::ast::TableConstraint, ParseError> {
@@ -14176,7 +14249,13 @@ impl Parser {
             )));
         }
         self.advance();
-        Ok(crate::ast::TableConstraint::Check { name: None, expr })
+        // A CHECK written inside CREATE TABLE cannot be NOT VALID: there
+        // are no existing rows for PG to skip, so it rejects the suffix.
+        Ok(crate::ast::TableConstraint::Check {
+            name: None,
+            expr,
+            not_valid: false,
+        })
     }
 
     /// v7.13.0 — `true` when the next token is `CHECK` (a bare ident).

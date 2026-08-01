@@ -2047,6 +2047,14 @@ pub struct CheckConstraint {
     pub name: Option<String>,
     /// The AST Expr's `Display` form, re-parsed on every INSERT/UPDATE.
     pub expr: String,
+    /// v7.39 (round 652) — `false` for a constraint added `NOT VALID`: the
+    /// rows already in the table were never scanned against it, and
+    /// `pg_constraint.convalidated` says so. It does NOT weaken the check on
+    /// new rows — INSERT and UPDATE enforce it either way, as in PG.
+    /// `VALIDATE CONSTRAINT` does the deferred scan and flips it. Persisted
+    /// by the FILE_VERSION 87 appendix; older catalogs deserialise as `true`,
+    /// which is what every constraint they could hold actually was.
+    pub validated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7909,7 +7917,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 86;
+const FILE_VERSION: u8 = 87;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -8763,6 +8771,25 @@ impl Catalog {
             for (pos, fsp) in fsps {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
                 out.push(fsp);
+            }
+            // v7.39 (round 652) — CHECK-validated appendix (FILE_VERSION
+            // 87+). Sparse the other way round from the ones above: the
+            // common case is every constraint validated, so only the
+            // NOT VALID ones are written, by their index into the CHECK
+            // appendix. Layout: `[u16 count]([u16 check_idx]) × count`.
+            let unvalidated: Vec<usize> = t
+                .schema
+                .checks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| (!c.validated).then_some(i))
+                .collect();
+            write_u16(
+                &mut out,
+                u16::try_from(unvalidated.len()).expect("≤ 65k CHECK constraints/table"),
+            );
+            for idx in unvalidated {
+                write_u16(&mut out, u16::try_from(idx).expect("≤ 65k CHECK/table"));
             }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
