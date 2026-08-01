@@ -1890,6 +1890,46 @@ pub(super) fn timezone_pg(
     if let Value::TimeTz { .. } = &args[1] {
         return timetz_at_zone(args, ctx);
     }
+    // v7.39 (round 663) — a plain `time` input. PG reads the value as a wall
+    // clock in the target zone and hands back a `timetz` carrying that
+    // zone's offset: `timezone('UTC', TIME '12:00')` is `12:00:00+00`. SPG
+    // fell through to the timestamp path, which wants a date, and answered
+    // "needs DATE or TIMESTAMP". Reuse `timetz_at_zone` by presenting the
+    // time as a timetz already at the target offset — the swap it performs
+    // is then the identity, which is exactly PG's reading.
+    if let Value::Time(us) = &args[1] {
+        let mut rewritten = args.to_vec();
+        rewritten[1] = Value::TimeTz {
+            us: *us,
+            offset_secs: 0,
+        };
+        let out = timetz_at_zone(&rewritten, ctx)?;
+        if let Value::TimeTz { offset_secs, .. } = &out {
+            return Ok(Value::TimeTz {
+                us: *us,
+                offset_secs: *offset_secs,
+            });
+        }
+        return Ok(out);
+    }
+    // v7.39 (round 663) — an INTERVAL is a legal zone: PG's
+    // `timezone(interval, …)` is `AT TIME ZONE INTERVAL '2 hours'`, a fixed
+    // offset with no zone database behind it. SPG demanded text and refused
+    // the form outright. Normalise it to the `+HH:MM` spelling the text path
+    // already understands, so one implementation serves both.
+    if let Value::Interval { months, days, micros } = &args[0] {
+        if *months != 0 || *days != 0 {
+            return Err(EvalError::TypeMismatch {
+                detail: "interval time zone must not include months or days".into(),
+            });
+        }
+        let total_min = *micros / 60_000_000;
+        let (sign, mag) = if total_min < 0 { ('-', -total_min) } else { ('+', total_min) };
+        let spelled = format!("{sign}{:02}:{:02}", mag / 60, mag % 60);
+        let mut rewritten = args.to_vec();
+        rewritten[0] = Value::text(spelled);
+        return timezone_pg(&rewritten, ctx);
+    }
     let Value::Text(zone) = &args[0] else {
         return Err(EvalError::TypeMismatch {
             detail: format!(

@@ -16485,6 +16485,28 @@ fn apply_function_dispatch(
                 return Ok(Value::Bool(true));
             };
             let Some(t) = cat.get(&tname) else {
+                // v7.39 (round 663) — a synthesised system catalog is not in
+                // the user catalog, and treating that as "does not exist"
+                // made `has_column_privilege('pg_class'::regclass, 'oid',
+                // 'SELECT')` an error where PG answers `t`. PG grants SELECT
+                // on the system catalogs to PUBLIC; SPG has no way to revoke
+                // it, so the answer is `true` for a read and `false` for the
+                // write privileges nobody holds on them.
+                if crate::system_catalog::is_synthesised_catalog(&tname, cat) {
+                    let Value::Text(p) = priv_arg else {
+                        return Ok(Value::Bool(true));
+                    };
+                    let Some(bit) = crate::acl::priv_from_word(p.as_ref()) else {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "unrecognized privilege type: \"{}\"",
+                                p.as_ref()
+                            ),
+                        });
+                    };
+                    let select_bit = crate::acl::priv_from_word("SELECT");
+                    return Ok(Value::Bool(Some(bit) == select_bit));
+                }
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!("relation \"{tname}\" does not exist"),
                 });

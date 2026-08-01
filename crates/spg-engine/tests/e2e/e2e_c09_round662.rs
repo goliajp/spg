@@ -130,3 +130,109 @@ fn round662_the_window_default_argument_was_never_missing() {
         "2,-9"
     );
 }
+
+/// v7.39 (round 663) — F20's overload tail, and the same lesson a third
+/// time: 63 rows across 43 names were recorded as capability gaps, and
+/// re-measured most were the PROBE's literals. Range constructors want
+/// `'[]'` for the flags argument and had been handed `'a'`; the privilege
+/// functions want a real relation and had been handed `'SELECT'`. Called
+/// properly, eleven of fifteen sampled forms already answered and were
+/// simply listed nowhere.
+#[test]
+fn round663_forms_that_already_worked_are_listed_now() {
+    let mut e = Engine::new();
+    assert_eq!(one(&mut e, "SELECT point('(1,2),(3,4)'::box)"), "(2,3)");
+    assert_eq!(one(&mut e, "SELECT int4range(1, 3, '[]')"), "[1,4)");
+    assert_eq!(one(&mut e, "SELECT int4multirange()"), "{}");
+    assert_eq!(
+        one(&mut e, "SELECT int4multirange(int4range(1,3))"),
+        "{[1,3)}"
+    );
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT date_trunc('day', TIMESTAMPTZ '2020-01-01 12:00:00+00', 'UTC')"
+        ),
+        "2020-01-01 00:00:00"
+    );
+    // …and the rows the round added exist. Counts are what SPG carries, not
+    // what PG has: `point` is 2 against PG's 5 and `int4multirange` 2
+    // against 3, because the remaining forms take arguments the probe could
+    // not construct (a `box` corner pair, a variadic range array). Those are
+    // recorded as still-short rather than asserted away.
+    for (name, want) in [("point", "2"), ("int4range", "2"), ("int4multirange", "2")] {
+        assert_eq!(
+            one(
+                &mut e,
+                &format!("SELECT count(*) FROM pg_proc WHERE proname = '{name}'")
+            ),
+            want,
+            "{name}"
+        );
+    }
+}
+
+/// Three were real. `timezone` refused an INTERVAL as the zone — PG's
+/// `AT TIME ZONE INTERVAL '2 hours'`, a fixed offset with no zone database
+/// behind it — and refused a plain `time` input, which PG reads as a wall
+/// clock in the target zone and hands back as `timetz`.
+#[test]
+fn round663_timezone_takes_an_interval_and_a_time() {
+    let mut e = Engine::new();
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT timezone(INTERVAL '2 hours', TIMESTAMPTZ '2020-01-01 00:00:00+00')"
+        ),
+        "2020-01-01 02:00:00"
+    );
+    assert_eq!(one(&mut e, "SELECT timezone('UTC', TIME '12:00')"), "12:00:00+00");
+    // The text form is unchanged.
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT timezone('UTC', TIMESTAMPTZ '2020-01-01 00:00:00+00')"
+        ),
+        "2020-01-01 00:00:00"
+    );
+    // Months or days in the interval are not an offset.
+    assert!(e
+        .execute("SELECT timezone(INTERVAL '1 day', TIMESTAMPTZ '2020-01-01 00:00:00+00')")
+        .is_err());
+}
+
+/// And the privilege functions could not see a system catalog at all:
+/// `has_column_privilege('pg_class'::regclass, 'oid', 'SELECT')` answered
+/// `relation "pg_class" does not exist`, because the check looks the name up
+/// in the USER catalog and a synthesised view is not there. PG answers `t` —
+/// the system catalogs are readable by PUBLIC.
+#[test]
+fn round663_privilege_checks_can_see_the_system_catalogs() {
+    let mut e = Engine::new();
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT has_column_privilege('pg_class'::regclass, 'oid', 'SELECT')"
+        ),
+        "true"
+    );
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT has_column_privilege('pg_class'::regclass, 1::smallint, 'SELECT')"
+        ),
+        "true"
+    );
+    // Nobody writes them.
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT has_column_privilege('pg_class'::regclass, 'oid', 'UPDATE')"
+        ),
+        "false"
+    );
+    // A name that is neither a user table nor a catalog still errors.
+    assert!(e
+        .execute("SELECT has_column_privilege('no_such_rel'::regclass, 'x', 'SELECT')")
+        .is_err());
+}
