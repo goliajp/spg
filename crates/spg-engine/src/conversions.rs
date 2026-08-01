@@ -4081,7 +4081,22 @@ pub(crate) fn coerce_value(
         // `0.1::real::numeric` matches PG's float4 text.
         (Value::Real(x), DataType::Numeric { precision, scale }) => {
             if precision == 0 && scale == 0 && x.is_finite() {
-                if let Some((mantissa, src_scale)) = parse_numeric_text(&alloc::format!("{x}")) {
+                // v7.39 (round 662) — SIX significant digits, PG's `FLT_DIG`.
+                // `format!("{x}")` is Rust's shortest round-trip, up to nine
+                // digits for f32 — right for `real::text`, wrong here.
+                // `real::numeric` is a different rule and PG measurably takes
+                // the shorter one: `12345.678::real::numeric` is `12345.7`,
+                // `1.23456789::real::numeric` is `1.23457`,
+                // `123456789::real::numeric` is `123457000`. SPG answered
+                // `12345.678`, `1.2345679`, `123456790` — more digits than a
+                // float4 carries, presented as if it did.
+                //
+                // Found while adding `to_char(real, …)`: PG routes that
+                // through numeric, not float8, so the missing overload was the
+                // symptom and this cast was the cause.
+                let six = alloc::format!("{:.5e}", x);
+                let six: f64 = six.parse().unwrap_or_else(|_| f64::from(x));
+                if let Some((mantissa, src_scale)) = parse_numeric_text(&alloc::format!("{six}")) {
                     Some(Value::Numeric {
                         scaled: mantissa,
                         scale: src_scale,
