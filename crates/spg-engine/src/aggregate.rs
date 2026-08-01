@@ -5075,6 +5075,16 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
             } else if st.use_money {
                 // PG has no avg(money); we accept it as a sensible superset —
                 // average of the cent totals, rounded half-away-from-zero.
+                //
+                // DELIBERATE. Round 664 read "PG refuses, SPG answers" off
+                // the F29 list and wrote guards on four accumulators to
+                // remove this before a test caught it. Per the round-641
+                // policy such a divergence is judged by correctness risk,
+                // and this one carries none: money IS cents, so rounding is
+                // the type's granularity rather than a loss introduced
+                // here, and no PG application can reach the shape, because
+                // PG rejects it. Pinned at eight shapes in
+                // `e2e_avg_money_round664`.
                 let n = i128::from(st.count);
                 let q = (st.sum_money * 2 + if st.sum_money >= 0 { n } else { -n }) / (2 * n);
                 Value::Money(q as i64)
