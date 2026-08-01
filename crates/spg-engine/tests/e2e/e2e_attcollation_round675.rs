@@ -129,3 +129,29 @@ fn round676_an_explicit_collate_is_reported_by_both_catalogs() {
         "a|NULL,b|C,c|POSIX"
     );
 }
+
+/// Round 679 — information_schema reports the name the DDL wrote, even one
+/// SPG cannot perform, and a `pg_catalog.` qualifier is stripped while an
+/// encoding suffix is not.
+///
+/// Round 676 stripped both with the same `rsplit('.')`, so
+/// `COLLATE "en_US.utf8"` was recorded as `utf8`. PG writes
+/// `pg_catalog.default` and `en_US.utf8` with the same separator and only
+/// the first is a qualifier.
+#[test]
+fn round679_the_declared_name_is_reported_verbatim() {
+    let mut e = Engine::new();
+    e.execute(
+        "CREATE TABLE w(a TEXT, b TEXT COLLATE \"C\", c TEXT COLLATE \"en_US.utf8\", \
+         d TEXT COLLATE pg_catalog.\"default\")",
+    )
+    .unwrap();
+    assert_eq!(
+        rows(
+            &mut e,
+            "SELECT column_name, collation_name FROM information_schema.columns \
+             WHERE table_name = 'w' ORDER BY ordinal_position"
+        ),
+        "a|NULL,b|C,c|en_US.utf8,d|default"
+    );
+}

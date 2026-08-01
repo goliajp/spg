@@ -3379,6 +3379,37 @@ impl Engine {
             .into_iter()
             .map(|c| column_def_to_schema(c, mysql))
             .collect::<Result<Vec<_>, _>>()?;
+        // v7.39 (round 679) — say so when a declared collation is stored but
+        // not applied.
+        //
+        // Round 670 measured three rules colliding here: refusing the DDL
+        // breaks a customer's pg_dump restore (zero-customer-change), while
+        // accepting it silently is what F36 records as the defect — the
+        // declaration taken and ignored. A WARNING is the option that was
+        // not available then: rounds 676-677 gave the name somewhere to
+        // live, and round 678 gave `collate::is_supported` a way to say
+        // whether this build can perform it. The restore still succeeds;
+        // the gap stops being silent.
+        //
+        // SPG performs C and POSIX, so those warn about nothing.
+        for c in &cols {
+            let Some(name) = c.collation_name.as_deref() else {
+                continue;
+            };
+            if crate::collate::is_supported(name)
+                && (name.eq_ignore_ascii_case("C")
+                    || name.eq_ignore_ascii_case("POSIX")
+                    || name.eq_ignore_ascii_case("default"))
+            {
+                continue;
+            }
+            self.warning(alloc::format!(
+                "column \"{}\" declares COLLATE \"{name}\"; SPG records the declaration but \
+                 orders this column by bytes (the C collation) — ORDER BY, min/max and range \
+                 comparisons will not follow \"{name}\"",
+                c.name
+            ));
+        }
         // v7.17.0 Phase 1.4 + 1.5 — classify every raw
         // user_type_ref (parked as user_enum_type by
         // column_def_to_schema) into either an enum binding or a
