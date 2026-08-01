@@ -419,6 +419,52 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
             .unwrap_or(Ordering::Equal),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
+        // v7.39 (round 673) — the rest of what `aggregate`'s `value_cmp`
+        // carries and this one did not. Every one of these fell to the
+        // canonical-text fallback, which sorts by how a value PRINTS:
+        //
+        //   ORDER BY inet   10.0.0.10, 10.0.0.100, 10.0.0.9   (PG: .9, .10, .100)
+        //   ORDER BY money  $10.00, $100.00, $9.00            (PG: 9, 10, 100)
+        //   ORDER BY bytea  64, 0a, 09                        (PG: 09, 0a, 64)
+        //   ORDER BY uuid   0000000a, 00000064, 00000009      (PG: 09, 0a, 64)
+        //
+        // Round 672 measured these as "fine" and was wrong: its probe used
+        // 2/5/9, single digits that sort identically by text and by value.
+        // 9/10/100 is what tells them apart.
+        //
+        // The comment forty lines below already recorded this exact failure
+        // for NUMERIC — "the old `_ => debug-string` fallback sorted
+        // 12.50 < 5.25 < 99.99, corrupting ORDER BY numeric_col". That fix
+        // named one type; the fallback kept the rest.
+        (Value::Money(x), Value::Money(y)) => x.cmp(y),
+        (Value::Bytes(x), Value::Bytes(y)) => x.as_ref().cmp(y.as_ref()),
+        (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
+        (Value::Macaddr(x), Value::Macaddr(y)) => x.cmp(y),
+        (Value::Macaddr8(x), Value::Macaddr8(y)) => x.cmp(y),
+        (
+            Value::Inet {
+                family: xf,
+                bits: xb,
+                addr: xa,
+            },
+            Value::Inet {
+                family: yf,
+                bits: yb,
+                addr: ya,
+            },
+        )
+        | (
+            Value::Cidr {
+                family: xf,
+                bits: xb,
+                addr: xa,
+            },
+            Value::Cidr {
+                family: yf,
+                bits: yb,
+                addr: ya,
+            },
+        ) => (xf, xa, xb).cmp(&(yf, ya, yb)),
         // v7.39 (round 672) — TIME was missing HERE while `aggregate`'s own
         // `value_cmp` had it, so `ORDER BY time_col` fell to the catch-all
         // and did not sort at all. Measured: three rows inserted 09/02/05
