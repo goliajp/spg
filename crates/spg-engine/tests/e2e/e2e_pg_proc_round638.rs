@@ -51,7 +51,7 @@ fn round638_pg_proc_lists_what_the_engine_has() {
     // the 709 functions the engine answers. The gap was measured by calling
     // every candidate name and reading the engine's own reply, which
     // separates "does not exist" from "takes N args".
-    assert_eq!(vals(&mut e, "SELECT count(*) FROM pg_proc"), vec!["866"]);
+    assert_eq!(vals(&mut e, "SELECT count(*) FROM pg_proc"), vec!["881"]);
     assert_eq!(vals(&mut e, "SELECT count(DISTINCT proname) FROM pg_proc"), vec!["573"]);
     // Signatures byte for byte with PG18's for the same names.
     assert_eq!(
@@ -84,7 +84,7 @@ fn round638_no_row_is_orphaned_by_the_join() {
             &mut e,
             "SELECT count(*) FROM pg_proc p JOIN pg_type t ON t.oid = p.prorettype"
         ),
-        vec!["866"],
+        vec!["881"],
         "as many as pg_proc has — nothing points at a type pg_type omits"
     );
 }

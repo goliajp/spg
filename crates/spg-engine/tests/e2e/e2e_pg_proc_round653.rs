@@ -155,7 +155,7 @@ fn round653_the_new_types_are_types_the_engine_produces() {
 #[test]
 fn round654_overloads_match_what_the_engine_accepts() {
     let mut e = Engine::new();
-    for (name, want) in [("abs", "6"), ("avg", "7"), ("sum", "8"), ("max", "22")] {
+    for (name, want) in [("abs", "6"), ("avg", "7"), ("sum", "8"), ("max", "23")] {
         assert_eq!(
             vals(
                 &mut e,

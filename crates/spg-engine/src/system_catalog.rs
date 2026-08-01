@@ -5952,6 +5952,30 @@ pub(crate) const PG_PROC_FUNCS: &[(i64, &str, &str, i32, i64)] = &[
     (4290, "tstzmultirange", "f", 1, 4534),
     (6430, "uuidv7", "f", 1, 2950),
     (3218, "width_bucket", "f", 2, 23),
+    // v7.39 (round 663) — F20's tail. Round 654 left 63 rows across 43 names
+    // looking like capability gaps; re-measured, most were the PROBE's fault
+    // again — range constructors want `'[]'` for the flags argument and got
+    // `'a'`, privilege functions want a real relation and got `'SELECT'`.
+    // Called properly, `point(box)`, three-argument range constructors,
+    // `int4multirange()`, the hypothetical-set aggregates, three-argument
+    // `date_trunc` and one-argument `age` all answer; they were listed
+    // nowhere. Same rule as round 654: a call was constructed for the exact
+    // PG18 signature and the row kept only if the engine answered.
+    (3942, "daterange", "f", 3, 3912),
+    (3841, "int4range", "f", 3, 3904),
+    (3946, "int8range", "f", 3, 3926),
+    (4235, "lower", "f", 1, 2283),
+    (3463, "make_timestamptz", "f", 7, 1184),
+    (6373, "max", "a", 1, 2249),
+    (6374, "min", "a", 1, 2249),
+    (3845, "numrange", "f", 3, 3906),
+    (1534, "point", "f", 1, 600),
+    (4228, "range_merge", "f", 1, 3831),
+    (3156, "row_to_json", "f", 2, 114),
+    (1775, "to_char", "f", 2, 25),
+    (3934, "tsrange", "f", 3, 3908),
+    (3938, "tstzrange", "f", 3, 3910),
+    (4236, "upper", "f", 1, 2283),
 ];
 
 /// v7.17.0 Phase 3.P0-65 — synthesise `mysql.user`. MySQL admin
@@ -9589,6 +9613,18 @@ pub(crate) const CATALOG_RELATIONS: &[(&str, i64)] = &[
 /// the way are discarded — `pg_attribute` is introspection, not a hot path,
 /// and every one of these is either fixed-size or O(tables), which is what
 /// `pg_attribute` itself already costs.
+/// v7.39 (round 663) — is this one of the catalogs SPG synthesises?
+///
+/// `has_column_privilege('pg_class'::regclass, 'oid', 'SELECT')` answered
+/// `relation "pg_class" does not exist`, because the privilege check looks
+/// the name up in the user catalog and a synthesised view is not there. PG
+/// answers `t` — the system catalogs are readable by PUBLIC. The predicate
+/// is the same dispatch the column reader uses, so a catalog cannot be
+/// visible to one and invisible to the other.
+pub(crate) fn is_synthesised_catalog(name: &str, cat: &Catalog) -> bool {
+    catalog_relation_columns(name, cat).is_some()
+}
+
 fn catalog_relation_columns(name: &str, cat: &Catalog) -> Option<Vec<ColumnSchema>> {
     Some(match name {
         "pg_am" => synth_pg_am(cat).0,
