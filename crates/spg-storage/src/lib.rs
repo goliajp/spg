@@ -7953,7 +7953,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 87;
+const FILE_VERSION: u8 = 88;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -8826,6 +8826,30 @@ impl Catalog {
             );
             for idx in unvalidated {
                 write_u16(&mut out, u16::try_from(idx).expect("≤ 65k CHECK/table"));
+            }
+            // v7.39 (round 677) — per-column collation names (FILE_VERSION
+            // 88+). Sparse: only the columns that were written with an
+            // explicit `COLLATE` appear, so a table that declares none pays
+            // two bytes. Layout: `[u16 count]([u16 col_idx][str]) × count`.
+            //
+            // Without this the declaration survives CREATE TABLE and dies
+            // at the next restart — measured: a column declared
+            // `COLLATE "C"` reported attcollation 950 in the session that
+            // created it and 100 after a reload.
+            let collated: Vec<(usize, &str)> = t
+                .schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.collation_name.as_deref().map(|n| (i, n)))
+                .collect();
+            write_u16(
+                &mut out,
+                u16::try_from(collated.len()).expect("≤ 65k columns/table"),
+            );
+            for (idx, name) in collated {
+                write_u16(&mut out, u16::try_from(idx).expect("≤ 65k columns/table"));
+                write_str(&mut out, name);
             }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions

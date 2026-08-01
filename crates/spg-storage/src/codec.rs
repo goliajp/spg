@@ -604,6 +604,27 @@ pub(crate) fn deserialize_table(
             c.validated = false;
         }
     }
+    // v7.39 (round 677) — per-column collation appendix (FILE_VERSION 88+).
+    // Index-aligned to the column list, sparse: only the columns declared
+    // with an explicit `COLLATE` are present. A v87 catalog has none, and
+    // its columns keep `collation_name: None`, which reads as "takes the
+    // type's collation" — exactly what those catalogs meant.
+    if version >= 88 {
+        let n = cur.read_u16()? as usize;
+        for _ in 0..n {
+            let idx = cur.read_u16()? as usize;
+            let name = cur.read_str()?;
+            let cols = &mut t.schema_mut().columns;
+            let len = cols.len();
+            let Some(c) = cols.get_mut(idx) else {
+                return Err(StorageError::Corrupt(format!(
+                    "collation appendix: index {idx} past {len} columns \
+                     for table {table_name:?}"
+                )));
+            };
+            c.collation_name = Some(name);
+        }
+    }
     let _ = table_name;
     Ok(())
 }
