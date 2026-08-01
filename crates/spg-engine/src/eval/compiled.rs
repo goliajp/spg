@@ -1298,7 +1298,7 @@ pub(crate) fn eval_compiled(
     // zero-clone Text path is untouched.
     let rowref = crate::join::RowRef::Owned(row);
     let mut local_stack: Vec<Value<'_>> = core::mem::take(stack);
-    let result = eval_compiled_ref(c, &rowref, ctx, &mut local_stack);
+    let result = eval_compiled_ref(c, rowref, ctx, &mut local_stack);
     let owned = result.map(Value::into_owned);
     *stack = recycle_stack(local_stack);
     owned
@@ -1376,7 +1376,7 @@ pub(crate) fn eval_compiled_pred(
     }
     let rowref = crate::join::RowRef::Owned(row);
     let mut local_stack: Vec<Value<'_>> = core::mem::take(stack);
-    let verdict = eval_compiled_ref(c, &rowref, ctx, &mut local_stack)
+    let verdict = eval_compiled_ref(c, rowref, ctx, &mut local_stack)
         .and_then(|v| crate::eval::predicate_is_true(&v, "WHERE", mysql));
     *stack = recycle_stack(local_stack);
     verdict
@@ -1669,7 +1669,12 @@ fn recycle_stack(mut v: Vec<Value<'_>>) -> Vec<Value<'static>> {
 // switch to borrowed push to eliminate per-row String allocs.
 pub(crate) fn eval_compiled_ref<'row, 'val>(
     c: &'val CompiledExpr,
-    row: &'val crate::join::RowRef<'row>,
+    // v7.39 (round 656) — BY VALUE. `RowRef` is `Copy` and its `get`
+    // borrows the row data, not the wrapper, so taking a reference here
+    // only served to tie the result's lifetime to a caller local — which
+    // is what stopped the aggregate loop from holding its `RowRef` by
+    // value and forced a materialised `Vec<RowRef>` per scan.
+    row: crate::join::RowRef<'row>,
     ctx: &EvalContext<'_>,
     stack: &mut Vec<Value<'val>>,
 ) -> Result<Value<'val>, EvalError>
@@ -1688,7 +1693,12 @@ where
 /// out of public surface — only the Case opcode reaches for it.
 fn eval_compiled_ref_into<'row, 'val>(
     c: &'val CompiledExpr,
-    row: &'val crate::join::RowRef<'row>,
+    // v7.39 (round 656) — BY VALUE. `RowRef` is `Copy` and its `get`
+    // borrows the row data, not the wrapper, so taking a reference here
+    // only served to tie the result's lifetime to a caller local — which
+    // is what stopped the aggregate loop from holding its `RowRef` by
+    // value and forced a materialised `Vec<RowRef>` per scan.
+    row: crate::join::RowRef<'row>,
     ctx: &EvalContext<'_>,
     stack: &mut Vec<Value<'val>>,
     _mark: usize,
@@ -1702,7 +1712,12 @@ where
 #[inline]
 fn run_compiled_steps<'row, 'val>(
     steps: &'val [Step],
-    row: &'val crate::join::RowRef<'row>,
+    // v7.39 (round 656) — BY VALUE. `RowRef` is `Copy` and its `get`
+    // borrows the row data, not the wrapper, so taking a reference here
+    // only served to tie the result's lifetime to a caller local — which
+    // is what stopped the aggregate loop from holding its `RowRef` by
+    // value and forced a materialised `Vec<RowRef>` per scan.
+    row: crate::join::RowRef<'row>,
     ctx: &EvalContext<'_>,
     stack: &mut Vec<Value<'val>>,
 ) -> Result<(), EvalError>

@@ -172,6 +172,8 @@ mod e2e_inherit_alter_truncate_round647;
 mod e2e_regtype_oid_round648;
 mod e2e_numeric_ladder_round649;
 mod e2e_fts_catalogs_round650;
+mod e2e_pg_proc_round653;
+mod e2e_scan_memory_round656;
 mod e2e_tokenizer_round651;
 mod e2e_catalog_column_types_round620;
 mod e2e_array_insert_select_round621;

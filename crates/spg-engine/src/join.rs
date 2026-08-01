@@ -219,12 +219,88 @@ pub(crate) fn build_pos_to_src(offsets: &[usize]) -> Vec<u16> {
     tab
 }
 
+/// v7.39 (round 656) — what the aggregate engine reads its input through.
+///
+/// The scan path used to hand `aggregate::run` a `Vec<RowRef>` built by
+/// `filtered.iter().map(RowRef::Owned).collect()` — one 64-byte enum per
+/// row to wrap an 8-byte reference. Measured, that is the whole of a
+/// scalar aggregate's working memory and it is O(rows): 7.0 MB at 100k
+/// rows, 19.8 at 250k, 40.4 at 500k, 79.6 at 1M — ~81 bytes a row for a
+/// query that returns one number. At 50M rows it is 3.2 GB, and what the
+/// customer meets is not slowness, it is OOM.
+///
+/// `RowRef` is 64 bytes because its `Tuple` variant carries four slice
+/// references for the join path; a single-table scan only ever uses
+/// `Owned`. So the scan now passes its `&[Row]` straight through and the
+/// `RowRef` is built per row on the stack, where it costs nothing. The
+/// join path keeps handing over its `&[RowRef]` exactly as before.
+#[derive(Clone, Copy)]
+pub(crate) enum AggRows<'a> {
+    /// A single-table scan's rows, borrowed. No per-row allocation.
+    Owned(&'a [Row<'static>]),
+    /// The join path's deferred tuples, already built.
+    Refs(&'a [RowRef<'a>]),
+    /// A single-table scan whose survivors are already a list of row
+    /// POINTERS (`Vec<&Row>` after WHERE). This is the shape the plain
+    /// relational scan has, and it is where the measured cost lived: it
+    /// used to `collect()` those pointers into a second vector of
+    /// 64-byte `RowRef`s, 8 bytes of data wrapped in 64.
+    Ptrs(&'a [&'a Row<'static>]),
+}
+
+impl<'a> AggRows<'a> {
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Owned(r) => r.len(),
+            Self::Refs(r) => r.len(),
+            Self::Ptrs(r) => r.len(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, i: usize) -> Option<RowRef<'a>> {
+        match self {
+            Self::Owned(r) => r.get(i).map(RowRef::Owned),
+            Self::Refs(r) => r.get(i).copied(),
+            Self::Ptrs(r) => r.get(i).map(|p| RowRef::Owned(p)),
+        }
+    }
+
+    /// The sub-range the parallel shards walk. Slicing is free on both
+    /// arms — no copy, no allocation.
+    #[inline]
+    pub(crate) fn range(&self, lo: usize, hi: usize) -> Self {
+        match self {
+            Self::Owned(r) => Self::Owned(&r[lo..hi]),
+            Self::Refs(r) => Self::Refs(&r[lo..hi]),
+            Self::Ptrs(r) => Self::Ptrs(&r[lo..hi]),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn first(&self) -> Option<RowRef<'a>> {
+        self.get(0)
+    }
+
+    #[inline]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = RowRef<'a>> + '_ {
+        (0..self.len()).filter_map(move |i| self.get(i))
+    }
+}
+
 /// v7.32 (P4 borrow channel, increment 2) — a row handed to the
 /// aggregate engine. Either a borrowed materialised `Row` (single-table
 /// and legacy paths) or a deferred row-index tuple over join sources
 /// (the join+aggregate path) that resolves cells *by reference* via
 /// `tuple_value`, so the join+aggregate path never materialises a
 /// combined `Row` for the bound-column fast path.
+#[derive(Clone, Copy)]
 pub(crate) enum RowRef<'a> {
     Owned(&'a Row<'static>),
     Tuple {
@@ -239,11 +315,18 @@ pub(crate) enum RowRef<'a> {
     },
 }
 
-impl RowRef<'_> {
+impl<'a> RowRef<'a> {
     /// Borrow the cell at a combined-schema position. The bound-column
     /// fast path in `aggregate::run` reads cells this way — zero clone.
+    ///
+    /// v7.39 (round 656) — the returned reference borrows the ROW DATA
+    /// (`'a`), not `&self`. Both variants only ever hand back something
+    /// that lives in the `'a` slices, and saying so is what lets the
+    /// aggregate loop hold a `RowRef` by value: a per-iteration local can
+    /// then still yield references that outlive it, which is exactly what
+    /// the group-key `Vec<&Value>` needs.
     #[inline]
-    pub(crate) fn get(&self, pos: usize) -> Option<&Value<'_>> {
+    pub(crate) fn get(&self, pos: usize) -> Option<&'a Value<'a>> {
         match self {
             RowRef::Owned(r) => r.values.get(pos),
             RowRef::Tuple {
@@ -2053,7 +2136,7 @@ impl Engine {
             let mut eval_stack: Vec<Value<'_>> = Vec::new();
             let pass = if let Some(cw) = &compiled_where {
                 matches!(
-                    eval::eval_compiled_ref(cw, &rr, ctx, &mut eval_stack)
+                    eval::eval_compiled_ref(cw, rr, ctx, &mut eval_stack)
                         .map_err(EngineError::Eval)?,
                     Value::Bool(true)
                 )
@@ -3727,3 +3810,34 @@ pub static ANTI_JOIN_FAST_PATH_TRIED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 pub static ANTI_JOIN_FAST_PATH_FIRED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+mod r655_rowref_size {
+    /// v7.39 (round 655/656) — `RowRef` is 64 bytes because its `Tuple`
+    /// variant carries four slice references for the join path. A scan
+    /// only ever uses `Owned`, an 8-byte pointer.
+    ///
+    /// Round 655 measured what that cost: a scalar aggregate's working
+    /// memory was O(rows) at ~81 bytes/row — 7.0 MB at 100k, 19.8 at
+    /// 250k, 40.4 at 500k, 79.6 at 1M — because
+    /// `run_single_table_aggregate` collected one `RowRef` per surviving
+    /// row on top of the `Vec<&Row>` it already had. Round 656 gave
+    /// `AggRows` a `Ptrs` arm that reads those pointers directly:
+    /// **81 -> 17 bytes/row**; round 657 reserved the survivor vector
+    /// when there is no WHERE, taking it to **15** — a 5.4x cut overall,
+    /// measured at all four sizes.
+    ///
+    /// The size is pinned because the enum is still built per row inside
+    /// the loop — on the stack now, so it costs nothing, but a bigger
+    /// variant would start costing again in registers and moves. A
+    /// failure here means "re-measure scan RSS at 100k/250k/500k/1M",
+    /// not "this is forbidden".
+    fn rowref_stays_small() {
+        assert_eq!(
+            core::mem::size_of::<super::RowRef<'_>>(),
+            64,
+            "RowRef changed size; a table scan allocates one per row, so \
+             this multiplies by the row count — re-measure scan RSS"
+        );
+    }
+}
