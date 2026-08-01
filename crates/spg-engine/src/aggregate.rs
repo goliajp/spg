@@ -357,44 +357,9 @@ pub(crate) fn classify_agg_name(name: &str) -> AggKind {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default, Clone)]
 pub(crate) struct AggState {
-    count: i64,
-    sum_int: i64,
-    sum_float: f64,
+    /// The shared sum/avg running state (see `NumAcc`).
+    num: NumAcc,
     extreme: Option<Value<'static>>,
-    use_float: bool,
-    /// v7.39 (round 269) — a non-REAL float has flowed into
-    /// `sum_float`. `sum(real)` stays real in PG; it only widens to
-    /// double precision once something wider joins the accumulation.
-    float_not_real: bool,
-    /// v7.37.16 — exact NUMERIC accumulator for `sum(numeric)` /
-    /// `avg(numeric)`. Only touched when a `Value::Numeric` flows
-    /// through the sum/avg path (`use_numeric` gates it); the
-    /// int/float fast path never reads or writes these, so the common
-    /// `sum(int)` / `sum(float8)` accumulation is byte-identical. Holds
-    /// the running sum as an integral mantissa at `sum_num_scale`
-    /// (aligned on the max input scale, so it stays exact — no f64).
-    sum_num_scaled: i128,
-    sum_num_scale: u16,
-    /// v7.39 (read01 numeric.c) — bignum spill for a sum that leaves i128;
-    /// see `SumBig`. The i128 lane freezes at zero once this engages.
-    sum_big: SumBig,
-    use_numeric: bool,
-    /// v7.38 (read01, T6.P3) — the NUMERIC special class of the running sum, so a
-    /// NaN / ±Infinity input propagates to sum()/avg() (the finite mantissa keeps
-    /// accumulating but is ignored when this is non-Finite). Default = Finite.
-    sum_num_kind: spg_storage::NumericKind,
-    /// v7.37 — component-wise accumulator for `sum(interval)` /
-    /// `avg(interval)`. Gated by `use_interval`; the numeric/int/float
-    /// paths never touch these. `micros` is i128 to avoid overflow when
-    /// avg spills month/day remainders into the time field.
-    sum_iv_months: i64,
-    sum_iv_days: i64,
-    sum_iv_micros: i128,
-    use_interval: bool,
-    /// v7.37 — `sum(money)` accumulator (integer cents). PG has `sum(money)`
-    /// but no `avg(money)`. Gated by `use_money`.
-    sum_money: i128,
-    use_money: bool,
     /// v7.17.0 — running collection for string_agg / array_agg.
     /// Each entry is one row's contribution (NULL preserved as
     /// `Value::Null`; string_agg's finalize step drops them, but
@@ -1241,21 +1206,36 @@ fn validate_within_group(
 /// (1) Stream the WHERE-filtered rows, group by the GROUP BY value
 /// tuple, and update per-group aggregate state. Returns the groups in
 /// insertion order. See `run` for the bind-once fast path rationale.
-#[allow(clippy::too_many_lines, clippy::type_complexity)]
-/// v7.37.16 — per-spec accumulator for the fused multi-spec fast path.
-/// Field-for-field the same running state the single-spec sum/avg fast
-/// path keeps in locals; finalized into `AggState` identically.
-#[derive(Default, Clone)]
-struct FusedAcc {
+/// v7.39 (round 665) — the running numeric state a sum/avg keeps, in ONE
+/// place.
+///
+/// It used to live in four independently written copies: `FusedAcc`'s own
+/// fields, `AggState`'s own fields, and twice more as loose locals inside
+/// `accumulate_groups`. `FusedAcc`'s doc comment described that openly —
+/// "field-for-field the same running state the single-spec sum/avg fast
+/// path keeps in locals" — so the duplication was deliberate manual
+/// inlining, not drift.
+///
+/// The cost was not abstract. Round 664 measured it: adding one guard to
+/// the sum/avg family meant editing FOUR sites, and three of the four were
+/// found only by running a different SQL shape and watching the wrong
+/// answer come back. Reading the code did not reveal them, because the
+/// three parallel loops in the fused block are not symmetric — the middle
+/// one is a `length()` shortcut that accumulates nothing numeric.
+///
+/// `count` deliberately stays outside: `count(*)` keeps it too, and it is
+/// not part of the numeric running state.
+#[derive(Debug, Default, Clone)]
+struct NumAcc {
     sum_int: i64,
     sum_float: f64,
     use_float: bool,
     float_not_real: bool,
-    num_scaled: i128,
-    num_kind: spg_storage::NumericKind,
-    num_scale: u16,
+    sum_num_scaled: i128,
+    sum_num_kind: spg_storage::NumericKind,
+    sum_num_scale: u16,
     /// v7.39 (read01 numeric.c) — bignum spill; see `SumBig`.
-    num_big: SumBig,
+    sum_big: SumBig,
     use_numeric: bool,
     sum_iv_months: i64,
     sum_iv_days: i64,
@@ -1263,7 +1243,21 @@ struct FusedAcc {
     use_interval: bool,
     sum_money: i128,
     use_money: bool,
+    /// Inside the struct, not beside it. Measured: splitting it out gave
+    /// `acc_cell` two base pointers where the copy it replaced had one,
+    /// and `sum(int)` over 500k rows lost ~8% (paired, n=12, p=0.04).
+    /// `count(*)` reading `st.num.count` is a small price for that.
     count: i64,
+}
+
+#[allow(clippy::too_many_lines, clippy::type_complexity)]
+/// v7.37.16 — per-spec accumulator for the fused multi-spec fast path.
+/// Field-for-field the same running state the single-spec sum/avg fast
+/// path keeps in locals; finalized into `AggState` identically.
+#[derive(Default, Clone)]
+struct FusedAcc {
+    /// The shared sum/avg running state (see `NumAcc`).
+    num: NumAcc,
     /// v7.39 (round 568/569) — the min/max lane. `min` and `max` were
     /// the only ordinary aggregates the fused layout did not accept, so
     /// they fell to the generic per-spec machinery and cost DOUBLE a
@@ -1402,33 +1396,33 @@ fn merge_fused(a: &mut FusedAcc, b: &FusedAcc) {
             a.extreme = Some(be.clone());
         }
     }
-    a.count += b.count;
-    a.sum_int += b.sum_int;
-    a.sum_float += b.sum_float;
-    a.use_float |= b.use_float;
-    a.float_not_real |= b.float_not_real;
-    if b.use_numeric {
+    a.num.count += b.num.count;
+    a.num.sum_int += b.num.sum_int;
+    a.num.sum_float += b.num.sum_float;
+    a.num.use_float |= b.num.use_float;
+    a.num.float_not_real |= b.num.float_not_real;
+    if b.num.use_numeric {
         // v7.39 (read01 numeric.c) — fold the shard's bignum spill first,
         // then its i128 lane (zero if the shard promoted).
-        if let Some(bb) = &b.num_big {
-            sum_add_bignum(&mut a.num_scaled, &mut a.num_scale, &mut a.num_big, bb);
+        if let Some(bb) = &b.num.sum_big {
+            sum_add_bignum(&mut a.num.sum_num_scaled, &mut a.num.sum_num_scale, &mut a.num.sum_big, bb);
         }
         sum_add_exact(
-            &mut a.num_scaled,
-            &mut a.num_scale,
-            &mut a.num_big,
-            b.num_scaled,
-            b.num_scale,
+            &mut a.num.sum_num_scaled,
+            &mut a.num.sum_num_scale,
+            &mut a.num.sum_big,
+            b.num.sum_num_scaled,
+            b.num.sum_num_scale,
         );
-        a.num_kind = fold_sum_kind(a.num_kind, b.num_kind);
-        a.use_numeric = true;
+        a.num.sum_num_kind = fold_sum_kind(a.num.sum_num_kind, b.num.sum_num_kind);
+        a.num.use_numeric = true;
     }
-    a.sum_iv_months += b.sum_iv_months;
-    a.sum_iv_days += b.sum_iv_days;
-    a.sum_iv_micros += b.sum_iv_micros;
-    a.use_interval |= b.use_interval;
-    a.sum_money += b.sum_money;
-    a.use_money |= b.use_money;
+    a.num.sum_iv_months += b.num.sum_iv_months;
+    a.num.sum_iv_days += b.num.sum_iv_days;
+    a.num.sum_iv_micros += b.num.sum_iv_micros;
+    a.num.use_interval |= b.num.use_interval;
+    a.num.sum_money += b.num.sum_money;
+    a.num.use_money |= b.num.use_money;
 }
 
 /// v7.39 — write fused accumulators into the per-spec AggStates
@@ -1443,25 +1437,25 @@ fn fill_states_from_fused(
     for (i, src) in spec_src.iter().enumerate() {
         let state = &mut states[i];
         match src {
-            None => state.count = group_rows,
+            None => state.num.count = group_rows,
             Some(slot) => {
                 let a = &accs[*slot];
-                state.count = a.count;
-                state.sum_int = a.sum_int;
-                state.sum_float = a.sum_float;
-                state.use_float = a.use_float;
-                state.float_not_real = a.float_not_real;
-                state.sum_num_scaled = a.num_scaled;
-                state.sum_num_kind = a.num_kind;
-                state.sum_num_scale = a.num_scale;
-                state.sum_big = a.num_big.clone();
-                state.use_numeric = a.use_numeric;
-                state.sum_iv_months = a.sum_iv_months;
-                state.sum_iv_days = a.sum_iv_days;
-                state.sum_iv_micros = a.sum_iv_micros;
-                state.use_interval = a.use_interval;
-                state.sum_money = a.sum_money;
-                state.use_money = a.use_money;
+                state.num.count = a.num.count;
+                state.num.sum_int = a.num.sum_int;
+                state.num.sum_float = a.num.sum_float;
+                state.num.use_float = a.num.use_float;
+                state.num.float_not_real = a.num.float_not_real;
+                state.num.sum_num_scaled = a.num.sum_num_scaled;
+                state.num.sum_num_kind = a.num.sum_num_kind;
+                state.num.sum_num_scale = a.num.sum_num_scale;
+                state.num.sum_big = a.num.sum_big.clone();
+                state.num.use_numeric = a.num.use_numeric;
+                state.num.sum_iv_months = a.num.sum_iv_months;
+                state.num.sum_iv_days = a.num.sum_iv_days;
+                state.num.sum_iv_micros = a.num.sum_iv_micros;
+                state.num.use_interval = a.num.use_interval;
+                state.num.sum_money = a.num.sum_money;
+                state.num.use_money = a.num.use_money;
                 if a.extreme.is_some() {
                     state.extreme = a.extreme.clone();
                 }
@@ -1602,7 +1596,19 @@ fn min_max_unsupported_type(v: &Value<'_>) -> bool {
     )
 }
 
-fn fused_acc_cell(a: &mut FusedAcc, v: &Value<'_>) -> Result<(), EvalError> {
+/// Fold one value into a running sum/avg. THE accumulator — there is no
+/// second copy, by design; see `NumAcc` for what four copies cost.
+///
+/// No `inline(always)` here, and the reason is measured rather than
+/// stylistic. The four copies were hand-inlining, so the obvious guess was
+/// that the collapse would cost a call per row and the attribute would buy
+/// it back. It did not: with `count` split out of `NumAcc`, `sum(int)`
+/// over 500k rows lost ~8% WITH the attribute applied. What actually
+/// mattered was the pointer count — the copy this replaces took one
+/// `&mut FusedAcc`, and passing `&mut NumAcc` plus a separate `&mut i64`
+/// made two base pointers. Folding `count` back into the struct closed the
+/// gap; the attribute never did, so it is not here.
+fn acc_cell(a: &mut NumAcc, v: &Value<'_>) -> Result<(), EvalError> {
     match v {
         Value::Null => {}
         Value::SmallInt(n) => {
@@ -1616,9 +1622,9 @@ fn fused_acc_cell(a: &mut FusedAcc, v: &Value<'_>) -> Result<(), EvalError> {
         // v7.38 (read01, T4) — BIGINT sums as exact NUMERIC (PG).
         Value::BigInt(n) => {
             sum_add_exact(
-                &mut a.num_scaled,
-                &mut a.num_scale,
-                &mut a.num_big,
+                &mut a.sum_num_scaled,
+                &mut a.sum_num_scale,
+                &mut a.sum_big,
                 i128::from(*n),
                 0,
             );
@@ -1642,19 +1648,19 @@ fn fused_acc_cell(a: &mut FusedAcc, v: &Value<'_>) -> Result<(), EvalError> {
             kind,
         } => {
             sum_add_exact(
-                &mut a.num_scaled,
-                &mut a.num_scale,
-                &mut a.num_big,
+                &mut a.sum_num_scaled,
+                &mut a.sum_num_scale,
+                &mut a.sum_big,
                 *scaled,
                 *scale,
             );
-            a.num_kind = fold_sum_kind(a.num_kind, *kind);
+            a.sum_num_kind = fold_sum_kind(a.sum_num_kind, *kind);
             a.use_numeric = true;
             a.count += 1;
         }
         // v7.39 (read01 numeric.c) — a NumericBig input promotes to the spill.
         Value::NumericBig(b) => {
-            sum_add_bignum(&mut a.num_scaled, &mut a.num_scale, &mut a.num_big, b);
+            sum_add_bignum(&mut a.sum_num_scaled, &mut a.sum_num_scale, &mut a.sum_big, b);
             a.use_numeric = true;
             a.count += 1;
         }
@@ -2046,7 +2052,7 @@ fn accumulate_groups(
         && !agg_specs[0].distinct
     {
         let state = &mut order[0].1[0];
-        state.count = rows.len() as i64;
+        state.num.count = rows.len() as i64;
         return Ok(order);
     }
     // v7.37.16 (heavy.rs agg_500k 1.6× loss) — fused streaming accumulator
@@ -2076,11 +2082,14 @@ fn accumulate_groups(
                         match op {
                             FusedOp::CountCol(p) => {
                                 if !matches!(row.get(*p), Some(Value::Null) | None) {
-                                    accs[si].count += 1;
+                                    accs[si].num.count += 1;
                                 }
                             }
                             FusedOp::AccCol(p) => {
-                                fused_acc_cell(&mut accs[si], row.get(*p).unwrap_or(&Value::Null))?;
+                                {
+                                    let a = &mut accs[si];
+                                    acc_cell(&mut a.num, row.get(*p).unwrap_or(&Value::Null))
+                                }?;
                             }
                             FusedOp::Extreme { pos, max } => {
                                 fused_extreme_cell(
@@ -2197,11 +2206,14 @@ fn accumulate_groups(
                         match op {
                             FusedOp::CountCol(p) => {
                                 if !matches!(row.get(*p), Some(Value::Null) | None) {
-                                    slots[oi].count += 1;
+                                    slots[oi].num.count += 1;
                                 }
                             }
                             FusedOp::AccCol(p) => {
-                                fused_acc_cell(&mut slots[oi], row.get(*p).unwrap_or(&Value::Null))
+                                {
+                                    let a = &mut slots[oi];
+                                    acc_cell(&mut a.num, row.get(*p).unwrap_or(&Value::Null))
+                                }
                                     .map_err(Some)?;
                             }
                             FusedOp::Extreme { pos, max } => {
@@ -2305,7 +2317,7 @@ fn accumulate_groups(
             }
         }
         let state = &mut order[0].1[0];
-        state.count = count;
+        state.num.count = count;
         return Ok(order);
     }
     // v7.36 (perf — mailrs Phase 1, user_storage_usage 7.5 → ?) —
@@ -2328,112 +2340,16 @@ fn accumulate_groups(
     {
         let arg_pos0 = arg_pos[0];
         let arg_c0 = &arg_compiled[0];
-        let mut sum_int: i64 = 0;
-        let mut sum_float: f64 = 0.0;
-        let mut use_float = false;
-        let mut float_not_real = false;
-        // v7.37.16 — exact NUMERIC accumulator, only written when a
-        // Numeric cell appears. The int/float branches above are
-        // untouched (byte-identical), so the common int/float sum pays
-        // nothing for this.
-        let mut num_scaled: i128 = 0;
-        let mut num_kind = spg_storage::NumericKind::Finite;
-        let mut num_scale: u16 = 0;
-        let mut num_big: SumBig = None;
-        let mut use_numeric = false;
-        // Interval accumulator (sum/avg over an interval column).
-        let mut sum_iv_months: i64 = 0;
-        let mut sum_iv_days: i64 = 0;
-        let mut sum_iv_micros: i128 = 0;
-        let mut use_interval = false;
-        let mut sum_money: i128 = 0;
-        let mut use_money = false;
-        let mut count: i64 = 0;
+        // v7.39 (round 665) — was fifteen loose locals mirroring
+        // `NumAcc` field for field; `FusedAcc`'s doc comment even
+        // said so. One struct now, folded by the one `acc_cell`.
+        let mut na = NumAcc::default();
         // Borrow-aware fast inner: avoid the per-row clone when arg
         // is a bound column position.
         if let Some(p) = arg_pos0 {
             for row in rows.iter() {
                 let v_ref = row.get(p).unwrap_or(&Value::Null);
-                match v_ref {
-                    Value::Null => continue,
-                    Value::SmallInt(n) => {
-                        sum_int += i64::from(*n);
-                        count += 1;
-                    }
-                    Value::Int(n) => {
-                        sum_int += i64::from(*n);
-                        count += 1;
-                    }
-                    // v7.38 (read01, T4) — sum/avg over BIGINT accumulate as
-                    // exact NUMERIC (scale 0), matching PG (sum(bigint)/avg(bigint)
-                    // → numeric) and defending the i64 sum against overflow.
-                    Value::BigInt(n) => {
-                        sum_add_exact(
-                            &mut num_scaled,
-                            &mut num_scale,
-                            &mut num_big,
-                            i128::from(*n),
-                            0,
-                        );
-                        use_numeric = true;
-                        count += 1;
-                    }
-                    Value::Float(x) => {
-                        sum_float += *x;
-                        use_float = true;
-                        float_not_real = true;
-                        count += 1;
-                    }
-                    Value::Real(x) => {
-                        sum_float += f64::from(*x);
-                        use_float = true;
-                        count += 1;
-                    }
-                    Value::Numeric {
-                        scaled,
-                        scale,
-                        kind,
-                    } => {
-                        sum_add_exact(
-                            &mut num_scaled,
-                            &mut num_scale,
-                            &mut num_big,
-                            *scaled,
-                            *scale,
-                        );
-                        num_kind = fold_sum_kind(num_kind, *kind);
-                        use_numeric = true;
-                        count += 1;
-                    }
-                    Value::Interval {
-                        months,
-                        days,
-                        micros,
-                    } => {
-                        sum_iv_months += i64::from(*months);
-                        sum_iv_days += i64::from(*days);
-                        sum_iv_micros += i128::from(*micros);
-                        use_interval = true;
-                        count += 1;
-                    }
-                    // v7.39 (read01 numeric.c) — a NumericBig cell promotes
-                    // the running sum to the bignum spill.
-                    Value::NumericBig(b) => {
-                        sum_add_bignum(&mut num_scaled, &mut num_scale, &mut num_big, b);
-                        use_numeric = true;
-                        count += 1;
-                    }
-                    Value::Money(c) => {
-                        sum_money += i128::from(*c);
-                        use_money = true;
-                        count += 1;
-                    }
-                    other => {
-                        return Err(EvalError::TypeMismatch {
-                            detail: format!("sum/avg need numeric, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
-                        });
-                    }
-                }
+                acc_cell(&mut na, v_ref)?;
             }
         } else if let Some(p) = arg_c0.as_ref().and_then(|c| c.as_single_column_length()) {
             // v7.36 (perf — mailrs Phase 1, user_storage_usage hot
@@ -2464,104 +2380,18 @@ fn accumulate_groups(
                         });
                     }
                 };
-                sum_int += n;
-                count += 1;
+                na.sum_int += n;
+                na.count += 1;
             }
         } else {
             let c = arg_c0.as_ref().unwrap();
             for row in rows.iter() {
                 let v = eval::eval_compiled_ref(c, row, &ctx, &mut eval_stack)?;
-                match v {
-                    Value::Null => continue,
-                    Value::SmallInt(n) => {
-                        sum_int += i64::from(n);
-                        count += 1;
-                    }
-                    Value::Int(n) => {
-                        sum_int += i64::from(n);
-                        count += 1;
-                    }
-                    // v7.38 (read01, T4) — BIGINT sums as exact NUMERIC (PG).
-                    Value::BigInt(n) => {
-                        sum_add_exact(
-                            &mut num_scaled,
-                            &mut num_scale,
-                            &mut num_big,
-                            i128::from(n),
-                            0,
-                        );
-                        use_numeric = true;
-                        count += 1;
-                    }
-                    Value::Float(x) => {
-                        sum_float += x;
-                        use_float = true;
-                        float_not_real = true;
-                        count += 1;
-                    }
-                    Value::Real(x) => {
-                        sum_float += f64::from(x);
-                        use_float = true;
-                        count += 1;
-                    }
-                    Value::Numeric {
-                        scaled,
-                        scale,
-                        kind,
-                    } => {
-                        sum_add_exact(&mut num_scaled, &mut num_scale, &mut num_big, scaled, scale);
-                        num_kind = fold_sum_kind(num_kind, kind);
-                        use_numeric = true;
-                        count += 1;
-                    }
-                    Value::Interval {
-                        months,
-                        days,
-                        micros,
-                    } => {
-                        sum_iv_months += i64::from(months);
-                        sum_iv_days += i64::from(days);
-                        sum_iv_micros += i128::from(micros);
-                        use_interval = true;
-                        count += 1;
-                    }
-                    // v7.39 (read01 numeric.c) — a NumericBig cell promotes
-                    // the running sum to the bignum spill.
-                    Value::NumericBig(ref b) => {
-                        sum_add_bignum(&mut num_scaled, &mut num_scale, &mut num_big, b);
-                        use_numeric = true;
-                        count += 1;
-                    }
-                    Value::Money(c) => {
-                        sum_money += i128::from(c);
-                        use_money = true;
-                        count += 1;
-                    }
-                    other => {
-                        return Err(EvalError::TypeMismatch {
-                            detail: format!("sum/avg need numeric, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
-                        });
-                    }
-                }
+                acc_cell(&mut na, &v)?;
             }
         }
         let state = &mut order[0].1[0];
-        state.count = count;
-        state.sum_int = sum_int;
-        state.sum_float = sum_float;
-        state.use_float = use_float;
-        state.float_not_real = float_not_real;
-        state.sum_num_scaled = num_scaled;
-        state.sum_num_kind = num_kind;
-        state.sum_num_scale = num_scale;
-        state.sum_big = num_big;
-        state.use_numeric = use_numeric;
-        state.sum_iv_months = sum_iv_months;
-        state.sum_iv_days = sum_iv_days;
-        state.sum_iv_micros = sum_iv_micros;
-        state.use_interval = use_interval;
-        state.sum_money = sum_money;
-        state.use_money = use_money;
+        state.num = na;
         return Ok(order);
     }
     // v7.37.x (mailrs Track A 100k attack) — tight inlined loop for
@@ -2882,11 +2712,11 @@ fn accumulate_groups(
                         }
                     }
                     AggKind::CountStar => {
-                        entry.1[i].count += 1;
+                        entry.1[i].num.count += 1;
                     }
                     AggKind::Count => {
                         if !matches!(arg_ref, Value::Null) {
-                            entry.1[i].count += 1;
+                            entry.1[i].num.count += 1;
                         }
                     }
                     AggKind::BoolOr => match arg_ref {
@@ -3289,11 +3119,11 @@ fn accumulate_groups(
                         }
                     }
                     AggKind::CountStar => {
-                        entry.1[i].count += 1;
+                        entry.1[i].num.count += 1;
                     }
                     AggKind::Count => {
                         if !matches!(arg_ref, Value::Null) {
-                            entry.1[i].count += 1;
+                            entry.1[i].num.count += 1;
                         }
                     }
                     AggKind::BoolOr => match arg_ref {
@@ -4513,94 +4343,27 @@ pub(crate) fn update_state(
     // is still threaded through for error messages so the user-
     // facing wording is unchanged.
     match kind {
-        AggKind::CountStar => st.count += 1,
+        AggKind::CountStar => st.num.count += 1,
         AggKind::Count => {
             if !is_null {
-                st.count += 1;
+                st.num.count += 1;
             }
         }
         AggKind::Sum | AggKind::Avg => {
-            if is_null {
-                return Ok(());
-            }
-            st.count += 1;
-            match v {
-                // v7.39 (round 626, S05b/F29) — SMALLINT. This arm was
-                // missing HERE while the three other sum accumulators had
-                // it, so `SELECT sum(x)` over a SMALLINT column answered
-                // "sum/avg need numeric, got smallint" — an ordinary query
-                // against an ordinary column type. PG sums it to bigint,
-                // which is what `sum_int` already produces.
-                Value::SmallInt(n) => st.sum_int += i64::from(*n),
-                Value::Int(n) => st.sum_int += i64::from(*n),
-                // v7.38 (read01, T4) — BIGINT sums as exact NUMERIC (PG).
-                Value::BigInt(n) => {
-                    st.use_numeric = true;
-                    sum_add_exact(
-                        &mut st.sum_num_scaled,
-                        &mut st.sum_num_scale,
-                        &mut st.sum_big,
-                        i128::from(*n),
-                        0,
-                    );
-                }
-                Value::Float(x) => {
-                    st.use_float = true;
-                    st.sum_float += *x;
-                    st.float_not_real = true;
-                }
-                Value::Real(x) => {
-                    st.use_float = true;
-                    st.sum_float += f64::from(*x);
-                }
-                // v7.37.16 — exact NUMERIC accumulation (no f64). Aligns
-                // scales on the running max; result stays exact.
-                Value::Numeric {
-                    scaled,
-                    scale,
-                    kind,
-                } => {
-                    st.use_numeric = true;
-                    st.sum_num_kind = fold_sum_kind(st.sum_num_kind, *kind);
-                    sum_add_exact(
-                        &mut st.sum_num_scaled,
-                        &mut st.sum_num_scale,
-                        &mut st.sum_big,
-                        *scaled,
-                        *scale,
-                    );
-                }
-                // v7.39 (read01 numeric.c) — a NumericBig input promotes the
-                // running sum to the bignum spill.
-                Value::NumericBig(b) => {
-                    st.use_numeric = true;
-                    sum_add_bignum(
-                        &mut st.sum_num_scaled,
-                        &mut st.sum_num_scale,
-                        &mut st.sum_big,
-                        b,
-                    );
-                }
-                Value::Interval {
-                    months,
-                    days,
-                    micros,
-                } => {
-                    st.use_interval = true;
-                    st.sum_iv_months += i64::from(*months);
-                    st.sum_iv_days += i64::from(*days);
-                    st.sum_iv_micros += i128::from(*micros);
-                }
-                Value::Money(c) => {
-                    st.use_money = true;
-                    st.sum_money += i128::from(*c);
-                }
-                other => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: format!("sum/avg need numeric, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
-                    });
-                }
-            }
+            // v7.39 (round 665) — was a hand-copied duplicate of `acc_cell`,
+            // arm for arm, down to the wording of the type error. Verified
+            // equivalent before collapsing: same nine variants, same error,
+            // and the two apparent differences are both unobservable — this
+            // one counted before the match so a value that errors bumped the
+            // count first (the error aborts the query, so it is discarded),
+            // and its `is_null` early return is literally
+            // `matches!(v, Value::Null)`, which is the arm `acc_cell` has.
+            //
+            // Round 626 had to add a SMALLINT arm HERE that the other three
+            // copies already carried; `SELECT sum(x)` over a smallint column
+            // answered "sum/avg need numeric, got smallint" until then. That
+            // is the failure mode this collapse removes.
+            acc_cell(&mut st.num, v)?;
         }
         AggKind::Min => {
             if is_null {
@@ -4750,7 +4513,7 @@ pub(crate) fn update_state(
                 if let Some(k) = order_keys {
                     st.item_keys.push(k);
                 }
-                st.count += 1;
+                st.num.count += 1;
             } else {
                 return Err(EvalError::TypeMismatch {
                     detail: format!("string_agg requires text value, got {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
@@ -4767,7 +4530,7 @@ pub(crate) fn update_state(
             if let Some(k) = order_keys {
                 st.item_keys.push(k);
             }
-            st.count += 1;
+            st.num.count += 1;
         }
         // v7.17.0 — bool_and(p): TRUE iff every non-NULL input is
         // TRUE. NULL skipped; running accumulator stays at TRUE
@@ -4865,8 +4628,8 @@ pub(crate) fn update_state(
                     detail: format!("{name} needs numeric, got {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
                 });
             };
-            st.count += 1;
-            st.sum_float += x;
+            st.num.count += 1;
+            st.num.sum_float += x;
             st.sum_sq += x * x;
         }
         // v7.32 (round-29) — bitwise aggregates over integer inputs.
@@ -4909,7 +4672,7 @@ pub(crate) fn update_state(
             if let Some(k) = order_keys {
                 st.item_keys.push(k);
             }
-            st.count += 1;
+            st.num.count += 1;
         }
         // v7.32 (round-29) — regression family f(Y, X). Only rows with
         // BOTH inputs non-NULL contribute (PG semantics). `v` is Y,
@@ -4954,7 +4717,7 @@ pub(crate) fn update_state(
             if let Some(k) = order_keys {
                 st.item_keys.push(k);
             }
-            st.count += 1;
+            st.num.count += 1;
         }
         // v7.32 (round-29) — json_object_agg(key, value): keys in
         // `items`, values in `aux_items`. A NULL key is skipped (PG
@@ -4986,7 +4749,7 @@ pub(crate) fn update_state(
             }
             st.items.push(v.clone().into_owned());
             st.aux_items.push(val);
-            st.count += 1;
+            st.num.count += 1;
         }
     }
     Ok(())
@@ -4995,35 +4758,35 @@ pub(crate) fn update_state(
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static> {
     match name {
-        "count" | "count_star" => Value::BigInt(st.count),
+        "count" | "count_star" => Value::BigInt(st.num.count),
         "sum" => {
-            if st.count == 0 {
+            if st.num.count == 0 {
                 Value::Null
-            } else if st.use_interval {
+            } else if st.num.use_interval {
                 Value::Interval {
-                    months: st.sum_iv_months as i32,
-                    days: st.sum_iv_days as i32,
-                    micros: st.sum_iv_micros as i64,
+                    months: st.num.sum_iv_months as i32,
+                    days: st.num.sum_iv_days as i32,
+                    micros: st.num.sum_iv_micros as i64,
                 }
-            } else if st.use_money {
-                Value::Money(st.sum_money as i64)
-            } else if st.use_numeric {
+            } else if st.num.use_money {
+                Value::Money(st.num.sum_money as i64)
+            } else if st.num.use_numeric {
                 // v7.38 (read01, T6.P3) — a NaN / ±Infinity input propagates.
-                if st.sum_num_kind != spg_storage::NumericKind::Finite {
-                    Value::numeric_special(st.sum_num_kind)
-                } else if let Some(big) = &st.sum_big {
+                if st.num.sum_num_kind != spg_storage::NumericKind::Finite {
+                    Value::numeric_special(st.num.sum_num_kind)
+                } else if let Some(big) = &st.num.sum_big {
                     // v7.39 (read01 numeric.c) — the sum spilled past i128;
                     // fold in the int lane and render exactly.
                     let tot = big.add(&spg_storage::bignum::BigNumeric::from_i128(
-                        i128::from(st.sum_int),
+                        i128::from(st.num.sum_int),
                         0,
                     ));
                     crate::eval::binop::bignum_to_value(tot)
                 } else {
                     let (scaled, scale) = crate::numeric::numeric_add(
-                        st.sum_num_scaled,
-                        st.sum_num_scale,
-                        i128::from(st.sum_int),
+                        st.num.sum_num_scaled,
+                        st.num.sum_num_scale,
+                        i128::from(st.num.sum_int),
                         0,
                     );
                     Value::Numeric {
@@ -5032,47 +4795,47 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
                         kind: spg_storage::NumericKind::Finite,
                     }
                 }
-            } else if st.use_float {
-                let total = st.sum_float + (st.sum_int as f64);
+            } else if st.num.use_float {
+                let total = st.num.sum_float + (st.num.sum_int as f64);
                 // v7.39 (round 269) — sum over REAL input stays real in
                 // PG; it widens only when something wider joined the
                 // accumulation. avg is deliberately not the same:
                 // avg(real) IS double precision (measured on 18.4).
-                if st.float_not_real {
+                if st.num.float_not_real {
                     Value::Float(total)
                 } else {
                     #[allow(clippy::cast_possible_truncation)]
                     Value::Real(total as f32)
                 }
             } else {
-                Value::BigInt(st.sum_int)
+                Value::BigInt(st.num.sum_int)
             }
         }
         "avg" => {
-            if st.count == 0 {
+            if st.num.count == 0 {
                 Value::Null
-            } else if st.use_interval {
+            } else if st.num.use_interval {
                 // PG interval_div: the month quotient truncates and its
                 // remainder spills into DAYS (a month = 30 days), taking the
                 // whole-day part into the day field and only the sub-day
                 // fraction into time; the day remainder then spills into time.
-                let n = i128::from(st.count);
+                let n = i128::from(st.num.count);
                 let day_us = 86_400_000_000i128;
-                let months = i128::from(st.sum_iv_months);
-                let days = i128::from(st.sum_iv_days);
+                let months = i128::from(st.num.sum_iv_months);
+                let days = i128::from(st.num.sum_iv_days);
                 let month_out = months / n;
                 let mrem_days_total = (months % n) * 30; // days (still over n)
                 let days_from_month = mrem_days_total / n;
                 let mrem_frac_us = (mrem_days_total % n) * day_us / n;
                 let day_out = days / n;
                 let drem_us = (days % n) * day_us / n;
-                let micros = st.sum_iv_micros / n + mrem_frac_us + drem_us;
+                let micros = st.num.sum_iv_micros / n + mrem_frac_us + drem_us;
                 Value::Interval {
                     months: month_out as i32,
                     days: (day_out + days_from_month) as i32,
                     micros: micros as i64,
                 }
-            } else if st.use_money {
+            } else if st.num.use_money {
                 // PG has no avg(money); we accept it as a sensible superset —
                 // average of the cent totals, rounded half-away-from-zero.
                 //
@@ -5085,20 +4848,20 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
                 // here, and no PG application can reach the shape, because
                 // PG rejects it. Pinned at eight shapes in
                 // `e2e_avg_money_round664`.
-                let n = i128::from(st.count);
-                let q = (st.sum_money * 2 + if st.sum_money >= 0 { n } else { -n }) / (2 * n);
+                let n = i128::from(st.num.count);
+                let q = (st.num.sum_money * 2 + if st.num.sum_money >= 0 { n } else { -n }) / (2 * n);
                 Value::Money(q as i64)
-            } else if st.use_numeric {
+            } else if st.num.use_numeric {
                 // v7.38 (read01, T6.P3) — avg of a special is that special
                 // (NaN→NaN, ±Inf→±Inf); PG matches.
-                if st.sum_num_kind != spg_storage::NumericKind::Finite {
-                    Value::numeric_special(st.sum_num_kind)
-                } else if let Some(big) = &st.sum_big {
+                if st.num.sum_num_kind != spg_storage::NumericKind::Finite {
+                    Value::numeric_special(st.num.sum_num_kind)
+                } else if let Some(big) = &st.num.sum_big {
                     // v7.39 (read01 numeric.c) — bignum avg = spilled sum /
                     // count at PG's division display scale.
                     use spg_storage::bignum::BigNumeric;
-                    let sum_tot = big.add(&BigNumeric::from_i128(i128::from(st.sum_int), 0));
-                    let cnt = BigNumeric::from_i128(i128::from(st.count), 0);
+                    let sum_tot = big.add(&BigNumeric::from_i128(i128::from(st.num.sum_int), 0));
+                    let cnt = BigNumeric::from_i128(i128::from(st.num.count), 0);
                     let rscale = crate::numeric::division_display_scale_big(&sum_tot, &cnt);
                     match sum_tot.div(&cnt, rscale) {
                         Some(q) => crate::eval::binop::bignum_to_value(q),
@@ -5106,27 +4869,27 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
                     }
                 } else {
                     let (sum_scaled, sum_scale) = crate::numeric::numeric_add(
-                        st.sum_num_scaled,
-                        st.sum_num_scale,
-                        i128::from(st.sum_int),
+                        st.num.sum_num_scaled,
+                        st.num.sum_num_scale,
+                        i128::from(st.num.sum_int),
                         0,
                     );
                     let (scaled, scale) =
-                        crate::numeric::numeric_avg(sum_scaled, sum_scale, i128::from(st.count));
+                        crate::numeric::numeric_avg(sum_scaled, sum_scale, i128::from(st.num.count));
                     Value::Numeric {
                         scaled,
                         scale,
                         kind: spg_storage::NumericKind::Finite,
                     }
                 }
-            } else if st.use_float {
-                Value::Float((st.sum_float + (st.sum_int as f64)) / (st.count as f64))
+            } else if st.num.use_float {
+                Value::Float((st.num.sum_float + (st.num.sum_int as f64)) / (st.num.count as f64))
             } else {
                 // v7.38 (read01, T4) — avg over integer input is exact NUMERIC
                 // (PG: avg(int)/avg(bigint) → numeric), at PG's division display
                 // scale. sum(int) is unaffected (it reads sum_int as BigInt).
                 let (scaled, scale) =
-                    crate::numeric::numeric_avg(i128::from(st.sum_int), 0, i128::from(st.count));
+                    crate::numeric::numeric_avg(i128::from(st.num.sum_int), 0, i128::from(st.num.count));
                 Value::Numeric {
                     scaled,
                     scale,
@@ -5212,7 +4975,7 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
         // `var_samp`, `stddev` == `stddev_samp`. samp needs n >= 2
         // (n < 2 → NULL); pop needs n >= 1 (n == 1 → 0).
         "variance" | "var_samp" | "var_pop" | "stddev" | "stddev_samp" | "stddev_pop" => {
-            let n = st.count;
+            let n = st.num.count;
             if n == 0 {
                 return Value::Null;
             }
@@ -5273,7 +5036,7 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
             // equal `(Σx² - (Σx)²/N) / denom`, whose different float
             // rounding drifted a ULP from PG on stddev (only masked
             // before by an imprecise hand-rolled sqrt).
-            let numerator = (nf * st.sum_sq - st.sum_float * st.sum_float).max(0.0);
+            let numerator = (nf * st.sum_sq - st.num.sum_float * st.num.sum_float).max(0.0);
             let divisor = if pop { nf * nf } else { nf * (nf - 1.0) };
             let var = numerator / divisor;
             let result = if name.starts_with("stddev") {
