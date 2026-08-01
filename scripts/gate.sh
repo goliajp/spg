@@ -110,6 +110,13 @@ run_biz() {
     cargo run --release --locked -p sqllogictest
     xtests/dump_compat/run.sh local-build
     xtests/data_compat/run.sh local-build
+    # v7.39 (round 666) — the differential corpus joins the protocol.
+    # It was the sixth gate in practice and the only one nobody could run
+    # from here: it lived under `.claude/` (gitignored) and assumed a human
+    # had already started a server. Both are fixed, so it belongs in the
+    # list. It needs the live PG18 oracle container, same as the two
+    # harnesses above.
+    xtests/diffcorpus/run.sh
 }
 
 run_dogfood() {
