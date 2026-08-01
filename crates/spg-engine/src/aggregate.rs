@@ -31,7 +31,7 @@ use spg_sql::ast::{Expr, SelectItem, SelectStatement};
 use spg_storage::{ColumnSchema, DataType, Row, Value};
 
 use crate::eval::{self, EvalContext, EvalError};
-use crate::join::RowRef;
+use crate::join::AggRows;
 
 /// True if this statement should go through the aggregate path.
 pub fn uses_aggregate(stmt: &SelectStatement) -> bool {
@@ -630,7 +630,7 @@ struct DeferredProject {
 /// the four-stage aggregate pipeline.
 fn try_pure_count_star_short_circuit(
     stmt: &SelectStatement,
-    rows: &[RowRef<'_>],
+    rows: AggRows<'_>,
     schema_cols: &[ColumnSchema],
     table_alias: Option<&str>,
 ) -> Option<AggResult> {
@@ -748,7 +748,7 @@ fn resolve_group_by_aliases(
 
 pub(crate) fn run(
     stmt: &SelectStatement,
-    rows: &[RowRef<'_>],
+    rows: AggRows<'_>,
     schema_cols: &[ColumnSchema],
     table_alias: Option<&str>,
     correlated_eval: Option<CorrelatedEval<'_>>,
@@ -1702,7 +1702,7 @@ fn with_catalog<'a>(
 }
 
 fn accumulate_groups(
-    rows: &[RowRef<'_>],
+    rows: AggRows<'_>,
     group_exprs: &[Expr],
     agg_specs: &[AggSpec],
     schema_cols: &[ColumnSchema],
@@ -2071,7 +2071,7 @@ fn accumulate_groups(
         // shard result and re-raise after join.
         let fused_scan =
             |range: core::ops::Range<usize>, accs: &mut Vec<FusedAcc>| -> Result<(), EvalError> {
-                for row in &rows[range] {
+                for row in rows.range(range.start, range.end).iter() {
                     for (si, op) in unique_ops.iter().enumerate() {
                         match op {
                             FusedOp::CountCol(p) => {
@@ -2169,7 +2169,7 @@ fn accumulate_groups(
                 key_rows: hashbrown::HashMap::new(),
             };
             let out: ShardOut = (|| {
-                for row in &rows[lo..hi] {
+                for row in rows.range(lo, hi).iter() {
                     let v = row.get(gp).unwrap_or(&Value::Null);
                     let key: Option<i64> = match v {
                         Value::SmallInt(n) => Some(i64::from(*n)),
@@ -2299,7 +2299,7 @@ fn accumulate_groups(
     {
         let p = arg_pos[0].unwrap();
         let mut count: i64 = 0;
-        for row in rows {
+        for row in rows.iter() {
             if !matches!(row.get(p), Some(Value::Null) | None) {
                 count += 1;
             }
@@ -2352,7 +2352,7 @@ fn accumulate_groups(
         // Borrow-aware fast inner: avoid the per-row clone when arg
         // is a bound column position.
         if let Some(p) = arg_pos0 {
-            for row in rows {
+            for row in rows.iter() {
                 let v_ref = row.get(p).unwrap_or(&Value::Null);
                 match v_ref {
                     Value::Null => continue,
@@ -2445,7 +2445,7 @@ fn accumulate_groups(
             // out — pure i64 sum. The original Step VM path keeps
             // running for everything outside this shape (`SUM(col)`,
             // `SUM(expr)`, multi-step compiled args).
-            for row in rows {
+            for row in rows.iter() {
                 let Some(v_ref) = row.get(p) else {
                     continue;
                 };
@@ -2469,7 +2469,7 @@ fn accumulate_groups(
             }
         } else {
             let c = arg_c0.as_ref().unwrap();
-            for row in rows {
+            for row in rows.iter() {
                 let v = eval::eval_compiled_ref(c, row, &ctx, &mut eval_stack)?;
                 match v {
                     Value::Null => continue,
@@ -2572,7 +2572,7 @@ fn accumulate_groups(
     if dedicated_max_loop && !single_anon_group {
         let gpos = group_pos[0].expect("dedicated_max_loop gates on Some");
         let apos = arg_pos[0].expect("dedicated_max_loop gates on Some");
-        for row in rows {
+        for row in rows.iter() {
             let kv = row.get(gpos).unwrap_or(&Value::Null);
             let idx = match kv {
                 Value::Text(s) => match groups_text.get(s.as_ref()) {
@@ -2636,7 +2636,7 @@ fn accumulate_groups(
         return Ok(order);
     }
 
-    for row in rows {
+    for row in rows.iter() {
         // v7.37.4 (L1 CSE) — reset per-row cache for shared compiled
         // aggregate-arg evals. No-op when no dedupe (empty vec).
         for slot in row_eval_cache.iter_mut() {
@@ -3487,7 +3487,7 @@ fn accumulate_groups(
 /// `__agg_0..N`. Group types are probed from the first row; aggregate
 /// types from each spec.
 fn build_synth_schema(
-    rows: &[RowRef<'_>],
+    rows: AggRows<'_>,
     group_exprs: &[Expr],
     agg_specs: &[AggSpec],
     schema_cols: &[ColumnSchema],
@@ -3502,7 +3502,8 @@ fn build_synth_schema(
         // observable. Avoids needing to evaluate group exprs on no row.
         group_exprs.iter().map(|_| DataType::Text).collect()
     } else {
-        let probe_row = rows[0].as_row();
+        let probe = rows.get(0).expect("non-empty checked above");
+        let probe_row = probe.as_row();
         let probe: &Row<'static> = &probe_row;
         group_exprs
             .iter()
@@ -3580,7 +3581,7 @@ fn finalize_synth_rows(
     order: &[(Vec<Value<'static>>, Vec<AggState>)],
     agg_specs: &[AggSpec],
     synth_schema: &[ColumnSchema],
-    rows: &[RowRef<'_>],
+    rows: AggRows<'_>,
     schema_cols: &[ColumnSchema],
     table_alias: Option<&str>,
     catalog: Option<&spg_storage::Catalog>,
@@ -3591,7 +3592,7 @@ fn finalize_synth_rows(
     // fraction) are constant per PG, so evaluate each once up front.
     let direct_arg_vals: Vec<Option<Value>> = agg_specs
         .iter()
-        .map(|spec| match (&spec.direct_arg, rows.first()) {
+        .map(|spec| match (&spec.direct_arg, rows.first().as_ref()) {
             (Some(e), Some(r)) => eval::eval_expr(e, &r.as_row(), &ctx).map(Some),
             _ => Ok(None),
         })
@@ -3600,7 +3601,7 @@ fn finalize_synth_rows(
     // arguments of a multi-key call, evaluated once like the first.
     let direct_extra_vals: Vec<Vec<Value>> = agg_specs
         .iter()
-        .map(|spec| match rows.first() {
+        .map(|spec| match rows.first().as_ref() {
             Some(r) if !spec.direct_args_extra.is_empty() => spec
                 .direct_args_extra
                 .iter()

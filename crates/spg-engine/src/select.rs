@@ -3188,11 +3188,15 @@ impl Engine {
                         },
                     })
             };
-            let filtered_refs: alloc::vec::Vec<RowRef<'_>> =
-                filtered.iter().map(RowRef::Owned).collect();
+            // v7.39 (round 656) — hand the rows over as they are rather than
+            // collecting a second vector of `RowRef` wrappers. Note this is
+            // a set-returning-function path, NOT the relational scan: the
+            // measured O(rows) cost lived in `run_single_table_aggregate`,
+            // and converting these four first was a miss that cost a full
+            // round — every test stayed green and the number did not move.
             let agg = aggregate::run(
                 stmt,
-                &filtered_refs,
+                crate::join::AggRows::Owned(&filtered),
                 &schema_cols,
                 Some(&alias),
                 Some(&agg_correlated),
@@ -3431,11 +3435,15 @@ impl Engine {
                         },
                     })
             };
-            let filtered_refs: alloc::vec::Vec<RowRef<'_>> =
-                filtered.iter().map(RowRef::Owned).collect();
+            // v7.39 (round 656) — hand the rows over as they are rather than
+            // collecting a second vector of `RowRef` wrappers. Note this is
+            // a set-returning-function path, NOT the relational scan: the
+            // measured O(rows) cost lived in `run_single_table_aggregate`,
+            // and converting these four first was a miss that cost a full
+            // round — every test stayed green and the number did not move.
             let agg = aggregate::run(
                 stmt,
-                &filtered_refs,
+                crate::join::AggRows::Owned(&filtered),
                 &schema_cols,
                 Some(&alias),
                 Some(&agg_correlated),
@@ -4660,11 +4668,15 @@ impl Engine {
                         },
                     })
             };
-            let filtered_refs: alloc::vec::Vec<RowRef<'_>> =
-                filtered.iter().map(RowRef::Owned).collect();
+            // v7.39 (round 656) — hand the rows over as they are rather than
+            // collecting a second vector of `RowRef` wrappers. Note this is
+            // a set-returning-function path, NOT the relational scan: the
+            // measured O(rows) cost lived in `run_single_table_aggregate`,
+            // and converting these four first was a miss that cost a full
+            // round — every test stayed green and the number did not move.
             let agg = aggregate::run(
                 stmt,
-                &filtered_refs,
+                crate::join::AggRows::Owned(&filtered),
                 &schema_cols,
                 Some(&alias),
                 Some(&agg_correlated),
@@ -4881,11 +4893,15 @@ impl Engine {
                         },
                     })
             };
-            let filtered_refs: alloc::vec::Vec<RowRef<'_>> =
-                filtered.iter().map(RowRef::Owned).collect();
+            // v7.39 (round 656) — hand the rows over as they are rather than
+            // collecting a second vector of `RowRef` wrappers. Note this is
+            // a set-returning-function path, NOT the relational scan: the
+            // measured O(rows) cost lived in `run_single_table_aggregate`,
+            // and converting these four first was a miss that cost a full
+            // round — every test stayed green and the number did not move.
             let agg = aggregate::run(
                 stmt,
-                &filtered_refs,
+                crate::join::AggRows::Owned(&filtered),
                 &schema_cols,
                 Some(alias),
                 Some(&agg_correlated),
@@ -5046,7 +5062,7 @@ impl Engine {
             };
             let agg = aggregate::run(
                 stmt,
-                &rows,
+                crate::join::AggRows::Refs(&rows),
                 &empty_schema,
                 None,
                 None,
@@ -5563,7 +5579,20 @@ impl Engine {
         let ctx = self
             .ev_ctx(schema_cols, Some(alias))
             .with_sample_rng(&sample_cell);
-        let mut filtered: Vec<&Row<'static>> = Vec::new();
+        // v7.39 (round 657) — pre-sized. Pushing 500k pointers into a
+        // `Vec::new()` walks the doubling chain 8, 16, … 262144, 524288,
+        // and every abandoned buffer on the way stays resident: RSS is a
+        // high-water mark, so the intermediates are paid for even though
+        // they are freed. Round 656 measured the scan at 17 bytes/row
+        // where the survivor list itself only needs 8.
+        let mut filtered: Vec<&Row<'static>> = if stmt.where_.is_none() {
+            Vec::with_capacity(table.rows().len())
+        } else {
+            // With a WHERE, the row count is an UPPER bound and reserving it
+            // is the worse trade: `… WHERE id = 5` over 50M rows would take
+            // 400 MB of pointers to hold one survivor. Let it grow.
+            Vec::new()
+        };
         // v6.2.6 — Memoize: per-query LRU cache for correlated
         // scalar subqueries. Fresh per row-loop entry so each
         // SELECT execution gets an isolated cache.
@@ -5770,11 +5799,15 @@ impl Engine {
                     },
                 })
         };
-        let filtered_rr: alloc::vec::Vec<RowRef<'_>> =
-            filtered.iter().map(|&r| RowRef::Owned(r)).collect();
+        // v7.39 (round 656) — the plain relational scan. This collect() was
+        // the measured defect: one 64-byte `RowRef` per surviving row to
+        // wrap an 8-byte pointer `filtered` already holds. Scalar
+        // aggregates measured ~81 bytes/row of working memory because of
+        // it — 40 MB at 500k rows, 3.2 GB at 50M, for a query that returns
+        // one number. `AggRows::Ptrs` reads the pointers directly.
         let agg = aggregate::run(
             stmt,
-            &filtered_rr,
+            crate::join::AggRows::Ptrs(&filtered),
             schema_cols,
             Some(alias),
             Some(&agg_correlated),
@@ -6644,7 +6677,7 @@ impl Engine {
             };
             let agg = aggregate::run(
                 stmt,
-                &refs,
+                crate::join::AggRows::Refs(&refs),
                 combined_schema,
                 None,
                 Some(&agg_correlated),
