@@ -850,37 +850,17 @@ pub fn cast_value_ref_in(
             // v7.39 (read01 oid.c) — OID is unsigned 32-bit: a negative
             // integer wraps (PG's (Oid) cast semantics: -1 -> 4294967295),
             // beyond u32 errors "OID out of range", bad text is 22P02.
-            if name.eq_ignore_ascii_case("oid") {
-                let as_i64 = match &v {
-                    Value::Null => return Ok(Value::Null),
-                    Value::SmallInt(n) => Some(i64::from(*n)),
-                    Value::Int(n) => Some(i64::from(*n)),
-                    Value::BigInt(n) => Some(*n),
-                    Value::Text(t) => match t.trim().parse::<i64>() {
-                        Ok(n) => Some(n),
-                        Err(_) => {
-                            return Err(EvalError::TypeMismatch {
-                                detail: alloc::format!(
-                                    "invalid input syntax for type oid: {:?}",
-                                    t.trim()
-                                ),
-                            });
-                        }
-                    },
-                    _ => None,
-                };
-                if let Some(n) = as_i64 {
-                    // 32-bit wrap for negatives (C cast semantics).
-                    if (-(1i64 << 31)..0).contains(&n) {
-                        return Ok(Value::BigInt(n + (1i64 << 32)));
-                    }
-                    if !(0..=u32::MAX as i64).contains(&n) {
-                        return Err(EvalError::TypeMismatch {
-                            detail: "OID out of range".into(),
-                        });
-                    }
-                    return Ok(Value::BigInt(n));
-                }
+            // v7.39 (read01 oid.c) — OID is unsigned 32-bit: a negative
+            // integer wraps (PG's (Oid) cast semantics: -1 -> 4294967295),
+            // beyond u32 errors "OID out of range", bad text is 22P02.
+            //
+            // Round 667 moved the rules to `conversions::coerce_to_oid` so
+            // the column-assignment path shares them instead of growing a
+            // second copy.
+            if name.eq_ignore_ascii_case("oid")
+                && let Some(out) = crate::conversions::coerce_to_oid(&v)?
+            {
+                return Ok(out);
             }
             // v7.39 (read01 mac8.c) — macaddr8 -> macaddr requires the
             // EUI-64 ff:fe infix; anything else is PG's dedicated error.

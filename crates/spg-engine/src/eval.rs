@@ -3542,15 +3542,19 @@ fn eval_function_call_positional(
         // that has not been converted) should still name its column's
         // type rather than the storage it arrived in.
         //
-        // Only those two: this is not a general "prefer the declared
-        // type" switch. Where the value knows its own identity it is the
-        // better witness, because an expression's static shape is an
-        // approximation and its result is the fact.
+        // v7.39 (round 667) — `oid` joins them for the same reason and no
+        // other: its cell is a `Value::BigInt` too, so `pg_typeof(1::oid)`
+        // answered `bigint`. Still not a general switch — where the value
+        // knows its own identity it is the better witness, because an
+        // expression's static shape is an approximation and its result is
+        // the fact.
         if !matches!(v, Value::Null)
             && let Some(shape) = crate::describe::describe_expr(&args[0], ctx.columns)
             && matches!(
                 shape.ty,
-                spg_storage::DataType::Xid | spg_storage::DataType::Xid8
+                spg_storage::DataType::Xid
+                    | spg_storage::DataType::Xid8
+                    | spg_storage::DataType::Oid
             )
             && let Some(n) = pg_typeof_name_for_datatype(shape.ty)
         {
@@ -4948,6 +4952,7 @@ pub(crate) fn pg_typeof_name_for_datatype(t: spg_storage::DataType) -> Option<&'
         D::Name => "name",
         D::Xid => "xid",
         D::Xid8 => "xid8",
+        D::Oid => "oid",
         D::Uuid => "uuid",
         D::Interval => "interval",
         _ => return None,

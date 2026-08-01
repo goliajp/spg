@@ -15350,6 +15350,7 @@ impl Parser {
             }
             "name" => ColumnTypeName::Name,
             "xid" => ColumnTypeName::Xid,
+            "oid" => ColumnTypeName::Oid,
             "xid8" => ColumnTypeName::Xid8,
             "bool" | "boolean" => ColumnTypeName::Bool,
             // v7.39 (round 620) — an UNBOUNDED `varchar` is the same type as

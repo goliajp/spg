@@ -2991,6 +2991,20 @@ fn column_accepts(actual: DataType, declared: DataType) -> bool {
             // has always been; xid8 has no value of its own at all.
             | (DataType::BigInt, DataType::Xid | DataType::Xid8)
             | (DataType::Xid | DataType::Xid8, DataType::BigInt)
+            // v7.39 (round 667) — an OID column likewise stores a plain
+            // integer. INT is listed as well as BIGINT because a bare
+            // literal arrives as one: PG takes `INSERT INTO t(o) VALUES
+            // (42)` into an oid column, and measured, it does NOT take the
+            // same integer into an xid column ("column is of type xid but
+            // expression is of type integer"). SPG has been laxer than PG
+            // on that xid direction since before this round — that is the
+            // limitation `DataType::Xid8` documents, not something added
+            // here.
+            | (
+                DataType::BigInt | DataType::Int | DataType::SmallInt,
+                DataType::Oid,
+            )
+            | (DataType::Oid, DataType::BigInt | DataType::Int)
             | (DataType::Json | DataType::Jsonb, DataType::Text)
             | (DataType::Json, DataType::Jsonb)
             | (DataType::Jsonb, DataType::Json)

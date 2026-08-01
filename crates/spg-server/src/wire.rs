@@ -90,7 +90,7 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         DataType::SmallInt | DataType::Int => WireType::Int,
         // v7.39 (round 640) — the native wire has no transaction-id tag;
         // xid / xid8 travel as the 64-bit integer they are stored as.
-        DataType::BigInt | DataType::Xid | DataType::Xid8 => WireType::BigInt,
+        DataType::BigInt | DataType::Xid | DataType::Xid8 | DataType::Oid => WireType::BigInt,
         DataType::Float => WireType::Float,
         DataType::Real => WireType::Float,
         // VARCHAR / CHAR / NUMERIC / DATE / TIMESTAMP collapse to
