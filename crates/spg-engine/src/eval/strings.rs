@@ -1303,9 +1303,46 @@ fn check_eeee_format(fmt: &str) -> Result<(), EvalError> {
 // from integer arithmetic instead of the lossy f64 `n`. `n` is still used by
 // the RN / EEEE / V paths (roman / scientific / V-scale), which are inherently
 // float-shaped, and as the fallback when the exact form overflows i128.
-fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
+/// v7.39 (round 669, F33) — returns `Result` because PG REFUSES two
+/// degenerate pictures that SPG used to answer, and refusing needs a
+/// channel this function did not have.
+///
+/// Measured against PG18: `to_char(1234, 'th')` is `"." is not a number`
+/// (an ordinal suffix with no digit position before it), and
+/// `to_char(1234.5, 'SS9999')` — or any picture with two `S` — is
+/// `cannot use "S" twice`. Both answered here.
+///
+/// The rest of F33's ledger entry did not survive re-measurement. It
+/// recorded 56 of 104 single-letter shapes and 13 of 24 keyword shapes as
+/// divergent; today it is 2 and 4, and three of those six are the `L`
+/// currency symbol, which is not a defect at all — the oracle container
+/// runs `lc_monetary = en_US.utf8` while SPG advertises `C`, and PG under
+/// `SET lc_monetary='C'` answers byte-for-byte what SPG does.
+fn to_char_numeric(
+    n: f64,
+    exact: Option<(i128, u16)>,
+    fmt: &str,
+) -> Result<String, EvalError> {
     let fill_mode = fmt.len() >= 2 && fmt[..2].eq_ignore_ascii_case("FM");
     let pat = if fill_mode { &fmt[2..] } else { fmt };
+
+    // Two shapes PG rejects outright, checked before anything is rendered.
+    let upper = pat.to_ascii_uppercase();
+    if upper.matches('S').count() > 1 {
+        return Err(EvalError::TypeMismatch {
+            detail: "cannot use \"S\" twice".into(),
+        });
+    }
+    // An ordinal suffix needs a digit position ahead of it. `9TH` is fine;
+    // a bare `TH` has nothing to be the ordinal OF, and PG reports that as
+    // the decimal point failing to be a number.
+    if (upper == "TH" || upper == "RD" || upper == "ND" || upper == "ST")
+        && !pat.chars().any(|c| c.is_ascii_digit())
+    {
+        return Err(EvalError::TypeMismatch {
+            detail: "\".\" is not a number".into(),
+        });
+    }
     // v7.39 (round 243) — characters with no meaning in a number picture
     // print AS THEMSELVES in PG (`XYZ999` → `XYZ 123`); SPG dropped them.
     // Peel a leading / trailing run of letters outside the template
@@ -1376,7 +1413,7 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
     }
     let Some(first_kw) = first_kw else {
         // No picture element at all: PG echoes the pattern.
-        return String::from(pat);
+        return Ok(String::from(pat));
     };
     let mut lit_prefix_len = 0usize;
     while lit_prefix_len < first_kw {
@@ -1413,7 +1450,7 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
     // no numeric body to render between a prefix and a suffix that are the
     // same four characters.
     if lit_prefix_len >= pat.len() {
-        return String::from(pat);
+        return Ok(String::from(pat));
     }
     if lit_prefix_len > 0 || lit_suffix_len > 0 {
         let prefix = &pat[..lit_prefix_len];
@@ -1424,7 +1461,10 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
         } else {
             String::from(inner)
         };
-        return alloc::format!("{prefix}{}{suffix}", to_char_numeric(n, exact, &inner_fmt));
+        return Ok(alloc::format!(
+            "{prefix}{}{suffix}",
+            to_char_numeric(n, exact, &inner_fmt)?
+        ));
     }
     // v7.39 (round 243) — a LEADING `PL` is its own column: `+` for a
     // non-negative value, a space otherwise, ahead of the normally
@@ -1437,20 +1477,20 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
             String::from(rest)
         };
         let col = if n < 0.0 { " " } else { "+" };
-        return alloc::format!("{col}{}", to_char_numeric(n, exact, &rest_fmt));
+        return Ok(alloc::format!("{col}{}", to_char_numeric(n, exact, &rest_fmt)?));
     }
     // `RN` / `rn`: Roman numerals (handled before the digit-slot machinery).
     if pat.eq_ignore_ascii_case("RN") {
-        return to_char_roman(n, fill_mode);
+        return Ok(to_char_roman(n, fill_mode));
     }
     // `EEEE`: scientific notation. The mantissa format is whatever precedes
     // `EEEE`; the digit count after its decimal sets the mantissa precision.
     if let Some(epos) = pat.to_ascii_uppercase().find("EEEE") {
-        return to_char_scientific(n, &pat[..epos], fill_mode);
+        return Ok(to_char_scientific(n, &pat[..epos], fill_mode));
     }
     // `V`: scale — multiply by 10^(digits after V) and drop the decimal.
     if let Some(vpos) = pat.find(['V', 'v']) {
-        return to_char_v_scale(n, &pat[..vpos], &pat[vpos + 1..], fill_mode);
+        return Ok(to_char_v_scale(n, &pat[..vpos], &pat[vpos + 1..], fill_mode));
     }
     // `PR` suffix: PG's accounting-negative notation — a negative value is
     // wrapped in angle brackets with no minus sign (`<1234.50>`), a
@@ -1696,7 +1736,7 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
         } else if has_lit_currency {
             out.insert(0, '$');
         }
-        return out;
+        return Ok(out);
     }
 
     // --- Integer body (significant digits, no leading blanks). ---
@@ -1820,7 +1860,7 @@ fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> String {
     } else if has_lit_currency {
         out.insert(0, '$');
     }
-    out
+    Ok(out)
 }
 
 /// The English ordinal suffix (`st`/`nd`/`rd`/`th`) for `n`, matching PG's
@@ -1962,7 +2002,7 @@ pub(super) fn to_char_in_zone(
             Value::Numeric { scaled, scale, .. } => Some((*scaled, *scale)),
             _ => None,
         };
-        return Ok(Value::text(to_char_numeric(n, exact, fmt)));
+        return Ok(Value::text(to_char_numeric(n, exact, fmt)?));
     }
     let (days, day_micros) = match &args[0] {
         Value::Date(d) => (*d, 0_i64),
