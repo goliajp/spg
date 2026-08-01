@@ -2983,6 +2983,13 @@ fn eval_array_arm(
             }
             Value::Float(_) => has_float = true,
             Value::Text(_) | Value::Json(_) => has_text = true,
+            // v7.39 (round 652) — a reg value belongs to the array by
+            // its OID half. Falling into the catch-all made
+            // `ARRAY['pg_class'::regclass]` a text array, so
+            // `oid = ANY(…)` compared bigint against text and was
+            // refused — while the identical `oid = 'pg_class'::regclass`
+            // worked. Same defect the IN-list gate had, one layer down.
+            Value::RegClass(..) | Value::RegProc(..) | Value::RegType(..) => has_bigint = true,
             _ => has_text = true,
         }
     }
@@ -3044,6 +3051,14 @@ fn eval_array_arm(
                 Value::Int(n) => Some(i64::from(n)),
                 Value::SmallInt(n) => Some(i64::from(n)),
                 Value::BigInt(n) => Some(n),
+                // Keep in step with the `has_bigint` classification above:
+                // whatever is counted there has to be convertible here, and
+                // the arm below panics rather than errors. Round 652 added
+                // the reg family to the classifier and this materialiser
+                // took a wire-visible panic until it learned them too.
+                Value::RegClass(oid, _) | Value::RegProc(oid, _) | Value::RegType(oid, _) => {
+                    Some(oid)
+                }
                 _ => unreachable!(),
             })
             .collect();
@@ -5691,12 +5706,39 @@ fn require_in_list_comparable(
             .flatten()
     };
     // An untyped literal adopts the needle's type, so it never conflicts.
+    //
+    // v7.39 (round 652) — and so does a cast to one of the reg types.
+    // `'pg_class'::regclass` carries an oid AND a name, which is why
+    // `compare` has arms for both, but it DESCRIBES as text — SPG has no
+    // `DataType` for it. This check ran before any comparison and
+    // refused `WHERE oid IN ('pg_class'::regclass, …)` as `bigint =
+    // text`, while the identical `oid = 'pg_class'::regclass` worked.
+    // That shape is how pg_dump, ORMs and monitoring queries name a
+    // handful of relations at once, so it is not a corner.
+    let reg_cast = |e: &Expr| {
+        match e {
+            Expr::Cast { target, .. } => match target {
+                spg_sql::ast::CastTarget::RegClass | spg_sql::ast::CastTarget::RegType => true,
+                // `regproc` and `regnamespace` have no variant of their
+                // own; they arrive through the generic named path.
+                spg_sql::ast::CastTarget::Named(n) => {
+                    n.eq_ignore_ascii_case("regproc")
+                        || n.eq_ignore_ascii_case("regnamespace")
+                        || n.eq_ignore_ascii_case("regtype")
+                        || n.eq_ignore_ascii_case("regclass")
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    };
     let untyped = |e: &Expr| {
-        matches!(
-            e,
-            Expr::Literal(spg_sql::ast::Literal::String(_))
-                | Expr::Literal(spg_sql::ast::Literal::Null)
-        )
+        reg_cast(e)
+            || matches!(
+                e,
+                Expr::Literal(spg_sql::ast::Literal::String(_))
+                    | Expr::Literal(spg_sql::ast::Literal::Null)
+            )
     };
     // The needle can be untyped too (`NULL IN (1,2)`): SPG has no `Unknown`
     // DataType, so a bare NULL describes as TEXT and would look like a text

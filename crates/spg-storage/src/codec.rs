@@ -212,6 +212,10 @@ pub(crate) fn deserialize_table(
             checks.push(crate::CheckConstraint {
                 name: None,
                 expr: cur.read_str()?,
+                // v7.39 (round 652) — the v87 appendix at the tail marks the
+                // NOT VALID ones. Before v87 the surface did not parse, so
+                // everything a v86 catalog holds was validated on the way in.
+                validated: true,
             });
         }
         t.schema_mut().checks = checks;
@@ -578,6 +582,24 @@ pub(crate) fn deserialize_table(
             if let Some(col) = t.schema_mut().columns.get_mut(pos) {
                 col.mysql_fsp = Some(fsp);
             }
+        }
+    }
+    // v7.39 (round 652) — CHECK-validated appendix (FILE_VERSION 87+),
+    // index-aligned to the CHECK appendix above. Only the NOT VALID ones
+    // are written, so a catalog with no such constraint pays two bytes.
+    if version >= 87 {
+        let n = cur.read_u16()? as usize;
+        for _ in 0..n {
+            let idx = cur.read_u16()? as usize;
+            let checks = &mut t.schema_mut().checks;
+            let len = checks.len();
+            let Some(c) = checks.get_mut(idx) else {
+                return Err(StorageError::Corrupt(format!(
+                    "check-validated appendix: index {idx} past {len} CHECK constraints \
+                     for table {table_name:?}"
+                )));
+            };
+            c.validated = false;
         }
     }
     let _ = table_name;

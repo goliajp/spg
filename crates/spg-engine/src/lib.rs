@@ -1546,7 +1546,18 @@ impl Engine {
     #[must_use]
     pub fn role_exists(&self, name: &str) -> bool {
         // The engine's default identity exists even before any CREATE USER.
-        self.users.contains(name) || name.eq_ignore_ascii_case("admin")
+        //
+        // v7.39 (round 652) — and so does `postgres`. `synth_pg_roles`
+        // has always inserted it as the bootstrap superuser when no user
+        // by that name was created, so this predicate and the catalogue
+        // it is supposed to reflect disagreed: `pg_roles` listed
+        // `postgres` while `'postgres'::regrole` said it did not exist.
+        // Every pg_dump names it (`OWNER TO postgres`), so the ALTER
+        // TABLE OWNER check added this round would have refused the one
+        // role that appears in essentially every dump.
+        self.users.contains(name)
+            || name.eq_ignore_ascii_case("admin")
+            || name.eq_ignore_ascii_case("postgres")
     }
 
     /// v7.39 (round 520) — the role an oid names, as `pg_get_userbyid`

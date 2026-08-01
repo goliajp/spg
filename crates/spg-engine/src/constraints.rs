@@ -3418,3 +3418,52 @@ impl crate::Engine {
         })
     }
 }
+
+/// v7.39 (round 652) — scan the rows already in `table` against one CHECK
+/// predicate, the way PG does when `ALTER TABLE … ADD CONSTRAINT … CHECK`
+/// arrives without `NOT VALID` (and when `VALIDATE CONSTRAINT` runs later).
+///
+/// Returns `Ok(())` when every live row satisfies it. A row that evaluates
+/// to definite-false gets PG's 23514 wording for this case, which is NOT
+/// the per-row INSERT wording: PG names the relation and says "is violated
+/// by some row" without quoting the row.
+///
+/// Tombstoned rows are skipped. They are physically present until vacuum,
+/// and a row someone already deleted must not be able to refuse a
+/// constraint the visible table satisfies.
+pub fn validate_check_against_existing_rows(
+    table: &spg_storage::Table,
+    table_name: &str,
+    conname: &str,
+    expr_src: &str,
+) -> Result<(), EngineError> {
+    let expr = spg_sql::parser::parse_expression(expr_src).map_err(|e| {
+        EngineError::Unsupported(alloc::format!(
+            "CHECK constraint {conname:?} on {table_name:?} ({expr_src:?}) failed to parse: {e:?}"
+        ))
+    })?;
+    let schema = table.schema();
+    let ctx = eval::EvalContext::new(&schema.columns, None);
+    let headers = table.headers();
+    for (i, row) in table.rows().iter().enumerate() {
+        if headers
+            .get(i)
+            .is_some_and(|h| h.xmax != spg_storage::row_header::XMAX_ALIVE)
+        {
+            continue;
+        }
+        let v = eval::eval_expr(&expr, row, &ctx).map_err(|e| {
+            EngineError::Unsupported(alloc::format!(
+                "CHECK constraint {conname:?} on {table_name:?} eval at row #{i}: {e:?}"
+            ))
+        })?;
+        // As on the INSERT path: NULL passes, only definite-false refuses.
+        if matches!(v, spg_storage::Value::Bool(false)) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "check constraint \"{conname}\" of relation \"{table_name}\" \
+                 is violated by some row"
+            )));
+        }
+    }
+    Ok(())
+}

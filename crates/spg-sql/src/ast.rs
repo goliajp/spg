@@ -1164,6 +1164,21 @@ pub enum AlterTableTarget {
     /// separate ALTER TABLE statement, so this surface lets the
     /// dump load straight through.
     AddTableConstraint(TableConstraint),
+    /// v7.39 (round 652) — `OWNER TO <role>`. SPG is single-owner, so
+    /// there is nothing to record; what PG does that SPG did not is
+    /// REFUSE a role that does not exist. The name has to reach the
+    /// engine for that, because only the engine knows the roles.
+    OwnerTo { role: String },
+    /// v7.39 (round 652) — `CLUSTER ON <index>` and `SET WITHOUT
+    /// CLUSTER` (the latter as `None`). SPG has no clustered storage, so
+    /// the hint is still a no-op; naming an index that does not exist is
+    /// not.
+    ClusterOn { index: Option<String> },
+    /// v7.39 (round 652) — `VALIDATE CONSTRAINT <name>`: scan the rows
+    /// already in the table against a constraint added `NOT VALID` and,
+    /// if they all pass, mark it validated. It used to be swallowed as a
+    /// no-op on the theory that SPG validated at ADD time; SPG did not.
+    ValidateConstraint { name: String },
     /// v7.15.0 — `ALTER TABLE t RENAME [COLUMN] old TO new`.
     /// Renames the column in the schema and propagates the rename
     /// to every stored source string that references it as a
@@ -2245,7 +2260,17 @@ pub enum TableConstraint {
     /// this same variant at parse time. Engine evaluates the
     /// predicate against each INSERT/UPDATE candidate row; a
     /// false / NULL result rejects the mutation.
-    Check { name: Option<String>, expr: Expr },
+    /// v7.39 (round 652) — `not_valid` carries the `NOT VALID` suffix.
+    /// PG adds such a constraint without scanning the existing rows: new
+    /// rows are checked, the ones already there are grandfathered in, and
+    /// `pg_constraint.convalidated` reads `f` until `VALIDATE CONSTRAINT`
+    /// scans and flips it. pg_dump emits the suffix for exactly those, so
+    /// validating them on restore would refuse a dump PG itself produced.
+    Check {
+        name: Option<String>,
+        expr: Expr,
+        not_valid: bool,
+    },
     /// v7.39 (round 210) — `EXCLUDE [USING <method>] (<col> WITH <op>
     /// [, …])`: no two rows may satisfy `(r.c1 op1 s.c1) AND …` for
     /// every element (the booking/scheduling non-overlap constraint,
@@ -6409,6 +6434,14 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
         AlterTableTarget::AddTableConstraint(tc) => {
             write!(f, "ADD {tc}")
         }
+        AlterTableTarget::ValidateConstraint { name } => {
+            write!(f, "VALIDATE CONSTRAINT {}", quote_ident(name))
+        }
+        AlterTableTarget::OwnerTo { role } => write!(f, "OWNER TO {}", quote_ident(role)),
+        AlterTableTarget::ClusterOn { index } => match index {
+            Some(i) => write!(f, "CLUSTER ON {}", quote_ident(i)),
+            None => f.write_str("SET WITHOUT CLUSTER"),
+        },
         AlterTableTarget::SetColumnAutoIncrement { column, seq_name } => {
             // Round-trip-safe spelling: re-parsing this form lowers
             // back to SetColumnAutoIncrement (the nextval default is
@@ -6587,11 +6620,19 @@ impl fmt::Display for TableConstraint {
                 }
                 f.write_str(")")
             }
-            Self::Check { name, expr } => {
+            Self::Check {
+                name,
+                expr,
+                not_valid,
+            } => {
                 if let Some(n) = name {
                     write!(f, "CONSTRAINT {} ", quote_ident(n))?;
                 }
-                write!(f, "CHECK ({expr})")
+                write!(f, "CHECK ({expr})")?;
+                if *not_valid {
+                    write!(f, " NOT VALID")?;
+                }
+                Ok(())
             }
             Self::Index { name, columns } => {
                 f.write_str("KEY ")?;

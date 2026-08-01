@@ -1003,6 +1003,10 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
     // v7.39 (round 424) — the mysql_fsp appendix (FILE_VERSION 82+): a
     // `[u16 count]` of zero for a catalog with no MySQL temporal column.
     const EMPTY_MYSQL_FSP_APPENDIX: usize = 2;
+    // v7.39 (round 652) — the check-validated appendix (FILE_VERSION 87+):
+    // a `[u16 count]` of zero when every CHECK constraint is validated,
+    // which is every catalog that has no NOT VALID one.
+    const EMPTY_CHECK_VALIDATED_APPENDIX: usize = 2;
     let tail_v60plus = EMPTY_CONSTRAINT_NAME_APPENDIX
         + EMPTY_COMPOSITE_APPENDIX
         + EMPTY_OWNER_ACL_APPENDIX
@@ -1010,7 +1014,8 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         + EMPTY_EXCLUSION_APPENDIX
         + EMPTY_RESTART_APPENDIX
         + EMPTY_MYSQL_INT_WIDTH_APPENDIX
-        + EMPTY_MYSQL_FSP_APPENDIX;
+        + EMPTY_MYSQL_FSP_APPENDIX
+        + EMPTY_CHECK_VALIDATED_APPENDIX;
     let mut v52 = Vec::with_capacity(v53.len() - appendix.len() - trailing_v53plus - tail_v60plus);
     v52.extend_from_slice(&v53[..start - trailing_v53plus]);
     v52.extend_from_slice(&v53[start + appendix.len() + tail_v60plus..]);
@@ -5457,3 +5462,71 @@ mod mysql_ci_fold_tests {
         assert_eq!(mysql_ci_fold("日本語"), "日本語");
     }
 }
+
+/// v7.39 (round 652) — a CHECK added `NOT VALID` has to survive a catalog
+/// round-trip. If the flag were dropped on save, the next pg_dump would
+/// stop emitting the `NOT VALID` suffix and the restore after that would
+/// refuse the very rows PG grandfathered in — a two-hop silent break that
+/// no single dump/restore cycle shows.
+#[test]
+fn check_validated_flag_round_trips() {
+    let mut cat = Catalog::new();
+    cat.create_table(TableSchema::new(
+        "t",
+        vec![ColumnSchema::new("a", DataType::Int, true)],
+    ))
+    .unwrap();
+    {
+        let t = cat.get_mut("t").unwrap();
+        t.schema_mut().checks = alloc::vec![
+            crate::CheckConstraint {
+                name: Some("c_valid".into()),
+                expr: "a > 0".into(),
+                validated: true,
+            },
+            crate::CheckConstraint {
+                name: Some("c_unvalidated".into()),
+                expr: "a < 100".into(),
+                validated: false,
+            },
+        ];
+    }
+    let bytes = cat.serialize();
+    let back = Catalog::deserialize(&bytes).expect("round-trip");
+    let checks = &back.get("t").unwrap().schema().checks;
+    assert_eq!(checks.len(), 2);
+    assert!(checks[0].validated, "validated one stays validated");
+    assert!(!checks[1].validated, "NOT VALID one stays unvalidated");
+    assert_eq!(checks[1].name.as_deref(), Some("c_unvalidated"));
+}
+
+/// v7.39 (round 652/654) — `CheckConstraint` carries the NOT VALID mark,
+/// and this pins its size so a future field is a deliberate decision.
+///
+/// The history is worth keeping. Adding this bool was measured at +18-30%
+/// on `stddev(id)` and `count(DISTINCT g)` by four different instruments,
+/// every one of which turned out to have an unverified premise: a panel
+/// whose gate fires on 2/68 cells with no code change at all; a probe that
+/// ran a different number of queries than the panel; paired samples that
+/// were not independent because a process holds its state for life; and a
+/// PG control column whose own cv (9.2%) matched the measurement's, so
+/// normalising by it ADDED noise. Measured on server-side
+/// `EXPLAIN ANALYZE` time — cv 2-3%, the first instrument without a known
+/// defect — the cost is about +5%.
+///
+/// So a change here is worth noticing, but a failure means "measure it
+/// with the boot-level server-side instrument", not "this is forbidden"
+/// and above all not "restore the old size and you are fine" — restoring
+/// 48 bytes via `Box<str>` did NOT recover the performance.
+#[test]
+fn check_constraint_size_is_pinned() {
+    assert_eq!(
+        core::mem::size_of::<crate::CheckConstraint>(),
+        56,
+        "CheckConstraint changed shape; re-measure with the boot-level \
+         server-side EXPLAIN ANALYZE instrument before accepting"
+    );
+}
+
+
+
