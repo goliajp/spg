@@ -1007,6 +1007,10 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
     // a `[u16 count]` of zero when every CHECK constraint is validated,
     // which is every catalog that has no NOT VALID one.
     const EMPTY_CHECK_VALIDATED_APPENDIX: usize = 2;
+    // v7.39 (round 677) — the per-column collation appendix (FILE_VERSION
+    // 88+): a `u16` count of 0 when no column was declared with an explicit
+    // COLLATE, which is this fixture's case.
+    const EMPTY_COLLATION_APPENDIX: usize = 2;
     let tail_v60plus = EMPTY_CONSTRAINT_NAME_APPENDIX
         + EMPTY_COMPOSITE_APPENDIX
         + EMPTY_OWNER_ACL_APPENDIX
@@ -1015,7 +1019,8 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         + EMPTY_RESTART_APPENDIX
         + EMPTY_MYSQL_INT_WIDTH_APPENDIX
         + EMPTY_MYSQL_FSP_APPENDIX
-        + EMPTY_CHECK_VALIDATED_APPENDIX;
+        + EMPTY_CHECK_VALIDATED_APPENDIX
+        + EMPTY_COLLATION_APPENDIX;
     let mut v52 = Vec::with_capacity(v53.len() - appendix.len() - trailing_v53plus - tail_v60plus);
     v52.extend_from_slice(&v53[..start - trailing_v53plus]);
     v52.extend_from_slice(&v53[start + appendix.len() + tail_v60plus..]);
@@ -5528,5 +5533,58 @@ fn check_constraint_size_is_pinned() {
     );
 }
 
+/// v7.39 (round 677) — a column's declared collation survives a round trip.
+///
+/// Measured before the appendix existed: a column created `COLLATE "C"`
+/// reported `attcollation` 950 in the session that created it and 100 after
+/// a reload, because the name lived only in the in-memory schema. F36 calls
+/// that "the declaration is taken and ignored"; half of the ignoring was
+/// this.
+#[test]
+fn v88_collation_name_survives_serialize_deserialize() {
+    let mut cat = Catalog::new();
+    let mut b = ColumnSchema::new("b", DataType::Text, true);
+    b.collation_name = Some("C".into());
+    let mut c = ColumnSchema::new("c", DataType::Text, true);
+    c.collation_name = Some("POSIX".into());
+    cat.create_table(TableSchema::new(
+        "ct",
+        vec![ColumnSchema::new("a", DataType::Text, true), b, c],
+    ))
+    .unwrap();
 
+    let bytes = cat.serialize();
+    let back = Catalog::deserialize(&bytes).expect("round trip");
+    let cols = &back.get("ct").unwrap().schema().columns;
+    assert_eq!(cols[0].collation_name, None, "no COLLATE stays None");
+    assert_eq!(cols[1].collation_name.as_deref(), Some("C"));
+    assert_eq!(cols[2].collation_name.as_deref(), Some("POSIX"));
+}
 
+/// A table that declares no collation pays two bytes for the appendix, and
+/// the appendix is what makes the sparse layout worth having.
+#[test]
+fn v88_a_table_with_no_collation_pays_two_bytes() {
+    let mut plain = Catalog::new();
+    plain
+        .create_table(TableSchema::new(
+            "p",
+            vec![ColumnSchema::new("a", DataType::Text, true)],
+        ))
+        .unwrap();
+
+    let mut collated = Catalog::new();
+    let mut a = ColumnSchema::new("a", DataType::Text, true);
+    a.collation_name = Some("C".into());
+    collated
+        .create_table(TableSchema::new("p", vec![a]))
+        .unwrap();
+
+    // The collated one carries the index and the name on top of the count.
+    assert!(
+        collated.serialize().len() > plain.serialize().len(),
+        "a declared collation has to cost something"
+    );
+    let back = Catalog::deserialize(&plain.serialize()).expect("round trip");
+    assert_eq!(back.get("p").unwrap().schema().columns[0].collation_name, None);
+}
