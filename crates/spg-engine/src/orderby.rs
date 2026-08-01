@@ -419,6 +419,16 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
             .unwrap_or(Ordering::Equal),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
+        // v7.39 (round 672) — TIME was missing HERE while `aggregate`'s own
+        // `value_cmp` had it, so `ORDER BY time_col` fell to the catch-all
+        // and did not sort at all. Measured: three rows inserted 09/02/05
+        // came back 05,09,02 where PG gives 02,05,09.
+        //
+        // Two independently written comparison matrices, each missing types
+        // the other carries — the same shape F32 recorded for the four
+        // sum/avg accumulators. `docs/COLLATION_RFC.md` §3 records
+        // converging them as the structural fix; this is the measured half.
+        (Value::Time(x), Value::Time(y)) => x.cmp(y),
         // v7.39 (read01 pg_lsn.c) — LSN ordering is plain u64.
         (Value::PgLsn(x), Value::PgLsn(y)) => x.cmp(y),
         // v7.39 (read01 char.c) — "char" orders by byte value.

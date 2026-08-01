@@ -6876,6 +6876,17 @@ fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
             .partial_cmp(&crate::orderby::numeric_to_f64(*ys, *ysc))
             .unwrap_or(Equal),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        // v7.39 (round 672) — BpChar was missing HERE while `orderby`'s own
+        // `value_cmp` had it, so `min`/`max` over a CHAR(n) column fell to
+        // the catch-all and returned the FIRST row for both. Measured:
+        // min/max over 'dddd','aaaa','cccc' both answered 'dddd'.
+        //
+        // The blank padding is not compared: `char_padded_cmp` is what the
+        // Text arm above would do after trimming, which is what PG does for
+        // bpchar.
+        (Value::BpChar(x), Value::BpChar(y)) => x.trim_end().cmp(y.trim_end()),
+        (Value::Text(x), Value::BpChar(y)) => x.as_ref().cmp(y.trim_end()),
+        (Value::BpChar(x), Value::Text(y)) => x.trim_end().cmp(y.as_ref()),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         // Temporal — stored as integral day / microsecond counts, so
         // the natural integer order is the calendar order.
