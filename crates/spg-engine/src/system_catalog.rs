@@ -4810,7 +4810,9 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
         rows.push(Row::new(alloc::vec![
             Value::BigInt(oid),
             Value::text::<String>(name.into()),
-            Value::BigInt(11), // pronamespace = pg_catalog
+            // v7.39 (round 661) — `pg_catalog` only for what PG18 really
+            // has; SPG's own surface goes to `spg_catalog`.
+            Value::BigInt(if SPG_ONLY_PROCS.contains(&name) { 13500 } else { 11 }),
             Value::BigInt(10), // proowner
             Value::BigInt(12), // prolang = internal
             Value::Float(1.0), // procost
@@ -4906,6 +4908,99 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
 /// for the common subset. v7.39 (read01 regproc.c) — module-level so the
 /// regproc/regprocedure casts resolve names against the same table
 /// pg_proc synthesises.
+/// v7.39 (round 661) — the names the engine answers that PG18 does not have.
+/// They keep their rows (all 86 are callable — measured) but sit in
+/// `spg_catalog`, so a client asking "does PostgreSQL provide this?" gets
+/// the right answer while a client asking "can I call this?" still finds it.
+pub(crate) const SPG_ONLY_PROCS: &[&str] = &[
+    "benchmark",
+    "connection_id",
+    "current_catalog",
+    "current_role",
+    "database",
+    "field",
+    "found_rows",
+    "from_unixtime",
+    "gen_uuid_v7",
+    "ifnull",
+    "json_array",
+    "last_insert_id",
+    "log2",
+    "nullif",
+    "pg_backend_start_time",
+    "pg_current_edition",
+    "pg_current_query",
+    "pg_get_wait_event_name",
+    "pg_get_wait_event_type",
+    "pg_is_in_backup",
+    "pg_last_xid",
+    "pg_object_size",
+    "pg_prewarm",
+    "pg_relation_size_pretty",
+    "pg_rotate_logfile_v2",
+    "pg_start_backup",
+    "pg_stat_get_archiver_archived_count",
+    "pg_stat_get_archiver_failed_count",
+    "pg_stat_get_archiver_last_archived_wal",
+    "pg_stat_get_archiver_last_failed_wal",
+    "pg_stat_get_bgwriter_buf_written_checkpoints",
+    "pg_stat_get_bgwriter_requested_checkpoints",
+    "pg_stat_get_bgwriter_timed_checkpoints",
+    "pg_stat_get_buf_fsync_backend",
+    "pg_stat_get_buf_written_backend",
+    "pg_stat_get_checkpoint_sync_time",
+    "pg_stat_get_checkpoint_write_time",
+    "pg_stat_get_idx_scan",
+    "pg_stat_get_idx_tup_fetch",
+    "pg_stat_get_idx_tup_read",
+    "pg_stat_get_recovery_prefetch_reset_time",
+    "pg_stat_get_seq_scan",
+    "pg_stat_get_seq_scan_pos",
+    "pg_stat_get_seq_tup_read",
+    "pg_stat_get_slru_blks_exists",
+    "pg_stat_get_slru_blks_hit",
+    "pg_stat_get_slru_blks_read",
+    "pg_stat_get_slru_blks_written",
+    "pg_stat_get_slru_blks_zeroed",
+    "pg_stat_get_slru_flushes",
+    "pg_stat_get_slru_stat_reset_time",
+    "pg_stat_get_slru_truncates",
+    "pg_stat_get_stat_snapshot_timestamp",
+    "pg_stat_get_tid_scan_pos",
+    "pg_stat_get_wal_buffers_full",
+    "pg_stat_get_wal_bytes",
+    "pg_stat_get_wal_fpi",
+    "pg_stat_get_wal_records",
+    "pg_stat_get_wal_sync",
+    "pg_stat_get_wal_sync_time",
+    "pg_stat_get_wal_write",
+    "pg_stat_get_wal_write_time",
+    "pg_stop_backup",
+    "pg_terminate_backend_with_timeout",
+    "pg_wait_for_backend_termination",
+    "quote",
+    "rand",
+    "row",
+    "row_count",
+    "similarity",
+    "sleep",
+    "spg_build_time",
+    "spg_edition",
+    "spg_uptime_seconds",
+    "spg_version",
+    "unix_timestamp",
+    "user",
+    "uuid_generate_v4",
+    "uuid_generate_v7",
+    "uuid_nil",
+    "uuid_ns_dns",
+    "uuid_ns_oid",
+    "uuid_ns_url",
+    "uuid_ns_x500",
+    "uuid_short",
+    "xmlforest",
+];
+
 pub(crate) const PG_PROC_FUNCS: &[(i64, &str, &str, i32, i64)] = &[
     // Scalar functions.
     // PG ships eight length() overloads; mirror the full set so
@@ -9218,6 +9313,24 @@ pub(crate) fn synth_pg_namespace(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         Row::new(alloc::vec![
             Value::BigInt(13000),
             Value::text("information_schema"),
+            Value::BigInt(10),
+            Value::Null,
+        ]),
+        // v7.39 (round 661) — F34. SPG answers 86 functions PG18 does not
+        // have: the MySQL-dialect family, four `spg_*` of its own, the
+        // extension families (uuid-ossp, pg_trgm, pg_prewarm) and fifty
+        // `pg_*` names PG never had — `pg_stat_get_idx_scan` against PG's
+        // `pg_stat_get_numscans`, `pg_start_backup` which PG15 removed.
+        // Every one of them is callable (measured, 86/86), so removing the
+        // rows would cost discoverability; leaving them at
+        // `pronamespace = 11` claims PostgreSQL provides them, which is the
+        // same lie round 653 refused when it kept 149 dialect names OUT of
+        // pg_proc. PG's own answer for functions core does not have is a
+        // different namespace — that is where extension functions live —
+        // so that is what these get.
+        Row::new(alloc::vec![
+            Value::BigInt(13500),
+            Value::text("spg_catalog"),
             Value::BigInt(10),
             Value::Null,
         ]),

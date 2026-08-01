@@ -155,10 +155,15 @@ fn pg_namespace_returns_public() {
     let mut child = common::ChildGuard(raw);
     let mut s = connect_open(addrs.pgwire.as_ref().unwrap());
 
-    // v7.39 — the engine meta view serves pg_namespace (the canned
-    // wire response is gone): pg_catalog, public, information_schema.
+    // v7.39 — the engine meta view serves pg_namespace (the canned wire
+    // response is gone). Round 661 added `spg_catalog`, which holds the 86
+    // functions SPG answers that PG18 does not have — they used to claim
+    // `pg_catalog`, i.e. PostgreSQL provenance.
     let (_msgs, n) = run_query_count_rows(&mut s, "SELECT * FROM pg_catalog.pg_namespace");
-    assert_eq!(n, 3, "expected pg_catalog / public / information_schema");
+    assert_eq!(
+        n, 4,
+        "expected pg_catalog / public / information_schema / spg_catalog"
+    );
 }
 
 #[test]
