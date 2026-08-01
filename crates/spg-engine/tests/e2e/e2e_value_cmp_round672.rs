@@ -21,8 +21,16 @@
 //! because the two matrices were never converged, which
 //! `docs/COLLATION_RFC.md` §3 records as the structural fix.
 //!
-//! The other eleven predicted types measured fine, so the census produces
-//! candidates and only measurement produces findings.
+//! Round 673 correction: "the other eleven measured fine" was WRONG, and
+//! wrong because of the probe rather than the code. It used 2/5/9 — single
+//! digits, which sort identically by text and by value. With 9/10/100, four
+//! more types turn out to have been sorting by how they PRINT:
+//! `ORDER BY inet` gave 10.0.0.10, 10.0.0.100, 10.0.0.9; money gave $10,
+//! $100, $9; bytea and uuid likewise. All four are fixed in round 673 and
+//! pinned below with discriminating values.
+//!
+//! So the census produces candidates, measurement produces findings, and a
+//! probe that cannot tell two orders apart produces neither.
 
 use spg_engine::{Engine, QueryResult};
 
@@ -78,6 +86,39 @@ fn round672_order_by_sorts_time_and_its_neighbours() {
     assert_eq!(
         one(&mut e, "SELECT t FROM vc ORDER BY t DESC"),
         "09:00:00,05:00:00,02:00:00"
+    );
+}
+
+/// The values here are 9 / 10 / 100 on purpose. Single digits sort the same
+/// by text and by value, which is why round 672 read four broken types as
+/// working. PG18-verified.
+#[test]
+fn round673_order_by_sorts_by_value_not_by_how_it_prints() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE fb(i INET, m MONEY, b BYTEA, u UUID)")
+        .unwrap();
+    e.execute(
+        "INSERT INTO fb VALUES \
+         ('10.0.0.10','10.00','\\x0a','0000000a-0000-0000-0000-000000000000'), \
+         ('10.0.0.9','9.00','\\x09','00000009-0000-0000-0000-000000000000'), \
+         ('10.0.0.100','100.00','\\x64','00000064-0000-0000-0000-000000000000')",
+    )
+    .unwrap();
+    assert_eq!(
+        one(&mut e, "SELECT host(i) FROM fb ORDER BY i"),
+        "10.0.0.9,10.0.0.10,10.0.0.100"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT m FROM fb ORDER BY m"),
+        "$9.00,$10.00,$100.00"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT encode(b,'hex') FROM fb ORDER BY b"),
+        "09,0a,64"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT left(u::text,8) FROM fb ORDER BY u"),
+        "00000009,0000000a,00000064"
     );
 }
 
