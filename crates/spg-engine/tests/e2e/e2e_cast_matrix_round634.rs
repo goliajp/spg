@@ -99,9 +99,12 @@ fn round634_an_oid_reaches_regproc() {
     assert_eq!(vals(&mut e, "SELECT 'now'::REGPROC"), vec!["now"]);
     assert!(err(&mut e, "SELECT 'abs'::REGPROC").contains("more than one function"));
     assert!(err(&mut e, "SELECT 'nosuchfn'::REGPROC").contains("does not exist"));
-    // Recorded: `'random'::REGPROC` resolves here and is ambiguous in PG,
-    // which has overloads of it that SPG's static table does not carry.
-    assert_eq!(vals(&mut e, "SELECT 'random'::REGPROC"), vec!["random"]);
+    // v7.39 (round 654) — this WAS the recorded divergence: "'random'::REGPROC
+    // resolves here and is ambiguous in PG, which has overloads of it that
+    // SPG's static table does not carry". Filling in the overloads closed it
+    // without anyone aiming at it — both engines now answer
+    // `more than one function named "random"`, byte for byte.
+    assert!(err(&mut e, "SELECT 'random'::REGPROC").contains("more than one function"));
 }
 
 #[test]
