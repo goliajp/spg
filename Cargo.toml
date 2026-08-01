@@ -64,6 +64,16 @@ spg-embedded-tokio = { path = "crates/spg-embedded-tokio", version = "7.34" }
 # an in-process SPG (no TCP listener).
 spg-sqlx = { path = "crates/spg-sqlx", version = "7.34" }
 
+# v7.39 (round 678) — Unicode collation for F36. Chosen by measurement, not
+# reputation: `docs/COLLATION_RFC.md` records that libc `strcoll` was
+# rejected because it orders by the locales installed on the HOST (an
+# ORDER BY that depends on which machine the database runs on), and that
+# this crate compiles under `#![no_std]` and reproduces all seven probes
+# taken off PG18. `compiled_data` carries the tables in-crate; no runtime
+# data loading, which an embedded/arena engine could not do anyway.
+icu_collator = { version = "2", default-features = false, features = ["compiled_data"] }
+icu_locale_core = { version = "2", default-features = false }
+
 [workspace.lints.rust]
 # v3.0.4: relaxed from `forbid` to `deny` so spg-crypto can drop into
 # inline NEON / AVX2 intrinsics (all unsafe). The crate-level allow is

@@ -42,6 +42,8 @@ libm        = { version = "0.2", default-features = false }
 # v7.37.17 (17.6 siblings) — PG 13+ normalize(text, form) Unicode
 # normalization. Already transitively in the lock graph.
 unicode-normalization = { version = "0.1", default-features = false }
+icu_collator = { workspace = true }
+icu_locale_core = { workspace = true }
 
 [features]
 # v7.38 元机制 D — `std` feature gates `EnvConfig::from_env()` so the
