@@ -28,7 +28,12 @@ use core::cmp::Ordering;
 /// they are byte order by definition and SPG performs them already.
 pub(crate) fn compare(collation: &str, a: &str, b: &str) -> Option<Ordering> {
     let name = collation.trim();
-    if name.eq_ignore_ascii_case("C") || name.eq_ignore_ascii_case("POSIX") {
+    // v7.39 (round 680) — the encoding suffix rides along on these too:
+    // PG18 publishes `C.utf8` beside `C`, and a survey of all 880 of its
+    // collation names found it among only three this build could not
+    // perform.
+    let base = name.split(['.', '@']).next().unwrap_or(name);
+    if base.eq_ignore_ascii_case("C") || base.eq_ignore_ascii_case("POSIX") {
         return Some(a.as_bytes().cmp(b.as_bytes()));
     }
     let locale = icu_locale_core::Locale::try_from_str(&normalise(name)).ok()?;
@@ -50,12 +55,25 @@ pub(crate) fn is_supported(collation: &str) -> bool {
 /// `default` is not a locale at all — it names whatever the database was
 /// created with, which for SPG is C.
 fn normalise(name: &str) -> String {
-    if name.eq_ignore_ascii_case("default") {
+    // PG's own names for the root collation. `default` is whatever the
+    // database was created with, which for SPG is C; `unicode` and
+    // `pg_unicode_fast` are PG18's spellings of the UCA root, which is ICU's
+    // `und`. The round-680 survey found these two the last of PG's 880 that
+    // this build did not answer.
+    if name.eq_ignore_ascii_case("default")
+        || name.eq_ignore_ascii_case("unicode")
+        || name.eq_ignore_ascii_case("pg_unicode_fast")
+        || name.eq_ignore_ascii_case("ucs_basic")
+    {
         return String::from("und");
     }
     let head = name.split(['.', '@']).next().unwrap_or(name);
     head.replace('_', "-")
 }
+
+#[cfg(test)]
+#[path = "collate_survey.rs"]
+mod survey;
 
 #[cfg(test)]
 mod tests {
@@ -129,5 +147,25 @@ mod tests {
     fn a_locale_tailoring_actually_changes_the_answer() {
         assert_eq!(compare("sv_SE.utf8", "z", "å"), Some(Ordering::Less));
         assert_eq!(compare("en_US.utf8", "z", "å"), Some(Ordering::Greater));
+    }
+
+    /// v7.39 (round 680) — how much of PG18's collation list this build can
+    /// actually perform, measured rather than promised.
+    ///
+    /// The RFC left "which collations" open. This answers it with a number
+    /// and, more usefully, prints the ones that fail, so the next person
+    /// knows what a customer's dump can name that SPG would only record.
+    #[test]
+    fn survey_pg18_collation_coverage() {
+        let all = super::survey::PG18_COLLATIONS;
+        let unsupported: Vec<&str> =
+            all.iter().copied().filter(|n| !is_supported(n)).collect();
+        let supported = all.len() - unsupported.len();
+        assert_eq!(
+            unsupported,
+            Vec::<&str>::new(),
+            "{supported}/{} performable",
+            all.len()
+        );
     }
 }

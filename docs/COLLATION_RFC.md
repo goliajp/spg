@@ -80,9 +80,14 @@ the converged comparison needs the same treatment and a bench.
 
 ## 4. Open, and each is its own decision
 
-* **Which collations.** PG lists 880; SPG lists 3. ICU4X tailors per locale
-  through `CollatorPreferences`, but `compiled_data` carries a subset that
-  has not been surveyed. Needs measuring before promising a list.
+* ~~**Which collations.**~~ **Answered in round 680: all 880.** The list was
+  taken off PG18's `pg_collation` verbatim and every name fed to
+  `collate::compare`. First run: **877 of 880**. The three misses each had a
+  reason and all three are now covered — `C.utf8` is the C collation wearing
+  an encoding suffix, and `unicode` / `pg_unicode_fast` are PG18's names for
+  the UCA root, which is ICU's `und`. The survey is a test rather than a
+  note, and it asserts an empty failure list rather than a percentage, so a
+  future ICU upgrade that drops a locale fails loudly.
 * **Index order.** Collation determines index key order. Changing it
   invalidates every on-disk text index, so this needs a rebuild path and a
   data-compat story, not just a comparison swap.
