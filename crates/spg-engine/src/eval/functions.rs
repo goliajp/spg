@@ -18055,10 +18055,21 @@ fn apply_function_dispatch(
                 let s = match v {
                     Value::Null => return Ok(None),
                     Value::Text(s) => s.to_string(),
+                    // v7.39 (round 653) — a `pg_lsn` value, which is what
+                    // `'0/1'::pg_lsn` produces and what a `pg_lsn` column
+                    // holds. This arm was missing, so the two functions
+                    // refused their own type: the cast worked, the column
+                    // worked, and `pg_lsn_larger('0/1'::pg_lsn, …)` answered
+                    // "args must be text, got pg_lsn". Found while checking
+                    // that every type the new pg_proc rows name is a type
+                    // the engine can actually produce.
+                    Value::PgLsn(raw) => {
+                        return Ok(Some(i64::from_ne_bytes(raw.to_ne_bytes())));
+                    }
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "pg_lsn_*(): args must be text, got {}",
+                                "pg_lsn_*(): args must be text or pg_lsn, got {}",
                                 crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         });

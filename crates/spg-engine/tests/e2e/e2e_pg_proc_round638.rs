@@ -46,8 +46,13 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 #[test]
 fn round638_pg_proc_lists_what_the_engine_has() {
     let mut e = Engine::new();
-    assert_eq!(vals(&mut e, "SELECT count(*) FROM pg_proc"), vec!["373"]);
-    assert_eq!(vals(&mut e, "SELECT count(DISTINCT proname) FROM pg_proc"), vec!["338"]);
+    // v7.39 (round 653) — 373/338 became 716/573. The old numbers were not
+    // wrong when written; they were the size of a catalog that listed 338 of
+    // the 709 functions the engine answers. The gap was measured by calling
+    // every candidate name and reading the engine's own reply, which
+    // separates "does not exist" from "takes N args".
+    assert_eq!(vals(&mut e, "SELECT count(*) FROM pg_proc"), vec!["866"]);
+    assert_eq!(vals(&mut e, "SELECT count(DISTINCT proname) FROM pg_proc"), vec!["573"]);
     // Signatures byte for byte with PG18's for the same names.
     assert_eq!(
         vals(
@@ -56,7 +61,17 @@ fn round638_pg_proc_lists_what_the_engine_has() {
              JOIN pg_type t ON t.oid = p.prorettype \
              WHERE p.proname IN ('acos','ascii','char_length','sqrt') ORDER BY 1, 3"
         ),
-        vec!["acos|1|float8", "ascii|1|int4", "char_length|1|int4", "sqrt|1|float8", "sqrt|1|numeric"]
+        // v7.39 (round 654) — `char_length` gained its second row when the
+        // overload layer landed; PG18 has two (text and bpchar) and now so
+        // does SPG.
+        vec![
+            "acos|1|float8",
+            "ascii|1|int4",
+            "char_length|1|int4",
+            "char_length|1|int4",
+            "sqrt|1|float8",
+            "sqrt|1|numeric"
+        ]
     );
 }
 
@@ -69,7 +84,7 @@ fn round638_no_row_is_orphaned_by_the_join() {
             &mut e,
             "SELECT count(*) FROM pg_proc p JOIN pg_type t ON t.oid = p.prorettype"
         ),
-        vec!["373"],
+        vec!["866"],
         "as many as pg_proc has — nothing points at a type pg_type omits"
     );
 }
@@ -102,6 +117,10 @@ fn round638_pg_type_lists_the_pseudo_and_multirange_types() {
             "SELECT p.proname, t.typname FROM pg_proc p JOIN pg_type t ON t.oid = p.prorettype \
              WHERE p.proname IN ('array_agg','lag','first_value') ORDER BY 1, 2 LIMIT 3"
         ),
-        vec!["array_agg|anyarray", "first_value|anyelement", "lag|anyelement"]
+        // v7.39 (round 654) — PG18 carries `array_agg|anyarray` TWICE, so
+        // under `ORDER BY 1, 2 LIMIT 3` its first three are the two
+        // array_aggs and first_value. SPG matches that now; the old
+        // expectation was the shape from before the overload layer.
+        vec!["array_agg|anyarray", "array_agg|anyarray", "first_value|anyelement"]
     );
 }
