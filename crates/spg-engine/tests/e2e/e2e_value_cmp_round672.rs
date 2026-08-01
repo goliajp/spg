@@ -155,3 +155,37 @@ fn round672_the_two_matrices_agree_on_extremes() {
         );
     }
 }
+
+/// Round 674 converged the two matrices — `aggregate::value_cmp` now
+/// delegates every non-NULL pair to `orderby::value_cmp`, 229 lines down to
+/// 28. What it does NOT delegate is where NULL sorts, because that is the
+/// one thing the two legitimately disagreed about: orderby puts NULLs first
+/// and the ORDER BY layer above applies NULLS FIRST / NULLS LAST, while the
+/// aggregate one puts them last so a NULL never wins a min or a max.
+///
+/// Merging those would have flipped one of them silently. All eight shapes
+/// are PG18-verified.
+#[test]
+fn round674_null_ordering_survived_the_convergence() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE nl(v INT, t TEXT)").unwrap();
+    e.execute("INSERT INTO nl VALUES (2,'b'),(NULL,NULL),(1,'a')")
+        .unwrap();
+    let g = |e: &mut Engine, ord: &str| {
+        one(
+            e,
+            &format!("SELECT coalesce(v::text,'NULL') FROM nl ORDER BY {ord}"),
+        )
+    };
+    assert_eq!(g(&mut e, "v"), "1,2,NULL", "ASC defaults to NULLS LAST");
+    assert_eq!(g(&mut e, "v DESC"), "NULL,2,1", "DESC defaults to NULLS FIRST");
+    assert_eq!(g(&mut e, "v NULLS FIRST"), "NULL,1,2");
+    assert_eq!(g(&mut e, "v NULLS LAST"), "1,2,NULL");
+    assert_eq!(g(&mut e, "v DESC NULLS FIRST"), "NULL,2,1");
+    assert_eq!(
+        one(&mut e, "SELECT coalesce(t,'NULL') FROM nl ORDER BY t"),
+        "a,b,NULL"
+    );
+    // The aggregate side: a NULL must never win either extreme.
+    assert_eq!(one(&mut e, "SELECT min(v), max(v) FROM nl"), "1|2");
+}

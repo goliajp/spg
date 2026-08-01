@@ -6666,233 +6666,32 @@ fn extreme_cmp(
     value_cmp(a, b)
 }
 
+/// Compare two values for `min` / `max`.
+///
+/// v7.39 (round 674) — the 228 lines that used to live here were a SECOND
+/// comparison matrix, written independently of `orderby::value_cmp`. A
+/// census of which `Value` variants each named found them diverged rather
+/// than duplicated, and two silent wrongs fell out of the gap: `ORDER BY
+/// time_col` did not sort (round 672) and `min`/`max` over `CHAR(n)`
+/// returned the first row (round 672). Round 673 found four more on the
+/// orderby side, where a canonical-text fallback had `ORDER BY money`
+/// putting $100 before $9.
+///
+/// What stays here is the ONLY thing the two legitimately disagreed about:
+/// where NULL sorts. This one puts NULLs last so `min`/`max` skip them;
+/// `orderby::value_cmp` puts them first and the ORDER BY layer above it
+/// applies NULLS FIRST / NULLS LAST. Both were correct in context, which is
+/// why merging the matrices wholesale would have flipped one of them —
+/// verified before collapsing, not after, and the eight NULL shapes are
+/// pinned.
 fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
-    use core::cmp::Ordering::Equal;
-    // v7.38 (read01, T3.C3) — a NUMERIC beyond i128 orders via exact bignum.
-    if let Some(ord) = crate::orderby::numeric_bignum_cmp(a, b) {
-        return ord;
-    }
-    // v7.38 (read01, T6.P3) — min()/max() over NUMERIC honor the special total
-    // order -Inf < finite < +Inf < NaN, ahead of the finite arms which would
-    // read a special's canonical 0 as the number 0.
-    {
-        use spg_storage::NumericKind as NK;
-        let kind = |v: &Value| -> Option<NK> {
-            match v {
-                Value::Numeric { kind, .. } => Some(*kind),
-                Value::Int(_) | Value::BigInt(_) | Value::SmallInt(_) => Some(NK::Finite),
-                _ => None,
-            }
-        };
-        if let (Some(lk), Some(rk)) = (kind(a), kind(b)) {
-            if lk != NK::Finite || rk != NK::Finite {
-                let rank = |k: NK| match k {
-                    NK::NegInf => -2,
-                    NK::Finite => 0,
-                    NK::PosInf => 1,
-                    NK::NaN => 2,
-                };
-                return rank(lk).cmp(&rank(rk));
-            }
-        }
-    }
+    use core::cmp::Ordering;
     match (a, b) {
-        (Value::Null, Value::Null) => Equal,
-        (Value::Null, _) => core::cmp::Ordering::Greater, // NULLs last
-        (_, Value::Null) => core::cmp::Ordering::Less,
-        (Value::SmallInt(x), Value::SmallInt(y)) => x.cmp(y),
-        (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::BigInt(x), Value::BigInt(y)) => x.cmp(y),
-        // Money (integer cents) — without this arm min/max(money) fell to the
-        // `_ => Equal` fallback and kept whichever row arrived first.
-        (Value::Money(x), Value::Money(y)) => x.cmp(y),
-        (
-            Value::Interval {
-                months: xm,
-                days: xd,
-                micros: xu,
-            },
-            Value::Interval {
-                months: ym,
-                days: yd,
-                micros: yu,
-            },
-        ) => {
-            // Compare on total micros (a month = 30 days), matching PG ordering.
-            let tot = |mo: i32, d: i32, u: i64| -> i128 {
-                i128::from(mo) * 30 * 86_400_000_000
-                    + i128::from(d) * 86_400_000_000
-                    + i128::from(u)
-            };
-            tot(*xm, *xd, *xu).cmp(&tot(*ym, *yd, *yu))
-        }
-        // Remaining ordered scalar types — each was falling to the
-        // `_ => Equal` fallback, so min/max over these columns kept whichever
-        // row arrived first. Natural PG ordering: time/timestamptz by the i64,
-        // bytea/uuid/macaddr byte-wise, inet by (family, address, netmask).
-        // (Text/Bool already have arms further down.)
-        (Value::Time(x), Value::Time(y)) => x.cmp(y),
-        (Value::Bytes(x), Value::Bytes(y)) => x.as_ref().cmp(y.as_ref()),
-        (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
-        (Value::Macaddr(x), Value::Macaddr(y)) => x.cmp(y),
-        (Value::Macaddr8(x), Value::Macaddr8(y)) => x.cmp(y),
-        (Value::PgLsn(x), Value::PgLsn(y)) => x.cmp(y),
-        // v7.39 (round 511) — a tid orders by block then offset. Without
-        // an arm it reached the `_ => Equal` fallback below, and min/max
-        // kept whichever row arrived first: `max(ctid)` over twelve rows
-        // answered `(0,1)`.
-        (Value::Tid(b1, o1), Value::Tid(b2, o2)) => b1.cmp(b2).then(o1.cmp(o2)),
-        (Value::Xid(x), Value::Xid(y)) => x.cmp(y),
-        (Value::Cid(x), Value::Cid(y)) => x.cmp(y),
-        (Value::Char1(x), Value::Char1(y)) => x.cmp(y),
-        (
-            Value::Inet {
-                family: xf,
-                bits: xb,
-                addr: xa,
-            },
-            Value::Inet {
-                family: yf,
-                bits: yb,
-                addr: ya,
-            },
-        )
-        | (
-            Value::Cidr {
-                family: xf,
-                bits: xb,
-                addr: xa,
-            },
-            Value::Cidr {
-                family: yf,
-                bits: yb,
-                addr: ya,
-            },
-        ) => (xf, xa, xb).cmp(&(yf, ya, yb)),
-        // Cross integer widths — min/max over a column whose cells
-        // land in mixed integer variants (literal-seeded rows, casts).
-        (Value::SmallInt(x), Value::Int(y)) => i32::from(*x).cmp(y),
-        (Value::Int(x), Value::SmallInt(y)) => x.cmp(&i32::from(*y)),
-        (Value::SmallInt(x), Value::BigInt(y)) => i64::from(*x).cmp(y),
-        (Value::BigInt(x), Value::SmallInt(y)) => x.cmp(&i64::from(*y)),
-        (Value::Int(x), Value::BigInt(y)) => i64::from(*x).cmp(y),
-        (Value::BigInt(x), Value::Int(y)) => x.cmp(&i64::from(*y)),
-        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Equal),
-        (Value::Real(x), Value::Real(y)) => x.partial_cmp(y).unwrap_or(Equal),
-        (Value::SmallInt(x), Value::Float(y)) => f64::from(*x).partial_cmp(y).unwrap_or(Equal),
-        (Value::Float(x), Value::SmallInt(y)) => x.partial_cmp(&f64::from(*y)).unwrap_or(Equal),
-        (Value::Int(x), Value::Float(y)) => f64::from(*x).partial_cmp(y).unwrap_or(Equal),
-        (Value::Float(x), Value::Int(y)) => x.partial_cmp(&f64::from(*y)).unwrap_or(Equal),
-        (Value::BigInt(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Equal),
-        (Value::Float(x), Value::BigInt(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Equal),
-        // Exact decimal — align scales before comparing the integral
-        // representations so 12.50 vs 5.25 orders correctly (the old
-        // `_ => Equal` fallback made min/max(numeric) keep the first row).
-        (
-            Value::Numeric {
-                scaled: xs,
-                scale: xsc,
-                ..
-            },
-            Value::Numeric {
-                scaled: ys,
-                scale: ysc,
-                ..
-            },
-        ) => crate::orderby::cmp_numeric(*xs, *xsc, *ys, *ysc),
-        // Mixed exact-decimal ↔ integer — promote the integer to a
-        // NUMERIC at scale 0 and compare exactly (mirrors binop.rs
-        // `numeric_or_widen`), so min/max over a mixed NUMERIC/int column
-        // matches arithmetic + WHERE. The old `_ => Equal` fallback made
-        // min/max keep whichever row happened to arrive first.
-        (
-            Value::Numeric {
-                scaled: xs,
-                scale: xsc,
-                ..
-            },
-            Value::SmallInt(y),
-        ) => crate::orderby::cmp_numeric(*xs, *xsc, i128::from(*y), 0),
-        (
-            Value::SmallInt(x),
-            Value::Numeric {
-                scaled: ys,
-                scale: ysc,
-                ..
-            },
-        ) => crate::orderby::cmp_numeric(i128::from(*x), 0, *ys, *ysc),
-        (
-            Value::Numeric {
-                scaled: xs,
-                scale: xsc,
-                ..
-            },
-            Value::Int(y),
-        ) => crate::orderby::cmp_numeric(*xs, *xsc, i128::from(*y), 0),
-        (
-            Value::Int(x),
-            Value::Numeric {
-                scaled: ys,
-                scale: ysc,
-                ..
-            },
-        ) => crate::orderby::cmp_numeric(i128::from(*x), 0, *ys, *ysc),
-        (
-            Value::Numeric {
-                scaled: xs,
-                scale: xsc,
-                ..
-            },
-            Value::BigInt(y),
-        ) => crate::orderby::cmp_numeric(*xs, *xsc, i128::from(*y), 0),
-        (
-            Value::BigInt(x),
-            Value::Numeric {
-                scaled: ys,
-                scale: ysc,
-                ..
-            },
-        ) => crate::orderby::cmp_numeric(i128::from(*x), 0, *ys, *ysc),
-        // Mixed exact-decimal ↔ float — PG demotes NUMERIC to float8 for
-        // `numeric op double precision`, so compare as f64.
-        (
-            Value::Numeric {
-                scaled: xs,
-                scale: xsc,
-                ..
-            },
-            Value::Float(y),
-        ) => crate::orderby::numeric_to_f64(*xs, *xsc)
-            .partial_cmp(y)
-            .unwrap_or(Equal),
-        (
-            Value::Float(x),
-            Value::Numeric {
-                scaled: ys,
-                scale: ysc,
-                ..
-            },
-        ) => x
-            .partial_cmp(&crate::orderby::numeric_to_f64(*ys, *ysc))
-            .unwrap_or(Equal),
-        (Value::Text(x), Value::Text(y)) => x.cmp(y),
-        // v7.39 (round 672) — BpChar was missing HERE while `orderby`'s own
-        // `value_cmp` had it, so `min`/`max` over a CHAR(n) column fell to
-        // the catch-all and returned the FIRST row for both. Measured:
-        // min/max over 'dddd','aaaa','cccc' both answered 'dddd'.
-        //
-        // The blank padding is not compared: `char_padded_cmp` is what the
-        // Text arm above would do after trimming, which is what PG does for
-        // bpchar.
-        (Value::BpChar(x), Value::BpChar(y)) => x.trim_end().cmp(y.trim_end()),
-        (Value::Text(x), Value::BpChar(y)) => x.as_ref().cmp(y.trim_end()),
-        (Value::BpChar(x), Value::Text(y)) => x.trim_end().cmp(y.as_ref()),
-        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        // Temporal — stored as integral day / microsecond counts, so
-        // the natural integer order is the calendar order.
-        (Value::Date(x), Value::Date(y)) => x.cmp(y),
-        (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
-        _ => Equal,
+        (Value::Null, Value::Null) => Ordering::Equal,
+        // NULLs last, so a NULL never wins a min() or a max().
+        (Value::Null, _) => Ordering::Greater,
+        (_, Value::Null) => Ordering::Less,
+        _ => crate::orderby::value_cmp(a, b),
     }
 }
 
