@@ -5762,6 +5762,11 @@ fn column_def_to_schema(c: ColumnDef, mysql: bool) -> Result<ColumnSchema, Engin
         ty,
         spg_storage::DataType::Text | spg_storage::DataType::Varchar(_) | spg_storage::DataType::Char(_)
     );
+    // v7.39 (round 676) — carry the collation NAME as written, which
+    // `Collation` below cannot: it folds C / POSIX / en_US / default into
+    // one value. `pg_attribute.attcollation` reads this to answer 950 for a
+    // column declared `COLLATE "C"` instead of the type's default 100.
+    schema.collation_name = c.collation_name.clone();
     schema.collation = if mysql && is_text_col && !c.collation_explicit {
         spg_storage::Collation::CaseInsensitive
     } else {

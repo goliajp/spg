@@ -88,9 +88,21 @@ the converged comparison needs the same treatment and a bench.
   data-compat story, not just a comparison swap.
 * **What the declaration means.** Today `CREATE TABLE t(x TEXT COLLATE
   "en_US")` is accepted and ignored. Once the collator exists the
-  declaration has to be stored per column and honoured, which is an AST and
-  a catalog change: `ColumnDef` has no collation field at all — the name is
-  discarded at parse time.
+  declaration has to be stored per column and honoured.
+
+  Corrected in round 676, having been stated wrongly here and in two other
+  places: `ColumnDef` DOES carry `collation: Collation` and
+  `collation_explicit: bool`. What it does not carry is the NAME. `Collation`
+  is a two-variant enum — `Binary` and `CaseInsensitive` — built for MySQL's
+  `utf8mb4_bin` / `_general_ci` distinction, and `from_collation_name` folds
+  everything without a `_ci` suffix into `Binary`. So `COLLATE "C"`,
+  `COLLATE "POSIX"`, `COLLATE "en_US"` and `COLLATE "default"` all arrive as
+  the same value and cannot be told apart afterwards.
+
+  The name therefore has to survive CREATE TABLE, the persisted schema and
+  the catalog read. That is a `ColumnSchema` field plus a FILE_VERSION
+  appendix — the sparse index-aligned kind this codec already uses several
+  times over, costing two bytes for a table that declares none.
 
 ## 5. Recommendation
 

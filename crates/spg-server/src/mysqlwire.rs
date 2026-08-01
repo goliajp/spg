@@ -1223,6 +1223,7 @@ fn handle_com_stmt_prepare(
             // wire-correct. EXECUTE then dispatches on the
             // type byte the client sent.
             let placeholder = ColumnSchema {
+                collation_name: None,
                 user_composite_type: None,
                 acl: Vec::new(),
                 name: "?".to_string(),

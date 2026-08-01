@@ -95,6 +95,37 @@ fn round675_information_schema_reports_a_collation_name() {
             "SELECT column_name, collation_name FROM information_schema.columns \
              WHERE table_name = 'ac' AND column_name IN ('t','i') ORDER BY ordinal_position"
         ),
-        "t|default,i|NULL"
+        "t|NULL,i|NULL"
+    );
+}
+
+/// Round 676 correction. Round 675 filled `collation_name` from the column
+/// TYPE and asserted `t|default`; measured on PG18 a plain TEXT column
+/// reports NULL there while its `attcollation` is 100. The two columns
+/// answer different questions — one names the collation in force, the other
+/// names the one the DDL wrote down — and only the second is what
+/// information_schema publishes.
+#[test]
+fn round676_an_explicit_collate_is_reported_by_both_catalogs() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE cc(a TEXT, b TEXT COLLATE \"C\", c TEXT COLLATE \"POSIX\")")
+        .unwrap();
+    // pg_attribute: the collation in force, as an oid.
+    assert_eq!(
+        rows(
+            &mut e,
+            "SELECT attname, attcollation FROM pg_attribute \
+             WHERE attrelid = 'cc'::regclass AND attnum > 0 ORDER BY attnum"
+        ),
+        "a|100,b|950,c|951"
+    );
+    // information_schema: the collation the DDL named, or nothing.
+    assert_eq!(
+        rows(
+            &mut e,
+            "SELECT column_name, collation_name FROM information_schema.columns \
+             WHERE table_name = 'cc' ORDER BY ordinal_position"
+        ),
+        "a|NULL,b|C,c|POSIX"
     );
 }
