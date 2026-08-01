@@ -547,14 +547,21 @@ fn info_column_row(
                 _ => Value::Int(2),
             },
             num_scale,
-            // Mirrors `pg_attr_collation`: the collatable types carry the
-            // `default` collation and `name` carries `C`; PG prints the
-            // NAME here where pg_attribute prints the oid.
-            match col.ty {
-                DataType::Text | DataType::Varchar(_) | DataType::Char(_) => {
-                    Value::text::<&str>("default")
-                }
-                DataType::Name => Value::text::<&str>("C"),
+            // v7.39 (round 676) — the EXPLICIT collation, or NULL.
+            //
+            // Round 675 filled this from the type, mirroring
+            // `pg_attribute.attcollation`, and that was wrong: measured on
+            // PG18, a plain `TEXT` column reports NULL here while its
+            // attcollation is 100. The two columns do not answer the same
+            // question — attcollation names the collation in force,
+            // information_schema names the one the DDL wrote down.
+            match col.collation_name.as_deref() {
+                Some(n) if n.eq_ignore_ascii_case("C") => Value::text::<&str>("C"),
+                Some(n) if n.eq_ignore_ascii_case("POSIX") => Value::text::<&str>("POSIX"),
+                Some(n) if n.eq_ignore_ascii_case("default") => Value::text::<&str>("default"),
+                // A name SPG cannot perform is not reported as if it could
+                // be. F36 tracks accepting-and-ignoring; naming it here
+                // would claim more than is true.
                 _ => Value::Null,
             },
             Value::text::<&str>(udt),
@@ -3411,10 +3418,35 @@ const PG_CLASS_RELISPARTITION: usize = 26;
 /// (default 100, C 950, POSIX 951), so this connects a catalog that was
 /// already right to the columns that were reporting nothing.
 ///
-/// A column with an explicit `COLLATE` still reports the type default here:
-/// the name is discarded during parsing and there is nowhere to read it
-/// from yet. That is the next step in `docs/COLLATION_RFC.md` §5 and the
-/// reason F36 records the declaration as "taken and ignored".
+/// A column with an explicit `COLLATE` still reports the type default here.
+/// Round 676 measured why, correcting what rounds 670-675 asserted: the
+/// parser does capture the clause, into `ColumnDef::collation`, but that is
+/// a two-variant MySQL enum (`Binary` / `CaseInsensitive`) and
+/// `from_collation_name` folds every name without a `_ci` suffix into
+/// `Binary`. `COLLATE "C"`, `"POSIX"` and `"en_US"` all arrive identical.
+/// Carrying the name needs a `ColumnSchema` field and a FILE_VERSION
+/// appendix — the next step in `docs/COLLATION_RFC.md` §5.
+fn pg_attr_collation_named(ty: DataType, declared: Option<&str>) -> i64 {
+    // v7.39 (round 676) — an explicit `COLLATE` now answers with the
+    // collation it names, using the oids `pg_collation` already publishes.
+    // A name SPG cannot perform falls back to the type's collation rather
+    // than inventing an oid: F36 records that accepting-and-ignoring is the
+    // gap, and reporting a made-up oid would deepen it instead.
+    if let Some(name) = declared {
+        let n = name.trim();
+        if n.eq_ignore_ascii_case("C") {
+            return 950;
+        }
+        if n.eq_ignore_ascii_case("POSIX") {
+            return 951;
+        }
+        if n.eq_ignore_ascii_case("default") {
+            return 100;
+        }
+    }
+    pg_attr_collation(ty)
+}
+
 fn pg_attr_collation(ty: DataType) -> i64 {
     match ty {
         DataType::Text | DataType::Varchar(_) | DataType::Char(_) => 100,
@@ -3667,7 +3699,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Bool(false), // attisdropped
                 Value::Bool(true),  // attislocal — true (not inherited)
                 Value::Int(0),      // attinhcount
-                Value::BigInt(pg_attr_collation(col.ty)), // attcollation
+                Value::BigInt(pg_attr_collation_named(col.ty, col.collation_name.as_deref())), // attcollation
                 crate::acl::render_acl_list(&col.acl).map_or(Value::Null, Value::text),
                 // v7.39 (round 543) — PG18's tail, measured on a plain
                 // table: attcompression empty, atthasmissing false,

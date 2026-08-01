@@ -2385,6 +2385,12 @@ pub struct ColumnDef {
     /// stays byte-wise — and both resolve to `Collation::Binary`, so this
     /// flag is the only thing that tells them apart.
     pub collation_explicit: bool,
+    /// v7.39 (round 676) — the collation name AS WRITTEN, because
+    /// `collation` above cannot carry it: `Collation` is a two-variant
+    /// MySQL enum and `from_collation_name` folds `C`, `POSIX`, `en_US` and
+    /// `default` all into `Binary`. `pg_attribute.attcollation` needs to
+    /// tell them apart.
+    pub collation_name: Option<String>,
     /// v7.17.0 Phase 4.4 — MySQL `UNSIGNED` modifier flag. Pre-
     /// 4.4 SPG accepted and discarded the keyword, leaving
     /// negative values silently accepted on a column the

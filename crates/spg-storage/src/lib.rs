@@ -1453,6 +1453,19 @@ pub struct ColumnSchema {
     /// MySQL-style `AUTO_INCREMENT`. When set, an INSERT that leaves
     /// this column unbound (or sets it to NULL) gets the next integer
     /// computed from the column's current max + 1.
+    /// v7.39 (round 676) — the collation NAME as written, when the column
+    /// carried an explicit `COLLATE`.
+    ///
+    /// `spg_sql::Collation` cannot carry it: it is a two-variant MySQL enum
+    /// and `from_collation_name` folds `C`, `POSIX`, `en_US` and `default`
+    /// all into `Binary`. Without the name `pg_attribute.attcollation` can
+    /// only ever report the type's default, which is what F36 records as
+    /// "the declaration is taken and ignored".
+    ///
+    /// None means the column was written without a `COLLATE` clause and
+    /// takes its type's collation. Persisted through the v88 appendix,
+    /// which costs two bytes for a table that declares none.
+    pub collation_name: Option<String>,
     pub auto_increment: bool,
     /// v7.17.0 Phase 1.4 — when the column is bound to a user-
     /// defined ENUM type (the parser saw an unknown type ident
@@ -7571,6 +7584,7 @@ impl ColumnSchema {
             name: name.into(),
             ty,
             nullable,
+            collation_name: None,
             default: None,
             runtime_default: None,
             auto_increment: false,

@@ -44,6 +44,8 @@ pub(crate) fn deserialize_table(
             name: c_name,
             ty,
             nullable,
+            // v7.39 (round 676) — filled from the v88 appendix below.
+            collation_name: None,
             default,
             runtime_default: None,
             auto_increment,
