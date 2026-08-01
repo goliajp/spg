@@ -8368,10 +8368,26 @@ fn apply_function_dispatch(
         }
         "age" => age(args),
         // mxid_age(xid) — multixact wraparound distance. SPG has no
-        // multixact machinery (single-writer model) → honestly 0,
-        // same rationale as the age(xid) overload.
+        // multixact machinery (single-writer model) → honestly 0.
+        //
+        // v7.39 (round 668) — that rationale holds for an xid and only for
+        // an xid. It used to cite "the same rationale as the age(xid)
+        // overload", which was a misreading: `age(xid)` computes a real
+        // distance from the current snapshot and always has. A bare integer
+        // is not an xid in either function, and PG says so
+        // (`function mxid_age(integer) does not exist`).
         "mxid_age" => match args.first() {
             Some(Value::Null) | None => Ok(Value::Null),
+            Some(Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_)) => {
+                let n = match args.first() {
+                    Some(Value::SmallInt(_)) => "smallint",
+                    Some(Value::BigInt(_)) => "bigint",
+                    _ => "integer",
+                };
+                Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("function mxid_age({n}) does not exist"),
+                })
+            }
             _ => Ok(Value::Int(0)),
         },
         "to_char" => to_char(args),

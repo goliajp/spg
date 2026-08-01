@@ -564,13 +564,31 @@ pub(super) fn age(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.iter().any(|v| matches!(v, Value::Null)) {
         return Ok(Value::Null);
     }
-    // v7.37.17 (17.6 siblings) — PG's age(xid) overload, used by
-    // autovacuum-wraparound monitoring (`age(relfrozenxid)`).
-    // SPG's u64 tx ids never wrap, so the wraparound distance is
-    // honestly 0 ("no vacuum urgency") for every xid.
+    // v7.39 (round 668) — a bare integer is NOT an xid, and PG says so:
+    // `age(7)` is `function age(integer) does not exist`.
+    //
+    // This arm used to answer 0 for any integer, on the rationale that it
+    // was serving `age(relfrozenxid)`. It is not: `relfrozenxid` is a real
+    // `xid` column producing a `Value::Xid` (round 640), which reaches the
+    // dedicated overload in `functions.rs` and gets a real distance from
+    // the current snapshot. Measured on a fresh server whose counter is 2:
+    // `age('0'::xid)` is 2, `age('1'::xid)` is 1, `age('2'::xid)` is 0.
+    //
+    // Round 627 wrote this refusal and withdrew it, recording that three
+    // tests went red and reading that as "the overload needs integers".
+    // The premise was wrong — what the overload needs is `Value::Xid`, and
+    // it has it.
     if args.len() == 1 {
-        if let Value::Int(_) | Value::BigInt(_) | Value::SmallInt(_) = &args[0] {
-            return Ok(Value::Int(0));
+        let n = match &args[0] {
+            Value::SmallInt(_) => Some("smallint"),
+            Value::Int(_) => Some("integer"),
+            Value::BigInt(_) => Some("bigint"),
+            _ => None,
+        };
+        if let Some(n) = n {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("function age({n}) does not exist"),
+            });
         }
     }
     // Coerce to TIMESTAMP micros — DATE lifts to midnight; TIMESTAMP

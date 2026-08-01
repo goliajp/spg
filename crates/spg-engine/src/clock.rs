@@ -194,15 +194,45 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64, mysql: bool, tz_offset: i64) {
             // was being recognised as the other overload.
             // The index must stay BEHIND the arity check: reading `args[0]`
             // first panicked the connection thread on a zero-argument call.
-            let is_xid_arg = args.first().is_some_and(|a| {
+            // v7.39 (round 668) — renamed, because the old name said `xid`
+            // while the list also held bare integers, and that conflation is
+            // what let `age(12345)` be described as "the xid overload" in two
+            // tests. What this really decides is whether to inject a clock.
+            //
+            // Integer CASTS join it: they are not xids either, but they must
+            // reach the refusal in `datetime::age` to be told so in PG's
+            // words. Injecting a clock first turned `age(12345::bigint)` into
+            // the two-timestamp form, which answered "age() needs DATE or
+            // TIMESTAMP, got bigint" where PG says
+            // "function age(bigint) does not exist".
+            let takes_no_clock = args.first().is_some_and(|a| {
                 matches!(a, Expr::Literal(Literal::Integer(_)))
+                    // `Int` and `BigInt` are their own CastTarget variants,
+                    // so the name list below never sees them. Measured: with
+                    // only the names, `12345::smallint` reached the refusal
+                    // and `12345::bigint` did not.
+                    || matches!(
+                        a,
+                        Expr::Cast {
+                            target: spg_sql::ast::CastTarget::Int
+                                | spg_sql::ast::CastTarget::BigInt,
+                            ..
+                        }
+                    )
                     || matches!(
                         a,
                         Expr::Cast { target: spg_sql::ast::CastTarget::Named(n), .. }
                             if n.eq_ignore_ascii_case("xid")
+                                || n.eq_ignore_ascii_case("int2")
+                                || n.eq_ignore_ascii_case("int4")
+                                || n.eq_ignore_ascii_case("int8")
+                                || n.eq_ignore_ascii_case("smallint")
+                                || n.eq_ignore_ascii_case("integer")
+                                || n.eq_ignore_ascii_case("int")
+                                || n.eq_ignore_ascii_case("bigint")
                     )
             });
-            if args.len() == 1 && name.eq_ignore_ascii_case("age") && !is_xid_arg {
+            if args.len() == 1 && name.eq_ignore_ascii_case("age") && !takes_no_clock {
                 let midnight = now.div_euclid(86_400_000_000) * 86_400_000_000;
                 let today = Expr::Cast {
                     expr: alloc::boxed::Box::new(Expr::Literal(Literal::Integer(midnight))),

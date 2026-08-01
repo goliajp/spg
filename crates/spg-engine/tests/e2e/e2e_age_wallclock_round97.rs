@@ -46,9 +46,17 @@ fn single_arg_age_uses_the_wall_clock() {
 
 #[test]
 fn age_xid_overload_untouched() {
-    // The integer (xid) overload must NOT get a clock argument injected.
+    // The xid overload must NOT get a clock argument injected.
+    //
+    // v7.39 (round 668) — this used to check `age(12345)`, calling a bare
+    // integer "the integer (xid) overload". It is not one: PG refuses it,
+    // and the overload this test means is the one taking a real `xid`. The
+    // property under test is unchanged — no clock argument is injected —
+    // but it is now checked on the call that actually has the overload.
     let mut e = Engine::new().with_clock(fixed_today);
-    assert_eq!(text(&mut e, "SELECT age(12345)::text"), "0");
+    // A clock-injected call would become the two-timestamp form and yield an
+    // interval; the xid form stays an integer distance.
+    assert_eq!(text(&mut e, "SELECT age('4294967295'::xid)::text"), "0");
 }
 
 #[test]
