@@ -34,6 +34,7 @@ macro_rules! bump_counter {
     }};
 }
 
+mod collate;
 mod acl;
 pub mod aggregate;
 pub(crate) mod amcheck;
