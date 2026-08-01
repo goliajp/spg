@@ -555,14 +555,18 @@ fn info_column_row(
             // attcollation is 100. The two columns do not answer the same
             // question — attcollation names the collation in force,
             // information_schema names the one the DDL wrote down.
+            // v7.39 (round 679) — report the name the DDL wrote, whatever it
+            // was. Round 676 whitelisted C / POSIX / default and answered
+            // NULL for anything else, on the reasoning that naming a
+            // collation SPG cannot perform would claim too much. Measured
+            // against PG, that is backwards: information_schema reports what
+            // the DDL DECLARED, and a client reading it back to regenerate
+            // DDL needs the name it wrote. What must not overclaim is the
+            // BEHAVIOUR, and round 679 makes that explicit instead — a
+            // WARNING at CREATE TABLE saying the column is ordered by bytes.
             match col.collation_name.as_deref() {
-                Some(n) if n.eq_ignore_ascii_case("C") => Value::text::<&str>("C"),
-                Some(n) if n.eq_ignore_ascii_case("POSIX") => Value::text::<&str>("POSIX"),
-                Some(n) if n.eq_ignore_ascii_case("default") => Value::text::<&str>("default"),
-                // A name SPG cannot perform is not reported as if it could
-                // be. F36 tracks accepting-and-ignoring; naming it here
-                // would claim more than is true.
-                _ => Value::Null,
+                Some(n) => Value::text::<&str>(n),
+                None => Value::Null,
             },
             Value::text::<&str>(udt),
             // v7.39 (round 248) — a SERIAL column is NOT identity in PG

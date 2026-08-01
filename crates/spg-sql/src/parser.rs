@@ -15807,12 +15807,16 @@ impl Parser {
                     // `pg_attribute.attcollation` has to tell them apart.
                     // The schema qualifier goes: PG's `pg_catalog.default`
                     // and a bare `default` name the same collation.
-                    collation_name = Some(alloc::string::String::from(
-                        raw.trim_matches(|c: char| c == '"' || c == '\'')
-                            .rsplit('.')
-                            .next()
-                            .unwrap_or(&raw),
-                    ));
+                    // v7.39 (round 679) — strip a SCHEMA qualifier, not an
+                    // encoding suffix. Round 676 used `rsplit('.')` for
+                    // both, and `COLLATE "en_US.utf8"` came out as `utf8`:
+                    // PG writes `pg_catalog.default` (qualifier) and
+                    // `en_US.utf8` (locale + encoding) with the same
+                    // separator. Only `pg_catalog.` is a qualifier, and it
+                    // is the only one PG's own dumps emit.
+                    let bare = raw.trim_matches(|c: char| c == '"' || c == '\'');
+                    let bare = bare.strip_prefix("pg_catalog.").unwrap_or(bare);
+                    collation_name = Some(alloc::string::String::from(bare));
                     let parsed = Collation::from_collation_name(&raw);
                     // Last COLLATE clause wins, but `Binary` from a
                     // bare keyword like `default` should not
