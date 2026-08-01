@@ -11,8 +11,24 @@ SPG_PORT="${SPG_PORT:-26000}"
 # this since it was written; this corpus was the one gate that still assumed
 # a human had a server up, which is a large part of why it stayed outside
 # `scripts/gate.sh` and outside version control.
+# v7.39 (round 667) — ALWAYS start our own, and take the port from whoever
+# has it.
+#
+# The first version reused any server already listening, which is how this
+# gate's first real red was a false one: a probe server left running from
+# before a fix was still on the port, so the gate judged a binary that was
+# two commits stale and reported a deviation that no longer existed. A gate
+# that silently grades an unknown build is worse than no gate — it was
+# exactly the hazard the cleanup comment below already warned about, just
+# arriving from the other side.
+#
+# SPG_REUSE=1 opts back into reusing a running server, for hand-driving
+# against one you started deliberately.
 OWN_SERVER=""
-if ! (exec 3<>/dev/tcp/127.0.0.1/"$SPG_PORT") 2>/dev/null; then
+if [ "${SPG_REUSE:-0}" = 1 ] && (exec 3<>/dev/tcp/127.0.0.1/"$SPG_PORT") 2>/dev/null; then
+  :
+else
+  lsof -ti :"$SPG_PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
   (cd "$ROOT" && cargo build --release --bin spg-server -q)
   SPG_DATA_DIR="$(mktemp -d)"
   export SPG_DATA_DIR

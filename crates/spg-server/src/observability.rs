@@ -596,6 +596,7 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 DataType::BigInt
                 | DataType::Xid
                 | DataType::Xid8
+                | DataType::Oid
                 | DataType::Date
                 | DataType::Timestamp
                 | DataType::Timestamptz

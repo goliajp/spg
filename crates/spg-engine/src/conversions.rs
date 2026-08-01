@@ -2501,11 +2501,15 @@ fn type_name_to_data_type_lower(n: &str) -> Option<DataType> {
         "float_array" | "double_array" | "real_array" | "float8_array" | "float4_array" => {
             DataType::FloatArray
         }
-        // Width-suffixed float spellings and OID — SPG has one
-        // float representation and OIDs are plain integers.
+        // Width-suffixed float spellings — SPG has one float
+        // representation.
         "float4" | "real" => DataType::Real,
         "float8" | "double precision" | "float" => DataType::Float,
-        "oid" => DataType::BigInt,
+        // v7.39 (round 667) — this said "OIDs are plain integers" and
+        // mapped to BigInt, which is why `pg_typeof(1::oid)` answered
+        // `bigint`. The VALUE is still a bigint; what changed is that the
+        // declared type is no longer thrown away. See `DataType::Oid`.
+        "oid" => DataType::Oid,
         // TIME [WITHOUT TIME ZONE] — first-class since the codec
         // carries Value::Time; the coerce path parses HH:MM:SS.
         "time" | "time without time zone" => DataType::Time,
@@ -2565,6 +2569,7 @@ pub(crate) const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::Name => DataType::Name,
         ColumnTypeName::Xid => DataType::Xid,
         ColumnTypeName::Xid8 => DataType::Xid8,
+        ColumnTypeName::Oid => DataType::Oid,
         ColumnTypeName::Varchar(n) => DataType::Varchar(n),
         ColumnTypeName::Char(n) => DataType::Char(n),
         ColumnTypeName::Bool => DataType::Bool,
@@ -3545,7 +3550,18 @@ fn coerce_untyped_value(
     match (&v, expected) {
         // A regclass IS an oid — it coerces to any integer width, and to text
         // through its relation name.
-        (Value::RegClass(oid, _) | Value::RegProc(oid, _) | Value::RegType(oid, _), DataType::BigInt) => {
+        //
+        // v7.39 (round 667) — `DataType::Oid` is listed with BigInt here and
+        // is not optional. Giving the `oid` name its own DataType turned
+        // `'text'::regtype::oid` from a coercion into a column of type
+        // BIGINT into one of type OID, and nine catalog tests went red at
+        // once. This is the THIRD list that has to name the reg* trio
+        // together; the other two are the bigint materialiser below and the
+        // classifier that decides a value is reg-shaped.
+        (
+            Value::RegClass(oid, _) | Value::RegProc(oid, _) | Value::RegType(oid, _),
+            DataType::BigInt | DataType::Oid,
+        ) => {
             Ok(Value::BigInt(*oid))
         }
         (Value::RegClass(oid, _) | Value::RegProc(oid, _) | Value::RegType(oid, _), DataType::Int) => {
@@ -3889,6 +3905,43 @@ fn try_coerce_time_family(
         }
         _ => None,
     }
+}
+
+/// Normalise a value into PG's `oid` domain, or `Ok(None)` when the value is
+/// not something an oid can be made from.
+///
+/// v7.39 (round 667) — extracted rather than copied. The rules lived inline
+/// in the `::oid` cast and were already right (a negative wraps the way C's
+/// `(Oid)` cast does, past `u32::MAX` is "OID out of range", bad text is
+/// PG's 22P02 wording). Assigning INTO an oid column needed the same rules,
+/// and round 665 had just finished paying for four hand-copies of one
+/// accumulator, so this is one function with two callers instead.
+pub(crate) fn coerce_to_oid(v: &Value<'_>) -> Result<Option<Value<'static>>, EvalError> {
+    let as_i64 = match v {
+        Value::Null => return Ok(Some(Value::Null)),
+        Value::SmallInt(n) => i64::from(*n),
+        Value::Int(n) => i64::from(*n),
+        Value::BigInt(n) => *n,
+        Value::Text(t) => match t.trim().parse::<i64>() {
+            Ok(n) => n,
+            Err(_) => {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("invalid input syntax for type oid: {:?}", t.trim()),
+                });
+            }
+        },
+        _ => return Ok(None),
+    };
+    // 32-bit wrap for negatives (C cast semantics).
+    if (-(1i64 << 31)..0).contains(&as_i64) {
+        return Ok(Some(Value::BigInt(as_i64 + (1i64 << 32))));
+    }
+    if !(0..=i64::from(u32::MAX)).contains(&as_i64) {
+        return Err(EvalError::TypeMismatch {
+            detail: "OID out of range".into(),
+        });
+    }
+    Ok(Some(Value::BigInt(as_i64)))
 }
 
 pub(crate) fn coerce_value(
@@ -4243,6 +4296,10 @@ pub(crate) fn coerce_value(
         // is of type bigint"); closing that needs a `Value::Xid8`, which
         // is its own unit of work.
         (Value::BigInt(n), DataType::Xid8) => Some(Value::BigInt(n)),
+        // v7.39 (round 667) — assigning into an OID column. PG takes an
+        // integer here (and, measured, refuses the same integer for an xid
+        // column); the range and wrap rules are the cast's, shared.
+        (ref other, DataType::Oid) => coerce_to_oid(other)?,
         (Value::Text(s), DataType::Float) => {
             // v7.39 (round 270) — a numeric-looking text outside the
             // double range is "out of range", not "invalid input

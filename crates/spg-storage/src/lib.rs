@@ -184,6 +184,27 @@ pub enum DataType {
     /// the wire OID, and not enough to refuse a bigint where PG refuses
     /// one. `pg_current_xact_id()` returns this type on PG.
     Xid8,
+    /// v7.39 (round 667) — PG's `oid`: an unsigned 32-bit object
+    /// identifier. Modelled exactly like [`DataType::Xid8`] above: it has
+    /// no value of its own, a cell is a `Value::BigInt`, and only the
+    /// declared type witnesses it.
+    ///
+    /// That deliberately buys less than a full value type. What it buys:
+    /// `CREATE TABLE t(o OID)` is accepted (it was rejected outright with
+    /// `type "oid" does not exist`, while the neighbouring `XID` worked),
+    /// `pg_typeof` answers `oid` rather than `bigint`, and the catalogs
+    /// report their own key columns honestly. What it does NOT buy is
+    /// refusing a bigint where PG refuses an oid — `sum(oid)` and
+    /// `avg(oid)` still answer here and error on PG, because at runtime
+    /// the cell is indistinguishable from a bigint. Round 664 tried to
+    /// close those two by name and withdrew: a guard keyed on the name
+    /// would have caught `sum(bigint)` with it.
+    ///
+    /// The cast itself was already right before this — `4294967296::oid`
+    /// and `'abc'::oid` produce PG's errors word for word, and `(-1)::oid`
+    /// wraps to 4294967295 as PG does. Only the resulting type was lost,
+    /// because `conversions.rs` mapped the target to `BigInt`.
+    Oid,
     /// `INTERVAL` — calendar-aware span (months + microseconds). v2.11
     /// supports INTERVAL only as a runtime intermediate (literals,
     /// arithmetic results); on-disk encoding is rejected so this branch
@@ -475,6 +496,7 @@ impl fmt::Display for DataType {
             Self::BigInt => f.write_str("BIGINT"),
             Self::Xid => f.write_str("XID"),
             Self::Xid8 => f.write_str("XID8"),
+            Self::Oid => f.write_str("OID"),
             Self::Float => f.write_str("FLOAT"),
             Self::Real => f.write_str("REAL"),
             Self::Text => f.write_str("TEXT"),

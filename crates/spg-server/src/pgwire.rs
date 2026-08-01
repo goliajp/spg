@@ -7878,6 +7878,8 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         // v7.39 (round 640) — a transaction id introspects as one.
         DataType::Xid => 28,
         DataType::Xid8 => 5069,
+        // v7.39 (round 667) — PG's oid type oid.
+        DataType::Oid => 26,
         DataType::SmallInt => 21,
         DataType::Int => 23,
         DataType::BigInt => 20,

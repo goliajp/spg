@@ -1091,6 +1091,7 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // column was declared with.
         DataType::Xid => out.push(73),
         DataType::Xid8 => out.push(74),
+        DataType::Oid => out.push(75),
         DataType::Bool => out.push(5),
         DataType::Vector { dim, encoding } => match encoding {
             // Tag 6: pre-v6 F32 vector. Layout unchanged; pre-v6
@@ -1278,6 +1279,7 @@ impl Cursor<'_> {
             72 => Ok(DataType::Name),
             73 => Ok(DataType::Xid),
             74 => Ok(DataType::Xid8),
+            75 => Ok(DataType::Oid),
             5 => Ok(DataType::Bool),
             6 => Ok(DataType::Vector {
                 dim: self.read_u32()?,
@@ -1833,7 +1835,7 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
         (Value::SmallInt(n), DataType::SmallInt) => out.extend_from_slice(&n.to_le_bytes()),
         (Value::Int(n), DataType::Int) => out.extend_from_slice(&n.to_le_bytes()),
         // v7.39 (round 640) — xid / xid8 share the BIGINT body.
-        (Value::BigInt(n), DataType::BigInt | DataType::Xid | DataType::Xid8) => {
+        (Value::BigInt(n), DataType::BigInt | DataType::Xid | DataType::Xid8 | DataType::Oid) => {
             out.extend_from_slice(&n.to_le_bytes())
         }
         (Value::Xid(x), DataType::Xid) => out.extend_from_slice(&i64::from(*x).to_le_bytes()),
@@ -3490,7 +3492,7 @@ impl<'a> Cursor<'a> {
             // xid, but it reads back as the Value::Xid round 512 already
             // gave the type, so a stored column and a `'5'::xid` literal
             // are the same thing to everything downstream.
-            DataType::BigInt | DataType::Xid8 => Ok(Value::BigInt(self.read_i64()?)),
+            DataType::BigInt | DataType::Xid8 | DataType::Oid => Ok(Value::BigInt(self.read_i64()?)),
             DataType::Xid => Ok(Value::Xid(self.read_i64()? as u32)),
             DataType::Float => Ok(Value::Float(self.read_f64()?)),
             DataType::Real => Ok(Value::Real(self.read_f32()?)),

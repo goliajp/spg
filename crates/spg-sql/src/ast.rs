@@ -2621,6 +2621,10 @@ pub enum ColumnTypeName {
     /// SPG answered `type "xid" does not exist` to.
     Xid,
     Xid8,
+    /// v7.39 (round 667) — `OID`. `XID` was already a column type here
+    /// and `OID` was not, so `CREATE TABLE t(o OID)` answered
+    /// `type "oid" does not exist` while `t(x XID)` built fine.
+    Oid,
     SmallInt,
     Int,
     BigInt,
@@ -2820,6 +2824,7 @@ impl fmt::Display for ColumnTypeName {
             Self::Name => f.write_str("name"),
             Self::Xid => f.write_str("xid"),
             Self::Xid8 => f.write_str("xid8"),
+            Self::Oid => f.write_str("oid"),
             Self::Varchar(n) => write!(f, "VARCHAR({n})"),
             Self::Char(n) => write!(f, "CHAR({n})"),
             Self::Bool => f.write_str("BOOL"),
