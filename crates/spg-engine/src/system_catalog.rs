@@ -308,6 +308,11 @@ pub(crate) fn synth_information_schema_columns(
         // JDBC getColumns reads it alongside the precision.
         ColumnSchema::new("numeric_precision_radix", DataType::Int, true),
         ColumnSchema::new("numeric_scale", DataType::Int, true),
+        // v7.39 (round 675) — the column did not exist, so
+        // `SELECT collation_name FROM information_schema.columns` was an
+        // "column does not exist" error rather than an answer. PG names the
+        // collation for the collatable types and leaves it NULL otherwise.
+        ColumnSchema::new("collation_name", DataType::Text, true),
         ColumnSchema::new("udt_name", DataType::Text, false),
         ColumnSchema::new("is_identity", DataType::Text, false),
         // v7.39 (round 248) — the columns the sweep found missing: JDBC /
@@ -542,6 +547,16 @@ fn info_column_row(
                 _ => Value::Int(2),
             },
             num_scale,
+            // Mirrors `pg_attr_collation`: the collatable types carry the
+            // `default` collation and `name` carries `C`; PG prints the
+            // NAME here where pg_attribute prints the oid.
+            match col.ty {
+                DataType::Text | DataType::Varchar(_) | DataType::Char(_) => {
+                    Value::text::<&str>("default")
+                }
+                DataType::Name => Value::text::<&str>("C"),
+                _ => Value::Null,
+            },
             Value::text::<&str>(udt),
             // v7.39 (round 248) — a SERIAL column is NOT identity in PG
             // (is_identity keys off GENERATED … AS IDENTITY). SPG only
@@ -3383,6 +3398,31 @@ const PG_CLASS_RELALLVISIBLE: usize = 11;
 const PG_CLASS_RELKIND: usize = 16;
 const PG_CLASS_RELISPARTITION: usize = 26;
 
+/// The collation a column of this type carries, as `pg_attribute.attcollation`.
+///
+/// v7.39 (round 675) — this was hard-coded 0 at both fill sites, under a
+/// comment reading "0 (default)". 0 is not the default; it is what PG puts
+/// on a type that HAS no collation. Measured on PG18: `text`, `varchar` and
+/// `char` carry 100 (the `default` collation), `name` carries 950 (`C`, and
+/// PG's name type really is C-collated), and everything else — int, date,
+/// bytea, json, uuid, xml, inet, money, numeric, timestamp, bool — is 0.
+///
+/// SPG's `pg_collation` already lists those three with PG's own oids
+/// (default 100, C 950, POSIX 951), so this connects a catalog that was
+/// already right to the columns that were reporting nothing.
+///
+/// A column with an explicit `COLLATE` still reports the type default here:
+/// the name is discarded during parsing and there is nowhere to read it
+/// from yet. That is the next step in `docs/COLLATION_RFC.md` §5 and the
+/// reason F36 records the declaration as "taken and ignored".
+fn pg_attr_collation(ty: DataType) -> i64 {
+    match ty {
+        DataType::Text | DataType::Varchar(_) | DataType::Char(_) => 100,
+        DataType::Name => 950,
+        _ => 0,
+    }
+}
+
 fn splice_pg_class_v18_schema(schema: &mut Vec<ColumnSchema>) {
     // v7.39 (round 541) — a REAL text[]. pg_dump does
     // `array_remove(c.reloptions, 'check_option=local')` and
@@ -3627,7 +3667,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Bool(false), // attisdropped
                 Value::Bool(true),  // attislocal — true (not inherited)
                 Value::Int(0),      // attinhcount
-                Value::BigInt(0),   // attcollation — 0 (default)
+                Value::BigInt(pg_attr_collation(col.ty)), // attcollation
                 crate::acl::render_acl_list(&col.acl).map_or(Value::Null, Value::text),
                 // v7.39 (round 543) — PG18's tail, measured on a plain
                 // table: attcompression empty, atthasmissing false,
@@ -3737,7 +3777,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Bool(false), // attisdropped
                 Value::Bool(true),  // attislocal
                 Value::Int(0),      // attinhcount
-                Value::BigInt(0),   // attcollation
+                Value::BigInt(pg_attr_collation(col.ty)), // attcollation
                 Value::Null,        // attacl
                 Value::text(""),    // attcompression
                 Value::Bool(false), // atthasmissing
