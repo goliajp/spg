@@ -567,11 +567,11 @@ impl Engine {
     /// A role named in a GRANT must exist. PUBLIC (the empty grantee) always
     /// does; so does the login role, which is not a UserStore entry.
     pub(crate) fn acl_check_role_exists(&self, role: &str) -> Result<(), EngineError> {
-        if role.is_empty()
-            || role.eq_ignore_ascii_case(LOGIN_ROLE)
-            || role.eq_ignore_ascii_case(crate::session::BOOTSTRAP_ROLE)
-            || self.users.contains(role)
-        {
+        // v7.39 (round 696) — `role_exists` covers the bootstrap role and
+        // the session's own identity, so the tail of this condition became
+        // it. PUBLIC and the built-in login role stay spelled out; they are
+        // GRANT's own vocabulary, not entries in any role store.
+        if role.is_empty() || role.eq_ignore_ascii_case(LOGIN_ROLE) || self.role_exists(role) {
             return Ok(());
         }
         Err(EngineError::Unsupported(alloc::format!(

@@ -1547,6 +1547,13 @@ impl Engine {
     /// and roles live on the engine rather than the catalog.
     #[must_use]
     pub fn role_exists(&self, name: &str) -> bool {
+        // v7.39 (round 696) — the SESSION's own identity, same class as the
+        // `postgres` case below and missed by it. `current_user` reported
+        // the connected name while this predicate denied it, so `SET ROLE
+        // <me>` refused the role the session was already running as.
+        if name == self.session_user() {
+            return true;
+        }
         // The engine's default identity exists even before any CREATE USER.
         //
         // v7.39 (round 652) — and so does `postgres`. `synth_pg_roles`

@@ -64,8 +64,7 @@ fn is_dump_noise_statement(lc: &str) -> bool {
         // `relacl`, enforced against the session role); a grant on any other
         // object class still parses and no-ops so dumps restore.
         // MySQL bulk-load brackets.
-        "lock"
-            | "unlock"
+        "unlock"
             // MySQL OPTIMIZE / ANALYZE TABLE / CHECK TABLE
             // diagnostics that pg_dump-style tools also emit
             // post-restore.
@@ -94,14 +93,12 @@ fn is_dump_noise_statement(lc: &str) -> bool {
             // sequences), no matching security-label / storage-
             // option to apply, no separate CREATE/DROP CAST that
             // affects execution.
-            | "security"
             // v7.37.17 (17.6 siblings) — PG role-cleanup statements
             // pg_dump / pg_dumpall emit around DROP ROLE:
             //   REASSIGN OWNED BY <role> [, ...] TO <newrole>
             //   DROP OWNED BY <role> [, ...] [CASCADE | RESTRICT]
             // Both operate on the role's owned objects; SPG has no
             // role-owner model, so accept-and-no-op.
-            | "reassign"
             // v7.37.17 (17.6 sibling) — LOAD '<library>'. pg_dump
             // + extension scripts use LOAD to preload shared
             // libraries. SPG doesn't have a shared-library extension
@@ -1946,6 +1943,43 @@ impl Parser {
             if lc == "discard" {
                 return self.parse_discard();
             }
+            // v7.39 (round 696) — REASSIGN OWNED BY <role> [, …] TO <role>.
+            // Still performs nothing; the roles are carried out so a name
+            // that does not exist is refused, as PG18 refuses it.
+            if lc == "reassign" {
+                self.advance();
+                if matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("owned")) {
+                    self.advance();
+                }
+                if self.peek_is_by() {
+                    self.advance();
+                }
+                // Only the roles BEFORE the TO are the ones that must
+                // exist — `TO` names the new owner, which PG checks as
+                // well, so both lists are collected.
+                let mut names = self.take_comma_separated_names();
+                if matches!(self.peek(), Token::To) {
+                    self.advance();
+                    names.extend(self.take_comma_separated_names());
+                }
+                self.consume_until_statement_boundary();
+                return Ok(Statement::ValidateOnly {
+                    kind: crate::ast::ValidateOnlyKind::OwnedByRole,
+                    names,
+                });
+            }
+            // v7.39 (round 696) — SECURITY LABEL. PG18 refuses it
+            // unconditionally with `no security label providers have been
+            // loaded`, whatever object it names, because none is loaded.
+            // SPG has none either; accepting it told the caller a label had
+            // been applied when nothing anywhere records one.
+            if lc == "security" {
+                self.consume_until_statement_boundary();
+                return Ok(Statement::ValidateOnly {
+                    kind: crate::ast::ValidateOnlyKind::SecurityLabel,
+                    names: Vec::new(),
+                });
+            }
             if is_dump_noise_statement(&lc) {
                 self.consume_until_statement_boundary();
                 return Ok(Statement::Empty);
@@ -2688,9 +2722,20 @@ impl Parser {
                     Token::Ident(s) | Token::QuotedIdent(s)
                         if s.eq_ignore_ascii_case("owned") =>
                     {
+                        // v7.39 (round 696) — still a no-op (SPG has no
+                        // role-owner model), but the ROLE is carried out so
+                        // the engine can refuse one that does not exist,
+                        // which is what PG18 does.
                         self.advance();
+                        if self.peek_is_by() {
+                            self.advance();
+                        }
+                        let names = self.take_comma_separated_names();
                         self.consume_until_statement_boundary();
-                        Ok(Statement::Empty)
+                        Ok(Statement::ValidateOnly {
+                            kind: crate::ast::ValidateOnlyKind::OwnedByRole,
+                            names,
+                        })
                     }
                     // v7.39 (round 436) — MySQL's `DROP TEMPORARY TABLE t`.
                     // It drops only a TEMPORARY table, and name resolution
@@ -3284,8 +3329,28 @@ impl Parser {
             // compat.
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("lock") => {
                 self.advance();
+                // v7.39 (round 696) — the LOCK still has no effect (SPG's
+                // engine holds a process-wide write lock), but the TABLE
+                // NAME is now carried out so the engine can refuse one that
+                // does not exist, as PG18 does. MySQL's `LOCK TABLES …
+                // READ|WRITE` is a different statement with the same first
+                // word; it keeps the old no-op, because a MySQL dump's
+                // bracket names tables it is about to create.
+                let mysql_tables = matches!(self.peek(), Token::Ident(k)
+                    if k.eq_ignore_ascii_case("tables"));
+                if mysql_tables {
+                    self.consume_until_statement_boundary();
+                    return Ok(Statement::Empty);
+                }
+                if matches!(self.peek(), Token::Table) {
+                    self.advance();
+                }
+                let names = self.take_comma_separated_names();
                 self.consume_until_statement_boundary();
-                Ok(Statement::Empty)
+                Ok(Statement::ValidateOnly {
+                    kind: crate::ast::ValidateOnlyKind::LockTable,
+                    names,
+                })
             }
             // v7.37.17 (17.6 sibling) — CHECKPOINT. Forces a WAL
             // durability marker + snapshot in PG. SPG has WAL
@@ -21532,6 +21597,31 @@ impl Parser {
             }
             return Ok(expr);
         }
+    }
+
+    /// v7.39 (round 696) — a comma-separated list of bare names, stopping at
+    /// the first token that is not one. Schema qualifiers collapse to the
+    /// last part, which is what every other name path here does (SPG is
+    /// single-schema).
+    fn take_comma_separated_names(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Token::Ident(n) | Token::QuotedIdent(n) = self.peek().clone() {
+            self.advance();
+            let mut last = n;
+            while matches!(self.peek(), Token::Dot) {
+                self.advance();
+                if let Token::Ident(t) | Token::QuotedIdent(t) = self.advance() {
+                    last = t;
+                }
+            }
+            out.push(last);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        out
     }
 
     /// v7.39 (round 694) — is the next token pair a postfix `[]`?

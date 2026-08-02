@@ -1241,9 +1241,13 @@ impl Engine {
             // effect and no error.
             Statement::SetDbRoleSetting(st) => {
                 // PG refuses a scope that names something absent.
+                // v7.39 (round 696) — one predicate. This wrote its own
+                // (`users.any(…) || postgres`), `acl_check_role_exists`
+                // wrote a third, and round 652 already recorded what
+                // happens when a role predicate and the catalog it reflects
+                // disagree. `role_exists` is the one that answers.
                 if let Some(role) = &st.role
-                    && !self.users.iter().any(|(n, _)| n.eq_ignore_ascii_case(role))
-                    && !role.eq_ignore_ascii_case("postgres")
+                    && !self.role_exists(role)
                 {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "role \"{role}\" does not exist"
@@ -1411,6 +1415,47 @@ impl Engine {
             // The F31 audit found this: the test was called
             // `alter_system_set_no_op` and set `work_mem`, a name that
             // exists, so it could never have caught a name that does not.
+            // v7.39 (round 696) — the four statements the F31 sweep found
+            // accepting a name that does not exist. SPG still performs
+            // nothing for any of them; what changed is that it no longer
+            // says "understood" about an object that is not there.
+            Statement::ValidateOnly { kind, names } => {
+                use spg_sql::ast::ValidateOnlyKind as K;
+                match kind {
+                    K::LockTable => {
+                        for n in names {
+                            if self.catalog.get(n.as_str()).is_none() {
+                                return Err(EngineError::Storage(
+                                    spg_storage::StorageError::TableNotFound {
+                                        name: n.clone(),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    K::OwnedByRole => {
+                        for n in names {
+                            if !self.role_exists(n.as_str()) {
+                                return Err(EngineError::Unsupported(alloc::format!(
+                                    "role \"{n}\" does not exist"
+                                )));
+                            }
+                        }
+                    }
+                    // PG18 refuses this whatever it names, because no label
+                    // provider is loaded — and SPG has none either, so the
+                    // refusal is the honest answer rather than a stand-in.
+                    K::SecurityLabel => {
+                        return Err(EngineError::Unsupported(alloc::string::String::from(
+                            "no security label providers have been loaded",
+                        )));
+                    }
+                }
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
             Statement::AlterSystem { parameter } => {
                 if let Some(name) = parameter
                     && let Some(msg) = self.reject_unsettable_guc(name.as_str())

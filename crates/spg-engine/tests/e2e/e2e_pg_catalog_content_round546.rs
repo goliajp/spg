@@ -225,7 +225,13 @@ fn round546_role_views_agree_and_mask() {
             &mut e,
             "SELECT rolname, rolsuper, rolcanlogin, rolconnlimit, rolpassword FROM pg_authid"
         ),
-        vec!["postgres|true|true|-1|********"]
+        // v7.39 (round 696) — the session's own identity is a role now. It
+        // was the one name `current_user` reported and no role view listed,
+        // which is the same disagreement round 652 closed for `postgres`.
+        vec![
+            "postgres|true|true|-1|********",
+            "admin|true|true|-1|********",
+        ]
     );
     assert_eq!(
         columns(&mut e, "SELECT * FROM pg_group"),
@@ -233,7 +239,10 @@ fn round546_role_views_agree_and_mask() {
     );
     assert_eq!(
         rows(&mut e, "SELECT usename, passwd FROM pg_shadow"),
-        vec!["postgres|********"]
+        // v7.39 (round 696) — and here too: the role views agree with each
+        // other, which is what this test is named for, and they now all
+        // include the session's identity.
+        vec!["postgres|********", "admin|********"]
     );
     // pg_authid's oid is pg_roles' oid — the join a tool makes.
     assert_eq!(
@@ -241,7 +250,11 @@ fn round546_role_views_agree_and_mask() {
             &mut e,
             "SELECT a.rolname FROM pg_authid a JOIN pg_roles r ON r.oid = a.oid"
         ),
-        vec!["postgres"]
+        // v7.39 (round 696) — BOTH roles join, which is the stronger form
+        // of what this assertion is for: the session identity added this
+        // round carries the same oid in every view, so a tool that joins
+        // them does not lose it.
+        vec!["postgres", "admin"]
     );
 }
 
