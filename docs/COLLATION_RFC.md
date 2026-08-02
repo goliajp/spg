@@ -167,6 +167,40 @@ call sites. There are 33 construction sites; only those that know the column
 can supply a collation, and the rest keep today's byte order, which is
 correct for a column that declares none.
 
+## 4c. What actually honours a collation — measured, round 685
+
+Rounds 683-684 wired the single-table scan and its commit says "COLLATE now
+changes the order". Measured across query shapes afterwards, that is true of
+two:
+
+| shape | honours COLLATE |
+|---|---|
+| `SELECT loc FROM t ORDER BY loc` | yes |
+| `SELECT DISTINCT loc FROM t ORDER BY loc` | yes |
+| `SELECT a.loc FROM a JOIN b … ORDER BY a.loc` | **no** |
+| `SELECT loc FROM t GROUP BY loc ORDER BY loc` | **no** |
+
+Round 685 then repeated round 682's mistake: seven more sites were wired
+across `select.rs` before checking whether the failing queries reach them.
+Forcing every collated comparison to reverse moved nothing, proving none of
+the seven is on those paths. Reverted, again, to the committed tree.
+
+Two things this establishes for whoever does the join and group-by paths:
+
+**Probe shapes matter more than probe count.** The first survey wrapped
+every case in `string_agg(loc, ',' ORDER BY loc)`, whose final order comes
+from the aggregate's own sort, not the query's. Six shapes looked broken
+that were never being measured. Bare `SELECT … ORDER BY` is what tells the
+truth.
+
+**Force-reverse before wiring, not after.** It costs one build and answers
+"is this code on the path" exactly. Both rounds that skipped it wired the
+wrong places; the round that used it first landed in one go.
+
+**`TopNEntry` in `join.rs` is not the join sort.** It is the top-N heap,
+reached only with a LIMIT. A plain ORDER BY over a join sorts somewhere
+else, and that somewhere has not been located yet.
+
 ## 5. Recommendation
 
 Adopt (a). Sequence: converge comparison (with a bench) → thread the
