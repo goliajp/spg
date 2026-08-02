@@ -1,5 +1,10 @@
-//! TABLE name shorthand + COLLATE clause (byte-order collations
-//! absorb; locale collations error honestly).
+//! TABLE name shorthand + COLLATE clause.
+//!
+//! v7.39 (round 691) — this file used to pin "a locale collation errors
+//! honestly", which was true while SPG had one text ordering. It performs
+//! them now, on an ORDER BY key, so the pin below moved from the error to
+//! the ORDER it produces. A locale collation at a COMPARISON still errors,
+//! and that is pinned in `e2e_collate_explicit_round691.rs` along with why.
 
 use spg_engine::{Engine, QueryResult};
 
@@ -36,7 +41,7 @@ fn table_shorthand_selects_star() {
 }
 
 #[test]
-fn collate_c_absorbs_locale_errors() {
+fn collate_c_absorbs_and_a_locale_orders() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE co (t TEXT)").unwrap();
     e.execute("INSERT INTO co VALUES ('b'), ('a')").unwrap();
@@ -46,11 +51,10 @@ fn collate_c_absorbs_locale_errors() {
     // POSIX / default spellings absorb too.
     rows(&mut e, "SELECT t COLLATE \"POSIX\" FROM co");
     rows(&mut e, "SELECT t COLLATE \"default\" FROM co");
-    // Locale collation would silently sort differently — honest
-    // error instead.
-    let err = e
-        .execute("SELECT t FROM co ORDER BY t COLLATE \"en_US\"")
-        .unwrap_err();
-    let msg = format!("{err:?}");
-    assert!(msg.contains("en_US"), "unexpected error: {msg}");
+    // v7.39 (round 691) — a locale collation on an ORDER BY key is
+    // performed. On this data it agrees with byte order; the pin that shows
+    // it CHANGES the answer lives in `e2e_collate_explicit_round691.rs`.
+    let got = rows(&mut e, "SELECT t FROM co ORDER BY t COLLATE \"en_US\"");
+    assert_eq!(got.len(), 2);
+    assert!(matches!(&got[0][0], spg_storage::Value::Text(s) if s == "a"));
 }

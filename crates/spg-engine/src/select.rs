@@ -23,7 +23,7 @@ use crate::{
     apply_offset_and_limit, apply_offset_and_limit_tagged, approx_row_bytes, build_order_keys,
     collect_meta_view_names, collect_qualified_refs, collect_scalar_subqueries,
     collect_window_nodes, compute_window_partition, eval, expr_tree_has_subquery,
-    materialise_in_order, materialise_meta_view, memoize, order_by_value_cmp_in, order_key_cmp,
+    materialise_in_order, materialise_meta_view, memoize, order_by_value_cmp_in,
     partition_key_cmp, rewrite_window_to_columns, select_has_window,
     select_references_meta_view, select_refers_to, sort_by_keys, synth_info_key_column_usage,
     synth_info_referential_constraints, synth_info_routines, synth_info_statistics,
@@ -316,6 +316,19 @@ impl Engine {
             let arg_bound = args
                 .first()
                 .and_then(|a| crate::orderby::bound_column_position(a, schema_cols, alias_opt));
+            // v7.39 (round 690) — a window's ORDER BY over a column that
+            // declares a collation sorts by it, the same as a top-level
+            // ORDER BY. Resolved from the bound position, so only a bare
+            // column gets one; an expression produces a new value and the
+            // derivation that would give IT a collation is unbuilt.
+            let o_colls: Vec<Option<alloc::string::String>> = o_bound
+                .iter()
+                .map(|p| {
+                    p.and_then(|pos| schema_cols.get(pos))
+                        .and_then(|sc| sc.collation_name.clone())
+                        .filter(|n| crate::collate::is_supported(n))
+                })
+                .collect();
             let mut indexed: Vec<(Vec<Value<'static>>, Vec<(Value, bool, Option<bool>)>, usize)> =
                 Vec::with_capacity(n_rows);
             for (i, row) in filtered.iter().enumerate() {
@@ -358,7 +371,7 @@ impl Engine {
                 if p_cmp != core::cmp::Ordering::Equal {
                     return p_cmp;
                 }
-                order_key_cmp(&a.1, &b.1)
+                crate::window::order_key_cmp_in(&a.1, &b.1, &o_colls)
             });
             // Per-partition compute.
             let mut out_vals: Vec<Value<'static>> = alloc::vec![Value::Null; n_rows];
@@ -5984,7 +5997,7 @@ impl Engine {
         // v7.39 (round 683) — the declared collation for each ORDER BY
         // position, resolved once and carried beside `descs` for the same
         // reason `descs` is carried: it is per key position, not per row.
-        let order_colls = crate::orderby::order_by_collations(&order_by, &ctx);
+        let order_colls = crate::orderby::order_by_collations(&order_by, &ctx)?;
         let topk_stream: Option<(usize, Vec<bool>)> = if !order_by.is_empty()
             && !stmt.distinct
             && !stmt.limit_with_ties
@@ -6856,7 +6869,7 @@ impl Engine {
             // exactly ONE resolver call in the engine before this — the
             // single-table scan's — which is why every other shape sorted by
             // bytes no matter what the schemas carried.
-            let colls = crate::orderby::order_by_collations(&stmt.order_by, &ctx);
+            let colls = crate::orderby::order_by_collations(&stmt.order_by, &ctx)?;
             crate::orderby::partial_sort_tagged_in(&mut tagged, keep, &descs, &colls);
         }
         let mut output_rows: Vec<Row<'static>> = tagged.into_iter().map(|(_, r)| r).collect();

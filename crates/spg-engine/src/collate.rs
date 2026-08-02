@@ -39,7 +39,18 @@ pub(crate) fn compare(collation: &str, a: &str, b: &str) -> Option<Ordering> {
     let locale = icu_locale_core::Locale::try_from_str(&normalise(name)).ok()?;
     let prefs = icu_collator::CollatorPreferences::from(&locale);
     let collator = icu_collator::Collator::try_new(prefs, pg_options()).ok()?;
-    Some(collator.compare(a, b))
+    // v7.39 (round 690) — the deterministic tiebreak. PG18's `en_US.utf8`
+    // has `collisdeterministic = t`, which means a collation tie is broken
+    // by the bytes, and it is observable: `e` + U+0301 and U+00E9 are
+    // canonically equivalent, so ICU calls them Equal, but PG18 orders the
+    // decomposed form FIRST (0x65 < 0xC3) and reports `=` as false.
+    // Without this, two such values would sort in whatever order the sort
+    // happened to leave them in.
+    Some(
+        collator
+            .compare(a, b)
+            .then_with(|| a.as_bytes().cmp(b.as_bytes())),
+    )
 }
 
 /// The options PG's collations behave under.
@@ -63,14 +74,18 @@ fn pg_options() -> icu_collator::options::CollatorOptions {
     // level, a tiebreak below it. `_id` sorts as `id`, `O'Brien` next to
     // `Obrien`, `de-luca` next to `deluca` — measured, all three.
     //
-    // One case stays wrong and no setting fixes it. Ordering values that
-    // are ENTIRELY punctuation, PG gives ` , -, ., _` and shifted ICU gives
-    // `_,  , ...`: with no letters, every primary weight is equal and the
-    // answer comes from the quaternary weights, where the two implementations
-    // differ. NonIgnorable gets that case right and every case with a letter
-    // in it wrong. Real columns hold names and identifiers, so the trade is
-    // one degenerate shape against every ordinary one — and it is a trade,
-    // recorded as F36's residual rather than described as complete.
+    // One case used to stay wrong and no setting fixed it: ordering values
+    // that are ENTIRELY punctuation, PG gave ` , -, ., _` and shifted ICU
+    // gave `_,  , ...`. Rounds 683/684 recorded that as F36's residual and
+    // took the trade — NonIgnorable got that one shape right and every
+    // shape with a letter in it wrong.
+    //
+    // v7.39 (round 690) — it closed as a side effect of the deterministic
+    // tiebreak in `compare`, and the reason is worth keeping: with no
+    // letters, ICU finds these EQUAL at every level, so what used to decide
+    // was nothing at all. The bytes decide now, and PG's answer for this
+    // shape IS byte order (` ` 0x20 < `-` 0x2D < `.` 0x2E < `_` 0x5F).
+    // Re-measured against PG18, not assumed.
     let mut o = icu_collator::options::CollatorOptions::default();
     o.alternate_handling = Some(icu_collator::options::AlternateHandling::Shifted);
     o.max_variable = Some(icu_collator::options::MaxVariable::Punctuation);
@@ -136,7 +151,7 @@ mod tests {
         assert_eq!(compare("en_US.utf8", "résumé", "resumes"), Some(Ordering::Less));
         // Digits before letters. Punctuation's place among them is a
         // quaternary question once nothing else separates the values — see
-        // `all_punctuation_values_are_a_known_residual`.
+        // `all_punctuation_values_now_match_pg`.
         assert_eq!(sorted("en_US.utf8", vec!["a", "1", "A"]), ["1", "a", "A"]);
         // `ab`, `a-b` and `a b` share a primary weight, so their relative
         // order is quaternary (the residual). What holds regardless: all
@@ -217,11 +232,14 @@ mod tests {
     /// two that get this right get every case with a letter in it wrong.
     /// F36 residual.
     #[test]
-    fn all_punctuation_values_are_a_known_residual() {
+    fn all_punctuation_values_now_match_pg() {
+        // Round 683/684 recorded this shape as F36's residual; round 690's
+        // deterministic tiebreak closed it, because ICU calls these Equal at
+        // every level and PG's answer here is byte order. Re-measured on
+        // PG18 (`' -._`) before this pin changed.
         assert_eq!(
             sorted("en_US.utf8", vec!["_", " ", "-", "."]),
-            ["_", " ", "-", "."],
-            "if this changes, re-measure against PG: it wants ' ', '-', '.', '_'"
+            [" ", "-", ".", "_"]
         );
     }
 

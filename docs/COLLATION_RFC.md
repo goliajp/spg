@@ -298,6 +298,145 @@ bare column reference, which is why that row is wrong.
 So the remaining work is not more wiring. It is collation DERIVATION — what
 collation an expression has — and that is a piece of design, not an edit.
 
+## 4g. Round 690 — min/max and the window, and a tie broken by bytes
+
+Two of the four residuals from 4f were bare column references, so neither
+needed derivation. Both are now PG18-verified.
+
+`min` / `max` fold a running extreme rather than sorting rows, so round
+688's sort work did not reach them: `min(loc), max(loc)` gave
+`Banana | Ápple` where PG18 gives `apple | Zebra`. The fix carries the
+argument's collation on `AggSpec`, beside `enum_labels` — both are facts
+about the ARGUMENT that the comparison cannot look up for itself.
+
+Two things that round measured and are worth keeping:
+
+* The resolver first went INSIDE the enum-label loop, which is guarded by
+  "the catalog holds at least one enum type". With no enum in the database
+  it never ran, and the answer did not move. A collation has nothing to do
+  with enums; it needed its own unconditional pass. The wrong answer looked
+  exactly like a wrong code path, which is what the force-reverse discipline
+  is for — the path was right, the guard was not.
+
+* The fused aggregate lane sends an ENUM argument to the generic path,
+  because it does not carry member order. A collation could have taken the
+  same exit and did not: `FusedOp::Extreme` carries it, so a collated column
+  keeps the shard-parallel scan.
+
+A window's ORDER BY sorts a key tuple it builds per row. The collation is
+resolved from the key's already-bound column position and passed to a new
+`order_key_cmp_in`. Only the SORT takes it: peer detection asks whether two
+keys are EQUAL, and under a deterministic collation byte equality gives the
+same verdict, so the peer scans keep the cheaper comparison.
+
+That last point turned out to need something. PG18's `en_US.utf8` has
+`collisdeterministic = t`, which means a collation TIE is broken by the
+bytes, and it is observable: `e` + U+0301 and U+00E9 are canonically
+equivalent, so ICU calls them Equal, but PG18 orders the decomposed form
+first (0x65 < 0xC3) and reports `=` as false. `collate::compare` now appends
+that tiebreak. Without it two canonically-equivalent values sorted in
+whatever order the sort happened to leave them in.
+
+Remaining: `BETWEEN` and `ORDER BY upper()` — both derivation, as 4f
+records — plus the explicit expression `COLLATE`, which is refused at parse
+time. That one needs no derivation (the name is written in the query) but it
+is currently DROPPED by the expression parser, so honouring it means finding
+it a home. `ast::OrderBy` already carries `desc` and `nulls_first`, which
+are ordering-only facts of the same kind; a new `Expr` variant would instead
+put a new arm on `eval_expr`, which this repo has measured to overflow the
+debug stack.
+
+## 4h. Round 691 — the explicit `COLLATE`, and where a name can live
+
+`ORDER BY loc COLLATE "en_US.utf8"` was refused at parse time. It needed no
+derivation — the name is written in the query — so what was missing was
+somewhere to PUT it. The expression parser consumed the clause and dropped
+it, and by the time the sort ran there was nothing left to honour.
+
+It went on `ast::OrderBy`, beside `desc` and `nulls_first`. At an ORDER BY
+key a collation IS ordering information, and nothing downstream of the sort
+wants it. The alternative was an `Expr::Collate` variant, which would put a
+new arm on `eval_expr` — measured in this repo to overflow the debug stack,
+and recorded as such.
+
+The parser reaches the field through a save/restore channel, the same shape
+it already uses for `pending_sample_preds`, active only while an ORDER BY
+key is parsing. Four key parsers share it: the statement's ORDER BY, `WITHIN
+GROUP`, and an aggregate's own ORDER BY; MySQL's synthesised rollup order
+passes `None`, having no source text to have written one in.
+
+Two boundaries the round drew deliberately:
+
+* Outside an ORDER BY key an unperformable collation still ERRORS. A
+  comparison cannot be fixed by carrying a name — `binop::compare` takes two
+  values, and which operand's collation applies is the derivation question.
+  Accepting the clause there and ignoring it would be F36's own defect.
+
+* An explicit name this build cannot perform is REFUSED, not dropped. A name
+  a COLUMN declares is treated differently: that table already exists, the
+  declaration was warned about at DDL time, and failing every query against
+  it would be worse than ordering by bytes.
+
+Verified against PG18 on a column declaring nothing: the explicit name
+orders the key, an explicit `C` stays byte order, and an explicit name beats
+a column's own declaration.
+
+Remaining after this: `BETWEEN` and `ORDER BY upper()`, both derivation.
+
+## 4i. Round 692 — derivation, and the warning that had gone stale
+
+`ORDER BY upper(loc)` needs to know what collation an EXPRESSION has, which
+is a rule set, not a wire. Measured off PG18 with `collation for (…)`:
+
+| expression                    | PG18 reports                 |
+|-------------------------------|------------------------------|
+| `upper(a)`, a is en_US.utf8   | `"en_US.utf8"`               |
+| `upper(plain)`, undeclared    | `"default"`                  |
+| `a \|\| 'literal'`          | `"en_US.utf8"`               |
+| `'literal'`                   | (none)                       |
+| `a COLLATE "C"`               | `"C"`                        |
+| `a \|\| b`, en_US and C     | (none) — and USING it errors |
+
+`crates/spg-engine/src/collate_derive.rs` holds them: a four-state
+`Derived` (None / Implicit / Explicit / Conflict) and a `combine` that is
+PG's precedence. `ORDER BY a || b` over two differently-collated columns now
+fails with PG's own sentence, `collation mismatch between implicit
+collations "en_US.utf8" and "C"`. Picking a winner there would have been
+easy and would have been F36's defect in a new place: it silently changes
+the ORDER of a query the user believes is well-defined.
+
+Two things the round turned up that were not in the plan:
+
+* **`ORDER BY a COLLATE "C"` was still absorbed.** Round 691 recorded a
+  name into the lowering channel only when the OLD allow-list rejected it,
+  and `C` was on that list — it had been a no-op since before a column could
+  declare anything. Once a column can, absorbing the clause means the
+  COLUMN's collation wins where the query asked for bytes. Every name goes
+  to the channel now. This surfaced because a pin used a table whose first
+  column declared en_US; the round-691 pins used one that declared nothing,
+  where byte order and the absorbed clause agree.
+
+* **The DDL warning had become false.** It read "SPG records the declaration
+  but orders this column by bytes … ORDER BY, min/max and range comparisons
+  will not follow it". Two thirds of that stopped being true in rounds
+  683–690. It now names what IS still true — range comparisons — and a
+  separate message covers a name this build cannot perform at all. A stale
+  warning is worse than none: a customer reads it and plans around it.
+
+The one row above SPG does not match is `upper(plain)`: PG's container has
+`datcollate = en_US.utf8`, so an undeclared column inherits en_US there,
+while SPG's database default is C. That is the database-level default, not a
+derivation rule, and it is the same difference `ORDER BY plain` has always
+had.
+
+Remaining: the range comparison (`BETWEEN`, `<`, `>`). Measured on PG18,
+that is the whole of what is left — equality, `LIKE`, `IN` and
+`count(DISTINCT …)` are all unaffected by a collation, and `least`/`greatest`
+follow the ordering operators. It goes through `binop::compare`, whose own
+comment records it as 35.6 % of self time on a scan, so it needs a design
+that resolves the collation ONCE per predicate rather than per row, and a
+bench beside the correctness gate.
+
 ## 5. Recommendation
 
 Adopt (a). Sequence: converge comparison (with a bench) → thread the

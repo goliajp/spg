@@ -35,6 +35,7 @@ macro_rules! bump_counter {
 }
 
 mod collate;
+mod collate_derive;
 mod acl;
 pub mod aggregate;
 pub(crate) mod amcheck;

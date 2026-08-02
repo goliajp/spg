@@ -1215,16 +1215,50 @@ pub(crate) fn sort_by_keys_in(
 pub(crate) fn order_by_collations(
     order_by: &[spg_sql::ast::OrderBy],
     ctx: &EvalContext,
-) -> alloc::vec::Vec<Option<alloc::string::String>> {
+) -> Result<alloc::vec::Vec<Option<alloc::string::String>>, crate::EngineError> {
+    // v7.39 (round 691) — a name written in the query that this build cannot
+    // perform is refused, not dropped. Silently ignoring it is exactly the
+    // defect F36 exists to close, and the parser refused it before the name
+    // had anywhere to go. A name a COLUMN declares is different: the table
+    // already exists, the declaration was warned about at DDL time, and
+    // failing every query against it would be worse than ordering by bytes.
+    for o in order_by {
+        if let Some(name) = &o.collation
+            && !crate::collate::is_supported(name)
+        {
+            return Err(crate::EngineError::Unsupported(alloc::format!(
+                "collation \"{name}\" is not one this build can perform"
+            )));
+        }
+    }
     order_by
         .iter()
         .map(|o| {
-            let Expr::Column(c) = &o.expr else {
-                return None;
-            };
-            let pos = eval::find_column_pos(c, ctx)?;
-            let name = ctx.columns.get(pos)?.collation_name.clone()?;
-            crate::collate::is_supported(&name).then_some(name)
+            // v7.39 (round 691) — an explicit `COLLATE` on the key wins over
+            // the column's declaration, which is PG's rule and also the only
+            // way to sort by a collation the column does not declare. It
+            // needs no derivation: the name is written in the query.
+            if let Some(name) = &o.collation {
+                return Ok(crate::collate::is_supported(name).then(|| name.clone()));
+            }
+            // v7.39 (round 692) — DERIVED, not just "is it a bare column".
+            // `ORDER BY upper(loc)` sorts by `loc`'s collation in PG, and
+            // that is a property of the expression, not of the key's shape.
+            let derived = crate::collate_derive::derive(&o.expr, &|c| {
+                let pos = eval::find_column_pos(c, ctx)?;
+                ctx.columns.get(pos)?.collation_name.clone()
+            });
+            // Two different implicit collations do not silently pick a
+            // winner. PG: `collation mismatch between implicit collations`.
+            if let Some((a, b)) = derived.conflict() {
+                return Err(crate::EngineError::Unsupported(alloc::format!(
+                    "collation mismatch between implicit collations \"{a}\" and \"{b}\""
+                )));
+            }
+            Ok(derived
+                .name()
+                .filter(|n| crate::collate::is_supported(n))
+                .map(alloc::string::ToString::to_string))
         })
         .collect()
 }

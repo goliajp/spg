@@ -677,6 +677,20 @@ struct Parser {
     /// predicates in. parse_bare_select save/restores around its
     /// FROM+WHERE so nested selects only drain their own.
     pending_sample_preds: Vec<Expr>,
+    /// v7.39 (round 691) — collation lowering channel, the same shape as
+    /// `pending_sample_preds` above. `expr COLLATE "name"` is ORDERING
+    /// information, and `ast::OrderBy` is where this parser keeps ordering
+    /// information (`desc`, `nulls_first`); the alternative — a new `Expr`
+    /// variant — puts a new arm on `eval_expr`, which this repo has
+    /// measured to overflow the debug stack. So while an ORDER BY KEY is
+    /// being parsed the postfix loop drops the name here instead of
+    /// refusing it, and the key's parser takes it.
+    ///
+    /// Only inside an ORDER BY key: everywhere else an unperformable
+    /// collation still errors, because accepting one at a COMPARISON and
+    /// ignoring it is the defect F36 exists to close.
+    in_order_by_key: bool,
+    order_key_collation: Option<String>,
     /// POSITION(sub IN str) — while parsing the needle, the IN
     /// keyword is the argument separator, not a membership test.
     /// The postfix loop leaves IN unconsumed when this is set.
@@ -892,6 +906,8 @@ impl Parser {
         Self {
             tokens,
             mysql_dialect,
+            in_order_by_key: false,
+            order_key_collation: None,
             pos: 0,
             nest_depth: 0,
             pending_sample_preds: Vec::new(),
@@ -11361,7 +11377,15 @@ impl Parser {
         self.advance();
         let mut keys = Vec::new();
         loop {
-            let expr = self.parse_expr(0)?;
+            // v7.39 (round 691) — save/restore, the discipline this parser
+            // already uses around `pending_sample_preds`, so a subquery inside
+            // a key neither inherits nor leaks the channel.
+            let saved_flag = core::mem::replace(&mut self.in_order_by_key, true);
+            let saved_coll = self.order_key_collation.take();
+            let parsed = self.parse_expr(0);
+            self.in_order_by_key = saved_flag;
+            let collation = core::mem::replace(&mut self.order_key_collation, saved_coll);
+            let expr = parsed?;
             let desc = if matches!(self.peek(), Token::Desc) {
                 self.advance();
                 true
@@ -11393,6 +11417,7 @@ impl Parser {
                 expr,
                 desc,
                 nulls_first,
+                collation,
             });
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
@@ -13035,12 +13060,14 @@ impl Parser {
                 },
                 desc: false,
                 nulls_first: None,
+                collation: None,
             });
             out.push(OrderBy {
                 expr: e.clone(),
                 desc: false,
                 // MySQL orders NULL first on an ascending key.
                 nulls_first: Some(true),
+                collation: None,
             });
         }
         out
@@ -21425,6 +21452,17 @@ impl Parser {
                 }
                 let mysql_ci = self.mysql_dialect
                     && (lc.ends_with("_ci") || matches!(lc.as_str(), "case_insensitive" | "nocase"));
+                // v7.39 (round 691/692) — inside an ORDER BY key EVERY name
+                // goes to the lowering channel, the byte-order spellings
+                // included. Round 691 recorded only the names the old
+                // allow-list rejected, which left `ORDER BY a COLLATE "C"`
+                // absorbed as a no-op — and once a column could declare a
+                // collation, absorbing the clause meant the COLUMN's
+                // collation won where the query had asked for bytes.
+                if self.in_order_by_key && !mysql_ci {
+                    self.order_key_collation = Some(cname);
+                    continue;
+                }
                 if !matches!(
                     lc.as_str(),
                     "c" | "posix" | "default" | "ucs_basic" | "pg_c_utf8"
@@ -23464,7 +23502,15 @@ impl Parser {
         self.advance(); // BY
         let mut keys: Vec<OrderBy> = Vec::new();
         loop {
-            let expr = self.parse_expr(0)?;
+            // v7.39 (round 691) — save/restore, the discipline this parser
+            // already uses around `pending_sample_preds`, so a subquery inside
+            // a key neither inherits nor leaks the channel.
+            let saved_flag = core::mem::replace(&mut self.in_order_by_key, true);
+            let saved_coll = self.order_key_collation.take();
+            let parsed = self.parse_expr(0);
+            self.in_order_by_key = saved_flag;
+            let collation = core::mem::replace(&mut self.order_key_collation, saved_coll);
+            let expr = parsed?;
             let desc = if matches!(self.peek(), Token::Desc) {
                 self.advance();
                 true
@@ -23479,6 +23525,7 @@ impl Parser {
                 expr,
                 desc,
                 nulls_first,
+                collation,
             });
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
@@ -24415,7 +24462,15 @@ impl Parser {
                         }
                         self.advance();
                         loop {
-                            let expr = self.parse_expr(0)?;
+                            // v7.39 (round 691) — save/restore, the discipline this parser
+                            // already uses around `pending_sample_preds`, so a subquery inside
+                            // a key neither inherits nor leaks the channel.
+                            let saved_flag = core::mem::replace(&mut self.in_order_by_key, true);
+                            let saved_coll = self.order_key_collation.take();
+                            let parsed = self.parse_expr(0);
+                            self.in_order_by_key = saved_flag;
+                            let collation = core::mem::replace(&mut self.order_key_collation, saved_coll);
+                            let expr = parsed?;
                             let desc = if matches!(self.peek(), Token::Desc) {
                                 self.advance();
                                 true
@@ -24430,6 +24485,7 @@ impl Parser {
                                 expr,
                                 desc,
                                 nulls_first,
+                                collation,
                             });
                             if matches!(self.peek(), Token::Comma) {
                                 self.advance();
