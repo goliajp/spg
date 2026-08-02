@@ -1964,7 +1964,7 @@ impl Parser {
                 }
                 self.consume_until_statement_boundary();
                 return Ok(Statement::ValidateOnly {
-                    kind: crate::ast::ValidateOnlyKind::OwnedByRole,
+                    kind: crate::ast::ValidateOnlyKind::RoleName,
                     names,
                 });
             }
@@ -2733,7 +2733,7 @@ impl Parser {
                         let names = self.take_comma_separated_names();
                         self.consume_until_statement_boundary();
                         Ok(Statement::ValidateOnly {
-                            kind: crate::ast::ValidateOnlyKind::OwnedByRole,
+                            kind: crate::ast::ValidateOnlyKind::RoleName,
                             names,
                         })
                     }
@@ -3027,8 +3027,7 @@ impl Parser {
                     Token::Ident(s) | Token::QuotedIdent(s)
                         if matches!(
                             s.to_ascii_lowercase().as_str(),
-                            "extension"
-                                | "type"
+                            "type"
                                 | "domain"
                                 | "aggregate"
                                 | "operator"
@@ -3051,6 +3050,25 @@ impl Parser {
                     {
                         self.consume_until_statement_boundary();
                         Ok(Statement::Empty)
+                    }
+                    // v7.39 (round 697) — `DROP EXTENSION [IF EXISTS] <e>
+                    // [, …] [CASCADE|RESTRICT]`. PG refuses one that is not
+                    // installed; `IF EXISTS` is the spelling that says do
+                    // not, and it keeps the no-op.
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("extension") =>
+                    {
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let names = self.take_comma_separated_names();
+                        self.consume_until_statement_boundary();
+                        if if_exists {
+                            return Ok(Statement::Empty);
+                        }
+                        Ok(Statement::ValidateOnly {
+                            kind: crate::ast::ValidateOnlyKind::ExtensionInstalled,
+                            names,
+                        })
                     }
                     Token::Ident(s) | Token::QuotedIdent(s)
                         if s.eq_ignore_ascii_case("statistics") =>
@@ -3607,9 +3625,14 @@ impl Parser {
                 // v7.16.2 — PG `SET [SESSION] AUTHORIZATION
                 // { DEFAULT | '<role>' | <ident> }` (mailrs
                 // round-10 A.1). pg_dump preamble emits the
-                // `DEFAULT` form to reset session authorization;
-                // SPG has no role system so this is a strict
-                // no-op. PG also accepts `RESET SESSION
+                // `DEFAULT` form to reset session authorization.
+                //
+                // v7.39 (round 697) — this said "SPG has no role system so
+                // this is a strict no-op". SPG has had one since round 58;
+                // the comment outlived it, and with it the reason a name
+                // that is not a role was accepted here. It still switches
+                // no authorization — what it does now is refuse a role
+                // that does not exist, as PG18 does. PG also accepts `RESET SESSION
                 // AUTHORIZATION` (handled by the RESET parser
                 // elsewhere). Reference:
                 // <https://www.postgresql.org/docs/current/sql-set-session-authorization.html>
@@ -3620,10 +3643,12 @@ impl Parser {
                         Token::Default => {
                             self.advance();
                         }
-                        Token::String(_)
-                        | Token::Ident(_)
-                        | Token::QuotedIdent(_) => {
+                        Token::String(r) | Token::Ident(r) | Token::QuotedIdent(r) => {
                             self.advance();
+                            return Ok(Statement::ValidateOnly {
+                                kind: crate::ast::ValidateOnlyKind::RoleName,
+                                names: alloc::vec![r],
+                            });
                         }
                         other => {
                             return Err(self.err(alloc::format!(
@@ -4562,7 +4587,13 @@ impl Parser {
                 _ => break,
             }
         }
-        Ok(Statement::CreateExtension(name))
+        // v7.39 (round 697) — the NAME is checked now. `CREATE EXTENSION
+        // nosuch` reported success and `pg_extension` then did not list it,
+        // which is the accept-and-do-nothing shape F31 exists to find.
+        Ok(Statement::ValidateOnly {
+            kind: crate::ast::ValidateOnlyKind::ExtensionAvailable,
+            names: alloc::vec![name],
+        })
     }
 
     /// v7.12.4 — body of `CREATE [OR REPLACE] FUNCTION`. The

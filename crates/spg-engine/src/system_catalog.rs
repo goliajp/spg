@@ -7867,6 +7867,32 @@ pub(crate) fn synth_pg_foreign_table() -> (Vec<ColumnSchema>, Vec<Row<'static>>)
 }
 
 /// Synthesise `pg_catalog.pg_extension`. SPG ships its "extension"
+/// v7.39 (round 697) — the extensions this build provides, and the single
+/// place that says so.
+///
+/// `pg_extension` read it from a local literal and `CREATE EXTENSION` /
+/// `DROP EXTENSION` read nothing at all, so `CREATE EXTENSION nosuch`
+/// reported plain success and `pg_extension` then did not list it.
+///
+/// PG18 ERRORS on a name it does not have (`is not available`). SPG does
+/// not, and the reason is the zero-customer-change line rather than
+/// laziness: a customer's dump carries `CREATE EXTENSION pgcrypto`, PG
+/// restores it because the extension can be installed there, and SPG cannot
+/// be installed into. Refusing would turn a restore that works today into
+/// one that needs the dump edited. It warns instead — the same resolution
+/// F36 reached for a collation this build cannot perform: record it, say
+/// plainly what is not provided, do not pretend.
+///
+/// `pgcrypto` is on the list because SPG really does answer it — `digest`
+/// and `gen_random_uuid` both work, measured. `hstore` is not, and does
+/// not: `'a=>1'::hstore` says the type does not exist.
+pub(crate) const INSTALLED_EXTENSIONS: &[(&str, &str)] = &[
+    ("plpgsql", "1.0"),
+    ("vector", "0.8.0"),
+    ("pg_trgm", "1.6"),
+    ("pgcrypto", "1.3"),
+];
+
 /// surfaces natively (vector, pg_trgm, plpgsql-shaped DO blocks), so
 /// the table lists those as installed — `SELECT … FROM pg_extension
 /// WHERE extname = 'vector'` probes from PG clients (mailrs embed
@@ -7895,7 +7921,7 @@ pub(crate) fn synth_pg_extension() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
         ColumnSchema::new("extconfig", DataType::TextArray, true),
         ColumnSchema::new("extcondition", DataType::TextArray, true),
     ];
-    let exts: &[(&str, &str)] = &[("plpgsql", "1.0"), ("vector", "0.8.0"), ("pg_trgm", "1.6")];
+    let exts = INSTALLED_EXTENSIONS;
     let rows = exts
         .iter()
         .enumerate()
