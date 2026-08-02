@@ -1835,6 +1835,7 @@ fn run_pg_session(
         }
         let body: &[u8] = &rbuf;
         trace_frontend_message(msg_type, body, tx_state);
+        let timing_start = timing_enabled().then(std::time::Instant::now);
 
         match msg_type {
             b'Q' => handle_pg_simple_query(
@@ -2009,6 +2010,7 @@ fn run_pg_session(
                 wbuf.clear();
             }
         }
+        timing_record(timing_start);
         // Defensive backstop: if a client piles up many P/B/E without
         // ever sending Sync, drain the buffer once it crosses the
         // 4 KiB threshold so the client receiving these responses
@@ -2276,6 +2278,38 @@ fn lock_wait_deadline(
 /// transaction driven through a sqlx pool commits into the WAL but not into
 /// live state, and the difference from the working dedicated-connection case
 /// is whatever the pool does around each statement.
+/// v7.39 (round 703-SW) — env-gated handling-time aggregate, the same
+/// pattern as `trace_frontend_message` beside it. `SPG_PGWIRE_TIMING=1`
+/// prints one stderr line per 1000 messages with the mean SERVER-side
+/// handling time — from "full message in hand" to "match arm done (response
+/// flushed)". The read wait is deliberately outside the bracket: it is the
+/// client thinking, not the server working.
+///
+/// Exists to split the per-statement wire floor (S-W ⑤): the interleaved
+/// probes put SPG at ~0.73 ms per trivial statement over the NAT against
+/// PG's ~0.58, and WHERE those 150 µs live — server handling vs syscall
+/// pattern vs client — is a measurement, not a guess. Off = one cached
+/// bool load per message.
+fn timing_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SPG_PGWIRE_TIMING").is_ok_and(|v| v != "0"))
+}
+
+fn timing_record(start: Option<std::time::Instant>) {
+    let Some(t0) = start else { return };
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static TOT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let tot = TOT_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed) + ns;
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_multiple_of(1000) {
+        eprintln!(
+            "[pgwire-timing] n={n} mean_handle_us={:.1}",
+            tot as f64 / n as f64 / 1000.0
+        );
+    }
+}
+
 fn trace_frontend_message(msg_type: u8, body: &[u8], tx_state: u8) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var("SPG_PGWIRE_TRACE").is_ok_and(|v| v != "0")) {
