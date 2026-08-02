@@ -437,6 +437,55 @@ comment records it as 35.6 % of self time on a scan, so it needs a design
 that resolves the collation ONCE per predicate rather than per row, and a
 bench beside the correctness gate.
 
+## 4j. Round 693 — the range comparison, and where it did NOT go
+
+`loc BETWEEN 'a' AND 'd'` returns a different ROW SET, not a different
+order: PG18 under en_US.utf8 gives `apple, Ápple, Banana, cherry`, and byte
+order drops two of those. This was the last shape.
+
+The interesting part is where it landed. §4f said `binop::compare` "takes
+two values and no column" and records itself as 35.6 % of a scan's self
+time, so a parameter there had to survive a bench. It never got one. The
+first attempt DID put a hook in `eval_expr`'s Binary arm, which looks like
+the obvious home — and a panic planted in it was never reached, because a
+WHERE predicate does not go through the tree evaluator at all. It compiles
+to a step VM.
+
+That turned out to be the better seam. The predicate COMPILER already bails
+a subtree out to the tree evaluator when an operand witnesses an enum, with
+a comment noting the check is compile-time and costs nothing when the
+catalog has no enum types. A collation takes the same exit: an operand that
+derives one sends its subtree out, once, while the predicate compiles. A
+column that declares nothing never leaves the VM, so the scan pays nothing
+per row — the hot path is untouched rather than optimised.
+
+Bench, with a control, because a bare "within noise" is not evidence:
+`cargo bench -p spg-engine --bench execute` moved between -3.8 % and +3.5 %
+against its stored baseline. Re-running the IDENTICAL binary immediately
+afterwards moved between -8.8 % and +1.3 %. The machine's own run-to-run
+drift is wider than the change, so there is nothing to see; the control is
+what says so.
+
+`least` / `greatest` follow the ordering operators, and needed their own
+edit for a structural reason, not an oversight: their witness is the
+argument's column, so like the enum case they cannot be answered from the
+value-level function dispatch.
+
+Measured on PG18, that is the complete list. `=`, `<>`, `LIKE`, `IN` and
+`count(DISTINCT …)` are unaffected by a collation — its `en_US.utf8` is
+deterministic, so equality is byte equality there too.
+
+### What remains after 693
+
+* **Index order.** A collation decides a text index's key order, so changing
+  one invalidates every text index on disk. Needs a rebuild path and a
+  data-compat story; unchanged since §4.
+* **The database default.** SPG's `datcollate` is C. The oracle container's
+  is `en_US.utf8`, which is why a column declaring NOTHING still sorts by
+  locale there and by bytes here. That is a database-creation-time property,
+  not a derivation rule, and it is the only difference the shape list still
+  shows.
+
 ## 5. Recommendation
 
 Adopt (a). Sequence: converge comparison (with a bench) → thread the

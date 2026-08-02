@@ -21104,6 +21104,22 @@ impl Parser {
                 "interval" => CastTarget::Interval,
                 "json" => CastTarget::Json,
                 "jsonb" => CastTarget::Jsonb,
+                // v7.39 (round 694) — these have dedicated CastTarget
+                // variants, so they never reached the postfix `[]` handling
+                // further down and `::regtype[]` was a SYNTAX error at the
+                // `]`. PG has an array type for every scalar; take the
+                // suffix here and hand the canonical `<ty>_array` name to
+                // the engine, the same shape every other array cast uses.
+                "regtype" if self.peek_postfix_array_brackets() => {
+                    self.advance();
+                    self.advance();
+                    CastTarget::Named(alloc::string::String::from("regtype_array"))
+                }
+                "regclass" if self.peek_postfix_array_brackets() => {
+                    self.advance();
+                    self.advance();
+                    CastTarget::Named(alloc::string::String::from("regclass_array"))
+                }
                 "regtype" => CastTarget::RegType,
                 "regclass" => CastTarget::RegClass,
                 // v7.12.0 — `::tsvector` / `::tsquery`.
@@ -21478,6 +21494,16 @@ impl Parser {
             }
             return Ok(expr);
         }
+    }
+
+    /// v7.39 (round 694) — is the next token pair a postfix `[]`?
+    ///
+    /// The general cast-target path tests this inline; the types with their
+    /// own `CastTarget` variant need it as a guard on their match arm,
+    /// which is what this exists for.
+    fn peek_postfix_array_brackets(&self) -> bool {
+        matches!(self.peek(), Token::LBracket)
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::RBracket))
     }
 
     /// Parse the operator tail after a `(a, b, …)` row constructor

@@ -77,6 +77,12 @@ impl Derived {
     /// * otherwise one implicit one wins over none;
     /// * two different implicit ones conflict;
     /// * a conflict is contagious.
+    /// v7.39 (round 693) — the comparison hook combines two OPERANDS'
+    /// derivations, which is the same rule applied at a different place.
+    pub(crate) fn combine_pub(self, other: Self) -> Self {
+        self.combine(other)
+    }
+
     fn combine(self, other: Self) -> Self {
         match (self, other) {
             (c @ Self::Conflict(..), _) | (_, c @ Self::Conflict(..)) => c,

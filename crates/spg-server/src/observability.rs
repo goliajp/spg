@@ -616,7 +616,7 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 // v7.11.12 — INT[] / BIGINT[] rough heuristic
                 // (~4 elements × element size).
                 DataType::IntArray => 16,
-                DataType::BigIntArray => 32,
+                DataType::BigIntArray | DataType::OidArray => 32,
                 // v7.12.0 — tsvector averages ~80 lexemes × ~8B
                 // each per the v7.12 design risk register R2.
                 DataType::TsVector => 640,

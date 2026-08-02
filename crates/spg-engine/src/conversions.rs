@@ -2510,6 +2510,23 @@ fn type_name_to_data_type_lower(n: &str) -> Option<DataType> {
         // `bigint`. The VALUE is still a bigint; what changed is that the
         // declared type is no longer thrown away. See `DataType::Oid`.
         "oid" => DataType::Oid,
+        // v7.39 (round 694) — the array forms of the system types. PG has
+        // an array type for every scalar; these five were the ones a cast
+        // could name and SPG could not answer. `regtype[]` and
+        // `regclass[]` did not even parse (their scalars have dedicated
+        // CastTarget variants, so they never reached the postfix `[]`
+        // handling); `oid[]` and `name[]` parsed and then met `type
+        // "oid_array" does not exist`.
+        //
+        // They land on TextArray rather than a variant apiece for the
+        // reason the scalars do NOT: a reg* value renders as a NAME, and
+        // TextArray already carries and renders names. `oid_array` is the
+        // exception and takes BigIntArray, because an OID renders as its
+        // number.
+        "oid_array" => DataType::OidArray,
+        "name_array" | "regtype_array" | "regclass_array" | "regproc_array" => {
+            DataType::TextArray
+        }
         // TIME [WITHOUT TIME ZONE] — first-class since the codec
         // carries Value::Time; the coerce path parses HH:MM:SS.
         "time" | "time without time zone" => DataType::Time,
@@ -5237,7 +5254,13 @@ pub(crate) fn coerce_value(
                 })
                 .collect(),
         )),
-        (Value::Text(s), DataType::BigIntArray) => {
+        // v7.39 (round 694) — `oid[]` decodes exactly as `bigint[]` does;
+        // the variant exists to keep the DECLARED type, not to change the
+        // body. Listed here rather than mapped to BigIntArray upstream
+        // because mapping it upstream is what made `pg_typeof('{1,2}'::oid[])`
+        // answer `bigint[]`, which is the defect round 667 closed for the
+        // scalar.
+        (Value::Text(s), DataType::BigIntArray | DataType::OidArray) => {
             // v7.39 (round 325, V57) — PG's wording (and the same message
             // the CAST path gives for the identical input; this one used to
             // name TEXT[] whatever the column's element type was).

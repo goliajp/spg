@@ -352,6 +352,25 @@ impl CompiledExpr {
 /// v7.37.16 — pub(crate): the aggregate bind-once fast path
 /// (aggregate.rs `col_pos`) uses this as its resolver so bare-name
 /// group/arg columns bind exactly like compiled-WHERE columns do.
+/// v7.39 (round 693) — does this comparison operand carry a collation the
+/// VM cannot perform?
+///
+/// Deliberately a COMPILE-time question. The answer is the same for every
+/// row of the scan, and the alternative — asking per row inside `compare` —
+/// puts a lookup on the hottest path in the engine.
+fn operand_declares_a_collation(e: &Expr, ctx: &EvalContext<'_>) -> bool {
+    let derived = crate::collate_derive::derive(e, &|c: &ColumnName| {
+        let pos = crate::eval::find_column_pos(c, ctx)?;
+        ctx.columns.get(pos)?.collation_name.clone()
+    });
+    // A conflict has to leave the VM too — the tree evaluator is where the
+    // error is raised, with PG's own sentence.
+    derived.conflict().is_some()
+        || derived
+            .name()
+            .is_some_and(|n| crate::collate::is_supported(n))
+}
+
 pub(crate) fn compile_column_pos(c: &ColumnName, ctx: &EvalContext<'_>) -> Option<usize> {
     if let Some(q) = &c.qualifier {
         if let Some(pos) = ctx
@@ -554,6 +573,29 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 && ctx.catalog.is_some_and(|cat| !cat.enum_types().is_empty())
                 && (crate::eval::expr_enum_labels(lhs, ctx.columns, ctx.catalog).is_some()
                     || crate::eval::expr_enum_labels(rhs, ctx.columns, ctx.catalog).is_some())
+            {
+                steps.push(Step::Subtree(e.clone()));
+                return;
+            }
+            // v7.39 (round 693) — and the same move for a declared
+            // collation, which is the shape F36 had left: `loc BETWEEN 'a'
+            // AND 'd'` returns a different ROW SET under en_US.utf8 than
+            // under byte order.
+            //
+            // Compile-time, like its enum neighbour, and for the better of
+            // the two reasons. `binop::compare` is the dominant cost of a
+            // scan — its own comment measures 35.6 % of self time on
+            // `g = 5` — so a per-row collation lookup there would have to
+            // earn its place against a bench. Deciding once, while the
+            // predicate compiles, costs the scan nothing at all: a column
+            // that declares nothing never leaves the VM.
+            //
+            // Only the ORDERING operators. Measured on PG18, `=`, `<>`,
+            // LIKE, IN and count(DISTINCT …) all give byte-equality's
+            // answer under a deterministic collation.
+            if matches!(op, BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq)
+                && operand_declares_a_collation(lhs, ctx)
+                | operand_declares_a_collation(rhs, ctx)
             {
                 steps.push(Step::Subtree(e.clone()));
                 return;

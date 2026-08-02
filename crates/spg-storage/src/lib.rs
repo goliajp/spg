@@ -245,6 +245,11 @@ pub enum DataType {
     /// v7.11.12: `BIGINT[]` — single-dimension i64 array. PG
     /// wire OID 1016 (_int8). Catalog FILE_VERSION 19+.
     BigIntArray,
+    /// v7.39 (round 694) — `oid[]`. It exists for the reason
+    /// [`DataType::Oid`] does: mapping it onto `BigIntArray` answers
+    /// `pg_typeof('{1,2}'::oid[])` with `bigint[]`, which is the defect
+    /// round 667 closed for the scalar.
+    OidArray,
     /// v7.37.5 β-P4 — `INTERVAL[]` — single-dimension array of
     /// `IntervalSpan { months, days, micros }`. PG wire OID 1187
     /// (`_interval`). Catalog tag 35 + per-cell body
@@ -497,6 +502,7 @@ impl fmt::Display for DataType {
             Self::Xid => f.write_str("XID"),
             Self::Xid8 => f.write_str("XID8"),
             Self::Oid => f.write_str("OID"),
+            Self::OidArray => f.write_str("OID[]"),
             Self::Float => f.write_str("FLOAT"),
             Self::Real => f.write_str("REAL"),
             Self::Text => f.write_str("TEXT"),

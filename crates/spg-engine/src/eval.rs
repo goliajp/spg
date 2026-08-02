@@ -2072,6 +2072,81 @@ fn enum_compare_hook(
     Some(Ok(Value::Bool(b)))
 }
 
+/// v7.39 (round 693) — Binary-comparison hook for a declared collation, the
+/// last shape F36 left open: `loc BETWEEN 'a' AND 'd'` returns a different
+/// ROW SET under `en_US.utf8` than under byte order, not merely a different
+/// order.
+///
+/// It sits beside [`enum_compare_hook`] because it is the same kind of fact
+/// — something about the operand COLUMNS that `compare` cannot look up from
+/// two values — and takes the same two protections: `#[inline(never)]`, so
+/// `eval_expr`'s recursion frame does not grow (the comment at the call site
+/// records a fourth `||` there tipping the 768 KiB guard on its own), and
+/// the caller's Text/Text gate, so no integer comparison reaches it.
+///
+/// EQUALITY is deliberately not handled. PG18's `en_US.utf8` is
+/// deterministic, so `=`, `<>`, `LIKE`, `IN` and `count(DISTINCT …)` give
+/// byte-equality's answer — measured, all five. Only the ordering operators
+/// change, and `least`/`greatest` follow them through their own comparator.
+#[inline(never)]
+fn collate_compare_hook(
+    op: BinOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    l: &Value<'_>,
+    r: &Value<'_>,
+    ctx: &EvalContext<'_>,
+) -> Option<Result<Value<'static>, EvalError>> {
+    if !matches!(op, BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq) {
+        return None;
+    }
+    let (Value::Text(a), Value::Text(b)) = (l, r) else {
+        return None;
+    };
+    let resolve = |c: &spg_sql::ast::ColumnName| -> Option<alloc::string::String> {
+        let pos = find_column_pos(c, ctx)?;
+        ctx.columns.get(pos)?.collation_name.clone()
+    };
+    let derived = crate::collate_derive::derive(lhs, &resolve)
+        .combine_pub(crate::collate_derive::derive(rhs, &resolve));
+    if let Some((x, y)) = derived.conflict() {
+        return Some(Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "collation mismatch between implicit collations \"{x}\" and \"{y}\""
+            ),
+        }));
+    }
+    let ord = crate::collate::compare(derived.name()?, a, b)?;
+    let b = match op {
+        BinOp::Lt => ord == core::cmp::Ordering::Less,
+        BinOp::LtEq => ord != core::cmp::Ordering::Greater,
+        BinOp::Gt => ord == core::cmp::Ordering::Greater,
+        BinOp::GtEq => ord != core::cmp::Ordering::Less,
+        _ => return None,
+    };
+    Some(Ok(Value::Bool(b)))
+}
+
+/// v7.39 (round 693) — the collation `least`/`greatest` should compare by,
+/// derived across every argument the same way a comparison's two operands
+/// are. `None` keeps byte order, which is right for arguments that declare
+/// nothing.
+#[inline(never)]
+fn greatest_least_collation(args: &[Expr], ctx: &EvalContext<'_>) -> Option<alloc::string::String> {
+    let resolve = |c: &spg_sql::ast::ColumnName| -> Option<alloc::string::String> {
+        let pos = find_column_pos(c, ctx)?;
+        ctx.columns.get(pos)?.collation_name.clone()
+    };
+    let derived = args.iter().fold(
+        crate::collate_derive::Derived::None,
+        |acc, a| acc.combine_pub(crate::collate_derive::derive(a, &resolve)),
+    );
+    derived
+        .name()
+        .filter(|n| crate::collate::is_supported(n))
+        .map(alloc::string::ToString::to_string)
+}
+
 fn enum_arg_type_name<'e>(args: &'e [Expr], ctx: &EvalContext<'e>) -> Option<&'e str> {
     args.iter()
         .find_map(|a| expr_enum_type_name(a, ctx.columns))
@@ -3463,6 +3538,18 @@ fn eval_function_call_positional(
             "timestamp with time zone".into(),
         ));
     }
+    // v7.39 (round 694) — `oid[]`. Its VALUE is a BigIntArray, so the
+    // value-driven namer answers `bigint[]`; the declared type lives in the
+    // expression, exactly as it does for the Timestamptz arm above and for
+    // the enum / domain / composite arms further down. The scalar `oid`
+    // needed the same treatment in round 667.
+    if args.len() == 1
+        && name.eq_ignore_ascii_case("pg_typeof")
+        && crate::describe::describe_expr(&args[0], ctx.columns)
+            .is_some_and(|s| matches!(s.ty, spg_storage::DataType::OidArray))
+    {
+        return Ok(Value::text::<alloc::string::String>("oid[]".into()));
+    }
     // v7.39 (read01 round 56) — a COMPOSITE column reports its type NAME, not
     // the generic `record` the runtime value would give. Composite-ness lives
     // outside the DataType lattice (the stored form is JSON), so the witness is
@@ -3694,6 +3781,38 @@ fn eval_function_call_positional(
                     // A non-member snuck in — fall out to the generic path.
                     None => return apply_function(name, &evaluated, ctx),
                 },
+            });
+        }
+        return Ok(best.cloned().unwrap_or(Value::Null));
+    }
+    // v7.39 (round 693) — and the same for a declared COLLATION, which
+    // `least`/`greatest` need for the same structural reason: the witness
+    // is the argument's column, so it cannot live in the value-level
+    // dispatch either. Measured on PG18 over a column declaring
+    // en_US.utf8: `least(a,'d')` is `d` and `greatest(a,'d')` is `Zebra`,
+    // where byte order gives the pair reversed.
+    if (name.eq_ignore_ascii_case("greatest") || name.eq_ignore_ascii_case("least"))
+        && evaluated
+            .iter()
+            .all(|v| matches!(v, Value::Text(_) | Value::Null))
+        && let Some(coll) = greatest_least_collation(args, ctx)
+    {
+        let is_greatest = name.eq_ignore_ascii_case("greatest");
+        let mut best: Option<&Value<'static>> = None;
+        for v in evaluated.iter().filter(|v| !matches!(v, Value::Null)) {
+            best = Some(match (best, v) {
+                (None, _) => v,
+                (Some(Value::Text(y)), Value::Text(x)) => {
+                    match crate::collate::compare(&coll, x, y) {
+                        Some(core::cmp::Ordering::Greater) if is_greatest => v,
+                        Some(core::cmp::Ordering::Less) if !is_greatest => v,
+                        Some(_) => best.unwrap_or(v),
+                        // Not a collation this build performs after all —
+                        // one answer, from the generic path.
+                        None => return apply_function(name, &evaluated, ctx),
+                    }
+                }
+                (Some(b), _) => b,
             });
         }
         return Ok(best.cloned().unwrap_or(Value::Null));
@@ -4642,9 +4761,19 @@ pub fn eval_expr(
                 // Text and the catalog has enum types at all.
                 if matches!(lc.as_ref(), Value::Text(_))
                     && matches!(rc.as_ref(), Value::Text(_))
-                    && let Some(r) = enum_compare_hook(*op, lhs, rhs, lc.as_ref(), rc.as_ref(), ctx)
                 {
-                    return r;
+                    if let Some(r) =
+                        enum_compare_hook(*op, lhs, rhs, lc.as_ref(), rc.as_ref(), ctx)
+                    {
+                        return r;
+                    }
+                    // v7.39 (round 693) — and the collation hook, under the
+                    // same Text/Text gate for the same reason.
+                    if let Some(r) =
+                        collate_compare_hook(*op, lhs, rhs, lc.as_ref(), rc.as_ref(), ctx)
+                    {
+                        return r;
+                    }
                 }
                 // v7.39 (round 351, M11) — the three conditions fold into
                 // ONE call. Adding a fourth as another `||` here tipped the
@@ -4953,6 +5082,8 @@ pub(crate) fn pg_typeof_name_for_datatype(t: spg_storage::DataType) -> Option<&'
         D::Xid => "xid",
         D::Xid8 => "xid8",
         D::Oid => "oid",
+        // v7.39 (round 694) — and its array, for the same reason.
+        D::OidArray => "oid[]",
         D::Uuid => "uuid",
         D::Interval => "interval",
         _ => return None,
