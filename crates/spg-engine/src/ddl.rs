@@ -3403,12 +3403,33 @@ impl Engine {
             {
                 continue;
             }
-            self.warning(alloc::format!(
-                "column \"{}\" declares COLLATE \"{name}\"; SPG records the declaration but \
-                 orders this column by bytes (the C collation) — ORDER BY, min/max and range \
-                 comparisons will not follow \"{name}\"",
-                c.name
-            ));
+            // v7.39 (round 692) — the message says what is true TODAY.
+            // Rounds 683–692 made ORDER BY, DISTINCT, GROUP BY, joins,
+            // min/max and window ordering follow a declared collation, so
+            // the old wording ("orders this column by bytes") had become
+            // the wrong warning — and a wrong warning is worse than none,
+            // because a customer reads it and plans around it.
+            //
+            // What is still true is the range comparison: `BETWEEN`, `<`,
+            // `>` go through `binop::compare`, which takes two values and
+            // no column. That one is not wiring; it needs collation
+            // derivation at a comparison, and `compare` is the dominant
+            // cost of a scan, so it needs a bench with it.
+            if crate::collate::is_supported(name) {
+                self.warning(alloc::format!(
+                    "column \"{}\" declares COLLATE \"{name}\"; SPG orders it by \"{name}\", \
+                     but RANGE COMPARISONS (BETWEEN, <, >) still compare by bytes — \
+                     they may return a different row set than \"{name}\" implies",
+                    c.name
+                ));
+            } else {
+                self.warning(alloc::format!(
+                    "column \"{}\" declares COLLATE \"{name}\", which this build cannot \
+                     perform; SPG records the declaration and orders this column by bytes \
+                     (the C collation)",
+                    c.name
+                ));
+            }
         }
         // v7.17.0 Phase 1.4 + 1.5 — classify every raw
         // user_type_ref (parked as user_enum_type by

@@ -518,6 +518,11 @@ struct AggSpec {
     /// Enriched once per query in `run` (spec collection is AST-only and
     /// has no catalog).
     enum_labels: Option<Vec<String>>,
+    /// v7.39 (round 690) — the argument column's declared collation, for
+    /// `min`/`max`. Resolved beside `enum_labels` and for the same reason:
+    /// both are facts about the ARGUMENT that the comparison needs and
+    /// cannot look up for itself.
+    arg_collation: Option<alloc::string::String>,
     /// v7.39 (enum order knife) — per-ORDER-BY-key member labels for the
     /// ordered collection aggregates (`array_agg(x ORDER BY enum_col)`).
     /// Parallel to `order_by`; all-None when no key is enum-typed.
@@ -873,6 +878,24 @@ pub(crate) fn run(
     // rather than silently coercing to a degenerate aggregate.
     validate_agg_arities(stmt, &agg_specs)?;
     validate_within_group(&agg_specs, schema_cols)?;
+
+    // v7.39 (round 690) — resolve the argument's declared collation for
+    // `min`/`max`. This rides beside `enum_labels` in `AggSpec` but NOT
+    // inside its resolver loop: that loop only runs when the catalog holds
+    // at least one enum type, and a collation has nothing to do with enums.
+    for spec in &mut agg_specs {
+        if matches!(spec.kind, AggKind::Min | AggKind::Max)
+            && let Some(Expr::Column(c)) = &spec.arg
+        {
+            // A bare column argument carries its collation; an expression
+            // produces a new value and has none (derivation is unbuilt).
+            spec.arg_collation = schema_cols
+                .iter()
+                .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+                .and_then(|sc| sc.collation_name.clone())
+                .filter(|n| crate::collate::is_supported(n));
+        }
+    }
 
     // v7.39 (enum order knife) — resolve enum member-order metadata once
     // per query: min/max extremes and ordered-collection sort keys over
@@ -1269,6 +1292,9 @@ struct FusedAcc {
     /// does not need to be told.
     extreme_max: bool,
     extreme_mysql: bool,
+    /// v7.39 (round 690) — the argument's declared collation, so a
+    /// shard merge compares the two extremes the same way the scan did.
+    extreme_coll: Option<alloc::string::String>,
 }
 
 /// v7.39 (round 569) — a fresh accumulator per op, carrying each one's
@@ -1277,9 +1303,10 @@ fn fused_accs(ops: &[FusedOp], mysql: bool) -> Vec<FusedAcc> {
     ops.iter()
         .map(|op| {
             let mut a = FusedAcc::default();
-            if let FusedOp::Extreme { max, .. } = op {
+            if let FusedOp::Extreme { max, coll, .. } = op {
                 a.extreme_max = *max;
                 a.extreme_mysql = mysql;
+                a.extreme_coll = coll.clone();
             }
             a
         })
@@ -1294,7 +1321,15 @@ enum FusedOp {
     CountCol(usize),
     AccCol(usize),
     /// v7.39 (round 569) — min/max over a bound column.
-    Extreme { pos: usize, max: bool },
+    /// v7.39 (round 690) — `coll` is the column's declared collation.
+    /// Unlike an enum's member order (which sends the spec to the
+    /// generic path), a collation rides along, so a collated column
+    /// keeps the fused lane's shard-parallel scan.
+    Extreme {
+        pos: usize,
+        max: bool,
+        coll: Option<alloc::string::String>,
+    },
 }
 
 /// Returns the (spec_src, unique_ops) layout when EVERY aggregate
@@ -1337,9 +1372,16 @@ fn fused_layout(
                 let max = s.name.as_str() == "max";
                 let slot = unique_ops
                     .iter()
-                    .position(|o| matches!(o, FusedOp::Extreme { pos, max: m } if *pos == p && *m == max))
+                    .position(|o| {
+                        matches!(o, FusedOp::Extreme { pos, max: m, coll }
+                            if *pos == p && *m == max && *coll == s.arg_collation)
+                    })
                     .unwrap_or_else(|| {
-                        unique_ops.push(FusedOp::Extreme { pos: p, max });
+                        unique_ops.push(FusedOp::Extreme {
+                            pos: p,
+                            max,
+                            coll: s.arg_collation.clone(),
+                        });
                         unique_ops.len() - 1
                     });
                 Some(slot)
@@ -1384,7 +1426,7 @@ fn merge_fused(a: &mut FusedAcc, b: &FusedAcc) {
         let take = match &a.extreme {
             None => true,
             Some(ae) => {
-                let ord = extreme_cmp(None, be, ae, a.extreme_mysql);
+                let ord = extreme_cmp_in(None, a.extreme_coll.as_deref(), be, ae, a.extreme_mysql);
                 if a.extreme_max {
                     ord == core::cmp::Ordering::Greater
                 } else {
@@ -1547,7 +1589,7 @@ fn fused_extreme_cell(a: &mut FusedAcc, v: &Value<'_>, max: bool) -> Result<(), 
     let take = match &a.extreme {
         None => true,
         Some(prev) => {
-            let ord = extreme_cmp(None, v, prev, a.extreme_mysql);
+            let ord = extreme_cmp_in(None, a.extreme_coll.as_deref(), v, prev, a.extreme_mysql);
             if max {
                 ord == core::cmp::Ordering::Greater
             } else {
@@ -2091,7 +2133,7 @@ fn accumulate_groups(
                                     acc_cell(&mut a.num, row.get(*p).unwrap_or(&Value::Null))
                                 }?;
                             }
-                            FusedOp::Extreme { pos, max } => {
+                            FusedOp::Extreme { pos, max, .. } => {
                                 fused_extreme_cell(
                                     &mut accs[si],
                                     row.get(*pos).unwrap_or(&Value::Null),
@@ -2216,7 +2258,7 @@ fn accumulate_groups(
                                 }
                                     .map_err(Some)?;
                             }
-                            FusedOp::Extreme { pos, max } => {
+                            FusedOp::Extreme { pos, max, .. } => {
                                 fused_extreme_cell(
                                     &mut slots[oi],
                                     row.get(*pos).unwrap_or(&Value::Null),
@@ -2454,7 +2496,7 @@ fn accumulate_groups(
                 let upd = match &st.extreme {
                     None => true,
                     Some(prev) => {
-                        extreme_cmp(agg_specs[0].enum_labels.as_deref(), av, prev, ctx.mysql_dialect)
+                        extreme_cmp_in(agg_specs[0].enum_labels.as_deref(), agg_specs[0].arg_collation.as_deref(), av, prev, ctx.mysql_dialect)
                             == core::cmp::Ordering::Greater
                     }
                 };
@@ -2668,7 +2710,7 @@ fn accumulate_groups(
                             let upd = match &st.extreme {
                                 None => true,
                                 Some(prev) => {
-                                    extreme_cmp(spec.enum_labels.as_deref(), arg_ref, prev, ctx.mysql_dialect)
+                                    extreme_cmp_in(spec.enum_labels.as_deref(), spec.arg_collation.as_deref(), arg_ref, prev, ctx.mysql_dialect)
                                         == core::cmp::Ordering::Greater
                                 }
                             };
@@ -2694,7 +2736,7 @@ fn accumulate_groups(
                             let upd = match &st.extreme {
                                 None => true,
                                 Some(prev) => {
-                                    extreme_cmp(spec.enum_labels.as_deref(), arg_ref, prev, ctx.mysql_dialect)
+                                    extreme_cmp_in(spec.enum_labels.as_deref(), spec.arg_collation.as_deref(), arg_ref, prev, ctx.mysql_dialect)
                                         == core::cmp::Ordering::Less
                                 }
                             };
@@ -2733,6 +2775,7 @@ fn accumulate_groups(
                             arg2_val.as_ref(),
                             order_keys,
                             spec.enum_labels.as_deref(),
+                            spec.arg_collation.as_deref(),
                             ctx.mysql_dialect,
                         )?,
                     },
@@ -2750,6 +2793,7 @@ fn accumulate_groups(
                             arg2_val.as_ref(),
                             order_keys,
                             spec.enum_labels.as_deref(),
+                            spec.arg_collation.as_deref(),
                             ctx.mysql_dialect,
                         )?,
                     },
@@ -2762,6 +2806,7 @@ fn accumulate_groups(
                             arg2_val.as_ref(),
                             order_keys,
                             spec.enum_labels.as_deref(),
+                            spec.arg_collation.as_deref(),
                             ctx.mysql_dialect,
                         )?;
                     }
@@ -3075,7 +3120,7 @@ fn accumulate_groups(
                             let upd = match &st.extreme {
                                 None => true,
                                 Some(prev) => {
-                                    extreme_cmp(spec.enum_labels.as_deref(), arg_ref, prev, ctx.mysql_dialect)
+                                    extreme_cmp_in(spec.enum_labels.as_deref(), spec.arg_collation.as_deref(), arg_ref, prev, ctx.mysql_dialect)
                                         == core::cmp::Ordering::Greater
                                 }
                             };
@@ -3101,7 +3146,7 @@ fn accumulate_groups(
                             let upd = match &st.extreme {
                                 None => true,
                                 Some(prev) => {
-                                    extreme_cmp(spec.enum_labels.as_deref(), arg_ref, prev, ctx.mysql_dialect)
+                                    extreme_cmp_in(spec.enum_labels.as_deref(), spec.arg_collation.as_deref(), arg_ref, prev, ctx.mysql_dialect)
                                         == core::cmp::Ordering::Less
                                 }
                             };
@@ -3140,6 +3185,7 @@ fn accumulate_groups(
                             arg2_val.as_ref(),
                             order_keys,
                             spec.enum_labels.as_deref(),
+                            spec.arg_collation.as_deref(),
                             ctx.mysql_dialect,
                         )?,
                     },
@@ -3157,6 +3203,7 @@ fn accumulate_groups(
                             arg2_val.as_ref(),
                             order_keys,
                             spec.enum_labels.as_deref(),
+                            spec.arg_collation.as_deref(),
                             ctx.mysql_dialect,
                         )?,
                     },
@@ -3169,6 +3216,7 @@ fn accumulate_groups(
                             arg2_val.as_ref(),
                             order_keys,
                             spec.enum_labels.as_deref(),
+                            spec.arg_collation.as_deref(),
                             ctx.mysql_dialect,
                         )?;
                     }
@@ -3306,6 +3354,7 @@ fn accumulate_groups(
                 arg2_val.as_ref(),
                 order_keys,
                 spec.enum_labels.as_deref(),
+                spec.arg_collation.as_deref(),
                 ctx.mysql_dialect,
             )?;
         }
@@ -4156,6 +4205,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     let spec = AggSpec {
                         kind: classify_agg_name(&canonical),
                         enum_labels: None,
+                        arg_collation: None,
                         order_enum_labels: Vec::new(),
                         name: canonical.clone(),
                         arg,
@@ -4219,6 +4269,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                 let spec = AggSpec {
                     kind: classify_agg_name(&canonical),
                     enum_labels: None,
+                    arg_collation: None,
                     order_enum_labels: Vec::new(),
                     name: canonical,
                     arg: arg.clone(),
@@ -4298,6 +4349,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                 let spec = AggSpec {
                     kind: AggKind::ArrayAgg,
                     enum_labels: None,
+                    arg_collation: None,
                     order_enum_labels: Vec::new(),
                     name: "array_agg".to_string(),
                     arg: Some(arg.clone()),
@@ -4363,6 +4415,9 @@ pub(crate) fn update_state(
     arg2: Option<&Value<'_>>,
     order_keys: Option<Vec<Value<'static>>>,
     enum_labels: Option<&[String]>,
+    // v7.39 (round 690) — the argument column's collation, beside
+    // `enum_labels` because it is the same kind of fact about the argument.
+    arg_collation: Option<&str>,
     mysql: bool,
 ) -> Result<(), EvalError> {
     let is_null = matches!(v, Value::Null);
@@ -4411,7 +4466,7 @@ pub(crate) fn update_state(
             match &st.extreme {
                 None => st.extreme = Some(v.clone().into_owned()),
                 Some(cur) => {
-                    if extreme_cmp(enum_labels, v, cur, mysql) == core::cmp::Ordering::Less {
+                    if extreme_cmp_in(enum_labels, arg_collation, v, cur, mysql) == core::cmp::Ordering::Less {
                         st.extreme = Some(v.clone().into_owned());
                     }
                 }
@@ -4494,7 +4549,7 @@ pub(crate) fn update_state(
             match &st.extreme {
                 None => st.extreme = Some(v.clone().into_owned()),
                 Some(cur) => {
-                    if extreme_cmp(enum_labels, v, cur, mysql) == core::cmp::Ordering::Greater {
+                    if extreme_cmp_in(enum_labels, arg_collation, v, cur, mysql) == core::cmp::Ordering::Greater {
                         st.extreme = Some(v.clone().into_owned());
                     }
                 }
@@ -6128,6 +6183,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
                     expr: rewrite_expr(&o.expr, group_exprs, aggs),
                     desc: o.desc,
                     nulls_first: o.nulls_first,
+                    collation: o.collation.clone(),
                 })
                 .collect(),
             // The filter is evaluated against SOURCE rows during
@@ -6680,8 +6736,33 @@ fn extreme_cmp(
     b: &Value,
     mysql: bool,
 ) -> core::cmp::Ordering {
+    extreme_cmp_in(enum_labels, None, a, b, mysql)
+}
+
+/// v7.39 (round 690) — `extreme_cmp` with the argument column's collation.
+///
+/// `min`/`max` over a column declared `COLLATE "en_US.utf8"` answered
+/// `Banana` and `Ápple` where PG18 gives `apple` and `Zebra`. The collation
+/// rides beside `enum_labels`, which is already exactly this: per-aggregate
+/// metadata about the argument, resolved once where the spec is built.
+///
+/// No derivation needed here — `min(loc)`'s argument is the column itself.
+/// An expression argument gets None and keeps byte order, which is the same
+/// limit `ORDER BY upper(loc)` has.
+fn extreme_cmp_in(
+    enum_labels: Option<&[String]>,
+    collation: Option<&str>,
+    a: &Value,
+    b: &Value,
+    mysql: bool,
+) -> core::cmp::Ordering {
     if let Some(labels) = enum_labels
         && let Some(ord) = crate::eval::enum_ord_cmp(labels, a, b)
+    {
+        return ord;
+    }
+    if let (Value::Text(x), Value::Text(y), Some(c)) = (a, b, collation)
+        && let Some(ord) = crate::collate::compare(c, x, y)
     {
         return ord;
     }

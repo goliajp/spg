@@ -3623,6 +3623,16 @@ pub struct OrderBy {
     /// NULLS FIRST for DESC); the engine resolves the effective
     /// value via `nulls_first.unwrap_or(desc)`.
     pub nulls_first: Option<bool>,
+    /// v7.39 (round 691) — an explicit `COLLATE` written on this key.
+    /// It lives here rather than in the expression for the same reason
+    /// `desc` does: at an ORDER BY key a collation is ordering
+    /// information, and nothing downstream of the sort needs it. A new
+    /// `Expr` variant would instead put a new arm on `eval_expr`, which
+    /// this repo has measured to overflow the debug stack.
+    ///
+    /// `None` means none was written, and the key falls back to whatever
+    /// its COLUMN declares — which is every key that existed before this.
+    pub collation: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

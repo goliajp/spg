@@ -17,7 +17,7 @@ use spg_sql::ast::{
 use spg_storage::{Row, Value};
 
 use crate::eval::{self, EvalContext};
-use crate::{EngineError, order_by_value_cmp, value_cmp, value_to_f64};
+use crate::{EngineError, value_cmp, value_to_f64};
 
 pub(crate) fn select_has_window(stmt: &SelectStatement) -> bool {
     for item in &stmt.items {
@@ -203,10 +203,27 @@ pub(crate) fn order_key_cmp(
     a: &[(Value, bool, Option<bool>)],
     b: &[(Value, bool, Option<bool>)],
 ) -> core::cmp::Ordering {
+    order_key_cmp_in(a, b, &[])
+}
+
+/// v7.39 (round 690) — `order_key_cmp` with the ORDER BY columns'
+/// declared collations, `colls[k]` for key `k` (a short slice means
+/// "none", which is what every caller but the sort passes).
+///
+/// Only the SORT needs these. Peer detection asks whether two keys are
+/// EQUAL, and PG18's `en_US.utf8` is deterministic — a collation tie is
+/// broken by the bytes there too, so byte equality already gives the same
+/// verdict, and the peer-group scans keep the cheaper comparison.
+pub(crate) fn order_key_cmp_in(
+    a: &[(Value, bool, Option<bool>)],
+    b: &[(Value, bool, Option<bool>)],
+    colls: &[Option<alloc::string::String>],
+) -> core::cmp::Ordering {
     // v7.24.1 — per-key DESC + effective NULLS placement (shared
     // contract with order_by_value_cmp).
-    for ((va, desc, nf), (vb, _, _)) in a.iter().zip(b.iter()) {
-        let c = order_by_value_cmp(*desc, *nf, va, vb);
+    for (k, ((va, desc, nf), (vb, _, _))) in a.iter().zip(b.iter()).enumerate() {
+        let coll = colls.get(k).and_then(Option::as_deref);
+        let c = crate::orderby::order_by_value_cmp_coll(*desc, *nf, va, vb, false, coll);
         if c != core::cmp::Ordering::Equal {
             return c;
         }
@@ -879,6 +896,9 @@ fn generic_aggregate_window(
                     name,
                     v,
                     arg2.as_ref().and_then(|a| a.get(j)),
+                    None,
+                    // Window aggregates do not resolve the argument's
+                    // enum labels or collation yet — same gap, one place.
                     None,
                     None,
                     ctx.mysql_dialect,
