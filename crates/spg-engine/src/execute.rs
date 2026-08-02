@@ -1433,7 +1433,7 @@ impl Engine {
                             }
                         }
                     }
-                    K::OwnedByRole => {
+                    K::RoleName => {
                         for n in names {
                             if !self.role_exists(n.as_str()) {
                                 return Err(EngineError::Unsupported(alloc::format!(
@@ -1445,6 +1445,30 @@ impl Engine {
                     // PG18 refuses this whatever it names, because no label
                     // provider is loaded — and SPG has none either, so the
                     // refusal is the honest answer rather than a stand-in.
+                    // v7.39 (round 697) — one list answers both, which is
+                    // why these and `pg_extension` cannot disagree.
+                    //
+                    // A WARNING, not an error, and that is a deliberate
+                    // departure from PG. PG can error because an extension
+                    // can be installed there; SPG cannot be installed into,
+                    // so refusing would turn a customer dump that restores
+                    // today into one that needs editing. Saying nothing was
+                    // the actual defect: `CREATE EXTENSION hstore` reported
+                    // success and nothing hstore-shaped worked afterwards.
+                    K::ExtensionAvailable | K::ExtensionInstalled => {
+                        for n in names {
+                            if !crate::system_catalog::INSTALLED_EXTENSIONS
+                                .iter()
+                                .any(|(e, _)| e.eq_ignore_ascii_case(n.as_str()))
+                            {
+                                self.warning(alloc::format!(
+                                    "extension \"{n}\" is not provided by this build; SPG \
+                                     accepts the statement so a dump restores, but nothing \
+                                     that extension supplies will be available"
+                                ));
+                            }
+                        }
+                    }
                     K::SecurityLabel => {
                         return Err(EngineError::Unsupported(alloc::string::String::from(
                             "no security label providers have been loaded",

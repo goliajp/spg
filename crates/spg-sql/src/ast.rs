@@ -138,12 +138,19 @@ pub struct SetDbRoleSettingStatement {
 pub enum ValidateOnlyKind {
     /// `LOCK TABLE <t> [, …]` — the relation must exist.
     LockTable,
-    /// `DROP OWNED BY <r> [, …]` / `REASSIGN OWNED BY <r> [, …] TO <r>` —
-    /// every role named must exist.
-    OwnedByRole,
+    /// Every role named must exist: `DROP OWNED BY <r> [, …]`,
+    /// `REASSIGN OWNED BY <r> [, …] TO <r>`, and (round 697)
+    /// `SET SESSION AUTHORIZATION <r>`.
+    RoleName,
     /// `SECURITY LABEL …` — PG refuses unconditionally, because no label
     /// provider is loaded. SPG has none either.
     SecurityLabel,
+    /// v7.39 (round 697) — `CREATE EXTENSION <e>`: the extension must be
+    /// AVAILABLE (PG: `extension "x" is not available`).
+    ExtensionAvailable,
+    /// v7.39 (round 697) — `DROP EXTENSION <e>`: it must be installed
+    /// (PG: `extension "x" does not exist`).
+    ExtensionInstalled,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5048,10 +5055,16 @@ impl fmt::Display for Statement {
             // stored), so the shortest faithful spelling of what it was.
             Self::ValidateOnly { kind, names } => match kind {
                 ValidateOnlyKind::LockTable => write!(f, "LOCK TABLE {}", names.join(", ")),
-                ValidateOnlyKind::OwnedByRole => {
+                ValidateOnlyKind::RoleName => {
                     write!(f, "DROP OWNED BY {}", names.join(", "))
                 }
                 ValidateOnlyKind::SecurityLabel => f.write_str("SECURITY LABEL"),
+                ValidateOnlyKind::ExtensionAvailable => {
+                    write!(f, "CREATE EXTENSION {}", names.join(", "))
+                }
+                ValidateOnlyKind::ExtensionInstalled => {
+                    write!(f, "DROP EXTENSION {}", names.join(", "))
+                }
             },
             Self::AlterSystem { parameter } => match parameter {
                 Some(p) => write!(f, "ALTER SYSTEM RESET {p}"),

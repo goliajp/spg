@@ -16,6 +16,14 @@
 statement ok
 SET SESSION AUTHORIZATION DEFAULT
 
+# v7.39 (round 697) — the role is CREATED first now. This asserted that
+# `SET SESSION AUTHORIZATION 'someuser'` succeeds for a role nobody made,
+# which PG18 refuses (`role "someuser" does not exist`) — the case was
+# pinning SPG's own laxness, the F31 shape, inside the conformance corpus.
+# The form under test is the quoted-role spelling, and it still is.
+statement ok
+CREATE ROLE someuser
+
 statement ok
 SET SESSION AUTHORIZATION 'someuser'
 
