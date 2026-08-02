@@ -174,6 +174,7 @@ mod e2e_numeric_ladder_round649;
 mod e2e_fts_catalogs_round650;
 mod e2e_not_valid_round652;
 mod e2e_attcollation_round675;
+mod e2e_collate_order_round688;
 mod e2e_collation_round670;
 mod e2e_value_cmp_round672;
 mod e2e_numeric_template_round669;

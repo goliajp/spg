@@ -24,7 +24,7 @@ use crate::{
     collect_meta_view_names, collect_qualified_refs, collect_scalar_subqueries,
     collect_window_nodes, compute_window_partition, eval, expr_tree_has_subquery,
     materialise_in_order, materialise_meta_view, memoize, order_by_value_cmp_in, order_key_cmp,
-    partial_sort_tagged, partition_key_cmp, rewrite_window_to_columns, select_has_window,
+    partition_key_cmp, rewrite_window_to_columns, select_has_window,
     select_references_meta_view, select_refers_to, sort_by_keys, synth_info_key_column_usage,
     synth_info_referential_constraints, synth_info_routines, synth_info_statistics,
     synth_information_schema_columns, synth_information_schema_tables, synth_mysql_db,
@@ -511,6 +511,7 @@ impl Engine {
             .map(|p| {
                 let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
                 c.user_enum_type = p.user_enum_type;
+                c.collation_name = p.collation_name;
                 c.mysql_fsp = p.mysql_fsp;
                 c
             })
@@ -5086,6 +5087,7 @@ impl Engine {
                     .map(|p| {
                         let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
                         c.user_enum_type = p.user_enum_type;
+                        c.collation_name = p.collation_name;
                 c.mysql_fsp = p.mysql_fsp;
                         c
                     })
@@ -5110,6 +5112,7 @@ impl Engine {
                 .map(|p| {
                     let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
                     c.user_enum_type = p.user_enum_type;
+                    c.collation_name = p.collation_name;
                 c.mysql_fsp = p.mysql_fsp;
                     c
                 })
@@ -5163,6 +5166,7 @@ impl Engine {
             .map(|p| {
                 let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
                 c.user_enum_type = p.user_enum_type;
+                c.collation_name = p.collation_name;
                 c.mysql_fsp = p.mysql_fsp;
                 c
             })
@@ -6361,6 +6365,7 @@ impl Engine {
             .map(|p| {
                 let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
                 c.user_enum_type = p.user_enum_type;
+                c.collation_name = p.collation_name;
                 c.mysql_fsp = p.mysql_fsp;
                 c
             })
@@ -6845,7 +6850,14 @@ impl Engine {
                     .map(|l| l as usize + stmt.offset_literal().map_or(0, |o| o as usize))
             };
             let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
-            partial_sort_tagged(&mut tagged, keep, &descs);
+            // v7.39 (round 688) — the join's ORDER BY resolves its keys
+            // against `ctx`, which is built from `build_combined_schema`, so
+            // this is where a declared collation reaches the sort. There was
+            // exactly ONE resolver call in the engine before this — the
+            // single-table scan's — which is why every other shape sorted by
+            // bytes no matter what the schemas carried.
+            let colls = crate::orderby::order_by_collations(&stmt.order_by, &ctx);
+            crate::orderby::partial_sort_tagged_in(&mut tagged, keep, &descs, &colls);
         }
         let mut output_rows: Vec<Row<'static>> = tagged.into_iter().map(|(_, r)| r).collect();
         apply_offset_and_limit(
@@ -6858,6 +6870,7 @@ impl Engine {
             .map(|p| {
                 let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
                 c.user_enum_type = p.user_enum_type;
+                c.collation_name = p.collation_name;
                 c.mysql_fsp = p.mysql_fsp;
                 c
             })
@@ -6992,6 +7005,13 @@ pub(crate) struct ProjectedItem {
     /// DataType lattice, so a projection that dropped it made the RESULT
     /// schema forget how wide the fraction should print.
     pub(crate) mysql_fsp: Option<u8>,
+    /// v7.39 (round 688) — and its declared collation, the third thing to
+    /// live outside the DataType lattice and the third to be lost the same
+    /// way. Measured: `SELECT a.loc FROM a JOIN b … ORDER BY a.loc` over a
+    /// column declared `COLLATE "en_US.utf8"` sorted by bytes, because the
+    /// projection rebuilt the output column and the ORDER BY resolves
+    /// against THAT schema.
+    pub(crate) collation_name: Option<String>,
 }
 
 /// Dedupe a row set, preserving first-seen order. `Row`'s `PartialEq` is
@@ -8186,6 +8206,7 @@ pub(crate) fn build_projection_hiding_tail(
                         nullable: col.nullable,
                         user_enum_type: col.user_enum_type.clone(),
                         mysql_fsp: col.mysql_fsp,
+                        collation_name: col.collation_name.clone(),
                     });
                 }
             }
@@ -8221,6 +8242,7 @@ pub(crate) fn build_projection_hiding_tail(
                         nullable: col.nullable,
                         user_enum_type: col.user_enum_type.clone(),
                         mysql_fsp: col.mysql_fsp,
+                        collation_name: col.collation_name.clone(),
                     });
                 }
                 if matched == 0 {
@@ -8248,6 +8270,7 @@ pub(crate) fn build_projection_hiding_tail(
                         // its enum identity through the projection.
                         user_enum_type: sch.user_enum_type.clone(),
                         mysql_fsp: sch.mysql_fsp,
+                        collation_name: sch.collation_name.clone(),
                     });
                 } else if let Some(shape) = describe::describe_expr(expr, schema_cols) {
                     let output_name = alias
@@ -8266,6 +8289,15 @@ pub(crate) fn build_projection_hiding_tail(
                         nullable: shape.nullable,
                         user_enum_type: None,
                         mysql_fsp: crate::eval::expr_mysql_fsp(expr, schema_cols),
+                        // A bare column reference keeps its collation; any
+                        // other expression produces a new value and has none.
+                        collation_name: match expr {
+                            Expr::Column(c) => schema_cols
+                                .iter()
+                                .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+                                .and_then(|sc| sc.collation_name.clone()),
+                            _ => None,
+                        },
                     });
                 } else {
                     let output_name = alias
@@ -8284,6 +8316,13 @@ pub(crate) fn build_projection_hiding_tail(
                         user_enum_type: crate::eval::expr_enum_type_name_pub(expr, schema_cols)
                             .map(alloc::string::String::from),
                         mysql_fsp: crate::eval::expr_mysql_fsp(expr, schema_cols),
+                        collation_name: match expr {
+                            Expr::Column(c) => schema_cols
+                                .iter()
+                                .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+                                .and_then(|sc| sc.collation_name.clone()),
+                            _ => None,
+                        },
                     });
                 }
             }
