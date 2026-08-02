@@ -5977,6 +5977,10 @@ impl Engine {
         // space, not O(rows). `None` = accumulate everything (the prior
         // behaviour). The final `partial_sort_tagged(keep)` below still
         // runs and produces the identical rows.
+        // v7.39 (round 683) — the declared collation for each ORDER BY
+        // position, resolved once and carried beside `descs` for the same
+        // reason `descs` is carried: it is per key position, not per row.
+        let order_colls = crate::orderby::order_by_collations(&order_by, &ctx);
         let topk_stream: Option<(usize, Vec<bool>)> = if !order_by.is_empty()
             && !stmt.distinct
             && !stmt.limit_with_ties
@@ -6091,7 +6095,7 @@ impl Engine {
                     && let Some(b) = &topk_boundary
                 {
                     boundary_checks += 1;
-                    let loses = crate::orderby::cmp_multi_key(&buf, b, descs)
+                    let loses = crate::orderby::cmp_multi_key_in(&buf, b, descs, &order_colls)
                         == core::cmp::Ordering::Greater;
                     if loses {
                         boundary_rejects += 1;
@@ -6321,7 +6325,7 @@ impl Engine {
                     .map(|l| l as usize + stmt.offset_literal().map_or(0, |o| o as usize))
             };
             let descs: Vec<bool> = order_by.iter().map(|o| o.desc).collect();
-            partial_sort_tagged(&mut tagged, keep, &descs);
+            crate::orderby::partial_sort_tagged_in(&mut tagged, keep, &descs, &order_colls);
         }
 
         // v7.17.0 Phase 3.P0-49 — `FETCH FIRST … WITH TIES` extends

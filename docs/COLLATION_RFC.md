@@ -109,6 +109,64 @@ the converged comparison needs the same treatment and a bench.
   appendix — the sparse index-aligned kind this codec already uses several
   times over, costing two bytes for a table that declares none.
 
+## 4b. Threading — measured in round 681, not yet built
+
+Three findings, each of which narrows the job:
+
+**Equality is untouched.** PG18's `en_US.utf8` is a deterministic collation
+(`collisdeterministic` is true). Measured: `'a' = 'A'` is false, `DISTINCT`
+over `'a','A'` gives two groups, and a join on them matches nothing. A
+locale collation changes ORDER and nothing else, so every comparison site
+that only asks about equality — join keys, DISTINCT, GROUP BY — needs
+nothing at all.
+
+**Sort keys would have avoided threading entirely, and are not available.**
+`icu_collator` can emit a byte string whose byte order IS the collation's
+order (`write_sort_key_to`). Built once where the column is known, it would
+leave all 47 downstream comparisons the byte compares they already are, and
+cost O(n) instead of O(n log n) collator calls. It is behind the crate's
+`unstable` feature with an upstream graduation tracking issue. Sort keys
+would become the on-disk order of every text index; an API upstream says may
+still change is the wrong foundation for bytes that outlive the process.
+Revisit when it graduates.
+
+**Round 682 tried to build it and reverted.** Three attempts, each aimed at
+a place the collation "obviously" had to pass through, and none of them was
+on the path a plain `SELECT loc FROM t ORDER BY loc` actually takes:
+
+  * `sort_by_keys` / `cmp_multi_key` (the OrderKey family) — wired, no effect.
+  * the four `order_by_value_cmp_in` sites in `select.rs` — wired, no effect.
+  * `describe.rs` dropping the collation when projecting a bare column
+    reference — a real bug, fixed, still no effect.
+
+What settled it was not reading more code. Forcing `collate::compare` to
+reverse EVERY comparison and watching the output not move proved the
+resolver was never called at all. The path is `run_single_table_scan`, whose
+top-N trim calls `cmp_multi_key` directly, and two more callers sit in
+`locks.rs` and `join.rs` — the latter inside an `Ord` impl with no context
+to look a column up from.
+
+So the honest shape of this step: it is not "one enum and its comparison".
+It is every sort path in the engine, one of which cannot reach a schema at
+all without changing what it stores. That is a design change to how sort
+keys carry their metadata, and it needs to be designed before it is typed —
+the three attempts above were typed first.
+
+The revert was to the round-680 tree. Nothing half-wired was left behind,
+because a collation honoured on some paths and not others is worse than one
+honoured nowhere: it would make ORDER BY depend on which plan the optimiser
+picked.
+
+**The seam was thought to be `OrderKey`.** `orderby::OrderKey` is
+the repo's own sort-key abstraction — `Num(f64)`, `Int(i128)`,
+`Text(String)`, `Bytes(..)`, and NULL sentinels — built at the point where
+the ORDER BY expression and the row's columns are both in hand, then
+compared by `cmp_multi_key` / `sort_by_keys`. A text key carrying its
+column's collation is a change to one enum and its comparison, not to 47
+call sites. There are 33 construction sites; only those that know the column
+can supply a collation, and the rest keep today's byte order, which is
+correct for a column that declares none.
+
 ## 5. Recommendation
 
 Adopt (a). Sequence: converge comparison (with a bench) → thread the

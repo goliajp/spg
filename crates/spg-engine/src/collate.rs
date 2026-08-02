@@ -38,10 +38,43 @@ pub(crate) fn compare(collation: &str, a: &str, b: &str) -> Option<Ordering> {
     }
     let locale = icu_locale_core::Locale::try_from_str(&normalise(name)).ok()?;
     let prefs = icu_collator::CollatorPreferences::from(&locale);
-    let collator =
-        icu_collator::Collator::try_new(prefs, icu_collator::options::CollatorOptions::default())
-            .ok()?;
+    let collator = icu_collator::Collator::try_new(prefs, pg_options()).ok()?;
     Some(collator.compare(a, b))
+}
+
+/// The options PG's collations behave under.
+///
+/// v7.39 (round 683) — `AlternateHandling::Shifted`, and it is not a
+/// preference. ICU defaults to `NonIgnorable`, where punctuation carries a
+/// primary weight; PG (via glibc/ICU as configured) uses shifted, where it
+/// is ignorable at the primary level and only breaks ties. Measured on
+/// PG18: `_under` sorts between `cherry` and `Zebra` — as `under` — and
+/// with the ICU default it sorts before all of them.
+///
+/// Round 678's rules missed this because the probe used single characters.
+/// With one character per value every primary weight is equal, so the
+/// tiebreak IS the answer, and " < _ < 1 < a" got recorded as the rule when
+/// it is only the degenerate case.
+fn pg_options() -> icu_collator::options::CollatorOptions {
+    // v7.39 (round 684) — `Shifted`, max_variable `Punctuation`. Chosen by
+    // sweeping all five settings against PG, not by preference.
+    //
+    // Punctuation is variable-weighted in PG: ignorable at the primary
+    // level, a tiebreak below it. `_id` sorts as `id`, `O'Brien` next to
+    // `Obrien`, `de-luca` next to `deluca` — measured, all three.
+    //
+    // One case stays wrong and no setting fixes it. Ordering values that
+    // are ENTIRELY punctuation, PG gives ` , -, ., _` and shifted ICU gives
+    // `_,  , ...`: with no letters, every primary weight is equal and the
+    // answer comes from the quaternary weights, where the two implementations
+    // differ. NonIgnorable gets that case right and every case with a letter
+    // in it wrong. Real columns hold names and identifiers, so the trade is
+    // one degenerate shape against every ordinary one — and it is a trade,
+    // recorded as F36's residual rather than described as complete.
+    let mut o = icu_collator::options::CollatorOptions::default();
+    o.alternate_handling = Some(icu_collator::options::AlternateHandling::Shifted);
+    o.max_variable = Some(icu_collator::options::MaxVariable::Punctuation);
+    o
 }
 
 /// Whether this build can perform a collation by that name.
@@ -101,13 +134,16 @@ mod tests {
             ["e", "E", "é", "ê", "f"]
         );
         assert_eq!(compare("en_US.utf8", "résumé", "resumes"), Some(Ordering::Less));
-        // Space < underscore < digit < letter.
-        assert_eq!(sorted("en_US.utf8", vec!["a", "1", "_", " ", "A"]), [" ", "_", "1", "a", "A"]);
-        // Space and hyphen carry weight — they are not ignorable.
-        assert_eq!(
-            sorted("en_US.utf8", vec!["aB", "ab", "a-b", "a b"]),
-            ["a b", "a-b", "ab", "aB"]
-        );
+        // Digits before letters. Punctuation's place among them is a
+        // quaternary question once nothing else separates the values — see
+        // `all_punctuation_values_are_a_known_residual`.
+        assert_eq!(sorted("en_US.utf8", vec!["a", "1", "A"]), ["1", "a", "A"]);
+        // `ab`, `a-b` and `a b` share a primary weight, so their relative
+        // order is quaternary (the residual). What holds regardless: all
+        // three sort before `aB`, because case is the tertiary weight and
+        // it outranks punctuation's.
+        let g = sorted("en_US.utf8", vec!["aB", "ab", "a-b", "a b"]);
+        assert_eq!(g[3], "aB", "case outranks punctuation: {g:?}");
         // No numeric-aware ordering: a10 sorts between a1 and a2.
         assert_eq!(sorted("en_US.utf8", vec!["a2", "a10", "a1"]), ["a1", "a10", "a2"]);
         // Latin, then Kana, then Han.
@@ -138,6 +174,55 @@ mod tests {
     fn an_unknown_name_declines_instead_of_guessing() {
         assert_eq!(compare("no_such_locale_at_all", "a", "b"), None);
         assert!(!is_supported("no_such_locale_at_all"));
+    }
+
+    /// v7.39 (round 683) — word-initial punctuation, which is where the
+    /// round-678 rules were incomplete. Measured on PG18: `_under` sorts
+    /// between `cherry` and `Zebra`, i.e. as `under`, because punctuation is
+    /// variable-weighted — ignorable at the primary level and only a
+    /// tiebreak once the letters agree. The round-678 probe used single
+    /// characters, where every primary weight IS equal, so it only ever saw
+    /// the degenerate case and recorded it as "space < underscore < digit
+    /// < letter".
+    /// Punctuation is ignorable at the primary level, so a value sorts by
+    /// its letters. All PG18-measured.
+    #[test]
+    fn punctuation_is_variable_weighted_like_pg() {
+        assert_eq!(
+            sorted("en_US.utf8", vec!["_under", "apple", "Zebra", "cherry"]),
+            ["apple", "cherry", "_under", "Zebra"]
+        );
+        assert_eq!(
+            sorted("en_US.utf8", vec!["_id", "name", "zip", "_ts", "email"]),
+            ["email", "_id", "name", "_ts", "zip"]
+        );
+        assert_eq!(
+            sorted("en_US.utf8", vec!["O'Brien", "Oakes", "Obrien", "O-Brien"]),
+            ["Oakes", "Obrien", "O'Brien", "O-Brien"]
+        );
+        // `de luca` / `de-luca` / `deluca` all reduce to `deluca` at the
+        // primary level, so their RELATIVE order is a quaternary question —
+        // the residual below. What is asserted is that they group together
+        // ahead of `demarco`, which is the property the collation buys.
+        let g = sorted("en_US.utf8", vec!["de luca", "deluca", "de-luca", "demarco"]);
+        assert_eq!(g[3], "demarco", "the de-luca variants group before demarco: {g:?}");
+    }
+
+    /// The one case that stays wrong, pinned as wrong so it is not mistaken
+    /// for correct. A value that is ENTIRELY punctuation has no letters, so
+    /// every primary weight ties and the answer comes from quaternary
+    /// weights, where PG and ICU differ. PG gives ` , -, ., _`.
+    ///
+    /// Swept all five alternate-handling / max_variable combinations: the
+    /// two that get this right get every case with a letter in it wrong.
+    /// F36 residual.
+    #[test]
+    fn all_punctuation_values_are_a_known_residual() {
+        assert_eq!(
+            sorted("en_US.utf8", vec!["_", " ", "-", "."]),
+            ["_", " ", "-", "."],
+            "if this changes, re-measure against PG: it wants ' ', '-', '.', '_'"
+        );
     }
 
     /// Different locales really do disagree — otherwise this whole
