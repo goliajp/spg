@@ -262,6 +262,42 @@ all schemas rebuilt for an intermediate result, and all three silently lost
 the collation. Whenever a `ColumnSchema` is constructed rather than cloned,
 check what the original carried.
 
+## 4f. Round 689 — the full shape list, re-measured
+
+Round 688 verified four shapes and reported the ordering side closed. F36
+originally measured nine. Re-running the fuller set says three of seven pass
+and four do not, so "closed" was said on a subset:
+
+| shape | SPG | PG18 | |
+|---|---|---|---|
+| `ORDER BY loc` | en_US | en_US | ok |
+| index scan `WHERE loc > 'A' ORDER BY loc` | en_US | en_US | ok |
+| **`WHERE loc BETWEEN 'B' AND 'c'`** | **4 rows** | **1 row** | **different DATA** |
+| `min(loc)` / `max(loc)` | Banana / Ápple | apple / Zebra | wrong |
+| `row_number() OVER (ORDER BY loc)` | bytes | en_US | wrong |
+| `ORDER BY upper(loc)` | bytes | en_US | wrong |
+| `'a' < 'b' COLLATE "en_US.utf8"` | refused | t | wrong |
+
+BETWEEN is the serious one: it is not an ordering difference, it is a
+different row set from the same SQL. It goes through `binop::compare`,
+proven by panicking in that function's Text arm and watching the query hit
+it.
+
+`compare(op, l, r)` takes two values and no column, exactly as the sort
+comparators did. Two things make it harder than the sort was. Its own
+comment records it as the dominant cost of a scan — 35.6% of self time on
+`g = 5` — so a parameter added here has to survive a bench, not just a
+correctness gate. And a comparison's operands are two arbitrary expressions,
+so "which column's collation applies" is a resolution question PG answers
+with collation derivation rules that SPG does not model at all.
+
+`ORDER BY upper(loc)` is the same question in the sort: PG gives a function
+result the collation of its argument. SPG resolves a collation only for a
+bare column reference, which is why that row is wrong.
+
+So the remaining work is not more wiring. It is collation DERIVATION — what
+collation an expression has — and that is a piece of design, not an edit.
+
 ## 5. Recommendation
 
 Adopt (a). Sequence: converge comparison (with a bench) → thread the
