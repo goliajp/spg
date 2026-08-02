@@ -226,6 +226,42 @@ comparison families — reversing each of those whole left it unchanged. So a
 plain ORDER BY over a join sorts somewhere a census of `value_cmp` and
 `cmp_multi_key` callers does not reach, and that is where to look next.
 
+## 4e. Round 687 — the join path, located exactly
+
+`SELECT a.loc FROM a JOIN b … ORDER BY a.loc` sorts by bytes. Three facts,
+each proven rather than reasoned:
+
+1. **`build_combined_schema` in `join.rs` IS on the path, and DOES need the
+   collation.** Proven by panicking inside it and watching the query hit the
+   panic. It builds each qualified column with `ColumnSchema::new`, which
+   knows only name, type and nullability, so the source column's collation
+   stops there.
+
+2. **Fixing only that is not enough.** With the collation carried across the
+   combined schema, the query still sorted by bytes — the projection drops
+   it one layer later.
+
+3. **`ProjectedItem` is where it is dropped, and the fix has two
+   precedents.** That struct already carries `user_enum_type` and
+   `mysql_fsp` for exactly this reason, and its own doc comments say so: "a
+   projection that dropped this made the RESULT schema forget it — and a
+   UNION's combined ORDER BY … silently fell back to TEXT order". Collation
+   is the third thing living outside the DataType lattice. Six sites rebuild
+   a `ColumnSchema` from a `ProjectedItem` and each copies those two fields
+   by hand.
+
+So the remaining work is: add `collation_name` to `ProjectedItem`, fill it
+in `build_projection` beside `user_enum_type` (four sites), and copy it at
+the six rebuild sites. Round 687 attempted this and made three mechanical
+editing errors on a 9000-line file, so `select.rs` was reverted; the two
+`join.rs` and `aggregate.rs` findings above stand on their own evidence.
+
+**The pattern, now three-for-three.** GROUP BY's `__grp_j` columns (round
+686), the join's qualified columns, and the projection's output columns are
+all schemas rebuilt for an intermediate result, and all three silently lost
+the collation. Whenever a `ColumnSchema` is constructed rather than cloned,
+check what the original carried.
+
 ## 5. Recommendation
 
 Adopt (a). Sequence: converge comparison (with a bench) → thread the
