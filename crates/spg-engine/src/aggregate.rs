@@ -3353,10 +3353,16 @@ fn build_synth_schema(
         // its enum identity so HAVING comparisons and the grouped-output
         // ORDER BY sort by member order downstream.
         if let Some(Expr::Column(c)) = group_exprs.get(i) {
-            col.user_enum_type = schema_cols
-                .iter()
-                .find(|sc| sc.name == c.name)
-                .and_then(|sc| sc.user_enum_type.clone());
+            let src = schema_cols.iter().find(|sc| sc.name == c.name);
+            col.user_enum_type = src.and_then(|sc| sc.user_enum_type.clone());
+            // v7.39 (round 686) — and its collation, for the same reason and
+            // by the same route. A `__grp_j` column is where a GROUP BY key
+            // lives from here on, so anything the downstream ORDER BY needs
+            // about the original column has to travel with it. Without this
+            // the resolver looks the key up in the synthetic schema, finds
+            // `__grp_0` with no collation, and the group-by ordering silently
+            // stays byte-wise.
+            col.collation_name = src.and_then(|sc| sc.collation_name.clone());
         }
         synth_schema.push(col);
     }
@@ -3840,6 +3846,24 @@ fn sort_synth_by_order_by(
         .iter()
         .map(|e| crate::eval::expr_enum_labels(e, synth_schema, catalog))
         .collect();
+    // v7.39 (round 686) — per-key declared collation, built exactly like the
+    // enum labels above because it is the same kind of thing: metadata the
+    // comparator needs, resolved once per sort from the key expression.
+    //
+    // Located by forcing this call site to reverse and watching
+    // `GROUP BY loc ORDER BY loc` flip. Rounds 682 and 685 wired eleven
+    // sites between them without doing that, and none was on the path.
+    let key_colls: Vec<Option<alloc::string::String>> = order_rewritten
+        .iter()
+        .map(|e| {
+            let spg_sql::ast::Expr::Column(c) = e else {
+                return None;
+            };
+            let pos = crate::eval::find_column_pos(c, &synth_ctx)?;
+            let name = synth_schema.get(pos)?.collation_name.clone()?;
+            crate::collate::is_supported(&name).then_some(name)
+        })
+        .collect();
     // v6.4.0 — multi-key ORDER BY on aggregate output. Each key
     // gets its own rewrite + per-key DESC flag. (Rewrites hoisted
     // above as `order_rewritten` — shared with the deferral
@@ -3891,7 +3915,14 @@ fn sort_synth_by_order_by(
                 }
                 continue;
             }
-            let c = crate::order_by_value_cmp_in(desc, nf, ka, kb, mysql);
+            let c = crate::orderby::order_by_value_cmp_coll(
+                desc,
+                nf,
+                ka,
+                kb,
+                mysql,
+                key_colls.get(i).and_then(|c| c.as_deref()),
+            );
             if c != Ordering::Equal {
                 return c;
             }

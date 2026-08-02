@@ -49,12 +49,40 @@ pub(crate) fn order_by_value_cmp_in(
     b: &Value,
     mysql: bool,
 ) -> core::cmp::Ordering {
+    order_by_value_cmp_coll(desc, nulls_first, a, b, mysql, None)
+}
+
+/// v7.39 (round 686) — the value-comparing family, with a collation.
+pub(crate) fn order_by_value_cmp_coll(
+    desc: bool,
+    nulls_first: Option<bool>,
+    a: &Value,
+    b: &Value,
+    mysql: bool,
+    collation: Option<&str>,
+) -> core::cmp::Ordering {
+    if let (Value::Text(x), Value::Text(y), Some(c)) = (a, b, collation)
+        && let Some(ord) = crate::collate::compare(c, x, y)
+    {
+        return if desc { ord.reverse() } else { ord };
+    }
+    order_by_value_cmp_raw(desc, nulls_first, a, b, mysql)
+}
+
+fn order_by_value_cmp_raw(
+    desc: bool,
+    nulls_first: Option<bool>,
+    a: &Value,
+    b: &Value,
+    mysql: bool,
+) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     // v7.39 (round 403) — MySQL treats NULL as the SMALLEST value, so its
     // default is NULLS FIRST for ASC / NULLS LAST for DESC; PG's default is
     // the reverse (NULLS LAST for ASC / FIRST for DESC). An explicit
     // NULLS FIRST/LAST still wins.
     let nf = nulls_first.unwrap_or(if mysql { !desc } else { desc });
+
     match (matches!(a, Value::Null), matches!(b, Value::Null)) {
         (true, true) => Ordering::Equal,
         (true, false) => {
