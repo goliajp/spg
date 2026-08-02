@@ -980,6 +980,25 @@ pub(crate) enum OrderKey {
 /// finite `Num` vs `Text` (heterogeneous ORDER BY expression) is given
 /// a deterministic total order (Num before Text) so the sort stays
 /// total + stable.
+/// v7.39 (round 683) — the same comparison under a column's collation.
+///
+/// Only a Text/Text pair can move: PG18's `en_US.utf8` is a deterministic
+/// collation, so equality is unchanged there too (`'a' = 'A'` is false) and
+/// only ORDER differs. A collation this build cannot perform keeps byte
+/// order, which is what round 679's CREATE TABLE warning tells the user.
+fn order_key_elem_cmp_in(
+    a: &OrderKey,
+    b: &OrderKey,
+    collation: Option<&str>,
+) -> core::cmp::Ordering {
+    if let (OrderKey::Text(x), OrderKey::Text(y), Some(c)) = (a, b, collation)
+        && let Some(ord) = crate::collate::compare(c, x, y)
+    {
+        return ord;
+    }
+    order_key_elem_cmp(a, b)
+}
+
 fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     match (a, b) {
@@ -1116,7 +1135,24 @@ pub(crate) fn partial_sort_tagged(
     keep: Option<usize>,
     descs: &[bool],
 ) {
-    let cmp = |a: &(Vec<OrderKey>, Row), b: &(Vec<OrderKey>, Row)| cmp_multi_key(&a.0, &b.0, descs);
+    partial_sort_tagged_in(tagged, keep, descs, &[]);
+}
+
+/// v7.39 (round 683) — `partial_sort_tagged` honouring one collation per key
+/// position. This is the full-sort half of the single-table scan; the top-N
+/// half compares through `cmp_multi_key_in` directly. Both had to land in
+/// the same round: a collation honoured by one and not the other would make
+/// ORDER BY depend on whether a LIMIT was small enough to take the top-N
+/// path.
+pub(crate) fn partial_sort_tagged_in(
+    tagged: &mut Vec<(Vec<OrderKey>, Row)>,
+    keep: Option<usize>,
+    descs: &[bool],
+    collations: &[Option<alloc::string::String>],
+) {
+    let cmp = |a: &(Vec<OrderKey>, Row), b: &(Vec<OrderKey>, Row)| {
+        cmp_multi_key_in(&a.0, &b.0, descs, collations)
+    };
     match keep {
         Some(k) if k < tagged.len() && k > 0 => {
             let pivot = k - 1;
@@ -1131,7 +1167,38 @@ pub(crate) fn partial_sort_tagged(
 }
 
 pub(crate) fn sort_by_keys(tagged: &mut [(Vec<OrderKey>, Row)], descs: &[bool]) {
-    tagged.sort_by(|a, b| cmp_multi_key(&a.0, &b.0, descs));
+    sort_by_keys_in(tagged, descs, &[]);
+}
+
+/// v7.39 (round 683) — `sort_by_keys` honouring one collation per position.
+pub(crate) fn sort_by_keys_in(
+    tagged: &mut [(Vec<OrderKey>, Row)],
+    descs: &[bool],
+    collations: &[Option<alloc::string::String>],
+) {
+    tagged.sort_by(|a, b| cmp_multi_key_in(&a.0, &b.0, descs, collations));
+}
+
+/// v7.39 (round 683) — the collation for each ORDER BY position.
+///
+/// Only a bare column reference has one: `ORDER BY upper(name)` sorts a new
+/// value, and SPG does not track collation through expressions. Resolved
+/// once per sort, beside `descs`, never per row.
+pub(crate) fn order_by_collations(
+    order_by: &[spg_sql::ast::OrderBy],
+    ctx: &EvalContext,
+) -> alloc::vec::Vec<Option<alloc::string::String>> {
+    order_by
+        .iter()
+        .map(|o| {
+            let Expr::Column(c) = &o.expr else {
+                return None;
+            };
+            let pos = eval::find_column_pos(c, ctx)?;
+            let name = ctx.columns.get(pos)?.collation_name.clone()?;
+            crate::collate::is_supported(&name).then_some(name)
+        })
+        .collect()
 }
 
 /// Streaming top-N trim for `ORDER BY … LIMIT k`. Called inside the row-
@@ -1217,9 +1284,27 @@ pub(crate) fn topk_trim_recycling<'a>(
 /// v7.37.16 — keys are `OrderKey` (numeric fast path OR full text);
 /// see `order_key_elem_cmp`.
 pub(crate) fn cmp_multi_key(a: &[OrderKey], b: &[OrderKey], descs: &[bool]) -> core::cmp::Ordering {
+    cmp_multi_key_in(a, b, descs, &[])
+}
+
+/// v7.39 (round 683) — `cmp_multi_key` with one collation per key position.
+///
+/// Per POSITION because that is how the other per-key metadata already
+/// travels: every sort site in the engine carries `descs: &[bool]`, one
+/// flag per ORDER BY item, derived from the same `order_by`. A collation is
+/// the same shape and rides beside it — including through the `Ord` impl in
+/// `join.rs`, which stores its `descs` in the struct and can store these
+/// the same way. Round 682 looked for a seam and typed at three wrong ones;
+/// the seam was the metadata that was already being carried.
+pub(crate) fn cmp_multi_key_in(
+    a: &[OrderKey],
+    b: &[OrderKey],
+    descs: &[bool],
+    collations: &[Option<alloc::string::String>],
+) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     for (i, (ka, kb)) in a.iter().zip(b.iter()).enumerate() {
-        let ord = order_key_elem_cmp(ka, kb);
+        let ord = order_key_elem_cmp_in(ka, kb, collations.get(i).and_then(|c| c.as_deref()));
         let ord = if descs.get(i).copied().unwrap_or(false) {
             ord.reverse()
         } else {
