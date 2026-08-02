@@ -4610,7 +4610,18 @@ pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         } else if (msg.contains("table \"")
             || msg.contains("relation \"")
             // v7.39 (read01 round 89) — a missing view is PG's 42P01 too.
-            || msg.contains("view \""))
+            || msg.contains("view \"")
+            // v7.39 (round 698) — and a missing SEQUENCE, which PG also
+            // answers 42P01 for (`sequence "s" does not exist`).
+            //
+            // Leaving it out cost more than the code: an unclassified error
+            // stays 42000, and the 42000 branch below is the one that does
+            // NOT strip SPG's internal prefixes. The sequence not-found
+            // rides `StorageError::Corrupt`, whose Display prefixes
+            // `corrupt on-disk format: ` — so `DROP SEQUENCE nosuch`
+            // reported a CORRUPTION to the client. An operator reading that
+            // goes looking for a damaged file.
+            || msg.contains("sequence \""))
             && msg.contains("does not exist")
         {
             "42P01"
@@ -4974,6 +4985,42 @@ mod engine_error_sqlstate_tests {
         // v7.39 (read01 round 47) — the rest of the DDL object-error surface.
         assert_eq!(code("relation \"r1\" already exists"), "42P07");
         assert_eq!(code("relation \"nope_tbl\" does not exist"), "42P01");
+        // v7.39 (round 698) — a missing SEQUENCE, which stayed 42000 and so
+        // reached the client still carrying `corrupt on-disk format: `.
+        // The classification and the banner are the same bug: only a typed
+        // SQLSTATE earns the right to rewrite the message text.
+        assert_eq!(code("sequence \"nope_seq\" does not exist"), "42P01");
+        // v7.39 (round 701) — a LAYER name is never PG's vocabulary, in any
+        // class. Rounds 698 and 700 each met one instance of this (`corrupt
+        // on-disk format: ` on a sequence, then on a trigger) and fixed the
+        // instance by classifying the message; the class is fixed by
+        // peeling the layer names whatever the SQLSTATE.
+        assert_eq!(
+            crate::strip_layer_prefixes_keeping_unsupported(
+                "storage: relation \"nope\" does not exist"
+            ),
+            "relation \"nope\" does not exist"
+        );
+        assert_eq!(
+            crate::strip_layer_prefixes_keeping_unsupported(
+                "corrupt on-disk format: trigger \"t\" for table \"x\" does not exist"
+            ),
+            "trigger \"t\" for table \"x\" does not exist"
+        );
+        // …and `unsupported: ` is the one that stays, because in the
+        // generic 42000 class it is the only honest thing SPG can say.
+        assert_eq!(
+            crate::strip_layer_prefixes_keeping_unsupported("unsupported: whatever"),
+            "unsupported: whatever"
+        );
+        assert_eq!(
+            crate::strip_internal_error_prefixes("unsupported: whatever"),
+            "whatever"
+        );
+        assert_eq!(
+            code("corrupt on-disk format: sequence \"nope_seq\" does not exist"),
+            "42P01"
+        );
         assert_eq!(code("type \"r_enum\" already exists"), "42710");
         assert_eq!(
             code("constraint \"c1\" for relation \"r1\" already exists"),
@@ -7195,10 +7242,19 @@ fn send_error_pos(
     // truthful for the generic 42000 class; a typed SQLSTATE means we
     // understood the error precisely, so strip it from the client
     // message (PG has no such prefix).
-    let main_msg: &str = if sqlstate != "42000" {
-        crate::strip_internal_error_prefixes(main)
+    //
+    // v7.39 (round 701) — but ONLY that one is class-dependent. The
+    // condition used to gate the whole peel, so an unclassified error kept
+    // `storage: ` / `eval: ` / `corrupt on-disk format: ` as well — layer
+    // names from inside SPG that are never PG's vocabulary in any class.
+    // `COPY nosuch TO STDOUT` reached clients as `storage: relation
+    // "nosuch" does not exist`, and round 698's missing sequence carried a
+    // corruption banner. 698 fixed its instance by classifying the message;
+    // this fixes every instance, classified or not.
+    let main_msg: &str = if sqlstate == "42000" {
+        crate::strip_layer_prefixes_keeping_unsupported(main)
     } else {
-        main
+        crate::strip_internal_error_prefixes(main)
     };
     // PG's 23505 message carries no table suffix — the table lands in
     // the PG_DIAG `t` field (extracted from `main` below, which keeps

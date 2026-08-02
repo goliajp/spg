@@ -7570,7 +7570,15 @@ impl fmt::Display for StorageError {
             }
             // v7.39 (read01 round 47) — an index is a relation to PG (42P07).
             Self::DuplicateIndex { name } => write!(f, "relation \"{name}\" already exists"),
-            Self::ColumnNotFound { column } => write!(f, "column not found: {column}"),
+            // v7.39 (round 701) — PG's wording, and the same fix `EvalError::
+            // ColumnNotFound` took in read01 round 81 with the same reason:
+            // "column not found: x" matches none of the wire layer's `does
+            // not exist` patterns, so a missing column reached the client as
+            // the generic error class. The eval-side variant was changed and
+            // the storage-side one was not, so which sentence you got
+            // depended on which layer noticed — `CREATE INDEX ix ON t(nope)`
+            // came out of storage and kept the old spelling.
+            Self::ColumnNotFound { column } => write!(f, "column \"{column}\" does not exist"),
             Self::Corrupt(detail) => write!(f, "corrupt on-disk format: {detail}"),
             Self::IndexNotFound { name } => write!(f, "index \"{name}\" does not exist"),
             Self::Unsupported(detail) => write!(f, "unsupported: {detail}"),

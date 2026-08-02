@@ -2026,6 +2026,15 @@ impl Engine {
                         modified_catalog: false,
                     })
                 }
+                // v7.39 (round 700) — PG18 answers `relation "x" does not
+                // exist` here, not `index "x" …`. An index IS a relation
+                // there, and the wire classifier reads the relation wording
+                // for 42P01; SPG's own spelling missed both.
+                Err(StorageError::IndexNotFound { .. }) => {
+                    Err(EngineError::Unsupported(alloc::format!(
+                        "relation \"{idx_name}\" does not exist"
+                    )))
+                }
                 Err(e) => Err(EngineError::Storage(e)),
             };
         }
@@ -4202,8 +4211,20 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         let removed = self.active_catalog_mut().drop_trigger(name, table);
         if !removed && !if_exists {
-            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
-                alloc::format!("trigger {name:?} on {table:?} does not exist"),
+            // v7.39 (round 700) — two fixes in one line, and they are the
+            // same fix round 698 made for sequences.
+            //
+            // `StorageError::Corrupt` prefixes its Display with `corrupt
+            // on-disk format: `, so a misspelt trigger name reported a
+            // CORRUPTION to the client. And the wording was SPG's own
+            // (`on "t"`); PG18 says `for table "t"`, which is what the
+            // wire's classifier and any tool matching on it expect.
+            //
+            // Round 698 said its sweep found nothing else. It swept the
+            // sequence / view / type shapes and not the trigger one — the
+            // sweep was narrower than the sentence claimed.
+            return Err(EngineError::Unsupported(alloc::format!(
+                "trigger \"{name}\" for table \"{table}\" does not exist"
             )));
         }
         // v7.39 (round 282) — PG raises a NOTICE when IF EXISTS skips, and
@@ -4559,6 +4580,19 @@ impl Engine {
         if s.or_replace && self.active_catalog().has_view(&s.name) {
             self.check_view_replace_columns(&s)?;
         }
+        // v7.39 (round 700) — the BODY has to resolve. PG analyses a view
+        // definition at CREATE time, so `CREATE VIEW v AS SELECT * FROM
+        // nosuch` is `relation "nosuch" does not exist`. SPG stored it and
+        // reported success, leaving a view that appears in `pg_views`, that
+        // every SELECT against fails, and that a dump then carries forward
+        // — a broken object made by a statement that said it worked.
+        //
+        // The probe is `view_output_columns`, which the OR REPLACE path
+        // already runs: a `LIMIT 0` execution of the same body. It resolves
+        // relations and columns without producing rows, so the check costs
+        // one empty plan and cannot disagree with what the view will do,
+        // because it IS what the view will do.
+        self.view_output_columns(&s.body, &s.columns)?;
         // Render the SELECT body to canonical form so the catalog
         // round-trips a deterministic source (no whitespace /
         // comment surprises in the on-disk snapshot).
@@ -5269,16 +5303,31 @@ impl Engine {
         name: &str,
         with_data: bool,
     ) -> Result<QueryResult, EngineError> {
-        let source = self
-            .active_catalog()
-            .materialized_views()
-            .get(name)
-            .cloned()
-            .ok_or_else(|| {
-                EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
-                    "materialized view {name:?} does not exist"
-                )))
-            })?;
+        // v7.39 (round 699) — PG18 distinguishes the two ways this fails,
+        // and SPG gave one sentence for both:
+        //
+        //   missing name        `relation "x" does not exist`
+        //   exists, wrong kind  `"x" is not a materialized view`
+        //
+        // The second is the one that matters to a caller: it says the name
+        // resolved and the OBJECT is not what the statement is for, which
+        // is a different thing to go and check.
+        //
+        // Both were `StorageError::Corrupt`, the same wrapper round 698
+        // found putting `corrupt on-disk format:` in front of a plain typo.
+        // `Unsupported` carries no banner, and the wire's classifier reads
+        // `relation "…" does not exist` for 42P01 already.
+        let source = match self.active_catalog().materialized_views().get(name).cloned() {
+            Some(s) => s,
+            None => {
+                let exists = self.active_catalog().get(name).is_some();
+                return Err(EngineError::Unsupported(if exists {
+                    alloc::format!("\"{name}\" is not a materialized view")
+                } else {
+                    alloc::format!("relation \"{name}\" does not exist")
+                }));
+            }
+        };
         // Wipe the existing rows first (PG truncates the matview
         // and rebuilds; we approximate with an empty INSERT loop).
         {

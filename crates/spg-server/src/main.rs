@@ -1974,10 +1974,33 @@ thread_local! {
 /// underneath are already the ones they use. A single error can arrive
 /// double-wrapped through the dispatch, so this peels every layer.
 pub(crate) fn strip_internal_error_prefixes(msg: &str) -> &str {
+    strip_layer_prefixes(msg, true)
+}
+
+/// v7.39 (round 701) — the same peeling, with `unsupported: ` left on.
+///
+/// The caller that keeps it is the one holding the generic 42000: that
+/// prefix is the only one of these that carries meaning to a client, and
+/// only in that class. The rest — `storage: `, `eval: `, `corrupt on-disk
+/// format: `, … — name a LAYER inside SPG and are never part of PG's
+/// vocabulary, whatever the SQLSTATE.
+///
+/// The distinction had been implicit: pgwire skipped the whole peel for
+/// 42000, which was written for `unsupported: ` and caught the others by
+/// accident. So `COPY nosuch TO STDOUT` reached the client as `storage:
+/// relation "nosuch" does not exist`, and round 698's missing sequence as
+/// `corrupt on-disk format: …`. Round 698 fixed its case by classifying the
+/// message; this fixes the class.
+pub(crate) fn strip_layer_prefixes_keeping_unsupported(msg: &str) -> &str {
+    strip_layer_prefixes(msg, false)
+}
+
+fn strip_layer_prefixes(msg: &str, peel_unsupported: bool) -> &str {
     let mut m = msg;
     loop {
-        let next = m
-            .strip_prefix("unsupported: ")
+        let next = peel_unsupported
+            .then(|| m.strip_prefix("unsupported: "))
+            .flatten()
             .or_else(|| m.strip_prefix("storage: "))
             .or_else(|| m.strip_prefix("eval: "))
             .or_else(|| m.strip_prefix("type mismatch: "))
