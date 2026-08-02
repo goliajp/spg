@@ -3733,21 +3733,24 @@ fn build_combined_schema(
     primary_cols: &[ColumnSchema],
     joined: &[JoinedPeer<'_>],
 ) -> Vec<ColumnSchema> {
+    // v7.39 (round 688) — the qualified copy carries what lives outside the
+    // DataType lattice. `ColumnSchema::new` knows name, type and
+    // nullability, so a column's collation stopped here and `ORDER BY a.loc`
+    // over a join sorted by bytes. Proven on the path by panicking inside
+    // this function and watching the query hit it (round 687).
+    let carry = |name: alloc::string::String, col: &ColumnSchema| {
+        let mut c = ColumnSchema::new(name, col.ty, col.nullable);
+        c.collation_name = col.collation_name.clone();
+        c.user_enum_type = col.user_enum_type.clone();
+        c
+    };
     let mut combined_schema: Vec<ColumnSchema> = Vec::new();
     for col in primary_cols {
-        combined_schema.push(ColumnSchema::new(
-            alloc::format!("{primary_alias}.{}", col.name),
-            col.ty,
-            col.nullable,
-        ));
+        combined_schema.push(carry(alloc::format!("{primary_alias}.{}", col.name), col));
     }
     for peer in joined {
         for col in &peer.cols {
-            combined_schema.push(ColumnSchema::new(
-                alloc::format!("{}.{}", peer.alias, col.name),
-                col.ty,
-                col.nullable,
-            ));
+            combined_schema.push(carry(alloc::format!("{}.{}", peer.alias, col.name), col));
         }
     }
     combined_schema
