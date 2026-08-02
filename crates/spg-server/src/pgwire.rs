@@ -7897,6 +7897,8 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::TextArray => 1009,   // PG `_text` (TEXT[]) — v7.10.9 Epic 2
         DataType::IntArray => 1007,    // PG `_int4` (INT[]) — v7.11.12 Epic 3
         DataType::BigIntArray => 1016, // PG `_int8` (BIGINT[]) — v7.11.12 Epic 3
+        // v7.39 (round 694) — PG `_oid`.
+        DataType::OidArray => 1028,
         DataType::TsVector => 3614,    // PG `tsvector` — v7.12.0 G-CRIT-3
         DataType::TsQuery => 3615,     // PG `tsquery` — v7.12.0 G-CRIT-3
         DataType::Uuid => 2950,        // PG `uuid` — v7.17.0 Phase 3 P0-25

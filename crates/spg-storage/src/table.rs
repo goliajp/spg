@@ -3005,6 +3005,10 @@ fn column_accepts(actual: DataType, declared: DataType) -> bool {
                 DataType::Oid,
             )
             | (DataType::Oid, DataType::BigInt | DataType::Int)
+            // v7.39 (round 694) — `oid[]` rides in a BigIntArray cell, so
+            // it accepts one either way, exactly as the scalar above does.
+            | (DataType::BigIntArray | DataType::IntArray, DataType::OidArray)
+            | (DataType::OidArray, DataType::BigIntArray)
             | (DataType::Json | DataType::Jsonb, DataType::Text)
             | (DataType::Json, DataType::Jsonb)
             | (DataType::Jsonb, DataType::Json)

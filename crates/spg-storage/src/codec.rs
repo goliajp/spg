@@ -1115,6 +1115,10 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         DataType::Xid => out.push(73),
         DataType::Xid8 => out.push(74),
         DataType::Oid => out.push(75),
+        // v7.39 (round 694) — tag 76, `oid[]`. Its BODY is a BigIntArray's,
+        // byte for byte; only the declared type differs, which is the whole
+        // point of the variant.
+        DataType::OidArray => out.push(76),
         DataType::Bool => out.push(5),
         DataType::Vector { dim, encoding } => match encoding {
             // Tag 6: pre-v6 F32 vector. Layout unchanged; pre-v6
@@ -1303,6 +1307,7 @@ impl Cursor<'_> {
             73 => Ok(DataType::Xid),
             74 => Ok(DataType::Xid8),
             75 => Ok(DataType::Oid),
+            76 => Ok(DataType::OidArray),
             5 => Ok(DataType::Bool),
             6 => Ok(DataType::Vector {
                 dim: self.read_u32()?,
@@ -3662,7 +3667,7 @@ impl<'a> Cursor<'a> {
                 Ok(Value::IntArray(items))
             }
             // v7.11.12: BIGINT[] dense body.
-            DataType::BigIntArray => {
+            DataType::BigIntArray | DataType::OidArray => {
                 let count = self.read_u16()? as usize;
                 let mut items: Vec<Option<i64>> = Vec::with_capacity(count);
                 for _ in 0..count {

@@ -175,6 +175,8 @@ mod e2e_fts_catalogs_round650;
 mod e2e_not_valid_round652;
 mod e2e_attcollation_round675;
 mod e2e_collate_derive_round692;
+mod e2e_collate_range_round693;
+mod e2e_system_array_types_round694;
 mod e2e_collate_explicit_round691;
 mod e2e_collate_minmax_round690;
 mod e2e_collate_order_round688;

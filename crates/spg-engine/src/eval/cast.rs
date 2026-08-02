@@ -571,6 +571,42 @@ pub fn cast_value_ref_in(
         // dump-loader pattern unblocks. SPG-shaped queries that
         // genuinely need an OID for runtime joins are still
         // documented as unsupported.
+        // v7.39 (round 694) — `'{text,int4}'::regtype[]`. PG canonicalises
+        // every ELEMENT (`int4` → `integer`) and rejects an unknown one, so
+        // the array runs the scalar's own name resolution per member rather
+        // than keeping the literal. `regclass[]` keeps its names — a
+        // relation name is already what PG prints.
+        CastTarget::Named(n) if n.eq_ignore_ascii_case("regtype_array") => {
+            let Value::Text(s) = &v else {
+                return Ok(v);
+            };
+            let body = s.trim();
+            let inner = body
+                .strip_prefix('{')
+                .and_then(|b| b.strip_suffix('}'))
+                .unwrap_or(body);
+            let mut out: Vec<Option<alloc::string::String>> = Vec::new();
+            for part in inner.split(',') {
+                let t = part.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if t.eq_ignore_ascii_case("NULL") {
+                    out.push(None);
+                    continue;
+                }
+                let bare = t.rsplit('.').next().unwrap_or(t);
+                match crate::conversions::regtype_canonical_name(bare) {
+                    Some(c) => out.push(Some(c)),
+                    None => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!("type \"{t}\" does not exist"),
+                        });
+                    }
+                }
+            }
+            Ok(Value::TextArray(out))
+        }
         CastTarget::RegType | CastTarget::RegClass => match v {
             Value::Text(s) => {
                 // Strip an optional `<schema>.` prefix — PG's
