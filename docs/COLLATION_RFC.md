@@ -201,6 +201,31 @@ wrong places; the round that used it first landed in one go.
 reached only with a LIMIT. A plain ORDER BY over a join sorts somewhere
 else, and that somewhere has not been located yet.
 
+## 4d. Round 686 — GROUP BY landed; the join sort is still unlocated
+
+`GROUP BY loc ORDER BY loc` now matches PG. Located by forcing each
+candidate to reverse and watching which one flipped: `aggregate.rs`'s
+`sort_synth_by_order_by`, not any of the eleven places rounds 682 and 685
+wired on a guess.
+
+Landing it took two changes, and the second is the interesting one. Wiring
+the comparator was not enough, because a GROUP BY key does not keep its
+column: the aggregate builds a synthetic schema of `__grp_0..K`, and the
+resolver looked the key up there and found no collation. The fix is beside a
+precedent — the enum-order work already carries `user_enum_type` onto the
+synthetic column for exactly this reason. A collation travels the same way.
+
+**Anything a downstream sort needs about an original column has to be
+carried onto the synthetic one.** That is the shape to check first for the
+remaining path.
+
+The join sort is NOT `partial_sort_tagged` in `exec_joined_select`. Round
+685 wired that on a guess; round 686 force-reversed it and `SELECT a.loc
+FROM a JOIN b … ORDER BY a.loc` did not move. It is also neither of the two
+comparison families — reversing each of those whole left it unchanged. So a
+plain ORDER BY over a join sorts somewhere a census of `value_cmp` and
+`cmp_multi_key` callers does not reach, and that is where to look next.
+
 ## 5. Recommendation
 
 Adopt (a). Sequence: converge comparison (with a bench) → thread the
