@@ -53,6 +53,15 @@
 //! drive's cache at all. Two different guarantees, two costs a
 //! hundred times apart. `xbench/competitor/src/bin/fsync_probe.rs`
 //! measures the one this code actually pays.
+//!
+//! v7.39 (round 702-SW) — and that 4 ms primitive turned out to BE the
+//! write-path red line, so the WAL no longer pays it by default: every
+//! commit-path sync goes through `wal::wal_sync`, which on macOS issues
+//! `F_BARRIERFSYNC` (0.37 ms measured — ordered, barrier-flushed, and
+//! still stronger than PG's own macOS default of plain `fdatasync`).
+//! `SPG_WAL_FULLFSYNC=1` opts back into the full media barrier. The
+//! numbers above describe `sync_data` itself, which is now the opt-in
+//! strict path and the non-macOS path.
 
 use std::env;
 use std::sync::Arc;

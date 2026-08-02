@@ -322,7 +322,7 @@ pub(crate) fn append_durability_marker(state: &ServerState) -> std::io::Result<u
     // freely during the fsync.
     WAL_FSYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(sync_handle) = state.wal_sync_clone.as_ref() {
-        sync_handle.sync_data()?;
+        wal_sync(sync_handle)?;
     } else {
         // Fallback: `try_clone` failed at startup (very rare). Take
         // the mutex briefly to sync — the slow case, but at least
@@ -330,7 +330,7 @@ pub(crate) fn append_durability_marker(state: &ServerState) -> std::io::Result<u
         let wal = wal_mutex
             .lock()
             .map_err(|_| std::io::Error::other("wal mutex poisoned"))?;
-        wal.sync_data()?;
+        wal_sync(&wal)?;
     }
     Ok(pre_marker_offset)
 }
@@ -435,6 +435,53 @@ pub(crate) fn wal_counters() -> (u64, u64) {
     )
 }
 
+/// v7.39 (round 702-SW) — the WAL's durability primitive, in one place.
+///
+/// On macOS, `File::sync_data` asks for `F_FULLFSYNC` — a full barrier to
+/// the drive's media, measured at **4.08 ms** per call on the testbed. The
+/// same box answers `F_BARRIERFSYNC` in **0.37 ms**: writes are ordered and
+/// flushed with a barrier token, without waiting for the media confirmation.
+/// That one primitive was the whole of the write-path red line: 100
+/// autocommit INSERTs cost 511 ms here against PG18's 145 over the same
+/// wire, and 100 × (4.08 − 0.37) is the difference.
+///
+/// Choosing the cheaper barrier is not a durability retreat relative to
+/// what SPG competes with — it is the same platform-default philosophy PG
+/// itself applies. PG's `wal_sync_method` on macOS defaults to plain
+/// `fdatasync`, which forces no drive barrier AT ALL (its `fsync_writethrough`
+/// = F_FULLFSYNC exists and is not the default); SQLite's WAL makes the
+/// same choice. F_BARRIERFSYNC is *stronger* than both defaults.
+///
+/// `SPG_WAL_FULLFSYNC=1` opts back into F_FULLFSYNC for deployments that
+/// want the media confirmation — the strict direction, so an env var is the
+/// right channel. The fast path is the default, per the sealed-fix rule.
+/// A failing fcntl (filesystem without barrier support) falls back to
+/// `sync_data` on the spot.
+// The one unsafe is the `fcntl` FFI call itself — same class as the
+// `statvfs` in `wal_volume_free_bytes`, and just as self-contained: a raw
+// fd in, an int out, no memory crosses the boundary.
+#[allow(unsafe_code)]
+pub(crate) fn wal_sync(f: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let force_full = *FULL.get_or_init(|| {
+            std::env::var("SPG_WAL_FULLFSYNC").is_ok_and(|v| v != "0")
+        });
+        if !force_full {
+            use std::os::fd::AsRawFd as _;
+            // libc has no F_BARRIERFSYNC constant; Apple's fcntl.h says 85.
+            const F_BARRIERFSYNC: libc::c_int = 85;
+            let rc = unsafe { libc::fcntl(f.as_raw_fd(), F_BARRIERFSYNC) };
+            if rc != -1 {
+                return Ok(());
+            }
+            // Unsupported filesystem — take the full barrier instead.
+        }
+    }
+    f.sync_data()
+}
+
 fn client_fsync(state: &ServerState, f: &std::fs::File) -> std::io::Result<()> {
     static FSYNC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     WAL_FSYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -447,7 +494,7 @@ fn client_fsync(state: &ServerState, f: &std::fs::File) -> std::io::Result<()> {
             ));
         }
     }
-    f.sync_data()
+    wal_sync(f)
 }
 
 pub(crate) fn session_sync_commit(state: &ServerState) -> bool {
@@ -1317,5 +1364,34 @@ mod wal_v3_durability_marker_tests {
             msg.contains("durability_checkpoint") && msg.contains("4-byte payload"),
             "error message should name the malformed marker: got {msg:?}",
         );
+    }
+}
+
+#[cfg(test)]
+mod wal_sync_tests {
+    /// v7.39 (round 702-SW) — the primitive completes and the file's bytes
+    /// survive it. What CANNOT be unit-tested is the barrier semantics —
+    /// that lives in the kernel — so what this pins is the seam: the call
+    /// succeeds on a real file on the filesystems the tests run on, both
+    /// with the default (F_BARRIERFSYNC on macOS) and with the strict
+    /// opt-in path's primitive (`sync_data`, exercised directly since the
+    /// env override is process-wide and cached).
+    #[test]
+    fn wal_sync_completes_and_preserves_bytes() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join("spg_wal_sync_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("probe.wal");
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"barrier-me").unwrap();
+        super::wal_sync(&f).expect("wal_sync must succeed on a plain file");
+        f.sync_data().expect("the strict primitive still works too");
+        assert_eq!(std::fs::read(&path).unwrap(), b"barrier-me");
+        let _ = std::fs::remove_file(&path);
     }
 }
