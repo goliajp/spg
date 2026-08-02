@@ -177,6 +177,7 @@ mod e2e_attcollation_round675;
 mod e2e_collate_derive_round692;
 mod e2e_collate_range_round693;
 mod e2e_system_array_types_round694;
+mod e2e_validate_only_round696;
 mod e2e_collate_explicit_round691;
 mod e2e_collate_minmax_round690;
 mod e2e_collate_order_round688;

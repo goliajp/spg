@@ -84,9 +84,15 @@ fn round542_pg_user_has_pgs_columns() {
         vec!["postgres|10|true|true|true|true|********|NULL|NULL"]
     );
     // The password never leaves the catalog — PG's view exists for that.
+    //
+    // v7.39 (round 696) — TWO rows now: the bootstrap superuser and the
+    // session's own identity. `current_user` always reported that identity;
+    // until this round nothing else did, so `SET ROLE <me>` refused the role
+    // the session was already running as. Masked either way, which is what
+    // this pin is actually about.
     assert_eq!(
         rows(&mut e, "SELECT passwd FROM pg_user"),
-        vec!["********"]
+        vec!["********", "********"]
     );
 }
 

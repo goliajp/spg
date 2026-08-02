@@ -132,6 +132,20 @@ pub struct SetDbRoleSettingStatement {
     pub value: Option<String>,
 }
 
+/// v7.39 (round 696) — which operand a [`Statement::ValidateOnly`] names,
+/// and therefore which catalog answers whether it exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidateOnlyKind {
+    /// `LOCK TABLE <t> [, …]` — the relation must exist.
+    LockTable,
+    /// `DROP OWNED BY <r> [, …]` / `REASSIGN OWNED BY <r> [, …] TO <r>` —
+    /// every role named must exist.
+    OwnedByRole,
+    /// `SECURITY LABEL …` — PG refuses unconditionally, because no label
+    /// provider is loaded. SPG has none either.
+    SecurityLabel,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Statement::Select dominates; Boxing would touch every match site
 pub enum Statement {
@@ -145,6 +159,25 @@ pub enum Statement {
     ///
     /// `None` is `RESET ALL`, which names no parameter.
     AlterSystem { parameter: Option<String> },
+    /// v7.39 (round 696) — statements SPG performs nothing for, but whose
+    /// OPERAND PG validates before performing nothing either.
+    ///
+    /// All four used to be consumed whole by `is_dump_noise_statement`,
+    /// which meant `LOCK TABLE nosuch` and `DROP OWNED BY nosuchrole` were
+    /// ACCEPTED where PG18 errors. Accepting a statement that names
+    /// something that does not exist is the F29 shape: the caller is told
+    /// their intent was understood when the object it referred to is not
+    /// there.
+    ///
+    /// They share one variant because they share one rule — resolve the
+    /// name, refuse if absent, otherwise no-op — and four variants would be
+    /// four places for that rule to drift.
+    ValidateOnly {
+        kind: ValidateOnlyKind,
+        /// The names the statement referred to. Empty means the form names
+        /// nothing (`SECURITY LABEL`, whose refusal is unconditional).
+        names: Vec<String>,
+    },
 
     /// v7.39 (round 547) — `ALTER ROLE … SET/RESET` and
     /// `ALTER DATABASE … SET/RESET`: the GUC defaults a session picks up
@@ -4721,6 +4754,10 @@ impl Statement {
             // postgresql.auto.conf), but PG classes ALTER SYSTEM as a
             // writer and a read-only session refuses it there too.
             Statement::AlterSystem { .. } => false,
+            // v7.39 (round 696) — they perform nothing, so nothing is
+            // written; PG classes LOCK and the OWNED BY pair as writers and
+            // a read-only session refuses them there.
+            Statement::ValidateOnly { .. } => false,
             // v7.39 (round 547) — records a GUC default in the catalog.
             Statement::SetDbRoleSetting(_) => false,
             // v7.39 (round 535) — REINDEX / CLUSTER rebuild nothing here,
@@ -5007,6 +5044,15 @@ impl fmt::Display for Statement {
         match self {
             Self::Empty => Ok(()),
             // v7.39 (round 695) — deparsed the way PG writes it.
+            // v7.39 (round 696) — never deparsed into a dump (nothing is
+            // stored), so the shortest faithful spelling of what it was.
+            Self::ValidateOnly { kind, names } => match kind {
+                ValidateOnlyKind::LockTable => write!(f, "LOCK TABLE {}", names.join(", ")),
+                ValidateOnlyKind::OwnedByRole => {
+                    write!(f, "DROP OWNED BY {}", names.join(", "))
+                }
+                ValidateOnlyKind::SecurityLabel => f.write_str("SECURITY LABEL"),
+            },
             Self::AlterSystem { parameter } => match parameter {
                 Some(p) => write!(f, "ALTER SYSTEM RESET {p}"),
                 None => f.write_str("ALTER SYSTEM RESET ALL"),

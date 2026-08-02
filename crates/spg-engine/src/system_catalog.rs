@@ -7087,6 +7087,28 @@ pub(crate) fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'st
     {
         rows.insert(0, pg_roles_row(10, "postgres", true, true, true));
     }
+    // v7.39 (round 696) — and the SESSION's own identity, which is the
+    // same class of gap round 652 closed for `postgres` and missed here.
+    //
+    // A pg-wire client authenticates as some user, `current_user` reports
+    // that name, and yet `pg_roles` did not list it, `'bench'::regrole`
+    // said it did not exist, and `SET ROLE bench` refused the role the
+    // session was ALREADY running as. Nothing surfaced it because nothing
+    // asked — round 696's `DROP OWNED BY <role>` check asked, and was
+    // refused for the connected user.
+    let me = engine.session_user();
+    if !rows
+        .iter()
+        .any(|r| matches!(&r.values[0], Value::Text(s) if s == me))
+    {
+        rows.push(pg_roles_row(
+            oid + rows.len() as i64 + 1,
+            me,
+            true,
+            true,
+            true,
+        ));
+    }
     (schema, rows)
 }
 

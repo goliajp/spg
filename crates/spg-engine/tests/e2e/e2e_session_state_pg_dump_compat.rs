@@ -36,12 +36,26 @@ fn deallocate_names_a_missing_statement() {
 }
 
 #[test]
-fn security_label_on_object_no_op() {
+fn security_label_is_refused_because_no_provider_is_loaded() {
+    // v7.39 (round 696) — was `security_label_on_object_no_op`, which
+    // asserted SPG ACCEPTS this. PG18 refuses it unconditionally — `no
+    // security label providers have been loaded` — whatever object it
+    // names, because none is. SPG has none either, so accepting it told the
+    // caller a label had been applied when nothing anywhere records one.
+    //
+    // This is not a pg_dump concern: pg_dump only emits SECURITY LABEL for
+    // labels it read from a database that HAD a provider loaded, and such a
+    // dump cannot restore into a PG without one either.
     let mut e = Engine::new();
     ddl(&mut e, "CREATE TABLE t (id INT)");
-    ddl(&mut e, "SECURITY LABEL ON TABLE t IS 'unclassified'");
-    ddl(
-        &mut e,
+    for sql in [
+        "SECURITY LABEL ON TABLE t IS 'unclassified'",
         "SECURITY LABEL FOR selinux ON TABLE t IS 'system_u:object_r:sepgsql_table_t:s0'",
-    );
+    ] {
+        let err = e.execute(sql).expect_err(sql);
+        assert!(
+            format!("{err}").contains("no security label providers have been loaded"),
+            "{sql}: {err}"
+        );
+    }
 }
