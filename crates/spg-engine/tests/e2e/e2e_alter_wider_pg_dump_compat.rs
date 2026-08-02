@@ -66,3 +66,32 @@ fn alter_text_search_event_large_no_op() {
     ddl(&mut e, "ALTER EVENT TRIGGER my_trg DISABLE");
     ddl(&mut e, "ALTER LARGE OBJECT 12345 OWNER TO postgres");
 }
+
+/// v7.39 (round 695) — `ALTER SYSTEM` now validates the parameter NAME.
+///
+/// The test above this one is called `alter_system_set_no_op` and sets
+/// `work_mem` — a name that exists — so it could never have caught a name
+/// that does not. PG18 answers `unrecognized configuration parameter`;
+/// SPG accepted anything, because the whole statement was swallowed with
+/// the pg_dump no-op tail.
+///
+/// Nothing is APPLIED either way: SPG has no postgresql.auto.conf. What
+/// changed is that it says so about a name it does not know, reusing the
+/// session's own GUC check so `SET` and `ALTER SYSTEM` cannot drift apart.
+#[test]
+fn round695_alter_system_rejects_an_unknown_parameter() {
+    let mut e = Engine::new();
+    let err = e
+        .execute("ALTER SYSTEM SET nosuch_guc_695 = 1")
+        .expect_err("PG18 refuses this");
+    assert!(
+        format!("{err}").contains("unrecognized configuration parameter"),
+        "{err}"
+    );
+    // The forms PG accepts still pass, including a dotted customised
+    // option (PG treats `myapp.thing` as one, and extensions rely on it).
+    ddl(&mut e, "ALTER SYSTEM SET work_mem = '64MB'");
+    ddl(&mut e, "ALTER SYSTEM RESET work_mem");
+    ddl(&mut e, "ALTER SYSTEM RESET ALL");
+    ddl(&mut e, "ALTER SYSTEM SET myapp.thing = 1");
+}
