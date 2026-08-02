@@ -1,4 +1,7 @@
 //! v7.6.2 — INSERT-side FK enforcement.
+//!
+//! v7.39 (round 695) — and, since the file already held the DELETE-side
+//! placeholder, every ON DELETE action, verified against PG18.
 
 use spg_engine::{Engine, EngineError, QueryResult};
 
@@ -85,23 +88,76 @@ fn insert_to_table_without_fk_is_unaffected() {
 }
 
 #[test]
-fn cascade_action_stored_but_not_yet_enforced_on_delete() {
-    // v7.6.2 only enforces INSERT. DELETE-side CASCADE lands in
-    // v7.6.4 — until then, DELETE on parent still removes the
-    // parent row without touching child. This test pins that
-    // behaviour so v7.6.4 has a visible behavioural anchor.
+fn round695_every_on_delete_action_behaves_as_pg18_does() {
+    // v7.39 (round 695) — this test was `cascade_action_stored_but_not_yet
+    // _enforced_on_delete`, written for v7.6.2 to pin "DELETE on the parent
+    // removes it without touching the child, and v7.6.4 will change that".
+    // v7.6.4 shipped. What the test had become was two `let _ =` statements
+    // asserting nothing at all, under a name that told a reader the feature
+    // was missing — the F31 shape exactly, and the worst variant of it,
+    // because a vacuous test cannot even go red when the claim stops
+    // holding.
+    //
+    // All four actions, each verified against PG18.
     let mut eng = engine_with(&[
-        "CREATE TABLE u (id INT NOT NULL)",
-        "CREATE INDEX u_pk ON u (id)",
-        "CREATE TABLE o (id INT NOT NULL, uid INT NOT NULL REFERENCES u(id) ON DELETE CASCADE)",
-        "INSERT INTO u VALUES (1)",
-        "INSERT INTO o VALUES (10, 1)",
+        "CREATE TABLE u (id INT PRIMARY KEY)",
+        "CREATE TABLE o (id INT, uid INT REFERENCES u(id) ON DELETE CASCADE)",
+        "INSERT INTO u VALUES (1),(2)",
+        "INSERT INTO o VALUES (10, 1), (11, 2)",
     ]);
-    let _ = eng.execute("DELETE FROM u WHERE id = 1");
-    // Whether DELETE was accepted or rejected at this point depends
-    // on whether v7.6.3 has shipped yet; either way `o` should be
-    // observable via SELECT — the test just asserts no panic.
-    let _ = eng.execute("SELECT id FROM o");
+    eng.execute("DELETE FROM u WHERE id = 1").unwrap();
+    // CASCADE took the child row with it; the unrelated one stayed.
+    assert_eq!(ids(&mut eng, "SELECT id FROM o ORDER BY id"), "11");
+
+    // RESTRICT refuses, and PG's wording for RESTRICT is its OWN — it is not
+    // NO ACTION's. The two differ in when they fire, so the word matters.
+    let mut eng = engine_with(&[
+        "CREATE TABLE p (id INT PRIMARY KEY)",
+        "CREATE TABLE r (id INT, pid INT REFERENCES p(id) ON DELETE RESTRICT)",
+        "INSERT INTO p VALUES (1)",
+        "INSERT INTO r VALUES (10, 1)",
+    ]);
+    let err = format!("{}", eng.execute("DELETE FROM p WHERE id = 1").unwrap_err());
+    assert!(
+        err.contains("violates RESTRICT setting of foreign key constraint"),
+        "RESTRICT wording: {err}"
+    );
+    assert!(err.contains("is referenced from table"), "{err}");
+    assert!(!err.contains("is still referenced"), "that is NO ACTION's: {err}");
+
+    // NO ACTION (the default) refuses with the other wording.
+    let mut eng = engine_with(&[
+        "CREATE TABLE m (id INT PRIMARY KEY)",
+        "CREATE TABLE n (id INT, mid INT REFERENCES m(id))",
+        "INSERT INTO m VALUES (1)",
+        "INSERT INTO n VALUES (10, 1)",
+    ]);
+    let err = format!("{}", eng.execute("DELETE FROM m WHERE id = 1").unwrap_err());
+    assert!(err.contains("violates foreign key constraint"), "{err}");
+    assert!(err.contains("is still referenced from table"), "{err}");
+    assert!(!err.contains("RESTRICT setting"), "{err}");
+
+    // SET NULL keeps the child row and nulls the reference.
+    let mut eng = engine_with(&[
+        "CREATE TABLE x (id INT PRIMARY KEY)",
+        "CREATE TABLE y (id INT, xid INT REFERENCES x(id) ON DELETE SET NULL)",
+        "INSERT INTO x VALUES (1)",
+        "INSERT INTO y VALUES (10, 1)",
+    ]);
+    eng.execute("DELETE FROM x WHERE id = 1").unwrap();
+    assert_eq!(ids(&mut eng, "SELECT id FROM y WHERE xid IS NULL"), "10");
+}
+
+/// Comma-joined first column, so a row set can be asserted in one line.
+fn ids(eng: &mut Engine, sql: &str) -> String {
+    match eng.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}")) {
+        QueryResult::Rows { rows, .. } => rows
+            .iter()
+            .map(|r| spg_engine::eval::value_to_text(&r.values[0]))
+            .collect::<Vec<_>>()
+            .join(","),
+        other => panic!("{sql}: {other:?}"),
+    }
 }
 
 #[test]

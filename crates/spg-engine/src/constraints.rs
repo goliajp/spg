@@ -1385,6 +1385,7 @@ fn fk_restrict_message(
     child_name: &str,
     fk: &spg_storage::ForeignKeyConstraint,
     parent_key: &[&Value<'_>],
+    action: spg_storage::FkAction,
 ) -> String {
     let conname = crate::system_catalog::pg_fk_conname(child, fk, child_name);
     let pcols = match catalog.get(parent_name) {
@@ -1410,6 +1411,23 @@ fn fk_restrict_message(
         })
         .collect::<Vec<_>>()
         .join(", ");
+    // v7.39 (round 695) — PG18 distinguishes RESTRICT from NO ACTION in
+    // BOTH halves of this message, and SPG had been giving NO ACTION's
+    // wording for both. Measured:
+    //   RESTRICT   `violates RESTRICT setting of foreign key constraint …`
+    //              `… is referenced from table "…"`
+    //   NO ACTION  `violates foreign key constraint …`
+    //              `… is still referenced from table "…"`
+    // The distinction is not cosmetic: the two differ in WHEN they fire (a
+    // deferred NO ACTION is checked at commit, RESTRICT immediately), so a
+    // reader who sees the wrong word draws the wrong conclusion about why.
+    if matches!(action, spg_storage::FkAction::Restrict) {
+        return alloc::format!(
+            "update or delete on table \"{parent_name}\" violates RESTRICT \
+             setting of foreign key constraint \"{conname}\" on table \"{child_name}\" \
+             DETAIL: Key ({pcols})=({vals}) is referenced from table \"{child_name}\"."
+        );
+    }
     alloc::format!(
         "update or delete on table \"{parent_name}\" violates foreign key \
          constraint \"{conname}\" on table \"{child_name}\" \
@@ -2781,6 +2799,7 @@ pub(crate) fn plan_fk_parent_deletions(
                                 &child_name,
                                 fk,
                                 &parent_key,
+                                fk.on_delete,
                             )));
                         }
                         spg_storage::FkAction::Cascade => {
@@ -2986,6 +3005,7 @@ pub(crate) fn plan_fk_parent_updates(
                                 &child_name,
                                 fk,
                                 &old_key,
+                                fk.on_update,
                             )));
                         }
                         spg_storage::FkAction::Cascade => {

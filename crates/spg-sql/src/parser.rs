@@ -9598,6 +9598,45 @@ impl Parser {
             // used to fall into the pg_dump no-op tail below, so a DBA
             // setting a per-role default was told it worked and nothing
             // happened. Intercepted here, BEFORE that tail.
+            // v7.39 (round 695) — `ALTER SYSTEM SET <name> = …` / `RESET
+            // <name>` / `RESET ALL`. Same reason the ROLE / DATABASE
+            // interception below exists: swallowed with the no-op tail, an
+            // unknown parameter name was ACCEPTED where PG18 answers
+            // `unrecognized configuration parameter`. SPG applies nothing
+            // either way — there is no postgresql.auto.conf — but it now
+            // says so about a name it does not know.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("system") => {
+                // NOTE: the scrutinee is `self.advance()`, so SYSTEM is
+                // already consumed here. An extra advance eats the SET and
+                // the parameter name is never seen — which is exactly the
+                // bug a panic in this branch disproved: the branch WAS on
+                // the path, the reading of it was wrong.
+                let mut parameter = None;
+                // SET <name> … | RESET <name> | RESET ALL
+                if matches!(self.peek(), Token::Ident(k)
+                    if k.eq_ignore_ascii_case("set") || k.eq_ignore_ascii_case("reset"))
+                {
+                    self.advance();
+                    if let Token::Ident(n) | Token::QuotedIdent(n) = self.peek().clone()
+                        && !n.eq_ignore_ascii_case("all")
+                    {
+                        self.advance();
+                        // A dotted GUC (`plpgsql.check_asserts`) is two
+                        // tokens; keep the whole name.
+                        let mut full = n;
+                        while matches!(self.peek(), Token::Dot) {
+                            self.advance();
+                            if let Token::Ident(t) | Token::QuotedIdent(t) = self.advance() {
+                                full.push('.');
+                                full.push_str(&t);
+                            }
+                        }
+                        parameter = Some(full);
+                    }
+                }
+                self.consume_until_statement_boundary();
+                return Ok(Statement::AlterSystem { parameter });
+            }
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(s.to_ascii_lowercase().as_str(), "role" | "user" | "database")
                     && self.peeks_db_role_setting() =>
@@ -9625,7 +9664,6 @@ impl Parser {
                         // no matching machinery for any of these; the
                         // parser accepts + Empty-returns so pg_dump
                         // tail statements don't stall.
-                        | "system"
                         | "user"
                         | "tablespace"
                         | "collation"

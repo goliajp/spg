@@ -135,6 +135,17 @@ pub struct SetDbRoleSettingStatement {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Statement::Select dominates; Boxing would touch every match site
 pub enum Statement {
+    /// v7.39 (round 695) — `ALTER SYSTEM SET <name> = …` / `RESET <name>`.
+    ///
+    /// It used to be swallowed with the rest of the ALTER no-ops, which meant
+    /// `ALTER SYSTEM SET nosuch_guc = 1` was ACCEPTED where PG18 answers
+    /// `unrecognized configuration parameter`. SPG still applies nothing —
+    /// there is no postgresql.auto.conf to write — but a name it does not
+    /// know is now refused rather than swallowed.
+    ///
+    /// `None` is `RESET ALL`, which names no parameter.
+    AlterSystem { parameter: Option<String> },
+
     /// v7.39 (round 547) — `ALTER ROLE … SET/RESET` and
     /// `ALTER DATABASE … SET/RESET`: the GUC defaults a session picks up
     /// when it starts. Both used to land in the pg_dump no-op tail, so
@@ -4706,6 +4717,10 @@ impl Statement {
             // state, and IMMEDIATE can run the deferred checks there and
             // then; writer-path.
             Statement::SetConstraints { .. } => false,
+            // v7.39 (round 695) — it writes nothing (SPG has no
+            // postgresql.auto.conf), but PG classes ALTER SYSTEM as a
+            // writer and a read-only session refuses it there too.
+            Statement::AlterSystem { .. } => false,
             // v7.39 (round 547) — records a GUC default in the catalog.
             Statement::SetDbRoleSetting(_) => false,
             // v7.39 (round 535) — REINDEX / CLUSTER rebuild nothing here,
@@ -4991,6 +5006,11 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => Ok(()),
+            // v7.39 (round 695) — deparsed the way PG writes it.
+            Self::AlterSystem { parameter } => match parameter {
+                Some(p) => write!(f, "ALTER SYSTEM RESET {p}"),
+                None => f.write_str("ALTER SYSTEM RESET ALL"),
+            },
             // v7.39 (round 547) — round-trips as PG writes it.
             Self::SetDbRoleSetting(st) => {
                 match (&st.database, &st.role) {

@@ -1401,6 +1401,27 @@ impl Engine {
                 affected: 0,
                 modified_catalog: false,
             }),
+            // v7.39 (round 695) — `ALTER SYSTEM SET|RESET <name>`. SPG has
+            // no postgresql.auto.conf to write, so nothing is APPLIED; what
+            // changed is that a name PG18 does not know is now refused
+            // instead of accepted. It reuses the session's own GUC check —
+            // one place decides what a parameter name means, so `SET` and
+            // `ALTER SYSTEM` cannot drift apart in what they accept.
+            //
+            // The F31 audit found this: the test was called
+            // `alter_system_set_no_op` and set `work_mem`, a name that
+            // exists, so it could never have caught a name that does not.
+            Statement::AlterSystem { parameter } => {
+                if let Some(name) = parameter
+                    && let Some(msg) = self.reject_unsettable_guc(name.as_str())
+                {
+                    return Err(EngineError::Unsupported(msg));
+                }
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
             Statement::DropTable { names, if_exists } => self.exec_drop_table(names, if_exists),
             Statement::DropIndex { name, if_exists } => self.exec_drop_index(name, if_exists),
             Statement::CreateIndex(s) => self.exec_create_index(s),
