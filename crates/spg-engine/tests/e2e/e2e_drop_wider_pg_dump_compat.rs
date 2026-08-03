@@ -46,9 +46,28 @@ fn drop_aggregate_operator_cast_no_op() {
 #[test]
 fn drop_language_collation_conversion_no_op() {
     let mut e = Engine::new();
-    ddl(&mut e, "DROP LANGUAGE plpythonu CASCADE");
+    // v7.39 (round 708) — DROP LANGUAGE / DROP CONVERSION answer as PG
+    // does: unknown names do not exist, shipped languages are required,
+    // IF EXISTS stays quiet. The old bare-name assertions pinned the
+    // swallow — F31.
+    let err = e
+        .execute("DROP LANGUAGE plpythonu CASCADE")
+        .expect_err("PG18: language \"plpythonu\" does not exist");
+    assert!(format!("{err}").contains("language \"plpythonu\" does not exist"));
+    let err = e
+        .execute("DROP LANGUAGE plpgsql")
+        .expect_err("PG18 refuses to drop a required language");
+    assert!(
+        format!("{err}")
+            .contains("cannot drop language plpgsql because extension plpgsql requires it")
+    );
+    ddl(&mut e, "DROP LANGUAGE IF EXISTS plpythonu");
     ddl(&mut e, "DROP COLLATION IF EXISTS \"my_collation\"");
     ddl(&mut e, "DROP CONVERSION IF EXISTS ascii_to_utf8");
+    let err = e
+        .execute("DROP CONVERSION ascii_to_utf8")
+        .expect_err("PG-shaped not-found for a conversion SPG does not ship");
+    assert!(format!("{err}").contains("conversion \"ascii_to_utf8\" does not exist"));
 }
 
 #[test]

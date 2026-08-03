@@ -3032,8 +3032,6 @@ impl Parser {
                                 | "operator"
                                 | "cast"
                                 | "collation"
-                                | "language"
-                                | "conversion"
                                 | "text"
                                 | "foreign"
                                 | "server"
@@ -3049,6 +3047,33 @@ impl Parser {
                     {
                         self.consume_until_statement_boundary();
                         Ok(Statement::Empty)
+                    }
+                    // v7.39 (round 708) — DROP CONVERSION / DROP LANGUAGE
+                    // leave the noise list; see the ValidateOnly kinds.
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("conversion")
+                            || s.eq_ignore_ascii_case("language")
+                            // `DROP PROCEDURAL LANGUAGE` puts the modifier
+                            // FIRST — the first draft looked for it after.
+                            || s.eq_ignore_ascii_case("procedural") =>
+                    {
+                        let kind = if s.eq_ignore_ascii_case("conversion") {
+                            crate::ast::ValidateOnlyKind::ConversionName
+                        } else {
+                            crate::ast::ValidateOnlyKind::LanguageName
+                        };
+                        self.advance();
+                        if matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("language"))
+                        {
+                            self.advance();
+                        }
+                        let if_exists = self.consume_if_exists();
+                        let names = self.take_comma_separated_names();
+                        self.consume_until_statement_boundary();
+                        if if_exists {
+                            return Ok(Statement::Empty);
+                        }
+                        Ok(Statement::ValidateOnly { kind, names })
                     }
                     // v7.39 (round 707) — `DROP AGGREGATE [IF EXISTS]
                     // name(argtypes)[, …]`. Parsed for real so the engine
@@ -9742,9 +9767,15 @@ impl Parser {
                         new,
                     });
                 }
-                // Other ALTER TYPE forms — accept as no-op (pg_dump tail).
+                // Other ALTER TYPE forms — the ACTION stays a no-op
+                // (pg_dump tail), but v7.39 (round 708) the NAME is
+                // validated: `ALTER TYPE nosuch RENAME TO x` reported
+                // success for a type that does not exist.
                 self.consume_until_statement_boundary();
-                return Ok(Statement::Empty);
+                return Ok(Statement::ValidateOnly {
+                    kind: crate::ast::ValidateOnlyKind::TypeName,
+                    names: alloc::vec![type_name],
+                });
             }
             // v7.14.0 — ALTER VIEW / ALTER FUNCTION /
             // ALTER DOMAIN / ALTER DATABASE / ALTER USER / ALTER
@@ -9811,13 +9842,77 @@ impl Parser {
                 let is_database = s.eq_ignore_ascii_case("database");
                 return self.parse_db_role_setting(is_database);
             }
+            // v7.39 (round 708) — `ALTER ROLE|USER <name> [WITH attrs…]`
+            // (the non-SET forms; SET/RESET took the branch above). The
+            // attributes still no-op — recorded, and the ignored PASSWORD
+            // is ledgered as its own follow-up — but the ROLE is validated:
+            // any name was accepted for a role that does not exist.
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("role") || s.eq_ignore_ascii_case("user") =>
+            {
+                // NB: the enclosing `match self.advance()` already consumed
+                // ROLE/USER — the round-695 trap, hit again in this round's
+                // first draft (the name was eaten and WITH parsed as the
+                // role). The cursor is at the name.
+                let name = self.expect_ident_or_string()?;
+                self.consume_until_statement_boundary();
+                if name.eq_ignore_ascii_case("all") {
+                    // `ALTER ROLE ALL …` names every role; nothing to check.
+                    return Ok(Statement::Empty);
+                }
+                return Ok(Statement::ValidateOnly {
+                    kind: crate::ast::ValidateOnlyKind::RoleName,
+                    names: alloc::vec![name],
+                });
+            }
+            // v7.39 (round 708) — `ALTER AGGREGATE name(args) …`. Same
+            // argument-list parse as DROP AGGREGATE (round 707); the
+            // action no-ops, the existence check is real.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("aggregate") => {
+                // Same round-695 trap as above: AGGREGATE is already
+                // consumed; the cursor is at the name.
+                let name = self.expect_ident_like()?;
+                let mut names = alloc::vec![name];
+                if matches!(self.peek(), Token::LParen) {
+                    self.advance();
+                    loop {
+                        match self.peek().clone() {
+                            Token::RParen => {
+                                self.advance();
+                                break;
+                            }
+                            Token::Star => {
+                                self.advance();
+                                names.push(String::from("*"));
+                            }
+                            Token::Comma => {
+                                self.advance();
+                            }
+                            _ => {
+                                let mut t = self.expect_ident_like()?;
+                                while let Token::Ident(nx) = self.peek() {
+                                    let nx = nx.clone();
+                                    self.advance();
+                                    t.push(' ');
+                                    t.push_str(&nx);
+                                }
+                                names.push(t);
+                            }
+                        }
+                    }
+                }
+                self.consume_until_statement_boundary();
+                return Ok(Statement::ValidateOnly {
+                    kind: crate::ast::ValidateOnlyKind::AggregateName,
+                    names,
+                });
+            }
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(
                     s.to_ascii_lowercase().as_str(),
                     "view"
                         | "function"
                         | "database"
-                        | "role"
                         | "schema"
                         | "owner"
                         | "default"
@@ -9831,10 +9926,8 @@ impl Parser {
                         // no matching machinery for any of these; the
                         // parser accepts + Empty-returns so pg_dump
                         // tail statements don't stall.
-                        | "user"
                         | "tablespace"
                         | "collation"
-                        | "aggregate"
                         | "language"
                         | "operator"
                         | "conversion"

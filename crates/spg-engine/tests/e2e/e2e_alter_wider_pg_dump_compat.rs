@@ -24,7 +24,15 @@ fn alter_user_no_op() {
     // pg_dumpall doesn't emit ALTER GROUP for modern PG releases
     // (uses ALTER ROLE instead) so leaving it un-added is safe.
     let mut e = Engine::new();
+    // v7.39 (round 708) — the ROLE must exist now, as PG requires; the
+    // attributes still no-op (the ignored PASSWORD is ledgered as its own
+    // follow-up). The old bare assertion pinned the swallow — F31.
+    ddl(&mut e, "CREATE ROLE alice");
     ddl(&mut e, "ALTER USER alice WITH PASSWORD 'x'");
+    let err = e
+        .execute("ALTER USER nosuch708 WITH PASSWORD 'x'")
+        .expect_err("PG18 refuses an unknown role");
+    assert!(format!("{err}").contains("role \"nosuch708\" does not exist"));
 }
 
 #[test]
@@ -37,7 +45,13 @@ fn alter_tablespace_collation_no_op() {
 #[test]
 fn alter_aggregate_language_operator_no_op() {
     let mut e = Engine::new();
-    ddl(&mut e, "ALTER AGGREGATE myavg(int) RENAME TO my_avg");
+    // v7.39 (round 708) — the AGGREGATE must exist (PG refuses an unknown
+    // one with the canonical signature); a real one still no-ops through.
+    ddl(&mut e, "ALTER AGGREGATE sum(int) RENAME TO my_sum");
+    let err = e
+        .execute("ALTER AGGREGATE myavg(int) RENAME TO my_avg")
+        .expect_err("PG18 refuses an unknown aggregate");
+    assert!(format!("{err}").contains("aggregate myavg(integer) does not exist"));
     ddl(&mut e, "ALTER LANGUAGE plpgsql OWNER TO postgres");
     ddl(&mut e, "ALTER OPERATOR + (int, int) SET SCHEMA public");
 }

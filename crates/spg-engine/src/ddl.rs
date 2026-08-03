@@ -4309,8 +4309,19 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         let removed = self.active_catalog_mut().drop_rule(name, table);
         if !removed && !if_exists {
-            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
-                alloc::format!("rule {name:?} on {table:?} does not exist"),
+            // v7.39 (round 708) — PG's order and words, both measured: the
+            // RELATION resolves first (`relation "t" does not exist`), and
+            // only then the rule, spelled `for relation`, not `on`. The old
+            // message also rode `StorageError::Corrupt`, whose Display put
+            // `corrupt on-disk format:` in front of a typo — the same
+            // wrapper rounds 698 and 700 kept meeting.
+            if self.active_catalog().get(table).is_none() {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "relation \"{table}\" does not exist"
+                )));
+            }
+            return Err(EngineError::Unsupported(alloc::format!(
+                "rule \"{name}\" for relation \"{table}\" does not exist"
             )));
         }
         Ok(QueryResult::CommandOk {
