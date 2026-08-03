@@ -148,6 +148,21 @@ pub enum ValidateOnlyKind {
     /// v7.39 (round 697) — `CREATE EXTENSION <e>`: the extension must be
     /// AVAILABLE (PG: `extension "x" is not available`).
     ExtensionAvailable,
+    /// v7.39 (round 708) — `ALTER TYPE <t> <any no-op form>`: the TYPE must
+    /// exist (PG: `type "x" does not exist`); the action itself stays a
+    /// no-op (PG genuinely renames; that residual is recorded).
+    TypeName,
+    /// v7.39 (round 708) — `ALTER AGGREGATE name(args) …`: names[0] is the
+    /// aggregate, the rest its argument type names (`*` = the `(*)` form).
+    /// Existence only; the action no-ops (PG really renames built-ins —
+    /// measured — and SPG does not model that).
+    AggregateName,
+    /// v7.39 (round 708) — `DROP CONVERSION <c>`: SPG ships no conversions,
+    /// so every name answers PG's `conversion "x" does not exist`.
+    ConversionName,
+    /// v7.39 (round 708) — `DROP LANGUAGE <l>`: an unknown language does
+    /// not exist; a shipped one is required (PG's two wordings, measured).
+    LanguageName,
     /// v7.39 (round 706) — `CREATE SERVER` / `CREATE FOREIGN TABLE` /
     /// `CREATE FOREIGN DATA WRAPPER`. SPG has no foreign-data
     /// infrastructure at all, so PG's refusals (`foreign-data wrapper "x"
@@ -5116,6 +5131,16 @@ impl fmt::Display for Statement {
                     write!(f, "CREATE EXTENSION {}", names.join(", "))
                 }
                 ValidateOnlyKind::ForeignInfra => f.write_str("CREATE SERVER"),
+                ValidateOnlyKind::TypeName => write!(f, "ALTER TYPE {}", names.join(", ")),
+                ValidateOnlyKind::AggregateName => {
+                    write!(f, "ALTER AGGREGATE {}", names.join(", "))
+                }
+                ValidateOnlyKind::ConversionName => {
+                    write!(f, "DROP CONVERSION {}", names.join(", "))
+                }
+                ValidateOnlyKind::LanguageName => {
+                    write!(f, "DROP LANGUAGE {}", names.join(", "))
+                }
                 ValidateOnlyKind::ExtensionInstalled => {
                     write!(f, "DROP EXTENSION {}", names.join(", "))
                 }

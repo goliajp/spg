@@ -1516,6 +1516,80 @@ impl Engine {
                             }
                         }
                     }
+                    // v7.39 (round 708) — ALTER TYPE's no-op forms validate
+                    // the name against the three user-type catalogs.
+                    K::TypeName => {
+                        for n in &names {
+                            let cat = self.active_catalog();
+                            if !cat.enum_types().contains_key(n)
+                                && !cat.domain_types().contains_key(n)
+                                && !cat.composite_types().contains_key(n)
+                            {
+                                return Err(EngineError::Unsupported(alloc::format!(
+                                    "type \"{n}\" does not exist"
+                                )));
+                            }
+                        }
+                    }
+                    // v7.39 (round 708) — names[0] = aggregate, rest = arg
+                    // type names; existence by name (round 707's residual on
+                    // overloads applies here too).
+                    K::AggregateName => {
+                        let Some(name) = names.first() else {
+                            return Ok(QueryResult::CommandOk {
+                                affected: 0,
+                                modified_catalog: false,
+                            });
+                        };
+                        if !crate::aggregate::is_aggregate_name(name.as_str()) {
+                            let canon: Vec<alloc::string::String> = names[1..]
+                                .iter()
+                                .map(|t| {
+                                    if t == "*" {
+                                        alloc::string::String::from("*")
+                                    } else {
+                                        crate::conversions::type_name_to_data_type(t).map_or_else(
+                                            || t.clone(),
+                                            crate::conversions::pg_type_name_for_error,
+                                        )
+                                    }
+                                })
+                                .collect();
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "aggregate {name}({}) does not exist",
+                                canon.join(", ")
+                            )));
+                        }
+                    }
+                    // v7.39 (round 708) — SPG ships no conversions at all,
+                    // so PG's not-found answer is total here.
+                    K::ConversionName => {
+                        if let Some(n) = names.first() {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "conversion \"{n}\" does not exist"
+                            )));
+                        }
+                    }
+                    // v7.39 (round 708) — the shipped languages are
+                    // required; anything else does not exist. Both wordings
+                    // are PG18 measurements.
+                    K::LanguageName => {
+                        // One name per statement; PG errors on the first
+                        // either way, so `first` says what the loop only
+                        // implied (clippy: never actually loops).
+                        if let Some(n) = names.first() {
+                            let lc = n.to_ascii_lowercase();
+                            return Err(EngineError::Unsupported(match lc.as_str() {
+                                "plpgsql" => alloc::format!(
+                                    "cannot drop language {lc} because extension {lc} requires it"
+                                ),
+                                "sql" | "internal" | "c" => alloc::format!(
+                                    "cannot drop language {lc} because it is required by the database system"
+                                ),
+                                _ => alloc::format!("language \"{n}\" does not exist"),
+                            }));
+                        }
+                    }
                     // v7.39 (round 706) — see ValidateOnlyKind::ForeignInfra
                     // for why this warns instead of copying PG's refusal.
                     K::ForeignInfra => {

@@ -228,3 +228,55 @@ fn round707_drop_aggregate_answers_as_pg_does() {
     // IF EXISTS keeps the unknown quiet.
     e.execute("DROP AGGREGATE IF EXISTS nosuch707(int)").unwrap();
 }
+
+/// v7.39 (round 708) — the S05g ④ batch: twelve probes, six real gaps, all
+/// "the object named does not exist and SPG said fine". Each expectation is
+/// a PG18 measurement. The four accepted-and-recorded shapes (ALTER
+/// AGGREGATE rename of a built-in, ALTER OPERATOR SET SCHEMA, ALTER
+/// SERVER, ALTER TABLESPACE) are NOT pinned as errors, because PG genuinely
+/// performs the first two and SPG's ForeignInfra/no-op stance covers the
+/// rest — recorded in the ledger, not frozen in a test.
+#[test]
+fn round708_the_alter_and_drop_batch_validates_its_names() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE rt708(i INT)").unwrap();
+    for (sql, want) in [
+        (
+            "ALTER AGGREGATE nosuch708(int) RENAME TO x",
+            "aggregate nosuch708(integer) does not exist",
+        ),
+        (
+            "ALTER USER nosuch708 WITH PASSWORD 'x'",
+            "role \"nosuch708\" does not exist",
+        ),
+        (
+            "ALTER TYPE nosuch708 RENAME TO x",
+            "type \"nosuch708\" does not exist",
+        ),
+        (
+            "DROP RULE nosuch708 ON nosuch708t",
+            "relation \"nosuch708t\" does not exist",
+        ),
+        (
+            "DROP RULE nosuch708 ON rt708",
+            "rule \"nosuch708\" for relation \"rt708\" does not exist",
+        ),
+        (
+            "DROP CONVERSION nosuch708",
+            "conversion \"nosuch708\" does not exist",
+        ),
+        (
+            "DROP LANGUAGE nosuch708",
+            "language \"nosuch708\" does not exist",
+        ),
+    ] {
+        let err = err_of(&mut e, sql);
+        assert!(err.contains(want), "{sql}\n  got: {err}\n  want: {want}");
+        assert!(!err.contains("corrupt on-disk format"), "{sql}: {err}");
+    }
+    // The rule error carries PG's `for relation`, not the old `on`.
+    // And a known type still no-ops through the unmodelled forms.
+    e.execute("CREATE TYPE mood708 AS ENUM ('a')").unwrap();
+    e.execute("ALTER TYPE mood708 RENAME TO mood709").unwrap();
+    e.execute("DROP PROCEDURAL LANGUAGE IF EXISTS nosuch708").unwrap();
+}
