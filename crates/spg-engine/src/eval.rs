@@ -2147,6 +2147,75 @@ fn greatest_least_collation(args: &[Expr], ctx: &EvalContext<'_>) -> Option<allo
         .map(alloc::string::ToString::to_string)
 }
 
+/// v7.39 (round 704) — rewrite a comparison's operator-not-found error when
+/// the operand at fault is an UNKNOWN string literal against a numeric-family
+/// value. PG commits such a literal to the other side's type before comparing,
+/// so its error is the input function's — `invalid input syntax for type
+/// integer: "abc"` — not `operator does not exist: integer = text`. An
+/// explicit `::text` operand keeps the operator error (`1 IS DISTINCT FROM
+/// 'a'::text`, measured on PG18), which is precisely the distinction two
+/// `Value`s cannot carry: the first cut of this round rewrote inside
+/// `binop::compare` and the r238 pin plus corpus 19 caught it the same day.
+///
+/// Error-path only — a comparison that succeeds never calls this — so the
+/// 35.6 %-of-self-time note on `compare` is untouched.
+#[cold]
+#[inline(never)]
+fn unknown_literal_cmp_error(
+    err: EvalError,
+    lhs: &Expr,
+    rhs: &Expr,
+    lv: &Value<'_>,
+    rv: &Value<'_>,
+) -> EvalError {
+    let EvalError::TypeMismatch { detail } = &err else {
+        return err;
+    };
+    // Two spellings of the same fall-through: `compare`'s operator error,
+    // and the owned numeric path's conversion error (`f = 'y'` reaches
+    // "cannot convert text to FLOAT"). Both mean the literal failed to
+    // lift; neither is what PG says about an unknown literal.
+    if !detail.starts_with("operator does not exist")
+        && !detail.starts_with("cannot convert text to")
+    {
+        return err;
+    }
+    let numeric = |v: &Value<'_>| {
+        matches!(
+            v.data_type(),
+            Some(
+                spg_storage::DataType::SmallInt
+                    | spg_storage::DataType::Int
+                    | spg_storage::DataType::BigInt
+                    | spg_storage::DataType::Float
+                    | spg_storage::DataType::Real
+                    | spg_storage::DataType::Numeric { .. }
+            )
+        )
+    };
+    let rewrite = |s: &Value<'_>, other: &Value<'_>| -> Option<EvalError> {
+        let Value::Text(text) = s else { return None };
+        let dt = other.data_type()?;
+        Some(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "invalid input syntax for type {}: \"{text}\"",
+                crate::conversions::pg_type_name_for_error(dt)
+            ),
+        })
+    };
+    if is_unknown_string_literal(lhs) && numeric(rv)
+        && let Some(e) = rewrite(lv, rv)
+    {
+        return e;
+    }
+    if is_unknown_string_literal(rhs) && numeric(lv)
+        && let Some(e) = rewrite(rv, lv)
+    {
+        return e;
+    }
+    err
+}
+
 fn enum_arg_type_name<'e>(args: &'e [Expr], ctx: &EvalContext<'e>) -> Option<&'e str> {
     args.iter()
         .find_map(|a| expr_enum_type_name(a, ctx.columns))
@@ -4785,7 +4854,9 @@ pub fn eval_expr(
                     if lc.as_ref().is_null() || rc.as_ref().is_null() {
                         return Ok(Value::Null);
                     }
-                    return compare(*op, lc.as_ref(), rc.as_ref());
+                    return compare(*op, lc.as_ref(), rc.as_ref()).map_err(|e| {
+                        unknown_literal_cmp_error(e, lhs, rhs, lc.as_ref(), rc.as_ref())
+                    });
                 }
                 let (l, r) = collation_fold_for_compare(
                     *op,
@@ -4795,7 +4866,17 @@ pub fn eval_expr(
                     rc.into_owned(),
                     ctx,
                 );
-                return apply_binary_in(*op, l, r, ctx.mysql_dialect);
+                // The owned call consumes the values; the rewrite needs the
+                // literal's text and the other side's type only on the ERROR
+                // path, so capture those two up front — the capture itself is
+                // gated on the cheap expr test, so a comparison with no
+                // unknown literal pays one branch.
+                let probe = (is_unknown_string_literal(lhs) || is_unknown_string_literal(rhs))
+                    .then(|| (l.clone(), r.clone()));
+                return apply_binary_in(*op, l, r, ctx.mysql_dialect).map_err(|e| match &probe {
+                    Some((pl, pr)) => unknown_literal_cmp_error(e, lhs, rhs, pl, pr),
+                    None => e,
+                });
             }
             let l = eval_expr(lhs, row, ctx)?;
             let r = eval_expr(rhs, row, ctx)?;

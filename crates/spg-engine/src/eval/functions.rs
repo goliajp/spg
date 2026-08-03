@@ -931,6 +931,31 @@ fn reject_non_text_first_arg(name: &str, args: &[Value<'_>]) -> Result<(), EvalE
     })
 }
 
+/// v7.39 (round 704) — the sentence PG18 gives `substring(42 FROM 1)`:
+/// `function pg_catalog.substring(integer, integer, integer) does not
+/// exist` — the missing OVERLOAD, with the signature spelled out and the
+/// `pg_catalog` prefix its resolution adds (the same rendering `trim` →
+/// `pg_catalog.btrim` already follows). SPG's old sentence
+/// ("substring() needs text or bytea, got integer") described the same
+/// fact in its own words, which no tool matching PG's shape recognises.
+fn substring_no_overload(args: &[Value<'_>]) -> EvalError {
+    let sig: alloc::vec::Vec<alloc::string::String> = args
+        .iter()
+        .map(|a| {
+            a.data_type().map_or_else(
+                || alloc::string::String::from("unknown"),
+                crate::conversions::pg_type_name_for_error,
+            )
+        })
+        .collect();
+    EvalError::TypeMismatch {
+        detail: format!(
+            "function pg_catalog.substring({}) does not exist",
+            sig.join(", ")
+        ),
+    }
+}
+
 fn apply_function_dispatch(
     name: &str,
     args: &[Value<'_>],
@@ -6442,13 +6467,8 @@ fn apply_function_dispatch(
                             Value::BitString { .. } => {
                                 Value::BitString { nbits: 0, bytes: alloc::borrow::Cow::Owned(Vec::new()) }
                             }
-                            other => {
-                                return Err(EvalError::TypeMismatch {
-                                    detail: format!(
-                                        "substring() needs text or bytea, got {}",
-                                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
-                                    ),
-                                });
+                            _ => {
+                                return Err(substring_no_overload(args));
                             }
                         });
                     }
@@ -6526,12 +6546,7 @@ fn apply_function_dispatch(
                         bytes: alloc::borrow::Cow::Owned(out),
                     })
                 }
-                other => Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "substring() needs text or bytea, got {}",
-                        crate::conversions::pg_type_name_for_error_opt(other.data_type())
-                    ),
-                }),
+                _ => Err(substring_no_overload(args)),
             }
         }
         // v7.11.15 — `position(needle, haystack)`. PG semantics:
@@ -19225,6 +19240,32 @@ fn apply_function_dispatch(
                     });
                 }
                 return call_user_function(def, args, ctx);
+            }
+            // v7.39 (round 704) — a WINDOW function called without OVER.
+            // These names exist — `pg_proc` lists them all with prokind
+            // `w` — so answering `function lag(integer) does not exist`
+            // sent the caller to check spelling and extensions for a
+            // function SPG has. PG's sentence names the actual mistake.
+            // The set is the `"w"` rows of `system_catalog`'s pg_proc
+            // seed, spelled here because this crate half is no_std-shaped
+            // and the list is closed (PG's own is, too).
+            if matches!(
+                other,
+                "row_number"
+                    | "rank"
+                    | "dense_rank"
+                    | "percent_rank"
+                    | "cume_dist"
+                    | "ntile"
+                    | "lag"
+                    | "lead"
+                    | "first_value"
+                    | "last_value"
+                    | "nth_value"
+            ) {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!("window function {other} requires an OVER clause"),
+                });
             }
             // v7.39 (round 254) — PG names the call SIGNATURE, not just the
             // function: `function nosuchfn(integer) does not exist` (42883).

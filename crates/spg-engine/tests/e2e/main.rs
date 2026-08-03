@@ -180,6 +180,7 @@ mod e2e_system_array_types_round694;
 mod e2e_validate_only_round696;
 mod e2e_ddl_object_errors_round700;
 mod e2e_dml_object_errors_round701;
+mod e2e_expr_errors_round704;
 mod e2e_refresh_matview_round699;
 mod e2e_sequence_sqlstate_round698;
 mod e2e_validate_only_round697;

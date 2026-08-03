@@ -1158,6 +1158,21 @@ fn validate_within_group(
     for spec in agg_specs {
         if is_within_group_name(&spec.name) {
             if spec.order_by.is_empty() {
+                // v7.39 (round 704) — the hypothetical-set names double as
+                // WINDOW functions, and PG resolves the bare zero-argument
+                // spelling to the window reading: `SELECT rank() FROM t` is
+                // `window function rank requires an OVER clause` there, not
+                // a WITHIN GROUP complaint. With a direct argument the
+                // ordered-set reading is the one the caller meant, and the
+                // WITHIN GROUP wording stands.
+                if spec.direct_arg.is_none() && is_hypothetical_set_name(&spec.name) {
+                    return Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "window function {} requires an OVER clause",
+                            spec.name
+                        ),
+                    });
+                }
                 return Err(EvalError::TypeMismatch {
                     detail: format!("{}() requires WITHIN GROUP (ORDER BY …)", spec.name),
                 });
