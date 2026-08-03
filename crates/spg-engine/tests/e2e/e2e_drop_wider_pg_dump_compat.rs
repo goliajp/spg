@@ -29,7 +29,16 @@ fn drop_type_domain_no_op() {
 #[test]
 fn drop_aggregate_operator_cast_no_op() {
     let mut e = Engine::new();
-    ddl(&mut e, "DROP AGGREGATE myavg(int)");
+    // v7.39 (round 707) — DROP AGGREGATE is real now: an unknown name is
+    // refused as PG refuses it, and a dump only drops aggregates it will
+    // recreate — with IF EXISTS when the target may be absent, which is
+    // the spelling pg_dump --clean emits. The old bare-name assertion was
+    // pinning the swallow (the F31 shape).
+    ddl(&mut e, "DROP AGGREGATE IF EXISTS myavg(int)");
+    let err = e
+        .execute("DROP AGGREGATE myavg(int)")
+        .expect_err("PG18 refuses an unknown aggregate");
+    assert!(format!("{err}").contains("aggregate myavg(integer) does not exist"));
     ddl(&mut e, "DROP OPERATOR + (int, int) CASCADE");
     ddl(&mut e, "DROP CAST (int AS text)");
 }

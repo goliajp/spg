@@ -148,6 +148,15 @@ pub enum ValidateOnlyKind {
     /// v7.39 (round 697) — `CREATE EXTENSION <e>`: the extension must be
     /// AVAILABLE (PG: `extension "x" is not available`).
     ExtensionAvailable,
+    /// v7.39 (round 706) — `CREATE SERVER` / `CREATE FOREIGN TABLE` /
+    /// `CREATE FOREIGN DATA WRAPPER`. SPG has no foreign-data
+    /// infrastructure at all, so PG's refusals (`foreign-data wrapper "x"
+    /// does not exist`, `server "x" does not exist`) cannot be copied —
+    /// PG can refuse because the missing piece is installable there.
+    /// Accepted with a WARNING, the extension resolution (round 697):
+    /// refusing turns a dump that restores today into one that needs
+    /// editing, and silent acceptance was the actual defect.
+    ForeignInfra,
     /// v7.39 (round 697) — `DROP EXTENSION <e>`: it must be installed
     /// (PG: `extension "x" does not exist`).
     ExtensionInstalled,
@@ -179,6 +188,22 @@ pub enum Statement {
     /// They share one variant because they share one rule — resolve the
     /// name, refuse if absent, otherwise no-op — and four variants would be
     /// four places for that rule to drift.
+    /// v7.39 (round 707) — `DROP AGGREGATE [IF EXISTS] name(argtypes)[, …]`.
+    /// Consumed whole by the dump-noise list before, so `DROP AGGREGATE
+    /// nosuch(int)` reported success. PG validates every named aggregate's
+    /// EXISTENCE first (measured: a list with one unknown fails on the
+    /// unknown even when an earlier entry exists), renders the signature
+    /// with canonical type names (`int` → `integer`), and refuses to drop a
+    /// built-in (`cannot drop function sum(integer) because it is required
+    /// by the database system`). Every SPG aggregate is a built-in, so the
+    /// outcome is one of those two errors — or the IF EXISTS no-op.
+    ///
+    /// `args` holds the argument type names as written; `None` is the
+    /// `(*)` spelling.
+    DropAggregate {
+        if_exists: bool,
+        items: Vec<(String, Option<Vec<String>>)>,
+    },
     ValidateOnly {
         kind: ValidateOnlyKind,
         /// The names the statement referred to. Empty means the form names
@@ -4776,6 +4801,7 @@ impl Statement {
             // written; PG classes LOCK and the OWNED BY pair as writers and
             // a read-only session refuses them there.
             Statement::ValidateOnly { .. } => false,
+            Statement::DropAggregate { .. } => false,
             // v7.39 (round 547) — records a GUC default in the catalog.
             Statement::SetDbRoleSetting(_) => false,
             // v7.39 (round 535) — REINDEX / CLUSTER rebuild nothing here,
@@ -5064,6 +5090,22 @@ impl fmt::Display for Statement {
             // v7.39 (round 695) — deparsed the way PG writes it.
             // v7.39 (round 696) — never deparsed into a dump (nothing is
             // stored), so the shortest faithful spelling of what it was.
+            Self::DropAggregate { if_exists, items } => {
+                f.write_str("DROP AGGREGATE ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                for (i, (name, args)) in items.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    match args {
+                        Some(a) => write!(f, "{name}({})", a.join(", "))?,
+                        None => write!(f, "{name}(*)")?,
+                    }
+                }
+                Ok(())
+            }
             Self::ValidateOnly { kind, names } => match kind {
                 ValidateOnlyKind::LockTable => write!(f, "LOCK TABLE {}", names.join(", ")),
                 ValidateOnlyKind::RoleName => {
@@ -5073,6 +5115,7 @@ impl fmt::Display for Statement {
                 ValidateOnlyKind::ExtensionAvailable => {
                     write!(f, "CREATE EXTENSION {}", names.join(", "))
                 }
+                ValidateOnlyKind::ForeignInfra => f.write_str("CREATE SERVER"),
                 ValidateOnlyKind::ExtensionInstalled => {
                     write!(f, "DROP EXTENSION {}", names.join(", "))
                 }
