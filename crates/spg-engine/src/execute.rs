@@ -1419,6 +1419,53 @@ impl Engine {
             // accepting a name that does not exist. SPG still performs
             // nothing for any of them; what changed is that it no longer
             // says "understood" about an object that is not there.
+            // v7.39 (round 707) — see Statement::DropAggregate. Existence
+            // first across the whole list (PG's order, measured), canonical
+            // type names in the signature, and every SPG aggregate is a
+            // built-in, so a name that exists is undroppable.
+            Statement::DropAggregate { if_exists, items } => {
+                let render = |name: &str, args: &Option<Vec<String>>| -> alloc::string::String {
+                    match args {
+                        None => alloc::format!("{name}(*)"),
+                        Some(a) => {
+                            let canon: Vec<alloc::string::String> = a
+                                .iter()
+                                .map(|t| {
+                                    crate::conversions::type_name_to_data_type(t).map_or_else(
+                                        || t.clone(),
+                                        crate::conversions::pg_type_name_for_error,
+                                    )
+                                })
+                                .collect();
+                            alloc::format!("{name}({})", canon.join(", "))
+                        }
+                    }
+                };
+                for (name, args) in &items {
+                    if !crate::aggregate::is_aggregate_name(name.as_str()) {
+                        if if_exists {
+                            continue;
+                        }
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "aggregate {} does not exist",
+                            render(name, args)
+                        )));
+                    }
+                }
+                if let Some((name, args)) = items
+                    .iter()
+                    .find(|(n, _)| crate::aggregate::is_aggregate_name(n.as_str()))
+                {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "cannot drop function {} because it is required by the database system",
+                        render(name, args)
+                    )));
+                }
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
             Statement::ValidateOnly { kind, names } => {
                 use spg_sql::ast::ValidateOnlyKind as K;
                 match kind {
@@ -1468,6 +1515,15 @@ impl Engine {
                                 ));
                             }
                         }
+                    }
+                    // v7.39 (round 706) — see ValidateOnlyKind::ForeignInfra
+                    // for why this warns instead of copying PG's refusal.
+                    K::ForeignInfra => {
+                        self.warning(alloc::string::String::from(
+                            "foreign-data infrastructure is not provided by this build; \
+                             SPG accepts the statement so a dump restores, but no foreign \
+                             server, wrapper or table it defines will function",
+                        ));
                     }
                     K::SecurityLabel => {
                         return Err(EngineError::Unsupported(alloc::string::String::from(

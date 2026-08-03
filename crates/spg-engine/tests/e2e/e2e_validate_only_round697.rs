@@ -134,14 +134,14 @@ fn round697_the_extension_list_and_the_catalog_agree() {
     }
 }
 
-/// The two that stay different, pinned as differences so that the day one
-/// changes, someone sees it rather than discovering it by accident.
+/// Residuals pinned as differences so the day one changes, someone sees it
+/// — and round 707 proved the mechanism: the DROP AGGREGATE half of this
+/// pin went red the day that gap closed, and left this file carrying only
+/// the SET SCHEMA half.
 #[test]
 fn round697_the_two_recorded_residuals() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t697(i INT)").unwrap();
-    // PG: `aggregate nosuch697(integer) does not exist`.
-    ok(&mut e, "DROP AGGREGATE nosuch697(int)");
     // PG: `schema "nosuch697" does not exist`. See the header for why this
     // one cannot be checked while CREATE SCHEMA does not register.
     ok(&mut e, "ALTER TABLE t697 SET SCHEMA nosuch697");
@@ -157,4 +157,74 @@ fn round697_the_two_recorded_residuals() {
         !schemas.iter().any(|s| s == "s697"),
         "if CREATE SCHEMA starts registering, SET SCHEMA becomes checkable: {schemas:?}"
     );
+}
+
+/// v7.39 (round 706) — the foreign-data family (S05g ②). `CREATE SERVER`,
+/// `CREATE FOREIGN TABLE` and `CREATE FOREIGN DATA WRAPPER` were consumed
+/// silently; PG refuses the first two when the wrapper / server they name
+/// does not exist. SPG cannot copy the refusal — PG can refuse because an
+/// FDW is installable there, and SPG has no foreign-data machinery at all,
+/// so refusing turns a dump that restores today into one that needs
+/// editing. The extension resolution applies: accept, and WARN, so a
+/// restore log says what will not function instead of reporting success.
+#[test]
+fn round706_the_foreign_family_warns_rather_than_lying() {
+    let mut e = Engine::new();
+    for sql in [
+        "CREATE SERVER myserver FOREIGN DATA WRAPPER pgfdw OPTIONS (host 'h')",
+        "CREATE FOREIGN DATA WRAPPER myfdw",
+        "CREATE FOREIGN TABLE ft(id INT) SERVER myserver",
+    ] {
+        e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err}"));
+        let notices = e.take_notices();
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.message.contains("foreign-data infrastructure is not provided")),
+            "{sql}: expected the warning, got {notices:?}"
+        );
+    }
+}
+
+/// v7.39 (round 707) — `DROP AGGREGATE` answers as PG18 answers (S05g ③).
+/// It was consumed whole by the dump-noise list, so `DROP AGGREGATE
+/// nosuch(int)` reported success. Every shape here is a PG18 measurement:
+/// existence is validated across the WHOLE list before anything else (a
+/// list with one unknown fails on the unknown even when an earlier entry
+/// exists), the signature renders with canonical type names, `(*)` stays
+/// `(*)`, and a name that exists is a built-in and therefore undroppable.
+#[test]
+fn round707_drop_aggregate_answers_as_pg_does() {
+    let mut e = Engine::new();
+    let err = |e: &mut Engine, sql: &str| -> String {
+        format!("{}", e.execute(sql).expect_err(&format!("PG18 refuses: {sql}")))
+    };
+    assert!(
+        err(&mut e, "DROP AGGREGATE nosuch707(int)")
+            .contains("aggregate nosuch707(integer) does not exist"),
+    );
+    assert!(
+        err(&mut e, "DROP AGGREGATE nosuch707(int, text)")
+            .contains("aggregate nosuch707(integer, text) does not exist"),
+    );
+    assert!(
+        err(&mut e, "DROP AGGREGATE nosuch707(*)")
+            .contains("aggregate nosuch707(*) does not exist"),
+    );
+    assert!(
+        err(&mut e, "DROP AGGREGATE nosuch707(double precision)")
+            .contains("aggregate nosuch707(double precision) does not exist"),
+    );
+    // Existence first, across the list — sum exists, nosuch wins the error.
+    assert!(
+        err(&mut e, "DROP AGGREGATE sum(integer), nosuch707(int)")
+            .contains("aggregate nosuch707(integer) does not exist"),
+    );
+    // A built-in is undroppable, with PG's sentence.
+    assert!(
+        err(&mut e, "DROP AGGREGATE sum(int)")
+            .contains("cannot drop function sum(integer) because it is required by the database system"),
+    );
+    // IF EXISTS keeps the unknown quiet.
+    e.execute("DROP AGGREGATE IF EXISTS nosuch707(int)").unwrap();
 }

@@ -3029,7 +3029,6 @@ impl Parser {
                             s.to_ascii_lowercase().as_str(),
                             "type"
                                 | "domain"
-                                | "aggregate"
                                 | "operator"
                                 | "cast"
                                 | "collation"
@@ -3050,6 +3049,63 @@ impl Parser {
                     {
                         self.consume_until_statement_boundary();
                         Ok(Statement::Empty)
+                    }
+                    // v7.39 (round 707) — `DROP AGGREGATE [IF EXISTS]
+                    // name(argtypes)[, …]`. Parsed for real so the engine
+                    // can answer as PG does; see Statement::DropAggregate.
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("aggregate") =>
+                    {
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let mut items: Vec<(String, Option<Vec<String>>)> = Vec::new();
+                        loop {
+                            let name = self.expect_ident_like()?;
+                            if !matches!(self.peek(), Token::LParen) {
+                                return Err(self.err(alloc::format!(
+                                    "expected argument list after DROP AGGREGATE {name}"
+                                )));
+                            }
+                            self.advance();
+                            let mut args: Vec<String> = Vec::new();
+                            let mut star = false;
+                            loop {
+                                match self.peek().clone() {
+                                    Token::RParen => {
+                                        self.advance();
+                                        break;
+                                    }
+                                    Token::Star => {
+                                        self.advance();
+                                        star = true;
+                                    }
+                                    Token::Comma => {
+                                        self.advance();
+                                    }
+                                    _ => {
+                                        // A type name may be multi-token
+                                        // (`double precision`); glue idents
+                                        // until , or ).
+                                        let mut t = self.expect_ident_like()?;
+                                        while let Token::Ident(nx) = self.peek() {
+                                            let nx = nx.clone();
+                                            self.advance();
+                                            t.push(' ');
+                                            t.push_str(&nx);
+                                        }
+                                        args.push(t);
+                                    }
+                                }
+                            }
+                            items.push((name, if star { None } else { Some(args) }));
+                            if matches!(self.peek(), Token::Comma) {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                        self.consume_until_statement_boundary();
+                        Ok(Statement::DropAggregate { if_exists, items })
                     }
                     // v7.39 (round 697) — `DROP EXTENSION [IF EXISTS] <e>
                     // [, …] [CASCADE|RESTRICT]`. PG refuses one that is not
@@ -4479,13 +4535,11 @@ impl Parser {
                         // + return Empty.
                         | "statistics"
                         | "event"
-                        | "foreign"
                         // v7.37.17 (17.6 siblings) — additional CREATE
                         // targets pg_dump / operator install scripts
                         // may emit that SPG has no matching machinery
                         // for. Consume + Empty-return.
                         | "text"
-                        | "server"
                         | "tablespace"
                         | "access"
                         | "large"
@@ -4493,6 +4547,20 @@ impl Parser {
             {
                 self.consume_until_statement_boundary();
                 Ok(Statement::Empty)
+            }
+            // v7.39 (round 706) — the foreign-data family leaves the silent
+            // list: `CREATE SERVER …`, `CREATE FOREIGN TABLE …`, `CREATE
+            // FOREIGN DATA WRAPPER …` are still consumed whole (SPG has no
+            // FDW machinery), but the ENGINE now warns, so a restore log
+            // says what will not function instead of reporting success.
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("server") || s.eq_ignore_ascii_case("foreign") =>
+            {
+                self.consume_until_statement_boundary();
+                Ok(Statement::ValidateOnly {
+                    kind: crate::ast::ValidateOnlyKind::ForeignInfra,
+                    names: Vec::new(),
+                })
             }
             other => Err(self.err(format!(
                 "expected TABLE / INDEX / USER / EXTENSION / PUBLICATION / SUBSCRIPTION / FUNCTION / TRIGGER / SEQUENCE / SCHEMA / VIEW / TYPE / DOMAIN [OR REPLACE …] after CREATE, got {other:?}"
