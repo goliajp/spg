@@ -8832,6 +8832,7 @@ impl Parser {
                 limit: None,
                 offset: None,
                 limit_with_ties: false,
+            window_check_exprs: Vec::new(),
             };
             // v7.37 D.30 — replace each FROM-qualified column *leaf* in the
             // assignment RHS with a correlated scalar subquery, instead of
@@ -9141,6 +9142,7 @@ impl Parser {
                     limit: None,
                     offset: None,
                     limit_with_ties: false,
+            window_check_exprs: Vec::new(),
                 }))
             };
             let refs = |e: &Expr| expr_refs_tables(e, &names);
@@ -9181,6 +9183,7 @@ impl Parser {
                         limit: None,
                         offset: None,
                         limit_with_ties: false,
+            window_check_exprs: Vec::new(),
                     }),
                     negated: false,
                 })
@@ -12448,6 +12451,7 @@ impl Parser {
                     limit: None,
                     offset: None,
                     limit_with_ties: false,
+            window_check_exprs: Vec::new(),
                 };
             }
             if !matches!(self.peek(), Token::RParen) {
@@ -12936,6 +12940,29 @@ impl Parser {
                 break;
             }
         }
+        // v7.39 (round 705) — which definitions did anything reference?
+        // The ones nothing did used to be dropped here, unexamined, so
+        // `WINDOW w AS (ORDER BY nosuch)` succeeded — PG analyses every
+        // definition whether referenced or not. Their key expressions ride
+        // out on the statement for the engine to resolve.
+        let mut window_refs: Vec<String> = Vec::new();
+        if !window_defs.is_empty() {
+            for it in &items {
+                if let SelectItem::Expr { expr, .. } = it {
+                    Self::collect_named_window_refs(expr, &mut window_refs);
+                }
+            }
+        }
+        let window_check_exprs: Vec<Expr> = window_defs
+            .iter()
+            .filter(|(n, _)| !window_refs.iter().any(|r| r.eq_ignore_ascii_case(n)))
+            .flat_map(|(_, (partition, order, _))| {
+                partition
+                    .iter()
+                    .cloned()
+                    .chain(order.iter().map(|(e, _, _)| e.clone()))
+            })
+            .collect();
         if !window_defs.is_empty()
             || items
                 .iter()
@@ -12991,6 +13018,7 @@ impl Parser {
             limit: None,
             offset: None,
             limit_with_ties: false,
+            window_check_exprs,
         };
         // Grouping expansion (ROLLUP / CUBE / GROUPING SETS): the
         // first set is the primary (already on stmt.group_by); each
@@ -17623,6 +17651,7 @@ impl Parser {
                 limit: None,
                 offset: None,
                 limit_with_ties: false,
+            window_check_exprs: Vec::new(),
             });
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
@@ -17777,6 +17806,7 @@ impl Parser {
                 limit: None,
                 offset: None,
                 limit_with_ties: false,
+            window_check_exprs: Vec::new(),
             };
             return Ok(TableRef {
                 name: alias.clone(),
@@ -18078,6 +18108,7 @@ impl Parser {
                 limit: None,
                 offset: None,
                 limit_with_ties: false,
+            window_check_exprs: Vec::new(),
             };
             return Ok(TableRef {
                 name: table_alias.clone(),
@@ -18800,6 +18831,7 @@ impl Parser {
             limit: None,
             offset: None,
             limit_with_ties: false,
+            window_check_exprs: Vec::new(),
         };
         TableRef {
             name,
@@ -18849,6 +18881,54 @@ impl Parser {
                         .is_some_and(Self::expr_has_named_window)
             }
             _ => false,
+        }
+    }
+
+    /// v7.39 (round 705) — the NAMES the expression references through the
+    /// `OVER w` markers, so `parse_bare_select` can tell which WINDOW
+    /// definitions nothing referenced. Traversal mirrors
+    /// `expr_has_named_window` above.
+    fn collect_named_window_refs(e: &Expr, into: &mut Vec<String>) {
+        match e {
+            Expr::WindowFunction { partition_by, .. } => {
+                if let [Expr::Column(c)] = partition_by.as_slice()
+                    && matches!(
+                        c.qualifier.as_deref(),
+                        Some("__named_window__") | Some("__named_window_ref__")
+                    )
+                {
+                    into.push(c.name.clone());
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                Self::collect_named_window_refs(lhs, into);
+                Self::collect_named_window_refs(rhs, into);
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => {
+                Self::collect_named_window_refs(expr, into);
+            }
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    Self::collect_named_window_refs(a, into);
+                }
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                if let Some(o) = operand.as_deref() {
+                    Self::collect_named_window_refs(o, into);
+                }
+                for (w, t) in branches {
+                    Self::collect_named_window_refs(w, into);
+                    Self::collect_named_window_refs(t, into);
+                }
+                if let Some(eb) = else_branch.as_deref() {
+                    Self::collect_named_window_refs(eb, into);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -18991,6 +19071,7 @@ impl Parser {
             limit: None,
             offset: None,
             limit_with_ties: false,
+            window_check_exprs: Vec::new(),
         })
     }
 
@@ -19174,6 +19255,7 @@ impl Parser {
             limit: None,
             offset: None,
             limit_with_ties: false,
+            window_check_exprs: Vec::new(),
         };
         Ok(TableRef {
             name: alias.clone(),

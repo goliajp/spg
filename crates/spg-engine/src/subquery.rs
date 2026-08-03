@@ -2177,6 +2177,7 @@ impl Engine {
             limit: None,
             offset: None,
             limit_with_ties: false,
+            window_check_exprs: Vec::new(),
         };
         let cte = Cte {
             name: cte_name.clone(),
