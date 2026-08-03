@@ -358,6 +358,40 @@ impl CompiledExpr {
 /// Deliberately a COMPILE-time question. The answer is the same for every
 /// row of the scan, and the alternative — asking per row inside `compare` —
 /// puts a lookup on the hottest path in the engine.
+/// v7.39 (round 704) — does this comparison pair an unknown string literal
+/// with a numeric-family operand whose type the literal will not parse as?
+/// Compile-time twin of the eval Binary arm's error rewrite; see the bail
+/// site for why the shape cannot stay on the VM.
+fn unparseable_numeric_literal_cmp(lhs: &Expr, rhs: &Expr, ctx: &EvalContext<'_>) -> bool {
+    let check = |lit: &Expr, other: &Expr| -> bool {
+        let Expr::Literal(spg_sql::ast::Literal::String(text)) = lit else {
+            return false;
+        };
+        let Some(desc) = crate::describe::describe_expr(other, ctx.columns) else {
+            return false;
+        };
+        if !matches!(
+            desc.ty,
+            spg_storage::DataType::SmallInt
+                | spg_storage::DataType::Int
+                | spg_storage::DataType::BigInt
+                | spg_storage::DataType::Float
+                | spg_storage::DataType::Real
+                | spg_storage::DataType::Numeric { .. }
+        ) {
+            return false;
+        }
+        crate::conversions::coerce_value(
+            spg_storage::Value::text(text.as_str()),
+            desc.ty,
+            "",
+            0,
+        )
+        .is_err()
+    };
+    check(lhs, rhs) || check(rhs, lhs)
+}
+
 fn operand_declares_a_collation(e: &Expr, ctx: &EvalContext<'_>) -> bool {
     let derived = crate::collate_derive::derive(e, &|c: &ColumnName| {
         let pos = crate::eval::find_column_pos(c, ctx)?;
@@ -597,6 +631,19 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 && operand_declares_a_collation(lhs, ctx)
                 | operand_declares_a_collation(rhs, ctx)
             {
+                steps.push(Step::Subtree(e.clone()));
+                return;
+            }
+            // v7.39 (round 704) — an UNKNOWN string literal against a
+            // numeric-family operand that will NOT parse as its type. PG's
+            // error for `WHERE i = 'abc'` is the input function's
+            // (`invalid input syntax for type integer: "abc"`); the VM's
+            // value-level compare can only say "operator does not exist",
+            // so this shape leaves for the tree evaluator, whose Binary
+            // arm has the Exprs and rewrites the error. Compile-time and
+            // failure-only: a literal that parses stays on the VM path
+            // and costs nothing.
+            if cmp && unparseable_numeric_literal_cmp(lhs, rhs, ctx) {
                 steps.push(Step::Subtree(e.clone()));
                 return;
             }

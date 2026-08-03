@@ -5725,10 +5725,20 @@ pub(super) fn compare(
     // an Xid, so an integer comparison never pays for this.
     // PG implicitly casts an unknown-type string literal to the other
     // operand's type (`i = '5'`, `1 = '1'`, `2 < '10'`). When one side is Text
-    // and the other is a typed scalar, coerce the Text to that type first; a
-    // Text that won't parse (`1 = 'abc'`) falls through to the type-mismatch
-    // error, matching PG. Text-vs-Text stays a string comparison, and Bool has
-    // its own arm, so both are left alone.
+    // and the other is a typed scalar, coerce the Text to that type first.
+    // Text-vs-Text stays a string comparison, and Bool has its own arm, so
+    // both are left alone.
+    //
+    // v7.39 (round 704) — an UNKNOWN numeric-family literal that won't parse
+    // raises the type's input-function error in PG (`invalid input syntax
+    // for type integer: "abc"`); an explicit `::text` operand raises the
+    // OPERATOR error (`1 IS DISTINCT FROM 'a'::text`, measured). This
+    // function sees two Values and cannot tell those apart — the first cut
+    // of round 704 propagated the input error from HERE and broke the
+    // typed-text shapes (the r238 pin and corpus 19 both caught it). The
+    // distinction lives where the Expr is visible: the eval Binary arm
+    // rewrites the fall-through error for an unknown string literal, and
+    // the predicate compiler bails that shape to the tree evaluator.
     let needs_text_coerce = |other: &Value<'_>| -> Option<DataType> {
         match other.data_type() {
             // Text-vs-Text is a string comparison; an untyped operand can't
@@ -5852,27 +5862,33 @@ pub(super) fn compare(
         // PG-style implicit coercion: comparing a DATE / TIMESTAMP
         // column against a text literal lifts the literal into the
         // matching domain (e.g. `day >= '2024-01-01'`).
+        //
+        // v7.39 (round 704) — a literal that will not lift fails with the
+        // TYPE's own input-function wording (`invalid input syntax for
+        // type date: "notadate"`), measured off PG18. The old "cannot
+        // parse … for comparison" described the same fact in SPG's words,
+        // which nothing matching PG's shape recognises.
         (Value::Date(a), Value::Text(b)) => {
             let bd = parse_date_literal(b).ok_or_else(|| EvalError::TypeMismatch {
-                detail: format!("cannot parse {b:?} as DATE for comparison"),
+                detail: format!("invalid input syntax for type date: \"{b}\""),
             })?;
             a.cmp(&bd)
         }
         (Value::Text(a), Value::Date(b)) => {
             let ad = parse_date_literal(a).ok_or_else(|| EvalError::TypeMismatch {
-                detail: format!("cannot parse {a:?} as DATE for comparison"),
+                detail: format!("invalid input syntax for type date: \"{a}\""),
             })?;
             ad.cmp(b)
         }
         (Value::Timestamp(a), Value::Text(b)) => {
             let bt = parse_timestamp_literal(b).ok_or_else(|| EvalError::TypeMismatch {
-                detail: format!("cannot parse {b:?} as TIMESTAMP for comparison"),
+                detail: format!("invalid input syntax for type timestamp: \"{b}\""),
             })?;
             a.cmp(&bt)
         }
         (Value::Text(a), Value::Timestamp(b)) => {
             let at = parse_timestamp_literal(a).ok_or_else(|| EvalError::TypeMismatch {
-                detail: format!("cannot parse {a:?} as TIMESTAMP for comparison"),
+                detail: format!("invalid input syntax for type timestamp: \"{a}\""),
             })?;
             at.cmp(b)
         }
