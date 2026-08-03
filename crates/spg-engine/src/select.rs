@@ -2607,6 +2607,40 @@ impl Engine {
         // a cancellation race before any row is produced. Release
         // build expands to `let _ = (...);` — zero cost.
         crate::injection_point!("planner_first_row_fetch", &stmt.from);
+        // v7.39 (round 705) — WINDOW-clause definitions nothing referenced.
+        // PG analyses every definition, referenced or not, so `SELECT i FROM
+        // t WINDOW w AS (ORDER BY nosuch)` fails there and silently
+        // succeeded here (the parser used to drop the unreferenced defs
+        // whole). The check is the CREATE VIEW check's shape (round 700): a
+        // LIMIT-0 run of the same FROM with the definitions' key
+        // expressions as the projection — it cannot disagree with what a
+        // referencing window would have done, because it resolves the same
+        // names the same way. Zero cost for the ordinary statement: the
+        // list is empty unless a WINDOW clause left unreferenced defs.
+        if !stmt.window_check_exprs.is_empty() {
+            let mut probe = stmt.clone();
+            probe.items = stmt
+                .window_check_exprs
+                .iter()
+                .map(|e| spg_sql::ast::SelectItem::Expr {
+                    expr: e.clone(),
+                    alias: None,
+                })
+                .collect();
+            probe.window_check_exprs = Vec::new();
+            probe.distinct = false;
+            probe.distinct_on = Vec::new();
+            probe.group_by = None;
+            probe.group_by_all = false;
+            probe.having = None;
+            probe.unions = Vec::new();
+            probe.order_by = Vec::new();
+            probe.locking = None;
+            probe.limit = Some(spg_sql::ast::LimitExpr::Literal(0));
+            probe.offset = None;
+            probe.limit_with_ties = false;
+            self.exec_select_cancel_inner(&probe, cancel)?;
+        }
         // v7.39 (read01 round 74) — lower `(f(args)).*`. Naming a record's fields
         // takes the catalog, so the parser leaves a marker and the rewrite lands
         // here: the call moves into a LATERAL FROM item and the item becomes one
@@ -7198,6 +7232,7 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
         limit: None,
         offset: None,
         limit_with_ties: false,
+            window_check_exprs: Vec::new(),
         ..stmt.clone()
     };
     let derived = TableRef {
@@ -7257,6 +7292,7 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
         limit: stmt.limit.clone(),
         offset: stmt.offset.clone(),
         limit_with_ties: stmt.limit_with_ties,
+        window_check_exprs: Vec::new(),
     })
 }
 

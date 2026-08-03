@@ -806,6 +806,7 @@ impl Engine {
             limit: None,
             offset: None,
             limit_with_ties: false,
+            window_check_exprs: Vec::new(),
             group_by_all: false,
         };
         let result = self.exec_bare_select_cancel(&probe, cancel)?;

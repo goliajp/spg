@@ -3357,6 +3357,17 @@ pub struct SelectStatement {
     /// accepting `WITH TIES` since Phase 5.1; this field captures
     /// the choice so the executor can act on it.
     pub limit_with_ties: bool,
+    /// v7.39 (round 705) — the key expressions of WINDOW-clause definitions
+    /// that NOTHING referenced. PG analyses every definition whether
+    /// referenced or not, so `WINDOW w AS (ORDER BY nosuch)` fails there
+    /// and silently succeeded here — the referenced ones get their columns
+    /// resolved through the WindowFunction nodes they were inlined into,
+    /// and the unreferenced ones used to be dropped at parse, unexamined.
+    /// The engine resolves these with a LIMIT-0 probe of the same FROM.
+    ///
+    /// Not part of `Display`: an unreferenced definition has no effect on
+    /// the result, so a deparsed body (a stored view) omits it.
+    pub window_check_exprs: Vec<Expr>,
 }
 
 impl Expr {
@@ -8486,6 +8497,7 @@ mod tests {
             limit: None,
             offset: None,
             limit_with_ties: false,
+            window_check_exprs: Vec::new(),
             distinct: false,
             distinct_on: Vec::new(),
             ctes: vec![],

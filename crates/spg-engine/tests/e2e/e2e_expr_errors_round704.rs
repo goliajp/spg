@@ -121,3 +121,41 @@ fn round704_a_temporal_literal_that_wont_lift_uses_the_input_functions_words() {
             .contains("invalid input syntax for type timestamp: \"nope\""),
     );
 }
+
+/// v7.39 (round 705) — the batch's fifth gap. An unreferenced WINDOW
+/// definition is analysed, as PG analyses it: `WINDOW w AS (ORDER BY
+/// nosuch)` failed on PG18 and silently succeeded here, because the parser
+/// dropped unreferenced definitions whole. The check reuses the CREATE
+/// VIEW discipline from round 700 — a LIMIT-0 run of the same FROM with
+/// the definitions' key expressions as the projection.
+#[test]
+fn round705_an_unreferenced_window_definition_is_still_analysed() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    let err = err_of(&mut e, "SELECT i FROM t704 WINDOW w AS (ORDER BY nosuch705)");
+    assert!(err.contains("nosuch705"), "{err}");
+    // A good unreferenced definition stays a no-op…
+    let n = match e
+        .execute("SELECT count(*) FROM t704 WINDOW w AS (PARTITION BY i ORDER BY b)")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(n, "1");
+    // …and a REFERENCED one still works end to end.
+    let got = match e
+        .execute("SELECT row_number() OVER w FROM t704 WINDOW w AS (ORDER BY i)")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(got, "1");
+    // A bad column inside a referenced definition errors through the
+    // window itself, as before.
+    assert!(
+        err_of(&mut e, "SELECT row_number() OVER w FROM t704 WINDOW w AS (ORDER BY nosuch705)")
+            .contains("nosuch705")
+    );
+}

@@ -7580,6 +7580,7 @@ fn resolve_unqualified_source_leaf(
                         limit: None,
                         offset: None,
                         limit_with_ties: false,
+            window_check_exprs: Vec::new(),
                     },
                 ));
                 *changed = true;
