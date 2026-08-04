@@ -1387,6 +1387,20 @@ impl Engine {
                 ..
             }
         );
+        // v7.39 (round 711) — carry the timing through the ALTER path too.
+        let timing = match tc {
+            spg_sql::ast::TableConstraint::PrimaryKey {
+                deferrable,
+                initially_deferred,
+                ..
+            }
+            | spg_sql::ast::TableConstraint::Unique {
+                deferrable,
+                initially_deferred,
+                ..
+            } => (deferrable, initially_deferred),
+            _ => (false, false),
+        };
         match tc {
             spg_sql::ast::TableConstraint::PrimaryKey { columns, .. }
             | spg_sql::ast::TableConstraint::Unique { columns, .. } => {
@@ -1421,6 +1435,8 @@ impl Engine {
                             columns: positions.clone(),
                             nulls_not_distinct: nnd,
                             name: con_name.clone(),
+                            deferrable: timing.0,
+                            initially_deferred: timing.1,
                         },
                     );
                     // PK implies NOT NULL on referenced cols.
@@ -3429,6 +3445,17 @@ impl Engine {
         foreign_keys: Vec<spg_sql::ast::ForeignKeyConstraint>,
         inline_pk_columns: &[String],
     ) -> Result<TableSchema, EngineError> {
+        // v7.39 (round 711) — the inline PK's timing clause, captured
+        // before `columns` is consumed into the schema below.
+        let inline_pk_timing: (bool, bool) = columns
+            .iter()
+            .filter(|c| c.is_primary_key)
+            .fold((false, false), |acc, c| {
+                (
+                    acc.0 | c.constraint_deferrable,
+                    acc.1 | c.constraint_initially_deferred,
+                )
+            });
         // v7.9.19 — table-level constraints: PRIMARY KEY (a, b, ...)
         // and UNIQUE (a, b, ...). Each builds a BTree index on the
         // leading column (the existing single-column storage tier)
@@ -3631,15 +3658,32 @@ impl Engine {
         // when the user left it unnamed.
         let mut excl_storage: Vec<spg_storage::ExclusionConstraint> = Vec::new();
         for tc in table_constraints {
-            let (is_pk, names, nnd, con_name) = match tc {
-                spg_sql::ast::TableConstraint::PrimaryKey { name, columns } => {
-                    (true, columns.clone(), false, name.clone())
-                }
+            let (is_pk, names, nnd, con_name, timing) = match tc {
+                spg_sql::ast::TableConstraint::PrimaryKey {
+                    name,
+                    columns,
+                    deferrable,
+                    initially_deferred,
+                } => (
+                    true,
+                    columns.clone(),
+                    false,
+                    name.clone(),
+                    (*deferrable, *initially_deferred),
+                ),
                 spg_sql::ast::TableConstraint::Unique {
                     name,
                     columns,
                     nulls_not_distinct,
-                } => (false, columns.clone(), *nulls_not_distinct, name.clone()),
+                    deferrable,
+                    initially_deferred,
+                } => (
+                    false,
+                    columns.clone(),
+                    *nulls_not_distinct,
+                    name.clone(),
+                    (*deferrable, *initially_deferred),
+                ),
                 spg_sql::ast::TableConstraint::Check { name, expr, .. } => {
                     // v7.13.0 — collect CHECK predicate sources;
                     // they get attached to the schema below.
@@ -3718,6 +3762,8 @@ impl Engine {
                 columns: positions,
                 nulls_not_distinct: nnd,
                 name: con_name,
+                deferrable: timing.0,
+                initially_deferred: timing.1,
             });
         }
         // v7.24 (round-16 collateral) — inline `PRIMARY KEY` column
@@ -3741,6 +3787,8 @@ impl Engine {
                     is_primary_key: true,
                     columns: positions,
                     nulls_not_distinct: false,
+                    deferrable: inline_pk_timing.0,
+                    initially_deferred: inline_pk_timing.1,
                     // Inline `col INT PRIMARY KEY` carries no name.
                     name: None,
                 });

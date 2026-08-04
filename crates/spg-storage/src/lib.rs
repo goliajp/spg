@@ -2124,6 +2124,14 @@ pub struct UniquenessConstraint {
     /// first and falls back to the synthesised one, so catalogs written
     /// before this field (< FILE_VERSION 60) keep working unchanged.
     pub name: Option<String>,
+    /// v7.39 (round 711) — `[NOT] DEFERRABLE`. Round 621 taught the parser
+    /// to CONSUME the clause on PK/UNIQUE (the FK path had stored it since
+    /// round 288); this is the storing half. Persisted in the v89 timing
+    /// appendix.
+    pub deferrable: bool,
+    /// `INITIALLY DEFERRED`: the check belongs to COMMIT, not the
+    /// statement, unless `SET CONSTRAINTS … IMMEDIATE` pulls it in.
+    pub initially_deferred: bool,
 }
 
 /// v7.39 (round 210) — an `EXCLUDE` constraint. Forbids two distinct live
@@ -7970,7 +7978,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 88;
+const FILE_VERSION: u8 = 89;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the
@@ -8867,6 +8875,19 @@ impl Catalog {
             for (idx, name) in collated {
                 write_u16(&mut out, u16::try_from(idx).expect("≤ 65k columns/table"));
                 write_str(&mut out, name);
+            }
+            // v7.39 (round 711) — PK/UNIQUE constraint timing (FILE_VERSION
+            // 89+). Dense, one byte per uniqueness constraint in
+            // declaration order, the same bit layout the FK block has
+            // carried since round 288: bit 0 = DEFERRABLE, bit 1 =
+            // INITIALLY DEFERRED. A v88 reader stops before it.
+            write_u16(
+                &mut out,
+                u16::try_from(t.schema.uniqueness_constraints.len())
+                    .expect("≤ 65k uniqueness constraints/table"),
+            );
+            for uc in &t.schema.uniqueness_constraints {
+                out.push(u8::from(uc.deferrable) | (u8::from(uc.initially_deferred) << 1));
             }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions

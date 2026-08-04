@@ -189,6 +189,10 @@ pub(crate) fn deserialize_table(
                 // v7.39 (read01 round 48) — filled in by the v60
                 // constraint-name appendix at the tail; < v60 stays None.
                 name: None,
+                // v7.39 (round 711) — filled by the v89 timing appendix;
+                // < v89 stays immediate, which is what those catalogs meant.
+                deferrable: false,
+                initially_deferred: false,
             });
         }
         t.schema_mut().uniqueness_constraints = ucs;
@@ -623,6 +627,24 @@ pub(crate) fn deserialize_table(
                 )));
             };
             c.collation_name = Some(name);
+        }
+    }
+    // v7.39 (round 711) — PK/UNIQUE constraint timing (FILE_VERSION 89+).
+    // Dense, one byte per uniqueness constraint in declaration order; the
+    // FK block has carried the same bit layout since round 288.
+    if version >= 89 {
+        let n = cur.read_u16()? as usize;
+        let ucs = &mut t.schema_mut().uniqueness_constraints;
+        for i in 0..n {
+            let b = cur.read_u8()?;
+            let Some(uc) = ucs.get_mut(i) else {
+                return Err(StorageError::Corrupt(format!(
+                    "uniqueness timing appendix: index {i} past {} constraints                      for table {table_name:?}",
+                    n
+                )));
+            };
+            uc.deferrable = b & 1 != 0;
+            uc.initially_deferred = b & 2 != 0;
         }
     }
     let _ = table_name;

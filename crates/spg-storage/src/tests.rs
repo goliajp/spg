@@ -1011,6 +1011,9 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
     // 88+): a `u16` count of 0 when no column was declared with an explicit
     // COLLATE, which is this fixture's case.
     const EMPTY_COLLATION_APPENDIX: usize = 2;
+    // v7.39 (round 711) — the PK/UNIQUE timing appendix (FILE_VERSION 89+):
+    // a `u16` count of 0 — this fixture's table declares no PK or UNIQUE.
+    const EMPTY_UNIQUE_TIMING_APPENDIX: usize = 2;
     let tail_v60plus = EMPTY_CONSTRAINT_NAME_APPENDIX
         + EMPTY_COMPOSITE_APPENDIX
         + EMPTY_OWNER_ACL_APPENDIX
@@ -1020,7 +1023,8 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         + EMPTY_MYSQL_INT_WIDTH_APPENDIX
         + EMPTY_MYSQL_FSP_APPENDIX
         + EMPTY_CHECK_VALIDATED_APPENDIX
-        + EMPTY_COLLATION_APPENDIX;
+        + EMPTY_COLLATION_APPENDIX
+        + EMPTY_UNIQUE_TIMING_APPENDIX;
     let mut v52 = Vec::with_capacity(v53.len() - appendix.len() - trailing_v53plus - tail_v60plus);
     v52.extend_from_slice(&v53[..start - trailing_v53plus]);
     v52.extend_from_slice(&v53[start + appendix.len() + tail_v60plus..]);

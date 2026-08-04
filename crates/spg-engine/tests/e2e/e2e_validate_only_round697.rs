@@ -412,3 +412,49 @@ fn round710_the_tail_batch() {
         ok(&mut e, sql);
     }
 }
+
+/// v7.39 (round 711) — F08's storing half (S05d step 1). Round 621 taught
+/// the parser to CONSUME `DEFERRABLE INITIALLY DEFERRED` on PK/UNIQUE; the
+/// FK path had stored the flags since round 288, and `UniquenessConstraint`
+/// had nowhere to put them — so the declaration died between the parser and
+/// the catalog. They persist now (FILE_VERSION 89 timing appendix, same bit
+/// layout as the FK byte), through both the CREATE TABLE and the ALTER
+/// TABLE ADD CONSTRAINT spellings, and `pg_constraint` reports them.
+///
+/// The ENFORCEMENT half — the transaction-scoped check queue — is the next
+/// knife; nothing here claims the checks defer yet.
+#[test]
+fn round711_pk_unique_deferrable_flags_are_stored() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE d711 (id INT PRIMARY KEY DEFERRABLE INITIALLY DEFERRED)")
+        .unwrap();
+    e.execute("CREATE TABLE d711b (id INT, CONSTRAINT u711 UNIQUE (id) DEFERRABLE)")
+        .unwrap();
+    e.execute("CREATE TABLE d711c (id INT PRIMARY KEY)").unwrap();
+    e.execute("CREATE TABLE d711d (id INT)").unwrap();
+    e.execute("ALTER TABLE d711d ADD CONSTRAINT p711 PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED")
+        .unwrap();
+    let rows = match e
+        .execute(
+            "SELECT conname, condeferrable, condeferred FROM pg_constraint \
+             WHERE contype IN ('p','u') ORDER BY conname",
+        )
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => rows
+            .iter()
+            .map(|r| {
+                r.values
+                    .iter()
+                    .map(spg_engine::eval::value_to_text)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert!(rows.contains(&"d711_pkey|true|true".to_string()), "{rows:?}");
+    assert!(rows.contains(&"u711|true|false".to_string()), "{rows:?}");
+    assert!(rows.contains(&"d711c_pkey|false|false".to_string()), "{rows:?}");
+    assert!(rows.contains(&"p711|true|true".to_string()), "{rows:?}");
+}

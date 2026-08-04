@@ -2361,6 +2361,10 @@ pub enum TableConstraint {
     PrimaryKey {
         name: Option<String>,
         columns: Vec<String>,
+        /// v7.39 (round 711) — `[NOT] DEFERRABLE [INITIALLY DEFERRED]`.
+        /// Round 621 consumed the clauses; these carry them.
+        deferrable: bool,
+        initially_deferred: bool,
     },
     /// `UNIQUE (col1, col2, ...)`. Engine builds a BTree index
     /// named `<table>_<leading_col>_key` (single-column) or
@@ -2374,6 +2378,9 @@ pub enum TableConstraint {
         /// NULL rows collide on the constraint. Default is
         /// `false` (NULLS DISTINCT, standard SQL behaviour).
         nulls_not_distinct: bool,
+        /// v7.39 (round 711) — see PrimaryKey.
+        deferrable: bool,
+        initially_deferred: bool,
     },
     /// v7.13.0 — `CHECK (<expr>)` table-level constraint
     /// (mailrs round-5 G3). Column-level inline CHECKs fold into
@@ -2460,6 +2467,11 @@ pub struct ColumnDef {
     /// is allowed. Ignored unless `is_unique`. Folded into the table-level
     /// `TableConstraint::Unique { nulls_not_distinct }`.
     pub unique_nulls_not_distinct: bool,
+    /// v7.39 (round 711) — `DEFERRABLE [INITIALLY DEFERRED]` written on the
+    /// inline PK/UNIQUE column constraint. Consumed since round 621; carried
+    /// since this round so the fold into the table-level constraint keeps it.
+    pub constraint_deferrable: bool,
+    pub constraint_initially_deferred: bool,
     /// v7.13.0 — inline `CHECK (<expr>)` column constraint
     /// (mailrs round-5 G3). Stored alongside the column so the
     /// CREATE TABLE handler can fold these into table-level
@@ -6818,7 +6830,7 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
 impl fmt::Display for TableConstraint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PrimaryKey { name, columns } => {
+            Self::PrimaryKey { name, columns, .. } => {
                 if let Some(n) = name {
                     write!(f, "CONSTRAINT {} ", quote_ident(n))?;
                 }
@@ -6835,6 +6847,7 @@ impl fmt::Display for TableConstraint {
                 name,
                 columns,
                 nulls_not_distinct,
+                ..
             } => {
                 if let Some(n) = name {
                     write!(f, "CONSTRAINT {} ", quote_ident(n))?;
