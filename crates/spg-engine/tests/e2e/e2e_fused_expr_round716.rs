@@ -194,3 +194,45 @@ fn round726_srf_expansion_answers_as_pg() {
         assert_eq!(row_text(&mut e, sql), want, "{sql}");
     }
 }
+
+/// v7.39 (round 727) — a SIMPLE derived table flattens (PG's subquery
+/// pull-up): bare-column projection over one stored table rewrites to
+/// the unwrapped form and gets the parallel lanes back. These pin the
+/// SEMANTICS the rewrite must preserve — alias visibility, WHERE
+/// conjunction, GROUP BY through the alias — and the two shapes that
+/// must NOT be legalised by it (round-727 differential, 8/8 plus two
+/// error shapes whose only difference is PG's LINE decoration).
+#[test]
+fn round727_simple_derived_flattens_and_answers_as_pg() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        ("SELECT count(*) FROM (SELECT id v FROM f716 WHERE id <= 50) q", "50"),
+        ("SELECT max(v) FROM (SELECT id v FROM f716 WHERE id <= 50) q", "50"),
+        // Outer WHERE over the alias conjoins with the inner filter.
+        (
+            "SELECT count(*) FROM (SELECT id v FROM f716 WHERE id <= 50) q WHERE v > 20",
+            "30",
+        ),
+        // GROUP BY through the alias.
+        (
+            "SELECT v, count(*) FROM (SELECT g v FROM f716 WHERE id <= 30) q              GROUP BY v ORDER BY v",
+            "0|10 / 1|10 / 2|10",
+        ),
+        // Qualified references and an inner table alias.
+        (
+            "SELECT sum(v) FROM (SELECT id AS v FROM f716 ff WHERE ff.id <= 10) q",
+            "55",
+        ),
+    ] {
+        assert_eq!(row_text(&mut e, sql), want, "{sql}");
+    }
+    // A name q does not export stays an ERROR — flattening must not
+    // legalise it against the base table.
+    let err = format!(
+        "{}",
+        e.execute("SELECT s FROM (SELECT id v FROM f716) q")
+            .expect_err("s is not exported by q")
+    );
+    assert!(err.contains("does not exist") || err.contains("not found"), "{err}");
+}
