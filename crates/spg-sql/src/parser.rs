@@ -3025,19 +3025,41 @@ impl Parser {
                     // is Materialized-View-shaped (elsewhere in
                     // this parser).
                     Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("text")
+                            // The DROP dispatch matches on PEEK — `text` is
+                            // not yet consumed, so SEARCH/CONFIGURATION sit
+                            // at pos+1/pos+2 (the round-695 trap's mirror).
+                            && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(k)) if k.eq_ignore_ascii_case("search"))
+                            && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(k)) if k.eq_ignore_ascii_case("configuration")) =>
+                    {
+                        // v7.39 (round 709) — DROP TEXT SEARCH CONFIGURATION
+                        // validates the name; DICTIONARY / PARSER / TEMPLATE
+                        // stay in the noise arm below.
+                        self.advance(); // TEXT
+                        self.advance(); // SEARCH
+                        self.advance(); // CONFIGURATION
+                        let if_exists = self.consume_if_exists();
+                        let names = self.take_comma_separated_names();
+                        self.consume_until_statement_boundary();
+                        if if_exists {
+                            return Ok(Statement::Empty);
+                        }
+                        Ok(Statement::ValidateOnly {
+                            kind: crate::ast::ValidateOnlyKind::TsConfigName,
+                            names,
+                        })
+                    }
+                    Token::Ident(s) | Token::QuotedIdent(s)
                         if matches!(
                             s.to_ascii_lowercase().as_str(),
                             "type"
                                 | "domain"
                                 | "operator"
                                 | "cast"
-                                | "collation"
+                                // `text` = TEXT SEARCH DICTIONARY / PARSER /
+                                // TEMPLATE (CONFIGURATION intercepted above).
                                 | "text"
-                                | "foreign"
-                                | "server"
                                 | "materialized"
-                                | "event"
-                                | "tablespace"
                                 | "large"
                                 | "role"
                                 | "access"
@@ -3047,6 +3069,59 @@ impl Parser {
                     {
                         self.consume_until_statement_boundary();
                         Ok(Statement::Empty)
+                    }
+                    // v7.39 (round 709) — DROP COLLATION / EVENT TRIGGER /
+                    // TABLESPACE / TEXT SEARCH CONFIGURATION validate their
+                    // NAME; DROP SERVER / DROP FOREIGN TABLE join the
+                    // foreign-data warning family (round 706) so a
+                    // CREATE→DROP sequence in a dump stays consistent.
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("server")
+                            || s.eq_ignore_ascii_case("foreign") =>
+                    {
+                        self.advance();
+                        self.consume_until_statement_boundary();
+                        Ok(Statement::ValidateOnly {
+                            kind: crate::ast::ValidateOnlyKind::ForeignInfra,
+                            names: Vec::new(),
+                        })
+                    }
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("collation")
+                            || s.eq_ignore_ascii_case("tablespace") =>
+                    {
+                        let kind = if s.eq_ignore_ascii_case("collation") {
+                            crate::ast::ValidateOnlyKind::CollationName
+                        } else {
+                            crate::ast::ValidateOnlyKind::TablespaceName
+                        };
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let names = self.take_comma_separated_names();
+                        self.consume_until_statement_boundary();
+                        if if_exists {
+                            return Ok(Statement::Empty);
+                        }
+                        Ok(Statement::ValidateOnly { kind, names })
+                    }
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("event") =>
+                    {
+                        self.advance();
+                        if matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("trigger"))
+                        {
+                            self.advance();
+                        }
+                        let if_exists = self.consume_if_exists();
+                        let names = self.take_comma_separated_names();
+                        self.consume_until_statement_boundary();
+                        if if_exists {
+                            return Ok(Statement::Empty);
+                        }
+                        Ok(Statement::ValidateOnly {
+                            kind: crate::ast::ValidateOnlyKind::EventTriggerName,
+                            names,
+                        })
                     }
                     // v7.39 (round 708) — DROP CONVERSION / DROP LANGUAGE
                     // leave the noise list; see the ValidateOnly kinds.
@@ -9865,6 +9940,64 @@ impl Parser {
                     names: alloc::vec![name],
                 });
             }
+            // v7.39 (round 709) — ALTER COLLATION / TEXT SEARCH
+            // CONFIGURATION / EVENT TRIGGER / LARGE OBJECT leave the no-op
+            // list far enough to validate the NAME; the actions still no-op.
+            // (TEXT SEARCH DICTIONARY / PARSER / TEMPLATE stay noise: SPG
+            // models none of them and their dumps are rare.)
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("collation") => {
+                let name = self.expect_ident_or_string()?;
+                self.consume_until_statement_boundary();
+                return Ok(Statement::ValidateOnly {
+                    kind: crate::ast::ValidateOnlyKind::CollationName,
+                    names: alloc::vec![name],
+                });
+            }
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("text")
+                    && matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("search"))
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(k)) if k.eq_ignore_ascii_case("configuration")) =>
+            {
+                self.advance(); // SEARCH
+                self.advance(); // CONFIGURATION
+                let name = self.expect_ident_like()?;
+                self.consume_until_statement_boundary();
+                return Ok(Statement::ValidateOnly {
+                    kind: crate::ast::ValidateOnlyKind::TsConfigName,
+                    names: alloc::vec![name],
+                });
+            }
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("event")
+                    && matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("trigger")) =>
+            {
+                self.advance(); // TRIGGER
+                let name = self.expect_ident_like()?;
+                self.consume_until_statement_boundary();
+                return Ok(Statement::ValidateOnly {
+                    kind: crate::ast::ValidateOnlyKind::EventTriggerName,
+                    names: alloc::vec![name],
+                });
+            }
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("large")
+                    && matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("object")) =>
+            {
+                self.advance(); // OBJECT
+                let oid = match self.advance() {
+                    Token::Integer(n) => alloc::format!("{n}"),
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "expected large object oid, got {other:?}"
+                        )));
+                    }
+                };
+                self.consume_until_statement_boundary();
+                return Ok(Statement::ValidateOnly {
+                    kind: crate::ast::ValidateOnlyKind::LargeObjectOid,
+                    names: alloc::vec![oid],
+                });
+            }
             // v7.39 (round 708) — `ALTER AGGREGATE name(args) …`. Same
             // argument-list parse as DROP AGGREGATE (round 707); the
             // action no-ops, the existence check is real.
@@ -9927,16 +10060,15 @@ impl Parser {
                         // parser accepts + Empty-returns so pg_dump
                         // tail statements don't stall.
                         | "tablespace"
-                        | "collation"
                         | "language"
                         | "operator"
                         | "conversion"
                         | "statistics"
                         | "server"
                         | "foreign"
+                        // `text` stays for TEXT SEARCH DICTIONARY / PARSER
+                        // / TEMPLATE (CONFIGURATION intercepted above).
                         | "text"
-                        | "event"
-                        | "large"
                 ) =>
             {
                 self.consume_until_statement_boundary();

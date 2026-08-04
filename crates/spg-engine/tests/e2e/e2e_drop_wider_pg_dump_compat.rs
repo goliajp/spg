@@ -83,7 +83,13 @@ fn drop_text_search_foreign_server_no_op() {
 fn drop_matview_event_tablespace_no_op() {
     let mut e = Engine::new();
     ddl(&mut e, "DROP MATERIALIZED VIEW IF EXISTS mv CASCADE");
-    ddl(&mut e, "DROP EVENT TRIGGER my_trg");
+    // v7.39 (round 709) — the name check is real; IF EXISTS is the quiet
+    // spelling. The old bare assertion pinned the swallow — F31.
+    let err = e
+        .execute("DROP EVENT TRIGGER my_trg")
+        .expect_err("PG18 refuses an unknown event trigger");
+    assert!(format!("{err}").contains("event trigger \"my_trg\" does not exist"));
+    ddl(&mut e, "DROP EVENT TRIGGER IF EXISTS my_trg");
     ddl(&mut e, "DROP TABLESPACE IF EXISTS mytbs");
 }
 

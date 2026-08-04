@@ -280,3 +280,81 @@ fn round708_the_alter_and_drop_batch_validates_its_names() {
     e.execute("ALTER TYPE mood708 RENAME TO mood709").unwrap();
     e.execute("DROP PROCEDURAL LANGUAGE IF EXISTS nosuch708").unwrap();
 }
+
+/// v7.39 (round 709) — the S05g ④ second batch: twelve probes, nine now
+/// byte-identical with PG18. The three that stay different are judgements,
+/// not gaps: DROP SERVER / DROP FOREIGN TABLE join the foreign-data
+/// warning family (a dump's CREATE→DROP sequence must stay consistent with
+/// round 706's accepted CREATE), and the two CREATEs that reference a
+/// FUNCTION (event trigger, access method) wait on a function-existence
+/// predicate — recorded, not half-done.
+#[test]
+fn round709_the_second_batch_validates_its_names() {
+    let mut e = Engine::new();
+    for (sql, want) in [
+        (
+            "ALTER COLLATION nosuch709 RENAME TO x",
+            "collation \"nosuch709\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "ALTER TEXT SEARCH CONFIGURATION nosuch709 OWNER TO bench",
+            "text search configuration \"nosuch709\" does not exist",
+        ),
+        (
+            "ALTER EVENT TRIGGER nosuch709 DISABLE",
+            "event trigger \"nosuch709\" does not exist",
+        ),
+        (
+            "DROP EVENT TRIGGER nosuch709",
+            "event trigger \"nosuch709\" does not exist",
+        ),
+        (
+            "DROP TABLESPACE nosuch709",
+            "tablespace \"nosuch709\" does not exist",
+        ),
+        (
+            "DROP TABLESPACE pg_default",
+            "permission denied for tablespace pg_default",
+        ),
+        (
+            "DROP TEXT SEARCH CONFIGURATION nosuch709",
+            "text search configuration \"nosuch709\" does not exist",
+        ),
+        (
+            "DROP COLLATION nosuch709",
+            "collation \"nosuch709\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "ALTER LARGE OBJECT 999999 OWNER TO bench",
+            "large object 999999 does not exist",
+        ),
+    ] {
+        let err = err_of(&mut e, sql);
+        assert!(err.contains(want), "{sql}\n  got: {err}\n  want: {want}");
+    }
+    // The legitimate forms: a performable collation, a shipped ts config,
+    // a real large object, and every IF EXISTS spelling.
+    ok(&mut e, "ALTER COLLATION \"en_US\" RENAME TO whatever");
+    ok(&mut e, "ALTER TEXT SEARCH CONFIGURATION english OWNER TO postgres");
+    let lo = match e.execute("SELECT lo_create(4242)").unwrap() {
+        QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(lo, "4242");
+    ok(&mut e, "ALTER LARGE OBJECT 4242 OWNER TO postgres");
+    for sql in [
+        "DROP TABLESPACE IF EXISTS nosuch709",
+        "DROP COLLATION IF EXISTS nosuch709",
+        "DROP EVENT TRIGGER IF EXISTS nosuch709",
+        "DROP TEXT SEARCH CONFIGURATION IF EXISTS nosuch709",
+    ] {
+        ok(&mut e, sql);
+    }
+    // The foreign-data DROPs warn like their CREATEs.
+    e.execute("DROP SERVER nosuch709").unwrap();
+    assert!(
+        e.take_notices()
+            .iter()
+            .any(|n| n.message.contains("foreign-data infrastructure is not provided")),
+    );
+}

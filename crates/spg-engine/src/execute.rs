@@ -1590,6 +1590,60 @@ impl Engine {
                             }));
                         }
                     }
+                    // v7.39 (round 709) — batch-2 name checks, each wording
+                    // a PG18 measurement.
+                    K::CollationName => {
+                        for n in &names {
+                            if !crate::collate::is_supported(n) {
+                                return Err(EngineError::Unsupported(alloc::format!(
+                                    "collation \"{n}\" for encoding \"UTF8\" does not exist"
+                                )));
+                            }
+                        }
+                    }
+                    K::TsConfigName => {
+                        for n in &names {
+                            // One list with the pg_ts_config synth: SPG
+                            // ships `simple` and `english`.
+                            if !n.eq_ignore_ascii_case("simple")
+                                && !n.eq_ignore_ascii_case("english")
+                            {
+                                return Err(EngineError::Unsupported(alloc::format!(
+                                    "text search configuration \"{n}\" does not exist"
+                                )));
+                            }
+                        }
+                    }
+                    K::EventTriggerName => {
+                        if let Some(n) = names.first() {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "event trigger \"{n}\" does not exist"
+                            )));
+                        }
+                    }
+                    K::TablespaceName => {
+                        if let Some(n) = names.first() {
+                            return Err(EngineError::Unsupported(
+                                if n.eq_ignore_ascii_case("pg_default")
+                                    || n.eq_ignore_ascii_case("pg_global")
+                                {
+                                    alloc::format!("permission denied for tablespace {n}")
+                                } else {
+                                    alloc::format!("tablespace \"{n}\" does not exist")
+                                },
+                            ));
+                        }
+                    }
+                    K::LargeObjectOid => {
+                        if let Some(n) = names.first() {
+                            let oid: u32 = n.parse().unwrap_or(0);
+                            if !self.active_catalog().large_objects().contains_key(&oid) {
+                                return Err(EngineError::Unsupported(alloc::format!(
+                                    "large object {n} does not exist"
+                                )));
+                            }
+                        }
+                    }
                     // v7.39 (round 706) — see ValidateOnlyKind::ForeignInfra
                     // for why this warns instead of copying PG's refusal.
                     K::ForeignInfra => {
