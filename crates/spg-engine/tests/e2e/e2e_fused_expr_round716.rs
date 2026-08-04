@@ -95,3 +95,30 @@ fn round716_fused_compiled_arg_error_propagates() {
     );
     assert!(err.contains("division by zero"), "{err}");
 }
+
+/// v7.39 (round 717) — GREATEST / LEAST compile to their own step
+/// (`Step::Extremum`): the uniform-type fast path compares in place,
+/// and these are the shapes that must still FALL BACK to the function
+/// arm and answer exactly as before. Expectations measured on PG18
+/// round 717: `greatest(3, 2.5)` widens to numeric 3, all-NULL is
+/// NULL, unknown-type text literals compare as text.
+#[test]
+fn round717_extremum_fallback_shapes_unchanged() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        // Mixed int/numeric widens the winner (PG: numeric 3).
+        ("SELECT greatest(3, 2.5)", "3"),
+        ("SELECT least(3, 2.5)", "2.5"),
+        // All-NULL answers NULL ("NULL" is the harness's rendering).
+        ("SELECT greatest(NULL::int, NULL::int)", "NULL"),
+        // Unknown-type literals compare as text.
+        ("SELECT least('14:30', '09:00')", "09:00"),
+        // NULLs are ignored, not poisoning (PG dialect).
+        ("SELECT count(greatest(nullif(id, 1), 0)) FROM f716", "100"),
+        // Per-row uniform fast path over two columns.
+        ("SELECT sum(greatest(id, g)) FROM f716", "5050"),
+    ] {
+        assert_eq!(row_text(&mut e, sql), want, "{sql}");
+    }
+}
