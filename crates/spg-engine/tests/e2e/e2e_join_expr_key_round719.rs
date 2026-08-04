@@ -81,3 +81,38 @@ fn round719_null_keys_never_match() {
         "the two NULL-id left rows null-extend, plus a.id = 1"
     );
 }
+
+/// v7.39 (round 720) — the MIRROR shape: `<peer column> = <integer-only
+/// expression over the joined left side>` (`ON b.id = a.id + 1` — what
+/// the EXISTS pull-up emits). Build hashes the peer column, the probe
+/// evaluates the left expression per tuple with zero materialisation.
+/// The mixed-conjunct form below is the round-720 regression itself: a
+/// plain eq_pair beside a probe-side computed key briefly let int_keyed
+/// hash on the pair ALONE — 5000-row buckets re-verified per probe, a
+/// resurrected round-590 quadratic (the differential hung). Both key
+/// halves must land in the composite key.
+#[test]
+fn round720_mirror_int_expr_key_joins_answer_as_pg() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        ("SELECT count(*) FROM j719 a JOIN j719 b ON b.id = a.id + 1", "99"),
+        ("SELECT count(*) FROM j719 a JOIN j719 b ON b.id = a.id * 2", "50"),
+        // Mixed: id offset by one never keeps g = id % 3 equal.
+        (
+            "SELECT count(*) FROM j719 a JOIN j719 b ON b.id = a.id + 1 AND b.g = a.g",
+            "0",
+        ),
+        // Mixed where SOME survive: b.id = a.id + 3 preserves g (mod 3).
+        (
+            "SELECT count(*) FROM j719 a JOIN j719 b ON b.id = a.id + 3 AND b.g = a.g",
+            "97",
+        ),
+        (
+            "SELECT count(*) FROM j719 a LEFT JOIN j719 b ON b.id = a.id + 99              WHERE b.id IS NULL",
+            "99",
+        ),
+    ] {
+        assert_eq!(one(&mut e, sql), want, "{sql}");
+    }
+}

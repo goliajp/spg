@@ -716,10 +716,17 @@ fn extract_join_keys<'a>(
     // identify it in `residual` and drop the re-verification (see
     // `join_stage_hash`).
     Vec<(usize, &'a Expr, &'a Expr)>,
+    // v7.39 (round 720) — the MIRROR: `<peer column> = <integer-only
+    // expression over the joined left side>` (`ON b.id = a.id + 500000`,
+    // the shape the EXISTS pull-up emits). (peer-col pos, left expr,
+    // conjunct). Only the integer-only shape is collected — anything
+    // else keeps the residual path it has today.
+    Vec<(usize, &'a Expr, &'a Expr)>,
     Vec<&'a Expr>,
 ) {
     let mut eq_pairs: Vec<(usize, usize)> = Vec::new();
     let mut eq_exprs: Vec<(usize, &Expr, &Expr)> = Vec::new();
+    let mut eq_probe_exprs: Vec<(usize, &Expr, &Expr)> = Vec::new();
     let mut residual: Vec<&Expr> = Vec::new();
     if let (Some(on_expr), None) = (peer.on, peer.lateral) {
         for sub in reorder::split_and_conjunctions(on_expr) {
@@ -740,10 +747,55 @@ fn extract_join_keys<'a>(
                 residual.push(sub);
                 continue;
             }
+            if let Some((p, e)) =
+                match_equi_probe_expr(sub, peer, combined_schema, consumed_cols)
+            {
+                eq_probe_exprs.push((p, e, sub));
+                residual.push(sub);
+                continue;
+            }
             residual.push(sub);
         }
     }
-    (eq_pairs, eq_exprs, residual)
+    (eq_pairs, eq_exprs, eq_probe_exprs, residual)
+}
+
+/// v7.39 (round 720) — one conjunct as `<peer plain column> = <integer-only
+/// expression over the already-joined left side>`, either order. Only the
+/// integer-only shape (the classifier below) is admitted: the consumer is
+/// the i64 lane, and everything else keeps today's residual path.
+fn match_equi_probe_expr<'a>(
+    sub: &'a Expr,
+    peer: &JoinedPeer<'_>,
+    combined_schema: &[ColumnSchema],
+    consumed_cols: usize,
+) -> Option<(usize, &'a Expr)> {
+    let Expr::Binary {
+        lhs,
+        op: spg_sql::ast::BinOp::Eq,
+        rhs,
+    } = sub
+    else {
+        return None;
+    };
+    let left_slice = &combined_schema[..consumed_cols];
+    for (a, b) in [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())] {
+        if let Expr::Column(c) = a
+            && let Some(p) = Engine::peer_col_pos(&peer.alias, &peer.cols, c)
+            && matches!(
+                peer.cols[p].ty,
+                spg_storage::DataType::Int
+                    | spg_storage::DataType::BigInt
+                    | spg_storage::DataType::SmallInt
+            )
+            && !matches!(b, Expr::Column(_))
+            && expr_mentions_a_column(b)
+            && int_only_left_expr(b, left_slice)
+        {
+            return Some((p, b));
+        }
+    }
+    None
 }
 
 /// One conjunct as `<left column> = <expression over the peer alone>`, in
@@ -826,6 +878,78 @@ fn int_only_key_expr(e: &Expr, peer: &JoinedPeer<'_>) -> bool {
                 && int_only_key_expr(rhs, peer)
         }
         _ => false,
+    }
+}
+
+/// v7.39 (round 720) — the round-719 classifier's MIRROR: integer-only
+/// over the already-joined LEFT side (`ON b.id = a.id + 500000` — the
+/// shape the EXISTS pull-up emits). Same allowlist, columns resolved
+/// against the combined-row prefix instead of the peer.
+fn int_only_left_expr(e: &Expr, left_slice: &[ColumnSchema]) -> bool {
+    use spg_sql::ast::BinOp;
+    match e {
+        Expr::Column(c) => Engine::composite_col_pos(left_slice, c).is_some_and(|p| {
+            matches!(
+                left_slice[p].ty,
+                spg_storage::DataType::Int
+                    | spg_storage::DataType::BigInt
+                    | spg_storage::DataType::SmallInt
+            )
+        }),
+        Expr::Literal(spg_sql::ast::Literal::Integer(_)) => true,
+        Expr::Binary { lhs, op, rhs } => {
+            matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                && int_only_left_expr(lhs, left_slice)
+                && int_only_left_expr(rhs, left_slice)
+        }
+        _ => false,
+    }
+}
+
+/// v7.39 (round 720) — evaluate an `int_only_left_expr` against one probe
+/// TUPLE, reading cells straight out of the join sources: no row
+/// materialisation, no allocation. `Ok(None)` = a NULL column (the key
+/// joins nothing, SQL `=`); overflow errors with the integer family's
+/// own sentence, as the interpreted path errors.
+fn eval_int_only_probe(
+    e: &Expr,
+    left_slice: &[ColumnSchema],
+    sources: &[JoinSrc<'_>],
+    offsets: &[usize],
+    tuple: &[usize],
+) -> Result<Option<i64>, EngineError> {
+    use spg_sql::ast::BinOp;
+    match e {
+        Expr::Column(c) => {
+            let pos = Engine::composite_col_pos(left_slice, c).expect("classifier-checked");
+            Ok(match tuple_value(sources, offsets, tuple, pos) {
+                Some(Value::BigInt(n)) => Some(*n),
+                Some(Value::Int(n)) => Some(i64::from(*n)),
+                Some(Value::SmallInt(n)) => Some(i64::from(*n)),
+                _ => None,
+            })
+        }
+        Expr::Literal(spg_sql::ast::Literal::Integer(n)) => Ok(Some(*n)),
+        Expr::Binary { lhs, op, rhs } => {
+            let (Some(a), Some(b)) = (
+                eval_int_only_probe(lhs, left_slice, sources, offsets, tuple)?,
+                eval_int_only_probe(rhs, left_slice, sources, offsets, tuple)?,
+            ) else {
+                return Ok(None);
+            };
+            let out = match op {
+                BinOp::Add => a.checked_add(b),
+                BinOp::Sub => a.checked_sub(b),
+                BinOp::Mul => a.checked_mul(b),
+                _ => unreachable!("classifier admits Add/Sub/Mul only"),
+            };
+            out.map(Some).ok_or_else(|| {
+                EngineError::Eval(crate::eval::EvalError::TypeMismatch {
+                    detail: "bigint out of range".into(),
+                })
+            })
+        }
+        _ => unreachable!("classifier admits columns/integers/arithmetic only"),
     }
 }
 
@@ -1316,7 +1440,7 @@ impl Engine {
             }
             let right_arity = peer.cols.len();
             let peer_mask = keep_mask(needed, &peer.cols, &peer.alias);
-            let (mut eq_pairs, eq_exprs, residual) =
+            let (mut eq_pairs, eq_exprs, eq_probe_exprs, residual) =
                 extract_join_keys(peer, &combined_schema, pipe.consumed_cols);
             // v7.39 (round 588) — an ANSI-89 join writes its condition in the
             // WHERE clause. Give the peer those keys too, so `FROM a, b WHERE
@@ -1362,12 +1486,15 @@ impl Engine {
             // through to the nested loop and crossed the whole peer against
             // every left row: quadratic, 701 ms at 2k rows and past 20
             // SECONDS at 20k where PG holds 0.4-2.7 ms.
-            if (!eq_pairs.is_empty() || !eq_exprs.is_empty()) && peer.lateral.is_none() {
+            if (!eq_pairs.is_empty() || !eq_exprs.is_empty() || !eq_probe_exprs.is_empty())
+                && peer.lateral.is_none()
+            {
                 self.join_stage_hash(
                     &mut pipe,
                     peer,
                     &eq_pairs,
                     &eq_exprs,
+                    &eq_probe_exprs,
                     &residual,
                     &peer_mask,
                     right_arity,
@@ -1615,6 +1742,7 @@ impl Engine {
         peer: &mut JoinedPeer<'p>,
         eq_pairs: &[(usize, usize)],
         eq_exprs: &[(usize, &Expr, &Expr)],
+        eq_probe_exprs: &[(usize, &Expr, &Expr)],
         residual: &[&Expr],
         peer_mask: &Option<Vec<bool>>,
         right_arity: usize,
@@ -1685,6 +1813,7 @@ impl Engine {
         // / inbox / contacts / list_categories the eq_pair is
         // `(messages.mailbox_id, mailboxes.id)` both BigInt.
         let int_keyed = eq_exprs.is_empty()
+            && eq_probe_exprs.is_empty()
             && eq_pairs.len() == 1
             && matches!(
                 combined_schema[eq_pairs[0].0].ty,
@@ -1715,6 +1844,7 @@ impl Engine {
         // nothing: key equality IS SQL `=` (NULLs never enter the
         // table), so the conjunct is dropped from residual below.
         let int_expr_keyed = eq_pairs.is_empty()
+            && eq_probe_exprs.is_empty()
             && eq_exprs.len() == 1
             && matches!(
                 combined_schema[eq_exprs[0].0].ty,
@@ -1723,6 +1853,14 @@ impl Engine {
                     | spg_storage::DataType::SmallInt
             )
             && int_only_key_expr(eq_exprs[0].1, peer);
+        // v7.39 (round 720) — the mirror lane: a single `<peer int
+        // column> = <integer-only left expression>` key (the EXISTS
+        // pull-up's shape). Build hashes the peer COLUMN (the plain
+        // int_keyed build); the probe evaluates the left expression per
+        // tuple straight off the join sources. Extraction already
+        // guaranteed both sides integer-family.
+        let int_probe_expr_keyed =
+            eq_pairs.is_empty() && eq_exprs.is_empty() && eq_probe_exprs.len() == 1;
         // The residual set the matching pairs actually re-check: the
         // int-keyed computed conjunct comes out; everything else stays.
         let residual: Vec<&Expr> = if int_expr_keyed {
@@ -1731,11 +1869,17 @@ impl Engine {
                 .copied()
                 .filter(|r| !core::ptr::eq(*r, eq_exprs[0].2))
                 .collect()
+        } else if int_probe_expr_keyed {
+            residual
+                .iter()
+                .copied()
+                .filter(|r| !core::ptr::eq(*r, eq_probe_exprs[0].2))
+                .collect()
         } else {
             residual.to_vec()
         };
         let residual = residual.as_slice();
-        let any_int_lane = int_keyed || int_expr_keyed;
+        let any_int_lane = int_keyed || int_expr_keyed || int_probe_expr_keyed;
         let mut table: hashbrown::HashMap<String, Bucket> =
             hashbrown::HashMap::with_capacity(if any_int_lane { 0 } else { n_rights });
         let mut int_table: hashbrown::HashMap<i64, Bucket> =
@@ -1763,8 +1907,14 @@ impl Engine {
                 continue;
             };
             if any_int_lane {
-                let key = if int_keyed {
-                    let rpos = eq_pairs[0].1;
+                let key = if int_keyed || int_probe_expr_keyed {
+                    // Plain-column build: the key column is the eq_pair's
+                    // right side, or the mirror lane's peer column.
+                    let rpos = if int_keyed {
+                        eq_pairs[0].1
+                    } else {
+                        eq_probe_exprs[0].0
+                    };
                     match right.values.get(rpos) {
                         Some(Value::BigInt(n)) => *n,
                         Some(Value::Int(n)) => i64::from(*n),
@@ -1820,6 +1970,22 @@ impl Engine {
                 }
                 aggregate::push_canonical_key(&mut keystr, &v);
             }
+            // v7.39 (round 720) — then the PROBE-side computed keys'
+            // build halves: the peer COLUMN each one equates to. Without
+            // this, `ON b.g = a.g AND b.id = a.id + 1` hashed on `g`
+            // alone and re-verified the second conjunct per candidate
+            // pair — the exact quadratic round 590 fixed, resurrected in
+            // mirror image (measured: a 500k self-join never returned).
+            // The canonical integer encoding is type-agnostic (`n{n}|`),
+            // so the probe's evaluated i64 meets the column's own value.
+            for (p, _, _) in eq_probe_exprs {
+                match right.values.get(*p) {
+                    Some(v) if !matches!(v, Value::Null) => {
+                        aggregate::push_canonical_key(&mut keystr, v);
+                    }
+                    _ => continue 'build,
+                }
+            }
             match table.get_mut(keystr.as_str()) {
                 Some(b) => b.push(ri),
                 None => {
@@ -1843,7 +2009,21 @@ impl Engine {
             cancel.check()?;
             let mut left_matched = false;
             let mut left_has_null = false;
-            let int_probe_key: Option<i64> = if any_int_lane {
+            let int_probe_key: Option<i64> = if int_probe_expr_keyed {
+                match eval_int_only_probe(
+                    eq_probe_exprs[0].1,
+                    &combined_schema[..pipe.consumed_cols],
+                    &pipe.sources,
+                    &pipe.offsets,
+                    tuple,
+                )? {
+                    Some(k) => Some(k),
+                    None => {
+                        left_has_null = true;
+                        None
+                    }
+                }
+            } else if any_int_lane {
                 let lpos = if int_keyed { eq_pairs[0].0 } else { eq_exprs[0].0 };
                 match tuple_value(&pipe.sources, &pipe.offsets, tuple, lpos) {
                     Some(Value::BigInt(n)) => Some(*n),
@@ -1871,6 +2051,23 @@ impl Engine {
                         match tuple_value(&pipe.sources, &pipe.offsets, tuple, *lpos) {
                             Some(v) if !matches!(v, Value::Null) => aggregate::push_canonical_key(&mut keystr, v),
                             _ => {
+                                left_has_null = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !left_has_null {
+                    for (_, e, _) in eq_probe_exprs {
+                        match eval_int_only_probe(
+                            e,
+                            &combined_schema[..pipe.consumed_cols],
+                            &pipe.sources,
+                            &pipe.offsets,
+                            tuple,
+                        )? {
+                            Some(k) => aggregate::push_canonical_key(&mut keystr, &Value::BigInt(k)),
+                            None => {
                                 left_has_null = true;
                                 break;
                             }
