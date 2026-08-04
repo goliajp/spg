@@ -116,3 +116,39 @@ fn round720_mirror_int_expr_key_joins_answer_as_pg() {
         assert_eq!(one(&mut e, sql), want, "{sql}");
     }
 }
+
+/// v7.39 (round 721) — the ANTI-join pull-up admits a COMPUTED outer
+/// correlation half: `NOT EXISTS (SELECT 1 FROM t b WHERE b.id = a.id +
+/// K)` becomes LEFT JOIN ON b.id = a.id + K (the round-720 mirror hash
+/// shape) + IS NULL, instead of bailing to the per-row correlated
+/// executor. Admission bar: negated only, both sides integer-family
+/// (checked against the catalog at extraction). Expectations measured
+/// against PG18 in the round-721 differential.
+#[test]
+fn round721_not_exists_computed_key_pulls_up() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        // b.id = a.id + 99 exists only for a.id = 1 -> 99 rows survive.
+        (
+            "SELECT count(*) FROM j719 a WHERE NOT EXISTS              (SELECT 1 FROM j719 b WHERE b.id = a.id + 99)",
+            "99",
+        ),
+        (
+            "SELECT count(*) FROM j719 a WHERE NOT EXISTS              (SELECT 1 FROM j719 b WHERE b.id = a.id * 2)",
+            "50",
+        ),
+        // An all-inner residual rides along in the ON.
+        (
+            "SELECT count(*) FROM j719 a WHERE NOT EXISTS              (SELECT 1 FROM j719 b WHERE b.id = a.id + 1 AND b.g = 0)",
+            "67",
+        ),
+        // sum pins the surviving VALUES.
+        (
+            "SELECT sum(a.id) FROM j719 a WHERE NOT EXISTS              (SELECT 1 FROM j719 b WHERE b.id = a.id + 50)",
+            "3775",
+        ),
+    ] {
+        assert_eq!(one(&mut e, sql), want, "{sql}");
+    }
+}

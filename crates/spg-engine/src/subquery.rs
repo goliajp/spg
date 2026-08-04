@@ -2630,6 +2630,27 @@ impl Engine {
             }
             s
         };
+        // v7.39 (round 721) — alias -> stored-table name, so the computed
+        // correlation half can check its outer columns' types (int-only is
+        // the admission bar; see the extraction).
+        let outer_tables: alloc::collections::BTreeMap<String, String> = {
+            let from = stmt.from.as_ref().expect("from present");
+            let mut m = alloc::collections::BTreeMap::new();
+            let push = |m: &mut alloc::collections::BTreeMap<String, String>, t: &TableRef| {
+                m.insert(
+                    t.alias
+                        .clone()
+                        .unwrap_or_else(|| t.name.clone())
+                        .to_ascii_lowercase(),
+                    t.name.clone(),
+                );
+            };
+            push(&mut m, &from.primary);
+            for j in &from.joins {
+                push(&mut m, &j.table);
+            }
+            m
+        };
         let conjuncts = reorder::split_and_conjunctions(&where_expr);
         let mut survivors: Vec<Expr> = Vec::new();
         let mut new_joins: Vec<FromJoin> = Vec::new();
@@ -2683,6 +2704,7 @@ impl Engine {
                         subquery,
                         neg,
                         &outer_aliases,
+                        &outer_tables,
                         new_joins.len(),
                     )
                 {
@@ -2851,6 +2873,7 @@ impl Engine {
         inner: &SelectStatement,
         negated: bool,
         outer_aliases: &alloc::collections::BTreeSet<String>,
+        outer_tables: &alloc::collections::BTreeMap<String, String>,
         alias_n: usize,
     ) -> Option<(FromJoin, Option<Expr>)> {
         EXISTS_PULLUP_CANDIDATE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2913,7 +2936,30 @@ impl Engine {
         // + WHERE sc.<first key> IS NULL. NULL semantics: a NULL on any
         // join key means no match, identical to NOT EXISTS three-valued
         // logic (the IS NULL probe matches the pad row).
-        let mut corr_pairs: Vec<(String, ColumnName)> = Vec::new();
+        // v7.39 (round 721) — the outer half of a correlation pair is an
+        // EXPRESSION now (a plain column rides as Expr::Column). What
+        // widened it: `WHERE b.id = a.id + 500000` bailed to the per-row
+        // correlated executor (~208 ms on the panel's 500k anti-join)
+        // because only column=column pairs were recognised. A computed
+        // outer half is admitted for the ANTI join when it is integer-only
+        // over outer columns AND the inner column is integer-family — the
+        // exact shape the round-720 mirror hash lane executes; anything
+        // wider would pull up into a nested-loop join and be SLOWER than
+        // the correlated executor it replaces.
+        let inner_col_is_int = |name: &str| -> bool {
+            self.active_catalog().get(&inner_table).is_some_and(|t| {
+                t.schema().columns.iter().any(|cs| {
+                    cs.name.eq_ignore_ascii_case(name)
+                        && matches!(
+                            cs.ty,
+                            spg_storage::DataType::Int
+                                | spg_storage::DataType::BigInt
+                                | spg_storage::DataType::SmallInt
+                        )
+                })
+            })
+        };
+        let mut corr_pairs: Vec<(String, Expr)> = Vec::new();
         let mut rest: Vec<Expr> = Vec::new();
         for c in reorder::split_and_conjunctions(w) {
             if let Expr::Binary {
@@ -2921,14 +2967,33 @@ impl Engine {
                 op: BinOp::Eq,
                 rhs,
             } = c
-                && let (Expr::Column(a), Expr::Column(b)) = (lhs.as_ref(), rhs.as_ref())
             {
-                let pair = if is_inner(a) && is_outer(b) {
-                    Some((a.name.clone(), b.clone()))
-                } else if is_inner(b) && is_outer(a) {
-                    Some((b.name.clone(), a.clone()))
-                } else {
-                    None
+                let pair = match (lhs.as_ref(), rhs.as_ref()) {
+                    (Expr::Column(a), Expr::Column(b)) if is_inner(a) && is_outer(b) => {
+                        Some((a.name.clone(), Expr::Column(b.clone())))
+                    }
+                    (Expr::Column(a), Expr::Column(b)) if is_inner(b) && is_outer(a) => {
+                        Some((b.name.clone(), Expr::Column(a.clone())))
+                    }
+                    (Expr::Column(a), e)
+                        if negated
+                            && is_inner(a)
+                            && !matches!(e, Expr::Column(_))
+                            && inner_col_is_int(&a.name)
+                            && outer_int_only_expr(e, outer_aliases, outer_tables, self) =>
+                    {
+                        Some((a.name.clone(), e.clone()))
+                    }
+                    (e, Expr::Column(a))
+                        if negated
+                            && is_inner(a)
+                            && !matches!(e, Expr::Column(_))
+                            && inner_col_is_int(&a.name)
+                            && outer_int_only_expr(e, outer_aliases, outer_tables, self) =>
+                    {
+                        Some((a.name.clone(), e.clone()))
+                    }
+                    _ => None,
                 };
                 if let Some(p) = pair {
                     corr_pairs.push(p);
@@ -2985,7 +3050,7 @@ impl Engine {
                 name: ik.clone(),
             })),
             op: BinOp::Eq,
-            rhs: alloc::boxed::Box::new(Expr::Column(oc.clone())),
+            rhs: alloc::boxed::Box::new(oc.clone()),
         });
         let first_key_eq = on_iter
             .next()
@@ -3307,6 +3372,51 @@ fn disambiguate_expr_unqualified_columns(
         }
         // Subquery bodies own their own scope — leave untouched.
         _ => {}
+    }
+}
+
+/// v7.39 (round 721) — integer-only over the OUTER side: every column
+/// belongs to an outer alias whose stored table types it integer-family,
+/// every literal a plain integer, operators closed over the integers.
+/// The admission bar for a computed correlation half: exactly what the
+/// round-720 mirror hash lane executes.
+fn outer_int_only_expr(
+    e: &Expr,
+    outer_aliases: &alloc::collections::BTreeSet<String>,
+    outer_tables: &alloc::collections::BTreeMap<String, String>,
+    engine: &Engine,
+) -> bool {
+    match e {
+        Expr::Column(c) => {
+            let Some(q) = c.qualifier.as_deref() else {
+                return false;
+            };
+            let q = q.to_ascii_lowercase();
+            if !outer_aliases.contains(&q) {
+                return false;
+            }
+            let Some(tname) = outer_tables.get(&q) else {
+                return false;
+            };
+            engine.active_catalog().get(tname).is_some_and(|t| {
+                t.schema().columns.iter().any(|cs| {
+                    cs.name.eq_ignore_ascii_case(&c.name)
+                        && matches!(
+                            cs.ty,
+                            spg_storage::DataType::Int
+                                | spg_storage::DataType::BigInt
+                                | spg_storage::DataType::SmallInt
+                        )
+                })
+            })
+        }
+        Expr::Literal(spg_sql::ast::Literal::Integer(_)) => true,
+        Expr::Binary { lhs, op, rhs } => {
+            matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                && outer_int_only_expr(lhs, outer_aliases, outer_tables, engine)
+                && outer_int_only_expr(rhs, outer_aliases, outer_tables, engine)
+        }
+        _ => false,
     }
 }
 
