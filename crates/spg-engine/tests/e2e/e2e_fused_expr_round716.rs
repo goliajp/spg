@@ -161,3 +161,36 @@ fn round724_collect_aggregates_answer_as_pg() {
         assert_eq!(row_text(&mut e, sql), want, "{sql}");
     }
 }
+
+/// v7.39 (round 726) — the batch SRF path builds ONE plan per scan and
+/// clones the base row once per input row (slots rewritten per output
+/// row). These pin the expansion's answers — round-726 differential,
+/// 7/7 byte-same (multi-SRF padding, text arrays, generate_series over
+/// a column, ORDER BY the expanded item).
+#[test]
+fn round726_srf_expansion_answers_as_pg() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        (
+            "SELECT count(*) FROM (SELECT unnest(ARRAY[id, g]) v FROM f716 WHERE id <= 50) q",
+            "100",
+        ),
+        (
+            "SELECT sum(v) FROM (SELECT unnest(ARRAY[id, g]) v FROM f716 WHERE id <= 10) q",
+            "65",
+        ),
+        // Two SRFs of different lengths: the shorter pads with NULL.
+        (
+            "SELECT unnest(ARRAY[id]), unnest(ARRAY[g, id, 7]) FROM f716 WHERE id = 5",
+            "5|2 / NULL|5 / NULL|7",
+        ),
+        // A projected non-SRF column repeats per expanded row.
+        (
+            "SELECT s, unnest(ARRAY[id, g]) FROM f716 WHERE id = 3",
+            "row3|3 / row3|0",
+        ),
+    ] {
+        assert_eq!(row_text(&mut e, sql), want, "{sql}");
+    }
+}
