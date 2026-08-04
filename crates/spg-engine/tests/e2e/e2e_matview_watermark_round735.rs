@@ -142,3 +142,41 @@ fn round737_update_falls_back_to_full() {
     e.execute("REFRESH MATERIALIZED VIEW mv737").unwrap();
     assert_eq!(one(&mut e, "SELECT sum(v) FROM mv737"), "139");
 }
+
+/// v7.39 (round 738, S14/B3 knife 3) — DELETE and tombstone deltas
+/// apply through the row map (built by the maintainable full refresh's
+/// internal scan). Content is the witness: mixed insert/delete cycles,
+/// a WHERE-filtered base row whose delete touches nothing, and a
+/// from-scratch rebuild cross-check.
+#[test]
+fn round738_delete_delta_matches_full_recompute() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE b738 (id INT, g INT)").unwrap();
+    e.execute("INSERT INTO b738 SELECT gg, gg % 4 FROM generate_series(1, 40) gg")
+        .unwrap();
+    e.execute("CREATE MATERIALIZED VIEW mv738 AS SELECT id, g FROM b738 WHERE g <> 2")
+        .unwrap();
+    // A full refresh installs the row map (CREATE ran the SQL path).
+    e.execute("INSERT INTO b738 VALUES (41, 0)").unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW mv738").unwrap();
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv738"), "31");
+    // Delete-only cycle: id 1..=8 removes 6 view rows (two are g=2,
+    // never in the view — their deletes must touch nothing).
+    e.execute("DELETE FROM b738 WHERE id <= 8").unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW mv738").unwrap();
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv738"), "25");
+    assert_eq!(one(&mut e, "SELECT min(id) FROM mv738"), "9");
+    // Mixed cycle IN ORDER: insert then delete THAT row, plus one
+    // surviving insert.
+    e.execute("INSERT INTO b738 VALUES (100, 1)").unwrap();
+    e.execute("DELETE FROM b738 WHERE id = 100").unwrap();
+    e.execute("INSERT INTO b738 VALUES (101, 3)").unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW mv738").unwrap();
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv738"), "26");
+    assert_eq!(one(&mut e, "SELECT max(id) FROM mv738"), "101");
+    // Cross-check against a from-scratch rebuild.
+    e.execute("DROP MATERIALIZED VIEW mv738").unwrap();
+    e.execute("CREATE MATERIALIZED VIEW mv738 AS SELECT id, g FROM b738 WHERE g <> 2")
+        .unwrap();
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv738"), "26");
+}
