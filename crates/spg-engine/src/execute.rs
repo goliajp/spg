@@ -2029,7 +2029,12 @@ impl Engine {
                 restart_identity,
                 cascade: _,
                 only,
-            } => self.exec_truncate(tables.as_slice(), restart_identity, only),
+            } => {
+                for t in &tables {
+                    self.bump_table_change(t);
+                }
+                self.exec_truncate(tables.as_slice(), restart_identity, only)
+            }
             // v6.7.3 — COMPACT COLD SEGMENTS.
             Statement::CompactColdSegments => self.exec_compact_cold_segments(),
             // v7.12.1 — SET / RESET session parameter. Engine

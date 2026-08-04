@@ -813,6 +813,7 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let table = stmt.table.clone();
+        self.bump_table_change(&table);
         self.exec_update_cancel_inner(stmt, None, cancel)
             .map_err(|e| enrich_not_null(e, &table))
     }
@@ -3119,6 +3120,7 @@ impl Engine {
         if !stmt.ctes.is_empty() {
             return self.exec_delete_with_ctes(stmt.clone(), cancel);
         }
+        self.bump_table_change(&stmt.table);
         // v7.39 (RLS) Phase 2 — DELETE USING visibility: only delete rows the
         // policy-subject session can see (a hidden row is silently skipped).
         let rls_del;
@@ -4439,6 +4441,7 @@ impl Engine {
         // with the relation, PG's full 23502 form (the storage layer
         // that raises it has no table name).
         let table = stmt.table.clone();
+        self.bump_table_change(&table);
         self.exec_insert_inner(stmt)
             .map_err(|e| enrich_not_null(e, &table))
     }
