@@ -10520,8 +10520,13 @@ fn expand_projection_srfs(
 ) -> Result<(alloc::vec::Vec<Row<'static>>, alloc::vec::Vec<usize>), EngineError> {
     let mut out = alloc::vec::Vec::with_capacity(filtered.len());
     let mut src = alloc::vec::Vec::with_capacity(filtered.len());
+    // v7.39 (round 726) — ONE plan for the whole scan. The per-row
+    // spelling rebuilt it for every input row: a full clone of the
+    // rewritten projection trees and the extended schema, 50k times on
+    // the panel's unnest cell.
+    let mut plan = build_srf_plan(engine, projection, srf_idxs, ctx)?;
     for (i, row) in filtered.iter().enumerate() {
-        let expanded = expand_srf_row(engine, projection, srf_idxs, row, ctx)?;
+        let expanded = expand_srf_row_with(engine, &mut plan, projection, row, ctx)?;
         src.extend(core::iter::repeat_n(i, expanded.len()));
         out.extend(expanded);
     }
@@ -10570,18 +10575,26 @@ fn expand_srf_row_with(
     let mut ext_ctx = ctx.clone();
     ext_ctx.columns = &plan.ext_cols;
     let mut out = Vec::with_capacity(n_rows);
+    // v7.39 (round 726) — the base columns are the SAME for every
+    // expanded row; clone them once and rewrite only the SRF slots per
+    // k. The old form cloned the whole input row per OUTPUT row — for
+    // `unnest(ARRAY[id, g])` over d that was a 100k-fold clone of a
+    // TEXT column the projection never reads.
+    let base_len = row.values.len();
+    let mut ext_vals = row.values.clone();
+    ext_vals.resize(base_len + lists.len(), Value::Null);
     for k in 0..n_rows {
-        let mut ext_vals = row.values.clone();
-        for list in &lists {
+        for (slot, list) in lists.iter().enumerate() {
             // Past the end of THIS srf's rows → NULL (PG pads).
-            ext_vals.push(list.get(k).cloned().unwrap_or(Value::Null));
+            ext_vals[base_len + slot] = list.get(k).cloned().unwrap_or(Value::Null);
         }
-        let ext_row = Row::new(ext_vals);
+        let ext_row = Row::new(core::mem::take(&mut ext_vals));
         let mut vals = Vec::with_capacity(projection.len());
         for (i, p) in projection.iter().enumerate() {
             let expr = plan.rewritten[i].as_ref().unwrap_or(&p.expr);
             vals.push(eval::eval_expr(expr, &ext_row, &ext_ctx).map_err(EngineError::Eval)?);
         }
+        ext_vals = ext_row.values;
         out.push(Row::new(vals));
     }
     Ok(out)
