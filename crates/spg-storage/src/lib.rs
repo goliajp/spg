@@ -3357,6 +3357,17 @@ pub enum RowChange {
 }
 
 impl RowChange {
+    /// v7.39 (round 736) — which table this change applies to.
+    #[must_use]
+    pub fn table_name(&self) -> &str {
+        match self {
+            Self::Insert { table, .. }
+            | Self::Update { table, .. }
+            | Self::Delete { table, .. }
+            | Self::Tombstone { table, .. } => table,
+        }
+    }
+
     /// v7.37.15 (Epic W slice 2) — stamp the committing writer
     /// version onto this change. Every change drained from a single
     /// statement shares one version (the statement's `xmin`/`xmax`),

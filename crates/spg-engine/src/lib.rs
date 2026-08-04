@@ -1312,6 +1312,18 @@ pub struct Engine {
     /// O(1) no-op — an incremental-maintenance first step PG does not
     /// have (its REFRESH always recomputes).
     matview_refresh_watermark: alloc::collections::BTreeMap<String, Vec<(String, u64)>>,
+    /// v7.39 (round 736, S14/B3 knife 2) — delta-maintainable
+    /// materialized views: mv name -> its single base table. Registered
+    /// at CREATE MATERIALIZED VIEW / full REFRESH when the body is a
+    /// single-stored-table pure projection (no aggregates / joins /
+    /// CTEs / subqueries / DISTINCT / ORDER / LIMIT / windows / SRFs).
+    matview_maintainable: alloc::collections::BTreeMap<String, String>,
+    /// Buffered base-table row changes per maintainable view, fanned
+    /// out from the statement redo drain. Capped (see
+    /// `MATVIEW_DELTA_CEILING`); an overflowed view falls back to a
+    /// full refresh — never-die, never-stale.
+    matview_delta_buf: alloc::collections::BTreeMap<String, Vec<RowChange>>,
+    matview_delta_overflow: alloc::collections::BTreeSet<String>,
     /// v7.38 轴 4 — currently-selected SQL isolation level. Set by
     /// `SET TRANSACTION ISOLATION LEVEL …`; read by
     /// `SHOW transaction_isolation`. v7.37.8 implements the
@@ -1538,6 +1550,9 @@ impl Engine {
             last_redo: Vec::new(),
             table_change_seq: alloc::collections::BTreeMap::new(),
             matview_refresh_watermark: alloc::collections::BTreeMap::new(),
+            matview_maintainable: alloc::collections::BTreeMap::new(),
+            matview_delta_buf: alloc::collections::BTreeMap::new(),
+            matview_delta_overflow: alloc::collections::BTreeSet::new(),
         }
     }
 
@@ -1998,6 +2013,9 @@ impl Engine {
             last_redo: Vec::new(),
             table_change_seq: alloc::collections::BTreeMap::new(),
             matview_refresh_watermark: alloc::collections::BTreeMap::new(),
+            matview_maintainable: alloc::collections::BTreeMap::new(),
+            matview_delta_buf: alloc::collections::BTreeMap::new(),
+            matview_delta_overflow: alloc::collections::BTreeSet::new(),
         }
     }
 
@@ -2126,6 +2144,9 @@ impl Engine {
                     last_redo: Vec::new(),
                     table_change_seq: alloc::collections::BTreeMap::new(),
                     matview_refresh_watermark: alloc::collections::BTreeMap::new(),
+                    matview_maintainable: alloc::collections::BTreeMap::new(),
+                    matview_delta_buf: alloc::collections::BTreeMap::new(),
+                    matview_delta_overflow: alloc::collections::BTreeSet::new(),
                 })
             }
             EnvelopeParse::CrcMismatch { expected, computed } => {
@@ -2690,6 +2711,40 @@ impl Engine {
     /// v7.39 (round 735, S14/B3) — record that `table`'s rows (or shape)
     /// changed. Cheap (one BTreeMap bump), called from every write entry;
     /// the materialized-view refresh watermark reads it.
+    /// v7.39 (round 736) — per-view buffered-delta ceiling. Past this,
+    /// the view's next REFRESH is a full one (the buffer is the
+    /// optimisation, not the truth).
+    pub(crate) const MATVIEW_DELTA_CEILING: usize = 65_536;
+
+    /// v7.39 (round 736) — fan the drained redo out to every
+    /// maintainable view whose base table it touches.
+    pub(crate) fn fan_out_matview_deltas(&mut self, drained: &[RowChange]) {
+        if self.matview_maintainable.is_empty() {
+            return;
+        }
+        for ch in drained {
+            let t = ch.table_name().to_ascii_lowercase();
+            let hit: Vec<String> = self
+                .matview_maintainable
+                .iter()
+                .filter(|(_, base)| **base == t)
+                .map(|(mv, _)| mv.clone())
+                .collect();
+            for mv in hit {
+                if self.matview_delta_overflow.contains(&mv) {
+                    continue;
+                }
+                let buf = self.matview_delta_buf.entry(mv.clone()).or_default();
+                if buf.len() >= Self::MATVIEW_DELTA_CEILING {
+                    self.matview_delta_overflow.insert(mv.clone());
+                    self.matview_delta_buf.remove(&mv);
+                } else {
+                    buf.push(ch.clone());
+                }
+            }
+        }
+    }
+
     pub(crate) fn bump_table_change(&mut self, table: &str) {
         let k = table.to_ascii_lowercase();
         *self.table_change_seq.entry(k).or_insert(0) += 1;
