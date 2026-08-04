@@ -262,3 +262,44 @@ fn round728_json_constructors_answer_as_pg() {
         assert_eq!(row_text(&mut e, sql), want, "{sql}");
     }
 }
+
+/// v7.39 (round 729) — DISTINCT ON whose keys are the ORDER BY's
+/// leading ascending keys takes the group-top-1 hash pass (no full-input
+/// sort); everything else keeps the sorting path. Round-729
+/// differential 8/8 byte-same, including deferred LIMIT/OFFSET, an
+/// expression key, a text tail key DESC, and the DESC-first-key shape
+/// that must NOT take the fast path.
+#[test]
+fn round729_distinct_on_top1_answers_as_pg() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        // Per group, max id (tail DESC).
+        (
+            "SELECT g, id FROM (SELECT DISTINCT ON (g) g, id FROM f716              ORDER BY g, id DESC) x ORDER BY g",
+            "0|99 / 1|100 / 2|98",
+        ),
+        // Tail ASC -> min id.
+        (
+            "SELECT g, id FROM (SELECT DISTINCT ON (g) g, id FROM f716              ORDER BY g, id) x ORDER BY g",
+            "0|3 / 1|1 / 2|2",
+        ),
+        // Deferred LIMIT applies after the dedup, in group order.
+        (
+            "SELECT DISTINCT ON (g) g, id FROM f716 ORDER BY g, id DESC LIMIT 2",
+            "0|99 / 1|100",
+        ),
+        // Expression key.
+        (
+            "SELECT DISTINCT ON (g % 2) g % 2 AS m, id FROM f716              ORDER BY g % 2, id DESC LIMIT 2",
+            "0|99 / 1|100",
+        ),
+        // DESC first key: NOT the fast path, still right.
+        (
+            "SELECT DISTINCT ON (g) g, id FROM f716 WHERE id <= 6 ORDER BY g DESC, id",
+            "2|2 / 1|1 / 0|3",
+        ),
+    ] {
+        assert_eq!(row_text(&mut e, sql), want, "{sql}");
+    }
+}
