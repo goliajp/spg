@@ -163,6 +163,20 @@ pub enum ValidateOnlyKind {
     /// v7.39 (round 708) — `DROP LANGUAGE <l>`: an unknown language does
     /// not exist; a shipped one is required (PG's two wordings, measured).
     LanguageName,
+    /// v7.39 (round 709) — a collation name: performable or PG's
+    /// `collation "x" for encoding "UTF8" does not exist`.
+    CollationName,
+    /// v7.39 (round 709) — a text search configuration name.
+    TsConfigName,
+    /// v7.39 (round 709) — an event trigger name. SPG has none, so the
+    /// not-found answer is total.
+    EventTriggerName,
+    /// v7.39 (round 709) — a tablespace name. SPG has none beyond PG's two
+    /// built-ins, whose drop PG refuses with `permission denied` (measured).
+    TablespaceName,
+    /// v7.39 (round 709) — a large-object oid (names[0], decimal). The
+    /// registry is real (round 287), so the check is a lookup.
+    LargeObjectOid,
     /// v7.39 (round 706) — `CREATE SERVER` / `CREATE FOREIGN TABLE` /
     /// `CREATE FOREIGN DATA WRAPPER`. SPG has no foreign-data
     /// infrastructure at all, so PG's refusals (`foreign-data wrapper "x"
@@ -5131,6 +5145,21 @@ impl fmt::Display for Statement {
                     write!(f, "CREATE EXTENSION {}", names.join(", "))
                 }
                 ValidateOnlyKind::ForeignInfra => f.write_str("CREATE SERVER"),
+                ValidateOnlyKind::CollationName => {
+                    write!(f, "DROP COLLATION {}", names.join(", "))
+                }
+                ValidateOnlyKind::TsConfigName => {
+                    write!(f, "DROP TEXT SEARCH CONFIGURATION {}", names.join(", "))
+                }
+                ValidateOnlyKind::EventTriggerName => {
+                    write!(f, "DROP EVENT TRIGGER {}", names.join(", "))
+                }
+                ValidateOnlyKind::TablespaceName => {
+                    write!(f, "DROP TABLESPACE {}", names.join(", "))
+                }
+                ValidateOnlyKind::LargeObjectOid => {
+                    write!(f, "ALTER LARGE OBJECT {}", names.join(", "))
+                }
                 ValidateOnlyKind::TypeName => write!(f, "ALTER TYPE {}", names.join(", ")),
                 ValidateOnlyKind::AggregateName => {
                     write!(f, "ALTER AGGREGATE {}", names.join(", "))

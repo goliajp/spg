@@ -77,7 +77,14 @@ fn alter_text_search_event_large_no_op() {
         &mut e,
         "ALTER TEXT SEARCH CONFIGURATION english OWNER TO postgres",
     );
-    ddl(&mut e, "ALTER EVENT TRIGGER my_trg DISABLE");
+    // v7.39 (round 709) — both name checks are real now: an event trigger
+    // never exists here, and a large object exists once created. The old
+    // bare assertions pinned the swallow — F31.
+    let err = e
+        .execute("ALTER EVENT TRIGGER my_trg DISABLE")
+        .expect_err("PG18 refuses an unknown event trigger");
+    assert!(format!("{err}").contains("event trigger \"my_trg\" does not exist"));
+    e.execute("SELECT lo_create(12345)").unwrap();
     ddl(&mut e, "ALTER LARGE OBJECT 12345 OWNER TO postgres");
 }
 
