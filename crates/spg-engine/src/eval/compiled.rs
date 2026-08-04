@@ -48,6 +48,19 @@ pub(crate) enum Step {
         n_args: usize,
     },
     NullIf,
+    /// v7.39 (round 717) — GREATEST / LEAST. Through `Step::Function`
+    /// every row re-ran `apply_function_lower`'s name dispatch, and
+    /// "least" lives in the crowded five-letter probe chain — measured
+    /// +6 ms over "greatest" on the same 500k scan REGARDLESS of which
+    /// argument wins (the take-always and take-never shapes cost the
+    /// same, so the branch was never the tax; the name was). Uniform
+    /// same-type arguments compare in place off the stack; the mixed /
+    /// coercing / xid / MySQL-NULL shapes fall to the function arm,
+    /// which still does what it always did.
+    Extremum {
+        n_args: usize,
+        max: bool,
+    },
     /// v7.39 (round 621) — `AND` / `OR`, short-circuiting.
     ///
     /// The VM is a stack machine, so both operands were pushed before the
@@ -837,6 +850,15 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 steps.push(Step::NullIf);
                 return;
             }
+            // v7.39 (round 717) — GREATEST / LEAST get their own step;
+            // see the variant.
+            if (lower == "greatest" || lower == "least") && !args.is_empty() {
+                steps.push(Step::Extremum {
+                    n_args: args.len(),
+                    max: lower == "greatest",
+                });
+                return;
+            }
             steps.push(Step::Function {
                 name_lower: lower,
                 n_args: args.len(),
@@ -1272,7 +1294,13 @@ pub(crate) fn fully_compilable(e: &Expr) -> bool {
 fn is_session_deterministic_function(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "date_trunc" | "date_part" | "to_char" | "age"
+        // v7.39 (round 717) — `format` belongs here, not on the pure
+        // list: it renders arguments through the SESSION's RenderStyle
+        // (datestyle / extra_float_digits / bytea_output), exactly the
+        // dependency class to_char carries. Its absence from BOTH lists
+        // was the round-716 panel's 4.89× cell — the only remaining
+        // text-shape loss that was pure fallback tax.
+        "date_trunc" | "date_part" | "to_char" | "age" | "format"
     )
 }
 
@@ -2155,6 +2183,83 @@ where
                     match chosen {
                         Some(k) => {
                             let v = stack.swap_remove(start + k);
+                            stack.truncate(start);
+                            stack.push(v);
+                        }
+                        None => {
+                            stack.truncate(start);
+                            stack.push(Value::Null);
+                        }
+                    }
+                }
+            }
+            Step::Extremum { n_args, max } => {
+                let start = stack.len().saturating_sub(*n_args);
+                // Fast path: every non-NULL argument carries the SAME
+                // concrete type — the comparison is the type's own and
+                // the widen-to-common finish is the identity. Everything
+                // else (mixed types, unknown-type text beside a typed
+                // sibling, xid's refusal, MySQL's NULL-poisoning) falls
+                // to the function arm unchanged.
+                let mut uniform: Option<spg_storage::DataType> = None;
+                let mut any_null = false;
+                let mut fall_back = false;
+                for v in &stack[start..] {
+                    if matches!(v, Value::Null) {
+                        any_null = true;
+                        continue;
+                    }
+                    if matches!(v, Value::Xid(_)) {
+                        fall_back = true;
+                        break;
+                    }
+                    match (v.data_type(), uniform) {
+                        (Some(t), None) => uniform = Some(t),
+                        (Some(t), Some(prev)) if t != prev => {
+                            fall_back = true;
+                            break;
+                        }
+                        (Some(_), Some(_)) => {}
+                        (None, _) => {
+                            fall_back = true;
+                            break;
+                        }
+                    }
+                }
+                if fall_back || (ctx.mysql_dialect && any_null) {
+                    let name = if *max { "greatest" } else { "least" };
+                    let result =
+                        super::functions::apply_function_lower(name, &stack[start..], ctx)?;
+                    stack.truncate(start);
+                    stack.push(result);
+                } else {
+                    let mut best: Option<usize> = None;
+                    for k in start..stack.len() {
+                        if matches!(&stack[k], Value::Null) {
+                            continue;
+                        }
+                        match best {
+                            None => best = Some(k),
+                            Some(b) => {
+                                let ord = super::values::value_cmp_for_min_max(
+                                    &stack[b],
+                                    &stack[k],
+                                    ctx.mysql_dialect,
+                                );
+                                let take = if *max {
+                                    ord == core::cmp::Ordering::Less
+                                } else {
+                                    ord == core::cmp::Ordering::Greater
+                                };
+                                if take {
+                                    best = Some(k);
+                                }
+                            }
+                        }
+                    }
+                    match best {
+                        Some(k) => {
+                            let v = stack.swap_remove(k);
                             stack.truncate(start);
                             stack.push(v);
                         }
