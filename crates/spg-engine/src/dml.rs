@@ -4724,6 +4724,34 @@ impl Engine {
         // the post-ON-CONFLICT row set.
         let exclusions = table.schema().exclusion_constraints.clone();
         let _ = table;
+        // v7.39 (round 712) — a constraint that is DEFERRED right now sits
+        // out the statement-time check; the COMMIT sweep (or a SET
+        // CONSTRAINTS … IMMEDIATE) runs it instead. This is the enforcement
+        // half of F08: a transient duplicate healed before COMMIT is a
+        // legal PG sequence that used to fail here on the first INSERT.
+        // (Placed after `table`'s borrow ends — the filter reads the
+        // catalog again for the synthesised constraint name.)
+        let uniqueness: Vec<_> = if let Some(tx) = self.current_tx
+            && let Some(st) = self.tx_catalogs.get(&tx)
+        {
+            let tname = stmt.table.clone();
+            uniqueness
+                .into_iter()
+                .filter(|uc| {
+                    if !uc.deferrable {
+                        return true;
+                    }
+                    let conname = st
+                        .catalog
+                        .get(tname.as_str())
+                        .map(|t| crate::system_catalog::pg_unique_conname(t, uc, &tname))
+                        .unwrap_or_default();
+                    !crate::constraints::uc_deferred_in(st, uc, &conname)
+                })
+                .collect()
+        } else {
+            uniqueness
+        };
         // v7.39 (round 347, M2) — MySQL's LAST_INSERT_ID() reports the
         // FIRST value this statement generated, and is left ALONE by a
         // statement that generated none (measured on MariaDB 11: an

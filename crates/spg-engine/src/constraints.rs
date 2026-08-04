@@ -3314,6 +3314,39 @@ impl Engine {
                 .collect();
             enforce_fk_inserts(&st.catalog, tname, &fks, &rows)?;
         }
+        // v7.39 (round 712) — and the deferred PK/UNIQUE constraints,
+        // through the whole-table validator (the rows are already in the
+        // table at this point; see its doc for why the insert-time probe
+        // cannot be reused).
+        for tname in &tables {
+            let Some(t) = st.catalog.get(tname) else {
+                continue;
+            };
+            let deferred_ucs: alloc::vec::Vec<(
+                spg_storage::UniquenessConstraint,
+                alloc::string::String,
+            )> = t
+                .schema()
+                .uniqueness_constraints
+                .iter()
+                .filter(|uc| uc.deferrable)
+                .map(|uc| {
+                    let conname = crate::system_catalog::pg_unique_conname(t, uc, tname);
+                    (uc.clone(), conname)
+                })
+                .filter(|(uc, conname)| {
+                    if let Some(names) = only
+                        && !names.iter().any(|w| w == conname)
+                    {
+                        return false;
+                    }
+                    uc_deferred_in(st, uc, conname)
+                })
+                .collect();
+            for (uc, _) in &deferred_ucs {
+                validate_uniqueness_whole_table(&st.catalog, tname, uc, self.backslash_escapes)?;
+            }
+        }
         Ok(())
     }
 }
@@ -3331,6 +3364,74 @@ impl Engine {
 /// check both ask — and the pair drifting apart is exactly how a
 /// deferred violation would slip through a successful COMMIT.
 /// Answers the timing question only; `deferrable` is the caller's gate.
+/// v7.39 (round 712) — the PK/UNIQUE twin of [`fk_deferred_in`], now that
+/// round 711 stores the flags. `conname` is the RESOLVED name (stored, or
+/// the `<table>_pkey` form `pg_unique_conname` synthesises) so that
+/// `SET CONSTRAINTS d711_pkey …` reaches an unnamed constraint the same
+/// way it does in PG.
+pub(crate) fn uc_deferred_in(
+    st: &crate::TxState,
+    uc: &spg_storage::UniquenessConstraint,
+    conname: &str,
+) -> bool {
+    if let Some(explicit) = st.constraints_deferred_by_name.get(conname) {
+        return *explicit;
+    }
+    st.constraints_deferred.unwrap_or(uc.initially_deferred)
+}
+
+/// v7.39 (round 712) — whole-table uniqueness validation, for the COMMIT
+/// sweep. `enforce_uniqueness_inserts` probes NEW rows against the table;
+/// at COMMIT the rows are already IN the table, so probing them there
+/// would collide with themselves. This walks the live rows once per
+/// constraint and asks the only question left: do two of them share a key?
+pub(crate) fn validate_uniqueness_whole_table(
+    catalog: &Catalog,
+    tname: &str,
+    uc: &spg_storage::UniquenessConstraint,
+    mysql: bool,
+) -> Result<(), EngineError> {
+    let Some(table) = catalog.get(tname) else {
+        return Ok(());
+    };
+    let schema = table.schema();
+    let mut seen: hashbrown::HashSet<alloc::string::String> = hashbrown::HashSet::new();
+    for (i, row) in table.rows().iter().enumerate() {
+        if table.headers().get(i).is_some_and(|h| h.is_deleted()) {
+            continue;
+        }
+        let key: Vec<Value<'static>> = uc
+            .columns
+            .iter()
+            .map(|&ci| {
+                let v = row.values.get(ci).cloned().unwrap_or(Value::Null);
+                collated_key_cell(&v, ci, schema, mysql)
+            })
+            .collect();
+        // NULL keys pass each other unless NULLS NOT DISTINCT — the same
+        // rule the statement-time check applies.
+        if !uc.nulls_not_distinct && key.iter().any(Value::is_null) {
+            continue;
+        }
+        let encoded = alloc::format!("{key:?}");
+        if !seen.insert(encoded) {
+            let conname = crate::system_catalog::pg_unique_conname(table, uc, tname);
+            let detail = unique_key_detail(
+                &uc.columns
+                    .iter()
+                    .map(|&ci| schema.columns[ci].name.clone())
+                    .collect::<Vec<_>>(),
+                &key,
+            );
+            return Err(EngineError::Unsupported(alloc::format!(
+                "duplicate key value violates unique constraint \"{conname}\" \
+                 on table \"{tname}\"{detail}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn fk_deferred_in(
     st: &crate::TxState,
     fk: &spg_storage::ForeignKeyConstraint,
@@ -3380,11 +3481,21 @@ impl crate::Engine {
                         "constraint \"{n}\" is not deferrable"
                     )));
                 }
-                None => {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "constraint \"{n}\" does not exist"
-                    )));
-                }
+                // v7.39 (round 712) — a PK/UNIQUE constraint answers to
+                // SET CONSTRAINTS too, by stored or synthesised name.
+                None => match self.find_uc_by_name(n) {
+                    Some(uc) if uc.deferrable => {}
+                    Some(_) => {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "constraint \"{n}\" is not deferrable"
+                        )));
+                    }
+                    None => {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "constraint \"{n}\" does not exist"
+                        )));
+                    }
+                },
             }
         }
         // Order matters: run what is CURRENTLY deferred first, then
@@ -3425,6 +3536,20 @@ impl crate::Engine {
     /// not complain when two tables share one — every match is affected —
     /// so this only has to answer whether SOME constraint owns the name,
     /// and what its deferrability is.
+    /// v7.39 (round 712) — the PK/UNIQUE twin, matching the stored name or
+    /// the synthesised `<table>_pkey` / `<table>_<col>_key` form.
+    fn find_uc_by_name(&self, name: &str) -> Option<spg_storage::UniquenessConstraint> {
+        let cat = self.active_catalog();
+        cat.table_names().into_iter().find_map(|tname| {
+            let t = cat.get(&tname)?;
+            t.schema()
+                .uniqueness_constraints
+                .iter()
+                .find(|uc| crate::system_catalog::pg_unique_conname(t, uc, &tname) == name)
+                .cloned()
+        })
+    }
+
     fn find_fk_by_name(&self, name: &str) -> Option<spg_storage::ForeignKeyConstraint> {
         let cat = self.active_catalog();
         cat.table_names().into_iter().find_map(|t| {
