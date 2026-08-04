@@ -3815,6 +3815,20 @@ impl Engine {
         // table. Joined derived tables keep riding the LATERAL
         // machinery in join.rs.
         if from.joins.is_empty() && from.primary.lateral_subquery.is_some() {
+            // v7.39 (round 727) — flatten first. A simple derived table
+            // (bare-column projection over one stored table, nothing that
+            // changes cardinality or order) used to force the inner
+            // SELECT through the SERIAL row-at-a-time projection pipeline
+            // just to materialise a synthetic table the outer query then
+            // re-scans: `count(*) FROM (SELECT id v FROM d WHERE …) q`
+            // measured 18.6 ms against PG's 5 — and bare count over the
+            // same filter WITHOUT the wrapper is 2 ms here, because it
+            // rides the fused parallel lane. Rewriting to the unwrapped
+            // form is PG's subquery pull-up; the whole tree gets the
+            // fast lanes back.
+            if let Some(flat) = try_flatten_derived(stmt, &from.primary) {
+                return self.exec_select_cancel(&flat, cancel);
+            }
             return self.exec_select_derived(stmt, &from.primary, cancel);
         }
         // v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
@@ -11075,4 +11089,184 @@ fn coerce_branch_column(
         *slot = crate::conversions::coerce_value(slot.clone(), target, col_name, col_idx)?;
     }
     Ok(())
+}
+
+/// v7.39 (round 727) — PG-style pull-up of a SIMPLE derived table:
+/// `SELECT … FROM (SELECT <bare columns> FROM t [WHERE …]) q …`
+/// rewrites to `SELECT …' FROM t [WHERE inner AND outer'] …` with every
+/// reference to q's output columns substituted by the underlying column.
+///
+/// Admission is deliberately narrow — anything that changes cardinality,
+/// order, or scope stays on the materialising path:
+/// * outer: no CTEs / unions / DISTINCT [ON] / windows, single derived
+///   FROM with no ordinality or positional column aliases, and no
+///   subquery anywhere its expressions (an inner scope could reference
+///   q too — descending is a later knife);
+/// * inner: one stored table, bare-column projection only, no
+///   CTE/union/DISTINCT/GROUP/HAVING/ORDER/LIMIT/OFFSET/windows/locking;
+/// * every outer column reference must resolve inside q's output list —
+///   a name that does not is an ERROR today, and flattening would
+///   silently legalise it against the base table.
+fn try_flatten_derived(
+    stmt: &SelectStatement,
+    primary: &TableRef,
+) -> Option<SelectStatement> {
+    use spg_sql::ast::SelectItem;
+    let inner = primary.lateral_subquery.as_deref()?;
+    // Outer shape.
+    if !stmt.ctes.is_empty()
+        || !stmt.unions.is_empty()
+        || stmt.distinct
+        || !stmt.distinct_on.is_empty()
+        || !stmt.window_check_exprs.is_empty()
+        || stmt.locking.is_some()
+        || primary.with_ordinality
+        || !primary.unnest_column_aliases.is_empty()
+    {
+        return None;
+    }
+    // Inner shape.
+    if !inner.ctes.is_empty()
+        || !inner.unions.is_empty()
+        || inner.distinct
+        || !inner.distinct_on.is_empty()
+        || inner.group_by.is_some()
+        || inner.group_by_all
+        || inner.having.is_some()
+        || !inner.order_by.is_empty()
+        || inner.limit.is_some()
+        || inner.offset.is_some()
+        || !inner.window_check_exprs.is_empty()
+        || inner.locking.is_some()
+    {
+        return None;
+    }
+    let ifrom = inner.from.as_ref()?;
+    let it = &ifrom.primary;
+    if !ifrom.joins.is_empty()
+        || it.name.is_empty()
+        || it.lateral_subquery.is_some()
+        || it.unnest_expr.is_some()
+        || it.generate_series_args.is_some()
+        || it.as_of_segment.is_some()
+        || it.jsonb_each_text_arg.is_some()
+        || it.table_fn_call.is_some()
+        || it.rows_from.is_some()
+        || it.json_table.is_some()
+        || it.with_ordinality
+        || !it.unnest_column_aliases.is_empty()
+    {
+        return None;
+    }
+    if inner.where_.as_ref().is_some_and(crate::expr_has_subquery) {
+        return None;
+    }
+    // The output map: q's visible name -> the underlying column.
+    let inner_alias = it.alias.clone().unwrap_or_else(|| it.name.clone());
+    let mut map: alloc::collections::BTreeMap<String, spg_sql::ast::ColumnName> =
+        alloc::collections::BTreeMap::new();
+    for item in &inner.items {
+        let SelectItem::Expr { expr, alias } = item else {
+            return None;
+        };
+        let Expr::Column(c) = expr else {
+            return None;
+        };
+        if let Some(q) = c.qualifier.as_deref()
+            && !q.eq_ignore_ascii_case(&inner_alias)
+        {
+            return None;
+        }
+        let out_name = alias.clone().unwrap_or_else(|| c.name.clone());
+        // A duplicated output name would make substitution ambiguous.
+        if map.insert(out_name.to_ascii_lowercase(), c.clone()).is_some() {
+            return None;
+        }
+    }
+    if map.is_empty() {
+        return None;
+    }
+    let derived_alias = primary
+        .alias
+        .clone()
+        .unwrap_or_else(|| primary.name.clone())
+        .to_ascii_lowercase();
+    // Substitute in a clone; bail (None) on the first reference the map
+    // cannot answer.
+    let mut out = stmt.clone();
+    let ok = core::cell::Cell::new(true);
+    let mut subst = |e: &mut Expr| -> bool {
+        match e {
+            Expr::Column(c) => {
+                match c.qualifier.as_deref() {
+                    Some(q) if q.eq_ignore_ascii_case(&derived_alias) => {}
+                    None => {}
+                    Some(_) => {
+                        ok.set(false);
+                        return true;
+                    }
+                }
+                match map.get(&c.name.to_ascii_lowercase()) {
+                    Some(target) => *c = target.clone(),
+                    None => ok.set(false),
+                }
+                true
+            }
+            // Any subquery could reference q from its own scope;
+            // descending is a later knife — bail for now.
+            Expr::ScalarSubquery(_)
+            | Expr::Exists { .. }
+            | Expr::InSubquery { .. }
+            | Expr::RowInSubquery { .. }
+            | Expr::RowCmpSubquery { .. } => {
+                ok.set(false);
+                true
+            }
+            _ => false,
+        }
+    };
+    for item in &mut out.items {
+        match item {
+            SelectItem::Expr { expr, .. } => {
+                crate::expr_analysis::rewrite_nodes_mut(expr, &mut subst);
+            }
+            // `SELECT * FROM (…) q` means q's columns, in q's order.
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => return None,
+        }
+    }
+    if let Some(w) = &mut out.where_ {
+        crate::expr_analysis::rewrite_nodes_mut(w, &mut subst);
+    }
+    if let Some(gs) = &mut out.group_by {
+        for g in gs {
+            crate::expr_analysis::rewrite_nodes_mut(g, &mut subst);
+        }
+    }
+    if let Some(h) = &mut out.having {
+        crate::expr_analysis::rewrite_nodes_mut(h, &mut subst);
+    }
+    for o in &mut out.order_by {
+        crate::expr_analysis::rewrite_nodes_mut(&mut o.expr, &mut subst);
+    }
+    for d in &mut out.distinct_on {
+        crate::expr_analysis::rewrite_nodes_mut(d, &mut subst);
+    }
+    if !ok.get() {
+        return None;
+    }
+    // FROM becomes the stored table; the filters conjoin.
+    out.from = Some(spg_sql::ast::FromClause {
+        primary: it.clone(),
+        joins: Vec::new(),
+    });
+    out.where_ = match (inner.where_.clone(), out.where_.take()) {
+        (Some(a), Some(b)) => Some(Expr::Binary {
+            lhs: alloc::boxed::Box::new(a),
+            op: spg_sql::ast::BinOp::And,
+            rhs: alloc::boxed::Box::new(b),
+        }),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    };
+    Some(out)
 }
