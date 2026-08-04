@@ -1464,16 +1464,21 @@ impl Engine {
             // doesn't alias the residual borrow.
             let extra_preds = core::mem::take(&mut peer.where_preds);
             let residual: Vec<&Expr> = residual.into_iter().chain(extra_preds.iter()).collect();
-            if self.join_stage_inl(
-                &mut pipe,
-                peer,
-                &eq_pairs,
-                &residual,
-                &peer_mask,
-                right_arity,
-                &ctx,
-                cancel,
-            )? {
+            // v7.39 (round 725) — SEMI stays out of the INL walker (its
+            // per-hit push has no first-match short-circuit); the hash
+            // stage right below is where the pull-up's keys land anyway.
+            if !matches!(peer.kind, JoinKind::Semi)
+                && self.join_stage_inl(
+                    &mut pipe,
+                    peer,
+                    &eq_pairs,
+                    &residual,
+                    &peer_mask,
+                    right_arity,
+                    &ctx,
+                    cancel,
+                )?
+            {
                 continue;
             }
             // v7.39 (round 606) — a COMPUTED key on its own is still a key.
@@ -2116,6 +2121,12 @@ impl Engine {
                         if track_right {
                             peer_matched[ri] = true;
                         }
+                        // v7.39 (round 725) — SEMI: one pairing per drive
+                        // row is the answer; the rest of the bucket is
+                        // EXISTS's dead work.
+                        if matches!(peer.kind, JoinKind::Semi) {
+                            break;
+                        }
                     }
                 }
             }
@@ -2309,6 +2320,11 @@ impl Engine {
                         }
                     }
                     left_matched = true;
+                    // v7.39 (round 725) — SEMI keeps one pairing (see the
+                    // hash stage; this loop is its safety net).
+                    if matches!(peer.kind, JoinKind::Semi) {
+                        break;
+                    }
                 }
             }
             if !left_matched && matches!(peer.kind, JoinKind::Left | JoinKind::FullOuter) {
