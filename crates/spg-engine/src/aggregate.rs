@@ -389,7 +389,13 @@ pub(crate) struct AggState {
     /// v7.24 (round-16 A) — per-item ORDER BY key tuples, parallel
     /// to `items` (pushed under the same skip/keep conditions).
     /// Empty when the aggregate carries no internal ordering.
-    item_keys: Vec<Vec<Value<'static>>>,
+    /// v7.39 (round 723) — FLAT (SoA): `order_by.len()` key values per
+    /// item, back to back. The per-item `Vec<Vec<Value>>` form allocated
+    /// one heap Vec PER ROW just to hold (usually) one integer — ~20 ms
+    /// of pure allocator traffic on the panel's 500k `string_agg(s, ','
+    /// ORDER BY id)`. The key width is the spec's `order_by.len()`,
+    /// which every consumer already has.
+    item_keys: Vec<Value<'static>>,
     /// v7.17.0 — captured separator for string_agg. PG accepts a
     /// non-constant separator expression but in practice every
     /// caller passes a literal; the engine snapshots the last
@@ -3672,21 +3678,29 @@ fn finalize_synth_rows(
             // aggregate-internal ORDER BY before finalize consumes
             // them.
             let st_sorted;
+            let kw = agg_specs[i].order_by.len();
             let st_final: &AggState =
-                if !agg_specs[i].order_by.is_empty() && st.item_keys.len() == st.items.len() {
+                if kw > 0 && st.item_keys.len() == st.items.len() * kw {
                     let mut idx: Vec<usize> = (0..st.items.len()).collect();
                     let ob = &agg_specs[i].order_by;
                     idx.sort_by(|&x, &y| {
                         cmp_order_keys(
                             ob,
                             &agg_specs[i].order_enum_labels,
-                            &st.item_keys[x],
-                            &st.item_keys[y],
+                            &st.item_keys[x * kw..(x + 1) * kw],
+                            &st.item_keys[y * kw..(y + 1) * kw],
                             ctx.mysql_dialect,
                         )
                     });
+                    // Permute by MOVE out of the clone — the old form
+                    // cloned every item a second time on top of
+                    // `st.clone()`'s first (5000 Strings twice per group).
                     let mut sorted = st.clone();
-                    sorted.items = idx.iter().map(|&j| st.items[j].clone()).collect();
+                    let mut new_items: Vec<Value<'static>> = Vec::with_capacity(idx.len());
+                    for &j in &idx {
+                        new_items.push(core::mem::replace(&mut sorted.items[j], Value::Null));
+                    }
+                    sorted.items = new_items;
                     st_sorted = sorted;
                     &st_sorted
                 } else if agg_specs[i].distinct && st.items.len() > 1 {
@@ -4750,7 +4764,7 @@ pub(crate) fn update_state(
             if let Some(item) = rendered {
                 st.items.push(item);
                 if let Some(k) = order_keys {
-                    st.item_keys.push(k);
+                    st.item_keys.extend(k);
                 }
                 st.num.count += 1;
             } else {
@@ -4767,7 +4781,7 @@ pub(crate) fn update_state(
         AggKind::ArrayAgg => {
             st.items.push(v.clone().into_owned());
             if let Some(k) = order_keys {
-                st.item_keys.push(k);
+                st.item_keys.extend(k);
             }
             st.num.count += 1;
         }
@@ -4909,7 +4923,7 @@ pub(crate) fn update_state(
             }
             st.items.push(v.clone().into_owned());
             if let Some(k) = order_keys {
-                st.item_keys.push(k);
+                st.item_keys.extend(k);
             }
             st.num.count += 1;
         }
@@ -4954,7 +4968,7 @@ pub(crate) fn update_state(
             // elements (`json_agg(x ORDER BY x DESC)`), the same way
             // string_agg / array_agg do.
             if let Some(k) = order_keys {
-                st.item_keys.push(k);
+                st.item_keys.extend(k);
             }
             st.num.count += 1;
         }
@@ -5567,7 +5581,8 @@ fn finalize_ordered_set(
             // v7.39 (read01 orderedsetaggs.c) — the multi-key form
             // compares the hypothetical tuple against the collected
             // `item_keys` tuples with the full sort spec.
-            let multi = order_by.len() > 1 && st.item_keys.len() == items.len();
+            let kw = order_by.len();
+            let multi = kw > 1 && st.item_keys.len() == items.len() * kw;
             let hv: Vec<Value<'static>> = core::iter::once(h.clone().into_owned())
                 .chain(direct_extra.iter().cloned())
                 .collect();
@@ -5576,7 +5591,7 @@ fn finalize_ordered_set(
                 .map_or((false, None), |o| (o.desc, o.nulls_first));
             let cmp_i = |i: usize| -> core::cmp::Ordering {
                 if multi {
-                    cmp_order_keys(order_by, &[], &st.item_keys[i], &hv, mysql)
+                    cmp_order_keys(order_by, &[], &st.item_keys[i * kw..(i + 1) * kw], &hv, mysql)
                 } else {
                     crate::order_by_value_cmp_in(desc, nulls_first, &items[i], h, mysql)
                 }
@@ -5604,7 +5619,13 @@ fn finalize_ordered_set(
                     // item_keys in the multi-key form, so sort + dedup).
                     let tuple_cmp = |&x: &usize, &y: &usize| -> core::cmp::Ordering {
                         if multi {
-                            cmp_order_keys(order_by, &[], &st.item_keys[x], &st.item_keys[y], mysql)
+                            cmp_order_keys(
+                                order_by,
+                                &[],
+                                &st.item_keys[x * kw..(x + 1) * kw],
+                                &st.item_keys[y * kw..(y + 1) * kw],
+                                mysql,
+                            )
                         } else {
                             value_cmp(&items[x], &items[y])
                         }
