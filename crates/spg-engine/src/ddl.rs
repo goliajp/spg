@@ -157,7 +157,8 @@ impl Engine {
                 column,
                 new_type,
                 using,
-            } => self.alter_column_type(tbl, column, new_type, using),
+                collation,
+            } => self.alter_column_type(tbl, column, new_type, using, collation),
             T::AddTableConstraint(tc) => self.alter_add_table_constraint(tbl, tc),
             T::ValidateConstraint { name } => self.alter_validate_constraint(tbl, &name),
             // v7.39 (round 652) — SPG is single-owner and has no
@@ -1191,6 +1192,7 @@ impl Engine {
         column: String,
         new_type: spg_sql::ast::ColumnTypeName,
         using: Option<Expr>,
+        collation: Option<(spg_sql::ast::Collation, alloc::string::String)>,
     ) -> Result<(), EngineError> {
         // v7.13.0 — mailrs round-5 G8. Re-evaluate each
         // row's column value (either through the USING
@@ -1198,6 +1200,48 @@ impl Engine {
         // the existing value) and re-coerce to the new
         // type. Indices on the column get rebuilt.
         let new_data_type = column_type_to_data_type(new_type);
+        // v7.39 (round 713) — `TYPE <ty> COLLATE <name>`. PG refuses a
+        // collation on a non-collatable type; on a collatable one it
+        // re-collates, and NO clause resets to the type default (both
+        // measured round 713). The clause parsed here all along and was
+        // dropped — the statement succeeded, the ordering never changed.
+        let is_collatable = matches!(
+            new_data_type,
+            DataType::Text | DataType::Varchar(_) | DataType::Char(_)
+        );
+        if collation.is_some() && !is_collatable {
+            let spelled = crate::conversions::regtype_oid_to_name(
+                crate::system_catalog::pg_type_oid(new_data_type),
+            )
+            .unwrap_or("this type");
+            return Err(EngineError::Unsupported(alloc::format!(
+                "collations are not supported by type {spelled}"
+            )));
+        }
+        // The declared-collation warnings mirror CREATE TABLE's (rounds
+        // 678/692): a performable name still compares ranges by bytes; a
+        // name this build cannot perform is recorded and byte-ordered.
+        // Warn-not-refuse is the round-670 zero-customer-change ruling.
+        if let Some((_, name)) = &collation
+            && !(name.eq_ignore_ascii_case("C")
+                || name.eq_ignore_ascii_case("POSIX")
+                || name.eq_ignore_ascii_case("default"))
+        {
+            if crate::collate::is_supported(name) {
+                self.warning(alloc::format!(
+                    "column \"{column}\" declares COLLATE \"{name}\"; SPG orders it by \
+                     \"{name}\", but RANGE COMPARISONS (BETWEEN, <, >) still compare by \
+                     bytes — they may return a different row set than \"{name}\" implies"
+                ));
+            } else {
+                self.warning(alloc::format!(
+                    "column \"{column}\" declares COLLATE \"{name}\", which this build \
+                     cannot perform; SPG records the declaration and orders this column \
+                     by bytes (the C collation)"
+                ));
+            }
+        }
+        let mysql_dialect = self.backslash_escapes;
         // v7.39 — under in-place MVCC the row store carries tombstoned
         // versions; their dead values must not join the rewrite (an
         // INT corpse under a TEXT conversion would abort the whole
@@ -1288,6 +1332,34 @@ impl Engine {
             new_values.push(Some(coerced));
         }
         table.schema_mut().columns[col_pos].ty = new_data_type;
+        // v7.39 (round 713) — the collation lands with the type, exactly
+        // as CREATE TABLE lands it (the round-370/676 pair of fields).
+        // An absent clause is a RESET, not a keep: PG re-derives the
+        // collation from the new type, so `TYPE text` alone takes the
+        // column back to the default — under the MySQL dialect that
+        // default is the folding collation, everywhere else byte order.
+        {
+            let sc = &mut table.schema_mut().columns[col_pos];
+            match &collation {
+                Some((cenum, name)) => {
+                    sc.collation_name = Some(name.clone());
+                    sc.collation = match cenum {
+                        spg_sql::ast::Collation::Binary => spg_storage::Collation::Binary,
+                        spg_sql::ast::Collation::CaseInsensitive => {
+                            spg_storage::Collation::CaseInsensitive
+                        }
+                    };
+                }
+                None => {
+                    sc.collation_name = None;
+                    sc.collation = if mysql_dialect && is_collatable {
+                        spg_storage::Collation::CaseInsensitive
+                    } else {
+                        spg_storage::Collation::Binary
+                    };
+                }
+            }
+        }
         for (i, v) in new_values.into_iter().enumerate() {
             let Some(v) = v else { continue };
             let mut row_values = table

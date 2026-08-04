@@ -10987,7 +10987,18 @@ impl Parser {
                         )));
                     }
                 }
-                let new_type = self.parse_column_type_name()?;
+                // v7.39 (round 713) — the type parser has consumed a
+                // trailing `COLLATE <name>` since Phase 2.5, and
+                // `parse_column_type_name` discarded it: `ALTER COLUMN t
+                // TYPE text COLLATE "C"` parsed clean and changed
+                // nothing. Keep the clause; the engine re-collates.
+                let (new_type, _, _, _, coll, coll_explicit, coll_name, _, _, _, _, _) =
+                    self.parse_type_with_implied_flags()?;
+                let collation = if coll_explicit {
+                    coll_name.map(|n| (coll, n))
+                } else {
+                    None
+                };
                 let using = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using"))
                 {
                     self.advance();
@@ -10999,6 +11010,7 @@ impl Parser {
                     column: col_name,
                     new_type,
                     using,
+                    collation,
                 }])
             }
             // v7.15.0 — `ALTER TABLE t RENAME [COLUMN] old TO new`.

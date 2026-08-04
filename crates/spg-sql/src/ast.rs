@@ -1254,6 +1254,14 @@ pub enum AlterTableTarget {
         column: String,
         new_type: ColumnTypeName,
         using: Option<Expr>,
+        /// v7.39 (round 713) — `COLLATE <name>` between the type and
+        /// USING. PG re-collates the column, and an ABSENT clause RESETS
+        /// the collation to the type default (measured round 713) — so
+        /// `None` is not "leave it alone". The type parser consumed the
+        /// clause all along and this surface dropped it on the floor:
+        /// the statement succeeded and the ordering did not change, the
+        /// silent-divergence shape. Folded variant + the name as written.
+        collation: Option<(Collation, String)>,
     },
     /// v7.13.3 — `ALTER TABLE t DROP [COLUMN] [IF EXISTS] <col>
     /// [CASCADE | RESTRICT]` (mailrs round-7 S8). The column +
@@ -6653,8 +6661,12 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
             column,
             new_type,
             using,
+            collation,
         } => {
             write!(f, "ALTER COLUMN {} TYPE {new_type}", quote_ident(column))?;
+            if let Some((_, name)) = collation {
+                write!(f, " COLLATE {}", quote_ident(name))?;
+            }
             if let Some(u) = using {
                 write!(f, " USING {u}")?;
             }
