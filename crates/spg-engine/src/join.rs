@@ -709,9 +709,17 @@ fn extract_join_keys<'a>(
     peer: &JoinedPeer<'a>,
     combined_schema: &[ColumnSchema],
     consumed_cols: usize,
-) -> (Vec<(usize, usize)>, Vec<(usize, &'a Expr)>, Vec<&'a Expr>) {
+) -> (
+    Vec<(usize, usize)>,
+    // v7.39 (round 719) — the third member is the whole CONJUNCT the
+    // (left-pos, key-expr) pair came from, so the int-keyed lane can
+    // identify it in `residual` and drop the re-verification (see
+    // `join_stage_hash`).
+    Vec<(usize, &'a Expr, &'a Expr)>,
+    Vec<&'a Expr>,
+) {
     let mut eq_pairs: Vec<(usize, usize)> = Vec::new();
-    let mut eq_exprs: Vec<(usize, &Expr)> = Vec::new();
+    let mut eq_exprs: Vec<(usize, &Expr, &Expr)> = Vec::new();
     let mut residual: Vec<&Expr> = Vec::new();
     if let (Some(on_expr), None) = (peer.on, peer.lateral) {
         for sub in reorder::split_and_conjunctions(on_expr) {
@@ -727,8 +735,8 @@ fn extract_join_keys<'a>(
             // at 200, and past 25 SECONDS at 20,000, where PG holds 4-11 ms
             // by hashing on both. The conjunct stays in `residual` as well,
             // so the join's answer never depends on the key encoding.
-            if let Some(pair) = match_equi_expr(sub, peer, combined_schema, consumed_cols) {
-                eq_exprs.push(pair);
+            if let Some((l, e)) = match_equi_expr(sub, peer, combined_schema, consumed_cols) {
+                eq_exprs.push((l, e, sub));
                 residual.push(sub);
                 continue;
             }
@@ -788,6 +796,34 @@ fn peer_only_key_expr(e: &Expr, peer: &JoinedPeer<'_>) -> bool {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::IntDiv | BinOp::Mod
             ) && peer_only_key_expr(lhs, peer)
                 && peer_only_key_expr(rhs, peer)
+        }
+        _ => false,
+    }
+}
+
+/// v7.39 (round 719) — is this key expression INTEGER-ONLY: every column
+/// an integer-family column of the peer, every literal a plain integer,
+/// every operator closed over the integers (Add / Sub / Mul — Div and Mod
+/// stay out; integer division's result type is the arm's business, not
+/// this classifier's). When it is, the computed key can live in the i64
+/// hash table and equality ON THE KEY IS the SQL `=` — no canonical-string
+/// encoding, and no residual re-verification.
+fn int_only_key_expr(e: &Expr, peer: &JoinedPeer<'_>) -> bool {
+    use spg_sql::ast::BinOp;
+    match e {
+        Expr::Column(c) => Engine::peer_col_pos(&peer.alias, &peer.cols, c).is_some_and(|p| {
+            matches!(
+                peer.cols[p].ty,
+                spg_storage::DataType::Int
+                    | spg_storage::DataType::BigInt
+                    | spg_storage::DataType::SmallInt
+            )
+        }),
+        Expr::Literal(spg_sql::ast::Literal::Integer(_)) => true,
+        Expr::Binary { lhs, op, rhs } => {
+            matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                && int_only_key_expr(lhs, peer)
+                && int_only_key_expr(rhs, peer)
         }
         _ => false,
     }
@@ -1578,7 +1614,7 @@ impl Engine {
         pipe: &mut JoinPipeline<'a>,
         peer: &mut JoinedPeer<'p>,
         eq_pairs: &[(usize, usize)],
-        eq_exprs: &[(usize, &Expr)],
+        eq_exprs: &[(usize, &Expr, &Expr)],
         residual: &[&Expr],
         peer_mask: &Option<Vec<bool>>,
         right_arity: usize,
@@ -1667,10 +1703,43 @@ impl Engine {
                     )
                 )
             };
+        // v7.39 (round 719) — a single COMPUTED key that is integer-only
+        // takes the i64 lane too. `ON a.id = b.id + 1` used to pay three
+        // taxes the plain-column key did not: a canonical-STRING hash
+        // table (build + probe both encode), the conjunct re-verified in
+        // `residual` against a fully materialised combined row per
+        // matching pair (round 590's defence against key-encoding
+        // ambiguity), and an interpreted eval per build row. On the
+        // panel's 500k self-joins those were ~210-260 ms against PG's
+        // ~40. For a native i64 key the ambiguity defence protects
+        // nothing: key equality IS SQL `=` (NULLs never enter the
+        // table), so the conjunct is dropped from residual below.
+        let int_expr_keyed = eq_pairs.is_empty()
+            && eq_exprs.len() == 1
+            && matches!(
+                combined_schema[eq_exprs[0].0].ty,
+                spg_storage::DataType::BigInt
+                    | spg_storage::DataType::Int
+                    | spg_storage::DataType::SmallInt
+            )
+            && int_only_key_expr(eq_exprs[0].1, peer);
+        // The residual set the matching pairs actually re-check: the
+        // int-keyed computed conjunct comes out; everything else stays.
+        let residual: Vec<&Expr> = if int_expr_keyed {
+            residual
+                .iter()
+                .copied()
+                .filter(|r| !core::ptr::eq(*r, eq_exprs[0].2))
+                .collect()
+        } else {
+            residual.to_vec()
+        };
+        let residual = residual.as_slice();
+        let any_int_lane = int_keyed || int_expr_keyed;
         let mut table: hashbrown::HashMap<String, Bucket> =
-            hashbrown::HashMap::with_capacity(if int_keyed { 0 } else { n_rights });
+            hashbrown::HashMap::with_capacity(if any_int_lane { 0 } else { n_rights });
         let mut int_table: hashbrown::HashMap<i64, Bucket> =
-            hashbrown::HashMap::with_capacity(if int_keyed { n_rights } else { 0 });
+            hashbrown::HashMap::with_capacity(if any_int_lane { n_rights } else { 0 });
         // v7.39 (round 590) — a key expression names the peer's own columns
         // and is evaluated against one peer row, so it resolves against the
         // PEER's schema, not the combined one the residual uses.
@@ -1693,13 +1762,29 @@ impl Engine {
             let Some(right) = rights_src.get(ri) else {
                 continue;
             };
-            if int_keyed {
-                let rpos = eq_pairs[0].1;
-                let key = match right.values.get(rpos) {
-                    Some(Value::BigInt(n)) => *n,
-                    Some(Value::Int(n)) => i64::from(*n),
-                    Some(Value::SmallInt(n)) => i64::from(*n),
-                    _ => continue 'build,
+            if any_int_lane {
+                let key = if int_keyed {
+                    let rpos = eq_pairs[0].1;
+                    match right.values.get(rpos) {
+                        Some(Value::BigInt(n)) => *n,
+                        Some(Value::Int(n)) => i64::from(*n),
+                        Some(Value::SmallInt(n)) => i64::from(*n),
+                        _ => continue 'build,
+                    }
+                } else {
+                    // Computed integer key: evaluate against the peer
+                    // row. NULL joins nothing (SQL `=`); any non-integer
+                    // value cannot happen under `int_only_key_expr`, and
+                    // an arithmetic error (overflow) propagates, as it
+                    // does on every other evaluation path.
+                    match eval::eval_expr(eq_exprs[0].1, right, &peer_ctx)
+                        .map_err(EngineError::Eval)?
+                    {
+                        Value::BigInt(n) => n,
+                        Value::Int(n) => i64::from(n),
+                        Value::SmallInt(n) => i64::from(n),
+                        _ => continue 'build,
+                    }
                 };
                 // v7.37.x (docker-fair NOTEX hash-build attack) — most
                 // FK-to-PK joins are unique on the build side, so the
@@ -1728,7 +1813,7 @@ impl Engine {
             // the probe will read them. A NULL never matches under `=`, so a
             // row whose key expression is NULL joins nothing and is left out
             // of the table entirely.
-            for (_, e) in eq_exprs {
+            for (_, e, _) in eq_exprs {
                 let v = eval::eval_expr(e, right, &peer_ctx).map_err(EngineError::Eval)?;
                 if matches!(v, Value::Null) {
                     continue 'build;
@@ -1758,8 +1843,8 @@ impl Engine {
             cancel.check()?;
             let mut left_matched = false;
             let mut left_has_null = false;
-            let int_probe_key: Option<i64> = if int_keyed {
-                let lpos = eq_pairs[0].0;
+            let int_probe_key: Option<i64> = if any_int_lane {
+                let lpos = if int_keyed { eq_pairs[0].0 } else { eq_exprs[0].0 };
                 match tuple_value(&pipe.sources, &pipe.offsets, tuple, lpos) {
                     Some(Value::BigInt(n)) => Some(*n),
                     Some(Value::Int(n)) => Some(i64::from(*n)),
@@ -1782,7 +1867,7 @@ impl Engine {
                 }
                 if !left_has_null {
                     aggregate::encode_key_refs_into(&probebuf, &mut keystr);
-                    for (lpos, _) in eq_exprs {
+                    for (lpos, _, _) in eq_exprs {
                         match tuple_value(&pipe.sources, &pipe.offsets, tuple, *lpos) {
                             Some(v) if !matches!(v, Value::Null) => aggregate::push_canonical_key(&mut keystr, v),
                             _ => {
@@ -1796,7 +1881,7 @@ impl Engine {
             };
             let cands_opt: Option<&Bucket> = if left_has_null {
                 None
-            } else if int_keyed {
+            } else if any_int_lane {
                 int_table.get(&int_probe_key.unwrap())
             } else {
                 table.get(keystr.as_str())
