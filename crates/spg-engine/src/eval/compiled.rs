@@ -1376,6 +1376,16 @@ fn is_pure_scalar_function(name: &str) -> bool {
                 // their arguments (JSON's number/text rendering is fixed
                 // by the format, not the session's RenderStyle — probed
                 // against the ::JSONB cast lane, already whitelisted).
+                // v7.39 (round 730) — the digest family: pure bytes-in,
+                // hex/bytea-out. count(md5(s)) was the panel's last
+                // serial-lane text cell (2.37×): the hash itself is
+                // ~40% faster than PG's per call here, and ALL of the
+                // loss was the missing parallel lane.
+                | "md5"
+                | "sha224"
+                | "sha256"
+                | "sha384"
+                | "sha512"
                 | "jsonb_build_object"
                 | "json_build_object"
                 | "jsonb_build_array"

@@ -4597,12 +4597,18 @@ fn apply_function_dispatch(
             let mut h = Md5::new();
             h.update(input);
             let digest = h.finalize();
-            let mut hex = alloc::string::String::with_capacity(32);
+            // v7.39 (round 730) — nibble table, not write!(): the fmt
+            // machinery cost more than the hash's own finalisation on
+            // the 500k panel scan.
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut hex = alloc::vec::Vec::with_capacity(32);
             for b in digest.iter() {
-                use core::fmt::Write;
-                let _ = write!(hex, "{b:02x}");
+                hex.push(HEX[(b >> 4) as usize]);
+                hex.push(HEX[(b & 0xf) as usize]);
             }
-            Ok(Value::text(hex))
+            Ok(Value::text(
+                alloc::string::String::from_utf8(hex).expect("hex is ascii"),
+            ))
         }
         // v7.37.17 (17.6 siblings) — MySQL TO_BASE64 / FROM_BASE64.
         // MySQL wraps the encoded form at 76 chars per line; the
