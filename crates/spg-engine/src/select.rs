@@ -10631,6 +10631,7 @@ pub(crate) fn expr_contains_builtin_srf(e: &spg_sql::ast::Expr) -> bool {
 /// single-element `unnest`, against 0 for the same scan without one — 211 MB
 /// where the plain scan took 4.3 — and the shape held whatever the array
 /// contained, which is what invariant work looks like.
+#[derive(Clone)]
 struct SrfPlan {
     /// The lifted SRF calls, in slot order.
     nodes: alloc::vec::Vec<spg_sql::ast::Expr>,
@@ -10737,6 +10738,67 @@ fn expand_projection_srfs(
     // rewritten projection trees and the extended schema, 50k times on
     // the panel's unnest cell.
     let mut plan = build_srf_plan(engine, projection, srf_idxs, ctx)?;
+    // v7.39 (round 733) — shard the expansion. Each shard clones the
+    // plan (its ext_cols slot types are per-row mutable) and builds a
+    // MINIMAL context — EvalContext is not Sync — which is sound only
+    // when every expression involved is pure: the whole projection and
+    // every SRF argument must be fully_compilable, or the row loop
+    // stays serial with the full session context.
+    // The projection is judged in its REWRITTEN form — the SRF call
+    // itself is never compilable, but after the lift it is a plain
+    // `__srf_N` column reference.
+    let all_pure = projection
+        .iter()
+        .enumerate()
+        .all(|(i, p)| {
+            eval::fully_compilable(plan.rewritten[i].as_ref().unwrap_or(&p.expr))
+        })
+        && plan.nodes.iter().all(|n| match n {
+            Expr::FunctionCall { args, .. } => args.iter().all(eval::fully_compilable),
+            other => eval::fully_compilable(other),
+        });
+    if all_pure
+        && filtered.len() >= crate::PARALLEL_MIN_ROWS / 5
+        && let Some(r) = engine.parallel_runner.0.as_deref()
+    {
+        let n_shards = (filtered.len() / (crate::PARALLEL_MIN_ROWS / 5)).clamp(2, 8);
+        let chunk = filtered.len().div_ceil(n_shards);
+        type ShardOut = Result<(Vec<Row<'static>>, Vec<usize>), EngineError>;
+        let schema_cols = ctx.columns;
+        let alias = ctx.table_alias;
+        let mysql = ctx.mysql_dialect;
+        let style = ctx.render_style;
+        let plan_ref = &plan;
+        let results = r.run_shards(n_shards, &|si| {
+            let lo = si * chunk;
+            let hi = ((si + 1) * chunk).min(filtered.len());
+            let mut sctx = eval::EvalContext::new(schema_cols, alias);
+            sctx.mysql_dialect = mysql;
+            sctx.render_style = style;
+            let mut local_plan = plan_ref.clone();
+            let mut run = || -> ShardOut {
+                let mut o: Vec<Row<'static>> = Vec::with_capacity(hi - lo);
+                let mut sidx: Vec<usize> = Vec::with_capacity(hi - lo);
+                for (i, row) in filtered[lo..hi].iter().enumerate() {
+                    let expanded =
+                        expand_srf_row_with(engine, &mut local_plan, projection, row, &sctx)?;
+                    sidx.extend(core::iter::repeat_n(lo + i, expanded.len()));
+                    o.extend(expanded);
+                }
+                Ok((o, sidx))
+            };
+            alloc::boxed::Box::new(run())
+        });
+        for boxed in results {
+            let shard = boxed
+                .downcast::<ShardOut>()
+                .expect("runner echoes the closure's box");
+            let (o, sidx) = (*shard)?;
+            out.extend(o);
+            src.extend(sidx);
+        }
+        return Ok((out, src));
+    }
     for (i, row) in filtered.iter().enumerate() {
         let expanded = expand_srf_row_with(engine, &mut plan, projection, row, ctx)?;
         src.extend(core::iter::repeat_n(i, expanded.len()));
