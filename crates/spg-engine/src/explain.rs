@@ -1198,6 +1198,9 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
                     spg_sql::ast::JoinKind::Left => (" Left", true),
                     spg_sql::ast::JoinKind::Right => (" Right", true),
                     spg_sql::ast::JoinKind::FullOuter => (" Full", true),
+                    // v7.39 (round 725) — PG's plan node name for the
+                    // EXISTS pull-up's join.
+                    spg_sql::ast::JoinKind::Semi => (" Semi", true),
                     spg_sql::ast::JoinKind::Cross => ("", true),
                 };
                 let is_eq_join = j

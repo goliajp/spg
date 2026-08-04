@@ -2975,9 +2975,11 @@ impl Engine {
                     (Expr::Column(a), Expr::Column(b)) if is_inner(b) && is_outer(a) => {
                         Some((b.name.clone(), Expr::Column(a.clone())))
                     }
+                    // v7.39 (round 725) — the `negated`-only restriction is
+                    // gone: positive EXISTS pulls up as a true SEMI join now,
+                    // so a computed key no longer risks row multiplication.
                     (Expr::Column(a), e)
-                        if negated
-                            && is_inner(a)
+                        if is_inner(a)
                             && !matches!(e, Expr::Column(_))
                             && inner_col_is_int(&a.name)
                             && outer_int_only_expr(e, outer_aliases, outer_tables, self) =>
@@ -2985,8 +2987,7 @@ impl Engine {
                         Some((a.name.clone(), e.clone()))
                     }
                     (e, Expr::Column(a))
-                        if negated
-                            && is_inner(a)
+                        if is_inner(a)
                             && !matches!(e, Expr::Column(_))
                             && inner_col_is_int(&a.name)
                             && outer_int_only_expr(e, outer_aliases, outer_tables, self) =>
@@ -3021,26 +3022,14 @@ impl Engine {
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return None;
         }
-        // EXISTS (semi-join) requires uniqueness on EVERY inner key so
-        // the INNER JOIN can't multiply outer rows when more than one
-        // inner row matches the tuple. NOT EXISTS (anti-join) uses
-        // LEFT + IS NULL and is safe regardless of inner key uniqueness:
-        // duplicate inner matches collapse into "matched" for the
-        // anti-join probe.
-        if !negated {
-            // For multi-col EXISTS today we conservatively require each
-            // inner column to carry a single-column UNIQUE / PRIMARY KEY
-            // — the join cardinality guarantee is per-column. A truer
-            // composite-unique gate could relax this; the prod hot
-            // path (mailrs) is negated so deferring is safe.
-            for (k, _) in &corr_pairs {
-                if !self.column_is_single_unique(&inner_table, k) {
-                    EXISTS_PULLUP_BAIL_UNIQUE_KEY_MISSING
-                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    return None;
-                }
-            }
-        }
+        // v7.39 (round 725) — EXISTS pulls up as a true SEMI join now
+        // (each outer row keeps at most one pairing), so the uniqueness
+        // gate that guarded the old INNER-join form is gone: an INNER
+        // join multiplies outer rows on duplicate inner matches, a semi
+        // join cannot. That gate was the round-721 ledger's first entry
+        // — the panel's positive-EXISTS cell bailed on it (7.44×, the
+        // inner column carries no declared UNIQUE) and ran the per-row
+        // correlated executor. NOT EXISTS keeps LEFT + IS NULL.
         let fresh = alloc::format!("__exsj_{alias_n}");
         // Build the ON conjunction: every (inner_key = outer_col) pair
         // joined by AND, then folded with the all-inner residual.
@@ -3071,7 +3060,7 @@ impl Engine {
             kind: if negated {
                 JoinKind::Left
             } else {
-                JoinKind::Inner
+                JoinKind::Semi
             },
             table: TableRef {
                 name: inner_table,

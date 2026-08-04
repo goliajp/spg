@@ -152,3 +152,42 @@ fn round721_not_exists_computed_key_pulls_up() {
         assert_eq!(one(&mut e, sql), want, "{sql}");
     }
 }
+
+/// v7.39 (round 725) — positive EXISTS pulls up as a true SEMI join
+/// (`JoinKind::Semi`: each outer row keeps at most one pairing), which
+/// retires the round-721 uniqueness gate — an INNER join multiplied
+/// outer rows on duplicate inner matches, a semi join cannot. The
+/// duplicate-heavy shapes here are the exact multiplication trap:
+/// g = id % 3 has ~33 duplicates per value, and no column carries a
+/// declared UNIQUE. All PG18-measured (round-725 differential, 8/8).
+#[test]
+fn round725_exists_semi_join_never_multiplies() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        // Duplicate-bucket probe: every a.id <= 97 has b.id = a.id + 3.
+        (
+            "SELECT count(*) FROM j719 a WHERE EXISTS              (SELECT 1 FROM j719 b WHERE b.id = a.id + 3)",
+            "97",
+        ),
+        // Massive-duplicate inner key (b.g: 33 rows per value): the
+        // count must be the OUTER row count, not the pairing count.
+        (
+            "SELECT count(*) FROM j719 a WHERE EXISTS              (SELECT 1 FROM j719 b WHERE b.g = a.g) AND a.id <= 10",
+            "10",
+        ),
+        // Computed key + all-inner residual, positive form (the lifted
+        // round-721 restriction).
+        (
+            "SELECT count(*) FROM j719 a WHERE EXISTS              (SELECT 1 FROM j719 b WHERE b.id = a.id + 1 AND b.g = 0)",
+            "33",
+        ),
+        // Values, not just counts.
+        (
+            "SELECT sum(a.id) FROM j719 a WHERE EXISTS              (SELECT 1 FROM j719 b WHERE b.id = a.id * 2)",
+            "1275",
+        ),
+    ] {
+        assert_eq!(one(&mut e, sql), want, "{sql}");
+    }
+}

@@ -4032,6 +4032,12 @@ pub enum JoinKind {
     /// v7.37.16 — `FULL [OUTER] JOIN`: keep every row from both sides
     /// (LEFT-unmatched → NULL right, RIGHT-unmatched → NULL left).
     FullOuter,
+    /// v7.39 (round 725) — SEMI join: each drive row is kept AT MOST
+    /// once, paired with the first peer row that satisfies the ON. Not
+    /// reachable from SQL — the EXISTS pull-up emits it, which is what
+    /// frees positive EXISTS from the round-721 uniqueness gate (an
+    /// INNER join would multiply the outer rows; a semi join cannot).
+    Semi,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -7473,6 +7479,7 @@ impl fmt::Display for FromClause {
                 JoinKind::Cross => write!(f, " CROSS JOIN {}", j.table)?,
                 JoinKind::Right => write!(f, " RIGHT JOIN {}", j.table)?,
                 JoinKind::FullOuter => write!(f, " FULL OUTER JOIN {}", j.table)?,
+                JoinKind::Semi => write!(f, " SEMI JOIN {}", j.table)?,
             }
             if let Some(on) = &j.on {
                 write!(f, " ON {on}")?;
