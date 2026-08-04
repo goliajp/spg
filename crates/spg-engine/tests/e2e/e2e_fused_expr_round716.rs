@@ -321,3 +321,42 @@ fn round730_digests_answer_as_pg() {
         assert_eq!(row_text(&mut e, sql), want, "{sql}");
     }
 }
+
+/// v7.39 (round 731) — an UNORDERED window partition hash-groups
+/// instead of comparison-sorting 500k rows, and a single bound INT
+/// partition key skips the per-row key Vec + string encode entirely.
+/// Round-731 differential 8/8 byte-same; these pin the per-row window
+/// values whose ROW ORDER the fast path must preserve (the stable sort
+/// kept original order within a partition; so does the hash group).
+#[test]
+fn round731_unordered_window_partitions_answer_as_pg() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        (
+            "SELECT g, id, sum(id) OVER (PARTITION BY g) FROM f716              WHERE id <= 6 ORDER BY id",
+            "1|1|5 / 2|2|7 / 0|3|9 / 1|4|5 / 2|5|7 / 0|6|9",
+        ),
+        // row_number without ORDER BY has NO defined intra-partition
+        // order in SQL; PG18 answers an arbitrary one (its hash plan's).
+        // SPG keeps original row order — one legal answer, pinned for
+        // STABILITY (the hash grouping must preserve what the stable
+        // sort preserved), not for PG-matching.
+        (
+            "SELECT g, id, row_number() OVER (PARTITION BY g) FROM f716              WHERE id <= 9 ORDER BY id",
+            "1|1|1 / 2|2|1 / 0|3|1 / 1|4|2 / 2|5|2 / 0|6|2 / 1|7|3 / 2|8|3 / 0|9|3",
+        ),
+        // Expression partition key (not the INT fast path) still groups.
+        (
+            "SELECT max(m) FROM (SELECT max(id) OVER (PARTITION BY g % 2) m              FROM f716 WHERE id <= 50) q",
+            "50",
+        ),
+        // Ordered windows keep the sorting path.
+        (
+            "SELECT g, id, sum(id) OVER (PARTITION BY g ORDER BY id) FROM f716              WHERE id <= 6 ORDER BY id",
+            "1|1|1 / 2|2|2 / 0|3|3 / 1|4|5 / 2|5|7 / 0|6|9",
+        ),
+    ] {
+        assert_eq!(row_text(&mut e, sql), want, "{sql}");
+    }
+}
