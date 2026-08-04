@@ -236,3 +236,29 @@ fn round727_simple_derived_flattens_and_answers_as_pg() {
     );
     assert!(err.contains("does not exist") || err.contains("not found"), "{err}");
 }
+
+/// v7.39 (round 728) — the JSON constructors join the pure whitelist
+/// (their rendering is fixed by the JSON format, not the session's
+/// RenderStyle), so `count(jsonb_build_object(...))` rides the fused
+/// parallel lane. Round-728 differential: 6/7 byte-same; the 7th is
+/// the ledgered datcollate difference (PG under COLLATE "C" answers
+/// identically, probed).
+#[test]
+fn round728_json_constructors_answer_as_pg() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        ("SELECT count(jsonb_build_object('a', id)) FROM f716", "100"),
+        (
+            "SELECT jsonb_build_object('a', id, 'b', s) FROM f716 WHERE id = 2",
+            "{\"a\": 2, \"b\": \"row2\"}",
+        ),
+        (
+            "SELECT jsonb_build_array(id, s, NULL) FROM f716 WHERE id = 7",
+            "[7, \"row7\", null]",
+        ),
+        ("SELECT json_build_object('x', g) FROM f716 WHERE id = 5", "{\"x\" : 2}"),
+    ] {
+        assert_eq!(row_text(&mut e, sql), want, "{sql}");
+    }
+}
