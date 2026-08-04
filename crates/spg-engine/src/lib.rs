@@ -1324,6 +1324,14 @@ pub struct Engine {
     /// full refresh — never-die, never-stale.
     matview_delta_buf: alloc::collections::BTreeMap<String, Vec<RowChange>>,
     matview_delta_overflow: alloc::collections::BTreeSet<String>,
+    /// v7.39 (round 738, S14/B3 knife 3) — per-view row map: expected
+    /// PHYSICAL length of the view's backing table, plus base-row
+    /// RowId -> view row position. Built only by the maintainable full
+    /// refresh's internal scan (the SQL path cannot see rowids), and
+    /// consulted by the delete/tombstone delta arms. In-memory: restart
+    /// or any length mismatch (a vacuum moved rows) -> full refresh.
+    matview_row_map:
+        alloc::collections::BTreeMap<String, (usize, alloc::collections::BTreeMap<u64, usize>)>,
     /// v7.38 轴 4 — currently-selected SQL isolation level. Set by
     /// `SET TRANSACTION ISOLATION LEVEL …`; read by
     /// `SHOW transaction_isolation`. v7.37.8 implements the
@@ -1553,6 +1561,7 @@ impl Engine {
             matview_maintainable: alloc::collections::BTreeMap::new(),
             matview_delta_buf: alloc::collections::BTreeMap::new(),
             matview_delta_overflow: alloc::collections::BTreeSet::new(),
+            matview_row_map: alloc::collections::BTreeMap::new(),
         }
     }
 
@@ -2016,6 +2025,7 @@ impl Engine {
             matview_maintainable: alloc::collections::BTreeMap::new(),
             matview_delta_buf: alloc::collections::BTreeMap::new(),
             matview_delta_overflow: alloc::collections::BTreeSet::new(),
+            matview_row_map: alloc::collections::BTreeMap::new(),
         }
     }
 
@@ -2147,6 +2157,7 @@ impl Engine {
                     matview_maintainable: alloc::collections::BTreeMap::new(),
                     matview_delta_buf: alloc::collections::BTreeMap::new(),
                     matview_delta_overflow: alloc::collections::BTreeSet::new(),
+                    matview_row_map: alloc::collections::BTreeMap::new(),
                 })
             }
             EnvelopeParse::CrcMismatch { expected, computed } => {

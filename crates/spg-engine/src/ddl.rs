@@ -5577,31 +5577,31 @@ impl Engine {
                 && self.matview_maintainable.contains_key(name)
                 && self.matview_refresh_watermark.contains_key(name)
                 && !self.matview_delta_overflow.contains(name)
-                && self
-                    .matview_delta_buf
-                    .get(name)
-                    .is_some_and(|b| {
-                        !b.is_empty()
-                            && b.iter().all(|c| matches!(c, spg_storage::RowChange::Insert { .. }))
-                    })
+                && self.matview_delta_buf.get(name).is_some_and(|b| !b.is_empty())
             {
                 let buf = self.matview_delta_buf.remove(name).expect("checked above");
-                let applied = self.apply_matview_insert_delta(name, &body, buf)?;
-                let current: alloc::vec::Vec<(String, u64)> = dep_tables
-                    .iter()
-                    .map(|t| {
-                        (
-                            t.clone(),
-                            self.table_change_seq.get(t.as_str()).copied().unwrap_or(0),
-                        )
-                    })
-                    .collect();
-                self.matview_refresh_watermark
-                    .insert(String::from(name), current);
-                return Ok(QueryResult::CommandOk {
-                    affected: applied,
-                    modified_catalog: !self.in_transaction(),
-                });
+                // v7.39 (round 738) — ordered application: Insert /
+                // Delete / Tombstone in ARRIVAL order (an insert later
+                // deleted must land then leave). None = this buffer
+                // cannot be applied (an Update, or no row map where one
+                // is needed) -> the full path below.
+                if let Some(applied) = self.apply_matview_delta_ordered(name, &body, &buf)? {
+                    let current: alloc::vec::Vec<(String, u64)> = dep_tables
+                        .iter()
+                        .map(|t| {
+                            (
+                                t.clone(),
+                                self.table_change_seq.get(t.as_str()).copied().unwrap_or(0),
+                            )
+                        })
+                        .collect();
+                    self.matview_refresh_watermark
+                        .insert(String::from(name), current);
+                    return Ok(QueryResult::CommandOk {
+                        affected: applied,
+                        modified_catalog: !self.in_transaction(),
+                    });
+                }
             }
         }
         // Wipe the existing rows first (PG truncates the matview
@@ -5622,6 +5622,95 @@ impl Engine {
                 modified_catalog: !self.in_transaction(),
             });
         }
+        // v7.39 (round 738, S14/B3 knife 3) — a maintainable view's FULL
+        // refresh scans the base table internally instead of running the
+        // body SQL: same rows (single stored table, pure projection,
+        // pure WHERE — that is what registration means), but each output
+        // row's base RowId is in hand, which is the only place the
+        // delete/tombstone row map can be built. Non-maintainable views
+        // keep the SQL path and carry no map.
+        let internal = if let Some(base) = matview_maintainable_base(&body) {
+            let snap = self.current_snapshot();
+            let t = self.active_catalog().get(&base).ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "materialized view {name:?} base table {base:?} missing"
+                ))
+            })?;
+            let base_cols = t.schema().columns.clone();
+            let alias = body
+                .from
+                .as_ref()
+                .and_then(|f| f.primary.alias.clone())
+                .unwrap_or_else(|| base.clone());
+            let ctx = self.ev_ctx(&base_cols, Some(alias.as_str()));
+            let mut pairs: alloc::vec::Vec<(u64, spg_storage::Row<'static>)> =
+                alloc::vec::Vec::new();
+            let t = self.active_catalog().get(&base).expect("checked above");
+            for (i, row) in t.rows().iter().enumerate() {
+                if !t.is_row_visible(i, &snap) {
+                    continue;
+                }
+                if let Some(w) = &body.where_ {
+                    let cond = eval::eval_expr(w, row, &ctx).map_err(EngineError::Eval)?;
+                    if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
+                        continue;
+                    }
+                }
+                let mut vals = alloc::vec::Vec::with_capacity(body.items.len());
+                for item in &body.items {
+                    let spg_sql::ast::SelectItem::Expr { expr, .. } = item else {
+                        unreachable!("maintainable admits Expr items only");
+                    };
+                    vals.push(eval::eval_expr(expr, row, &ctx).map_err(EngineError::Eval)?);
+                }
+                let rid = t
+                    .rowids()
+                    .get(i)
+                    .copied()
+                    .unwrap_or(spg_storage::row_header::RowId::UNASSIGNED);
+                pairs.push((rid.0, spg_storage::Row::new(vals)));
+            }
+            Some(pairs)
+        } else {
+            None
+        };
+        if let Some(pairs) = internal {
+            let cat = self.active_catalog_mut();
+            let table = cat.get_mut(name).expect("backing table verified above");
+            let mut map: alloc::collections::BTreeMap<u64, usize> =
+                alloc::collections::BTreeMap::new();
+            let affected = pairs.len();
+            for (rid, row) in pairs {
+                table.insert(row).map_err(EngineError::Storage)?;
+                map.insert(rid, table.rows().len() - 1);
+            }
+            let expected = table.rows().len();
+            self.matview_row_map
+                .insert(String::from(name), (expected, map));
+            if let Some(dep_tables) = deps {
+                let current: alloc::vec::Vec<(String, u64)> = dep_tables
+                    .iter()
+                    .map(|t| {
+                        (
+                            t.clone(),
+                            self.table_change_seq.get(t.as_str()).copied().unwrap_or(0),
+                        )
+                    })
+                    .collect();
+                self.matview_refresh_watermark
+                    .insert(String::from(name), current);
+            }
+            self.matview_delta_buf.remove(name);
+            self.matview_delta_overflow.remove(name);
+            if let Some(base) = matview_maintainable_base(&body) {
+                self.matview_maintainable.insert(String::from(name), base);
+            }
+            return Ok(QueryResult::CommandOk {
+                affected,
+                modified_catalog: !self.in_transaction(),
+            });
+        }
+        self.matview_row_map.remove(name);
         let rows = match self.exec_select_cancel(&body, CancelToken::none())? {
             QueryResult::Rows { rows, .. } => rows,
             other => {
@@ -5692,6 +5781,7 @@ impl Engine {
                 self.matview_delta_buf.remove(name);
                 self.matview_delta_overflow.remove(name);
                 self.matview_refresh_watermark.remove(name);
+                self.matview_row_map.remove(name);
                 removed += 1;
             } else if !if_exists {
                 return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
@@ -6402,13 +6492,44 @@ impl Engine {
     /// registered-maintainable single-table pure projection, so each new
     /// base row maps to at most one view row: eval the WHERE (absent =
     /// keep), then each item, against the base row.
-    fn apply_matview_insert_delta(
+    /// v7.39 (round 738) — apply buffered changes in ARRIVAL order.
+    /// `Ok(None)` = this buffer cannot be applied incrementally (an
+    /// Update change; or a delete/tombstone with no valid row map) —
+    /// the caller takes the full path. Inserts run the projection and
+    /// append; deletes and tombstones resolve base RowIds through the
+    /// row map and remove the view rows, keeping the map's positions
+    /// and expected length exact after every step.
+    fn apply_matview_delta_ordered(
         &mut self,
         name: &str,
         body: &spg_sql::ast::SelectStatement,
-        buf: alloc::vec::Vec<spg_storage::RowChange>,
-    ) -> Result<usize, EngineError> {
+        buf: &[spg_storage::RowChange],
+    ) -> Result<Option<usize>, EngineError> {
         use spg_sql::ast::SelectItem;
+        let needs_map = buf
+            .iter()
+            .any(|c| !matches!(c, spg_storage::RowChange::Insert { .. }));
+        if buf
+            .iter()
+            .any(|c| matches!(c, spg_storage::RowChange::Update { .. }))
+        {
+            return Ok(None);
+        }
+        if needs_map {
+            let Some((expected, _)) = self.matview_row_map.get(name) else {
+                return Ok(None);
+            };
+            let live = self
+                .active_catalog()
+                .get(name)
+                .map(|t| t.rows().len())
+                .unwrap_or(usize::MAX);
+            if live != *expected {
+                // A vacuum (or anything else) moved the backing rows.
+                self.matview_row_map.remove(name);
+                return Ok(None);
+            }
+        }
         let base = self
             .matview_maintainable
             .get(name)
@@ -6430,38 +6551,81 @@ impl Engine {
             .as_ref()
             .and_then(|f| f.primary.alias.clone())
             .unwrap_or_else(|| base.clone());
-        let ctx = self.ev_ctx(&base_cols, Some(alias.as_str()));
-        let mut out_rows: alloc::vec::Vec<spg_storage::Row<'static>> = alloc::vec::Vec::new();
-        for ch in &buf {
-            let spg_storage::RowChange::Insert { row, .. } = ch else {
-                unreachable!("caller filtered to Insert-only");
-            };
-            if let Some(w) = &body.where_ {
-                let cond = eval::eval_expr(w, row, &ctx).map_err(EngineError::Eval)?;
-                if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
-                    continue;
+        let mut applied = 0usize;
+        for ch in buf {
+            match ch {
+                spg_storage::RowChange::Insert { row, rowid, .. } => {
+                    let keep = if let Some(w) = &body.where_ {
+                        let ctx = self.ev_ctx(&base_cols, Some(alias.as_str()));
+                        let cond = eval::eval_expr(w, row, &ctx).map_err(EngineError::Eval)?;
+                        crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)?
+                    } else {
+                        true
+                    };
+                    if !keep {
+                        continue;
+                    }
+                    let mut vals = alloc::vec::Vec::with_capacity(body.items.len());
+                    {
+                        let ctx = self.ev_ctx(&base_cols, Some(alias.as_str()));
+                        for item in &body.items {
+                            let SelectItem::Expr { expr, .. } = item else {
+                                unreachable!("registration admits Expr items only");
+                            };
+                            vals.push(
+                                eval::eval_expr(expr, row, &ctx).map_err(EngineError::Eval)?,
+                            );
+                        }
+                    }
+                    let cat = self.active_catalog_mut();
+                    let table = cat.get_mut(name).ok_or_else(|| {
+                        EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
+                            "materialized view {name:?} backing table missing"
+                        )))
+                    })?;
+                    table
+                        .insert(spg_storage::Row::new(vals))
+                        .map_err(EngineError::Storage)?;
+                    let new_pos = table.rows().len() - 1;
+                    if let Some((expected, map)) = self.matview_row_map.get_mut(name) {
+                        map.insert(rowid.0, new_pos);
+                        *expected += 1;
+                    }
+                    applied += 1;
                 }
+                spg_storage::RowChange::Delete { rowids, .. }
+                | spg_storage::RowChange::Tombstone { rowids, .. } => {
+                    for rid in rowids {
+                        let Some((expected, map)) = self.matview_row_map.get_mut(name) else {
+                            unreachable!("needs_map gated above");
+                        };
+                        let Some(pos) = map.remove(&rid.0) else {
+                            // A base row the WHERE filtered out — the
+                            // view never held it; nothing to remove.
+                            continue;
+                        };
+                        for p in map.values_mut() {
+                            if *p > pos {
+                                *p -= 1;
+                            }
+                        }
+                        *expected -= 1;
+                        let cat = self.active_catalog_mut();
+                        let table = cat.get_mut(name).ok_or_else(|| {
+                            EngineError::Storage(spg_storage::StorageError::Corrupt(
+                                alloc::format!(
+                                    "materialized view {name:?} backing table missing"
+                                ),
+                            ))
+                        })?;
+                        table.delete_rows(&[pos]);
+                        applied += 1;
+                    }
+                }
+                spg_storage::RowChange::Update { .. } => unreachable!("gated above"),
             }
-            let mut vals = alloc::vec::Vec::with_capacity(body.items.len());
-            for item in &body.items {
-                let SelectItem::Expr { expr, .. } = item else {
-                    unreachable!("registration admits Expr items only");
-                };
-                vals.push(eval::eval_expr(expr, row, &ctx).map_err(EngineError::Eval)?);
-            }
-            out_rows.push(spg_storage::Row::new(vals));
         }
-        let applied = out_rows.len();
-        let cat = self.active_catalog_mut();
-        let table = cat.get_mut(name).ok_or_else(|| {
-            EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
-                "materialized view {name:?} backing table missing"
-            )))
-        })?;
-        for row in out_rows {
-            table.insert(row).map_err(EngineError::Storage)?;
-        }
-        Ok(applied)
+        Ok(Some(applied))
     }
 }
 
