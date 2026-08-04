@@ -1298,6 +1298,20 @@ pub struct Engine {
     /// Redo captured by the most recent successful mutating `execute`,
     /// awaiting drain by the embedding layer. Cleared on each capture.
     last_redo: Vec<RowChange>,
+    /// v7.39 (round 735, S14/B3) — per-table change sequence, bumped on
+    /// every write entry (INSERT / UPDATE / DELETE / TRUNCATE / COPY /
+    /// table-shape DDL). In-memory only: after a restart the map is
+    /// empty, every watermark comparison misses, and the next REFRESH
+    /// is a full one — stale-view-safe by construction. A rolled-back
+    /// transaction's bump stays too, which can only cause an EXTRA full
+    /// refresh, never a wrong no-op.
+    table_change_seq: alloc::collections::BTreeMap<String, u64>,
+    /// v7.39 (round 735, S14/B3) — per-materialized-view refresh
+    /// watermark: the (table, change-seq) pairs its last full refresh
+    /// saw. When every dependency's seq is unchanged, REFRESH is an
+    /// O(1) no-op — an incremental-maintenance first step PG does not
+    /// have (its REFRESH always recomputes).
+    matview_refresh_watermark: alloc::collections::BTreeMap<String, Vec<(String, u64)>>,
     /// v7.38 轴 4 — currently-selected SQL isolation level. Set by
     /// `SET TRANSACTION ISOLATION LEVEL …`; read by
     /// `SHOW transaction_isolation`. v7.37.8 implements the
@@ -1522,6 +1536,8 @@ impl Engine {
             redo_capture: false,
             current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
             last_redo: Vec::new(),
+            table_change_seq: alloc::collections::BTreeMap::new(),
+            matview_refresh_watermark: alloc::collections::BTreeMap::new(),
         }
     }
 
@@ -1980,6 +1996,8 @@ impl Engine {
             redo_capture: false,
             current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
             last_redo: Vec::new(),
+            table_change_seq: alloc::collections::BTreeMap::new(),
+            matview_refresh_watermark: alloc::collections::BTreeMap::new(),
         }
     }
 
@@ -2106,6 +2124,8 @@ impl Engine {
                     redo_capture: false,
                     current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
                     last_redo: Vec::new(),
+                    table_change_seq: alloc::collections::BTreeMap::new(),
+                    matview_refresh_watermark: alloc::collections::BTreeMap::new(),
                 })
             }
             EnvelopeParse::CrcMismatch { expected, computed } => {
@@ -2665,6 +2685,14 @@ impl Engine {
     /// (drained via [`Engine::take_redo`]). Off = zero capture overhead.
     pub fn set_redo_capture(&mut self, on: bool) {
         self.redo_capture = on;
+    }
+
+    /// v7.39 (round 735, S14/B3) — record that `table`'s rows (or shape)
+    /// changed. Cheap (one BTreeMap bump), called from every write entry;
+    /// the materialized-view refresh watermark reads it.
+    pub(crate) fn bump_table_change(&mut self, table: &str) {
+        let k = table.to_ascii_lowercase();
+        *self.table_change_seq.entry(k).or_insert(0) += 1;
     }
 
     /// v7.37.8 — read accessor for tests / observability. The

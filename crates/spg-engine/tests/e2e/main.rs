@@ -188,6 +188,7 @@ mod e2e_alter_collate_round713;
 mod e2e_fused_expr_round716;
 mod e2e_join_expr_key_round719;
 mod e2e_cast_plain_round722;
+mod e2e_matview_watermark_round735;
 mod e2e_collate_explicit_round691;
 mod e2e_collate_minmax_round690;
 mod e2e_collate_order_round688;

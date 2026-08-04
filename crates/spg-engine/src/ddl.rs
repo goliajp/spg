@@ -110,6 +110,9 @@ impl Engine {
         // applied stay (no transactional rollback in v7.13 — wrap in
         // BEGIN/COMMIT if atomicity matters).
         let table_name = s.name.clone();
+        // v7.39 (round 735, S14/B3) — any table-shape change invalidates
+        // a dependent materialized view's refresh watermark.
+        self.bump_table_change(&table_name);
         for target in s.targets {
             self.exec_alter_table_subaction(&table_name, target)?;
         }
@@ -5510,6 +5513,51 @@ impl Engine {
                 }));
             }
         };
+        let parsed = spg_sql::parser::parse_statement(&source).map_err(|e| {
+            EngineError::Unsupported(alloc::format!(
+                "materialized view {name:?} body re-parse failed: {e}"
+            ))
+        })?;
+        let Statement::Select(body) = parsed else {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "materialized view {name:?} body is not a SELECT (catalog corruption)"
+            )));
+        };
+        // v7.39 (round 735, S14/B3) — the refresh watermark. When the
+        // body's FULL dependency set is provable (plain stored tables
+        // only — any CTE / union / subquery / expression source makes
+        // the collector answer None) and no dependency's change
+        // sequence moved since the last refresh, this REFRESH is an
+        // O(1) no-op with an identical observable result. PG recomputes
+        // unconditionally — this is the incremental-maintenance first
+        // step its architecture doesn't have. WITH NO DATA never
+        // no-ops (its contract is to EMPTY the view).
+        let deps = if with_data {
+            matview_dep_tables(&body)
+        } else {
+            None
+        };
+        if let Some(dep_tables) = &deps {
+            let current: alloc::vec::Vec<(String, u64)> = dep_tables
+                .iter()
+                .map(|t| {
+                    (
+                        t.clone(),
+                        self.table_change_seq.get(t.as_str()).copied().unwrap_or(0),
+                    )
+                })
+                .collect();
+            if self
+                .matview_refresh_watermark
+                .get(name)
+                .is_some_and(|last| *last == current)
+            {
+                return Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                });
+            }
+        }
         // Wipe the existing rows first (PG truncates the matview
         // and rebuilds; we approximate with an empty INSERT loop).
         {
@@ -5522,21 +5570,12 @@ impl Engine {
             table.truncate();
         }
         if !with_data {
+            self.matview_refresh_watermark.remove(name);
             return Ok(QueryResult::CommandOk {
                 affected: 0,
                 modified_catalog: !self.in_transaction(),
             });
         }
-        let parsed = spg_sql::parser::parse_statement(&source).map_err(|e| {
-            EngineError::Unsupported(alloc::format!(
-                "materialized view {name:?} body re-parse failed: {e}"
-            ))
-        })?;
-        let Statement::Select(body) = parsed else {
-            return Err(EngineError::Unsupported(alloc::format!(
-                "materialized view {name:?} body is not a SELECT (catalog corruption)"
-            )));
-        };
         let rows = match self.exec_select_cancel(&body, CancelToken::none())? {
             QueryResult::Rows { rows, .. } => rows,
             other => {
@@ -5550,6 +5589,24 @@ impl Engine {
         let affected = rows.len();
         for row in rows {
             table.insert(row).map_err(EngineError::Storage)?;
+        }
+        // v7.39 (round 735, S14/B3) — record what this full refresh saw.
+        // Re-read the sequences AFTER the recompute: a write that landed
+        // mid-refresh moves a seq past what we record only if it came
+        // first (single-writer engine), so recording the pre-read values
+        // could mask it; the post-read cannot.
+        if let Some(dep_tables) = deps {
+            let current: alloc::vec::Vec<(String, u64)> = dep_tables
+                .iter()
+                .map(|t| {
+                    (
+                        t.clone(),
+                        self.table_change_seq.get(t.as_str()).copied().unwrap_or(0),
+                    )
+                })
+                .collect();
+            self.matview_refresh_watermark
+                .insert(String::from(name), current);
         }
         Ok(QueryResult::CommandOk {
             affected,
@@ -6267,4 +6324,66 @@ fn pg_signature_type_name(raw: &str) -> alloc::string::String {
         _ => return raw.into(),
     };
     alloc::format!("pg_catalog.{internal}")
+}
+
+/// v7.39 (round 735, S14/B3) — the FULL set of stored tables a
+/// materialized-view body reads, or `None` when that set cannot be
+/// PROVEN (CTEs, unions, subqueries anywhere, any non-table FROM
+/// source, a join whose ON carries a subquery…). `None` means "always
+/// refresh fully" — the conservative direction; an under-collected set
+/// here would be a WRONG no-op serving stale data, so every uncertain
+/// shape bails.
+fn matview_dep_tables(
+    stmt: &spg_sql::ast::SelectStatement,
+) -> Option<alloc::collections::BTreeSet<String>> {
+    use spg_sql::ast::SelectItem;
+    if !stmt.ctes.is_empty() || !stmt.unions.is_empty() {
+        return None;
+    }
+    let from = stmt.from.as_ref()?;
+    let mut out = alloc::collections::BTreeSet::new();
+    let mut take = |t: &spg_sql::ast::TableRef| -> bool {
+        if t.name.is_empty()
+            || t.lateral_subquery.is_some()
+            || t.unnest_expr.is_some()
+            || t.generate_series_args.is_some()
+            || t.as_of_segment.is_some()
+            || t.jsonb_each_text_arg.is_some()
+            || t.table_fn_call.is_some()
+            || t.rows_from.is_some()
+            || t.json_table.is_some()
+        {
+            return false;
+        }
+        out.insert(t.name.to_ascii_lowercase());
+        true
+    };
+    if !take(&from.primary) {
+        return None;
+    }
+    for j in &from.joins {
+        if !take(&j.table) {
+            return None;
+        }
+        if j.on.as_ref().is_some_and(crate::expr_has_subquery) {
+            return None;
+        }
+    }
+    let any_sub = stmt.items.iter().any(|i| match i {
+        SelectItem::Expr { expr, .. } => crate::expr_has_subquery(expr),
+        _ => false,
+    }) || stmt.where_.as_ref().is_some_and(crate::expr_has_subquery)
+        || stmt
+            .group_by
+            .as_ref()
+            .is_some_and(|gs| gs.iter().any(crate::expr_has_subquery))
+        || stmt.having.as_ref().is_some_and(crate::expr_has_subquery)
+        || stmt
+            .order_by
+            .iter()
+            .any(|o| crate::expr_has_subquery(&o.expr));
+    if any_sub {
+        return None;
+    }
+    Some(out)
 }
