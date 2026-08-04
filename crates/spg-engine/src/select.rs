@@ -331,6 +331,59 @@ impl Engine {
                 .collect();
             let mut indexed: Vec<(Vec<Value<'static>>, Vec<(Value, bool, Option<bool>)>, usize)> =
                 Vec::with_capacity(n_rows);
+            // v7.39 (round 731) — single bound INT partition key, no window
+            // ORDER BY: group on the i64 directly. The generic build paid
+            // two heap Vecs per row (pkey + empty okey) plus a canonical
+            // string encode per row just to bucket 500k rows into 100
+            // groups; the whole per-row key apparatus disappears here.
+            // Neither key Vec is read downstream on this path: the hash
+            // grouping replaces partition_key_cmp, and okey is empty by
+            // construction.
+            let int_pkey_fast = order_by.is_empty()
+                && partition_by.len() == 1
+                && p_bound[0].is_some_and(|pos| {
+                    matches!(
+                        schema_cols.get(pos).map(|c| c.ty),
+                        Some(
+                            spg_storage::DataType::Int
+                                | spg_storage::DataType::BigInt
+                                | spg_storage::DataType::SmallInt
+                        )
+                    )
+                });
+            if int_pkey_fast {
+                let pos = p_bound[0].expect("gated bound");
+                let mut slot: hashbrown::HashMap<Option<i64>, usize> = hashbrown::HashMap::new();
+                let mut groups: Vec<Vec<usize>> = Vec::new();
+                for (i, row) in filtered.iter().enumerate() {
+                    let k: Option<i64> = match row.values.get(pos) {
+                        Some(Value::BigInt(n)) => Some(*n),
+                        Some(Value::Int(n)) => Some(i64::from(*n)),
+                        Some(Value::SmallInt(n)) => Some(i64::from(*n)),
+                        _ => None,
+                    };
+                    match slot.get(&k) {
+                        Some(&gi) => groups[gi].push(i),
+                        None => {
+                            slot.insert(k, groups.len());
+                            groups.push(alloc::vec![i]);
+                        }
+                    }
+                }
+                // The downstream partition-boundary scan compares pkeys
+                // of ADJACENT entries, so the key must ride along — one
+                // single-element Vec per row (half the generic build's
+                // allocations, no string encode).
+                for g in groups {
+                    for i in g {
+                        let k: Value<'static> = match filtered[i].values.get(pos) {
+                            Some(v) => v.clone(),
+                            None => Value::Null,
+                        };
+                        indexed.push((alloc::vec![k], Vec::new(), i));
+                    }
+                }
+            } else {
             for (i, row) in filtered.iter().enumerate() {
                 let pkey: Vec<Value<'static>> = partition_by
                     .iter()
@@ -364,15 +417,50 @@ impl Engine {
                     .collect::<Result<_, _>>()?;
                 indexed.push((pkey, okey, i));
             }
+            }
             // Sort by (partition_key, order_key). Partition key uses
             // a stable encoded form; order key respects ASC/DESC.
-            indexed.sort_by(|a, b| {
-                let p_cmp = partition_key_cmp(&a.0, &b.0);
-                if p_cmp != core::cmp::Ordering::Equal {
-                    return p_cmp;
+            // v7.39 (round 731) — with NO window ORDER BY the sort's only
+            // job was putting same-partition rows next to each other, and a
+            // 500k-row comparison sort is a spectacular way to hash-group:
+            // the panel's `sum(id) OVER (PARTITION BY g)` spent ~100 ms
+            // here. Group by encoded key instead, preserving row order
+            // inside each group — exactly what the stable sort preserved,
+            // so every function (row_number included) answers the same.
+            if int_pkey_fast {
+                // Already grouped above; same-partition rows are adjacent
+                // in original row order.
+            } else if order_by.is_empty() && !partition_by.is_empty() {
+                let mut slot: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
+                let mut groups: Vec<
+                    Vec<(Vec<Value<'static>>, Vec<(Value, bool, Option<bool>)>, usize)>,
+                > = Vec::new();
+                let mut keybuf = String::new();
+                for entry in indexed.drain(..) {
+                    keybuf.clear();
+                    for v in &entry.0 {
+                        crate::aggregate::push_canonical_key(&mut keybuf, v);
+                    }
+                    match slot.get(keybuf.as_str()) {
+                        Some(&gi) => groups[gi].push(entry),
+                        None => {
+                            slot.insert(keybuf.clone(), groups.len());
+                            groups.push(alloc::vec![entry]);
+                        }
+                    }
                 }
-                crate::window::order_key_cmp_in(&a.1, &b.1, &o_colls)
-            });
+                for g in groups {
+                    indexed.extend(g);
+                }
+            } else {
+                indexed.sort_by(|a, b| {
+                    let p_cmp = partition_key_cmp(&a.0, &b.0);
+                    if p_cmp != core::cmp::Ordering::Equal {
+                        return p_cmp;
+                    }
+                    crate::window::order_key_cmp_in(&a.1, &b.1, &o_colls)
+                });
+            }
             // Per-partition compute.
             let mut out_vals: Vec<Value<'static>> = alloc::vec![Value::Null; n_rows];
             let mut p_start = 0;
