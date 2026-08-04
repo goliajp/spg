@@ -5473,6 +5473,12 @@ impl Engine {
         // a real MATERIALIZED VIEW gets a registry entry (and REFRESH support).
         if !s.as_plain_table {
             cat.register_materialized_view(s.name.clone(), body_repr);
+            // v7.39 (round 737, S14/B3) — register for delta maintenance
+            // when the body qualifies; the fan-out starts buffering from
+            // the next statement on.
+            if let Some(base) = matview_maintainable_base(&s.body) {
+                self.matview_maintainable.insert(s.name.clone(), base);
+            }
         }
         Ok(QueryResult::CommandOk {
             affected: 0,
@@ -5557,6 +5563,46 @@ impl Engine {
                     modified_catalog: false,
                 });
             }
+            // v7.39 (round 737, S14/B3 knife 2) — INSERT-ONLY delta
+            // application. The base changed; if this view is registered
+            // maintainable, has a watermark (i.e. its buffer covers
+            // everything since the last full refresh), did not
+            // overflow, and every buffered change is an Insert, the new
+            // rows run through the projection and APPEND — no truncate,
+            // no rescan. Any delete / update / tombstone in the buffer
+            // falls back to the full path this round (their row-map
+            // machinery is the next knife). Either way the watermark
+            // and buffer reset below.
+            if with_data
+                && self.matview_maintainable.contains_key(name)
+                && self.matview_refresh_watermark.contains_key(name)
+                && !self.matview_delta_overflow.contains(name)
+                && self
+                    .matview_delta_buf
+                    .get(name)
+                    .is_some_and(|b| {
+                        !b.is_empty()
+                            && b.iter().all(|c| matches!(c, spg_storage::RowChange::Insert { .. }))
+                    })
+            {
+                let buf = self.matview_delta_buf.remove(name).expect("checked above");
+                let applied = self.apply_matview_insert_delta(name, &body, buf)?;
+                let current: alloc::vec::Vec<(String, u64)> = dep_tables
+                    .iter()
+                    .map(|t| {
+                        (
+                            t.clone(),
+                            self.table_change_seq.get(t.as_str()).copied().unwrap_or(0),
+                        )
+                    })
+                    .collect();
+                self.matview_refresh_watermark
+                    .insert(String::from(name), current);
+                return Ok(QueryResult::CommandOk {
+                    affected: applied,
+                    modified_catalog: !self.in_transaction(),
+                });
+            }
         }
         // Wipe the existing rows first (PG truncates the matview
         // and rebuilds; we approximate with an empty INSERT loop).
@@ -5608,6 +5654,17 @@ impl Engine {
             self.matview_refresh_watermark
                 .insert(String::from(name), current);
         }
+        // v7.39 (round 737) — a full refresh resets the delta machinery:
+        // stale buffered changes are superseded, overflow clears, and
+        // (re)registration keeps a view maintainable across restarts,
+        // where CREATE never re-runs.
+        self.matview_delta_buf.remove(name);
+        self.matview_delta_overflow.remove(name);
+        if let Some(base) = matview_maintainable_base(&body) {
+            self.matview_maintainable.insert(String::from(name), base);
+        } else {
+            self.matview_maintainable.remove(name);
+        }
         Ok(QueryResult::CommandOk {
             affected,
             modified_catalog: !self.in_transaction(),
@@ -5629,6 +5686,12 @@ impl Engine {
             if was_present {
                 // Drop the backing table too.
                 self.active_catalog_mut().drop_table(name);
+                // v7.39 (round 737, S14/B3) — retire every maintenance
+                // structure with the view.
+                self.matview_maintainable.remove(name);
+                self.matview_delta_buf.remove(name);
+                self.matview_delta_overflow.remove(name);
+                self.matview_refresh_watermark.remove(name);
                 removed += 1;
             } else if !if_exists {
                 return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
@@ -6333,6 +6396,118 @@ fn pg_signature_type_name(raw: &str) -> alloc::string::String {
 /// refresh fully" — the conservative direction; an under-collected set
 /// here would be a WRONG no-op serving stale data, so every uncertain
 /// shape bails.
+impl Engine {
+    /// v7.39 (round 737, S14/B3 knife 2) — run buffered INSERTs through
+    /// the view's projection and append the survivors. The body is a
+    /// registered-maintainable single-table pure projection, so each new
+    /// base row maps to at most one view row: eval the WHERE (absent =
+    /// keep), then each item, against the base row.
+    fn apply_matview_insert_delta(
+        &mut self,
+        name: &str,
+        body: &spg_sql::ast::SelectStatement,
+        buf: alloc::vec::Vec<spg_storage::RowChange>,
+    ) -> Result<usize, EngineError> {
+        use spg_sql::ast::SelectItem;
+        let base = self
+            .matview_maintainable
+            .get(name)
+            .cloned()
+            .expect("caller checked registration");
+        let base_cols = self
+            .active_catalog()
+            .get(&base)
+            .ok_or_else(|| {
+                EngineError::Unsupported(alloc::format!(
+                    "materialized view {name:?} base table {base:?} missing"
+                ))
+            })?
+            .schema()
+            .columns
+            .clone();
+        let alias = body
+            .from
+            .as_ref()
+            .and_then(|f| f.primary.alias.clone())
+            .unwrap_or_else(|| base.clone());
+        let ctx = self.ev_ctx(&base_cols, Some(alias.as_str()));
+        let mut out_rows: alloc::vec::Vec<spg_storage::Row<'static>> = alloc::vec::Vec::new();
+        for ch in &buf {
+            let spg_storage::RowChange::Insert { row, .. } = ch else {
+                unreachable!("caller filtered to Insert-only");
+            };
+            if let Some(w) = &body.where_ {
+                let cond = eval::eval_expr(w, row, &ctx).map_err(EngineError::Eval)?;
+                if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
+                    continue;
+                }
+            }
+            let mut vals = alloc::vec::Vec::with_capacity(body.items.len());
+            for item in &body.items {
+                let SelectItem::Expr { expr, .. } = item else {
+                    unreachable!("registration admits Expr items only");
+                };
+                vals.push(eval::eval_expr(expr, row, &ctx).map_err(EngineError::Eval)?);
+            }
+            out_rows.push(spg_storage::Row::new(vals));
+        }
+        let applied = out_rows.len();
+        let cat = self.active_catalog_mut();
+        let table = cat.get_mut(name).ok_or_else(|| {
+            EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
+                "materialized view {name:?} backing table missing"
+            )))
+        })?;
+        for row in out_rows {
+            table.insert(row).map_err(EngineError::Storage)?;
+        }
+        Ok(applied)
+    }
+}
+
+/// v7.39 (round 737, S14/B3 knife 2) — the base table of a
+/// DELTA-MAINTAINABLE view body, or None. Strictly narrower than
+/// `matview_dep_tables`: ONE stored table, pure projection items, a
+/// pure WHERE, and none of the shapes whose delta is not row-local
+/// (aggregates / GROUP BY / DISTINCT [ON] / ORDER / LIMIT / OFFSET /
+/// windows / SRFs — plus everything the dep collector already bails
+/// on). Anything outside refreshes fully, as today.
+fn matview_maintainable_base(stmt: &spg_sql::ast::SelectStatement) -> Option<String> {
+    use spg_sql::ast::SelectItem;
+    let deps = matview_dep_tables(stmt)?;
+    if deps.len() != 1 {
+        return None;
+    }
+    if stmt.distinct
+        || !stmt.distinct_on.is_empty()
+        || stmt.group_by.is_some()
+        || stmt.group_by_all
+        || stmt.having.is_some()
+        || !stmt.order_by.is_empty()
+        || stmt.limit.is_some()
+        || stmt.offset.is_some()
+        || !stmt.window_check_exprs.is_empty()
+        || crate::aggregate::uses_aggregate(stmt)
+        || crate::window::select_has_window(stmt)
+    {
+        return None;
+    }
+    for item in &stmt.items {
+        let SelectItem::Expr { expr, .. } = item else {
+            return None;
+        };
+        if !crate::eval::fully_compilable(expr) || crate::select::expr_contains_builtin_srf(expr) {
+            return None;
+        }
+    }
+    if let Some(w) = &stmt.where_
+        && !crate::eval::fully_compilable(w)
+    {
+        return None;
+    }
+    deps.into_iter().next()
+}
+
 fn matview_dep_tables(
     stmt: &spg_sql::ast::SelectStatement,
 ) -> Option<alloc::collections::BTreeSet<String>> {

@@ -84,3 +84,61 @@ fn round735_a_second_dependency_counts() {
     e.execute("REFRESH MATERIALIZED VIEW mv735").unwrap();
     assert_eq!(one(&mut e, "SELECT sum(s) FROM mv735"), "430");
 }
+
+/// v7.39 (round 737, S14/B3 knife 2) — INSERT-ONLY delta application.
+/// A maintainable view (single stored table, pure projection, pure
+/// WHERE) whose buffered changes are all Inserts refreshes by running
+/// JUST those rows through the projection and appending. Content is
+/// the only witness that matters: every cycle asserts what a full
+/// recompute would produce.
+#[test]
+fn round737_insert_only_delta_matches_full_recompute() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE b737 (id INT, g INT)").unwrap();
+    e.execute("INSERT INTO b737 SELECT gg, gg % 5 FROM generate_series(1, 50) gg")
+        .unwrap();
+    e.execute(
+        "CREATE MATERIALIZED VIEW mv737 AS SELECT id * 10 tenfold, g FROM b737 WHERE g <> 3",
+    )
+    .unwrap();
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv737"), "40");
+    // Insert-only cycle: two kept rows, one filtered by the WHERE.
+    e.execute("INSERT INTO b737 VALUES (51, 1), (52, 3), (53, 4)").unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW mv737").unwrap();
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv737"), "42");
+    assert_eq!(one(&mut e, "SELECT sum(tenfold) FROM mv737 WHERE tenfold > 500"), "1040");
+    // Another insert-only cycle stacks on the first.
+    e.execute("INSERT INTO b737 VALUES (54, 0)").unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW mv737").unwrap();
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv737"), "43");
+    // A DELETE poisons the buffer -> full path, content still exact.
+    e.execute("DELETE FROM b737 WHERE id <= 10").unwrap();
+    e.execute("INSERT INTO b737 VALUES (55, 1)").unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW mv737").unwrap();
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv737"), "36");
+    // And the cycle AFTER a full refresh is insert-only again.
+    e.execute("INSERT INTO b737 VALUES (56, 2)").unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW mv737").unwrap();
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv737"), "37");
+    // Full-recompute cross-check: rebuild from scratch and compare.
+    e.execute("DROP MATERIALIZED VIEW mv737").unwrap();
+    e.execute(
+        "CREATE MATERIALIZED VIEW mv737 AS SELECT id * 10 tenfold, g FROM b737 WHERE g <> 3",
+    )
+    .unwrap();
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv737"), "37");
+}
+
+/// An UPDATE in the buffer must fall back to the full path (its delta
+/// machinery is the next knife) — content stays exact either way.
+#[test]
+fn round737_update_falls_back_to_full() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE b737 (id INT, v INT)").unwrap();
+    e.execute("INSERT INTO b737 VALUES (1, 10), (2, 20)").unwrap();
+    e.execute("CREATE MATERIALIZED VIEW mv737 AS SELECT v FROM b737").unwrap();
+    e.execute("UPDATE b737 SET v = 99 WHERE id = 2").unwrap();
+    e.execute("INSERT INTO b737 VALUES (3, 30)").unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW mv737").unwrap();
+    assert_eq!(one(&mut e, "SELECT sum(v) FROM mv737"), "139");
+}
