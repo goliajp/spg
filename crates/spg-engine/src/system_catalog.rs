@@ -6701,9 +6701,10 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text(conname),
                 Value::BigInt(2200),
                 Value::text::<String>(kind.into()),
-                Value::Bool(false), // condeferrable
-                Value::Bool(false),
-                Value::Bool(true) /* conenforced */, // condeferred
+                // v7.39 (round 711) — real, now that the flags are stored.
+                Value::Bool(uc.deferrable), // condeferrable
+                Value::Bool(uc.initially_deferred), // condeferred
+                Value::Bool(true), // conenforced
                 Value::Bool(true),  // convalidated
                 Value::BigInt(conrelid),
                 Value::BigInt(0),  // contypid

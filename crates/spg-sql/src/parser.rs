@@ -10540,11 +10540,17 @@ impl Parser {
                         self.advance(); // PRIMARY
                         self.expect_keyword_ident("key")?;
                         let cols = self.parse_paren_ident_list("PRIMARY KEY")?;
+                        // v7.39 (round 711) — the ALTER form carries the
+                        // timing too (pg_dump writes it here).
+                        let (deferrable, initially_deferred) =
+                            self.consume_deferrable_clauses_timed()?;
                         return Ok(alloc::vec![
                             crate::ast::AlterTableTarget::AddTableConstraint(
                                 crate::ast::TableConstraint::PrimaryKey {
                                     name: Some(con_name),
                                     columns: cols,
+                                    deferrable,
+                                    initially_deferred,
                                 }
                             )
                         ]);
@@ -10628,11 +10634,15 @@ impl Parser {
                         self.advance();
                         self.expect_keyword_ident("key")?;
                         let cols = self.parse_paren_ident_list("PRIMARY KEY")?;
+                        let (deferrable, initially_deferred) =
+                            self.consume_deferrable_clauses_timed()?;
                         return Ok(alloc::vec![
                             crate::ast::AlterTableTarget::AddTableConstraint(
                                 crate::ast::TableConstraint::PrimaryKey {
                                     name: None,
                                     columns: cols,
+                                    deferrable,
+                                    initially_deferred,
                                 }
                             )
                         ]);
@@ -13889,6 +13899,8 @@ impl Parser {
                         name: None,
                         columns: alloc::vec![col.name.clone()],
                         nulls_not_distinct: col.unique_nulls_not_distinct,
+                        deferrable: col.constraint_deferrable,
+                        initially_deferred: col.constraint_initially_deferred,
                     });
                 }
                 if let Some(check_expr) = col.check.clone() {
@@ -14462,6 +14474,9 @@ impl Parser {
                 name: idx_name,
                 columns: cols,
                 nulls_not_distinct: false,
+                // MySQL inline UNIQUE KEY has no deferral vocabulary.
+                deferrable: false,
+                initially_deferred: false,
             }))
         } else if is_fulltext {
             // v7.17.0 Phase 2.2 — MySQL `FULLTEXT KEY` now
@@ -14629,12 +14644,14 @@ impl Parser {
         self.advance(); // PRIMARY
         self.advance(); // KEY
         let columns = self.parse_paren_ident_list("PRIMARY KEY")?;
-        // v7.39 (round 621) — the deferrability trailer, consumed and enforced
-        // immediately (see the column-level arm for the reasoning).
-        self.consume_optional_deferrable_clauses()?;
+        // v7.39 (round 711) — the trailer's values are CARRIED now; round
+        // 621 consumed and dropped them (the storing half of F08).
+        let (deferrable, initially_deferred) = self.consume_deferrable_clauses_timed()?;
         Ok(crate::ast::TableConstraint::PrimaryKey {
             name: None,
             columns,
+            deferrable,
+            initially_deferred,
         })
     }
 
@@ -14660,11 +14677,13 @@ impl Parser {
             }
         }
         let columns = self.parse_paren_ident_list("UNIQUE")?;
-        self.consume_optional_deferrable_clauses()?;
+        let (deferrable, initially_deferred) = self.consume_deferrable_clauses_timed()?;
         Ok(crate::ast::TableConstraint::Unique {
             name: None,
             columns,
             nulls_not_distinct,
+            deferrable,
+            initially_deferred,
         })
     }
 
@@ -16518,6 +16537,8 @@ impl Parser {
         let mut is_primary_key = false;
         let mut is_unique = false;
         let mut unique_nulls_not_distinct = false;
+        let mut constraint_deferrable = false;
+        let mut constraint_initially_deferred = false;
         let mut check: Option<Expr> = None;
         let mut on_update_runtime: Option<Expr> = None;
         let mut generated_stored_expr: Option<Box<Expr>> = None;
@@ -16762,6 +16783,7 @@ impl Parser {
             if matches!(self.peek(), Token::Not)
                 && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("deferrable"))
             {
+                // NOT DEFERRABLE — explicit immediate; nothing to carry.
                 self.consume_optional_deferrable_clauses()?;
                 continue;
             }
@@ -16824,7 +16846,11 @@ impl Parser {
                 || (matches!(self.peek(), Token::Not)
                     && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("deferrable")))
             {
-                self.consume_optional_deferrable_clauses()?;
+                // v7.39 (round 711) — CARRIED now (the storing half of
+                // F08); round 621 only consumed.
+                let (d, idef) = self.consume_deferrable_clauses_timed()?;
+                constraint_deferrable |= d;
+                constraint_initially_deferred |= idef;
                 continue;
             }
             if let Token::Ident(s) = self.peek()
@@ -16929,6 +16955,8 @@ impl Parser {
             is_primary_key,
             is_unique,
             unique_nulls_not_distinct,
+            constraint_deferrable,
+            constraint_initially_deferred,
             check,
             user_type_ref,
             on_update_runtime,
