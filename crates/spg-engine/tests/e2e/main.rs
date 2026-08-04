@@ -184,6 +184,7 @@ mod e2e_expr_errors_round704;
 mod e2e_refresh_matview_round699;
 mod e2e_sequence_sqlstate_round698;
 mod e2e_validate_only_round697;
+mod e2e_alter_collate_round713;
 mod e2e_collate_explicit_round691;
 mod e2e_collate_minmax_round690;
 mod e2e_collate_order_round688;

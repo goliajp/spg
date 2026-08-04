@@ -3865,7 +3865,7 @@ fn pg_atttypmod(ty: DataType) -> i32 {
     }
 }
 
-fn pg_type_oid(ty: DataType) -> i64 {
+pub(crate) fn pg_type_oid(ty: DataType) -> i64 {
     match ty {
         DataType::Bool => 16,
         DataType::Bytes => 17,
