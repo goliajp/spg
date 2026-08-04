@@ -1866,6 +1866,31 @@ impl Engine {
         // guaranteed both sides integer-family.
         let int_probe_expr_keyed =
             eq_pairs.is_empty() && eq_exprs.is_empty() && eq_probe_exprs.len() == 1;
+        // v7.39 (round 732) — TWO integer keys pack into one i128 (exact,
+        // no collision): the EXISTS pull-up's mixed shape `ON b.g = a.g
+        // AND b.id = a.id + 3` ran the canonical-STRING lane, encoding
+        // 500k build and 500k probe keys. Any combination of plain int
+        // pairs and int probe-exprs totalling two qualifies; eq_exprs
+        // (peer-side computed) stay out — their build half evaluates per
+        // peer row and is already covered by the single-key lane.
+        let int2_keyed = eq_exprs.is_empty()
+            && eq_pairs.len() + eq_probe_exprs.len() == 2
+            && !eq_probe_exprs.is_empty()
+            && eq_pairs.iter().all(|(l, r)| {
+                matches!(
+                    combined_schema[*l].ty,
+                    spg_storage::DataType::BigInt
+                        | spg_storage::DataType::Int
+                        | spg_storage::DataType::SmallInt
+                ) && matches!(
+                    peer.cols.get(*r).map(|c| c.ty),
+                    Some(
+                        spg_storage::DataType::BigInt
+                            | spg_storage::DataType::Int
+                            | spg_storage::DataType::SmallInt
+                    )
+                )
+            });
         // The residual set the matching pairs actually re-check: the
         // int-keyed computed conjunct comes out; everything else stays.
         let residual: Vec<&Expr> = if int_expr_keyed {
@@ -1880,11 +1905,29 @@ impl Engine {
                 .copied()
                 .filter(|r| !core::ptr::eq(*r, eq_probe_exprs[0].2))
                 .collect()
+        } else if !eq_probe_exprs.is_empty() {
+            // v7.39 (round 732) — the mixed form (`ON b.g = a.g AND
+            // b.id = a.id + 3`, the EXISTS pull-up's two-conjunct
+            // shape) runs the STRING lane with the probe-expr's value
+            // in the composite key — and still re-verified that
+            // conjunct against a fully materialised combined row per
+            // matching pair. The probe-expr key halves are
+            // integer-only by extraction and the canonical integer
+            // encoding is exact (`n{n}|`), so key equality IS the
+            // conjunct: drop it from residual, same argument as the
+            // i64 lanes.
+            residual
+                .iter()
+                .copied()
+                .filter(|r| !eq_probe_exprs.iter().any(|(_, _, c)| core::ptr::eq(*r, *c)))
+                .collect()
         } else {
             residual.to_vec()
         };
         let residual = residual.as_slice();
         let any_int_lane = int_keyed || int_expr_keyed || int_probe_expr_keyed;
+        let mut int2_table: hashbrown::HashMap<i128, Bucket> =
+            hashbrown::HashMap::with_capacity(if int2_keyed { n_rights } else { 0 });
         let mut table: hashbrown::HashMap<String, Bucket> =
             hashbrown::HashMap::with_capacity(if any_int_lane { 0 } else { n_rights });
         let mut int_table: hashbrown::HashMap<i64, Bucket> =
@@ -1911,6 +1954,50 @@ impl Engine {
             let Some(right) = rights_src.get(ri) else {
                 continue;
             };
+            if int2_keyed {
+                // Key parts in a FIXED order: plain pairs first, then
+                // probe-exprs — the probe reads them the same way.
+                let mut parts = [0i64; 2];
+                let mut pi = 0;
+                let mut null_key = false;
+                for (_, rpos) in eq_pairs {
+                    match right.values.get(*rpos) {
+                        Some(Value::BigInt(n)) => parts[pi] = *n,
+                        Some(Value::Int(n)) => parts[pi] = i64::from(*n),
+                        Some(Value::SmallInt(n)) => parts[pi] = i64::from(*n),
+                        _ => {
+                            null_key = true;
+                            break;
+                        }
+                    }
+                    pi += 1;
+                }
+                if !null_key {
+                    for (p, _, _) in eq_probe_exprs {
+                        match right.values.get(*p) {
+                            Some(Value::BigInt(n)) => parts[pi] = *n,
+                            Some(Value::Int(n)) => parts[pi] = i64::from(*n),
+                            Some(Value::SmallInt(n)) => parts[pi] = i64::from(*n),
+                            _ => {
+                                null_key = true;
+                                break;
+                            }
+                        }
+                        pi += 1;
+                    }
+                }
+                if null_key {
+                    continue 'build;
+                }
+                let key = ((parts[0] as i128) << 64) | (parts[1] as u64 as i128);
+                match int2_table.entry(key) {
+                    hashbrown::hash_map::Entry::Occupied(mut o) => o.get_mut().push(ri),
+                    hashbrown::hash_map::Entry::Vacant(v) => {
+                        v.insert(Bucket::One(ri));
+                    }
+                }
+                continue;
+            }
             if any_int_lane {
                 let key = if int_keyed || int_probe_expr_keyed {
                     // Plain-column build: the key column is the eq_pair's
@@ -2014,7 +2101,52 @@ impl Engine {
             cancel.check()?;
             let mut left_matched = false;
             let mut left_has_null = false;
-            let int_probe_key: Option<i64> = if int_probe_expr_keyed {
+            let int2_probe_key: Option<i128> = if int2_keyed {
+                let mut parts = [0i64; 2];
+                let mut pi = 0;
+                let mut nul = false;
+                for (lpos, _) in eq_pairs {
+                    match tuple_value(&pipe.sources, &pipe.offsets, tuple, *lpos) {
+                        Some(Value::BigInt(n)) => parts[pi] = *n,
+                        Some(Value::Int(n)) => parts[pi] = i64::from(*n),
+                        Some(Value::SmallInt(n)) => parts[pi] = i64::from(*n),
+                        _ => {
+                            nul = true;
+                            break;
+                        }
+                    }
+                    pi += 1;
+                }
+                if !nul {
+                    for (_, e, _) in eq_probe_exprs {
+                        match eval_int_only_probe(
+                            e,
+                            &combined_schema[..pipe.consumed_cols],
+                            &pipe.sources,
+                            &pipe.offsets,
+                            tuple,
+                        )? {
+                            Some(k) => parts[pi] = k,
+                            None => {
+                                nul = true;
+                                break;
+                            }
+                        }
+                        pi += 1;
+                    }
+                }
+                if nul {
+                    left_has_null = true;
+                    None
+                } else {
+                    Some(((parts[0] as i128) << 64) | (parts[1] as u64 as i128))
+                }
+            } else {
+                None
+            };
+            let int_probe_key: Option<i64> = if int2_keyed {
+                None
+            } else if int_probe_expr_keyed {
                 match eval_int_only_probe(
                     eq_probe_exprs[0].1,
                     &combined_schema[..pipe.consumed_cols],
@@ -2083,6 +2215,8 @@ impl Engine {
             };
             let cands_opt: Option<&Bucket> = if left_has_null {
                 None
+            } else if int2_keyed {
+                int2_table.get(&int2_probe_key.unwrap())
             } else if any_int_lane {
                 int_table.get(&int_probe_key.unwrap())
             } else {

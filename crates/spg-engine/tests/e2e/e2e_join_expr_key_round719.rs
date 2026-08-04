@@ -191,3 +191,40 @@ fn round725_exists_semi_join_never_multiplies() {
         assert_eq!(one(&mut e, sql), want, "{sql}");
     }
 }
+
+/// v7.39 (round 732) — TWO integer keys pack into one exact i128 (the
+/// EXISTS pull-up's mixed shape: a plain pair beside a computed key),
+/// and on every lane where a probe-expr's value IS in the key, its
+/// conjunct leaves residual. Round-732 differential 6/6 byte-same;
+/// these pin the mixed-key answers, LEFT null-extension included.
+#[test]
+fn round732_two_int_keys_answer_as_pg() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        // g preserved by +3 (mod 3): 97 pairs.
+        (
+            "SELECT count(*) FROM j719 a JOIN j719 b ON b.g = a.g AND b.id = a.id + 3",
+            "97",
+        ),
+        // g broken by +1: zero.
+        (
+            "SELECT count(*) FROM j719 a JOIN j719 b ON b.g = a.g AND b.id = a.id + 1",
+            "0",
+        ),
+        (
+            "SELECT count(*) FROM j719 a LEFT JOIN j719 b ON b.g = a.g AND b.id = a.id + 3              WHERE b.id IS NULL",
+            "3",
+        ),
+        (
+            "SELECT count(*) FROM j719 a WHERE EXISTS              (SELECT 1 FROM j719 b WHERE b.g = a.g AND b.id = a.id + 3)",
+            "97",
+        ),
+        (
+            "SELECT sum(b.id) FROM j719 a JOIN j719 b ON b.g = a.g AND b.id = a.id + 99",
+            "100",
+        ),
+    ] {
+        assert_eq!(one(&mut e, sql), want, "{sql}");
+    }
+}
