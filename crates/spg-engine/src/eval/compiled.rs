@@ -1372,6 +1372,14 @@ fn is_pure_scalar_function(name: &str) -> bool {
                 | "lpad"
                 | "rpad"
                 | "split_part"
+                // v7.39 (round 728) — the JSON constructors: pure over
+                // their arguments (JSON's number/text rendering is fixed
+                // by the format, not the session's RenderStyle — probed
+                // against the ::JSONB cast lane, already whitelisted).
+                | "jsonb_build_object"
+                | "json_build_object"
+                | "jsonb_build_array"
+                | "json_build_array"
                 // null/conditional
                 | "coalesce"
                 | "nullif"
