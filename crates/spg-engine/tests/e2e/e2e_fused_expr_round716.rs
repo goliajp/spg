@@ -303,3 +303,21 @@ fn round729_distinct_on_top1_answers_as_pg() {
         assert_eq!(row_text(&mut e, sql), want, "{sql}");
     }
 }
+
+/// v7.39 (round 730) — the digest family (md5, sha224/256/384/512)
+/// joins the pure whitelist and md5's hex encoding drops the fmt
+/// machinery for a nibble table. Round-730 differential 6/6 byte-same.
+#[test]
+fn round730_digests_answer_as_pg() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        // RFC 1321 test vectors, byte-for-byte.
+        ("SELECT md5('')", "d41d8cd98f00b204e9800998ecf8427e"),
+        ("SELECT md5('abc')", "900150983cd24fb0d6963f7d28e17f72"),
+        ("SELECT md5(s) FROM f716 WHERE id = 42", "aca06b198407cefd751b33a5bab7baa7"),
+        ("SELECT count(md5(s)) FROM f716", "100"),
+    ] {
+        assert_eq!(row_text(&mut e, sql), want, "{sql}");
+    }
+}
