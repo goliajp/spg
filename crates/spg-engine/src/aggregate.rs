@@ -1316,6 +1316,12 @@ struct FusedAcc {
     /// v7.39 (round 690) — the argument's declared collation, so a
     /// shard merge compares the two extremes the same way the scan did.
     extreme_coll: Option<alloc::string::String>,
+    /// v7.39 (round 724) — the collection lanes: string_agg / array_agg
+    /// items in ROW order (shard merge concatenates in shard order,
+    /// which IS row order), plus the flat ORDER BY keys (round 723's
+    /// layout). The finalize sort/join is the existing AggState path.
+    items: Vec<Value<'static>>,
+    item_keys: Vec<Value<'static>>,
 }
 
 /// v7.39 (round 569) — a fresh accumulator per op, carrying each one's
@@ -1366,6 +1372,16 @@ enum FusedOp {
         max: bool,
         coll: Option<alloc::string::String>,
     },
+    /// v7.39 (round 724) — string_agg / array_agg over a bound column,
+    /// optional bound ORDER BY keys. The payload is the spec index; the
+    /// scan reads arg_pos / order_pos through it. Collection was the
+    /// last per-row aggregate stuck on the serial generic loop — 32 ms
+    /// single-threaded on the panel's 500k string_agg where PG runs a
+    /// parallel plan.
+    Collect {
+        spec: usize,
+        string_kind: bool,
+    },
 }
 
 /// Returns the (spec_src, unique_ops) layout when EVERY aggregate
@@ -1377,26 +1393,48 @@ fn fused_layout(
     // v7.39 (round 716) — a compiled argument keeps a spec on the fused
     // lane now; a bound column still takes the (cheaper) column op.
     arg_compiled: &[Option<eval::CompiledExpr>],
+    // v7.39 (round 724) — bound ORDER BY key positions, for Collect.
+    order_pos: &[Vec<Option<usize>>],
+    arg2_literal_val: &[Option<Value<'static>>],
 ) -> Option<(Vec<Option<usize>>, Vec<FusedOp>)> {
     if agg_specs.is_empty() {
         return None;
     }
     let has_arg = |i: usize| arg_pos[i].is_some() || arg_compiled[i].is_some();
-    let eligible = agg_specs.iter().enumerate().all(|(i, s)| {
-        s.filter.is_none()
-            && s.arg2.is_none()
-            && s.order_by.is_empty()
-            && !s.distinct
+    // v7.39 (round 724) — a collection spec: bound argument, literal
+    // separator (string_agg), every ORDER BY key a bound column. The
+    // finalize path (sort + join) is the ordinary AggState one, so
+    // multi-key and DESC orders are the finalizer's business, not ours.
+    let collectible = |i: usize, s: &AggSpec| -> bool {
+        !s.distinct
+            && s.filter.is_none()
             && !s.first_ordered
+            && arg_pos[i].is_some()
+            && s.order_by.iter().enumerate().all(|(k, _)| {
+                order_pos[i].get(k).copied().flatten().is_some()
+            })
             && match s.name.as_str() {
-                "count_star" => s.arg.is_none(),
-                "count" | "sum" | "avg" => has_arg(i),
-                // v7.39 (round 569) — an enum argument compares by
-                // catalog member order, which the fused lane does not
-                // carry; those keep the generic path.
-                "min" | "max" => has_arg(i) && s.enum_labels.is_none(),
+                "string_agg" => matches!(&arg2_literal_val[i], Some(Value::Text(_))),
+                "array_agg" => s.arg2.is_none() && s.enum_labels.is_none(),
                 _ => false,
             }
+    };
+    let eligible = agg_specs.iter().enumerate().all(|(i, s)| {
+        collectible(i, s)
+            || (s.filter.is_none()
+                && s.arg2.is_none()
+                && s.order_by.is_empty()
+                && !s.distinct
+                && !s.first_ordered
+                && match s.name.as_str() {
+                    "count_star" => s.arg.is_none(),
+                    "count" | "sum" | "avg" => has_arg(i),
+                    // v7.39 (round 569) — an enum argument compares by
+                    // catalog member order, which the fused lane does not
+                    // carry; those keep the generic path.
+                    "min" | "max" => has_arg(i) && s.enum_labels.is_none(),
+                    _ => false,
+                })
     });
     if !eligible {
         return None;
@@ -1411,6 +1449,15 @@ fn fused_layout(
         .enumerate()
         .map(|(i, s)| match s.name.as_str() {
             "count_star" => None,
+            // Collection ops never share slots (each keeps its own
+            // items), so no dedupe probe.
+            "string_agg" | "array_agg" => {
+                unique_ops.push(FusedOp::Collect {
+                    spec: i,
+                    string_kind: s.name.as_str() == "string_agg",
+                });
+                Some(unique_ops.len() - 1)
+            }
             "min" | "max" => {
                 let max = s.name.as_str() == "max";
                 let slot = if let Some(p) = arg_pos[i] {
@@ -1497,7 +1544,7 @@ fn fused_layout(
 /// decimal scales. Merging in shard order keeps float summation
 /// deterministic for a given shard count (PG's parallel aggregate
 /// makes the same no-serial-equivalence tradeoff for floats).
-fn merge_fused(a: &mut FusedAcc, b: &FusedAcc) {
+fn merge_fused(a: &mut FusedAcc, b: &mut FusedAcc) {
     // v7.39 (round 569) — fold the shard's extreme in the direction this
     // accumulator was built for.
     if let Some(be) = &b.extreme {
@@ -1543,22 +1590,109 @@ fn merge_fused(a: &mut FusedAcc, b: &FusedAcc) {
     a.num.use_interval |= b.num.use_interval;
     a.num.sum_money += b.num.sum_money;
     a.num.use_money |= b.num.use_money;
+    // v7.39 (round 724) — collection lanes concatenate; shard order is
+    // row order. The merge takes `b` by reference (both call sites), so
+    // this clones — the per-shard vectors are moved into place only at
+    // fill time.
+    a.items.extend(core::mem::take(&mut b.items));
+    a.item_keys.extend(core::mem::take(&mut b.item_keys));
 }
 
 /// v7.39 — write fused accumulators into the per-spec AggStates
 /// (shared by the single-group and parallel-GROUP-BY fast paths).
 /// `group_rows` finalizes count(*) specs.
+/// v7.39 (round 724) — one row's contribution to a fused Collect op.
+/// Mirrors `update_state`'s StringAgg / ArrayAgg arms: string_agg skips
+/// NULL and renders through the shared helper (a non-renderable type
+/// errors with the same sentence); array_agg keeps NULL elements.
+fn collect_cell(
+    a: &mut FusedAcc,
+    row: &crate::join::RowRef<'_>,
+    pos: usize,
+    key_pos: &[Option<usize>],
+    string_kind: bool,
+) -> Result<(), EvalError> {
+    let v = row.get(pos).unwrap_or(&Value::Null);
+    if string_kind {
+        if matches!(v, Value::Null) {
+            return Ok(());
+        }
+        let Some(item) = render_string_agg_item(v) else {
+            return Err(EvalError::TypeMismatch {
+                detail: format!(
+                    "string_agg requires text value, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(v.data_type())
+                ),
+            });
+        };
+        a.items.push(item);
+    } else {
+        a.items.push(v.clone().into_owned());
+    }
+    a.num.count += 1;
+    for kp in key_pos {
+        let kv = row
+            .get(kp.expect("layout-gated bound key"))
+            .cloned()
+            .map(Value::into_owned)
+            .unwrap_or(Value::Null);
+        a.item_keys.push(kv);
+    }
+    Ok(())
+}
+
+/// The string_agg item rendering, shared by `update_state` and the
+/// round-724 fused Collect op — one place, so the two paths cannot
+/// drift. Text collects as-is; other scalars coerce to their text
+/// rendering (MySQL group_concat semantics — also matches PG's
+/// cast-then-aggregate idiom for `string_agg(v::text, sep)`).
+fn render_string_agg_item(v: &Value<'_>) -> Option<Value<'static>> {
+    match v {
+        Value::Text(s) => Some(Value::text(s.clone())),
+        // v7.39 (round 626, S05b/F29) — CHAR(n). PG aggregates a
+        // bpchar column (`string_agg(c, ',')` -> text) and SPG said
+        // "string_agg requires text value, got character". The text
+        // form of a bpchar drops its padding, which is what PG's
+        // own bpchar->text cast does.
+        Value::BpChar(s) => Some(Value::text(s.trim_end_matches(' ').to_string())),
+        // v7.39 (read01 round 111) — xmlagg feeds xml values through this
+        // shared StringAgg path; render the fragment's text (it joins
+        // separator-less into the concatenated document).
+        Value::Xml(s) => Some(Value::text(s.to_string())),
+        Value::Int(n) => Some(Value::text(n.to_string())),
+        Value::BigInt(n) => Some(Value::text(n.to_string())),
+        Value::SmallInt(n) => Some(Value::text(n.to_string())),
+        Value::Float(f) => Some(Value::text(f.to_string())),
+        Value::Bool(b) => Some(Value::text(if *b { "1" } else { "0" })),
+        _ => None,
+    }
+}
+
 fn fill_states_from_fused(
     states: &mut [AggState],
     spec_src: &[Option<usize>],
-    accs: &[FusedAcc],
+    accs: &mut [FusedAcc],
     group_rows: i64,
+    // v7.39 (round 724) — string_agg's literal separator, per spec.
+    arg2_literal_val: &[Option<Value<'static>>],
 ) {
     for (i, src) in spec_src.iter().enumerate() {
         let state = &mut states[i];
         match src {
             None => state.num.count = group_rows,
             Some(slot) => {
+                // Collection lanes MOVE (they are per-spec, never
+                // shared; see the layout's no-dedupe rule).
+                {
+                    let a = &mut accs[*slot];
+                    if !a.items.is_empty() {
+                        state.items = core::mem::take(&mut a.items);
+                        state.item_keys = core::mem::take(&mut a.item_keys);
+                    }
+                }
+                if let Some(Value::Text(sep)) = &arg2_literal_val[i] {
+                    state.separator = Some(sep.to_string());
+                }
                 let a = &accs[*slot];
                 state.num.count = a.num.count;
                 state.num.sum_int = a.num.sum_int;
@@ -2188,7 +2322,7 @@ fn accumulate_groups(
     // - remaining ops run in one tight pass, no update_state.
     // Finalize writes the same AggState fields as the single-spec path.
     if single_anon_group
-        && let Some((spec_src, unique_ops)) = fused_layout(agg_specs, &arg_pos, &arg_compiled)
+        && let Some((spec_src, unique_ops)) = fused_layout(agg_specs, &arg_pos, &arg_compiled, &order_pos, &arg2_literal_val)
     {
         let mut accs: Vec<FusedAcc> = fused_accs(&unique_ops, ctx.mysql_dialect);
         // v7.39 (parallel-agg P1) — shard the row scan across the
@@ -2250,6 +2384,15 @@ fn accumulate_groups(
                                 let v = eval::eval_compiled_ref(c, row, fctx, &mut stack)?;
                                 fused_extreme_cell(&mut accs[si], &v, *max)?;
                             }
+                            FusedOp::Collect { spec, string_kind } => {
+                                collect_cell(
+                                    &mut accs[si],
+                                    &row,
+                                    arg_pos[*spec].expect("gated bound"),
+                                    &order_pos[*spec],
+                                    *string_kind,
+                                )?;
+                            }
                         }
                     }
                 }
@@ -2291,8 +2434,8 @@ fn accumulate_groups(
                     let shard = boxed
                         .downcast::<ShardOut>()
                         .expect("runner echoes the closure's box");
-                    let shard_accs = (*shard)?;
-                    for (si, b) in shard_accs.iter().enumerate() {
+                    let mut shard_accs = (*shard)?;
+                    for (si, b) in shard_accs.iter_mut().enumerate() {
                         merge_fused(&mut accs[si], b);
                     }
                 }
@@ -2300,7 +2443,7 @@ fn accumulate_groups(
                 fused_scan(0..rows.len(), &mut accs, &ctx)?;
             }
         }
-        fill_states_from_fused(&mut order[0].1, &spec_src, &accs, rows.len() as i64);
+        fill_states_from_fused(&mut order[0].1, &spec_src, &mut accs, rows.len() as i64, &arg2_literal_val);
         return Ok(order);
     }
     // v7.39 (parallel-agg P3) — parallel GROUP BY fast path: a single
@@ -2315,7 +2458,7 @@ fn accumulate_groups(
         && group_exprs.len() == 1
         && rows.len() >= crate::PARALLEL_MIN_ROWS
         && let Some(r) = runner
-        && let Some((spec_src, unique_ops)) = fused_layout(agg_specs, &arg_pos, &arg_compiled)
+        && let Some((spec_src, unique_ops)) = fused_layout(agg_specs, &arg_pos, &arg_compiled, &order_pos, &arg2_literal_val)
         && !unique_ops.is_empty()
     {
         crate::PARALLEL_AGG_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2425,6 +2568,16 @@ fn accumulate_groups(
                                     .map_err(Some)?;
                                 fused_extreme_cell(&mut slots[oi], &v, *max).map_err(Some)?;
                             }
+                            FusedOp::Collect { spec, string_kind } => {
+                                collect_cell(
+                                    &mut slots[oi],
+                                    &row,
+                                    arg_pos[*spec].expect("gated bound"),
+                                    &order_pos[*spec],
+                                    *string_kind,
+                                )
+                                .map_err(Some)?;
+                            }
                         }
                     }
                 }
@@ -2443,27 +2596,30 @@ fn accumulate_groups(
                 .downcast::<ShardOut>()
                 .expect("runner echoes the closure's box");
             match *shard {
-                Ok(m) => {
+                Ok(mut m) => {
                     for (k, kv) in m.keys {
-                        let accs = &m.slots[&k];
+                        // Removed (not borrowed): the slot MOVES into the
+                        // merged map on first sight, and the round-724
+                        // collection lanes move out of it on merge.
+                        let mut accs = m.slots.remove(&k).expect("keyed slot");
                         let rows_k = m.key_rows[&k];
                         match merged.get_mut(&k) {
                             Some((dst, cnt)) => {
-                                for (i, b) in accs.iter().enumerate() {
+                                for (i, b) in accs.iter_mut().enumerate() {
                                     merge_fused(&mut dst[i], b);
                                 }
                                 *cnt += rows_k;
                             }
                             None => {
                                 merged_keys.push((k, kv));
-                                merged.insert(k, (accs.clone(), rows_k));
+                                merged.insert(k, (accs, rows_k));
                             }
                         }
                     }
-                    if let Some(nb) = m.null_slot {
+                    if let Some(mut nb) = m.null_slot.take() {
                         match &mut merged_null {
                             Some((dst, cnt)) => {
-                                for (i, b) in nb.iter().enumerate() {
+                                for (i, b) in nb.iter_mut().enumerate() {
                                     merge_fused(&mut dst[i], b);
                                 }
                                 *cnt += m.null_rows;
@@ -2481,16 +2637,16 @@ fn accumulate_groups(
         }
         if !fallback {
             for (k, kv) in merged_keys {
-                let (accs, group_rows) = merged.remove(&k).expect("key recorded");
+                let (mut accs, group_rows) = merged.remove(&k).expect("key recorded");
                 let mut states: Vec<AggState> =
                     (0..agg_specs.len()).map(|_| AggState::default()).collect();
-                fill_states_from_fused(&mut states, &spec_src, &accs, group_rows);
+                fill_states_from_fused(&mut states, &spec_src, &mut accs, group_rows, &arg2_literal_val);
                 order.push((alloc::vec![kv], states));
             }
-            if let Some((accs, group_rows)) = merged_null {
+            if let Some((mut accs, group_rows)) = merged_null {
                 let mut states: Vec<AggState> =
                     (0..agg_specs.len()).map(|_| AggState::default()).collect();
-                fill_states_from_fused(&mut states, &spec_src, &accs, group_rows);
+                fill_states_from_fused(&mut states, &spec_src, &mut accs, group_rows, &arg2_literal_val);
                 order.push((alloc::vec![Value::Null], states));
             }
             return Ok(order);
@@ -4742,25 +4898,7 @@ pub(crate) fn update_state(
             // text rendering (MySQL group_concat semantics — also
             // matches PG's cast-then-aggregate idiom for
             // string_agg(v::text, sep)).
-            let rendered: Option<Value<'static>> = match v {
-                Value::Text(s) => Some(Value::text(s.clone())),
-                // v7.39 (round 626, S05b/F29) — CHAR(n). PG aggregates a
-                // bpchar column (`string_agg(c, ',')` -> text) and SPG said
-                // "string_agg requires text value, got character". The text
-                // form of a bpchar drops its padding, which is what PG's
-                // own bpchar->text cast does.
-                Value::BpChar(s) => Some(Value::text(s.trim_end_matches(' ').to_string())),
-                // v7.39 (read01 round 111) — xmlagg feeds xml values through this
-                // shared StringAgg path; render the fragment's text (it joins
-                // separator-less into the concatenated document).
-                Value::Xml(s) => Some(Value::text(s.to_string())),
-                Value::Int(n) => Some(Value::text(n.to_string())),
-                Value::BigInt(n) => Some(Value::text(n.to_string())),
-                Value::SmallInt(n) => Some(Value::text(n.to_string())),
-                Value::Float(f) => Some(Value::text(f.to_string())),
-                Value::Bool(b) => Some(Value::text(if *b { "1" } else { "0" })),
-                _ => None,
-            };
+            let rendered = render_string_agg_item(v);
             if let Some(item) = rendered {
                 st.items.push(item);
                 if let Some(k) = order_keys {

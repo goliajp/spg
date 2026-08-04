@@ -122,3 +122,42 @@ fn round717_extremum_fallback_shapes_unchanged() {
         assert_eq!(row_text(&mut e, sql), want, "{sql}");
     }
 }
+
+/// v7.39 (round 724) — string_agg / array_agg ride the fused parallel
+/// lanes (`FusedOp::Collect`): shard collection concatenates in shard
+/// order (= row order), ORDER BY keys collect flat per row, and the
+/// ordinary finalize does the sort and join. Expectations are the
+/// round-724 PG18 differential (10/10 byte-same, including multi-key
+/// DESC orders and a 100k md5-pinned concatenation). This engine has
+/// no parallel runner, so these exercise the serial arm of the same
+/// ops the shards run.
+#[test]
+fn round724_collect_aggregates_answer_as_pg() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        (
+            "SELECT string_agg(s, '|' ORDER BY id) FROM f716 WHERE id <= 4",
+            "row1|row2|row3|row4",
+        ),
+        (
+            "SELECT string_agg(s, ',' ORDER BY id DESC) FROM f716 WHERE id <= 3",
+            "row3,row2,row1",
+        ),
+        (
+            "SELECT g, string_agg(s, ',') FROM f716 WHERE id <= 6 GROUP BY g ORDER BY g",
+            "0|row3,row6 / 1|row1,row4 / 2|row2,row5",
+        ),
+        (
+            "SELECT array_agg(id ORDER BY id DESC) FROM f716 WHERE id <= 4",
+            "{4,3,2,1}",
+        ),
+        // Mixed with plain fused specs on the same scan.
+        (
+            "SELECT g, string_agg(s, ',' ORDER BY id), count(*), max(id)              FROM f716 WHERE id <= 6 GROUP BY g ORDER BY g",
+            "0|row3,row6|2|6 / 1|row1,row4|2|4 / 2|row2,row5|2|5",
+        ),
+    ] {
+        assert_eq!(row_text(&mut e, sql), want, "{sql}");
+    }
+}
