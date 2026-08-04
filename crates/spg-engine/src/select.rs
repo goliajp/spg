@@ -2511,8 +2511,11 @@ impl Engine {
         // returned short pages, with no error. The limit is deferred to
         // after the dedup, which is PG's order.
         let don_stmt;
-        let (stmt, don_hidden, don_limit) = if stmt.distinct_on.is_empty() {
-            (stmt, 0, (None, None))
+        // v7.39 (round 729) — the top-1 consumer needs the ORIGINAL
+        // order spec (the rewritten stmt's is emptied).
+        let orig_order_by = stmt.order_by.clone();
+        let (stmt, don_hidden, don_limit, don_top1) = if stmt.distinct_on.is_empty() {
+            (stmt, 0, (None, None), 0usize)
         } else {
             let mut s = stmt.clone();
             let hidden = s.distinct_on.len();
@@ -2522,6 +2525,43 @@ impl Engine {
                     alias: Some(alloc::format!("__distinct_on_{i}")),
                 });
             }
+            // v7.39 (round 729) — group-top-1 short circuit. When the
+            // DISTINCT ON keys are exactly the ORDER BY's leading keys,
+            // the answer is "per group, the row that wins the remaining
+            // order" — a single O(n) hash pass. The old path sorted the
+            // ENTIRE input first (500k rows, ~180 ms on the panel cell)
+            // to keep 100. The inner query runs UNSORTED with every
+            // order key appended as a hidden column; the dedup below
+            // keeps each group's best, then sorts the SURVIVORS.
+            // Declared-collation order keys stay on the sorting path
+            // (the value comparator here is collation-blind).
+            let prefix_matches = s.order_by.len() >= hidden
+                && stmt
+                    .distinct_on
+                    .iter()
+                    .zip(s.order_by.iter())
+                    .all(|(d, o)| *d == o.expr && !o.desc && o.nulls_first.is_none());
+            let colls_plain = crate::orderby::order_by_collations(
+                &s.order_by,
+                &self.ev_ctx(&[], None),
+            )
+            .map(|cs| cs.iter().all(Option::is_none))
+            .unwrap_or(false);
+            let top1_tail = if prefix_matches && colls_plain && s.group_by.is_none() {
+                let tail = s.order_by.len() - hidden;
+                for (j, o) in s.order_by[hidden..].iter().enumerate() {
+                    s.items.push(SelectItem::Expr {
+                        expr: o.expr.clone(),
+                        alias: Some(alloc::format!("__don_ord_{j}")),
+                    });
+                }
+                // Carry the tail's direction flags through the aliases'
+                // ORDER; the survivors re-sort below with the full spec.
+                s.order_by = Vec::new();
+                tail + 1 // sentinel: 1 + number of tail keys (0 tail is still active)
+            } else {
+                0
+            };
             // Only a folded literal is deferred; a placeholder or an
             // expression keeps the path it has today rather than being
             // resolved a second way here.
@@ -2535,7 +2575,7 @@ impl Engine {
                 (None, None)
             };
             don_stmt = s;
-            (&don_stmt, hidden, deferred)
+            (&don_stmt, hidden, deferred, top1_tail)
         };
         self.acl_check_select_as(stmt, as_role)?;
         validate_aggregate_placement(stmt)?;
@@ -2573,18 +2613,88 @@ impl Engine {
             return Ok(result);
         };
         // The keys are the hidden trailing columns appended above.
-        let key_start = columns.len().saturating_sub(don_hidden);
-        let mut seen: alloc::vec::Vec<alloc::vec::Vec<Value<'static>>> = alloc::vec::Vec::new();
-        let mut kept: alloc::vec::Vec<Row<'static>> = alloc::vec::Vec::new();
-        for mut row in rows {
-            let key: alloc::vec::Vec<Value<'static>> =
-                row.values.get(key_start..).unwrap_or(&[]).to_vec();
-            if seen.iter().any(|k| k == &key) {
-                continue;
+        // v7.39 (round 729) — top-1 mode: the trailing columns are the
+        // DON keys plus the ORDER tail; keep each group's best in one
+        // hash pass, then sort the SURVIVORS with the original spec.
+        let mut kept: alloc::vec::Vec<Row<'static>>;
+        let key_start;
+        if don_top1 > 0 {
+            let tail = don_top1 - 1;
+            key_start = columns.len().saturating_sub(don_hidden + tail);
+            let ord_start = key_start + don_hidden;
+            let tail_dirs: alloc::vec::Vec<(bool, Option<bool>)> = orig_order_by
+                [don_hidden..]
+                .iter()
+                .map(|o| (o.desc, o.nulls_first))
+                .collect();
+            let mysql = self.backslash_escapes;
+            let better = |a: &Row<'static>, b: &Row<'static>| -> bool {
+                for (k, (desc, nf)) in tail_dirs.iter().enumerate() {
+                    let av = a.values.get(ord_start + k).unwrap_or(&Value::Null);
+                    let bv = b.values.get(ord_start + k).unwrap_or(&Value::Null);
+                    match crate::order_by_value_cmp_in(*desc, *nf, av, bv, mysql) {
+                        core::cmp::Ordering::Less => return true,
+                        core::cmp::Ordering::Greater => return false,
+                        core::cmp::Ordering::Equal => {}
+                    }
+                }
+                false
+            };
+            let mut slot: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
+            let mut best: alloc::vec::Vec<Row<'static>> = alloc::vec::Vec::new();
+            let mut keybuf = String::new();
+            for row in rows {
+                keybuf.clear();
+                for v in row.values.get(key_start..ord_start).unwrap_or(&[]) {
+                    aggregate::push_canonical_key(&mut keybuf, v);
+                }
+                match slot.get(keybuf.as_str()) {
+                    Some(&i) => {
+                        if better(&row, &best[i]) {
+                            best[i] = row;
+                        }
+                    }
+                    None => {
+                        slot.insert(keybuf.clone(), best.len());
+                        best.push(row);
+                    }
+                }
             }
-            seen.push(key);
-            row.values.truncate(key_start);
-            kept.push(row);
+            // Survivors sort with the FULL original spec (keys are still
+            // aboard as hidden columns).
+            let full_dirs: alloc::vec::Vec<(bool, Option<bool>)> = orig_order_by
+                .iter()
+                .map(|o| (o.desc, o.nulls_first))
+                .collect();
+            best.sort_by(|a, b| {
+                for (k, (desc, nf)) in full_dirs.iter().enumerate() {
+                    let av = a.values.get(key_start + k).unwrap_or(&Value::Null);
+                    let bv = b.values.get(key_start + k).unwrap_or(&Value::Null);
+                    match crate::order_by_value_cmp_in(*desc, *nf, av, bv, mysql) {
+                        core::cmp::Ordering::Equal => {}
+                        o => return o,
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
+            for r in &mut best {
+                r.values.truncate(key_start);
+            }
+            kept = best;
+        } else {
+            key_start = columns.len().saturating_sub(don_hidden);
+            let mut seen: alloc::vec::Vec<alloc::vec::Vec<Value<'static>>> = alloc::vec::Vec::new();
+            kept = alloc::vec::Vec::new();
+            for mut row in rows {
+                let key: alloc::vec::Vec<Value<'static>> =
+                    row.values.get(key_start..).unwrap_or(&[]).to_vec();
+                if seen.iter().any(|k| k == &key) {
+                    continue;
+                }
+                seen.push(key);
+                row.values.truncate(key_start);
+                kept.push(row);
+            }
         }
         let mut columns = columns;
         columns.truncate(key_start);
