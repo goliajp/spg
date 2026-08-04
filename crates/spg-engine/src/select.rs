@@ -6957,6 +6957,24 @@ impl Engine {
         }
 
         let projection = build_projection(&stmt.items, combined_schema, "", self.backslash_escapes)?;
+        // v7.39 (round 734) — a set-returning projection over a JOIN.
+        // This executor's projection loop treats every item as a scalar,
+        // so `SELECT unnest(ARRAY[a.id, b.g]) FROM a JOIN b …` died with
+        // "function unnest(integer[]) does not exist" where PG expands
+        // it. The row-set executor already carries the full SRF pipeline
+        // (lockstep expansion, ORDER-BY-on-expanded-rows, the round-733
+        // sharding): materialise the joined survivors and hand over. The
+        // WHERE is cleared — the join already applied it, and combined
+        // columns resolve identically in both executors.
+        if !self.srf_target_idxs(&projection).is_empty() {
+            let refs = deferred.row_refs();
+            let rows: Vec<Row<'static>> =
+                refs.iter().map(|r| r.as_row().into_owned()).collect();
+            let mut s2 = stmt.clone();
+            s2.where_ = None;
+            let schema = combined_schema.clone();
+            return self.exec_select_over_rows(&s2, rows, schema, "", cancel);
+        }
         // v7.33 (P4 borrow channel, increment 3) — project directly off
         // the deferred row-index tuples instead of materialising an
         // intermediate combined Row per survivor. A bound qualified
