@@ -33,9 +33,18 @@ path = "src/bin/counter_dump.rs"
 # for the fixture descriptor format (serde already in the lock); tar
 # extraction goes through `tar -xzf` on the host (no native dep);
 # SHA-256 lives in `sha2` which the workspace already locks.
-# v7.37.9 — enable `perf-counters` here so the counter_dump diagnostic
-# binary sees non-zero values. Production crates leave the feature off.
-spg-engine   = { path = "../../crates/spg-engine",   version = "7.9", features = ["perf-counters"] }
+# v7.39 (round 718) — `perf-counters` is NOT enabled here any more.
+# Feature unification meant any workspace-wide build (`cargo test
+# --workspace` — the six-gate test leg) silently rebuilt spg-server
+# WITH per-row atomic counters: eight parallel shards hammering one
+# cache line, measured 7-13x slower on the fused-lane cells. Every
+# bench taken from target/release after a workspace build measured
+# that tainted binary. The counter statics exist unconditionally, so
+# this crate compiles without the feature (counters read 0); when the
+# counter_dump diagnostic needs real values, build it explicitly:
+#   cargo run --release -p spg-dogfood-replay --bin spg-counter-dump \
+#     --features spg-engine/perf-counters
+spg-engine   = { path = "../../crates/spg-engine",   version = "7.9" }
 spg-embedded = { path = "../../crates/spg-embedded", version = "7.9" }
 spg-storage  = { path = "../../crates/spg-storage",  version = "7.9" }
 sha2         = "0.10"
