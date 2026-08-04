@@ -360,3 +360,37 @@ fn round731_unordered_window_partitions_answer_as_pg() {
         assert_eq!(row_text(&mut e, sql), want, "{sql}");
     }
 }
+
+/// v7.39 (round 734) — a set-returning projection over a JOIN exists
+/// now: the joined survivors materialise and hand over to the row-set
+/// executor, which carries the full SRF pipeline. Before, ANY SRF in a
+/// joined target list answered "function unnest(integer[]) does not
+/// exist" — a capability gap, not a slow path. Round-734 differential
+/// 6/6 byte-same (LEFT null-extension through the SRF included).
+#[test]
+fn round734_srf_over_a_join_answers_as_pg() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        (
+            "SELECT unnest(ARRAY[a.id, b.g]) FROM f716 a JOIN f716 b ON a.id = b.id              WHERE a.id <= 2 ORDER BY 1",
+            "1 / 1 / 2 / 2",
+        ),
+        (
+            "SELECT sum(v) FROM (SELECT unnest(ARRAY[a.id, b.g]) v              FROM f716 a JOIN f716 b ON a.id = b.id WHERE a.id <= 10) q",
+            "65",
+        ),
+        (
+            "SELECT a.s, unnest(ARRAY[b.id]) FROM f716 a JOIN f716 b ON a.id = b.id + 1              WHERE a.id <= 3 ORDER BY 2",
+            "row2|1 / row3|2",
+        ),
+        // A NULL-extended LEFT row's SRF argument is NULL -> zero rows
+        // for that input, so only the matched row expands.
+        (
+            "SELECT a.id, unnest(ARRAY[b.id]) FROM f716 a              LEFT JOIN f716 b ON b.id = a.id + 99 WHERE a.id <= 2 ORDER BY 1",
+            "1|100 / 2|NULL",
+        ),
+    ] {
+        assert_eq!(row_text(&mut e, sql), want, "{sql}");
+    }
+}
