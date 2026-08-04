@@ -1318,7 +1318,8 @@ fn fused_accs(ops: &[FusedOp], mysql: bool) -> Vec<FusedAcc> {
     ops.iter()
         .map(|op| {
             let mut a = FusedAcc::default();
-            if let FusedOp::Extreme { max, coll, .. } = op {
+            if let FusedOp::Extreme { max, coll, .. } | FusedOp::ExtremeExpr { max, coll, .. } = op
+            {
                 a.extreme_max = *max;
                 a.extreme_mysql = mysql;
                 a.extreme_coll = coll.clone();
@@ -1345,6 +1346,20 @@ enum FusedOp {
         max: bool,
         coll: Option<alloc::string::String>,
     },
+    /// v7.39 (round 716, S07) — the same three shapes over a COMPILED
+    /// argument expression. `count(least(id, 0))` used to fall off this
+    /// lane entirely — `fused_layout` only accepted bound columns — and
+    /// landed in the SERIAL generic loop, which is where the whole 7.6×
+    /// against PG lived: PG runs the identical cell as a parallel seq
+    /// scan. The payload is the SPEC INDEX whose `arg_compiled` program
+    /// to run; the accumulator lanes are the ones the column ops use.
+    CountExpr(usize),
+    AccExpr(usize),
+    ExtremeExpr {
+        spec: usize,
+        max: bool,
+        coll: Option<alloc::string::String>,
+    },
 }
 
 /// Returns the (spec_src, unique_ops) layout when EVERY aggregate
@@ -1353,10 +1368,14 @@ enum FusedOp {
 fn fused_layout(
     agg_specs: &[AggSpec],
     arg_pos: &[Option<usize>],
+    // v7.39 (round 716) — a compiled argument keeps a spec on the fused
+    // lane now; a bound column still takes the (cheaper) column op.
+    arg_compiled: &[Option<eval::CompiledExpr>],
 ) -> Option<(Vec<Option<usize>>, Vec<FusedOp>)> {
     if agg_specs.is_empty() {
         return None;
     }
+    let has_arg = |i: usize| arg_pos[i].is_some() || arg_compiled[i].is_some();
     let eligible = agg_specs.iter().enumerate().all(|(i, s)| {
         s.filter.is_none()
             && s.arg2.is_none()
@@ -1365,11 +1384,11 @@ fn fused_layout(
             && !s.first_ordered
             && match s.name.as_str() {
                 "count_star" => s.arg.is_none(),
-                "count" | "sum" | "avg" => arg_pos[i].is_some(),
+                "count" | "sum" | "avg" => has_arg(i),
                 // v7.39 (round 569) — an enum argument compares by
                 // catalog member order, which the fused lane does not
                 // carry; those keep the generic path.
-                "min" | "max" => arg_pos[i].is_some() && s.enum_labels.is_none(),
+                "min" | "max" => has_arg(i) && s.enum_labels.is_none(),
                 _ => false,
             }
     });
@@ -1377,50 +1396,88 @@ fn fused_layout(
         return None;
     }
     let mut unique_ops: Vec<FusedOp> = Vec::new();
+    // Compiled dedupe key = the source Expr (same rule the executor-time
+    // CSE uses): two specs share a slot only when their argument TREES
+    // are equal, which `fully_compilable`'s purity makes sufficient.
+    let same_arg = |j: usize, i: usize| agg_specs[j].arg == agg_specs[i].arg;
     let spec_src: Vec<Option<usize>> = agg_specs
         .iter()
         .enumerate()
         .map(|(i, s)| match s.name.as_str() {
             "count_star" => None,
             "min" | "max" => {
-                let p = arg_pos[i].expect("gated bound");
                 let max = s.name.as_str() == "max";
-                let slot = unique_ops
-                    .iter()
-                    .position(|o| {
-                        matches!(o, FusedOp::Extreme { pos, max: m, coll }
-                            if *pos == p && *m == max && *coll == s.arg_collation)
-                    })
-                    .unwrap_or_else(|| {
-                        unique_ops.push(FusedOp::Extreme {
-                            pos: p,
-                            max,
-                            coll: s.arg_collation.clone(),
-                        });
-                        unique_ops.len() - 1
-                    });
+                let slot = if let Some(p) = arg_pos[i] {
+                    unique_ops
+                        .iter()
+                        .position(|o| {
+                            matches!(o, FusedOp::Extreme { pos, max: m, coll }
+                                if *pos == p && *m == max && *coll == s.arg_collation)
+                        })
+                        .unwrap_or_else(|| {
+                            unique_ops.push(FusedOp::Extreme {
+                                pos: p,
+                                max,
+                                coll: s.arg_collation.clone(),
+                            });
+                            unique_ops.len() - 1
+                        })
+                } else {
+                    unique_ops
+                        .iter()
+                        .position(|o| {
+                            matches!(o, FusedOp::ExtremeExpr { spec, max: m, coll }
+                                if same_arg(*spec, i) && *m == max && *coll == s.arg_collation)
+                        })
+                        .unwrap_or_else(|| {
+                            unique_ops.push(FusedOp::ExtremeExpr {
+                                spec: i,
+                                max,
+                                coll: s.arg_collation.clone(),
+                            });
+                            unique_ops.len() - 1
+                        })
+                };
                 Some(slot)
             }
             "count" => {
-                let p = arg_pos[i].expect("gated bound");
-                let slot = unique_ops
-                    .iter()
-                    .position(|o| matches!(o, FusedOp::CountCol(q) if *q == p))
-                    .unwrap_or_else(|| {
-                        unique_ops.push(FusedOp::CountCol(p));
-                        unique_ops.len() - 1
-                    });
+                let slot = if let Some(p) = arg_pos[i] {
+                    unique_ops
+                        .iter()
+                        .position(|o| matches!(o, FusedOp::CountCol(q) if *q == p))
+                        .unwrap_or_else(|| {
+                            unique_ops.push(FusedOp::CountCol(p));
+                            unique_ops.len() - 1
+                        })
+                } else {
+                    unique_ops
+                        .iter()
+                        .position(|o| matches!(o, FusedOp::CountExpr(j) if same_arg(*j, i)))
+                        .unwrap_or_else(|| {
+                            unique_ops.push(FusedOp::CountExpr(i));
+                            unique_ops.len() - 1
+                        })
+                };
                 Some(slot)
             }
             _ => {
-                let p = arg_pos[i].expect("gated bound");
-                let slot = unique_ops
-                    .iter()
-                    .position(|o| matches!(o, FusedOp::AccCol(q) if *q == p))
-                    .unwrap_or_else(|| {
-                        unique_ops.push(FusedOp::AccCol(p));
-                        unique_ops.len() - 1
-                    });
+                let slot = if let Some(p) = arg_pos[i] {
+                    unique_ops
+                        .iter()
+                        .position(|o| matches!(o, FusedOp::AccCol(q) if *q == p))
+                        .unwrap_or_else(|| {
+                            unique_ops.push(FusedOp::AccCol(p));
+                            unique_ops.len() - 1
+                        })
+                } else {
+                    unique_ops
+                        .iter()
+                        .position(|o| matches!(o, FusedOp::AccExpr(j) if same_arg(*j, i)))
+                        .unwrap_or_else(|| {
+                            unique_ops.push(FusedOp::AccExpr(i));
+                            unique_ops.len() - 1
+                        })
+                };
                 Some(slot)
             }
         })
@@ -2124,7 +2181,9 @@ fn accumulate_groups(
     //   and one accumulate per row;
     // - remaining ops run in one tight pass, no update_state.
     // Finalize writes the same AggState fields as the single-spec path.
-    if single_anon_group && let Some((spec_src, unique_ops)) = fused_layout(agg_specs, &arg_pos) {
+    if single_anon_group
+        && let Some((spec_src, unique_ops)) = fused_layout(agg_specs, &arg_pos, &arg_compiled)
+    {
         let mut accs: Vec<FusedAcc> = fused_accs(&unique_ops, ctx.mysql_dialect);
         // v7.39 (parallel-agg P1) — shard the row scan across the
         // host-injected executor when the input is large enough.
@@ -2132,8 +2191,21 @@ fn accumulate_groups(
         // returns its own Vec<FusedAcc>; the merge is field-wise
         // (see merge_fused). Errors inside a shard surface as the
         // shard result and re-raise after join.
-        let fused_scan =
-            |range: core::ops::Range<usize>, accs: &mut Vec<FusedAcc>| -> Result<(), EvalError> {
+        // v7.39 (round 716) — the scan takes its EvalContext as a
+        // parameter: `EvalContext` is not Sync (per-eval memo Cells, the
+        // sequence resolver's plain `&dyn Fn`), so the parallel branch
+        // hands each shard a locally-built minimal context instead of
+        // capturing the outer one. The compiled ops only reach the parts
+        // a shard context carries — columns, alias, dialect, catalog —
+        // because `fully_compilable` excludes everything else (params,
+        // sequences, user functions, FTS).
+        let fused_scan = |range: core::ops::Range<usize>,
+                          accs: &mut Vec<FusedAcc>,
+                          fctx: &EvalContext<'_>|
+         -> Result<(), EvalError> {
+                // One Step-VM stack per shard call, reused across every
+                // row and every compiled op.
+                let mut stack: Vec<Value<'_>> = Vec::new();
                 for row in rows.range(range.start, range.end).iter() {
                     for (si, op) in unique_ops.iter().enumerate() {
                         match op {
@@ -2155,6 +2227,23 @@ fn accumulate_groups(
                                     *max,
                                 )?;
                             }
+                            FusedOp::CountExpr(sp) => {
+                                let c = arg_compiled[*sp].as_ref().expect("gated compiled");
+                                let v = eval::eval_compiled_ref(c, row, fctx, &mut stack)?;
+                                if !matches!(v, Value::Null) {
+                                    accs[si].num.count += 1;
+                                }
+                            }
+                            FusedOp::AccExpr(sp) => {
+                                let c = arg_compiled[*sp].as_ref().expect("gated compiled");
+                                let v = eval::eval_compiled_ref(c, row, fctx, &mut stack)?;
+                                acc_cell(&mut accs[si].num, &v)?;
+                            }
+                            FusedOp::ExtremeExpr { spec, max, .. } => {
+                                let c = arg_compiled[*spec].as_ref().expect("gated compiled");
+                                let v = eval::eval_compiled_ref(c, row, fctx, &mut stack)?;
+                                fused_extreme_cell(&mut accs[si], &v, *max)?;
+                            }
                         }
                     }
                 }
@@ -2169,12 +2258,27 @@ fn accumulate_groups(
                 type ShardOut = Result<Vec<FusedAcc>, EvalError>;
                 let ops = &unique_ops;
                 let mysql_for_accs = ctx.mysql_dialect;
+                // v7.39 (round 716) — the whitelisted concat family
+                // renders through the SESSION's style; a shard context
+                // built from defaults would silently re-render dates and
+                // floats the default way. RenderStyle is Copy.
+                let outer_style = ctx.render_style;
                 let results = r.run_shards(n_shards, &|i| {
                     let lo = i * chunk;
                     let hi = ((i + 1) * chunk).min(rows.len());
                     let mut local: Vec<FusedAcc> =
                         fused_accs(ops, mysql_for_accs);
-                    let out: ShardOut = fused_scan(lo..hi, &mut local).map(|()| local);
+                    // Shard-local minimal context (the outer one is not
+                    // Sync); see the fused_scan comment.
+                    let mut sctx = EvalContext::new(schema_cols, table_alias);
+                    sctx.mysql_dialect = mysql_for_accs;
+                    sctx.render_style = outer_style;
+                    let sctx = match catalog {
+                        Some(c) => sctx.with_catalog(c),
+                        None => sctx,
+                    };
+                    let out: ShardOut =
+                        fused_scan(lo..hi, &mut local, &sctx).map(|()| local);
                     alloc::boxed::Box::new(out)
                 });
                 for boxed in results {
@@ -2187,7 +2291,7 @@ fn accumulate_groups(
                     }
                 }
             } else {
-                fused_scan(0..rows.len(), &mut accs)?;
+                fused_scan(0..rows.len(), &mut accs, &ctx)?;
             }
         }
         fill_states_from_fused(&mut order[0].1, &spec_src, &accs, rows.len() as i64);
@@ -2205,7 +2309,7 @@ fn accumulate_groups(
         && group_exprs.len() == 1
         && rows.len() >= crate::PARALLEL_MIN_ROWS
         && let Some(r) = runner
-        && let Some((spec_src, unique_ops)) = fused_layout(agg_specs, &arg_pos)
+        && let Some((spec_src, unique_ops)) = fused_layout(agg_specs, &arg_pos, &arg_compiled)
         && !unique_ops.is_empty()
     {
         crate::PARALLEL_AGG_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2224,6 +2328,8 @@ fn accumulate_groups(
         let chunk = rows.len().div_ceil(n_shards);
         let ops = &unique_ops;
         let mysql_for_accs = ctx.mysql_dialect;
+        // Same session-style carry as the anonymous-group lane.
+        let outer_style = ctx.render_style;
         let results = r.run_shards(n_shards, &|si| {
             let lo = si * chunk;
             let hi = ((si + 1) * chunk).min(rows.len());
@@ -2235,6 +2341,18 @@ fn accumulate_groups(
                 key_rows: hashbrown::HashMap::new(),
             };
             let out: ShardOut = (|| {
+                // v7.39 (round 716) — per-shard Step-VM stack for the
+                // compiled-argument ops, reused across rows, plus a
+                // shard-local minimal context (the outer one is not
+                // Sync); see the anonymous-group fused_scan comment.
+                let mut stack: Vec<Value<'_>> = Vec::new();
+                let mut sctx = EvalContext::new(schema_cols, table_alias);
+                sctx.mysql_dialect = mysql_for_accs;
+                sctx.render_style = outer_style;
+                let sctx = match catalog {
+                    Some(c) => sctx.with_catalog(c),
+                    None => sctx,
+                };
                 for row in rows.range(lo, hi).iter() {
                     let v = row.get(gp).unwrap_or(&Value::Null);
                     let key: Option<i64> = match v {
@@ -2280,6 +2398,26 @@ fn accumulate_groups(
                                     *max,
                                 )
                                 .map_err(Some)?;
+                            }
+                            FusedOp::CountExpr(sp) => {
+                                let c = arg_compiled[*sp].as_ref().expect("gated compiled");
+                                let v = eval::eval_compiled_ref(c, row, &sctx, &mut stack)
+                                    .map_err(Some)?;
+                                if !matches!(v, Value::Null) {
+                                    slots[oi].num.count += 1;
+                                }
+                            }
+                            FusedOp::AccExpr(sp) => {
+                                let c = arg_compiled[*sp].as_ref().expect("gated compiled");
+                                let v = eval::eval_compiled_ref(c, row, &sctx, &mut stack)
+                                    .map_err(Some)?;
+                                acc_cell(&mut slots[oi].num, &v).map_err(Some)?;
+                            }
+                            FusedOp::ExtremeExpr { spec, max, .. } => {
+                                let c = arg_compiled[*spec].as_ref().expect("gated compiled");
+                                let v = eval::eval_compiled_ref(c, row, &sctx, &mut stack)
+                                    .map_err(Some)?;
+                                fused_extreme_cell(&mut slots[oi], &v, *max).map_err(Some)?;
                             }
                         }
                     }
