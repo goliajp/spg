@@ -23,8 +23,16 @@ fn reset_storage_params_no_ops() {
 fn alter_of_type_no_op() {
     let mut e = Engine::new();
     ddl(&mut e, "CREATE TABLE t (id INT)");
+    // v7.39 (round 710) — the TYPE must exist now, as PG requires; the
+    // binding itself stays a no-op. The old bare assertion pinned the
+    // swallow — F31.
+    ddl(&mut e, "CREATE TYPE some_composite_type AS (id INT)");
     ddl(&mut e, "ALTER TABLE t OF some_composite_type");
     ddl(&mut e, "ALTER TABLE t NOT OF");
+    let err = e
+        .execute("ALTER TABLE t OF nosuch_type")
+        .expect_err("PG18 refuses an unknown type");
+    assert!(format!("{err}").contains("type \"nosuch_type\" does not exist"));
 }
 
 #[test]

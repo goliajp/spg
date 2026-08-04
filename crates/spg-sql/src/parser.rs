@@ -1059,6 +1059,33 @@ impl Parser {
             parts.remove(0);
         }
         let name = parts.join(".");
+        // v7.39 (round 710) — `COMMENT ON FUNCTION f(int, text) IS …`.
+        // pg_dump writes the SIGNATURE, and the paren list was a syntax
+        // error here — a dump carrying one function comment failed to
+        // restore. The list is consumed (the comment store keys by name;
+        // overload-precise comments are the function-predicate follow-up).
+        if matches!(self.peek(), Token::LParen)
+            && matches!(kind.as_str(), "function" | "procedure" | "aggregate" | "routine")
+        {
+            let mut depth = 0usize;
+            loop {
+                match self.advance() {
+                    Token::LParen => depth += 1,
+                    Token::RParen => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    Token::Eof => {
+                        return Err(self.err(alloc::string::String::from(
+                            "unterminated argument list in COMMENT ON",
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
         // `IS`
         if !matches!(self.peek(), Token::Is) {
             self.expect_keyword_ident("is")?;
@@ -10114,6 +10141,18 @@ impl Parser {
                 target: crate::ast::AlterIndexTarget::Rename { new, if_exists },
             }));
         }
+        // v7.39 (round 710) — SET ( … ) / RESET ( … ) storage parameters.
+        // A syntax error before; the index is validated, the params no-op.
+        if matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("reset"))
+            || (matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("set"))
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)))
+        {
+            self.consume_until_statement_boundary();
+            return Ok(Statement::AlterIndex(crate::ast::AlterIndexStatement {
+                name,
+                target: crate::ast::AlterIndexTarget::StorageParams,
+            }));
+        }
         // REBUILD
         self.expect_keyword_ident("rebuild")?;
         // Optional: WITH (encoding = <enc>)
@@ -10342,6 +10381,24 @@ impl Parser {
             // Accept-and-no-op (it used to be a parse error).
             Token::Ident(s) if s.eq_ignore_ascii_case("replica") => {
                 self.advance();
+                // v7.39 (round 710) — `REPLICA IDENTITY USING INDEX <i>`
+                // validates the index; DEFAULT / FULL / NOTHING stay no-op.
+                if matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("identity"))
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(k)) if k.eq_ignore_ascii_case("using"))
+                {
+                    self.advance(); // IDENTITY
+                    self.advance(); // USING
+                    if matches!(self.peek(), Token::Index)
+                        || matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("index"))
+                    {
+                        self.advance();
+                    }
+                    let index = self.expect_ident_like()?;
+                    self.consume_until_statement_boundary();
+                    return Ok(alloc::vec![
+                        crate::ast::AlterTableTarget::ReplicaIdentityUsingIndex { index }
+                    ]);
+                }
                 self.consume_until_statement_boundary();
                 Ok(Vec::new())
             }
@@ -10379,8 +10436,12 @@ impl Parser {
             // Accept-and-no-op until a customer dump round-trips it.
             Token::Ident(s) if s.eq_ignore_ascii_case("of") => {
                 self.advance();
+                // v7.39 (round 710) — the type name is validated now.
+                let type_name = self.expect_ident_like()?;
                 self.consume_until_statement_boundary();
-                Ok(Vec::new())
+                Ok(alloc::vec![crate::ast::AlterTableTarget::OfType {
+                    type_name
+                }])
             }
             // v7.37.18 (18.18) — `NOT OF` lexes NOT as Token::Not
             // (reserved keyword) rather than Token::Ident("not"),

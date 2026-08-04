@@ -172,6 +172,37 @@ impl Engine {
                     )))
                 }
             }
+            // v7.39 (round 710) — same shape as OwnerTo/ClusterOn above:
+            // the ACTION no-ops, the NAME check is what was missing.
+            T::OfType { type_name } => {
+                let cat = self.active_catalog();
+                if cat.enum_types().contains_key(&type_name)
+                    || cat.domain_types().contains_key(&type_name)
+                    || cat.composite_types().contains_key(&type_name)
+                {
+                    Ok(())
+                } else {
+                    Err(EngineError::Unsupported(alloc::format!(
+                        "type \"{type_name}\" does not exist"
+                    )))
+                }
+            }
+            T::ReplicaIdentityUsingIndex { index } => {
+                let table = self.active_catalog().get(tbl).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+                })?;
+                if table
+                    .indices()
+                    .iter()
+                    .any(|i| i.name.eq_ignore_ascii_case(&index))
+                {
+                    Ok(())
+                } else {
+                    Err(EngineError::Unsupported(alloc::format!(
+                        "index \"{index}\" for table \"{tbl}\" does not exist"
+                    )))
+                }
+            }
             T::ClusterOn { index } => {
                 let Some(index) = index else { return Ok(()) };
                 let table = self.active_catalog().get(tbl).ok_or_else(|| {
@@ -2037,6 +2068,26 @@ impl Engine {
                 }
                 Err(e) => Err(EngineError::Storage(e)),
             };
+        }
+        // v7.39 (round 710) — SET/RESET storage params: validate the
+        // index, no-op the parameters (PG resolves the relation first —
+        // `relation "x" does not exist` — and SPG engine-manages storage
+        // parameters, as the ALTER TABLE arms already record).
+        if matches!(target, spg_sql::ast::AlterIndexTarget::StorageParams) {
+            let cat = self.active_catalog();
+            let exists = cat.table_names().iter().any(|tn| {
+                cat.get(tn.as_str())
+                    .is_some_and(|t| t.indices().iter().any(|i| i.name == idx_name))
+            });
+            if !exists {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "relation \"{idx_name}\" does not exist"
+                )));
+            }
+            return Ok(QueryResult::CommandOk {
+                affected: 0,
+                modified_catalog: false,
+            });
         }
         let spg_sql::ast::AlterIndexTarget::Rebuild { encoding } = target else {
             unreachable!("Rename branch returned above");
