@@ -1129,6 +1129,17 @@ pub fn cast_value_ref_in(
 /// v7.39 (round 613) — the tail of the `Named` arm: stringify for the text
 /// targets, coerce, and round a temporal precision. Split out so the fast
 /// path below reaches exactly this code rather than a copy of it.
+/// v7.39 (round 722) — the compiled `Step::CastPlain` entry: same tail,
+/// name pre-resolved at compile time.
+pub(crate) fn finish_named_cast_plain(
+    v: Value<'static>,
+    dt: spg_storage::DataType,
+    resolve_name: &str,
+    mysql: bool,
+) -> Result<Value<'static>, EvalError> {
+    finish_named_cast(v, dt, resolve_name, None, mysql)
+}
+
 fn finish_named_cast(
     v: Value<'static>,
     dt: spg_storage::DataType,

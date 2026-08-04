@@ -206,6 +206,17 @@ pub(crate) enum Step {
     Cast {
         target: spg_sql::ast::CastTarget,
     },
+    /// v7.39 (round 722) — a NAMED cast whose name resolved at COMPILE
+    /// time (`::NUMERIC`, `::REAL`, `numeric(10,2)` — the
+    /// `plain_named_target` table). The blanket Named -> Subtree rule
+    /// sent these to the interpreter — worse, it made the whole
+    /// aggregate argument non-compilable, so `count(id::NUMERIC)` fell
+    /// off the round-716 fused parallel lane entirely. The name rides
+    /// along for error wording only.
+    CastPlain {
+        dt: spg_storage::DataType,
+        name: alloc::string::String,
+    },
     /// v7.37.5-A2b — `CASE [operand] WHEN x THEN y … ELSE z END`.
     /// Each `(when, then)` branch and the optional `else` is a
     /// pre-compiled sub-program; the executor short-circuits on the
@@ -974,6 +985,21 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 spg_sql::ast::CastTarget::Named(n) => named_varchar_family(n),
                 _ => false,
             };
+            // v7.39 (round 722) — a plain scalar spelling resolves NOW, not
+            // per row; see `Step::CastPlain`. The text family keeps its
+            // dedicated route (the timestamptz::text Subtree guard below
+            // must still see it).
+            if let spg_sql::ast::CastTarget::Named(n) = target
+                && !named_text_family
+                && let Some(dt) = super::cast::plain_named_target(n)
+            {
+                compile_into(expr, ctx, steps);
+                steps.push(Step::CastPlain {
+                    dt,
+                    name: n.clone(),
+                });
+                return;
+            }
             if matches!(target, spg_sql::ast::CastTarget::RegClass)
                 || (matches!(target, spg_sql::ast::CastTarget::Named(_)) && !named_text_family)
             {
@@ -1249,7 +1275,12 @@ pub(crate) fn fully_compilable(e: &Expr) -> bool {
             // targets still need eval's catalog pre-hooks.
             let target_ok = match target {
                 spg_sql::ast::CastTarget::RegClass => false,
-                spg_sql::ast::CastTarget::Named(n) => named_varchar_family(n),
+                // v7.39 (round 722) — a compile-time-resolvable plain name
+                // is as compilable as the dedicated variants; see
+                // `Step::CastPlain`.
+                spg_sql::ast::CastTarget::Named(n) => {
+                    named_varchar_family(n) || super::cast::plain_named_target(n).is_some()
+                }
                 _ => true,
             };
             target_ok && fully_compilable(expr)
@@ -2324,6 +2355,35 @@ where
                     stack.push(super::cast::cast_value_ref_in(
                         v.into_owned(),
                         target,
+                        ctx.mysql_dialect,
+                    )?);
+                }
+            }
+            Step::CastPlain { dt, name } => {
+                let v = stack.pop().unwrap_or(Value::Null);
+                // The name is pre-validated (it came off the plain table),
+                // so NULL keeps its short-circuit; a same-type value passes
+                // through untouched, exactly the identity the Cast step
+                // recognises.
+                let identity = matches!(
+                    (&v, dt),
+                    (Value::Null, _)
+                        | (Value::Int(_), spg_storage::DataType::Int)
+                        | (Value::BigInt(_), spg_storage::DataType::BigInt)
+                        | (Value::SmallInt(_), spg_storage::DataType::SmallInt)
+                        | (Value::Real(_), spg_storage::DataType::Real)
+                        | (Value::Float(_), spg_storage::DataType::Float)
+                        | (Value::Bool(_), spg_storage::DataType::Bool)
+                        | (Value::Date(_), spg_storage::DataType::Date)
+                        | (Value::Uuid(_), spg_storage::DataType::Uuid)
+                );
+                if identity {
+                    stack.push(v);
+                } else {
+                    stack.push(super::cast::finish_named_cast_plain(
+                        v.into_owned(),
+                        *dt,
+                        name,
                         ctx.mysql_dialect,
                     )?);
                 }
