@@ -306,7 +306,12 @@ impl Engine {
         // changes into `last_redo` for the embedding layer's WAL, on
         // failure discard them (a failed statement leaves no redo; the
         // drain clears the tables' capture buffers either way).
-        if self.redo_capture {
+        // v7.39 (round 736, S14/B3) — a delta-maintainable materialized
+        // view needs the same physical change stream the WAL reads, so
+        // its presence enables capture too (the fan-out below copies;
+        // `last_redo` stays the embedding layer's alone).
+        let matview_capture = !self.matview_maintainable.is_empty();
+        if self.redo_capture || matview_capture {
             self.active_catalog_mut().enable_redo_all();
         }
         // v7.38 Epic P (panic isolation) — run statement execution
@@ -374,9 +379,12 @@ impl Engine {
             self.lo_descriptors.clear();
             self.lo_next_fd = 0;
         }
-        if self.redo_capture {
+        if self.redo_capture || matview_capture {
             let mut drained = self.active_catalog_mut().drain_redo();
             if result.is_ok() {
+                if matview_capture {
+                    self.fan_out_matview_deltas(&drained);
+                }
                 // v7.37.15 (Epic W slice 2) — stamp the real committing
                 // writer version onto every change this statement
                 // produced. All changes from one statement share the one
@@ -391,7 +399,9 @@ impl Engine {
                         change.set_writer_version(v);
                     }
                 }
-                self.last_redo = drained;
+                if self.redo_capture {
+                    self.last_redo = drained;
+                }
             }
         }
         self.current_tx = saved;
