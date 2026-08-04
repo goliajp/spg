@@ -458,3 +458,82 @@ fn round711_pk_unique_deferrable_flags_are_stored() {
     assert!(rows.contains(&"d711c_pkey|false|false".to_string()), "{rows:?}");
     assert!(rows.contains(&"p711|true|true".to_string()), "{rows:?}");
 }
+
+/// v7.39 (round 712) — F08's enforcement half: deferred PK/UNIQUE checks
+/// really defer. Every shape is the r711 PG18 measurement:
+///
+///   ① a transient duplicate healed before COMMIT commits cleanly — the
+///     legal PG sequence that used to fail on the second INSERT;
+///   ② a violation left in place errors AT COMMIT (23505 wording) and the
+///     transaction rolls back;
+///   ③ `SET CONSTRAINTS ALL IMMEDIATE` pulls the check to the SET;
+///   ④ INITIALLY IMMEDIATE flips into deferral via SET CONSTRAINTS;
+///   ⑤ NOT DEFERRABLE is immune to SET CONSTRAINTS.
+///
+/// The machinery is round 288's FK deferral extended: the same tx-state
+/// timing rules (`uc_deferred_in` mirrors `fk_deferred_in`), the same
+/// COMMIT sweep — with a WHOLE-TABLE validator, because by COMMIT the rows
+/// are already in the table and the insert-time probe would collide with
+/// itself.
+#[test]
+fn round712_deferred_unique_checks_defer() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE d712 (id INT PRIMARY KEY DEFERRABLE INITIALLY DEFERRED)")
+        .unwrap();
+    // ① heal before COMMIT.
+    e.execute("BEGIN").unwrap();
+    e.execute("INSERT INTO d712 VALUES (1)").unwrap();
+    e.execute("INSERT INTO d712 VALUES (1)").unwrap();
+    e.execute("DELETE FROM d712 WHERE id = 1").unwrap();
+    e.execute("COMMIT").unwrap();
+    // ② leave the violation in place: COMMIT errors, tx rolls back.
+    e.execute("BEGIN").unwrap();
+    e.execute("INSERT INTO d712 VALUES (2)").unwrap();
+    e.execute("INSERT INTO d712 VALUES (2)").unwrap();
+    let err = format!("{}", e.execute("COMMIT").expect_err("PG errors at COMMIT"));
+    assert!(
+        err.contains("duplicate key value violates unique constraint \"d712_pkey\""),
+        "{err}"
+    );
+    let n = match e.execute("SELECT count(*) FROM d712").unwrap() {
+        QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(n, "0", "the failed COMMIT must leave nothing behind");
+    // ③ IMMEDIATE pulls the check forward — by the SYNTHESISED name, which
+    // is how PG reaches an unnamed constraint.
+    e.execute("BEGIN").unwrap();
+    e.execute("INSERT INTO d712 VALUES (3)").unwrap();
+    e.execute("INSERT INTO d712 VALUES (3)").unwrap();
+    assert!(
+        format!(
+            "{}",
+            e.execute("SET CONSTRAINTS d712_pkey IMMEDIATE")
+                .expect_err("the pending violation surfaces at the SET")
+        )
+        .contains("d712_pkey")
+    );
+    let _ = e.execute("ROLLBACK");
+    // ④ INITIALLY IMMEDIATE flips into deferral.
+    e.execute("CREATE TABLE d712b (id INT PRIMARY KEY DEFERRABLE)").unwrap();
+    e.execute("BEGIN").unwrap();
+    e.execute("SET CONSTRAINTS ALL DEFERRED").unwrap();
+    e.execute("INSERT INTO d712b VALUES (4)").unwrap();
+    e.execute("INSERT INTO d712b VALUES (4)").unwrap();
+    e.execute("DELETE FROM d712b WHERE id = 4").unwrap();
+    e.execute("COMMIT").unwrap();
+    // ⑤ NOT DEFERRABLE is immune.
+    e.execute("CREATE TABLE d712c (id INT PRIMARY KEY)").unwrap();
+    e.execute("BEGIN").unwrap();
+    e.execute("SET CONSTRAINTS ALL DEFERRED").unwrap();
+    e.execute("INSERT INTO d712c VALUES (5)").unwrap();
+    assert!(
+        format!(
+            "{}",
+            e.execute("INSERT INTO d712c VALUES (5)")
+                .expect_err("immediate, whatever SET CONSTRAINTS says")
+        )
+        .contains("d712c_pkey")
+    );
+    let _ = e.execute("ROLLBACK");
+}
