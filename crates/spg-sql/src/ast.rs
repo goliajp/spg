@@ -1187,6 +1187,12 @@ pub enum AlterIndexTarget {
     /// DB where the rename already happened is a no-op rather
     /// than an error).
     Rename { new: String, if_exists: bool },
+    /// v7.39 (round 710) — `SET ( option = value, … )` / `RESET ( … )`.
+    /// Was a SYNTAX ERROR; PG resolves the INDEX first (`relation "x"
+    /// does not exist`), so the index is validated and the storage
+    /// parameters no-op (SPG engine-manages them, as ALTER TABLE's
+    /// SET/RESET arms already record).
+    StorageParams,
 }
 
 /// v6.7.2 — `ALTER TABLE t SET <setting> = <value>`. v6.7.2 ships
@@ -1399,6 +1405,15 @@ pub enum AlterTableTarget {
     /// EXPRESSION AS (expr)` (PG 17) changes a stored generated column's
     /// expression and recomputes every existing row.
     AlterColumnSetExpression { column: String, expr: Expr },
+    /// v7.39 (round 710) — `OF <type>` / the type half of the typed-table
+    /// binding. The BINDING stays a no-op (recorded); the TYPE must exist
+    /// (PG: `type "x" does not exist`).
+    OfType { type_name: String },
+    /// v7.39 (round 710) — `REPLICA IDENTITY USING INDEX <i>`. The
+    /// identity setting no-ops (SPG has no logical replication consumer);
+    /// the INDEX must exist on this table (PG: `index "i" for table "t"
+    /// does not exist`).
+    ReplicaIdentityUsingIndex { index: String },
 }
 
 /// v7.16.1 — target of `ALTER TABLE … { ENABLE | DISABLE }
@@ -5630,6 +5645,11 @@ impl fmt::Display for Statement {
             Self::AlterIndex(a) => {
                 write!(f, "ALTER INDEX ")?;
                 match &a.target {
+                    // Parameters are consumed, not stored; the shortest
+                    // faithful spelling.
+                    AlterIndexTarget::StorageParams => {
+                        write!(f, "{} SET ()", quote_ident(&a.name))
+                    }
                     AlterIndexTarget::Rebuild { encoding } => {
                         write!(f, "{} REBUILD", quote_ident(&a.name))?;
                         if let Some(enc) = encoding {
@@ -6565,6 +6585,10 @@ impl fmt::Display for CreateTableStatement {
 
 fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Result {
     match t {
+        AlterTableTarget::OfType { type_name } => write!(f, "OF {type_name}"),
+        AlterTableTarget::ReplicaIdentityUsingIndex { index } => {
+            write!(f, "REPLICA IDENTITY USING INDEX {index}")
+        }
         AlterTableTarget::Inherit { parent, detach } => {
             if *detach {
                 write!(f, "NO INHERIT {parent}")

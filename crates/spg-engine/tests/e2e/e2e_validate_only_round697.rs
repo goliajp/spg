@@ -358,3 +358,57 @@ fn round709_the_second_batch_validates_its_names() {
             .any(|n| n.message.contains("foreign-data infrastructure is not provided")),
     );
 }
+
+/// v7.39 (round 710) — the S05g ④ tail batch: ten probes, five fixed, two
+/// of them PARSE holes rather than validation holes. `COMMENT ON FUNCTION
+/// f(int)` — the spelling pg_dump writes — was a syntax error at the `(`,
+/// so one function comment in a dump failed the restore; `ALTER INDEX i
+/// SET (fillfactor = 90)` was a syntax error at SET. Both parse now; the
+/// signature's per-overload validation stays with the function-predicate
+/// follow-up, and index storage params no-op as ALTER TABLE's already do.
+///
+/// Recorded, not fixed: LOAD accepts (SPG has no loadable libraries — the
+/// foreign-infra reasoning), and ALTER TABLE SET's parameter names and
+/// bounds go unchecked pending a parameter catalog.
+#[test]
+fn round710_the_tail_batch() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t710(i INT)").unwrap();
+    e.execute("CREATE INDEX ix710 ON t710(i)").unwrap();
+    for (sql, want) in [
+        ("ALTER TABLE t710 OF nosuch710", "type \"nosuch710\" does not exist"),
+        (
+            "ALTER TABLE t710 REPLICA IDENTITY USING INDEX nosuch710",
+            "index \"nosuch710\" for table \"t710\" does not exist",
+        ),
+        (
+            "ALTER INDEX nosuch710 SET (fillfactor = 90)",
+            "relation \"nosuch710\" does not exist",
+        ),
+        (
+            "CREATE TRIGGER tg710 BEFORE INSERT ON t710 FOR EACH ROW \
+             EXECUTE FUNCTION nosuch_fn710()",
+            "function nosuch_fn710() does not exist",
+        ),
+    ] {
+        let err = err_of(&mut e, sql);
+        assert!(err.contains(want), "{sql}\n  got: {err}\n  want: {want}");
+    }
+    // The legitimate forms, including the dump spellings that used to be
+    // syntax errors.
+    e.execute("CREATE TYPE ct710 AS (a INT, b TEXT)").unwrap();
+    e.execute("CREATE FUNCTION f710() RETURNS INT LANGUAGE sql AS $$ SELECT 1 $$")
+        .unwrap();
+    for sql in [
+        "ALTER TABLE t710 OF ct710",
+        "ALTER TABLE t710 NOT OF",
+        "ALTER TABLE t710 REPLICA IDENTITY USING INDEX ix710",
+        "ALTER TABLE t710 REPLICA IDENTITY FULL",
+        "ALTER INDEX ix710 SET (fillfactor = 90)",
+        "ALTER INDEX ix710 RESET (fillfactor)",
+        "COMMENT ON FUNCTION f710() IS 'x'",
+        "COMMENT ON FUNCTION f710(int, text) IS 'x'",
+    ] {
+        ok(&mut e, sql);
+    }
+}

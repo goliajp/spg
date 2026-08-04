@@ -5573,9 +5573,12 @@ impl Catalog {
         // trigger names its function by NAME (a trigger function takes no
         // arguments), so the existence check goes through the name index.
         if self.functions_named(&def.function).is_empty() {
+            // v7.39 (round 710) — PG's wording: the FUNCTION is what does
+            // not exist (`function nosuch_fn() does not exist`), and the
+            // old message rode `Corrupt`'s on-disk banner besides.
             return Err(StorageError::Corrupt(format!(
-                "trigger {:?} references unknown function {:?}",
-                def.name, def.function
+                "function {}() does not exist",
+                def.function
             )));
         }
         let dup = self
