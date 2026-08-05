@@ -54,8 +54,14 @@ NULL
 statement error
 INSERT INTO meetings VALUES (99, 'not a time')
 
-statement error
+# v7.39 (round 761, F31 tranche 2 #59) — PG18-measured: an offset-less
+# TIME literal lands at the session offset; the old record pinned SPG's
+# refusal, a divergence the audit closed.
+statement ok
 INSERT INTO meetings VALUES (99, '14:30:45')
+
+statement ok
+DELETE FROM meetings WHERE id = 99
 
 statement error
 INSERT INTO meetings VALUES (99, '14:30:45+15')

@@ -13134,6 +13134,20 @@ fn apply_function_dispatch(
             if matches!(&args[0], Value::Null) {
                 return Ok(Value::Null);
             }
+            // v7.39 (round 761, F31 tranche 2 #41) — PG has no
+            // concat_ws overload for a non-text separator
+            // (`concat_ws(0, 'a', 'b')` refuses with "function
+            // concat_ws(integer, unknown, unknown) does not exist",
+            // PG18-measured); the old arm coerced it. MySQL's
+            // CONCAT_WS coerces, so that dialect keeps it.
+            if !ctx.mysql_dialect && !matches!(&args[0], Value::Text(_)) {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "concat_ws() needs a text separator, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(args[0].data_type())
+                    ),
+                });
+            }
             let sep = super::strings::value_to_format_text_styled_ref(&args[0], &ctx.render_style);
             // v7.39 (round 612) — see `concat`.
             let mut out = String::with_capacity(

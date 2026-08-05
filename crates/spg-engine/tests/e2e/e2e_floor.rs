@@ -98,9 +98,10 @@ fn floor_zero() {
 fn floor_integer_passthrough() {
     let mut e = Engine::new();
     let row = one_row(e.execute("SELECT floor(42)").unwrap());
-    // PG returns an integer in this case but SPG can return
-    // BigInt or matching int type; assert it's the right value
-    // regardless of width.
+    // PG18-measured (round 761): pg_typeof(floor(42)) is DOUBLE
+    // PRECISION there (int4 implicitly widens to float8 — the old
+    // note claimed "an integer"); SPG keeps the integer family.
+    // Assert the value regardless of width.
     match &row[0] {
         Value::Int(n) => assert_eq!(*n, 42),
         Value::BigInt(n) => assert_eq!(*n, 42),

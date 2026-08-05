@@ -5273,9 +5273,16 @@ impl Parser {
                 }
                 Token::Null => {
                     self.advance();
-                    // NULL after a NOT NULL is contradictory, but
-                    // PG accepts bare NULL as the default-nullable
-                    // marker. No-op.
+                    // v7.39 (round 761, F31 tranche 2 #31) — bare NULL
+                    // is the default-nullable marker (PG accepts it),
+                    // but AFTER a NOT NULL it is a conflict PG refuses
+                    // (`conflicting NULL/NOT NULL constraints`,
+                    // PG18-measured); the old arm no-opped both ways.
+                    if not_null {
+                        return Err(self.err(alloc::string::String::from(
+                            "conflicting NULL/NOT NULL constraints",
+                        )));
+                    }
                 }
                 Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("check") => {
                     self.advance();
@@ -16883,7 +16890,12 @@ impl Parser {
             // timestamps etc). Accept + no-op.
             if matches!(self.peek(), Token::Null) {
                 if nullability_seen && !nullable {
-                    return Err(self.err("column declared NOT NULL then NULL — pick one".into()));
+                    // v7.39 (round 761, F31 tranche 2 #31) — PG's
+                    // sentence, PG18-measured (the table name is the
+                    // caller's; the column half is exact).
+                    return Err(self.err(alloc::format!(
+                        "conflicting NULL/NOT NULL declarations for column \"{name}\""
+                    )));
                 }
                 self.advance();
                 nullable = true;
