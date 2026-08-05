@@ -5773,6 +5773,9 @@ impl crate::Engine {
             Some(&for_query),
             // A scalar call has no set to build; RETURN NEXT / RETURN QUERY are
             // errors here, as in PG.
+            // (second None below: the read path holds the engine immutably, so
+            // RAISE messages have nowhere session-bound to go — B3 residual.)
+            None,
             None,
         )
         .map_err(|e| EvalError::TypeMismatch {
@@ -5889,6 +5892,8 @@ impl crate::Engine {
             Some(&select_into),
             Some(&for_query),
             Some(&sink),
+            // Read path — immutable engine borrow; B3 residual.
+            None,
         )
         .map_err(|e| EvalError::TypeMismatch {
             detail: alloc::format!("{e}"),

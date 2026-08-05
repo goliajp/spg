@@ -202,6 +202,8 @@ pub fn fire_row_trigger(
     // SPG bound none, so any function that read `TG_OP` died on
     // "column tg_op does not exist" — most audit / dispatch triggers do.
     tg: &TgMeta<'_>,
+    // v7.39 (round 757, F31-B3) — see [`NoticeSink`].
+    notice_sink: Option<&NoticeSink>,
 ) -> Result<(TriggerOutcome, Vec<DeferredEmbeddedStmt>), TriggerError> {
     if !function.language.eq_ignore_ascii_case("plpgsql") {
         return Err(TriggerError::UnsupportedConstruct {
@@ -278,6 +280,7 @@ pub fn fire_row_trigger(
         default_text_search_config,
         is_after,
         select_into_resolver: None,
+        notice_sink,
         for_query_resolver: None,
         // A trigger function is not set-returning.
         set_sink: None,
@@ -320,6 +323,13 @@ enum BodyOutcome {
     Continue,
 }
 
+/// v7.39 (round 757, F31-B3) — where `RAISE NOTICE / WARNING / INFO`
+/// deliver their rendered messages. The caller drains it into the
+/// session's pending notices, and pgwire ships one NoticeResponse per
+/// entry; `None` (the SELECT-path scalar-function caller, which holds
+/// the engine immutably) drops them — ledgered as the B3 residual.
+pub type NoticeSink = core::cell::RefCell<Vec<(crate::NoticeSeverity, String)>>;
+
 /// Shared parameters every body-stmt evaluation needs. Bundled so
 /// the recursive `execute_stmts` doesn't have to thread eight
 /// individual `&str` / `&[…]` args around.
@@ -337,6 +347,8 @@ struct BodyCtx<'a> {
     /// fresh value). `None` for trigger paths where SelectInto
     /// isn't yet supported.
     select_into_resolver: Option<&'a SelectIntoResolver<'a>>,
+    /// v7.39 (round 757, F31-B3) — see [`NoticeSink`].
+    notice_sink: Option<&'a NoticeSink>,
     /// v7.37.20 (20.5) — synchronous SELECT-to-rows resolver used
     /// by `FOR <var> IN <SELECT> LOOP`. Provided by the DO block
     /// executor; runs the SELECT once and returns every row.
@@ -580,12 +592,20 @@ fn execute_stmts(
                         message: resolved,
                     });
                 }
-                // NOTICE / WARNING / INFO / LOG / DEBUG — log to
-                // stderr for v7.12.6. Wiring through the server's
-                // log channel is a v7.12.7+ polish item; the
-                // resolved message stays accessible regardless.
-                let _ = resolved;
-                let _ = level;
+                // v7.39 (round 757, F31-B3) — NOTICE / WARNING /
+                // INFO reach the client (the round-753 audit found
+                // them silently discarded here since v7.12.6); LOG
+                // and DEBUG are server-log levels PG does not send
+                // at the default client_min_messages.
+                let severity = match level {
+                    RaiseLevel::Notice => Some(crate::NoticeSeverity::Notice),
+                    RaiseLevel::Warning => Some(crate::NoticeSeverity::Warning),
+                    RaiseLevel::Info => Some(crate::NoticeSeverity::Info),
+                    _ => None,
+                };
+                if let (Some(sev), Some(sink)) = (severity, ctx.notice_sink) {
+                    sink.borrow_mut().push((sev, resolved));
+                }
             }
             PlPgSqlStmt::SelectInto { var, body } => {
                 // v7.16.2 — execute via the engine callback the
@@ -1177,6 +1197,7 @@ pub fn execute_do_block_top_level<'a>(
     default_text_search_config: Option<&'a str>,
     select_into_resolver: Option<&'a SelectIntoResolver<'a>>,
     for_query_resolver: Option<&'a ForQueryResolver<'a>>,
+    notice_sink: Option<&'a NoticeSink>,
 ) -> Result<Vec<spg_sql::ast::Statement>, TriggerError> {
     // A DO block returns nothing, so RETURN NEXT / RETURN QUERY have nowhere to
     // go — PG rejects them there too.
@@ -1203,6 +1224,7 @@ pub fn execute_do_block_top_level<'a>(
         default_text_search_config,
         is_after: false,
         select_into_resolver,
+        notice_sink,
         for_query_resolver,
         set_sink,
     };
@@ -1298,6 +1320,9 @@ pub fn call_plpgsql_scalar<'a>(
     // v7.39 (read01 round 66) — where `RETURN NEXT` / `RETURN QUERY` append.
     // `Some` when the function is SETOF; the caller reads the rows out of it.
     set_sink: Option<&'a core::cell::RefCell<Vec<Vec<Value<'static>>>>>,
+    // v7.39 (round 757, F31-B3) — see [`NoticeSink`]. The SELECT-path
+    // caller passes `None` (immutable engine borrow; B3 residual).
+    notice_sink: Option<&'a NoticeSink>,
 ) -> Result<Option<Value<'static>>, TriggerError> {
     let mut locals: BTreeMap<String, Value<'static>> = args;
     let empty_cols: &[ColumnSchema] = &[];
@@ -1323,6 +1348,7 @@ pub fn call_plpgsql_scalar<'a>(
         default_text_search_config,
         is_after: false,
         select_into_resolver,
+        notice_sink,
         for_query_resolver,
         set_sink,
     };

@@ -472,6 +472,26 @@ impl Engine {
         });
     }
 
+    /// v7.39 (round 757, F31-B3) — deliver a plpgsql body's RAISE
+    /// messages into the pending-notice queue, honouring
+    /// `client_min_messages` (INFO passes unconditionally, as in PG).
+    pub(crate) fn drain_raise_sink(&mut self, sink: crate::triggers::NoticeSink) {
+        self.queue_raised(sink.into_inner());
+    }
+
+    /// The vec-shaped half: body walkers that cannot hold `&mut self`
+    /// collect into a plain Vec and the owning method queues it here.
+    pub(crate) fn queue_raised(
+        &mut self,
+        raised: alloc::vec::Vec<(crate::NoticeSeverity, alloc::string::String)>,
+    ) {
+        for (severity, message) in raised {
+            if self.notice_severity_reaches_client(severity) {
+                self.pending_notices.push(crate::Notice { severity, message });
+            }
+        }
+    }
+
     /// v7.39 (read01 round 46) — drain the NOTICEs the last statement
     /// raised. pgwire emits one NoticeResponse per entry ahead of the
     /// statement's CommandComplete; embedded callers may ignore them.
@@ -544,6 +564,8 @@ impl Engine {
         let own = match severity {
             crate::NoticeSeverity::Notice => 6,
             crate::NoticeSeverity::Warning => 7,
+            // PG sends INFO to the client unconditionally.
+            crate::NoticeSeverity::Info => return true,
         };
         own >= setting
     }
