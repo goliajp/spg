@@ -7602,7 +7602,10 @@ impl Parser {
     ///   - `FOR ALL TABLES`
     ///   - `FOR ALL TABLES EXCEPT t1, t2, …` (v6.1.3)
     ///   - `FOR TABLE t1, t2, …` (v6.1.3) — `FOR TABLES …` also
-    ///     accepted (PG accepts both forms in PG 19).
+    ///     accepted as an SPG lenience. PG18-measured (round 753): PG
+    ///     REJECTS the bare plural (`invalid publication object list`,
+    ///     TABLES only pairs with IN SCHEMA); the old note claimed an
+    ///     unverifiable "PG 19 accepts both". Ledgered, not load-bearing.
     fn parse_create_publication_after_keyword(&mut self) -> Result<Statement, ParseError> {
         let name = self.expect_ident_or_string()?;
         // Bare DDL maps to FOR ALL TABLES — matches the v6.1.2
@@ -16438,10 +16441,10 @@ impl Parser {
             }
             break;
         }
-        // v7.10.10 — postfix `[]` widens TEXT → TEXT[]. PG accepts
-        // `TYPE[]` after any base type; v7.10 only models TEXT[]
-        // so we reject other base types here. mailrs uses TEXT[]
-        // for labels / addresses / message-on-thread.
+        // v7.10.10 — postfix `[]` widens the base type to its array
+        // type. PG accepts `TYPE[]` after any base type and so does
+        // SPG now (round-753 probe: INT[] / NUMERIC[] / TIMESTAMP[]
+        // all through; the old "only TEXT[]" note was stale).
         if matches!(self.peek(), Token::LBracket) {
             self.advance();
             if !matches!(self.peek(), Token::RBracket) {
@@ -25546,8 +25549,11 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         Token::CosineDistance => (BinOp::CosineDistance, 6),
         Token::Plus => (BinOp::Add, 7),
         Token::Minus => (BinOp::Sub, 7),
-        // `||` sits beside `+`/`-` (matches PG conceptually — concat groups
-        // by the same level as binary additive arithmetic).
+        // `||` sits beside `+`/`-`. PG18-measured (round 753): this
+        // DIVERGES — PG binds every "other" operator (`||`, `|`, `&`)
+        // BELOW additive, so `'a' || 1 + 1` answers `a2` there and
+        // errors here (`text + integer`). Queued as F31-B1; `1 + 2 ||
+        // '3'` agrees on both because left-assoc happens to match.
         Token::Concat => (BinOp::Concat, 7),
         // Bitwise `|` / `&` ride the same rung as `||` — PG groups
         // all "other" operators between additive and comparison, so
