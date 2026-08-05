@@ -3262,6 +3262,10 @@ impl Engine {
         let dummy_row = Row::new(alloc::vec::Vec::new());
         // v7.11.13 — unnest dispatches per array element type so
         // INT[] / BIGINT[] surface their PG types in projection.
+        // v7.39 (round 758, F31-B8a) — the composite SRF names its own
+        // columns (PG: lexeme | positions | weights); everything else
+        // keeps the alias / "unnest" defaults below.
+        let mut composite_names: Option<&[&str]> = None;
         let (dtypes, rows): (alloc::vec::Vec<DataType>, alloc::vec::Vec<Row<'static>>) =
             if let Some(m) = multi {
                 m
@@ -3272,6 +3276,10 @@ impl Engine {
                     let v = eval::eval_expr(expr, &dummy_row, &ctx).map_err(EngineError::Eval)?;
                     crate::eval::values::flatten_2d(&v).unwrap_or(v)
                 };
+                let mut return_multi: Option<(
+                    alloc::vec::Vec<DataType>,
+                    alloc::vec::Vec<Row<'static>>,
+                )> = None;
                 let (elem_dtype, rows): (DataType, alloc::vec::Vec<Row<'static>>) =
                     match unnest_src {
                         Value::Null => (DataType::Text, alloc::vec::Vec::new()),
@@ -3327,6 +3335,59 @@ impl Engine {
                                 .collect();
                             (DataType::Range(kind), rows)
                         }
+                        // v7.39 (round 758, F31-B8a) — unnest(tsvector):
+                        // one row per lexeme, PG18-measured columns
+                        // lexeme | positions | weights (`a | {1,3} |
+                        // {D,D}`); a position-less lexeme (a stripped
+                        // vector) reads NULL in both array columns.
+                        Value::TsVector(lexemes) => {
+                            composite_names = Some(&["lexeme", "positions", "weights"]);
+                            let rows = lexemes
+                                .iter()
+                                .map(|l| {
+                                    let (pos, wts) = if l.positions.is_empty() {
+                                        (Value::Null, Value::Null)
+                                    } else {
+                                        let letter = match l.weight {
+                                            3 => "A",
+                                            2 => "B",
+                                            1 => "C",
+                                            _ => "D",
+                                        };
+                                        (
+                                            Value::SmallIntArray(
+                                                l.positions
+                                                    .iter()
+                                                    .map(|p| {
+                                                        Some(i16::try_from(*p).unwrap_or(i16::MAX))
+                                                    })
+                                                    .collect(),
+                                            ),
+                                            Value::TextArray(
+                                                l.positions
+                                                    .iter()
+                                                    .map(|_| Some(letter.into()))
+                                                    .collect(),
+                                            ),
+                                        )
+                                    };
+                                    Row::new(alloc::vec![
+                                        Value::text(l.word.clone()),
+                                        pos,
+                                        wts
+                                    ])
+                                })
+                                .collect();
+                            return_multi = Some((
+                                alloc::vec![
+                                    DataType::Text,
+                                    DataType::SmallIntArray,
+                                    DataType::TextArray
+                                ],
+                                rows,
+                            ));
+                            (DataType::Text, alloc::vec::Vec::new())
+                        }
                         other => {
                             // v7.39 (round 622, S05a) — see table_access.rs:
                             // the same sentence, and it is a type mismatch.
@@ -3338,7 +3399,11 @@ impl Engine {
                             }));
                         }
                     };
-                (alloc::vec![elem_dtype], rows)
+                if let Some(m) = return_multi {
+                    m
+                } else {
+                    (alloc::vec![elem_dtype], rows)
+                }
             };
         let alias = primary
             .alias
@@ -3360,7 +3425,9 @@ impl Engine {
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| {
-                        if n_vals == 1 {
+                        if let Some(names) = composite_names {
+                            names.get(i).map_or_else(|| "unnest".to_string(), |n| (*n).to_string())
+                        } else if n_vals == 1 {
                             alias.clone()
                         } else {
                             "unnest".to_string()
