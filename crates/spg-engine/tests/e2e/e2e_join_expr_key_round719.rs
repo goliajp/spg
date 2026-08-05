@@ -228,3 +228,32 @@ fn round732_two_int_keys_answer_as_pg() {
         assert_eq!(one(&mut e, sql), want, "{sql}");
     }
 }
+
+/// v7.39 (round 744) — the count-star anti-join fast path accepts a
+/// COMPUTED inner key (`ON a.id = b.id + 1 WHERE b.id IS NULL`), with
+/// the IS NULL column constrained to one the key expression READS —
+/// any other inner column could be NULL on a matched row and the count
+/// would be wrong (that shape keeps the general path, pinned).
+#[test]
+fn round744_anti_join_fast_takes_computed_keys() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        (
+            "SELECT count(*) FROM j719 a LEFT JOIN j719 b ON a.id = b.id + 1              WHERE b.id IS NULL",
+            "1",
+        ),
+        (
+            "SELECT count(*) FROM j719 a LEFT JOIN j719 b ON a.id = b.id * 2              WHERE b.id IS NULL",
+            "50",
+        ),
+        // g is NOT read by the key: general path, and NULL-g matched
+        // rows must not be counted (none here — g is never NULL).
+        (
+            "SELECT count(*) FROM j719 a LEFT JOIN j719 b ON a.id = b.id + 1              WHERE b.g IS NULL",
+            "1",
+        ),
+    ] {
+        assert_eq!(one(&mut e, sql), want, "{sql}");
+    }
+}

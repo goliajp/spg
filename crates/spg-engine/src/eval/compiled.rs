@@ -1386,6 +1386,8 @@ fn is_pure_scalar_function(name: &str) -> bool {
                 | "sha256"
                 | "sha384"
                 | "sha512"
+                | "to_json"
+                | "to_jsonb"
                 | "jsonb_build_object"
                 | "json_build_object"
                 | "jsonb_build_array"
