@@ -433,3 +433,42 @@ fn round742_split_part_and_count_over_offset() {
         assert_eq!(row_text(&mut e, sql), want, "{sql}");
     }
 }
+
+/// v7.39 (round 743) — count(*) over a constant-length unnest derived
+/// is `k * count`: a k-element array literal unnests to exactly k rows
+/// per input, NULL elements included. Also: unnest(ARRAY[...]) in a
+/// target list evaluates its elements directly (no build-then-split
+/// array). PG18-measured, round-743 differential 12/12.
+#[test]
+fn round743_count_over_const_unnest_and_direct_elements() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        (
+            "SELECT count(*) FROM (SELECT unnest(ARRAY[id, g]) v FROM f716 WHERE id <= 50) q",
+            "100",
+        ),
+        // NULL elements are rows.
+        (
+            "SELECT count(*) FROM (SELECT unnest(ARRAY[id, NULL, 7]) v FROM f716 WHERE id <= 10) q",
+            "30",
+        ),
+        // count(v) skips NULLs -> NOT the identity; stays exact.
+        (
+            "SELECT count(v) FROM (SELECT unnest(ARRAY[id, NULL]) v FROM f716 WHERE id <= 10) q",
+            "10",
+        ),
+        // An inner LIMIT keeps the expanding path.
+        (
+            "SELECT count(*) FROM (SELECT unnest(ARRAY[id, g]) v FROM f716 WHERE id <= 10 LIMIT 5) q",
+            "5",
+        ),
+        // Direct-element evaluation preserves values and order.
+        (
+            "SELECT unnest(ARRAY[id * 2, g]) FROM f716 WHERE id = 7",
+            "14 / 1",
+        ),
+    ] {
+        assert_eq!(row_text(&mut e, sql), want, "{sql}");
+    }
+}
