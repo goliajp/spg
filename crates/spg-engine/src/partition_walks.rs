@@ -12,8 +12,10 @@ use alloc::vec::Vec;
 use spg_storage::{Catalog, PartitionRole};
 
 /// Return the top-most partition ancestor of `name`. For a
-/// non-partition table, returns `Some(name.to_string())` —
-/// matching PG, which treats a plain table as its own root.
+/// non-partition table, returns `Some(name.to_string())` — callers
+/// that need PG's `pg_partition_root` NULL-for-plain-tables rule
+/// (round 770: PG answers NULL there, the old note here claimed
+/// otherwise) must gate on `partition_role` themselves.
 /// Returns `None` only when `name` isn't in the catalog at all.
 #[must_use]
 pub fn root_of(catalog: &Catalog, name: &str) -> Option<String> {

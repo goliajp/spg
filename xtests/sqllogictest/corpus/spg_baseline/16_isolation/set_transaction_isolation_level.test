@@ -6,8 +6,10 @@
 # / [NOT] DEFERRABLE clauses; the engine tracks the selected
 # level on `Engine::current_isolation_level()`; `SHOW
 # transaction_isolation` returns it as the PG-canonical string
-# (`read committed`, `repeatable read`, `serializable` — `read
-# uncommitted` silently upgrades to `read committed` per PG).
+# (`read committed`, `repeatable read`, `serializable`,
+# `read uncommitted`). v7.39 (round 770) — PG KEEPS the
+# `read uncommitted` LABEL and only behaves as read committed
+# (measured); the old record pinned the folded label.
 #
 # Actual MVCC / SSI semantic differentiation lands in the v7.38
 # isolation framework train (corpus 17_isolation_semantics/).
@@ -28,14 +30,14 @@ SHOW transaction_isolation
 ----
 read committed
 
-# READ UNCOMMITTED upgrades to READ COMMITTED per PG.
+# READ UNCOMMITTED keeps its label; behaviour is read committed.
 statement ok
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED
 
 query T nosort
 SHOW transaction_isolation
 ----
-read committed
+read uncommitted
 
 # REPEATABLE READ — recorded but treated as READ COMMITTED today.
 statement ok

@@ -18955,9 +18955,12 @@ fn apply_function_dispatch(
         "pg_blocking_pids" => Ok(Value::Null),
         // v7.37.16 (16.12) — PG partition catalog scalar functions.
         // PG `pg_partition_root(regclass)` returns the top-most
-        // ancestor of a partition. SPG's catalog only knows table
-        // names (not OIDs), so we take TEXT; a non-existent name
-        // or non-partition table returns NULL (matches PG).
+        // ancestor of a partition (a partition PARENT is its own
+        // root). SPG's catalog only knows table names (not OIDs), so
+        // we take TEXT. v7.39 (round 770, F31 tranche 6 #174) — a
+        // PLAIN table answers NULL, PG18-measured; the walk helper
+        // used to return the table itself under a comment claiming
+        // that matched PG.
         "pg_partition_root" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
@@ -18982,6 +18985,13 @@ fn apply_function_dispatch(
             let Some(cat) = ctx.catalog else {
                 return Ok(Value::Null);
             };
+            // Plain table (no partition role either way) → NULL.
+            if cat
+                .get(&name)
+                .is_some_and(|t| t.schema().partition_role.is_none())
+            {
+                return Ok(Value::Null);
+            }
             Ok(match crate::partition_walks::root_of(cat, &name) {
                 Some(root) => Value::text::<String>(root),
                 None => Value::Null,

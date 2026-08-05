@@ -88,10 +88,11 @@ fn list_duplicate_value_across_siblings_rejected() {
     let err = e
         .execute("CREATE TABLE c_l_b PARTITION OF c_l FOR VALUES IN ('jp')")
         .unwrap_err();
-    let msg = format!("{err:?}");
+    let msg = format!("{err}");
+    // v7.39 (round 770, F31 tranche 6 #170) — PG's overlap sentence.
     assert!(
-        msg.contains("already") || msg.contains("LIST"),
-        "expected duplicate-value error, got {msg}"
+        msg.contains("partition \"c_l_b\" would overlap partition \"c_l_a\""),
+        "expected PG's overlap sentence, got {msg}"
     );
 }
 
