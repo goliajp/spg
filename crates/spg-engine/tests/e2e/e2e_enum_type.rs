@@ -158,10 +158,10 @@ fn create_composite_type_accepts_and_registers() {
 }
 
 #[test]
-fn create_composite_type_rejects_empty_field_list() {
+fn create_composite_type_accepts_empty_field_list() {
+    // v7.39 (round 769, F31 tranche 5 #140) — legal PG, measured.
     let mut e = Engine::new();
-    let err = e.execute("CREATE TYPE empty AS ()");
-    assert!(err.is_err(), "empty composite must be rejected");
+    e.execute("CREATE TYPE empty AS ()").unwrap();
 }
 
 #[test]

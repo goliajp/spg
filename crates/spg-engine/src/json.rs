@@ -771,8 +771,19 @@ pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'stati
             });
         }
     };
-    let path_text = match rhs {
-        Value::Text(s) | Value::Json(s) => s.as_ref(),
+    // v7.39 (round 769, F31 tranche 5 #135) — PG accepts the path as a
+    // real TEXT[] value too (`doc #> ARRAY['a','b']`), not only the
+    // `'{a,b}'` literal; a NULL element yields NULL (no such key).
+    let owned_steps: Vec<String>;
+    let path: Vec<String> = match rhs {
+        Value::TextArray(items) => {
+            if items.iter().any(Option::is_none) {
+                return Ok(Value::Null);
+            }
+            owned_steps = items.iter().flatten().cloned().collect();
+            owned_steps
+        }
+        Value::Text(s) | Value::Json(s) => parse_text_array(s.as_ref())?,
         Value::Null => return Ok(Value::Null),
         other => {
             return Err(EvalError::TypeMismatch {
@@ -783,7 +794,6 @@ pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'stati
             });
         }
     };
-    let path = parse_text_array(path_text)?;
     // Validate once, then narrow a VERBATIM source slice per step — PG's `#>` /
     // `#>>` return the located value's original text, not a re-serialization.
     parse(src).map_err(|e| EvalError::TypeMismatch {
