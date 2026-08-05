@@ -4956,11 +4956,9 @@ impl Engine {
                 fields,
                 field_user_types,
             } => {
-                if fields.is_empty() {
-                    return Err(EngineError::Unsupported(
-                        "CREATE TYPE … AS (…) must declare at least one field".into(),
-                    ));
-                }
+                // v7.39 (round 769, F31 tranche 5 #140) — an attribute-less
+                // composite is legal PG (`CREATE TYPE x AS ()`, measured); the
+                // old engine-side guard doubled the parser's former refusal.
                 // Reject duplicate field names per PG.
                 for i in 0..fields.len() {
                     for j in (i + 1)..fields.len() {

@@ -5343,6 +5343,19 @@ impl Parser {
             self.advance();
             let mut fields: Vec<(String, ColumnTypeName)> = Vec::new();
             let mut field_user_types: Vec<Option<String>> = Vec::new();
+            // v7.39 (round 769, F31 tranche 5 #140) — `CREATE TYPE x AS ()`
+            // is legal PG (an attribute-less composite; measured — the old
+            // e2e note claimed PG requires at least one attribute).
+            if matches!(self.peek(), Token::RParen) {
+                self.advance();
+                return Ok(Statement::CreateType(crate::ast::CreateTypeStatement {
+                    name,
+                    kind: crate::ast::TypeKind::Composite {
+                        fields,
+                        field_user_types,
+                    },
+                }));
+            }
             loop {
                 let field_name = self.expect_ident_like()?;
                 // v7.39 (round 264) — keep the raw type name when it is not
@@ -7852,6 +7865,10 @@ impl Parser {
             // spellings that lex as keyword tokens, not idents:
             // `SET standard_conforming_strings = on` is in every
             // pg_dump preamble (`off` already lexes as an ident).
+            // v7.39 (round 769, F31 tranche 5 #150) — `SET x TO DEFAULT`:
+            // DEFAULT lexes as its keyword token, so the ident arm above
+            // never saw it and the everyday reset form was a syntax error.
+            Token::Default => Ok(crate::ast::SetValue::Default),
             Token::On => Ok(crate::ast::SetValue::Ident("on".to_string())),
             Token::True => Ok(crate::ast::SetValue::Ident("true".to_string())),
             Token::False => Ok(crate::ast::SetValue::Ident("false".to_string())),

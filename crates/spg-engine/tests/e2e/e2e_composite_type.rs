@@ -40,12 +40,13 @@ fn create_composite_with_single_field_accepted() {
 }
 
 #[test]
-fn create_composite_with_no_fields_errors() {
+fn create_composite_with_no_fields_is_accepted() {
+    // v7.39 (round 769, F31 tranche 5 #140) — PG18-measured: an
+    // attribute-less composite is LEGAL (`CREATE TYPE x AS ()`
+    // succeeds there; the old note claimed PG requires a field).
     let mut e = Engine::new();
-    // `CREATE TYPE foo AS ()` should fail — PG requires at least
-    // one field.
-    let err = e.execute("CREATE TYPE empty AS ()");
-    assert!(err.is_err(), "empty composite must be rejected");
+    e.execute("CREATE TYPE empty AS ()").unwrap();
+    e.execute("DROP TYPE empty").unwrap();
 }
 
 #[test]
