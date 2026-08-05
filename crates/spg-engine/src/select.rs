@@ -4027,6 +4027,16 @@ impl Engine {
             if let Some(flat) = try_flatten_derived(stmt, &from.primary) {
                 return self.exec_select_cancel(&flat, cancel);
             }
+            // v7.39 (round 742) — `SELECT count(*) FROM (SELECT … ORDER
+            // BY … OFFSET k) q` is `greatest(count_of_inner - k, 0)`:
+            // ORDER BY never changes the row count, and OFFSET drops
+            // exactly k. The materialising path sorted 500k rows to
+            // count 10k (57 ms); PG runs its parallel sort anyway
+            // (28 ms). The rewrite skips the sort entirely on both
+            // counts — a plan PG itself does not have.
+            if let Some(rewritten) = try_count_over_offset(stmt, &from.primary) {
+                return self.exec_select_cancel(&rewritten, cancel);
+            }
             return self.exec_select_derived(stmt, &from.primary, cancel);
         }
         // v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
@@ -11547,4 +11557,137 @@ fn try_flatten_derived(
         (None, b) => b,
     };
     Some(out)
+}
+
+/// v7.39 (round 742) — rewrite `SELECT count(*) FROM (SELECT <plain>
+/// FROM t [WHERE p] ORDER BY … OFFSET k [no LIMIT]) q` into
+/// `SELECT greatest(count(*) - k, 0) FROM t [WHERE p]`. Sound because
+/// ORDER BY is count-invariant and OFFSET k drops exactly min(k, n)
+/// rows. Admission mirrors the flatten's conservatism; a LIMIT, a
+/// DISTINCT, an SRF, or an unprovable inner shape stays put.
+fn try_count_over_offset(
+    stmt: &SelectStatement,
+    primary: &TableRef,
+) -> Option<SelectStatement> {
+    use spg_sql::ast::{Expr as E, LimitExpr, SelectItem};
+    let inner = primary.lateral_subquery.as_deref()?;
+    // Outer: exactly `SELECT count(*)`, nothing else.
+    if !stmt.ctes.is_empty()
+        || !stmt.unions.is_empty()
+        || stmt.distinct
+        || !stmt.distinct_on.is_empty()
+        || stmt.where_.is_some()
+        || stmt.group_by.is_some()
+        || stmt.having.is_some()
+        || !stmt.order_by.is_empty()
+        || stmt.limit.is_some()
+        || stmt.offset.is_some()
+        || stmt.items.len() != 1
+    {
+        return None;
+    }
+    let SelectItem::Expr { expr, .. } = &stmt.items[0] else {
+        return None;
+    };
+    let E::FunctionCall { name, args } = expr else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("count_star") || !args.is_empty() {
+        return None;
+    }
+    // Inner: flatten-shaped plus ORDER BY and a literal OFFSET, no LIMIT.
+    let Some(LimitExpr::Literal(k)) = &inner.offset else {
+        return None;
+    };
+    let k = i64::from(*k);
+    if inner.limit.is_some() || inner.order_by.is_empty() {
+        return None;
+    }
+    let mut counted = inner.clone();
+    counted.order_by = Vec::new();
+    counted.offset = None;
+    // The stripped inner must now be a provable simple shape (its
+    // items become irrelevant — count(*) reads none of them — but an
+    // SRF item would change the row count, so the flatten predicate's
+    // scrutiny still applies).
+    let base = matview_flatten_probe(&counted)?;
+    let mut out = stmt.clone();
+    out.items = alloc::vec![SelectItem::Expr {
+        expr: E::FunctionCall {
+            name: String::from("greatest"),
+            args: alloc::vec![
+                E::Binary {
+                    lhs: alloc::boxed::Box::new(E::FunctionCall {
+                        name: String::from("count_star"),
+                        args: alloc::vec![],
+                    }),
+                    op: spg_sql::ast::BinOp::Sub,
+                    rhs: alloc::boxed::Box::new(E::Literal(
+                        spg_sql::ast::Literal::Integer(k)
+                    )),
+                },
+                E::Literal(spg_sql::ast::Literal::Integer(0)),
+            ],
+        },
+        alias: Some(String::from("count")),
+    }];
+    out.from = Some(spg_sql::ast::FromClause {
+        primary: base,
+        joins: Vec::new(),
+    });
+    out.where_ = counted.where_.clone();
+    Some(out)
+}
+
+/// The inner-shape probe `try_count_over_offset` shares with the
+/// flatten: single stored table, no modifiers, no subqueries, no SRF
+/// items. Returns the base TableRef.
+fn matview_flatten_probe(inner: &SelectStatement) -> Option<TableRef> {
+    use spg_sql::ast::SelectItem;
+    if !inner.ctes.is_empty()
+        || !inner.unions.is_empty()
+        || inner.distinct
+        || !inner.distinct_on.is_empty()
+        || inner.group_by.is_some()
+        || inner.group_by_all
+        || inner.having.is_some()
+        || !inner.order_by.is_empty()
+        || inner.limit.is_some()
+        || inner.offset.is_some()
+        || !inner.window_check_exprs.is_empty()
+        || inner.locking.is_some()
+    {
+        return None;
+    }
+    let ifrom = inner.from.as_ref()?;
+    let it = &ifrom.primary;
+    if !ifrom.joins.is_empty()
+        || it.name.is_empty()
+        || it.lateral_subquery.is_some()
+        || it.unnest_expr.is_some()
+        || it.generate_series_args.is_some()
+        || it.as_of_segment.is_some()
+        || it.jsonb_each_text_arg.is_some()
+        || it.table_fn_call.is_some()
+        || it.rows_from.is_some()
+        || it.json_table.is_some()
+        || it.with_ordinality
+    {
+        return None;
+    }
+    for item in &inner.items {
+        match item {
+            SelectItem::Expr { expr, .. } => {
+                if crate::expr_has_subquery(expr) || expr_contains_builtin_srf(expr) {
+                    return None;
+                }
+            }
+            SelectItem::Wildcard => {}
+            SelectItem::QualifiedWildcard(_) => return None,
+        }
+    }
+    if inner.where_.as_ref().is_some_and(crate::expr_has_subquery) {
+        return None;
+    }
+    Some(it.clone())
 }

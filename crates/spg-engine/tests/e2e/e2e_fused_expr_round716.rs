@@ -394,3 +394,42 @@ fn round734_srf_over_a_join_answers_as_pg() {
         assert_eq!(row_text(&mut e, sql), want, "{sql}");
     }
 }
+
+/// v7.39 (round 742) — two knives. split_part stops at the requested
+/// field (no per-row Vec of every field); and `count(*) OVER an
+/// ORDER-BY-OFFSET derived` rewrites to `greatest(count - k, 0)` — the
+/// sort is count-invariant, so it never runs (PG runs its own). Both
+/// PG18-measured (round-742 differential 12/12).
+#[test]
+fn round742_split_part_and_count_over_offset() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        // split_part: positive, negative, out-of-range, empty delim.
+        ("SELECT split_part('a,b,c', ',', 2)", "b"),
+        ("SELECT split_part('a,b,c', ',', -1)", "c"),
+        ("SELECT split_part('a,b,c', ',', -4)", ""),
+        ("SELECT split_part('abc', '', -1)", "abc"),
+        ("SELECT split_part(s, 'o', 2) FROM f716 WHERE id = 42", "w42"),
+        // count-over-offset: mid, beyond-end, zero, WHERE'd, DESC.
+        (
+            "SELECT count(*) FROM (SELECT id FROM f716 ORDER BY id OFFSET 90) q",
+            "10",
+        ),
+        (
+            "SELECT count(*) FROM (SELECT id FROM f716 ORDER BY id OFFSET 200) q",
+            "0",
+        ),
+        (
+            "SELECT count(*) FROM (SELECT id FROM f716 WHERE g = 0 ORDER BY id DESC OFFSET 3) q",
+            "30",
+        ),
+        // A LIMIT keeps the materialising path (and its answer).
+        (
+            "SELECT count(*) FROM (SELECT id FROM f716 ORDER BY id OFFSET 90 LIMIT 4) q",
+            "4",
+        ),
+    ] {
+        assert_eq!(row_text(&mut e, sql), want, "{sql}");
+    }
+}
