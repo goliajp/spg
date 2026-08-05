@@ -257,3 +257,34 @@ fn round744_anti_join_fast_takes_computed_keys() {
         assert_eq!(one(&mut e, sql), want, "{sql}");
     }
 }
+
+/// v7.39 (round 745) — peer-only residual predicates filter the hash
+/// BUILD up front (ON-clause semantics: a rejected build row pads
+/// exactly like an absent one). LEFT pads and mixed ON predicates are
+/// the risk surface — all PG18-measured (round-745 differential 6/6).
+#[test]
+fn round745_build_side_predicates_answer_as_pg() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        (
+            "SELECT count(*) FROM j719 a JOIN j719 b ON a.id = b.id              WHERE a.g = 0 AND b.g = 0",
+            "33",
+        ),
+        // LEFT: rows failing the ON's peer predicate still pad.
+        (
+            "SELECT count(*) FROM j719 a LEFT JOIN j719 b ON a.id = b.id AND b.g = 0              WHERE a.id <= 10",
+            "10",
+        ),
+        (
+            "SELECT count(b.id) FROM j719 a LEFT JOIN j719 b ON a.id = b.id AND b.g = 0              WHERE a.id <= 10",
+            "3",
+        ),
+        (
+            "SELECT sum(b.id) FROM j719 a JOIN j719 b ON a.id = b.id AND b.g = 1              WHERE a.id <= 10",
+            "22",
+        ),
+    ] {
+        assert_eq!(one(&mut e, sql), want, "{sql}");
+    }
+}
