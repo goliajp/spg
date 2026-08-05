@@ -1014,12 +1014,15 @@ pub enum IsolationLevel {
 
 impl IsolationLevel {
     /// Canonical PG-style display name, as `SHOW transaction_isolation`
-    /// would return it (`"read committed"`, `"repeatable read"`,
-    /// `"serializable"`). `READ UNCOMMITTED` maps to `"read committed"`
-    /// per the documented PG behaviour.
+    /// would return it. v7.39 (round 770, F31 tranche 6 #154) — PG
+    /// KEEPS the "read uncommitted" label (measured: `BEGIN ISOLATION
+    /// LEVEL READ UNCOMMITTED; SHOW transaction_isolation` answers
+    /// `read uncommitted`) and only BEHAVES as read committed; the old
+    /// fold renamed the label too.
     pub fn as_pg_str(self) -> &'static str {
         match self {
-            Self::ReadUncommitted | Self::ReadCommitted => "read committed",
+            Self::ReadUncommitted => "read uncommitted",
+            Self::ReadCommitted => "read committed",
             Self::RepeatableRead => "repeatable read",
             Self::Serializable => "serializable",
         }

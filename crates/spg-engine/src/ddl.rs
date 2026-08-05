@@ -714,10 +714,10 @@ impl Engine {
                     {
                         for new_b in &bounds_v {
                             if existing.iter().any(|e| e == new_b) {
+                                // v7.39 (round 770) — PG's overlap sentence.
+                                let _ = crate::partition::bound_to_diag(new_b);
                                 return Err(EngineError::Unsupported(alloc::format!(
-                                    "ATTACH PARTITION: LIST value {} already in sibling \
-                                     child {sib:?}",
-                                    crate::partition::bound_to_diag(new_b),
+                                    "partition \"{child_name}\" would overlap partition \"{sib}\"",
                                 )));
                             }
                         }
@@ -3274,10 +3274,12 @@ impl Engine {
                     {
                         for new_b in &bounds {
                             if existing.iter().any(|e| e == new_b) {
+                                // v7.39 (round 770, F31 tranche 6 #170) —
+                                // PG's sentence, measured: `partition "b"
+                                // would overlap partition "a"`.
+                                let _ = crate::partition::bound_to_diag(new_b);
                                 return Err(EngineError::Unsupported(alloc::format!(
-                                    "PARTITION OF: LIST value {} already in \
-                                     sibling child {sib:?}",
-                                    crate::partition::bound_to_diag(new_b),
+                                    "partition \"{}\" would overlap partition \"{sib}\"", stmt.name,
                                 )));
                             }
                         }

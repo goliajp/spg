@@ -173,12 +173,10 @@ fn pg_partition_root_walks_to_top_ancestor() {
         one_text(&mut e, "SELECT pg_partition_root('does_not_exist')"),
         None
     );
-    // Plain table is its own root.
+    // v7.39 (round 770, F31 tranche 6 #174) — a PLAIN table answers
+    // NULL, PG18-measured (the old pin asserted own-root).
     e.execute("CREATE TABLE plain (id BIGINT)").unwrap();
-    assert_eq!(
-        one_text(&mut e, "SELECT pg_partition_root('plain')"),
-        Some("plain".to_string())
-    );
+    assert_eq!(one_text(&mut e, "SELECT pg_partition_root('plain')"), None);
 }
 
 #[test]
