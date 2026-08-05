@@ -342,8 +342,10 @@ pub(super) fn extract_field(
         F::Minute => mm,
         F::Second => ss,
         F::Microsecond => ss * 1_000_000 + frac,
-        // seconds since the unix epoch (truncated; PG returns
-        // numeric with fraction — mailrs casts ::BIGINT anyway).
+        // seconds since the unix epoch. v7.39 (round 766 audit) —
+        // the epoch VALUE carries its fraction downstream (measured
+        // `1577836800.500000`, identical to PG); this integer arm is
+        // only the whole-seconds component.
         F::Epoch => i64::from(days) * 86_400 + secs,
         // 1970-01-01 was a Thursday: dow 4, isodow 4.
         F::Dow => i64::from((days + 4).rem_euclid(7)),
@@ -447,9 +449,10 @@ fn civil_components(days: i32) -> (i32, u32, u32) {
 }
 
 /// `date_part(field_text, source)` — function form of `EXTRACT(field FROM
-/// source)`. Same component dispatch (DATE / TIMESTAMP / INTERVAL) and
-/// same `BigInt` return shape; PG returns double precision but we keep the
-/// integer convention so the runner's `query I` shape works unchanged.
+/// source)`. Same component dispatch (DATE / TIMESTAMP / INTERVAL).
+/// v7.39 (round 766 audit) — pg_typeof(date_part(…)) measures `double
+/// precision` on both sides now (the old note claimed SPG kept a
+/// BigInt convention; the typing caught up with PG).
 pub(super) fn date_part(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     use spg_sql::ast::ExtractField as F;
     if args.len() != 2 {

@@ -1667,11 +1667,11 @@ fn matchall_length_bounds(node: &ReNode) -> Option<(usize, Option<usize>)> {
     Some((min_sum, max_sum))
 }
 
-/// v7.17.0 Phase 3.7 — `regexp_matches(s, pat)` returns the FIRST
-/// match as a single-element TEXT[]. (PG returns one row per match
-/// across all captures; SPG simplifies to first-match-only TEXT[].
-/// The `g` flag form `regexp_matches(s, pat, 'g')` falls through
-/// to all-matches concatenation as a flat array.)
+/// v7.17.0 Phase 3.7 — `regexp_matches(s, pat)`: one row with the
+/// first match's captures as TEXT[]; the `g` flag yields one row per
+/// match. v7.39 (round 766 audit) — measured IDENTICAL to PG18 on
+/// both forms now (the old note claimed a first-match-only
+/// simplification that no longer exists).
 /// PG's regexp functions take a flags string in a trailing argument whose
 /// position differs per function. Returns true when that argument is present
 /// and contains `i` (case-insensitive matching).
