@@ -4983,11 +4983,28 @@ pub(crate) fn coerce_value(
         (Value::Text(s), DataType::Line) => match parse_line_text(&s) {
             Some((a, b, c)) => Some(Value::Line { a, b, c }),
             None => {
-                return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type line: {s:?}"
-                    ),
-                }));
+                // v7.39 (round 775, F31 J6) — the degenerate `{0,0,C}`
+                // form gets PG's OWN sentence (measured), not the
+                // generic syntax one.
+                let zero_ab = s
+                    .trim()
+                    .strip_prefix('{')
+                    .and_then(|x| x.strip_suffix('}'))
+                    .map(|inner| inner.split(',').collect::<alloc::vec::Vec<_>>())
+                    .is_some_and(|parts| {
+                        parts.len() == 3
+                            && parts[0].trim().parse::<f64>() == Ok(0.0)
+                            && parts[1].trim().parse::<f64>() == Ok(0.0)
+                            && parts[2].trim().parse::<f64>().is_ok()
+                    });
+                let detail = if zero_ab {
+                    alloc::string::String::from(
+                        "invalid line specification: A and B cannot both be zero",
+                    )
+                } else {
+                    alloc::format!("invalid input syntax for type line: {s:?}")
+                };
+                return Err(EngineError::Eval(EvalError::TypeMismatch { detail }));
             }
         },
         (Value::Text(s), DataType::Circle) => match parse_circle_text(&s) {
