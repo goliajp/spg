@@ -139,7 +139,7 @@ pub fn websearch_to_tsquery(config: TsConfig, text: &str) -> TsQueryAst {
     // Apply config to each plain term + each phrase part.
     for t in &mut tokens {
         match t {
-            WebToken::Term(s) | WebToken::NotTerm(s) => {
+            WebToken::Term(s) => {
                 let lexs = collect_lexemes(config, s);
                 *s = lexs.join(" ");
             }
@@ -154,33 +154,42 @@ pub fn websearch_to_tsquery(config: TsConfig, text: &str) -> TsQueryAst {
                 let lexs = collect_lexemes(config, &combined);
                 *words = lexs;
             }
-            WebToken::Or => {}
+            WebToken::Or | WebToken::Neg => {}
         }
     }
     // Group by OR boundaries; within each group AND together.
     let mut or_groups: Vec<Vec<TsQueryAst>> = alloc::vec![Vec::new()];
+    // v7.39 (round 756, F31-B7) — dashes seen since the last operand;
+    // each wraps one `Not` level (PG stacks: `--apple` → !!'apple').
+    let mut pending_negs = 0usize;
+    let mut push_node = |groups: &mut Vec<Vec<TsQueryAst>>, negs: usize, node: TsQueryAst| {
+        let mut node = node;
+        for _ in 0..negs {
+            node = TsQueryAst::Not(alloc::boxed::Box::new(node));
+        }
+        groups.last_mut().unwrap().push(node);
+    };
     let mut i = 0;
     while i < tokens.len() {
         match &tokens[i] {
             WebToken::Or => {
                 or_groups.push(Vec::new());
+                pending_negs = 0;
+            }
+            WebToken::Neg => {
+                pending_negs += 1;
             }
             WebToken::Term(s) => {
                 if !s.is_empty() {
-                    let node = fold_and(&split_words(s));
-                    or_groups.last_mut().unwrap().push(node);
+                    push_node(&mut or_groups, pending_negs, fold_and(&split_words(s)));
                 }
-            }
-            WebToken::NotTerm(s) => {
-                if !s.is_empty() {
-                    let node = TsQueryAst::Not(alloc::boxed::Box::new(fold_and(&split_words(s))));
-                    or_groups.last_mut().unwrap().push(node);
-                }
+                pending_negs = 0;
             }
             WebToken::Phrase(words) => {
                 if !words.is_empty() {
-                    or_groups.last_mut().unwrap().push(fold_phrase(words));
+                    push_node(&mut or_groups, pending_negs, fold_phrase(words));
                 }
+                pending_negs = 0;
             }
         }
         i += 1;
@@ -1209,9 +1218,14 @@ fn classify_into(raw: &str, signed: bool, out: &mut Vec<Token>) {
 
 enum WebToken {
     Term(String),
-    NotTerm(String),
     Phrase(Vec<String>),
     Or,
+    /// v7.39 (round 756, F31-B7) — one `-` prefix. PG18-measured: a
+    /// dash attaches ACROSS whitespace to the next word or phrase and
+    /// STACKS (`- apple` → `!'apple'`, `-"a b"` → `!('a' <-> 'b')`,
+    /// `--apple` / `- - apple` → `!!'apple'`); the old tokenizer only
+    /// negated a directly-attached word and dropped the rest.
+    Neg,
 }
 
 /// websearch tokenizer — splits on whitespace, recognises quoted
@@ -1243,22 +1257,42 @@ fn web_tokens(text: &str) -> Vec<WebToken> {
             }
             continue;
         }
-        let negate = b == b'-';
-        if negate {
+        if b == b'-' {
+            out.push(WebToken::Neg);
             i += 1;
+            continue;
         }
         let start = i;
         while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'"' {
             i += 1;
         }
         let word = &text[start..i];
-        if word.eq_ignore_ascii_case("or") && !negate {
+        if word.eq_ignore_ascii_case("or") {
             out.push(WebToken::Or);
-        } else if negate {
-            out.push(WebToken::NotTerm(word.to_string()));
         } else {
             out.push(WebToken::Term(word.to_string()));
         }
+    }
+    // v7.39 (round 756, F31-B7) — PG18-measured: the word "or" is an
+    // OR operator only when it has a left operand and is not the last
+    // token. At operand position (start, or right after another OR)
+    // and at end of input it is a plain term: 'or apple' → 'or' &
+    // 'apple', 'apple or' → 'apple' & 'or', 'or or and -' → 'or' |
+    // 'and'. (An operator whose right side comes up empty still
+    // vanishes with it — 'apple or -' → 'apple' — which the grouping
+    // below already does by dropping empty OR groups.)
+    let n = out.len();
+    let mut at_operand_pos = true;
+    for idx in 0..n {
+        if matches!(out[idx], WebToken::Or) && (at_operand_pos || idx + 1 == n) {
+            out[idx] = WebToken::Term(String::from("or"));
+        }
+        // A `-` prefix leaves us still waiting for the operand.
+        at_operand_pos = match out[idx] {
+            WebToken::Or => true,
+            WebToken::Neg => at_operand_pos,
+            _ => false,
+        };
     }
     out
 }
