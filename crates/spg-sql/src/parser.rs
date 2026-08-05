@@ -9473,7 +9473,15 @@ impl Parser {
         // <table> [alias]`. PG requires an alias after a subquery source.
         let (source, source_select) = if matches!(self.peek(), Token::LParen) {
             self.advance(); // (
-            let inner = self.parse_select_stmt()?;
+            // v7.39 (round 768, F31-D5) — `USING (VALUES …)`: the same
+            // constant-SELECT lowering the derived-table parser uses
+            // (PG deletes through this form; it was a parse error).
+            let inner = if matches!(self.peek(), Token::Values) {
+                self.advance(); // VALUES
+                Statement::Select(self.parse_values_rows_body()?)
+            } else {
+                self.parse_select_stmt()?
+            };
             match self.advance() {
                 Token::RParen => {}
                 other => {
@@ -9501,6 +9509,29 @@ impl Parser {
             }
             _ => None,
         };
+        // v7.39 (round 768, F31-D5) — optional positional column-alias
+        // list after the source alias (`s(id, v)`).
+        let mut source_column_aliases: Vec<String> = Vec::new();
+        if source_alias.is_some() && matches!(self.peek(), Token::LParen) {
+            self.advance();
+            loop {
+                source_column_aliases.push(self.expect_ident_like()?);
+                match self.peek() {
+                    Token::Comma => {
+                        self.advance();
+                    }
+                    Token::RParen => {
+                        self.advance();
+                        break;
+                    }
+                    other => {
+                        return Err(self.err(format!(
+                            "expected ',' or ')' in MERGE source column list, got {other:?}"
+                        )));
+                    }
+                }
+            }
+        }
         if source_select.is_some() && source_alias.is_none() {
             return Err(self.err("MERGE USING (subquery) requires an alias".into()));
         }
@@ -9760,6 +9791,7 @@ impl Parser {
             source,
             source_alias,
             source_select,
+            source_column_aliases,
             on,
             clauses,
             returning,
