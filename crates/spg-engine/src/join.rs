@@ -1924,6 +1924,50 @@ impl Engine {
         } else {
             residual.to_vec()
         };
+        // v7.39 (round 745) — a residual conjunct that reads ONLY peer
+        // columns filters the BUILD side up front instead of re-checking
+        // every matched pair: `JOIN d b ON a.id = b.id WHERE b.g = 7`
+        // built a 500k-row hash table to match 5k drive rows and ran
+        // `b.g = 7` per candidate. ON-clause semantics make this sound
+        // for every join kind (a build row the predicate rejects can
+        // never satisfy the ON, so its absence pads exactly the same);
+        // WHERE-sourced peer predicates only reach here for INNER/CROSS
+        // (the collector is kind-gated). Only compilable conjuncts move
+        // — the interpreter path keeps its exact wording for the rest.
+        let mut build_preds: Vec<eval::CompiledExpr> = Vec::new();
+        let residual: Vec<&Expr> = {
+            let peer_ctx_probe = EvalContext::new(&peer.cols, Some(peer.alias.as_str()));
+            residual
+                .iter()
+                .copied()
+                .filter(|r| {
+                    let peer_only = {
+                        let all = core::cell::Cell::new(true);
+                        crate::expr_analysis::visit_expr_columns_and_subqueries(
+                            r,
+                            &mut |c| {
+                                if Engine::peer_col_pos(&peer.alias, &peer.cols, c).is_none() {
+                                    all.set(false);
+                                }
+                            },
+                            &mut |_| {
+                                all.set(false);
+                            },
+                        );
+                        all.get()
+                    };
+                    if peer_only
+                        && eval::fully_compilable(r)
+                        && expr_mentions_a_column(r)
+                    {
+                        build_preds.push(eval::compile_expr(r, &peer_ctx_probe));
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect()
+        };
         let residual = residual.as_slice();
         let any_int_lane = int_keyed || int_expr_keyed || int_probe_expr_keyed;
         let mut int2_table: hashbrown::HashMap<i128, Bucket> =
@@ -1941,6 +1985,7 @@ impl Engine {
             ..ctx.clone()
         };
         let mut keybuf: Vec<&Value> = Vec::with_capacity(eq_pairs.len());
+        let mut pred_stack: Vec<Value<'static>> = Vec::new();
         // v7.31 (perf 3e) — scratch key buffer: build inserts allocate
         // only on vacant, probes never allocate.
         let mut keystr = String::new();
@@ -1954,6 +1999,21 @@ impl Engine {
             let Some(right) = rights_src.get(ri) else {
                 continue;
             };
+            // v7.39 (round 745) — the hoisted peer-only predicates.
+            if !build_preds.is_empty() {
+                let mut keep = true;
+                for c in &build_preds {
+                    let v = eval::eval_compiled(c, right, &peer_ctx, &mut pred_stack)
+                        .map_err(EngineError::Eval)?;
+                    if !crate::eval::predicate_is_true(&v, "JOIN/ON", ctx.mysql_dialect)? {
+                        keep = false;
+                        break;
+                    }
+                }
+                if !keep {
+                    continue 'build;
+                }
+            }
             if int2_keyed {
                 // Key parts in a FIXED order: plain pairs first, then
                 // probe-exprs — the probe reads them the same way.
