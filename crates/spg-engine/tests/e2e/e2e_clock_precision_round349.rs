@@ -75,7 +75,12 @@ fn pg_precision_spellings_work() {
         one(&mut e, "SELECT LOCALTIMESTAMP(3)"),
         Value::Timestamp(1_784_723_696_541_000)
     );
-    assert_eq!(one(&mut e, "SELECT CURRENT_TIME(3)"), Value::text("12:34:56.541"));
+    // v7.39 (round 755, F31-B6) — CURRENT_TIME is a true TIMETZ now
+    // (PG18-measured); 12:34:56.541 of the fixed clock, UTC session.
+    assert_eq!(
+        one(&mut e, "SELECT CURRENT_TIME(3)"),
+        Value::TimeTz { us: 45_296_541_000, offset_secs: 0 }
+    );
     assert_eq!(
         one(&mut e, "SELECT CURRENT_TIMESTAMP(0)"),
         Value::Timestamp(1_784_723_696_000_000)

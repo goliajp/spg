@@ -2028,7 +2028,8 @@ impl Engine {
         alloc::string::String,
     )> {
         let cat = self.active_catalog();
-        cat.triggers()
+        let mut matching: Vec<&spg_storage::TriggerDef> = cat
+            .triggers()
             .iter()
             .filter(|t| {
                 // v7.16.1 — skip disabled triggers (mailrs
@@ -2039,6 +2040,13 @@ impl Engine {
                     && t.for_each.eq_ignore_ascii_case("row")
                     && t.events.iter().any(|e| e.eq_ignore_ascii_case(event))
             })
+            .collect();
+        // v7.39 (round 755, F31-B2) — same-event triggers fire in NAME
+        // order, PG18-measured (a_trig before z_trig regardless of
+        // creation order); the catalog Vec keeps insertion order.
+        matching.sort_by(|a, b| a.name.cmp(&b.name));
+        matching
+            .into_iter()
             // v7.39 (read01 round 62) — functions are keyed by SIGNATURE now. A
             // trigger names its function by NAME, and a trigger function takes
             // no arguments, so there is at most one.
@@ -2068,7 +2076,8 @@ impl Engine {
         alloc::string::String,
     )> {
         let cat = self.active_catalog();
-        cat.triggers()
+        let mut matching: Vec<&spg_storage::TriggerDef> = cat
+            .triggers()
             .iter()
             .filter(|t| {
                 // v7.16.1 — skip disabled triggers.
@@ -2078,6 +2087,11 @@ impl Engine {
                     && t.for_each.eq_ignore_ascii_case("row")
                     && t.events.iter().any(|e| e.eq_ignore_ascii_case("UPDATE"))
             })
+            .collect();
+        // v7.39 (round 755, F31-B2) — NAME order, PG18-measured.
+        matching.sort_by(|a, b| a.name.cmp(&b.name));
+        matching
+            .into_iter()
             // (fd, UPDATE-OF cols, WHEN text, trigger name).
             .filter_map(|t| {
                 cat.functions_named(&t.function).first().map(|fd| {
