@@ -394,11 +394,19 @@ fn clock_replacement_for(e: &Expr, now: i64, mysql: bool, tz_offset: i64) -> Opt
         TimestampTz,
         Date,
         UnixSeconds,
-        /// v7.37.17 (17.6 siblings) — curtime / utc_time /
-        /// current_time render the time-of-day as 'HH:MM:SS' text:
-        /// SPG has no standalone TIME type, so text is the honest
-        /// drop-in shape.
+        /// v7.37.17 (17.6 siblings) — curtime / utc_time render the
+        /// time-of-day as 'HH:MM:SS' text (the MySQL spellings).
         TimeText,
+        /// v7.39 (round 755, F31-B6) — PG's `localtime`: a true TIME
+        /// value. The old fold to `current_timestamp` made
+        /// `pg_typeof(localtime)` answer `timestamp without time
+        /// zone`; PG18-measured it is `time without time zone`.
+        TimeOfDay,
+        /// v7.39 (round 755, F31-B6) — PG's `current_time`: a true
+        /// TIMETZ value with the session offset and microseconds
+        /// (PG18-measured `11:14:20.658952+00`); the old text shape
+        /// answered `11:14:20` typed unknown.
+        TimeOfDayTz,
     }
     let shape = match name.len() {
         3 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("now") => {
@@ -433,14 +441,14 @@ fn clock_replacement_for(e: &Expr, now: i64, mysql: bool, tz_offset: i64) -> Opt
         13 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("utc_timestamp") => {
             Some(ClockShape::Timestamp)
         }
-        12 if name.eq_ignore_ascii_case("current_time") => Some(ClockShape::TimeText),
+        12 if name.eq_ignore_ascii_case("current_time") => Some(ClockShape::TimeOfDayTz),
         // v7.37.17 (17.6 siblings) — PG's clock family. localtime /
         // localtimestamp (parenless) fold into current_timestamp
         // for the drop-in model. transaction_timestamp / statement_
         // _timestamp / clock_timestamp all return current_timestamp
         // — SPG runs everything in a single unified clock.
         9 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("localtime") => {
-            Some(ClockShape::Timestamp)
+            Some(ClockShape::TimeOfDay)
         }
         14 if kind == ClockSite::Fn && name.eq_ignore_ascii_case("unix_timestamp") => {
             Some(ClockShape::UnixSeconds)
@@ -493,19 +501,53 @@ fn clock_replacement_for(e: &Expr, now: i64, mysql: bool, tz_offset: i64) -> Opt
         }
         return Some(Expr::Literal(spg_sql::ast::Literal::String(text)));
     }
+    if matches!(shape, ClockShape::TimeOfDay | ClockShape::TimeOfDayTz) {
+        // The precision truncation already ran on `now` above, so the
+        // fraction carried here is exact; both keywords keep PG's full
+        // microsecond default.
+        let day_us = local.rem_euclid(86_400_000_000);
+        let day_secs = day_us / 1_000_000;
+        let mut text = alloc::format!(
+            "{:02}:{:02}:{:02}.{:06}",
+            day_secs / 3600,
+            (day_secs / 60) % 60,
+            day_secs % 60,
+            day_us % 1_000_000
+        );
+        let target = if matches!(shape, ClockShape::TimeOfDayTz) {
+            let off_secs = tz_offset.div_euclid(1_000_000);
+            let (sign, a) = if off_secs < 0 { ('-', -off_secs) } else { ('+', off_secs) };
+            text.push(sign);
+            text.push_str(&alloc::format!("{:02}", a / 3600));
+            if (a / 60) % 60 != 0 {
+                text.push_str(&alloc::format!(":{:02}", (a / 60) % 60));
+            }
+            spg_sql::ast::CastTarget::Named(alloc::string::String::from("timetz"))
+        } else {
+            spg_sql::ast::CastTarget::Named(alloc::string::String::from("time"))
+        };
+        return Some(Expr::Cast {
+            expr: alloc::boxed::Box::new(Expr::Literal(spg_sql::ast::Literal::String(text))),
+            target,
+        });
+    }
     let payload = match shape {
         ClockShape::TimestampTz => now,
         ClockShape::Timestamp => local,
         ClockShape::Date => local.div_euclid(86_400_000_000),
         ClockShape::UnixSeconds => now.div_euclid(1_000_000),
-        ClockShape::TimeText => unreachable!("handled above"),
+        ClockShape::TimeText | ClockShape::TimeOfDay | ClockShape::TimeOfDayTz => {
+            unreachable!("handled above")
+        }
     };
     let target = match shape {
         ClockShape::Timestamp => spg_sql::ast::CastTarget::Timestamp,
         ClockShape::TimestampTz => spg_sql::ast::CastTarget::Timestamptz,
         ClockShape::Date => spg_sql::ast::CastTarget::Date,
         ClockShape::UnixSeconds => spg_sql::ast::CastTarget::BigInt,
-        ClockShape::TimeText => unreachable!("handled above"),
+        ClockShape::TimeText | ClockShape::TimeOfDay | ClockShape::TimeOfDayTz => {
+            unreachable!("handled above")
+        }
     };
     Some(Expr::Cast {
         expr: alloc::boxed::Box::new(Expr::Literal(spg_sql::ast::Literal::Integer(payload))),

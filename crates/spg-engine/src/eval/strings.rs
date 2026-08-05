@@ -760,6 +760,10 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
         Value::Numeric { .. } | Value::NumericBig(_) => "numeric",
         Value::Date(_) => "date",
         Value::Time(_) => "time without time zone",
+        // v7.39 (round 755, F31-B6) — fell to the "unknown" arm, so
+        // `pg_typeof(current_time)` had no name even once the keyword
+        // produced a real TIMETZ.
+        Value::TimeTz { .. } => "time with time zone",
         Value::Timestamp(_) => "timestamp without time zone",
         Value::Interval { .. } => "interval",
         Value::Json(_) => {

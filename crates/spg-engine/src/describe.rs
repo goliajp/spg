@@ -691,7 +691,10 @@ fn function_return_shape(
                 true,
             )
         }
-        "current_time" | "localtime" => (DataType::Timestamp, false), // approx — SPG lacks TIME
+        // v7.39 (round 755, F31-B6) — true TIME family, PG18-measured
+        // (`time with time zone` / `time without time zone`).
+        "current_time" => (DataType::TimeTz, false),
+        "localtime" => (DataType::Time, false),
         // Text-returning library — every fn that produces a string.
         "concat"
         | "concat_ws"

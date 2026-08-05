@@ -55,10 +55,13 @@ fn localtimestamp_bare_and_parens_both_work() {
 }
 
 #[test]
-fn localtime_returns_timestamp_alias() {
+fn localtime_returns_time() {
+    // v7.39 (round 755, F31-B6) — a true TIME value, PG18-measured
+    // (`pg_typeof(localtime)` = `time without time zone`); the old
+    // fold to current_timestamp answered a full timestamp.
     let mut e = Engine::new().with_clock(|| 1_700_000_000_000_000);
     assert!(matches!(
         first(&mut e, "SELECT localtime()"),
-        spg_storage::Value::Timestamp(_)
+        spg_storage::Value::Time(_)
     ));
 }
