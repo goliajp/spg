@@ -208,6 +208,7 @@ mod e2e_similarity_real_round766;
 mod e2e_merge_values_source_round768;
 mod e2e_tranche5_fixes_round769;
 mod e2e_tranche6_fixes_round770;
+mod e2e_regex_reversed_range_round772;
 mod e2e_collate_explicit_round691;
 mod e2e_collate_minmax_round690;
 mod e2e_collate_order_round688;
