@@ -155,7 +155,11 @@ $$",
 }
 
 #[test]
-fn after_trigger_cannot_assign_to_new() {
+fn after_trigger_new_assignment_is_accepted_and_ignored() {
+    // v7.39 (round 767, F31-D4) — PG treats NEW as a plain record
+    // variable: an AFTER trigger assigning it succeeds and the row
+    // keeps its written values (measured; the old pin asserted SPG's
+    // hard refusal, which broke PG-valid triggers).
     let mut e = eng();
     ok(&mut e, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
     ok(
@@ -166,14 +170,9 @@ fn after_trigger_cannot_assign_to_new() {
         &mut e,
         "CREATE TRIGGER tg AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION bad()",
     );
-    let err = e
-        .execute("INSERT INTO t VALUES (1, 10)")
-        .expect_err("AFTER trigger assigning NEW must error");
-    let msg = alloc_format(&err);
-    assert!(
-        msg.to_lowercase().contains("after") && msg.to_lowercase().contains("read-only"),
-        "expected AFTER NEW read-only error, got {msg}"
-    );
+    ok(&mut e, "INSERT INTO t VALUES (1, 10)");
+    let v = first_value(&mut e, "SELECT v FROM t");
+    assert_eq!(v, Value::Int(10), "the written row is untouched");
 }
 
 #[test]
@@ -326,7 +325,10 @@ $$",
 }
 
 #[test]
-fn after_update_trigger_cannot_assign_to_new() {
+fn after_update_trigger_new_assignment_is_accepted_and_ignored() {
+    // v7.39 (round 767, F31-D4) — same PG record-variable rule on the
+    // UPDATE path: the assignment is accepted, the update's own values
+    // land.
     let mut e = eng();
     ok(&mut e, "CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)");
     ok(&mut e, "INSERT INTO t VALUES (1, 10)");
@@ -338,14 +340,9 @@ fn after_update_trigger_cannot_assign_to_new() {
         &mut e,
         "CREATE TRIGGER tg AFTER UPDATE ON t FOR EACH ROW EXECUTE FUNCTION bad_after()",
     );
-    let err = e
-        .execute("UPDATE t SET v = 99 WHERE id = 1")
-        .expect_err("AFTER UPDATE writing NEW must error");
-    let msg = alloc_format(&err);
-    assert!(
-        msg.to_lowercase().contains("after") && msg.to_lowercase().contains("read-only"),
-        "expected AFTER NEW read-only error, got {msg}"
-    );
+    ok(&mut e, "UPDATE t SET v = 99 WHERE id = 1");
+    let v = first_value(&mut e, "SELECT v FROM t");
+    assert_eq!(v, Value::Int(99), "the UPDATE's own value lands");
 }
 
 // --- v7.12.6: IF / ELSIF / ELSE control flow ---

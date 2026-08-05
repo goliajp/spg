@@ -408,12 +408,14 @@ fn execute_stmts(
                 })?;
                 match target {
                     AssignTarget::NewColumn(col) => {
-                        if ctx.is_after {
-                            return Err(TriggerError::NewReadOnlyInAfterTrigger {
-                                function: ctx.function.into(),
-                                column: col.clone(),
-                            });
-                        }
+                        // v7.39 (round 767, F31-D4) — PG treats NEW as a
+                        // plain plpgsql record variable: assigning to it
+                        // inside an AFTER trigger is ACCEPTED and simply
+                        // has no effect on the row (measured — the old
+                        // hard refusal broke PG-valid triggers reused
+                        // across BEFORE/AFTER). The local copy mutates
+                        // (later reads in the body see it); the AFTER
+                        // caller discards the outcome as before.
                         let pos = ctx
                             .columns
                             .iter()
@@ -435,10 +437,17 @@ fn execute_stmts(
                         row.values[pos] = evaluated;
                     }
                     AssignTarget::OldColumn(col) => {
-                        return Err(TriggerError::OldIsReadOnly {
-                            function: ctx.function.into(),
-                            column: col.clone(),
-                        });
+                        // v7.39 (round 767, F31-D4) — PG accepts an
+                        // assignment to OLD too (same record-variable
+                        // rule; measured: AFTER UPDATE body running
+                        // `OLD.id := 5` succeeds and the table keeps
+                        // the real update). SPG has no owned OLD copy
+                        // on this path, so the write is accepted and
+                        // discarded — a later read of OLD.<col> in the
+                        // SAME body sees the original value, a niche
+                        // divergence ledgered in the F31 audit.
+                        let _ = col;
+                        let _ = evaluated;
                     }
                     AssignTarget::Local(name) => {
                         // v7.12.6 — write into the DECLARE scope.
