@@ -13043,18 +13043,17 @@ fn apply_function_dispatch(
                     String::new()
                 }));
             }
-            let parts: alloc::vec::Vec<&str> = s.split(&delim[..]).collect();
-            let total = parts.len() as i64;
-            let idx = if n > 0 {
-                n - 1
+            // v7.39 (round 742) — no Vec, no full collection: a positive
+            // n stops at the nth field, a negative one walks rsplit the
+            // same way (the field SETS are identical; only the order
+            // flips). The old collect built every field of every row
+            // just to keep (usually) the second one.
+            let field = if n > 0 {
+                s.split(&delim[..]).nth((n - 1) as usize)
             } else {
-                // n=-1 → last (idx = total - 1)
-                total + n
+                s.rsplit(&delim[..]).nth((-n - 1) as usize)
             };
-            if idx < 0 || idx >= total {
-                return Ok(Value::text(String::new()));
-            }
-            Ok(Value::text(parts[idx as usize].to_string()))
+            Ok(Value::text(field.unwrap_or("").to_string()))
         }
         // PG `translate(s, from, to)` — char-by-char positional
         // mapping. Each codepoint in `from` is replaced by the
