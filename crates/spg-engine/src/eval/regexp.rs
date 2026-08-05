@@ -740,6 +740,15 @@ fn re_parse_class(chars: &[char], p: &mut usize) -> Result<ReNode, EvalError> {
         if *p + 1 < chars.len() && chars[*p] == '-' && chars[*p + 1] != ']' {
             let end = chars[*p + 1];
             *p += 2;
+            // v7.39 (round 772, F31 J2) — a REVERSED range (`[z-a]`)
+            // is PG's "invalid regular expression: invalid character
+            // range" (measured); the old parser recorded it and
+            // matched nothing, silently.
+            if end < start {
+                return Err(EvalError::TypeMismatch {
+                    detail: "invalid regular expression: invalid character range".into(),
+                });
+            }
             members.push(ClassMember::Range(start, end));
         } else {
             members.push(ClassMember::Single(start));
