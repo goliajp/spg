@@ -557,7 +557,14 @@ pub enum Statement {
     CreatePublication(CreatePublicationStatement),
     /// v6.1.2 — `DROP PUBLICATION <name>`. PG-compatible silent
     /// no-op when the publication does not exist.
-    DropPublication(String),
+    DropPublication {
+        name: String,
+        /// v7.39 (round 754, F31-B4) — `IF EXISTS` quietly skips a
+        /// missing publication; the bare form refuses with PG's
+        /// sentence (PG18-measured — the old "silent no-op" note on
+        /// the executor was wrong).
+        if_exists: bool,
+    },
     /// v6.1.3 — `SHOW PUBLICATIONS`. Returns one row per
     /// publication ordered by name with `(name, scope_summary,
     /// table_count)` columns. The scope summary is the human-
@@ -575,7 +582,12 @@ pub enum Statement {
     /// v6.1.4 — `DROP SUBSCRIPTION <name>`. Like DROP
     /// PUBLICATION, silent no-op when absent. Stops the
     /// associated worker thread before removing the row.
-    DropSubscription(String),
+    DropSubscription {
+        name: String,
+        /// v7.39 (round 754, F31-B4) — same contract as
+        /// [`Statement::DropPublication`].
+        if_exists: bool,
+    },
     /// v6.1.4 — `SHOW SUBSCRIPTIONS`. Returns one row per
     /// subscription ordered by name with `(name, conn_str,
     /// publications, enabled, last_received_pos)`.
@@ -1176,6 +1188,12 @@ pub enum PublicationScope {
     AllTables,
     ForTables(Vec<String>),
     AllTablesExcept(Vec<String>),
+    /// v7.39 (round 754, F31-B5) — `FOR TABLES IN SCHEMA <name>`
+    /// (PG 15+). AST-only: the executor folds `public` to
+    /// [`PublicationScope::AllTables`] (SPG's single-schema world)
+    /// and refuses any other schema with PG's sentence, so the
+    /// catalog / serializer / replication filter never see it.
+    TablesInSchema(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4967,9 +4985,9 @@ impl Statement {
             | Statement::AlterIndex(_)
             | Statement::AlterTable(_)
             | Statement::CreatePublication(_)
-            | Statement::DropPublication(_)
+            | Statement::DropPublication { .. }
             | Statement::CreateSubscription(_)
-            | Statement::DropSubscription(_)
+            | Statement::DropSubscription { .. }
             | Statement::Analyze(_)
             | Statement::Truncate { .. }
             | Statement::CompactColdSegments
@@ -5666,8 +5684,9 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
-            Self::DropSubscription(name) => {
-                write!(f, "DROP SUBSCRIPTION {}", quote_ident(name))
+            Self::DropSubscription { name, if_exists } => {
+                let opt = if *if_exists { "IF EXISTS " } else { "" };
+                write!(f, "DROP SUBSCRIPTION {opt}{}", quote_ident(name))
             }
             Self::WaitForWalPosition { pos, timeout_ms } => {
                 write!(f, "WAIT FOR WAL POSITION {pos}")?;
@@ -5735,6 +5754,10 @@ impl fmt::Display for Statement {
                         }
                         Ok(())
                     }
+                    PublicationScope::TablesInSchema(schema) => {
+                        write!(f, " FOR TABLES IN SCHEMA {}", quote_ident(schema))?;
+                        Ok(())
+                    }
                     PublicationScope::AllTablesExcept(ts) => {
                         f.write_str(" FOR ALL TABLES EXCEPT ")?;
                         for (i, t) in ts.iter().enumerate() {
@@ -5751,8 +5774,9 @@ impl fmt::Display for Statement {
                 write!(f, "CREATE EXTENSION IF NOT EXISTS {}", quote_ident(name))
             }
             Self::DoBlock(body) => write!(f, "DO $$ {body} $$"),
-            Self::DropPublication(name) => {
-                write!(f, "DROP PUBLICATION {}", quote_ident(name))
+            Self::DropPublication { name, if_exists } => {
+                let opt = if *if_exists { "IF EXISTS " } else { "" };
+                write!(f, "DROP PUBLICATION {opt}{}", quote_ident(name))
             }
             Self::SetParameter { name, value, local } => {
                 write!(f, "SET {}{name} = ", if *local { "LOCAL " } else { "" })?;

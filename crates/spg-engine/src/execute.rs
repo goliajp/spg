@@ -1957,9 +1957,13 @@ impl Engine {
             Statement::AlterIndex(s) => self.exec_alter_index(s),
             Statement::AlterTable(s) => self.exec_alter_table(s),
             Statement::CreatePublication(s) => self.exec_create_publication(s),
-            Statement::DropPublication(name) => self.exec_drop_publication(&name),
+            Statement::DropPublication { name, if_exists } => {
+                self.exec_drop_publication(&name, if_exists)
+            }
             Statement::CreateSubscription(s) => self.exec_create_subscription(s),
-            Statement::DropSubscription(name) => self.exec_drop_subscription(&name),
+            Statement::DropSubscription { name, if_exists } => {
+                self.exec_drop_subscription(&name, if_exists)
+            }
             // v6.1.7 — WAIT FOR WAL POSITION needs `lag_state`,
             // which lives in spg-server's ServerState. The engine
             // surfaces a clear error; the server-layer dispatch

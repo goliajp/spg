@@ -772,6 +772,9 @@ fn build_publication_filter(state: &ServerState, names: &[String]) -> Publicatio
             PublicationScope::AllTablesExcept(ts) => {
                 filter.deny_sets.push(ts.iter().cloned().collect());
             }
+            // Folded to AllTables when the publication was created;
+            // the catalog this reads never stores it.
+            PublicationScope::TablesInSchema(_) => unreachable!(),
         }
     }
     filter
