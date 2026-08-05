@@ -7,6 +7,7 @@
 //! 451 established that the durable total is not what a verdict should read.
 use sqlx::{AnyConnection, Connection as _, Executor as _};
 use std::time::Instant;
+use std::fmt::Write as _;
 
 const N: i64 = 50_000;
 
@@ -18,7 +19,7 @@ fn batch_sql(base: i64, rows: i64) -> String {
         if k > 0 {
             s.push(',');
         }
-        s.push_str(&format!("({id},{},{})", id % 100, id * 7 % 100_000));
+        let _ = write!(s, "({id},{},{})", id % 100, id * 7 % 100_000);
     }
     s
 }

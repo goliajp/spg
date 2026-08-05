@@ -779,7 +779,7 @@ fn seed_with_sender_cardinality_wide(
         .unwrap();
     // Deterministic ASCII body so the seed is stable across runs.
     let body_template: String = (0..body_len)
-        .map(|i| char::from((b'a' + (i % 26) as u8) as u8))
+        .map(|i| char::from(b'a' + (i % 26) as u8))
         .collect();
     let body_sql_safe = body_template.replace('\'', "''");
     let mut vals = String::new();
@@ -1067,7 +1067,7 @@ fn seed_mailrs_inbox(db: &mut Engine, n_messages: usize) {
             format!("mid-{i}")
         };
         // flags: roughly 30 % unread (bit 0 = 0).
-        let flags = if i % 10 < 3 { 0 } else { 1 };
+        let flags = i32::from(i % 10 >= 3);
         let _ = write!(
             vals,
             "({}, 'th-{}', 'subj{i}', 'sender{}@example.com', {}, {}, false, false, 'normal', 0.5, '{}', '{body} {i}')",

@@ -90,7 +90,8 @@ fn event_trigger_readers_return_null() {
         );
     }
     // pg_listening_channels has no such context requirement in PG.
-    for f in &["pg_listening_channels()"] {
+    {
+        let f = "pg_listening_channels()";
         let sql = format!("SELECT {f}");
         assert!(
             matches!(first(&mut e, &sql), spg_storage::Value::Null),

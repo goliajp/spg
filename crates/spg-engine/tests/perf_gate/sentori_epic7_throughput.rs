@@ -33,7 +33,7 @@ use spg_engine::Engine;
 fn make_payload(idx: u64) -> String {
     // 1900 chars of body — keeps the canonical-JSON form right at
     // 2 KB once keys + structural punctuation land.
-    let filler: String = core::iter::repeat('x').take(1900).collect();
+    let filler: String = "x".repeat(1900);
     format!(
         r#"{{"event":"login","seq":{idx},"user_id":{user},"meta":{{"ua":"{filler}"}}}}"#,
         user = idx % 1000,

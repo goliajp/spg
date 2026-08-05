@@ -4485,7 +4485,7 @@ impl Engine {
         }
         // Coerce the scalar text to the declared type; on failure → ON
         // ERROR (default NULL, DEFAULT expr, or raise).
-        let dt = crate::conversions::column_type_to_data_type(ty.clone());
+        let dt = crate::conversions::column_type_to_data_type(*ty);
         let scalar = Value::Text(alloc::borrow::Cow::Owned(first.scalar_text()));
         match crate::conversions::coerce_value(scalar, dt, name, 0) {
             Ok(v) => Ok(v),
@@ -11259,7 +11259,7 @@ fn json_table_schema(cols: &[spg_sql::ast::JsonTableColumn]) -> alloc::vec::Vec<
                 let dt = if *exists {
                     DataType::Bool
                 } else {
-                    crate::conversions::column_type_to_data_type(ty.clone())
+                    crate::conversions::column_type_to_data_type(*ty)
                 };
                 out.push(ColumnSchema::new(name.clone(), dt, true));
             }

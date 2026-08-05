@@ -641,10 +641,10 @@ fn indexkeyable_type(ty: &spg_storage::DataType) -> bool {
 /// candidates with the collated fold, so any plain btree on the leading
 /// column works, unique or not). Expression / partial indexes key on
 /// something other than the raw column and are skipped.
-fn probe_btree<'t>(
-    table: &'t spg_storage::Table,
+fn probe_btree(
+    table: &spg_storage::Table,
     leading_pos: usize,
-) -> Option<&'t spg_storage::Index> {
+) -> Option<&spg_storage::Index> {
     table.indices().iter().find(|i| {
         matches!(i.kind, spg_storage::IndexKind::BTree(_))
             && i.column_position == leading_pos
@@ -1818,7 +1818,7 @@ pub(crate) fn enforce_unique_index_inserts(
 /// (`SET x = CASE …`), and a shift (`SET x = x + 1` over adjacent keys)
 /// are all rejected exactly as PG rejects them, while a row whose key is
 /// unchanged, or reassigned to a genuinely free value, passes.
-
+///
 /// v7.39 (round 166, attack A3) — probe-based twin of the UPDATE
 /// `replay` closure: instead of seeding a HashSet from the whole table,
 /// membership(k) is modelled as `(table \ removed) ∪ added` with the

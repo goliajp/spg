@@ -26564,6 +26564,82 @@ fn select_mentions_table(s: &crate::ast::SelectStatement, name: &str) -> bool {
     s.unions.iter().any(|(_, u)| select_mentions_table(u, name))
 }
 
+
+/// v7.39 (round 284) — fold a constant `LIMIT` / `OFFSET` expression to a
+/// row count, the way PG evaluates one before applying it.
+///
+/// `None` = not a constant (a column, a subquery, a function call).
+/// `Some(Err(msg))` = PG rejects it, and the message is PG's; `{L}` in the
+/// message stands in for LIMIT / OFFSET, which the caller substitutes.
+/// All wordings were read off live PG 18.4.
+fn fold_limit_constant(e: &crate::ast::Expr) -> Option<Result<i128, alloc::string::String>> {
+    use crate::ast::{BinOp, Expr, Literal, UnOp};
+    match e {
+        Expr::Literal(Literal::Integer(n)) => Some(Ok(i128::from(*n))),
+        Expr::Literal(Literal::Numeric { unscaled, scale }) => {
+            Some(Ok(round_scaled_half_away(*unscaled, *scale)))
+        }
+        // PG coerces a string by its CONTENT, and fails on the value.
+        Expr::Literal(Literal::String(t)) => Some(t.trim().parse::<i64>().map_or_else(
+            |_| Err(alloc::format!("invalid input syntax for type bigint: \"{t}\"")),
+            |n| Ok(i128::from(n)),
+        )),
+        Expr::Literal(Literal::Bool(_)) => Some(Err(
+            "argument of {L} must be type bigint, not type boolean".into(),
+        )),
+        Expr::Unary { op: UnOp::Neg, expr } => match fold_limit_constant(expr)? {
+            Ok(v) => Some(Ok(-v)),
+            e @ Err(_) => Some(e),
+        },
+        Expr::Binary { lhs, op, rhs } => {
+            let a = match fold_limit_constant(lhs)? {
+                Ok(v) => v,
+                e @ Err(_) => return Some(e),
+            };
+            let b = match fold_limit_constant(rhs)? {
+                Ok(v) => v,
+                e @ Err(_) => return Some(e),
+            };
+            let out = match op {
+                BinOp::Add => a.checked_add(b),
+                BinOp::Sub => a.checked_sub(b),
+                BinOp::Mul => a.checked_mul(b),
+                BinOp::Div if b != 0 => a.checked_div(b),
+                BinOp::Div => return Some(Err("division by zero".into())),
+                BinOp::Mod if b != 0 => a.checked_rem(b),
+                BinOp::Mod => return Some(Err("division by zero".into())),
+                _ => return None,
+            };
+            // PG evaluates the arithmetic in the operand's own type, so an
+            // int-by-int product that leaves int range fails there — before
+            // the row count is ever looked at.
+            match out {
+                Some(v) if v > i128::from(i32::MAX) || v < i128::from(i32::MIN) => {
+                    Some(Err("integer out of range".into()))
+                }
+                Some(v) => Some(Ok(v)),
+                None => Some(Err("integer out of range".into())),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Round `unscaled / 10^scale` half away from zero — PG's numeric→bigint
+/// cast, which is what makes `LIMIT 2.5` keep three rows.
+fn round_scaled_half_away(unscaled: i128, scale: u16) -> i128 {
+    if scale == 0 {
+        return unscaled;
+    }
+    let Some(div) = 10i128.checked_pow(u32::from(scale)) else {
+        return 0;
+    };
+    let neg = unscaled < 0;
+    let mag = unscaled.unsigned_abs() as i128;
+    let rounded = (mag + div / 2) / div;
+    if neg { -rounded } else { rounded }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -28093,79 +28169,4 @@ $$";
             assert_eq!(s, again, "round-trip mismatch for {sql:?}");
         }
     }
-}
-
-/// v7.39 (round 284) — fold a constant `LIMIT` / `OFFSET` expression to a
-/// row count, the way PG evaluates one before applying it.
-///
-/// `None` = not a constant (a column, a subquery, a function call).
-/// `Some(Err(msg))` = PG rejects it, and the message is PG's; `{L}` in the
-/// message stands in for LIMIT / OFFSET, which the caller substitutes.
-/// All wordings were read off live PG 18.4.
-fn fold_limit_constant(e: &crate::ast::Expr) -> Option<Result<i128, alloc::string::String>> {
-    use crate::ast::{BinOp, Expr, Literal, UnOp};
-    match e {
-        Expr::Literal(Literal::Integer(n)) => Some(Ok(i128::from(*n))),
-        Expr::Literal(Literal::Numeric { unscaled, scale }) => {
-            Some(Ok(round_scaled_half_away(*unscaled, *scale)))
-        }
-        // PG coerces a string by its CONTENT, and fails on the value.
-        Expr::Literal(Literal::String(t)) => Some(t.trim().parse::<i64>().map_or_else(
-            |_| Err(alloc::format!("invalid input syntax for type bigint: \"{t}\"")),
-            |n| Ok(i128::from(n)),
-        )),
-        Expr::Literal(Literal::Bool(_)) => Some(Err(
-            "argument of {L} must be type bigint, not type boolean".into(),
-        )),
-        Expr::Unary { op: UnOp::Neg, expr } => match fold_limit_constant(expr)? {
-            Ok(v) => Some(Ok(-v)),
-            e @ Err(_) => Some(e),
-        },
-        Expr::Binary { lhs, op, rhs } => {
-            let a = match fold_limit_constant(lhs)? {
-                Ok(v) => v,
-                e @ Err(_) => return Some(e),
-            };
-            let b = match fold_limit_constant(rhs)? {
-                Ok(v) => v,
-                e @ Err(_) => return Some(e),
-            };
-            let out = match op {
-                BinOp::Add => a.checked_add(b),
-                BinOp::Sub => a.checked_sub(b),
-                BinOp::Mul => a.checked_mul(b),
-                BinOp::Div if b != 0 => a.checked_div(b),
-                BinOp::Div => return Some(Err("division by zero".into())),
-                BinOp::Mod if b != 0 => a.checked_rem(b),
-                BinOp::Mod => return Some(Err("division by zero".into())),
-                _ => return None,
-            };
-            // PG evaluates the arithmetic in the operand's own type, so an
-            // int-by-int product that leaves int range fails there — before
-            // the row count is ever looked at.
-            match out {
-                Some(v) if v > i128::from(i32::MAX) || v < i128::from(i32::MIN) => {
-                    Some(Err("integer out of range".into()))
-                }
-                Some(v) => Some(Ok(v)),
-                None => Some(Err("integer out of range".into())),
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Round `unscaled / 10^scale` half away from zero — PG's numeric→bigint
-/// cast, which is what makes `LIMIT 2.5` keep three rows.
-fn round_scaled_half_away(unscaled: i128, scale: u16) -> i128 {
-    if scale == 0 {
-        return unscaled;
-    }
-    let Some(div) = 10i128.checked_pow(u32::from(scale)) else {
-        return 0;
-    };
-    let neg = unscaled < 0;
-    let mag = unscaled.unsigned_abs() as i128;
-    let rounded = (mag + div / 2) / div;
-    if neg { -rounded } else { rounded }
 }
