@@ -2060,9 +2060,11 @@ pub struct CreateTriggerStatement {
     /// `FOR EACH ROW` vs `FOR EACH STATEMENT`. v7.12.4 ships
     /// only `Row`; `Statement` parses but the executor refuses.
     pub for_each: TriggerForEach,
-    /// Name of the function to invoke. v7.12.4 requires the
-    /// function to be `CREATE FUNCTION`'d earlier; forward
-    /// references (PG accepts) are deferred to v7.12.5.
+    /// Name of the function to invoke. The function must exist at
+    /// CREATE TRIGGER time — PG18-measured (round 753): PG refuses a
+    /// forward reference (`function no_such_fn() does not exist`), so
+    /// requiring it IS the PG behaviour (the old note claimed the
+    /// opposite).
     pub function: String,
     /// v7.13.0 — `UPDATE OF col, col, …` column-list filter
     /// (mailrs round-5 G7). Non-empty only when the events list

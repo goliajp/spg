@@ -4002,10 +4002,10 @@ pub struct Catalog {
     /// invocation. This keeps `spg-storage` free of `spg-sql`
     /// dependency — same pattern as partial-index predicates.
     functions: BTreeMap<String, FunctionDef>,
-    /// v7.12.4 — triggers in insertion order. Multiple triggers
-    /// per table / event fire in this order (matching PG's
-    /// alphabetical-by-default with insertion-stable tie-break
-    /// behaviour — we just keep insertion order for now).
+    /// v7.12.4 — triggers in insertion order. PG18-measured (round
+    /// 753): PG fires same-event triggers in NAME order (a_trig
+    /// before z_trig regardless of creation order); SPG fires in
+    /// insertion order — a real divergence, ledgered as F31-B2.
     triggers: Vec<TriggerDef>,
     /// v7.39 (round 139) — query-rewrite RULEs, flat like triggers.
     rules: Vec<RuleDef>,

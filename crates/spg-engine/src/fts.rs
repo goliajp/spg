@@ -49,8 +49,9 @@ impl TsConfig {
 
 /// v7.12.1 — tokenise + (optionally) stem `text` into a sorted +
 /// deduped lexeme set with merged positions. Each token's
-/// position is 1-based and capped at u16::MAX (matching PG's
-/// `MaxTSPosition`).
+/// position is 1-based and clamped at 16383 (PG18-measured, round
+/// 753: a 20k-word document's positions top out at 16383 — the
+/// `MAXENTRYPOS - 1` clamp — while every lexeme is still recorded).
 pub fn to_tsvector(config: TsConfig, text: &str) -> Vec<TsLexeme> {
     let mut out: Vec<TsLexeme> = Vec::new();
     let mut position: u16 = 0;
@@ -72,7 +73,7 @@ pub fn to_tsvector(config: TsConfig, text: &str) -> Vec<TsLexeme> {
                     // PG drops stopwords from the vector but
                     // still increments position so phrase
                     // distances stay meaningful.
-                    position = position.saturating_add(1);
+                    position = position.saturating_add(1).min(16383);
                     continue;
                 }
                 porter_stem(&folded)
@@ -81,7 +82,7 @@ pub fn to_tsvector(config: TsConfig, text: &str) -> Vec<TsLexeme> {
         if lex.is_empty() {
             continue;
         }
-        position = position.saturating_add(1);
+        position = position.saturating_add(1).min(16383);
         match out.binary_search_by(|l| l.word.as_str().cmp(lex.as_str())) {
             Ok(idx) => {
                 if !out[idx].positions.contains(&position) {
@@ -127,8 +128,12 @@ pub fn phraseto_tsquery(config: TsConfig, text: &str) -> TsQueryAst {
 /// syntax. Quoted phrases → phrase node; `OR` (case-insensitive)
 /// → OR; leading `-` → NOT; otherwise AND.
 ///
-/// The grammar is liberal — malformed input degrades to a plain
-/// AND of the bare tokens, matching PG semantics.
+/// The grammar is liberal — malformed input degrades instead of
+/// erroring. PG18-measured (round 753): an unclosed quote still
+/// forms a phrase (`"unclosed phrase` → `'unclosed' <-> 'phrase'`,
+/// SPG agrees); bare operator words become terms (`or or and -` →
+/// `'or' | 'and'` in PG, SPG answers `'and'` — the leading or-term
+/// is dropped; ledgered as F31-B7).
 pub fn websearch_to_tsquery(config: TsConfig, text: &str) -> TsQueryAst {
     let mut tokens = web_tokens(text);
     // Apply config to each plain term + each phrase part.
@@ -376,7 +381,7 @@ fn collect_lexemes_positioned(config: TsConfig, text: &str) -> Vec<(String, u16)
             TsDict::Simple => folded,
             TsDict::EnglishStem => {
                 if is_english_stopword(&folded) {
-                    position = position.saturating_add(1);
+                    position = position.saturating_add(1).min(16383);
                     continue;
                 }
                 porter_stem(&folded)
@@ -385,7 +390,7 @@ fn collect_lexemes_positioned(config: TsConfig, text: &str) -> Vec<(String, u16)
         if lex.is_empty() {
             continue;
         }
-        position = position.saturating_add(1);
+        position = position.saturating_add(1).min(16383);
         out.push((lex, position));
     }
     out
