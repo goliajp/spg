@@ -3219,6 +3219,11 @@ pub struct MergeStatement {
     /// is empty; the alias (required by PG for a subquery source) is in
     /// `source_alias`. `None` = plain `USING <table>` (source names a table).
     pub source_select: Option<Box<SelectStatement>>,
+    /// v7.39 (round 768, F31-D5) — `USING (VALUES …) s(id, v)`: the
+    /// positional column-alias list after the source alias. Empty when
+    /// the statement carries none; the engine renames the materialised
+    /// source columns positionally (PG's rule).
+    pub source_column_aliases: Vec<String>,
     pub on: Expr,
     pub clauses: Vec<MergeWhenClause>,
     /// v7.39 (read01 round 130) — PG17+ `MERGE … RETURNING <projection>`.
@@ -7304,6 +7309,16 @@ impl fmt::Display for MergeStatement {
         }
         if let Some(a) = &self.source_alias {
             write!(f, " {}", quote_ident(a))?;
+        }
+        if !self.source_column_aliases.is_empty() {
+            f.write_str("(")?;
+            for (i, c) in self.source_column_aliases.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{}", quote_ident(c))?;
+            }
+            f.write_str(")")?;
         }
         write!(f, " ON {}", self.on)?;
         for clause in &self.clauses {

@@ -2570,11 +2570,20 @@ impl Engine {
         let (source_cols, source_rows) = if let Some(sub) = &stmt.source_select {
             // v7.37 D.44 — `USING (SELECT …) alias` subquery source: materialise
             // the SELECT and use its result columns/rows as the merge input.
-            let QueryResult::Rows { columns, rows } = self.exec_select_cancel(sub, cancel)? else {
+            let QueryResult::Rows { mut columns, rows } = self.exec_select_cancel(sub, cancel)?
+            else {
                 return Err(EngineError::Unsupported(alloc::format!(
                     "MERGE USING subquery did not return rows"
                 )));
             };
+            // v7.39 (round 768, F31-D5) — `s(id, v)` renames the source
+            // columns positionally (PG's rule; the VALUES lowering names
+            // them column1..columnN otherwise).
+            for (i, new_name) in stmt.source_column_aliases.iter().enumerate() {
+                if let Some(c) = columns.get_mut(i) {
+                    c.name = new_name.clone();
+                }
+            }
             (columns, rows)
         } else {
             let s = self.active_catalog().get(&stmt.source).ok_or_else(|| {
