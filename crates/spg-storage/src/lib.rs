@@ -1629,9 +1629,11 @@ pub struct ColumnSchema {
 ///   * `Binary`  — byte-wise comparison (the SPG default;
 ///                 matches PG `COLLATE "C"` / `pg_catalog.default`
 ///                 and MySQL `*_bin`).
-///   * `CaseInsensitive` — ASCII case-folded comparison
-///                 (matches PG `COLLATE "case_insensitive"` and
-///                 MySQL `*_ci` collations). Non-ASCII bytes
+///   * `CaseInsensitive` — ASCII case-folded comparison (like
+///                 MySQL `*_ci` collations; PG has NO built-in
+///                 collation of this name — round-761 audit: a
+///                 nondeterministic ICU collation must be CREATEd
+///                 there first). Non-ASCII bytes
 ///                 still compare byte-wise; full ICU folding is
 ///                 out of v7.17 scope.
 /// New variants append at the end — older catalogs read missing

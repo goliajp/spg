@@ -240,14 +240,19 @@ fn mixed_types_coerced() {
 }
 
 #[test]
-fn integer_separator_coerced_to_text() {
+fn integer_separator_refuses_like_pg() {
+    // v7.39 (round 761, F31 tranche 2 #41) — PG18-measured: there is
+    // no concat_ws overload for a non-text separator (`function
+    // concat_ws(integer, unknown, unknown) does not exist`); the old
+    // pin asserted a coercion PG does not perform ("PG accepts" — it
+    // does not).
     let mut e = Engine::new();
-    // PG accepts non-text separator (numeric coerces). Edge case
-    // — apps rarely emit this but the engine should not panic.
-    assert_eq!(
-        first_text(&mut e, "SELECT concat_ws(0, 'a', 'b')"),
-        Value::text("a0b")
+    let err = format!(
+        "{}",
+        e.execute("SELECT concat_ws(0, 'a', 'b')")
+            .expect_err("non-text separator refuses")
     );
+    assert!(err.contains("needs a text separator, got integer"), "{err}");
 }
 
 // ── COLUMN-LEVEL BEHAVIOR ─────────────────────────────────────────

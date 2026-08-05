@@ -163,15 +163,18 @@ fn timetz_malformed_input_is_error() {
 }
 
 #[test]
-fn timetz_missing_offset_is_error() {
-    // PG accepts a TIME literal in a TIMETZ column by assuming
-    // the session TZ — SPG has no session TZ wired through here
-    // so we surface as a hard error. App must spell the offset.
+fn timetz_missing_offset_takes_the_session_zone() {
+    // v7.39 (round 761, F31 tranche 2 #59) — PG18-measured: a TIME
+    // literal lands in a TIMETZ column at the session offset
+    // (`07:08:09` reads back `07:08:09+00` in a UTC session). The
+    // old pin asserted SPG's hard error instead.
     let mut eng = engine_with(&["CREATE TABLE t (id INT NOT NULL, started TIMETZ)"]);
-    let r = eng.execute("INSERT INTO t VALUES (1, '14:30:45')");
-    assert!(
-        r.is_err(),
-        "TIMETZ literal without an offset must error in SPG"
+    eng.execute("INSERT INTO t VALUES (1, '14:30:45')").unwrap();
+    let r = eng.execute("SELECT started::text FROM t").unwrap();
+    let spg_engine::QueryResult::Rows { rows, .. } = r else { panic!() };
+    assert_eq!(
+        spg_engine::eval::value_to_text(&rows[0].values[0]),
+        "14:30:45+00"
     );
 }
 

@@ -4517,9 +4517,13 @@ pub(crate) fn coerce_value(
         },
         // YEAR → Text 4-digit zero-padded.
         (Value::Year(y), DataType::Text) => Some(Value::text(alloc::format!("{y:04}"))),
-        // v7.17.0 Phase 3.P0-34 — Text → TIMETZ. Mandatory
-        // signed offset suffix; missing offset is a hard error
-        // (SPG has no session TZ wired into eval, unlike PG).
+        // v7.17.0 Phase 3.P0-34 — Text → TIMETZ.
+        // v7.39 (round 761, F31 tranche 2 #59) — an offset-less
+        // literal is accepted at the session offset, PG18-measured
+        // (`INSERT '07:08:09'` into a TIMETZ column reads back
+        // `07:08:09+00` in a UTC session). The old "mandatory signed
+        // offset" rule refused what PG accepts; offset 0 is the same
+        // session-zero assumption the time→timetz cast below carries.
         // v7.39 (round 634) — a time or a timestamp reaching `::TIMETZ`.
         // PG registers time -> timetz as IMPLICIT and timestamptz -> timetz
         // as an assignment cast; SPG answered "cannot cast time without
@@ -4531,7 +4535,9 @@ pub(crate) fn coerce_value(
             us: t.rem_euclid(86_400_000_000),
             offset_secs: 0,
         }),
-        (Value::Text(s), DataType::TimeTz) => match parse_timetz_str(&s) {
+        (Value::Text(s), DataType::TimeTz) => match parse_timetz_str(&s)
+            .or_else(|| parse_time_str(s.trim()).map(|us| (us, 0)))
+        {
             Some((us, offset_secs)) => Some(Value::TimeTz { us, offset_secs }),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
