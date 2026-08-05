@@ -1989,7 +1989,189 @@ impl Engine {
         // v7.31 (perf 3e) — scratch key buffer: build inserts allocate
         // only on vacant, probes never allocate.
         let mut keystr = String::new();
+        // v7.39 (round 746) — SHARDED build for the integer lanes. The
+        // build walk (visibility gate + hoisted predicates + key
+        // extraction) ran single-threaded over the whole peer — 25 ms of
+        // a 500k predicate scan on the panel's filtered self-join while
+        // PG runs a parallel scan. Shards produce local i64/i128 tables
+        // merged in SHARD ORDER, which preserves ascending row order
+        // inside every bucket — exactly what the serial walk produced,
+        // so match emission order is unchanged. String-lane and Mixed
+        // (cold-bearing) builds stay serial.
+        let mut built_parallel = false;
+        if (any_int_lane || int2_keyed)
+            && n_rights >= crate::PARALLEL_MIN_ROWS
+            && !matches!(rights_src, JoinSrc::Mixed { .. })
+            && let Some(r) = self.parallel_runner.0.as_deref()
+        {
+            struct ShardTables {
+                t64: hashbrown::HashMap<i64, Bucket>,
+                t128: hashbrown::HashMap<i128, Bucket>,
+            }
+            type ShardOut = Result<ShardTables, EngineError>;
+            let n_shards = (n_rights / crate::PARALLEL_MIN_ROWS).clamp(2, 8);
+            let chunk = n_rights.div_ceil(n_shards);
+            let rights_ref = &rights_src;
+            let preds_ref = &build_preds;
+            let peer_cols = &peer.cols;
+            let peer_alias_s = peer.alias.as_str();
+            let mysql = ctx.mysql_dialect;
+            let style = ctx.render_style;
+            let cat = ctx.catalog;
+            let eq_pairs_ref = eq_pairs;
+            let eq_exprs_ref = eq_exprs;
+            let eq_probe_ref = eq_probe_exprs;
+            let results = r.run_shards(n_shards, &|si| {
+                let lo = si * chunk;
+                let hi = ((si + 1) * chunk).min(n_rights);
+                let mut sctx = EvalContext::new(peer_cols, Some(peer_alias_s));
+                sctx.mysql_dialect = mysql;
+                sctx.render_style = style;
+                let sctx = match cat {
+                    Some(c) => sctx.with_catalog(c),
+                    None => sctx,
+                };
+                let mut stack: Vec<Value<'static>> = Vec::new();
+                let mut out = ShardTables {
+                    t64: hashbrown::HashMap::new(),
+                    t128: hashbrown::HashMap::new(),
+                };
+                let run = || -> ShardOut {
+                    let mut out = out;
+                    'srows: for ri in lo..hi {
+                        if let Some((gt, hot_len)) = build_gate
+                            && ri < hot_len
+                            && !gt.is_row_visible(ri, &scan_snapshot)
+                        {
+                            continue;
+                        }
+                        let Some(right) = rights_ref.get(ri) else {
+                            continue;
+                        };
+                        for c in preds_ref.iter() {
+                            let v = eval::eval_compiled(c, right, &sctx, &mut stack)
+                                .map_err(EngineError::Eval)?;
+                            if !crate::eval::predicate_is_true(&v, "JOIN/ON", mysql)? {
+                                continue 'srows;
+                            }
+                        }
+                        if int2_keyed {
+                            let mut parts = [0i64; 2];
+                            let mut pi = 0;
+                            for (_, rpos) in eq_pairs_ref {
+                                match right.values.get(*rpos) {
+                                    Some(Value::BigInt(n)) => parts[pi] = *n,
+                                    Some(Value::Int(n)) => parts[pi] = i64::from(*n),
+                                    Some(Value::SmallInt(n)) => parts[pi] = i64::from(*n),
+                                    _ => continue 'srows,
+                                }
+                                pi += 1;
+                            }
+                            for (p, _, _) in eq_probe_ref {
+                                match right.values.get(*p) {
+                                    Some(Value::BigInt(n)) => parts[pi] = *n,
+                                    Some(Value::Int(n)) => parts[pi] = i64::from(*n),
+                                    Some(Value::SmallInt(n)) => parts[pi] = i64::from(*n),
+                                    _ => continue 'srows,
+                                }
+                                pi += 1;
+                            }
+                            let key = ((parts[0] as i128) << 64) | (parts[1] as u64 as i128);
+                            match out.t128.entry(key) {
+                                hashbrown::hash_map::Entry::Occupied(mut o) => o.get_mut().push(ri),
+                                hashbrown::hash_map::Entry::Vacant(v) => {
+                                    v.insert(Bucket::One(ri));
+                                }
+                            }
+                            continue;
+                        }
+                        let key: i64 = if !eq_pairs_ref.is_empty() || !eq_probe_ref.is_empty() {
+                            let rpos = if eq_probe_ref.is_empty() {
+                                eq_pairs_ref[0].1
+                            } else {
+                                eq_probe_ref[0].0
+                            };
+                            match right.values.get(rpos) {
+                                Some(Value::BigInt(n)) => *n,
+                                Some(Value::Int(n)) => i64::from(*n),
+                                Some(Value::SmallInt(n)) => i64::from(*n),
+                                _ => continue 'srows,
+                            }
+                        } else {
+                            match eval::eval_expr(eq_exprs_ref[0].1, right, &sctx)
+                                .map_err(EngineError::Eval)?
+                            {
+                                Value::BigInt(n) => n,
+                                Value::Int(n) => i64::from(n),
+                                Value::SmallInt(n) => i64::from(n),
+                                _ => continue 'srows,
+                            }
+                        };
+                        match out.t64.entry(key) {
+                            hashbrown::hash_map::Entry::Occupied(mut o) => o.get_mut().push(ri),
+                            hashbrown::hash_map::Entry::Vacant(v) => {
+                                v.insert(Bucket::One(ri));
+                            }
+                        }
+                    }
+                    Ok(out)
+                };
+                alloc::boxed::Box::new(run())
+            });
+            let mut ok = true;
+            let mut shard_tables: Vec<ShardTables> = Vec::with_capacity(n_shards);
+            let mut first_err: Option<EngineError> = None;
+            for boxed in results {
+                match boxed.downcast::<ShardOut>() {
+                    Ok(sh) => match *sh {
+                        Ok(t) => shard_tables.push(t),
+                        Err(e) => {
+                            ok = false;
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
+                    },
+                    Err(_) => ok = false,
+                }
+            }
+            if let Some(e) = first_err {
+                return Err(e);
+            }
+            if ok {
+                for t in shard_tables {
+                    for (k, b) in t.t64 {
+                        match int_table.entry(k) {
+                            hashbrown::hash_map::Entry::Occupied(mut o) => {
+                                for ri in b.as_slice() {
+                                    o.get_mut().push(*ri);
+                                }
+                            }
+                            hashbrown::hash_map::Entry::Vacant(v) => {
+                                v.insert(b);
+                            }
+                        }
+                    }
+                    for (k, b) in t.t128 {
+                        match int2_table.entry(k) {
+                            hashbrown::hash_map::Entry::Occupied(mut o) => {
+                                for ri in b.as_slice() {
+                                    o.get_mut().push(*ri);
+                                }
+                            }
+                            hashbrown::hash_map::Entry::Vacant(v) => {
+                                v.insert(b);
+                            }
+                        }
+                    }
+                }
+                built_parallel = true;
+            }
+        }
         'build: for ri in 0..n_rights {
+            if built_parallel {
+                break;
+            }
             if let Some((gt, hot_len)) = build_gate
                 && ri < hot_len
                 && !gt.is_row_visible(ri, &scan_snapshot)
