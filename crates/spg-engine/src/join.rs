@@ -2857,51 +2857,77 @@ impl Engine {
         let Some(on) = join.on.as_ref() else {
             return Ok(None);
         };
-        let Some((outer_col, inner_col)) = analyse_join_eq(on, outer_alias, inner_alias)? else {
-            return Ok(None);
-        };
-        // WHERE clause: single `inner_alias.inner_col IS NULL` predicate
-        // (canonical anti-join filter).
+        // v7.39 (round 744) — the ON accepts a plain pair (the r178
+        // shape) OR `outer.col = <integer-only expression over inner>`
+        // (the computed key the round-721 pull-up emits). For the
+        // computed shape the IS NULL column must be one the key
+        // expression READS: a real match forces the expression non-NULL,
+        // hence every referenced column non-NULL — so the filter selects
+        // exactly the pad rows. Any other inner column could be NULL on
+        // a MATCHED row and the count would be wrong.
+        enum InnerKey {
+            Col(String),
+            Expr(Expr),
+        }
+        let (outer_col, inner_key, null_cols): (String, InnerKey, Vec<String>) =
+            if let Some((oc, ic)) = analyse_join_eq(on, outer_alias, inner_alias)? {
+                let nulls = alloc::vec![ic.clone()];
+                (oc, InnerKey::Col(ic), nulls)
+            } else if let Some((oc, e)) = analyse_join_eq_expr(on, outer_alias, inner_alias) {
+                let mut cols: Vec<String> = Vec::new();
+                collect_inner_int_cols(&e, &mut cols);
+                (oc, InnerKey::Expr(e), cols)
+            } else {
+                return Ok(None);
+            };
+        // WHERE clause: single `inner_alias.<col> IS NULL` predicate
+        // (canonical anti-join filter), col constrained as above.
         let Some(where_expr) = stmt.where_.as_ref() else {
             return Ok(None);
         };
-        if !is_inner_is_null(where_expr, inner_alias, &inner_col) {
+        if !null_cols
+            .iter()
+            .any(|c| is_inner_is_null(where_expr, inner_alias, c))
+        {
             return Ok(None);
         }
-        // Inner column must be UNIQUE / PK on a single integer column,
-        // so the antiset built from B's rows is collision-free under
-        // `HashSet<i64>`. Look the table up in the catalog.
+        // Set membership is duplicate-insensitive for an ANTI count, so
+        // no uniqueness gate is needed on either shape; the columns just
+        // have to be integer-family so the i64 set is exact.
         let catalog = self.active_catalog();
         let Some(inner_table) = catalog.get(join.table.name.as_str()) else {
             return Ok(None);
         };
         let inner_schema = inner_table.schema();
-        let Some(inner_pos) = inner_schema
-            .columns
-            .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&inner_col))
-        else {
-            return Ok(None);
+        let int_col_pos = |name: &str| -> Option<usize> {
+            inner_schema
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(name))
+                .filter(|&p| {
+                    matches!(
+                        inner_schema.columns[p].ty,
+                        spg_storage::DataType::BigInt
+                            | spg_storage::DataType::Int
+                            | spg_storage::DataType::SmallInt
+                    )
+                })
         };
-        let inner_ty = inner_schema.columns[inner_pos].ty;
-        if !matches!(
-            inner_ty,
-            spg_storage::DataType::BigInt
-                | spg_storage::DataType::Int
-                | spg_storage::DataType::SmallInt
-        ) {
-            return Ok(None);
-        }
-        // The inner column must be a single-column PK so the antiset is
-        // collision-free. (Single-column UNIQUE follows the same rule;
-        // restricting Phase 1 to PK keeps the gate trivial.)
-        if !inner_schema
-            .uniqueness_constraints
-            .iter()
-            .any(|u| u.is_primary_key && u.columns.as_slice() == [inner_pos])
-        {
-            return Ok(None);
-        }
+        let inner_pos: Option<usize> = match &inner_key {
+            InnerKey::Col(c) => {
+                let Some(p) = int_col_pos(c) else {
+                    return Ok(None);
+                };
+                Some(p)
+            }
+            InnerKey::Expr(_) => {
+                // Every column the expression reads must be inner int.
+                if !null_cols.iter().all(|c| int_col_pos(c).is_some()) {
+                    return Ok(None);
+                }
+                None
+            }
+        };
         let Some(outer_table) = catalog.get(from.primary.name.as_str()) else {
             return Ok(None);
         };
@@ -2939,14 +2965,26 @@ impl Engine {
         let scan_snapshot = self.current_snapshot();
         let mut antiset: hashbrown::HashSet<i64> =
             hashbrown::HashSet::with_capacity(inner_table.row_count());
+        let inner_ctx = self.ev_ctx(&inner_schema.columns, Some(inner_alias));
         for (i, row) in inner_table.rows().iter().enumerate() {
             if !inner_table.is_row_visible(i, &scan_snapshot) {
                 continue;
             }
-            if let Some(v) = row.values.get(inner_pos)
-                && let Some(k) = read_int(v)
-            {
-                antiset.insert(k);
+            match (&inner_key, inner_pos) {
+                (InnerKey::Col(_), Some(p)) => {
+                    if let Some(v) = row.values.get(p)
+                        && let Some(k) = read_int(v)
+                    {
+                        antiset.insert(k);
+                    }
+                }
+                (InnerKey::Expr(e), _) => {
+                    let v = eval::eval_expr(e, row, &inner_ctx).map_err(EngineError::Eval)?;
+                    if let Some(k) = read_int(&v) {
+                        antiset.insert(k);
+                    }
+                }
+                _ => unreachable!("Col always carries a position"),
             }
         }
         // Walk outer; count rows whose key isn't in the set OR whose key
@@ -2975,7 +3013,7 @@ impl Engine {
         )];
         let rows = alloc::vec![Row::new(alloc::vec![Value::BigInt(count)])];
         let _ = outer_alias;
-        let _ = (outer_col, inner_col);
+        let _ = outer_col;
         ANTI_JOIN_FAST_PATH_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok(Some(QueryResult::Rows { columns, rows }))
     }
@@ -4222,6 +4260,67 @@ fn analyse_join_eq(
         return Ok(Some((b.name.clone(), a.name.clone())));
     }
     Ok(None)
+}
+
+/// v7.39 (round 744) — recognise `outer.col = <integer-only expression
+/// over the inner alias>` (commuted accepted). The expression allowlist
+/// mirrors `int_only_key_expr`: inner-qualified columns, integer
+/// literals, Add/Sub/Mul.
+fn analyse_join_eq_expr(
+    on: &Expr,
+    outer_alias: &str,
+    inner_alias: &str,
+) -> Option<(String, Expr)> {
+    use spg_sql::ast::BinOp;
+    let Expr::Binary {
+        lhs,
+        op: BinOp::Eq,
+        rhs,
+    } = on
+    else {
+        return None;
+    };
+    fn inner_only_int(e: &Expr, inner_alias: &str) -> bool {
+        use spg_sql::ast::BinOp;
+        match e {
+            Expr::Column(c) => c
+                .qualifier
+                .as_deref()
+                .is_some_and(|q| q.eq_ignore_ascii_case(inner_alias)),
+            Expr::Literal(spg_sql::ast::Literal::Integer(_)) => true,
+            Expr::Binary { lhs, op, rhs } => {
+                matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                    && inner_only_int(lhs, inner_alias)
+                    && inner_only_int(rhs, inner_alias)
+            }
+            _ => false,
+        }
+    }
+    for (a, b) in [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())] {
+        if let Expr::Column(c) = a
+            && c.qualifier
+                .as_deref()
+                .is_some_and(|q| q.eq_ignore_ascii_case(outer_alias))
+            && !matches!(b, Expr::Column(_))
+            && inner_only_int(b, inner_alias)
+            && expr_mentions_a_column(b)
+        {
+            return Some((c.name.clone(), b.clone()));
+        }
+    }
+    None
+}
+
+/// The inner columns an `analyse_join_eq_expr` key reads.
+fn collect_inner_int_cols(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Column(c) => out.push(c.name.clone()),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_inner_int_cols(lhs, out);
+            collect_inner_int_cols(rhs, out);
+        }
+        _ => {}
+    }
 }
 
 /// v7.37.x — recognise `<inner_alias>.<inner_col> IS NULL`.
