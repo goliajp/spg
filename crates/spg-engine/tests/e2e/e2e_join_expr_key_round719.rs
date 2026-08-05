@@ -288,3 +288,51 @@ fn round745_build_side_predicates_answer_as_pg() {
         assert_eq!(one(&mut e, sql), want, "{sql}");
     }
 }
+
+/// v7.39 (round 746) — the integer-lane hash BUILD shards across the
+/// parallel runner (local tables merged in shard order, preserving
+/// ascending row order inside every bucket). This engine has no runner,
+/// so these exercise the serial walk — the answers the sharded build
+/// must reproduce are pinned by the round-746 differential (7/7,
+/// including bucket-order-sensitive projections).
+#[test]
+fn round746_build_answers_hold() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        (
+            "SELECT count(*) FROM j719 a JOIN j719 b ON a.id = b.id              WHERE a.g = 0 AND b.g = 0",
+            "33",
+        ),
+        // Duplicate-key bucket order feeds output order.
+        (
+            "SELECT b.g FROM j719 a JOIN j719 b ON a.g = b.g              WHERE a.id = 1 AND b.id <= 6 ORDER BY b.id",
+            "1 / 1",
+        ),
+    ] {
+        assert_eq!(one_join(&mut e, sql, want), true, "{sql}");
+    }
+}
+
+fn one_join(e: &mut Engine, sql: &str, want: &str) -> bool {
+    match e.execute(sql).unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            let got = rows
+                .iter()
+                .map(|r| {
+                    r.values
+                        .iter()
+                        .map(spg_engine::eval::value_to_text)
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+                .collect::<Vec<_>>()
+                .join(" / ");
+            got == want || {
+                eprintln!("got {got:?} want {want:?}");
+                false
+            }
+        }
+        other => panic!("{other:?}"),
+    }
+}
