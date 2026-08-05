@@ -660,6 +660,56 @@ pub(crate) fn commit_delay_us() -> u64 {
     parse_env_u64("SPG_COMMIT_DELAY_US").unwrap_or(0)
 }
 
+/// v7.39 (round 741, S15/B4) — the ADAPTIVE coalescing window, in
+/// microseconds. PG's `commit_delay` is a hand-tuned constant; this one
+/// steers itself by the only signal that matters — did the last group
+/// actually coalesce? AIMD: a group of >= 2 doubles the window (from a
+/// 25 µs floor) up to 200 µs — half an F_BARRIERFSYNC, so one merged
+/// writer already pays for the wait — and a group of 1 halves it back
+/// toward zero, which is why a serial single client (whose waits can
+/// never see a second task) decays to the zero-latency shape within a
+/// few statements. An explicit SPG_COMMIT_DELAY_US pins the window and
+/// disables adaptation entirely.
+pub(crate) static ADAPTIVE_COMMIT_WINDOW_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// v7.39 (round 741) — ground truth for the S15 bench: how many tasks
+/// each finished group carried, split into "flushed alone" vs
+/// "coalesced", plus the coalesced task total. (The S14 lesson: green
+/// output cannot distinguish an engaged optimisation from a silent
+/// fallback; counters can.)
+pub(crate) static COMMIT_GROUPS_SOLO: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static COMMIT_GROUPS_COALESCED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static COMMIT_TASKS_COALESCED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The window the leader actually uses this round.
+fn effective_commit_delay_us() -> u64 {
+    let explicit = parse_env_u64("SPG_COMMIT_DELAY_US");
+    match explicit {
+        Some(v) => v,
+        None => ADAPTIVE_COMMIT_WINDOW_US.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// AIMD update after a group of `n` tasks ships. No-op when the
+/// operator pinned the window.
+fn adapt_commit_window(n: usize) {
+    use std::sync::atomic::Ordering;
+    if parse_env_u64("SPG_COMMIT_DELAY_US").is_some() {
+        return;
+    }
+    let cur = ADAPTIVE_COMMIT_WINDOW_US.load(Ordering::Relaxed);
+    let next = if n >= 2 {
+        (cur.max(25)).saturating_mul(2).min(200)
+    } else {
+        cur / 2
+    };
+    ADAPTIVE_COMMIT_WINDOW_US.store(next, Ordering::Relaxed);
+}
+
 /// v4.42 — push a `CommitTask` onto the commit-barrier queue and
 /// decide whether the caller becomes the leader. Returns `true`
 /// iff the latching `leader_active` flag flipped from `false` to
@@ -746,8 +796,10 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
         wal_bytes: Vec<u8>,
     }
     let group_max = commit_group_max();
-    let delay_us = commit_delay_us();
     loop {
+        // v7.39 (round 741, S15/B4) — re-read per round: the window
+        // adapts between rounds.
+        let delay_us = effective_commit_delay_us();
         // ----- 1. Pull one group under the queue lock -----
         //
         // First check non-blocking. If pending is already full or
@@ -789,6 +841,17 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
             let take = q.pending.len().min(group_max);
             q.pending.drain(..take).collect()
         };
+        // v7.39 (round 741) — steer the window and record ground truth.
+        {
+            use std::sync::atomic::Ordering;
+            if group.len() >= 2 {
+                COMMIT_GROUPS_COALESCED.fetch_add(1, Ordering::Relaxed);
+                COMMIT_TASKS_COALESCED.fetch_add(group.len() as u64, Ordering::Relaxed);
+            } else {
+                COMMIT_GROUPS_SOLO.fetch_add(1, Ordering::Relaxed);
+            }
+            adapt_commit_window(group.len());
+        }
 
         // ----- 2. Sequential prepare + in-memory commit -----
         //
