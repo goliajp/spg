@@ -180,3 +180,45 @@ fn round738_delete_delta_matches_full_recompute() {
         .unwrap();
     assert_eq!(one(&mut e, "SELECT count(*) FROM mv738"), "26");
 }
+
+/// v7.39 (round 739, S14/B3 knife 4) — the UPDATE delta arm: four
+/// quadrants of (old row in view?) x (new row passes WHERE?). Content
+/// witnesses each: in-place value change, a row LEAVING the view, a
+/// row ENTERING it, and an update entirely outside it — followed by
+/// deletes over the updated map and a from-scratch cross-check.
+#[test]
+fn round739_update_delta_matches_full_recompute() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE b739 (id INT, g INT, v INT)").unwrap();
+    e.execute("INSERT INTO b739 SELECT gg, gg % 3, gg * 100 FROM generate_series(1, 30) gg")
+        .unwrap();
+    e.execute("CREATE MATERIALIZED VIEW mv739 AS SELECT id, v FROM b739 WHERE g <> 1")
+        .unwrap();
+    // Install the row map via a full (internal-scan) refresh.
+    e.execute("INSERT INTO b739 VALUES (31, 0, 3100)").unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW mv739").unwrap();
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv739"), "21");
+    // (in view, stays): value changes in place.
+    e.execute("UPDATE b739 SET v = 999 WHERE id = 3").unwrap();
+    // (in view, leaves): g flips to the filtered value.
+    e.execute("UPDATE b739 SET g = 1 WHERE id = 6").unwrap();
+    // (outside, enters): a g=1 row flips in.
+    e.execute("UPDATE b739 SET g = 2 WHERE id = 4").unwrap();
+    // (outside, stays outside): invisible either way.
+    e.execute("UPDATE b739 SET v = 1 WHERE id = 7").unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW mv739").unwrap();
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv739"), "21");
+    assert_eq!(one(&mut e, "SELECT v FROM mv739 WHERE id = 3"), "999");
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv739 WHERE id = 6"), "0");
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv739 WHERE id = 4"), "1");
+    // Deletes over the updated map still resolve correctly.
+    e.execute("DELETE FROM b739 WHERE id IN (3, 4, 5)").unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW mv739").unwrap();
+    // 21 - 3: id 3 (in), id 4 (entered above), id 5 (g=2, in) all leave.
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv739"), "18");
+    // Cross-check.
+    e.execute("DROP MATERIALIZED VIEW mv739").unwrap();
+    e.execute("CREATE MATERIALIZED VIEW mv739 AS SELECT id, v FROM b739 WHERE g <> 1")
+        .unwrap();
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv739"), "18");
+}

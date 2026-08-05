@@ -6509,12 +6509,6 @@ impl Engine {
         let needs_map = buf
             .iter()
             .any(|c| !matches!(c, spg_storage::RowChange::Insert { .. }));
-        if buf
-            .iter()
-            .any(|c| matches!(c, spg_storage::RowChange::Update { .. }))
-        {
-            return Ok(None);
-        }
         if needs_map {
             let Some((expected, _)) = self.matview_row_map.get(name) else {
                 return Ok(None);
@@ -6622,7 +6616,114 @@ impl Engine {
                         applied += 1;
                     }
                 }
-                spg_storage::RowChange::Update { .. } => unreachable!("gated above"),
+                // v7.39 (round 739) — the Update arm: four quadrants of
+                // (was the OLD row in the view?) x (does the NEW row
+                // pass the WHERE?). In-place replacement keeps the map
+                // untouched; a row leaving the view removes + shifts; a
+                // row entering appends + records.
+                spg_storage::RowChange::Update { new_row, rowid, .. } => {
+                    let keep = if let Some(w) = &body.where_ {
+                        let ctx = self.ev_ctx(&base_cols, Some(alias.as_str()));
+                        let r = spg_storage::Row::new(new_row.clone());
+                        let cond = eval::eval_expr(w, &r, &ctx).map_err(EngineError::Eval)?;
+                        crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)?
+                    } else {
+                        true
+                    };
+                    let old_pos = self
+                        .matview_row_map
+                        .get(name)
+                        .and_then(|(_, m)| m.get(&rowid.0).copied());
+                    match (old_pos, keep) {
+                        (Some(pos), true) => {
+                            let mut vals =
+                                alloc::vec::Vec::with_capacity(body.items.len());
+                            {
+                                let ctx = self.ev_ctx(&base_cols, Some(alias.as_str()));
+                                let r = spg_storage::Row::new(new_row.clone());
+                                for item in &body.items {
+                                    let SelectItem::Expr { expr, .. } = item else {
+                                        unreachable!("registration admits Expr items only");
+                                    };
+                                    vals.push(
+                                        eval::eval_expr(expr, &r, &ctx)
+                                            .map_err(EngineError::Eval)?,
+                                    );
+                                }
+                            }
+                            let cat = self.active_catalog_mut();
+                            let table = cat.get_mut(name).ok_or_else(|| {
+                                EngineError::Storage(spg_storage::StorageError::Corrupt(
+                                    alloc::format!(
+                                        "materialized view {name:?} backing table missing"
+                                    ),
+                                ))
+                            })?;
+                            table.update_row(pos, vals).map_err(EngineError::Storage)?;
+                            applied += 1;
+                        }
+                        (Some(pos), false) => {
+                            let (expected, map) = self
+                                .matview_row_map
+                                .get_mut(name)
+                                .expect("needs_map gated above");
+                            map.remove(&rowid.0);
+                            for p in map.values_mut() {
+                                if *p > pos {
+                                    *p -= 1;
+                                }
+                            }
+                            *expected -= 1;
+                            let cat = self.active_catalog_mut();
+                            let table = cat.get_mut(name).ok_or_else(|| {
+                                EngineError::Storage(spg_storage::StorageError::Corrupt(
+                                    alloc::format!(
+                                        "materialized view {name:?} backing table missing"
+                                    ),
+                                ))
+                            })?;
+                            table.delete_rows(&[pos]);
+                            applied += 1;
+                        }
+                        (None, true) => {
+                            let mut vals =
+                                alloc::vec::Vec::with_capacity(body.items.len());
+                            {
+                                let ctx = self.ev_ctx(&base_cols, Some(alias.as_str()));
+                                let r = spg_storage::Row::new(new_row.clone());
+                                for item in &body.items {
+                                    let SelectItem::Expr { expr, .. } = item else {
+                                        unreachable!("registration admits Expr items only");
+                                    };
+                                    vals.push(
+                                        eval::eval_expr(expr, &r, &ctx)
+                                            .map_err(EngineError::Eval)?,
+                                    );
+                                }
+                            }
+                            let cat = self.active_catalog_mut();
+                            let table = cat.get_mut(name).ok_or_else(|| {
+                                EngineError::Storage(spg_storage::StorageError::Corrupt(
+                                    alloc::format!(
+                                        "materialized view {name:?} backing table missing"
+                                    ),
+                                ))
+                            })?;
+                            table
+                                .insert(spg_storage::Row::new(vals))
+                                .map_err(EngineError::Storage)?;
+                            let new_pos = table.rows().len() - 1;
+                            let (expected, map) = self
+                                .matview_row_map
+                                .get_mut(name)
+                                .expect("needs_map gated above");
+                            map.insert(rowid.0, new_pos);
+                            *expected += 1;
+                            applied += 1;
+                        }
+                        (None, false) => {}
+                    }
+                }
             }
         }
         Ok(Some(applied))
