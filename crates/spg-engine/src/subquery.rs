@@ -2959,7 +2959,48 @@ impl Engine {
                 })
             })
         };
-        let mut corr_pairs: Vec<(String, Expr)> = Vec::new();
+        // v7.39 (round 752) — the inner half of a correlation pair is not
+        // always a bare column any more: `WHERE a.id = b.id + 1` (outer
+        // column = inner-only integer expression) was the round-721
+        // ledger's second entry and ran the per-row correlated executor.
+        // It is the round-719 lane's exact shape once pulled up
+        // (`ON <fresh int expr> = <outer int column>`), so the pair's
+        // inner half widens to carry it.
+        enum InnerHalf {
+            Col(String),
+            IntExpr(Expr),
+        }
+        // Integer-only over the inner alias — the mirror of
+        // `outer_int_only_expr`, with the same operator set as the join
+        // lane's `int_only_key_expr` (Add/Sub/Mul, int-family columns,
+        // integer literals) so an admitted pair is one the i64 lane
+        // executes rather than a nested loop.
+        fn inner_int_only_expr(
+            e: &Expr,
+            is_inner: &dyn Fn(&ColumnName) -> bool,
+            inner_col_is_int: &dyn Fn(&str) -> bool,
+        ) -> bool {
+            match e {
+                Expr::Column(c) => is_inner(c) && inner_col_is_int(&c.name),
+                Expr::Literal(spg_sql::ast::Literal::Integer(_)) => true,
+                Expr::Binary { lhs, op, rhs } => {
+                    matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                        && inner_int_only_expr(lhs, is_inner, inner_col_is_int)
+                        && inner_int_only_expr(rhs, is_inner, inner_col_is_int)
+                }
+                _ => false,
+            }
+        }
+        fn first_inner_col(e: &Expr) -> Option<String> {
+            match e {
+                Expr::Column(c) => Some(c.name.clone()),
+                Expr::Binary { lhs, rhs, .. } => {
+                    first_inner_col(lhs).or_else(|| first_inner_col(rhs))
+                }
+                _ => None,
+            }
+        }
+        let mut corr_pairs: Vec<(InnerHalf, Expr)> = Vec::new();
         let mut rest: Vec<Expr> = Vec::new();
         for c in reorder::split_and_conjunctions(w) {
             if let Expr::Binary {
@@ -2970,10 +3011,10 @@ impl Engine {
             {
                 let pair = match (lhs.as_ref(), rhs.as_ref()) {
                     (Expr::Column(a), Expr::Column(b)) if is_inner(a) && is_outer(b) => {
-                        Some((a.name.clone(), Expr::Column(b.clone())))
+                        Some((InnerHalf::Col(a.name.clone()), Expr::Column(b.clone())))
                     }
                     (Expr::Column(a), Expr::Column(b)) if is_inner(b) && is_outer(a) => {
-                        Some((b.name.clone(), Expr::Column(a.clone())))
+                        Some((InnerHalf::Col(b.name.clone()), Expr::Column(a.clone())))
                     }
                     // v7.39 (round 725) — the `negated`-only restriction is
                     // gone: positive EXISTS pulls up as a true SEMI join now,
@@ -2984,7 +3025,7 @@ impl Engine {
                             && inner_col_is_int(&a.name)
                             && outer_int_only_expr(e, outer_aliases, outer_tables, self) =>
                     {
-                        Some((a.name.clone(), e.clone()))
+                        Some((InnerHalf::Col(a.name.clone()), e.clone()))
                     }
                     (e, Expr::Column(a))
                         if is_inner(a)
@@ -2992,7 +3033,42 @@ impl Engine {
                             && inner_col_is_int(&a.name)
                             && outer_int_only_expr(e, outer_aliases, outer_tables, self) =>
                     {
-                        Some((a.name.clone(), e.clone()))
+                        Some((InnerHalf::Col(a.name.clone()), e.clone()))
+                    }
+                    // v7.39 (round 752) — the reverse: outer bare column =
+                    // inner-only integer expression. The outer column must
+                    // be integer-family too (checked through the alias→table
+                    // map by `outer_int_only_expr` on the lone column) or
+                    // the i64 lane cannot key it, and the expression must
+                    // mention at least one inner column — a column-free
+                    // `a.id = 5` is not a correlation.
+                    (Expr::Column(o), e)
+                        if is_outer(o)
+                            && !matches!(e, Expr::Column(_))
+                            && outer_int_only_expr(
+                                &Expr::Column(o.clone()),
+                                outer_aliases,
+                                outer_tables,
+                                self,
+                            )
+                            && inner_int_only_expr(e, &is_inner, &inner_col_is_int)
+                            && first_inner_col(e).is_some() =>
+                    {
+                        Some((InnerHalf::IntExpr(e.clone()), Expr::Column(o.clone())))
+                    }
+                    (e, Expr::Column(o))
+                        if is_outer(o)
+                            && !matches!(e, Expr::Column(_))
+                            && outer_int_only_expr(
+                                &Expr::Column(o.clone()),
+                                outer_aliases,
+                                outer_tables,
+                                self,
+                            )
+                            && inner_int_only_expr(e, &is_inner, &inner_col_is_int)
+                            && first_inner_col(e).is_some() =>
+                    {
+                        Some((InnerHalf::IntExpr(e.clone()), Expr::Column(o.clone())))
                     }
                     _ => None,
                 };
@@ -3033,11 +3109,21 @@ impl Engine {
         let fresh = alloc::format!("__exsj_{alias_n}");
         // Build the ON conjunction: every (inner_key = outer_col) pair
         // joined by AND, then folded with the all-inner residual.
+        let inner_half_expr = |ih: &InnerHalf| -> Expr {
+            match ih {
+                InnerHalf::Col(name) => Expr::Column(ColumnName {
+                    qualifier: Some(fresh.clone()),
+                    name: name.clone(),
+                }),
+                InnerHalf::IntExpr(e) => {
+                    let mut e = e.clone();
+                    rename_qualifier(&mut e, &inner_alias, &fresh);
+                    e
+                }
+            }
+        };
         let mut on_iter = corr_pairs.iter().map(|(ik, oc)| Expr::Binary {
-            lhs: alloc::boxed::Box::new(Expr::Column(ColumnName {
-                qualifier: Some(fresh.clone()),
-                name: ik.clone(),
-            })),
+            lhs: alloc::boxed::Box::new(inner_half_expr(ik)),
             op: BinOp::Eq,
             rhs: alloc::boxed::Box::new(oc.clone()),
         });
@@ -3086,8 +3172,18 @@ impl Engine {
             // anti-join: pick the FIRST inner key as the IS NULL probe.
             // Any IS NULL on a joined-side column is sufficient — the
             // LEFT-JOIN pad row sets ALL inner columns to NULL atomically,
-            // so a single column witnesses "no match".
-            let probe_key = corr_pairs[0].0.clone();
+            // so a single column witnesses "no match". For an IntExpr
+            // inner half the probe is the first column INSIDE it: a pair
+            // only matches when its Eq is TRUE, which needs the whole
+            // Add/Sub/Mul expression non-NULL, which needs every column
+            // in it non-NULL — so that column is a valid witness, and a
+            // bare column is what the anti-join fast path recognises.
+            let probe_key = match &corr_pairs[0].0 {
+                InnerHalf::Col(name) => name.clone(),
+                InnerHalf::IntExpr(e) => {
+                    first_inner_col(e).expect("IntExpr admitted only with an inner column")
+                }
+            };
             Some(Expr::IsNull {
                 expr: alloc::boxed::Box::new(Expr::Column(ColumnName {
                     qualifier: Some(fresh),
