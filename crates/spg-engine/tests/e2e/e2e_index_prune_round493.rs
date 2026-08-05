@@ -122,87 +122,11 @@ fn round493_rollback_restores_a_churned_key() {
     assert_eq!(one(&mut e, "SELECT count(*) FROM t"), "2000");
 }
 
-/// The safety gate itself: with a snapshot held open, the horizon drops
-/// and the insert path must prune NOTHING.
-///
-/// This pins the mechanism the change depends on rather than the read
-/// semantics on top of it. (An attempt to pin the latter — a REPEATABLE
-/// READ transaction in one session reading across another session's churn
-/// — fails identically with the pruning compiled out, so it is a separate,
-/// pre-existing question and is recorded as one rather than smuggled in
-/// here.)
-#[test]
-fn round493_a_held_snapshot_stops_the_pruning() {
-    use spg_engine::{UNIQ_PROBE_CALLS, UNIQ_PROBE_LOCATORS};
-    use std::sync::atomic::Ordering::Relaxed;
-
-    // Counters only exist under the perf-counters feature; without it this
-    // asserts nothing, so it says so rather than passing vacuously.
-    let counted = {
-        let before = UNIQ_PROBE_CALLS.load(Relaxed);
-        let mut probe = Engine::new();
-        probe.execute("CREATE TABLE c (id INT PRIMARY KEY)").unwrap();
-        probe.execute("INSERT INTO c VALUES (1)").unwrap();
-        UNIQ_PROBE_CALLS.load(Relaxed) > before
-    };
-    if !counted {
-        return;
-    }
-
-    let churn = |e: &mut Engine, rounds: usize| {
-        for c in 0..rounds {
-            e.execute("DELETE FROM t WHERE id >= 100 AND id < 200").unwrap();
-            let mut re = String::from("INSERT INTO t VALUES ");
-            for i in 100..200 {
-                if i > 100 {
-                    re.push(',');
-                }
-                re.push_str(&format!("({i},{c})"));
-            }
-            e.execute(&re).unwrap();
-        }
-    };
-    let locators_per_probe = |e: &mut Engine| -> f64 {
-        let base = (
-            UNIQ_PROBE_CALLS.load(Relaxed),
-            UNIQ_PROBE_LOCATORS.load(Relaxed),
-        );
-        e.execute("DELETE FROM t WHERE id >= 100 AND id < 200").unwrap();
-        let mut re = String::from("INSERT INTO t VALUES ");
-        for i in 100..200 {
-            if i > 100 {
-                re.push(',');
-            }
-            re.push_str(&format!("({i},7)"));
-        }
-        e.execute(&re).unwrap();
-        let calls = UNIQ_PROBE_CALLS.load(Relaxed) - base.0;
-        let locs = UNIQ_PROBE_LOCATORS.load(Relaxed) - base.1;
-        assert!(calls > 0, "the uniqueness probe did not run");
-        locs as f64 / calls as f64
-    };
-
-    // No snapshot held: the horizon is the current version, so a churned
-    // key's dead entries go.
-    let mut free = seeded(0);
-    churn(&mut free, 20);
-    let pruned = locators_per_probe(&mut free);
-    assert!(pruned < 3.0, "expected pruning, got {pruned} locators per probe");
-
-    // Snapshot held in another session: the horizon drops to it and the
-    // same churn must leave every version in place.
-    let mut held = seeded(0);
-    held.set_current_session(1);
-    held.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
-    let _ = held.execute("SELECT count(*) FROM t").unwrap();
-    held.set_current_session(2);
-    churn(&mut held, 20);
-    let kept = locators_per_probe(&mut held);
-    assert!(
-        kept > 10.0,
-        "a held snapshot must stop the pruning, got {kept} locators per probe"
-    );
-}
+// The safety gate itself — `round493_a_held_snapshot_stops_the_pruning`
+// — lives in its own test target (`tests/uniq_prune_counters.rs`, round
+// 751): it reads the process-global UNIQ_PROBE_* counters, which the
+// parallel runner in this binary let other tests dilute (the I06 flake),
+// and which need `--features perf-counters` to count at all.
 
 #[test]
 fn round493_duplicate_key_is_still_rejected_after_churn() {
