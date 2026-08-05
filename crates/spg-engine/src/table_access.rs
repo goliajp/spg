@@ -135,6 +135,72 @@ impl Engine {
                             })
                             .collect(),
                     ),
+                    // v7.39 (round 759, F31-B8b) — unnest(tsvector) in a
+                    // JOINED FROM list (the primary-position executor got
+                    // this arm in round 758; `FROM unnest(tsv) t, …` comes
+                    // through here instead). Same PG18-measured shape:
+                    // lexeme | positions | weights.
+                    Value::TsVector(lexemes) => {
+                        let mut cols = alloc::vec![
+                            ColumnSchema::new("lexeme".to_string(), DataType::Text, true),
+                            ColumnSchema::new(
+                                "positions".to_string(),
+                                DataType::SmallIntArray,
+                                true
+                            ),
+                            ColumnSchema::new("weights".to_string(), DataType::TextArray, true),
+                        ];
+                        for (i, new_name) in tref.unnest_column_aliases.iter().enumerate() {
+                            if let Some(col) = cols.get_mut(i) {
+                                col.name = new_name.clone();
+                            }
+                        }
+                        let mut rows: Vec<Row<'static>> = lexemes
+                            .iter()
+                            .map(|l| {
+                                let (pos, wts) = if l.positions.is_empty() {
+                                    (Value::Null, Value::Null)
+                                } else {
+                                    let letter = match l.weight {
+                                        3 => "A",
+                                        2 => "B",
+                                        1 => "C",
+                                        _ => "D",
+                                    };
+                                    (
+                                        Value::SmallIntArray(
+                                            l.positions
+                                                .iter()
+                                                .map(|p| Some(i16::try_from(*p).unwrap_or(i16::MAX)))
+                                                .collect(),
+                                        ),
+                                        Value::TextArray(
+                                            l.positions.iter().map(|_| Some(letter.into())).collect(),
+                                        ),
+                                    )
+                                };
+                                Row::new(alloc::vec![Value::text(l.word.clone()), pos, wts])
+                            })
+                            .collect();
+                        if tref.with_ordinality {
+                            let ord_name = tref
+                                .unnest_column_aliases
+                                .get(3)
+                                .cloned()
+                                .unwrap_or_else(|| alloc::string::String::from("ordinality"));
+                            cols.push(ColumnSchema::new(ord_name, DataType::BigInt, false));
+                            rows = rows
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, row)| {
+                                    let mut vals = row.values;
+                                    vals.push(Value::BigInt(i as i64 + 1));
+                                    Row::new(vals)
+                                })
+                                .collect();
+                        }
+                        return Ok((rows, cols));
+                    }
                     other => {
                         // v7.39 (round 622, S05a) — a `TypeMismatch`, not an
                         // `Unsupported`: unnest IS supported, this value is

@@ -19242,6 +19242,16 @@ impl Parser {
             Expr::Unary { expr, .. } => Self::expr_has_any_column(expr),
             Expr::Cast { expr, .. } => Self::expr_has_any_column(expr),
             Expr::FunctionCall { args, .. } => args.iter().any(Self::expr_has_any_column),
+            // v7.39 (round 759, F31-B8b) — a column INSIDE an array
+            // constructor or subscript fell to the `_ => false` arm, so
+            // `unnest(ARRAY[x, x + 1])` never wrapped into the lateral
+            // channel and the eager peer eval answered `column "x" does
+            // not exist` (the substitution walker already recurses both
+            // shapes; only this detector was blind to them).
+            Expr::Array(items) => items.iter().any(Self::expr_has_any_column),
+            Expr::ArraySubscript { target, index } => {
+                Self::expr_has_any_column(target) || Self::expr_has_any_column(index)
+            }
             Expr::Case {
                 operand,
                 branches,
