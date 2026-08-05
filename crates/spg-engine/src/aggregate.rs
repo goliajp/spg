@@ -33,6 +33,85 @@ use spg_storage::{ColumnSchema, DataType, Row, Value};
 use crate::eval::{self, EvalContext, EvalError};
 use crate::join::AggRows;
 
+impl crate::Engine {
+    /// v7.39 (round 763, F31-C1) — expand a `*` / `alias.*` SELECT item
+    /// into explicit column refs when the statement takes the aggregate
+    /// path and the FROM is one plain catalog table. Returns `None`
+    /// when nothing applies (the caller keeps the original statement).
+    /// Joined / derived / SRF sources keep the old refusal for now.
+    pub(crate) fn expand_aggregate_wildcard(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Option<SelectStatement> {
+        use spg_sql::ast::SelectItem;
+        if !stmt
+            .items
+            .iter()
+            .any(|i| matches!(i, SelectItem::Wildcard | SelectItem::QualifiedWildcard(_)))
+        {
+            return None;
+        }
+        if !uses_aggregate(stmt) {
+            return None;
+        }
+        let from = stmt.from.as_ref()?;
+        if !from.joins.is_empty()
+            || from.primary.unnest_expr.is_some()
+            || from.primary.lateral_subquery.is_some()
+            || from.primary.generate_series_args.is_some()
+            || from.primary.table_fn_call.is_some()
+            || from.primary.json_table.is_some()
+            || from.primary.jsonb_each_text_arg.is_some()
+        {
+            return None;
+        }
+        let table = self.active_catalog().get(&from.primary.name)?;
+        let alias = from
+            .primary
+            .alias
+            .clone()
+            .unwrap_or_else(|| from.primary.name.clone());
+        let mut items: Vec<SelectItem> = Vec::with_capacity(stmt.items.len());
+        for item in &stmt.items {
+            match item {
+                SelectItem::Wildcard => {
+                    for c in &table.schema().columns {
+                        items.push(SelectItem::Expr {
+                            expr: Expr::Column(spg_sql::ast::ColumnName {
+                                qualifier: None,
+                                name: c.name.clone(),
+                            }),
+                            alias: None,
+                        });
+                    }
+                }
+                SelectItem::QualifiedWildcard(q) => {
+                    if !q.eq_ignore_ascii_case(&alias) {
+                        return None; // unknown qualifier — keep the old path
+                    }
+                    // Bare names: the single-table qualifier is
+                    // redundant, and the group-expr matcher unifies
+                    // bare-to-bare (a qualified ref would miss a bare
+                    // GROUP BY id).
+                    for c in &table.schema().columns {
+                        items.push(SelectItem::Expr {
+                            expr: Expr::Column(spg_sql::ast::ColumnName {
+                                qualifier: None,
+                                name: c.name.clone(),
+                            }),
+                            alias: None,
+                        });
+                    }
+                }
+                other => items.push(other.clone()),
+            }
+        }
+        let mut out = stmt.clone();
+        out.items = items;
+        Some(out)
+    }
+}
+
 /// True if this statement should go through the aggregate path.
 pub fn uses_aggregate(stmt: &SelectStatement) -> bool {
     if stmt.group_by.is_some() || stmt.having.is_some() {
