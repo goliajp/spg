@@ -315,6 +315,13 @@ pub enum Token {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LexErrorKind {
+    /// v7.39 (round 773, F31 J3) — an E-string's byte escapes decoded
+    /// to an invalid UTF-8 sequence. PG decodes `\NNN` / `\xHH` as
+    /// BYTES and validates the whole literal (`E'\303\251'` is `é`;
+    /// `E'\777'` is byte 0xFF and refuses); the old decoder mapped
+    /// each byte to its Latin-1 codepoint, silently mangling every
+    /// multi-byte sequence.
+    InvalidByteSequence(u8),
     UnknownChar(char),
     UnterminatedString,
     UnterminatedQuotedIdent,
@@ -341,6 +348,10 @@ pub struct LexError {
 impl fmt::Display for LexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
+            LexErrorKind::InvalidByteSequence(b) => write!(
+                f,
+                "invalid byte sequence for encoding \"UTF8\": 0x{b:02x}"
+            ),
             LexErrorKind::UnknownChar(c) => write!(f, "unknown char {c:?} at byte {}", self.pos),
             LexErrorKind::UnterminatedString => {
                 write!(f, "unterminated string literal at byte {}", self.pos)
@@ -1413,7 +1424,17 @@ fn lex_escape_string(
     let bytes = input.as_bytes();
     debug_assert_eq!(bytes[start], b'\'');
     let mut i = start + 1;
-    let mut s = String::new();
+    // v7.39 (round 773, F31 J3) — PG decodes byte escapes into a BYTE
+    // buffer and validates the whole literal as UTF-8 at the end
+    // (E'\303\251' is é; E'\777' is byte 0xFF and refuses with the
+    // encoding sentence). The old char-per-escape model mapped each
+    // byte to its Latin-1 codepoint, silently mangling multi-byte
+    // sequences.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut push_char = |buf: &mut Vec<u8>, c: char| {
+        let mut tmp = [0u8; 4];
+        buf.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+    };
     loop {
         if i >= bytes.len() {
             return Err(LexError {
@@ -1424,7 +1445,7 @@ fn lex_escape_string(
         let b = bytes[i];
         if b == b'\'' {
             if peek_eq(bytes, i + 1, b'\'') {
-                s.push('\'');
+                push_char(&mut buf, '\'');
                 i += 2;
                 continue;
             }
@@ -1438,26 +1459,26 @@ fn lex_escape_string(
                 match n {
                     // `\Z` is ctrl-Z, not the letter Z.
                     b'Z' => {
-                        s.push('\u{001A}');
+                        push_char(&mut buf, '\u{001A}');
                         i += 2;
                         continue;
                     }
                     // `\%` / `\_` keep BOTH characters: the backslash is
                     // what LIKE reads as "this wildcard is literal".
                     b'%' | b'_' => {
-                        s.push('\\');
-                        s.push(n as char);
+                        push_char(&mut buf, '\\');
+                        push_char(&mut buf, n as char);
                         i += 2;
                         continue;
                     }
                     // `\xHH` and `\NNN` are not escapes at all here.
                     b'x' | b'X' => {
-                        s.push('x');
+                        push_char(&mut buf, 'x');
                         i += 2;
                         continue;
                     }
                     d if d.is_ascii_digit() && d != b'0' => {
-                        s.push(d as char);
+                        push_char(&mut buf, d as char);
                         i += 2;
                         continue;
                     }
@@ -1466,39 +1487,39 @@ fn lex_escape_string(
             }
             match n {
                 b'\\' => {
-                    s.push('\\');
+                    push_char(&mut buf, '\\');
                     i += 2;
                 }
                 b'\'' => {
-                    s.push('\'');
+                    push_char(&mut buf, '\'');
                     i += 2;
                 }
                 b'"' => {
-                    s.push('"');
+                    push_char(&mut buf, '"');
                     i += 2;
                 }
                 b'n' => {
-                    s.push('\n');
+                    push_char(&mut buf, '\n');
                     i += 2;
                 }
                 b'r' => {
-                    s.push('\r');
+                    push_char(&mut buf, '\r');
                     i += 2;
                 }
                 b't' => {
-                    s.push('\t');
+                    push_char(&mut buf, '\t');
                     i += 2;
                 }
                 b'b' => {
-                    s.push('\u{0008}');
+                    push_char(&mut buf, '\u{0008}');
                     i += 2;
                 }
                 b'f' => {
-                    s.push('\u{000C}');
+                    push_char(&mut buf, '\u{000C}');
                     i += 2;
                 }
                 b'v' => {
-                    s.push('\u{000B}');
+                    push_char(&mut buf, '\u{000B}');
                     i += 2;
                 }
                 // \uHHHH (4 hex) / \UHHHHHHHH (8 hex) Unicode escapes. A
@@ -1527,13 +1548,13 @@ fn lex_escape_string(
                             });
                         };
                         let combined = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                        s.push(char::from_u32(combined).ok_or(LexError {
+                        push_char(&mut buf, char::from_u32(combined).ok_or(LexError {
                             kind: LexErrorKind::InvalidUnicodeEscape,
                             pos: i,
                         })?);
                         i += 12;
                     } else {
-                        s.push(char::from_u32(cp).ok_or(LexError {
+                        push_char(&mut buf, char::from_u32(cp).ok_or(LexError {
                             kind: LexErrorKind::InvalidUnicodeEscape,
                             pos: i,
                         })?);
@@ -1541,7 +1562,7 @@ fn lex_escape_string(
                     }
                 }
                 b'0' if i + 2 >= bytes.len() || !bytes[i + 2].is_ascii_digit() => {
-                    s.push('\0');
+                    push_char(&mut buf, '\0');
                     i += 2;
                 }
                 b'x' => {
@@ -1552,16 +1573,16 @@ fn lex_escape_string(
                     let n2 = h2.and_then(hex_digit_value);
                     match (n1, n2) {
                         (Some(a), Some(b2)) => {
-                            s.push((((a << 4) | b2) as u8) as char);
+                            buf.push(((a << 4) | b2) as u8);
                             i += 4;
                         }
                         (Some(a), _) => {
-                            s.push((a as u8) as char);
+                            buf.push(a as u8);
                             i += 3;
                         }
                         _ => {
                             // \x with no hex follows — literal x.
-                            s.push('x');
+                            push_char(&mut buf, 'x');
                             i += 2;
                         }
                     }
@@ -1580,29 +1601,35 @@ fn lex_escape_string(
                             _ => break,
                         }
                     }
-                    if let Some(c) = char::from_u32(value) {
-                        s.push(c);
-                    } else {
-                        // Invalid Unicode — preserve as raw byte char.
-                        s.push((value & 0xFF) as u8 as char);
-                    }
+                    // A byte, as PG: \777 masks to 0xFF and the final
+                    // UTF-8 validation refuses it.
+                    buf.push((value & 0xFF) as u8);
                     i += take;
                 }
                 other => {
                     // Lenient fallback — same as PG with
                     // `standard_conforming_strings = off` warning:
                     // decode `\X` to literal `X`.
-                    s.push(other as char);
+                    push_char(&mut buf, other as char);
                     i += 2;
                 }
             }
         } else {
             let ch = input[i..].chars().next().expect("non-empty UTF-8 boundary");
-            s.push(ch);
+            push_char(&mut buf, ch);
             i += ch.len_utf8();
         }
     }
-    Ok((Token::String(s), i - start))
+    match String::from_utf8(buf) {
+        Ok(decoded) => Ok((Token::String(decoded), i - start)),
+        Err(e) => {
+            let bad = e.as_bytes()[e.utf8_error().valid_up_to()];
+            Err(LexError {
+                kind: LexErrorKind::InvalidByteSequence(bad),
+                pos: start,
+            })
+        }
+    }
 }
 
 /// v7.38 (read01, T18) — lex a PG `U&'...'` Unicode string literal. `start`
