@@ -9390,7 +9390,7 @@ fn generate_series_timestamps(
 fn check_with_ties_requires_order_by(stmt: &SelectStatement) -> Result<(), EngineError> {
     if stmt.limit_with_ties && stmt.order_by.is_empty() {
         return Err(EngineError::Unsupported(alloc::string::String::from(
-            "FETCH FIRST … ROWS WITH TIES requires an ORDER BY clause",
+            "WITH TIES cannot be specified without ORDER BY clause",
         )));
     }
     Ok(())
