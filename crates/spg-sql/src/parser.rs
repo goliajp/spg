@@ -20529,7 +20529,9 @@ impl Parser {
             // v7.39 round 407: +1 from the pre-XOR ladder's rung 8).
             Token::Caret if self.mysql_dialect => (Sym::Xor, 9),
             Token::Caret => (Sym::Power, 9),
-            Token::Hash => (Sym::Xor, 7),
+            // v7.39 (round 760, F31-B1) — `#` is a generic operator too:
+            // PG answers `5 # 3 + 1` as `5 # 4` = 1 (additive first).
+            Token::Hash => (Sym::Xor, 6),
             Token::Adjacent => (Sym::RangeAdjacent, 5),
             _ => return Ok(None),
         };
@@ -25584,26 +25586,18 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         Token::CosineDistance => (BinOp::CosineDistance, 6),
         Token::Plus => (BinOp::Add, 7),
         Token::Minus => (BinOp::Sub, 7),
-        // `||` sits beside `+`/`-`. PG18-measured (round 753): this
-        // DIVERGES — PG binds every "other" operator (`||`, `|`, `&`)
-        // BELOW additive, so `'a' || 1 + 1` answers `a2` there and
-        // errors here (`text + integer`). Queued as F31-B1; `1 + 2 ||
-        // '3'` agrees on both because left-assoc happens to match.
-        Token::Concat => (BinOp::Concat, 7),
-        // Bitwise `|` / `&` ride the same rung as `||` — PG groups
-        // all "other" operators between additive and comparison, so
-        // `flags & $1 = 0` parses as `(flags & $1) = 0`.
-        //
-        // Known divergence (the same one `||` has carried since v1):
-        // SPG's rung 7 TIES with `+ -`, while PG binds generic
-        // operators LOOSER than additive — `a & b + 1` is
-        // `(a & b) + 1` here vs `a & (b + 1)` in PG. Parenthesise
-        // mixed bitwise/arithmetic. Keeping every generic operator
-        // on one shared rung is deliberate: splitting bitwise off
-        // would fix that case but skew `a || b & c`, which PG
-        // left-folds at a single level.
-        Token::Pipe => (BinOp::BitOr, 7),
-        Token::Amp => (BinOp::BitAnd, 7),
+        // v7.39 (round 760, F31-B1) — the generic-operator rung. PG
+        // binds every "other" operator (`||`, `|`, `&`, `#`, the
+        // pgvector distances above) BETWEEN additive (7) and the
+        // comparisons (5): `'a' || 1 + 1` is `'a' || 2` → `a2`,
+        // `a & b + 1` is `a & (b + 1)`, and `flags & $1 = 0` stays
+        // `(flags & $1) = 0`. They shared rung 7 with `+ -` since v1
+        // ("matches PG conceptually" — the round-753 audit measured it
+        // false; the old rung errored on `'a' || 1 + 1` with
+        // `text + integer`). Same-level chains left-fold, as PG does.
+        Token::Concat => (BinOp::Concat, 6),
+        Token::Pipe => (BinOp::BitOr, 6),
+        Token::Amp => (BinOp::BitAnd, 6),
         Token::Star => (BinOp::Mul, 8),
         Token::Slash => (BinOp::Div, 8),
         Token::Percent => (BinOp::Mod, 8),
