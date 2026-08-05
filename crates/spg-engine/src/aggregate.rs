@@ -972,7 +972,7 @@ pub(crate) fn run(
     // `array_agg()` or `string_agg(x)`) surfaces as a SQL error
     // rather than silently coercing to a degenerate aggregate.
     validate_agg_arities(stmt, &agg_specs)?;
-    validate_within_group(&agg_specs, schema_cols)?;
+    validate_within_group(&agg_specs, schema_cols, stmt.group_by.as_deref())?;
 
     // v7.39 (round 690) — resolve the argument's declared collation for
     // `min`/`max`. This rides beside `enum_labels` in `AggSpec` but NOT
@@ -1247,7 +1247,58 @@ fn ordered_set_signature_error(
 fn validate_within_group(
     agg_specs: &[AggSpec],
     columns: &[ColumnSchema],
+    group_by: Option<&[Expr]>,
 ) -> Result<(), EvalError> {
+    // v7.39 (round 765, F31-D2) — PG requires an ordered-set
+    // aggregate's DIRECT arguments to use only grouped columns
+    // (`percentile_cont(x) WITHIN GROUP (ORDER BY x)` refuses with
+    // "column … must appear in the GROUP BY clause", DETAIL "Direct
+    // arguments of an ordered-set aggregate must use only grouped
+    // columns", PG18-measured); SPG evaluated the first row's value
+    // and answered.
+    fn first_ungrouped(e: &Expr, group_by: Option<&[Expr]>) -> Option<String> {
+        let mut found: Option<String> = None;
+        let mut subs: Vec<&SelectStatement> = Vec::new();
+        crate::visit_expr_columns_and_subqueries(
+            e,
+            &mut |c| {
+                if found.is_some() {
+                    return;
+                }
+                let grouped = group_by.is_some_and(|gs| {
+                    gs.iter().any(|g| match g {
+                        Expr::Column(gc) => gc.name.eq_ignore_ascii_case(&c.name),
+                        _ => false,
+                    })
+                });
+                // The visitor's exotic-node BAIL marker is an empty
+                // name — not a real column; skip it (refusing on it
+                // would reject constant shapes like ARRAY[…] casts).
+                if !grouped && !c.name.is_empty() {
+                    found = Some(match &c.qualifier {
+                        Some(q) => format!("{q}.{}", c.name),
+                        None => c.name.clone(),
+                    });
+                }
+            },
+            &mut |s| subs.push(s),
+        );
+        found
+    }
+    for spec in agg_specs {
+        if !is_within_group_name(&spec.name) {
+            continue;
+        }
+        for d in spec.direct_arg.iter().chain(spec.direct_args_extra.iter()) {
+            if let Some(col) = first_ungrouped(d, group_by) {
+                return Err(EvalError::TypeMismatch {
+                    detail: format!(
+                        "column \"{col}\" must appear in the GROUP BY clause or be used in an aggregate function"
+                    ),
+                });
+            }
+        }
+    }
     // v7.32 (round-29) — WITHIN GROUP aggregates require the clause (PG
     // raises a hard error otherwise rather than silently degrading), and
     // SPG supports the single-sort-key form only.
