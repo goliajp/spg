@@ -258,6 +258,16 @@ pub(crate) fn commit_queue_execute(
         ack: ack_tx,
         sync_commit: session_sync_commit(state),
     };
+    if std::env::var("SPG_COMMIT_TRACE").is_ok() {
+        use std::sync::atomic::Ordering;
+        eprintln!(
+            "spg-server: commit-trace solo={} coalesced_groups={} coalesced_tasks={} window_us={}",
+            crate::wal::COMMIT_GROUPS_SOLO.load(Ordering::Relaxed),
+            crate::wal::COMMIT_GROUPS_COALESCED.load(Ordering::Relaxed),
+            crate::wal::COMMIT_TASKS_COALESCED.load(Ordering::Relaxed),
+            crate::wal::ADAPTIVE_COMMIT_WINDOW_US.load(Ordering::Relaxed),
+        );
+    }
     let became_leader = enqueue_commit_task(state, task);
     if became_leader {
         run_leader_commit_round(state);
