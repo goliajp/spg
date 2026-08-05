@@ -309,7 +309,12 @@ fn integer_series_element_type_matches_pg() {
         ),
         "bigint"
     );
-    // sum(int4) widens to bigint (matches PG), not numeric.
+    // sum(int4) widens to bigint. v7.39 (round 774 audit, H1) — PG
+    // 18.4's catalog has NO sum(integer) aggregate (smallint/bigint/
+    // numeric/… only), so int4 resolves to the FLOAT8 overload there
+    // (pg_typeof answers double precision). SPG keeps the exact
+    // bigint; ledgered as a wire-typing decision item, text output is
+    // identical for whole numbers.
     assert_eq!(
         typ(
             &mut e,
