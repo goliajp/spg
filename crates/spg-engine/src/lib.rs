@@ -1668,7 +1668,7 @@ impl Engine {
         });
         let mut snap = self.current_snapshot_inner();
         snap.locked_out = locked_out;
-        return snap;
+        snap
     }
 
     fn current_snapshot_inner(&self) -> spg_storage::snapshot::Snapshot {

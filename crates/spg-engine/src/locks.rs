@@ -263,126 +263,6 @@ impl LockTable {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const R: RelId = RelId(1);
-    fn row(n: u64) -> RowId {
-        RowId(n)
-    }
-
-    #[test]
-    fn conflict_matrix_matches_pg() {
-        use LockMode::{Exclusive, KeyShare, NoKeyUpdate, Share};
-        // Row = held, Col = requested. true = conflict (blocks).
-        assert!(!KeyShare.conflicts_with(KeyShare));
-        assert!(!KeyShare.conflicts_with(Share));
-        assert!(!KeyShare.conflicts_with(NoKeyUpdate));
-        assert!(KeyShare.conflicts_with(Exclusive));
-
-        assert!(!Share.conflicts_with(KeyShare));
-        assert!(!Share.conflicts_with(Share));
-        assert!(Share.conflicts_with(NoKeyUpdate));
-        assert!(Share.conflicts_with(Exclusive));
-
-        assert!(!NoKeyUpdate.conflicts_with(KeyShare)); // load-bearing
-        assert!(NoKeyUpdate.conflicts_with(Share));
-        assert!(NoKeyUpdate.conflicts_with(NoKeyUpdate));
-        assert!(NoKeyUpdate.conflicts_with(Exclusive));
-
-        assert!(Exclusive.conflicts_with(KeyShare));
-        assert!(Exclusive.conflicts_with(Share));
-        assert!(Exclusive.conflicts_with(NoKeyUpdate));
-        assert!(Exclusive.conflicts_with(Exclusive));
-    }
-
-    #[test]
-    fn compatible_locks_both_granted() {
-        let mut t = LockTable::new();
-        // FK check (KeyShare) + non-key UPDATE (NoKeyUpdate) on the same
-        // row both succeed — the concurrency win we match.
-        assert_eq!(
-            t.acquire(R, row(1), LockMode::KeyShare, 10, WaitPolicy::Wait),
-            LockOutcome::Granted
-        );
-        assert_eq!(
-            t.acquire(R, row(1), LockMode::NoKeyUpdate, 20, WaitPolicy::Wait),
-            LockOutcome::Granted
-        );
-    }
-
-    #[test]
-    fn exclusive_blocks_and_nowait_skiplocked_report() {
-        let mut t = LockTable::new();
-        assert_eq!(
-            t.acquire(R, row(1), LockMode::Exclusive, 10, WaitPolicy::Wait),
-            LockOutcome::Granted
-        );
-        // A conflicting Wait parks.
-        match t.acquire(R, row(1), LockMode::Exclusive, 20, WaitPolicy::Wait) {
-            LockOutcome::WouldBlock { on } => assert_eq!(on, alloc::vec![10]),
-            other => panic!("expected WouldBlock, got {other:?}"),
-        }
-        // NoWait / SkipLocked report immediately instead.
-        assert_eq!(
-            t.acquire(R, row(1), LockMode::Exclusive, 30, WaitPolicy::NoWait),
-            LockOutcome::NotAvailable
-        );
-        assert_eq!(
-            t.acquire(R, row(1), LockMode::Exclusive, 40, WaitPolicy::SkipLocked),
-            LockOutcome::Skip
-        );
-    }
-
-    #[test]
-    fn release_lets_a_waiter_in() {
-        let mut t = LockTable::new();
-        t.acquire(R, row(1), LockMode::Exclusive, 10, WaitPolicy::Wait);
-        t.acquire(R, row(1), LockMode::Exclusive, 20, WaitPolicy::Wait);
-        t.release_all(10);
-        assert_eq!(
-            t.acquire(R, row(1), LockMode::Exclusive, 20, WaitPolicy::Wait),
-            LockOutcome::Granted
-        );
-        assert_eq!(t.locked_row_count(), 1);
-        t.release_all(20);
-        assert_eq!(t.locked_row_count(), 0);
-    }
-
-    #[test]
-    fn deadlock_cycle_aborts_youngest() {
-        let mut t = LockTable::new();
-        // tx10 holds row1, tx20 holds row2.
-        t.acquire(R, row(1), LockMode::Exclusive, 10, WaitPolicy::Wait);
-        t.acquire(R, row(2), LockMode::Exclusive, 20, WaitPolicy::Wait);
-        // tx10 waits for row2 (held by 20): edge 10 -> 20.
-        assert!(matches!(
-            t.acquire(R, row(2), LockMode::Exclusive, 10, WaitPolicy::Wait),
-            LockOutcome::WouldBlock { .. }
-        ));
-        // tx20 waits for row1 (held by 10): edge 20 -> 10 closes the
-        // cycle → abort the youngest (20).
-        assert_eq!(
-            t.acquire(R, row(1), LockMode::Exclusive, 20, WaitPolicy::Wait),
-            LockOutcome::Deadlock { victim: 20 }
-        );
-    }
-
-    #[test]
-    fn relock_same_version_is_idempotent() {
-        let mut t = LockTable::new();
-        assert_eq!(
-            t.acquire(R, row(1), LockMode::Exclusive, 10, WaitPolicy::Wait),
-            LockOutcome::Granted
-        );
-        // Same version re-locking the same row never blocks on itself.
-        assert_eq!(
-            t.acquire(R, row(1), LockMode::Exclusive, 10, WaitPolicy::Wait),
-            LockOutcome::Granted
-        );
-    }
-}
 
 /// v7.39 (round 295, E3 Phase 1b) — the locking pre-pass.
 ///
@@ -551,5 +431,126 @@ const fn lock_verb(s: spg_sql::ast::LockStrength) -> &'static str {
         LS::NoKeyUpdate => "FOR NO KEY UPDATE",
         LS::Share => "FOR SHARE",
         LS::KeyShare => "FOR KEY SHARE",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const R: RelId = RelId(1);
+    fn row(n: u64) -> RowId {
+        RowId(n)
+    }
+
+    #[test]
+    fn conflict_matrix_matches_pg() {
+        use LockMode::{Exclusive, KeyShare, NoKeyUpdate, Share};
+        // Row = held, Col = requested. true = conflict (blocks).
+        assert!(!KeyShare.conflicts_with(KeyShare));
+        assert!(!KeyShare.conflicts_with(Share));
+        assert!(!KeyShare.conflicts_with(NoKeyUpdate));
+        assert!(KeyShare.conflicts_with(Exclusive));
+
+        assert!(!Share.conflicts_with(KeyShare));
+        assert!(!Share.conflicts_with(Share));
+        assert!(Share.conflicts_with(NoKeyUpdate));
+        assert!(Share.conflicts_with(Exclusive));
+
+        assert!(!NoKeyUpdate.conflicts_with(KeyShare)); // load-bearing
+        assert!(NoKeyUpdate.conflicts_with(Share));
+        assert!(NoKeyUpdate.conflicts_with(NoKeyUpdate));
+        assert!(NoKeyUpdate.conflicts_with(Exclusive));
+
+        assert!(Exclusive.conflicts_with(KeyShare));
+        assert!(Exclusive.conflicts_with(Share));
+        assert!(Exclusive.conflicts_with(NoKeyUpdate));
+        assert!(Exclusive.conflicts_with(Exclusive));
+    }
+
+    #[test]
+    fn compatible_locks_both_granted() {
+        let mut t = LockTable::new();
+        // FK check (KeyShare) + non-key UPDATE (NoKeyUpdate) on the same
+        // row both succeed — the concurrency win we match.
+        assert_eq!(
+            t.acquire(R, row(1), LockMode::KeyShare, 10, WaitPolicy::Wait),
+            LockOutcome::Granted
+        );
+        assert_eq!(
+            t.acquire(R, row(1), LockMode::NoKeyUpdate, 20, WaitPolicy::Wait),
+            LockOutcome::Granted
+        );
+    }
+
+    #[test]
+    fn exclusive_blocks_and_nowait_skiplocked_report() {
+        let mut t = LockTable::new();
+        assert_eq!(
+            t.acquire(R, row(1), LockMode::Exclusive, 10, WaitPolicy::Wait),
+            LockOutcome::Granted
+        );
+        // A conflicting Wait parks.
+        match t.acquire(R, row(1), LockMode::Exclusive, 20, WaitPolicy::Wait) {
+            LockOutcome::WouldBlock { on } => assert_eq!(on, alloc::vec![10]),
+            other => panic!("expected WouldBlock, got {other:?}"),
+        }
+        // NoWait / SkipLocked report immediately instead.
+        assert_eq!(
+            t.acquire(R, row(1), LockMode::Exclusive, 30, WaitPolicy::NoWait),
+            LockOutcome::NotAvailable
+        );
+        assert_eq!(
+            t.acquire(R, row(1), LockMode::Exclusive, 40, WaitPolicy::SkipLocked),
+            LockOutcome::Skip
+        );
+    }
+
+    #[test]
+    fn release_lets_a_waiter_in() {
+        let mut t = LockTable::new();
+        t.acquire(R, row(1), LockMode::Exclusive, 10, WaitPolicy::Wait);
+        t.acquire(R, row(1), LockMode::Exclusive, 20, WaitPolicy::Wait);
+        t.release_all(10);
+        assert_eq!(
+            t.acquire(R, row(1), LockMode::Exclusive, 20, WaitPolicy::Wait),
+            LockOutcome::Granted
+        );
+        assert_eq!(t.locked_row_count(), 1);
+        t.release_all(20);
+        assert_eq!(t.locked_row_count(), 0);
+    }
+
+    #[test]
+    fn deadlock_cycle_aborts_youngest() {
+        let mut t = LockTable::new();
+        // tx10 holds row1, tx20 holds row2.
+        t.acquire(R, row(1), LockMode::Exclusive, 10, WaitPolicy::Wait);
+        t.acquire(R, row(2), LockMode::Exclusive, 20, WaitPolicy::Wait);
+        // tx10 waits for row2 (held by 20): edge 10 -> 20.
+        assert!(matches!(
+            t.acquire(R, row(2), LockMode::Exclusive, 10, WaitPolicy::Wait),
+            LockOutcome::WouldBlock { .. }
+        ));
+        // tx20 waits for row1 (held by 10): edge 20 -> 10 closes the
+        // cycle → abort the youngest (20).
+        assert_eq!(
+            t.acquire(R, row(1), LockMode::Exclusive, 20, WaitPolicy::Wait),
+            LockOutcome::Deadlock { victim: 20 }
+        );
+    }
+
+    #[test]
+    fn relock_same_version_is_idempotent() {
+        let mut t = LockTable::new();
+        assert_eq!(
+            t.acquire(R, row(1), LockMode::Exclusive, 10, WaitPolicy::Wait),
+            LockOutcome::Granted
+        );
+        // Same version re-locking the same row never blocks on itself.
+        assert_eq!(
+            t.acquire(R, row(1), LockMode::Exclusive, 10, WaitPolicy::Wait),
+            LockOutcome::Granted
+        );
     }
 }
