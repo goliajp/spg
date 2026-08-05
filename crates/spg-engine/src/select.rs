@@ -4037,6 +4037,14 @@ impl Engine {
             if let Some(rewritten) = try_count_over_offset(stmt, &from.primary) {
                 return self.exec_select_cancel(&rewritten, cancel);
             }
+            // v7.39 (round 743) — `count(*) OVER a derived whose only
+            // item is unnest(ARRAY[k elements])` is `k * count(WHERE)`:
+            // a constant-length array unnests to exactly k rows per
+            // input row, NULL elements included. PG expands the set to
+            // count it (6.6 ms on the panel cell); the identity doesn't.
+            if let Some(rewritten) = try_count_over_const_unnest(stmt, &from.primary) {
+                return self.exec_select_cancel(&rewritten, cancel);
+            }
             return self.exec_select_derived(stmt, &from.primary, cancel);
         }
         // v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
@@ -9422,6 +9430,18 @@ pub(crate) fn top_level_srf_output(
     };
     match kind {
         SrfKind::Unnest => {
+            // v7.39 (round 743) — `unnest(ARRAY[e1, …, ek])` evaluates
+            // the elements DIRECTLY: the old path built the whole
+            // Value::Array (one eval + a clone per element) only for
+            // array_value_to_elements to clone every element back out.
+            // Any other argument shape (a column, a function result)
+            // keeps the build-then-split path.
+            if let spg_sql::ast::Expr::Array(items) = &args[0] {
+                return items
+                    .iter()
+                    .map(|e| eval::eval_expr(e, row, ctx).map_err(EngineError::Eval))
+                    .collect();
+            }
             let arr = eval::eval_expr(&args[0], row, ctx).map_err(EngineError::Eval)?;
             array_value_to_elements(&arr)
         }
@@ -10659,7 +10679,6 @@ pub(crate) fn expr_contains_builtin_srf(e: &spg_sql::ast::Expr) -> bool {
 /// single-element `unnest`, against 0 for the same scan without one — 211 MB
 /// where the plain scan took 4.3 — and the shape held whatever the array
 /// contained, which is what invariant work looks like.
-#[derive(Clone)]
 struct SrfPlan {
     /// The lifted SRF calls, in slot order.
     nodes: alloc::vec::Vec<spg_sql::ast::Expr>,
@@ -10669,6 +10688,12 @@ struct SrfPlan {
     /// The input schema followed by one column per slot. Only the slots'
     /// TYPES vary per row, and they are patched in place.
     ext_cols: alloc::vec::Vec<ColumnSchema>,
+    /// v7.39 (round 743) — the rewritten projection COMPILED against the
+    /// extended schema, once per plan. The per-output-row evaluation ran
+    /// the interpreter (~560 ns/row on the unnest panel cell); the Step
+    /// VM reads the `__srf_N` slots as plain columns. `None` = that item
+    /// is not fully compilable and keeps the interpreter.
+    compiled: alloc::vec::Vec<Option<eval::CompiledExpr>>,
     base_cols: usize,
 }
 
@@ -10733,10 +10758,30 @@ fn build_srf_plan(
             true,
         ));
     }
+    // v7.39 (round 743) — compile the rewritten items against the
+    // EXTENDED schema. The slot columns' declared type is a per-row
+    // patched detail the compiled column read does not consult.
+    let compiled: Vec<Option<eval::CompiledExpr>> = {
+        let mut ext_ctx = ctx.clone();
+        ext_ctx.columns = &ext_cols;
+        projection
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let e = rewritten[i].as_ref().unwrap_or(&p.expr);
+                if eval::fully_compilable(e) {
+                    Some(eval::compile_expr(e, &ext_ctx))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
     Ok(SrfPlan {
         nodes,
         rewritten,
         ext_cols,
+        compiled,
         base_cols,
     })
 }
@@ -10803,7 +10848,14 @@ fn expand_projection_srfs(
             let mut sctx = eval::EvalContext::new(schema_cols, alias);
             sctx.mysql_dialect = mysql;
             sctx.render_style = style;
-            let mut local_plan = plan_ref.clone();
+            // v7.39 (round 743) — SrfPlan is no longer Clone (it carries
+            // compiled programs); each shard rebuilds it, which also
+            // recompiles against the shard's own context. Build errors
+            // were already surfaced by the outer build above.
+            let mut local_plan = match build_srf_plan(engine, projection, srf_idxs, &sctx) {
+                Ok(p) => p,
+                Err(e) => return alloc::boxed::Box::new(ShardOut::Err(e)) as _,
+            };
             let mut run = || -> ShardOut {
                 let mut o: Vec<Row<'static>> = Vec::with_capacity(hi - lo);
                 let mut sidx: Vec<usize> = Vec::with_capacity(hi - lo);
@@ -10885,6 +10937,7 @@ fn expand_srf_row_with(
     let base_len = row.values.len();
     let mut ext_vals = row.values.clone();
     ext_vals.resize(base_len + lists.len(), Value::Null);
+    let mut eval_stack: alloc::vec::Vec<Value<'static>> = alloc::vec::Vec::new();
     for k in 0..n_rows {
         for (slot, list) in lists.iter().enumerate() {
             // Past the end of THIS srf's rows → NULL (PG pads).
@@ -10893,8 +10946,16 @@ fn expand_srf_row_with(
         let ext_row = Row::new(core::mem::take(&mut ext_vals));
         let mut vals = Vec::with_capacity(projection.len());
         for (i, p) in projection.iter().enumerate() {
-            let expr = plan.rewritten[i].as_ref().unwrap_or(&p.expr);
-            vals.push(eval::eval_expr(expr, &ext_row, &ext_ctx).map_err(EngineError::Eval)?);
+            // v7.39 (round 743) — compiled when possible; the
+            // interpreter for the rest, with its exact wording.
+            vals.push(match &plan.compiled[i] {
+                Some(c) => eval::eval_compiled(c, &ext_row, &ext_ctx, &mut eval_stack)
+                    .map_err(EngineError::Eval)?,
+                None => {
+                    let expr = plan.rewritten[i].as_ref().unwrap_or(&p.expr);
+                    eval::eval_expr(expr, &ext_row, &ext_ctx).map_err(EngineError::Eval)?
+                }
+            });
         }
         ext_vals = ext_row.values;
         out.push(Row::new(vals));
@@ -11690,4 +11751,92 @@ fn matview_flatten_probe(inner: &SelectStatement) -> Option<TableRef> {
         return None;
     }
     Some(it.clone())
+}
+
+/// v7.39 (round 743) — rewrite `SELECT count(*) FROM (SELECT
+/// unnest(ARRAY[e1..ek]) [AS v] FROM t [WHERE p]) q` into
+/// `SELECT count(*) * k FROM t [WHERE p]`. Sound because a
+/// constant-LENGTH array literal unnests to exactly k rows per input
+/// row (NULL elements are rows too). One SRF item only, elements
+/// subquery-free, and the stripped inner must pass the same probe the
+/// count-over-offset rewrite uses.
+fn try_count_over_const_unnest(
+    stmt: &SelectStatement,
+    primary: &TableRef,
+) -> Option<SelectStatement> {
+    use spg_sql::ast::{Expr as E, SelectItem};
+    let inner = primary.lateral_subquery.as_deref()?;
+    if !stmt.ctes.is_empty()
+        || !stmt.unions.is_empty()
+        || stmt.distinct
+        || !stmt.distinct_on.is_empty()
+        || stmt.where_.is_some()
+        || stmt.group_by.is_some()
+        || stmt.having.is_some()
+        || !stmt.order_by.is_empty()
+        || stmt.limit.is_some()
+        || stmt.offset.is_some()
+        || stmt.items.len() != 1
+    {
+        return None;
+    }
+    let SelectItem::Expr { expr, .. } = &stmt.items[0] else {
+        return None;
+    };
+    let E::FunctionCall { name, args } = expr else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("count_star") || !args.is_empty() {
+        return None;
+    }
+    // Inner: exactly one item, and it is unnest(ARRAY[...]).
+    if inner.items.len() != 1
+        || !inner.order_by.is_empty()
+        || inner.limit.is_some()
+        || inner.offset.is_some()
+    {
+        return None;
+    }
+    let SelectItem::Expr { expr: item, .. } = &inner.items[0] else {
+        return None;
+    };
+    let E::FunctionCall { name: fname, args: fargs } = item else {
+        return None;
+    };
+    if !fname.eq_ignore_ascii_case("unnest") || fargs.len() != 1 {
+        return None;
+    }
+    let E::Array(elems) = &fargs[0] else {
+        return None;
+    };
+    if elems.is_empty() || elems.iter().any(crate::expr_has_subquery) {
+        return None;
+    }
+    let k = elems.len() as i64;
+    // The stripped inner (the SRF item replaced by a plain constant)
+    // must be the provable simple shape.
+    let mut counted = inner.clone();
+    counted.items = alloc::vec![SelectItem::Expr {
+        expr: E::Literal(spg_sql::ast::Literal::Integer(1)),
+        alias: None,
+    }];
+    let base = matview_flatten_probe(&counted)?;
+    let mut out = stmt.clone();
+    out.items = alloc::vec![SelectItem::Expr {
+        expr: E::Binary {
+            lhs: alloc::boxed::Box::new(E::FunctionCall {
+                name: String::from("count_star"),
+                args: alloc::vec![],
+            }),
+            op: spg_sql::ast::BinOp::Mul,
+            rhs: alloc::boxed::Box::new(E::Literal(spg_sql::ast::Literal::Integer(k))),
+        },
+        alias: Some(String::from("count")),
+    }];
+    out.from = Some(spg_sql::ast::FromClause {
+        primary: base,
+        joins: Vec::new(),
+    });
+    out.where_ = counted.where_.clone();
+    Some(out)
 }
