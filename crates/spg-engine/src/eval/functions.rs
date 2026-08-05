@@ -2463,10 +2463,12 @@ fn apply_function_dispatch(
         // use. Return 0.0 (SPG has no notification queue yet).
         "pg_notification_queue_usage" => Ok(Value::Float(0.0)),
         // v7.37.17 (17.6 siblings) — jsonb_object_keys returns the
-        // top-level keys of a jsonb object. PG has this as a SRF
-        // (set-returning function) — SPG's scalar surface returns
-        // TextArray. Errors on non-object input (matches PG). Empty
-        // object → empty array.
+        // top-level keys of a jsonb object. v7.39 (round 771 audit) —
+        // the FROM/SRF surface answers one row per key exactly as PG
+        // does now (measured; the old note described a scalar
+        // TextArray simplification). This scalar arm remains the
+        // projection-position building block. Errors on non-object
+        // input (matches PG).
         "jsonb_object_keys" | "json_object_keys" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
@@ -3005,8 +3007,10 @@ fn apply_function_dispatch(
             }
         }
         // v7.37.17 (17.6 siblings) — factorial(smallint | int | bigint)
-        // returns n! as BIGINT. Overflows at n=20 for i64 — errors
-        // beyond that. Negative n = error (matches PG).
+        // returns n! as NUMERIC. v7.39 (round 771 audit) — measured
+        // identical to PG18 (factorial(21) answers the exact numeric;
+        // the old note claimed a BIGINT overflow at 20 that no longer
+        // exists). Negative n = error, PG's sentence.
         "factorial" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
@@ -4765,9 +4769,10 @@ fn apply_function_dispatch(
         "load_file" => Ok(Value::Null),
         // v7.37.17 (17.6 siblings) — PG cryptographic hash functions.
         // sha1 is already in the dep graph (users.rs MySQL auth);
-        // sha2 provides sha224/sha256/sha384/sha512. Hex output
-        // matches PG's `encode(digest(x, 'sha256'), 'hex')` shape
-        // that PostgreSQL 15+ built-in `sha256(x)` uses.
+        // sha2 provides sha224/sha256/sha384/sha512. v7.39 (round
+        // 771 audit) — the sha* builtins return BYTEA exactly as
+        // PG's do (measured `\xca97…|bytea`; the old note described
+        // a hex-text shape).
         "sha1" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
@@ -7021,7 +7026,7 @@ fn apply_function_dispatch(
             };
             if stride_months != 0 {
                 return Err(EvalError::TypeMismatch {
-                    detail: "date_bin(): stride with months not supported".into(),
+                    detail: "timestamps cannot be binned into intervals containing months or years".into(),
                 });
             }
             const DAY_US: i64 = 24 * 60 * 60 * 1_000_000;
@@ -10731,9 +10736,9 @@ fn apply_function_dispatch(
             Ok(Value::BigInt(lo + r as i64))
         }
         // v7.37.17 (17.6 siblings) — setseed(f) reseeds the PRNG.
-        // PG accepts f ∈ [-1, 1]; SPG allows the full f64 range
-        // for simplicity. Returns void (NULL). Deterministic
-        // repro tests rely on this.
+        // f ∈ [-1, 1] is enforced with PG's sentence (round 771 —
+        // the old note claimed SPG allowed the full f64 range; it
+        // refuses, measured). Returns void (NULL).
         "setseed" => {
             if args.len() != 1 {
                 return Err(EvalError::TypeMismatch {
@@ -10761,7 +10766,7 @@ fn apply_function_dispatch(
             if !(-1.0..=1.0).contains(&seed) {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
-                        "setseed(): seed {seed} out of range [-1, 1]"
+                        "setseed parameter {seed} is out of allowed range [-1,1]"
                     ),
                 });
             }
