@@ -367,6 +367,15 @@ pub(crate) struct AggState {
     /// PG behaviour when no `ORDER BY` is given inside the
     /// aggregate call.
     items: Vec<Value<'static>>,
+    /// v7.39 (round 762, F31-C2) — per-item separator, parallel to
+    /// `items`. PG evaluates string_agg's separator PER ROW: element
+    /// i is prefixed by ITS row's separator (`string_agg(v,
+    /// '<'||v||'>')` over a,b,c answers `a<b>b<c>c`; a NULL separator
+    /// renders empty; a skipped-NULL value row's separator is never
+    /// used). Populated only on the general path when the call has a
+    /// second argument; the fused lane is literal-separator only and
+    /// keeps the single `separator` snapshot below.
+    item_seps: Vec<Option<String>>,
     /// v7.25 (round-17) — per-group dedupe set for DISTINCT
     /// aggregates (encoded values; NULLs never reach it because
     /// the caller's skip runs after the per-aggregate NULL rules).
@@ -396,11 +405,12 @@ pub(crate) struct AggState {
     /// ORDER BY id)`. The key width is the spec's `order_by.len()`,
     /// which every consumer already has.
     item_keys: Vec<Value<'static>>,
-    /// v7.17.0 — captured separator for string_agg. PG accepts a
-    /// non-constant separator expression but in practice every
-    /// caller passes a literal; the engine snapshots the last
-    /// non-NULL text it sees, which matches PG's "use the latest
-    /// row's value" behaviour.
+    /// v7.17.0 — captured separator for string_agg: the last
+    /// non-NULL text seen. v7.39 (round 762, F31-C2) — this is the
+    /// CONSTANT-separator snapshot only (fused lane, group_concat
+    /// default, DISTINCT fallback); the per-row truth lives in
+    /// `item_seps` (the old note claimed "use the latest row's
+    /// value" was PG's behaviour — measured false, PG is per-row).
     separator: Option<String>,
     /// v7.17.0 — running boolean accumulator for bool_and /
     /// bool_or / every. `None` until the first non-NULL input;
@@ -3597,10 +3607,11 @@ fn accumulate_groups(
                 Some(e) => eval_arg(e, row, &ctx)?,
             };
             // v7.17.0 — `string_agg(value, separator)` evaluates the
-            // separator per row but PG treats it as constant; we
-            // pass the per-row value into update_state so a future
-            // varying-separator caller still sees correct output,
-            // even though SPG (like PG) only uses the most recent.
+            // separator per row. v7.39 (round 762, F31-C2) — PG uses
+            // the PER-ROW value (element i prefixed by row i's
+            // separator, PG18-measured `a<b>b<c>c`); update_state
+            // records it alongside the item now (the old note claimed
+            // PG "treats it as constant" — measured false).
             let arg2_val = match &spec.arg2 {
                 None => None,
                 Some(e) => Some(eval_arg(e, row, &ctx)?),
@@ -3911,6 +3922,15 @@ fn finalize_synth_rows(
                     for &j in &idx {
                         new_items.push(core::mem::replace(&mut sorted.items[j], Value::Null));
                     }
+                    // v7.39 (round 762, F31-C2) — the per-row separators
+                    // travel with their items through the sort.
+                    if sorted.item_seps.len() == sorted.items.len() {
+                        let mut new_seps: Vec<Option<String>> = Vec::with_capacity(idx.len());
+                        for &j in &idx {
+                            new_seps.push(core::mem::take(&mut sorted.item_seps[j]));
+                        }
+                        sorted.item_seps = new_seps;
+                    }
                     sorted.items = new_items;
                     st_sorted = sorted;
                     &st_sorted
@@ -3932,6 +3952,10 @@ fn finalize_synth_rows(
                     // value comparison and regressed enum columns.
                     let labels = agg_specs[i].enum_labels.as_deref();
                     let mut sorted = st.clone();
+                    // v7.39 (round 762, F31-C2) — DISTINCT re-sorts items
+                    // alone; per-row separators cannot follow, so the
+                    // constant-separator path applies (the last row's).
+                    sorted.item_seps.clear();
                     sorted.items.sort_by(|a, b| {
                         if let Some(labels) = labels
                             && !matches!(a, Value::Null)
@@ -4019,12 +4043,22 @@ fn finalize_one_group(
             for &j in &idx {
                 new_items.push(core::mem::replace(&mut sorted.items[j], Value::Null));
             }
+            // v7.39 (round 762, F31-C2) — separators travel with items.
+            if sorted.item_seps.len() == sorted.items.len() {
+                let mut new_seps: Vec<Option<String>> = Vec::with_capacity(idx.len());
+                for &j in &idx {
+                    new_seps.push(core::mem::take(&mut sorted.item_seps[j]));
+                }
+                sorted.item_seps = new_seps;
+            }
             sorted.items = new_items;
             st_sorted = sorted;
             &st_sorted
         } else if agg_specs[i].distinct && st.items.len() > 1 {
             let labels = agg_specs[i].enum_labels.as_deref();
             let mut sorted = st.clone();
+            // v7.39 (round 762, F31-C2) — see the sibling branch above.
+            sorted.item_seps.clear();
             sorted.items.sort_by(|a, b| {
                 if let Some(labels) = labels
                     && !matches!(a, Value::Null)
@@ -5003,13 +5037,16 @@ pub(crate) fn update_state(
             }
         }
         // v7.17.0 — string_agg(value, separator). NULL value is
-        // skipped (PG aggregate-skip-null). Separator captured
-        // from the latest row that flows through; matches PG's
-        // semantics of evaluating the separator per row but using
-        // the last value at finalize time (in practice it's
-        // constant). count is bumped so we can distinguish "empty
-        // group → NULL" from "all-NULL group → NULL".
+        // skipped (PG aggregate-skip-null). v7.39 (round 762,
+        // F31-C2) — the separator is PER ROW in PG (the old note's
+        // "using the last value at finalize" claim was measured
+        // false): each surviving item records its own row's
+        // separator in `item_seps`; the `separator` snapshot stays
+        // for the constant-path consumers. count is bumped so we can
+        // distinguish "empty group → NULL" from "all-NULL group →
+        // NULL".
         AggKind::StringAgg => {
+            let has_arg2 = arg2.is_some();
             if let Some(sep) = arg2
                 && let Value::Text(s) = sep
             {
@@ -5025,6 +5062,14 @@ pub(crate) fn update_state(
             let rendered = render_string_agg_item(v);
             if let Some(item) = rendered {
                 st.items.push(item);
+                // v7.39 (round 762, F31-C2) — the row's own separator
+                // rides with its item (NULL separator → None → empty).
+                if has_arg2 {
+                    st.item_seps.push(match arg2 {
+                        Some(Value::Text(sp)) => Some(sp.to_string()),
+                        _ => None,
+                    });
+                }
                 if let Some(k) = order_keys {
                     st.item_keys.extend(k);
                 }
@@ -5445,10 +5490,26 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
                     String::new()
                 }
             });
+            // v7.39 (round 762, F31-C2) — per-row separators, when the
+            // accumulate path carried them (aligned with items).
+            let per_row: Option<&[Option<String>]> = if !st.item_seps.is_empty()
+                && st.item_seps.len() == st.items.len()
+            {
+                Some(&st.item_seps)
+            } else {
+                None
+            };
             let mut out = String::new();
             for (i, item) in st.items.iter().enumerate() {
                 if i > 0 {
-                    out.push_str(&sep);
+                    match per_row {
+                        Some(seps) => {
+                            if let Some(sp) = &seps[i] {
+                                out.push_str(sp);
+                            }
+                        }
+                        None => out.push_str(&sep),
+                    }
                 }
                 match item {
                     Value::Text(s) => out.push_str(s),
