@@ -2262,9 +2262,10 @@ pub(crate) fn coerce_int_to_year(n: i64, col_name: &str) -> Result<Value<'static
 ///   * `HH:MM:SS.f` .. `.ffffff` — 1-6 fractional digits, right-padded
 ///     with zeros to microseconds
 ///
-/// Range: hour 0..=23, minute 0..=59, second 0..=59. Anything else
-/// returns None — caller surfaces as a hard SQL error (no silent
-/// truncation, matches PG's `time_in` behaviour).
+/// Range: hour 0..=24 (`24:00:00` is PG's day-end special, measured
+/// round 764), minute 0..=59, second 0..=59. Anything else returns
+/// None — caller surfaces as a hard SQL error (no silent truncation,
+/// matches PG's `time_in` behaviour).
 pub(crate) fn parse_time_str(s: &str) -> Option<i64> {
     let s = s.trim();
     // PG special TIME value: `allballs` is midnight (all zeros).
@@ -4486,11 +4487,23 @@ pub(crate) fn coerce_value(
         (Value::Text(s), DataType::Time) => match parse_time_str(&s) {
             Some(us) => Some(Value::Time(us)),
             None => {
-                return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type time: {s:?}"
-                    ),
-                }));
+                // v7.39 (round 764, F31 tranche 3 #81) — PG splits the
+                // refusals: a time-SHAPED literal with an impossible
+                // component (`25:00:00`, `10:61:00`) is "date/time
+                // field value out of range" (22008-family), only junk
+                // is "invalid input syntax" (PG18-measured).
+                let time_shaped = {
+                    let core = s.trim().split('.').next().unwrap_or("");
+                    !core.is_empty()
+                        && core.split(':').count() >= 2
+                        && core.split(':').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+                };
+                let detail = if time_shaped {
+                    alloc::format!("date/time field value out of range: {s:?}")
+                } else {
+                    alloc::format!("invalid input syntax for type time: {s:?}")
+                };
+                return Err(EngineError::Eval(EvalError::TypeMismatch { detail }));
             }
         },
         // v7.17.0 Phase 3.P0-32 — TIME → Text canonical `HH:MM:SS[.ffffff]`.
