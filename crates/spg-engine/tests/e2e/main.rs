@@ -196,6 +196,7 @@ mod e2e_publication_ddl_round754;
 mod e2e_trigger_name_order_round755;
 mod e2e_time_keywords_round755;
 mod e2e_websearch_edges_round756;
+mod e2e_raise_notice_round757;
 mod e2e_collate_explicit_round691;
 mod e2e_collate_minmax_round690;
 mod e2e_collate_order_round688;

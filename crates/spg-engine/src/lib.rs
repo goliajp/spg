@@ -1438,6 +1438,9 @@ pub type ActivityProvider = fn() -> Vec<ActivityRow>;
 pub enum NoticeSeverity {
     Notice,
     Warning,
+    /// v7.39 (round 757, F31-B3) — `RAISE INFO`. PG sends INFO to the
+    /// client ALWAYS, regardless of `client_min_messages`.
+    Info,
 }
 
 impl NoticeSeverity {
@@ -1447,6 +1450,7 @@ impl NoticeSeverity {
         match self {
             Self::Notice => "NOTICE",
             Self::Warning => "WARNING",
+            Self::Info => "INFO",
         }
     }
 }

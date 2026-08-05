@@ -1959,6 +1959,7 @@ impl Engine {
         let mut applied_after_before: Vec<(usize, Row, Row)> = Vec::with_capacity(planned.len());
         // v7.12.7 — embedded SQL queue.
         let mut deferred_embedded: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
+        let mut raised_notices: Vec<(crate::NoticeSeverity, alloc::string::String)> = Vec::new();
         for (pos, new_vals) in &planned {
             let old_row = table.rows()[*pos].clone();
             let mut new_row = Row::new(new_vals.clone());
@@ -1982,7 +1983,8 @@ impl Engine {
                 )? {
                     continue;
                 }
-                let (outcome, deferred) = triggers::fire_row_trigger(
+                let raise_sink = triggers::NoticeSink::default();
+                let fired = triggers::fire_row_trigger(
                     fd,
                     Some(new_row.clone()),
                     Some(&old_row),
@@ -1996,8 +1998,10 @@ impl Engine {
                         name: tgname,
                         level: "ROW",
                     },
-                )
-                .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                    Some(&raise_sink),
+                );
+                raised_notices.extend(raise_sink.into_inner());
+                let (outcome, deferred) = fired.map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
                 deferred_embedded.extend(deferred);
                 match outcome {
                     triggers::TriggerOutcome::Row(r) => new_row = r,
@@ -2101,7 +2105,8 @@ impl Engine {
                 )? {
                     continue;
                 }
-                let (_outcome, deferred) = triggers::fire_row_trigger(
+                let raise_sink = triggers::NoticeSink::default();
+                let fired = triggers::fire_row_trigger(
                     fd,
                     Some(new_row.clone()),
                     Some(&old_row),
@@ -2115,8 +2120,10 @@ impl Engine {
                         name: tgname,
                         level: "ROW",
                     },
-                )
-                .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                    Some(&raise_sink),
+                );
+                raised_notices.extend(raise_sink.into_inner());
+                let (_outcome, deferred) = fired.map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
                 deferred_embedded.extend(deferred);
             }
         }
@@ -2125,6 +2132,7 @@ impl Engine {
         // open tx (no-op in autocommit).
         self.record_update_pairs(&stmt.table, update_rid_pairs);
         // v7.12.7 — drain trigger-emitted embedded SQL for this UPDATE.
+        self.queue_raised(raised_notices);
         self.execute_deferred_trigger_stmts(deferred_embedded, cancel)?;
         // v6.2.1 — auto-analyze modified-row tracking for UPDATE.
         if !self.in_transaction() && affected > 0 {
@@ -3696,6 +3704,7 @@ impl Engine {
         // parent.
         // v7.12.7 — embedded SQL queue.
         let mut deferred_embedded: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
+        let mut raised_notices: Vec<(crate::NoticeSeverity, alloc::string::String)> = Vec::new();
         if !before_delete_triggers.is_empty() {
             let mut filtered_positions: Vec<usize> = Vec::with_capacity(positions.len());
             let mut filtered_old_rows: Vec<Vec<Value<'static>>> =
@@ -3707,7 +3716,8 @@ impl Engine {
                     if !triggers::trigger_when_holds(when, None, Some(&old_row), &schema_cols)? {
                         continue;
                     }
-                    let (outcome, deferred) = triggers::fire_row_trigger(
+                    let raise_sink = triggers::NoticeSink::default();
+                    let fired = triggers::fire_row_trigger(
                         fd,
                         None,
                         Some(&old_row),
@@ -3721,8 +3731,10 @@ impl Engine {
                             name: tgname,
                             level: "ROW",
                         },
-                    )
-                    .map_err(|e| {
+                        Some(&raise_sink),
+                    );
+                    raised_notices.extend(raise_sink.into_inner());
+                    let (outcome, deferred) = fired.map_err(|e| {
                         EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
                     })?;
                     deferred_embedded.extend(deferred);
@@ -3815,7 +3827,8 @@ impl Engine {
                     if !triggers::trigger_when_holds(when, None, Some(&old_row), &schema_cols)? {
                         continue;
                     }
-                    let (_outcome, deferred) = triggers::fire_row_trigger(
+                    let raise_sink = triggers::NoticeSink::default();
+                    let fired = triggers::fire_row_trigger(
                         fd,
                         None,
                         Some(&old_row),
@@ -3829,8 +3842,10 @@ impl Engine {
                             name: tgname,
                             level: "ROW",
                         },
-                    )
-                    .map_err(|e| {
+                        Some(&raise_sink),
+                    );
+                    raised_notices.extend(raise_sink.into_inner());
+                    let (_outcome, deferred) = fired.map_err(|e| {
                         EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
                     })?;
                     deferred_embedded.extend(deferred);
@@ -3838,6 +3853,7 @@ impl Engine {
             }
         }
         // v7.12.7 — drain trigger-emitted embedded SQL for this DELETE.
+        self.queue_raised(raised_notices);
         self.execute_deferred_trigger_stmts(deferred_embedded, cancel)?;
         // v6.2.1 — auto-analyze modified-row tracking for DELETE.
         if !self.in_transaction() && affected > 0 {
@@ -4019,6 +4035,7 @@ impl Engine {
         let eval_ctx = self.ev_ctx(&[], None);
         let empty = Row::new(Vec::new());
         let mut deferred_all: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
+        let mut raised_notices: Vec<(crate::NoticeSeverity, alloc::string::String)> = Vec::new();
         let mut returned: Vec<Row<'static>> = Vec::new();
         let mut affected = 0usize;
         for tuple in &stmt.rows {
@@ -4050,7 +4067,8 @@ impl Engine {
             let mut current = Row::new(new_vals);
             let mut skipped = false;
             for (fd, _when, tgname) in &triggers_list {
-                let (outcome, deferred) = triggers::fire_row_trigger(
+                let raise_sink = triggers::NoticeSink::default();
+                let fired = triggers::fire_row_trigger(
                     fd,
                     Some(current.clone()),
                     None,
@@ -4064,8 +4082,10 @@ impl Engine {
                         name: tgname,
                         level: "ROW",
                     },
-                )
-                .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                    Some(&raise_sink),
+                );
+                raised_notices.extend(raise_sink.into_inner());
+                let (outcome, deferred) = fired.map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
                 deferred_all.extend(deferred);
                 match outcome {
                     triggers::TriggerOutcome::Row(r) => current = r,
@@ -4080,6 +4100,7 @@ impl Engine {
                 affected += 1;
             }
         }
+        self.queue_raised(raised_notices);
         self.execute_deferred_trigger_stmts(deferred_all, cancel)?;
         if let Some(items) = &stmt.returning {
             return self.project_instead_of_returning(items, &stmt.table, &col_schemas, &returned);
@@ -4306,6 +4327,7 @@ impl Engine {
             .get("default_text_search_config")
             .cloned();
         let mut deferred_all: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
+        let mut raised_notices: Vec<(crate::NoticeSeverity, alloc::string::String)> = Vec::new();
         let mut returned: Vec<Row<'static>> = Vec::new();
         let mut affected = 0usize;
         {
@@ -4324,7 +4346,8 @@ impl Engine {
                 let mut current = Row::new(new_vals);
                 let mut skipped = false;
                 for (fd, _when, tgname) in &triggers_list {
-                    let (outcome, deferred) = triggers::fire_row_trigger(
+                    let raise_sink = triggers::NoticeSink::default();
+                    let fired = triggers::fire_row_trigger(
                         fd,
                         Some(current.clone()),
                         Some(old),
@@ -4338,8 +4361,10 @@ impl Engine {
                             name: tgname,
                             level: "ROW",
                         },
-                    )
-                    .map_err(|e| {
+                        Some(&raise_sink),
+                    );
+                    raised_notices.extend(raise_sink.into_inner());
+                    let (outcome, deferred) = fired.map_err(|e| {
                         EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
                     })?;
                     deferred_all.extend(deferred);
@@ -4357,6 +4382,7 @@ impl Engine {
                 }
             }
         }
+        self.queue_raised(raised_notices);
         self.execute_deferred_trigger_stmts(deferred_all, cancel)?;
         if let Some(items) = &stmt.returning {
             return self.project_instead_of_returning(items, &stmt.table, &columns, &returned);
@@ -4386,6 +4412,7 @@ impl Engine {
             .get("default_text_search_config")
             .cloned();
         let mut deferred_all: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
+        let mut raised_notices: Vec<(crate::NoticeSeverity, alloc::string::String)> = Vec::new();
         let mut returned: Vec<Row<'static>> = Vec::new();
         let mut affected = 0usize;
         for old in &old_rows {
@@ -4393,7 +4420,8 @@ impl Engine {
             let mut current = old.clone();
             let mut skipped = false;
             for (fd, _when, tgname) in &triggers_list {
-                let (outcome, deferred) = triggers::fire_row_trigger(
+                let raise_sink = triggers::NoticeSink::default();
+                let fired = triggers::fire_row_trigger(
                     fd,
                     None,
                     Some(old),
@@ -4407,8 +4435,10 @@ impl Engine {
                         name: tgname,
                         level: "ROW",
                     },
-                )
-                .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                    Some(&raise_sink),
+                );
+                raised_notices.extend(raise_sink.into_inner());
+                let (outcome, deferred) = fired.map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
                 deferred_all.extend(deferred);
                 match outcome {
                     triggers::TriggerOutcome::Row(r) => current = r,
@@ -4423,6 +4453,7 @@ impl Engine {
                 affected += 1;
             }
         }
+        self.queue_raised(raised_notices);
         self.execute_deferred_trigger_stmts(deferred_all, cancel)?;
         if let Some(items) = &stmt.returning {
             return self.project_instead_of_returning(items, &stmt.table, &columns, &returned);
@@ -4981,6 +5012,7 @@ impl Engine {
         table.set_prune_horizon(prune_horizon);
         // Stage 3 — insert the surviving rows + fire row triggers under
         // a fresh mutable borrow, then apply queued ON CONFLICT updates.
+        let mut raised_notices: Vec<(crate::NoticeSeverity, alloc::string::String)> = Vec::new();
         let (returning_rows, deferred_embedded, affected, oc_pairs, oc_old_images) =
             insert_parsed_rows(
                 table,
@@ -5001,6 +5033,7 @@ impl Engine {
                 &stmt.table,
                 trigger_session_cfg.as_deref(),
                 stmt.returning.is_some() || !also_ins.is_empty(),
+                &mut raised_notices,
             )?;
         let _ = skipped_count;
         // v7.12.7 — drop the table mut borrow and drain any
@@ -5012,6 +5045,7 @@ impl Engine {
         // v7.37.17 (E4 r3) — persist ON CONFLICT update pairs on the tx
         // (after the table borrow drops).
         self.record_update_pairs(&stmt.table, oc_pairs);
+        self.queue_raised(raised_notices);
         self.execute_deferred_trigger_stmts(deferred_embedded, CancelToken::none())?;
         // v7.39 (round 140) — fire DO ALSO INSERT rules per inserted row. NEW is
         // the post-image (defaults / sequences applied); there is no OLD.
@@ -7019,6 +7053,9 @@ fn insert_parsed_rows(
     table_name: &str,
     trigger_session_cfg: Option<&str>,
     returning_enabled: bool,
+    // v7.39 (round 757, F31-B3) — RAISE messages surface here; the
+    // caller queues them into the session (this is a free fn, no self).
+    raised_notices: &mut Vec<(crate::NoticeSeverity, alloc::string::String)>,
 ) -> Result<
     (
         Vec<Vec<Value<'static>>>,
@@ -7065,7 +7102,8 @@ fn insert_parsed_rows(
             if !triggers::trigger_when_holds(when, Some(&row), None, column_meta)? {
                 continue;
             }
-            let (outcome, deferred) = triggers::fire_row_trigger(
+            let raise_sink = triggers::NoticeSink::default();
+            let fired = triggers::fire_row_trigger(
                 fd,
                 Some(row.clone()),
                 None,
@@ -7079,8 +7117,10 @@ fn insert_parsed_rows(
                     name: tgname,
                     level: "ROW",
                 },
-            )
-            .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                Some(&raise_sink),
+            );
+            raised_notices.extend(raise_sink.into_inner());
+            let (outcome, deferred) = fired.map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
             deferred_embedded.extend(deferred);
             match outcome {
                 triggers::TriggerOutcome::Row(r) => row = r,
@@ -7120,7 +7160,8 @@ fn insert_parsed_rows(
             if !triggers::trigger_when_holds(when, Some(&inserted), None, column_meta)? {
                 continue;
             }
-            let (_outcome, deferred) = triggers::fire_row_trigger(
+            let raise_sink = triggers::NoticeSink::default();
+            let fired = triggers::fire_row_trigger(
                 fd,
                 Some(inserted.clone()),
                 None,
@@ -7134,8 +7175,10 @@ fn insert_parsed_rows(
                     name: tgname,
                     level: "ROW",
                 },
-            )
-            .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                Some(&raise_sink),
+            );
+            raised_notices.extend(raise_sink.into_inner());
+            let (_outcome, deferred) = fired.map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
             deferred_embedded.extend(deferred);
         }
     }

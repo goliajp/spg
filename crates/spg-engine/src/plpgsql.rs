@@ -101,13 +101,20 @@ impl Engine {
                 }),
             }
         };
+        let raise_sink = triggers::NoticeSink::default();
         let collected = triggers::execute_do_block_top_level(
             &body,
             dts.as_deref(),
             Some(&resolver_fn),
             Some(&for_query_fn),
-        )
-        .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("DO: {e}"))))?;
+            Some(&raise_sink),
+        );
+        // v7.39 (round 757, F31-B3) — deliver the body's RAISE messages
+        // even when it errored afterwards (PG sends the notices raised
+        // before the failure, then the error).
+        engine_cell.borrow_mut().drain_raise_sink(raise_sink);
+        let collected = collected
+            .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("DO: {e}"))))?;
         // engine_cell goes out of scope here, releasing the &mut self borrow
         // Run each embedded statement against the engine. The
         // statements were already substitute-walked for NEW/OLD/
