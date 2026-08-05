@@ -233,6 +233,15 @@ pub enum Statement {
         if_exists: bool,
         items: Vec<(String, Option<Vec<String>>)>,
     },
+    /// v7.39 (round 750) — `ALTER ROLE|USER <name> … PASSWORD 'x' |
+    /// PASSWORD NULL`. The one attribute of the no-op family with a
+    /// SECURITY consequence: it was silently dropped (ledgered r710),
+    /// so a rotated credential never rotated. `None` = PASSWORD NULL
+    /// (the role keeps existing but can no longer password-auth).
+    AlterRolePassword {
+        name: String,
+        password: Option<String>,
+    },
     ValidateOnly {
         kind: ValidateOnlyKind,
         /// The names the statement referred to. Empty means the form names
@@ -4871,6 +4880,8 @@ impl Statement {
             // written; PG classes LOCK and the OWNED BY pair as writers and
             // a read-only session refuses them there.
             Statement::ValidateOnly { .. } => false,
+            // v7.39 (round 750) — a credential rotation persists.
+            Statement::AlterRolePassword { .. } => true,
             Statement::DropAggregate { .. } => false,
             // v7.39 (round 547) — records a GUC default in the catalog.
             Statement::SetDbRoleSetting(_) => false,
@@ -5175,6 +5186,13 @@ impl fmt::Display for Statement {
                     }
                 }
                 Ok(())
+            }
+            Self::AlterRolePassword { name, password } => {
+                write!(f, "ALTER ROLE {}", quote_ident(name))?;
+                match password {
+                    Some(_) => f.write_str(" PASSWORD '<redacted>'"),
+                    None => f.write_str(" PASSWORD NULL"),
+                }
             }
             Self::ValidateOnly { kind, names } => match kind {
                 ValidateOnlyKind::LockTable => write!(f, "LOCK TABLE {}", names.join(", ")),

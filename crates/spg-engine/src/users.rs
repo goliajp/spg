@@ -511,6 +511,46 @@ impl UserStore {
     /// both auth paths (legacy BLAKE3 + SCRAM) available. The salt
     /// here is independent of the BLAKE3 hash salt — they serve
     /// different purposes.
+    /// v7.39 (round 750) — rotate a role's credential in place: every
+    /// derived form (legacy hash, both MySQL hashes) re-derives from
+    /// the new password; the caller re-derives SCRAM separately (it
+    /// owns the salt source). `None` = PASSWORD NULL: the credential
+    /// clears — the record keeps existing but nothing verifies.
+    pub fn set_password(
+        &mut self,
+        name: &str,
+        password: Option<&str>,
+        salt: [u8; SALT_LEN],
+    ) -> Result<(), UserError> {
+        let rec = self.users.get_mut(name).ok_or(UserError::NotFound)?;
+        match password {
+            Some(p) => {
+                if p.is_empty() {
+                    return Err(UserError::EmptyPassword);
+                }
+                rec.salt = salt;
+                rec.hash = derive_hash(&salt, p);
+                rec.mysql_native = Some(compute_mysql_native_hash(p));
+                rec.caching_sha2 = Some(compute_caching_sha2_hash(p));
+                rec.password_declared = true;
+            }
+            None => {
+                // An unguessable value: derived from the fresh salt, so
+                // no input can ever hash to it.
+                let digest = spg_crypto::hash(&salt);
+                let mut anti = [0u8; SALT_LEN];
+                anti.copy_from_slice(&digest[..SALT_LEN]);
+                rec.salt = salt;
+                rec.hash = derive_hash(&anti, "\u{0}unreachable");
+                rec.mysql_native = None;
+                rec.caching_sha2 = None;
+                rec.scram = None;
+                rec.password_declared = false;
+            }
+        }
+        Ok(())
+    }
+
     pub fn enable_scram(
         &mut self,
         name: &str,
@@ -943,8 +983,50 @@ impl Engine {
         self.users.drop(name)
     }
 
+    /// v7.39 (round 750) — the engine half of `ALTER ROLE … PASSWORD`:
+    /// rotate every derived credential form, then re-derive the
+    /// SCRAM-SHA-256 verifier with a fresh salt (the same source
+    /// `create_user` uses). `None` clears the credential entirely.
+    pub fn alter_user_password(
+        &mut self,
+        name: &str,
+        password: Option<&str>,
+    ) -> Result<(), UserError> {
+        let salt = self.salt_fn.map_or_else(
+            || {
+                let mut s_bytes = [0u8; 16];
+                let digest = spg_crypto::hash(name.as_bytes());
+                s_bytes.copy_from_slice(&digest[..16]);
+                s_bytes
+            },
+            |f| f(),
+        );
+        self.users.set_password(name, password, salt)?;
+        if let Some(p) = password {
+            let scram_salt = self.salt_fn.map_or_else(
+                || {
+                    let mut s = [0u8; SCRAM_SALT_LEN];
+                    let digest = spg_crypto::hash(name.as_bytes());
+                    s.copy_from_slice(&digest[16..32]);
+                    s
+                },
+                |f| f(),
+            );
+            self.users
+                .enable_scram(name, p, scram_salt, SCRAM_DEFAULT_ITERS)?;
+        }
+        Ok(())
+    }
+
     pub fn verify_user(&self, name: &str, password: &str) -> Option<Role> {
         self.users.verify(name, password)
+    }
+
+    /// v7.39 (round 750) — whether a role currently carries a SCRAM
+    /// verifier (the rotation pins read it; pgwire uses richer paths).
+    #[must_use]
+    pub fn user_scram(&self, name: &str) -> Option<()> {
+        self.users.get(name).and_then(|r| r.scram().map(|_| ()))
     }
 }
 
