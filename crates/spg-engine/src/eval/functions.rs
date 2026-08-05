@@ -19178,9 +19178,11 @@ fn apply_function_dispatch(
                     });
                 }
             };
-            // PG returns REAL (f32) — we use Float (f64) and let
-            // coerce_value narrow on assignment to a REAL column.
-            Ok(Value::Float(spg_storage::trgm::similarity(a, b)))
+            // v7.39 (round 766, F31 tranche 4 #107) — PG returns REAL
+            // (f32) and prints float4 digits (`0.33333334`); the old
+            // f64 answer showed 16 digits and typed double precision.
+            #[allow(clippy::cast_possible_truncation)]
+            Ok(Value::Real(spg_storage::trgm::similarity(a, b) as f32))
         }
         "show_trgm" => {
             if args.len() != 1 {

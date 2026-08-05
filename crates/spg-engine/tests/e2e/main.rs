@@ -204,6 +204,7 @@ mod e2e_string_agg_per_row_sep_round762;
 mod e2e_star_with_aggregates_round763;
 mod e2e_time_range_wording_round764;
 mod e2e_ordered_set_direct_args_round765;
+mod e2e_similarity_real_round766;
 mod e2e_collate_explicit_round691;
 mod e2e_collate_minmax_round690;
 mod e2e_collate_order_round688;
