@@ -472,3 +472,31 @@ fn round743_count_over_const_unnest_and_direct_elements() {
         assert_eq!(row_text(&mut e, sql), want, "{sql}");
     }
 }
+
+/// v7.39 (round 747) — the collection aggregates' per-group finalize
+/// (sort + join) shards across groups; shard ranges concatenate in
+/// group order, so output order is unchanged. This engine has no
+/// runner (serial arm), and the answers both arms must produce are
+/// pinned from the round-747 differential (6/6, including an
+/// md5-pinned concatenation of every group's result).
+#[test]
+fn round747_grouped_collections_answer_as_pg() {
+    let mut e = Engine::new();
+    seed(&mut e);
+    for (sql, want) in [
+        (
+            "SELECT g, string_agg(s, ',' ORDER BY id DESC) FROM f716              WHERE id <= 6 GROUP BY g ORDER BY g",
+            "0|row6,row3 / 1|row4,row1 / 2|row5,row2",
+        ),
+        (
+            "SELECT g, array_agg(DISTINCT g) FROM f716 WHERE id <= 30              GROUP BY g ORDER BY g",
+            "0|{0} / 1|{1} / 2|{2}",
+        ),
+        (
+            "SELECT g, json_agg(id ORDER BY id DESC) FROM f716 WHERE id <= 6              GROUP BY g ORDER BY g",
+            "0|[6, 3] / 1|[4, 1] / 2|[5, 2]",
+        ),
+    ] {
+        assert_eq!(row_text(&mut e, sql), want, "{sql}");
+    }
+}

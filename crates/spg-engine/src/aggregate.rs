@@ -965,6 +965,7 @@ pub(crate) fn run(
         table_alias,
         catalog,
         engine,
+        runner,
     )?;
 
     // v7.37.x (mailrs Track A 100k attack) — defer the bound
@@ -3777,6 +3778,7 @@ fn cmp_order_keys(
     core::cmp::Ordering::Equal
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finalize_synth_rows(
     order: &[(Vec<Value<'static>>, Vec<AggState>)],
     agg_specs: &[AggSpec],
@@ -3786,8 +3788,61 @@ fn finalize_synth_rows(
     table_alias: Option<&str>,
     catalog: Option<&spg_storage::Catalog>,
     engine: Option<&crate::Engine>,
+    runner: Option<&dyn crate::ParallelRunner>,
 ) -> Result<Vec<Row<'static>>, EvalError> {
     let ctx = with_catalog(EvalContext::new(schema_cols, table_alias), catalog, engine);
+    // v7.39 (round 747) — GROUP-parallel finalize for the collection
+    // aggregates. `string_agg(s, ',' ORDER BY id) GROUP BY g` sorted
+    // and joined every group's items serially — the panel's last
+    // >=2.0x cell. Groups are independent; shards produce their row
+    // ranges in group order and concatenate. Admission: every spec a
+    // collection kind (their finalize reads items/keys/separator and
+    // the dialect only — nothing that needs the engine hook), no
+    // ordered-set / first_ordered / regression shapes.
+    let collections_only = agg_specs.iter().all(|s| {
+        matches!(
+            classify_agg_name(&s.name),
+            AggKind::StringAgg | AggKind::ArrayAgg | AggKind::JsonAgg
+        ) && !s.first_ordered
+            && !is_within_group_name(&s.name)
+    });
+    if collections_only
+        && order.len() >= 16
+        && let Some(r) = runner
+    {
+        let group_len_probe = order.first().map(|(g, _)| g.len()).unwrap_or(0);
+        let _ = group_len_probe;
+        let n_shards = (order.len() / 8).clamp(2, 8);
+        let chunk = order.len().div_ceil(n_shards);
+        type ShardOut = Result<Vec<Row<'static>>, EvalError>;
+        let mysql = ctx.mysql_dialect;
+        let style = ctx.render_style;
+        let results = r.run_shards(n_shards, &|si| {
+            let lo = si * chunk;
+            let hi = ((si + 1) * chunk).min(order.len());
+            let mut sctx = EvalContext::new(schema_cols, table_alias);
+            sctx.mysql_dialect = mysql;
+            sctx.render_style = style;
+            let run = || -> ShardOut {
+                let mut out: Vec<Row<'static>> = Vec::with_capacity(hi - lo);
+                for (gvals, states) in &order[lo..hi] {
+                    out.push(finalize_one_group(
+                        gvals, states, agg_specs, synth_schema, &sctx,
+                    )?);
+                }
+                Ok(out)
+            };
+            alloc::boxed::Box::new(run())
+        });
+        let mut synth_rows: Vec<Row<'static>> = Vec::with_capacity(order.len());
+        for boxed in results {
+            let shard = boxed
+                .downcast::<ShardOut>()
+                .expect("runner echoes the closure's box");
+            synth_rows.extend((*shard)?);
+        }
+        return Ok(synth_rows);
+    }
     // v7.32 (round-29) — ordered-set direct arguments (the percentile
     // fraction) are constant per PG, so evaluate each once up front.
     let direct_arg_vals: Vec<Option<Value>> = agg_specs
@@ -3926,6 +3981,75 @@ fn finalize_synth_rows(
         synth_rows.push(Row::new(values));
     }
     Ok(synth_rows)
+}
+
+/// v7.39 (round 747) — one group's synth row for the COLLECTION
+/// aggregates (string_agg / array_agg / json_agg): the ordered/distinct
+/// sort branches verbatim from the serial loop, then `finalize`. The
+/// group-parallel path calls this; admission guarantees no
+/// first_ordered / within-group / timestamptz-retag shapes reach it
+/// (json/array of timestamptz retag is still applied for safety).
+fn finalize_one_group(
+    gvals: &[Value<'static>],
+    states: &[AggState],
+    agg_specs: &[AggSpec],
+    synth_schema: &[ColumnSchema],
+    ctx: &EvalContext<'_>,
+) -> Result<Row<'static>, EvalError> {
+    let group_len = gvals.len();
+    let mut values: Vec<Value<'static>> = Vec::with_capacity(synth_schema.len());
+    values.extend(gvals.iter().cloned());
+    for (i, st) in states.iter().enumerate() {
+        let st_sorted;
+        let kw = agg_specs[i].order_by.len();
+        let st_final: &AggState = if kw > 0 && st.item_keys.len() == st.items.len() * kw {
+            let mut idx: Vec<usize> = (0..st.items.len()).collect();
+            let ob = &agg_specs[i].order_by;
+            idx.sort_by(|&x, &y| {
+                cmp_order_keys(
+                    ob,
+                    &agg_specs[i].order_enum_labels,
+                    &st.item_keys[x * kw..(x + 1) * kw],
+                    &st.item_keys[y * kw..(y + 1) * kw],
+                    ctx.mysql_dialect,
+                )
+            });
+            let mut sorted = st.clone();
+            let mut new_items: Vec<Value<'static>> = Vec::with_capacity(idx.len());
+            for &j in &idx {
+                new_items.push(core::mem::replace(&mut sorted.items[j], Value::Null));
+            }
+            sorted.items = new_items;
+            st_sorted = sorted;
+            &st_sorted
+        } else if agg_specs[i].distinct && st.items.len() > 1 {
+            let labels = agg_specs[i].enum_labels.as_deref();
+            let mut sorted = st.clone();
+            sorted.items.sort_by(|a, b| {
+                if let Some(labels) = labels
+                    && !matches!(a, Value::Null)
+                    && !matches!(b, Value::Null)
+                    && let Some(ord) = crate::eval::enum_ord_cmp(labels, a, b)
+                {
+                    return ord;
+                }
+                crate::order_by_value_cmp_in(false, Some(false), a, b, ctx.mysql_dialect)
+            });
+            st_sorted = sorted;
+            &st_sorted
+        } else {
+            st
+        };
+        let v = finalize(&agg_specs[i].name, st_final, ctx.mysql_dialect);
+        let v = match (v, synth_schema.get(group_len + i).map(|c| c.ty)) {
+            (Value::TimestampArray(items), Some(DataType::TimestamptzArray)) => {
+                Value::TimestamptzArray(items)
+            }
+            (v, _) => v,
+        };
+        values.push(v);
+    }
+    Ok(Row::new(values))
 }
 
 /// (3) Rewrite the user's SELECT items + HAVING to reference the
