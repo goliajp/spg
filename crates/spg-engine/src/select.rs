@@ -2550,6 +2550,15 @@ impl Engine {
         cancel: CancelToken<'_>,
         as_role: Option<&str>,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 (round 763, F31-C1) — `SELECT *, count(*) … GROUP BY
+        // <all columns>` is legal PG (the wildcard expands to grouped
+        // columns); SPG refused the whole shape. Expand the wildcard
+        // into explicit column refs up front — the aggregate layer's
+        // existing "must appear in the GROUP BY clause" validation
+        // then answers PG's sentence for any non-grouped column.
+        if let Some(expanded) = self.expand_aggregate_wildcard(stmt) {
+            return self.exec_select_cancel_as(&expanded, cancel, as_role);
+        }
         // v7.39 (round 559) — `SELECT count(*) FROM t` without touching
         // a row.
         //

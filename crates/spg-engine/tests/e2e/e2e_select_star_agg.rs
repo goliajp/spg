@@ -79,17 +79,11 @@ fn star_and_aggregate_with_group_by() {
     // GROUP BY (so the wildcard expansion is unambiguous).
     let mut e = Engine::new();
     setup(&mut e);
-    let r = e.execute("SELECT *, count(*) FROM t GROUP BY id, name");
-    // Whether SPG accepts this today is a known gap; pin
-    // current behavior — passing or erroring cleanly is
-    // acceptable for now.
-    match r {
-        Ok(spg_engine::QueryResult::Rows { rows, .. }) => {
-            assert_eq!(rows.len(), 3, "3 distinct (id,name) tuples");
-        }
-        Err(_) => {
-            // Documented v7.17 gap; pin with a comment.
-        }
-        _ => panic!("unexpected result shape"),
-    }
+    // v7.39 (round 763, F31-C1) — the "known gap" closed: the
+    // wildcard expands to the grouped columns and the shape answers.
+    let r = e.execute("SELECT *, count(*) FROM t GROUP BY id, name").unwrap();
+    let spg_engine::QueryResult::Rows { rows, .. } = r else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows.len(), 3, "3 distinct (id,name) tuples");
 }
