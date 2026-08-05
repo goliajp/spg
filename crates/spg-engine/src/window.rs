@@ -512,8 +512,13 @@ pub(crate) fn compute_window_partition(
                                 kind: spg_storage::NumericKind::Finite,
                             }
                         } else if all_int && i64::try_from(int_sum).is_ok() {
-                            // Integer inputs → BIGINT, matching PG and the
-                            // GROUP BY sum() path.
+                            // Integer inputs → BIGINT, matching the
+                            // GROUP BY sum() path. v7.39 (round 774
+                            // audit, H1) — PG 18.4 resolves sum(int4)
+                            // to its FLOAT8 overload (no sum(integer)
+                            // in its catalog); SPG keeps the exact
+                            // bigint — ledgered, not silently claimed
+                            // as parity.
                             Value::BigInt(int_sum as i64)
                         } else {
                             Value::Float(sum)
