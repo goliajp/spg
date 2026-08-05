@@ -5585,7 +5585,15 @@ impl Engine {
                 // deleted must land then leave). None = this buffer
                 // cannot be applied (an Update, or no row map where one
                 // is needed) -> the full path below.
-                if let Some(applied) = self.apply_matview_delta_ordered(name, &body, &buf)? {
+                let outcome = self.apply_matview_delta_ordered(name, &body, &buf)?;
+                if outcome.is_some() {
+                    crate::MATVIEW_DELTA_APPLIED
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                } else {
+                    crate::MATVIEW_DELTA_BAILED
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(applied) = outcome {
                     let current: alloc::vec::Vec<(String, u64)> = dep_tables
                         .iter()
                         .map(|t| {
@@ -6589,8 +6597,19 @@ impl Engine {
                 }
                 spg_storage::RowChange::Delete { rowids, .. }
                 | spg_storage::RowChange::Tombstone { rowids, .. } => {
+                    // v7.39 (round 740) — TOMBSTONE the view row, never
+                    // physically remove it. delete_rows on a mid-table
+                    // position is O(table) in the persistent vec, and
+                    // every surviving map entry would need shifting —
+                    // measured 70 ms for THREE deletes over a 250k-row
+                    // view. A tombstone is O(1), keeps every physical
+                    // position (the map needs no shift and `expected`
+                    // means what it says), and the view's readers
+                    // already gate on MVCC visibility like any table.
+                    // Vacuumed/compacted views change their length and
+                    // the expected-length check catches it -> full.
                     for rid in rowids {
-                        let Some((expected, map)) = self.matview_row_map.get_mut(name) else {
+                        let Some((_, map)) = self.matview_row_map.get_mut(name) else {
                             unreachable!("needs_map gated above");
                         };
                         let Some(pos) = map.remove(&rid.0) else {
@@ -6598,12 +6617,7 @@ impl Engine {
                             // view never held it; nothing to remove.
                             continue;
                         };
-                        for p in map.values_mut() {
-                            if *p > pos {
-                                *p -= 1;
-                            }
-                        }
-                        *expected -= 1;
+                        let v = self.writer_version_for_current_stmt();
                         let cat = self.active_catalog_mut();
                         let table = cat.get_mut(name).ok_or_else(|| {
                             EngineError::Storage(spg_storage::StorageError::Corrupt(
@@ -6612,7 +6626,7 @@ impl Engine {
                                 ),
                             ))
                         })?;
-                        table.delete_rows(&[pos]);
+                        let _ = table.mark_row_deleted(pos, v);
                         applied += 1;
                     }
                 }
@@ -6663,17 +6677,12 @@ impl Engine {
                             applied += 1;
                         }
                         (Some(pos), false) => {
-                            let (expected, map) = self
+                            let (_, map) = self
                                 .matview_row_map
                                 .get_mut(name)
                                 .expect("needs_map gated above");
                             map.remove(&rowid.0);
-                            for p in map.values_mut() {
-                                if *p > pos {
-                                    *p -= 1;
-                                }
-                            }
-                            *expected -= 1;
+                            let v = self.writer_version_for_current_stmt();
                             let cat = self.active_catalog_mut();
                             let table = cat.get_mut(name).ok_or_else(|| {
                                 EngineError::Storage(spg_storage::StorageError::Corrupt(
@@ -6682,7 +6691,7 @@ impl Engine {
                                     ),
                                 ))
                             })?;
-                            table.delete_rows(&[pos]);
+                            let _ = table.mark_row_deleted(pos, v);
                             applied += 1;
                         }
                         (None, true) => {
