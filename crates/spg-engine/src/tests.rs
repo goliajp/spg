@@ -934,11 +934,17 @@ fn create_publication_duplicate_errors() {
 }
 
 #[test]
-fn drop_publication_silent_when_absent() {
+fn drop_publication_absent_refuses_if_exists_skips() {
+    // v7.39 (round 754, F31-B4) — PG18-measured: the bare form
+    // REFUSES (the old "PG-compatible silent no-op" pin asserted a
+    // behaviour PG does not have); IF EXISTS skips with affected=0.
     let mut e = Engine::new();
-    // PG-compatible: DROP a publication that doesn't exist
-    // succeeds (no-op) but reports zero affected.
-    let r = e.execute("DROP PUBLICATION nope").unwrap();
+    let err = e.execute("DROP PUBLICATION nope").unwrap_err();
+    assert!(
+        alloc::format!("{err}").contains("publication \"nope\" does not exist"),
+        "got {err}"
+    );
+    let r = e.execute("DROP PUBLICATION IF EXISTS nope").unwrap();
     match r {
         QueryResult::CommandOk { affected, .. } => assert_eq!(affected, 0),
         other => panic!("expected CommandOk, got {other:?}"),
@@ -1011,6 +1017,8 @@ fn create_publication_for_table_list_lands_with_scope() {
 #[test]
 fn create_publication_all_tables_except_lands_with_scope() {
     let mut e = Engine::new();
+    // v7.39 (round 754) — listed relations must exist now.
+    e.execute("CREATE TABLE t3 (id INT NOT NULL)").unwrap();
     e.execute("CREATE PUBLICATION pub_a FOR ALL TABLES EXCEPT t3")
         .unwrap();
     let scope = e.publications().get("pub_a").cloned();
@@ -1037,6 +1045,10 @@ fn show_publications_empty_returns_zero_rows() {
 #[test]
 fn show_publications_returns_one_row_per_publication_ordered_by_name() {
     let mut e = Engine::new();
+    // v7.39 (round 754) — listed relations must exist now.
+    e.execute("CREATE TABLE t1 (id INT NOT NULL)").unwrap();
+    e.execute("CREATE TABLE t2 (id INT NOT NULL)").unwrap();
+    e.execute("CREATE TABLE bad (id INT NOT NULL)").unwrap();
     e.execute("CREATE PUBLICATION z_pub").unwrap();
     e.execute("CREATE PUBLICATION a_pub FOR TABLE t1, t2")
         .unwrap();
@@ -1084,6 +1096,11 @@ fn for_list_scopes_persist_across_snapshot() {
     // The v6.1.2 envelope-v3 round-trip exercised AllTables;
     // v6.1.3 needs the scope-1 / scope-2 tags to survive too.
     let mut e = Engine::new();
+    // v7.39 (round 754) — listed relations must exist now.
+    for t in ["t1", "t2", "bad", "worse"] {
+        e.execute(&alloc::format!("CREATE TABLE {t} (id INT NOT NULL)"))
+            .unwrap();
+    }
     e.execute("CREATE PUBLICATION p1 FOR TABLE t1, t2").unwrap();
     e.execute("CREATE PUBLICATION p2 FOR ALL TABLES EXCEPT bad, worse")
         .unwrap();
@@ -1131,9 +1148,16 @@ fn create_subscription_duplicate_name_errors() {
 }
 
 #[test]
-fn drop_subscription_silent_when_absent() {
+fn drop_subscription_absent_refuses_if_exists_skips() {
+    // v7.39 (round 754, F31-B4) — same contract as publications:
+    // bare refuses with PG's sentence, IF EXISTS skips.
     let mut e = Engine::new();
-    let r = e.execute("DROP SUBSCRIPTION never").unwrap();
+    let err = e.execute("DROP SUBSCRIPTION never").unwrap_err();
+    assert!(
+        alloc::format!("{err}").contains("subscription \"never\" does not exist"),
+        "got {err}"
+    );
+    let r = e.execute("DROP SUBSCRIPTION IF EXISTS never").unwrap();
     match r {
         QueryResult::CommandOk { affected, .. } => assert_eq!(affected, 0),
         other => panic!("expected CommandOk, got {other:?}"),

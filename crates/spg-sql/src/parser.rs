@@ -2782,13 +2782,18 @@ impl Parser {
                     }
                     Token::Publication => {
                         self.advance();
+                        // v7.39 (round 754, F31-B4) — the round-753
+                        // audit probe tripped over the missing
+                        // `IF EXISTS` here (syntax error).
+                        let if_exists = self.consume_if_exists();
                         let name = self.expect_ident_or_string()?;
-                        Ok(Statement::DropPublication(name))
+                        Ok(Statement::DropPublication { name, if_exists })
                     }
                     Token::Subscription => {
                         self.advance();
+                        let if_exists = self.consume_if_exists();
                         let name = self.expect_ident_or_string()?;
-                        Ok(Statement::DropSubscription(name))
+                        Ok(Statement::DropSubscription { name, if_exists })
                     }
                     Token::Ident(s) | Token::QuotedIdent(s)
                         if s.eq_ignore_ascii_case("user") || s.eq_ignore_ascii_case("role") =>
@@ -7628,12 +7633,32 @@ impl Parser {
                 } else {
                     PublicationScope::AllTables
                 }
-            } else if matches!(self.peek(), Token::Table | Token::Tables) {
-                // PG 19 accepts both `FOR TABLE …` (singular) and
-                // `FOR TABLES …` (plural); SPG matches.
+            } else if matches!(self.peek(), Token::Table) {
                 self.advance();
                 let tables = self.parse_publication_table_list()?;
                 PublicationScope::ForTables(tables)
+            } else if matches!(self.peek(), Token::Tables) {
+                // v7.39 (round 754, F31-B5) — PG18-measured: the bare
+                // plural (`FOR TABLES t`) is REJECTED (`invalid
+                // publication object list`); TABLES only pairs with
+                // `IN SCHEMA`. The old arm accepted it on an
+                // unverifiable "PG 19 accepts both" claim.
+                self.advance();
+                if !matches!(self.peek(), Token::In) {
+                    return Err(self.err(alloc::string::String::from(
+                        "invalid publication object list",
+                    )));
+                }
+                self.advance();
+                if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("schema")) {
+                    return Err(self.err(format!(
+                        "expected SCHEMA after FOR TABLES IN, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                let schema = self.expect_ident_or_string()?;
+                PublicationScope::TablesInSchema(schema)
             } else {
                 return Err(self.err(format!(
                     "expected ALL TABLES or TABLE <list> after FOR, got {:?}",
@@ -27841,7 +27866,7 @@ mod tests {
     #[test]
     fn parser_recognises_drop_publication() {
         let s = parse("DROP PUBLICATION pub_a");
-        let Statement::DropPublication(name) = s else {
+        let Statement::DropPublication { name, .. } = s else {
             panic!("expected DropPublication, got {s:?}")
         };
         assert_eq!(name, "pub_a");
@@ -27861,16 +27886,25 @@ mod tests {
     }
 
     #[test]
-    fn parser_recognises_for_tables_plural() {
-        // PG 19 accepts both `FOR TABLE` and `FOR TABLES` — match.
-        let s = parse("CREATE PUBLICATION pub_a FOR TABLES t1, t2");
+    fn parser_rejects_bare_for_tables_and_takes_in_schema() {
+        // v7.39 (round 754, F31-B5) — PG18-measured: the bare plural
+        // is rejected (`invalid publication object list`; the old
+        // test pinned an unverifiable "PG 19 accepts both" claim);
+        // TABLES pairs with IN SCHEMA.
+        let err = parse_statement("CREATE PUBLICATION pub_a FOR TABLES t1, t2")
+            .expect_err("bare FOR TABLES must reject");
+        assert!(
+            alloc::format!("{err}").contains("invalid publication object list"),
+            "got: {err}"
+        );
+        let s = parse("CREATE PUBLICATION pub_a FOR TABLES IN SCHEMA public");
         let Statement::CreatePublication(p) = s else {
             panic!("expected CreatePublication, got {s:?}")
         };
-        let PublicationScope::ForTables(ts) = p.scope else {
-            panic!("expected ForTables")
+        let PublicationScope::TablesInSchema(schema) = p.scope else {
+            panic!("expected TablesInSchema")
         };
-        assert_eq!(ts, alloc::vec!["t1", "t2"]);
+        assert_eq!(schema, "public");
     }
 
     #[test]
@@ -27944,7 +27978,7 @@ mod tests {
     #[test]
     fn parser_recognises_drop_subscription() {
         let s = parse("DROP SUBSCRIPTION sub_a");
-        let Statement::DropSubscription(name) = s else {
+        let Statement::DropSubscription { name, .. } = s else {
             panic!("expected DropSubscription, got {s:?}")
         };
         assert_eq!(name, "sub_a");
@@ -28069,7 +28103,7 @@ mod tests {
         assert_eq!(name, "alice");
         // And DROP PUBLICATION lands the new variant.
         let s = parse("DROP PUBLICATION p1");
-        assert!(matches!(s, Statement::DropPublication(_)));
+        assert!(matches!(s, Statement::DropPublication { .. }));
     }
 
     #[test]

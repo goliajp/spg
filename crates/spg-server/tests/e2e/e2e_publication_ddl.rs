@@ -94,10 +94,14 @@ fn create_publication_roundtrip_basic() {
     let affected = expect_cc(&mut s);
     assert_eq!(affected, 1, "DROP existing publication affected=1");
 
-    // DROP after first drop is a silent no-op → affected=0.
+    // v7.39 (round 754, F31-B4) — DROP after the first drop REFUSES
+    // with PG's sentence (PG18-measured); IF EXISTS skips quietly.
     send_query(&mut s, "DROP PUBLICATION pub_a");
+    let err = expect_err(&mut s);
+    assert!(err.contains("publication \"pub_a\" does not exist"), "got: {err}");
+    send_query(&mut s, "DROP PUBLICATION IF EXISTS pub_a");
     let affected = expect_cc(&mut s);
-    assert_eq!(affected, 0, "DROP absent publication affected=0");
+    assert_eq!(affected, 0, "IF EXISTS on absent publication affected=0");
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -124,7 +128,10 @@ fn duplicate_publication_name_errors() {
 }
 
 #[test]
-fn drop_nonexistent_publication_succeeds_silently() {
+fn drop_nonexistent_publication_refuses_if_exists_skips() {
+    // v7.39 (round 754, F31-B4) — PG18-measured: the bare form
+    // refuses (the old "succeeds silently" pin asserted a behaviour
+    // PG does not have); IF EXISTS skips.
     let dir = unique_tmpdir();
     let db = dir.join("spg.db");
     let (raw, addrs) = local_spawn(&db);
@@ -133,7 +140,13 @@ fn drop_nonexistent_publication_succeeds_silently() {
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
     send_query(&mut s, "DROP PUBLICATION never_existed");
-    expect_cc(&mut s); // must succeed
+    let err = expect_err(&mut s);
+    assert!(
+        err.contains("publication \"never_existed\" does not exist"),
+        "got: {err}"
+    );
+    send_query(&mut s, "DROP PUBLICATION IF EXISTS never_existed");
+    expect_cc(&mut s);
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -246,6 +259,11 @@ fn for_table_list_succeeds_and_shows_scope() {
     let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
+    // v7.39 (round 754) — listed relations must exist now.
+    send_query(&mut s, "CREATE TABLE t1 (id INT)");
+    expect_cc(&mut s);
+    send_query(&mut s, "CREATE TABLE t2 (id INT)");
+    expect_cc(&mut s);
     send_query(&mut s, "CREATE PUBLICATION pub_a FOR TABLE t1, t2");
     expect_cc(&mut s);
 
@@ -268,6 +286,11 @@ fn for_all_tables_except_succeeds_and_shows_scope() {
     let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
+    // v7.39 (round 754) — listed relations must exist now.
+    send_query(&mut s, "CREATE TABLE t3 (id INT)");
+    expect_cc(&mut s);
+    send_query(&mut s, "CREATE TABLE t4 (id INT)");
+    expect_cc(&mut s);
     send_query(
         &mut s,
         "CREATE PUBLICATION pub_a FOR ALL TABLES EXCEPT t3, t4",
@@ -293,6 +316,11 @@ fn show_publications_returns_all_scope_variants_ordered_by_name() {
     let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
+    // v7.39 (round 754) — listed relations must exist now.
+    send_query(&mut s, "CREATE TABLE t1 (id INT)");
+    expect_cc(&mut s);
+    send_query(&mut s, "CREATE TABLE bad (id INT)");
+    expect_cc(&mut s);
     send_query(&mut s, "CREATE PUBLICATION z_all");
     expect_cc(&mut s);
     send_query(&mut s, "CREATE PUBLICATION a_list FOR TABLE t1");

@@ -334,8 +334,14 @@ impl Engine {
     pub(crate) fn exec_drop_subscription(
         &mut self,
         name: &str,
+        if_exists: bool,
     ) -> Result<QueryResult, EngineError> {
         let removed = self.subscriptions.drop(name);
+        if !removed && !if_exists {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "subscription \"{name}\" does not exist"
+            )));
+        }
         Ok(QueryResult::CommandOk {
             affected: usize::from(removed),
             modified_catalog: removed,

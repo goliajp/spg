@@ -132,6 +132,9 @@ impl Publications {
                     out.push(SCOPE_ALL_TABLES_EXCEPT);
                     write_table_list(&mut out, ts);
                 }
+                // Folded to AllTables at exec_create_publication; the
+                // catalog never stores it.
+                PublicationScope::TablesInSchema(_) => unreachable!(),
             }
         }
         out
@@ -260,6 +263,8 @@ impl Engine {
                         alloc::format!("FOR ALL TABLES EXCEPT {}", ts.join(", ")),
                         Value::Int(i32::try_from(ts.len()).unwrap_or(i32::MAX)),
                     ),
+                    // Folded at exec_create_publication; never stored.
+                    spg_sql::ast::PublicationScope::TablesInSchema(_) => unreachable!(),
                 };
                 Row::new(alloc::vec![
                     Value::text(name.clone()),
@@ -287,8 +292,36 @@ impl Engine {
         // path (which begins an internal TX around every WAL-
         // logged statement). PG itself allows CREATE PUBLICATION
         // inside a transaction (it rolls back with the TX).
+        // v7.39 (round 754, F31-B5) — `FOR TABLES IN SCHEMA` folds at
+        // execution: `public` IS the whole single-schema table space,
+        // any other name does not exist here (PG's sentence, PG18-
+        // measured).
+        // v7.39 (round 754) — PG18-measured: every listed relation
+        // must exist (`relation "x" does not exist`); the old path
+        // recorded unknown names silently.
+        if let PublicationScope::ForTables(ts) | PublicationScope::AllTablesExcept(ts) = &s.scope {
+            for t in ts {
+                if self.active_catalog().get(t).is_none() {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "relation \"{t}\" does not exist"
+                    )));
+                }
+            }
+        }
+        let scope = match s.scope {
+            PublicationScope::TablesInSchema(schema) => {
+                if schema.eq_ignore_ascii_case("public") {
+                    PublicationScope::AllTables
+                } else {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "schema \"{schema}\" does not exist"
+                    )));
+                }
+            }
+            other => other,
+        };
         self.publications
-            .create(s.name, s.scope)
+            .create(s.name, scope)
             .map_err(|e| EngineError::Unsupported(alloc::format!("CREATE PUBLICATION: {e:?}")))?;
         Ok(QueryResult::CommandOk {
             affected: 1,
@@ -296,12 +329,23 @@ impl Engine {
         })
     }
 
-    /// v6.1.2 — `DROP PUBLICATION` runtime path. PG-compatible silent
-    /// no-op when the publication doesn't exist (returns `affected=0`
+    /// v6.1.2 — `DROP PUBLICATION` runtime path. v7.39 (round 754,
+    /// F31-B4): a missing name REFUSES with PG's sentence unless
+    /// `IF EXISTS` was written — the old "PG-compatible silent no-op"
+    /// note here was measured false (PG errors). (`affected=0`
     /// in that case so the wire-level command tag distinguishes
     /// "dropped" from "no-op", though both succeed).
-    pub(crate) fn exec_drop_publication(&mut self, name: &str) -> Result<QueryResult, EngineError> {
+    pub(crate) fn exec_drop_publication(
+        &mut self,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<QueryResult, EngineError> {
         let removed = self.publications.drop(name);
+        if !removed && !if_exists {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "publication \"{name}\" does not exist"
+            )));
+        }
         Ok(QueryResult::CommandOk {
             affected: usize::from(removed),
             modified_catalog: removed,
