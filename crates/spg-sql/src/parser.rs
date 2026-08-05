@@ -9957,10 +9957,43 @@ impl Parser {
                 // first draft (the name was eaten and WITH parsed as the
                 // role). The cursor is at the name.
                 let name = self.expect_ident_or_string()?;
-                self.consume_until_statement_boundary();
+                // v7.39 (round 750) — scan the attribute tail for
+                // PASSWORD. Everything else stays a recorded no-op, but
+                // a dropped credential rotation is a SECURITY bug:
+                // `ALTER USER x PASSWORD 'new'` answered ALTER ROLE and
+                // changed nothing, so the old password kept working.
+                // ENCRYPTED/UNENCRYPTED are PG-noise prefixes; `PASSWORD
+                // NULL` clears the credential.
+                let mut password: Option<Option<String>> = None;
+                loop {
+                    match self.peek() {
+                        Token::Semicolon | Token::Eof => break,
+                        Token::Ident(w) if w.eq_ignore_ascii_case("password") => {
+                            self.advance();
+                            match self.advance() {
+                                Token::String(p) => password = Some(Some(p)),
+                                Token::Null => password = Some(None),
+                                Token::Ident(n) if n.eq_ignore_ascii_case("null") => {
+                                    password = Some(None);
+                                }
+                                other => {
+                                    return Err(self.err(alloc::format!(
+                                        "expected password string or NULL after PASSWORD, got {other:?}"
+                                    )));
+                                }
+                            }
+                        }
+                        _ => {
+                            self.advance();
+                        }
+                    }
+                }
                 if name.eq_ignore_ascii_case("all") {
                     // `ALTER ROLE ALL …` names every role; nothing to check.
                     return Ok(Statement::Empty);
+                }
+                if let Some(pw) = password {
+                    return Ok(Statement::AlterRolePassword { name, password: pw });
                 }
                 return Ok(Statement::ValidateOnly {
                     kind: crate::ast::ValidateOnlyKind::RoleName,

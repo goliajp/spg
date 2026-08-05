@@ -1476,6 +1476,25 @@ impl Engine {
                     modified_catalog: false,
                 })
             }
+            // v7.39 (round 750) — `ALTER ROLE … PASSWORD` really rotates
+            // the credential now (it was a recorded no-op — ledgered as a
+            // security defect in round 710: `ALTER USER x PASSWORD 'new'`
+            // answered ALTER ROLE and the OLD password kept working).
+            Statement::AlterRolePassword { name, password } => {
+                if !self.role_exists(name.as_str()) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "role \"{name}\" does not exist"
+                    )));
+                }
+                self.alter_user_password(&name, password.as_deref())
+                    .map_err(|e| {
+                        EngineError::Unsupported(alloc::format!("ALTER ROLE: {e}"))
+                    })?;
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: !self.in_transaction(),
+                })
+            }
             Statement::ValidateOnly { kind, names } => {
                 use spg_sql::ast::ValidateOnlyKind as K;
                 match kind {
