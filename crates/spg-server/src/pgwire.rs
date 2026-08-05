@@ -2227,7 +2227,20 @@ fn execute_with_role(
                     .engine
                     .write()
                     .map_err(|_| EngineError::Unsupported("engine rwlock poisoned".into()))?;
-                engine.execute_in_with_cancel(sql, tx_id, cancel)
+                let r = engine.execute_in_with_cancel(sql, tx_id, cancel);
+                // v7.39 (round 740) — matview delta ground-truth trace,
+                // opt-in; reads the engine's public counters.
+                if std::env::var("SPG_MATVIEW_TRACE").is_ok() {
+                    use core::sync::atomic::Ordering;
+                    eprintln!(
+                        "spg-server: matview-trace sql={:?} fanout={} applied={} bailed={}",
+                        &sql[..sql.len().min(60)],
+                        spg_engine::MATVIEW_FANOUT_BUFFERED.load(Ordering::Relaxed),
+                        spg_engine::MATVIEW_DELTA_APPLIED.load(Ordering::Relaxed),
+                        spg_engine::MATVIEW_DELTA_BAILED.load(Ordering::Relaxed),
+                    );
+                }
+                r
             }; // guard drops here — the holder can now commit
             match attempt {
                 Err(EngineError::LockWouldBlock) => {

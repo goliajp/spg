@@ -222,3 +222,73 @@ fn round739_update_delta_matches_full_recompute() {
         .unwrap();
     assert_eq!(one(&mut e, "SELECT count(*) FROM mv739"), "18");
 }
+
+/// v7.39 (round 740) — GROUND TRUTH that the delta path actually runs
+/// (the content pins above cannot tell "applied" from "silently full").
+#[test]
+fn round740_delta_path_engages() {
+    use core::sync::atomic::Ordering;
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE b740 (id INT, g INT)").unwrap();
+    e.execute("INSERT INTO b740 SELECT gg, gg % 3 FROM generate_series(1, 30) gg")
+        .unwrap();
+    e.execute("CREATE MATERIALIZED VIEW mv740 AS SELECT id FROM b740 WHERE g <> 1")
+        .unwrap();
+    // Full refresh #1 installs watermark + row map.
+    e.execute("INSERT INTO b740 VALUES (31, 0)").unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW mv740").unwrap();
+    let buffered0 = spg_engine::MATVIEW_FANOUT_BUFFERED.load(Ordering::Relaxed);
+    let applied0 = spg_engine::MATVIEW_DELTA_APPLIED.load(Ordering::Relaxed);
+    // Mixed changes, then the refresh that MUST take the delta path.
+    e.execute("INSERT INTO b740 VALUES (32, 2)").unwrap();
+    e.execute("UPDATE b740 SET g = 1 WHERE id = 5").unwrap();
+    e.execute("DELETE FROM b740 WHERE id = 6").unwrap();
+    assert!(
+        spg_engine::MATVIEW_FANOUT_BUFFERED.load(Ordering::Relaxed) > buffered0,
+        "the fan-out must have buffered these changes"
+    );
+    e.execute("REFRESH MATERIALIZED VIEW mv740").unwrap();
+    assert!(
+        spg_engine::MATVIEW_DELTA_APPLIED.load(Ordering::Relaxed) > applied0,
+        "this refresh must have taken the DELTA path, not fallen back to full \
+         (bailed={} buffered={})",
+        spg_engine::MATVIEW_DELTA_BAILED.load(Ordering::Relaxed),
+        spg_engine::MATVIEW_FANOUT_BUFFERED.load(Ordering::Relaxed),
+    );
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mv740"), "20");
+}
+
+/// v7.39 (round 740) — the server-scale reproduction: 500k base, the
+/// exact statement sequence the wire probe ran. Diagnoses whether the
+/// delta bail seen on the wire is scale-related or server-layer.
+#[test]
+fn round740_delta_engages_at_server_scale() {
+    use core::sync::atomic::Ordering;
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE big740 (id INT, g INT, s TEXT)").unwrap();
+    e.execute(
+        "INSERT INTO big740 SELECT gg, gg % 100, 'row' || gg FROM generate_series(1, 500000) gg",
+    )
+    .unwrap();
+    e.execute("CREATE MATERIALIZED VIEW mvb740 AS SELECT id, s FROM big740 WHERE g < 50")
+        .unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW mvb740").unwrap();
+    let applied0 = spg_engine::MATVIEW_DELTA_APPLIED.load(Ordering::Relaxed);
+    let bailed0 = spg_engine::MATVIEW_DELTA_BAILED.load(Ordering::Relaxed);
+    e.execute("INSERT INTO big740 VALUES (500001, 7, 'x'), (500002, 99, 'y')").unwrap();
+    e.execute("UPDATE big740 SET g = 99 WHERE id = 10").unwrap();
+    e.execute("DELETE FROM big740 WHERE id IN (20, 21)").unwrap();
+    let t0 = std::time::Instant::now();
+    e.execute("REFRESH MATERIALIZED VIEW mvb740").unwrap();
+    let delta_ms = t0.elapsed().as_micros() as f64 / 1000.0;
+    assert!(
+        delta_ms < 20.0,
+        "the delta refresh must be far under the ~180ms full recompute, got {delta_ms}ms"
+    );
+    assert!(
+        spg_engine::MATVIEW_DELTA_APPLIED.load(Ordering::Relaxed) > applied0,
+        "500k-scale refresh must take the delta path (bailed delta: {})",
+        spg_engine::MATVIEW_DELTA_BAILED.load(Ordering::Relaxed) - bailed0,
+    );
+    assert_eq!(one(&mut e, "SELECT count(*) FROM mvb740"), "249998");
+}

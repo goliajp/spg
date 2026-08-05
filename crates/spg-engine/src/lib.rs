@@ -887,6 +887,15 @@ pub(crate) const PARALLEL_MIN_ROWS: usize = 100_000;
 
 /// v7.39 — diagnostic counter: how many aggregate scans took the
 /// sharded path (read by benches to ground-truth activation).
+/// v7.39 (round 740) — matview delta ground-truth counters (the r735
+/// lesson: a green content pin cannot distinguish "delta applied" from
+/// "silently fell back to full"; these can).
+pub static MATVIEW_FANOUT_BUFFERED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static MATVIEW_DELTA_APPLIED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static MATVIEW_DELTA_BAILED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 pub static PARALLEL_AGG_FIRED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
@@ -2751,6 +2760,8 @@ impl Engine {
                     self.matview_delta_buf.remove(&mv);
                 } else {
                     buf.push(ch.clone());
+                    MATVIEW_FANOUT_BUFFERED
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
