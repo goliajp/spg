@@ -808,6 +808,42 @@ impl Table {
             .map(|(i, (r, _))| (i, r))
     }
 
+    /// The hot-tier slot a scan should resume at, given the last
+    /// [`RowId`](crate::row_header::RowId) it consumed and where that row
+    /// used to sit.
+    ///
+    /// Slots move. `vacuum` reclaims tombstones by rebuilding the row
+    /// vector, so every position after the first reclaimed one shifts
+    /// down — a reader that remembered a bare index would silently skip
+    /// or repeat rows. Row ids do not move: they are allocated
+    /// monotonically and never reused, which makes them the only stable
+    /// way to say "carry on after this row".
+    ///
+    /// `hint` is the position that row occupied when it was read. It is
+    /// still right whenever nothing was reclaimed under the reader, so
+    /// the check costs one lookup; the binary search is the fallback for
+    /// when it is not, and it works because appends only ever push
+    /// larger ids and reclaiming preserves their order.
+    pub fn resume_slot_after(&self, last: crate::row_header::RowId, hint: usize) -> usize {
+        if hint > 0
+            && self
+                .rowids
+                .get(hint - 1)
+                .is_some_and(|&r| r == last)
+        {
+            return hint;
+        }
+        let (mut lo, mut hi) = (0usize, self.rowids.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.rowids.get(mid) {
+                Some(&r) if r <= last => lo = mid + 1,
+                _ => hi = mid,
+            }
+        }
+        lo
+    }
+
     /// The same visibility-gated walk as [`Table::scan_visible`], resuming
     /// at hot-tier index `start`.
     ///

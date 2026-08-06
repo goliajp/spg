@@ -50,8 +50,14 @@ pub(crate) struct LazyScan {
     /// cursor's snapshot at DECLARE even in READ COMMITTED, and the
     /// eager path gets this for free by reading everything up front.
     pub snapshot: spg_storage::snapshot::Snapshot,
-    /// Hot-tier index the next batch resumes at.
-    pub next_index: usize,
+    /// The last row the cursor consumed, and the slot it sat in.
+    ///
+    /// The id is the authority and the slot is a hint: `vacuum` rebuilds
+    /// the row vector when it reclaims tombstones, so a bare index would
+    /// point somewhere else afterwards and the drain would skip or
+    /// repeat rows. `None` before the first batch.
+    pub last_rowid: Option<spg_storage::row_header::RowId>,
+    pub slot_hint: usize,
     /// The scan reached the end of the table; `rows` is now the whole
     /// result and the cursor behaves exactly like an eager one.
     pub done: bool,
@@ -362,9 +368,12 @@ impl crate::Engine {
         let mut budget = crate::bytebudget::ByteBudget::new(self.max_query_bytes);
         let mut produced = 0usize;
         let mut hit_end = true;
-        for (i, row) in table.scan_visible_from(lz.next_index, &lz.snapshot) {
+        let start = match lz.last_rowid {
+            None => 0,
+            Some(last) => table.resume_slot_after(last, lz.slot_hint),
+        };
+        for (i, row) in table.scan_visible_from(start, &lz.snapshot) {
             if want.is_some_and(|w| produced >= w) {
-                lz.next_index = i;
                 hit_end = false;
                 break;
             }
@@ -374,7 +383,10 @@ impl crate::Engine {
             // twice if the cursor were fetched again. It cannot be
             // today — the error aborts the transaction — but the state
             // it leaves behind should not depend on that.
-            lz.next_index = i + 1;
+            if let Some(&rid) = table.rowids().get(i) {
+                lz.last_rowid = Some(rid);
+                lz.slot_hint = i + 1;
+            }
             if let Some(w) = &lz.stmt.where_ {
                 let cond = crate::eval::eval_expr(w, row, &ctx).map_err(EngineError::Eval)?;
                 if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
@@ -477,7 +489,8 @@ impl crate::Engine {
                     table,
                     alias,
                     snapshot: self.current_snapshot(),
-                    next_index: 0,
+                    last_rowid: None,
+                    slot_hint: 0,
                     done: false,
                 };
                 (columns, Vec::new(), Some(lz))
