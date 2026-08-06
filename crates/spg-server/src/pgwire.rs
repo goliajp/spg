@@ -893,6 +893,21 @@ fn handle_pg_simple_query(
                         send_row_description(wbuf, columns)
                             .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
                         header_written = true;
+                        // Tell the outer error match that bytes for
+                        // this statement are already in `wbuf`. It has
+                        // to be set here, not after the executor
+                        // returns: the `!wrote_header` arm rewinds and
+                        // re-runs the whole statement through
+                        // `execute_with_role`, which is right for a
+                        // shape refusal (nothing emitted yet) and
+                        // wrong once rows exist. A SCALARSQ SELECT
+                        // erroring mid-stream — division by zero,
+                        // byte budget, cancel — used to land there and
+                        // discard already-encoded rows (measured: 1741
+                        // bytes for a 99-row prefix) to execute a
+                        // second time. The generic emit closure above
+                        // has always set the flag at header time.
+                        wrote_header = true;
                     }
                     let before = wbuf.len();
                     encode_data_row_from_values(
