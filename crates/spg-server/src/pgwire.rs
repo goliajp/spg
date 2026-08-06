@@ -782,6 +782,27 @@ fn handle_pg_simple_query(
         } else {
             None
         };
+        // v7.39 (round 798) — flush the encoded rows to the socket as
+        // they accumulate instead of holding the whole response.
+        //
+        // Measured on a 300k-row SELECT: the write buffer accounts for
+        // roughly the encoded size of the result — 63 MB of the 145 MB a
+        // wide projection costs, and it grows without bound because
+        // nothing sent it until the last row was encoded. One buffer of
+        // this size per concurrent large query is what a server cannot
+        // promise. A watermark turns that into a constant: 63 flushes
+        // for that query rather than 300k syscalls, which is why the
+        // watermark is a megabyte and not a row.
+        //
+        // Flushing forfeits the ability to withdraw what was written.
+        // The arm that rewinds and re-runs the statement is unreachable
+        // once rows exist (round 791 moved `wrote_header` to where the
+        // header is actually written), and the mid-stream error arm's
+        // `truncate(pre_len)` becomes a no-op after a flush, so the
+        // client sees the rows it was already sent followed by an
+        // ErrorResponse — which is what PG does at the protocol level,
+        // and what libpq clients discard anyway.
+        const WBUF_FLUSH_WATERMARK: usize = 1 << 20;
         // Factor the emit closure body once so cache-hit and miss
         // paths share the encode logic without duplication.
         let mut emit = |item: spg_engine::StreamItem<'_>| -> Result<(), spg_engine::EngineError> {
@@ -816,7 +837,14 @@ fn handle_pg_simple_query(
                         &wire_style,
                         &wire_tz,
                     )
-                    .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
+                    .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
+                    if wbuf.len() >= WBUF_FLUSH_WATERMARK {
+                        stream
+                            .write_all(wbuf)
+                            .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
+                        wbuf.clear();
+                    }
+                    Ok(())
                 }
             }
         };
@@ -922,6 +950,12 @@ fn handle_pg_simple_query(
                     if first_row_size.is_none() {
                         first_row_size = Some(wbuf.len() - before);
                     }
+                    if wbuf.len() >= WBUF_FLUSH_WATERMARK {
+                        stream
+                            .write_all(wbuf)
+                            .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
+                        wbuf.clear();
+                    }
                     Ok(())
                 };
                 let (columns, n) = engine_lock.execute_readonly_select_with_arena(
@@ -962,6 +996,12 @@ fn handle_pg_simple_query(
                             .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
                             if first_row_size.is_none() {
                                 first_row_size = Some(wbuf.len() - before);
+                            }
+                            if wbuf.len() >= WBUF_FLUSH_WATERMARK {
+                                stream.write_all(wbuf).map_err(|e| {
+                                    spg_engine::EngineError::Unsupported(e.to_string())
+                                })?;
+                                wbuf.clear();
                             }
                         }
                         Ok(rows.len())
