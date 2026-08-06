@@ -1300,6 +1300,16 @@ impl Engine {
         // nothing (row numbers are 8 B each), so the budget charges
         // land where the clones happen — the materialising fallback
         // here, eager peers below, and the output assembly.
+        // v7.39 (round 790) — the joins-only exclusion here was TRIED
+        // and reverted. Relaxing it (so a joinless FROM also seeds the
+        // primary by row index instead of materialising) measured
+        // WORSE, not better: 147 MB → 178 MB on the 300k-row probe.
+        // The index seed avoids the row copy but the joinless output
+        // assembly then pays more than it saves; the streaming gate in
+        // select.rs is where the single-table win actually came from
+        // (181 → 147 MB). Leave this one alone until someone profiles
+        // the joinless output path — see
+        // `.claude/state/t35c-single-table-streaming-gap.md`.
         let primary_table: Option<&Table> = if !from.joins.is_empty()
             && from.primary.unnest_expr.is_none()
             && from.primary.lateral_subquery.is_none()

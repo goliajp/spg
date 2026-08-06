@@ -6821,9 +6821,16 @@ impl Engine {
         let Some(from) = &stmt.from else {
             return Ok(None);
         };
-        if from.joins.is_empty() {
-            return Ok(None);
-        }
+        // v7.39 (round 790) — single-table SELECTs stream too. This
+        // gate said "joins only" because the path was written for
+        // mailrs's joined PROJ shape; a plain `SELECT <cols> FROM t`
+        // fell to the materialising fallback, which builds the whole
+        // `Vec<Row<'static>>` and only then iterates it. Measured on
+        // 300k rows: 181 MB single-table vs 70 MB for the SAME rows
+        // reached through a one-row JOIN — 2.6x, purely for lacking a
+        // join. The deferred-join structure handles one source as the
+        // degenerate stride-1 case, so the walk below is unchanged.
+        let _single_table = from.joins.is_empty();
         if !stmt.order_by.is_empty()
             || stmt.limit.is_some()
             || stmt.offset.is_some()
