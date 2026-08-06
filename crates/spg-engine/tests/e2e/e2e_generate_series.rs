@@ -309,12 +309,11 @@ fn integer_series_element_type_matches_pg() {
         ),
         "bigint"
     );
-    // sum(int4) widens to bigint. v7.39 (round 774 audit, H1) — PG
-    // 18.4's catalog has NO sum(integer) aggregate (smallint/bigint/
-    // numeric/… only), so int4 resolves to the FLOAT8 overload there
-    // (pg_typeof answers double precision). SPG keeps the exact
-    // bigint; ledgered as a wire-typing decision item, text output is
-    // identical for whole numbers.
+    // sum(int4) widens to bigint (matches PG). v7.39 (round 782) —
+    // the round-774 note claiming PG resolves int4 to its float8
+    // overload was measured against a TAMPERED oracle: that database
+    // had pg_proc oid 2108 (sum(integer)) renamed to `x708`, so the
+    // name could not resolve. Stock PG18 answers bigint, as here.
     assert_eq!(
         typ(
             &mut e,
