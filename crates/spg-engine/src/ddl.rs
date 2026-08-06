@@ -5284,7 +5284,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: removed,
-            modified_catalog: removed > 0 && !self.in_transaction(),
+            modified_catalog: removed > 0 && self.catalog_change_is_committed(),
         })
     }
 
@@ -5338,7 +5338,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: removed,
-            modified_catalog: removed > 0 && !self.in_transaction(),
+            modified_catalog: removed > 0 && self.catalog_change_is_committed(),
         })
     }
 
@@ -5373,7 +5373,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: removed,
-            modified_catalog: removed > 0 && !self.in_transaction(),
+            modified_catalog: removed > 0 && self.catalog_change_is_committed(),
         })
     }
 
@@ -5808,7 +5808,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: removed,
-            modified_catalog: removed > 0 && !self.in_transaction(),
+            modified_catalog: removed > 0 && self.catalog_change_is_committed(),
         })
     }
 
@@ -5846,7 +5846,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: removed,
-            modified_catalog: removed > 0 && !self.in_transaction(),
+            modified_catalog: removed > 0 && self.catalog_change_is_committed(),
         })
     }
 
@@ -5879,7 +5879,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: removed,
-            modified_catalog: removed > 0 && !self.in_transaction(),
+            modified_catalog: removed > 0 && self.catalog_change_is_committed(),
         })
     }
 }

@@ -221,3 +221,61 @@ fn ddl_survives_a_crash_even_while_another_connection_holds_a_transaction() {
          victim_tbl was gone and control_tbl was not"
     );
 }
+
+/// r797 — the same gap, still open in the DROP family.
+///
+/// Round 795 replaced `modified_catalog: !self.in_transaction()`
+/// wherever it appeared verbatim. Six sites wrote it as
+/// `removed > 0 && !self.in_transaction()` — DROP DOMAIN, DROP SCHEMA,
+/// DROP TYPE, DROP MATERIALIZED VIEW, DROP VIEW, DROP SEQUENCE — and a
+/// textual replacement walked straight past them. Measured before the
+/// fix: DROP VIEW with another connection holding a transaction reported
+/// success, and the view was back after kill -9 and a restart.
+///
+/// A dropped object coming back is the mirror of round 795's created
+/// table going away, and it is the reason this round audited all
+/// forty-five `in_transaction()` sites by hand instead of matching the
+/// pattern once more.
+#[test]
+fn a_drop_stays_dropped_even_while_another_connection_holds_a_transaction() {
+    let dir = unique_dir("dropfamily");
+    let db = dir.join("spg.db");
+    let (raw, addrs) = spawn_on(&db, None);
+    let addr = addrs.pgwire.as_ref().unwrap().clone();
+
+    let mut worker = open(&addr);
+    assert!(!errored(&q(&mut worker, "CREATE TABLE t (id INT)")));
+    assert!(!errored(&q(
+        &mut worker,
+        "CREATE VIEW control_v AS SELECT id FROM t"
+    )));
+    assert!(!errored(&q(
+        &mut worker,
+        "CREATE VIEW victim_v AS SELECT id FROM t"
+    )));
+    // Gets the pre-drop state to disk with nobody else in a transaction.
+    assert!(!errored(&q(&mut worker, "DROP VIEW control_v")));
+
+    let mut holder = open(&addr);
+    q(&mut holder, "BEGIN");
+    assert!(!errored(&q(&mut worker, "DROP VIEW victim_v")));
+
+    let mut raw = raw;
+    raw.kill().expect("kill the server");
+    raw.wait().ok();
+    drop(worker);
+    drop(holder);
+
+    let (raw2, addrs2) = spawn_on(&db, None);
+    let _child2 = common::ChildGuard(raw2);
+    let mut after_conn = open(addrs2.pgwire.as_ref().unwrap());
+    let views = col0(&q(
+        &mut after_conn,
+        "SELECT viewname FROM pg_views WHERE viewname LIKE '%_v' ORDER BY 1",
+    ));
+    assert!(
+        views.is_empty(),
+        "both DROPs were acked; before the fix victim_v came back, got {views:?}"
+    );
+}
+
