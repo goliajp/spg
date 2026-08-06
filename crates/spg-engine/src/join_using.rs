@@ -266,8 +266,31 @@ impl Engine {
     /// (`None` for a non-catalog source).
     fn table_qual_and_columns(&self, tref: &TableRef) -> (String, Option<Vec<String>>) {
         let qual = tref.alias.clone().unwrap_or_else(|| tref.name.clone());
+        // v7.39 (round 778, F31-F1) — a derived table / VALUES source
+        // has a resolvable schema too: the `x(id, v)` alias list wins,
+        // else the inner projection's own output names (PG accepts
+        // USING/NATURAL over these; SPG refused with "requires table
+        // sources with known schemas").
+        if let Some(inner) = tref.lateral_subquery.as_deref() {
+            if !tref.unnest_column_aliases.is_empty() {
+                return (qual, Some(tref.unnest_column_aliases.clone()));
+            }
+            let mut names: Vec<String> = Vec::with_capacity(inner.items.len());
+            for item in &inner.items {
+                match item {
+                    spg_sql::ast::SelectItem::Expr { expr, alias } => {
+                        names.push(alias.clone().unwrap_or_else(|| {
+                            crate::select::default_output_name(expr, false)
+                        }));
+                    }
+                    // A wildcard-bearing inner projection is not
+                    // resolvable here — keep the old refusal.
+                    _ => return (qual, None),
+                }
+            }
+            return (qual, Some(names));
+        }
         let is_non_catalog = tref.unnest_expr.is_some()
-            || tref.lateral_subquery.is_some()
             || tref.generate_series_args.is_some()
             || tref.jsonb_each_text_arg.is_some();
         if is_non_catalog {
