@@ -4491,7 +4491,12 @@ pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
     let code =
         // v7.37.17 (Phase E3) — isolation switch after the tx's first
         // query: PG's 25001 ACTIVE_SQL_TRANSACTION.
-        if msg.contains("must be called before any query") {
+        if msg.contains("must be called before any query")
+            // PG's PreventInTransactionBlock family — VACUUM, ALTER
+            // SYSTEM, CREATE DATABASE, the CONCURRENTLY index forms,
+            // DISCARD ALL. All 25001, all phrased this way.
+            || msg.contains("cannot run inside a transaction block")
+        {
             "25001"
         // v7.39 (bpchar epic) — CHAR(n)/VARCHAR(n) overflow is PG's 22001
         // STRING_DATA_RIGHT_TRUNCATION.

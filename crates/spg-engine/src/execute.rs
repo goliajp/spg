@@ -1693,7 +1693,17 @@ impl Engine {
                     modified_catalog: false,
                 })
             }
+            Statement::NoOpPreventedInTransaction { what } => {
+                self.require_no_transaction_block(&what)?;
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
             Statement::AlterSystem { parameter } => {
+                // PG refuses this inside a transaction block (25001): it
+                // edits postgresql.auto.conf, which no rollback undoes.
+                self.require_no_transaction_block("ALTER SYSTEM")?;
                 if let Some(name) = parameter
                     && let Some(msg) = self.reject_unsettable_guc(name.as_str())
                 {
@@ -1706,7 +1716,14 @@ impl Engine {
             }
             Statement::DropTable { names, if_exists } => self.exec_drop_table(names, if_exists),
             Statement::DropIndex { name, if_exists } => self.exec_drop_index(name, if_exists),
-            Statement::CreateIndex(s) => self.exec_create_index(s),
+            Statement::CreateIndex(s) => {
+                // PG bars only the CONCURRENTLY form inside a transaction
+                // block (25001); a plain CREATE INDEX there is fine.
+                if s.concurrently {
+                    self.require_no_transaction_block("CREATE INDEX CONCURRENTLY")?;
+                }
+                self.exec_create_index(s)
+            }
             Statement::Insert(s) => {
                 // v7.39 (pg_stat knife A) — per-table n_tup_ins. Charged
                 // to the statement's target (a partition-routed insert
@@ -1982,8 +1999,18 @@ impl Engine {
             // the wire, so `REINDEX TABLE typo` answered `REINDEX`. A
             // maintenance script that misspells a table was told it
             // succeeded.
-            Statement::Maintain { kind, target } => {
+            Statement::Maintain {
+                kind,
+                concurrently,
+                target,
+            } => {
                 use spg_sql::ast::MaintainKind;
+                if concurrently {
+                    self.require_no_transaction_block(match kind {
+                        MaintainKind::ClusterRelation => "CLUSTER",
+                        _ => "REINDEX CONCURRENTLY",
+                    })?;
+                }
                 match (kind, target.as_deref()) {
                     (MaintainKind::ReindexRelation | MaintainKind::ClusterRelation, Some(t)) => {
                         // An INDEX is a relation too — `REINDEX INDEX ix`
@@ -2026,6 +2053,12 @@ impl Engine {
             // parse-time no-op silently ignored a customer's manual
             // reclaim. Gate-off stays a provable no-op inside vacuum.
             Statement::Vacuum { table, analyze } => {
+                // PG 18.4, measured: every VACUUM form — bare, with a
+                // table, and VACUUM ANALYZE — is refused inside a
+                // transaction block with 25001, while a plain ANALYZE is
+                // allowed. Reclaiming storage cannot be rolled back, so
+                // it must not be able to join a transaction that can.
+                self.require_no_transaction_block("VACUUM")?;
                 match &table {
                     Some(t) => {
                         // v7.39 (round 535) — PG refuses a VACUUM whose
@@ -2848,5 +2881,24 @@ impl Engine {
             )],
             rows: out_rows,
         })
+    }
+}
+
+impl Engine {
+    /// PG's `PreventInTransactionBlock`: statements whose effect no
+    /// rollback can undo are refused inside an explicit transaction with
+    /// 25001, naming themselves in the message.
+    ///
+    /// The witness is THIS connection's slot, not the global
+    /// `in_transaction()`: the engine is shared, so a global check would
+    /// refuse an autocommit VACUUM merely because a different connection
+    /// had a transaction open. Same predicate `DISCARD ALL` already uses.
+    pub(crate) fn require_no_transaction_block(&self, what: &str) -> Result<(), EngineError> {
+        if self.current_tx.is_some_and(|tx| self.is_tx_open(tx)) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "{what} cannot run inside a transaction block"
+            )));
+        }
+        Ok(())
     }
 }

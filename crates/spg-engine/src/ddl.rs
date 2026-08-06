@@ -3493,6 +3493,7 @@ impl Engine {
                         continue;
                     };
                     out_indexes.push(CreateIndexStatement {
+                        concurrently: false,
                         name: String::new(),
                         key_order: spg_sql::ast::IndexColumnOrder::default(),
                         key_collation: None,
@@ -4123,7 +4124,14 @@ impl Engine {
         &mut self,
         s: &CreateUserStatement,
     ) -> Result<QueryResult, EngineError> {
-        if self.in_transaction() {
+        // The witness is THIS connection's slot. `in_transaction()` is
+        // global on a shared engine, so it refused an autocommit
+        // CREATE USER merely because a DIFFERENT connection had a
+        // transaction open — measured, round 794: connection B in
+        // autocommit got "not allowed inside a transaction" while A
+        // held one. Fourth time this trap has been sprung (session
+        // bag, advisory locks, transaction slots were the others).
+        if self.current_tx.is_some_and(|tx| self.is_tx_open(tx)) {
             return Err(EngineError::Unsupported(
                 "CREATE USER is not allowed inside a transaction".into(),
             ));
@@ -4193,7 +4201,8 @@ impl Engine {
         name: &str,
         if_exists: bool,
     ) -> Result<QueryResult, EngineError> {
-        if self.in_transaction() {
+        // Per-slot, for the reason spelled out in `exec_create_user`.
+        if self.current_tx.is_some_and(|tx| self.is_tx_open(tx)) {
             return Err(EngineError::Unsupported(
                 "DROP USER is not allowed inside a transaction".into(),
             ));
