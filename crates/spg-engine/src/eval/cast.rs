@@ -796,6 +796,63 @@ pub fn cast_value_ref_in(
             }),
         },
         CastTarget::Named(name) => {
+            // v7.39 (round 777, F31-E1) — a typmod'd ARRAY cast:
+            // `::numeric(3,1)[]` arrives as Named("numeric(3,1)_array")
+            // and fell through to the user-type lookup ('type
+            // "numeric(3,1)_array" does not exist'). PG applies the
+            // modifier per element ({1.5, 2.3}, measured). Cast to the
+            // bare base array first, then run every element through the
+            // scalar typmod cast.
+            if let Some(base_paren) = name.strip_suffix("_array")
+                && base_paren.ends_with(')')
+                && let Some(popen) = base_paren.find('(')
+            {
+                let base = &base_paren[..popen];
+                let arr = cast_value_ref_in(
+                    v,
+                    &CastTarget::Named(alloc::format!("{base}_array")),
+                    mysql,
+                )?;
+                let scalar = CastTarget::Named(alloc::string::String::from(base_paren));
+                return match arr {
+                    Value::NumericArray(items) => {
+                        let mut out = alloc::vec::Vec::with_capacity(items.len());
+                        for it in items {
+                            out.push(match it {
+                                None => None,
+                                Some((scaled, scale)) => {
+                                    match cast_value_ref_in(
+                                        Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite },
+                                        &scalar,
+                                        mysql,
+                                    )? {
+                                        Value::Numeric { scaled, scale, .. } => {
+                                            Some((scaled, scale))
+                                        }
+                                        Value::NumericBig(b) => {
+                                            return Err(EvalError::TypeMismatch {
+                                                detail: alloc::format!(
+                                                    "numeric value too large for {base_paren}[]: {b:?}"
+                                                ),
+                                            });
+                                        }
+                                        Value::Null => None,
+                                        other => {
+                                            return Err(EvalError::TypeMismatch {
+                                                detail: alloc::format!(
+                                                    "unexpected element cast result {other:?}"
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        Ok(Value::NumericArray(out))
+                    }
+                    other => Ok(other),
+                };
+            }
             // v7.39 (round 613) — a plain scalar spelling goes straight to
             // the tail. See `PLAIN_NAMED_TARGETS` for why that is the same
             // thing as walking the arm, and the pin for the check that says

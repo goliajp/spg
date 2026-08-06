@@ -210,6 +210,7 @@ mod e2e_tranche5_fixes_round769;
 mod e2e_tranche6_fixes_round770;
 mod e2e_regex_reversed_range_round772;
 mod e2e_estring_bytes_round773;
+mod e2e_typmod_array_cast_round777;
 mod e2e_collate_explicit_round691;
 mod e2e_collate_minmax_round690;
 mod e2e_collate_order_round688;
