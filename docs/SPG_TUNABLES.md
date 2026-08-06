@@ -44,10 +44,10 @@ one-to-one to a PG GUC with the matching unit-of-measure.
 | `SPG_QUERY_TIMEOUT_MS`    | `0` (off) | Hard wall-clock cap per query (matches PG `statement_timeout`). |
 | `SPG_MAX_QUERY_NS`        | `0`     | Per-query CPU budget. |
 | `SPG_MAX_QUERY_ROWS`      | `0`     | Maximum rows a single query may return (defensive). |
-| `SPG_MAX_QUERY_BYTES`     | `0`     | Maximum raw bytes returned in a single rowset. |
+| `SPG_MAX_QUERY_BYTES`     | `268435456` (256 MiB) | Maximum raw bytes returned in a single rowset. Unlike the rest of this table, unset does NOT mean unlimited — the server applies 256 MiB and refuses a larger result with `query materialisation exceeded max_query_bytes=…`. Set it to `0` for no limit. |
 | `SPG_SLOW_QUERY_THRESHOLD_MS` | `0` (off) | Emit a `slow_query` event when wall-clock exceeds the threshold. |
-| `SPG_SLOW_QUERY_LOG_MS`   | `0`     | Same idea, log-stream variant. |
-| `SPG_PLAN_CACHE_MAX`      | `1024`  | Plan-cache entry cap. |
+| `SPG_SLOW_QUERY_LOG_MS`   | `1000`  | Same idea, log-stream variant. Also unset-is-not-off: queries over one second are logged unless this is set to `0`. |
+| `SPG_PLAN_CACHE_MAX`      | `256`   | Plan-cache entry cap. |
 
 ## Storage tiering & freeze cycle
 
@@ -56,14 +56,12 @@ one-to-one to a PG GUC with the matching unit-of-measure.
 | `SPG_HOT_TIER_BYTES`      | `512 MiB`   | Per-table hot-tier byte budget. `ALTER TABLE … SET hot_tier_bytes` overrides at the table level. |
 | `SPG_FREEZER_DISABLE`     | unset (on)  | Disables the background freezer (useful for debugging hot-tier perf). |
 | `SPG_FREEZER_WORKERS`     | `cpu_count` | Number of freezer threads. |
-| `SPG_FREEZER_TICK_MS`     | `200`       | Freezer poll interval. |
-| `SPG_FREEZER_BATCH_ROWS`  | `2048`      | Rows per freeze batch. |
-| `SPG_FREEZE_BATCH_ROWS`   | (alias of `SPG_FREEZER_BATCH_ROWS`) | Legacy spelling. |
+| `SPG_FREEZER_TICK_MS`     | `1000`      | Freezer poll interval. Values below 10 ms are ignored. |
+| `SPG_FREEZER_BATCH_ROWS`  | `1000`      | Rows per freeze batch. |
 | `SPG_COMPACTION_TARGET_SEGMENT_BYTES` | `64 MiB` | Cold-segment compaction target size. |
-| `SPG_COMPRESSION_MIN_BYTES` | `1024`   | Don't bother compressing payloads smaller than this. |
+| `SPG_COMPRESSION_MIN_BYTES` | `256`    | Don't bother compressing payloads smaller than this. |
 | `SPG_SEGMENT_COMPRESSION` | `zstd`      | Compression codec for new cold segments. |
 | `SPG_PREFETCH_WORKERS`    | `cpu_count` | Background prefetch threads for cold-tier reads. |
-| `SPG_PRELOAD`             | unset       | Comma-separated table names to warm at startup. |
 | `SPG_PRELOAD_COLD_SEGMENT` | unset      | Specific cold-segment IDs to pre-mmap at startup. |
 
 ## WAL & durability
