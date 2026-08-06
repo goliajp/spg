@@ -123,7 +123,7 @@ impl Engine {
         self.install_excl_range_indexes(&table_name);
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -1933,7 +1933,7 @@ impl Engine {
         self.active_catalog_mut().set_comment(&key, comment);
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -2140,7 +2140,7 @@ impl Engine {
             return match renamed {
                 Ok(()) => Ok(QueryResult::CommandOk {
                     affected: 0,
-                    modified_catalog: !self.in_transaction(),
+                    modified_catalog: self.catalog_change_is_committed(),
                 }),
                 Err(StorageError::IndexNotFound { .. }) if if_exists => {
                     Ok(QueryResult::CommandOk {
@@ -2219,7 +2219,7 @@ impl Engine {
         self.plan_cache.evict_referencing(&table_name);
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -2601,7 +2601,7 @@ impl Engine {
         self.plan_cache.evict_referencing(&table_name);
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -2644,7 +2644,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -2750,7 +2750,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -2840,7 +2840,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -2860,7 +2860,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -3109,7 +3109,7 @@ impl Engine {
         self.install_excl_range_indexes(&table_name);
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -3377,7 +3377,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -4029,7 +4029,7 @@ impl Engine {
         });
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -4082,7 +4082,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -4096,7 +4096,7 @@ impl Engine {
             None if s.if_exists => {
                 return Ok(QueryResult::CommandOk {
                     affected: 0,
-                    modified_catalog: !self.in_transaction(),
+                    modified_catalog: self.catalog_change_is_committed(),
                 });
             }
             None => {
@@ -4116,7 +4116,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -4670,7 +4670,7 @@ impl Engine {
             .map_err(EngineError::Storage)?;
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -4691,7 +4691,7 @@ impl Engine {
                 .map_err(EngineError::Storage)?;
             return Ok(QueryResult::CommandOk {
                 affected: 0,
-                modified_catalog: !self.in_transaction(),
+                modified_catalog: self.catalog_change_is_committed(),
             });
         }
         let cat = self.active_catalog_mut();
@@ -4734,7 +4734,7 @@ impl Engine {
         .map_err(EngineError::Storage)?;
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -4814,7 +4814,7 @@ impl Engine {
             .map_err(EngineError::Storage)?;
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -5007,7 +5007,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
     /// v7.39 (round 260) — `ALTER DOMAIN`. Every form used to be
@@ -5174,7 +5174,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -5261,7 +5261,7 @@ impl Engine {
             .map_err(EngineError::Storage)?;
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -5307,7 +5307,7 @@ impl Engine {
             .map_err(EngineError::Storage)?;
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -5491,7 +5491,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -5616,7 +5616,7 @@ impl Engine {
                         .insert(String::from(name), current);
                     return Ok(QueryResult::CommandOk {
                         affected: applied,
-                        modified_catalog: !self.in_transaction(),
+                        modified_catalog: self.catalog_change_is_committed(),
                     });
                 }
             }
@@ -5636,7 +5636,7 @@ impl Engine {
             self.matview_refresh_watermark.remove(name);
             return Ok(QueryResult::CommandOk {
                 affected: 0,
-                modified_catalog: !self.in_transaction(),
+                modified_catalog: self.catalog_change_is_committed(),
             });
         }
         // v7.39 (round 738, S14/B3 knife 3) — a maintainable view's FULL
@@ -5724,7 +5724,7 @@ impl Engine {
             }
             return Ok(QueryResult::CommandOk {
                 affected,
-                modified_catalog: !self.in_transaction(),
+                modified_catalog: self.catalog_change_is_committed(),
             });
         }
         self.matview_row_map.remove(name);
@@ -5773,7 +5773,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 

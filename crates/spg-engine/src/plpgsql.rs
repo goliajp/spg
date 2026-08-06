@@ -128,7 +128,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 

@@ -1492,7 +1492,7 @@ impl Engine {
                     })?;
                 Ok(QueryResult::CommandOk {
                     affected: 0,
-                    modified_catalog: !self.in_transaction(),
+                    modified_catalog: self.catalog_change_is_committed(),
                 })
             }
             Statement::ValidateOnly { kind, names } => {
@@ -2426,7 +2426,7 @@ impl Engine {
                     .map_err(EngineError::Storage)?;
                 Ok(QueryResult::CommandOk {
                     affected: 0,
-                    modified_catalog: !self.in_transaction(),
+                    modified_catalog: self.catalog_change_is_committed(),
                 })
             }
             Statement::AlterTypeAddValue {
@@ -2893,6 +2893,24 @@ impl Engine {
     /// `in_transaction()`: the engine is shared, so a global check would
     /// refuse an autocommit VACUUM merely because a different connection
     /// had a transaction open. Same predicate `DISCARD ALL` already uses.
+    /// Whether a catalog change this statement made is already committed,
+    /// i.e. THIS connection is not inside an explicit transaction block.
+    ///
+    /// It rides out on `QueryResult::modified_catalog`, and the server
+    /// takes it as "persist and audit this now": in no-WAL mode it drives
+    /// the snapshot write, and it gates the audit append in every mode.
+    ///
+    /// The witness has to be this connection's slot. Asking the
+    /// engine-wide `in_transaction()` — true while ANY connection holds a
+    /// transaction — reported an autocommit DDL as uncommitted, and both
+    /// consequences were measured in round 795: the statement was missing
+    /// from the audit log entirely, and after `kill -9` plus a restart the
+    /// table it created was gone, having been acked to the client. A
+    /// second connection idling inside a BEGIN was the whole cause.
+    pub(crate) fn catalog_change_is_committed(&self) -> bool {
+        !self.current_tx.is_some_and(|tx| self.is_tx_open(tx))
+    }
+
     pub(crate) fn require_no_transaction_block(&self, what: &str) -> Result<(), EngineError> {
         if self.current_tx.is_some_and(|tx| self.is_tx_open(tx)) {
             return Err(EngineError::Unsupported(alloc::format!(
