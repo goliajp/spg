@@ -42,11 +42,12 @@ SELECT props::text FROM config WHERE id = 5
 ----
 "a"=>NULL, "b"=>"world"
 
-# Duplicate keys: last-write-wins.
+# Duplicate keys: PG's hstore_in keeps the FIRST occurrence
+# (v7.39 round 780 — measured; this record pinned last-wins).
 query T
 SELECT props::text FROM config WHERE id = 6
 ----
-"k"=>"2"
+"k"=>"1"
 
 # Malformed → hard error.
 statement error

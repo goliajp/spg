@@ -14,7 +14,8 @@
 //! Invariants pinned:
 //!   * Storage: `Vec<(String, Option<String>)>` — keys are
 //!     unique; insertion preserves first occurrence.
-//!   * Duplicate keys → last-write-wins (matches PG).
+//!   * Duplicate keys → FIRST occurrence wins (PG18-measured, round
+//!     780; the note used to say last-write-wins).
 //!   * NULL value → stored as `None`; renders as `=>NULL`
 //!     (no quotes on NULL token).
 //!   * Empty input `''` → empty map.
@@ -113,7 +114,7 @@ fn insert_empty_hstore() {
 }
 
 #[test]
-fn duplicate_keys_last_wins() {
+fn duplicate_keys_first_wins() {
     let mut eng = engine_with(&[
         "CREATE TABLE t (id INT NOT NULL, props HSTORE)",
         "INSERT INTO t VALUES (1, 'a=>1, a=>2, b=>3')",
@@ -122,10 +123,12 @@ fn duplicate_keys_last_wins() {
     let Value::Hstore(pairs) = &rows[0][0] else {
         panic!()
     };
-    // After dedup: a=>2 (last wins) and b=>3.
+    // v7.39 (round 780, F31-D1) — PG's hstore_in keeps the FIRST
+    // occurrence (measured: 'a=>1, a=>2' is "a"=>"1"); the old pin
+    // asserted last-wins.
     assert_eq!(pairs.len(), 2);
     let a = pairs.iter().find(|(k, _)| k == "a").unwrap();
-    assert_eq!(a.1.as_deref(), Some("2"));
+    assert_eq!(a.1.as_deref(), Some("1"));
 }
 
 #[test]
