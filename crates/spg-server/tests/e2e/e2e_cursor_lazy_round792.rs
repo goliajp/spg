@@ -416,3 +416,60 @@ fn a_byte_ceiling_bounds_the_batch_not_the_cursor() {
     q(&mut s, "ROLLBACK");
 }
 
+/// A drain that spans a concurrent `VACUUM` is still complete.
+///
+/// `VACUUM` reclaims tombstoned rows by rebuilding the row vector, and
+/// it does reclaim here — measured, dead 100 -> 0 with this cursor's
+/// transaction open — so the slots a resuming scan walks are not the
+/// ones it left behind.
+///
+/// What this does NOT pin is that resuming by row id rather than by
+/// slot is what makes it work. Both resume strategies were measured
+/// against this exact sequence and both drain all 301 rows, so no
+/// failing case could be constructed and the row-id resume is not a
+/// demonstrated fix for anything. It is here because the storage layer
+/// says positions go ambiguous after compaction and a resume point
+/// should mean what it says; the open question of why the slot-based
+/// walk survives a compaction it should not is in the ledger.
+#[test]
+fn vacuum_under_an_open_cursor_neither_skips_nor_repeats() {
+    let (_child, addrs) = spawn("vacuum");
+    let addr = addrs.pgwire.as_ref().unwrap();
+    let mut a = open(addr);
+    seed(&mut a, 400);
+    // Tombstones spread across the whole table, committed and finished
+    // with before the cursor starts.
+    q(&mut a, "DELETE FROM t WHERE id % 4 = 0");
+    // A write after the delete, so the tombstones sit strictly below the
+    // floor `vacuum_oldest_active` computes once this cursor's
+    // transaction is open. Versions only advance on writes: without
+    // this the delete IS the floor, nothing is reclaimable while the
+    // transaction is open, and the compaction under test never happens.
+    q(&mut a, "INSERT INTO t VALUES (5001, 'later')");
+    let survivors = rows(&mut a, "SELECT count(*) FROM t");
+    assert_eq!(survivors, vec!["301"]);
+
+    q(&mut a, "BEGIN");
+    q(&mut a, "DECLARE c CURSOR FOR SELECT id FROM t");
+    let head = rows(&mut a, "FETCH 20 FROM c");
+    assert_eq!(head.len(), 20);
+
+    // Second connection compacts while the cursor sits mid-drain.
+    let mut b = open(addr);
+    let vac = q(&mut b, "VACUUM t");
+    assert!(!has_error(&vac), "VACUUM is not supposed to fail here");
+
+    let rest = rows(&mut a, "FETCH ALL FROM c");
+    q(&mut a, "COMMIT");
+
+    let mut all = head;
+    all.extend(rest);
+    assert_eq!(all.len(), 301, "every surviving row, still exactly once");
+    let uniq: BTreeSet<&String> = all.iter().collect();
+    assert_eq!(uniq.len(), 301, "and none of them twice");
+    assert!(
+        all.iter().all(|r| r.parse::<i64>().unwrap() % 4 != 0),
+        "the deleted rows stay deleted"
+    );
+}
+
