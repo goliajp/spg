@@ -694,7 +694,11 @@ pub(super) fn array_rebuild(model: &Value<'_>, elems: &[Value<'static>]) -> Opti
 /// fallback for everything it did not know (rounds 71/72 killed the first four).
 /// The rule: a homogeneous non-numeric, non-text list keeps its type; the numeric
 /// ladder unifies (float > numeric > bigint > int); anything mixed or unknown is
-/// `text[]`, which is a DECISION — PG makes the same one.
+/// `text[]`, which is a DECISION. v7.39 (round 779 audit, I1) — PG does NOT
+/// make the same one for the EMPTY case: bare `ARRAY[]` refuses there
+/// (`cannot determine type of empty array`) while SPG answers `text[]`.
+/// A deliberate superset, §9-ledgered: `ARRAY[]::t[]`, `'{}'::t[]` and every
+/// non-empty list agree with PG exactly.
 pub(crate) fn build_array_from_values(vals: &[Value<'static>]) -> Value<'static> {
     if let Some(v) = homogeneous_typed_array(vals) {
         return v;

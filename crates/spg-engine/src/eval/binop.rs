@@ -3458,6 +3458,10 @@ fn sqrt_newton(x: f64) -> f64 {
 /// zero surfaces as `DivisionByZero` so callers see the same error
 /// variant for `/` and `%`.
 fn mod_op(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
+    // v7.39 (round 779 audit, F2) — the float arm below is an SPG
+    // SUPERSET: PG resolves `%` over numeric / integer only (measured:
+    // `5.5::float8 % 2::float8` is "operator does not exist" there).
+    // §9-ledgered; the spelling MySQL callers expect.
     let any_float = matches!(l.data_type(), Some(DataType::Float))
         || matches!(r.data_type(), Some(DataType::Float));
     if any_float {
