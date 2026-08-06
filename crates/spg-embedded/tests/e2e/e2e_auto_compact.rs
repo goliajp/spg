@@ -137,10 +137,18 @@ fn auto_compact_disabled_when_threshold_is_max() {
             compact_target_bytes: 1 << 30,
         },
     );
-    std::thread::sleep(Duration::from_millis(400));
+    // v7.39 (round 783) — poll instead of sleeping a fixed proxy: the
+    // freezer ticks every 20 ms and moves 50 rows a batch, so 500 rows
+    // is ~10 ticks on an idle box and arbitrarily more on a loaded
+    // one. The old fixed 400 ms read 3 segments under a doubled test
+    // load; the assertion below is unchanged.
     let count = {
-        let g = db.lock().unwrap();
-        g.cold_segment_count()
+        let mut seen = 0;
+        crate::wait_until::wait_until(Duration::from_secs(20), || {
+            seen = db.lock().unwrap().cold_segment_count();
+            seen >= 4
+        });
+        seen
     };
     freezer.stop();
     assert!(
