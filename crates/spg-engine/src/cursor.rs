@@ -18,12 +18,51 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use spg_sql::ast::CursorDirection;
+use spg_sql::ast::{CursorDirection, SelectStatement};
 use spg_storage::Row;
 
 use crate::{ColumnSchema, EngineError};
 
-/// One open cursor: the materialized result set + position.
+/// A cursor that produces its rows on demand instead of at DECLARE.
+///
+/// Only the scan shape qualifies — one table, an optional WHERE, a
+/// projection, and nothing that needs the whole input before the first
+/// output row (no ORDER BY, GROUP BY, DISTINCT, join, aggregate,
+/// subquery, set operation, or LIMIT). For that shape the resumable
+/// state is one hot-tier index, so a FETCH walks forward from where the
+/// previous one stopped.
+///
+/// The statement is kept rather than a prepared plan: rebuilding the
+/// projection per batch is per-statement setup, not per-row work, and
+/// keeping it avoids a second lifetime-bound plan representation inside
+/// the cursor.
+#[derive(Debug, Clone)]
+pub(crate) struct LazyScan {
+    pub stmt: SelectStatement,
+    pub table: String,
+    pub alias: String,
+    /// The snapshot DECLARE ran under, reused by every batch.
+    ///
+    /// Taking a fresh one per batch would make the cursor sensitive to
+    /// commits that land between two FETCHes: outside RR/SER,
+    /// `current_snapshot` is per-statement, so a row another connection
+    /// committed after DECLARE would appear mid-drain. PG pins the
+    /// cursor's snapshot at DECLARE even in READ COMMITTED, and the
+    /// eager path gets this for free by reading everything up front.
+    pub snapshot: spg_storage::snapshot::Snapshot,
+    /// Hot-tier index the next batch resumes at.
+    pub next_index: usize,
+    /// The scan reached the end of the table; `rows` is now the whole
+    /// result and the cursor behaves exactly like an eager one.
+    pub done: bool,
+}
+
+/// One open cursor: its rows and position.
+///
+/// `rows` is the whole result for an eagerly materialized cursor, and
+/// the prefix produced so far for a [`LazyScan`] one. Backward motion
+/// therefore never needs to produce anything: a client can only move
+/// back over rows it has already moved forward through.
 #[derive(Debug, Clone)]
 pub(crate) struct OpenCursor {
     pub columns: Vec<ColumnSchema>,
@@ -38,6 +77,10 @@ pub(crate) struct OpenCursor {
     /// Set at COMMIT for WITH HOLD cursors: an already-held cursor
     /// survives a LATER transaction's ROLLBACK too.
     pub held: bool,
+    /// `Some` while the cursor still produces rows on demand. `None`
+    /// for an eagerly materialized cursor, and for a lazy one whose
+    /// scan has run out (at which point the two are indistinguishable).
+    pub lazy: Option<LazyScan>,
 }
 
 /// Rows a FETCH returns plus the count a MOVE reports. FETCH streams
@@ -211,6 +254,169 @@ impl crate::Engine {
         self.cursors.retain(|_, c| c.held);
     }
 
+    /// The scan shape a [`LazyScan`] cursor can serve, or `None` when the
+    /// query needs its whole input before it can answer the first row.
+    ///
+    /// Everything excluded here either reorders rows (ORDER BY), folds
+    /// them (GROUP BY, aggregates, DISTINCT), reads a second source
+    /// (join, set operation, CTE, subquery), or expands one input row
+    /// into several (SRF in FROM). A cursor over any of those keeps
+    /// today's DECLARE-time materialisation.
+    ///
+    /// Cold-tier rows are excluded too: the generic scan walks them
+    /// after the hot tier through the PK index, so resuming across the
+    /// boundary would need a second kind of position. A table that has
+    /// spilled to cold segments keeps the eager path.
+    fn lazy_scan_shape<'a>(
+        &self,
+        query: &'a spg_sql::ast::Statement,
+        hold: bool,
+    ) -> Option<(&'a SelectStatement, String, String)> {
+        // WITH HOLD outlives its transaction, and PG materializes those
+        // at COMMIT precisely so a held cursor cannot see later changes.
+        // Producing rows on demand after that point would show them.
+        if hold {
+            return None;
+        }
+        let spg_sql::ast::Statement::Select(s) = query else {
+            return None;
+        };
+        if !s.ctes.is_empty()
+            || s.distinct
+            || s.group_by.is_some()
+            || s.group_by_all
+            || s.having.is_some()
+            || !s.unions.is_empty()
+            || !s.order_by.is_empty()
+            || s.limit.is_some()
+            || s.offset.is_some()
+            || s.limit_with_ties
+        {
+            return None;
+        }
+        if crate::aggregate::uses_aggregate(s) || crate::subquery::expr_tree_has_subquery(s) {
+            return None;
+        }
+        let from = s.from.as_ref()?;
+        if !from.joins.is_empty() {
+            return None;
+        }
+        let p = &from.primary;
+        if p.unnest_expr.is_some()
+            || p.generate_series_args.is_some()
+            || p.table_fn_call.is_some()
+            || p.lateral_subquery.is_some()
+            || p.as_of_segment.is_some()
+            || p.jsonb_each_text_arg.is_some()
+            || p.rows_from.is_some()
+            || p.scalar_fn_item
+        {
+            return None;
+        }
+        let table = self.active_catalog().get(&p.name)?;
+        if table.cold_row_count() > 0 {
+            return None;
+        }
+        let alias = p.alias.as_deref().unwrap_or(p.name.as_str());
+        Some((s, p.name.clone(), String::from(alias)))
+    }
+
+    /// Produce up to `want` more rows for a lazy cursor, appending them
+    /// to `rows` and advancing the scan position. `want` of `None` means
+    /// "the rest of the table" (FETCH ALL, and the backward-from-the-end
+    /// directions that need to know where the end is).
+    ///
+    /// An error here surfaces from the FETCH that hit it, which is where
+    /// PG raises it too — a cursor over `100/(100 - id)` hands back the
+    /// first 99 rows and fails on the batch that reaches row 100.
+    fn cursor_fill(
+        &self,
+        lz: &mut LazyScan,
+        want: Option<usize>,
+        rows: &mut Vec<Row<'static>>,
+    ) -> Result<(), EngineError> {
+        if lz.done {
+            return Ok(());
+        }
+        let Some(table) = self.active_catalog().get(&lz.table) else {
+            // The table went away under an open cursor. Nothing more to
+            // produce; what was already fetched stays fetched.
+            lz.done = true;
+            return Ok(());
+        };
+        let cols = table.schema().columns.clone();
+        let ctx = self.ev_ctx(&cols, Some(lz.alias.as_str()));
+        let projection = crate::select::build_projection(
+            &lz.stmt.items,
+            &cols,
+            lz.alias.as_str(),
+            self.backslash_escapes,
+        )?;
+        // Same ceiling the materialising path charges through the
+        // executor. Without it a cursor would be the one way to build an
+        // unbounded row set with `SPG_MAX_QUERY_BYTES` set — the budget
+        // lives in the query executor this path deliberately skips.
+        // One budget per batch: a FETCH is a statement, so what it caps
+        // is how much a single FETCH may produce, and `FETCH ALL` over a
+        // huge table trips it exactly like the bare SELECT would.
+        let mut budget = crate::bytebudget::ByteBudget::new(self.max_query_bytes);
+        let mut produced = 0usize;
+        let mut hit_end = true;
+        for (i, row) in table.scan_visible_from(lz.next_index, &lz.snapshot) {
+            if want.is_some_and(|w| produced >= w) {
+                lz.next_index = i;
+                hit_end = false;
+                break;
+            }
+            // Advance before the row is evaluated, not after: an error
+            // here escapes with rows already appended, and a position
+            // that still pointed behind them would hand those rows out
+            // twice if the cursor were fetched again. It cannot be
+            // today — the error aborts the transaction — but the state
+            // it leaves behind should not depend on that.
+            lz.next_index = i + 1;
+            if let Some(w) = &lz.stmt.where_ {
+                let cond = crate::eval::eval_expr(w, row, &ctx).map_err(EngineError::Eval)?;
+                if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
+                    continue;
+                }
+            }
+            let mut values = Vec::with_capacity(projection.len());
+            for pi in &projection {
+                values.push(crate::eval::eval_expr(&pi.expr, row, &ctx).map_err(EngineError::Eval)?);
+            }
+            budget.charge(crate::bytebudget::approx_values_bytes(&values))?;
+            rows.push(Row::new(values));
+            produced += 1;
+        }
+        if hit_end {
+            lz.done = true;
+        }
+        Ok(())
+    }
+
+    /// How many rows of the result `d` needs to be answerable. `None`
+    /// means the whole thing; `Some(0)` means the motion stays inside
+    /// what has already been produced.
+    fn lazy_need(d: CursorDirection, pos: usize) -> Option<usize> {
+        match d {
+            CursorDirection::Next => Some(pos + 1),
+            CursorDirection::Count(k) if k >= 0 => Some(pos.saturating_add(k as usize)),
+            CursorDirection::Relative(k) if k >= 0 => Some(pos.saturating_add(k as usize)),
+            CursorDirection::Absolute(k) if k >= 0 => Some(k as usize),
+            CursorDirection::First => Some(1),
+            // Everything else either walks backward through rows already
+            // produced, or needs the end of the set to be known.
+            CursorDirection::Prior
+            | CursorDirection::Backward(_)
+            | CursorDirection::BackwardAll
+            | CursorDirection::Count(_)
+            | CursorDirection::Relative(_)
+            | CursorDirection::Absolute(_) => Some(0),
+            CursorDirection::All | CursorDirection::Last => None,
+        }
+    }
+
     /// Execute `DECLARE <name> … CURSOR … FOR <query>`.
     pub(crate) fn exec_declare_cursor(
         &mut self,
@@ -237,12 +443,53 @@ impl crate::Engine {
                 "cursor \"{name}\" already exists"
             )));
         }
-        let result = self.execute_stmt_with_cancel(query, crate::CancelToken::none())?;
-        let crate::QueryResult::Rows { columns, rows } = result else {
-            return Err(EngineError::Unsupported(String::from(
-                "DECLARE CURSOR requires a query that returns rows",
-            )));
-        };
+        // A scan-shaped cursor produces its rows as the client fetches
+        // them. DECLARE then costs a projection build instead of the
+        // whole result set: a cursor over 300k rows that the client
+        // drains 1000 at a time used to cost 144 MB before the first
+        // row arrived (measured, round 792).
+        let (columns, rows, lazy) =
+            if let Some((sel, table, alias)) = self.lazy_scan_shape(&query, hold) {
+                let Some(t) = self.active_catalog().get(&table) else {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "relation \"{table}\" does not exist"
+                    )));
+                };
+                let scols = t.schema().columns.clone();
+                let projection = crate::select::build_projection(
+                    &sel.items,
+                    &scols,
+                    alias.as_str(),
+                    self.backslash_escapes,
+                )?;
+                let columns: Vec<ColumnSchema> = projection
+                    .into_iter()
+                    .map(|pi| {
+                        let mut c = ColumnSchema::new(pi.output_name, pi.ty, pi.nullable);
+                        c.user_enum_type = pi.user_enum_type;
+                        c.collation_name = pi.collation_name;
+                        c.mysql_fsp = pi.mysql_fsp;
+                        c
+                    })
+                    .collect();
+                let lz = LazyScan {
+                    stmt: sel.clone(),
+                    table,
+                    alias,
+                    snapshot: self.current_snapshot(),
+                    next_index: 0,
+                    done: false,
+                };
+                (columns, Vec::new(), Some(lz))
+            } else {
+                let result = self.execute_stmt_with_cancel(query, crate::CancelToken::none())?;
+                let crate::QueryResult::Rows { columns, rows } = result else {
+                    return Err(EngineError::Unsupported(String::from(
+                        "DECLARE CURSOR requires a query that returns rows",
+                    )));
+                };
+                (columns, rows, None)
+            };
         self.cursors.insert(
             name,
             OpenCursor {
@@ -252,6 +499,7 @@ impl crate::Engine {
                 scroll,
                 hold,
                 held: false,
+                lazy,
             },
         );
         Ok(crate::QueryResult::CommandOk {
@@ -267,12 +515,50 @@ impl crate::Engine {
         name: &str,
         direction: CursorDirection,
     ) -> Result<crate::QueryResult, EngineError> {
+        self.cursor_produce_for(name, direction)?;
         let cur = self.cursors.get_mut(name).ok_or_else(|| no_such_cursor(name))?;
         let slice = cur.fetch(direction, name)?;
         Ok(crate::QueryResult::Rows {
             columns: cur.columns.clone(),
             rows: slice.rows,
         })
+    }
+
+    /// Top up a lazy cursor so `direction` is answerable, then leave it
+    /// in the map for the caller's `fetch`.
+    ///
+    /// The cursor is taken out of the map for the duration: producing
+    /// rows reads the catalog through `&self`, which cannot be borrowed
+    /// while a `&mut` into `self.cursors` is live. It goes back
+    /// unconditionally — a cursor whose batch raised an error stays open,
+    /// as it does in PG.
+    fn cursor_produce_for(
+        &mut self,
+        name: &str,
+        direction: CursorDirection,
+    ) -> Result<(), EngineError> {
+        let Some(mut cur) = self.cursors.remove(name) else {
+            return Err(no_such_cursor(name));
+        };
+        let outcome = match cur.lazy.as_mut() {
+            None => Ok(()),
+            Some(lz) if lz.done => Ok(()),
+            Some(lz) => match Self::lazy_need(direction, cur.pos) {
+                Some(0) => Ok(()),
+                need => {
+                    let want = need.map(|n| n.saturating_sub(cur.rows.len()));
+                    match want {
+                        Some(0) => Ok(()),
+                        _ => self.cursor_fill(lz, want, &mut cur.rows),
+                    }
+                }
+            },
+        };
+        if cur.lazy.as_ref().is_some_and(|lz| lz.done) {
+            cur.lazy = None;
+        }
+        self.cursors.insert(String::from(name), cur);
+        outcome
     }
 
     /// Execute `MOVE <direction> FROM <name>` — same motion as FETCH, rows
@@ -282,6 +568,7 @@ impl crate::Engine {
         name: &str,
         direction: CursorDirection,
     ) -> Result<crate::QueryResult, EngineError> {
+        self.cursor_produce_for(name, direction)?;
         let cur = self.cursors.get_mut(name).ok_or_else(|| no_such_cursor(name))?;
         let slice = cur.fetch(direction, name)?;
         Ok(crate::QueryResult::CommandOk {

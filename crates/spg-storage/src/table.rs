@@ -808,6 +808,42 @@ impl Table {
             .map(|(i, (r, _))| (i, r))
     }
 
+    /// The same visibility-gated walk as [`Table::scan_visible`], resuming
+    /// at hot-tier index `start`.
+    ///
+    /// A server-side cursor hands out its result in batches and has to
+    /// continue where the previous batch stopped. Restarting the walk per
+    /// batch and discarding a growing prefix would make an N-batch drain
+    /// quadratic in the row count, so the resume point is a parameter
+    /// rather than something the caller skips over.
+    ///
+    /// `start` is a hot-tier position, not a [`RowId`](crate::row_header::RowId):
+    /// callers that resume across a compaction must re-derive it, which is
+    /// why the cursor path only resumes tables with no cold segments.
+    ///
+    /// `note_seq_scan` fires only for `start == 0`. One cursor drained in
+    /// 300 batches is one sequential scan of the table, and counting it
+    /// 300 times would misreport `pg_stat_user_tables.seq_scan`.
+    pub fn scan_visible_from<'a, 'b>(
+        &'a self,
+        start: usize,
+        snapshot: &'b crate::snapshot::Snapshot,
+    ) -> impl Iterator<Item = (usize, &'a Row<'static>)> + 'b
+    where
+        'a: 'b,
+    {
+        if start == 0 {
+            self.note_seq_scan();
+        }
+        self.rows
+            .iter()
+            .zip(self.headers.iter())
+            .enumerate()
+            .skip(start)
+            .filter(move |(i, (_, h))| self.header_visible(*i, h, snapshot))
+            .map(|(i, (r, _))| (i, r))
+    }
+
     /// v6.8.0 — exposed for the engine layer to patch
     /// `Index::included_columns` post-creation. Could fold into
     /// `add_index` once the engine's IF-NOT-EXISTS guard moves up,
