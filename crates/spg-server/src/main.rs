@@ -20,6 +20,7 @@
 //!
 //! Pass `-` (or omit) to skip any positional after the first.
 
+mod tempstore;
 mod alloc_budget;
 mod backup;
 mod autovacuum;
@@ -1402,6 +1403,15 @@ fn run(
     engine.set_backend_count_fn(live_backend_count);
     engine.set_backend_pid_fn(current_backend_pid);
     engine.set_backend_signal_fn(signal_backend);
+    // v7.39 (round 786, T35 Phase A) — spill storage. Sweep any runs a
+    // previous process was killed before dropping, then hand the engine
+    // its factory. Phase B is what starts using it; installing it here
+    // changes no behaviour on its own.
+    let swept = tempstore::sweep_orphans(&tempstore::temp_dir());
+    if swept > 0 {
+        eprintln!("spg-server: swept {swept} orphaned sort-spill file(s)");
+    }
+    engine.set_temp_run_factory(tempstore::create_run);
     // v7.39 (tz epic) — named-timezone lookups via the system zoneinfo.
     engine.set_tz_fns(
         spg_tzif::tz_offset_at,

@@ -88,6 +88,7 @@ mod show;
 mod spg_admin;
 pub mod statistics;
 pub mod subquery;
+pub mod tempstore;
 pub mod subscriptions;
 mod substitute;
 mod system_catalog;
@@ -408,6 +409,8 @@ pub type WalLsnFn = fn() -> u64;
 /// so the answer has to come from the host that accepted the sockets.
 /// `None` (embedded, no connections) ⇒ nothing to signal.
 pub type BackendSignalFn = fn(pid: u32, terminate: bool) -> bool;
+
+pub use tempstore::{TempRun, TempRunFactory, TempStoreError};
 
 /// v7.39 (tz epic) — host-injected IANA timezone lookups (the no_std
 /// engine can't read the system zoneinfo directory; spg-tzif is the
@@ -1080,6 +1083,11 @@ pub struct Engine {
     /// ON; the server keeps its allocator-precise budget as the
     /// outer layer).
     pub(crate) max_query_bytes: Option<usize>,
+    /// v7.39 (round 786, T35 Phase A) — host factory for spill runs.
+    /// `None` (the default, and every embedded caller that has not opted
+    /// in) keeps today's behaviour exactly: a sort that outgrows
+    /// `max_query_bytes` still refuses rather than spilling.
+    pub(crate) temp_run_factory: Option<crate::TempRunFactory>,
     /// v4.1 RBAC user table. Empty means "no RBAC configured yet" —
     /// the server decides what that means at the auth boundary
     /// (open mode vs legacy single-password mode). User CRUD goes
@@ -1514,6 +1522,7 @@ impl Engine {
             salt_fn: None,
             max_query_rows: None,
             max_query_bytes: None,
+            temp_run_factory: None,
             users: UserStore::new(),
             publications: publications::Publications::new(),
             subscriptions: subscriptions::Subscriptions::new(),
@@ -1853,6 +1862,29 @@ impl Engine {
         self.backend_signal_fn = Some(f);
     }
 
+    /// v7.39 (round 786, T35 Phase A) — install the host's spill-run
+    /// factory. Without one the engine cannot spill and a sort that
+    /// outgrows `max_query_bytes` keeps refusing, which is exactly the
+    /// behaviour every caller has today.
+    pub fn set_temp_run_factory(&mut self, f: crate::TempRunFactory) {
+        self.temp_run_factory = Some(f);
+    }
+
+    /// Whether spilling is available in this process.
+    #[must_use]
+    pub fn can_spill(&self) -> bool {
+        self.temp_run_factory.is_some()
+    }
+
+    /// v7.39 (round 786) — open a fresh spill run, or `None` when no
+    /// host factory is installed. Phase B's run generation calls this;
+    /// it lives here so the `None` path stays a single decision point.
+    pub(crate) fn open_temp_run(
+        &self,
+    ) -> Option<Result<alloc::boxed::Box<dyn crate::TempRun>, crate::TempStoreError>> {
+        self.temp_run_factory.map(|f| f())
+    }
+
     /// v7.39 (tz epic) — inject the host's IANA timezone lookups
     /// (spg-tzif's fn family on std hosts).
     pub fn set_tz_fns(
@@ -1978,6 +2010,7 @@ impl Engine {
             salt_fn: None,
             max_query_rows: None,
             max_query_bytes: None,
+            temp_run_factory: None,
             users: UserStore::new(),
             publications: publications::Publications::new(),
             subscriptions: subscriptions::Subscriptions::new(),
@@ -2110,6 +2143,7 @@ impl Engine {
                     salt_fn: None,
                     max_query_rows: None,
                     max_query_bytes: None,
+            temp_run_factory: None,
                     users,
                     publications,
                     subscriptions,
