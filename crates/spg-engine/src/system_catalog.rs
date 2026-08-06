@@ -7892,6 +7892,11 @@ pub(crate) const INSTALLED_EXTENSIONS: &[(&str, &str)] = &[
     ("vector", "0.8.0"),
     ("pg_trgm", "1.6"),
     ("pgcrypto", "1.3"),
+    // v7.39 (round 780, F31-D1) — hstore's type, codec and both text
+    // conversions are first-class since v7.17.0; once the type-NAME
+    // map listed it (same round) every hstore spelling works, so the
+    // install is real rather than a warned no-op.
+    ("hstore", "1.8"),
 ];
 
 /// surfaces natively (vector, pg_trgm, plpgsql-shaped DO blocks), so

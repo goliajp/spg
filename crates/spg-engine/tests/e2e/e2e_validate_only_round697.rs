@@ -91,6 +91,7 @@ fn round697_an_unprovided_extension_warns_rather_than_refusing() {
 
 /// `pgcrypto` is on the provided list because SPG really answers it. The
 /// list is a claim about capability, so it is checked against capability.
+/// v7.39 (round 780) — `hstore` joined it for the same reason.
 #[test]
 fn round697_the_provided_list_is_a_claim_that_holds() {
     let mut e = Engine::new();
@@ -103,8 +104,10 @@ fn round697_the_provided_list_is_a_claim_that_holds() {
     assert_eq!(one(&mut e, "SELECT digest('x','sha256') IS NOT NULL"), "true");
     assert_eq!(one(&mut e, "SELECT gen_random_uuid() IS NOT NULL"), "true");
     assert_eq!(one(&mut e, "SELECT '[1,2]'::vector::text"), "[1,2]");
-    // And hstore is NOT on it, because this is what hstore does here.
-    assert!(e.execute("SELECT 'a=>1'::hstore").is_err());
+    // v7.39 (round 780, F31-D1) — hstore joined the list: its type,
+    // codec and both text conversions were always there, and the
+    // type-NAME map now resolves the spelling, so the claim holds.
+    assert_eq!(one(&mut e, "SELECT 'a=>1'::hstore::text"), "\"a\"=>\"1\"");
 }
 
 #[test]

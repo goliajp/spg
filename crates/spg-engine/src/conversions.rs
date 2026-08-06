@@ -541,7 +541,8 @@ pub(crate) const fn hex_digit(n: u8) -> char {
 
 /// v7.17.0 Phase 3.P0-39 — parse a PG `hstore` text literal into
 /// a flat key→value map. Empty string → empty map. Duplicate
-/// keys take last-write-wins (matches PG `hstore_in`).
+/// keys keep the FIRST occurrence (PG18-measured, round 780; the old
+/// note claimed last-write-wins).
 ///
 /// Accepted shapes (minimal subset):
 ///   * `'a=>1, b=>2'`            — bareword keys/values
@@ -617,9 +618,12 @@ pub(crate) fn parse_hstore_str(
         } else {
             Some(parse_token(bytes, &mut i)?)
         };
-        // Replace any existing entry with the same key (last-wins).
-        if let Some(pos) = out.iter().position(|(k, _)| k == &key) {
-            out[pos] = (key, val_token);
+        // v7.39 (round 780, F31-D1) — PG's hstore_in keeps the FIRST
+        // occurrence of a duplicate key (measured: 'a=>1, a=>2' is
+        // "a"=>"1"); the old arm replaced it and the comment claimed
+        // last-write-wins matched PG.
+        if out.iter().any(|(k, _)| k == &key) {
+            // keep the first
         } else {
             out.push((key, val_token));
         }
@@ -2532,6 +2536,13 @@ fn type_name_to_data_type_lower(n: &str) -> Option<DataType> {
         // carries Value::Time; the coerce path parses HH:MM:SS.
         "time" | "time without time zone" => DataType::Time,
         "timetz" | "time with time zone" => DataType::TimeTz,
+        // v7.39 (round 780, F31-D1) — `hstore` is a first-class SPG
+        // type (parser, storage variant, codec and both text
+        // conversions have existed since v7.17.0) but the type-NAME
+        // map never listed it, so every wire spelling — a column
+        // declared `hstore`, a `::hstore` cast — answered
+        // 'type "hstore" does not exist'.
+        "hstore" => DataType::Hstore,
         "numeric_array" | "decimal_array" => DataType::NumericArray,
         "varchar_array" | "character varying_array" | "char_array" | "bpchar_array" => {
             DataType::TextArray
