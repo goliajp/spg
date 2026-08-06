@@ -2135,7 +2135,13 @@ impl Engine {
         self.queue_raised(raised_notices);
         self.execute_deferred_trigger_stmts(deferred_embedded, cancel)?;
         // v6.2.1 — auto-analyze modified-row tracking for UPDATE.
-        if !self.in_transaction() && affected > 0 {
+        // This connection's slot, not the engine-wide predicate: with a
+        // shared engine the global one is true while ANY connection has a
+        // transaction open, and an autocommit write then went uncounted.
+        // The table never crosses the analyze threshold, its statistics
+        // stay stale, and the planner keeps choosing from them — measured
+        // in round 796, 200 autocommit inserts counted as none.
+        if self.catalog_change_is_committed() && affected > 0 {
             self.statistics
                 .record_modifications(&stmt.table, affected as u64);
         }
@@ -3865,7 +3871,13 @@ impl Engine {
         self.queue_raised(raised_notices);
         self.execute_deferred_trigger_stmts(deferred_embedded, cancel)?;
         // v6.2.1 — auto-analyze modified-row tracking for DELETE.
-        if !self.in_transaction() && affected > 0 {
+        // This connection's slot, not the engine-wide predicate: with a
+        // shared engine the global one is true while ANY connection has a
+        // transaction open, and an autocommit write then went uncounted.
+        // The table never crosses the analyze threshold, its statistics
+        // stay stale, and the planner keeps choosing from them — measured
+        // in round 796, 200 autocommit inserts counted as none.
+        if self.catalog_change_is_committed() && affected > 0 {
             self.statistics
                 .record_modifications(&stmt.table, affected as u64);
         }
@@ -5087,7 +5099,13 @@ impl Engine {
         // counter so the background sweep can decide when to
         // re-ANALYZE. Cheap path on the autocommit-wrap hot loop
         // — one BTreeMap entry update per INSERT batch.
-        if !self.in_transaction() && affected > 0 {
+        // This connection's slot, not the engine-wide predicate: with a
+        // shared engine the global one is true while ANY connection has a
+        // transaction open, and an autocommit write then went uncounted.
+        // The table never crosses the analyze threshold, its statistics
+        // stay stale, and the planner keeps choosing from them — measured
+        // in round 796, 200 autocommit inserts counted as none.
+        if self.catalog_change_is_committed() && affected > 0 {
             self.statistics
                 .record_modifications(&stmt.table, affected as u64);
         }

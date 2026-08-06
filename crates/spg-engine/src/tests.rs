@@ -2730,3 +2730,43 @@ fn autovacuum_disabled_leaves_tombstones() {
     assert_eq!(t.row_count(), 5000, "autovacuum off — tombstones stay");
     assert_eq!(t.dead_rows(), 4000);
 }
+
+/// r796 — auto-analyze counts a statement's modified rows based on
+/// whether THIS connection is inside a transaction, not on whether the
+/// engine has one open somewhere.
+///
+/// `record_modifications` was gated on the engine-wide
+/// `in_transaction()`, true while any slot holds a transaction. On the
+/// server every connection shares one engine, so a second connection
+/// idling inside a BEGIN stopped every autocommit write from counting —
+/// the table then never crosses the analyze threshold, its statistics
+/// stay as they were, and the planner keeps choosing from them.
+#[test]
+fn another_slots_transaction_does_not_stop_autoanalyze_counting() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    // A different connection's slot, left open for the rest of the test.
+    let holder = crate::TxId(4242);
+    e.execute_in("BEGIN", holder).unwrap();
+
+    // 200 rows on the autocommit slot: well past the threshold, which is
+    // 50 + row_count/10.
+    for g in 0..200 {
+        e.execute_in(
+            &alloc::format!("INSERT INTO t VALUES ({g}, 'x')"),
+            crate::IMPLICIT_TX,
+        )
+        .unwrap();
+    }
+
+    assert!(
+        e.tables_needing_analyze().iter().any(|n| n == "t"),
+        "200 autocommit inserts are 200 modified rows whoever else has a \
+         transaction open"
+    );
+
+    e.execute_in("COMMIT", holder).unwrap();
+}
+
