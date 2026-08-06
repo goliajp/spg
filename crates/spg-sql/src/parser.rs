@@ -3657,6 +3657,31 @@ impl Parser {
                         )));
                     }
                 };
+                // v7.39 (round 776, F31 J7) — the per-column form
+                // (`ANALYZE t (x, y)`, PG-accepted) was a syntax error
+                // here while the VACUUM arm already consumed it; SPG
+                // analyzes whole tables, so the list parses and is
+                // accepted like the VACUUM path's.
+                if target.is_some() && matches!(self.peek(), Token::LParen) {
+                    self.advance();
+                    loop {
+                        let _ = self.expect_ident_like()?;
+                        match self.peek() {
+                            Token::Comma => {
+                                self.advance();
+                            }
+                            Token::RParen => {
+                                self.advance();
+                                break;
+                            }
+                            other => {
+                                return Err(self.err(format!(
+                                    "expected ',' or ')' in ANALYZE column list, got {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                }
                 Ok(Statement::Analyze(target))
             }
             // v7.12.1 — `SET <name> [TO|=] <value>`. The
