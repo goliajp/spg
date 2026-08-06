@@ -125,15 +125,20 @@ fn workload_completes_under_sustained_writes() {
         "200-row workload took {workload_wall:?} (budget {WORKLOAD_BUDGET:?})"
     );
 
-    // Drain a few extra freezer ticks so the cold-segment counter
-    // reflects the in-flight work.
-    std::thread::sleep(Duration::from_millis(500));
+    // v7.39 (round 784) — wait for the cold-segment counter to reach
+    // the assertion's floor instead of sleeping a fixed drain. The
+    // assertion below is unchanged; this only stops a loaded box from
+    // reading the counter mid-tick (round 783's flake class).
 
     // Sanity: at least two cold segments landed — proves the
     // parallel freezer actually ran with workers > 1 (a
     // single-threaded path would have produced the same count, so
     // this gate is about presence, not parallelism).
-    let cold_segs = count_rows(&mut s, "SELECT * FROM spg_stat_segment");
+    let mut cold_segs = 0;
+    crate::common::wait_until(Duration::from_secs(20), || {
+        cold_segs = count_rows(&mut s, "SELECT * FROM spg_stat_segment");
+        cold_segs >= 2
+    });
     assert!(
         cold_segs >= 2,
         "expected ≥ 2 cold segments after sustained writes, got {cold_segs}"

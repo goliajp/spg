@@ -346,10 +346,14 @@ fn checkpoint_truncates_wal_and_persists_through_restart() {
         }
         committed = written;
 
-        // Let the freezer fire so cold segments end up on disk.
-        thread::sleep(Duration::from_millis(300));
-
-        let wal_size_before = std::fs::metadata(&wal).unwrap().len();
+        // v7.39 (round 784) — wait for the WAL to actually carry the
+        // writes rather than sleeping a fixed proxy for the freezer
+        // tick (round 783's flake class). Assertion unchanged.
+        let mut wal_size_before = 0;
+        crate::common::wait_until(Duration::from_secs(20), || {
+            wal_size_before = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+            wal_size_before > 0
+        });
         assert!(
             wal_size_before > 0,
             "WAL must have grown past 0 before CHECKPOINT"

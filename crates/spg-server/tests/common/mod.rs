@@ -434,3 +434,31 @@ pub fn connect_to(addr: &str) -> TcpStream {
         }
     }
 }
+
+/// v7.39 (round 784) — poll a condition instead of sleeping a fixed
+/// proxy interval, for the tests whose intent is CONVERGENCE ("the
+/// background worker eventually gets there").
+///
+/// Round 783 traced this session's parallel-load flakes to constants
+/// that encode "about this long on an idle box"; two workspace suites
+/// at once are enough to make the constant lie. Polling keeps the
+/// assertion exactly as it was, returns as soon as the condition
+/// holds (usually sooner than the sleep it replaces), and only spends
+/// the deadline when the machine is genuinely slow.
+///
+/// NOT for tests whose intent is INVARIANCE ("must STAY at 1 row",
+/// "cold_segment_count stays 0") — polling until such a predicate
+/// holds returns immediately and weakens them. Round 784 found
+/// several of those hiding among the sleep-then-assert sites.
+pub fn wait_until(budget: std::time::Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if cond() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
