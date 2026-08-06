@@ -3,6 +3,8 @@
 //! libtest parallelises modules in-process.
 
 mod e2e_auto_compact;
+#[macro_use]
+mod wait_until;
 mod e2e_background_freezer;
 mod e2e_chaos;
 mod e2e_checkpoint_cow;
