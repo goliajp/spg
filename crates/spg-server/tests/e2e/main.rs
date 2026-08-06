@@ -56,6 +56,7 @@ mod e2e_cursor_lazy_round792;
 mod e2e_prevent_in_transaction_round794;
 mod e2e_catalog_commit_witness_round795;
 mod e2e_wbuf_flush_round798;
+mod e2e_implicit_tx_multi_round803;
 #[allow(unused_mut, unused_variables)]
 mod e2e_auth;
 #[allow(unused_mut, unused_variables, clippy::uninlined_format_args)]

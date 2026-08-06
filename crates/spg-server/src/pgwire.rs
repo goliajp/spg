@@ -1443,11 +1443,58 @@ fn dispatch_pg_simple_query_multi(
     settings: &mut std::collections::HashMap<String, String>,
     wbuf: &mut Vec<u8>,
 ) -> std::io::Result<()> {
-    for stmt in stmts {
+    // v7.39 (round 803) — PG wraps a multi-statement simple query in one
+    // implicit transaction, so a script that fails halfway leaves nothing
+    // behind. Measured on PG 18.4: `INSERT INTO t VALUES (1); INSERT INTO
+    // t VALUES (1);` against a primary key leaves zero rows there and
+    // used to leave one here.
+    //
+    // The wrap is a real transaction rather than a bookkeeping flag,
+    // which buys three PG behaviours without writing any of them:
+    //
+    //   * VACUUM / CREATE DATABASE / ALTER SYSTEM in a multi-statement
+    //     message hit the round-794 guard and report 25001, exactly as
+    //     PG does — and alone in a message, where no wrap happens, they
+    //     still run;
+    //   * an explicit COMMIT mid-script ends the wrap, so what follows is
+    //     its own unit. PG leaves 2 rows for
+    //     `INSERT 2; COMMIT; INSERT 3; SELECT 1/0;` and so does this;
+    //   * an explicit BEGIN…COMMIT inside the script nests as before,
+    //     since the wrap only opens when the connection is idle.
+    //
+    // BEGIN and the closing COMMIT/ROLLBACK go through the ordinary
+    // statement handler — WAL, transaction slot and all — with their wire
+    // frames written to a buffer that is dropped, because PG's implicit
+    // transaction is invisible on the wire.
+    // The wrap re-opens whenever the script hands the connection back
+    // idle with statements still to run. PG does not merely wrap once:
+    // measured, `INSERT 2; COMMIT; INSERT 3; INSERT 4; SELECT 1/0;`
+    // leaves two rows there, so the COMMIT closed one unit and rows 3
+    // and 4 formed another that the division rolled back. Wrapping only
+    // at the top left those two in autocommit, each standing on its own.
+    let script = stmts.len() > 1;
+    let mut implicit_tx = false;
+    for (i, stmt) in stmts.iter().enumerate() {
+        if script && !implicit_tx && *tx_state == b'I' && i + 1 < stmts.len() {
+            let mut discard = Vec::new();
+            handle_pg_simple_query_one_into_wbuf(
+                b"BEGIN", state, conn_state, role, tx_state, settings, &mut discard,
+            )?;
+            implicit_tx = true;
+        }
         let pre_len = wbuf.len();
         handle_pg_simple_query_one_into_wbuf(
             stmt, state, conn_state, role, tx_state, settings, wbuf,
         )?;
+        // An explicit COMMIT/ROLLBACK inside the script closes whatever
+        // was open, ours included — note this AFTER running the
+        // statement, so the next iteration sees an idle connection and
+        // opens a fresh wrap. Clearing it before the statement instead
+        // left the flag set for the rest of the script and the tail ran
+        // in autocommit.
+        if implicit_tx && *tx_state == b'I' {
+            implicit_tx = false;
+        }
         // PG halts a multi-stmt script after the first error frame
         // (the client sees Error + RFQ, no further frames). We
         // detect by checking whether tx_state was bumped to 'E' OR
@@ -1466,6 +1513,21 @@ fn dispatch_pg_simple_query_multi(
                 break;
             }
         }
+    }
+    // Close the wrap the way the script left it: committed if every
+    // statement stood, rolled back if one did not. `tx_state` is already
+    // 'I' when the script committed or rolled back for itself, and then
+    // there is nothing here to close.
+    if implicit_tx && matches!(*tx_state, b'T' | b'E') {
+        let closing: &[u8] = if *tx_state == b'E' {
+            b"ROLLBACK"
+        } else {
+            b"COMMIT"
+        };
+        let mut discard = Vec::new();
+        handle_pg_simple_query_one_into_wbuf(
+            closing, state, conn_state, role, tx_state, settings, &mut discard,
+        )?;
     }
     send_ready_for_query(wbuf, *tx_state)?;
     stream.write_all(wbuf)?;
