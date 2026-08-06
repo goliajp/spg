@@ -1301,15 +1301,39 @@ impl Engine {
         // land where the clones happen — the materialising fallback
         // here, eager peers below, and the output assembly.
         // v7.39 (round 790) — the joins-only exclusion here was TRIED
-        // and reverted. Relaxing it (so a joinless FROM also seeds the
-        // primary by row index instead of materialising) measured
-        // WORSE, not better: 147 MB → 178 MB on the 300k-row probe.
-        // The index seed avoids the row copy but the joinless output
-        // assembly then pays more than it saves; the streaming gate in
-        // select.rs is where the single-table win actually came from
-        // (181 → 147 MB). Leave this one alone until someone profiles
-        // the joinless output path — see
-        // `.claude/state/t35c-single-table-streaming-gap.md`.
+        // and reverted: relaxing it, so a joinless FROM seeds the
+        // primary by row index instead of materialising, measured
+        // WORSE (147 MB → 178 MB on a 300k-row probe). Round 800 found
+        // where the extra memory comes from, and it is not the output
+        // assembly this comment used to blame.
+        //
+        // Peak RSS, fresh server per cell, measured either side of the
+        // gate. The number that settles it is the baseline — taken
+        // after seeding and a single `WHERE id = 1` read, before any
+        // scan: 423 MB as it stands, 600 MB with the gate relaxed. One
+        // row of output, 177 MB apart.
+        //
+        // Seeding the primary by index means reading rows in place out
+        // of the stored `PersistentVec`, and touching it makes the
+        // whole table resident. Materialising copies only the surviving
+        // rows — one, for that warm-up — and keeps them in a compact
+        // Vec. So the copy is not the expensive representation here;
+        // in-place access is, and it costs the table's full residency
+        // whatever the query then does with it.
+        //
+        // The 72 MB this copy costs on a full scan is real (round 798
+        // decomposed it), but it is not recoverable by flipping this
+        // gate. Anything that goes after it has to avoid making the
+        // table resident, not merely avoid the copy.
+        //
+        // And memory is not even the strongest objection. The relaxed
+        // build was left on the test machine by accident and a gate run
+        // caught what the memory probes never would:
+        // `e2e_empty_target_list_round341` failed deterministically —
+        // a zero-column result set (`SELECT` with an empty target list)
+        // returned no DataRows at all where three were owed. Seeding
+        // the primary by row index does not merely cost more, it drops
+        // rows for a projection with nothing in it.
         let primary_table: Option<&Table> = if !from.joins.is_empty()
             && from.primary.unnest_expr.is_none()
             && from.primary.lateral_subquery.is_none()
