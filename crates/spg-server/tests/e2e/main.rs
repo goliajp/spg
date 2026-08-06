@@ -51,6 +51,7 @@ mod e2e_audit;
     clippy::uninlined_format_args
 )]
 mod e2e_audit_verify;
+mod e2e_midstream_error_round791;
 #[allow(unused_mut, unused_variables)]
 mod e2e_auth;
 #[allow(unused_mut, unused_variables, clippy::uninlined_format_args)]
