@@ -9,6 +9,9 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod e2e_tempstore_round786;
+#[path = "../../src/tempstore.rs"]
+mod tempstore_shim;
 mod e2e_alter_rebuild;
 #[allow(
     clippy::cast_lossless,
