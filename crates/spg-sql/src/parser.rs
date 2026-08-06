@@ -4702,7 +4702,18 @@ impl Parser {
                         | "large"
                 ) =>
             {
+                // DATABASE is the one member of this list PG refuses
+                // inside a transaction block; the rest (ROLE, CAST,
+                // TABLESPACE, …) it runs there quite happily, so only
+                // this one is named. Still a no-op otherwise — SPG is
+                // single-database.
+                let is_database = s.eq_ignore_ascii_case("database");
                 self.consume_until_statement_boundary();
+                if is_database {
+                    return Ok(Statement::NoOpPreventedInTransaction {
+                        what: String::from("CREATE DATABASE"),
+                    });
+                }
                 Ok(Statement::Empty)
             }
             // v7.39 (round 706) — the foreign-data family leaves the silent
@@ -13784,12 +13795,21 @@ impl Parser {
             },
             _ => MaintainKind::Whole,
         };
+        // PG bars `REINDEX … CONCURRENTLY` inside a transaction block and
+        // allows the plain form, so the modifier is recorded rather than
+        // skipped. It still has no effect on how the reindex runs.
+        let mut concurrently = false;
         if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("concurrently")) {
             self.advance();
+            concurrently = true;
         }
         let target = self.take_optional_maintain_name();
         self.consume_until_statement_boundary();
-        Ok(Statement::Maintain { kind, target })
+        Ok(Statement::Maintain {
+            kind,
+            concurrently,
+            target,
+        })
     }
 
     /// v7.39 (round 535) — `CLUSTER [VERBOSE] [<table> [USING <index>]]`
@@ -13809,6 +13829,9 @@ impl Parser {
             } else {
                 MaintainKind::Whole
             },
+            // CLUSTER has no CONCURRENTLY form, and PG runs it inside a
+            // transaction block quite happily (measured).
+            concurrently: false,
             target,
         })
     }
@@ -15444,11 +15467,13 @@ impl Parser {
         // — same accept-and-no-op shape as v7.37.16.5 DETACH
         // PARTITION CONCURRENTLY and v7.37.19.8 REFRESH MATERIALIZED
         // VIEW CONCURRENTLY.
+        let mut concurrently = false;
         if matches!(
             self.peek(),
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("concurrently")
         ) {
             self.advance();
+            concurrently = true;
         }
         let if_not_exists = self.consume_if_not_exists();
         // v7.39 (read01 round 93) — the index name is optional (PG since
@@ -15771,6 +15796,7 @@ impl Parser {
             )));
         }
         Ok(Statement::CreateIndex(CreateIndexStatement {
+            concurrently,
             name,
             key_order,
             key_collation,

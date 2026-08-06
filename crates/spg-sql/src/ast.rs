@@ -204,6 +204,15 @@ pub enum Statement {
     ///
     /// `None` is `RESET ALL`, which names no parameter.
     AlterSystem { parameter: Option<String> },
+    /// A statement SPG accepts as a no-op but PG refuses inside a
+    /// transaction block — today `CREATE DATABASE` / `DROP DATABASE`,
+    /// which are no-ops here because SPG is single-database.
+    ///
+    /// The no-op path they used to share (`Statement::Empty`) also
+    /// carries CREATE ROLE, CREATE CAST and a dozen others that PG is
+    /// happy to run inside a transaction, so the object has to be named
+    /// to refuse the right ones.
+    NoOpPreventedInTransaction { what: String },
     /// v7.39 (round 696) — statements SPG performs nothing for, but whose
     /// OPERAND PG validates before performing nothing either.
     ///
@@ -618,6 +627,11 @@ pub enum Statement {
     /// The name is carried now so the engine can say what PG says.
     Maintain {
         kind: MaintainKind,
+        /// `REINDEX … CONCURRENTLY`. Carried for the same reason as
+        /// [`CreateIndexStatement::concurrently`]: PG bars the
+        /// CONCURRENTLY form inside a transaction block and allows the
+        /// plain one.
+        concurrently: bool,
         /// `None` for the whole-database forms, which name nothing.
         target: Option<String>,
     },
@@ -2165,6 +2179,12 @@ pub struct IndexColumnOrder {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateIndexStatement {
     pub name: String,
+    /// `CREATE INDEX CONCURRENTLY`. SPG builds indexes synchronously
+    /// either way, so this changes nothing about how the index is made
+    /// — it is carried because PG refuses the CONCURRENTLY form inside
+    /// a transaction block and accepts the plain one, and the engine
+    /// cannot tell them apart without it.
+    pub concurrently: bool,
     /// v7.39 (round 537) — the leading key column's ordering clause,
     /// which is the column SPG indexes.
     pub key_order: IndexColumnOrder,
@@ -4904,6 +4924,9 @@ impl Statement {
             // postgresql.auto.conf), but PG classes ALTER SYSTEM as a
             // writer and a read-only session refuses it there too.
             Statement::AlterSystem { .. } => false,
+            // Same shape: a no-op here, a writer to PG, so a read-only
+            // session refuses it as PG's would.
+            Statement::NoOpPreventedInTransaction { .. } => false,
             // v7.39 (round 696) — they perform nothing, so nothing is
             // written; PG classes LOCK and the OWNED BY pair as writers and
             // a read-only session refuses them there.
@@ -5281,16 +5304,24 @@ impl fmt::Display for Statement {
                     (Some(p), Some(v)) => write!(f, " SET {p} = '{v}'"),
                 }
             }
-            Self::Maintain { kind, target } => {
+            Self::Maintain {
+                kind,
+                concurrently,
+                target,
+            } => {
                 f.write_str(match kind {
                     crate::ast::MaintainKind::ClusterRelation => "CLUSTER ",
                     _ => "REINDEX ",
                 })?;
+                if *concurrently {
+                    f.write_str("CONCURRENTLY ")?;
+                }
                 if let Some(t) = target {
                     f.write_str(t)?;
                 }
                 Ok(())
             }
+            Self::NoOpPreventedInTransaction { what } => f.write_str(what),
             Self::SetConstraints { names, deferred } => {
                 f.write_str("SET CONSTRAINTS ")?;
                 if names.is_empty() {
