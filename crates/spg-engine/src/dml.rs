@@ -2160,7 +2160,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -3894,7 +3894,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -4188,7 +4188,7 @@ impl Engine {
         self.run_also_rules(&rules, &columns, &rows, cancel)?;
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -4225,7 +4225,7 @@ impl Engine {
         self.run_also_rules(&rules, &columns, &pairs, cancel)?;
         Ok(QueryResult::CommandOk {
             affected: 0,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -4887,7 +4887,7 @@ impl Engine {
             self.run_also_rules(&instead_ins, &column_meta, &rows, CancelToken::none())?;
             return Ok(QueryResult::CommandOk {
                 affected: n,
-                modified_catalog: !self.in_transaction(),
+                modified_catalog: self.catalog_change_is_committed(),
             });
         }
         // v7.39 (read01 round 117) — NOT NULL, checked pre-write over the fully
@@ -5093,7 +5093,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
@@ -5540,7 +5540,7 @@ impl Engine {
         }
         Ok(QueryResult::CommandOk {
             affected: total_affected,
-            modified_catalog: !self.in_transaction(),
+            modified_catalog: self.catalog_change_is_committed(),
         })
     }
 
