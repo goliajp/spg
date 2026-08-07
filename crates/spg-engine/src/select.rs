@@ -6884,7 +6884,20 @@ impl Engine {
         // materialising path.
         let bound_pos = |e: &Expr| -> Option<usize> {
             match e {
-                Expr::Column(c) if c.qualifier.is_some() => eval::find_column_pos(c, &ctx),
+                // v7.39 (round 822) — an UNQUALIFIED column resolves here
+                // too. The `qualifier.is_some()` guard this replaces meant
+                // `SELECT pad FROM big` — the commonest projection there is
+                // — never reached the streaming walk: it fell out at this
+                // gate and re-ran on the materialising path, after the
+                // deferred join structure had already been built and paid
+                // for. Measured (round 821, statement_timeout=120 over 400k
+                // rows): `big.pad` and `b.pad` streamed and cancelled at
+                // ~65k rows in 0.14 s, while bare `pad` ran to completion in
+                // 0.80 s with the timeout never consulted. `find_column_pos`
+                // has always handled the unqualified case (it falls through
+                // to a by-name match), so the guard narrowed the gate for no
+                // reason it recorded.
+                Expr::Column(c) => eval::find_column_pos(c, &ctx),
                 _ => None,
             }
         };
@@ -8393,7 +8406,7 @@ pub(crate) fn resolve_projection_column<'a>(
     match (first, extra) {
         (Some(s), None) => Ok(s),
         (Some(_), Some(_)) => Err(EngineError::Eval(EvalError::TypeMismatch {
-            detail: alloc::format!("ambiguous column reference: {}", c.name),
+            detail: alloc::format!("column reference \"{}\" is ambiguous", c.name),
         })),
         _ => Err(EngineError::Eval(EvalError::ColumnNotFound {
             name: c.name.clone(),
