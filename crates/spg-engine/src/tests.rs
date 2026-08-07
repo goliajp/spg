@@ -2002,12 +2002,18 @@ fn epic_p_panic_in_no_params_select_is_caught_and_engine_survives() {
 // This one arms `planner_first_row_fetch`, which lives in
 // `exec_select_cancel_inner` — the materialising fall-back — so it fires
 // during setup, before any row is emitted. It needs a shape that still
-// takes that fall-back: `SELECT *` used to, and since r823 does not.
-// Making `find_column_pos` resolve unqualified names (which the general
-// resolver always did) let a plain projection bind, so it now streams,
-// and an injection point on the materialising path is simply never
-// reached — the test read as a firewall failure when nothing about the
-// firewall had changed. An arithmetic projection still materialises.
+// takes that fall-back, and which shapes those are keeps shrinking.
+// `SELECT *` stopped materialising at r823, when `find_column_pos`
+// learned to resolve unqualified names and a plain projection could
+// bind; the arithmetic projection chosen to replace it stopped at r831,
+// when a joinless single-table SELECT got a streaming walk of its own.
+// Each time, an injection point on the materialising path was simply
+// never reached and the test read as a firewall failure with nothing
+// about the firewall changed.
+//
+// `ORDER BY` is a different kind of choice: it is named in the shape
+// gates' explicit reject list, so it materialises by construction
+// rather than by not having been optimised yet.
 //
 // The emit-phase half — an unwind raised once rows are already flowing —
 // is what `epic_p_panic_inside_emit_callback_is_caught` below covers, and
@@ -2024,7 +2030,7 @@ fn epic_p_panic_in_streaming_select_is_caught_and_engine_survives() {
         .unwrap();
 
     let sel = e
-        .prepare_select_streaming("SELECT id + 0 FROM inj_panic_stream")
+        .prepare_select_streaming("SELECT id FROM inj_panic_stream ORDER BY id")
         .unwrap();
 
     let store = e.injection_store();

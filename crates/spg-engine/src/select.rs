@@ -6807,6 +6807,78 @@ impl Engine {
     ///
     /// Returns `Ok(None)` when the shape doesn't qualify; the caller
     /// then falls back to the materialising path.
+    /// v7.37 (round 831) — stream a joinless SELECT straight off the
+    /// stored table, one row at a time, without ever building a row set.
+    ///
+    /// Returns `Ok(None)` for anything this cannot serve, and the caller
+    /// falls through to the deferred-join path exactly as before: a
+    /// missing table, or a cold tier whose hydration the fallback handles.
+    fn try_stream_single_table<F>(
+        &self,
+        stmt: &SelectStatement,
+        from: &FromClause,
+        cancel: CancelToken<'_>,
+        emit: &mut F,
+    ) -> Result<Option<usize>, EngineError>
+    where
+        F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
+    {
+        let Some(table) = self.active_catalog().get(&from.primary.name) else {
+            return Ok(None);
+        };
+        // Cold-tier rows live outside `rows()`; the materialising fallback
+        // covers both tiers and this walk would silently drop them.
+        if table.has_cold_rows_fast() {
+            return Ok(None);
+        }
+        let alias = from
+            .primary
+            .alias
+            .as_deref()
+            .unwrap_or(from.primary.name.as_str());
+        let cols = table.schema().columns.clone();
+        let sess = self.dml_session();
+        let ctx = EvalContext::new(&cols, Some(alias))
+            .with_catalog(self.active_catalog())
+            .with_session(&sess);
+        let projection = build_projection(&stmt.items, &cols, alias, self.backslash_escapes)?;
+
+        let columns: Vec<ColumnSchema> = projection
+            .iter()
+            .map(|p| {
+                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
+                c.user_enum_type = p.user_enum_type.clone();
+                c.mysql_fsp = p.mysql_fsp;
+                c
+            })
+            .collect();
+        emit(crate::StreamItem::Header(&columns))?;
+
+        // One snapshot for the whole scan, as the materialising path takes.
+        let snapshot = self.current_snapshot();
+        let mut values: Vec<Value<'static>> = Vec::with_capacity(projection.len());
+        let mut count: usize = 0;
+        for (i, row) in table.scan_visible_from(0, &snapshot) {
+            if i.is_multiple_of(256) {
+                cancel.check()?;
+            }
+            if let Some(w) = &stmt.where_ {
+                let cond = crate::eval::eval_expr(w, row, &ctx).map_err(EngineError::Eval)?;
+                if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
+                    continue;
+                }
+            }
+            values.clear();
+            for p in &projection {
+                values.push(crate::eval::eval_expr(&p.expr, row, &ctx).map_err(EngineError::Eval)?);
+            }
+            let cell_refs: Vec<&Value> = values.iter().collect();
+            emit(crate::StreamItem::Row(&cell_refs))?;
+            count += 1;
+        }
+        Ok(Some(count))
+    }
+
     pub(crate) fn try_exec_joined_streaming<F>(
         &self,
         stmt: &SelectStatement,
@@ -6871,6 +6943,33 @@ impl Engine {
             .any(|i| matches!(i, SelectItem::Expr { expr, .. } if is_top_level_unnest(expr)))
         {
             return Ok(None);
+        }
+        // v7.37 (round 831) — a joinless FROM over a plain stored table
+        // never needs the deferred structure, and building one costs the
+        // whole table. `materialise_table_ref_filtered` clones every row
+        // into a `Vec<Row<'static>>` before anything is filtered or
+        // projected, so peak cost tracks the TABLE, not the result:
+        // measured over 300k rows of 200 bytes, `SELECT id FROM big` and
+        // `SELECT pad FROM big` both cost +107 MB over baseline, the narrow
+        // projection saving nothing, while an arithmetic projection — which
+        // the shape gates decline, so it materialises through the ordinary
+        // executor — cost +21 MB.
+        //
+        // Scanning in batches and releasing each one is what `cursor_fill`
+        // already does for a lazy cursor, and it is the same walk: resume
+        // from a slot, take visible rows, evaluate, hand them over, drop
+        // them. Round 800's finding stands and is why this reads rows OUT
+        // rather than seeding the join by index — touching the stored
+        // `PersistentVec` in place makes the whole table resident, which is
+        // worse than the copy. Each batch is copied, then freed.
+        if from.joins.is_empty()
+            && from.primary.unnest_expr.is_none()
+            && from.primary.lateral_subquery.is_none()
+            && from.primary.as_of_segment.is_none()
+            && from.primary.generate_series_args.is_none()
+            && let Some(n) = self.try_stream_single_table(stmt, from, cancel, emit)?
+        {
+            return Ok(Some(n));
         }
         // Build the deferred join under the regular byte budget.
         let mut budget = ByteBudget::new(self.max_query_bytes);
