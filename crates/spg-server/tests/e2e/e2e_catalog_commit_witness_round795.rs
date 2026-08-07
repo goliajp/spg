@@ -139,11 +139,17 @@ fn ddl_is_audited_even_while_another_connection_holds_a_transaction() {
     let addr = addrs.pgwire.as_ref().unwrap();
 
     let mut worker = open(addr);
-    assert!(!errored(&q(&mut worker, "CREATE TABLE control_tbl (id INT)")));
+    assert!(!errored(&q(
+        &mut worker,
+        "CREATE TABLE control_tbl (id INT)"
+    )));
 
     let mut holder = open(addr);
     q(&mut holder, "BEGIN");
-    assert!(!errored(&q(&mut worker, "CREATE TABLE victim_tbl (id INT)")));
+    assert!(!errored(&q(
+        &mut worker,
+        "CREATE TABLE victim_tbl (id INT)"
+    )));
     q(&mut holder, "COMMIT");
 
     // Read the chain through its own view rather than grepping the file:
@@ -182,14 +188,20 @@ fn ddl_survives_a_crash_even_while_another_connection_holds_a_transaction() {
     let addr = addrs.pgwire.as_ref().unwrap().clone();
 
     let mut worker = open(&addr);
-    assert!(!errored(&q(&mut worker, "CREATE TABLE control_tbl (id INT)")));
+    assert!(!errored(&q(
+        &mut worker,
+        "CREATE TABLE control_tbl (id INT)"
+    )));
 
     // The holder's transaction is never committed, and nothing writes
     // after the victim DDL — otherwise a later write's snapshot would
     // carry it to disk and hide the gap.
     let mut holder = open(&addr);
     q(&mut holder, "BEGIN");
-    assert!(!errored(&q(&mut worker, "CREATE TABLE victim_tbl (id INT)")));
+    assert!(!errored(&q(
+        &mut worker,
+        "CREATE TABLE victim_tbl (id INT)"
+    )));
 
     let before = col0(&q(
         &mut worker,
@@ -278,4 +290,3 @@ fn a_drop_stays_dropped_even_while_another_connection_holds_a_transaction() {
         "both DROPs were acked; before the fix victim_v came back, got {views:?}"
     );
 }
-

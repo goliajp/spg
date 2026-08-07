@@ -172,11 +172,7 @@ pub(crate) fn pg_viewdef_render(body: &str, pretty: bool) -> String {
         return body.to_string();
     }
     let mut out = String::from(" SELECT ");
-    let items: Vec<String> = stmt
-        .items
-        .iter()
-        .map(|i| viewdef_item_text(i))
-        .collect();
+    let items: Vec<String> = stmt.items.iter().map(|i| viewdef_item_text(i)).collect();
     out.push_str(&items.join(",\n    "));
     out.push_str("\n   FROM ");
     out.push_str(&from.primary.name);
@@ -288,8 +284,9 @@ fn random_in_range(lo: &Value<'_>, hi: &Value<'_>) -> Result<Value<'static>, Eva
         (Value::SmallInt(a), Value::SmallInt(b)) => {
             draw(i64::from(*a), i64::from(*b)).map(|v| Value::SmallInt(v as i16))
         }
-        (Value::Int(a), Value::Int(b)) => draw(i64::from(*a), i64::from(*b))
-            .map(|v| Value::Int(v as i32)),
+        (Value::Int(a), Value::Int(b)) => {
+            draw(i64::from(*a), i64::from(*b)).map(|v| Value::Int(v as i32))
+        }
         (Value::BigInt(a), Value::BigInt(b)) => draw(*a, *b).map(Value::BigInt),
         // Mixed integer widths widen to bigint, as arithmetic on them does.
         (
@@ -307,8 +304,16 @@ fn random_in_range(lo: &Value<'_>, hi: &Value<'_>) -> Result<Value<'static>, Eva
         // Numeric draws on the finer of the two scales, so `random(2.5, 2.5)`
         // answers 2.5 rather than an integer.
         (
-            Value::Numeric { scaled: a, scale: sa, kind: ka },
-            Value::Numeric { scaled: b, scale: sb, kind: kb },
+            Value::Numeric {
+                scaled: a,
+                scale: sa,
+                kind: ka,
+            },
+            Value::Numeric {
+                scaled: b,
+                scale: sb,
+                kind: kb,
+            },
         ) => {
             use spg_storage::NumericKind as NK;
             if !matches!(ka, NK::Finite) || !matches!(kb, NK::Finite) {
@@ -500,13 +505,14 @@ fn substring_position_arg(v: &Value<'_>, mysql: bool, what: &str) -> Result<i64,
     }
     // MySQL reads a number out of anything it can render; PG keeps its
     // "start must be integer" refusal for the shapes that are not text.
-    if mysql
-        && let Some(text) = mysql_str_arg(v, true)
-    {
+    if mysql && let Some(text) = mysql_str_arg(v, true) {
         return Ok(mysql_leading_int(&text));
     }
     Err(EvalError::TypeMismatch {
-        detail: format!("substring() {what} must be integer, got {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
+        detail: format!(
+            "substring() {what} must be integer, got {}",
+            crate::conversions::pg_type_name_for_error_opt(v.data_type())
+        ),
     })
 }
 
@@ -574,32 +580,39 @@ fn mysql_int_as_temporal(n: i64) -> Option<Value<'static>> {
     }
     let (y, mo, d, hh, mm, ss, ts) = match n {
         // 8-digit YYYYMMDD (DATE)
-        10_000_000..=99_999_999 => {
-            (
-                (n / 10_000) as i32,
-                ((n / 100) % 100) as u32,
-                (n % 100) as u32,
-                0, 0, 0, false,
-            )
-        }
+        10_000_000..=99_999_999 => (
+            (n / 10_000) as i32,
+            ((n / 100) % 100) as u32,
+            (n % 100) as u32,
+            0,
+            0,
+            0,
+            false,
+        ),
         // 6-digit YYMMDD (DATE)
         100_000..=999_999 => {
             let yy = (n / 10_000) as i32;
             let y = if yy < 70 { 2000 + yy } else { 1900 + yy };
-            (y, ((n / 100) % 100) as u32, (n % 100) as u32, 0, 0, 0, false)
-        }
-        // 14-digit YYYYMMDDHHMMSS (TIMESTAMP)
-        10_000_000_000_000..=99_999_999_999_999 => {
             (
-                (n / 10_000_000_000) as i32,
-                ((n / 100_000_000) % 100) as u32,
-                ((n / 1_000_000) % 100) as u32,
-                ((n / 10_000) % 100) as u32,
+                y,
                 ((n / 100) % 100) as u32,
                 (n % 100) as u32,
-                true,
+                0,
+                0,
+                0,
+                false,
             )
         }
+        // 14-digit YYYYMMDDHHMMSS (TIMESTAMP)
+        10_000_000_000_000..=99_999_999_999_999 => (
+            (n / 10_000_000_000) as i32,
+            ((n / 100_000_000) % 100) as u32,
+            ((n / 1_000_000) % 100) as u32,
+            ((n / 10_000) % 100) as u32,
+            ((n / 100) % 100) as u32,
+            (n % 100) as u32,
+            true,
+        ),
         // 12-digit YYMMDDHHMMSS (TIMESTAMP)
         100_000_000_000..=999_999_999_999 => {
             let yy = (n / 10_000_000_000) as i32;
@@ -634,11 +647,12 @@ fn mysql_datetime_us(v: &Value<'_>) -> Option<i64> {
     match v {
         Value::Timestamp(us) => Some(*us),
         Value::Date(d) => i64::from(*d).checked_mul(86_400_000_000),
-        Value::Text(s) if s.contains('-') => crate::eval::parse_timestamp_literal(s)
-            .or_else(|| {
+        Value::Text(s) if s.contains('-') => {
+            crate::eval::parse_timestamp_literal(s).or_else(|| {
                 crate::eval::parse_date_literal(s)
                     .and_then(|d| i64::from(d).checked_mul(86_400_000_000))
-            }),
+            })
+        }
         _ => None,
     }
 }
@@ -707,14 +721,11 @@ fn mysql_time_operand_us(v: &Value<'_>) -> Option<i64> {
 fn date_int_coerce_positions(name: &str) -> Option<&'static [usize]> {
     Some(match name {
         // Single-date-arg fns: position 0.
-        "date" | "date_add" | "date_sub" | "adddate" | "subdate"
-        | "year" | "month" | "day" | "dayofmonth" | "dayofyear" | "dayofweek"
-        | "weekday" | "dayname" | "monthname" | "quarter"
-        | "week" | "weekofyear" | "yearweek"
-        | "hour" | "minute" | "second" | "microsecond"
-        | "date_format" | "time_format" | "timestamp"
-        | "last_day" | "to_days" | "to_seconds"
-        | "addtime" | "subtime" => &[0],
+        "date" | "date_add" | "date_sub" | "adddate" | "subdate" | "year" | "month" | "day"
+        | "dayofmonth" | "dayofyear" | "dayofweek" | "weekday" | "dayname" | "monthname"
+        | "quarter" | "week" | "weekofyear" | "yearweek" | "hour" | "minute" | "second"
+        | "microsecond" | "date_format" | "time_format" | "timestamp" | "last_day" | "to_days"
+        | "to_seconds" | "addtime" | "subtime" => &[0],
         // Two-date-arg fns: positions 0 and 1.
         "datediff" | "timediff" => &[0, 1],
         // TIMESTAMPDIFF / TIMESTAMPADD: unit at position 0; position 2 is
@@ -925,7 +936,11 @@ fn reject_non_text_first_arg(name: &str, args: &[Value<'_>]) -> Result<(), EvalE
         .collect::<alloc::vec::Vec<_>>()
         .join(", ");
     // PG resolves `trim` to `pg_catalog.btrim` and names it that way.
-    let shown = if name == "trim" { "pg_catalog.btrim" } else { name };
+    let shown = if name == "trim" {
+        "pg_catalog.btrim"
+    } else {
+        name
+    };
     Err(EvalError::TypeMismatch {
         detail: alloc::format!("function {shown}({types}) does not exist"),
     })
@@ -20418,4 +20433,3 @@ fn oid_arg(v: Option<&Value>) -> Option<i64> {
         _ => None,
     }
 }
-

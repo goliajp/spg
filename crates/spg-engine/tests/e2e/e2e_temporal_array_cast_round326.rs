@@ -65,7 +65,10 @@ fn the_two_temporal_array_types_keep_their_identity() {
         "timestamp without time zone[]",
     );
     assert_eq!(
-        text(&mut e, "SELECT pg_typeof('{\"2020-01-01\"}'::timestamptz[])"),
+        text(
+            &mut e,
+            "SELECT pg_typeof('{\"2020-01-01\"}'::timestamptz[])"
+        ),
         "timestamp with time zone[]",
     );
 }
@@ -84,10 +87,7 @@ fn an_interval_array_literal_casts() {
 #[test]
 fn the_working_array_casts_are_untouched() {
     let mut e = Engine::new();
-    assert_eq!(
-        text(&mut e, "SELECT ('{1,2}'::int[])::text"),
-        "{1,2}"
-    );
+    assert_eq!(text(&mut e, "SELECT ('{1,2}'::int[])::text"), "{1,2}");
     assert_eq!(
         text(&mut e, "SELECT ('{2020-01-01,2020-01-02}'::date[])::text"),
         "{2020-01-01,2020-01-02}",

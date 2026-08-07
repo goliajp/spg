@@ -51,7 +51,8 @@ fn one(e: &mut Engine, sql: &str) -> String {
 
 fn seed(e: &mut Engine) {
     e.execute("CREATE TABLE ag(m MONEY, g INT)").unwrap();
-    e.execute("INSERT INTO ag VALUES (5,1),(6,1),(7,2)").unwrap();
+    e.execute("INSERT INTO ag VALUES (5,1),(6,1),(7,2)")
+        .unwrap();
 }
 
 #[test]

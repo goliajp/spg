@@ -58,7 +58,10 @@ fn round762_per_row_separator_answers_as_pg() {
             "aBbCc",
         ),
         // Constant separators and DISTINCT keep their shapes.
-        ("SELECT string_agg(v, ', ') FROM (VALUES ('x'),('y')) t(v)", "x, y"),
+        (
+            "SELECT string_agg(v, ', ') FROM (VALUES ('x'),('y')) t(v)",
+            "x, y",
+        ),
         (
             "SELECT string_agg(DISTINCT v, '-') FROM (VALUES ('b'),('a'),('b')) t(v)",
             "a-b",

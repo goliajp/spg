@@ -67,40 +67,64 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 fn round618_planned_terms() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 10) SELECT n FROM r ORDER BY n"),
+        vals(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 10) SELECT n FROM r ORDER BY n"
+        ),
         vec!["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
     );
     assert_eq!(
-        vals(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT n+1 FROM r WHERE n < 10) SELECT count(*) FROM r"),
+        vals(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT n+1 FROM r WHERE n < 10) SELECT count(*) FROM r"
+        ),
         vec!["10"],
         "UNION dedups; UNION ALL does not — both go through the same plan"
     );
     assert_eq!(
-        vals(&mut e, "WITH RECURSIVE r(a,b) AS (SELECT 1,'x' UNION ALL SELECT a+1, b||'y' FROM r WHERE a < 5) SELECT a,b FROM r ORDER BY a"),
+        vals(
+            &mut e,
+            "WITH RECURSIVE r(a,b) AS (SELECT 1,'x' UNION ALL SELECT a+1, b||'y' FROM r WHERE a < 5) SELECT a,b FROM r ORDER BY a"
+        ),
         vec!["1|x", "2|xy", "3|xyy", "4|xyyy", "5|xyyyy"],
         "two columns, one of them growing"
     );
     assert_eq!(
-        vals(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT n+10 FROM r WHERE n < 30) SELECT n FROM r ORDER BY n"),
+        vals(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT n+10 FROM r WHERE n < 30) SELECT n FROM r ORDER BY n"
+        ),
         vec!["1", "2", "11", "12", "21", "22", "31", "32"],
         "a second ANCHOR term, which must not re-emit every round"
     );
     assert_eq!(
-        vals(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT x.n+1 FROM r x WHERE x.n < 5) SELECT n FROM r ORDER BY n"),
+        vals(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT x.n+1 FROM r x WHERE x.n < 5) SELECT n FROM r ORDER BY n"
+        ),
         vec!["1", "2", "3", "4", "5"],
         "the CTE under an alias, which the plan has to resolve against"
     );
     assert_eq!(
-        vals(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n*2 FROM r WHERE n < 100) SELECT n FROM r ORDER BY n"),
+        vals(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n*2 FROM r WHERE n < 100) SELECT n FROM r ORDER BY n"
+        ),
         vec!["1", "2", "4", "8", "16", "32", "64", "128"]
     );
     assert_eq!(
-        vals(&mut e, "WITH RECURSIVE r(n,s) AS (SELECT 1, NULL::TEXT UNION ALL SELECT n+1, coalesce(s,'')||'z' FROM r WHERE n < 4) SELECT n,s FROM r ORDER BY n"),
+        vals(
+            &mut e,
+            "WITH RECURSIVE r(n,s) AS (SELECT 1, NULL::TEXT UNION ALL SELECT n+1, coalesce(s,'')||'z' FROM r WHERE n < 4) SELECT n,s FROM r ORDER BY n"
+        ),
         vec!["1|NULL", "2|z", "3|zz", "4|zzz"],
         "a NULL carried through the anchor"
     );
     assert_eq!(
-        vals(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1::BIGINT UNION ALL SELECT n+1 FROM r WHERE n < 5) SELECT n, pg_typeof(n) FROM r ORDER BY n"),
+        vals(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1::BIGINT UNION ALL SELECT n+1 FROM r WHERE n < 5) SELECT n, pg_typeof(n) FROM r ORDER BY n"
+        ),
         vec!["1|bigint", "2|bigint", "3|bigint", "4|bigint", "5|bigint"],
         "the column type the anchor settled is the one the rows keep"
     );
@@ -112,15 +136,24 @@ fn round618_planned_terms() {
 fn round618_termination() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE FALSE) SELECT n FROM r"),
+        vals(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE FALSE) SELECT n FROM r"
+        ),
         vec!["1"]
     );
     assert_eq!(
-        vals(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n FROM r WHERE n < 0) SELECT count(*) FROM r"),
+        vals(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n FROM r WHERE n < 0) SELECT count(*) FROM r"
+        ),
         vec!["1"]
     );
     assert_eq!(
-        vals(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT 1 FROM r) SELECT count(*) FROM r"),
+        vals(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT 1 FROM r) SELECT count(*) FROM r"
+        ),
         vec!["1"],
         "UNION's dedup is what stops this one — it would not terminate on ALL"
     );
@@ -131,17 +164,26 @@ fn round618_termination() {
 fn round618_shapes_that_fall_back() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL (SELECT n+1 FROM r WHERE n < 10 ORDER BY n LIMIT 1)) SELECT count(*) FROM r"),
+        vals(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL (SELECT n+1 FROM r WHERE n < 10 ORDER BY n LIMIT 1)) SELECT count(*) FROM r"
+        ),
         vec!["10"],
         "ORDER BY and LIMIT inside the recursive term"
     );
     assert_eq!(
-        vals(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT DISTINCT n+1 FROM r WHERE n < 5) SELECT n FROM r ORDER BY n"),
+        vals(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT DISTINCT n+1 FROM r WHERE n < 5) SELECT n FROM r ORDER BY n"
+        ),
         vec!["1", "2", "3", "4", "5"],
         "DISTINCT"
     );
     assert_eq!(
-        vals(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 3) SELECT * FROM r ORDER BY 1"),
+        vals(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 3) SELECT * FROM r ORDER BY 1"
+        ),
         vec!["1", "2", "3"],
         "a `*` projection in the OUTER query is fine; one in the TERM falls back"
     );
@@ -164,20 +206,32 @@ fn round618_shapes_that_fall_back() {
 fn round618_scale() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 100) SELECT count(*), sum(n), min(n), max(n) FROM r"),
+        vals(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 100) SELECT count(*), sum(n), min(n), max(n) FROM r"
+        ),
         vec!["100|5050|1|100"]
     );
     assert_eq!(
-        vals(&mut e, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 20) SELECT n FROM r WHERE n % 3 = 0 ORDER BY n"),
+        vals(
+            &mut e,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 20) SELECT n FROM r WHERE n % 3 = 0 ORDER BY n"
+        ),
         vec!["3", "6", "9", "12", "15", "18"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*), sum(n) FROM (WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 20000) SELECT n FROM r) q"),
+        vals(
+            &mut e,
+            "SELECT count(*), sum(n) FROM (WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 20000) SELECT n FROM r) q"
+        ),
         vec!["20000|200010000"],
         "twenty thousand rounds"
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM (WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT n+1 FROM r WHERE n < 20000) SELECT n FROM r) q"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM (WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT n+1 FROM r WHERE n < 20000) SELECT n FROM r) q"
+        ),
         vec!["20000"],
         "and the same under UNION, where every row is also keyed for the dedup"
     );

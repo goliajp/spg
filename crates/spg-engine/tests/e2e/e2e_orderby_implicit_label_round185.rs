@@ -29,7 +29,10 @@ fn cast_output_label_binds_order_by() {
     let mut e = Engine::new();
     // PG: text order — "10" < "2".
     assert_eq!(
-        col(&mut e, "SELECT x::text FROM (VALUES (2),(10)) v(x) ORDER BY x"),
+        col(
+            &mut e,
+            "SELECT x::text FROM (VALUES (2),(10)) v(x) ORDER BY x"
+        ),
         ["10", "2"]
     );
 }

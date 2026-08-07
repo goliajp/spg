@@ -106,7 +106,10 @@ fn window_clause_errors_are_42p20_over_the_wire() {
         exec_error(&mut s, "CREATE TABLE w (id int, g text, v int)"),
         None
     );
-    assert_eq!(exec_error(&mut s, "INSERT INTO w VALUES (1,'a',10),(2,'b',20)"), None);
+    assert_eq!(
+        exec_error(&mut s, "INSERT INTO w VALUES (1,'a',10),(2,'b',20)"),
+        None
+    );
 
     for (sql, want_msg) in [
         (

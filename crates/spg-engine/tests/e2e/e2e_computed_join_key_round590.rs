@@ -115,27 +115,47 @@ fn round590_computed_key_joins() {
     );
     // Multiplication, modulo, unary minus and a cast all qualify.
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb b ON a.b = b.b * 2 + 2 ORDER BY 1, 2"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb b ON a.b = b.b * 2 + 2 ORDER BY 1, 2"
+        ),
         vec!["2|0", "4|3"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb b ON a.b = b.b / 2 ORDER BY 1, 2"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb b ON a.b = b.b / 2 ORDER BY 1, 2"
+        ),
         vec!["4|3"]
     );
     assert!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb b ON a.b = b.b * 2 ORDER BY 1").is_empty(),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb b ON a.b = b.b * 2 ORDER BY 1"
+        )
+        .is_empty(),
         "nothing doubles into the other side"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb b ON a.k = b.id % 3 ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb b ON a.k = b.id % 3 ORDER BY 1"
+        ),
         vec!["1|1", "1|4", "2|1", "2|4", "3|2", "4|2"]
     );
     assert!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb b ON a.b = -b.b ORDER BY 1").is_empty(),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb b ON a.b = -b.b ORDER BY 1"
+        )
+        .is_empty(),
         "no value is its own negation here"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb b ON a.id = b.k::INT ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb b ON a.id = b.k::INT ORDER BY 1"
+        ),
         vec!["1|0", "1|1", "2|2", "2|3", "3|4"]
     );
 }
@@ -147,27 +167,42 @@ fn round590_computed_key_joins() {
 fn round590_numeric_keys_meet_across_types() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb b ON a.id = b.n + 1 ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb b ON a.id = b.n + 1 ORDER BY 1"
+        ),
         vec!["5|0"],
         "INT column against a NUMERIC expression"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb b ON a.id = b.f + 1 ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb b ON a.id = b.f + 1 ORDER BY 1"
+        ),
         vec!["5|0"],
         "INT column against a double expression"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb b ON a.f = b.n + 1.00 ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb b ON a.f = b.n + 1.00 ORDER BY 1"
+        ),
         vec!["1|0", "2|1", "4|3", "5|4"]
     );
     // -0.0 equals 0 and must land in the same bucket.
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb b ON a.f = b.f * 0 ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb b ON a.f = b.f * 0 ORDER BY 1"
+        ),
         vec!["4|0", "4|1", "4|3", "4|4", "4|9"]
     );
     // A NULL on the computed side joins nothing, exactly like a NULL column.
     assert_eq!(
-        one(&mut e, "SELECT count(*) FROM ja a JOIN jb b ON a.b = b.b + 0"),
+        one(
+            &mut e,
+            "SELECT count(*) FROM ja a JOIN jb b ON a.b = b.b + 0"
+        ),
         "0"
     );
 }
@@ -177,7 +212,10 @@ fn round590_numeric_keys_meet_across_types() {
 fn round590_ineligible_shapes_keep_the_old_path() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb b ON a.s = lower(b.s) ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb b ON a.s = lower(b.s) ORDER BY 1"
+        ),
         vec!["1|0", "2|1", "4|3", "5|4"],
         "a function call is not admitted, and the residual still answers"
     );

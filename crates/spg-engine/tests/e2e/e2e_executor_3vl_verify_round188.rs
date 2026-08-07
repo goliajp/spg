@@ -30,19 +30,23 @@ fn cell_strings(e: &mut Engine, sql: &str) -> Vec<String> {
 #[test]
 fn not_in_with_null_in_list_is_empty() {
     let mut e = Engine::new();
-    assert!(cell_strings(
-        &mut e,
-        "SELECT x FROM (VALUES (1),(2),(3)) v(x) \
+    assert!(
+        cell_strings(
+            &mut e,
+            "SELECT x FROM (VALUES (1),(2),(3)) v(x) \
          WHERE x NOT IN (SELECT y FROM (VALUES (2),(NULL::int)) w(y))"
-    )
-    .is_empty());
+        )
+        .is_empty()
+    );
     // Longer list, same 3VL rule.
-    assert!(cell_strings(
-        &mut e,
-        "SELECT x FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8)) v(x) \
+    assert!(
+        cell_strings(
+            &mut e,
+            "SELECT x FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8)) v(x) \
          WHERE x NOT IN (SELECT y FROM (VALUES (1),(3),(5),(7),(NULL::int)) w(y))"
-    )
-    .is_empty());
+        )
+        .is_empty()
+    );
 }
 
 #[test]

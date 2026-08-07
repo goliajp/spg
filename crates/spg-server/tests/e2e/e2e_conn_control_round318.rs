@@ -277,10 +277,7 @@ fn set_constraints_outside_a_block_warns() {
         msgs.iter().any(|m| m.ty == b'C'),
         "the command still succeeds"
     );
-    let notice = msgs
-        .iter()
-        .find(|m| m.ty == b'N')
-        .expect("PG warns here");
+    let notice = msgs.iter().find(|m| m.ty == b'N').expect("PG warns here");
     assert_eq!(field_of(notice, b'S').as_deref(), Some("WARNING"));
     assert_eq!(
         field_of(notice, b'M').as_deref(),

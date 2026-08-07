@@ -50,7 +50,10 @@ fn round473_the_catalog_reports_the_flag_and_the_definition_carries_it() {
         "ix1|true"
     );
     assert_eq!(
-        scalar(&mut e, "SELECT indexdef FROM pg_indexes WHERE tablename = 't1'"),
+        scalar(
+            &mut e,
+            "SELECT indexdef FROM pg_indexes WHERE tablename = 't1'"
+        ),
         "CREATE UNIQUE INDEX ix1 ON public.t1 USING btree (a) NULLS NOT DISTINCT"
     );
 }
@@ -68,7 +71,10 @@ fn round473_a_plain_unique_index_still_reports_neither() {
         "false"
     );
     assert_eq!(
-        scalar(&mut e, "SELECT indexdef FROM pg_indexes WHERE tablename = 't'"),
+        scalar(
+            &mut e,
+            "SELECT indexdef FROM pg_indexes WHERE tablename = 't'"
+        ),
         "CREATE UNIQUE INDEX ix ON public.t USING btree (a)"
     );
 }
@@ -82,7 +88,10 @@ fn round473_the_clause_sits_before_where_on_a_partial_index() {
     e.execute("CREATE UNIQUE INDEX pix ON p (a) NULLS NOT DISTINCT WHERE b > 0")
         .unwrap();
     assert_eq!(
-        scalar(&mut e, "SELECT indexdef FROM pg_indexes WHERE tablename = 'p'"),
+        scalar(
+            &mut e,
+            "SELECT indexdef FROM pg_indexes WHERE tablename = 'p'"
+        ),
         "CREATE UNIQUE INDEX pix ON public.p USING btree (a) NULLS NOT DISTINCT WHERE (b > 0)"
     );
 }
@@ -115,7 +124,10 @@ fn round473_regclass_names_tables_and_sequences_too() {
     e.execute("CREATE VIEW vv AS SELECT a FROM tt").unwrap();
     for name in ["tt", "sq", "vv"] {
         assert_eq!(
-            scalar(&mut e, &format!("SELECT '{name}'::regclass::oid::regclass::text")),
+            scalar(
+                &mut e,
+                &format!("SELECT '{name}'::regclass::oid::regclass::text")
+            ),
             name,
             "round trip for {name}"
         );

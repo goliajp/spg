@@ -59,8 +59,11 @@ const IMPLICIT: TxId = TxId(0);
 
 fn oncall_engine() -> Engine {
     let mut e = Engine::new();
-    e.execute_in("CREATE TABLE oncall (name TEXT PRIMARY KEY, on_call BOOLEAN)", IMPLICIT)
-        .unwrap();
+    e.execute_in(
+        "CREATE TABLE oncall (name TEXT PRIMARY KEY, on_call BOOLEAN)",
+        IMPLICIT,
+    )
+    .unwrap();
     e.execute_in(
         "INSERT INTO oncall VALUES ('alice', true), ('bob', true)",
         IMPLICIT,
@@ -74,8 +77,10 @@ fn oncall_engine() -> Engine {
 fn round552_write_skew_is_refused() {
     let mut e = oncall_engine();
     let (t1, t2) = (TxId(11), TxId(12));
-    e.execute_in("BEGIN ISOLATION LEVEL SERIALIZABLE", t1).unwrap();
-    e.execute_in("BEGIN ISOLATION LEVEL SERIALIZABLE", t2).unwrap();
+    e.execute_in("BEGIN ISOLATION LEVEL SERIALIZABLE", t1)
+        .unwrap();
+    e.execute_in("BEGIN ISOLATION LEVEL SERIALIZABLE", t2)
+        .unwrap();
     // Each sees both on call.
     assert_eq!(
         rows(&mut e, "SELECT count(*) FROM oncall WHERE on_call", t1),
@@ -101,7 +106,11 @@ fn round552_write_skew_is_refused() {
     );
     // The invariant holds: somebody is still on call.
     assert_eq!(
-        rows(&mut e, "SELECT count(*) FROM oncall WHERE on_call", IMPLICIT),
+        rows(
+            &mut e,
+            "SELECT count(*) FROM oncall WHERE on_call",
+            IMPLICIT
+        ),
         vec!["1"]
     );
 }
@@ -112,18 +121,25 @@ fn round552_same_row_conflict_still_caught() {
     let mut e = Engine::new();
     e.execute_in("CREATE TABLE cw (k INT PRIMARY KEY, n INT)", IMPLICIT)
         .unwrap();
-    e.execute_in("INSERT INTO cw VALUES (1, 10)", IMPLICIT).unwrap();
+    e.execute_in("INSERT INTO cw VALUES (1, 10)", IMPLICIT)
+        .unwrap();
     let (t1, t2) = (TxId(21), TxId(22));
-    e.execute_in("BEGIN ISOLATION LEVEL SERIALIZABLE", t1).unwrap();
-    e.execute_in("BEGIN ISOLATION LEVEL SERIALIZABLE", t2).unwrap();
-    e.execute_in("UPDATE cw SET n = n + 1 WHERE k = 1", t1).unwrap();
+    e.execute_in("BEGIN ISOLATION LEVEL SERIALIZABLE", t1)
+        .unwrap();
+    e.execute_in("BEGIN ISOLATION LEVEL SERIALIZABLE", t2)
+        .unwrap();
+    e.execute_in("UPDATE cw SET n = n + 1 WHERE k = 1", t1)
+        .unwrap();
     e.execute_in("COMMIT", t1).unwrap();
     // PG raises here or at commit; either way the second one loses.
     let second = e
         .execute_in("UPDATE cw SET n = n + 100 WHERE k = 1", t2)
         .and_then(|_| e.execute_in("COMMIT", t2));
     assert!(second.is_err(), "the loser must not commit");
-    assert_eq!(rows(&mut e, "SELECT n FROM cw WHERE k = 1", IMPLICIT), vec!["11"]);
+    assert_eq!(
+        rows(&mut e, "SELECT n FROM cw WHERE k = 1", IMPLICIT),
+        vec!["11"]
+    );
 }
 
 /// Two SERIALIZABLE transactions that share nothing both commit — the
@@ -136,8 +152,10 @@ fn round552_disjoint_transactions_both_commit() {
     e.execute_in("INSERT INTO a VALUES (1)", IMPLICIT).unwrap();
     e.execute_in("INSERT INTO b VALUES (1)", IMPLICIT).unwrap();
     let (t1, t2) = (TxId(31), TxId(32));
-    e.execute_in("BEGIN ISOLATION LEVEL SERIALIZABLE", t1).unwrap();
-    e.execute_in("BEGIN ISOLATION LEVEL SERIALIZABLE", t2).unwrap();
+    e.execute_in("BEGIN ISOLATION LEVEL SERIALIZABLE", t1)
+        .unwrap();
+    e.execute_in("BEGIN ISOLATION LEVEL SERIALIZABLE", t2)
+        .unwrap();
     rows(&mut e, "SELECT count(*) FROM a", t1);
     rows(&mut e, "SELECT count(*) FROM b", t2);
     e.execute_in("INSERT INTO a VALUES (2)", t1).unwrap();
@@ -153,8 +171,10 @@ fn round552_disjoint_transactions_both_commit() {
 fn round552_repeatable_read_is_unchanged() {
     let mut e = oncall_engine();
     let (t1, t2) = (TxId(41), TxId(42));
-    e.execute_in("BEGIN ISOLATION LEVEL REPEATABLE READ", t1).unwrap();
-    e.execute_in("BEGIN ISOLATION LEVEL REPEATABLE READ", t2).unwrap();
+    e.execute_in("BEGIN ISOLATION LEVEL REPEATABLE READ", t1)
+        .unwrap();
+    e.execute_in("BEGIN ISOLATION LEVEL REPEATABLE READ", t2)
+        .unwrap();
     rows(&mut e, "SELECT count(*) FROM oncall WHERE on_call", t1);
     rows(&mut e, "SELECT count(*) FROM oncall WHERE on_call", t2);
     e.execute_in("UPDATE oncall SET on_call = false WHERE name = 'alice'", t1)

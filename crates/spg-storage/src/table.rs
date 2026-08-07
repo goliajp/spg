@@ -825,12 +825,7 @@ impl Table {
     /// when it is not, and it works because appends only ever push
     /// larger ids and reclaiming preserves their order.
     pub fn resume_slot_after(&self, last: crate::row_header::RowId, hint: usize) -> usize {
-        if hint > 0
-            && self
-                .rowids
-                .get(hint - 1)
-                .is_some_and(|&r| r == last)
-        {
+        if hint > 0 && self.rowids.get(hint - 1).is_some_and(|&r| r == last) {
             return hint;
         }
         let (mut lo, mut hi) = (0usize, self.rowids.len());
@@ -1038,9 +1033,8 @@ impl Table {
                         // in-place MVCC an UPDATE appends a new row VERSION, so an
                         // ordinary `SET flag = 'done'` over a batch lands every
                         // one of them on the same key.
-                        let mut entries = map
-                            .insert_mut(key.clone(), Vec::new())
-                            .unwrap_or_default();
+                        let mut entries =
+                            map.insert_mut(key.clone(), Vec::new()).unwrap_or_default();
                         // v7.39 (round 493) — drop this key's dead versions while
                         // the list is already in hand.
                         //
@@ -1088,9 +1082,9 @@ impl Table {
                         // untouched.
                         if horizon > 0 && entries.len() > 1 && entries.len().is_power_of_two() {
                             entries.retain(|loc| match loc {
-                                RowLocator::Hot(i) => headers
-                                    .get(*i)
-                                    .is_none_or(|h| !crate::vacuum::is_reclaimable(h.xmax, horizon)),
+                                RowLocator::Hot(i) => headers.get(*i).is_none_or(|h| {
+                                    !crate::vacuum::is_reclaimable(h.xmax, horizon)
+                                }),
                                 RowLocator::Cold { .. } => true,
                             });
                         }
@@ -1340,7 +1334,11 @@ impl Table {
     /// compaction/delete that shifted slots). Preserves which columns are
     /// indexed; re-emits all `Hot` locators.
     fn rebuild_excl_indexes(&mut self) {
-        let cols: Vec<usize> = self.excl_indexes.iter().map(|e| e.column_position).collect();
+        let cols: Vec<usize> = self
+            .excl_indexes
+            .iter()
+            .map(|e| e.column_position)
+            .collect();
         self.excl_indexes.clear();
         for c in cols {
             self.ensure_excl_range_index(c);

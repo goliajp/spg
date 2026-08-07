@@ -43,9 +43,12 @@ fn create_statistics_does_not_block_following_dml() {
     // ("extended statistics require at least 2 columns"); the pin used
     // it only because the statement was being swallowed.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id INT NOT NULL, tag TEXT)").unwrap();
-    e.execute("CREATE STATISTICS stat ON id, tag FROM t").unwrap();
-    e.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')").unwrap();
+    e.execute("CREATE TABLE t (id INT NOT NULL, tag TEXT)")
+        .unwrap();
+    e.execute("CREATE STATISTICS stat ON id, tag FROM t")
+        .unwrap();
+    e.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
     let r = e.execute("SELECT count(*) FROM t").unwrap();
     let spg_engine::QueryResult::Rows { rows, .. } = r else {
         panic!()

@@ -80,10 +80,8 @@ fn geom_intersects(l: &Value<'_>, r: &Value<'_>) -> Result<Value<'static>, EvalE
                 if points.len() < 2 {
                     return Some(alloc::vec![]);
                 }
-                let mut out: alloc::vec::Vec<(Point2D, Point2D)> = points
-                    .windows(2)
-                    .map(|w| (w[0], w[1]))
-                    .collect();
+                let mut out: alloc::vec::Vec<(Point2D, Point2D)> =
+                    points.windows(2).map(|w| (w[0], w[1])).collect();
                 if *closed {
                     out.push((points[points.len() - 1], points[0]));
                 }
@@ -96,15 +94,17 @@ fn geom_intersects(l: &Value<'_>, r: &Value<'_>) -> Result<Value<'static>, EvalE
                 if b.abs() > EPS {
                     let y = |x: f64| (-c - a * x) / b;
                     Some(alloc::vec![(
-                        Point2D { x: -FAR, y: y(-FAR) },
+                        Point2D {
+                            x: -FAR,
+                            y: y(-FAR)
+                        },
                         Point2D { x: FAR, y: y(FAR) },
                     )])
                 } else if a.abs() > EPS {
                     let x = -c / a;
-                    Some(alloc::vec![(
-                        Point2D { x, y: -FAR },
-                        Point2D { x, y: FAR },
-                    )])
+                    Some(alloc::vec![
+                        (Point2D { x, y: -FAR }, Point2D { x, y: FAR },)
+                    ])
                 } else {
                     Some(alloc::vec![])
                 }
@@ -114,9 +114,11 @@ fn geom_intersects(l: &Value<'_>, r: &Value<'_>) -> Result<Value<'static>, EvalE
     }
 
     match (segments(l), segments(r)) {
-        (Some(ls), Some(rs)) => Ok(Value::Bool(ls.iter().any(|(p1, p2)| {
-            rs.iter().any(|(q1, q2)| segs_meet(*p1, *p2, *q1, *q2))
-        }))),
+        (Some(ls), Some(rs)) => {
+            Ok(Value::Bool(ls.iter().any(|(p1, p2)| {
+                rs.iter().any(|(q1, q2)| segs_meet(*p1, *p2, *q1, *q2))
+            })))
+        }
         _ => Err(EvalError::TypeMismatch {
             detail: alloc::format!(
                 "operator ?# not supported for {:?} and {:?}",
@@ -393,7 +395,6 @@ pub(crate) fn apply_binary_by_ref(
         }
         .map(Some);
     }
-
 
     match op {
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
@@ -1070,11 +1071,9 @@ pub(crate) fn apply_binary(
                 }
             };
             match (extent(&l), extent(&r)) {
-                (Some((llo, lhi)), Some((rlo, rhi))) => Ok(Value::Bool(if below {
-                    lhi < rlo
-                } else {
-                    llo > rhi
-                })),
+                (Some((llo, lhi)), Some((rlo, rhi))) => {
+                    Ok(Value::Bool(if below { lhi < rlo } else { llo > rhi }))
+                }
                 _ => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "operator {} not supported for {:?} and {:?}",
@@ -1239,8 +1238,7 @@ pub(crate) fn apply_binary(
         // has no hull and answers false. Rewriting to the hull lets the
         // existing range arms below do the work.
         BinOp::InetContainedBy | BinOp::InetContains | BinOp::OverLeft | BinOp::OverRight
-            if matches!(l, Value::Multirange { .. })
-                && matches!(r, Value::Multirange { .. }) =>
+            if matches!(l, Value::Multirange { .. }) && matches!(r, Value::Multirange { .. }) =>
         {
             let (Value::Multirange { kind, ranges: a }, Value::Multirange { ranges: b, .. }) =
                 (&l, &r)
@@ -1616,8 +1614,11 @@ pub(crate) fn apply_binary(
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
             compare(op, &l, &r)
         }
-        BinOp::And | BinOp::Or | BinOp::LogicalXor
-        | BinOp::IsDistinctFrom | BinOp::IsNotDistinctFrom => {
+        BinOp::And
+        | BinOp::Or
+        | BinOp::LogicalXor
+        | BinOp::IsDistinctFrom
+        | BinOp::IsNotDistinctFrom => {
             unreachable!("handled above")
         }
     }
@@ -1850,9 +1851,11 @@ pub(crate) fn apply_binary_interval(
     };
     let signed_months = i64::from(*rhs_months) * sign;
     let signed_days = i64::from(*rhs_days) * sign;
-    let signed_micros = rhs_us.checked_mul(sign).ok_or_else(|| EvalError::TypeMismatch {
-        detail: "INTERVAL micros overflows on negation".into(),
-    })?;
+    let signed_micros = rhs_us
+        .checked_mul(sign)
+        .ok_or_else(|| EvalError::TypeMismatch {
+            detail: "INTERVAL micros overflows on negation".into(),
+        })?;
     match lhs {
         // TIME ± INTERVAL wraps within the day (PG semantics): only
         // the sub-day microseconds apply, and the result is taken
@@ -1877,12 +1880,11 @@ pub(crate) fn apply_binary_interval(
             // midnight when the interval has no sub-day part), because the
             // interval may carry a time component. `date ± integer` stays a
             // date, but that is a different operator handled elsewhere.
-            let base =
-                i64::from(*d)
-                    .checked_mul(86_400_000_000)
-                    .ok_or_else(|| EvalError::TypeMismatch {
-                        detail: "DATE → TIMESTAMP lift overflows for INTERVAL math".into(),
-                    })?;
+            let base = i64::from(*d).checked_mul(86_400_000_000).ok_or_else(|| {
+                EvalError::TypeMismatch {
+                    detail: "DATE → TIMESTAMP lift overflows for INTERVAL math".into(),
+                }
+            })?;
             Ok(Some(Value::Timestamp(add_interval_to_micros(
                 base,
                 signed_months,
@@ -1901,17 +1903,17 @@ pub(crate) fn apply_binary_interval(
                 .ok_or_else(|| EvalError::TypeMismatch {
                     detail: "INTERVAL ± INTERVAL months overflows i32".into(),
                 })?;
-            let raw_days =
-                i64::from(*lhs_days)
-                    .checked_add(signed_days)
-                    .ok_or_else(|| EvalError::TypeMismatch {
-                        detail: "INTERVAL ± INTERVAL days overflows i64".into(),
-                    })?;
-            let raw_micros = lhs_us
-                .checked_add(signed_micros)
+            let raw_days = i64::from(*lhs_days)
+                .checked_add(signed_days)
                 .ok_or_else(|| EvalError::TypeMismatch {
-                    detail: "INTERVAL ± INTERVAL micros overflows i64".into(),
+                    detail: "INTERVAL ± INTERVAL days overflows i64".into(),
                 })?;
+            let raw_micros =
+                lhs_us
+                    .checked_add(signed_micros)
+                    .ok_or_else(|| EvalError::TypeMismatch {
+                        detail: "INTERVAL ± INTERVAL micros overflows i64".into(),
+                    })?;
             // v7.38 (read01) — PG interval arithmetic is PURELY component-wise:
             // it does NOT justify days ↔ micros, so `1 day - 2 hours` stays
             // `1 day -02:00:00` (mixed sign) and `1 day - 26 hours` stays
@@ -2020,18 +2022,22 @@ pub(crate) fn add_interval_to_micros(
             })?;
     }
     if days != 0 {
-        let day_micros = days
-            .checked_mul(MICROS_PER_DAY)
+        let day_micros =
+            days.checked_mul(MICROS_PER_DAY)
+                .ok_or_else(|| EvalError::TypeMismatch {
+                    detail: "INTERVAL days overflows i64 microseconds".into(),
+                })?;
+        out = out
+            .checked_add(day_micros)
             .ok_or_else(|| EvalError::TypeMismatch {
-                detail: "INTERVAL days overflows i64 microseconds".into(),
+                detail: "TIMESTAMP ± INTERVAL days overflows i64".into(),
             })?;
-        out = out.checked_add(day_micros).ok_or_else(|| EvalError::TypeMismatch {
-            detail: "TIMESTAMP ± INTERVAL days overflows i64".into(),
-        })?;
     }
-    let out = out.checked_add(micros).ok_or_else(|| EvalError::TypeMismatch {
-        detail: "timestamp out of range".into(),
-    })?;
+    let out = out
+        .checked_add(micros)
+        .ok_or_else(|| EvalError::TypeMismatch {
+            detail: "timestamp out of range".into(),
+        })?;
     // v7.39 (read01 timestamp.c) — PG's lower bound (4714-11-24 BC,
     // Unix-epoch microseconds); arithmetic below it errors like PG.
     // The upper bound is i64 itself (checked adds above) — SPG's
@@ -2429,10 +2435,16 @@ fn apply_binary_numeric(
     }
     // Promote integer ↔ numeric to a shared scale (max of both sides).
     let (a, sa) = numeric_or_widen(&l).ok_or_else(|| EvalError::TypeMismatch {
-        detail: format!("NUMERIC op against non-numeric {}", crate::conversions::pg_type_name_for_error_opt(l.data_type())),
+        detail: format!(
+            "NUMERIC op against non-numeric {}",
+            crate::conversions::pg_type_name_for_error_opt(l.data_type())
+        ),
     })?;
     let (b, sb) = numeric_or_widen(&r).ok_or_else(|| EvalError::TypeMismatch {
-        detail: format!("NUMERIC op against non-numeric {}", crate::conversions::pg_type_name_for_error_opt(r.data_type())),
+        detail: format!(
+            "NUMERIC op against non-numeric {}",
+            crate::conversions::pg_type_name_for_error_opt(r.data_type())
+        ),
     })?;
     match op {
         BinOp::Add | BinOp::Sub => {
@@ -3165,9 +3177,10 @@ fn arith(
             // "integer out of range", NOT a silent widening to bigint. This
             // matches SPG's own `::int` cast, which already errors on
             // overflow — the arithmetic path must agree.
-            let result = int_op(i64::from(a), i64::from(b)).ok_or_else(|| EvalError::TypeMismatch {
-                detail: format!("integer overflow on {op_name}"),
-            })?;
+            let result =
+                int_op(i64::from(a), i64::from(b)).ok_or_else(|| EvalError::TypeMismatch {
+                    detail: format!("integer overflow on {op_name}"),
+                })?;
             let small = i32::try_from(result).map_err(|_| EvalError::TypeMismatch {
                 detail: "integer out of range".into(),
             })?;
@@ -3246,8 +3259,8 @@ pub(crate) fn apply_binary_in(
     // v7.39 (round 393) — a STRING operand makes `/` a DOUBLE (`'10'/'4'`
     // is 2.5, not the DECIMAL 2.5000 that `10/4` is), checked on the
     // ORIGINAL operands before the reading pair lifts a string to a number.
-    let div_text_operand = matches!(op, BinOp::Div)
-        && (matches!(l, Value::Text(_)) || matches!(r, Value::Text(_)));
+    let div_text_operand =
+        matches!(op, BinOp::Div) && (matches!(l, Value::Text(_)) || matches!(r, Value::Text(_)));
     let (l, r) = super::mysql_operand_reading_pair(op, l, r);
     if let Some(v) = super::mysql_true_division(op, &l, &r, div_text_operand) {
         return Ok(v);
@@ -3340,7 +3353,8 @@ fn mysql_date_plus_interval(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Option<V
         return None; // a time component lifts the result to DATETIME
     }
     let base = i64::from(date).checked_mul(86_400_000_000)?;
-    let res = add_interval_to_micros(base, i64::from(months) * sign, i64::from(days) * sign, 0).ok()?;
+    let res =
+        add_interval_to_micros(base, i64::from(months) * sign, i64::from(days) * sign, 0).ok()?;
     let day = res.div_euclid(86_400_000_000);
     Some(Value::Date(i32::try_from(day).ok()?))
 }
@@ -3356,9 +3370,7 @@ fn int_div_op(l: &Value<'_>, r: &Value<'_>) -> Result<Value<'static>, EvalError>
             Value::Float(f) => *f,
             Value::Real(f) => f64::from(*f),
             #[allow(clippy::cast_precision_loss)]
-            Value::Numeric { scaled, scale, .. } => {
-                *scaled as f64 / 10_f64.powi(i32::from(*scale))
-            }
+            Value::Numeric { scaled, scale, .. } => *scaled as f64 / 10_f64.powi(i32::from(*scale)),
             Value::Text(t) | Value::BpChar(t) => crate::eval::mysql_leading_number(t),
             Value::Null => return None,
             _ => return None,
@@ -3535,15 +3547,13 @@ fn as_f64(v: &Value<'_>) -> Result<f64, EvalError> {
         Value::Float(x) => Ok(*x),
         Value::Real(x) => Ok(f64::from(*x)),
         #[allow(clippy::cast_precision_loss)]
-            // v7.39 (round 271) — parse the decimal text instead of
-            // dividing by a power built with repeated multiplication,
-            // which accumulated rounding error and ran to infinity once
-            // `scale` could exceed 308.
-        Value::Numeric { scaled, scale, .. } => {
-            Ok(crate::eval::format_numeric(*scaled, *scale)
-                .parse()
-                .unwrap_or(f64::NAN))
-        }
+        // v7.39 (round 271) — parse the decimal text instead of
+        // dividing by a power built with repeated multiplication,
+        // which accumulated rounding error and ran to infinity once
+        // `scale` could exceed 308.
+        Value::Numeric { scaled, scale, .. } => Ok(crate::eval::format_numeric(*scaled, *scale)
+            .parse()
+            .unwrap_or(f64::NAN)),
         // v7.39 (read01 numeric.c) — a big NUMERIC in a mixed float op
         // approximates through its decimal text (same promotion as the
         // i128-mantissa arm above).
@@ -3554,7 +3564,10 @@ fn as_f64(v: &Value<'_>) -> Result<f64, EvalError> {
                 detail: "value out of range: overflow".into(),
             }),
         other => Err(EvalError::TypeMismatch {
-            detail: format!("cannot convert {} to FLOAT", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+            detail: format!(
+                "cannot convert {} to FLOAT",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+            ),
         }),
     }
 }
@@ -4274,7 +4287,10 @@ pub(crate) fn range_as_multirange(v: &Value<'_>) -> Option<Value<'static>> {
             empty: false,
         }]
     };
-    Some(Value::Multirange { kind: *kind, ranges })
+    Some(Value::Multirange {
+        kind: *kind,
+        ranges,
+    })
 }
 
 pub(crate) fn multirange_union(
@@ -5584,11 +5600,7 @@ fn inet_bitwise(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Result<Value<'static
 /// types PG has no operator for — `1 IS DISTINCT FROM 'a'::text` was `true`,
 /// `nullif(1, 'a'::text)` was `1`, `1 IN (1, 'a'::text)` was `true` — so a
 /// predicate that PG rejects outright silently decided a row's fate.
-pub(super) fn require_comparable(
-    op: BinOp,
-    a: &Value<'_>,
-    b: &Value<'_>,
-) -> Result<(), EvalError> {
+pub(super) fn require_comparable(op: BinOp, a: &Value<'_>, b: &Value<'_>) -> Result<(), EvalError> {
     if a.is_null() || b.is_null() {
         return Ok(());
     }
@@ -6005,31 +6017,25 @@ pub(super) fn compare(
             Value::RegClass(a, _) | Value::RegProc(a, _) | Value::RegType(a, _),
             Value::RegClass(b, _) | Value::RegProc(b, _) | Value::RegType(b, _),
         ) => a.cmp(b),
-        (
-            Value::RegClass(a, _) | Value::RegProc(a, _) | Value::RegType(a, _),
-            Value::BigInt(b),
-        ) => a.cmp(b),
-        (
-            Value::BigInt(a),
-            Value::RegClass(b, _) | Value::RegProc(b, _) | Value::RegType(b, _),
-        ) => a.cmp(b),
-        (
-            Value::RegClass(a, _) | Value::RegProc(a, _) | Value::RegType(a, _),
-            Value::Int(b),
-        ) => a.cmp(&i64::from(*b)),
-        (
-            Value::Int(a),
-            Value::RegClass(b, _) | Value::RegProc(b, _) | Value::RegType(b, _),
-        ) => i64::from(*a).cmp(b),
+        (Value::RegClass(a, _) | Value::RegProc(a, _) | Value::RegType(a, _), Value::BigInt(b)) => {
+            a.cmp(b)
+        }
+        (Value::BigInt(a), Value::RegClass(b, _) | Value::RegProc(b, _) | Value::RegType(b, _)) => {
+            a.cmp(b)
+        }
+        (Value::RegClass(a, _) | Value::RegProc(a, _) | Value::RegType(a, _), Value::Int(b)) => {
+            a.cmp(&i64::from(*b))
+        }
+        (Value::Int(a), Value::RegClass(b, _) | Value::RegProc(b, _) | Value::RegType(b, _)) => {
+            i64::from(*a).cmp(b)
+        }
         // Text form compares by name (the pre-dual-shape contract).
-        (
-            Value::RegClass(_, a) | Value::RegProc(_, a) | Value::RegType(_, a),
-            Value::Text(b),
-        ) => a.as_ref().cmp(b.as_ref()),
-        (
-            Value::Text(a),
-            Value::RegClass(_, b) | Value::RegProc(_, b) | Value::RegType(_, b),
-        ) => a.as_ref().cmp(b.as_ref()),
+        (Value::RegClass(_, a) | Value::RegProc(_, a) | Value::RegType(_, a), Value::Text(b)) => {
+            a.as_ref().cmp(b.as_ref())
+        }
+        (Value::Text(a), Value::RegClass(_, b) | Value::RegProc(_, b) | Value::RegType(_, b)) => {
+            a.as_ref().cmp(b.as_ref())
+        }
         // v7.37.17 — same-type array `=` / `<>` / `<` / `<=` / `>` /
         // `>=` for the remaining Ord-element array variants. PG's
         // `array_cmp` total order = element-wise (`cmp_array`); uuid is

@@ -51,10 +51,7 @@ fn a_plain_256_place_decimal_no_longer_aborts_the_query() {
     // decimal".
     let lit = deep_decimal(255);
     assert_eq!(one(&mut e, &format!("SELECT {lit}")), lit);
-    assert_eq!(
-        one(&mut e, &format!("SELECT pg_typeof({lit})")),
-        "numeric",
-    );
+    assert_eq!(one(&mut e, &format!("SELECT pg_typeof({lit})")), "numeric",);
 }
 
 #[test]
@@ -121,7 +118,10 @@ fn a_deep_numeric_survives_a_round_trip_through_a_column() {
     e.execute("CREATE TABLE t (v numeric)").unwrap();
     e.execute("INSERT INTO t VALUES (1e-256), (0.25), (1e-400)")
         .unwrap();
-    assert_eq!(one(&mut e, "SELECT scale(v) FROM t ORDER BY v LIMIT 1"), "400");
+    assert_eq!(
+        one(&mut e, "SELECT scale(v) FROM t ORDER BY v LIMIT 1"),
+        "400"
+    );
     assert_eq!(
         one(&mut e, "SELECT count(*) FROM t WHERE scale(v) > 255"),
         "2",

@@ -27,8 +27,10 @@ use spg_engine::{Engine, QueryResult};
 
 fn engine() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE a (id INT, v INT, shared INT)").unwrap();
-    e.execute("CREATE TABLE b (id INT, d INT, shared INT)").unwrap();
+    e.execute("CREATE TABLE a (id INT, v INT, shared INT)")
+        .unwrap();
+    e.execute("CREATE TABLE b (id INT, d INT, shared INT)")
+        .unwrap();
     e.execute("INSERT INTO a VALUES (1,10,7),(2,20,7)").unwrap();
     e.execute("INSERT INTO b VALUES (1,100,9)").unwrap();
     e
@@ -56,12 +58,18 @@ fn round533_unqualified_source_column_resolves() {
     let mut e = engine();
     e.execute("UPDATE a SET v = v + d FROM b WHERE a.id = b.id")
         .unwrap();
-    assert_eq!(rows(&mut e, "SELECT v FROM a ORDER BY id"), vec!["110", "20"]);
+    assert_eq!(
+        rows(&mut e, "SELECT v FROM a ORDER BY id"),
+        vec!["110", "20"]
+    );
     // A constant assignment beside it, and a function call around it.
     e.execute("UPDATE a SET v = 0").unwrap();
     e.execute("UPDATE a SET v = abs(0 - d) FROM b WHERE a.id = b.id")
         .unwrap();
-    assert_eq!(rows(&mut e, "SELECT v FROM a ORDER BY id"), vec!["100", "0"]);
+    assert_eq!(
+        rows(&mut e, "SELECT v FROM a ORDER BY id"),
+        vec!["100", "0"]
+    );
 }
 
 /// A name both relations have is refused, with PG's wording — and the
@@ -76,7 +84,10 @@ fn round533_ambiguous_name_is_refused() {
         format!("{err}").contains("column reference \"shared\" is ambiguous"),
         "message was {err}"
     );
-    assert_eq!(rows(&mut e, "SELECT v FROM a ORDER BY id"), vec!["10", "20"]);
+    assert_eq!(
+        rows(&mut e, "SELECT v FROM a ORDER BY id"),
+        vec!["10", "20"]
+    );
 }
 
 /// A name only the target has still resolves to the target, and a name
@@ -87,7 +98,10 @@ fn round533_target_and_missing_names_unchanged() {
     let mut e = engine();
     e.execute("UPDATE a SET v = v + 1 FROM b WHERE a.id = b.id")
         .unwrap();
-    assert_eq!(rows(&mut e, "SELECT v FROM a ORDER BY id"), vec!["11", "20"]);
+    assert_eq!(
+        rows(&mut e, "SELECT v FROM a ORDER BY id"),
+        vec!["11", "20"]
+    );
     // With no FROM at all there is no source to resolve against.
     assert!(e.execute("UPDATE a SET v = d").is_err());
 }
@@ -98,7 +112,10 @@ fn round533_qualified_form_unchanged() {
     let mut e = engine();
     e.execute("UPDATE a SET v = b.d FROM b WHERE a.id = b.id")
         .unwrap();
-    assert_eq!(rows(&mut e, "SELECT v FROM a ORDER BY id"), vec!["100", "20"]);
+    assert_eq!(
+        rows(&mut e, "SELECT v FROM a ORDER BY id"),
+        vec!["100", "20"]
+    );
     // And a derived-table source, which round 530 fixed.
     e.execute("UPDATE a SET v = 0").unwrap();
     e.execute("UPDATE a SET v = v + x.d FROM (SELECT 1 AS id, 5 AS d) x WHERE a.id = x.id")

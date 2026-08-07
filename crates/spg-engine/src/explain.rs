@@ -241,7 +241,6 @@ pub(crate) fn collect_column_refs(expr: &Expr, out: &mut Vec<spg_sql::ast::Colum
     }
 }
 
-
 /// v7.39 (round 224, EXPLAIN epic Phase 0) — one node of the PG-shaped
 /// plan tree. `head` is the node line ("Seq Scan on t1", "Sort"), `attrs`
 /// the property lines beneath it ("Sort Key: v", "Filter: (id = 5)"),
@@ -394,9 +393,7 @@ fn promoted_key_for<'w>(
     jidx: usize,
     candidates: &[&'w Expr],
 ) -> Option<&'w Expr> {
-    let rel = |t: &spg_sql::ast::TableRef| {
-        t.alias.clone().unwrap_or_else(|| t.name.clone())
-    };
+    let rel = |t: &spg_sql::ast::TableRef| t.alias.clone().unwrap_or_else(|| t.name.clone());
     let peer = rel(&from.joins[jidx].table);
     let mut left: alloc::vec::Vec<String> = alloc::vec![rel(&from.primary)];
     left.extend(from.joins[..jidx].iter().map(|j| rel(&j.table)));
@@ -439,7 +436,6 @@ fn pg_cond(e: &Expr) -> String {
         alloc::format!("({s})")
     }
 }
-
 
 /// v7.39 (round 226, Phase 2) — split a WHERE into the conjunct the index
 /// actually serves (rendered as `Index Cond:`) and the residual conjuncts
@@ -600,9 +596,7 @@ fn scan_node(
     if crate::partition::is_partition_parent(engine.active_catalog(), name) {
         let mut app = PlanNode::new(String::from("Append"));
         let kept = where_
-            .and_then(|_| {
-                engine.explain_partition_kept_children_by_where(name, where_)
-            })
+            .and_then(|_| engine.explain_partition_kept_children_by_where(name, where_))
             .or_else(|| engine.explain_partition_kept_children_by_where(name, None));
         if let Some(children) = kept {
             for c in &children {
@@ -685,9 +679,7 @@ fn scan_node(
         } else {
             "Index Scan using"
         };
-        let mut n = PlanNode::new(alloc::format!(
-            "{verb} {idx_name} on {name}{alias_sfx}"
-        ));
+        let mut n = PlanNode::new(alloc::format!("{verb} {idx_name} on {name}{alias_sfx}"));
         if let Some(w) = where_ {
             let (cond, residual) = split.expect("computed alongside where_");
             match cond {
@@ -719,7 +711,11 @@ fn scan_node(
         let rows = est_scan_rows(table_rows, where_, false);
         let total = 1.0
             + table_rows as f64 * 0.01
-            + if filtered { table_rows as f64 * 0.0025 } else { 0.0 };
+            + if filtered {
+                table_rows as f64 * 0.0025
+            } else {
+                0.0
+            };
         n.cost = Some((0.0, total, rows, width));
         n
     }
@@ -733,8 +729,6 @@ fn child_cost(n: &PlanNode) -> (f64, f64, u64, u64) {
         .and_then(|c| c.cost)
         .unwrap_or((0.0, 0.0, 1, 8))
 }
-
-
 
 /// v7.39 (round 227, Phase 3) — fill the tree's ANALYZE blocks from
 /// GENUINELY MEASURED numbers only. The top node takes the real elapsed
@@ -870,8 +864,8 @@ fn scan_counter_snapshot(engine: &Engine) -> alloc::collections::BTreeMap<String
     for name in cat.table_names() {
         if let Some(t) = cat.get(&name) {
             let st = t.scan_stats();
-            let v = st.seq_tup_read.load(Ordering::Relaxed)
-                + st.idx_tup_fetch.load(Ordering::Relaxed);
+            let v =
+                st.seq_tup_read.load(Ordering::Relaxed) + st.idx_tup_fetch.load(Ordering::Relaxed);
             out.insert(name, v);
         }
     }
@@ -903,7 +897,11 @@ fn node_props(node: &PlanNode, with_costs: bool, parent_rel: Option<&str>) -> Ve
     // "Node Type" + the structural keys PG derives from the node head.
     let head = node.head.as_str();
     let (node_type, rel, idx) = if let Some(rest) = head.strip_prefix("Seq Scan on ") {
-        ("Seq Scan", Some(rest.split_whitespace().next().unwrap_or(rest)), None)
+        (
+            "Seq Scan",
+            Some(rest.split_whitespace().next().unwrap_or(rest)),
+            None,
+        )
     } else if let Some(rest) = head.strip_prefix("Index Only Scan using ") {
         let (i, r) = rest.split_once(" on ").unwrap_or((rest, ""));
         (
@@ -913,9 +911,17 @@ fn node_props(node: &PlanNode, with_costs: bool, parent_rel: Option<&str>) -> Ve
         )
     } else if let Some(rest) = head.strip_prefix("Index Scan using ") {
         let (i, r) = rest.split_once(" on ").unwrap_or((rest, ""));
-        ("Index Scan", Some(r.split_whitespace().next().unwrap_or(r)), Some(i))
+        (
+            "Index Scan",
+            Some(r.split_whitespace().next().unwrap_or(r)),
+            Some(i),
+        )
     } else if let Some(rest) = head.strip_prefix("CTE Scan on ") {
-        ("CTE Scan", Some(rest.split_whitespace().next().unwrap_or(rest)), None)
+        (
+            "CTE Scan",
+            Some(rest.split_whitespace().next().unwrap_or(rest)),
+            None,
+        )
     } else if let Some(rest) = head.strip_prefix("Insert on ") {
         ("Insert", Some(rest), None)
     } else if let Some(rest) = head.strip_prefix("Update on ") {
@@ -938,7 +944,11 @@ fn node_props(node: &PlanNode, with_costs: bool, parent_rel: Option<&str>) -> Ve
         push("Parent Relationship", Prop::Str(String::from(pr)));
     }
     if is_agg {
-        let strategy = if node_type == "HashAggregate" { "Hashed" } else { "Plain" };
+        let strategy = if node_type == "HashAggregate" {
+            "Hashed"
+        } else {
+            "Plain"
+        };
         push("Strategy", Prop::Str(String::from(strategy)));
         push("Partial Mode", Prop::Str(String::from("Simple")));
     }
@@ -998,7 +1008,13 @@ fn child_rel(i: usize) -> &'static str {
 /// holding `{"Plan": {…}}`, pretty-printed two spaces per level exactly as
 /// PG does, children nested under "Plans".
 fn render_json_plan(node: &PlanNode, with_costs: bool) -> String {
-    fn obj(node: &PlanNode, with_costs: bool, parent_rel: Option<&str>, ind: usize, out: &mut String) {
+    fn obj(
+        node: &PlanNode,
+        with_costs: bool,
+        parent_rel: Option<&str>,
+        ind: usize,
+        out: &mut String,
+    ) {
         let pad = " ".repeat(ind);
         let inner = " ".repeat(ind + 2);
         out.push_str("{\n");
@@ -1048,7 +1064,13 @@ fn render_json_plan(node: &PlanNode, with_costs: bool) -> String {
 /// PG namespace, one `<Query>`, and the node tree with hyphenated element
 /// names (`Node-Type`, `Relation-Name`) and `<Item>` sequences.
 fn render_xml_plan(node: &PlanNode, with_costs: bool) -> String {
-    fn elem(node: &PlanNode, with_costs: bool, parent_rel: Option<&str>, ind: usize, out: &mut String) {
+    fn elem(
+        node: &PlanNode,
+        with_costs: bool,
+        parent_rel: Option<&str>,
+        ind: usize,
+        out: &mut String,
+    ) {
         let pad = " ".repeat(ind);
         let inner = " ".repeat(ind + 2);
         out.push_str(&alloc::format!("{pad}<Plan>\n"));
@@ -1056,7 +1078,10 @@ fn render_xml_plan(node: &PlanNode, with_costs: bool) -> String {
             let tag = k.replace(' ', "-");
             match v {
                 Prop::Str(s) => {
-                    out.push_str(&alloc::format!("{inner}<{tag}>{}</{tag}>\n", xml_escape(&s)));
+                    out.push_str(&alloc::format!(
+                        "{inner}<{tag}>{}</{tag}>\n",
+                        xml_escape(&s)
+                    ));
                 }
                 Prop::Bare(s) => out.push_str(&alloc::format!("{inner}<{tag}>{s}</{tag}>\n")),
                 Prop::List(items) => {
@@ -1091,7 +1116,13 @@ fn render_xml_plan(node: &PlanNode, with_costs: bool) -> String {
 /// `Plan:` mapping holds the node properties, children as a nested `Plans:`
 /// sequence. PG emits a trailing space after the container keys; matched.
 fn render_yaml_plan(node: &PlanNode, with_costs: bool) -> String {
-    fn map(node: &PlanNode, with_costs: bool, parent_rel: Option<&str>, ind: usize, out: &mut String) {
+    fn map(
+        node: &PlanNode,
+        with_costs: bool,
+        parent_rel: Option<&str>,
+        ind: usize,
+        out: &mut String,
+    ) {
         let pad = " ".repeat(ind);
         for (i, (k, v)) in node_props(node, with_costs, parent_rel).iter().enumerate() {
             // The first property carries the sequence dash from the caller.
@@ -1192,7 +1223,14 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
             // wrapped in a Hash node, like PG); anything else ->
             // Nested Loop with a Join Filter.
             for (jidx, j) in from.joins.iter().enumerate() {
-                let right = scan_node(engine, &j.table.name, j.table.alias.as_deref(), None, &cte_names, false);
+                let right = scan_node(
+                    engine,
+                    &j.table.name,
+                    j.table.alias.as_deref(),
+                    None,
+                    &cte_names,
+                    false,
+                );
                 let (verb, hashable) = match j.kind {
                     spg_sql::ast::JoinKind::Inner => ("", true),
                     spg_sql::ast::JoinKind::Left => (" Left", true),
@@ -1226,19 +1264,15 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
                     let (_, lt, lr, lw) = left.cost.unwrap_or((0.0, 0.0, 1, 8));
                     let (hs, ht, hr, hw) = hash.cost.unwrap_or((0.0, 0.0, 1, 8));
                     let _ = hs;
-                    jn.cost = Some((
-                        ht,
-                        ht + lt + (lr + hr) as f64 * 0.01,
-                        lr.max(hr),
-                        lw + hw,
-                    ));
+                    jn.cost = Some((ht, ht + lt + (lr + hr) as f64 * 0.01, lr.max(hr), lw + hw));
                     jn.children.push(left);
                     jn.children.push(hash);
                     jn
                 } else {
                     let mut jn = PlanNode::new(alloc::format!("Nested Loop{verb}"));
                     if let Some(on) = &j.on {
-                        jn.attrs.push(alloc::format!("Join Filter: {}", pg_cond(on)));
+                        jn.attrs
+                            .push(alloc::format!("Join Filter: {}", pg_cond(on)));
                     }
                     let (_, lt, lr, lw) = left.cost.unwrap_or((0.0, 0.0, 1, 8));
                     let (_, rt, rr, rw) = right.cost.unwrap_or((0.0, 0.0, 1, 8));
@@ -1247,9 +1281,11 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
                     jn.children.push(right);
                     jn
                 };
-                if expr_has_subquery(stmt.where_.as_ref().unwrap_or(&Expr::Literal(
-                    spg_sql::ast::Literal::Null,
-                ))) {
+                if expr_has_subquery(
+                    stmt.where_
+                        .as_ref()
+                        .unwrap_or(&Expr::Literal(spg_sql::ast::Literal::Null)),
+                ) {
                     // Subquery filters stay on the scan node (attached
                     // above); nothing extra here — placeholder branch kept
                     // for the Phase 1 predicate-split work.
@@ -1272,7 +1308,8 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
         let mut agg = if let Some(gs) = &stmt.group_by {
             let mut a = PlanNode::new(String::from("HashAggregate"));
             let keys: Vec<String> = gs.iter().map(|g| alloc::format!("{g}")).collect();
-            a.attrs.push(alloc::format!("Group Key: {}", keys.join(", ")));
+            a.attrs
+                .push(alloc::format!("Group Key: {}", keys.join(", ")));
             a
         } else {
             PlanNode::new(String::from("Aggregate"))
@@ -1301,7 +1338,8 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
                 other => alloc::format!("{other:?}"),
             })
             .collect();
-        d.attrs.push(alloc::format!("Group Key: {}", keys.join(", ")));
+        d.attrs
+            .push(alloc::format!("Group Key: {}", keys.join(", ")));
         d.children.push(node);
         let (_, ct, cr, cw) = child_cost(&d);
         d.cost = Some((ct, ct + cr as f64 * 0.0025, (cr / 10).max(1), cw));
@@ -1320,7 +1358,8 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
                 }
             })
             .collect();
-        s.attrs.push(alloc::format!("Sort Key: {}", keys.join(", ")));
+        s.attrs
+            .push(alloc::format!("Sort Key: {}", keys.join(", ")));
         s.children.push(node);
         let (_, ct, cr, cw) = child_cost(&s);
         // Sort pays its work up front: startup ≈ total (PG shape).
@@ -1447,7 +1486,6 @@ fn render_costed(tree: &PlanNode, with_costs: bool, out: &mut Vec<String>) {
     }
     walk(tree, 0, out, with_costs);
 }
-
 
 impl Engine {
     /// v7.39 (round 286) — the `<Verb> on <table>` root PG puts over a

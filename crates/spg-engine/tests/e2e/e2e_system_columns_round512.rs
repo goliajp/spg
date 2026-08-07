@@ -65,7 +65,10 @@ fn round512_every_system_column_reports_its_own_type() {
 fn round512_tableoid_names_the_relation() {
     let mut e = engine();
     e.execute("INSERT INTO sc VALUES (1, 'x')").unwrap();
-    assert_eq!(text(&mut e, "SELECT tableoid::regclass::text FROM sc"), "sc");
+    assert_eq!(
+        text(&mut e, "SELECT tableoid::regclass::text FROM sc"),
+        "sc"
+    );
 }
 
 /// `*` expands none of them, in the mixed shape too.
@@ -105,12 +108,18 @@ fn round512_dml_can_name_a_row_by_ctid() {
     }
     e.execute("UPDATE sc SET a = 7 WHERE ctid = '(0,2)'::tid")
         .unwrap();
-    assert_eq!(text(&mut e, "SELECT a, b FROM sc ORDER BY a"), "1|x 3|z 7|y");
+    assert_eq!(
+        text(&mut e, "SELECT a, b FROM sc ORDER BY a"),
+        "1|x 3|z 7|y"
+    );
 
     // RETURNING must see the table's own columns, not the extended row the
     // predicate ran against.
     assert_eq!(
-        text(&mut e, "DELETE FROM sc WHERE ctid = '(0,3)'::tid RETURNING a, b"),
+        text(
+            &mut e,
+            "DELETE FROM sc WHERE ctid = '(0,3)'::tid RETURNING a, b"
+        ),
         "3|z"
     );
     assert_eq!(text(&mut e, "SELECT a, b FROM sc ORDER BY a"), "1|x 7|y");
@@ -129,5 +138,8 @@ fn round512_the_dedup_idiom_runs() {
     }
     e.execute("DELETE FROM d WHERE ctid NOT IN (SELECT min(ctid) FROM d GROUP BY k)")
         .unwrap();
-    assert_eq!(text(&mut e, "SELECT k, count(*) FROM d GROUP BY k ORDER BY k"), "1|1 2|1");
+    assert_eq!(
+        text(&mut e, "SELECT k, count(*) FROM d GROUP BY k ORDER BY k"),
+        "1|1 2|1"
+    );
 }

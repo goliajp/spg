@@ -95,7 +95,8 @@ fn the_three_valued_semantics_match_pg() {
 #[test]
 fn a_boolean_test_still_filters() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id INT NOT NULL, b BOOL)").unwrap();
+    e.execute("CREATE TABLE t (id INT NOT NULL, b BOOL)")
+        .unwrap();
     e.execute("INSERT INTO t VALUES (1, true), (2, false), (3, NULL)")
         .unwrap();
     assert_eq!(

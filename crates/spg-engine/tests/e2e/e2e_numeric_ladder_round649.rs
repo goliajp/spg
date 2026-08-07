@@ -91,7 +91,10 @@ fn round649_the_rest_of_the_ladder_is_unchanged() {
         ("coalesce(NULL::int, NULL::int)", "integer"),
         ("greatest(1::int, 1.5::float8)", "double precision"),
         ("least(1::int, 1.5::numeric)", "numeric"),
-        ("CASE WHEN true THEN 1::int ELSE 1.5::float8 END", "double precision"),
+        (
+            "CASE WHEN true THEN 1::int ELSE 1.5::float8 END",
+            "double precision",
+        ),
     ] {
         assert_eq!(
             one(&mut e, &format!("SELECT pg_typeof({sql})")),

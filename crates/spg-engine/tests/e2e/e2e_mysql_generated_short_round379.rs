@@ -23,9 +23,12 @@ fn mysql() -> Engine {
 
 fn row(e: &mut Engine, sql: &str) -> Vec<Value<'static>> {
     match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err}")) {
-        QueryResult::Rows { rows, .. } => {
-            rows[0].values.iter().cloned().map(Value::into_owned).collect()
-        }
+        QueryResult::Rows { rows, .. } => rows[0]
+            .values
+            .iter()
+            .cloned()
+            .map(Value::into_owned)
+            .collect(),
         other => panic!("`{sql}` did not return rows: {other:?}"),
     }
 }

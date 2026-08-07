@@ -53,10 +53,14 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE pm (id INT, v INT) PARTITION BY RANGE (v)").unwrap();
-    e.execute("CREATE TABLE pm1 PARTITION OF pm FOR VALUES FROM (0) TO (100)").unwrap();
-    e.execute("CREATE TABLE pm2 PARTITION OF pm FOR VALUES FROM (100) TO (200)").unwrap();
-    e.execute("INSERT INTO pm VALUES (1, 50), (2, 150)").unwrap();
+    e.execute("CREATE TABLE pm (id INT, v INT) PARTITION BY RANGE (v)")
+        .unwrap();
+    e.execute("CREATE TABLE pm1 PARTITION OF pm FOR VALUES FROM (0) TO (100)")
+        .unwrap();
+    e.execute("CREATE TABLE pm2 PARTITION OF pm FOR VALUES FROM (100) TO (200)")
+        .unwrap();
+    e.execute("INSERT INTO pm VALUES (1, 50), (2, 150)")
+        .unwrap();
     e
 }
 
@@ -65,7 +69,10 @@ fn seed() -> Engine {
 fn round621_the_row_moves() {
     let mut e = seed();
     e.execute("UPDATE pm SET v = 120 WHERE id = 1").unwrap();
-    assert_eq!(vals(&mut e, "SELECT id, v FROM pm ORDER BY id"), vec!["1|120", "2|150"]);
+    assert_eq!(
+        vals(&mut e, "SELECT id, v FROM pm ORDER BY id"),
+        vec!["1|120", "2|150"]
+    );
     assert_eq!(
         vals(&mut e, "SELECT count(*) FROM pm1"),
         vec!["0"],
@@ -119,7 +126,8 @@ fn round621_a_key_no_partition_takes() {
 #[test]
 fn round621_attach_scans_the_rows() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE pa (id INT, v INT) PARTITION BY RANGE (v)").unwrap();
+    e.execute("CREATE TABLE pa (id INT, v INT) PARTITION BY RANGE (v)")
+        .unwrap();
     e.execute("CREATE TABLE pax (id INT, v INT)").unwrap();
     e.execute("INSERT INTO pax VALUES (9, 250)").unwrap();
     e.execute("ALTER TABLE pa ATTACH PARTITION pax FOR VALUES FROM (200) TO (300)")

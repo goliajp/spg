@@ -49,12 +49,18 @@ fn a_month_is_a_calendar_month() {
     // on MySQL (measured: MariaDB renders 2024-02-29, no time), matching
     // DATE_SUB. 19782 = 2024-02-29.
     assert_eq!(
-        one(&mut e, "SELECT DATE_ADD(DATE '2024-01-31', INTERVAL 1 MONTH)"),
+        one(
+            &mut e,
+            "SELECT DATE_ADD(DATE '2024-01-31', INTERVAL 1 MONTH)"
+        ),
         Value::Date(19782),
         "2024-01-31 + 1 month clamps to 2024-02-29, not 2024-03-01",
     );
     assert_eq!(
-        one(&mut e, "SELECT DATE_SUB(DATE '2024-03-31', INTERVAL 1 MONTH)"),
+        one(
+            &mut e,
+            "SELECT DATE_SUB(DATE '2024-03-31', INTERVAL 1 MONTH)"
+        ),
         Value::Date(19782),
         "…and 2024-03-31 - 1 month is 2024-02-29",
     );
@@ -138,7 +144,8 @@ fn pg_keeps_its_own_spellings() {
         Value::Timestamp(1_705_363_200_000_000),
     );
     assert!(
-        e.execute("SELECT DATE '2024-01-15' + INTERVAL 1 DAY").is_err(),
+        e.execute("SELECT DATE '2024-01-15' + INTERVAL 1 DAY")
+            .is_err(),
         "PG: syntax error at or near \"1\"",
     );
 }

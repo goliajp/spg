@@ -12,19 +12,14 @@ use super::*;
 /// Compare two values for min/max selection. Returns Equal when
 /// values are equal (including cross-numeric-width), Less when
 /// a < b, Greater when a > b. NULL handling is upstream.
-pub(super) fn value_cmp_for_min_max(
-    a: &Value,
-    b: &Value,
-    mysql: bool,
-) -> core::cmp::Ordering {
+pub(super) fn value_cmp_for_min_max(a: &Value, b: &Value, mysql: bool) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     // v7.39 (round 412) — GREATEST / LEAST over text under the MySQL default
     // collation compares by the folded form (case- and accent-insensitive,
     // PAD SPACE), matching ORDER BY / MIN / MAX.
     if mysql {
         if let (Value::Text(x), Value::Text(y)) | (Value::BpChar(x), Value::BpChar(y)) = (a, b) {
-            return spg_storage::mysql_compare_fold(x)
-                .cmp(&spg_storage::mysql_compare_fold(y));
+            return spg_storage::mysql_compare_fold(x).cmp(&spg_storage::mysql_compare_fold(y));
         }
     }
     // v7.38 (read01, T3.C3) — a NUMERIC beyond i128 orders via exact bignum.
@@ -430,9 +425,7 @@ pub fn value_to_text_styled(v: &Value, style: &crate::eval::RenderStyle) -> Stri
         // v7.37.5 δ — multirange canonical PG text.
         Value::Multirange { ranges, .. } => crate::conversions::format_multirange(ranges),
         // v7.37.5 ζ-A — network/MAC/bit/XML/char1.
-        Value::Inet { family, bits, addr } => {
-            crate::conversions::format_inet(*family, *bits, addr)
-        }
+        Value::Inet { family, bits, addr } => crate::conversions::format_inet(*family, *bits, addr),
         // v7.39 (round 262) — a CIDR ALWAYS shows its mask length, where
         // an inet omits a full-width one: `'192.168.1.5'::inet::cidr` is
         // `192.168.1.5/32` and `'::1'::inet::cidr` is `::1/128` (probed).

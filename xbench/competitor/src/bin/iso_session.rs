@@ -99,7 +99,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("| T6 | pg_try_advisory_lock(4981) A then B | true / false | {a_lock} | {b_lock} |");
     let b2 = cell(&mut b, "SELECT pg_try_advisory_lock(4981)").await;
     let b_unlock = cell(&mut b, "SELECT pg_advisory_unlock(4981)").await;
-    println!("| T6b | B tries again / B unlocks a lock it never took | false / false | {b2} | {b_unlock} |");
+    println!(
+        "| T6b | B tries again / B unlocks a lock it never took | false / false | {b2} | {b_unlock} |"
+    );
     let _ = cell(&mut a, "SELECT pg_advisory_unlock(4981)").await;
 
     // T6c — the same question with both sessions inside a transaction,

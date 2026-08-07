@@ -46,7 +46,10 @@ fn non_half_unchanged() {
     let mut e = mysql();
     assert_eq!(text(&mut e, "SELECT FORMAT(1233.5, 0)"), "1,234");
     assert_eq!(text(&mut e, "SELECT FORMAT(3.14159, 2)"), "3.14");
-    assert_eq!(text(&mut e, "SELECT FORMAT(1234567.891, 2)"), "1,234,567.89");
+    assert_eq!(
+        text(&mut e, "SELECT FORMAT(1234567.891, 2)"),
+        "1,234,567.89"
+    );
 }
 
 /// Carry propagation and the decimal places / grouping.

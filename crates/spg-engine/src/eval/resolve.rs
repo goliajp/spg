@@ -227,7 +227,10 @@ pub(super) fn mysql_text_fold_applies(lhs: &Expr, rhs: &Expr, ctx: &EvalContext<
 /// deliberately declared binary answers true — and it suppresses the
 /// dialect's default fold.
 pub(super) fn operand_is_binary_column(e: &Expr, ctx: &EvalContext<'_>) -> bool {
-    matches!(column_collation(e, ctx), Some(spg_storage::Collation::Binary))
+    matches!(
+        column_collation(e, ctx),
+        Some(spg_storage::Collation::Binary)
+    )
 }
 
 pub(crate) fn is_binary_coerced(e: &Expr) -> bool {
@@ -294,9 +297,8 @@ pub(crate) fn find_column_pos(c: &ColumnName, ctx: &EvalContext<'_>) -> Option<u
     // because the bind-once callers are on hot-path setup.
     let suffix_at = |s: &str| s.len().checked_sub(c.name.len() + 1);
     let mut matches = ctx.columns.iter().enumerate().filter(|(_, s)| {
-        suffix_at(&s.name).is_some_and(|dot| {
-            s.name.as_bytes()[dot] == b'.' && s.name[dot + 1..] == *c.name
-        })
+        suffix_at(&s.name)
+            .is_some_and(|dot| s.name.as_bytes()[dot] == b'.' && s.name[dot + 1..] == *c.name)
     });
     match (matches.next(), matches.next()) {
         (Some((pos, _)), None) => Some(pos),
@@ -543,7 +545,10 @@ pub(crate) fn json_to_composite(
         // v7.39 (round 264) — a field that is ITSELF a composite rebuilds
         // recursively; otherwise the inner object stayed raw JSON and
         // `(v).inner.street` errored while `row_to_json` nested a string.
-        let cell = match (found, def.field_user_types.get(i).and_then(Option::as_deref)) {
+        let cell = match (
+            found,
+            def.field_user_types.get(i).and_then(Option::as_deref),
+        ) {
             (None, _) => Value::Null,
             (Some((_, jv)), Some(tn)) => {
                 let inner_text = jv.to_json_text();

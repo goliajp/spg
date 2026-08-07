@@ -112,8 +112,7 @@ fn round527_out_of_range_message_quotes_mysql_syntax() {
         .execute("SELECT CAST(1 AS UNSIGNED) * 0 - 5")
         .expect_err("out of range");
     assert!(
-        format!("{err2}")
-            .contains("out of range in 'cast(1 as unsigned) * 0 - 5'"),
+        format!("{err2}").contains("out of range in 'cast(1 as unsigned) * 0 - 5'"),
         "message was {err2}"
     );
 }

@@ -56,8 +56,10 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<String> {
 }
 
 fn partitioned(e: &mut Engine, parent: &str) {
-    e.execute(&format!("CREATE TABLE {parent} (k INT) PARTITION BY RANGE (k)"))
-        .unwrap();
+    e.execute(&format!(
+        "CREATE TABLE {parent} (k INT) PARTITION BY RANGE (k)"
+    ))
+    .unwrap();
     e.execute(&format!(
         "CREATE TABLE {parent}1 PARTITION OF {parent} FOR VALUES FROM (0) TO (10)"
     ))

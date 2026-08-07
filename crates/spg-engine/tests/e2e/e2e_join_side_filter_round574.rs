@@ -51,7 +51,8 @@ fn one(e: &mut Engine, sql: &str) -> String {
 
 fn engine() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE f574 (id INT, g INT, t TEXT)").unwrap();
+    e.execute("CREATE TABLE f574 (id INT, g INT, t TEXT)")
+        .unwrap();
     e.execute(
         "INSERT INTO f574 SELECT gg, CASE WHEN gg % 11 = 0 THEN NULL ELSE gg % 7 END, \
          CASE WHEN gg % 13 = 0 THEN NULL ELSE 'r' || gg END FROM generate_series(1, 600) gg",

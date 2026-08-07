@@ -37,10 +37,19 @@ fn picture_literals_print_as_themselves() {
 #[test]
 fn leading_pl_is_its_own_column() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT to_char(1234.5, 'PL9999.9')"), "+ 1234.5");
-    assert_eq!(one(&mut e, "SELECT to_char(-1234.5, 'PL9999.9')"), " -1234.5");
+    assert_eq!(
+        one(&mut e, "SELECT to_char(1234.5, 'PL9999.9')"),
+        "+ 1234.5"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT to_char(-1234.5, 'PL9999.9')"),
+        " -1234.5"
+    );
     // Both ends at once.
-    assert_eq!(one(&mut e, "SELECT to_char(1234.5, 'PL9999.9PL')"), "+ 1234.5+");
+    assert_eq!(
+        one(&mut e, "SELECT to_char(1234.5, 'PL9999.9PL')"),
+        "+ 1234.5+"
+    );
 }
 
 #[test]
@@ -57,7 +66,10 @@ fn v_scale_overflows_to_hashes_keeping_literals() {
 fn interval_units_may_run_together() {
     let mut e = Engine::new();
     assert_eq!(
-        one(&mut e, "SELECT to_char(interval '15h 2m 12s', 'HH24:MI:SS')"),
+        one(
+            &mut e,
+            "SELECT to_char(interval '15h 2m 12s', 'HH24:MI:SS')"
+        ),
         "15:02:12"
     );
     assert_eq!(
@@ -74,7 +86,10 @@ fn interval_units_may_run_together() {
     );
     // The spaced pair form is untouched.
     assert_eq!(
-        one(&mut e, "SELECT extract(epoch from interval '2 hours 30 minutes')::text"),
+        one(
+            &mut e,
+            "SELECT extract(epoch from interval '2 hours 30 minutes')::text"
+        ),
         "9000.000000"
     );
 }

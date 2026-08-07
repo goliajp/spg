@@ -95,8 +95,7 @@ fn naming_one_constraint_defers_only_that_one() {
     // fk_b was never named, so its violation is immediate — and quotes
     // its own name.
     assert!(
-        err(&mut e, "INSERT INTO c29b VALUES (1, 999)")
-            .contains("foreign key constraint \"fk_b\"")
+        err(&mut e, "INSERT INTO c29b VALUES (1, 999)").contains("foreign key constraint \"fk_b\"")
     );
     ok(&mut e, "ROLLBACK");
 }
@@ -159,8 +158,7 @@ fn blanket_and_named_settings_compose_the_way_pg_orders_them() {
     ok(&mut e, "SET CONSTRAINTS ALL DEFERRED");
     ok(&mut e, "SET CONSTRAINTS fk_a IMMEDIATE");
     assert!(
-        err(&mut e, "INSERT INTO c29a VALUES (1, 999)")
-            .contains("foreign key constraint \"fk_a\"")
+        err(&mut e, "INSERT INTO c29a VALUES (1, 999)").contains("foreign key constraint \"fk_a\"")
     );
     ok(&mut e, "ROLLBACK");
 

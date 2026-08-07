@@ -117,9 +117,15 @@ fn deallocate_all_only_clears_the_calling_session() {
     e.set_current_session(2);
     e.execute("PREPARE b AS SELECT 2").unwrap();
     e.execute("DEALLOCATE ALL").unwrap();
-    assert_eq!(one(&mut e, "SELECT count(*) FROM pg_prepared_statements"), "0");
+    assert_eq!(
+        one(&mut e, "SELECT count(*) FROM pg_prepared_statements"),
+        "0"
+    );
     e.set_current_session(1);
-    assert_eq!(one(&mut e, "SELECT count(*) FROM pg_prepared_statements"), "1");
+    assert_eq!(
+        one(&mut e, "SELECT count(*) FROM pg_prepared_statements"),
+        "1"
+    );
     assert_eq!(one(&mut e, "EXECUTE a"), "1");
 }
 

@@ -5590,5 +5590,8 @@ fn v88_a_table_with_no_collation_pays_two_bytes() {
         "a declared collation has to cost something"
     );
     let back = Catalog::deserialize(&plain.serialize()).expect("round trip");
-    assert_eq!(back.get("p").unwrap().schema().columns[0].collation_name, None);
+    assert_eq!(
+        back.get("p").unwrap().schema().columns[0].collation_name,
+        None
+    );
 }

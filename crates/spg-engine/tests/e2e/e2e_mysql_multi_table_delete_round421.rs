@@ -48,7 +48,8 @@ fn seed() -> Engine {
     let mut e = mysql();
     e.execute("CREATE TABLE a(id INT, v INT)").unwrap();
     e.execute("CREATE TABLE b(id INT, v INT)").unwrap();
-    e.execute("INSERT INTO a VALUES(1,10),(2,20),(3,30)").unwrap();
+    e.execute("INSERT INTO a VALUES(1,10),(2,20),(3,30)")
+        .unwrap();
     e.execute("INSERT INTO b VALUES(1,100),(2,200)").unwrap();
     e
 }
@@ -76,7 +77,8 @@ fn comma_form() {
 #[test]
 fn using_form_with_target_repeated() {
     let mut e = seed();
-    e.execute("DELETE FROM a USING a, b WHERE a.id = b.id").unwrap();
+    e.execute("DELETE FROM a USING a, b WHERE a.id = b.id")
+        .unwrap();
     assert_eq!(ints(&mut e, "SELECT id FROM a ORDER BY id"), vec![3]);
 }
 
@@ -104,7 +106,8 @@ fn left_join_anti_join_deletes_unmatched() {
 fn refused_forms_mutate_nothing() {
     let mut e = seed();
     assert!(
-        e.execute("DELETE a, b FROM a JOIN b ON a.id = b.id").is_err(),
+        e.execute("DELETE a, b FROM a JOIN b ON a.id = b.id")
+            .is_err(),
         "multi-target DELETE must be refused"
     );
     assert!(
@@ -122,19 +125,29 @@ fn update_left_join_honours_where() {
     e.execute("UPDATE a LEFT JOIN b ON a.id = b.id SET a.v = 999 WHERE a.id > 1")
         .unwrap();
     // Row 1 is excluded by the WHERE; rows 2 and 3 (3 unmatched) update.
-    assert_eq!(ints(&mut e, "SELECT v FROM a ORDER BY id"), vec![10, 999, 999]);
+    assert_eq!(
+        ints(&mut e, "SELECT v FROM a ORDER BY id"),
+        vec![10, 999, 999]
+    );
 }
 
 /// The round-420 UPDATE forms still behave.
 #[test]
 fn update_forms_unchanged() {
     let mut e = seed();
-    e.execute("UPDATE a, b SET a.v = b.v WHERE a.id = b.id").unwrap();
-    assert_eq!(ints(&mut e, "SELECT v FROM a ORDER BY id"), vec![100, 200, 30]);
+    e.execute("UPDATE a, b SET a.v = b.v WHERE a.id = b.id")
+        .unwrap();
+    assert_eq!(
+        ints(&mut e, "SELECT v FROM a ORDER BY id"),
+        vec![100, 200, 30]
+    );
     let mut e2 = seed();
     e2.execute("UPDATE a LEFT JOIN b ON a.id = b.id SET a.v = COALESCE(b.v, -1)")
         .unwrap();
-    assert_eq!(ints(&mut e2, "SELECT v FROM a ORDER BY id"), vec![100, 200, -1]);
+    assert_eq!(
+        ints(&mut e2, "SELECT v FROM a ORDER BY id"),
+        vec![100, 200, -1]
+    );
 }
 
 /// A PostgreSQL session rejects the MySQL spelling; its own `USING` form is
@@ -144,12 +157,14 @@ fn postgres_unchanged() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE a(id INT, v INT)").unwrap();
     e.execute("CREATE TABLE b(id INT, w INT)").unwrap();
-    e.execute("INSERT INTO a VALUES(1,10),(2,20),(3,30)").unwrap();
+    e.execute("INSERT INTO a VALUES(1,10),(2,20),(3,30)")
+        .unwrap();
     e.execute("INSERT INTO b VALUES(1,100),(2,200)").unwrap();
     assert!(
         e.execute("DELETE a FROM a JOIN b ON a.id = b.id").is_err(),
         "PG has no pre-FROM DELETE target"
     );
-    e.execute("DELETE FROM a USING b WHERE a.id = b.id").unwrap();
+    e.execute("DELETE FROM a USING b WHERE a.id = b.id")
+        .unwrap();
     assert_eq!(ints(&mut e, "SELECT id FROM a ORDER BY id"), vec![3]);
 }

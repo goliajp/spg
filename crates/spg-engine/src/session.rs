@@ -72,10 +72,8 @@ impl Engine {
     /// connection, right after `set_session_user`, when it demanded a
     /// password; open-mode connections never do.
     pub fn set_session_authenticated(&mut self) {
-        self.session_params.insert(
-            String::from(SESSION_AUTHENTICATED_KEY),
-            String::from("1"),
-        );
+        self.session_params
+            .insert(String::from(SESSION_AUTHENTICATED_KEY), String::from("1"));
     }
 
     /// Was this session's login identity checked against a credential?
@@ -131,9 +129,7 @@ impl Engine {
             // `role_is_superuser` still exempts the admin and bootstrap
             // logins and any role created SUPERUSER, so authenticating as an
             // administrator changes nothing.
-            None if self.session_is_authenticated() => {
-                self.role_is_superuser(self.session_user())
-            }
+            None if self.session_is_authenticated() => self.role_is_superuser(self.session_user()),
             None => true,
         }
     }
@@ -285,7 +281,11 @@ impl Engine {
             // is a newline, `='NO_BACKSLASH_ESCAPES,STRICT_TRANS_TABLES'`
             // → two bytes. sql_mode is a full replacement, so evaluate
             // the whole new value rather than tracking a delta.
-            Some(!normalised.to_ascii_uppercase().contains("NO_BACKSLASH_ESCAPES"))
+            Some(
+                !normalised
+                    .to_ascii_uppercase()
+                    .contains("NO_BACKSLASH_ESCAPES"),
+            )
         } else if key == "standard_conforming_strings" {
             Some(value_off)
         } else {
@@ -426,9 +426,18 @@ impl Engine {
     pub fn apply_db_role_settings(&mut self, database: &str, role: &str) {
         let scopes: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> = alloc::vec![
             (alloc::string::String::new(), alloc::string::String::new()),
-            (alloc::string::String::from(database), alloc::string::String::new()),
-            (alloc::string::String::new(), alloc::string::String::from(role)),
-            (alloc::string::String::from(database), alloc::string::String::from(role)),
+            (
+                alloc::string::String::from(database),
+                alloc::string::String::new()
+            ),
+            (
+                alloc::string::String::new(),
+                alloc::string::String::from(role)
+            ),
+            (
+                alloc::string::String::from(database),
+                alloc::string::String::from(role)
+            ),
         ];
         let mut apply: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> =
             alloc::vec::Vec::new();
@@ -481,7 +490,6 @@ impl Engine {
         }
         self.session_params.get(&lower).map(String::as_str)
     }
-
 
     /// v7.39 (read01 round 46) — raise a PG-style NOTICE for the statement
     /// now executing. The text is PG's exact wording minus the "NOTICE:  "
@@ -539,7 +547,8 @@ impl Engine {
     ) {
         for (severity, message) in raised {
             if self.notice_severity_reaches_client(severity) {
-                self.pending_notices.push(crate::Notice { severity, message });
+                self.pending_notices
+                    .push(crate::Notice { severity, message });
             }
         }
     }

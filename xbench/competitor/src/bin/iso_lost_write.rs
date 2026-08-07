@@ -23,7 +23,8 @@ async fn v(c: &mut AnyConnection) -> String {
 
 async fn setup(c: &mut AnyConnection) -> Result<(), sqlx::Error> {
     c.execute("DROP TABLE IF EXISTS iso2").await?;
-    c.execute("CREATE TABLE iso2 (id INT PRIMARY KEY, v INT)").await?;
+    c.execute("CREATE TABLE iso2 (id INT PRIMARY KEY, v INT)")
+        .await?;
     c.execute("INSERT INTO iso2 VALUES (1, 10)").await?;
     Ok(())
 }
@@ -35,7 +36,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("| case | writer's view | a third connection | after the holder COMMITs |");
     println!("|------|-------------:|-------------------:|-------------------------:|");
 
-    for case in ["no other transaction", "other holds READ COMMITTED", "other holds REPEATABLE READ"] {
+    for case in [
+        "no other transaction",
+        "other holds READ COMMITTED",
+        "other holds REPEATABLE READ",
+    ] {
         let mut a = AnyConnection::connect(&url).await?;
         let mut b = AnyConnection::connect(&url).await?;
         setup(&mut a).await?;

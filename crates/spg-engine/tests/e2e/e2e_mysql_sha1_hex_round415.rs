@@ -82,5 +82,8 @@ fn postgres_sha1_stays_bytea() {
     assert_eq!(scalar(&mut e, "SELECT octet_length(sha1('abc'))"), "20");
     // The value renders as `\x…`, not raw hex text.
     let s = scalar(&mut e, "SELECT sha1('abc')");
-    assert!(s.starts_with("\\x"), "PG sha1 should render bytea `\\x…`, got {s:?}");
+    assert!(
+        s.starts_with("\\x"),
+        "PG sha1 should render bytea `\\x…`, got {s:?}"
+    );
 }

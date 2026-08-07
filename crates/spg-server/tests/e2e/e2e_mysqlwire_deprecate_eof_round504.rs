@@ -136,11 +136,23 @@ fn round504_a_client_without_deprecate_eof_gets_both_eof_markers() {
         CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH,
     );
     let pkts = select_one_packets(&mut s);
-    assert_eq!(pkts.len(), 5, "count / def / EOF / row / EOF — got {pkts:?}");
+    assert_eq!(
+        pkts.len(),
+        5,
+        "count / def / EOF / row / EOF — got {pkts:?}"
+    );
     assert_eq!(pkts[0], vec![0x01], "one column");
-    assert_eq!(pkts[2], vec![0xfe, 0x00, 0x00, 0x02, 0x00], "closes the defs");
+    assert_eq!(
+        pkts[2],
+        vec![0xfe, 0x00, 0x00, 0x02, 0x00],
+        "closes the defs"
+    );
     assert_eq!(pkts[3], vec![0x01, b'1'], "the row");
-    assert_eq!(pkts[4], vec![0xfe, 0x00, 0x00, 0x02, 0x00], "closes the rows");
+    assert_eq!(
+        pkts[4],
+        vec![0xfe, 0x00, 0x00, 0x02, 0x00],
+        "closes the rows"
+    );
 }
 
 /// A client that DOES take it gets no intermediate marker, and a terminator
@@ -155,7 +167,11 @@ fn round504_a_client_with_deprecate_eof_gets_the_modern_framing() {
     let pkts = select_one_packets(&mut s);
     assert_eq!(pkts.len(), 4, "count / def / row / OK — got {pkts:?}");
     assert_eq!(pkts[0], vec![0x01], "one column");
-    assert_eq!(pkts[2], vec![0x01, b'1'], "the row, with no marker before it");
+    assert_eq!(
+        pkts[2],
+        vec![0x01, b'1'],
+        "the row, with no marker before it"
+    );
     assert_eq!(
         pkts[3],
         vec![0xfe, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00],

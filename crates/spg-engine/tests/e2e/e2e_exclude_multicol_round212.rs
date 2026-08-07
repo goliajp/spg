@@ -82,7 +82,8 @@ fn null_element_exempts_row() {
     // can never be true when one operand is NULL).
     let mut e = booking();
     e.execute("INSERT INTO book VALUES (1, '[1,5)')").unwrap();
-    e.execute("INSERT INTO book VALUES (NULL, '[1,5)')").unwrap();
+    e.execute("INSERT INTO book VALUES (NULL, '[1,5)')")
+        .unwrap();
     e.execute("INSERT INTO book VALUES (1, NULL)").unwrap();
 }
 

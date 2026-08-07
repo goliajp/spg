@@ -57,8 +57,10 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE ea (id INT, g INT, s TEXT)").unwrap();
-    e.execute("CREATE TABLE eb (id INT, g INT, s TEXT)").unwrap();
+    e.execute("CREATE TABLE ea (id INT, g INT, s TEXT)")
+        .unwrap();
+    e.execute("CREATE TABLE eb (id INT, g INT, s TEXT)")
+        .unwrap();
     e.execute("INSERT INTO ea VALUES (1,10,'a'),(2,20,'b'),(3,NULL,NULL),(NULL,30,'c'),(4,10,'a')")
         .unwrap();
     e.execute("INSERT INTO eb VALUES (2,10,'a'),(3,20,'x'),(NULL,40,NULL),(5,10,'a')")
@@ -72,38 +74,62 @@ fn seed() -> Engine {
 fn round616_bare_exists_and_not_exists() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id) ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id) ORDER BY 1 NULLS LAST"
+        ),
         vec!["2", "3"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ea a WHERE NOT EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id) ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id FROM ea a WHERE NOT EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id) ORDER BY 1 NULLS LAST"
+        ),
         vec!["1", "4", "NULL"],
         "the NULL-keyed row matches nothing, so NOT EXISTS keeps it"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id + 1) ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id + 1) ORDER BY 1 NULLS LAST"
+        ),
         vec!["1", "2", "4"],
         "a computed correlation key — the shape round 596 decorrelated"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ea a WHERE NOT EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id + 1) ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id FROM ea a WHERE NOT EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id + 1) ORDER BY 1 NULLS LAST"
+        ),
         vec!["3", "NULL"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.g = a.g) ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.g = a.g) ORDER BY 1 NULLS LAST"
+        ),
         vec!["1", "2", "4"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ea a WHERE NOT EXISTS (SELECT 1 FROM eb b WHERE b.g = a.g) ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id FROM ea a WHERE NOT EXISTS (SELECT 1 FROM eb b WHERE b.g = a.g) ORDER BY 1 NULLS LAST"
+        ),
         vec!["3", "NULL"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.s = a.s) ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.s = a.s) ORDER BY 1 NULLS LAST"
+        ),
         vec!["1", "4"],
         "a text correlation key"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ea a WHERE NOT EXISTS (SELECT 1 FROM eb b WHERE b.g = a.g + 30) ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id FROM ea a WHERE NOT EXISTS (SELECT 1 FROM eb b WHERE b.g = a.g + 30) ORDER BY 1 NULLS LAST"
+        ),
         vec!["2", "3", "NULL"]
     );
 }
@@ -114,42 +140,66 @@ fn round616_bare_exists_and_not_exists() {
 fn round616_exists_inside_a_larger_predicate() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id) AND a.g = 10 ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id) AND a.g = 10 ORDER BY 1 NULLS LAST"
+        ),
         Vec::<String>::new(),
         "beside another conjunct"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ea a WHERE a.g = 10 OR EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id) ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id FROM ea a WHERE a.g = 10 OR EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id) ORDER BY 1 NULLS LAST"
+        ),
         vec!["1", "2", "3", "4"],
         "under an OR"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ea a WHERE NOT (EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id)) ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id FROM ea a WHERE NOT (EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id)) ORDER BY 1 NULLS LAST"
+        ),
         vec!["1", "4", "NULL"],
         "an explicit NOT around it — which IS the shortcut's second spelling"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id) IS NOT TRUE ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id) IS NOT TRUE ORDER BY 1 NULLS LAST"
+        ),
         vec!["1", "4", "NULL"],
         "under a boolean test"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id) FROM ea a ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id, EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id) FROM ea a ORDER BY 1 NULLS LAST"
+        ),
         vec!["1|false", "2|true", "3|true", "4|false", "NULL|false"],
         "in the select list, where there is no predicate at all"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id AND b.g = a.g) ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id AND b.g = a.g) ORDER BY 1 NULLS LAST"
+        ),
         Vec::<String>::new(),
         "two correlation keys"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id AND b.s = 'a') ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id AND b.s = 'a') ORDER BY 1 NULLS LAST"
+        ),
         vec!["2"],
         "a correlated key beside an uncorrelated filter"
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id * 1)"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE b.id = a.id * 1)"
+        ),
         vec!["2"]
     );
 }
@@ -159,11 +209,17 @@ fn round616_exists_inside_a_larger_predicate() {
 fn round616_degenerate_inner() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE FALSE) ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id FROM ea a WHERE EXISTS (SELECT 1 FROM eb b WHERE FALSE) ORDER BY 1 NULLS LAST"
+        ),
         Vec::<String>::new()
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ea a WHERE NOT EXISTS (SELECT 1 FROM eb b WHERE FALSE) ORDER BY 1 NULLS LAST"),
+        vals(
+            &mut e,
+            "SELECT id FROM ea a WHERE NOT EXISTS (SELECT 1 FROM eb b WHERE FALSE) ORDER BY 1 NULLS LAST"
+        ),
         vec!["1", "2", "3", "4", "NULL"]
     );
 }
@@ -174,24 +230,41 @@ fn round616_scale() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE ba (id INT)").unwrap();
     e.execute("CREATE TABLE bb (id INT)").unwrap();
-    e.execute("INSERT INTO ba SELECT gg FROM generate_series(1, 20000) gg").unwrap();
-    e.execute("INSERT INTO bb SELECT gg FROM generate_series(10000, 30000) gg").unwrap();
+    e.execute("INSERT INTO ba SELECT gg FROM generate_series(1, 20000) gg")
+        .unwrap();
+    e.execute("INSERT INTO bb SELECT gg FROM generate_series(10000, 30000) gg")
+        .unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM ba a WHERE EXISTS (SELECT 1 FROM bb b WHERE b.id = a.id)"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM ba a WHERE EXISTS (SELECT 1 FROM bb b WHERE b.id = a.id)"
+        ),
         vec!["10001"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM ba a WHERE NOT EXISTS (SELECT 1 FROM bb b WHERE b.id = a.id)"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM ba a WHERE NOT EXISTS (SELECT 1 FROM bb b WHERE b.id = a.id)"
+        ),
         vec!["9999"],
         "and the two partition the table"
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM ba a WHERE EXISTS (SELECT 1 FROM bb b WHERE b.id = a.id + 10000)"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM ba a WHERE EXISTS (SELECT 1 FROM bb b WHERE b.id = a.id + 10000)"
+        ),
         vec!["20000"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM ba a WHERE EXISTS (SELECT 1 FROM bb b WHERE b.id = a.id)"),
-        vals(&mut e, "SELECT count(*) FROM ba a WHERE a.id IN (SELECT b.id FROM bb b)"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM ba a WHERE EXISTS (SELECT 1 FROM bb b WHERE b.id = a.id)"
+        ),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM ba a WHERE a.id IN (SELECT b.id FROM bb b)"
+        ),
         "the EXISTS and the IN spellings agree"
     );
 }

@@ -38,9 +38,10 @@ fn one(e: &mut Engine, sql: &str) -> String {
 }
 
 fn stat(e: &mut Engine, col: &str) -> i64 {
-    one(e, &format!(
-        "SELECT {col} FROM pg_stat_user_tables WHERE relname='t'"
-    ))
+    one(
+        e,
+        &format!("SELECT {col} FROM pg_stat_user_tables WHERE relname='t'"),
+    )
     .parse()
     .unwrap_or(-1)
 }
@@ -50,7 +51,8 @@ fn churned(cycles: usize) -> Engine {
     // Autovacuum off reproduces the server's exposure: it runs reclamation
     // in a background worker, and a tight delete/reinsert loop outruns it.
     e.set_autovacuum(false);
-    e.execute("CREATE TABLE t (id INT PRIMARY KEY, g INT)").unwrap();
+    e.execute("CREATE TABLE t (id INT PRIMARY KEY, g INT)")
+        .unwrap();
     let mut vals = String::from("INSERT INTO t VALUES ");
     for i in 0..5000 {
         if i > 0 {
@@ -60,7 +62,8 @@ fn churned(cycles: usize) -> Engine {
     }
     e.execute(&vals).unwrap();
     for _ in 0..cycles {
-        e.execute("DELETE FROM t WHERE id >= 1000 AND id < 1200").unwrap();
+        e.execute("DELETE FROM t WHERE id >= 1000 AND id < 1200")
+            .unwrap();
         let mut re = String::from("INSERT INTO t VALUES ");
         for i in 1000..1200 {
             if i > 1000 {
@@ -77,16 +80,31 @@ fn churned(cycles: usize) -> Engine {
 fn round490_churn_does_not_change_what_a_range_delete_removes() {
     for cycles in [0usize, 5, 30] {
         let mut e = churned(cycles);
-        assert_eq!(one(&mut e, "SELECT count(*) FROM t"), "5000", "cycles={cycles}");
         assert_eq!(
-            one(&mut e, "SELECT count(*) FROM t WHERE id >= 1000 AND id < 1200"),
+            one(&mut e, "SELECT count(*) FROM t"),
+            "5000",
+            "cycles={cycles}"
+        );
+        assert_eq!(
+            one(
+                &mut e,
+                "SELECT count(*) FROM t WHERE id >= 1000 AND id < 1200"
+            ),
             "200",
             "cycles={cycles}"
         );
-        e.execute("DELETE FROM t WHERE id >= 1000 AND id < 1200").unwrap();
-        assert_eq!(one(&mut e, "SELECT count(*) FROM t"), "4800", "cycles={cycles}");
+        e.execute("DELETE FROM t WHERE id >= 1000 AND id < 1200")
+            .unwrap();
         assert_eq!(
-            one(&mut e, "SELECT count(*) FROM t WHERE id >= 1000 AND id < 1200"),
+            one(&mut e, "SELECT count(*) FROM t"),
+            "4800",
+            "cycles={cycles}"
+        );
+        assert_eq!(
+            one(
+                &mut e,
+                "SELECT count(*) FROM t WHERE id >= 1000 AND id < 1200"
+            ),
             "0",
             "cycles={cycles}"
         );
@@ -106,7 +124,10 @@ fn round490_churn_does_not_change_what_a_range_update_touches() {
         );
         // Exactly the intended band moved; the rows either side did not.
         assert_eq!(
-            one(&mut e, "SELECT count(*) FROM t WHERE g = 77 AND (id < 1000 OR id >= 1200)"),
+            one(
+                &mut e,
+                "SELECT count(*) FROM t WHERE g = 77 AND (id < 1000 OR id >= 1200)"
+            ),
             "0",
             "cycles={cycles}"
         );
@@ -136,8 +157,13 @@ fn round490_range_mutation_still_uses_the_index() {
     let mut e = churned(30);
     let idx_before = stat(&mut e, "idx_scan");
     let seq_before = stat(&mut e, "seq_tup_read");
-    e.execute("DELETE FROM t WHERE id >= 1000 AND id < 1200").unwrap();
-    assert_eq!(stat(&mut e, "idx_scan") - idx_before, 1, "range DELETE seeks");
+    e.execute("DELETE FROM t WHERE id >= 1000 AND id < 1200")
+        .unwrap();
+    assert_eq!(
+        stat(&mut e, "idx_scan") - idx_before,
+        1,
+        "range DELETE seeks"
+    );
     assert_eq!(
         stat(&mut e, "seq_tup_read") - seq_before,
         0,

@@ -796,7 +796,10 @@ fn parse_index_only_bounds(
 /// neither is here.
 fn key_restores_type(ty: spg_storage::DataType) -> bool {
     use spg_storage::DataType as T;
-    matches!(ty, T::SmallInt | T::Int | T::BigInt | T::Text | T::Bool | T::Uuid)
+    matches!(
+        ty,
+        T::SmallInt | T::Int | T::BigInt | T::Text | T::Bool | T::Uuid
+    )
 }
 
 fn try_range_seek<'a>(
@@ -818,12 +821,11 @@ fn try_range_seek<'a>(
     // v7.39 (round 490) — drop the dead versions inside the walk. This loop
     // already tested `is_row_visible` and skipped; doing it one level down
     // means the cap stops counting them too (see `lookup_range_capped_by`).
-    let locators = idx.lookup_range_capped_by(bound_as_ref(&lo), bound_as_ref(&hi), cap, |l| {
-        match l {
+    let locators =
+        idx.lookup_range_capped_by(bound_as_ref(&lo), bound_as_ref(&hi), cap, |l| match l {
             spg_storage::RowLocator::Hot(i) => table.is_row_visible(i, snapshot),
             spg_storage::RowLocator::Cold { .. } => true,
-        }
-    })?;
+        })?;
     let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(locators.len());
     for loc in &locators {
         match *loc {
@@ -1633,7 +1635,10 @@ pub(crate) fn resolve_col_literal_pair(
                 | spg_storage::DataType::Char(_)
         )
     {
-        return Some((pos, crate::conversions::coerce_value(v, ty, &c.name, pos).ok()?));
+        return Some((
+            pos,
+            crate::conversions::coerce_value(v, ty, &c.name, pos).ok()?,
+        ));
     }
     Some((pos, v))
 }

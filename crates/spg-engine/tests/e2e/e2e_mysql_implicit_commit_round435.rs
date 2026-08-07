@@ -52,7 +52,8 @@ fn survives_rollback(mid: &str) -> String {
     e.execute("START TRANSACTION").unwrap();
     e.execute("INSERT INTO t(i) VALUES (1)").unwrap();
     e.execute(mid).unwrap_or_else(|err| panic!("{mid}: {err}"));
-    e.execute("ROLLBACK").unwrap_or_else(|err| panic!("ROLLBACK: {err}"));
+    e.execute("ROLLBACK")
+        .unwrap_or_else(|err| panic!("ROLLBACK: {err}"));
     rows_of_t(&mut e)
 }
 

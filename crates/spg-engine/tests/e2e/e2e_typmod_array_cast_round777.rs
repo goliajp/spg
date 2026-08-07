@@ -7,9 +7,7 @@ use spg_engine::{Engine, QueryResult};
 
 fn one(e: &mut Engine, sql: &str) -> String {
     match e.execute(sql).unwrap() {
-        QueryResult::Rows { rows, .. } => {
-            spg_engine::eval::value_to_text(&rows[0].values[0])
-        }
+        QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{other:?}"),
     }
 }
@@ -17,7 +15,10 @@ fn one(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn round777_typmod_array_cast_applies_per_element() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT ARRAY[1.5, 2.25]::numeric(3,1)[]"), "{1.5,2.3}");
+    assert_eq!(
+        one(&mut e, "SELECT ARRAY[1.5, 2.25]::numeric(3,1)[]"),
+        "{1.5,2.3}"
+    );
     assert_eq!(
         one(&mut e, "SELECT ARRAY[1.5, NULL, 2.25]::numeric(4,2)[]"),
         "{1.50,NULL,2.25}"

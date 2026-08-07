@@ -47,7 +47,8 @@ fn seed() -> Engine {
     let mut e = mysql();
     e.execute("CREATE TABLE a(id INT, v INT)").unwrap();
     e.execute("CREATE TABLE b(id INT, v INT)").unwrap();
-    e.execute("INSERT INTO a VALUES(1,10),(2,20),(3,30)").unwrap();
+    e.execute("INSERT INTO a VALUES(1,10),(2,20),(3,30)")
+        .unwrap();
     e.execute("INSERT INTO b VALUES(1,100),(2,200)").unwrap();
     e
 }
@@ -56,8 +57,12 @@ fn seed() -> Engine {
 #[test]
 fn comma_join_form() {
     let mut e = seed();
-    e.execute("UPDATE a, b SET a.v = b.v WHERE a.id = b.id").unwrap();
-    assert_eq!(col_v(&mut e, "SELECT v FROM a ORDER BY id"), vec![100, 200, 30]);
+    e.execute("UPDATE a, b SET a.v = b.v WHERE a.id = b.id")
+        .unwrap();
+    assert_eq!(
+        col_v(&mut e, "SELECT v FROM a ORDER BY id"),
+        vec![100, 200, 30]
+    );
 }
 
 /// The explicit JOIN form, with the predicate in ON.
@@ -66,7 +71,10 @@ fn inner_join_form() {
     let mut e = seed();
     e.execute("UPDATE a JOIN b ON a.id = b.id SET a.v = b.v + 1")
         .unwrap();
-    assert_eq!(col_v(&mut e, "SELECT v FROM a ORDER BY id"), vec![101, 201, 30]);
+    assert_eq!(
+        col_v(&mut e, "SELECT v FROM a ORDER BY id"),
+        vec![101, 201, 30]
+    );
 }
 
 /// LEFT JOIN updates EVERY target row — an unmatched one reads NULL from the
@@ -76,7 +84,10 @@ fn left_join_form_updates_unmatched_rows() {
     let mut e = seed();
     e.execute("UPDATE a LEFT JOIN b ON a.id = b.id SET a.v = COALESCE(b.v, -1)")
         .unwrap();
-    assert_eq!(col_v(&mut e, "SELECT v FROM a ORDER BY id"), vec![100, 200, -1]);
+    assert_eq!(
+        col_v(&mut e, "SELECT v FROM a ORDER BY id"),
+        vec![100, 200, -1]
+    );
 }
 
 /// Aliases on both sides.
@@ -85,7 +96,10 @@ fn alias_form() {
     let mut e = seed();
     e.execute("UPDATE a AS x, b AS y SET x.v = y.v WHERE x.id = y.id")
         .unwrap();
-    assert_eq!(col_v(&mut e, "SELECT v FROM a ORDER BY id"), vec![100, 200, 30]);
+    assert_eq!(
+        col_v(&mut e, "SELECT v FROM a ORDER BY id"),
+        vec![100, 200, 30]
+    );
 }
 
 /// An unqualified assignment target still resolves to the update target.
@@ -96,7 +110,8 @@ fn unqualified_assignment_target() {
     e.execute("CREATE TABLE b(id INT, w INT)").unwrap();
     e.execute("INSERT INTO a VALUES(1,10),(2,20)").unwrap();
     e.execute("INSERT INTO b VALUES(1,100)").unwrap();
-    e.execute("UPDATE a, b SET v = b.w WHERE a.id = b.id").unwrap();
+    e.execute("UPDATE a, b SET v = b.w WHERE a.id = b.id")
+        .unwrap();
     assert_eq!(col_v(&mut e, "SELECT v FROM a ORDER BY id"), vec![100, 20]);
 }
 
@@ -112,11 +127,15 @@ fn multi_target_is_refused_without_mutating() {
         "multi-target UPDATE must be refused"
     );
     assert!(
-        e.execute("UPDATE a, b SET b.v = 5 WHERE a.id = b.id").is_err(),
+        e.execute("UPDATE a, b SET b.v = 5 WHERE a.id = b.id")
+            .is_err(),
         "assigning only to a source table must be refused"
     );
     // Both tables untouched.
-    assert_eq!(col_v(&mut e, "SELECT v FROM a ORDER BY id"), vec![10, 20, 30]);
+    assert_eq!(
+        col_v(&mut e, "SELECT v FROM a ORDER BY id"),
+        vec![10, 20, 30]
+    );
     assert_eq!(col_v(&mut e, "SELECT v FROM b ORDER BY id"), vec![100, 200]);
 }
 
@@ -130,7 +149,8 @@ fn postgres_unchanged() {
     e.execute("INSERT INTO a VALUES(1,10),(2,20)").unwrap();
     e.execute("INSERT INTO b VALUES(1,100)").unwrap();
     assert!(
-        e.execute("UPDATE a, b SET a.v = b.w WHERE a.id = b.id").is_err(),
+        e.execute("UPDATE a, b SET a.v = b.w WHERE a.id = b.id")
+            .is_err(),
         "PG has no multi-table UPDATE"
     );
     e.execute("UPDATE a SET v = b.w FROM b WHERE a.id = b.id")

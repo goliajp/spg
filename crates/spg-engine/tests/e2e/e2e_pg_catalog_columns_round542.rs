@@ -31,9 +31,12 @@ use spg_engine::{Engine, QueryResult};
 
 fn engine() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (a INT PRIMARY KEY, b TEXT)").unwrap();
-    e.execute("CREATE VIEW v AS SELECT a FROM t WHERE a > 0").unwrap();
-    e.execute("CREATE MATERIALIZED VIEW mv AS SELECT a FROM t").unwrap();
+    e.execute("CREATE TABLE t (a INT PRIMARY KEY, b TEXT)")
+        .unwrap();
+    e.execute("CREATE VIEW v AS SELECT a FROM t WHERE a > 0")
+        .unwrap();
+    e.execute("CREATE MATERIALIZED VIEW mv AS SELECT a FROM t")
+        .unwrap();
     e
 }
 
@@ -176,7 +179,10 @@ fn round542_pg_matviews_has_rows_and_pgs_columns() {
     );
     // An ordinary view is not one.
     assert_eq!(
-        rows(&mut e, "SELECT count(*) FROM pg_matviews WHERE matviewname = 'v'"),
+        rows(
+            &mut e,
+            "SELECT count(*) FROM pg_matviews WHERE matviewname = 'v'"
+        ),
         vec!["0"]
     );
     // And an index on it shows.
@@ -204,7 +210,13 @@ fn round542_view_and_index_listings_are_complete() {
     );
     assert_eq!(
         columns(&mut e, "SELECT * FROM pg_indexes"),
-        vec!["schemaname", "tablename", "indexname", "tablespace", "indexdef"]
+        vec![
+            "schemaname",
+            "tablename",
+            "indexname",
+            "tablespace",
+            "indexdef"
+        ]
     );
     // NULL means the default tablespace, which is the only one SPG has.
     assert_eq!(

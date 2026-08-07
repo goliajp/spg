@@ -61,7 +61,10 @@ fn null_name_null_result() {
 fn release_lock_return_shape() {
     let mut e = mysql();
     // Nobody has 'r417_never' -> NULL.
-    assert_eq!(one(&mut e, "SELECT RELEASE_LOCK('r417_never')"), Value::Null);
+    assert_eq!(
+        one(&mut e, "SELECT RELEASE_LOCK('r417_never')"),
+        Value::Null
+    );
     // Take + release + one more release for a not-held name -> NULL.
     e.execute("SELECT GET_LOCK('r417_b', 0)").unwrap();
     assert_eq!(one(&mut e, "SELECT RELEASE_LOCK('r417_b')"), Value::Int(1));
@@ -72,8 +75,14 @@ fn release_lock_return_shape() {
 #[test]
 fn probe_unknown_lock() {
     let mut e = mysql();
-    assert_eq!(one(&mut e, "SELECT IS_FREE_LOCK('r417_ghost')"), Value::Int(1));
-    assert_eq!(one(&mut e, "SELECT IS_USED_LOCK('r417_ghost')"), Value::Null);
+    assert_eq!(
+        one(&mut e, "SELECT IS_FREE_LOCK('r417_ghost')"),
+        Value::Int(1)
+    );
+    assert_eq!(
+        one(&mut e, "SELECT IS_USED_LOCK('r417_ghost')"),
+        Value::Null
+    );
 }
 
 /// IS_USED_LOCK when held returns a non-NULL owner id (MariaDB's exact

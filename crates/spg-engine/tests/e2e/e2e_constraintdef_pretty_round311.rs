@@ -180,7 +180,12 @@ fn only_check_constraints_differ_between_the_two_forms() {
             for r in &rows {
                 let plain = spg_engine::eval::value_to_text(&r.values[1]);
                 let pretty = spg_engine::eval::value_to_text(&r.values[2]);
-                assert_eq!(plain, pretty, "{}", spg_engine::eval::value_to_text(&r.values[0]));
+                assert_eq!(
+                    plain,
+                    pretty,
+                    "{}",
+                    spg_engine::eval::value_to_text(&r.values[0])
+                );
             }
         }
         other => panic!("{other:?}"),

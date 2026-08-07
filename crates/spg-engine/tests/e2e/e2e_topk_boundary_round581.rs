@@ -77,7 +77,10 @@ fn round581_ties_at_the_boundary_are_kept() {
     assert_eq!(got.iter().filter(|v| *v == "198").count(), 50);
     // A second key breaks the tie and the answer is exact.
     assert_eq!(
-        vals(&mut e, "SELECT id, k FROM b581 ORDER BY k DESC, id DESC LIMIT 3"),
+        vals(
+            &mut e,
+            "SELECT id, k FROM b581 ORDER BY k DESC, id DESC LIMIT 3"
+        ),
         vec!["19999|199", "19799|199", "19599|199"]
     );
 }
@@ -104,7 +107,10 @@ fn round581_every_rejection_regime_answers_the_same() {
         "nothing is ever rejected"
     );
     assert_eq!(
-        vals(&mut e, "SELECT desc_v FROM r581 ORDER BY desc_v DESC LIMIT 3"),
+        vals(
+            &mut e,
+            "SELECT desc_v FROM r581 ORDER BY desc_v DESC LIMIT 3"
+        ),
         vec!["29999", "29998", "29997"],
         "almost everything is rejected"
     );
@@ -141,9 +147,15 @@ fn round581_null_boundaries() {
         "NULLs last ascending"
     );
     let desc = vals(&mut e, "SELECT v FROM n581 ORDER BY v DESC LIMIT 3");
-    assert!(desc.iter().all(|x| x == "NULL"), "NULLs first descending: {desc:?}");
+    assert!(
+        desc.iter().all(|x| x == "NULL"),
+        "NULLs first descending: {desc:?}"
+    );
     assert_eq!(
-        vals(&mut e, "SELECT v FROM n581 ORDER BY v DESC NULLS LAST LIMIT 3"),
+        vals(
+            &mut e,
+            "SELECT v FROM n581 ORDER BY v DESC NULLS LAST LIMIT 3"
+        ),
         vec!["29999", "29998", "29996"]
     );
     assert_eq!(
@@ -164,11 +176,17 @@ fn round581_offset_widens_the_floor() {
     e.execute("INSERT INTO o581 SELECT gg FROM generate_series(1, 30000) gg")
         .unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT id FROM o581 ORDER BY id DESC LIMIT 3 OFFSET 5000"),
+        vals(
+            &mut e,
+            "SELECT id FROM o581 ORDER BY id DESC LIMIT 3 OFFSET 5000"
+        ),
         vec!["25000", "24999", "24998"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM o581 ORDER BY id LIMIT 3 OFFSET 5000"),
+        vals(
+            &mut e,
+            "SELECT id FROM o581 ORDER BY id LIMIT 3 OFFSET 5000"
+        ),
         vec!["5001", "5002", "5003"]
     );
 }

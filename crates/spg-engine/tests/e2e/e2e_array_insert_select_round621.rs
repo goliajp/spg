@@ -109,13 +109,15 @@ fn round621_insert_select_carries_arrays() {
 fn round621_the_other_spellings() {
     let mut e = seed();
     e.execute("CREATE TABLE b2 (i INT, ia INT[])").unwrap();
-    e.execute("INSERT INTO b2 (i, ia) SELECT i, ia FROM b0").unwrap();
+    e.execute("INSERT INTO b2 (i, ia) SELECT i, ia FROM b0")
+        .unwrap();
     assert_eq!(
         vals(&mut e, "SELECT i, ia FROM b2 ORDER BY i"),
         vec!["1|{1,2}", "2|NULL", "3|{}", "4|{1,NULL,2}"],
         "a named column list"
     );
-    e.execute("CREATE TABLE b3 AS SELECT i, ta FROM b0").unwrap();
+    e.execute("CREATE TABLE b3 AS SELECT i, ta FROM b0")
+        .unwrap();
     assert_eq!(
         vals(&mut e, "SELECT i, ta FROM b3 ORDER BY i"),
         vec!["1|{x,y}", "2|NULL", "3|{}", r#"4|{"a b","c,d",NULL}"#],
@@ -152,9 +154,13 @@ fn round621_the_other_spellings() {
 fn round621_what_lands_is_an_array() {
     let mut e = seed();
     e.execute("CREATE TABLE b7 (i INT, ia INT[])").unwrap();
-    e.execute("INSERT INTO b7 (i, ia) SELECT i, ia FROM b0").unwrap();
+    e.execute("INSERT INTO b7 (i, ia) SELECT i, ia FROM b0")
+        .unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT i, array_length(ia,1), ia[1] FROM b7 ORDER BY i"),
+        vals(
+            &mut e,
+            "SELECT i, array_length(ia,1), ia[1] FROM b7 ORDER BY i"
+        ),
         vec!["1|2|1", "2|NULL|NULL", "3|NULL|NULL", "4|3|1"],
         "subscript and length work on it, so it is an array"
     );

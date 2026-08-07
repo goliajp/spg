@@ -6,8 +6,8 @@
 //! halves separately on both engines, at synchronous_commit=off since round
 //! 451 established that the durable total is not what a verdict should read.
 use sqlx::{AnyConnection, Connection as _, Executor as _};
-use std::time::Instant;
 use std::fmt::Write as _;
+use std::time::Instant;
 
 const N: i64 = 50_000;
 
@@ -73,18 +73,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // profile of the named connection thread is dominated by per-row
     // `eval_expr` / `binop` / `is_row_visible`, which is what a filter scan
     // looks like. These two counters say which.
-    let idx: i64 = sqlx::query_scalar(
-        "SELECT idx_scan FROM pg_stat_user_tables WHERE relname='wb'",
-    )
-    .fetch_one(&mut c)
-    .await
-    .unwrap_or(-1);
-    let seq: i64 = sqlx::query_scalar(
-        "SELECT seq_tup_read FROM pg_stat_user_tables WHERE relname='wb'",
-    )
-    .fetch_one(&mut c)
-    .await
-    .unwrap_or(-1);
+    let idx: i64 =
+        sqlx::query_scalar("SELECT idx_scan FROM pg_stat_user_tables WHERE relname='wb'")
+            .fetch_one(&mut c)
+            .await
+            .unwrap_or(-1);
+    let seq: i64 =
+        sqlx::query_scalar("SELECT seq_tup_read FROM pg_stat_user_tables WHERE relname='wb'")
+            .fetch_one(&mut c)
+            .await
+            .unwrap_or(-1);
     println!("# delete_reinsert_1k split, sync=off, median of {iters}");
     println!("  idx_scan={idx}  seq_tup_read={seq}");
     println!("  DELETE 1000 rows : {:.3} ms", median(dv));

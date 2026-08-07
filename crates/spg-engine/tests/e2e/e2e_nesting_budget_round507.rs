@@ -58,9 +58,18 @@ fn nest(prefix: &str, inner: &str, suffix: &str, n: usize) -> String {
 fn round507_every_recursive_shape_reaches_the_nesting_budget() {
     let deep = 200;
     let cases = [
-        ("derived", nest("SELECT * FROM (", "SELECT a FROM lbl", ") t", deep)),
-        ("parens", format!("SELECT {}1{}", "(".repeat(deep), ")".repeat(deep))),
-        ("calls", format!("SELECT {}'x'{}", "upper(".repeat(deep), ")".repeat(deep))),
+        (
+            "derived",
+            nest("SELECT * FROM (", "SELECT a FROM lbl", ") t", deep),
+        ),
+        (
+            "parens",
+            format!("SELECT {}1{}", "(".repeat(deep), ")".repeat(deep)),
+        ),
+        (
+            "calls",
+            format!("SELECT {}'x'{}", "upper(".repeat(deep), ")".repeat(deep)),
+        ),
         (
             "case",
             format!(
@@ -71,7 +80,12 @@ fn round507_every_recursive_shape_reaches_the_nesting_budget() {
         ),
         (
             "in_subquery",
-            nest("SELECT a FROM lbl WHERE a IN (", "SELECT a FROM lbl", ")", deep),
+            nest(
+                "SELECT a FROM lbl WHERE a IN (",
+                "SELECT a FROM lbl",
+                ")",
+                deep,
+            ),
         ),
         (
             "scalar_subquery",
@@ -100,10 +114,26 @@ fn round507_every_recursive_shape_reaches_the_nesting_budget() {
 #[test]
 fn round507_chained_shapes_reach_their_own_budgets() {
     let cases = [
-        ("arith", format!("SELECT 1{}", " + 1".repeat(5_000)), "chained binary"),
-        ("and", format!("SELECT a FROM lbl WHERE a=1{}", " AND a=1".repeat(5_000)), "chained binary"),
-        ("concat", format!("SELECT 'x'{}", " || 'x'".repeat(5_000)), "chained binary"),
-        ("cast", format!("SELECT 1{}", "::text".repeat(2_000)), "stack depth limit"),
+        (
+            "arith",
+            format!("SELECT 1{}", " + 1".repeat(5_000)),
+            "chained binary",
+        ),
+        (
+            "and",
+            format!("SELECT a FROM lbl WHERE a=1{}", " AND a=1".repeat(5_000)),
+            "chained binary",
+        ),
+        (
+            "concat",
+            format!("SELECT 'x'{}", " || 'x'".repeat(5_000)),
+            "chained binary",
+        ),
+        (
+            "cast",
+            format!("SELECT 1{}", "::text".repeat(2_000)),
+            "stack depth limit",
+        ),
     ];
     for (name, sql, want) in cases {
         match run(sql) {

@@ -28,9 +28,7 @@ fn seed(dialect_mysql: bool) -> Engine {
 fn num(e: &mut Engine, sql: &str) -> f64 {
     match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err}")) {
         QueryResult::Rows { rows, .. } => match &rows[0].values[0] {
-            Value::Numeric { scaled, scale, .. } => {
-                *scaled as f64 / 10f64.powi(i32::from(*scale))
-            }
+            Value::Numeric { scaled, scale, .. } => *scaled as f64 / 10f64.powi(i32::from(*scale)),
             Value::Float(x) => *x,
             other => panic!("`{sql}` not numeric: {other:?}"),
         },

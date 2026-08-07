@@ -31,10 +31,19 @@ fn round719_int_expr_key_joins_answer_as_pg() {
     seed(&mut e);
     for (sql, want) in [
         // id = id + 1: 99 pairs (2..=100 each match one predecessor).
-        ("SELECT count(*) FROM j719 a JOIN j719 b ON a.id = b.id + 1", "99"),
-        ("SELECT count(*) FROM j719 a JOIN j719 b ON a.id = b.id - 3", "97"),
+        (
+            "SELECT count(*) FROM j719 a JOIN j719 b ON a.id = b.id + 1",
+            "99",
+        ),
+        (
+            "SELECT count(*) FROM j719 a JOIN j719 b ON a.id = b.id - 3",
+            "97",
+        ),
         // id = id * 2: even ids 2..=100 -> 50 pairs.
-        ("SELECT count(*) FROM j719 a JOIN j719 b ON a.id = b.id * 2", "50"),
+        (
+            "SELECT count(*) FROM j719 a JOIN j719 b ON a.id = b.id * 2",
+            "50",
+        ),
         // Anti-join: only a.id = 1 has no b with b.id + 1 = 1.
         (
             "SELECT count(*) FROM j719 a LEFT JOIN j719 b ON a.id = b.id + 1 \
@@ -54,7 +63,10 @@ fn round719_int_expr_key_joins_answer_as_pg() {
             "0",
         ),
         // The winning row's VALUES, not just counts.
-        ("SELECT sum(a.id) FROM j719 a JOIN j719 b ON a.id = b.id + 99", "100"),
+        (
+            "SELECT sum(a.id) FROM j719 a JOIN j719 b ON a.id = b.id + 99",
+            "100",
+        ),
     ] {
         assert_eq!(one(&mut e, sql), want, "{sql}");
     }
@@ -65,9 +77,13 @@ fn round719_int_expr_key_joins_answer_as_pg() {
 fn round719_null_keys_never_match() {
     let mut e = Engine::new();
     seed(&mut e);
-    e.execute("INSERT INTO j719 VALUES (NULL, 0), (NULL, 1)").unwrap();
+    e.execute("INSERT INTO j719 VALUES (NULL, 0), (NULL, 1)")
+        .unwrap();
     assert_eq!(
-        one(&mut e, "SELECT count(*) FROM j719 a JOIN j719 b ON a.id = b.id + 1"),
+        one(
+            &mut e,
+            "SELECT count(*) FROM j719 a JOIN j719 b ON a.id = b.id + 1"
+        ),
         "99",
         "NULL build keys and NULL probe keys both stay out"
     );
@@ -96,8 +112,14 @@ fn round720_mirror_int_expr_key_joins_answer_as_pg() {
     let mut e = Engine::new();
     seed(&mut e);
     for (sql, want) in [
-        ("SELECT count(*) FROM j719 a JOIN j719 b ON b.id = a.id + 1", "99"),
-        ("SELECT count(*) FROM j719 a JOIN j719 b ON b.id = a.id * 2", "50"),
+        (
+            "SELECT count(*) FROM j719 a JOIN j719 b ON b.id = a.id + 1",
+            "99",
+        ),
+        (
+            "SELECT count(*) FROM j719 a JOIN j719 b ON b.id = a.id * 2",
+            "50",
+        ),
         // Mixed: id offset by one never keeps g = id % 3 equal.
         (
             "SELECT count(*) FROM j719 a JOIN j719 b ON b.id = a.id + 1 AND b.g = a.g",

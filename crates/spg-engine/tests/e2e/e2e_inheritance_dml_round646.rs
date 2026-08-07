@@ -48,7 +48,8 @@ fn family() -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TABLE par (a INT NOT NULL, b TEXT DEFAULT 'd')")
         .unwrap();
-    e.execute("CREATE TABLE ch (c BOOL) INHERITS (par)").unwrap();
+    e.execute("CREATE TABLE ch (c BOOL) INHERITS (par)")
+        .unwrap();
     e.execute("INSERT INTO par (a) VALUES (1)").unwrap();
     e.execute("INSERT INTO ch (a, c) VALUES (2, true)").unwrap();
     e

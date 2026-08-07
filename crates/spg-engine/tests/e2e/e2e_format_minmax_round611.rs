@@ -66,7 +66,8 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE ft (id INT, s TEXT, n NUMERIC, d DATE)").unwrap();
+    e.execute("CREATE TABLE ft (id INT, s TEXT, n NUMERIC, d DATE)")
+        .unwrap();
     e.execute(
         "INSERT INTO ft VALUES (1,'ab',1.50,'2020-01-02'),(2,NULL,NULL,NULL),\
          (3,'日本',3.0,'1999-12-31'),(4,'it''s',0.25,'2000-02-29')",
@@ -80,7 +81,10 @@ fn seed() -> Engine {
 fn round611_format_specs() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id, format('%s/%s', s, id), format('%s', s), format('%s', n) FROM ft ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, format('%s/%s', s, id), format('%s', s), format('%s', n) FROM ft ORDER BY id"
+        ),
         vec![
             "1|ab/1|ab|1.50",
             "2|/2||",
@@ -90,27 +94,42 @@ fn round611_format_specs() {
         "a NULL renders as empty under %s"
     );
     assert_eq!(
-        vals(&mut e, "SELECT format('%2$s-%1$s', 'a', 'b'), format('%1$s%1$s', 'x'), format('%3$s', 'a','b','c')"),
+        vals(
+            &mut e,
+            "SELECT format('%2$s-%1$s', 'a', 'b'), format('%1$s%1$s', 'x'), format('%3$s', 'a','b','c')"
+        ),
         vec!["b-a|xx|c"],
         "explicit positions, including the same one twice"
     );
     assert_eq!(
-        vals(&mut e, "SELECT format('[%10s]', 'ab'), format('[%-10s]', 'ab'), format('[%3s]', 'abcdef')"),
+        vals(
+            &mut e,
+            "SELECT format('[%10s]', 'ab'), format('[%-10s]', 'ab'), format('[%3s]', 'abcdef')"
+        ),
         vec!["[        ab]|[ab        ]|[abcdef]"],
         "a width pads but never truncates"
     );
     assert_eq!(
-        vals(&mut e, "SELECT format('[%*s]', 6, 'ab'), format('[%*s]', -6, 'ab'), format('[%*s]', 0, 'ab')"),
+        vals(
+            &mut e,
+            "SELECT format('[%*s]', 6, 'ab'), format('[%*s]', -6, 'ab'), format('[%*s]', 0, 'ab')"
+        ),
         vec!["[    ab]|[ab    ]|[ab]"],
         "a * width comes from an argument, and a negative one left-justifies"
     );
     assert_eq!(
-        vals(&mut e, "SELECT format('[%10s]', '日本'), format('[%-10s]', '日本')"),
+        vals(
+            &mut e,
+            "SELECT format('[%10s]', '日本'), format('[%-10s]', '日本')"
+        ),
         vec!["[        日本]|[日本        ]"],
         "the width counts characters"
     );
     assert_eq!(
-        vals(&mut e, "SELECT format('%L', NULL::TEXT), format('%s', NULL::TEXT), format('%%'), format('a%%b')"),
+        vals(
+            &mut e,
+            "SELECT format('%L', NULL::TEXT), format('%s', NULL::TEXT), format('%%'), format('a%%b')"
+        ),
         vec!["NULL||%|a%b"]
     );
     assert!(
@@ -124,7 +143,10 @@ fn round611_format_specs() {
 fn round611_format_quoting() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id, format('%I', s), format('%L', s), format('%L', n) FROM ft WHERE s IS NOT NULL ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, format('%I', s), format('%L', s), format('%L', n) FROM ft WHERE s IS NOT NULL ORDER BY id"
+        ),
         vec![
             "1|ab|'ab'|'1.50'",
             "3|\"日本\"|'日本'|'3.0'",
@@ -132,16 +154,25 @@ fn round611_format_quoting() {
         ]
     );
     assert_eq!(
-        vals(&mut e, "SELECT format('%I', 'Weird Name'), format('%I', 'plain'), format('%L', 'it''s')"),
+        vals(
+            &mut e,
+            "SELECT format('%I', 'Weird Name'), format('%I', 'plain'), format('%L', 'it''s')"
+        ),
         vec!["\"Weird Name\"|plain|'it''s'"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT format('%s', 't'::BOOL), format('%s', '2020-01-02'::DATE), format('%s', 1.50::NUMERIC)"),
+        vals(
+            &mut e,
+            "SELECT format('%s', 't'::BOOL), format('%s', '2020-01-02'::DATE), format('%s', 1.50::NUMERIC)"
+        ),
         vec!["t|2020-01-02|1.50"],
         "a non-text value renders through the owned path"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, format('%s|%s|%s', s, n, d) FROM ft ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, format('%s|%s|%s', s, n, d) FROM ft ORDER BY id"
+        ),
         vec![
             "1|ab|1.50|2020-01-02",
             "2|||",
@@ -156,13 +187,11 @@ fn round611_format_quoting() {
 fn round611_min_max() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id, greatest(id, 2), least(id, 2), greatest(s,'b'), least(s,'b') FROM ft ORDER BY id"),
-        vec![
-            "1|2|1|b|ab",
-            "2|2|2|b|b",
-            "3|3|2|日本|b",
-            "4|4|2|it's|b",
-        ],
+        vals(
+            &mut e,
+            "SELECT id, greatest(id, 2), least(id, 2), greatest(s,'b'), least(s,'b') FROM ft ORDER BY id"
+        ),
+        vec!["1|2|1|b|ab", "2|2|2|b|b", "3|3|2|日本|b", "4|4|2|it's|b",],
         "a NULL argument is IGNORED, not poisonous"
     );
     assert_eq!(
@@ -181,12 +210,18 @@ fn round611_min_max() {
          owned pass exists for"
     );
     assert_eq!(
-        vals(&mut e, "SELECT greatest('12:00'::TIME, '14:00'), least('12:00'::TIME, '14:00')"),
+        vals(
+            &mut e,
+            "SELECT greatest('12:00'::TIME, '14:00'), least('12:00'::TIME, '14:00')"
+        ),
         vec!["14:00:00|12:00:00"],
         "and for TIME, which compared as text before that pass existed"
     );
     assert_eq!(
-        vals(&mut e, "SELECT greatest(1, 2.5), greatest(1,2.5)/2, least(3, 2.5)/2"),
+        vals(
+            &mut e,
+            "SELECT greatest(1, 2.5), greatest(1,2.5)/2, least(3, 2.5)/2"
+        ),
         vec!["2.5|1.25000000000000000000|1.25000000000000000000"],
         "the winner is widened, so the division is not an integer one"
     );
@@ -195,12 +230,18 @@ fn round611_min_max() {
         vec!["2"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT greatest(NULL, 3, NULL), least(NULL, 3, NULL), greatest(NULL::INT, NULL::INT) IS NULL"),
+        vals(
+            &mut e,
+            "SELECT greatest(NULL, 3, NULL), least(NULL, 3, NULL), greatest(NULL::INT, NULL::INT) IS NULL"
+        ),
         vec!["3|3|true"],
         "all-NULL is NULL"
     );
     assert_eq!(
-        vals(&mut e, "SELECT greatest(1), least(1), greatest('a','b','c'), least('a','b','c')"),
+        vals(
+            &mut e,
+            "SELECT greatest(1), least(1), greatest('a','b','c'), least('a','b','c')"
+        ),
         vec!["1|1|c|a"],
         "one argument, and more than two"
     );
@@ -214,16 +255,25 @@ fn round611_scale() {
     e.execute("INSERT INTO big SELECT gg, 'row' || gg FROM generate_series(1, 20000) gg")
         .unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT sum(least(id, 100)), sum(greatest(id, 19900)) FROM big"),
+        vals(
+            &mut e,
+            "SELECT sum(least(id, 100)), sum(greatest(id, 19900)) FROM big"
+        ),
         vec!["1995050|398005050"],
         "checked against live PG18, which answers the same"
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE least(id, 100) = 100"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE least(id, 100) = 100"
+        ),
         vec!["19901"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE format('%s/%s', s, id) = s || '/' || id"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE format('%s/%s', s, id) = s || '/' || id"
+        ),
         vec!["20000"],
         "format agrees with the concatenation it spells"
     );
@@ -232,7 +282,10 @@ fn round611_scale() {
         vec!["20000"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE format('%2$s|%1$s', id, s) = s || '|' || id"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE format('%2$s|%1$s', id, s) = s || '|' || id"
+        ),
         vec!["20000"],
         "and so does the explicit-position spelling"
     );

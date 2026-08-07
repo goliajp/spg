@@ -25,7 +25,10 @@
 use spg_engine::{Engine, QueryResult};
 
 fn err_of(e: &mut Engine, sql: &str) -> String {
-    format!("{}", e.execute(sql).expect_err(&format!("PG18 refuses: {sql}")))
+    format!(
+        "{}",
+        e.execute(sql).expect_err(&format!("PG18 refuses: {sql}"))
+    )
 }
 
 fn seed(e: &mut Engine) {
@@ -41,10 +44,7 @@ fn round704_a_bare_window_function_names_the_missing_over() {
     seed(&mut e);
     for func in ["lag(i)", "lead(i)", "row_number()", "rank()", "ntile(4)"] {
         let err = err_of(&mut e, &format!("SELECT {func} FROM t704"));
-        assert!(
-            err.contains("requires an OVER clause"),
-            "{func}: {err}"
-        );
+        assert!(err.contains("requires an OVER clause"), "{func}: {err}");
         assert!(
             !err.contains("does not exist"),
             "{func} exists; the error must not deny it: {err}"
@@ -98,10 +98,7 @@ fn round704_substring_over_an_int_is_a_missing_overload() {
             .contains("function pg_catalog.substring(integer, integer, integer) does not exist"),
     );
     // The working overloads did not move.
-    let got = match e
-        .execute("SELECT substring('hello' FROM 2 FOR 3)")
-        .unwrap()
-    {
+    let got = match e.execute("SELECT substring('hello' FROM 2 FOR 3)").unwrap() {
         QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{other:?}"),
     };
@@ -132,7 +129,10 @@ fn round704_a_temporal_literal_that_wont_lift_uses_the_input_functions_words() {
 fn round705_an_unreferenced_window_definition_is_still_analysed() {
     let mut e = Engine::new();
     seed(&mut e);
-    let err = err_of(&mut e, "SELECT i FROM t704 WINDOW w AS (ORDER BY nosuch705)");
+    let err = err_of(
+        &mut e,
+        "SELECT i FROM t704 WINDOW w AS (ORDER BY nosuch705)",
+    );
     assert!(err.contains("nosuch705"), "{err}");
     // A good unreferenced definition stays a no-op…
     let n = match e
@@ -155,7 +155,10 @@ fn round705_an_unreferenced_window_definition_is_still_analysed() {
     // A bad column inside a referenced definition errors through the
     // window itself, as before.
     assert!(
-        err_of(&mut e, "SELECT row_number() OVER w FROM t704 WINDOW w AS (ORDER BY nosuch705)")
-            .contains("nosuch705")
+        err_of(
+            &mut e,
+            "SELECT row_number() OVER w FROM t704 WINDOW w AS (ORDER BY nosuch705)"
+        )
+        .contains("nosuch705")
     );
 }

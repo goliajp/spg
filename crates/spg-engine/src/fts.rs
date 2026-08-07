@@ -253,16 +253,24 @@ fn prune_stopword_terms(ast: &TsQueryAst) -> Option<TsQueryAst> {
             }
         }
         TsQueryAst::And(a, b) => match (prune_stopword_terms(a), prune_stopword_terms(b)) {
-            (Some(x), Some(y)) => Some(TsQueryAst::And(alloc::boxed::Box::new(x), alloc::boxed::Box::new(y))),
+            (Some(x), Some(y)) => Some(TsQueryAst::And(
+                alloc::boxed::Box::new(x),
+                alloc::boxed::Box::new(y),
+            )),
             (Some(x), None) | (None, Some(x)) => Some(x),
             (None, None) => None,
         },
         TsQueryAst::Or(a, b) => match (prune_stopword_terms(a), prune_stopword_terms(b)) {
-            (Some(x), Some(y)) => Some(TsQueryAst::Or(alloc::boxed::Box::new(x), alloc::boxed::Box::new(y))),
+            (Some(x), Some(y)) => Some(TsQueryAst::Or(
+                alloc::boxed::Box::new(x),
+                alloc::boxed::Box::new(y),
+            )),
             (Some(x), None) | (None, Some(x)) => Some(x),
             (None, None) => None,
         },
-        TsQueryAst::Not(x) => prune_stopword_terms(x).map(|p| TsQueryAst::Not(alloc::boxed::Box::new(p))),
+        TsQueryAst::Not(x) => {
+            prune_stopword_terms(x).map(|p| TsQueryAst::Not(alloc::boxed::Box::new(p)))
+        }
         TsQueryAst::Phrase {
             left,
             right,
@@ -1022,9 +1030,7 @@ pub fn tokenize_typed(text: &str) -> Vec<Token> {
         // for `/usr/local/bin` keeps it, and a token that drops it is a
         // different string to search for.
         let leading_slash = c == '/' && i + 1 < b.len() && is_word(b[i + 1]);
-        if is_word(c)
-            || leading_slash
-            || (c == '-' && i + 1 < b.len() && b[i + 1].is_ascii_digit())
+        if is_word(c) || leading_slash || (c == '-' && i + 1 < b.len() && b[i + 1].is_ascii_digit())
         {
             let start = i;
             // A signed integer only counts as one at the start of a run.
@@ -1099,7 +1105,11 @@ fn classify_into(raw: &str, signed: bool, out: &mut Vec<Token>) {
     // the head would be.
     let mut body = lower.as_str();
     if let Some(pos) = lower.find("://") {
-        push(out, &alloc::format!("{}://", &lower[..pos]), TokenType::Protocol);
+        push(
+            out,
+            &alloc::format!("{}://", &lower[..pos]),
+            TokenType::Protocol,
+        );
         body = &lower[pos + 3..];
     }
     // url vs file, and the discriminator is measured rather than
@@ -1116,11 +1126,9 @@ fn classify_into(raw: &str, signed: bool, out: &mut Vec<Token>) {
             Some(p) => body.split_at(p),
             None => (body, ""),
         };
-        let host_like = head
-            .rsplit_once('.')
-            .is_some_and(|(pre, tld)| {
-                !pre.is_empty() && tld.len() >= 2 && tld.chars().all(char::is_alphabetic)
-            });
+        let host_like = head.rsplit_once('.').is_some_and(|(pre, tld)| {
+            !pre.is_empty() && tld.len() >= 2 && tld.chars().all(char::is_alphabetic)
+        });
         if host_like && !head.is_empty() {
             push(out, raw_tail(raw, body), TokenType::Url);
             push(out, &raw_tail(raw, body)[..head.len()], TokenType::Host);

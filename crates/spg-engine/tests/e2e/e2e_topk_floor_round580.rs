@@ -59,7 +59,8 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn engine(n: i32) -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE f580 (id INT, g INT, t TEXT)").unwrap();
+    e.execute("CREATE TABLE f580 (id INT, g INT, t TEXT)")
+        .unwrap();
     e.execute(&format!(
         "INSERT INTO f580 SELECT gg, gg % 13, 'r' || gg FROM generate_series(1, {n}) gg"
     ))
@@ -73,13 +74,19 @@ fn engine(n: i32) -> Engine {
 fn round580_every_k_keeps_the_same_rows() {
     let mut e = engine(3000);
     for k in [1usize, 2, 9, 10, 511, 512, 513, 1023, 1024, 1025, 2000] {
-        let got = vals(&mut e, &format!("SELECT id FROM f580 ORDER BY id DESC LIMIT {k}"));
+        let got = vals(
+            &mut e,
+            &format!("SELECT id FROM f580 ORDER BY id DESC LIMIT {k}"),
+        );
         let want: Vec<String> = (3000 - k as i32 + 1..=3000)
             .rev()
             .map(|i| i.to_string())
             .collect();
         assert_eq!(got, want, "LIMIT {k} descending");
-        let got = vals(&mut e, &format!("SELECT id FROM f580 ORDER BY id LIMIT {k}"));
+        let got = vals(
+            &mut e,
+            &format!("SELECT id FROM f580 ORDER BY id LIMIT {k}"),
+        );
         let want: Vec<String> = (1..=k as i32).map(|i| i.to_string()).collect();
         assert_eq!(got, want, "LIMIT {k} ascending");
     }
@@ -96,7 +103,10 @@ fn round580_small_inputs_never_trim() {
     );
     assert_eq!(
         vals(&mut e, "SELECT id FROM f580 ORDER BY id DESC LIMIT 100"),
-        (1..=40).rev().map(|i: i32| i.to_string()).collect::<Vec<_>>(),
+        (1..=40)
+            .rev()
+            .map(|i: i32| i.to_string())
+            .collect::<Vec<_>>(),
         "a LIMIT beyond the input returns all of it"
     );
     let mut e = Engine::new();
@@ -123,7 +133,10 @@ fn round580_ties_keys_and_offset() {
     assert_eq!(got, want);
     // OFFSET counts toward what has to be kept.
     assert_eq!(
-        vals(&mut e, "SELECT id FROM f580 ORDER BY id DESC LIMIT 3 OFFSET 1020"),
+        vals(
+            &mut e,
+            "SELECT id FROM f580 ORDER BY id DESC LIMIT 3 OFFSET 1020"
+        ),
         vec!["1980", "1979", "1978"],
         "the offset reaches past the floor"
     );
@@ -137,7 +150,10 @@ fn round580_ties_keys_and_offset() {
         vec!["1", "2", "3"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT v FROM n580 ORDER BY v DESC NULLS LAST LIMIT 3"),
+        vals(
+            &mut e,
+            "SELECT v FROM n580 ORDER BY v DESC NULLS LAST LIMIT 3"
+        ),
         vec!["1999", "1998", "1997"]
     );
 }
@@ -148,7 +164,10 @@ fn round580_ties_keys_and_offset() {
 fn round580_non_streaming_shapes_unchanged() {
     let mut e = engine(3000);
     assert_eq!(
-        vals(&mut e, "SELECT DISTINCT g FROM f580 ORDER BY g DESC LIMIT 3"),
+        vals(
+            &mut e,
+            "SELECT DISTINCT g FROM f580 ORDER BY g DESC LIMIT 3"
+        ),
         vec!["12", "11", "10"]
     );
     assert_eq!(
@@ -158,7 +177,11 @@ fn round580_non_streaming_shapes_unchanged() {
     );
     let ties = (1..=3000).filter(|i: &i32| i % 13 == 12).count();
     assert_eq!(
-        vals(&mut e, "SELECT g FROM f580 ORDER BY g DESC FETCH FIRST 1 ROW WITH TIES").len(),
+        vals(
+            &mut e,
+            "SELECT g FROM f580 ORDER BY g DESC FETCH FIRST 1 ROW WITH TIES"
+        )
+        .len(),
         ties,
         "every row whose g is the maximum comes back"
     );

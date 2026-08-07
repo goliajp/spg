@@ -249,7 +249,10 @@ fn where_clause_filters_across_batches() {
     seed(&mut s, 200);
 
     q(&mut s, "BEGIN");
-    q(&mut s, "DECLARE c CURSOR FOR SELECT id FROM t WHERE id > 150");
+    q(
+        &mut s,
+        "DECLARE c CURSOR FOR SELECT id FROM t WHERE id > 150",
+    );
     let a = rows(&mut s, "FETCH 20 FROM c");
     let b = rows(&mut s, "FETCH ALL FROM c");
     q(&mut s, "COMMIT");
@@ -300,7 +303,10 @@ fn ordered_cursors_keep_working() {
     seed(&mut s, 40);
 
     q(&mut s, "BEGIN");
-    q(&mut s, "DECLARE c SCROLL CURSOR FOR SELECT id FROM t ORDER BY id DESC");
+    q(
+        &mut s,
+        "DECLARE c SCROLL CURSOR FOR SELECT id FROM t ORDER BY id DESC",
+    );
     let head = rows(&mut s, "FETCH 3 FROM c");
     let last = rows(&mut s, "FETCH LAST FROM c");
     q(&mut s, "COMMIT");
@@ -354,7 +360,11 @@ fn a_commit_from_another_connection_stays_out_of_an_open_cursor() {
     let rest = rows(&mut a, "FETCH ALL FROM c");
     q(&mut a, "COMMIT");
 
-    assert_eq!(rest.len(), 25, "the 30 rows that existed at DECLARE, less 5");
+    assert_eq!(
+        rest.len(),
+        25,
+        "the 30 rows that existed at DECLARE, less 5"
+    );
     assert!(
         !rest.iter().any(|r| r == "777"),
         "the later commit is not in the cursor"
@@ -472,4 +482,3 @@ fn vacuum_under_an_open_cursor_neither_skips_nor_repeats() {
         "the deleted rows stay deleted"
     );
 }
-

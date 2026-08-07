@@ -38,7 +38,10 @@ fn err(e: &mut Engine, sql: &str) -> String {
 fn elements_with_no_common_type_are_refused() {
     let mut e = Engine::new();
     for (sql, want) in [
-        ("SELECT ARRAY[1, true]", "ARRAY types integer and boolean cannot be matched"),
+        (
+            "SELECT ARRAY[1, true]",
+            "ARRAY types integer and boolean cannot be matched",
+        ),
         (
             "SELECT ARRAY[1, 'a'::text]",
             "ARRAY types integer and text cannot be matched",
@@ -64,7 +67,10 @@ fn untyped_literals_adopt_the_element_type() {
     let mut e = Engine::new();
     // Converts.
     assert_eq!(text(&mut e, "SELECT ARRAY[1,'2']"), "{1,2}");
-    assert_eq!(text(&mut e, "SELECT pg_typeof(ARRAY[1,'2'])::text"), "integer[]");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(ARRAY[1,'2'])::text"),
+        "integer[]"
+    );
     // Doesn't convert: PG reports the value, not a type mismatch.
     let got = err(&mut e, "SELECT ARRAY[1,'a']");
     assert!(
@@ -73,9 +79,15 @@ fn untyped_literals_adopt_the_element_type() {
     );
     // NULL is untyped too and never blocks the resolution.
     assert_eq!(text(&mut e, "SELECT ARRAY[1,NULL]"), "{1,NULL}");
-    assert_eq!(text(&mut e, "SELECT pg_typeof(ARRAY[1,NULL])::text"), "integer[]");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(ARRAY[1,NULL])::text"),
+        "integer[]"
+    );
     // All-untyped stays text.
-    assert_eq!(text(&mut e, "SELECT pg_typeof(ARRAY['a','b'])::text"), "text[]");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(ARRAY['a','b'])::text"),
+        "text[]"
+    );
     assert_eq!(text(&mut e, "SELECT ARRAY[NULL,NULL]"), "{NULL,NULL}");
 }
 
@@ -83,7 +95,10 @@ fn untyped_literals_adopt_the_element_type() {
 fn elements_within_a_type_family_still_unify() {
     let mut e = Engine::new();
     assert_eq!(text(&mut e, "SELECT ARRAY[1,2.5]"), "{1,2.5}");
-    assert_eq!(text(&mut e, "SELECT pg_typeof(ARRAY[1,2.5])::text"), "numeric[]");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(ARRAY[1,2.5])::text"),
+        "numeric[]"
+    );
     assert_eq!(text(&mut e, "SELECT ARRAY[1::bigint,2::int]"), "{1,2}");
     assert_eq!(
         text(&mut e, "SELECT pg_typeof(ARRAY[1::bigint,2::int])::text"),
@@ -100,13 +115,25 @@ fn the_everyday_array_surface_is_unchanged() {
     for (sql, want) in [
         ("SELECT (ARRAY[1,2,3])[2]::text", "2"),
         ("SELECT array_to_string((ARRAY[1,2,3])[1:2],',')", "1,2"),
-        ("SELECT array_to_string(array_append(ARRAY[1,2],3),',')", "1,2,3"),
-        ("SELECT array_to_string(array_remove(ARRAY[1,2,2,3],2),',')", "1,3"),
-        ("SELECT array_to_string(array_cat(ARRAY[1,2],ARRAY[3]),',')", "1,2,3"),
+        (
+            "SELECT array_to_string(array_append(ARRAY[1,2],3),',')",
+            "1,2,3",
+        ),
+        (
+            "SELECT array_to_string(array_remove(ARRAY[1,2,2,3],2),',')",
+            "1,3",
+        ),
+        (
+            "SELECT array_to_string(array_cat(ARRAY[1,2],ARRAY[3]),',')",
+            "1,2,3",
+        ),
         ("SELECT array_length(ARRAY[1,2,3],1)::text", "3"),
         ("SELECT cardinality(ARRAY[1,2,3])::text", "3"),
         ("SELECT array_to_string(ARRAY[1,NULL,3],',','X')", "1,X,3"),
-        ("SELECT array_to_string(string_to_array('a,b,,c',','),'|')", "a|b||c"),
+        (
+            "SELECT array_to_string(string_to_array('a,b,,c',','),'|')",
+            "a|b||c",
+        ),
         ("SELECT array_to_string(ARRAY[[1,2],[3,4]],',')", "1,2,3,4"),
     ] {
         assert_eq!(text(&mut e, sql), want, "{sql}");

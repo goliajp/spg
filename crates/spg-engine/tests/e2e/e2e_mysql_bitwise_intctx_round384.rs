@@ -65,7 +65,10 @@ fn overflow_value_is_numeric() {
     match e.execute("SELECT 1<<63").unwrap() {
         QueryResult::Rows { rows, .. } => assert!(matches!(
             rows[0].values[0],
-            Value::Numeric { scaled: 9_223_372_036_854_775_808, .. }
+            Value::Numeric {
+                scaled: 9_223_372_036_854_775_808,
+                ..
+            }
         )),
         other => panic!("1<<63: {other:?}"),
     }

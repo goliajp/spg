@@ -56,7 +56,10 @@ fn seed(e: &mut Engine) {
 fn round690_min_max_honour_the_collation() {
     let mut e = Engine::new();
     seed(&mut e);
-    assert_eq!(one(&mut e, "SELECT min(loc), max(loc) FROM m690"), "apple|Zebra");
+    assert_eq!(
+        one(&mut e, "SELECT min(loc), max(loc) FROM m690"),
+        "apple|Zebra"
+    );
     // The undeclared column keeps byte order — without this the pin above
     // would pass equally well if the collation were applied to everything.
     assert_eq!(

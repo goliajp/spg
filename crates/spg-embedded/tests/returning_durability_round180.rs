@@ -37,12 +37,14 @@ fn autocommit_returning_survives_crash() {
         let mut db = Database::open_path(&db_path).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT NOT NULL)")
             .unwrap();
-        db.execute("INSERT INTO t VALUES (1, 0) RETURNING id").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 0) RETURNING id")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (2, 0), (3, 0) RETURNING id")
             .unwrap();
         db.execute("UPDATE t SET v = 9 WHERE id <= 2 RETURNING id")
             .unwrap();
-        db.execute("DELETE FROM t WHERE id = 3 RETURNING id").unwrap();
+        db.execute("DELETE FROM t WHERE id = 3 RETURNING id")
+            .unwrap();
         std::mem::forget(db);
     }
     Database::force_unlock(&db_path).unwrap();
@@ -72,7 +74,8 @@ fn writable_cte_survives_crash_autocommit_and_tx() {
         db.execute("BEGIN").unwrap();
         db.execute("WITH s AS (SELECT 3 AS x) INSERT INTO t SELECT x, 0 FROM s")
             .unwrap();
-        db.execute("INSERT INTO t VALUES (4, 0) RETURNING id").unwrap();
+        db.execute("INSERT INTO t VALUES (4, 0) RETURNING id")
+            .unwrap();
         db.execute("COMMIT").unwrap();
         assert_eq!(count(&mut db, "SELECT id FROM t"), 4);
         std::mem::forget(db);

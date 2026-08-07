@@ -33,11 +33,10 @@ fn row_text(e: &mut Engine, sql: &str) -> String {
 }
 
 fn seed(e: &mut Engine) {
-    e.execute("CREATE TABLE f716 (id INT, g INT, s TEXT)").unwrap();
-    e.execute(
-        "INSERT INTO f716 SELECT gg, gg % 3, 'row' || gg FROM generate_series(1, 100) gg",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE f716 (id INT, g INT, s TEXT)")
+        .unwrap();
+    e.execute("INSERT INTO f716 SELECT gg, gg % 3, 'row' || gg FROM generate_series(1, 100) gg")
+        .unwrap();
 }
 
 /// The anonymous-group lane: count/sum/avg/min/max over compiled
@@ -54,7 +53,10 @@ fn round716_fused_compiled_args_anonymous_group() {
         ("SELECT sum(least(id, 50)) FROM f716", "3775"),
         ("SELECT min(greatest(id, 7)) FROM f716", "7"),
         ("SELECT max(mod(id, 7)) FROM f716", "6"),
-        ("SELECT count(coalesce(nullif(s, 'row1'), 'z')) FROM f716", "100"),
+        (
+            "SELECT count(coalesce(nullif(s, 'row1'), 'z')) FROM f716",
+            "100",
+        ),
         // Mixed bound-column and compiled specs share one scan.
         (
             "SELECT count(*), count(id), sum(id + 0), min(least(id, 5)) FROM f716",
@@ -207,8 +209,14 @@ fn round727_simple_derived_flattens_and_answers_as_pg() {
     let mut e = Engine::new();
     seed(&mut e);
     for (sql, want) in [
-        ("SELECT count(*) FROM (SELECT id v FROM f716 WHERE id <= 50) q", "50"),
-        ("SELECT max(v) FROM (SELECT id v FROM f716 WHERE id <= 50) q", "50"),
+        (
+            "SELECT count(*) FROM (SELECT id v FROM f716 WHERE id <= 50) q",
+            "50",
+        ),
+        (
+            "SELECT max(v) FROM (SELECT id v FROM f716 WHERE id <= 50) q",
+            "50",
+        ),
         // Outer WHERE over the alias conjoins with the inner filter.
         (
             "SELECT count(*) FROM (SELECT id v FROM f716 WHERE id <= 50) q WHERE v > 20",
@@ -234,7 +242,10 @@ fn round727_simple_derived_flattens_and_answers_as_pg() {
         e.execute("SELECT s FROM (SELECT id v FROM f716) q")
             .expect_err("s is not exported by q")
     );
-    assert!(err.contains("does not exist") || err.contains("not found"), "{err}");
+    assert!(
+        err.contains("does not exist") || err.contains("not found"),
+        "{err}"
+    );
 }
 
 /// v7.39 (round 728) — the JSON constructors join the pure whitelist
@@ -257,7 +268,10 @@ fn round728_json_constructors_answer_as_pg() {
             "SELECT jsonb_build_array(id, s, NULL) FROM f716 WHERE id = 7",
             "[7, \"row7\", null]",
         ),
-        ("SELECT json_build_object('x', g) FROM f716 WHERE id = 5", "{\"x\" : 2}"),
+        (
+            "SELECT json_build_object('x', g) FROM f716 WHERE id = 5",
+            "{\"x\" : 2}",
+        ),
     ] {
         assert_eq!(row_text(&mut e, sql), want, "{sql}");
     }
@@ -315,7 +329,10 @@ fn round730_digests_answer_as_pg() {
         // RFC 1321 test vectors, byte-for-byte.
         ("SELECT md5('')", "d41d8cd98f00b204e9800998ecf8427e"),
         ("SELECT md5('abc')", "900150983cd24fb0d6963f7d28e17f72"),
-        ("SELECT md5(s) FROM f716 WHERE id = 42", "aca06b198407cefd751b33a5bab7baa7"),
+        (
+            "SELECT md5(s) FROM f716 WHERE id = 42",
+            "aca06b198407cefd751b33a5bab7baa7",
+        ),
         ("SELECT count(md5(s)) FROM f716", "100"),
     ] {
         assert_eq!(row_text(&mut e, sql), want, "{sql}");
@@ -410,7 +427,10 @@ fn round742_split_part_and_count_over_offset() {
         ("SELECT split_part('a,b,c', ',', -1)", "c"),
         ("SELECT split_part('a,b,c', ',', -4)", ""),
         ("SELECT split_part('abc', '', -1)", "abc"),
-        ("SELECT split_part(s, 'o', 2) FROM f716 WHERE id = 42", "w42"),
+        (
+            "SELECT split_part(s, 'o', 2) FROM f716 WHERE id = 42",
+            "w42",
+        ),
         // count-over-offset: mid, beyond-end, zero, WHERE'd, DESC.
         (
             "SELECT count(*) FROM (SELECT id FROM f716 ORDER BY id OFFSET 90) q",

@@ -68,10 +68,15 @@ fn round514_cid_and_xid_are_their_own_types() {
 fn round514_the_oid_vectors_validate_element_by_element() {
     let mut e = engine();
     assert_eq!(
-        text(&mut e, "SELECT '1 2 3'::oidvector::text, '1 2 3'::int2vector::text"),
+        text(
+            &mut e,
+            "SELECT '1 2 3'::oidvector::text, '1 2 3'::int2vector::text"
+        ),
         "1 2 3|1 2 3"
     );
-    assert!(err(&mut e, "SELECT 'x'::oidvector").contains("invalid input syntax for type oid: \"x\""));
+    assert!(
+        err(&mut e, "SELECT 'x'::oidvector").contains("invalid input syntax for type oid: \"x\"")
+    );
     assert!(
         err(&mut e, "SELECT '1 x'::int2vector")
             .contains("invalid input syntax for type smallint: \"x\"")

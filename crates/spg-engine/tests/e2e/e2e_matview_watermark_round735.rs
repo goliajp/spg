@@ -55,10 +55,12 @@ fn round735_with_no_data_never_no_ops() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE b735 (id INT)").unwrap();
     e.execute("INSERT INTO b735 VALUES (1), (2)").unwrap();
-    e.execute("CREATE MATERIALIZED VIEW mv735 AS SELECT id FROM b735").unwrap();
+    e.execute("CREATE MATERIALIZED VIEW mv735 AS SELECT id FROM b735")
+        .unwrap();
     assert_eq!(one(&mut e, "SELECT count(*) FROM mv735"), "2");
     // WITH NO DATA empties even though nothing changed since the build.
-    e.execute("REFRESH MATERIALIZED VIEW mv735 WITH NO DATA").unwrap();
+    e.execute("REFRESH MATERIALIZED VIEW mv735 WITH NO DATA")
+        .unwrap();
     assert_eq!(one(&mut e, "SELECT count(*) FROM mv735"), "0");
     // And the next plain REFRESH repopulates (the NO DATA cleared the
     // watermark; a no-op here would leave the view empty forever).
@@ -71,8 +73,10 @@ fn round735_a_second_dependency_counts() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE l735 (id INT, v INT)").unwrap();
     e.execute("CREATE TABLE r735 (id INT, w INT)").unwrap();
-    e.execute("INSERT INTO l735 VALUES (1, 10), (2, 20)").unwrap();
-    e.execute("INSERT INTO r735 VALUES (1, 100), (2, 200)").unwrap();
+    e.execute("INSERT INTO l735 VALUES (1, 10), (2, 20)")
+        .unwrap();
+    e.execute("INSERT INTO r735 VALUES (1, 100), (2, 200)")
+        .unwrap();
     e.execute(
         "CREATE MATERIALIZED VIEW mv735 AS \
          SELECT l.id, l.v + r.w s FROM l735 l JOIN r735 r ON l.id = r.id",
@@ -97,16 +101,18 @@ fn round737_insert_only_delta_matches_full_recompute() {
     e.execute("CREATE TABLE b737 (id INT, g INT)").unwrap();
     e.execute("INSERT INTO b737 SELECT gg, gg % 5 FROM generate_series(1, 50) gg")
         .unwrap();
-    e.execute(
-        "CREATE MATERIALIZED VIEW mv737 AS SELECT id * 10 tenfold, g FROM b737 WHERE g <> 3",
-    )
-    .unwrap();
+    e.execute("CREATE MATERIALIZED VIEW mv737 AS SELECT id * 10 tenfold, g FROM b737 WHERE g <> 3")
+        .unwrap();
     assert_eq!(one(&mut e, "SELECT count(*) FROM mv737"), "40");
     // Insert-only cycle: two kept rows, one filtered by the WHERE.
-    e.execute("INSERT INTO b737 VALUES (51, 1), (52, 3), (53, 4)").unwrap();
+    e.execute("INSERT INTO b737 VALUES (51, 1), (52, 3), (53, 4)")
+        .unwrap();
     e.execute("REFRESH MATERIALIZED VIEW mv737").unwrap();
     assert_eq!(one(&mut e, "SELECT count(*) FROM mv737"), "42");
-    assert_eq!(one(&mut e, "SELECT sum(tenfold) FROM mv737 WHERE tenfold > 500"), "1040");
+    assert_eq!(
+        one(&mut e, "SELECT sum(tenfold) FROM mv737 WHERE tenfold > 500"),
+        "1040"
+    );
     // Another insert-only cycle stacks on the first.
     e.execute("INSERT INTO b737 VALUES (54, 0)").unwrap();
     e.execute("REFRESH MATERIALIZED VIEW mv737").unwrap();
@@ -122,10 +128,8 @@ fn round737_insert_only_delta_matches_full_recompute() {
     assert_eq!(one(&mut e, "SELECT count(*) FROM mv737"), "37");
     // Full-recompute cross-check: rebuild from scratch and compare.
     e.execute("DROP MATERIALIZED VIEW mv737").unwrap();
-    e.execute(
-        "CREATE MATERIALIZED VIEW mv737 AS SELECT id * 10 tenfold, g FROM b737 WHERE g <> 3",
-    )
-    .unwrap();
+    e.execute("CREATE MATERIALIZED VIEW mv737 AS SELECT id * 10 tenfold, g FROM b737 WHERE g <> 3")
+        .unwrap();
     assert_eq!(one(&mut e, "SELECT count(*) FROM mv737"), "37");
 }
 
@@ -135,8 +139,10 @@ fn round737_insert_only_delta_matches_full_recompute() {
 fn round737_update_falls_back_to_full() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE b737 (id INT, v INT)").unwrap();
-    e.execute("INSERT INTO b737 VALUES (1, 10), (2, 20)").unwrap();
-    e.execute("CREATE MATERIALIZED VIEW mv737 AS SELECT v FROM b737").unwrap();
+    e.execute("INSERT INTO b737 VALUES (1, 10), (2, 20)")
+        .unwrap();
+    e.execute("CREATE MATERIALIZED VIEW mv737 AS SELECT v FROM b737")
+        .unwrap();
     e.execute("UPDATE b737 SET v = 99 WHERE id = 2").unwrap();
     e.execute("INSERT INTO b737 VALUES (3, 30)").unwrap();
     e.execute("REFRESH MATERIALIZED VIEW mv737").unwrap();
@@ -189,7 +195,8 @@ fn round738_delete_delta_matches_full_recompute() {
 #[test]
 fn round739_update_delta_matches_full_recompute() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE b739 (id INT, g INT, v INT)").unwrap();
+    e.execute("CREATE TABLE b739 (id INT, g INT, v INT)")
+        .unwrap();
     e.execute("INSERT INTO b739 SELECT gg, gg % 3, gg * 100 FROM generate_series(1, 30) gg")
         .unwrap();
     e.execute("CREATE MATERIALIZED VIEW mv739 AS SELECT id, v FROM b739 WHERE g <> 1")
@@ -265,7 +272,8 @@ fn round740_delta_path_engages() {
 fn round740_delta_engages_at_server_scale() {
     use core::sync::atomic::Ordering;
     let mut e = Engine::new();
-    e.execute("CREATE TABLE big740 (id INT, g INT, s TEXT)").unwrap();
+    e.execute("CREATE TABLE big740 (id INT, g INT, s TEXT)")
+        .unwrap();
     e.execute(
         "INSERT INTO big740 SELECT gg, gg % 100, 'row' || gg FROM generate_series(1, 500000) gg",
     )
@@ -275,9 +283,11 @@ fn round740_delta_engages_at_server_scale() {
     e.execute("REFRESH MATERIALIZED VIEW mvb740").unwrap();
     let applied0 = spg_engine::MATVIEW_DELTA_APPLIED.load(Ordering::Relaxed);
     let bailed0 = spg_engine::MATVIEW_DELTA_BAILED.load(Ordering::Relaxed);
-    e.execute("INSERT INTO big740 VALUES (500001, 7, 'x'), (500002, 99, 'y')").unwrap();
+    e.execute("INSERT INTO big740 VALUES (500001, 7, 'x'), (500002, 99, 'y')")
+        .unwrap();
     e.execute("UPDATE big740 SET g = 99 WHERE id = 10").unwrap();
-    e.execute("DELETE FROM big740 WHERE id IN (20, 21)").unwrap();
+    e.execute("DELETE FROM big740 WHERE id IN (20, 21)")
+        .unwrap();
     let t0 = std::time::Instant::now();
     e.execute("REFRESH MATERIALIZED VIEW mvb740").unwrap();
     let delta_ms = t0.elapsed().as_micros() as f64 / 1000.0;

@@ -64,7 +64,10 @@ fn timestamp_two_arg_composes() {
         "2020-01-05 11:30:00"
     );
     // NULL either side.
-    assert_eq!(scalar(&mut e, "SELECT TIMESTAMP('2020-01-05', NULL)"), "NULL");
+    assert_eq!(
+        scalar(&mut e, "SELECT TIMESTAMP('2020-01-05', NULL)"),
+        "NULL"
+    );
     // The 1-arg cast spelling is unaffected.
     assert_eq!(
         scalar(&mut e, "SELECT TIMESTAMP('2020-01-05')"),
@@ -92,7 +95,10 @@ fn addtime_subtime_on_datetime() {
     );
     // Fractional seconds pad to six digits, as MariaDB renders them.
     assert_eq!(
-        scalar(&mut e, "SELECT ADDTIME('2020-01-05 10:00:00','00:00:01.500000')"),
+        scalar(
+            &mut e,
+            "SELECT ADDTIME('2020-01-05 10:00:00','00:00:01.500000')"
+        ),
         "2020-01-05 10:00:01.500000"
     );
     assert_eq!(
@@ -105,8 +111,14 @@ fn addtime_subtime_on_datetime() {
 #[test]
 fn addtime_subtime_on_time_unchanged() {
     let mut e = mysql();
-    assert_eq!(scalar(&mut e, "SELECT ADDTIME('01:00:00','00:30:00')"), "01:30:00");
-    assert_eq!(scalar(&mut e, "SELECT SUBTIME('01:00:00','00:30:00')"), "00:30:00");
+    assert_eq!(
+        scalar(&mut e, "SELECT ADDTIME('01:00:00','00:30:00')"),
+        "01:30:00"
+    );
+    assert_eq!(
+        scalar(&mut e, "SELECT SUBTIME('01:00:00','00:30:00')"),
+        "00:30:00"
+    );
 }
 
 /// TIMEDIFF over two DATETIMEs is their full difference (crossing midnight);
@@ -115,14 +127,23 @@ fn addtime_subtime_on_time_unchanged() {
 fn timediff_shapes() {
     let mut e = mysql();
     assert_eq!(
-        scalar(&mut e, "SELECT TIMEDIFF('2020-01-06 01:00:00','2020-01-05 23:00:00')"),
+        scalar(
+            &mut e,
+            "SELECT TIMEDIFF('2020-01-06 01:00:00','2020-01-05 23:00:00')"
+        ),
         "02:00:00"
     );
     assert_eq!(
-        scalar(&mut e, "SELECT TIMEDIFF('2020-01-05 12:00:00','2020-01-05 10:00:00')"),
+        scalar(
+            &mut e,
+            "SELECT TIMEDIFF('2020-01-05 12:00:00','2020-01-05 10:00:00')"
+        ),
         "02:00:00"
     );
-    assert_eq!(scalar(&mut e, "SELECT TIMEDIFF('10:00:00','12:30:00')"), "-02:30:00");
+    assert_eq!(
+        scalar(&mut e, "SELECT TIMEDIFF('10:00:00','12:30:00')"),
+        "-02:30:00"
+    );
     // datetime vs bare time -> NULL.
     assert_eq!(
         scalar(&mut e, "SELECT TIMEDIFF('2020-01-05 10:00:00','01:00:00')"),
@@ -135,13 +156,34 @@ fn timediff_shapes() {
 fn compound_extract_units() {
     let mut e = mysql();
     let ts = "'2020-03-05 10:30:45'";
-    assert_eq!(scalar(&mut e, &format!("SELECT EXTRACT(YEAR_MONTH FROM {ts})")), "202003");
-    assert_eq!(scalar(&mut e, &format!("SELECT EXTRACT(DAY_HOUR FROM {ts})")), "510");
-    assert_eq!(scalar(&mut e, &format!("SELECT EXTRACT(DAY_MINUTE FROM {ts})")), "51030");
-    assert_eq!(scalar(&mut e, &format!("SELECT EXTRACT(DAY_SECOND FROM {ts})")), "5103045");
-    assert_eq!(scalar(&mut e, &format!("SELECT EXTRACT(HOUR_MINUTE FROM {ts})")), "1030");
-    assert_eq!(scalar(&mut e, &format!("SELECT EXTRACT(HOUR_SECOND FROM {ts})")), "103045");
-    assert_eq!(scalar(&mut e, &format!("SELECT EXTRACT(MINUTE_SECOND FROM {ts})")), "3045");
+    assert_eq!(
+        scalar(&mut e, &format!("SELECT EXTRACT(YEAR_MONTH FROM {ts})")),
+        "202003"
+    );
+    assert_eq!(
+        scalar(&mut e, &format!("SELECT EXTRACT(DAY_HOUR FROM {ts})")),
+        "510"
+    );
+    assert_eq!(
+        scalar(&mut e, &format!("SELECT EXTRACT(DAY_MINUTE FROM {ts})")),
+        "51030"
+    );
+    assert_eq!(
+        scalar(&mut e, &format!("SELECT EXTRACT(DAY_SECOND FROM {ts})")),
+        "5103045"
+    );
+    assert_eq!(
+        scalar(&mut e, &format!("SELECT EXTRACT(HOUR_MINUTE FROM {ts})")),
+        "1030"
+    );
+    assert_eq!(
+        scalar(&mut e, &format!("SELECT EXTRACT(HOUR_SECOND FROM {ts})")),
+        "103045"
+    );
+    assert_eq!(
+        scalar(&mut e, &format!("SELECT EXTRACT(MINUTE_SECOND FROM {ts})")),
+        "3045"
+    );
 }
 
 /// The microsecond-tailed compound units.
@@ -150,19 +192,31 @@ fn compound_extract_microsecond_units() {
     let mut e = mysql();
     let ts = "'2020-03-05 10:30:45.123456'";
     assert_eq!(
-        scalar(&mut e, &format!("SELECT EXTRACT(DAY_MICROSECOND FROM {ts})")),
+        scalar(
+            &mut e,
+            &format!("SELECT EXTRACT(DAY_MICROSECOND FROM {ts})")
+        ),
         "5103045123456"
     );
     assert_eq!(
-        scalar(&mut e, &format!("SELECT EXTRACT(HOUR_MICROSECOND FROM {ts})")),
+        scalar(
+            &mut e,
+            &format!("SELECT EXTRACT(HOUR_MICROSECOND FROM {ts})")
+        ),
         "103045123456"
     );
     assert_eq!(
-        scalar(&mut e, &format!("SELECT EXTRACT(MINUTE_MICROSECOND FROM {ts})")),
+        scalar(
+            &mut e,
+            &format!("SELECT EXTRACT(MINUTE_MICROSECOND FROM {ts})")
+        ),
         "3045123456"
     );
     assert_eq!(
-        scalar(&mut e, &format!("SELECT EXTRACT(SECOND_MICROSECOND FROM {ts})")),
+        scalar(
+            &mut e,
+            &format!("SELECT EXTRACT(SECOND_MICROSECOND FROM {ts})")
+        ),
         "45123456"
     );
 }
@@ -177,12 +231,18 @@ fn compound_extract_edges() {
     );
     // hour 0, minute 5 -> 0*100 + 5 = 5 (no zero padding in the packed int).
     assert_eq!(
-        scalar(&mut e, "SELECT EXTRACT(HOUR_MINUTE FROM '2020-03-05 00:05:00')"),
+        scalar(
+            &mut e,
+            "SELECT EXTRACT(HOUR_MINUTE FROM '2020-03-05 00:05:00')"
+        ),
         "5"
     );
     // day 5, hour 1 -> 501.
     assert_eq!(
-        scalar(&mut e, "SELECT EXTRACT(DAY_HOUR FROM '2020-03-05 01:30:45')"),
+        scalar(
+            &mut e,
+            "SELECT EXTRACT(DAY_HOUR FROM '2020-03-05 01:30:45')"
+        ),
         "501"
     );
 }
@@ -193,16 +253,21 @@ fn compound_extract_edges() {
 fn postgres_unchanged() {
     let mut e = Engine::new();
     assert!(
-        e.execute("SELECT EXTRACT(YEAR_MONTH FROM TIMESTAMP '2020-03-05 10:30:45')").is_err(),
+        e.execute("SELECT EXTRACT(YEAR_MONTH FROM TIMESTAMP '2020-03-05 10:30:45')")
+            .is_err(),
         "PG has no compound EXTRACT units"
     );
     assert!(
-        e.execute("SELECT timestamp('2020-01-05','01:30:45')").is_err(),
+        e.execute("SELECT timestamp('2020-01-05','01:30:45')")
+            .is_err(),
         "PG has no 2-arg timestamp()"
     );
     // PG's own units still work.
     assert_eq!(
-        scalar(&mut e, "SELECT EXTRACT(YEAR FROM TIMESTAMP '2020-03-05 10:30:45')"),
+        scalar(
+            &mut e,
+            "SELECT EXTRACT(YEAR FROM TIMESTAMP '2020-03-05 10:30:45')"
+        ),
         "2020"
     );
     assert_eq!(

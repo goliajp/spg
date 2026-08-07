@@ -23,10 +23,12 @@ fn setup(e: &mut Engine) {
     e.execute("CREATE ROLE app1").unwrap();
     e.execute("GRANT grp TO app1").unwrap();
     e.execute("CREATE TABLE rt (id INT, owner TEXT)").unwrap();
-    e.execute("INSERT INTO rt VALUES (1,'app1'),(2,'other')").unwrap();
+    e.execute("INSERT INTO rt VALUES (1,'app1'),(2,'other')")
+        .unwrap();
     e.execute("GRANT SELECT ON rt TO app1").unwrap();
     e.execute("GRANT SELECT ON rt TO grp").unwrap();
-    e.execute("ALTER TABLE rt ENABLE ROW LEVEL SECURITY").unwrap();
+    e.execute("ALTER TABLE rt ENABLE ROW LEVEL SECURITY")
+        .unwrap();
     e.execute("CREATE POLICY p1 ON rt FOR SELECT TO grp USING (owner = 'app1')")
         .unwrap();
 }

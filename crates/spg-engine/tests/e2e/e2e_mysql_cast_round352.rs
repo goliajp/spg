@@ -41,9 +41,18 @@ fn one(e: &mut Engine, sql: &str) -> Value<'static> {
 #[test]
 fn a_string_casts_to_its_leading_number() {
     let mut e = mysql();
-    assert_eq!(one(&mut e, "SELECT CAST('12abc' AS SIGNED)"), Value::BigInt(12));
-    assert_eq!(one(&mut e, "SELECT CAST('abc' AS SIGNED)"), Value::BigInt(0));
-    assert_eq!(one(&mut e, "SELECT CAST('12' AS UNSIGNED)"), Value::BigInt(12));
+    assert_eq!(
+        one(&mut e, "SELECT CAST('12abc' AS SIGNED)"),
+        Value::BigInt(12)
+    );
+    assert_eq!(
+        one(&mut e, "SELECT CAST('abc' AS SIGNED)"),
+        Value::BigInt(0)
+    );
+    assert_eq!(
+        one(&mut e, "SELECT CAST('12' AS UNSIGNED)"),
+        Value::BigInt(12)
+    );
 }
 
 /// Half away from zero — NOT truncation, which is the easy thing to
@@ -76,8 +85,14 @@ fn unsigned_wraps_a_negative() {
 #[test]
 fn the_integer_tail_parses() {
     let mut e = mysql();
-    assert_eq!(one(&mut e, "SELECT CAST(1 AS SIGNED INTEGER)"), Value::BigInt(1));
-    assert_eq!(one(&mut e, "SELECT CAST('9' AS SIGNED INT)"), Value::BigInt(9));
+    assert_eq!(
+        one(&mut e, "SELECT CAST(1 AS SIGNED INTEGER)"),
+        Value::BigInt(1)
+    );
+    assert_eq!(
+        one(&mut e, "SELECT CAST('9' AS SIGNED INT)"),
+        Value::BigInt(9)
+    );
     assert_eq!(
         one(&mut e, "SELECT CAST(7 AS UNSIGNED INTEGER)"),
         Value::BigInt(7)
@@ -95,7 +110,10 @@ fn char_without_a_length_splits_by_dialect() {
         Value::text("1x")
     );
     // An explicit length still bounds it.
-    assert_eq!(one(&mut m, "SELECT CAST(123 AS CHAR(2))"), Value::BpChar("12".into()));
+    assert_eq!(
+        one(&mut m, "SELECT CAST(123 AS CHAR(2))"),
+        Value::BpChar("12".into())
+    );
 
     let mut p = Engine::new();
     assert_eq!(
@@ -109,10 +127,10 @@ fn char_without_a_length_splits_by_dialect() {
 #[test]
 fn pg_has_no_such_type() {
     let mut p = Engine::new();
-    for sql in [
-        "SELECT CAST('12' AS SIGNED)",
-        "SELECT CAST(1 AS UNSIGNED)",
-    ] {
-        assert!(p.execute(sql).is_err(), "PG: type \"signed\" does not exist");
+    for sql in ["SELECT CAST('12' AS SIGNED)", "SELECT CAST(1 AS UNSIGNED)"] {
+        assert!(
+            p.execute(sql).is_err(),
+            "PG: type \"signed\" does not exist"
+        );
     }
 }

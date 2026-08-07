@@ -49,7 +49,10 @@ fn rows2(e: &mut Engine, sql: &str) -> Vec<(i64, i64)> {
 fn having_aggregate_alias() {
     let mut e = setup();
     assert_eq!(
-        rows2(&mut e, "SELECT g, SUM(v) AS sv FROM s GROUP BY g HAVING sv > 30"),
+        rows2(
+            &mut e,
+            "SELECT g, SUM(v) AS sv FROM s GROUP BY g HAVING sv > 30"
+        ),
         vec![(2, 45)]
     );
 }

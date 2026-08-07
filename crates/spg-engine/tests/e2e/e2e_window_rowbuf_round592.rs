@@ -66,7 +66,8 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE wr (id INT, p INT, v INT, s TEXT)").unwrap();
+    e.execute("CREATE TABLE wr (id INT, p INT, v INT, s TEXT)")
+        .unwrap();
     e.execute(
         "INSERT INTO wr SELECT gg, gg % 4, CASE WHEN gg % 5 = 0 THEN NULL ELSE gg END, \
          CASE WHEN gg % 3 = 0 THEN NULL ELSE 'r' || gg END FROM generate_series(1, 2000) gg",

@@ -243,7 +243,11 @@ fn row_count_clause_errors_carry_pgs_sqlstates() {
     let _guard = common::ChildGuard(raw);
     for (sql, code, want) in [
         ("SELECT 1 LIMIT -1", "2201W", "LIMIT must not be negative"),
-        ("SELECT 1 FETCH FIRST -1 ROWS ONLY", "2201W", "LIMIT must not be negative"),
+        (
+            "SELECT 1 FETCH FIRST -1 ROWS ONLY",
+            "2201W",
+            "LIMIT must not be negative",
+        ),
         ("SELECT 1 OFFSET -1", "2201X", "OFFSET must not be negative"),
         (
             "SELECT 1 LIMIT 'a'",

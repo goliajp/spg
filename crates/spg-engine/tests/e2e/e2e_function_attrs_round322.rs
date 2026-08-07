@@ -22,7 +22,10 @@ use spg_engine::Engine;
 use spg_storage::Value;
 
 fn scalar(e: &mut Engine, sql: &str) -> Value<'static> {
-    match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         spg_engine::QueryResult::Rows { rows, .. } => rows
             .first()
             .and_then(|r| r.values.first())
@@ -57,7 +60,10 @@ fn attributes_are_accepted_on_either_side_of_the_body() {
     let mut e = Engine::new();
     e.execute("CREATE FUNCTION f2() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$ IMMUTABLE")
         .expect("trailing IMMUTABLE must parse");
-    let def = text(&mut e, "SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = 'f2'");
+    let def = text(
+        &mut e,
+        "SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = 'f2'",
+    );
     assert!(
         def.contains("\n IMMUTABLE\n"),
         "the attribute line must be there: {def}"
@@ -72,10 +78,8 @@ fn strict_returns_null_without_running_the_body() {
         "CREATE FUNCTION s1(a int) RETURNS int LANGUAGE sql STRICT AS $$ SELECT coalesce(a, -1) $$",
     )
     .unwrap();
-    e.execute(
-        "CREATE FUNCTION s2(a int) RETURNS int LANGUAGE sql AS $$ SELECT coalesce(a, -1) $$",
-    )
-    .unwrap();
+    e.execute("CREATE FUNCTION s2(a int) RETURNS int LANGUAGE sql AS $$ SELECT coalesce(a, -1) $$")
+        .unwrap();
 
     assert_eq!(
         scalar(&mut e, "SELECT s1(NULL)"),
@@ -118,7 +122,10 @@ fn functiondef_prints_the_attribute_line_in_pgs_order() {
          IMMUTABLE STRICT LEAKPROOF SECURITY DEFINER PARALLEL SAFE COST 7 AS $$ SELECT 1 $$",
     )
     .unwrap();
-    let def = text(&mut e, "SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = 'f4'");
+    let def = text(
+        &mut e,
+        "SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = 'f4'",
+    );
     assert!(
         def.contains("\n IMMUTABLE PARALLEL SAFE STRICT SECURITY DEFINER LEAKPROOF COST 7\n"),
         "PG's order is volatility, PARALLEL, STRICT, SECURITY DEFINER, \
@@ -128,7 +135,10 @@ fn functiondef_prints_the_attribute_line_in_pgs_order() {
     // An all-default function has no attribute line at all.
     e.execute("CREATE FUNCTION f5() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$")
         .unwrap();
-    let plain = text(&mut e, "SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = 'f5'");
+    let plain = text(
+        &mut e,
+        "SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = 'f5'",
+    );
     assert!(
         plain.contains(" LANGUAGE sql\nAS $function$"),
         "no attribute line when nothing was declared: {plain}"
@@ -139,9 +149,14 @@ fn functiondef_prints_the_attribute_line_in_pgs_order() {
 #[test]
 fn rows_is_recorded_and_printed() {
     let mut e = Engine::new();
-    e.execute("CREATE FUNCTION f6() RETURNS SETOF int LANGUAGE sql STABLE ROWS 5 AS $$ SELECT 1 $$")
-        .unwrap();
-    let def = text(&mut e, "SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = 'f6'");
+    e.execute(
+        "CREATE FUNCTION f6() RETURNS SETOF int LANGUAGE sql STABLE ROWS 5 AS $$ SELECT 1 $$",
+    )
+    .unwrap();
+    let def = text(
+        &mut e,
+        "SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = 'f6'",
+    );
     assert!(def.contains("\n STABLE ROWS 5\n"), "{def}");
 }
 
@@ -155,15 +170,24 @@ fn pg_proc_reports_the_declared_attributes() {
     )
     .unwrap();
     assert_eq!(
-        text(&mut e, "SELECT provolatile FROM pg_proc WHERE proname = 'p1'"),
+        text(
+            &mut e,
+            "SELECT provolatile FROM pg_proc WHERE proname = 'p1'"
+        ),
         "s"
     );
     assert_eq!(
-        text(&mut e, "SELECT proparallel FROM pg_proc WHERE proname = 'p1'"),
+        text(
+            &mut e,
+            "SELECT proparallel FROM pg_proc WHERE proname = 'p1'"
+        ),
         "r"
     );
     assert_eq!(
-        scalar(&mut e, "SELECT proisstrict FROM pg_proc WHERE proname = 'p1'"),
+        scalar(
+            &mut e,
+            "SELECT proisstrict FROM pg_proc WHERE proname = 'p1'"
+        ),
         Value::Bool(true)
     );
     assert_eq!(
@@ -171,7 +195,10 @@ fn pg_proc_reports_the_declared_attributes() {
         Value::Bool(true)
     );
     assert_eq!(
-        scalar(&mut e, "SELECT proleakproof FROM pg_proc WHERE proname = 'p1'"),
+        scalar(
+            &mut e,
+            "SELECT proleakproof FROM pg_proc WHERE proname = 'p1'"
+        ),
         Value::Bool(true)
     );
     assert_eq!(
@@ -183,11 +210,17 @@ fn pg_proc_reports_the_declared_attributes() {
     e.execute("CREATE FUNCTION p2() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$")
         .unwrap();
     assert_eq!(
-        text(&mut e, "SELECT provolatile FROM pg_proc WHERE proname = 'p2'"),
+        text(
+            &mut e,
+            "SELECT provolatile FROM pg_proc WHERE proname = 'p2'"
+        ),
         "v"
     );
     assert_eq!(
-        scalar(&mut e, "SELECT proisstrict FROM pg_proc WHERE proname = 'p2'"),
+        scalar(
+            &mut e,
+            "SELECT proisstrict FROM pg_proc WHERE proname = 'p2'"
+        ),
         Value::Bool(false)
     );
     assert_eq!(
@@ -213,6 +246,9 @@ fn attributes_survive_a_reload() {
         Value::Null,
         "STRICT must survive the round-trip"
     );
-    let def = text(&mut back, "SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = 'r1'");
+    let def = text(
+        &mut back,
+        "SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = 'r1'",
+    );
     assert!(def.contains("\n IMMUTABLE STRICT COST 3\n"), "{def}");
 }

@@ -206,7 +206,11 @@ fn round564_unrestorable_types_fall_back_intact() {
         "SELECT d FROM d564 WHERE d BETWEEN '2026-01-01' AND '2026-01-02'",
     );
     assert_eq!(cols, vec!["d".to_string()]);
-    assert_eq!(got, vec!["2026-01-01", "2026-01-02"], "still dates, not integers");
+    assert_eq!(
+        got,
+        vec!["2026-01-01", "2026-01-02"],
+        "still dates, not integers"
+    );
 
     // Text does restore, and must come back as text.
     rows(&mut c, "CREATE INDEX d564t ON d564 (t)");
@@ -237,7 +241,10 @@ fn round564_other_shapes_still_answer() {
         "SELECT k FROM o564 WHERE k BETWEEN 1 AND 3 ORDER BY k DESC LIMIT 4",
     );
     assert_eq!(ordered, vec!["3", "3", "3", "3"]);
-    let (_, distinct) = rows(&mut c, "SELECT DISTINCT k FROM o564 WHERE k BETWEEN 1 AND 3");
+    let (_, distinct) = rows(
+        &mut c,
+        "SELECT DISTINCT k FROM o564 WHERE k BETWEEN 1 AND 3",
+    );
     assert_eq!(distinct.len(), 3);
     let (_, two) = rows(&mut c, "SELECT count(*) FROM o564 WHERE k BETWEEN 1 AND 3");
     assert_eq!(two, vec!["30"]);

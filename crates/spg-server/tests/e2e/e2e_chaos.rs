@@ -204,7 +204,9 @@ fn chaos_wal_tail_truncation_drops_partial_record_no_panic() {
     // conversion: wait for the WAL to be substantial before mutilating
     // it, or the chop lands on a half-written file.
     common::wait_until(Duration::from_secs(5), || {
-        std::fs::metadata(&wal).map(|m| m.len() > 64).unwrap_or(false)
+        std::fs::metadata(&wal)
+            .map(|m| m.len() > 64)
+            .unwrap_or(false)
     });
 
     // Chop a few bytes off the WAL — guaranteed to land inside
@@ -344,7 +346,9 @@ fn chaos_wal_bit_flip_caught_by_crc32_refuses_to_replay() {
     // v7.37 (round 827) — wait for the observable (the WAL has real
     // content on disk) instead of sleeping a fixed proxy for it.
     common::wait_until(Duration::from_secs(5), || {
-        std::fs::metadata(&wal).map(|m| m.len() > 64).unwrap_or(false)
+        std::fs::metadata(&wal)
+            .map(|m| m.len() > 64)
+            .unwrap_or(false)
     });
 
     // Flip a single bit roughly in the middle of the file. v4.37

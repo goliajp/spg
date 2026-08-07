@@ -124,7 +124,10 @@ fn round553_isolation_level_is_per_connection() {
     query(&mut a, "COMMIT");
 
     // Back at the session default once its own block ends.
-    assert_eq!(query(&mut a, "SHOW transaction_isolation"), "read committed");
+    assert_eq!(
+        query(&mut a, "SHOW transaction_isolation"),
+        "read committed"
+    );
 
     let _ = child.0.kill();
 }

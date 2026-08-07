@@ -348,10 +348,9 @@ pub struct LexError {
 impl fmt::Display for LexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            LexErrorKind::InvalidByteSequence(b) => write!(
-                f,
-                "invalid byte sequence for encoding \"UTF8\": 0x{b:02x}"
-            ),
+            LexErrorKind::InvalidByteSequence(b) => {
+                write!(f, "invalid byte sequence for encoding \"UTF8\": 0x{b:02x}")
+            }
             LexErrorKind::UnknownChar(c) => write!(f, "unknown char {c:?} at byte {}", self.pos),
             LexErrorKind::UnterminatedString => {
                 write!(f, "unterminated string literal at byte {}", self.pos)
@@ -536,14 +535,14 @@ pub fn tokenize_with_offsets(
                 out.push(keyword_or_ident_raw(raw));
             }
             b if b.is_ascii_digit() => {
-                let (tok, consumed) =
-                    lex_number(&input[i..], backslash_escapes).map_err(|kind| LexError { kind, pos: i })?;
+                let (tok, consumed) = lex_number(&input[i..], backslash_escapes)
+                    .map_err(|kind| LexError { kind, pos: i })?;
                 out.push(tok);
                 i += consumed;
             }
             b'.' if peek_pred(bytes, i + 1, u8::is_ascii_digit) => {
-                let (tok, consumed) =
-                    lex_number(&input[i..], backslash_escapes).map_err(|kind| LexError { kind, pos: i })?;
+                let (tok, consumed) = lex_number(&input[i..], backslash_escapes)
+                    .map_err(|kind| LexError { kind, pos: i })?;
                 out.push(tok);
                 i += consumed;
             }
@@ -800,13 +799,15 @@ pub fn tokenize_with_offsets(
             }
             // v7.39 (round 508) — the `text_pattern_ops` comparisons, longest
             // match first so `~<=~` beats `~<~`.
-            b'~' if peek_eq(bytes, i + 1, b'<') && peek_eq(bytes, i + 2, b'=')
+            b'~' if peek_eq(bytes, i + 1, b'<')
+                && peek_eq(bytes, i + 2, b'=')
                 && peek_eq(bytes, i + 3, b'~') =>
             {
                 out.push(Token::PatternLtEq);
                 i += 4;
             }
-            b'~' if peek_eq(bytes, i + 1, b'>') && peek_eq(bytes, i + 2, b'=')
+            b'~' if peek_eq(bytes, i + 1, b'>')
+                && peek_eq(bytes, i + 2, b'=')
                 && peek_eq(bytes, i + 3, b'~') =>
             {
                 out.push(Token::PatternGtEq);
@@ -1416,11 +1417,7 @@ fn lex_quoted(
 /// Sharing one table meant a MySQL client's `'\Z'` arrived as the letter
 /// `Z`, and `'a\%b'` lost the escape LIKE needed — silently wrong bytes,
 /// not an error.
-fn lex_escape_string(
-    input: &str,
-    start: usize,
-    mysql: bool,
-) -> Result<(Token, usize), LexError> {
+fn lex_escape_string(input: &str, start: usize, mysql: bool) -> Result<(Token, usize), LexError> {
     let bytes = input.as_bytes();
     debug_assert_eq!(bytes[start], b'\'');
     let mut i = start + 1;
@@ -1548,16 +1545,22 @@ fn lex_escape_string(
                             });
                         };
                         let combined = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                        push_char(&mut buf, char::from_u32(combined).ok_or(LexError {
-                            kind: LexErrorKind::InvalidUnicodeEscape,
-                            pos: i,
-                        })?);
+                        push_char(
+                            &mut buf,
+                            char::from_u32(combined).ok_or(LexError {
+                                kind: LexErrorKind::InvalidUnicodeEscape,
+                                pos: i,
+                            })?,
+                        );
                         i += 12;
                     } else {
-                        push_char(&mut buf, char::from_u32(cp).ok_or(LexError {
-                            kind: LexErrorKind::InvalidUnicodeEscape,
-                            pos: i,
-                        })?);
+                        push_char(
+                            &mut buf,
+                            char::from_u32(cp).ok_or(LexError {
+                                kind: LexErrorKind::InvalidUnicodeEscape,
+                                pos: i,
+                            })?,
+                        );
                         i += 2 + ndigits;
                     }
                 }

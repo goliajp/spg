@@ -26,8 +26,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(100);
-    let url = std::env::var("SPG_WIRE_URL")
-        .map_err(|_| "set SPG_WIRE_URL to the server under test")?;
+    let url =
+        std::env::var("SPG_WIRE_URL").map_err(|_| "set SPG_WIRE_URL to the server under test")?;
 
     // `pool` mode reproduces the shape that loses rows on SPGS but not on
     // PG18: every statement through `execute(&pool)`, so the connection is
@@ -40,7 +40,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // extended protocol?" with "what does the pool do between statements?".
     let mut c = AnyConnection::connect(&url).await?;
     c.execute("DROP TABLE IF EXISTS amort").await?;
-    c.execute("CREATE TABLE amort(id INT PRIMARY KEY, v INT)").await?;
+    c.execute("CREATE TABLE amort(id INT PRIMARY KEY, v INT)")
+        .await?;
     c.execute("SET synchronous_commit = on").await?;
 
     let t0 = Instant::now();
@@ -73,7 +74,9 @@ async fn pool_mode(url: &str, rows: i64) -> Result<(), Box<dyn std::error::Error
         .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(url)
         .await?;
-    sqlx::query("DROP TABLE IF EXISTS amort").execute(&pool).await?;
+    sqlx::query("DROP TABLE IF EXISTS amort")
+        .execute(&pool)
+        .await?;
     sqlx::query("CREATE TABLE amort(id INT PRIMARY KEY, v INT)")
         .execute(&pool)
         .await?;

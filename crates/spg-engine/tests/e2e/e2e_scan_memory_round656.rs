@@ -50,11 +50,8 @@ fn seeded() -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TABLE d (id INT, g INT, s TEXT)").unwrap();
     for i in 1..=200 {
-        e.execute(&format!(
-            "INSERT INTO d VALUES ({i}, {}, 'row{i}')",
-            i % 10
-        ))
-        .unwrap();
+        e.execute(&format!("INSERT INTO d VALUES ({i}, {}, 'row{i}')", i % 10))
+            .unwrap();
     }
     e
 }
@@ -71,7 +68,10 @@ fn round656_aggregates_answer_the_same_through_aggrows() {
     assert_eq!(one(&mut e, "SELECT count(DISTINCT g) FROM d"), "10");
     assert_eq!(one(&mut e, "SELECT max(s) FROM d"), "row99");
     assert_eq!(
-        one(&mut e, "SELECT g, count(*) FROM d WHERE g < 2 GROUP BY g ORDER BY g"),
+        one(
+            &mut e,
+            "SELECT g, count(*) FROM d WHERE g < 2 GROUP BY g ORDER BY g"
+        ),
         "0|20,1|20"
     );
     assert_eq!(one(&mut e, "SELECT count(*) FROM d WHERE id > 190"), "10");

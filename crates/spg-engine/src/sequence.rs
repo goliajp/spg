@@ -406,7 +406,9 @@ impl Engine {
                 if !args.is_empty() {
                     return Ok(None);
                 }
-                Ok(Some(spg_storage::Value::Int(self.advisory_unlock_all_count())))
+                Ok(Some(spg_storage::Value::Int(
+                    self.advisory_unlock_all_count(),
+                )))
             }
             "get_lock" => {
                 // GET_LOCK(name, timeout) — timeout is not honoured (there is
@@ -713,7 +715,7 @@ impl Engine {
                     self.active_catalog_mut()
                         .sequence_set_value(&seq_name, value, is_called)
                 }
-                    .map_err(EngineError::Storage)?;
+                .map_err(EngineError::Storage)?;
                 Ok(Value::BigInt(v))
             }
             other => Err(EngineError::Unsupported(alloc::format!(
@@ -834,8 +836,10 @@ impl Engine {
         let mut vals: alloc::vec::Vec<spg_storage::Value<'static>> =
             alloc::vec::Vec::with_capacity(args.len());
         for a in args {
-            match crate::conversions::literal_expr_to_value_in(a.clone(), Some(self.active_catalog()))
-            {
+            match crate::conversions::literal_expr_to_value_in(
+                a.clone(),
+                Some(self.active_catalog()),
+            ) {
                 Ok(v) => vals.push(v),
                 // Not foldable (a column, a subquery) — leave the call
                 // alone, exactly as the sequence family does.
@@ -1000,8 +1004,7 @@ impl Engine {
                 Ok(Some(Value::Int(i32::try_from(written).unwrap_or(0))))
             }
             "lo_lseek" | "lo_lseek64" => {
-                let (Some(fd), Some(off), Some(whence)) =
-                    (int_arg(0), int_arg(1), int_arg(2))
+                let (Some(fd), Some(off), Some(whence)) = (int_arg(0), int_arg(1), int_arg(2))
                 else {
                     return Ok(None);
                 };

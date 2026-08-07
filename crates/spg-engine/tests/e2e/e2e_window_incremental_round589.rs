@@ -89,9 +89,17 @@ fn round589_whole_partition_frames() {
              count(*) OVER (PARTITION BY p) FROM wd ORDER BY id"
         ),
         vec![
-            "1|70|3|4", "2|70|3|4", "3|70|3|4", "4|70|3|4", "5|15|3|3", "6|15|3|3", "7|15|3|3",
+            "1|70|3|4",
+            "2|70|3|4",
+            "3|70|3|4",
+            "4|70|3|4",
+            "5|15|3|3",
+            "6|15|3|3",
+            "7|15|3|3",
             // An all-NULL partition sums to NULL, not 0.
-            "8|NULL|0|1", "9|93|2|2", "10|93|2|2",
+            "8|NULL|0|1",
+            "9|93|2|2",
+            "10|93|2|2",
         ]
     );
     assert_eq!(
@@ -104,10 +112,13 @@ fn round589_whole_partition_frames() {
     );
     // No PARTITION BY and no ORDER BY is one frame over everything.
     assert_eq!(
-        vals(&mut e, "SELECT sum(v) OVER (), count(*) OVER () FROM wd ORDER BY id")
-            .first()
-            .cloned()
-            .unwrap_or_default(),
+        vals(
+            &mut e,
+            "SELECT sum(v) OVER (), count(*) OVER () FROM wd ORDER BY id"
+        )
+        .first()
+        .cloned()
+        .unwrap_or_default(),
         "178|10"
     );
 }
@@ -281,10 +292,7 @@ fn round589_scale_matches_a_single_pass() {
         &mut e,
         "SELECT DISTINCT p, sum(id) OVER (PARTITION BY p) FROM wbig ORDER BY p",
     );
-    let want = vals(
-        &mut e,
-        "SELECT p, sum(id) FROM wbig GROUP BY p ORDER BY p",
-    );
+    let want = vals(&mut e, "SELECT p, sum(id) FROM wbig GROUP BY p ORDER BY p");
     assert_eq!(got, want, "the window total is the GROUP BY total");
     // The running total's last row is the grand total, and its first is
     // the first value.

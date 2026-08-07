@@ -79,7 +79,10 @@ fn fixed_is_mysql_only() {
 #[test]
 fn the_cast_forms_are_unchanged() {
     let mut e = Engine::new();
-    assert_eq!(first(&mut e, "SELECT 1.5::decimal(4,1)")[0], Value::numeric(15, 1));
+    assert_eq!(
+        first(&mut e, "SELECT 1.5::decimal(4,1)")[0],
+        Value::numeric(15, 1)
+    );
     assert_eq!(
         first(&mut e, "SELECT CAST(1.5 AS DECIMAL(4,1))")[0],
         Value::numeric(15, 1)

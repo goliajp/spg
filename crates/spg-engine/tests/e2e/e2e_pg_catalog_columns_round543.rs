@@ -30,9 +30,12 @@ use spg_engine::{Engine, QueryResult};
 
 fn engine() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (a INT PRIMARY KEY, b TEXT NOT NULL DEFAULT 'x', c INT CHECK (c > 0))")
+    e.execute(
+        "CREATE TABLE t (a INT PRIMARY KEY, b TEXT NOT NULL DEFAULT 'x', c INT CHECK (c > 0))",
+    )
+    .unwrap();
+    e.execute("CREATE INDEX ixe ON t ((a + 1)) WHERE b <> ''")
         .unwrap();
-    e.execute("CREATE INDEX ixe ON t ((a + 1)) WHERE b <> ''").unwrap();
     e.execute("CREATE FUNCTION fx(p integer, q text) RETURNS integer AS 'SELECT 1' LANGUAGE sql")
         .unwrap();
     e
@@ -104,14 +107,20 @@ fn round543_index_expression_and_predicate() {
 fn round543_proargnames_is_real() {
     let mut e = engine();
     assert_eq!(
-        rows(&mut e, "SELECT proname, proargnames FROM pg_proc WHERE proname = 'fx'"),
+        rows(
+            &mut e,
+            "SELECT proname, proargnames FROM pg_proc WHERE proname = 'fx'"
+        ),
         vec!["fx|{p,q}"]
     );
     // A function that takes none reports NULL, as PG's does.
     e.execute("CREATE FUNCTION fy() RETURNS integer AS 'SELECT 1' LANGUAGE sql")
         .unwrap();
     assert_eq!(
-        rows(&mut e, "SELECT proargnames FROM pg_proc WHERE proname = 'fy'"),
+        rows(
+            &mut e,
+            "SELECT proargnames FROM pg_proc WHERE proname = 'fy'"
+        ),
         vec!["NULL"]
     );
 }
@@ -123,7 +132,18 @@ fn round543_pg_type_is_complete() {
     let mut e = engine();
     let cols = columns(&mut e, "SELECT * FROM pg_type");
     assert_eq!(cols.len(), 32, "{cols:?}");
-    assert_eq!(&cols[15..22], &["typinput", "typoutput", "typreceive", "typsend", "typmodin", "typmodout", "typanalyze"]);
+    assert_eq!(
+        &cols[15..22],
+        &[
+            "typinput",
+            "typoutput",
+            "typreceive",
+            "typsend",
+            "typmodin",
+            "typmodout",
+            "typanalyze"
+        ]
+    );
     assert_eq!(&cols[29..], &["typdefaultbin", "typdefault", "typacl"]);
     // SPG's type I/O is built into the engine and is not a catalogued
     // function, so there is nothing for these to name — 0 is the value
@@ -176,11 +196,18 @@ fn round543_tail_values_match_pg() {
             "SELECT collname, colllocale, collicurules, collversion \
              FROM pg_collation ORDER BY collname"
         ),
-        vec!["C|NULL|NULL|NULL", "POSIX|NULL|NULL|NULL", "default|NULL|NULL|NULL"]
+        vec![
+            "C|NULL|NULL|NULL",
+            "POSIX|NULL|NULL|NULL",
+            "default|NULL|NULL|NULL"
+        ]
     );
     e.execute("CREATE PUBLICATION p FOR ALL TABLES").unwrap();
     assert_eq!(
-        rows(&mut e, "SELECT pubname, pubviaroot, pubgencols FROM pg_publication"),
+        rows(
+            &mut e,
+            "SELECT pubname, pubviaroot, pubgencols FROM pg_publication"
+        ),
         vec!["p|false|n"]
     );
 }

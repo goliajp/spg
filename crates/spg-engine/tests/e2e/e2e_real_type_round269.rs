@@ -27,9 +27,7 @@ fn lines(e: &mut Engine, sql: &str) -> Vec<String> {
                     spg_storage::Value::Null => String::new(),
                     // Expectations are transcribed from `psql -tA`,
                     // which spells booleans t/f.
-                    spg_storage::Value::Bool(b) => {
-                        String::from(if *b { "t" } else { "f" })
-                    }
+                    spg_storage::Value::Bool(b) => String::from(if *b { "t" } else { "f" }),
                     other => spg_engine::eval::value_to_text(other),
                 })
                 .collect::<Vec<_>>()
@@ -114,12 +112,7 @@ fn precision_and_radix_are_reported() {
              FROM information_schema.columns WHERE table_name = 't' ORDER BY ordinal_position",
         ),
         vec![
-            "i|32|0|2",
-            "b|64|0|2",
-            "n|8|2|10",
-            "r|24||2",
-            "f|53||2",
-            "s|||",
+            "i|32|0|2", "b|64|0|2", "n|8|2|10", "r|24||2", "f|53||2", "s|||",
         ],
     );
 }
@@ -128,7 +121,10 @@ fn precision_and_radix_are_reported() {
 fn casts_into_real_round_to_f32() {
     let mut e = Engine::new();
     // 16777217 is the first integer f32 cannot represent.
-    assert_eq!(lines(&mut e, "SELECT 16777217::real"), vec!["1.6777216e+07"]);
+    assert_eq!(
+        lines(&mut e, "SELECT 16777217::real"),
+        vec!["1.6777216e+07"]
+    );
     assert_eq!(lines(&mut e, "SELECT 0.1::real"), vec!["0.1"]);
     assert_eq!(lines(&mut e, "SELECT '0.1'::real"), vec!["0.1"]);
     assert_eq!(lines(&mut e, "SELECT 12345.678::real"), vec!["12345.678"]);
@@ -162,7 +158,10 @@ fn overflowing_the_f32_range_is_an_error_not_an_infinity() {
     );
     // An explicitly written infinity is a value, not an overflow.
     assert_eq!(lines(&mut e, "SELECT 'Infinity'::real"), vec!["Infinity"]);
-    assert_eq!(lines(&mut e, "SELECT 'inf'::float8::real"), vec!["Infinity"]);
+    assert_eq!(
+        lines(&mut e, "SELECT 'inf'::float8::real"),
+        vec!["Infinity"]
+    );
 }
 
 #[test]
@@ -183,7 +182,10 @@ fn sum_over_real_stays_real_but_avg_widens() {
         lines(&mut e, "SELECT pg_typeof(sum(f)) FROM t"),
         vec!["double precision"],
     );
-    assert_eq!(lines(&mut e, "SELECT sum(r), avg(r) FROM t"), vec!["1.5|1.5"]);
+    assert_eq!(
+        lines(&mut e, "SELECT sum(r), avg(r) FROM t"),
+        vec!["1.5|1.5"]
+    );
     // A wider value joining the accumulation widens the result.
     e.execute("INSERT INTO t VALUES (2.5, 2.5)").unwrap();
     assert_eq!(lines(&mut e, "SELECT sum(r) FROM t"), vec!["4"]);

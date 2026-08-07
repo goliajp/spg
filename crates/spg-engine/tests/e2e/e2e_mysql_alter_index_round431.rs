@@ -71,7 +71,10 @@ fn round431_add_index_named_and_synonyms() {
 
     let names = index_names(&mut e, "t");
     for want in ["idx_a", "idx_d", "idx_ab"] {
-        assert!(names.iter().any(|n| n == want), "{want} missing in {names:?}");
+        assert!(
+            names.iter().any(|n| n == want),
+            "{want} missing in {names:?}"
+        );
     }
 }
 
@@ -85,7 +88,10 @@ fn round431_add_index_unnamed_takes_column_name() {
 
     let names = index_names(&mut e, "t");
     for want in ["b", "b_2", "b_3"] {
-        assert!(names.iter().any(|n| n == want), "{want} missing in {names:?}");
+        assert!(
+            names.iter().any(|n| n == want),
+            "{want} missing in {names:?}"
+        );
     }
 }
 
@@ -98,7 +104,10 @@ fn round431_second_index_on_same_column_is_built() {
     ok(&mut e, "ALTER TABLE t ADD INDEX idx_x (a)");
 
     let names = index_names(&mut e, "t");
-    assert!(names.iter().any(|n| n == "idx_x"), "idx_x missing in {names:?}");
+    assert!(
+        names.iter().any(|n| n == "idx_x"),
+        "idx_x missing in {names:?}"
+    );
     ok(&mut e, "ALTER TABLE t DROP INDEX idx_x");
 }
 
@@ -122,7 +131,10 @@ fn round431_multi_action_alter() {
     );
     let names = index_names(&mut e, "t");
     for want in ["idx_x", "idx_y"] {
-        assert!(names.iter().any(|n| n == want), "{want} missing in {names:?}");
+        assert!(
+            names.iter().any(|n| n == want),
+            "{want} missing in {names:?}"
+        );
     }
 }
 
@@ -160,7 +172,10 @@ fn round431_drop_index_and_key() {
 
     let names = index_names(&mut e, "t");
     for gone in ["idx_a", "idx_d"] {
-        assert!(!names.iter().any(|n| n == gone), "{gone} still in {names:?}");
+        assert!(
+            !names.iter().any(|n| n == gone),
+            "{gone} still in {names:?}"
+        );
     }
 }
 

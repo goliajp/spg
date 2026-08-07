@@ -37,7 +37,7 @@ fn err(e: &mut Engine, sql: &str) -> String {
 }
 
 #[test]
-fn setval_rejects_out_of_range_values()  {
+fn setval_rejects_out_of_range_values() {
     let mut e = Engine::new();
     e.execute("CREATE SEQUENCE sq3 MAXVALUE 6").unwrap();
     let got = err(&mut e, "SELECT setval('sq3', 99)");
@@ -55,8 +55,14 @@ fn missing_sequence_is_a_missing_relation() {
     let mut e = Engine::new();
     for sql in ["SELECT nextval('nosuch')", "SELECT currval('nosuch')"] {
         let got = err(&mut e, sql);
-        assert!(got.contains("relation \"nosuch\" does not exist"), "{sql}: {got}");
-        assert!(!got.contains("corrupt"), "user error dressed as corruption: {got}");
+        assert!(
+            got.contains("relation \"nosuch\" does not exist"),
+            "{sql}: {got}"
+        );
+        assert!(
+            !got.contains("corrupt"),
+            "user error dressed as corruption: {got}"
+        );
     }
 }
 
@@ -73,7 +79,10 @@ fn a_sequence_is_a_one_row_relation() {
     );
     // Fresh sequence: last_value = start, is_called = false.
     e.execute("CREATE SEQUENCE sqf START 7").unwrap();
-    assert_eq!(one(&mut e, "SELECT last_value, is_called FROM sqf"), "7|false");
+    assert_eq!(
+        one(&mut e, "SELECT last_value, is_called FROM sqf"),
+        "7|false"
+    );
 }
 
 #[test]
@@ -96,7 +105,10 @@ fn the_sequence_core_is_unchanged() {
     let mut e = Engine::new();
     // Regression guard over the sweep's clean cases.
     e.execute("CREATE SEQUENCE sq").unwrap();
-    assert_eq!(one(&mut e, "SELECT nextval('sq'), nextval('sq'), currval('sq')"), "1|2|2");
+    assert_eq!(
+        one(&mut e, "SELECT nextval('sq'), nextval('sq'), currval('sq')"),
+        "1|2|2"
+    );
     assert_eq!(one(&mut e, "SELECT lastval()"), "2");
     assert_eq!(one(&mut e, "SELECT setval('sq', 200, false)"), "200");
     assert_eq!(one(&mut e, "SELECT nextval('sq')"), "200");
@@ -105,7 +117,10 @@ fn the_sequence_core_is_unchanged() {
     assert_eq!(one(&mut e, "SELECT nextval('sq2'), nextval('sq2')"), "10|8");
     e.execute("CREATE SEQUENCE sq4 CYCLE MAXVALUE 2").unwrap();
     assert_eq!(
-        one(&mut e, "SELECT nextval('sq4'), nextval('sq4'), nextval('sq4')"),
+        one(
+            &mut e,
+            "SELECT nextval('sq4'), nextval('sq4'), nextval('sq4')"
+        ),
         "1|2|1"
     );
 }

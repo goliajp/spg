@@ -128,8 +128,10 @@ fn attach_scans_a_non_empty_child() {
         other => panic!("{other:?}"),
     }
     // And the violating shape, which is what the scan is FOR.
-    e.execute("CREATE TABLE c2 (id BIGINT, region TEXT)").unwrap();
-    e.execute("INSERT INTO c2 VALUES (2, 'us'), (3, 'jp')").unwrap();
+    e.execute("CREATE TABLE c2 (id BIGINT, region TEXT)")
+        .unwrap();
+    e.execute("INSERT INTO c2 VALUES (2, 'us'), (3, 'jp')")
+        .unwrap();
     let err = e
         .execute("ALTER TABLE p ATTACH PARTITION c2 FOR VALUES IN ('us')")
         .unwrap_err();

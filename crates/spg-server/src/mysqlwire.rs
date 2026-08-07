@@ -154,10 +154,7 @@ const SERVER_STATUS_IN_TRANS: u16 = 0x0001;
 /// setting — v7.39 (round 331, V50) — where it used to be a constant.
 /// Measured on MariaDB 11: `SET autocommit=0` clears it.
 fn tx_status(state: &Arc<ServerState>, conn_tx_id: spg_engine::TxId, autocommit: bool) -> u16 {
-    let in_tx = state
-        .engine
-        .read()
-        .is_ok_and(|e| e.is_tx_open(conn_tx_id));
+    let in_tx = state.engine.read().is_ok_and(|e| e.is_tx_open(conn_tx_id));
     let mut flags = 0;
     if autocommit {
         flags |= SERVER_STATUS_AUTOCOMMIT;
@@ -328,7 +325,15 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
     //     carve-out — fast-path failures surface as Access
     //     Denied here.
     let scramble = std::mem::take(&mut greeting.scramble);
-    complete_auth_and_command(&mut stream, state, &parsed, &scramble, seqno_in, conn_id, sock)
+    complete_auth_and_command(
+        &mut stream,
+        state,
+        &parsed,
+        &scramble,
+        seqno_in,
+        conn_id,
+        sock,
+    )
 }
 
 /// v7.17.0 Phase 3.P0-77 — auth verification + command loop
@@ -348,7 +353,11 @@ fn complete_auth_and_command(
     match auth_outcome {
         AuthOutcome::Ok => {
             // No statement has run yet, so no transaction can be open.
-            write_packet(stream, reply_seqno, &encode_ok_packet(SERVER_STATUS_AUTOCOMMIT))?;
+            write_packet(
+                stream,
+                reply_seqno,
+                &encode_ok_packet(SERVER_STATUS_AUTOCOMMIT),
+            )?;
         }
         AuthOutcome::CachingSha2FastAuthOk => {
             write_packet(stream, reply_seqno, &[0x01, 0x03])?;
@@ -949,11 +958,9 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
         // Measured: a MariaDB statement stopped by `KILL QUERY` reports
         // `ERROR 1317 (70100) Query execution was interrupted` — its own
         // wording, not the engine's internal cancel text.
-        spg_engine::EngineError::Cancelled => (
-            1317,
-            "70100",
-            "Query execution was interrupted".to_string(),
-        ),
+        spg_engine::EngineError::Cancelled => {
+            (1317, "70100", "Query execution was interrupted".to_string())
+        }
         // v7.39 (round 429) — every OTHER error used to answer 1064 / 42000,
         // MySQL's SYNTAX ERROR. Clients branch on errno — a duplicate key
         // (1062) drives upsert fallbacks, "table already exists" (1050)
@@ -969,7 +976,11 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
         _ => {
             let (pg_state, msg) = crate::pgwire::engine_error_to_wire(e);
             let (errno, my_state) = mysql_code_for_sqlstate(pg_state);
-            (errno, my_state, crate::strip_internal_error_prefixes(&msg).to_string())
+            (
+                errno,
+                my_state,
+                crate::strip_internal_error_prefixes(&msg).to_string(),
+            )
         }
     }
 }
@@ -1031,7 +1042,12 @@ fn parse_set_autocommit(sql: &str) -> Option<bool> {
     if !name.trim().eq_ignore_ascii_case("autocommit") {
         return None;
     }
-    match value.trim().trim_matches('\'').to_ascii_lowercase().as_str() {
+    match value
+        .trim()
+        .trim_matches('\'')
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "0" | "off" | "false" => Some(false),
         "1" | "on" | "true" => Some(true),
         _ => None,
@@ -1125,13 +1141,20 @@ fn handle_com_query(
     match outcome {
         Err(e) => {
             let (errno, sqlstate, msg) = mysql_error_parts(&e);
-            write_packet(stream, start_seqno, &encode_err_packet(errno, sqlstate, &msg))?;
+            write_packet(
+                stream,
+                start_seqno,
+                &encode_err_packet(errno, sqlstate, &msg),
+            )?;
         }
         Ok(QueryResult::CommandOk { affected, .. }) => {
             write_packet(
                 stream,
                 start_seqno,
-                &encode_ok_with_affected(affected as u64, tx_status(state, conn_tx_id, *autocommit)),
+                &encode_ok_with_affected(
+                    affected as u64,
+                    tx_status(state, conn_tx_id, *autocommit),
+                ),
             )?;
         }
         Ok(QueryResult::Rows { columns, rows }) => {
@@ -1345,7 +1368,10 @@ fn handle_com_stmt_execute(
                 .ok()
                 .map(|()| bind.to_string())
         };
-        (engine.execute_prepared_in(stmt, &params, conn_tx_id), render)
+        (
+            engine.execute_prepared_in(stmt, &params, conn_tx_id),
+            render,
+        )
     };
     let status = tx_status(state, conn_tx_id, autocommit);
     conn_state.in_transaction.store(
@@ -1355,18 +1381,24 @@ fn handle_com_stmt_execute(
     // v7.33 (A1) — persist the prepared write before acking (was
     // non-durable pre-7.33, lost on crash).
     let outcome = match render {
-        Some(render) => match crate::pgwire::persist_wire_write(state, &render, &outcome, conn_tx_id) {
-            Ok(()) => outcome,
-            Err(e) => Err(spg_engine::EngineError::Unsupported(format!(
-                "durability append failed: {e}"
-            ))),
-        },
+        Some(render) => {
+            match crate::pgwire::persist_wire_write(state, &render, &outcome, conn_tx_id) {
+                Ok(()) => outcome,
+                Err(e) => Err(spg_engine::EngineError::Unsupported(format!(
+                    "durability append failed: {e}"
+                ))),
+            }
+        }
         None => outcome,
     };
     match outcome {
         Err(e) => {
             let (errno, sqlstate, msg) = mysql_error_parts(&e);
-            write_packet(stream, start_seqno, &encode_err_packet(errno, sqlstate, &msg))?;
+            write_packet(
+                stream,
+                start_seqno,
+                &encode_err_packet(errno, sqlstate, &msg),
+            )?;
         }
         Ok(QueryResult::CommandOk { affected, .. }) => {
             write_packet(

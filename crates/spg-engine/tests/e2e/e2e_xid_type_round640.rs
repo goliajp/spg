@@ -155,7 +155,10 @@ fn round640_frozen_xid_is_an_xid_and_age_reads_it() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (a int)").unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT pg_typeof(relfrozenxid) FROM pg_class LIMIT 1"),
+        vals(
+            &mut e,
+            "SELECT pg_typeof(relfrozenxid) FROM pg_class LIMIT 1"
+        ),
         vec!["xid"]
     );
     assert_eq!(

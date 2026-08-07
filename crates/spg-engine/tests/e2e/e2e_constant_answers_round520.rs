@@ -56,7 +56,10 @@ fn round520_encoding_max_length_reads_the_encoding() {
     );
     // An id that names no encoding is NULL.
     assert_eq!(text(&mut e, "SELECT pg_encoding_max_length(99)"), "NULL");
-    assert_eq!(text(&mut e, "SELECT pg_encoding_max_length(NULL::int)"), "NULL");
+    assert_eq!(
+        text(&mut e, "SELECT pg_encoding_max_length(NULL::int)"),
+        "NULL"
+    );
 }
 
 /// The one that mattered: an owner oid must name the OWNER.
@@ -97,7 +100,13 @@ fn round520_the_two_that_were_not_stubs() {
     let mut e = engine();
     e.execute("CREATE TABLE oc (a INT)").unwrap();
     e.execute("COMMENT ON TABLE oc IS 'hello'").unwrap();
-    assert_eq!(text(&mut e, "SELECT obj_description('oc'::regclass)"), "hello");
+    assert_eq!(
+        text(&mut e, "SELECT obj_description('oc'::regclass)"),
+        "hello"
+    );
     // An oid naming no function is NULL — round 518's rule, not a stub.
-    assert_eq!(text(&mut e, "SELECT pg_function_is_visible(999999::oid)"), "NULL");
+    assert_eq!(
+        text(&mut e, "SELECT pg_function_is_visible(999999::oid)"),
+        "NULL"
+    );
 }

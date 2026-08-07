@@ -19,16 +19,18 @@ use spg_storage::Value;
 
 fn hex_of(e: &mut Engine, sql: &str) -> String {
     match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err}")) {
-        spg_engine::QueryResult::Rows { rows, .. } => match rows.first().and_then(|r| r.values.first()) {
-            Some(Value::Text(t)) => {
-                use std::fmt::Write as _;
-                t.bytes().fold(String::new(), |mut acc, b| {
-                    let _ = write!(acc, "{b:02X}");
-                    acc
-                })
+        spg_engine::QueryResult::Rows { rows, .. } => {
+            match rows.first().and_then(|r| r.values.first()) {
+                Some(Value::Text(t)) => {
+                    use std::fmt::Write as _;
+                    t.bytes().fold(String::new(), |mut acc, b| {
+                        let _ = write!(acc, "{b:02X}");
+                        acc
+                    })
+                }
+                other => panic!("`{sql}` did not return text: {other:?}"),
             }
-            other => panic!("`{sql}` did not return text: {other:?}"),
-        },
+        }
         other => panic!("`{sql}` did not return rows: {other:?}"),
     }
 }
@@ -51,7 +53,11 @@ fn mysql_escapes_match_mariadb() {
         (r"\101", "313031"),
         (r"\q", "71"),
     ] {
-        assert_eq!(hex_of(&mut e, &format!("SELECT '{lit}'")), want, "for `{lit}`");
+        assert_eq!(
+            hex_of(&mut e, &format!("SELECT '{lit}'")),
+            want,
+            "for `{lit}`"
+        );
     }
 }
 
@@ -67,7 +73,11 @@ fn the_shared_escapes_are_unchanged() {
         (r"\\", "5C"),
         (r"\'", "27"),
     ] {
-        assert_eq!(hex_of(&mut e, &format!("SELECT '{lit}'")), want, "for `{lit}`");
+        assert_eq!(
+            hex_of(&mut e, &format!("SELECT '{lit}'")),
+            want,
+            "for `{lit}`"
+        );
     }
 }
 
@@ -83,7 +93,11 @@ fn pg_escape_strings_keep_pgs_table() {
         (r"\q", "71"),
         (r"\n", "0A"),
     ] {
-        assert_eq!(hex_of(&mut e, &format!("SELECT E'{lit}'")), want, "for `{lit}`");
+        assert_eq!(
+            hex_of(&mut e, &format!("SELECT E'{lit}'")),
+            want,
+            "for `{lit}`"
+        );
     }
 }
 

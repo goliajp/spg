@@ -24,14 +24,20 @@
 use spg_engine::Engine;
 
 fn err_of(e: &mut Engine, sql: &str) -> String {
-    format!("{}", e.execute(sql).expect_err(&format!("PG18 refuses: {sql}")))
+    format!(
+        "{}",
+        e.execute(sql).expect_err(&format!("PG18 refuses: {sql}"))
+    )
 }
 
 #[test]
 fn round699_a_missing_name_reads_as_a_missing_relation() {
     let mut e = Engine::new();
     let err = err_of(&mut e, "REFRESH MATERIALIZED VIEW nosuch699");
-    assert!(err.contains("relation \"nosuch699\" does not exist"), "{err}");
+    assert!(
+        err.contains("relation \"nosuch699\" does not exist"),
+        "{err}"
+    );
     // The banner round 698 was about must not be back.
     assert!(!err.contains("corrupt on-disk format"), "{err}");
 }
@@ -41,7 +47,10 @@ fn round699_a_name_that_is_not_a_matview_says_so() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE plain699(i INT)").unwrap();
     let err = err_of(&mut e, "REFRESH MATERIALIZED VIEW plain699");
-    assert!(err.contains("\"plain699\" is not a materialized view"), "{err}");
+    assert!(
+        err.contains("\"plain699\" is not a materialized view"),
+        "{err}"
+    );
     // And specifically NOT the missing-name wording, which is what made the
     // two indistinguishable before.
     assert!(!err.contains("does not exist"), "{err}");

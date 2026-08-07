@@ -35,7 +35,8 @@ use spg_engine::{Engine, QueryResult};
 
 fn engine() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (a INT PRIMARY KEY, b TEXT)").unwrap();
+    e.execute("CREATE TABLE t (a INT PRIMARY KEY, b TEXT)")
+        .unwrap();
     e.execute("CREATE VIEW v AS SELECT a FROM t WHERE a > 0 WITH LOCAL CHECK OPTION")
         .unwrap();
     e.execute("CREATE SEQUENCE s").unwrap();
@@ -95,10 +96,7 @@ fn round541_unknown_catalog_says_it_does_not_exist() {
         "SELECT 1 FROM pg_catalog.pg_nonesuch",
     ] {
         let err = format!("{}", e.execute(sql).expect_err(sql));
-        assert!(
-            err.contains("does not exist"),
-            "{sql}: message was {err}"
-        );
+        assert!(err.contains("does not exist"), "{sql}: message was {err}");
         assert!(
             !err.contains("materialisable"),
             "{sql}: still the internal message — {err}"
@@ -205,7 +203,10 @@ fn round541_reloptions_is_an_array_pg_dump_can_use() {
     );
     // A relation with no options reports NULL, not an empty array.
     assert_eq!(
-        rows(&mut e, "SELECT reloptions FROM pg_class WHERE relname = 't'"),
+        rows(
+            &mut e,
+            "SELECT reloptions FROM pg_class WHERE relname = 't'"
+        ),
         vec!["NULL"]
     );
 }
@@ -259,7 +260,16 @@ fn round541_empty_catalogs_have_pgs_columns() {
     let mut e = engine();
     assert_eq!(
         columns(&mut e, "SELECT * FROM pg_foreign_server"),
-        vec!["oid", "srvname", "srvowner", "srvfdw", "srvtype", "srvversion", "srvacl", "srvoptions"]
+        vec![
+            "oid",
+            "srvname",
+            "srvowner",
+            "srvfdw",
+            "srvtype",
+            "srvversion",
+            "srvacl",
+            "srvoptions"
+        ]
     );
     assert_eq!(
         columns(&mut e, "SELECT * FROM pg_catalog.pg_init_privs"),

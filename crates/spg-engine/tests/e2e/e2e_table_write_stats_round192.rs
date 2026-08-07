@@ -34,7 +34,8 @@ fn stats(e: &mut Engine, table: &str) -> (i64, i64, i64) {
 #[test]
 fn autocommit_counts() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("INSERT INTO t SELECT g, g FROM generate_series(1,100) g")
         .unwrap();
     e.execute("UPDATE t SET v = 0 WHERE id <= 10").unwrap();
@@ -47,7 +48,8 @@ fn tx_wrapped_counts_survive_commit() {
     // The server leader wraps every autocommit write in BEGIN..COMMIT;
     // pre-r192 these bumps vanished in the RC rebase.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     let tx = e.alloc_tx_id();
     e.execute_in("BEGIN", tx).unwrap();
     e.execute_in("INSERT INTO t VALUES (1, 0)", tx).unwrap();
@@ -61,7 +63,8 @@ fn rolled_back_writes_still_count() {
     // PG's stats collector is non-transactional: a rolled-back INSERT
     // still increments n_tup_ins.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     let tx = e.alloc_tx_id();
     e.execute_in("BEGIN", tx).unwrap();
     e.execute_in("INSERT INTO t VALUES (1, 0)", tx).unwrap();
@@ -83,11 +86,13 @@ fn rolled_back_writes_still_count() {
 #[test]
 fn rename_keeps_and_drop_resets() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("INSERT INTO t VALUES (1, 0)").unwrap();
     e.execute("ALTER TABLE t RENAME TO t2").unwrap();
     assert_eq!(stats(&mut e, "t2").0, 1, "stats survive rename");
     e.execute("DROP TABLE t2").unwrap();
-    e.execute("CREATE TABLE t2 (id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE t2 (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     assert_eq!(stats(&mut e, "t2").0, 0, "recreated table starts at zero");
 }

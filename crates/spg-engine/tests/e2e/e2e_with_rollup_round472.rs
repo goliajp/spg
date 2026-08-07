@@ -24,8 +24,10 @@ fn my() -> Engine {
     e.set_backslash_escapes(true);
     e.execute("CREATE TABLE s (region VARCHAR(8), product VARCHAR(8), amt INT)")
         .unwrap();
-    e.execute("INSERT INTO s VALUES ('east','a',10),('east','b',20),('west','a',30),('west','b',40)")
-        .unwrap();
+    e.execute(
+        "INSERT INTO s VALUES ('east','a',10),('east','b',20),('west','a',30),('west','b',40)",
+    )
+    .unwrap();
     e
 }
 
@@ -50,7 +52,10 @@ fn rows(e: &mut Engine, sql: &str) -> String {
 fn round472_one_key_rolls_up() {
     let mut e = my();
     assert_eq!(
-        rows(&mut e, "SELECT region, SUM(amt) FROM s GROUP BY region WITH ROLLUP"),
+        rows(
+            &mut e,
+            "SELECT region, SUM(amt) FROM s GROUP BY region WITH ROLLUP"
+        ),
         "east|30;west|70;NULL|100"
     );
 }
@@ -118,7 +123,8 @@ fn round472_postgres_sessions_do_not_get_the_mysql_spelling() {
     // `WITH ROLLUP` is not PG syntax; a PG session must still refuse it,
     // and PG's own `ROLLUP(…)` must still work there.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE s (region VARCHAR(8), amt INT)").unwrap();
+    e.execute("CREATE TABLE s (region VARCHAR(8), amt INT)")
+        .unwrap();
     e.execute("INSERT INTO s VALUES ('east',10),('west',20)")
         .unwrap();
     assert!(
@@ -126,7 +132,10 @@ fn round472_postgres_sessions_do_not_get_the_mysql_spelling() {
             .is_err()
     );
     assert_eq!(
-        rows(&mut e, "SELECT region, SUM(amt) FROM s GROUP BY ROLLUP(region)"),
+        rows(
+            &mut e,
+            "SELECT region, SUM(amt) FROM s GROUP BY ROLLUP(region)"
+        ),
         "east|10;west|20;NULL|30"
     );
 }

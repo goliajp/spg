@@ -510,7 +510,9 @@ impl Engine {
         &mut self,
         isolation: Option<spg_sql::ast::IsolationLevel>,
     ) -> Result<QueryResult, EngineError> {
-        let tx_id = self.current_tx.ok_or_else(|| EngineError::NoActiveTransaction)?;
+        let tx_id = self
+            .current_tx
+            .ok_or_else(|| EngineError::NoActiveTransaction)?;
         if self.tx_catalogs.contains_key(&tx_id) {
             return Err(EngineError::TransactionAlreadyOpen);
         }
@@ -600,7 +602,9 @@ impl Engine {
         // fails the COMMIT with 40001, rolling the tx back (PG: a
         // failed COMMIT ends the transaction).
         if let Err(e) = self.maybe_rc_rebase() {
-            let tx_id = self.current_tx.ok_or_else(|| EngineError::NoActiveTransaction)?;
+            let tx_id = self
+                .current_tx
+                .ok_or_else(|| EngineError::NoActiveTransaction)?;
             self.tx_catalogs.remove(&tx_id);
             if let Some(v) = self.tx_writer_versions.remove(&tx_id) {
                 self.abort_writer_version(v);
@@ -620,7 +624,9 @@ impl Engine {
         // sibling thread arrive (`wal_group_commit_leader_chosen`
         // fires once the slot is taken — see below).
         crate::injection_point!("tx_commit_walgroup_leader_switch", &self.current_tx);
-        let tx_id = self.current_tx.ok_or_else(|| EngineError::NoActiveTransaction)?;
+        let tx_id = self
+            .current_tx
+            .ok_or_else(|| EngineError::NoActiveTransaction)?;
         // v7.39 (round 552) — the read/write antidependency. SPG's
         // SERIALIZABLE was Snapshot Isolation: the write-write check
         // below caught two transactions touching the same row, and
@@ -813,8 +819,7 @@ impl Engine {
                     .foreign_keys
                     .iter()
                     .filter(|f| {
-                        !(f.deferrable
-                            && st.constraints_deferred.unwrap_or(f.initially_deferred))
+                        !(f.deferrable && st.constraints_deferred.unwrap_or(f.initially_deferred))
                     })
                     .cloned()
                     .collect();
@@ -910,9 +915,8 @@ impl Engine {
             // shape DDL-plus-traffic actually takes. Where they DID touch
             // the same table this tx still wins it outright — unchanged
             // from before, and recorded rather than claimed fixed.
-            let table_merge = self.mvcc_inplace
-                && state.cached_snapshot.is_some()
-                && state.rebase_poisoned;
+            let table_merge =
+                self.mvcc_inplace && state.cached_snapshot.is_some() && state.rebase_poisoned;
             if table_merge {
                 let changed: alloc::vec::Vec<String> =
                     state.catalog.dirty_tables().iter().cloned().collect();
@@ -940,7 +944,6 @@ impl Engine {
             // v7.37.15 Phase C.4 — release the tx's row locks. No-op
             // until the in-place write path (C.3) starts acquiring.
             self.release_tx_locks(v);
-
         }
         // All savepoints become permanent at COMMIT and the stack
         // resets for the next TX (`state.savepoints` is discarded with
@@ -975,7 +978,9 @@ impl Engine {
     }
 
     pub(crate) fn exec_rollback(&mut self) -> Result<QueryResult, EngineError> {
-        let tx_id = self.current_tx.ok_or_else(|| EngineError::NoActiveTransaction)?;
+        let tx_id = self
+            .current_tx
+            .ok_or_else(|| EngineError::NoActiveTransaction)?;
         if self.tx_catalogs.remove(&tx_id).is_none() {
             return Err(EngineError::NoActiveTransaction);
         }
@@ -1016,7 +1021,9 @@ impl Engine {
     }
 
     pub(crate) fn exec_savepoint(&mut self, name: String) -> Result<QueryResult, EngineError> {
-        let tx_id = self.current_tx.ok_or_else(|| EngineError::NoActiveTransaction)?;
+        let tx_id = self
+            .current_tx
+            .ok_or_else(|| EngineError::NoActiveTransaction)?;
         // v7.38 (read01 P3.19) — remember the SET LOCAL undo-log depth at
         // this savepoint so `ROLLBACK TO` can unwind only the later ones.
         let guc_depth = self.local_guc_saves.len();
@@ -1032,7 +1039,9 @@ impl Engine {
         // v7.37 (round 828) — the role shadow rolls back with the
         // subtransaction too, so it is part of the bookmark.
         let users_snapshot = state.users.clone();
-        state.savepoints.push((name.clone(), snapshot, users_snapshot));
+        state
+            .savepoints
+            .push((name.clone(), snapshot, users_snapshot));
         self.savepoint_guc_marks.retain(|(n, _)| n != &name);
         self.savepoint_guc_marks.push((name, guc_depth));
         Ok(QueryResult::CommandOk {
@@ -1045,7 +1054,9 @@ impl Engine {
         &mut self,
         name: &str,
     ) -> Result<QueryResult, EngineError> {
-        let tx_id = self.current_tx.ok_or_else(|| EngineError::NoActiveTransaction)?;
+        let tx_id = self
+            .current_tx
+            .ok_or_else(|| EngineError::NoActiveTransaction)?;
         // r196 — captured before the &mut borrow below; forces the
         // next statement's rebase after the shadow restore.
         let epoch_for_invalidate = self.commit_epoch.wrapping_sub(1);
@@ -1095,7 +1106,9 @@ impl Engine {
         &mut self,
         name: &str,
     ) -> Result<QueryResult, EngineError> {
-        let tx_id = self.current_tx.ok_or_else(|| EngineError::NoActiveTransaction)?;
+        let tx_id = self
+            .current_tx
+            .ok_or_else(|| EngineError::NoActiveTransaction)?;
         let state = self
             .tx_catalogs
             .get_mut(&tx_id)

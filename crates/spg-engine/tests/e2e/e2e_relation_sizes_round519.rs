@@ -29,8 +29,11 @@ fn engine() -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TABLE sz (a INT, b TEXT)").unwrap();
     for i in 0..200 {
-        e.execute(&format!("INSERT INTO sz VALUES ({i}, '{}')", "x".repeat(100)))
-            .unwrap();
+        e.execute(&format!(
+            "INSERT INTO sz VALUES ({i}, '{}')",
+            "x".repeat(100)
+        ))
+        .unwrap();
     }
     e
 }
@@ -52,7 +55,9 @@ fn text(e: &mut Engine, sql: &str) -> String {
 }
 
 fn num(e: &mut Engine, sql: &str) -> i64 {
-    text(e, sql).parse().unwrap_or_else(|_| panic!("{sql} is not a number"))
+    text(e, sql)
+        .parse()
+        .unwrap_or_else(|_| panic!("{sql} is not a number"))
 }
 
 /// The contract a monitoring query depends on.
@@ -90,7 +95,10 @@ fn round519_nothing_is_null_and_empty_is_zero() {
         assert_eq!(text(&mut e, sql), "NULL", "{sql}");
     }
     // A name that is not a relation at all: NULL.
-    assert_eq!(text(&mut e, "SELECT pg_relation_size('nosuchtable')"), "NULL");
+    assert_eq!(
+        text(&mut e, "SELECT pg_relation_size('nosuchtable')"),
+        "NULL"
+    );
 
     // A relation that exists and stores nothing: 0, not NULL.
     e.execute("CREATE VIEW vsz AS SELECT 1 AS a").unwrap();
@@ -103,7 +111,10 @@ fn round519_nothing_is_null_and_empty_is_zero() {
     );
     // A synthesised catalog relation is the same case: it exists, and SPG
     // stores none of it.
-    assert_eq!(text(&mut e, "SELECT pg_total_relation_size('pg_class')"), "0");
+    assert_eq!(
+        text(&mut e, "SELECT pg_total_relation_size('pg_class')"),
+        "0"
+    );
 }
 
 /// The bytes are real enough to move when the data does.
@@ -112,8 +123,11 @@ fn round519_the_size_tracks_the_rows() {
     let mut e = engine();
     let before = num(&mut e, "SELECT pg_relation_size('sz')");
     for i in 200..400 {
-        e.execute(&format!("INSERT INTO sz VALUES ({i}, '{}')", "y".repeat(100)))
-            .unwrap();
+        e.execute(&format!(
+            "INSERT INTO sz VALUES ({i}, '{}')",
+            "y".repeat(100)
+        ))
+        .unwrap();
     }
     let after = num(&mut e, "SELECT pg_relation_size('sz')");
     assert!(after > before, "{before} -> {after}");

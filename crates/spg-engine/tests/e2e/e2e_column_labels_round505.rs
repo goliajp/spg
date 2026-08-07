@@ -34,7 +34,8 @@ use spg_engine::{Engine, QueryResult};
 
 fn engine() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE lbl (a INT, b INT, s TEXT)").unwrap();
+    e.execute("CREATE TABLE lbl (a INT, b INT, s TEXT)")
+        .unwrap();
     e.execute("INSERT INTO lbl VALUES (1, 10, 'x')").unwrap();
     e
 }
@@ -104,7 +105,10 @@ fn round505_a_window_call_reports_its_function_not_the_synthetic_column() {
     let mut e = engine();
     for (sql, want) in [
         ("SELECT count(*) OVER () FROM lbl", "count"),
-        ("SELECT row_number() OVER (ORDER BY a) FROM lbl", "row_number"),
+        (
+            "SELECT row_number() OVER (ORDER BY a) FROM lbl",
+            "row_number",
+        ),
         ("SELECT sum(b) OVER () FROM lbl", "sum"),
     ] {
         let got = one(&mut e, sql);

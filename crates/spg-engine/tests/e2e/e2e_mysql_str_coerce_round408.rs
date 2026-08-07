@@ -49,7 +49,10 @@ fn locate_instr_numeric() {
 #[test]
 fn substring_index_find_in_set_numeric() {
     let mut e = mysql();
-    assert_eq!(scalar(&mut e, "SELECT SUBSTRING_INDEX(123.456, '.', 1)"), "123");
+    assert_eq!(
+        scalar(&mut e, "SELECT SUBSTRING_INDEX(123.456, '.', 1)"),
+        "123"
+    );
     assert_eq!(scalar(&mut e, "SELECT FIND_IN_SET(2, '1,2,3')"), "2");
     assert_eq!(scalar(&mut e, "SELECT FIND_IN_SET('b', 'a,b,c')"), "2");
 }

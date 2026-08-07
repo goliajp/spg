@@ -121,7 +121,8 @@ fn round506_aliases_win_and_derived_labels_propagate() {
 #[test]
 fn round506_a_pg_session_keeps_pgs_rule() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE lbl (a INT, b INT, s TEXT)").unwrap();
+    e.execute("CREATE TABLE lbl (a INT, b INT, s TEXT)")
+        .unwrap();
     e.execute("INSERT INTO lbl VALUES (1, 10, 'x')").unwrap();
     assert_eq!(one(&mut e, "SELECT a+b FROM lbl"), "?column?");
     assert_eq!(one(&mut e, "SELECT upper(s) FROM lbl"), "upper");

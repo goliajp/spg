@@ -37,7 +37,9 @@ fn ints(e: &mut Engine, sql: &str) -> Vec<i128> {
             .map(|r| match &r.values[0] {
                 Value::BigInt(n) => i128::from(*n),
                 Value::Int(n) => i128::from(*n),
-                Value::Numeric { scaled, scale: 0, .. } => *scaled,
+                Value::Numeric {
+                    scaled, scale: 0, ..
+                } => *scaled,
                 o => panic!("not int: {o:?}"),
             })
             .collect(),
@@ -62,25 +64,43 @@ fn texts(e: &mut Engine, sql: &str) -> Vec<String> {
 #[test]
 fn set_plus_zero_is_the_bitmask() {
     let mut e = setup();
-    assert_eq!(ints(&mut e, "SELECT s + 0 FROM st ORDER BY id"), vec![5, 10, 0]);
+    assert_eq!(
+        ints(&mut e, "SELECT s + 0 FROM st ORDER BY id"),
+        vec![5, 10, 0]
+    );
 }
 
 /// `s & flag` tests a member.
 #[test]
 fn set_bitwise_and() {
     let mut e = setup();
-    assert_eq!(ints(&mut e, "SELECT s & 2 FROM st ORDER BY id"), vec![0, 2, 0]);
-    assert_eq!(ints(&mut e, "SELECT s & 1 FROM st ORDER BY id"), vec![1, 0, 0]);
+    assert_eq!(
+        ints(&mut e, "SELECT s & 2 FROM st ORDER BY id"),
+        vec![0, 2, 0]
+    );
+    assert_eq!(
+        ints(&mut e, "SELECT s & 1 FROM st ORDER BY id"),
+        vec![1, 0, 0]
+    );
 }
 
 /// `WHERE s & flag` filters by membership (the wrong-results fix).
 #[test]
 fn where_membership_filter() {
     let mut e = setup();
-    assert_eq!(texts(&mut e, "SELECT s FROM st WHERE s & 2 ORDER BY id"), vec!["b,d"]);
-    assert_eq!(texts(&mut e, "SELECT s FROM st WHERE s & 1 ORDER BY id"), vec!["a,c"]);
+    assert_eq!(
+        texts(&mut e, "SELECT s FROM st WHERE s & 2 ORDER BY id"),
+        vec!["b,d"]
+    );
+    assert_eq!(
+        texts(&mut e, "SELECT s FROM st WHERE s & 1 ORDER BY id"),
+        vec!["a,c"]
+    );
     // bit 8 (member 'd') matches only row 2
-    assert_eq!(texts(&mut e, "SELECT s FROM st WHERE s & 8 ORDER BY id"), vec!["b,d"]);
+    assert_eq!(
+        texts(&mut e, "SELECT s FROM st WHERE s & 8 ORDER BY id"),
+        vec!["b,d"]
+    );
 }
 
 /// A plain read (and a text compare) keeps the text — the bitmask is only a

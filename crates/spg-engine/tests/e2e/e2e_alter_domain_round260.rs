@@ -42,18 +42,26 @@ fn err(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn add_and_drop_constraint_take_effect() {
     let mut e = Engine::new();
-    e.execute("CREATE DOMAIN ad AS int CHECK (VALUE > 0)").unwrap();
+    e.execute("CREATE DOMAIN ad AS int CHECK (VALUE > 0)")
+        .unwrap();
     let got = err(&mut e, "SELECT (-1)::ad");
-    assert!(got.contains("violates check constraint \"ad_check\""), "{got}");
+    assert!(
+        got.contains("violates check constraint \"ad_check\""),
+        "{got}"
+    );
     // Dropping it actually lets the value through — this used to report
     // success and keep rejecting.
-    e.execute("ALTER DOMAIN ad DROP CONSTRAINT ad_check").unwrap();
+    e.execute("ALTER DOMAIN ad DROP CONSTRAINT ad_check")
+        .unwrap();
     assert_eq!(one(&mut e, "SELECT (-1)::ad"), "-1");
     // …and a re-added one takes effect immediately.
     e.execute("ALTER DOMAIN ad ADD CONSTRAINT ad_check CHECK (VALUE > 10)")
         .unwrap();
     let got = err(&mut e, "SELECT 5::ad");
-    assert!(got.contains("violates check constraint \"ad_check\""), "{got}");
+    assert!(
+        got.contains("violates check constraint \"ad_check\""),
+        "{got}"
+    );
     assert_eq!(one(&mut e, "SELECT 20::ad"), "20");
     // A second, explicitly named constraint reports ITS name.
     e.execute("ALTER DOMAIN ad ADD CONSTRAINT c2 CHECK (VALUE < 1000)")
@@ -66,17 +74,25 @@ fn add_and_drop_constraint_take_effect() {
 #[test]
 fn the_error_wordings_are_pgs() {
     let mut e = Engine::new();
-    e.execute("CREATE DOMAIN ad AS int CHECK (VALUE > 0)").unwrap();
+    e.execute("CREATE DOMAIN ad AS int CHECK (VALUE > 0)")
+        .unwrap();
     let got = err(&mut e, "ALTER DOMAIN ad DROP CONSTRAINT nosuch");
     assert!(
         got.contains("constraint \"nosuch\" of domain \"ad\" does not exist"),
         "{got}"
     );
     // IF EXISTS is a no-op instead.
-    e.execute("ALTER DOMAIN ad DROP CONSTRAINT IF EXISTS nosuch").unwrap();
+    e.execute("ALTER DOMAIN ad DROP CONSTRAINT IF EXISTS nosuch")
+        .unwrap();
     let got = err(&mut e, "ALTER DOMAIN nosuchdomain DROP CONSTRAINT x");
-    assert!(got.contains("type \"nosuchdomain\" does not exist"), "{got}");
-    let got = err(&mut e, "ALTER DOMAIN ad ADD CONSTRAINT ad_check CHECK (VALUE > 0)");
+    assert!(
+        got.contains("type \"nosuchdomain\" does not exist"),
+        "{got}"
+    );
+    let got = err(
+        &mut e,
+        "ALTER DOMAIN ad ADD CONSTRAINT ad_check CHECK (VALUE > 0)",
+    );
     assert!(
         got.contains("constraint \"ad_check\" for domain \"ad\" already exists"),
         "{got}"
@@ -101,7 +117,10 @@ fn set_not_null_validates_existing_data() {
     e.execute("DELETE FROM zq7t WHERE id = 2").unwrap();
     e.execute("ALTER DOMAIN zq7 SET NOT NULL").unwrap();
     let got = err(&mut e, "SELECT NULL::zq7");
-    assert!(got.contains("domain zq7 does not allow null values"), "{got}");
+    assert!(
+        got.contains("domain zq7 does not allow null values"),
+        "{got}"
+    );
     // …and DROP NOT NULL puts it back.
     e.execute("ALTER DOMAIN zq7 DROP NOT NULL").unwrap();
     assert_eq!(one(&mut e, "SELECT NULL::zq7"), "NULL");
@@ -121,11 +140,15 @@ fn default_and_rename_take_effect() {
     e.execute("INSERT INTO wdt2 (id) VALUES (1)").unwrap();
     assert_eq!(one(&mut e, "SELECT v FROM wdt2 WHERE id=1"), "NULL");
     // RENAME moves the type to its new name.
-    e.execute("CREATE DOMAIN rn AS int CHECK (VALUE > 0)").unwrap();
+    e.execute("CREATE DOMAIN rn AS int CHECK (VALUE > 0)")
+        .unwrap();
     e.execute("ALTER DOMAIN rn RENAME TO rn2").unwrap();
     assert_eq!(one(&mut e, "SELECT 5::rn2"), "5");
     let got = err(&mut e, "SELECT (-5)::rn2");
-    assert!(got.contains("violates check constraint \"rn_check\""), "{got}");
+    assert!(
+        got.contains("violates check constraint \"rn_check\""),
+        "{got}"
+    );
     // The old name is gone.
     assert!(e.execute("SELECT 5::rn").is_err());
 }
@@ -137,11 +160,20 @@ fn multiple_unnamed_checks_get_pgs_auto_names() {
         .unwrap();
     // `<domain>_check`, then `_check1` (probed).
     let got = err(&mut e, "SELECT 0::nm");
-    assert!(got.contains("violates check constraint \"nm_check\""), "{got}");
+    assert!(
+        got.contains("violates check constraint \"nm_check\""),
+        "{got}"
+    );
     let got = err(&mut e, "SELECT 500::nm");
-    assert!(got.contains("violates check constraint \"nm_check1\""), "{got}");
+    assert!(
+        got.contains("violates check constraint \"nm_check1\""),
+        "{got}"
+    );
     // An unnamed ALTER-added one continues the sequence.
     e.execute("ALTER DOMAIN nm ADD CHECK (VALUE <> 7)").unwrap();
     let got = err(&mut e, "SELECT 7::nm");
-    assert!(got.contains("violates check constraint \"nm_check2\""), "{got}");
+    assert!(
+        got.contains("violates check constraint \"nm_check2\""),
+        "{got}"
+    );
 }

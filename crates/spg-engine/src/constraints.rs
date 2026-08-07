@@ -312,7 +312,6 @@ pub(crate) fn on_conflict_arbiters(
     Ok(alloc::vec![(positions, nnd)])
 }
 
-
 /// v7.37.15 (Phase C.3) — does this BTree index locator point at a
 /// gate-on tombstone? A `RowLocator::Hot(i)` indexes into
 /// `table.headers()`; if that header is `is_deleted()` (`xmax !=
@@ -641,10 +640,7 @@ fn indexkeyable_type(ty: &spg_storage::DataType) -> bool {
 /// candidates with the collated fold, so any plain btree on the leading
 /// column works, unique or not). Expression / partial indexes key on
 /// something other than the raw column and are skipped.
-fn probe_btree(
-    table: &spg_storage::Table,
-    leading_pos: usize,
-) -> Option<&spg_storage::Index> {
+fn probe_btree(table: &spg_storage::Table, leading_pos: usize) -> Option<&spg_storage::Index> {
     table.indices().iter().find(|i| {
         matches!(i.kind, spg_storage::IndexKind::BTree(_))
             && i.column_position == leading_pos
@@ -717,8 +713,7 @@ fn uc_probe_index<'t>(
 /// and over, so the suspicion is that each probe walks every dead version
 /// under its key. Round 490 fixed exactly that shape of defect on the
 /// seek side — which is why this is a counter and not an assumption.
-pub static UNIQ_PROBE_CALLS: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static UNIQ_PROBE_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static UNIQ_PROBE_LOCATORS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
@@ -1014,8 +1009,11 @@ fn excl_probe_existing(
         return Ok(ExclProbe::Conflict(old));
     }
     let succ = probe_entry(
-        map.range(core::ops::Bound::Included(&cand_key), core::ops::Bound::Unbounded)
-            .next(),
+        map.range(
+            core::ops::Bound::Included(&cand_key),
+            core::ops::Bound::Unbounded,
+        )
+        .next(),
     )?;
     if let KeyProbe::Conflict(old) = succ {
         return Ok(ExclProbe::Conflict(old));
@@ -1085,7 +1083,13 @@ pub(crate) fn enforce_exclusion_inserts(
                     continue;
                 }
                 if conflicts(ex, newr, &prow.values)? {
-                    return Err(exclusion_violation(table, ex, child_table, newr, &prow.values));
+                    return Err(exclusion_violation(
+                        table,
+                        ex,
+                        child_table,
+                        newr,
+                        &prow.values,
+                    ));
                 }
             }
         }
@@ -1110,7 +1114,11 @@ pub(crate) fn enforce_exclusion_inserts(
                 for j in (i + 1)..rows.len() {
                     if conflicts(ex, &rows[j], &rows[i])? {
                         return Err(exclusion_violation(
-                            table, ex, child_table, &rows[j], &rows[i],
+                            table,
+                            ex,
+                            child_table,
+                            &rows[j],
+                            &rows[i],
                         ));
                     }
                 }
@@ -1171,7 +1179,7 @@ fn intra_batch_proven_disjoint(
     let mut keyed: Vec<((i128, u8), usize)> = Vec::with_capacity(rows.len());
     for (i, r) in rows.iter().enumerate() {
         match r.get(pos) {
-            None => return Ok(false), // short row — let the exact loop handle it
+            None => return Ok(false),      // short row — let the exact loop handle it
             Some(Value::Null) => continue, // NULL exempts the row
             Some(v @ Value::Range { empty, .. }) => {
                 if *empty {
@@ -1252,7 +1260,13 @@ pub(crate) fn enforce_exclusion_updates(
                     continue;
                 }
                 if conflicts(ex, newr, &prow.values)? {
-                    return Err(exclusion_violation(table, ex, table_name, newr, &prow.values));
+                    return Err(exclusion_violation(
+                        table,
+                        ex,
+                        table_name,
+                        newr,
+                        &prow.values,
+                    ));
                 }
             }
         }
@@ -1692,15 +1706,16 @@ pub(crate) fn enforce_unique_index_inserts(
                     .get(idx.column_position)
                     .is_some_and(|c| indexkeyable_type(&c.ty));
             if schema_ok {
-                let fold = |values: &[spg_storage::Value<'static>]| -> Vec<spg_storage::Value<'static>> {
-                    positions
-                        .iter()
-                        .map(|&p| {
-                            let v = values.get(p).cloned().unwrap_or(spg_storage::Value::Null);
-                            collated_key_cell(&v, p, schema, mysql)
-                        })
-                        .collect()
-                };
+                let fold =
+                    |values: &[spg_storage::Value<'static>]| -> Vec<spg_storage::Value<'static>> {
+                        positions
+                            .iter()
+                            .map(|&p| {
+                                let v = values.get(p).cloned().unwrap_or(spg_storage::Value::Null);
+                                collated_key_cell(&v, p, schema, mysql)
+                            })
+                            .collect()
+                    };
                 let mut batch_seen: hashbrown::HashSet<String> =
                     hashbrown::HashSet::with_capacity(rows.len());
                 let mut probe_ok = true;
@@ -3270,10 +3285,7 @@ impl Engine {
         self.run_deferred_fk_checks_inner(Some(names))
     }
 
-    fn run_deferred_fk_checks_inner(
-        &mut self,
-        only: Option<&[String]>,
-    ) -> Result<(), EngineError> {
+    fn run_deferred_fk_checks_inner(&mut self, only: Option<&[String]>) -> Result<(), EngineError> {
         let Some(tx_id) = self.current_tx else {
             return Ok(());
         };
@@ -3296,8 +3308,13 @@ impl Engine {
             let Some(t) = st.catalog.get(tname) else {
                 continue;
             };
-            let fks: alloc::vec::Vec<_> =
-                t.schema().foreign_keys.iter().filter(|f| deferred_now(f)).cloned().collect();
+            let fks: alloc::vec::Vec<_> = t
+                .schema()
+                .foreign_keys
+                .iter()
+                .filter(|f| deferred_now(f))
+                .cloned()
+                .collect();
             if fks.is_empty() {
                 continue;
             }
@@ -3432,10 +3449,7 @@ pub(crate) fn validate_uniqueness_whole_table(
     Ok(())
 }
 
-pub(crate) fn fk_deferred_in(
-    st: &crate::TxState,
-    fk: &spg_storage::ForeignKeyConstraint,
-) -> bool {
+pub(crate) fn fk_deferred_in(st: &crate::TxState, fk: &spg_storage::ForeignKeyConstraint) -> bool {
     if let Some(name) = fk.name.as_deref()
         && let Some(explicit) = st.constraints_deferred_by_name.get(name)
     {

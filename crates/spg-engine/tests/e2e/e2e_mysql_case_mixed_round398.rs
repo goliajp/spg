@@ -32,7 +32,10 @@ fn one(e: &mut Engine, sql: &str) -> Value<'static> {
 fn case_mixed_branches() {
     let mut e = mysql();
     // WHEN 1 true -> THEN 1 (value 1, MariaDB renders '1')
-    assert_eq!(one(&mut e, "SELECT CASE WHEN 1 THEN 1 ELSE 'x' END"), Value::Int(1));
+    assert_eq!(
+        one(&mut e, "SELECT CASE WHEN 1 THEN 1 ELSE 'x' END"),
+        Value::Int(1)
+    );
     // WHEN 0 false -> ELSE 'x'
     assert_eq!(
         one(&mut e, "SELECT CASE WHEN 0 THEN 1 ELSE 'x' END"),
@@ -57,7 +60,10 @@ fn coalesce_mixed() {
 #[test]
 fn same_type_unchanged() {
     let mut e = mysql();
-    assert_eq!(one(&mut e, "SELECT CASE WHEN 1 THEN 1 ELSE 2 END"), Value::Int(1));
+    assert_eq!(
+        one(&mut e, "SELECT CASE WHEN 1 THEN 1 ELSE 2 END"),
+        Value::Int(1)
+    );
 }
 
 /// A PostgreSQL session keeps the strict rule (refuses the mix).
@@ -65,7 +71,8 @@ fn same_type_unchanged() {
 fn postgres_still_strict() {
     let mut e = Engine::new();
     assert!(
-        e.execute("SELECT CASE WHEN true THEN 1 ELSE 'x' END").is_err(),
+        e.execute("SELECT CASE WHEN true THEN 1 ELSE 'x' END")
+            .is_err(),
         "PG refuses int/text CASE branches"
     );
     assert!(

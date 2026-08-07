@@ -3,8 +3,12 @@ fn q(e: &mut Engine, sql: &str) {
     match e.execute(sql) {
         Ok(spg_engine::QueryResult::Rows { rows, .. }) => {
             println!("-- {sql}");
-            for r in rows.iter().take(12) { println!("   {:?}", r.values); }
-            if rows.is_empty() { println!("   (0 rows)"); }
+            for r in rows.iter().take(12) {
+                println!("   {:?}", r.values);
+            }
+            if rows.is_empty() {
+                println!("   (0 rows)");
+            }
         }
         Ok(o) => println!("-- {sql} => {o:?}"),
         Err(x) => println!("-- {sql} => ERR {x}"),
@@ -28,5 +32,7 @@ fn main() {
         "SELECT relname FROM pg_class WHERE oid = 'sq'::regclass",
         "SELECT relname FROM pg_class WHERE oid = 't'::regclass",
         "SELECT relname FROM pg_class WHERE oid = 'ix'::regclass",
-    ] { q(&mut e, s); }
+    ] {
+        q(&mut e, s);
+    }
 }

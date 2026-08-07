@@ -98,8 +98,14 @@ fn validate_known_guc(name: &str, value: &str) -> Result<(), EngineError> {
         "synchronous_commit" => {
             if !matches!(
                 value.to_ascii_lowercase().as_str(),
-                "on" | "off" | "local" | "remote_write" | "remote_apply" | "true" | "false"
-                    | "0" | "1"
+                "on" | "off"
+                    | "local"
+                    | "remote_write"
+                    | "remote_apply"
+                    | "true"
+                    | "false"
+                    | "0"
+                    | "1"
             ) {
                 return Err(bad());
             }
@@ -111,8 +117,17 @@ fn validate_known_guc(name: &str, value: &str) -> Result<(), EngineError> {
         "client_min_messages" => {
             if !matches!(
                 value.trim().to_ascii_lowercase().as_str(),
-                "debug5" | "debug4" | "debug3" | "debug2" | "debug1" | "log" | "notice"
-                    | "warning" | "error" | "fatal" | "panic"
+                "debug5"
+                    | "debug4"
+                    | "debug3"
+                    | "debug2"
+                    | "debug1"
+                    | "log"
+                    | "notice"
+                    | "warning"
+                    | "error"
+                    | "fatal"
+                    | "panic"
             ) {
                 return Err(bad());
             }
@@ -871,7 +886,10 @@ impl Engine {
                 source,
             },
         );
-        Ok(QueryResult::CommandOk { affected: 0, modified_catalog: false })
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: false,
+        })
     }
 
     /// v7.39 (round 277) — `EXECUTE`. The arguments evaluate as
@@ -908,7 +926,10 @@ impl Engine {
         match name {
             None => {
                 self.prepared_statements.clear();
-                Ok(QueryResult::CommandOk { affected: 0, modified_catalog: false })
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
             }
             Some(n) => {
                 if self.prepared_statements.remove(n).is_none() {
@@ -916,7 +937,10 @@ impl Engine {
                         "prepared statement \"{n}\" does not exist"
                     )));
                 }
-                Ok(QueryResult::CommandOk { affected: 0, modified_catalog: false })
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
             }
         }
     }
@@ -1419,9 +1443,7 @@ impl Engine {
                 hold,
                 query,
             } => self.exec_declare_cursor(name, scroll, hold, *query),
-            Statement::FetchCursor { name, direction } => {
-                self.exec_fetch_cursor(&name, direction)
-            }
+            Statement::FetchCursor { name, direction } => self.exec_fetch_cursor(&name, direction),
             Statement::MoveCursor { name, direction } => self.exec_move_cursor(&name, direction),
             Statement::CloseCursor { name } => self.exec_close_cursor(name.as_deref()),
             // v7.39 (round 222) — LISTEN/NOTIFY with real delivery.
@@ -1524,9 +1546,7 @@ impl Engine {
                     )));
                 }
                 self.alter_user_password(&name, password.as_deref())
-                    .map_err(|e| {
-                        EngineError::Unsupported(alloc::format!("ALTER ROLE: {e}"))
-                    })?;
+                    .map_err(|e| EngineError::Unsupported(alloc::format!("ALTER ROLE: {e}")))?;
                 Ok(QueryResult::CommandOk {
                     affected: 0,
                     modified_catalog: self.catalog_change_is_committed(),
@@ -1539,9 +1559,7 @@ impl Engine {
                         for n in names {
                             if self.catalog.get(n.as_str()).is_none() {
                                 return Err(EngineError::Storage(
-                                    spg_storage::StorageError::TableNotFound {
-                                        name: n.clone(),
-                                    },
+                                    spg_storage::StorageError::TableNotFound { name: n.clone() },
                                 ));
                             }
                         }
@@ -1885,11 +1903,9 @@ impl Engine {
             // v7.39 (round 249) — the engine is no_std: the HOST reads the
             // file and calls `copy_from_buffer`. Reaching this arm means a
             // host that hasn't wired the file endpoint.
-            Statement::CopyFromFile { path, .. } => Err(EngineError::Unsupported(
-                alloc::format!(
-                    "COPY FROM file: the host must read {path:?} and call copy_from_buffer"
-                ),
-            )),
+            Statement::CopyFromFile { path, .. } => Err(EngineError::Unsupported(alloc::format!(
+                "COPY FROM file: the host must read {path:?} and call copy_from_buffer"
+            ))),
             Statement::CopyTo {
                 table,
                 columns,
@@ -1904,11 +1920,9 @@ impl Engine {
             ),
             // v7.39 (round 252) — the engine is no_std: the HOST renders
             // via `copy_to_buffer` and writes the file itself.
-            Statement::CopyToFile { path, .. } => Err(EngineError::Unsupported(
-                alloc::format!(
-                    "COPY TO file: the host must render via copy_to_buffer and write {path:?}"
-                ),
-            )),
+            Statement::CopyToFile { path, .. } => Err(EngineError::Unsupported(alloc::format!(
+                "COPY TO file: the host must render via copy_to_buffer and write {path:?}"
+            ))),
             // v7.39 (round 475) — a redundant BEGIN inside a transaction.
             //
             // SPG raised "a transaction is already open" AND left the
@@ -1930,9 +1944,7 @@ impl Engine {
             // form makes connection B's BEGIN see connection A's transaction
             // (rounds 279 / 283 / 298 / 304 / 443 / 444 are the same trap).
             Statement::Begin(_)
-                if self
-                    .current_tx
-                    .is_some_and(|t| self.is_tx_open(t))
+                if self.current_tx.is_some_and(|t| self.is_tx_open(t))
                     && !self.backslash_escapes =>
             {
                 self.warning(alloc::string::String::from(
@@ -2399,9 +2411,7 @@ impl Engine {
                             effective(&name, boot)
                         } else if let Some(v) = self.session_param(&name) {
                             alloc::string::String::from(v)
-                        } else if let Some(boot) =
-                            crate::guc_catalog::guc_boot_value(&name)
-                        {
+                        } else if let Some(boot) = crate::guc_catalog::guc_boot_value(&name) {
                             // v7.39 (round 534) — a parameter PG18 knows but
                             // SPG does not model reports its compiled-in
                             // default. `SHOW random_page_cost` printed
@@ -2558,10 +2568,14 @@ impl Engine {
     ) -> Result<(char, Option<alloc::vec::Vec<bool>>), EngineError> {
         if !is_csv {
             if options.quote.is_some() {
-                return Err(EngineError::Unsupported("COPY QUOTE requires CSV mode".into()));
+                return Err(EngineError::Unsupported(
+                    "COPY QUOTE requires CSV mode".into(),
+                ));
             }
             if options.escape.is_some() {
-                return Err(EngineError::Unsupported("COPY ESCAPE requires CSV mode".into()));
+                return Err(EngineError::Unsupported(
+                    "COPY ESCAPE requires CSV mode".into(),
+                ));
             }
         }
         // v7.39 (round 265) — the direction-dependent rules (FORCE_QUOTE is
@@ -2590,7 +2604,6 @@ impl Engine {
         };
         Ok((escape, force))
     }
-
 
     /// v7.39 (round 249) — resolve the effective COPY FROM target column
     /// list, running PG's pre-file checks in PG's order: the relation
@@ -2641,7 +2654,10 @@ impl Engine {
             None => Ok(schema_cols.iter().map(|c| c.name.clone()).collect()),
             Some(cols) => {
                 for (i, name) in cols.iter().enumerate() {
-                    if !schema_cols.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
+                    if !schema_cols
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(name))
+                    {
                         return Err(EngineError::Unsupported(alloc::format!(
                             "column \"{name}\" of relation \"{table}\" does not exist"
                         )));
@@ -2674,8 +2690,7 @@ impl Engine {
         data: &str,
     ) -> Result<QueryResult, EngineError> {
         let target = self.copy_target_columns(table, columns)?;
-        let inserts =
-            crate::copy::copy_buffer_inserts(table, columns, &target, options, data)?;
+        let inserts = crate::copy::copy_buffer_inserts(table, columns, &target, options, data)?;
         let wrap = !self.in_transaction();
         if wrap {
             self.execute("BEGIN")?;
@@ -2792,7 +2807,8 @@ impl Engine {
             .iter()
             .filter_map(|&p| schema_cols.get(p).map(|c| c.name.clone()))
             .collect();
-        let (escape, force_mask) = Self::resolve_copy_csv_extras(options, is_csv, quote, &out_names)?;
+        let (escape, force_mask) =
+            Self::resolve_copy_csv_extras(options, is_csv, quote, &out_names)?;
         let encode_cells = |cells: &[Option<alloc::string::String>]| -> alloc::string::String {
             if is_csv {
                 crate::copy::encode_copy_csv_cells_opts(
@@ -2896,7 +2912,8 @@ impl Engine {
             .unwrap_or_else(|| alloc::string::String::from(if is_csv { "" } else { "\\N" }));
         let out_names: alloc::vec::Vec<alloc::string::String> =
             result_cols.iter().map(|c| c.name.clone()).collect();
-        let (escape, force_mask) = Self::resolve_copy_csv_extras(options, is_csv, quote, &out_names)?;
+        let (escape, force_mask) =
+            Self::resolve_copy_csv_extras(options, is_csv, quote, &out_names)?;
         let encode_cells = |cells: &[Option<alloc::string::String>]| -> alloc::string::String {
             if is_csv {
                 crate::copy::encode_copy_csv_cells_opts(

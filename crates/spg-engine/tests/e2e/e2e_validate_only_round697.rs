@@ -42,7 +42,10 @@ fn ok(e: &mut Engine, sql: &str) {
 }
 
 fn err_of(e: &mut Engine, sql: &str) -> String {
-    format!("{}", e.execute(sql).expect_err(&format!("PG18 refuses: {sql}")))
+    format!(
+        "{}",
+        e.execute(sql).expect_err(&format!("PG18 refuses: {sql}"))
+    )
 }
 
 #[test]
@@ -96,12 +99,13 @@ fn round697_an_unprovided_extension_warns_rather_than_refusing() {
 fn round697_the_provided_list_is_a_claim_that_holds() {
     let mut e = Engine::new();
     let one = |e: &mut Engine, sql: &str| match e.execute(sql) {
-        Ok(QueryResult::Rows { rows, .. }) => {
-            spg_engine::eval::value_to_text(&rows[0].values[0])
-        }
+        Ok(QueryResult::Rows { rows, .. }) => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{sql}: {other:?}"),
     };
-    assert_eq!(one(&mut e, "SELECT digest('x','sha256') IS NOT NULL"), "true");
+    assert_eq!(
+        one(&mut e, "SELECT digest('x','sha256') IS NOT NULL"),
+        "true"
+    );
     assert_eq!(one(&mut e, "SELECT gen_random_uuid() IS NOT NULL"), "true");
     assert_eq!(one(&mut e, "SELECT '[1,2]'::vector::text"), "[1,2]");
     // v7.39 (round 780, F31-D1) — hstore joined the list: its type,
@@ -181,9 +185,9 @@ fn round706_the_foreign_family_warns_rather_than_lying() {
         e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err}"));
         let notices = e.take_notices();
         assert!(
-            notices
-                .iter()
-                .any(|n| n.message.contains("foreign-data infrastructure is not provided")),
+            notices.iter().any(|n| n
+                .message
+                .contains("foreign-data infrastructure is not provided")),
             "{sql}: expected the warning, got {notices:?}"
         );
     }
@@ -200,7 +204,10 @@ fn round706_the_foreign_family_warns_rather_than_lying() {
 fn round707_drop_aggregate_answers_as_pg_does() {
     let mut e = Engine::new();
     let err = |e: &mut Engine, sql: &str| -> String {
-        format!("{}", e.execute(sql).expect_err(&format!("PG18 refuses: {sql}")))
+        format!(
+            "{}",
+            e.execute(sql).expect_err(&format!("PG18 refuses: {sql}"))
+        )
     };
     assert!(
         err(&mut e, "DROP AGGREGATE nosuch707(int)")
@@ -224,12 +231,12 @@ fn round707_drop_aggregate_answers_as_pg_does() {
             .contains("aggregate nosuch707(integer) does not exist"),
     );
     // A built-in is undroppable, with PG's sentence.
-    assert!(
-        err(&mut e, "DROP AGGREGATE sum(int)")
-            .contains("cannot drop function sum(integer) because it is required by the database system"),
-    );
+    assert!(err(&mut e, "DROP AGGREGATE sum(int)").contains(
+        "cannot drop function sum(integer) because it is required by the database system"
+    ),);
     // IF EXISTS keeps the unknown quiet.
-    e.execute("DROP AGGREGATE IF EXISTS nosuch707(int)").unwrap();
+    e.execute("DROP AGGREGATE IF EXISTS nosuch707(int)")
+        .unwrap();
 }
 
 /// v7.39 (round 708) — the S05g ④ batch: twelve probes, six real gaps, all
@@ -281,7 +288,8 @@ fn round708_the_alter_and_drop_batch_validates_its_names() {
     // And a known type still no-ops through the unmodelled forms.
     e.execute("CREATE TYPE mood708 AS ENUM ('a')").unwrap();
     e.execute("ALTER TYPE mood708 RENAME TO mood709").unwrap();
-    e.execute("DROP PROCEDURAL LANGUAGE IF EXISTS nosuch708").unwrap();
+    e.execute("DROP PROCEDURAL LANGUAGE IF EXISTS nosuch708")
+        .unwrap();
 }
 
 /// v7.39 (round 709) — the S05g ④ second batch: twelve probes, nine now
@@ -338,7 +346,10 @@ fn round709_the_second_batch_validates_its_names() {
     // The legitimate forms: a performable collation, a shipped ts config,
     // a real large object, and every IF EXISTS spelling.
     ok(&mut e, "ALTER COLLATION \"en_US\" RENAME TO whatever");
-    ok(&mut e, "ALTER TEXT SEARCH CONFIGURATION english OWNER TO postgres");
+    ok(
+        &mut e,
+        "ALTER TEXT SEARCH CONFIGURATION english OWNER TO postgres",
+    );
     let lo = match e.execute("SELECT lo_create(4242)").unwrap() {
         QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{other:?}"),
@@ -355,11 +366,10 @@ fn round709_the_second_batch_validates_its_names() {
     }
     // The foreign-data DROPs warn like their CREATEs.
     e.execute("DROP SERVER nosuch709").unwrap();
-    assert!(
-        e.take_notices()
-            .iter()
-            .any(|n| n.message.contains("foreign-data infrastructure is not provided")),
-    );
+    assert!(e.take_notices().iter().any(|n| {
+        n.message
+            .contains("foreign-data infrastructure is not provided")
+    }),);
 }
 
 /// v7.39 (round 710) — the S05g ④ tail batch: ten probes, five fixed, two
@@ -379,7 +389,10 @@ fn round710_the_tail_batch() {
     e.execute("CREATE TABLE t710(i INT)").unwrap();
     e.execute("CREATE INDEX ix710 ON t710(i)").unwrap();
     for (sql, want) in [
-        ("ALTER TABLE t710 OF nosuch710", "type \"nosuch710\" does not exist"),
+        (
+            "ALTER TABLE t710 OF nosuch710",
+            "type \"nosuch710\" does not exist",
+        ),
         (
             "ALTER TABLE t710 REPLICA IDENTITY USING INDEX nosuch710",
             "index \"nosuch710\" for table \"t710\" does not exist",
@@ -433,10 +446,13 @@ fn round711_pk_unique_deferrable_flags_are_stored() {
         .unwrap();
     e.execute("CREATE TABLE d711b (id INT, CONSTRAINT u711 UNIQUE (id) DEFERRABLE)")
         .unwrap();
-    e.execute("CREATE TABLE d711c (id INT PRIMARY KEY)").unwrap();
-    e.execute("CREATE TABLE d711d (id INT)").unwrap();
-    e.execute("ALTER TABLE d711d ADD CONSTRAINT p711 PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED")
+    e.execute("CREATE TABLE d711c (id INT PRIMARY KEY)")
         .unwrap();
+    e.execute("CREATE TABLE d711d (id INT)").unwrap();
+    e.execute(
+        "ALTER TABLE d711d ADD CONSTRAINT p711 PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED",
+    )
+    .unwrap();
     let rows = match e
         .execute(
             "SELECT conname, condeferrable, condeferred FROM pg_constraint \
@@ -456,9 +472,15 @@ fn round711_pk_unique_deferrable_flags_are_stored() {
             .collect::<Vec<_>>(),
         other => panic!("{other:?}"),
     };
-    assert!(rows.contains(&"d711_pkey|true|true".to_string()), "{rows:?}");
+    assert!(
+        rows.contains(&"d711_pkey|true|true".to_string()),
+        "{rows:?}"
+    );
     assert!(rows.contains(&"u711|true|false".to_string()), "{rows:?}");
-    assert!(rows.contains(&"d711c_pkey|false|false".to_string()), "{rows:?}");
+    assert!(
+        rows.contains(&"d711c_pkey|false|false".to_string()),
+        "{rows:?}"
+    );
     assert!(rows.contains(&"p711|true|true".to_string()), "{rows:?}");
 }
 
@@ -518,7 +540,8 @@ fn round712_deferred_unique_checks_defer() {
     );
     let _ = e.execute("ROLLBACK");
     // ④ INITIALLY IMMEDIATE flips into deferral.
-    e.execute("CREATE TABLE d712b (id INT PRIMARY KEY DEFERRABLE)").unwrap();
+    e.execute("CREATE TABLE d712b (id INT PRIMARY KEY DEFERRABLE)")
+        .unwrap();
     e.execute("BEGIN").unwrap();
     e.execute("SET CONSTRAINTS ALL DEFERRED").unwrap();
     e.execute("INSERT INTO d712b VALUES (4)").unwrap();
@@ -526,7 +549,8 @@ fn round712_deferred_unique_checks_defer() {
     e.execute("DELETE FROM d712b WHERE id = 4").unwrap();
     e.execute("COMMIT").unwrap();
     // ⑤ NOT DEFERRABLE is immune.
-    e.execute("CREATE TABLE d712c (id INT PRIMARY KEY)").unwrap();
+    e.execute("CREATE TABLE d712c (id INT PRIMARY KEY)")
+        .unwrap();
     e.execute("BEGIN").unwrap();
     e.execute("SET CONSTRAINTS ALL DEFERRED").unwrap();
     e.execute("INSERT INTO d712c VALUES (5)").unwrap();

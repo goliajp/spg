@@ -31,7 +31,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut b = AnyConnection::connect(&url).await?;
 
     a.execute("DROP TABLE IF EXISTS iso").await?;
-    a.execute("CREATE TABLE iso (id INT PRIMARY KEY, v INT)").await?;
+    a.execute("CREATE TABLE iso (id INT PRIMARY KEY, v INT)")
+        .await?;
     a.execute("INSERT INTO iso VALUES (1, 10), (2, 20)").await?;
 
     println!("| step | reader sees |");
@@ -39,34 +40,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Reader opens REPEATABLE READ and takes its snapshot with a read.
     a.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await?;
-    println!("| reader BEGIN + first read | {} |", scalar(&mut a, "SELECT v FROM iso WHERE id = 1").await);
+    println!(
+        "| reader BEGIN + first read | {} |",
+        scalar(&mut a, "SELECT v FROM iso WHERE id = 1").await
+    );
 
     // Writer commits an UPDATE.
     b.execute("UPDATE iso SET v = 11 WHERE id = 1").await?;
-    println!("| after writer UPDATE commits | {} |", scalar(&mut a, "SELECT v FROM iso WHERE id = 1").await);
+    println!(
+        "| after writer UPDATE commits | {} |",
+        scalar(&mut a, "SELECT v FROM iso WHERE id = 1").await
+    );
 
     // Writer deletes and re-inserts the same key — the round-493 churn.
     b.execute("DELETE FROM iso WHERE id = 1").await?;
     b.execute("INSERT INTO iso VALUES (1, 12)").await?;
-    println!("| after writer DELETE + re-INSERT | {} |", scalar(&mut a, "SELECT v FROM iso WHERE id = 1").await);
+    println!(
+        "| after writer DELETE + re-INSERT | {} |",
+        scalar(&mut a, "SELECT v FROM iso WHERE id = 1").await
+    );
 
     // A row the reader never saw must stay invisible.
     b.execute("INSERT INTO iso VALUES (3, 30)").await?;
-    println!("| count after writer INSERTs a new row | {} |", scalar(&mut a, "SELECT count(*)::int FROM iso").await);
+    println!(
+        "| count after writer INSERTs a new row | {} |",
+        scalar(&mut a, "SELECT count(*)::int FROM iso").await
+    );
 
     a.execute("COMMIT").await?;
-    println!("| reader after COMMIT | {} |", scalar(&mut a, "SELECT v FROM iso WHERE id = 1").await);
-    println!("| reader, second read after COMMIT | {} |", scalar(&mut a, "SELECT v FROM iso WHERE id = 1").await);
-    println!("| reader count after COMMIT | {} |", scalar(&mut a, "SELECT count(*)::int FROM iso").await);
+    println!(
+        "| reader after COMMIT | {} |",
+        scalar(&mut a, "SELECT v FROM iso WHERE id = 1").await
+    );
+    println!(
+        "| reader, second read after COMMIT | {} |",
+        scalar(&mut a, "SELECT v FROM iso WHERE id = 1").await
+    );
+    println!(
+        "| reader count after COMMIT | {} |",
+        scalar(&mut a, "SELECT count(*)::int FROM iso").await
+    );
     a.execute("BEGIN").await?;
-    println!("| reader inside a fresh BEGIN | {} |", scalar(&mut a, "SELECT v FROM iso WHERE id = 1").await);
+    println!(
+        "| reader inside a fresh BEGIN | {} |",
+        scalar(&mut a, "SELECT v FROM iso WHERE id = 1").await
+    );
     a.execute("COMMIT").await?;
-    println!("| reader after that COMMIT | {} |", scalar(&mut a, "SELECT v FROM iso WHERE id = 1").await);
+    println!(
+        "| reader after that COMMIT | {} |",
+        scalar(&mut a, "SELECT v FROM iso WHERE id = 1").await
+    );
     // A connection that never opened a transaction, for contrast.
     let mut fresh = AnyConnection::connect(&url).await?;
-    println!("| a brand-new connection | {} |", scalar(&mut fresh, "SELECT v FROM iso WHERE id = 1").await);
+    println!(
+        "| a brand-new connection | {} |",
+        scalar(&mut fresh, "SELECT v FROM iso WHERE id = 1").await
+    );
     // And the writer's own view.
-    println!("| the writer itself | {} |", scalar(&mut b, "SELECT v FROM iso WHERE id = 1").await);
+    println!(
+        "| the writer itself | {} |",
+        scalar(&mut b, "SELECT v FROM iso WHERE id = 1").await
+    );
     println!();
     println!("# PG18: 10, 10, 10, 2, then 12 everywhere after COMMIT.");
     Ok(())

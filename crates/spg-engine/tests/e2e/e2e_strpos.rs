@@ -201,7 +201,10 @@ fn strpos_numeric_args_coerced() {
         .execute("SELECT strpos(12345, '3')")
         .expect_err("PG has no strpos(integer, text)")
         .to_string();
-    assert!(m.contains("function strpos(integer, text) does not exist"), "{m}");
+    assert!(
+        m.contains("function strpos(integer, text) does not exist"),
+        "{m}"
+    );
 }
 
 // ── COLUMN / WHERE / INSERT ──────────────────────────────────────

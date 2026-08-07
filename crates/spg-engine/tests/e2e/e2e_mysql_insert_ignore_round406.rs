@@ -42,17 +42,15 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<String>> {
 #[test]
 fn primary_key_conflict_is_skipped() {
     let mut e = mysql();
-    e.execute("CREATE TABLE ig(id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE ig(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("INSERT INTO ig VALUES(1,10),(2,20)").unwrap();
     // id 2 collides (stays v=20); id 3 is new.
-    e.execute("INSERT IGNORE INTO ig VALUES(2,99),(3,30)").unwrap();
+    e.execute("INSERT IGNORE INTO ig VALUES(2,99),(3,30)")
+        .unwrap();
     assert_eq!(
         rows(&mut e, "SELECT id, v FROM ig ORDER BY id"),
-        vec![
-            vec!["1", "10"],
-            vec!["2", "20"],
-            vec!["3", "30"],
-        ]
+        vec![vec!["1", "10"], vec!["2", "20"], vec!["3", "30"],]
     );
 }
 
@@ -64,7 +62,8 @@ fn secondary_unique_conflict_is_skipped() {
         .unwrap();
     e.execute("INSERT INTO u VALUES(1,100)").unwrap();
     // id 2 has e=100 which collides on the UNIQUE key -> skipped; id 3 new.
-    e.execute("INSERT IGNORE INTO u VALUES(2,100),(3,300)").unwrap();
+    e.execute("INSERT IGNORE INTO u VALUES(2,100),(3,300)")
+        .unwrap();
     assert_eq!(
         rows(&mut e, "SELECT id, e FROM u ORDER BY id"),
         vec![vec!["1", "100"], vec!["3", "300"]]
@@ -75,9 +74,11 @@ fn secondary_unique_conflict_is_skipped() {
 #[test]
 fn ignore_is_case_insensitive() {
     let mut e = mysql();
-    e.execute("CREATE TABLE ig(id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE ig(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("INSERT INTO ig VALUES(1,10)").unwrap();
-    e.execute("insert IGNORE into ig values(1,99),(2,20)").unwrap();
+    e.execute("insert IGNORE into ig values(1,99),(2,20)")
+        .unwrap();
     assert_eq!(
         rows(&mut e, "SELECT id, v FROM ig ORDER BY id"),
         vec![vec!["1", "10"], vec!["2", "20"]]
@@ -89,8 +90,10 @@ fn ignore_is_case_insensitive() {
 #[test]
 fn no_conflict_all_insert() {
     let mut e = mysql();
-    e.execute("CREATE TABLE ig(id INT PRIMARY KEY, v INT)").unwrap();
-    e.execute("INSERT IGNORE INTO ig VALUES(1,10),(2,20)").unwrap();
+    e.execute("CREATE TABLE ig(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    e.execute("INSERT IGNORE INTO ig VALUES(1,10),(2,20)")
+        .unwrap();
     assert_eq!(
         rows(&mut e, "SELECT id, v FROM ig ORDER BY id"),
         vec![vec!["1", "10"], vec!["2", "20"]]
@@ -101,7 +104,8 @@ fn no_conflict_all_insert() {
 #[test]
 fn postgres_rejects_ignore() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE ig(id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE ig(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     assert!(
         e.execute("INSERT IGNORE INTO ig VALUES(1,10)").is_err(),
         "PG has no INSERT IGNORE"

@@ -41,10 +41,14 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 #[test]
 fn round621_the_spellings_parse() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE d1 (id INT PRIMARY KEY DEFERRABLE INITIALLY DEFERRED)").unwrap();
-    e.execute("CREATE TABLE d2 (id INT PRIMARY KEY DEFERRABLE)").unwrap();
-    e.execute("CREATE TABLE d3 (id INT UNIQUE DEFERRABLE INITIALLY IMMEDIATE)").unwrap();
-    e.execute("CREATE TABLE d4 (id INT PRIMARY KEY NOT DEFERRABLE)").unwrap();
+    e.execute("CREATE TABLE d1 (id INT PRIMARY KEY DEFERRABLE INITIALLY DEFERRED)")
+        .unwrap();
+    e.execute("CREATE TABLE d2 (id INT PRIMARY KEY DEFERRABLE)")
+        .unwrap();
+    e.execute("CREATE TABLE d3 (id INT UNIQUE DEFERRABLE INITIALLY IMMEDIATE)")
+        .unwrap();
+    e.execute("CREATE TABLE d4 (id INT PRIMARY KEY NOT DEFERRABLE)")
+        .unwrap();
     e.execute("CREATE TABLE d5 (id INT UNIQUE INITIALLY DEFERRED)")
         .expect("bare INITIALLY implies DEFERRABLE, as on the FK path");
     e.execute(
@@ -59,7 +63,8 @@ fn round621_the_spellings_parse() {
 #[test]
 fn round621_enforcement_is_immediate() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE d1 (id INT PRIMARY KEY DEFERRABLE INITIALLY DEFERRED)").unwrap();
+    e.execute("CREATE TABLE d1 (id INT PRIMARY KEY DEFERRABLE INITIALLY DEFERRED)")
+        .unwrap();
     e.execute("INSERT INTO d1 VALUES (1),(2)").unwrap();
     assert_eq!(vals(&mut e, "SELECT count(*) FROM d1"), vec!["2"]);
     assert!(
@@ -67,7 +72,8 @@ fn round621_enforcement_is_immediate() {
         "the PK is real; only its timing was dropped"
     );
     let mut e2 = Engine::new();
-    e2.execute("CREATE TABLE u1 (a INT, b INT, UNIQUE (a, b) DEFERRABLE)").unwrap();
+    e2.execute("CREATE TABLE u1 (a INT, b INT, UNIQUE (a, b) DEFERRABLE)")
+        .unwrap();
     e2.execute("INSERT INTO u1 VALUES (1, 2)").unwrap();
     assert!(
         e2.execute("INSERT INTO u1 VALUES (1, 2)").is_err(),
@@ -79,12 +85,14 @@ fn round621_enforcement_is_immediate() {
 #[test]
 fn round621_the_neighbouring_clauses() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE n1 (id INT PRIMARY KEY, s TEXT NOT NULL)").unwrap();
+    e.execute("CREATE TABLE n1 (id INT PRIMARY KEY, s TEXT NOT NULL)")
+        .unwrap();
     assert!(
         e.execute("INSERT INTO n1 (id) VALUES (1)").is_err(),
         "NOT NULL — whose leading NOT the new arm must not eat"
     );
-    e.execute("CREATE TABLE n2 (id INT UNIQUE NULLS NOT DISTINCT DEFERRABLE)").unwrap();
+    e.execute("CREATE TABLE n2 (id INT UNIQUE NULLS NOT DISTINCT DEFERRABLE)")
+        .unwrap();
     e.execute("INSERT INTO n2 VALUES (NULL)").unwrap();
     assert!(
         e.execute("INSERT INTO n2 VALUES (NULL)").is_err(),

@@ -19,9 +19,7 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<String>> {
                         spg_storage::Value::Text(s) => s.to_string(),
                         spg_storage::Value::Int(n) => n.to_string(),
                         spg_storage::Value::BigInt(n) => n.to_string(),
-                        spg_storage::Value::Bool(b) => {
-                            if *b { "t" } else { "f" }.to_string()
-                        }
+                        spg_storage::Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
                         other => format!("{other:?}"),
                     })
                     .collect()
@@ -170,11 +168,13 @@ fn root_scalar_and_empty() {
         ),
         vec![vec!["1"]]
     );
-    assert!(rows(
-        &mut e,
-        "SELECT * FROM json_table('[]', '$[*]' COLUMNS (a INT PATH '$.a')) jt"
-    )
-    .is_empty());
+    assert!(
+        rows(
+            &mut e,
+            "SELECT * FROM json_table('[]', '$[*]' COLUMNS (a INT PATH '$.a')) jt"
+        )
+        .is_empty()
+    );
 }
 
 #[test]

@@ -29,7 +29,8 @@ fn seeded() -> Engine {
         .unwrap();
     e.execute("INSERT INTO emp VALUES (1,10,100),(2,10,200),(3,20,300),(4,30,400)")
         .unwrap();
-    e.execute("INSERT INTO dept VALUES (10,5,'a'),(20,7,'b')").unwrap();
+    e.execute("INSERT INTO dept VALUES (10,5,'a'),(20,7,'b')")
+        .unwrap();
     e
 }
 
@@ -60,12 +61,16 @@ fn bare_target_alias_parses_and_binds() {
         ["1|105", "2|205", "3|307", "4|400"]
     );
     // The AS spelling too.
-    e.execute("UPDATE emp AS z SET sal = 1 WHERE z.id = 4").unwrap();
+    e.execute("UPDATE emp AS z SET sal = 1 WHERE z.id = 4")
+        .unwrap();
     assert_eq!(rows(&mut e, "SELECT sal FROM emp WHERE id = 4"), ["1"]);
     // DELETE with a bare alias.
     e.execute("DELETE FROM emp d USING dept WHERE d.dept = dept.id AND dept.name = 'b'")
         .unwrap();
-    assert_eq!(rows(&mut e, "SELECT id FROM emp ORDER BY id"), ["1", "2", "4"]);
+    assert_eq!(
+        rows(&mut e, "SELECT id FROM emp ORDER BY id"),
+        ["1", "2", "4"]
+    );
 }
 
 #[test]
@@ -122,5 +127,8 @@ fn the_joined_dml_core_is_unchanged() {
     assert_eq!(rows(&mut e, "SELECT sal FROM emp WHERE id = 3"), ["1"]);
     e.execute("DELETE FROM emp USING dept WHERE emp.dept = dept.id AND dept.name = 'b'")
         .unwrap();
-    assert_eq!(rows(&mut e, "SELECT id FROM emp ORDER BY id"), ["1", "2", "4"]);
+    assert_eq!(
+        rows(&mut e, "SELECT id FROM emp ORDER BY id"),
+        ["1", "2", "4"]
+    );
 }

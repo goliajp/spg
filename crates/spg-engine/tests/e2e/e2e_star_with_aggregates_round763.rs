@@ -11,7 +11,13 @@ use spg_engine::{Engine, QueryResult};
 fn one(e: &mut Engine, sql: &str) -> String {
     match e.execute(sql).unwrap() {
         QueryResult::Rows { rows, columns } => {
-            let mut out = vec![columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join("|")];
+            let mut out = vec![
+                columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            ];
             out.extend(rows.iter().map(|r| {
                 r.values
                     .iter()
@@ -29,7 +35,8 @@ fn one(e: &mut Engine, sql: &str) -> String {
 fn round763_star_with_aggregates_answers_as_pg() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE c1t (id INT, name TEXT)").unwrap();
-    e.execute("INSERT INTO c1t VALUES (1,'x'),(1,'x'),(2,'y')").unwrap();
+    e.execute("INSERT INTO c1t VALUES (1,'x'),(1,'x'),(2,'y')")
+        .unwrap();
     for sql in [
         "SELECT *, count(*) FROM c1t GROUP BY id, name ORDER BY id",
         "SELECT c1t.*, count(*) FROM c1t GROUP BY id, name ORDER BY id",
@@ -37,7 +44,10 @@ fn round763_star_with_aggregates_answers_as_pg() {
         assert_eq!(one(&mut e, sql), "id|name|count;1|x|2;2|y|1", "{sql}");
     }
     assert_eq!(
-        one(&mut e, "SELECT t.*, sum(id) FROM c1t t GROUP BY id, name ORDER BY id"),
+        one(
+            &mut e,
+            "SELECT t.*, sum(id) FROM c1t t GROUP BY id, name ORDER BY id"
+        ),
         "id|name|sum;1|x|2;2|y|2"
     );
     // A non-grouped column refuses with PG's sentence.

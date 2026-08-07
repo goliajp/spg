@@ -149,13 +149,13 @@ fn cast_reg_misc(kind: &str, s: &str) -> Result<Value<'static>, EvalError> {
             const COLLATIONS: &[&str] = &["C", "POSIX", "default", "ucs_basic"];
             match COLLATIONS.iter().find(|c| **c == name) {
                 // PG re-quotes anything that is not a plain lowercase word.
-                Some(c) => Ok(Value::text(if c.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_')
-                    && *c != "default"
-                {
-                    (*c).to_string()
-                } else {
-                    alloc::format!("\"{c}\"")
-                })),
+                Some(c) => Ok(Value::text(
+                    if c.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_') && *c != "default" {
+                        (*c).to_string()
+                    } else {
+                        alloc::format!("\"{c}\"")
+                    },
+                )),
                 None => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "collation \"{name}\" for encoding \"UTF8\" does not exist"
@@ -303,13 +303,20 @@ fn cast_mysql_integer(v: Value<'static>, unsigned: bool) -> Result<Value<'static
                 Value::Text(t) | Value::BpChar(t) => crate::eval::mysql_leading_number(t),
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!("cannot cast {} to integer", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+                        detail: alloc::format!(
+                            "cannot cast {} to integer",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                        ),
                     });
                 }
             };
             // Half away from zero, which is what MariaDB does
             // (2.5 → 3, -2.5 → -3).
-            let r = if n >= 0.0 { (n + 0.5).floor() } else { (n - 0.5).ceil() };
+            let r = if n >= 0.0 {
+                (n + 0.5).floor()
+            } else {
+                (n - 0.5).ceil()
+            };
             #[allow(clippy::cast_possible_truncation)]
             let as_i64 = r as i64;
             i128::from(as_i64)
@@ -457,7 +464,10 @@ pub fn cast_value_ref_in(
         // value's storage DataType, which these two deliberately do not
         // have, and the message leaked that `None` to the client.
         CastTarget::BigInt | CastTarget::Int
-            if matches!(v, Value::RegClass(..) | Value::RegProc(..) | Value::RegType(..)) =>
+            if matches!(
+                v,
+                Value::RegClass(..) | Value::RegProc(..) | Value::RegType(..)
+            ) =>
         {
             let (Value::RegClass(oid, _) | Value::RegProc(oid, _) | Value::RegType(oid, _)) = v
             else {
@@ -474,10 +484,12 @@ pub fn cast_value_ref_in(
         // '\x05'::bytea::int8 is 5, '\x'::bytea::int4 is 0.
         CastTarget::Int if matches!(v, Value::Bytes(_)) => bytea_to_integer(&v, 4),
         CastTarget::BigInt if matches!(v, Value::Bytes(_)) => bytea_to_integer(&v, 8),
-        CastTarget::Int => cast_numeric_special_reject(&v, "integer")
-            .unwrap_or_else(|| cast_numeric_to_int(v)),
-        CastTarget::BigInt => cast_numeric_special_reject(&v, "bigint")
-            .unwrap_or_else(|| cast_numeric_to_bigint(v)),
+        CastTarget::Int => {
+            cast_numeric_special_reject(&v, "integer").unwrap_or_else(|| cast_numeric_to_int(v))
+        }
+        CastTarget::BigInt => {
+            cast_numeric_special_reject(&v, "bigint").unwrap_or_else(|| cast_numeric_to_bigint(v))
+        }
         CastTarget::Float => cast_numeric_to_float(v),
         CastTarget::Bool => cast_to_bool(v),
         CastTarget::Date => cast_to_date(v),
@@ -627,10 +639,9 @@ pub fn cast_value_ref_in(
                     // PG answers 25, and `pg_typeof` said `text`.
                     return match crate::conversions::regtype_canonical_name(&bare) {
                         Some(c) => {
-                            let oid = crate::conversions::regtype_name_to_oid(
-                                &c.to_ascii_lowercase(),
-                            )
-                            .unwrap_or(0);
+                            let oid =
+                                crate::conversions::regtype_name_to_oid(&c.to_ascii_lowercase())
+                                    .unwrap_or(0);
                             Ok(Value::RegType(oid, c.into_boxed_str()))
                         }
                         None => Err(EvalError::TypeMismatch {
@@ -886,7 +897,10 @@ pub fn cast_value_ref_in(
                     },
                     Value::BitString { .. } => Ok(v),
                     other => Err(EvalError::TypeMismatch {
-                        detail: alloc::format!("cannot cast {} to bit", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+                        detail: alloc::format!(
+                            "cannot cast {} to bit",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                        ),
                     }),
                 };
             }
@@ -1076,7 +1090,10 @@ pub fn cast_value_ref_in(
                     }
                     other => {
                         return Err(EvalError::TypeMismatch {
-                            detail: alloc::format!("cannot cast {} to {name}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+                            detail: alloc::format!(
+                                "cannot cast {} to {name}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                            ),
                         });
                     }
                 });
@@ -1119,7 +1136,10 @@ pub fn cast_value_ref_in(
                     Value::Null => Ok(Value::Null),
                     Value::Text(s) => Ok(Value::text(crate::json::jsonpath_canonical(s.as_ref())?)),
                     other => Err(EvalError::TypeMismatch {
-                        detail: alloc::format!("cannot cast {} to jsonpath", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+                        detail: alloc::format!(
+                            "cannot cast {} to jsonpath",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                        ),
                     }),
                 };
             }
@@ -1130,7 +1150,9 @@ pub fn cast_value_ref_in(
             // truncates to n bytes (`CAST('abc' AS BINARY(2))` is `ab`,
             // measured). What it really buys is byte-wise comparison,
             // which `compare_is_case_insensitive` now refuses to fold.
-            if mysql && (name.eq_ignore_ascii_case("binary") || name.to_ascii_lowercase().starts_with("binary("))
+            if mysql
+                && (name.eq_ignore_ascii_case("binary")
+                    || name.to_ascii_lowercase().starts_with("binary("))
             {
                 return cast_mysql_binary(v, name);
             }
@@ -1142,7 +1164,8 @@ pub fn cast_value_ref_in(
             // (`-1` → 18446744073709551615).
             // PG has no such type — `type "signed" does not exist` — so the
             // reading is gated on the dialect, not just on the spelling.
-            if mysql && (name.eq_ignore_ascii_case("signed") || name.eq_ignore_ascii_case("unsigned"))
+            if mysql
+                && (name.eq_ignore_ascii_case("signed") || name.eq_ignore_ascii_case("unsigned"))
             {
                 return cast_mysql_integer(v, name.eq_ignore_ascii_case("unsigned"));
             }
@@ -1153,9 +1176,7 @@ pub fn cast_value_ref_in(
             let temporal_prec = temporal_typmod(name)
                 .or_else(|| (mysql && is_bare_temporal_type(name)).then_some(0));
             let resolve_name: alloc::borrow::Cow<'_, str> = if temporal_prec.is_some() {
-                alloc::borrow::Cow::Owned(
-                    name.split('(').next().unwrap_or(name).trim().to_string(),
-                )
+                alloc::borrow::Cow::Owned(name.split('(').next().unwrap_or(name).trim().to_string())
             } else {
                 alloc::borrow::Cow::Borrowed(name.as_str())
             };
@@ -1389,7 +1410,10 @@ fn is_known_scalar_name(lower: &str) -> bool {
     REG_MISC_TYPES.contains(&lower)
         || CATALOG_SCALAR_TYPES.contains(&lower)
         || OPAQUE_TYPES.contains(&lower)
-        || matches!(lower, "tid" | "record" | "cstring" | "regnamespace" | "regrole")
+        || matches!(
+            lower,
+            "tid" | "record" | "cstring" | "regnamespace" | "regrole"
+        )
 }
 
 /// v7.39 (round 509) — does this name a type at all?
@@ -1472,10 +1496,7 @@ fn parse_tid_text(t: &str) -> Option<Value<'static>> {
 /// type and per ELEMENT (`::oidvector` complains about `oid`,
 /// `::int2vector` about `smallint`), which is why they are spelled out
 /// rather than shared.
-fn cast_catalog_scalar(
-    name: &str,
-    v: &Value<'_>,
-) -> Result<Option<Value<'static>>, EvalError> {
+fn cast_catalog_scalar(name: &str, v: &Value<'_>) -> Result<Option<Value<'static>>, EvalError> {
     crate::conversions::with_lower_name(name, |lower| cast_catalog_scalar_lower(lower, v))
 }
 
@@ -1546,7 +1567,11 @@ fn cast_catalog_scalar_lower(
         // Space-separated element lists, validated element by element and
         // kept in their own spelling.
         "oidvector" | "int2vector" => {
-            let elem_ty = if lower == "oidvector" { "oid" } else { "smallint" };
+            let elem_ty = if lower == "oidvector" {
+                "oid"
+            } else {
+                "smallint"
+            };
             for part in t.split_whitespace() {
                 let ok = if elem_ty == "oid" {
                     part.parse::<u32>().is_ok()
@@ -1584,8 +1609,7 @@ fn cast_catalog_scalar_lower(
             let shaped = parts.len() == 3
                 && parts[0].parse::<u64>().is_ok()
                 && parts[1].parse::<u64>().is_ok()
-                && (parts[2].is_empty()
-                    || parts[2].split(',').all(|x| x.parse::<u64>().is_ok()));
+                && (parts[2].is_empty() || parts[2].split(',').all(|x| x.parse::<u64>().is_ok()));
             if !shaped {
                 return Err(bad(lower, t));
             }
@@ -1764,7 +1788,10 @@ fn cast_to_int_array(v: Value) -> Result<Value, EvalError> {
             Ok(Value::IntArray(out))
         }
         other => Err(EvalError::TypeMismatch {
-            detail: alloc::format!("::INT[] does not accept {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+            detail: alloc::format!(
+                "::INT[] does not accept {}",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+            ),
         }),
     }
 }
@@ -1801,7 +1828,10 @@ fn cast_to_bigint_array(v: Value) -> Result<Value, EvalError> {
             Ok(Value::BigIntArray(out))
         }
         other => Err(EvalError::TypeMismatch {
-            detail: alloc::format!("::BIGINT[] does not accept {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+            detail: alloc::format!(
+                "::BIGINT[] does not accept {}",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+            ),
         }),
     }
 }
@@ -2051,7 +2081,10 @@ fn cast_to_date(v: Value) -> Result<Value, EvalError> {
             })
         }
         other => Err(EvalError::TypeMismatch {
-            detail: format!("cannot cast {} to DATE", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+            detail: format!(
+                "cannot cast {} to DATE",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+            ),
         }),
     }
 }
@@ -2085,7 +2118,10 @@ fn cast_to_timestamp(v: Value) -> Result<Value, EvalError> {
             })
         }
         other => Err(EvalError::TypeMismatch {
-            detail: format!("cannot cast {} to TIMESTAMP", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+            detail: format!(
+                "cannot cast {} to TIMESTAMP",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+            ),
         }),
     }
 }
@@ -2098,16 +2134,13 @@ fn cast_to_timestamptz(v: Value) -> Result<Value, EvalError> {
     let Value::Text(s) = &v else {
         return cast_to_timestamp(v);
     };
-    crate::eval::format::parse_timestamp_literal_tz_ordered(
-        s,
-        crate::eval::format::DateOrder::Mdy,
-    )
-    .map(|(micros, _had_tz)| Value::Timestamp(micros))
-    .ok_or_else(|| EvalError::TypeMismatch {
-        // v7.39 (round 324, V42) — and with the RIGHT type name: this arm
-        // used to report `TIMESTAMP` for a `::timestamptz` cast.
-        detail: crate::eval::format::datetime_input_error_text(s, "timestamp with time zone"),
-    })
+    crate::eval::format::parse_timestamp_literal_tz_ordered(s, crate::eval::format::DateOrder::Mdy)
+        .map(|(micros, _had_tz)| Value::Timestamp(micros))
+        .ok_or_else(|| EvalError::TypeMismatch {
+            // v7.39 (round 324, V42) — and with the RIGHT type name: this arm
+            // used to report `TIMESTAMP` for a `::timestamptz` cast.
+            detail: crate::eval::format::datetime_input_error_text(s, "timestamp with time zone"),
+        })
 }
 
 /// v7.39 (round 254) — PG refuses to cast a NUMERIC special into any
@@ -2115,7 +2148,10 @@ fn cast_to_timestamptz(v: Value) -> Result<Value, EvalError> {
 /// infinity to bigint` (an infinity is named without its sign, probed
 /// live). Returns `None` for an ordinary value so the caller runs its
 /// normal conversion.
-fn cast_numeric_special_reject(v: &Value, target: &str) -> Option<Result<Value<'static>, EvalError>> {
+fn cast_numeric_special_reject(
+    v: &Value,
+    target: &str,
+) -> Option<Result<Value<'static>, EvalError>> {
     let Value::Numeric { kind, .. } = v else {
         return None;
     };
@@ -2207,7 +2243,10 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
             crate::conversions::JsonbScalar::Null => Ok(Value::Null),
         },
         other => Err(EvalError::TypeMismatch {
-            detail: format!("cannot cast {} to int", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+            detail: format!(
+                "cannot cast {} to int",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+            ),
         }),
     }
 }
@@ -2273,7 +2312,10 @@ fn cast_numeric_to_bigint(v: Value) -> Result<Value, EvalError> {
             crate::conversions::JsonbScalar::Null => Ok(Value::Null),
         },
         other => Err(EvalError::TypeMismatch {
-            detail: format!("cannot cast {} to bigint", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+            detail: format!(
+                "cannot cast {} to bigint",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+            ),
         }),
     }
 }
@@ -2327,7 +2369,10 @@ fn cast_numeric_to_float(v: Value) -> Result<Value, EvalError> {
             }
         }
         other => Err(EvalError::TypeMismatch {
-            detail: format!("cannot cast {} to float", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+            detail: format!(
+                "cannot cast {} to float",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+            ),
         }),
     }
 }
@@ -2364,7 +2409,10 @@ fn cast_to_bool(v: Value) -> Result<Value, EvalError> {
             crate::conversions::JsonbScalar::Null => Ok(Value::Null),
         },
         other => Err(EvalError::TypeMismatch {
-            detail: format!("cannot cast {} to bool", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+            detail: format!(
+                "cannot cast {} to bool",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+            ),
         }),
     }
 }
@@ -2375,13 +2423,18 @@ pub fn cast_to_vector(v: Value) -> Result<Value<'static>, EvalError> {
     match v {
         Value::Null => Ok(Value::Null),
         Value::Vector(v) => Ok(Value::vector(v.into_owned())),
-        Value::Text(s) => parse_vector_text(&s)
-            .map(Value::vector)
-            .ok_or_else(|| EvalError::TypeMismatch {
-                detail: format!("cannot parse {s:?} as a vector literal"),
-            }),
+        Value::Text(s) => {
+            parse_vector_text(&s)
+                .map(Value::vector)
+                .ok_or_else(|| EvalError::TypeMismatch {
+                    detail: format!("cannot parse {s:?} as a vector literal"),
+                })
+        }
         other => Err(EvalError::TypeMismatch {
-            detail: format!("::vector requires text input, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+            detail: format!(
+                "::vector requires text input, got {}",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+            ),
         }),
     }
 }
@@ -2450,10 +2503,7 @@ mod round613_plain_named_targets {
             "{name} is a bare temporal type"
         );
         assert!(
-            matches!(
-                cast_catalog_scalar(name, &Value::text("x")),
-                Ok(None)
-            ),
+            matches!(cast_catalog_scalar(name, &Value::text("x")), Ok(None)),
             "{name} is claimed by the catalog-scalar arm"
         );
     }
@@ -2499,8 +2549,19 @@ mod round613_plain_named_targets {
     #[test]
     fn a_name_with_its_own_arm_is_not_shortcut() {
         for name in [
-            "regproc", "aclitem", "anyarray", "tid", "xid", "jsonpath", "bit", "bit(4)",
-            "timestamp", "timestamp(2)", "time(3)", "nosuchtype", "int4range",
+            "regproc",
+            "aclitem",
+            "anyarray",
+            "tid",
+            "xid",
+            "jsonpath",
+            "bit",
+            "bit(4)",
+            "timestamp",
+            "timestamp(2)",
+            "time(3)",
+            "nosuchtype",
+            "int4range",
         ] {
             assert_eq!(plain_named_target(name), None, "{name} was shortcut");
         }

@@ -68,31 +68,49 @@ fn round621_drop_function_takes_cascade() {
 fn round621_overlaps_as_a_function() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT overlaps(DATE '2020-01-01', DATE '2020-06-01', DATE '2020-03-01', DATE '2020-09-01')"),
+        vals(
+            &mut e,
+            "SELECT overlaps(DATE '2020-01-01', DATE '2020-06-01', DATE '2020-03-01', DATE '2020-09-01')"
+        ),
         vec!["true"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT (DATE '2020-01-01', DATE '2020-06-01') OVERLAPS (DATE '2020-03-01', DATE '2020-09-01')"),
+        vals(
+            &mut e,
+            "SELECT (DATE '2020-01-01', DATE '2020-06-01') OVERLAPS (DATE '2020-03-01', DATE '2020-09-01')"
+        ),
         vec!["true"],
         "the operator form, which always worked, agrees"
     );
     assert_eq!(
-        vals(&mut e, "SELECT overlaps(DATE '2020-01-01', DATE '2020-02-01', DATE '2020-03-01', DATE '2020-04-01')"),
+        vals(
+            &mut e,
+            "SELECT overlaps(DATE '2020-01-01', DATE '2020-02-01', DATE '2020-03-01', DATE '2020-04-01')"
+        ),
         vec!["false"],
         "disjoint periods"
     );
     assert_eq!(
-        vals(&mut e, "SELECT overlaps(DATE '2020-01-01', DATE '2020-03-01', DATE '2020-03-01', DATE '2020-05-01')"),
+        vals(
+            &mut e,
+            "SELECT overlaps(DATE '2020-01-01', DATE '2020-03-01', DATE '2020-03-01', DATE '2020-05-01')"
+        ),
         vec!["false"],
         "half-open: touching endpoints do not overlap"
     );
     assert_eq!(
-        vals(&mut e, "SELECT overlaps(DATE '2020-06-01', DATE '2020-01-01', DATE '2020-03-01', DATE '2020-09-01')"),
+        vals(
+            &mut e,
+            "SELECT overlaps(DATE '2020-06-01', DATE '2020-01-01', DATE '2020-03-01', DATE '2020-09-01')"
+        ),
         vec!["true"],
         "the endpoints may be given in either order"
     );
     assert_eq!(
-        vals(&mut e, "SELECT overlaps(NULL::DATE, DATE '2020-06-01', DATE '2020-03-01', DATE '2020-09-01')"),
+        vals(
+            &mut e,
+            "SELECT overlaps(NULL::DATE, DATE '2020-06-01', DATE '2020-03-01', DATE '2020-09-01')"
+        ),
         vec!["NULL"]
     );
     assert_eq!(
@@ -115,7 +133,10 @@ fn round621_from_only() {
         "with the rest of the query around it"
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM ONLY op o JOIN op p ON o.a = p.a"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM ONLY op o JOIN op p ON o.a = p.a"
+        ),
         vec!["2"],
         "and under an alias, in a join"
     );

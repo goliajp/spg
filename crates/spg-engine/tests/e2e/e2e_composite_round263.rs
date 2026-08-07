@@ -37,10 +37,13 @@ use spg_engine::{Engine, QueryResult};
 
 fn seeded() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TYPE paddr AS (street text, zip int)").unwrap();
+    e.execute("CREATE TYPE paddr AS (street text, zip int)")
+        .unwrap();
     e.execute("CREATE TABLE pcp (id int, a paddr)").unwrap();
-    e.execute("INSERT INTO pcp VALUES (1, ROW('elm', 999))").unwrap();
-    e.execute("INSERT INTO pcp VALUES (2, '(\"oak ave\",111)')").unwrap();
+    e.execute("INSERT INTO pcp VALUES (1, ROW('elm', 999))")
+        .unwrap();
+    e.execute("INSERT INTO pcp VALUES (2, '(\"oak ave\",111)')")
+        .unwrap();
     e
 }
 
@@ -85,13 +88,22 @@ fn a_composite_column_round_trips_from_both_input_forms() {
         rows_of(&mut e, "SELECT id, a FROM pcp ORDER BY id"),
         ["1|(elm,999)", "2|(\"oak ave\",111)"]
     );
-    assert_eq!(one(&mut e, "SELECT a::text FROM pcp WHERE id=1"), "(elm,999)");
+    assert_eq!(
+        one(&mut e, "SELECT a::text FROM pcp WHERE id=1"),
+        "(elm,999)"
+    );
     // Field access works on a column, not just on a cast literal.
     assert_eq!(
-        rows_of(&mut e, "SELECT id, (a).street, (a).zip FROM pcp ORDER BY id"),
+        rows_of(
+            &mut e,
+            "SELECT id, (a).street, (a).zip FROM pcp ORDER BY id"
+        ),
         ["1|elm|999", "2|oak ave|111"]
     );
-    assert_eq!(one(&mut e, "SELECT (a).zip + 1 FROM pcp WHERE id = 1"), "1000");
+    assert_eq!(
+        one(&mut e, "SELECT (a).zip + 1 FROM pcp WHERE id = 1"),
+        "1000"
+    );
     // The stored field NAMES are the declared ones, for both inputs.
     assert_eq!(
         rows_of(&mut e, "SELECT row_to_json(a) FROM pcp ORDER BY id"),
@@ -114,7 +126,10 @@ fn casting_into_a_composite_coerces_each_field() {
     // Shape mismatches take PG's plain cast refusal.
     for sql in ["SELECT ROW('x')::paddr", "SELECT ROW('x',1,2)::paddr"] {
         let got = err(&mut e, sql);
-        assert!(got.contains("cannot cast type record to paddr"), "{sql} → {got}");
+        assert!(
+            got.contains("cannot cast type record to paddr"),
+            "{sql} → {got}"
+        );
     }
 }
 
@@ -122,9 +137,15 @@ fn casting_into_a_composite_coerces_each_field() {
 fn pg_typeof_names_the_composite() {
     let mut e = seeded();
     assert_eq!(one(&mut e, "SELECT pg_typeof(a) FROM pcp LIMIT 1"), "paddr");
-    assert_eq!(one(&mut e, "SELECT pg_typeof('(\"main st\",12345)'::paddr)"), "paddr");
+    assert_eq!(
+        one(&mut e, "SELECT pg_typeof('(\"main st\",12345)'::paddr)"),
+        "paddr"
+    );
     // The catalog gate still holds for builtin casts.
-    assert_eq!(one(&mut e, "SELECT pg_typeof(1::float8)"), "double precision");
+    assert_eq!(
+        one(&mut e, "SELECT pg_typeof(1::float8)"),
+        "double precision"
+    );
 }
 
 #[test]

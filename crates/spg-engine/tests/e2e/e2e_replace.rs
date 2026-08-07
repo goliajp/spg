@@ -217,7 +217,10 @@ fn replace_numeric_args_coerced_to_text() {
         .execute("SELECT replace(12321, '2', 'X')")
         .expect_err("PG has no replace(integer, text, text)")
         .to_string();
-    assert!(m.contains("function replace(integer, text, text) does not exist"), "{m}");
+    assert!(
+        m.contains("function replace(integer, text, text) does not exist"),
+        "{m}"
+    );
 }
 
 // ── COLUMN-LEVEL ─────────────────────────────────────────────────

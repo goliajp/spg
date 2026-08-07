@@ -279,9 +279,11 @@ impl Engine {
             for item in &inner.items {
                 match item {
                     spg_sql::ast::SelectItem::Expr { expr, alias } => {
-                        names.push(alias.clone().unwrap_or_else(|| {
-                            crate::select::default_output_name(expr, false)
-                        }));
+                        names.push(
+                            alias
+                                .clone()
+                                .unwrap_or_else(|| crate::select::default_output_name(expr, false)),
+                        );
                     }
                     // A wildcard-bearing inner projection is not
                     // resolvable here — keep the old refusal.

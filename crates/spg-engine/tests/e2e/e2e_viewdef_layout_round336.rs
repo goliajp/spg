@@ -35,18 +35,22 @@ use spg_storage::Value;
 
 fn text_of(e: &mut Engine, sql: &str) -> String {
     match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err}")) {
-        spg_engine::QueryResult::Rows { rows, .. } => match rows.first().and_then(|r| r.values.first()) {
-            Some(Value::Text(t)) => t.to_string(),
-            other => panic!("`{sql}` did not return text: {other:?}"),
-        },
+        spg_engine::QueryResult::Rows { rows, .. } => {
+            match rows.first().and_then(|r| r.values.first()) {
+                Some(Value::Text(t)) => t.to_string(),
+                other => panic!("`{sql}` did not return text: {other:?}"),
+            }
+        }
         other => panic!("`{sql}` did not return rows: {other:?}"),
     }
 }
 
 fn fixture() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE v58 (id INT, v INT, nm TEXT)").unwrap();
-    e.execute("CREATE VIEW v1 AS SELECT id, v FROM v58").unwrap();
+    e.execute("CREATE TABLE v58 (id INT, v INT, nm TEXT)")
+        .unwrap();
+    e.execute("CREATE VIEW v1 AS SELECT id, v FROM v58")
+        .unwrap();
     e.execute("CREATE VIEW v2 AS SELECT id, v FROM v58 WHERE v > 1 ORDER BY id")
         .unwrap();
     e.execute("CREATE VIEW v4 AS SELECT count(*) AS n, v FROM v58 GROUP BY v HAVING count(*) > 1")
@@ -96,7 +100,9 @@ fn information_schema_views_agrees_with_pg_get_viewdef() {
         let direct = text_of(&mut e, &format!("SELECT pg_get_viewdef('{v}')"));
         let via_info = text_of(
             &mut e,
-            &format!("SELECT view_definition FROM information_schema.views WHERE table_name = '{v}'"),
+            &format!(
+                "SELECT view_definition FROM information_schema.views WHERE table_name = '{v}'"
+            ),
         );
         assert_eq!(via_info, direct, "for view {v}");
         assert!(!via_info.contains("count_star"), "for view {v}");

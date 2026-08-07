@@ -46,7 +46,10 @@ fn fromless_select_honours_limit_and_offset() {
     e.execute("CREATE TABLE lt (a int)").unwrap();
     e.execute("INSERT INTO lt VALUES (1),(2),(3)").unwrap();
     assert!(rows(&mut e, "SELECT a FROM lt LIMIT 0").is_empty());
-    assert_eq!(rows(&mut e, "SELECT a FROM lt ORDER BY a LIMIT 2"), ["1", "2"]);
+    assert_eq!(
+        rows(&mut e, "SELECT a FROM lt ORDER BY a LIMIT 2"),
+        ["1", "2"]
+    );
 }
 
 #[test]
@@ -61,14 +64,26 @@ fn row_count_takes_bigint_coercion_not_an_integer_token() {
         rows(&mut e, "SELECT generate_series(1,5) LIMIT 3.5"),
         ["1", "2", "3", "4"]
     );
-    assert_eq!(rows(&mut e, "SELECT generate_series(1,5) LIMIT 2.2"), ["1", "2"]);
-    assert_eq!(rows(&mut e, "SELECT generate_series(1,5) OFFSET 2.5"), ["4", "5"]);
     assert_eq!(
-        rows(&mut e, "SELECT generate_series(1,3) FETCH FIRST 1.5 ROWS ONLY"),
+        rows(&mut e, "SELECT generate_series(1,5) LIMIT 2.2"),
+        ["1", "2"]
+    );
+    assert_eq!(
+        rows(&mut e, "SELECT generate_series(1,5) OFFSET 2.5"),
+        ["4", "5"]
+    );
+    assert_eq!(
+        rows(
+            &mut e,
+            "SELECT generate_series(1,3) FETCH FIRST 1.5 ROWS ONLY"
+        ),
         ["1", "2"]
     );
     // A string coerces by content; one that won't names the value.
-    assert_eq!(rows(&mut e, "SELECT generate_series(1,5) LIMIT '2'"), ["1", "2"]);
+    assert_eq!(
+        rows(&mut e, "SELECT generate_series(1,5) LIMIT '2'"),
+        ["1", "2"]
+    );
     let got = err(&mut e, "SELECT 1 LIMIT 'a'");
     assert!(
         got.contains("invalid input syntax for type bigint: \"a\""),
@@ -84,7 +99,10 @@ fn negative_row_counts_take_pgs_wording() {
         ("SELECT 1 LIMIT -2.5", "LIMIT must not be negative"),
         ("SELECT 1 OFFSET -1", "OFFSET must not be negative"),
         // FETCH FIRST shares LIMIT's wording in PG.
-        ("SELECT 1 FETCH FIRST -1 ROWS ONLY", "LIMIT must not be negative"),
+        (
+            "SELECT 1 FETCH FIRST -1 ROWS ONLY",
+            "LIMIT must not be negative",
+        ),
     ] {
         let got = err(&mut e, sql);
         assert!(got.contains(want), "{sql}\n  want {want:?}\n  got  {got:?}");
@@ -102,5 +120,8 @@ fn row_expression_arity_mismatch_takes_pgs_wording() {
     // The working row comparisons are untouched.
     assert_eq!(rows(&mut e, "SELECT (ROW(1,2) = ROW(1,2))::text"), ["true"]);
     assert_eq!(rows(&mut e, "SELECT (ROW(1,2) < ROW(2,1))::text"), ["true"]);
-    assert_eq!(rows(&mut e, "SELECT ((1,5) IN ((1,2),(3,4)))::text"), ["false"]);
+    assert_eq!(
+        rows(&mut e, "SELECT ((1,5) IN ((1,2),(3,4)))::text"),
+        ["false"]
+    );
 }

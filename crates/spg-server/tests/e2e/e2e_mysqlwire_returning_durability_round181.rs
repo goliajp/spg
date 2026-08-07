@@ -136,7 +136,11 @@ fn mysqlwire_returning_and_cte_survive_kill_restart() {
         let mut s = auth_open_mode(&addr);
         exec(&mut s, "CREATE TABLE t (id BIGINT, v BIGINT)", "ddl");
         // MariaDB-dialect RETURNING over COM_QUERY.
-        let n = exec(&mut s, "INSERT INTO t VALUES (1, 0) RETURNING id", "ins-ret");
+        let n = exec(
+            &mut s,
+            "INSERT INTO t VALUES (1, 0) RETURNING id",
+            "ins-ret",
+        );
         assert_eq!(n, 1, "RETURNING must yield the row over mysql-wire");
         exec(
             &mut s,

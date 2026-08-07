@@ -63,7 +63,8 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE tree (id INT, parent INT, label TEXT)").unwrap();
+    e.execute("CREATE TABLE tree (id INT, parent INT, label TEXT)")
+        .unwrap();
     e.execute(
         "INSERT INTO tree VALUES (1,NULL,'root'),(2,1,'a'),(3,1,'b'),(4,2,'a1'),(5,2,'a2'),\
          (6,3,'b1'),(7,6,'b1x')",
@@ -137,13 +138,7 @@ fn round598_rounds_see_the_outer_database() {
               JOIN t ON c.parent = t.id) SELECT id, label, depth FROM t ORDER BY id"
         ),
         vec![
-            "1|root|0",
-            "2|a|1",
-            "3|b|1",
-            "4|a1|2",
-            "5|a2|2",
-            "6|b1|2",
-            "7|b1x|3",
+            "1|root|0", "2|a|1", "3|b|1", "4|a1|2", "5|a2|2", "6|b1|2", "7|b1x|3",
         ]
     );
     assert_eq!(

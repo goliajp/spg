@@ -42,7 +42,11 @@ fn overlap_buried_mid_batch_rejected() {
         if i > 0 {
             sql.push_str(", ");
         }
-        let (lo, hi) = if i == 1000 { (0, 1) } else { (2 * i, 2 * i + 1) };
+        let (lo, hi) = if i == 1000 {
+            (0, 1)
+        } else {
+            (2 * i, 2 * i + 1)
+        };
         sql.push_str(&format!("('[{lo},{hi})')"));
     }
     let err = e.execute(&sql).unwrap_err().to_string();

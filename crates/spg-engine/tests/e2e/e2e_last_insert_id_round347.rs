@@ -58,7 +58,8 @@ fn it_follows_mariadbs_sequence() {
     e.execute("INSERT INTO li (n) VALUES (10)").unwrap();
     assert_eq!(last_id(&mut e), 1, "the generated id");
 
-    e.execute("INSERT INTO li (n) VALUES (20),(30),(40)").unwrap();
+    e.execute("INSERT INTO li (n) VALUES (20),(30),(40)")
+        .unwrap();
     assert_eq!(last_id(&mut e), 2, "the FIRST of the three, not the last");
 
     e.execute("INSERT INTO plain VALUES (1)").unwrap();
@@ -81,7 +82,10 @@ fn one_argument_sets_it() {
     let mut e = fixture();
     e.execute("INSERT INTO li (n) VALUES (1)").unwrap();
     assert_eq!(last_id(&mut e), 1);
-    assert_eq!(scalar(&mut e, "SELECT LAST_INSERT_ID(42)"), Value::BigInt(42));
+    assert_eq!(
+        scalar(&mut e, "SELECT LAST_INSERT_ID(42)"),
+        Value::BigInt(42)
+    );
     assert_eq!(last_id(&mut e), 42, "the argument stuck");
     assert_eq!(scalar(&mut e, "SELECT 1"), Value::Int(1));
     assert_eq!(last_id(&mut e), 42, "an ordinary SELECT leaves it alone");
@@ -116,5 +120,9 @@ fn it_is_session_state() {
     assert_ne!(second, first);
 
     e.set_current_session(1);
-    assert_eq!(last_id(&mut e), first, "the first connection's value is its own");
+    assert_eq!(
+        last_id(&mut e),
+        first,
+        "the first connection's value is its own"
+    );
 }

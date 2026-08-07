@@ -44,9 +44,11 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TYPE mood AS ENUM ('sad','ok','happy')").unwrap();
+    e.execute("CREATE TYPE mood AS ENUM ('sad','ok','happy')")
+        .unwrap();
     e.execute("CREATE TYPE pt AS (x INT, y INT)").unwrap();
-    e.execute("CREATE DOMAIN posint AS INT CHECK (VALUE > 0)").unwrap();
+    e.execute("CREATE DOMAIN posint AS INT CHECK (VALUE > 0)")
+        .unwrap();
     e
 }
 
@@ -62,20 +64,32 @@ fn round621_user_types_are_in_pg_type() {
         vec!["mood|e", "posint|d", "pt|c"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT typname, typcategory FROM pg_type WHERE typname = 'mood'"),
+        vals(
+            &mut e,
+            "SELECT typname, typcategory FROM pg_type WHERE typname = 'mood'"
+        ),
         vec!["mood|E"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT typname FROM pg_type WHERE typtype = 'e' ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT typname FROM pg_type WHERE typtype = 'e' ORDER BY 1"
+        ),
         vec!["mood"],
         "the query a client writes to enumerate enums"
     );
     assert_eq!(
-        vals(&mut e, "SELECT typname FROM pg_type WHERE typtype = 'c' AND typname = 'pt'"),
+        vals(
+            &mut e,
+            "SELECT typname FROM pg_type WHERE typtype = 'c' AND typname = 'pt'"
+        ),
         vec!["pt"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT typname FROM pg_type WHERE typtype = 'd' AND typname = 'posint'"),
+        vals(
+            &mut e,
+            "SELECT typname FROM pg_type WHERE typtype = 'd' AND typname = 'posint'"
+        ),
         vec!["posint"]
     );
 }
@@ -101,7 +115,10 @@ fn round621_pg_enum_joins_pg_type() {
 fn round621_format_type_and_typbasetype() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT format_type(t.oid, -1) FROM pg_type t WHERE t.typname = 'mood'"),
+        vals(
+            &mut e,
+            "SELECT format_type(t.oid, -1) FROM pg_type t WHERE t.typname = 'mood'"
+        ),
         vec!["mood"],
         "answered `???` before — for a row pg_type had just started returning"
     );
@@ -113,12 +130,18 @@ fn round621_format_type_and_typbasetype() {
         vec!["posint", "pt"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT typbasetype FROM pg_type WHERE typname = 'posint'"),
+        vals(
+            &mut e,
+            "SELECT typbasetype FROM pg_type WHERE typname = 'posint'"
+        ),
         vec!["23"],
         "the domain names its base, which is how a client learns it is an integer"
     );
     assert_eq!(
-        vals(&mut e, "SELECT typbasetype FROM pg_type WHERE typname = 'mood'"),
+        vals(
+            &mut e,
+            "SELECT typbasetype FROM pg_type WHERE typname = 'mood'"
+        ),
         vec!["0"],
         "an enum has no base"
     );
@@ -129,7 +152,10 @@ fn round621_format_type_and_typbasetype() {
 fn round621_the_types_themselves_are_unchanged() {
     let mut e = seed();
     assert_eq!(vals(&mut e, "SELECT 'happy'::mood"), vec!["happy"]);
-    assert_eq!(vals(&mut e, "SELECT pg_typeof('happy'::mood)"), vec!["mood"]);
+    assert_eq!(
+        vals(&mut e, "SELECT pg_typeof('happy'::mood)"),
+        vec!["mood"]
+    );
     assert_eq!(
         vals(&mut e, "SELECT typname FROM pg_type WHERE oid = 23"),
         vec!["int4"],

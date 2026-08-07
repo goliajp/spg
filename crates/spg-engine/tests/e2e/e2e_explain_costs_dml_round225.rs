@@ -24,8 +24,10 @@ fn plan(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn seeded() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t1 (id int PRIMARY KEY, v int)").unwrap();
-    e.execute("INSERT INTO t1 VALUES (1,2),(2,4),(3,6)").unwrap();
+    e.execute("CREATE TABLE t1 (id int PRIMARY KEY, v int)")
+        .unwrap();
+    e.execute("INSERT INTO t1 VALUES (1,2),(2,4),(3,6)")
+        .unwrap();
     e
 }
 
@@ -61,9 +63,8 @@ fn nested_nodes_all_costed() {
     // Every NODE line carries a cost suffix; attribute lines don't.
     for l in &lines {
         let t = l.trim_start();
-        let is_node = t.starts_with("Limit")
-            || t.starts_with("->  Sort")
-            || t.starts_with("->  Seq Scan");
+        let is_node =
+            t.starts_with("Limit") || t.starts_with("->  Sort") || t.starts_with("->  Seq Scan");
         if is_node {
             assert!(l.contains("(cost="), "node line missing cost: {l}");
             assert!(l.contains("width="), "node line missing width: {l}");
@@ -87,7 +88,10 @@ fn explain_dml_shapes() {
         vec!["Insert on t1", "  ->  Result"]
     );
     assert_eq!(
-        plan(&mut e, "EXPLAIN (COSTS OFF) UPDATE t1 SET v = 0 WHERE id = 1"),
+        plan(
+            &mut e,
+            "EXPLAIN (COSTS OFF) UPDATE t1 SET v = 0 WHERE id = 1"
+        ),
         vec![
             "Update on t1",
             "  ->  Index Scan using t1_pkey on t1",

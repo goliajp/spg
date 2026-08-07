@@ -31,14 +31,20 @@
 use spg_engine::{Engine, QueryResult};
 
 fn err_of(e: &mut Engine, sql: &str) -> String {
-    format!("{}", e.execute(sql).expect_err(&format!("PG18 refuses: {sql}")))
+    format!(
+        "{}",
+        e.execute(sql).expect_err(&format!("PG18 refuses: {sql}"))
+    )
 }
 
 #[test]
 fn round700_a_view_over_a_missing_relation_is_refused() {
     let mut e = Engine::new();
     let err = err_of(&mut e, "CREATE VIEW v700 AS SELECT * FROM nosuch700");
-    assert!(err.contains("relation \"nosuch700\" does not exist"), "{err}");
+    assert!(
+        err.contains("relation \"nosuch700\" does not exist"),
+        "{err}"
+    );
     // And nothing was left behind: the whole point is that the catalog does
     // not gain an object that cannot be read.
     let views = match e.execute("SELECT viewname FROM pg_views").unwrap() {
@@ -58,10 +64,10 @@ fn round700_the_view_body_check_is_the_body_itself() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE src700(i INT)").unwrap();
     assert!(
-        err_of(&mut e, "CREATE VIEW v700b AS SELECT nosuchcol FROM src700")
-            .contains("nosuchcol"),
+        err_of(&mut e, "CREATE VIEW v700b AS SELECT nosuchcol FROM src700").contains("nosuchcol"),
     );
-    e.execute("CREATE VIEW v700c AS SELECT i FROM src700").unwrap();
+    e.execute("CREATE VIEW v700c AS SELECT i FROM src700")
+        .unwrap();
     e.execute("INSERT INTO src700 VALUES (1)").unwrap();
     let n = match e.execute("SELECT count(*) FROM v700c").unwrap() {
         QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
@@ -69,7 +75,8 @@ fn round700_the_view_body_check_is_the_body_itself() {
     };
     assert_eq!(n, "1");
     // A view over another view still resolves.
-    e.execute("CREATE VIEW v700d AS SELECT i FROM v700c").unwrap();
+    e.execute("CREATE VIEW v700d AS SELECT i FROM v700c")
+        .unwrap();
     // And a CTE body, which resolves nothing from the catalog, is fine.
     e.execute("CREATE VIEW v700e AS WITH c AS (SELECT 1 AS x) SELECT x FROM c")
         .unwrap();
@@ -86,14 +93,18 @@ fn round700_drop_trigger_says_what_pg_says_without_a_corruption_banner() {
     );
     assert!(!err.contains("corrupt on-disk format"), "{err}");
     // IF EXISTS still says nothing.
-    e.execute("DROP TRIGGER IF EXISTS nosuch700 ON t700").unwrap();
+    e.execute("DROP TRIGGER IF EXISTS nosuch700 ON t700")
+        .unwrap();
 }
 
 #[test]
 fn round700_alter_index_rename_names_a_relation() {
     let mut e = Engine::new();
     let err = err_of(&mut e, "ALTER INDEX nosuch700 RENAME TO x700");
-    assert!(err.contains("relation \"nosuch700\" does not exist"), "{err}");
+    assert!(
+        err.contains("relation \"nosuch700\" does not exist"),
+        "{err}"
+    );
     e.execute("ALTER INDEX IF EXISTS nosuch700 RENAME TO x700")
         .unwrap();
 }
@@ -125,7 +136,10 @@ fn round700_the_shapes_that_already_matched_pg18() {
             "column \"nosuch700\" of relation \"t700\" does not exist",
         ),
         ("GRANT SELECT ON nosuch700 TO postgres", "does not exist"),
-        ("CREATE POLICY p700 ON nosuch700 USING (true)", "does not exist"),
+        (
+            "CREATE POLICY p700 ON nosuch700 USING (true)",
+            "does not exist",
+        ),
         (
             "ALTER TABLE t700 ADD CONSTRAINT c700 CHECK (j > 1)",
             "constraint \"c700\" for relation \"t700\" already exists",

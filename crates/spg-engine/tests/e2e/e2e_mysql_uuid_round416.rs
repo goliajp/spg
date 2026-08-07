@@ -90,7 +90,10 @@ fn v7_is_time_ordered() {
     // A generous sleep so the ms timestamp definitely advances.
     std::thread::sleep(std::time::Duration::from_millis(5));
     let b = scalar(&mut e, "SELECT UUID()");
-    assert!(a < b, "later UUID should sort after earlier: {a:?} then {b:?}");
+    assert!(
+        a < b,
+        "later UUID should sort after earlier: {a:?} then {b:?}"
+    );
 }
 
 /// A PostgreSQL session has no `UUID()` — the parse-time / eval-time error

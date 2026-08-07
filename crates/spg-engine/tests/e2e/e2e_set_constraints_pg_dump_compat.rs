@@ -44,6 +44,10 @@ fn set_constraints_named_applies_to_the_named_constraints() {
 fn set_constraints_named_unknown_is_an_error() {
     let mut e = Engine::new();
     ddl(&mut e, "BEGIN");
-    let msg = format!("{:?}", e.execute("SET CONSTRAINTS uq_orders_ref DEFERRED").unwrap_err());
+    let msg = format!(
+        "{:?}",
+        e.execute("SET CONSTRAINTS uq_orders_ref DEFERRED")
+            .unwrap_err()
+    );
     assert!(msg.contains("does not exist"), "got {msg}");
 }

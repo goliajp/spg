@@ -34,7 +34,10 @@ fn unique_tmpdir() -> PathBuf {
     p
 }
 
-fn spawn_server(dir: &std::path::Path, env: &[(&str, &str)]) -> (std::process::Child, common::ServerAddrs) {
+fn spawn_server(
+    dir: &std::path::Path,
+    env: &[(&str, &str)],
+) -> (std::process::Child, common::ServerAddrs) {
     let mut b = common::ServerBuilder::new()
         .arg_path(&dir.join("d.spgdb"))
         .arg("-")

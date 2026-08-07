@@ -111,8 +111,7 @@ fn round620_what_stays_refused() {
         err(&mut e, "SELECT 'a' AND true")
     );
     assert!(
-        err(&mut e, "SELECT NOT 'a'")
-            .contains(r#"invalid input syntax for type boolean: "a""#)
+        err(&mut e, "SELECT NOT 'a'").contains(r#"invalid input syntax for type boolean: "a""#)
     );
     assert!(
         err(&mut e, "SELECT 'o' AND true")

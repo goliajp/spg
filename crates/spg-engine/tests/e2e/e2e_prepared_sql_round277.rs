@@ -65,10 +65,8 @@ fn a_prepared_statement_executes_and_returns_rows() {
 #[test]
 fn declared_parameter_types_and_several_placeholders() {
     let mut e = fixture();
-    e.execute(
-        "PREPARE p2 (int, text) AS SELECT count(*) FROM pt WHERE id > $1 AND name <> $2",
-    )
-    .unwrap();
+    e.execute("PREPARE p2 (int, text) AS SELECT count(*) FROM pt WHERE id > $1 AND name <> $2")
+        .unwrap();
     assert_eq!(lines(&mut e, "EXECUTE p2(1, 'zz')"), vec!["2"]);
 }
 
@@ -100,9 +98,15 @@ fn deallocate_removes_one_and_all_removes_every() {
         err(&mut e, "EXECUTE p1"),
         "prepared statement \"p1\" does not exist",
     );
-    assert_eq!(lines(&mut e, "SELECT count(*) FROM pg_prepared_statements"), vec!["1"]);
+    assert_eq!(
+        lines(&mut e, "SELECT count(*) FROM pg_prepared_statements"),
+        vec!["1"]
+    );
     e.execute("DEALLOCATE ALL").unwrap();
-    assert_eq!(lines(&mut e, "SELECT count(*) FROM pg_prepared_statements"), vec!["0"]);
+    assert_eq!(
+        lines(&mut e, "SELECT count(*) FROM pg_prepared_statements"),
+        vec!["0"]
+    );
 }
 
 #[test]
@@ -110,10 +114,8 @@ fn pg_prepared_statements_reports_the_session() {
     let mut e = fixture();
     e.execute("PREPARE p1 AS SELECT id FROM pt WHERE id = $1")
         .unwrap();
-    e.execute(
-        "PREPARE p2 (int, text) AS SELECT count(*) FROM pt WHERE id > $1 AND name <> $2",
-    )
-    .unwrap();
+    e.execute("PREPARE p2 (int, text) AS SELECT count(*) FROM pt WHERE id > $1 AND name <> $2")
+        .unwrap();
     // PG normalises the declared names, so `int` reports as `integer`.
     // p1 declared none: PG INFERS {integer} there and SPG reports {} —
     // inference needs real parameter typing, recorded as a residual.

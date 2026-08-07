@@ -149,7 +149,10 @@ fn round523_downcast_reads_the_local_clock() {
     }
     let mut e = engine();
     assert_eq!(
-        text(&mut e, "SELECT (TIMESTAMPTZ '2020-01-01 15:00:00Z')::date::text"),
+        text(
+            &mut e,
+            "SELECT (TIMESTAMPTZ '2020-01-01 15:00:00Z')::date::text"
+        ),
         "2020-01-02"
     );
     assert_eq!(
@@ -208,12 +211,21 @@ fn round523_insert_stores_the_instant_pg_stores() {
     for (values, expect) in [
         // A bare string: a wall-clock reading in the session zone.
         ("('2020-01-01 00:00:00')", "2020-01-01 00:00:00+09"),
-        ("(TIMESTAMP '2020-01-01 00:00:00')", "2020-01-01 00:00:00+09"),
+        (
+            "(TIMESTAMP '2020-01-01 00:00:00')",
+            "2020-01-01 00:00:00+09",
+        ),
         // An offset-less timestamptz literal is local too.
-        ("(TIMESTAMPTZ '2020-01-01 00:00:00')", "2020-01-01 00:00:00+09"),
+        (
+            "(TIMESTAMPTZ '2020-01-01 00:00:00')",
+            "2020-01-01 00:00:00+09",
+        ),
         // These two already name an instant and must NOT shift — the
         // first cut of this fix moved the offset-bearing string twice.
-        ("(TIMESTAMPTZ '2020-01-01 00:00:00Z')", "2020-01-01 09:00:00+09"),
+        (
+            "(TIMESTAMPTZ '2020-01-01 00:00:00Z')",
+            "2020-01-01 09:00:00+09",
+        ),
         ("('2020-01-01 00:00:00+05')", "2020-01-01 04:00:00+09"),
     ] {
         e.execute("DELETE FROM tz1").unwrap();

@@ -310,7 +310,9 @@ impl Engine {
         use spg_storage::priv_bits;
         if !self.session_is_authenticated()
             || !role.eq_ignore_ascii_case(self.session_user())
-            || self.session_params.contains_key(crate::session::CURRENT_ROLE_KEY)
+            || self
+                .session_params
+                .contains_key(crate::session::CURRENT_ROLE_KEY)
         {
             return 0;
         }

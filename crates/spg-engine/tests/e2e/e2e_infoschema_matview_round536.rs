@@ -76,10 +76,7 @@ fn round536_matview_is_in_neither_information_schema_view() {
 fn round536_matview_is_still_in_pg_class() {
     let mut e = engine();
     assert_eq!(
-        rows(
-            &mut e,
-            "SELECT relkind FROM pg_class WHERE relname = 'mv'"
-        ),
+        rows(&mut e, "SELECT relkind FROM pg_class WHERE relname = 'mv'"),
         vec!["m"]
     );
 }

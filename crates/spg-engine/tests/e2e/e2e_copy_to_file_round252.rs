@@ -12,7 +12,8 @@ use spg_sql::ast::{CopyFormat, CopyOptions};
 
 fn seeded() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE ct (id int, name text, v int)").unwrap();
+    e.execute("CREATE TABLE ct (id int, name text, v int)")
+        .unwrap();
     e.execute("INSERT INTO ct VALUES (1,'a',10),(2,'b',NULL),(3,E'c\\ttab',30)")
         .unwrap();
     e
@@ -50,7 +51,10 @@ fn text_and_csv_payloads_match_pg_byte_for_byte() {
 fn the_query_form_renders_through_the_same_encoder() {
     let mut e = seeded();
     let inner = spg_sql::parser::parse_statement("SELECT id, name FROM ct ORDER BY id").unwrap();
-    let opts = CopyOptions { format: CopyFormat::Csv, ..CopyOptions::default() };
+    let opts = CopyOptions {
+        format: CopyFormat::Csv,
+        ..CopyOptions::default()
+    };
     let (payload, n) = e.copy_to_buffer("", None, Some(&inner), &opts).unwrap();
     assert_eq!(payload, "1,a\n2,b\n3,c\ttab\n");
     assert_eq!(n, 3);

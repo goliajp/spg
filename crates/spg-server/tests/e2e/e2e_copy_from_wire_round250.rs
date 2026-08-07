@@ -205,7 +205,10 @@ fn a_bad_row_rolls_the_whole_copy_back() {
         .spawn();
     let _guard = common::ChildGuard(raw);
     let mut s = pg_connect(addrs.pgwire.as_ref().unwrap());
-    assert_eq!(exec(&mut s, "CREATE TABLE ct (id int, name text, v int)"), None);
+    assert_eq!(
+        exec(&mut s, "CREATE TABLE ct (id int, name text, v int)"),
+        None
+    );
     // Row 1 is fine, row 2 is not: PG inserts NOTHING (COPY is one
     // command). The error is the bare cell error (22P02), not an
     // internal "COPY row INSERT failed:" wrapper.
@@ -216,11 +219,21 @@ fn a_bad_row_rolls_the_whole_copy_back() {
     )
     .expect_err("bad row must fail the COPY");
     assert_eq!(err.0, "22P02", "{}", err.1);
-    assert!(err.1.contains("invalid input syntax for type integer: \"notanint\""), "{}", err.1);
+    assert!(
+        err.1
+            .contains("invalid input syntax for type integer: \"notanint\""),
+        "{}",
+        err.1
+    );
     assert!(!err.1.contains("COPY row INSERT failed"), "{}", err.1);
     assert_eq!(first_cell(&mut s, "SELECT count(*) FROM ct"), "0");
     // The connection is healthy afterwards and a clean COPY lands.
-    let tag = copy_in(&mut s, "COPY ct FROM STDIN WITH (FORMAT csv)", "1,a,10\n2,b,\n").unwrap();
+    let tag = copy_in(
+        &mut s,
+        "COPY ct FROM STDIN WITH (FORMAT csv)",
+        "1,a,10\n2,b,\n",
+    )
+    .unwrap();
     assert_eq!(tag, "COPY 2");
     assert_eq!(first_cell(&mut s, "SELECT count(*) FROM ct"), "2");
 }

@@ -65,7 +65,10 @@ fn parenthesised_quantity() {
         "2020-01-03"
     );
     assert_eq!(
-        one(&mut e, "SELECT DATE_ADD('2020-01-01 00:00:00', INTERVAL (2*3) HOUR)"),
+        one(
+            &mut e,
+            "SELECT DATE_ADD('2020-01-01 00:00:00', INTERVAL (2*3) HOUR)"
+        ),
         "2020-01-01 06:00:00"
     );
 }
@@ -75,11 +78,17 @@ fn parenthesised_quantity() {
 fn column_quantity() {
     let mut e = seed();
     assert_eq!(
-        texts(&mut e, "SELECT DATE_ADD(d, INTERVAL n DAY) FROM t ORDER BY n"),
+        texts(
+            &mut e,
+            "SELECT DATE_ADD(d, INTERVAL n DAY) FROM t ORDER BY n"
+        ),
         vec!["2020-01-04", "2020-06-25"]
     );
     assert_eq!(
-        texts(&mut e, "SELECT DATE_SUB(d, INTERVAL n DAY) FROM t ORDER BY n"),
+        texts(
+            &mut e,
+            "SELECT DATE_SUB(d, INTERVAL n DAY) FROM t ORDER BY n"
+        ),
         vec!["2019-12-29", "2020-06-05"]
     );
     assert_eq!(
@@ -97,11 +106,17 @@ fn column_quantity() {
 fn expression_quantity() {
     let mut e = seed();
     assert_eq!(
-        texts(&mut e, "SELECT DATE_ADD(d, INTERVAL n*2 DAY) FROM t ORDER BY n"),
+        texts(
+            &mut e,
+            "SELECT DATE_ADD(d, INTERVAL n*2 DAY) FROM t ORDER BY n"
+        ),
         vec!["2020-01-07", "2020-07-05"]
     );
     assert_eq!(
-        one(&mut e, "SELECT DATE_ADD('2020-01-01', INTERVAL ABS(-5) DAY)"),
+        one(
+            &mut e,
+            "SELECT DATE_ADD('2020-01-01', INTERVAL ABS(-5) DAY)"
+        ),
         "2020-01-06"
     );
     assert_eq!(
@@ -174,13 +189,17 @@ fn literal_and_function_forms_unchanged() {
 #[test]
 fn postgres_unchanged() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT DATE '2020-01-01' + INTERVAL '3 days'"), "2020-01-04 00:00:00");
+    assert_eq!(
+        one(&mut e, "SELECT DATE '2020-01-01' + INTERVAL '3 days'"),
+        "2020-01-04 00:00:00"
+    );
     assert_eq!(one(&mut e, "SELECT INTERVAL '1' DAY"), "1 day");
     assert_eq!(one(&mut e, "SELECT INTERVAL '2 hours'"), "02:00:00");
     e.execute("CREATE TABLE t(n INT)").unwrap();
     e.execute("INSERT INTO t VALUES(3)").unwrap();
     assert!(
-        e.execute("SELECT DATE '2020-01-01' + INTERVAL n DAY FROM t").is_err(),
+        e.execute("SELECT DATE '2020-01-01' + INTERVAL n DAY FROM t")
+            .is_err(),
         "PG has no unquoted INTERVAL quantity"
     );
 }

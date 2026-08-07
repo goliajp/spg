@@ -74,10 +74,14 @@ fn replication_slot_admin_probes_return_null() {
     // answering nothing.
     let mut e = Engine::new();
     assert!(matches!(
-        first(&mut e, "SELECT pg_create_physical_replication_slot('slot1')"),
+        first(
+            &mut e,
+            "SELECT pg_create_physical_replication_slot('slot1')"
+        ),
         spg_storage::Value::Text(_)
     ));
-    e.execute("SELECT pg_drop_replication_slot('slot1')").unwrap();
+    e.execute("SELECT pg_drop_replication_slot('slot1')")
+        .unwrap();
     for f in &[
         "pg_copy_physical_replication_slot('a', 'b')",
         "pg_copy_logical_replication_slot('a', 'b', true)",

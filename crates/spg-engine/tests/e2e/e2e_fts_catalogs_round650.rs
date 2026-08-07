@@ -58,12 +58,24 @@ fn one(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn round650_ts_lexize_resolves_a_real_dictionary() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT ts_lexize('english_stem', 'running')"), "{run}");
-    assert_eq!(one(&mut e, "SELECT ts_lexize('simple', 'Running')"), "{running}");
-    // Case-insensitive, and the schema qualifier is optional.
-    assert_eq!(one(&mut e, "SELECT ts_lexize('ENGLISH_STEM', 'running')"), "{run}");
     assert_eq!(
-        one(&mut e, "SELECT ts_lexize('pg_catalog.english_stem', 'running')"),
+        one(&mut e, "SELECT ts_lexize('english_stem', 'running')"),
+        "{run}"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT ts_lexize('simple', 'Running')"),
+        "{running}"
+    );
+    // Case-insensitive, and the schema qualifier is optional.
+    assert_eq!(
+        one(&mut e, "SELECT ts_lexize('ENGLISH_STEM', 'running')"),
+        "{run}"
+    );
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT ts_lexize('pg_catalog.english_stem', 'running')"
+        ),
         "{run}"
     );
     // A stopword lexizes to the empty array under the stemmer, and to
@@ -118,18 +130,21 @@ fn round650_the_text_search_catalogs_list_what_spg_has() {
         rows(&mut e, "SELECT dictname FROM pg_ts_dict ORDER BY dictname"),
         vec!["english_stem", "simple"]
     );
-    assert_eq!(rows(&mut e, "SELECT prsname FROM pg_ts_parser"), vec!["default"]);
     assert_eq!(
-        rows(&mut e, "SELECT tmplname FROM pg_ts_template ORDER BY tmplname"),
+        rows(&mut e, "SELECT prsname FROM pg_ts_parser"),
+        vec!["default"]
+    );
+    assert_eq!(
+        rows(
+            &mut e,
+            "SELECT tmplname FROM pg_ts_template ORDER BY tmplname"
+        ),
         vec!["simple", "snowball"]
     );
     // The oids are PG's own for exactly these rows, so a tool that joins
     // on them lands where it expects.
     assert_eq!(
-        rows(
-            &mut e,
-            "SELECT oid, cfgname FROM pg_ts_config ORDER BY oid"
-        ),
+        rows(&mut e, "SELECT oid, cfgname FROM pg_ts_config ORDER BY oid"),
         vec!["3748|simple", "13248|english"]
     );
     // …and every dictionary's template resolves.

@@ -27,8 +27,10 @@ use spg_engine::{Engine, QueryResult};
 
 fn seeded() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TYPE paddr5 AS (street text, zip int)").unwrap();
-    e.execute("CREATE TYPE pnested AS (inner_a paddr5, n int)").unwrap();
+    e.execute("CREATE TYPE paddr5 AS (street text, zip int)")
+        .unwrap();
+    e.execute("CREATE TYPE pnested AS (inner_a paddr5, n int)")
+        .unwrap();
     e.execute("CREATE TABLE pnt (id int, v pnested)").unwrap();
     e.execute("INSERT INTO pnt VALUES (1, ROW(ROW('elm',9)::paddr5, 3))")
         .unwrap();
@@ -54,11 +56,17 @@ fn a_nested_composite_stays_a_record_in_expressions() {
     );
     // The inner field is a RECORD, so it can be walked into.
     assert_eq!(
-        one(&mut e, "SELECT ((ROW(ROW('s',1)::paddr5, 7)::pnested).inner_a).street"),
+        one(
+            &mut e,
+            "SELECT ((ROW(ROW('s',1)::paddr5, 7)::pnested).inner_a).street"
+        ),
         "s"
     );
     assert_eq!(
-        one(&mut e, "SELECT (ROW(ROW('s',1)::paddr5, 7)::pnested).inner_a"),
+        one(
+            &mut e,
+            "SELECT (ROW(ROW('s',1)::paddr5, 7)::pnested).inner_a"
+        ),
         "(s,1)"
     );
 }
@@ -81,6 +89,9 @@ fn a_nested_composite_column_round_trips() {
 #[test]
 fn a_composite_returning_subquery_materialises() {
     let mut e = seeded();
-    assert_eq!(one(&mut e, "SELECT (SELECT ROW('a',1)::paddr5) IS NOT NULL"), "t");
+    assert_eq!(
+        one(&mut e, "SELECT (SELECT ROW('a',1)::paddr5) IS NOT NULL"),
+        "t"
+    );
     assert_eq!(one(&mut e, "SELECT (SELECT ROW('a',1)::paddr5)"), "(a,1)");
 }

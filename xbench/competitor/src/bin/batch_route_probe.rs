@@ -7,8 +7,8 @@
 //! explicit transaction takes the ordinary path instead. Same bytes, same
 //! engine work, different route.
 use sqlx::{AnyConnection, Connection as _, Executor as _};
-use std::time::Instant;
 use std::fmt::Write as _;
+use std::time::Instant;
 
 fn batch_sql(base: i64, rows: i64) -> String {
     let mut s = String::with_capacity(rows as usize * 24 + 32);

@@ -87,5 +87,8 @@ fn round637_event_trigger_readers_name_the_trigger_kind() {
     // this one, and the binary-upgrade setters do not exist in PG at all,
     // so their NULL has nothing to disagree with.
     assert!(e.execute("SELECT pg_listening_channels()").is_ok());
-    assert!(e.execute("SELECT binary_upgrade_set_next_pg_type_oid(16384)").is_ok());
+    assert!(
+        e.execute("SELECT binary_upgrade_set_next_pg_type_oid(16384)")
+            .is_ok()
+    );
 }

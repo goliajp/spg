@@ -76,7 +76,9 @@ pub(crate) use math::{f64_ceil, f64_floor, f64_sqrt};
 use math::{
     f64_exp, f64_ln, f64_powi, f64_round_half_away, f64_trunc, prng_next_f64, prng_next_u64,
 };
-pub(crate) use regexp::{CompiledRe, compile_re, compiled_is_match, regex_is_match, regexp_matches_rows};
+pub(crate) use regexp::{
+    CompiledRe, compile_re, compiled_is_match, regex_is_match, regexp_matches_rows,
+};
 use regexp::{regexp_matches, regexp_replace, regexp_split_to_array};
 use resolve::{
     collation_fold_for_compare, compare_is_case_insensitive, composite_eq, eval_expr_cow,
@@ -103,8 +105,8 @@ pub(crate) fn datetime_resolve_zone_offset(z: &str) -> Option<i64> {
 }
 
 pub use values::value_to_text;
-pub use values::value_to_text_with_fsp;
 pub use values::value_to_text_styled;
+pub use values::value_to_text_with_fsp;
 use values::{
     array_2d_dims, array_element_at, array_len, array_rebuild, value_cmp_for_min_max, value_to_f64,
     values_equal_for_nullif,
@@ -634,11 +636,8 @@ pub(crate) fn session_read_temporal_text(
     let Value::Text(s) = &v else { return v };
     match target {
         D::Date => format::parse_date_literal_ordered(s, c.order).map_or(v, Value::Date),
-        D::Timestamp | D::Timestamptz => {
-            format::parse_timestamp_literal_tz_ordered(s, c.order).map_or(v, |(t, _)| {
-                Value::Timestamp(t)
-            })
-        }
+        D::Timestamp | D::Timestamptz => format::parse_timestamp_literal_tz_ordered(s, c.order)
+            .map_or(v, |(t, _)| Value::Timestamp(t)),
         _ => v,
     }
 }
@@ -835,10 +834,14 @@ pub(crate) fn mysql_operand_reading_pair(
         // v7.39 (round 353, M10) — a boolean IS an integer in MySQL, so
         // `!1 + 1` is 1 (measured). It was `operator does not exist:
         // boolean + integer`.
-        (Value::Bool(b), other) if mysql_arith(op) && other.data_type().is_some_and(is_numeric_type) => {
+        (Value::Bool(b), other)
+            if mysql_arith(op) && other.data_type().is_some_and(is_numeric_type) =>
+        {
             (Value::BigInt(i64::from(*b)), r)
         }
-        (other, Value::Bool(b)) if mysql_arith(op) && other.data_type().is_some_and(is_numeric_type) => {
+        (other, Value::Bool(b))
+            if mysql_arith(op) && other.data_type().is_some_and(is_numeric_type) =>
+        {
             let rr = Value::BigInt(i64::from(*b));
             (l, rr)
         }
@@ -1015,7 +1018,11 @@ pub(crate) fn mysql_true_division(
             }
         };
         let (a, b) = (f(l)?, f(r)?);
-        return Some(if b == 0.0 { Value::Null } else { Value::Float(a / b) });
+        return Some(if b == 0.0 {
+            Value::Null
+        } else {
+            Value::Float(a / b)
+        });
     }
     let (ls, lsc) = exact_decimal_parts(l)?;
     let (rs, rsc) = exact_decimal_parts(r)?;
@@ -1370,7 +1377,11 @@ fn eval_connective(
         return Err(EvalError::TypeMismatch {
             detail: alloc::format!(
                 "argument of {} must be type boolean, not type {ty}",
-                if matches!(op, BinOp::And) { "AND" } else { "OR" },
+                if matches!(op, BinOp::And) {
+                    "AND"
+                } else {
+                    "OR"
+                },
             ),
         });
     }
@@ -1458,11 +1469,7 @@ fn mysql_not(v: &Value<'_>) -> Result<Value<'static>, EvalError> {
 /// `argument of WHERE must be type boolean, not type integer`.
 ///
 /// NULL is not true (three-valued logic) and is not an error in either.
-pub(crate) fn predicate_is_true(
-    v: &Value<'_>,
-    kw: &str,
-    mysql: bool,
-) -> Result<bool, EvalError> {
+pub(crate) fn predicate_is_true(v: &Value<'_>, kw: &str, mysql: bool) -> Result<bool, EvalError> {
     match v {
         Value::Bool(b) => Ok(*b),
         Value::Null => Ok(false),
@@ -1769,7 +1776,10 @@ fn apply_enum_cast<'a>(
             }
         }
         other => Err(EvalError::TypeMismatch {
-            detail: alloc::format!("cannot cast {} to enum {name}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+            detail: alloc::format!(
+                "cannot cast {} to enum {name}",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+            ),
         }),
     }
 }
@@ -2137,10 +2147,11 @@ fn greatest_least_collation(args: &[Expr], ctx: &EvalContext<'_>) -> Option<allo
         let pos = find_column_pos(c, ctx)?;
         ctx.columns.get(pos)?.collation_name.clone()
     };
-    let derived = args.iter().fold(
-        crate::collate_derive::Derived::None,
-        |acc, a| acc.combine_pub(crate::collate_derive::derive(a, &resolve)),
-    );
+    let derived = args
+        .iter()
+        .fold(crate::collate_derive::Derived::None, |acc, a| {
+            acc.combine_pub(crate::collate_derive::derive(a, &resolve))
+        });
     derived
         .name()
         .filter(|n| crate::collate::is_supported(n))
@@ -2203,12 +2214,14 @@ fn unknown_literal_cmp_error(
             ),
         })
     };
-    if is_unknown_string_literal(lhs) && numeric(rv)
+    if is_unknown_string_literal(lhs)
+        && numeric(rv)
         && let Some(e) = rewrite(lv, rv)
     {
         return e;
     }
-    if is_unknown_string_literal(rhs) && numeric(lv)
+    if is_unknown_string_literal(rhs)
+        && numeric(lv)
         && let Some(e) = rewrite(rv, lv)
     {
         return e;
@@ -2541,7 +2554,9 @@ fn eval_cast_arm(
         // `1::nosuchtype` errored — the gap was exactly the NULL case, in
         // both spellings. Everything a catalog can name has been tried by
         // now; what is left is the builtin table.
-        if matches!(v, Value::Null) && !crate::eval::cast::builtin_target_resolves(name, ctx.mysql_dialect) {
+        if matches!(v, Value::Null)
+            && !crate::eval::cast::builtin_target_resolves(name, ctx.mysql_dialect)
+        {
             return Err(EvalError::TypeMismatch {
                 detail: cast::unknown_type_error_text(name),
             });
@@ -2656,7 +2671,8 @@ fn eval_cast_arm(
             if let Some(args_txt) = args_part {
                 // An overload IS distinguishable here — the argument list
                 // is what regprocedure exists to carry.
-                let want = crate::system_catalog::canonical_arg_types(&alloc::format!("({args_txt})"));
+                let want =
+                    crate::system_catalog::canonical_arg_types(&alloc::format!("({args_txt})"));
                 if let Some(f) = cands
                     .iter()
                     .find(|f| crate::system_catalog::canonical_arg_types(&f.args_repr) == want)
@@ -2800,13 +2816,13 @@ fn eval_cast_arm(
             }
         } else {
             return Ok(match kind {
-                "date" => Value::Date(
-                    i32::try_from(wall.div_euclid(86_400_000_000)).map_err(|_| {
+                "date" => {
+                    Value::Date(i32::try_from(wall.div_euclid(86_400_000_000)).map_err(|_| {
                         EvalError::TypeMismatch {
                             detail: "timestamp out of DATE range".into(),
                         }
-                    })?,
-                ),
+                    })?)
+                }
                 "time" => Value::Time(wall.rem_euclid(86_400_000_000)),
                 _ => Value::Timestamp(wall),
             });
@@ -3078,7 +3094,11 @@ fn eval_array_arm(
     // It usually LOOKED right (array_to_string renders `t` either way), which is
     // exactly what let it sit; the array FUNCTIONS are what tripped over it.
     if let Some(v) = values::homogeneous_typed_array(&materialised) {
-        return Ok(crate::describe::upgrade_timestamptz_array(v, items, ctx.columns));
+        return Ok(crate::describe::upgrade_timestamptz_array(
+            v,
+            items,
+            ctx.columns,
+        ));
     }
     // v7.39 (round 236) — PG resolves an ARRAY constructor's elements to ONE
     // element type and refuses the constructor when they have no common one:
@@ -3095,7 +3115,11 @@ fn eval_array_arm(
     // path before falling into the numeric/text ladder below — otherwise
     // the now-uniform boolean array would still degrade to text[].
     if let Some(v) = values::homogeneous_typed_array(&materialised) {
-        return Ok(crate::describe::upgrade_timestamptz_array(v, items, ctx.columns));
+        return Ok(crate::describe::upgrade_timestamptz_array(
+            v,
+            items,
+            ctx.columns,
+        ));
     }
     let mut has_text = false;
     let mut has_float = false;
@@ -3643,8 +3667,7 @@ fn eval_function_call_positional(
         && ctx
             .columns
             .iter()
-            .any(|sc| sc.name.eq_ignore_ascii_case(&c.name)
-                && sc.ty == spg_storage::DataType::Name)
+            .any(|sc| sc.name.eq_ignore_ascii_case(&c.name) && sc.ty == spg_storage::DataType::Name)
     {
         return Ok(Value::text::<alloc::string::String>("name".into()));
     }
@@ -3903,7 +3926,11 @@ fn eval_function_call_positional(
             if is_unknown_string_literal(a)
                 && let Some(slot) = coerced.get_mut(i)
             {
-                *slot = cast::cast_value_in(core::mem::replace(slot, Value::Null), want.clone(), false)?;
+                *slot = cast::cast_value_in(
+                    core::mem::replace(slot, Value::Null),
+                    want.clone(),
+                    false,
+                )?;
             }
         }
         return apply_function(name, &coerced, ctx);
@@ -4124,11 +4151,12 @@ fn eval_case_arm(
             Some(op_v) => {
                 let (l, r) = if ctx.mysql_dialect {
                     match (op_v, &when_value) {
-                        (Value::Text(x), Value::Text(y))
-                        | (Value::BpChar(x), Value::BpChar(y)) => (
-                            Value::text(spg_storage::mysql_compare_fold(x)),
-                            Value::text(spg_storage::mysql_compare_fold(y)),
-                        ),
+                        (Value::Text(x), Value::Text(y)) | (Value::BpChar(x), Value::BpChar(y)) => {
+                            (
+                                Value::text(spg_storage::mysql_compare_fold(x)),
+                                Value::text(spg_storage::mysql_compare_fold(y)),
+                            )
+                        }
                         _ => (op_v.clone(), when_value),
                     }
                 } else {
@@ -4202,7 +4230,10 @@ fn eval_array_slice_arm(
             Ok(Value::BigIntArray(items[s..e].to_vec()))
         }
         other => Err(EvalError::TypeMismatch {
-            detail: format!("slice target must be an array, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+            detail: format!(
+                "slice target must be an array, got {}",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+            ),
         }),
     }
 }
@@ -4298,7 +4329,10 @@ fn eval_like_arm(
         (Value::Text(a) | Value::BpChar(a), Value::Text(b) | Value::BpChar(b)) => (a, b),
         (Value::Text(_) | Value::BpChar(_), other) | (other, _) => {
             return Err(EvalError::TypeMismatch {
-                detail: format!("LIKE requires text operands, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+                detail: format!(
+                    "LIKE requires text operands, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                ),
             });
         }
     };
@@ -4828,11 +4862,8 @@ pub fn eval_expr(
                 // v7.39 (enum order knife) — enum-typed operands compare by
                 // member order, not label text. Cold unless both sides are
                 // Text and the catalog has enum types at all.
-                if matches!(lc.as_ref(), Value::Text(_))
-                    && matches!(rc.as_ref(), Value::Text(_))
-                {
-                    if let Some(r) =
-                        enum_compare_hook(*op, lhs, rhs, lc.as_ref(), rc.as_ref(), ctx)
+                if matches!(lc.as_ref(), Value::Text(_)) && matches!(rc.as_ref(), Value::Text(_)) {
+                    if let Some(r) = enum_compare_hook(*op, lhs, rhs, lc.as_ref(), rc.as_ref(), ctx)
                     {
                         return r;
                     }
@@ -5276,7 +5307,10 @@ fn fn_string_to_array(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
         Value::Text(t) => t,
         other => {
             return Err(EvalError::TypeMismatch {
-                detail: alloc::format!("string_to_array expects text, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+                detail: alloc::format!(
+                    "string_to_array expects text, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                ),
             });
         }
     };
@@ -5495,10 +5529,7 @@ impl crate::Engine {
         // the function's OWNER. Measured on PG 18.4: a definer function
         // owned by `owner55` counts rows of a table `caller55` cannot read,
         // while the SECURITY INVOKER sibling is refused.
-        let as_role = def
-            .security_definer
-            .then(|| def.owner.as_deref())
-            .flatten();
+        let as_role = def.security_definer.then(|| def.owner.as_deref()).flatten();
         let out = self
             .exec_select_cancel_as(&bound, crate::CancelToken::none(), as_role)
             .map_err(|e| EvalError::TypeMismatch {
@@ -6024,10 +6055,7 @@ pub(crate) fn unify_branch_types_static<'e>(
         // Refusing a valid query is worse than missing an invalid one, so
         // the check confines itself to an explicit cast, a typed literal and
         // a plain column reference.
-        let known = matches!(
-            e,
-            Expr::Cast { .. } | Expr::Literal(_) | Expr::Column(_)
-        );
+        let known = matches!(e, Expr::Cast { .. } | Expr::Literal(_) | Expr::Column(_));
         if !known {
             continue;
         }
@@ -6138,13 +6166,12 @@ pub(crate) fn unify_construct_values(
         if !items.get(i).is_some_and(untyped) || matches!(v, Value::Null) {
             continue;
         }
-        *v = crate::conversions::coerce_value(v.clone(), target, "", i)
-            .map_err(|e| match e {
-                crate::EngineError::Eval(ev) => ev,
-                other => EvalError::TypeMismatch {
-                    detail: alloc::format!("{other}"),
-                },
-            })?;
+        *v = crate::conversions::coerce_value(v.clone(), target, "", i).map_err(|e| match e {
+            crate::EngineError::Eval(ev) => ev,
+            other => EvalError::TypeMismatch {
+                detail: alloc::format!("{other}"),
+            },
+        })?;
     }
     Ok(())
 }

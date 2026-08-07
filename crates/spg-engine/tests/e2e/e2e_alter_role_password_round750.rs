@@ -21,7 +21,10 @@ fn round750_password_rotation_takes_effect() {
     );
     assert_eq!(e.verify_user("u750", "newpw"), Some(Role::ReadOnly));
     // The SCRAM verifier re-derived too (pgwire SASL reads it).
-    assert!(e.user_scram("u750").is_some(), "scram must survive rotation");
+    assert!(
+        e.user_scram("u750").is_some(),
+        "scram must survive rotation"
+    );
     // The ALTER ROLE spelling and the no-WITH form work the same.
     e.execute("ALTER ROLE u750 PASSWORD 'thirdpw'").unwrap();
     assert_eq!(e.verify_user("u750", "newpw"), None);
@@ -49,7 +52,8 @@ fn round750_missing_role_refuses_and_other_attrs_still_no_op() {
     assert!(err.contains("role \"nosuch750\" does not exist"), "{err}");
     // Attribute-only ALTERs stay validated no-ops (the r708 behaviour).
     e.execute("CREATE USER u750 WITH PASSWORD 'pw'").unwrap();
-    e.execute("ALTER USER u750 WITH CONNECTION LIMIT 5").unwrap();
+    e.execute("ALTER USER u750 WITH CONNECTION LIMIT 5")
+        .unwrap();
     assert_eq!(
         e.verify_user("u750", "pw"),
         Some(Role::ReadOnly),

@@ -62,9 +62,7 @@ fn round526_relpersistence_says_temporary() {
         assert_eq!(
             text(
                 &mut e,
-                &format!(
-                    "SELECT relkind, relpersistence FROM pg_class WHERE relname = '{name}'"
-                )
+                &format!("SELECT relkind, relpersistence FROM pg_class WHERE relname = '{name}'")
             ),
             expect,
             "pg_class row for {name}"
@@ -101,7 +99,10 @@ fn round526_numeric_reg_casts_resolve() {
     // An oid that names nothing prints as the bare number, as regclass does.
     assert_eq!(text(&mut e, "SELECT (99999::regnamespace)::text"), "99999");
     // The name direction still works.
-    assert_eq!(text(&mut e, "SELECT ('public'::regnamespace)::text"), "public");
+    assert_eq!(
+        text(&mut e, "SELECT ('public'::regnamespace)::text"),
+        "public"
+    );
     // And a role oid.
     assert_eq!(text(&mut e, "SELECT (10::regrole)::text"), "postgres");
 }

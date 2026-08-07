@@ -52,7 +52,10 @@ fn round638_pg_proc_lists_what_the_engine_has() {
     // every candidate name and reading the engine's own reply, which
     // separates "does not exist" from "takes N args".
     assert_eq!(vals(&mut e, "SELECT count(*) FROM pg_proc"), vec!["881"]);
-    assert_eq!(vals(&mut e, "SELECT count(DISTINCT proname) FROM pg_proc"), vec!["573"]);
+    assert_eq!(
+        vals(&mut e, "SELECT count(DISTINCT proname) FROM pg_proc"),
+        vec!["573"]
+    );
     // Signatures byte for byte with PG18's for the same names.
     assert_eq!(
         vals(
@@ -100,13 +103,15 @@ fn round638_pg_type_lists_the_pseudo_and_multirange_types() {
             "SELECT typname, oid, typtype FROM pg_type \
              WHERE typname IN ('anyelement','anyarray','record','regtype') ORDER BY 1"
         ),
-        vec!["anyarray|2277|p", "anyelement|2283|p", "record|2249|p", "regtype|2206|b"]
+        vec![
+            "anyarray|2277|p",
+            "anyelement|2283|p",
+            "record|2249|p",
+            "regtype|2206|b"
+        ]
     );
     assert_eq!(
-        vals(
-            &mut e,
-            "SELECT count(*) FROM pg_type WHERE typtype = 'm'"
-        ),
+        vals(&mut e, "SELECT count(*) FROM pg_type WHERE typtype = 'm'"),
         vec!["6"],
         "the multirange family"
     );
@@ -121,6 +126,10 @@ fn round638_pg_type_lists_the_pseudo_and_multirange_types() {
         // under `ORDER BY 1, 2 LIMIT 3` its first three are the two
         // array_aggs and first_value. SPG matches that now; the old
         // expectation was the shape from before the overload layer.
-        vec!["array_agg|anyarray", "array_agg|anyarray", "first_value|anyelement"]
+        vec![
+            "array_agg|anyarray",
+            "array_agg|anyarray",
+            "first_value|anyelement"
+        ]
     );
 }

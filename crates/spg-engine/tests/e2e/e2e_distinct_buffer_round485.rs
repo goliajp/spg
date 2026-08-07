@@ -64,9 +64,13 @@ fn round485_bignum_gate_still_orders_beyond_i128() {
 fn round485_numeric_scale_still_folds_under_distinct() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE n (v NUMERIC)").unwrap();
-    e.execute("INSERT INTO n VALUES (1), (1.0), (1.00)").unwrap();
+    e.execute("INSERT INTO n VALUES (1), (1.0), (1.00)")
+        .unwrap();
     // PG18: one row. Scale-aware equality, not textual.
-    assert_eq!(rows(&mut e, "SELECT count(*) FROM (SELECT DISTINCT v FROM n) s"), "1");
+    assert_eq!(
+        rows(&mut e, "SELECT count(*) FROM (SELECT DISTINCT v FROM n) s"),
+        "1"
+    );
 }
 
 #[test]
@@ -88,7 +92,10 @@ fn round485_bpchar_still_ignores_trailing_blanks() {
     e.execute("INSERT INTO c VALUES ('ab'), ('ab    '), ('abc'), ('b')")
         .unwrap();
     // PG18: 'ab' and 'ab    ' are one value, so three distinct rows.
-    assert_eq!(rows(&mut e, "SELECT count(*) FROM (SELECT DISTINCT v FROM c) s"), "3");
+    assert_eq!(
+        rows(&mut e, "SELECT count(*) FROM (SELECT DISTINCT v FROM c) s"),
+        "3"
+    );
     assert_eq!(
         rows(&mut e, "SELECT v::text AS t FROM c ORDER BY v, t"),
         "ab;ab;abc;b"
@@ -98,7 +105,8 @@ fn round485_bpchar_still_ignores_trailing_blanks() {
 #[test]
 fn round485_cross_width_integers_still_widen() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE i (a SMALLINT, b INT, c BIGINT)").unwrap();
+    e.execute("CREATE TABLE i (a SMALLINT, b INT, c BIGINT)")
+        .unwrap();
     e.execute("INSERT INTO i VALUES (9, 1000, -5)").unwrap();
     // Values from three widths ordered together: by magnitude, not by
     // spelling ("1000" would sort before "9" lexicographically).
@@ -115,12 +123,16 @@ fn round485_cross_width_integers_still_widen() {
 #[test]
 fn round485_same_variant_ordering_is_not_reversed() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE s (t TEXT, b BOOLEAN, i INT)").unwrap();
+    e.execute("CREATE TABLE s (t TEXT, b BOOLEAN, i INT)")
+        .unwrap();
     e.execute("INSERT INTO s VALUES ('b', true, 2), ('a', false, 1), ('c', true, 3)")
         .unwrap();
     assert_eq!(rows(&mut e, "SELECT t FROM s ORDER BY t"), "a;b;c");
     assert_eq!(rows(&mut e, "SELECT t FROM s ORDER BY t DESC"), "c;b;a");
-    assert_eq!(rows(&mut e, "SELECT b::text AS x FROM s ORDER BY b"), "false;true;true");
+    assert_eq!(
+        rows(&mut e, "SELECT b::text AS x FROM s ORDER BY b"),
+        "false;true;true"
+    );
     assert_eq!(rows(&mut e, "SELECT i FROM s ORDER BY i"), "1;2;3");
 }
 
@@ -160,7 +172,10 @@ fn round485_distinct_two_columns_across_reuse() {
         "1|x;1|y;2|x;2|NULL;NULL|z"
     );
     assert_eq!(
-        rows(&mut e, "SELECT count(*) FROM (SELECT DISTINCT a, b FROM d) s"),
+        rows(
+            &mut e,
+            "SELECT count(*) FROM (SELECT DISTINCT a, b FROM d) s"
+        ),
         "5"
     );
 }
@@ -181,7 +196,10 @@ fn round485_distinct_over_unique_column_keeps_every_row() {
 fn round485_distinct_with_limit_and_expression() {
     let mut e = seeded();
     assert_eq!(
-        rows(&mut e, "SELECT DISTINCT a FROM d ORDER BY a NULLS LAST LIMIT 2"),
+        rows(
+            &mut e,
+            "SELECT DISTINCT a FROM d ORDER BY a NULLS LAST LIMIT 2"
+        ),
         "1;2"
     );
     assert_eq!(

@@ -143,8 +143,7 @@ impl Engine {
         if !t.schema().row_security {
             return Ok(());
         }
-        let pred =
-            build_policy_predicate(
+        let pred = build_policy_predicate(
             t.schema(),
             self.current_role(),
             &self.users.memberships_of_transitive(self.current_role()),
@@ -301,8 +300,7 @@ impl Engine {
             return false;
         };
         let cat = self.active_catalog();
-        is_rls_base(&from.primary, cat)
-            || from.joins.iter().any(|j| is_rls_base(&j.table, cat))
+        is_rls_base(&from.primary, cat) || from.joins.iter().any(|j| is_rls_base(&j.table, cat))
     }
 }
 

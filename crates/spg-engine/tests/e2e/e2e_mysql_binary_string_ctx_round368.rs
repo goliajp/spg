@@ -57,8 +57,5 @@ fn concat_ws_reads_bytes_as_a_string() {
 #[test]
 fn postgres_session_keeps_hex_rendering() {
     let mut p = Engine::new();
-    assert_eq!(
-        text(&mut p, "SELECT CONCAT('\\x41'::bytea, 'B')"),
-        "\\x41B"
-    );
+    assert_eq!(text(&mut p, "SELECT CONCAT('\\x41'::bytea, 'B')"), "\\x41B");
 }

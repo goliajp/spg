@@ -1134,7 +1134,11 @@ impl<'arena> Value<'arena> {
             // b tid)` is accepted), but SPG's grammar has no keyword for
             // them yet; they stay eval-only rather than half-declared.
             Self::Xid(_) => Some(DataType::Xid),
-            Self::RegClass(..) | Self::RegProc(..) | Self::RegType(..) | Self::Tid(..) | Self::Cid(_) => None,
+            Self::RegClass(..)
+            | Self::RegProc(..)
+            | Self::RegType(..)
+            | Self::Tid(..)
+            | Self::Cid(_) => None,
             Self::Null => None,
         }
     }
@@ -2002,7 +2006,9 @@ pub enum PartitionRole {
     ///   * `DROP TABLE 父表` 不带 CASCADE **报错**(分区父表连子表一起删)。
     /// 多父继承合法,故 `parent_names` 是 Vec;`pg_inherits.inhseqno`
     /// 正是父表在这个列表里的位置(1-based)。
-    Inherits { parent_names: Vec<String> },
+    Inherits {
+        parent_names: Vec<String>,
+    },
     /// v7.37.16 (16.2) — HASH child:行属于本 child iff
     /// `pg_compatible_hash(key) mod modulus == remainder`。
     /// PG 强制 `0 ≤ remainder < modulus`;parser/DDL 层先 gate。
@@ -5333,9 +5339,7 @@ impl Catalog {
     }
 
     #[must_use]
-    pub const fn db_role_settings(
-        &self,
-    ) -> &BTreeMap<(String, String), BTreeMap<String, String>> {
+    pub const fn db_role_settings(&self) -> &BTreeMap<(String, String), BTreeMap<String, String>> {
         &self.db_role_settings
     }
 
@@ -5658,7 +5662,11 @@ impl Catalog {
     /// `lo_create(0)` / `lo_creat(-1)` spelling. Errors when the
     /// requested OID is taken.
     pub fn create_large_object(&mut self, oid: u32, bytes: Vec<u8>) -> Result<u32, String> {
-        let id = if oid == 0 { self.next_large_object_oid() } else { oid };
+        let id = if oid == 0 {
+            self.next_large_object_oid()
+        } else {
+            oid
+        };
         if self.large_objects.contains_key(&id) {
             return Err(format!("large object {id} already exists"));
         }
@@ -7607,7 +7615,11 @@ impl fmt::Display for StorageError {
             Self::IndexNotFound { name } => write!(f, "index \"{name}\" does not exist"),
             Self::Unsupported(detail) => write!(f, "unsupported: {detail}"),
             // v7.39 (round 220) — PG's exact 2200H wording.
-            Self::SequenceExhausted { name, limit, is_max } => write!(
+            Self::SequenceExhausted {
+                name,
+                limit,
+                is_max,
+            } => write!(
                 f,
                 "nextval: reached {} value of sequence \"{name}\" ({limit})",
                 if *is_max { "maximum" } else { "minimum" }
@@ -9242,7 +9254,10 @@ impl Catalog {
         );
         for (oid, bytes) in &self.large_objects {
             write_u32(&mut out, *oid);
-            write_u32(&mut out, u32::try_from(bytes.len()).expect("≤ 4G per object"));
+            write_u32(
+                &mut out,
+                u32::try_from(bytes.len()).expect("≤ 4G per object"),
+            );
             out.extend_from_slice(bytes);
         }
         // v7.39 (round 322, V46) — function-attribute block (FILE_VERSION
@@ -9625,8 +9640,7 @@ impl Catalog {
                 let name = cur.read_str()?;
                 let field_count = cur.read_u16()? as usize;
                 let mut fields = Vec::with_capacity(field_count);
-                let mut field_user_types: Vec<Option<String>> =
-                    Vec::with_capacity(field_count);
+                let mut field_user_types: Vec<Option<String>> = Vec::with_capacity(field_count);
                 for _ in 0..field_count {
                     let fname = cur.read_str()?;
                     let fty = cur.read_data_type()?;

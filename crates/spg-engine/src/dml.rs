@@ -263,8 +263,8 @@ fn view_redirect_checked(
     // v7.39 (round 133) — a column-rename list maps the view's column names back
     // to the primary's columns.
     let rename_cols = view.columns.clone();
-    let stmt = spg_sql::parser::parse_statement(&view.body)
-        .map_err(|_| ViewNotUpdatable::Unsupported)?;
+    let stmt =
+        spg_sql::parser::parse_statement(&view.body).map_err(|_| ViewNotUpdatable::Unsupported)?;
     let select = match stmt {
         spg_sql::ast::Statement::Select(s) => s,
         _ => return Err(ViewNotUpdatable::Unsupported),
@@ -291,7 +291,10 @@ fn view_redirect_checked(
     if select.limit.is_some() || select.offset.is_some() {
         return Err(ViewNotUpdatable::LimitOffset);
     }
-    let from = select.from.as_ref().ok_or(ViewNotUpdatable::NotSingleTable)?;
+    let from = select
+        .from
+        .as_ref()
+        .ok_or(ViewNotUpdatable::NotSingleTable)?;
     if !from.joins.is_empty() {
         return Err(ViewNotUpdatable::NotSingleTable);
     }
@@ -316,7 +319,9 @@ fn view_redirect_checked(
                 // renamed-wildcard-over-nested-view bails at the rename
                 // length check below, as before.
                 if is_leaf {
-                    let base = catalog.get(&primary_name).ok_or(ViewNotUpdatable::Unsupported)?;
+                    let base = catalog
+                        .get(&primary_name)
+                        .ok_or(ViewNotUpdatable::Unsupported)?;
                     for c in &base.schema().columns {
                         out_cols.push((c.name.clone(), Some(c.name.clone()), None));
                     }
@@ -464,7 +469,9 @@ fn view_redirect_checked(
                 if let Some(c) = inner.computed.iter().find(|c| c.name == *inner_ref) {
                     composed.push((name.clone(), None, Some(c)));
                 } else {
-                    let base = inner_by_name.get(inner_ref.as_str()).ok_or(ViewNotUpdatable::Unsupported)?;
+                    let base = inner_by_name
+                        .get(inner_ref.as_str())
+                        .ok_or(ViewNotUpdatable::Unsupported)?;
                     // A simple inner column — its base name is right there.
                     composed.push((name.clone(), (*base).clone(), None));
                 }
@@ -744,8 +751,8 @@ use crate::{
     enforce_uniqueness_inserts, eval, eval_runtime_default_free, expr_has_subquery,
     literal_expr_to_value, literal_expr_to_value_in, lookup_row_position_by_keys,
     on_conflict_keys_exist, plan_fk_parent_deletions, plan_fk_parent_updates,
-    resolve_column_default_free, triggers, try_index_seek_positions,
-    try_pk_predicate, value_to_literal_expr_permissive,
+    resolve_column_default_free, triggers, try_index_seek_positions, try_pk_predicate,
+    value_to_literal_expr_permissive,
 };
 
 /// Pre-borrow snapshots gathered by `prepare_insert_snapshots` for the
@@ -848,8 +855,7 @@ impl Engine {
         if source_cols.is_empty() {
             return Ok(None);
         }
-        let in_target =
-            |n: &str| target_cols.iter().any(|c| c.name.eq_ignore_ascii_case(n));
+        let in_target = |n: &str| target_cols.iter().any(|c| c.name.eq_ignore_ascii_case(n));
         let in_source = |n: &str| source_cols.iter().any(|c| c.eq_ignore_ascii_case(n));
         let mut out = stmt.clone();
         let mut changed = false;
@@ -1178,7 +1184,12 @@ impl Engine {
         // catalog plainly has.
         if let Err(reason) = view_redirect_checked(self.active_catalog(), &stmt.table) {
             if self.active_catalog().has_view(&stmt.table) {
-                return Err(view_not_updatable_error(&stmt.table, &UPDATE_VERB, reason, false));
+                return Err(view_not_updatable_error(
+                    &stmt.table,
+                    &UPDATE_VERB,
+                    reason,
+                    false,
+                ));
             }
         }
         if let Some(vr) = view_redirect_to_simple_base(self.active_catalog(), &stmt.table) {
@@ -1277,10 +1288,7 @@ impl Engine {
         // not the body.
         if !stmt.only
             && (crate::partition::is_partition_parent(self.active_catalog(), &stmt.table)
-                || crate::partition::has_inheritance_children(
-                    self.active_catalog(),
-                    &stmt.table,
-                ))
+                || crate::partition::has_inheritance_children(self.active_catalog(), &stmt.table))
         {
             let inherit_fanout =
                 !crate::partition::is_partition_parent(self.active_catalog(), &stmt.table);
@@ -1444,8 +1452,11 @@ impl Engine {
                         // same predicate as the hot path and must read the
                         // same session.
                         let cold_sess = self.dml_session();
-                        let ctx = eval::EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())))
-                            .with_session(&cold_sess);
+                        let ctx = eval::EvalContext::new(
+                            &schema_cols,
+                            Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())),
+                        )
+                        .with_session(&cold_sess);
                         for (key, row) in
                             crate::constraints::iter_cold_rows_with_pk_key(self.active_catalog(), t)
                         {
@@ -1601,10 +1612,13 @@ impl Engine {
         // `self` mutably; a session bag is small and this is once per
         // statement.
         let sess = self.dml_session();
-        let ctx = EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())))
-            .with_default_text_search_config(ts_cfg.as_deref())
-            .with_catalog(&cat_for_ctx)
-            .with_session(&sess);
+        let ctx = EvalContext::new(
+            &schema_cols,
+            Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())),
+        )
+        .with_default_text_search_config(ts_cfg.as_deref())
+        .with_catalog(&cat_for_ctx)
+        .with_session(&sess);
         // Walk candidate rows, evaluate WHERE then SET
         // expressions. We gather (position, new_values) tuples
         // first and apply them afterwards so the WHERE/RHS
@@ -1623,18 +1637,9 @@ impl Engine {
         // versions this snapshot cannot see, and the loop below skips on
         // exactly the same test, so the two must agree.
         let scan_snapshot = self.current_snapshot();
-        let seek_positions: Option<Vec<usize>> = stmt
-            .where_
-            .as_ref()
-            .and_then(|w| {
-                try_index_seek_positions(
-                    w,
-                    &schema_cols,
-                    table,
-                    stmt.table.as_str(),
-                    &scan_snapshot,
-                )
-            });
+        let seek_positions: Option<Vec<usize>> = stmt.where_.as_ref().and_then(|w| {
+            try_index_seek_positions(w, &schema_cols, table, stmt.table.as_str(), &scan_snapshot)
+        });
         let mut planned: Vec<(usize, Vec<Value<'static>>)> = Vec::new();
         let candidate_positions: Vec<usize> = match &seek_positions {
             Some(list) => list.clone(),
@@ -1710,7 +1715,8 @@ impl Engine {
                 if matches!(expr, Expr::FunctionCall { name, args }
                     if name == "__column_default" && args.is_empty())
                 {
-                    let v = resolve_column_default_free(&schema_cols[*pos], self.clock, Some(&sess))?;
+                    let v =
+                        resolve_column_default_free(&schema_cols[*pos], self.clock, Some(&sess))?;
                     new_vals[*pos] = v;
                     continue;
                 }
@@ -1755,7 +1761,12 @@ impl Engine {
             // v7.17.0 Phase 2.1 — apply ON UPDATE overrides for
             // any column the SET clause didn't touch.
             for (pos, src) in &on_update_overrides {
-                let v = eval_runtime_default_free(src, schema_cols[*pos].ty, clock_for_on_update, Some(&sess))?;
+                let v = eval_runtime_default_free(
+                    src,
+                    schema_cols[*pos].ty,
+                    clock_for_on_update,
+                    Some(&sess),
+                )?;
                 new_vals[*pos] = v;
             }
             planned.push((i, new_vals));
@@ -2001,7 +2012,9 @@ impl Engine {
                     Some(&raise_sink),
                 );
                 raised_notices.extend(raise_sink.into_inner());
-                let (outcome, deferred) = fired.map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                let (outcome, deferred) = fired.map_err(|e| {
+                    EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
+                })?;
                 deferred_embedded.extend(deferred);
                 match outcome {
                     triggers::TriggerOutcome::Row(r) => new_row = r,
@@ -2123,7 +2136,9 @@ impl Engine {
                     Some(&raise_sink),
                 );
                 raised_notices.extend(raise_sink.into_inner());
-                let (_outcome, deferred) = fired.map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                let (_outcome, deferred) = fired.map_err(|e| {
+                    EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
+                })?;
                 deferred_embedded.extend(deferred);
             }
         }
@@ -2648,8 +2663,7 @@ impl Engine {
                 col.nullable,
             ));
         }
-        let source_only_ctx =
-            EvalContext::new(&source_only_schema, None).with_session(&merge_sess);
+        let source_only_ctx = EvalContext::new(&source_only_schema, None).with_session(&merge_sess);
         let target_arity = target_cols.len();
         let source_arity = source_cols.len();
 
@@ -3230,7 +3244,12 @@ impl Engine {
         // catalog plainly has.
         if let Err(reason) = view_redirect_checked(self.active_catalog(), &stmt.table) {
             if self.active_catalog().has_view(&stmt.table) {
-                return Err(view_not_updatable_error(&stmt.table, &DELETE_VERB, reason, false));
+                return Err(view_not_updatable_error(
+                    &stmt.table,
+                    &DELETE_VERB,
+                    reason,
+                    false,
+                ));
             }
         }
         if let Some(vr) = view_redirect_to_simple_base(self.active_catalog(), &stmt.table) {
@@ -3290,10 +3309,7 @@ impl Engine {
         // not the body.
         if !stmt.only
             && (crate::partition::is_partition_parent(self.active_catalog(), &stmt.table)
-                || crate::partition::has_inheritance_children(
-                    self.active_catalog(),
-                    &stmt.table,
-                ))
+                || crate::partition::has_inheritance_children(self.active_catalog(), &stmt.table))
         {
             let inherit_fanout =
                 !crate::partition::is_partition_parent(self.active_catalog(), &stmt.table);
@@ -3408,8 +3424,11 @@ impl Engine {
                         // same predicate as the hot path and must read the
                         // same session.
                         let cold_sess = self.dml_session();
-                        let ctx = eval::EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())))
-                            .with_session(&cold_sess);
+                        let ctx = eval::EvalContext::new(
+                            &schema_cols,
+                            Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())),
+                        )
+                        .with_session(&cold_sess);
                         for (key, row) in
                             crate::constraints::iter_cold_rows_with_pk_key(self.active_catalog(), t)
                         {
@@ -3472,10 +3491,13 @@ impl Engine {
             let cat_for_ctx = self.active_catalog().clone();
             // v7.39 (round 524) — with the session, like UPDATE's.
             let sess = self.dml_session();
-            let ctx = EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())))
-                .with_default_text_search_config(ts_cfg.as_deref())
-                .with_catalog(&cat_for_ctx)
-                .with_session(&sess);
+            let ctx = EvalContext::new(
+                &schema_cols,
+                Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())),
+            )
+            .with_default_text_search_config(ts_cfg.as_deref())
+            .with_catalog(&cat_for_ctx)
+            .with_session(&sess);
             // v7.37.16 (gate-on inventory) — visibility gate, same as
             // the main walk below: a tombstoned version must not be
             // re-targeted. No-op under gate-off.
@@ -3553,10 +3575,13 @@ impl Engine {
             ));
         }
         let schema_cols = schema_cols;
-        let ctx = EvalContext::new(&schema_cols, Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())))
-            .with_default_text_search_config(ts_cfg.as_deref())
-            .with_catalog(&cat_for_ctx)
-            .with_session(&sess);
+        let ctx = EvalContext::new(
+            &schema_cols,
+            Some(stmt.alias.as_deref().unwrap_or(stmt.table.as_str())),
+        )
+        .with_default_text_search_config(ts_cfg.as_deref())
+        .with_catalog(&cat_for_ctx)
+        .with_session(&sess);
         let mut positions: Vec<usize> = Vec::new();
         // v7.6.3 — collect every to-delete row's full Value tuple
         // alongside its position, so the FK enforcement pass can
@@ -3571,18 +3596,9 @@ impl Engine {
         // to the matching hot positions; the full WHERE still
         // re-evaluates per candidate. Downstream passes assume
         // ascending position order, so the seek result is sorted.
-        let seek_positions: Option<Vec<usize>> = stmt
-            .where_
-            .as_ref()
-            .and_then(|w| {
-                try_index_seek_positions(
-                    w,
-                    &schema_cols,
-                    table,
-                    stmt.table.as_str(),
-                    &scan_snapshot,
-                )
-            });
+        let seek_positions: Option<Vec<usize>> = stmt.where_.as_ref().and_then(|w| {
+            try_index_seek_positions(w, &schema_cols, table, stmt.table.as_str(), &scan_snapshot)
+        });
         let candidate_positions: Vec<usize> = match seek_positions {
             Some(mut list) => {
                 list.sort_unstable();
@@ -4106,7 +4122,9 @@ impl Engine {
                     Some(&raise_sink),
                 );
                 raised_notices.extend(raise_sink.into_inner());
-                let (outcome, deferred) = fired.map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                let (outcome, deferred) = fired.map_err(|e| {
+                    EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
+                })?;
                 deferred_all.extend(deferred);
                 match outcome {
                     triggers::TriggerOutcome::Row(r) => current = r,
@@ -4459,7 +4477,9 @@ impl Engine {
                     Some(&raise_sink),
                 );
                 raised_notices.extend(raise_sink.into_inner());
-                let (outcome, deferred) = fired.map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+                let (outcome, deferred) = fired.map_err(|e| {
+                    EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
+                })?;
                 deferred_all.extend(deferred);
                 match outcome {
                     triggers::TriggerOutcome::Row(r) => current = r,
@@ -4561,7 +4581,12 @@ impl Engine {
         // catalog plainly has.
         if let Err(reason) = view_redirect_checked(self.active_catalog(), &stmt.table) {
             if self.active_catalog().has_view(&stmt.table) {
-                return Err(view_not_updatable_error(&stmt.table, &INSERT_VERB, reason, false));
+                return Err(view_not_updatable_error(
+                    &stmt.table,
+                    &INSERT_VERB,
+                    reason,
+                    false,
+                ));
             }
         }
         if let Some(vr) = view_redirect_to_simple_base(self.active_catalog(), &stmt.table) {
@@ -4917,7 +4942,12 @@ impl Engine {
         // v7.13.0 — CHECK constraint enforcement (mailrs round-5 G3).
         // v7.39 (round 525) — with the session: a CHECK may name one.
         let check_sess = self.dml_session();
-        enforce_check_constraints(self.active_catalog(), &stmt.table, &all_values, Some(&check_sess))?;
+        enforce_check_constraints(
+            self.active_catalog(),
+            &stmt.table,
+            &all_values,
+            Some(&check_sess),
+        )?;
         // v7.39 (RLS) Phase 2 — INSERT WITH CHECK: a policy-subject session's
         // new rows must satisfy the combined WITH CHECK predicate.
         self.rls_check_new_rows(
@@ -4945,13 +4975,12 @@ impl Engine {
         //     row using the incoming row's values as `EXCLUDED.*`.
         let (pending_updates, skipped_count) = match &stmt.on_conflict {
             Some(clause) => {
-                let (kept, pending, skipped) =
-                    self.resolve_insert_on_conflict(
-                        &stmt.table,
-                        stmt.alias.as_deref(),
-                        clause,
-                        all_values,
-                    )?;
+                let (kept, pending, skipped) = self.resolve_insert_on_conflict(
+                    &stmt.table,
+                    stmt.alias.as_deref(),
+                    clause,
+                    all_values,
+                )?;
                 all_values = kept;
                 (pending, skipped)
             }
@@ -5511,8 +5540,8 @@ impl Engine {
                     .ok_or_else(|| {
                         EngineError::Unsupported(alloc::format!(
                             // v7.39 (round 621) — PG's exact wording, which the row-movement
-                                // differential reads.
-                                "no partition of relation {parent_name:?} found for row"
+                            // differential reads.
+                            "no partition of relation {parent_name:?} found for row"
                         ))
                     })?,
                 // v7.37.16 (16.2) — HASH routing: hash(key) mod
@@ -6807,8 +6836,10 @@ fn parse_insert_rows(
             // v7.39 (round 523) — captured before the expressions are
             // consumed: only the EXPRESSION can say whether a value already
             // names an instant (see the fast path's note).
-            let slot_is_tstz: Vec<bool> =
-                tuple.iter().map(|e| expr_names_an_instant(e, date_order)).collect();
+            let slot_is_tstz: Vec<bool> = tuple
+                .iter()
+                .map(|e| expr_names_an_instant(e, date_order))
+                .collect();
             let raw_tuple: Vec<Option<Value<'static>>> = tuple
                 .into_iter()
                 .map(|e| {
@@ -6975,8 +7006,7 @@ fn parse_insert_rows(
                     };
                     auto_cursors.insert(i, cursor.max(n.saturating_add(1)));
                 }
-                let raw =
-                    crate::conversions::normalize_composite_for_column(raw, col, catalog)?;
+                let raw = crate::conversions::normalize_composite_for_column(raw, col, catalog)?;
                 let raw = crate::conversions::mysql_bytes_for_column(raw, col.ty, mysql);
                 // v7.39 (round 434) — `INSERT IGNORE` bends a value that
                 // would otherwise raise, so a MySQL bulk load never stops
@@ -7147,7 +7177,8 @@ fn insert_parsed_rows(
                 Some(&raise_sink),
             );
             raised_notices.extend(raise_sink.into_inner());
-            let (outcome, deferred) = fired.map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+            let (outcome, deferred) = fired
+                .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
             deferred_embedded.extend(deferred);
             match outcome {
                 triggers::TriggerOutcome::Row(r) => row = r,
@@ -7205,7 +7236,8 @@ fn insert_parsed_rows(
                 Some(&raise_sink),
             );
             raised_notices.extend(raise_sink.into_inner());
-            let (_outcome, deferred) = fired.map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+            let (_outcome, deferred) = fired
+                .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
             deferred_embedded.extend(deferred);
         }
     }
@@ -7661,29 +7693,27 @@ fn resolve_unqualified_source_leaf(
                 )));
             }
             if source {
-                *e = Expr::ScalarSubquery(alloc::boxed::Box::new(
-                    spg_sql::ast::SelectStatement {
-                        locking: None,
-                        ctes: Vec::new(),
-                        distinct: false,
-                        distinct_on: Vec::new(),
-                        items: alloc::vec![spg_sql::ast::SelectItem::Expr {
-                            expr: e.clone(),
-                            alias: None,
-                        }],
-                        from: Some(from.clone()),
-                        where_: sub_where.cloned(),
-                        group_by: None,
-                        group_by_all: false,
-                        having: None,
-                        unions: Vec::new(),
-                        order_by: Vec::new(),
-                        limit: None,
-                        offset: None,
-                        limit_with_ties: false,
-            window_check_exprs: Vec::new(),
-                    },
-                ));
+                *e = Expr::ScalarSubquery(alloc::boxed::Box::new(spg_sql::ast::SelectStatement {
+                    locking: None,
+                    ctes: Vec::new(),
+                    distinct: false,
+                    distinct_on: Vec::new(),
+                    items: alloc::vec![spg_sql::ast::SelectItem::Expr {
+                        expr: e.clone(),
+                        alias: None,
+                    }],
+                    from: Some(from.clone()),
+                    where_: sub_where.cloned(),
+                    group_by: None,
+                    group_by_all: false,
+                    having: None,
+                    unions: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                    limit_with_ties: false,
+                    window_check_exprs: Vec::new(),
+                }));
                 *changed = true;
             }
             Ok(())

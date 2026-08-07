@@ -101,7 +101,10 @@ fn round482_shapes_it_must_decline_still_work() {
     assert_eq!(n_rows(&mut e, "SELECT count(*) FROM t WHERE id = g"), "0");
     assert_eq!(n_rows(&mut e, "SELECT count(*) FROM t WHERE id > g"), "1");
     // an arithmetic operand
-    assert_eq!(n_rows(&mut e, "SELECT count(*) FROM t WHERE g + 1 = 6"), "2");
+    assert_eq!(
+        n_rows(&mut e, "SELECT count(*) FROM t WHERE g + 1 = 6"),
+        "2"
+    );
     // a compound predicate
     assert_eq!(
         n_rows(&mut e, "SELECT count(*) FROM t WHERE g = 5 AND id > 1"),
@@ -147,7 +150,10 @@ fn round483_the_guards_the_fast_dispatch_skips_still_fire() {
     assert_eq!(n_rows(&mut e, "SELECT count(*) FROM c WHERE '5' = i"), "1");
     assert_eq!(n_rows(&mut e, "SELECT count(*) FROM c WHERE b = '5'"), "1");
     // bpchar still compares blank-insensitively against text.
-    assert_eq!(n_rows(&mut e, "SELECT count(*) FROM c WHERE ch = 'ab'"), "1");
+    assert_eq!(
+        n_rows(&mut e, "SELECT count(*) FROM c WHERE ch = 'ab'"),
+        "1"
+    );
     // cross-width integer pairs still compare by value.
     assert_eq!(n_rows(&mut e, "SELECT count(*) FROM c WHERE i = b"), "1");
     assert_eq!(n_rows(&mut e, "SELECT count(*) FROM c WHERE i < b"), "0");
@@ -164,13 +170,11 @@ fn round483_ordering_is_unchanged_across_the_variants() {
     // A reordered dispatch that got an ordering backwards would still pass
     // an equality test; sort the whole column instead.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE o (i INT, s TEXT, f BOOLEAN)").unwrap();
+    e.execute("CREATE TABLE o (i INT, s TEXT, f BOOLEAN)")
+        .unwrap();
     e.execute("INSERT INTO o VALUES (3,'c',true),(1,'a',false),(2,'b',true)")
         .unwrap();
     assert_eq!(n_rows(&mut e, "SELECT i FROM o ORDER BY i"), "1;2;3");
     assert_eq!(n_rows(&mut e, "SELECT s FROM o ORDER BY s DESC"), "c;b;a");
-    assert_eq!(
-        n_rows(&mut e, "SELECT count(*) FROM o WHERE f = true"),
-        "2"
-    );
+    assert_eq!(n_rows(&mut e, "SELECT count(*) FROM o WHERE f = true"), "2");
 }

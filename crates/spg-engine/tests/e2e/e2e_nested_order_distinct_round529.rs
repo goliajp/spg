@@ -66,7 +66,10 @@ fn round529_order_by_alias_survives_nesting() {
     let expect = vec!["5", "10", "20"];
     // On its own — this always worked.
     assert_eq!(
-        rows(&mut e, "SELECT v AS w FROM s WHERE v IS NOT NULL ORDER BY w"),
+        rows(
+            &mut e,
+            "SELECT v AS w FROM s WHERE v IS NOT NULL ORDER BY w"
+        ),
         expect
     );
     // In a derived table.
@@ -140,7 +143,10 @@ fn round529_distinct_on_key_need_not_be_projected() {
     );
     // Projecting it still works, and gives the same grouping.
     assert_eq!(
-        rows(&mut e, "SELECT DISTINCT ON (g) g, v FROM s ORDER BY g, v DESC"),
+        rows(
+            &mut e,
+            "SELECT DISTINCT ON (g) g, v FROM s ORDER BY g, v DESC"
+        ),
         vec!["a|20", "b|NULL"]
     );
     // Several keys: four distinct (g, v) pairs, so four rows. The

@@ -54,13 +54,22 @@ fn round629_b_and_c_are_consumed() {
     );
     // B blanks the integer digits of a zero, and did so already — the bug
     // was the letter in front of them.
-    assert_eq!(vals(&mut e, "SELECT to_char(0,'B9999.99')"), vec!["     .00"]);
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(0,'B9999.99')"),
+        vec!["     .00"]
+    );
     // C is the ISO currency code: empty in the C locale, either side.
     assert_eq!(
-        vals(&mut e, "SELECT to_char(1234,'C9999'), to_char(1234,'9999C')"),
+        vals(
+            &mut e,
+            "SELECT to_char(1234,'C9999'), to_char(1234,'9999C')"
+        ),
         vec![" 1234| 1234"]
     );
-    assert_eq!(vals(&mut e, "SELECT to_char(1,'BB9'), to_char(1,'CC9')"), vec![" 1| 1"]);
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(1,'BB9'), to_char(1,'CC9')"),
+        vec![" 1| 1"]
+    );
 }
 
 #[test]
@@ -81,8 +90,14 @@ fn round629_no_numeric_field_means_no_sign_column() {
     assert_eq!(vals(&mut e, "SELECT to_char(12,'DAY')"), vec![" .AY"]);
     // And a picture with slots is untouched.
     assert_eq!(
-        vals(&mut e, "SELECT to_char(1,'9'), to_char(1,'99'), to_char(1234.5,'9999.9')"),
+        vals(
+            &mut e,
+            "SELECT to_char(1,'9'), to_char(1,'99'), to_char(1234.5,'9999.9')"
+        ),
         vec![" 1|  1| 1234.5"]
     );
-    assert_eq!(vals(&mut e, "SELECT to_char(-1,'9'), to_char(-1234.5,'9999.9')"), vec!["-1|-1234.5"]);
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(-1,'9'), to_char(-1234.5,'9999.9')"),
+        vec!["-1|-1234.5"]
+    );
 }

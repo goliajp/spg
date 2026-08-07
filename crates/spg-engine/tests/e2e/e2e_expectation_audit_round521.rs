@@ -90,8 +90,14 @@ fn round521_cash_words_says_and() {
 #[test]
 fn round521_array_to_json_pretty_shape() {
     let mut e = engine();
-    assert_eq!(text(&mut e, "SELECT array_to_json(ARRAY[1,2,3], true)"), "[1,\n 2,\n 3]");
-    assert_eq!(text(&mut e, "SELECT array_to_json(ARRAY[1,2,3], false)"), "[1,2,3]");
+    assert_eq!(
+        text(&mut e, "SELECT array_to_json(ARRAY[1,2,3], true)"),
+        "[1,\n 2,\n 3]"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT array_to_json(ARRAY[1,2,3], false)"),
+        "[1,2,3]"
+    );
 }
 
 /// `strip` takes a TSVECTOR, so an unknown literal becomes one — it used to
@@ -101,7 +107,10 @@ fn round521_array_to_json_pretty_shape() {
 fn round521_strip_answers_a_tsvector() {
     let mut e = engine();
     assert_eq!(text(&mut e, "SELECT strip('cat dog')::text"), "'cat' 'dog'");
-    assert_eq!(text(&mut e, "SELECT pg_typeof(strip('cat dog'))"), "tsvector");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(strip('cat dog'))"),
+        "tsvector"
+    );
     // And the positions really are gone.
     assert_eq!(
         text(&mut e, "SELECT strip('cat:3 dog:7'::tsvector)::text"),

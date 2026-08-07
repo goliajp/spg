@@ -395,7 +395,8 @@ impl crate::Engine {
             }
             let mut values = Vec::with_capacity(projection.len());
             for pi in &projection {
-                values.push(crate::eval::eval_expr(&pi.expr, row, &ctx).map_err(EngineError::Eval)?);
+                values
+                    .push(crate::eval::eval_expr(&pi.expr, row, &ctx).map_err(EngineError::Eval)?);
             }
             budget.charge(crate::bytebudget::approx_values_bytes(&values))?;
             rows.push(Row::new(values));
@@ -529,7 +530,10 @@ impl crate::Engine {
         direction: CursorDirection,
     ) -> Result<crate::QueryResult, EngineError> {
         self.cursor_produce_for(name, direction)?;
-        let cur = self.cursors.get_mut(name).ok_or_else(|| no_such_cursor(name))?;
+        let cur = self
+            .cursors
+            .get_mut(name)
+            .ok_or_else(|| no_such_cursor(name))?;
         let slice = cur.fetch(direction, name)?;
         Ok(crate::QueryResult::Rows {
             columns: cur.columns.clone(),
@@ -582,7 +586,10 @@ impl crate::Engine {
         direction: CursorDirection,
     ) -> Result<crate::QueryResult, EngineError> {
         self.cursor_produce_for(name, direction)?;
-        let cur = self.cursors.get_mut(name).ok_or_else(|| no_such_cursor(name))?;
+        let cur = self
+            .cursors
+            .get_mut(name)
+            .ok_or_else(|| no_such_cursor(name))?;
         let slice = cur.fetch(direction, name)?;
         Ok(crate::QueryResult::CommandOk {
             affected: moved_count(&slice),

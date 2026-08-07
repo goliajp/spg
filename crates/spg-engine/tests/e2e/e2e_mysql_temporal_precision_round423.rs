@@ -50,10 +50,16 @@ fn bare_temporal_cast_has_precision_zero() {
         one(&mut e, "SELECT CAST('2020-01-01 00:00:00.256' AS DATETIME)"),
         "2020-01-01 00:00:00"
     );
-    assert_eq!(one(&mut e, "SELECT CAST('10:00:00.756' AS TIME)"), "10:00:00");
+    assert_eq!(
+        one(&mut e, "SELECT CAST('10:00:00.756' AS TIME)"),
+        "10:00:00"
+    );
     // The explicit `(0)` spelling agrees.
     assert_eq!(
-        one(&mut e, "SELECT CAST('2020-01-01 00:00:00.256' AS DATETIME(0))"),
+        one(
+            &mut e,
+            "SELECT CAST('2020-01-01 00:00:00.256' AS DATETIME(0))"
+        ),
         "2020-01-01 00:00:00"
     );
 }
@@ -64,19 +70,31 @@ fn precision_reduction_truncates() {
     let mut e = mysql();
     // .256 -> .2 (a rounding implementation would give .3).
     assert_eq!(
-        one(&mut e, "SELECT CAST('2020-01-01 00:00:00.256' AS DATETIME(1))"),
+        one(
+            &mut e,
+            "SELECT CAST('2020-01-01 00:00:00.256' AS DATETIME(1))"
+        ),
         "2020-01-01 00:00:00.2"
     );
     assert_eq!(
-        one(&mut e, "SELECT CAST('2020-01-01 00:00:00.256' AS DATETIME(2))"),
+        one(
+            &mut e,
+            "SELECT CAST('2020-01-01 00:00:00.256' AS DATETIME(2))"
+        ),
         "2020-01-01 00:00:00.25"
     );
     // .999 -> .9, not 1.0.
     assert_eq!(
-        one(&mut e, "SELECT CAST('2020-01-01 00:00:00.999' AS DATETIME(1))"),
+        one(
+            &mut e,
+            "SELECT CAST('2020-01-01 00:00:00.999' AS DATETIME(1))"
+        ),
         "2020-01-01 00:00:00.9"
     );
-    assert_eq!(one(&mut e, "SELECT CAST('10:00:00.756' AS TIME(1))"), "10:00:00.7");
+    assert_eq!(
+        one(&mut e, "SELECT CAST('10:00:00.756' AS TIME(1))"),
+        "10:00:00.7"
+    );
 }
 
 /// A precision that keeps every digit is a no-op on the value.
@@ -84,7 +102,10 @@ fn precision_reduction_truncates() {
 fn full_precision_keeps_value() {
     let mut e = mysql();
     assert_eq!(
-        one(&mut e, "SELECT CAST('2020-01-01 00:00:00.256' AS DATETIME(6))"),
+        one(
+            &mut e,
+            "SELECT CAST('2020-01-01 00:00:00.256' AS DATETIME(6))"
+        ),
         // MariaDB renders `.256000`; the INSTANT matches, the zero-padding
         // is the queued column/expression-precision work.
         "2020-01-01 00:00:00.256"
@@ -124,8 +145,10 @@ fn column_precision_write_half_is_modelled() {
     let mut e = mysql();
     e.execute("CREATE TABLE t0(d DATETIME)").unwrap();
     e.execute("CREATE TABLE t6(d DATETIME(6))").unwrap();
-    e.execute("INSERT INTO t0 VALUES('2020-01-01 00:00:00.25')").unwrap();
-    e.execute("INSERT INTO t6 VALUES('2020-01-01 00:00:00.25')").unwrap();
+    e.execute("INSERT INTO t0 VALUES('2020-01-01 00:00:00.25')")
+        .unwrap();
+    e.execute("INSERT INTO t6 VALUES('2020-01-01 00:00:00.25')")
+        .unwrap();
     // Precision 0 -> the fraction is dropped, as MariaDB does (round 424).
     assert_eq!(one(&mut e, "SELECT d FROM t0"), "2020-01-01 00:00:00");
     // MariaDB renders '2020-01-01 00:00:00.250000'; the instant matches and
@@ -139,7 +162,10 @@ fn column_precision_write_half_is_modelled() {
 fn postgres_unchanged() {
     let mut e = Engine::new();
     assert_eq!(
-        one(&mut e, "SELECT CAST('2020-01-01 00:00:00.256' AS TIMESTAMP)"),
+        one(
+            &mut e,
+            "SELECT CAST('2020-01-01 00:00:00.256' AS TIMESTAMP)"
+        ),
         "2020-01-01 00:00:00.256"
     );
     assert_eq!(
@@ -148,8 +174,14 @@ fn postgres_unchanged() {
     );
     // PG rounds .256 up to .3 at precision 1.
     assert_eq!(
-        one(&mut e, "SELECT CAST('2020-01-01 00:00:00.256' AS TIMESTAMP(1))"),
+        one(
+            &mut e,
+            "SELECT CAST('2020-01-01 00:00:00.256' AS TIMESTAMP(1))"
+        ),
         "2020-01-01 00:00:00.3"
     );
-    assert_eq!(one(&mut e, "SELECT CAST('10:00:00.756' AS TIME)"), "10:00:00.756");
+    assert_eq!(
+        one(&mut e, "SELECT CAST('10:00:00.756' AS TIME)"),
+        "10:00:00.756"
+    );
 }

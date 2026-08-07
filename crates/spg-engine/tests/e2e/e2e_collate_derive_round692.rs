@@ -34,10 +34,8 @@ fn rows(e: &mut Engine, sql: &str) -> String {
 }
 
 fn seed(e: &mut Engine) {
-    e.execute(
-        "CREATE TABLE d692(a TEXT COLLATE \"en_US.utf8\", b TEXT COLLATE \"C\", plain TEXT)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE d692(a TEXT COLLATE \"en_US.utf8\", b TEXT COLLATE \"C\", plain TEXT)")
+        .unwrap();
     e.execute(
         "INSERT INTO d692 VALUES ('Zebra','Zebra','Zebra'),('apple','apple','apple'),\
          ('Banana','Banana','Banana'),('Ápple','Ápple','Ápple'),('cherry','cherry','cherry')",

@@ -96,126 +96,121 @@ impl Engine {
                 let v = eval::eval_expr(expr, &dummy_row, &ctx).map_err(EngineError::Eval)?;
                 crate::eval::values::flatten_2d(&v).unwrap_or(v)
             };
-            let (elem_dtype, rows) =
-                match unnest_src {
-                    Value::Null => (DataType::Text, Vec::new()),
-                    Value::TextArray(items) => (
-                        DataType::Text,
-                        items
-                            .into_iter()
-                            .map(|item| {
-                                Row::new(alloc::vec![match item {
-                                    Some(s) => Value::text(s),
-                                    None => Value::Null,
-                                }])
-                            })
-                            .collect(),
-                    ),
-                    Value::IntArray(items) => (
-                        DataType::Int,
-                        items
-                            .into_iter()
-                            .map(|item| {
-                                Row::new(alloc::vec![match item {
-                                    Some(n) => Value::Int(n),
-                                    None => Value::Null,
-                                }])
-                            })
-                            .collect(),
-                    ),
-                    Value::BigIntArray(items) => (
-                        DataType::BigInt,
-                        items
-                            .into_iter()
-                            .map(|item| {
-                                Row::new(alloc::vec![match item {
-                                    Some(n) => Value::BigInt(n),
-                                    None => Value::Null,
-                                }])
-                            })
-                            .collect(),
-                    ),
-                    // v7.39 (round 759, F31-B8b) — unnest(tsvector) in a
-                    // JOINED FROM list (the primary-position executor got
-                    // this arm in round 758; `FROM unnest(tsv) t, …` comes
-                    // through here instead). Same PG18-measured shape:
-                    // lexeme | positions | weights.
-                    Value::TsVector(lexemes) => {
-                        let mut cols = alloc::vec![
-                            ColumnSchema::new("lexeme".to_string(), DataType::Text, true),
-                            ColumnSchema::new(
-                                "positions".to_string(),
-                                DataType::SmallIntArray,
-                                true
-                            ),
-                            ColumnSchema::new("weights".to_string(), DataType::TextArray, true),
-                        ];
-                        for (i, new_name) in tref.unnest_column_aliases.iter().enumerate() {
-                            if let Some(col) = cols.get_mut(i) {
-                                col.name = new_name.clone();
-                            }
+            let (elem_dtype, rows) = match unnest_src {
+                Value::Null => (DataType::Text, Vec::new()),
+                Value::TextArray(items) => (
+                    DataType::Text,
+                    items
+                        .into_iter()
+                        .map(|item| {
+                            Row::new(alloc::vec![match item {
+                                Some(s) => Value::text(s),
+                                None => Value::Null,
+                            }])
+                        })
+                        .collect(),
+                ),
+                Value::IntArray(items) => (
+                    DataType::Int,
+                    items
+                        .into_iter()
+                        .map(|item| {
+                            Row::new(alloc::vec![match item {
+                                Some(n) => Value::Int(n),
+                                None => Value::Null,
+                            }])
+                        })
+                        .collect(),
+                ),
+                Value::BigIntArray(items) => (
+                    DataType::BigInt,
+                    items
+                        .into_iter()
+                        .map(|item| {
+                            Row::new(alloc::vec![match item {
+                                Some(n) => Value::BigInt(n),
+                                None => Value::Null,
+                            }])
+                        })
+                        .collect(),
+                ),
+                // v7.39 (round 759, F31-B8b) — unnest(tsvector) in a
+                // JOINED FROM list (the primary-position executor got
+                // this arm in round 758; `FROM unnest(tsv) t, …` comes
+                // through here instead). Same PG18-measured shape:
+                // lexeme | positions | weights.
+                Value::TsVector(lexemes) => {
+                    let mut cols = alloc::vec![
+                        ColumnSchema::new("lexeme".to_string(), DataType::Text, true),
+                        ColumnSchema::new("positions".to_string(), DataType::SmallIntArray, true),
+                        ColumnSchema::new("weights".to_string(), DataType::TextArray, true),
+                    ];
+                    for (i, new_name) in tref.unnest_column_aliases.iter().enumerate() {
+                        if let Some(col) = cols.get_mut(i) {
+                            col.name = new_name.clone();
                         }
-                        let mut rows: Vec<Row<'static>> = lexemes
-                            .iter()
-                            .map(|l| {
-                                let (pos, wts) = if l.positions.is_empty() {
-                                    (Value::Null, Value::Null)
-                                } else {
-                                    let letter = match l.weight {
-                                        3 => "A",
-                                        2 => "B",
-                                        1 => "C",
-                                        _ => "D",
-                                    };
-                                    (
-                                        Value::SmallIntArray(
-                                            l.positions
-                                                .iter()
-                                                .map(|p| Some(i16::try_from(*p).unwrap_or(i16::MAX)))
-                                                .collect(),
-                                        ),
-                                        Value::TextArray(
-                                            l.positions.iter().map(|_| Some(letter.into())).collect(),
-                                        ),
-                                    )
+                    }
+                    let mut rows: Vec<Row<'static>> = lexemes
+                        .iter()
+                        .map(|l| {
+                            let (pos, wts) = if l.positions.is_empty() {
+                                (Value::Null, Value::Null)
+                            } else {
+                                let letter = match l.weight {
+                                    3 => "A",
+                                    2 => "B",
+                                    1 => "C",
+                                    _ => "D",
                                 };
-                                Row::new(alloc::vec![Value::text(l.word.clone()), pos, wts])
+                                (
+                                    Value::SmallIntArray(
+                                        l.positions
+                                            .iter()
+                                            .map(|p| Some(i16::try_from(*p).unwrap_or(i16::MAX)))
+                                            .collect(),
+                                    ),
+                                    Value::TextArray(
+                                        l.positions.iter().map(|_| Some(letter.into())).collect(),
+                                    ),
+                                )
+                            };
+                            Row::new(alloc::vec![Value::text(l.word.clone()), pos, wts])
+                        })
+                        .collect();
+                    if tref.with_ordinality {
+                        let ord_name = tref
+                            .unnest_column_aliases
+                            .get(3)
+                            .cloned()
+                            .unwrap_or_else(|| alloc::string::String::from("ordinality"));
+                        cols.push(ColumnSchema::new(ord_name, DataType::BigInt, false));
+                        rows = rows
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, row)| {
+                                let mut vals = row.values;
+                                vals.push(Value::BigInt(i as i64 + 1));
+                                Row::new(vals)
                             })
                             .collect();
-                        if tref.with_ordinality {
-                            let ord_name = tref
-                                .unnest_column_aliases
-                                .get(3)
-                                .cloned()
-                                .unwrap_or_else(|| alloc::string::String::from("ordinality"));
-                            cols.push(ColumnSchema::new(ord_name, DataType::BigInt, false));
-                            rows = rows
-                                .into_iter()
-                                .enumerate()
-                                .map(|(i, row)| {
-                                    let mut vals = row.values;
-                                    vals.push(Value::BigInt(i as i64 + 1));
-                                    Row::new(vals)
-                                })
-                                .collect();
-                        }
-                        return Ok((rows, cols));
                     }
-                    other => {
-                        // v7.39 (round 622, S05a) — a `TypeMismatch`, not an
-                        // `Unsupported`: unnest IS supported, this value is
-                        // the wrong type for it. The third site already
-                        // spelled it that way, so the same user-visible
-                        // sentence carried two SQLSTATEs depending on which
-                        // of the three raised it. PG answers 42883 for all.
-                        return Err(EngineError::Eval(EvalError::TypeMismatch {
-                            detail: alloc::format!(
-                                "unnest() expects an array argument, got {}",
-                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
-                            ),
-                        }));
-                    }
-                };
+                    return Ok((rows, cols));
+                }
+                other => {
+                    // v7.39 (round 622, S05a) — a `TypeMismatch`, not an
+                    // `Unsupported`: unnest IS supported, this value is
+                    // the wrong type for it. The third site already
+                    // spelled it that way, so the same user-visible
+                    // sentence carried two SQLSTATEs depending on which
+                    // of the three raised it. PG answers 42883 for all.
+                    return Err(EngineError::Eval(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "unnest() expects an array argument, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                        ),
+                    }));
+                }
+            };
             let alias = tref.alias.clone().unwrap_or_else(|| "unnest".to_string());
             let col_name = tref.unnest_column_aliases.first().cloned().unwrap_or(alias);
             let mut cols = alloc::vec![ColumnSchema::new(col_name, elem_dtype, true)];
@@ -314,10 +309,8 @@ impl Engine {
         // v7.39 (round 295, E3 Phase 1b) — drop the rows the locking
         // pre-pass found held by someone else. Read-only: the locks were
         // taken under `&mut self` before this scan ran.
-        let mut rows: Vec<Row<'static>> = table
-            .scan_visible(&snap)
-            .map(|(_, r)| r.clone())
-            .collect();
+        let mut rows: Vec<Row<'static>> =
+            table.scan_visible(&snap).map(|(_, r)| r.clone()).collect();
         // v7.35.1 (mailrs prod #6 follow-up) — same fix as the
         // filtered variant: append every cold-tier row (one pass over
         // a unique BTree picks each row exactly once) so non-indexed

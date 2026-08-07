@@ -82,7 +82,8 @@ fn match_full_is_reported_as_full() {
     // The default spells NONE, not SIMPLE; an explicit MATCH FULL — the
     // one SPG actually enforces differently — must be visible here.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE mf_par (id int PRIMARY KEY)").unwrap();
+    e.execute("CREATE TABLE mf_par (id int PRIMARY KEY)")
+        .unwrap();
     e.execute("CREATE TABLE mf_child (a int REFERENCES mf_par(id) MATCH FULL)")
         .unwrap();
     assert_eq!(

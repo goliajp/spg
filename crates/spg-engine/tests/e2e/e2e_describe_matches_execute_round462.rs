@@ -48,8 +48,10 @@ const AGREE: &[&str] = &[
 
 fn seeded() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE wb(id INT PRIMARY KEY, g INT NOT NULL)").unwrap();
-    e.execute("CREATE TABLE wc(id INT PRIMARY KEY, h INT NOT NULL)").unwrap();
+    e.execute("CREATE TABLE wb(id INT PRIMARY KEY, g INT NOT NULL)")
+        .unwrap();
+    e.execute("CREATE TABLE wc(id INT PRIMARY KEY, h INT NOT NULL)")
+        .unwrap();
     e.execute("INSERT INTO wb VALUES (1,10),(2,20)").unwrap();
     e.execute("INSERT INTO wc VALUES (1,100),(2,200)").unwrap();
     e.execute("CREATE VIEW wv AS SELECT id, g FROM wb").unwrap();

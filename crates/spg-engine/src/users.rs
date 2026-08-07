@@ -432,10 +432,7 @@ impl UserStore {
     /// `grp`, including through nested grants). BFS with a seen-set
     /// so a grant cycle can't loop. Names are stored as given; the
     /// caller compares case-insensitively.
-    pub fn memberships_of_transitive(
-        &self,
-        member: &str,
-    ) -> alloc::collections::BTreeSet<String> {
+    pub fn memberships_of_transitive(&self, member: &str) -> alloc::collections::BTreeSet<String> {
         let mut seen: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
         let mut queue: alloc::vec::Vec<String> = alloc::vec![String::from(member)];
         while let Some(cur) = queue.pop() {
@@ -960,7 +957,8 @@ impl Engine {
         // v7.37 (round 828) — through the role router: inside a
         // transaction this writes the TX's shadow store, so ROLLBACK
         // undoes it and COMMIT publishes it, exactly like the catalog.
-        self.role_ddl_users_mut().create(name, password, role, salt)?;
+        self.role_ddl_users_mut()
+            .create(name, password, role, salt)?;
         // v4.8: also derive SCRAM-SHA-256 secrets so PG-wire SASL
         // auth can verify without re-running PBKDF2 per attempt.
         // Uses a fresh salt from the host RNG (falls back to a
@@ -1004,7 +1002,8 @@ impl Engine {
             },
             |f| f(),
         );
-        self.role_ddl_users_mut().set_password(name, password, salt)?;
+        self.role_ddl_users_mut()
+            .set_password(name, password, salt)?;
         if let Some(p) = password {
             let scram_salt = self.salt_fn.map_or_else(
                 || {

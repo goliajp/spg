@@ -103,7 +103,10 @@ fn round651_a_hyphenated_word_keeps_its_compound() {
 #[test]
 fn round651_markup_does_not_reach_the_index() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT to_tsvector('simple', '<b>x</b>')"), "'x':1");
+    assert_eq!(
+        one(&mut e, "SELECT to_tsvector('simple', '<b>x</b>')"),
+        "'x':1"
+    );
     assert_eq!(one(&mut e, "SELECT to_tsvector('simple', '&amp;')"), "");
     // …and a whole sentence of it.
     assert_eq!(
@@ -121,7 +124,10 @@ fn round651_markup_does_not_reach_the_index() {
 fn round651_a_url_splits_only_when_its_head_is_a_host() {
     let mut e = Engine::new();
     assert_eq!(
-        one(&mut e, "SELECT to_tsvector('simple', 'http://example.com/a/b')"),
+        one(
+            &mut e,
+            "SELECT to_tsvector('simple', 'http://example.com/a/b')"
+        ),
         "'/a/b':3 'example.com':2 'example.com/a/b':1"
     );
     // A one-letter last label is not a host; PG calls the whole thing a
@@ -139,7 +145,10 @@ fn round651_a_url_splits_only_when_its_head_is_a_host() {
 #[test]
 fn round651_ts_token_type_lists_the_parser_it_has() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT count(*) FROM ts_token_type('default')"), "23");
+    assert_eq!(
+        one(&mut e, "SELECT count(*) FROM ts_token_type('default')"),
+        "23"
+    );
     assert_eq!(
         rows(
             &mut e,
@@ -203,5 +212,8 @@ fn round651_ts_debug_reports_the_pipeline_that_runs() {
             "hword_asciipart|run|english_stem|{run}",
         ]
     );
-    assert!(e.execute("SELECT * FROM ts_debug('nosuchcfg', 'x')").is_err());
+    assert!(
+        e.execute("SELECT * FROM ts_debug('nosuchcfg', 'x')")
+            .is_err()
+    );
 }

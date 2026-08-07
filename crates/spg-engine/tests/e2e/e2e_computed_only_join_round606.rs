@@ -65,8 +65,10 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE ja (id INT, g INT, b BIGINT, n NUMERIC, s TEXT)").unwrap();
-    e.execute("CREATE TABLE jb2 (id INT, g INT, b BIGINT, n NUMERIC, s TEXT)").unwrap();
+    e.execute("CREATE TABLE ja (id INT, g INT, b BIGINT, n NUMERIC, s TEXT)")
+        .unwrap();
+    e.execute("CREATE TABLE jb2 (id INT, g INT, b BIGINT, n NUMERIC, s TEXT)")
+        .unwrap();
     e.execute(
         "INSERT INTO ja VALUES (1,10,1,1.0,'a'),(2,20,2,2.0,'b'),(3,30,NULL,NULL,NULL),\
          (4,10,4,4.00,'d'),(5,20,5,5.0,'e'),(NULL,10,6,6.0,'f')",
@@ -86,7 +88,10 @@ fn seed() -> Engine {
 fn round606_every_join_kind_on_a_computed_key() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb2 b ON a.id = b.id + 1 ORDER BY 1,2"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb2 b ON a.id = b.id + 1 ORDER BY 1,2"
+        ),
         vec!["1|0", "2|1", "3|2", "4|3", "5|4"]
     );
     assert_eq!(
@@ -130,36 +135,57 @@ fn round606_every_join_kind_on_a_computed_key() {
 fn round606_key_expression_shapes() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb2 b ON a.id = b.id - 1 ORDER BY 1,2"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb2 b ON a.id = b.id - 1 ORDER BY 1,2"
+        ),
         vec!["1|2", "2|3", "3|4"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb2 b ON a.id = b.id % 3 ORDER BY 1,2"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb2 b ON a.id = b.id % 3 ORDER BY 1,2"
+        ),
         vec!["1|1", "1|4", "2|2"],
         "several build rows per key"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb2 b ON a.id = b.id / 2 ORDER BY 1,2"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb2 b ON a.id = b.id / 2 ORDER BY 1,2"
+        ),
         vec!["1|2", "1|3", "2|4"],
         "integer division"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb2 b ON a.id = -b.id ORDER BY 1,2"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb2 b ON a.id = -b.id ORDER BY 1,2"
+        ),
         Vec::<String>::new(),
         "unary minus, matching nothing"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb2 b ON a.b = b.id + 1 ORDER BY 1,2"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb2 b ON a.b = b.id + 1 ORDER BY 1,2"
+        ),
         vec!["1|0", "2|1", "4|3", "5|4"],
         "BIGINT probe against an INT key expression"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb2 b ON a.id = b.b + 1 ORDER BY 1,2"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb2 b ON a.id = b.b + 1 ORDER BY 1,2"
+        ),
         vec!["1|0", "2|1", "3|2", "5|4"],
         "and the reverse"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM ja a JOIN jb2 b ON a.n = b.n + 1 ORDER BY 1,2"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM ja a JOIN jb2 b ON a.n = b.n + 1 ORDER BY 1,2"
+        ),
         vec!["1|0", "2|1", "5|4"],
         "NUMERIC, where 1.0 and 1.00 are the same value"
     );
@@ -172,7 +198,10 @@ fn round606_key_expression_shapes() {
         "a cast around the key"
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM ja a JOIN jb2 b ON a.g = b.g + 0"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM ja a JOIN jb2 b ON a.g = b.g + 0"
+        ),
         vec!["12"],
         "a key with many rows a bucket"
     );
@@ -215,7 +244,10 @@ fn round606_computed_key_beside_others() {
         "an ON-clause filter on the build side still NULL-fills, it does not drop"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.s, b.s FROM ja a JOIN jb2 b ON a.s = b.s ORDER BY 1,2"),
+        vals(
+            &mut e,
+            "SELECT a.s, b.s FROM ja a JOIN jb2 b ON a.s = b.s ORDER BY 1,2"
+        ),
         vec!["a|a", "b|b", "d|d"],
         "the plain path is unchanged"
     );
@@ -246,7 +278,10 @@ fn round606_scale() {
     e.execute("INSERT INTO big SELECT gg, gg % 50 FROM generate_series(1, 20000) gg")
         .unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big a JOIN big b ON a.id = b.id + 1"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big a JOIN big b ON a.id = b.id + 1"
+        ),
         vec!["19999"]
     );
     assert_eq!(
@@ -258,8 +293,14 @@ fn round606_scale() {
         "only id = 1 has no predecessor"
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big a JOIN big b ON a.id = b.id + 1 AND a.g = b.g"),
-        vals(&mut e, "SELECT count(*) FROM big a JOIN big b ON a.g = b.g AND a.id = b.id + 1"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big a JOIN big b ON a.id = b.id + 1 AND a.g = b.g"
+        ),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big a JOIN big b ON a.g = b.g AND a.id = b.id + 1"
+        ),
         "the order of the conjuncts decides which list a key lands in, never the answer"
     );
     assert_eq!(

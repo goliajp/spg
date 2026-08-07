@@ -12,7 +12,13 @@ use spg_engine::{Engine, QueryResult};
 fn grid(e: &mut Engine, sql: &str) -> Vec<String> {
     match e.execute(sql).unwrap() {
         QueryResult::Rows { rows, columns } => {
-            let mut out = vec![columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join("|")];
+            let mut out = vec![
+                columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            ];
             out.extend(rows.iter().map(|r| {
                 r.values
                     .iter()
@@ -30,12 +36,11 @@ fn grid(e: &mut Engine, sql: &str) -> Vec<String> {
 fn round758_unnest_tsvector_answers_as_pg() {
     let mut e = Engine::new();
     assert_eq!(
-        grid(&mut e, "SELECT * FROM unnest(to_tsvector('simple','a b a'))"),
-        [
-            "lexeme|positions|weights",
-            "a|{1,3}|{D,D}",
-            "b|{2}|{D}",
-        ]
+        grid(
+            &mut e,
+            "SELECT * FROM unnest(to_tsvector('simple','a b a'))"
+        ),
+        ["lexeme|positions|weights", "a|{1,3}|{D,D}", "b|{2}|{D}",]
     );
     // Columns are addressable by PG's names, qualified or not.
     assert_eq!(

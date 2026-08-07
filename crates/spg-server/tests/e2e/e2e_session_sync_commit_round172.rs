@@ -109,7 +109,10 @@ fn session_set_sync_commit_off_writes_apply_and_toggle_back() {
     send_query(&mut s, "SET synchronous_commit = off");
     expect_cc(&mut s);
     for i in 0..5_i64 {
-        send_query(&mut s, &format!("INSERT INTO rows VALUES ({i}, 'async-{i}')"));
+        send_query(
+            &mut s,
+            &format!("INSERT INTO rows VALUES ({i}, 'async-{i}')"),
+        );
         expect_cc(&mut s);
     }
     assert_eq!(

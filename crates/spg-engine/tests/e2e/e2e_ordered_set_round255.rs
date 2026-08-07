@@ -65,7 +65,8 @@ fn hypothetical_fractions_divide_by_the_full_input_size() {
     // denominator moves, and only for the two fractions.
     let mut e = Engine::new();
     e.execute("CREATE TABLE h (v int)").unwrap();
-    e.execute("INSERT INTO h VALUES (1),(2),(3),(4),(10),(20)").unwrap();
+    e.execute("INSERT INTO h VALUES (1),(2),(3),(4),(10),(20)")
+        .unwrap();
     let probe = |e: &mut Engine| {
         (
             one(e, "SELECT percent_rank(3) WITHIN GROUP (ORDER BY v) FROM h"),
@@ -76,7 +77,10 @@ fn hypothetical_fractions_divide_by_the_full_input_size() {
     };
     // 6 rows, no NULLs: (3-1)/6 and (3+1)/7.
     let (pr, cd, r, dr) = probe(&mut e);
-    assert_eq!((pr.as_str(), cd.as_str()), ("0.3333333333333333", "0.5714285714285714"));
+    assert_eq!(
+        (pr.as_str(), cd.as_str()),
+        ("0.3333333333333333", "0.5714285714285714")
+    );
     assert_eq!((r.as_str(), dr.as_str()), ("3", "3"));
     // 7 rows (one NULL): 2/7 and 4/8 — the NULL row counts.
     e.execute("INSERT INTO h VALUES (NULL)").unwrap();
@@ -94,10 +98,25 @@ fn hypothetical_fractions_divide_by_the_full_input_size() {
 fn percentile_cont_is_declared_only_over_numeric_and_interval() {
     let mut e = seeded();
     // Interpolatable: the numeric tower and interval.
-    assert_eq!(one(&mut e, "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v) FROM os"), "3.5");
-    assert_eq!(one(&mut e, "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY n) FROM os"), "3.5");
     assert_eq!(
-        one(&mut e, "SELECT pg_typeof(percentile_cont(0.5) WITHIN GROUP (ORDER BY iv)) FROM os"),
+        one(
+            &mut e,
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v) FROM os"
+        ),
+        "3.5"
+    );
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY n) FROM os"
+        ),
+        "3.5"
+    );
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT pg_typeof(percentile_cont(0.5) WITHIN GROUP (ORDER BY iv)) FROM os"
+        ),
         "interval"
     );
     // Refused — these answered NULL before.
@@ -115,10 +134,22 @@ fn percentile_cont_is_declared_only_over_numeric_and_interval() {
         assert!(got.contains(want), "{sql} → {got}");
     }
     // percentile_disc and mode take any sortable type (unchanged).
-    assert_eq!(one(&mut e, "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY t) FROM os"), "b");
-    assert_eq!(one(&mut e, "SELECT mode() WITHIN GROUP (ORDER BY t) FROM os"), "b");
     assert_eq!(
-        one(&mut e, "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY d) FROM os"),
+        one(
+            &mut e,
+            "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY t) FROM os"
+        ),
+        "b"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT mode() WITHIN GROUP (ORDER BY t) FROM os"),
+        "b"
+    );
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY d) FROM os"
+        ),
         "2024-01-03"
     );
 }
@@ -151,49 +182,97 @@ fn arity_mismatches_read_as_missing_overloads() {
         assert!(got.contains(want), "{sql} → {got}");
     }
     // The well-formed multi-key hypothetical call still works.
-    assert_eq!(one(&mut e, "SELECT rank(2,'b') WITHIN GROUP (ORDER BY v, t) FROM os"), "2");
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT rank(2,'b') WITHIN GROUP (ORDER BY v, t) FROM os"
+        ),
+        "2"
+    );
 }
 
 #[test]
 fn the_ordered_set_core_is_unchanged() {
     let mut e = seeded();
     for (sql, want) in [
-        ("SELECT percentile_cont(0.0) WITHIN GROUP (ORDER BY v) FROM os", "1"),
-        ("SELECT percentile_cont(1.0) WITHIN GROUP (ORDER BY v) FROM os", "20"),
-        ("SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY v) FROM os", "2.25"),
-        ("SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY v) FROM os", "3"),
-        ("SELECT percentile_disc(0.25) WITHIN GROUP (ORDER BY v) FROM os", "2"),
+        (
+            "SELECT percentile_cont(0.0) WITHIN GROUP (ORDER BY v) FROM os",
+            "1",
+        ),
+        (
+            "SELECT percentile_cont(1.0) WITHIN GROUP (ORDER BY v) FROM os",
+            "20",
+        ),
+        (
+            "SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY v) FROM os",
+            "2.25",
+        ),
+        (
+            "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY v) FROM os",
+            "3",
+        ),
+        (
+            "SELECT percentile_disc(0.25) WITHIN GROUP (ORDER BY v) FROM os",
+            "2",
+        ),
         ("SELECT mode() WITHIN GROUP (ORDER BY v) FROM os", "1"),
         // Array-argument forms.
         (
             "SELECT percentile_cont(ARRAY[0.25,0.5,0.75]) WITHIN GROUP (ORDER BY v) FROM os",
             "{2.25,3.5,8.5}",
         ),
-        ("SELECT percentile_disc(ARRAY[0.0,1.0]) WITHIN GROUP (ORDER BY v) FROM os", "{1,20}"),
+        (
+            "SELECT percentile_disc(ARRAY[0.0,1.0]) WITHIN GROUP (ORDER BY v) FROM os",
+            "{1,20}",
+        ),
         // Result types.
         (
             "SELECT pg_typeof(percentile_cont(0.5) WITHIN GROUP (ORDER BY v)) FROM os",
             "double precision",
         ),
-        ("SELECT pg_typeof(percentile_disc(0.5) WITHIN GROUP (ORDER BY v)) FROM os", "integer"),
-        ("SELECT pg_typeof(rank(3) WITHIN GROUP (ORDER BY v)) FROM os", "bigint"),
+        (
+            "SELECT pg_typeof(percentile_disc(0.5) WITHIN GROUP (ORDER BY v)) FROM os",
+            "integer",
+        ),
+        (
+            "SELECT pg_typeof(rank(3) WITHIN GROUP (ORDER BY v)) FROM os",
+            "bigint",
+        ),
         // FILTER and the aggregate-internal ORDER BY.
         ("SELECT count(*) FILTER (WHERE v > 2) FROM os", "4"),
         (
             "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE v > 1) FROM os",
             "4",
         ),
-        ("SELECT string_agg(t, ',' ORDER BY v DESC) FROM os", "y,x,c,b,b,a"),
+        (
+            "SELECT string_agg(t, ',' ORDER BY v DESC) FROM os",
+            "y,x,c,b,b,a",
+        ),
     ] {
         assert_eq!(one(&mut e, sql), want, "{sql}");
     }
     // An out-of-range fraction errors even before the rows are read.
-    let got = err(&mut e, "SELECT percentile_cont(1.5) WITHIN GROUP (ORDER BY v) FROM os");
-    assert!(got.contains("percentile value 1.5 is not between 0 and 1"), "{got}");
+    let got = err(
+        &mut e,
+        "SELECT percentile_cont(1.5) WITHIN GROUP (ORDER BY v) FROM os",
+    );
+    assert!(
+        got.contains("percentile value 1.5 is not between 0 and 1"),
+        "{got}"
+    );
     // A NULL fraction, and an all-NULL input, are NULL.
-    assert_eq!(one(&mut e, "SELECT percentile_cont(NULL) WITHIN GROUP (ORDER BY v) FROM os"), "NULL");
     assert_eq!(
-        one(&mut e, "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v) FROM os WHERE v IS NULL"),
+        one(
+            &mut e,
+            "SELECT percentile_cont(NULL) WITHIN GROUP (ORDER BY v) FROM os"
+        ),
+        "NULL"
+    );
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v) FROM os WHERE v IS NULL"
+        ),
         "NULL"
     );
 }

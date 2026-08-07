@@ -113,7 +113,10 @@ fn round433_lower_explicit_value_does_not_pull_the_counter_back() {
     auto_table(&mut e, "n");
     e.execute("INSERT INTO n(id,v) VALUES (50,1),(3,2),(NULL,3)")
         .unwrap();
-    assert_eq!(rows(&mut e, "SELECT id,v FROM n ORDER BY v"), "50/1 3/2 51/3");
+    assert_eq!(
+        rows(&mut e, "SELECT id,v FROM n ORDER BY v"),
+        "50/1 3/2 51/3"
+    );
 }
 
 #[test]
@@ -133,7 +136,8 @@ fn round433_update_to_zero_stores_zero() {
 #[test]
 fn round433_zero_in_a_non_auto_column_stays_zero() {
     let mut e = mysql();
-    e.execute("CREATE TABLE d(id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE d(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("INSERT INTO d VALUES (0,1)").unwrap();
     assert_eq!(rows(&mut e, "SELECT id,v FROM d"), "0/1");
 }

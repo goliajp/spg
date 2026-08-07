@@ -448,9 +448,9 @@ impl Engine {
                     } else {
                         Value::text(r.client_addr)
                     }, // client_addr
-                    Value::Null, // client_hostname
+                    Value::Null,               // client_hostname
                     Value::Int(r.client_port), // client_port
-                    started.clone(), // backend_start
+                    started.clone(),           // backend_start
                     if r.in_transaction {
                         started.clone()
                     } else {
@@ -461,7 +461,7 @@ impl Engine {
                     } else {
                         started
                     }, // query_start
-                    Value::Null,     // state_change
+                    Value::Null,               // state_change
                     Value::text(r.wait_event_type),
                     Value::text(r.wait_event),
                     if state.is_empty() {

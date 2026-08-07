@@ -37,11 +37,17 @@ fn round759_srf_args_reference_earlier_from_items() {
     let mut e = Engine::new();
     // Column nested in an ARRAY constructor — the detector's blind spot.
     assert_eq!(
-        one(&mut e, "SELECT y FROM unnest(ARRAY[1,2]) x, unnest(ARRAY[x, x+1]) y ORDER BY y"),
+        one(
+            &mut e,
+            "SELECT y FROM unnest(ARRAY[1,2]) x, unnest(ARRAY[x, x+1]) y ORDER BY y"
+        ),
         "1;2;2;3"
     );
     assert_eq!(
-        one(&mut e, "SELECT y FROM unnest(ARRAY[1,2]) x, LATERAL unnest(ARRAY[x]) y ORDER BY y"),
+        one(
+            &mut e,
+            "SELECT y FROM unnest(ARRAY[1,2]) x, LATERAL unnest(ARRAY[x]) y ORDER BY y"
+        ),
         "1;2"
     );
     // The round-753 audit probe, end to end: max position of a
@@ -55,7 +61,10 @@ fn round759_srf_args_reference_earlier_from_items() {
         "3"
     );
     assert_eq!(
-        one(&mut e, "SELECT (SELECT sum(y) FROM unnest(ARRAY[1,2]) x, unnest(ARRAY[x, x+1]) y)"),
+        one(
+            &mut e,
+            "SELECT (SELECT sum(y) FROM unnest(ARRAY[1,2]) x, unnest(ARRAY[x, x+1]) y)"
+        ),
         "8"
     );
 }
@@ -64,7 +73,8 @@ fn round759_srf_args_reference_earlier_from_items() {
 fn round759_table_sourced_lateral_still_answers_as_pg() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE lt (id INT, arr INT[])").unwrap();
-    e.execute("INSERT INTO lt VALUES (1, ARRAY[10,20]), (2, ARRAY[30])").unwrap();
+    e.execute("INSERT INTO lt VALUES (1, ARRAY[10,20]), (2, ARRAY[30])")
+        .unwrap();
     for sql in [
         "SELECT id, e FROM lt, unnest(lt.arr) e ORDER BY id, e",
         "SELECT id, e FROM lt, unnest(arr) e ORDER BY id, e",
@@ -73,7 +83,10 @@ fn round759_table_sourced_lateral_still_answers_as_pg() {
         assert_eq!(one(&mut e, sql), "1|10;1|20;2|30", "{sql}");
     }
     assert_eq!(
-        one(&mut e, "SELECT id, g FROM lt, generate_series(1, lt.id) g ORDER BY id, g"),
+        one(
+            &mut e,
+            "SELECT id, g FROM lt, generate_series(1, lt.id) g ORDER BY id, g"
+        ),
         "1|1;2|1;2|2"
     );
 }

@@ -79,7 +79,10 @@ fn round636_the_four_still_work() {
         vals(&mut e, "SELECT microsecond(TIME '01:02:03.456789')"),
         vec!["456789"]
     );
-    assert_eq!(vals(&mut e, "SELECT time_to_sec(TIME '01:00:01')"), vec!["3601"]);
+    assert_eq!(
+        vals(&mut e, "SELECT time_to_sec(TIME '01:00:01')"),
+        vec!["3601"]
+    );
     assert_eq!(vals(&mut e, "SELECT sec_to_time(3601)"), vec!["01:00:01"]);
     // obj_description over a real relation, and over one with no comment.
     e.execute("CREATE TABLE oc (a INT)").unwrap();
@@ -90,7 +93,10 @@ fn round636_the_four_still_work() {
     );
     // NULL in, NULL out — the arm the arity guard must not have displaced.
     assert_eq!(
-        vals(&mut e, "SELECT microsecond(NULL) IS NULL, time_to_sec(NULL) IS NULL"),
+        vals(
+            &mut e,
+            "SELECT microsecond(NULL) IS NULL, time_to_sec(NULL) IS NULL"
+        ),
         vec!["true|true"]
     );
 }

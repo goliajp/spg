@@ -53,7 +53,8 @@ fn affected(e: &mut Engine, sql: &str) -> usize {
 
 fn seeded() -> Engine {
     let mut e = mysql();
-    e.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("INSERT INTO t VALUES(1,10),(2,20)").unwrap();
     e
 }
@@ -126,11 +127,17 @@ fn insert_ignore_skipped_is_zero() {
 fn affected_tag_matches() {
     let mut e = seeded();
     assert_eq!(
-        affected(&mut e, "INSERT INTO t VALUES(1,10) ON DUPLICATE KEY UPDATE v = 10"),
+        affected(
+            &mut e,
+            "INSERT INTO t VALUES(1,10) ON DUPLICATE KEY UPDATE v = 10"
+        ),
         0
     );
     assert_eq!(
-        affected(&mut e, "INSERT INTO t VALUES(1,11) ON DUPLICATE KEY UPDATE v = 11"),
+        affected(
+            &mut e,
+            "INSERT INTO t VALUES(1,11) ON DUPLICATE KEY UPDATE v = 11"
+        ),
         2
     );
     assert_eq!(affected(&mut e, "REPLACE INTO t VALUES(2,21)"), 2);
@@ -141,7 +148,8 @@ fn affected_tag_matches() {
 #[test]
 fn postgres_counts_one_per_row() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("INSERT INTO t VALUES(1,10),(2,20)").unwrap();
     // A no-op DO UPDATE still counts 1 in PG.
     assert_eq!(

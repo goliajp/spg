@@ -53,7 +53,10 @@ fn round693_between_returns_the_collations_row_set() {
     let mut e = Engine::new();
     seed(&mut e);
     assert_eq!(
-        rows(&mut e, "SELECT a FROM r693 WHERE a BETWEEN 'a' AND 'd' ORDER BY a"),
+        rows(
+            &mut e,
+            "SELECT a FROM r693 WHERE a BETWEEN 'a' AND 'd' ORDER BY a"
+        ),
         "apple,Ápple,Banana,cherry"
     );
     assert_eq!(
@@ -104,8 +107,14 @@ fn round693_equality_and_like_are_unchanged() {
     let mut e = Engine::new();
     seed(&mut e);
     assert_eq!(rows(&mut e, "SELECT a FROM r693 WHERE a = 'APPLE'"), "");
-    assert_eq!(rows(&mut e, "SELECT a FROM r693 WHERE a = 'apple'"), "apple");
-    assert_eq!(rows(&mut e, "SELECT a FROM r693 WHERE a LIKE 'a%'"), "apple");
+    assert_eq!(
+        rows(&mut e, "SELECT a FROM r693 WHERE a = 'apple'"),
+        "apple"
+    );
+    assert_eq!(
+        rows(&mut e, "SELECT a FROM r693 WHERE a LIKE 'a%'"),
+        "apple"
+    );
     assert_eq!(
         rows(&mut e, "SELECT count(DISTINCT a)::text FROM r693"),
         "5"

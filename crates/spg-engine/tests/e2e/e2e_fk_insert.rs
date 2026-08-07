@@ -123,7 +123,10 @@ fn round695_every_on_delete_action_behaves_as_pg18_does() {
         "RESTRICT wording: {err}"
     );
     assert!(err.contains("is referenced from table"), "{err}");
-    assert!(!err.contains("is still referenced"), "that is NO ACTION's: {err}");
+    assert!(
+        !err.contains("is still referenced"),
+        "that is NO ACTION's: {err}"
+    );
 
     // NO ACTION (the default) refuses with the other wording.
     let mut eng = engine_with(&[

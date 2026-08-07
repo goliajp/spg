@@ -72,7 +72,10 @@ fn round691_an_explicit_c_is_byte_order() {
     let mut e = Engine::new();
     seed(&mut e);
     assert_eq!(
-        rows(&mut e, "SELECT plain FROM x691 ORDER BY plain COLLATE \"C\""),
+        rows(
+            &mut e,
+            "SELECT plain FROM x691 ORDER BY plain COLLATE \"C\""
+        ),
         BYTES
     );
 }

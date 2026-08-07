@@ -73,7 +73,8 @@ fn alloc_string(e: &spg_engine::EngineError) -> String {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE sr (id INT, g INT, a INT[], s TEXT)").unwrap();
+    e.execute("CREATE TABLE sr (id INT, g INT, a INT[], s TEXT)")
+        .unwrap();
     e.execute(
         "INSERT INTO sr VALUES (1,10,ARRAY[1,2,3],'x'),(2,20,ARRAY[4],'y'),\
          (3,30,NULL,NULL),(4,40,ARRAY[]::INT[],'z')",
@@ -94,7 +95,10 @@ fn round599_each_row_expands_with_its_own_values() {
         "a NULL array and an empty array both yield no rows"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, unnest(ARRAY[id, g]) FROM sr ORDER BY id, 2"),
+        vals(
+            &mut e,
+            "SELECT id, unnest(ARRAY[id, g]) FROM sr ORDER BY id, 2"
+        ),
         vec!["1|1", "1|10", "2|2", "2|20", "3|3", "3|30", "4|4", "4|40"]
     );
     assert_eq!(
@@ -106,7 +110,10 @@ fn round599_each_row_expands_with_its_own_values() {
         "a text SRF through the same plan"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, unnest(a) FROM sr WHERE id >= 3 ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, unnest(a) FROM sr WHERE id >= 3 ORDER BY id"
+        ),
         Vec::<String>::new()
     );
     assert_eq!(
@@ -151,11 +158,17 @@ fn round599_srf_inside_expressions() {
         vec!["2|102", "2|120"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, unnest(ARRAY[id,g]) FROM sr ORDER BY id, 2 LIMIT 4"),
+        vals(
+            &mut e,
+            "SELECT id, unnest(ARRAY[id,g]) FROM sr ORDER BY id, 2 LIMIT 4"
+        ),
         vec!["1|1", "1|10", "2|2", "2|20"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT s.id, u FROM sr s, unnest(s.a) u ORDER BY s.id, u"),
+        vals(
+            &mut e,
+            "SELECT s.id, u FROM sr s, unnest(s.a) u ORDER BY s.id, u"
+        ),
         vec!["1|1", "1|2", "1|3", "2|4"],
         "the FROM-clause spelling takes a different path and must agree"
     );
@@ -183,8 +196,11 @@ fn round599_srf_inside_expressions() {
 fn round599_conditional_rejection_does_not_depend_on_rows() {
     let mut e = seed();
     assert!(
-        err(&mut e, "SELECT CASE WHEN true THEN unnest(ARRAY[1,2]) END FROM sr")
-            .contains("not allowed in CASE")
+        err(
+            &mut e,
+            "SELECT CASE WHEN true THEN unnest(ARRAY[1,2]) END FROM sr"
+        )
+        .contains("not allowed in CASE")
     );
     assert!(
         err(
@@ -195,8 +211,11 @@ fn round599_conditional_rejection_does_not_depend_on_rows() {
         "no rows is not a reason to accept it"
     );
     assert!(
-        err(&mut e, "SELECT coalesce(unnest(ARRAY[1,2]), 0) FROM sr WHERE id = 1")
-            .contains("not allowed in COALESCE")
+        err(
+            &mut e,
+            "SELECT coalesce(unnest(ARRAY[1,2]), 0) FROM sr WHERE id = 1"
+        )
+        .contains("not allowed in COALESCE")
     );
 }
 

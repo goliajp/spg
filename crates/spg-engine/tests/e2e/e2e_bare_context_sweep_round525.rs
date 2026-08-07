@@ -146,7 +146,10 @@ fn round525_runtime_default_takes_any_expression() {
     e.execute("CREATE TABLE dn (a INT, w TIMESTAMP DEFAULT now())")
         .unwrap();
     e.execute("INSERT INTO dn (a) VALUES (1)").unwrap();
-    assert_eq!(text(&mut e, "SELECT count(*) FROM dn WHERE w IS NOT NULL"), "1");
+    assert_eq!(
+        text(&mut e, "SELECT count(*) FROM dn WHERE w IS NOT NULL"),
+        "1"
+    );
 }
 
 /// The two that already worked, pinned so a later change that breaks

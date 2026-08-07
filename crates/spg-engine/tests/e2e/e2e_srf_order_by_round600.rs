@@ -52,7 +52,8 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE sr (id INT, g INT, a INT[], s TEXT)").unwrap();
+    e.execute("CREATE TABLE sr (id INT, g INT, a INT[], s TEXT)")
+        .unwrap();
     e.execute(
         "INSERT INTO sr VALUES (1,10,ARRAY[1,2,3],'x'),(2,20,ARRAY[4],'y'),\
          (3,30,NULL,NULL),(4,40,ARRAY[]::INT[],'z')",

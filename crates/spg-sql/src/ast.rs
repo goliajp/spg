@@ -203,12 +203,17 @@ pub enum Statement {
     /// know is now refused rather than swallowed.
     ///
     /// `None` is `RESET ALL`, which names no parameter.
-    AlterSystem { parameter: Option<String> },
+    AlterSystem {
+        parameter: Option<String>,
+    },
     /// `DROP DATABASE [IF EXISTS] <name>`. SPG is single-database, so
     /// this never succeeds; the name and the flag are carried so the
     /// engine can answer with PG's wording for the two cases PG itself
     /// has — an unknown name, or the database you are connected to.
-    DropDatabase { name: String, if_exists: bool },
+    DropDatabase {
+        name: String,
+        if_exists: bool,
+    },
     /// A statement SPG accepts as a no-op but PG refuses inside a
     /// transaction block — today `CREATE DATABASE` / `DROP DATABASE`,
     /// which are no-ops here because SPG is single-database.
@@ -217,7 +222,9 @@ pub enum Statement {
     /// carries CREATE ROLE, CREATE CAST and a dozen others that PG is
     /// happy to run inside a transaction, so the object has to be named
     /// to refuse the right ones.
-    NoOpPreventedInTransaction { what: String },
+    NoOpPreventedInTransaction {
+        what: String,
+    },
     /// v7.39 (round 696) — statements SPG performs nothing for, but whose
     /// OPERAND PG validates before performing nothing either.
     ///
@@ -322,7 +329,10 @@ pub enum Statement {
         source: String,
     },
     /// v7.39 (round 277) — `EXECUTE <name> [(arg, …)]`.
-    Execute { name: String, args: Vec<Expr> },
+    Execute {
+        name: String,
+        args: Vec<Expr>,
+    },
     /// v7.39 (round 277) — `DEALLOCATE {<name> | ALL}`. `None` = ALL.
     Deallocate(Option<String>),
     /// v7.39 (round 280) — `CREATE STATISTICS [IF NOT EXISTS] <name>
@@ -339,7 +349,10 @@ pub enum Statement {
         table: String,
     },
     /// v7.39 (round 280) — `DROP STATISTICS [IF EXISTS] <name>`.
-    DropStatistics { name: String, if_exists: bool },
+    DropStatistics {
+        name: String,
+        if_exists: bool,
+    },
     /// v7.39 (round 278) — `CALL <proc>(…)`. Parses; the engine
     /// reports that the procedure does not exist, because SPG has no
     /// procedure catalog. Carried as a statement rather than raised at
@@ -378,7 +391,9 @@ pub enum Statement {
         direction: CursorDirection,
     },
     /// v7.39 (round 218) — `CLOSE <name>` / `CLOSE ALL` (`None` = ALL).
-    CloseCursor { name: Option<String> },
+    CloseCursor {
+        name: Option<String>,
+    },
     /// v7.39 (round 222) — `LISTEN <channel>`: subscribe this session to
     /// async notifications on the channel.
     Listen(String),
@@ -518,7 +533,10 @@ pub enum Statement {
     /// (`KILL connection_id()` is the documented way to drop your own
     /// connection). `query_only` is the `QUERY` form: stop the target's
     /// running statement but leave it connected.
-    Kill { query_only: bool, id: Box<Expr> },
+    Kill {
+        query_only: bool,
+        id: Box<Expr>,
+    },
     /// `SHOW COLUMNS FROM <table>` — return one row per column with
     /// its declared name / type / nullability.
     ShowColumns(String),
@@ -5547,7 +5565,10 @@ impl fmt::Display for Statement {
                         Some(cn) => write!(f, "ADD CONSTRAINT {cn} CHECK ({check})"),
                         None => write!(f, "ADD CHECK ({check})"),
                     },
-                    AlterDomainAction::DropConstraint { name: cn, if_exists } => {
+                    AlterDomainAction::DropConstraint {
+                        name: cn,
+                        if_exists,
+                    } => {
                         if *if_exists {
                             write!(f, "DROP CONSTRAINT IF EXISTS {cn}")
                         } else {
@@ -7597,10 +7618,7 @@ impl fmt::Display for FromClause {
 
 /// v7.39 (round 205) — render a JSON_TABLE COLUMNS list (recursive
 /// for NESTED). Kept close to the parser's grammar so it re-parses.
-fn fmt_json_table_columns(
-    f: &mut fmt::Formatter<'_>,
-    cols: &[JsonTableColumn],
-) -> fmt::Result {
+fn fmt_json_table_columns(f: &mut fmt::Formatter<'_>, cols: &[JsonTableColumn]) -> fmt::Result {
     for (i, c) in cols.iter().enumerate() {
         if i > 0 {
             f.write_str(", ")?;
@@ -7759,7 +7777,11 @@ impl fmt::Display for ColumnName {
 /// as `(a) AND (b) AND (c)` the way PG's deparse writes it. Only the
 /// SAME operator flattens; anything else is an ordinary operand.
 fn write_bool_chain(f: &mut fmt::Formatter<'_>, e: &Expr, op: BinOp) -> fmt::Result {
-    if let Expr::Binary { lhs, op: inner, rhs } = e
+    if let Expr::Binary {
+        lhs,
+        op: inner,
+        rhs,
+    } = e
         && *inner == op
     {
         write_bool_chain(f, lhs, op)?;
@@ -7886,7 +7908,10 @@ fn figure_name_inner(expr: &Expr) -> (Option<String>, NameStrength) {
         Expr::FieldAccess { field, .. } => strong(field.clone()),
         // A cast prefers its argument's name and settles for the type:
         // `upper(s)::text` is `upper`, `(a+b)::text` is `text`.
-        Expr::Cast { expr: inner, target } => match figure_name_inner(inner) {
+        Expr::Cast {
+            expr: inner,
+            target,
+        } => match figure_name_inner(inner) {
             (Some(n), NameStrength::Strong) => strong(n),
             _ => (Some(target.to_string()), NameStrength::Weak),
         },
@@ -7993,9 +8018,7 @@ fn write_pretty(out: &mut String, e: &Expr, parent: PrettyParent, is_rhs: bool, 
                 || (matches!(e, Expr::Binary { .. } | Expr::Unary { .. })
                     && (prec < p || (prec == p && is_rhs)))
         }
-        PrettyParent::Bool(p) => {
-            matches!(e, Expr::Binary { .. } | Expr::Unary { .. }) && prec < p
-        }
+        PrettyParent::Bool(p) => matches!(e, Expr::Binary { .. } | Expr::Unary { .. }) && prec < p,
         PrettyParent::Not => {
             matches!(e, Expr::Binary { .. } | Expr::Unary { .. }) && prec <= pretty_prec_not()
         }
@@ -8007,8 +8030,9 @@ fn write_pretty(out: &mut String, e: &Expr, parent: PrettyParent, is_rhs: bool, 
         Expr::Binary { lhs, op, rhs } => {
             let child = match op {
                 BinOp::And | BinOp::Or => PrettyParent::Bool(prec),
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
-                | BinOp::Concat => PrettyParent::Arith(prec),
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Concat => {
+                    PrettyParent::Arith(prec)
+                }
                 _ => PrettyParent::Comparison,
             };
             write_pretty(out, lhs, child, false, mysql);
@@ -8044,7 +8068,10 @@ fn write_pretty(out: &mut String, e: &Expr, parent: PrettyParent, is_rhs: bool, 
                 // quote back.
                 out.push_str("cast(");
                 write_pretty(out, expr, PrettyParent::None, false, mysql);
-                out.push_str(&alloc::format!(" as {})", target.to_string().to_lowercase()));
+                out.push_str(&alloc::format!(
+                    " as {})",
+                    target.to_string().to_lowercase()
+                ));
             } else {
                 write_pretty(out, expr, PrettyParent::Comparison, false, mysql);
                 out.push_str(&alloc::format!("::{target}"));

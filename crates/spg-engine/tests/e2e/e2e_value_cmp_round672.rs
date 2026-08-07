@@ -80,7 +80,10 @@ fn round672_order_by_sorts_time_and_its_neighbours() {
         one(&mut e, "SELECT host(i) FROM vc ORDER BY i"),
         "10.0.0.2,10.0.0.5,10.0.0.9"
     );
-    assert_eq!(one(&mut e, "SELECT m FROM vc ORDER BY m"), "$2.00,$5.00,$9.00");
+    assert_eq!(
+        one(&mut e, "SELECT m FROM vc ORDER BY m"),
+        "$2.00,$5.00,$9.00"
+    );
     // DESC too: a matrix returning Equal looks identical either way, so the
     // ascending assertion alone would not catch a regression to it.
     assert_eq!(
@@ -129,7 +132,10 @@ fn round672_min_max_cover_the_same_types() {
     let mut e = Engine::new();
     seed(&mut e);
     assert_eq!(one(&mut e, "SELECT min(c), max(c) FROM vc"), "aaaa|dddd");
-    assert_eq!(one(&mut e, "SELECT min(t), max(t) FROM vc"), "02:00:00|09:00:00");
+    assert_eq!(
+        one(&mut e, "SELECT min(t), max(t) FROM vc"),
+        "02:00:00|09:00:00"
+    );
     assert_eq!(one(&mut e, "SELECT min(m), max(m) FROM vc"), "$2.00|$9.00");
     // A CHAR(n) compares without its padding, as on PG.
     assert_eq!(
@@ -147,7 +153,10 @@ fn round672_the_two_matrices_agree_on_extremes() {
     let mut e = Engine::new();
     seed(&mut e);
     for col in ["t", "c", "i", "m", "b"] {
-        let by_sort = one(&mut e, &format!("SELECT {col} FROM vc ORDER BY {col} LIMIT 1"));
+        let by_sort = one(
+            &mut e,
+            &format!("SELECT {col} FROM vc ORDER BY {col} LIMIT 1"),
+        );
         let by_min = one(&mut e, &format!("SELECT min({col}) FROM vc"));
         assert_eq!(
             by_sort, by_min,
@@ -178,7 +187,11 @@ fn round674_null_ordering_survived_the_convergence() {
         )
     };
     assert_eq!(g(&mut e, "v"), "1,2,NULL", "ASC defaults to NULLS LAST");
-    assert_eq!(g(&mut e, "v DESC"), "NULL,2,1", "DESC defaults to NULLS FIRST");
+    assert_eq!(
+        g(&mut e, "v DESC"),
+        "NULL,2,1",
+        "DESC defaults to NULLS FIRST"
+    );
     assert_eq!(g(&mut e, "v NULLS FIRST"), "NULL,1,2");
     assert_eq!(g(&mut e, "v NULLS LAST"), "1,2,NULL");
     assert_eq!(g(&mut e, "v DESC NULLS FIRST"), "NULL,2,1");

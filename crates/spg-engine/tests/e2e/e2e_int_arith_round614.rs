@@ -83,12 +83,18 @@ fn err_of(e: &mut Engine, sql: &str) -> String {
 fn round614_integer_arithmetic_answers() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT 7+3, 7-3, 7*3, 7/3, 7%3, -7/3, -7%3, 7/-3, 7 % -3"),
+        vals(
+            &mut e,
+            "SELECT 7+3, 7-3, 7*3, 7/3, 7%3, -7/3, -7%3, 7/-3, 7 % -3"
+        ),
         vec!["10|4|21|2|1|-2|-1|-2|1"],
         "division truncates toward zero and the remainder takes the dividend's sign"
     );
     assert_eq!(
-        vals(&mut e, "SELECT 1::SMALLINT+1::SMALLINT, 1::INT+1::BIGINT, 1::BIGINT+1::INT"),
+        vals(
+            &mut e,
+            "SELECT 1::SMALLINT+1::SMALLINT, 1::INT+1::BIGINT, 1::BIGINT+1::INT"
+        ),
         vec!["2|2|2"]
     );
     assert_eq!(
@@ -125,9 +131,18 @@ fn round614_overflow_and_zero_divisor_errors() {
         ("SELECT 2147483647::INT + 1", "integer out of range"),
         ("SELECT (-2147483648)::INT - 1", "integer out of range"),
         ("SELECT 2147483647::INT * 2", "integer out of range"),
-        ("SELECT 32767::SMALLINT + 1::SMALLINT", "smallint out of range"),
-        ("SELECT 9223372036854775807::BIGINT + 1", "bigint out of range"),
-        ("SELECT (-9223372036854775808)::BIGINT / (-1)", "bigint out of range"),
+        (
+            "SELECT 32767::SMALLINT + 1::SMALLINT",
+            "smallint out of range",
+        ),
+        (
+            "SELECT 9223372036854775807::BIGINT + 1",
+            "bigint out of range",
+        ),
+        (
+            "SELECT (-9223372036854775808)::BIGINT / (-1)",
+            "bigint out of range",
+        ),
         ("SELECT 1/0", "division by zero"),
         ("SELECT 1%0", "division by zero"),
         ("SELECT 1::BIGINT/0", "division by zero"),
@@ -161,11 +176,17 @@ fn round614_over_rows() {
         ]
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM (SELECT generate_series(1,100) i) q WHERE i % 7 = 0"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM (SELECT generate_series(1,100) i) q WHERE i % 7 = 0"
+        ),
         vec!["14"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM (SELECT generate_series(1,100) i) q WHERE i + 1 > 50"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM (SELECT generate_series(1,100) i) q WHERE i + 1 > 50"
+        ),
         vec!["51"]
     );
 }
@@ -186,7 +207,10 @@ fn round614_scale() {
         vec!["6666"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT sum(id + g), sum(id * 2), sum(id / 2) FROM big"),
+        vals(
+            &mut e,
+            "SELECT sum(id + g), sum(id * 2), sum(id / 2) FROM big"
+        ),
         vals(
             &mut e,
             "SELECT sum(id) + sum(g), 2 * sum(id), sum(id / 2) FROM big"
@@ -194,11 +218,15 @@ fn round614_scale() {
         "the row-by-row arithmetic agrees with the aggregate of it"
     );
     assert!(
-        e.execute("SELECT count(*) FROM big WHERE id / (id - id) > 0").is_err(),
+        e.execute("SELECT count(*) FROM big WHERE id / (id - id) > 0")
+            .is_err(),
         "a divisor that becomes zero on the first row still raises"
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE id + 1 > 5 AND id > 0"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE id + 1 > 5 AND id > 0"
+        ),
         vec!["19996"],
         "two conjuncts, one fast-shaped and one not"
     );

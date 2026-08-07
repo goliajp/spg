@@ -96,7 +96,8 @@ use std::time::Instant;
 
 fn seed(n: i64) -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE i (id INT, k INT, pad TEXT)").unwrap();
+    e.execute("CREATE TABLE i (id INT, k INT, pad TEXT)")
+        .unwrap();
     e.execute(&format!(
         "INSERT INTO i SELECT g, g, repeat('x', 100) FROM generate_series(1, {n}) g"
     ))
@@ -134,10 +135,22 @@ fn main() {
     println!();
     println!("| shape                                  | 100k-row range ms |");
     for (label, sql) in [
-        ("index-only  SELECT k    (this path)  ", "SELECT k FROM i WHERE k BETWEEN 1 AND 100000"),
-        ("row-fetch   SELECT id   (old path)   ", "SELECT id FROM i WHERE k BETWEEN 1 AND 100000"),
-        ("row-fetch   SELECT k,id (old path)   ", "SELECT k, id FROM i WHERE k BETWEEN 1 AND 100000"),
-        ("no output   count(*)    (aggregate)  ", "SELECT count(*) FROM i WHERE k BETWEEN 1 AND 100000"),
+        (
+            "index-only  SELECT k    (this path)  ",
+            "SELECT k FROM i WHERE k BETWEEN 1 AND 100000",
+        ),
+        (
+            "row-fetch   SELECT id   (old path)   ",
+            "SELECT id FROM i WHERE k BETWEEN 1 AND 100000",
+        ),
+        (
+            "row-fetch   SELECT k,id (old path)   ",
+            "SELECT k, id FROM i WHERE k BETWEEN 1 AND 100000",
+        ),
+        (
+            "no output   count(*)    (aggregate)  ",
+            "SELECT count(*) FROM i WHERE k BETWEEN 1 AND 100000",
+        ),
     ] {
         println!("| {label} | {:>17.2} |", best(&mut e, sql));
     }

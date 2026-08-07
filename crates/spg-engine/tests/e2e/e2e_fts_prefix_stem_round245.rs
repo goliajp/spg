@@ -36,20 +36,32 @@ fn one(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn prefix_queries_parse_match_and_print() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT to_tsquery('english', 'fox:*')"), "'fox':*");
     assert_eq!(
-        one(&mut e, "SELECT (to_tsvector('english','foxtrot') @@ to_tsquery('english','fox:*'))::text"),
+        one(&mut e, "SELECT to_tsquery('english', 'fox:*')"),
+        "'fox':*"
+    );
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT (to_tsvector('english','foxtrot') @@ to_tsquery('english','fox:*'))::text"
+        ),
         "true"
     );
     assert_eq!(
-        one(&mut e, "SELECT (to_tsvector('english','oxcart') @@ to_tsquery('english','fox:*'))::text"),
+        one(
+            &mut e,
+            "SELECT (to_tsvector('english','oxcart') @@ to_tsquery('english','fox:*'))::text"
+        ),
         "false"
     );
     // Weight letters survive the round trip too.
     assert_eq!(one(&mut e, "SELECT 'a:AB'::tsquery"), "'a':AB");
     // A weighted query only matches lexemes carrying that weight.
     assert_eq!(
-        one(&mut e, "SELECT (setweight('a:1'::tsvector,'A') @@ 'a:A'::tsquery)::text"),
+        one(
+            &mut e,
+            "SELECT (setweight('a:1'::tsvector,'A') @@ 'a:A'::tsquery)::text"
+        ),
         "true"
     );
     assert_eq!(
@@ -61,9 +73,15 @@ fn prefix_queries_parse_match_and_print() {
 #[test]
 fn tsquery_phrase_operator() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT 'a'::tsquery <-> 'b'::tsquery"), "'a' <-> 'b'");
     assert_eq!(
-        one(&mut e, "SELECT ('a:1 b:2'::tsvector @@ ('a'::tsquery <-> 'b'::tsquery))::text"),
+        one(&mut e, "SELECT 'a'::tsquery <-> 'b'::tsquery"),
+        "'a' <-> 'b'"
+    );
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT ('a:1 b:2'::tsvector @@ ('a'::tsquery <-> 'b'::tsquery))::text"
+        ),
         "true"
     );
 }
@@ -71,19 +89,31 @@ fn tsquery_phrase_operator() {
 #[test]
 fn to_tsquery_prunes_stopwords() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT to_tsquery('english', '!(a & b)')"), "!'b'");
-    assert_eq!(one(&mut e, "SELECT to_tsquery('english', 'the & fox')"), "'fox'");
+    assert_eq!(
+        one(&mut e, "SELECT to_tsquery('english', '!(a & b)')"),
+        "!'b'"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT to_tsquery('english', 'the & fox')"),
+        "'fox'"
+    );
 }
 
 #[test]
 fn snowball_exceptions_and_short_ies() {
     let mut e = Engine::new();
     assert_eq!(
-        one(&mut e, "SELECT to_tsvector('english','skies sky flies cries babies studies dies ties')"),
+        one(
+            &mut e,
+            "SELECT to_tsvector('english','skies sky flies cries babies studies dies ties')"
+        ),
         "'babi':5 'cri':4 'die':7 'fli':3 'sky':1,2 'studi':6 'tie':8"
     );
     assert_eq!(
-        one(&mut e, "SELECT (to_tsvector('english','skies') @@ to_tsquery('english','sky'))::text"),
+        one(
+            &mut e,
+            "SELECT (to_tsvector('english','skies') @@ to_tsquery('english','sky'))::text"
+        ),
         "true"
     );
 }
@@ -104,14 +134,23 @@ fn the_fts_core_is_unchanged() {
             "SELECT (to_tsvector('english','a b c') @@ phraseto_tsquery('english','b c'))::text",
             "true",
         ),
-        ("SELECT ('a:1 c:3'::tsvector @@ 'a <2> c'::tsquery)::text", "true"),
-        ("SELECT ('a:1 c:3'::tsvector @@ 'a <-> c'::tsquery)::text", "false"),
+        (
+            "SELECT ('a:1 c:3'::tsvector @@ 'a <2> c'::tsquery)::text",
+            "true",
+        ),
+        (
+            "SELECT ('a:1 c:3'::tsvector @@ 'a <-> c'::tsquery)::text",
+            "false",
+        ),
         (
             "SELECT ts_headline('english', 'The quick brown fox', to_tsquery('english','fox'))",
             "The quick brown <b>fox</b>",
         ),
         ("SELECT querytree('a & !b'::tsquery)", "'a'"),
-        ("SELECT setweight('a:1 b:2'::tsvector, 'A')", "'a':1A 'b':2A"),
+        (
+            "SELECT setweight('a:1 b:2'::tsvector, 'A')",
+            "'a':1A 'b':2A",
+        ),
     ] {
         assert_eq!(one(&mut e, sql), want, "{sql}");
     }

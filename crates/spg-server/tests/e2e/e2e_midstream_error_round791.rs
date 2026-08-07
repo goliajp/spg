@@ -130,11 +130,7 @@ fn sqlstate_of(m: &PgMessage) -> String {
 }
 
 fn seed(s: &mut TcpStream, wide: bool) {
-    let val = if wide {
-        "repeat('x', 200)"
-    } else {
-        "g::TEXT"
-    };
+    let val = if wide { "repeat('x', 200)" } else { "g::TEXT" };
     exec(s, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
     exec(
         s,

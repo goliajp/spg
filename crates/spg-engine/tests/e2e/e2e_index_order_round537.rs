@@ -88,7 +88,8 @@ fn round537_unique_index_keeps_its_order() {
 #[test]
 fn round538_explicit_collate_on_the_key_prints() {
     let mut e = engine();
-    e.execute(r#"CREATE INDEX cx ON t (c COLLATE "C")"#).unwrap();
+    e.execute(r#"CREATE INDEX cx ON t (c COLLATE "C")"#)
+        .unwrap();
     assert_eq!(def(&mut e, "cx"), r#"(c COLLATE "C")"#);
     // Before the direction, as PG orders the two.
     e.execute(r#"CREATE INDEX cy ON t (c COLLATE "C" DESC)"#)
@@ -114,7 +115,8 @@ fn round538_locale_collation_is_still_refused() {
 #[test]
 fn round537_index_order_survives_a_round_trip() {
     let mut e = engine();
-    e.execute("CREATE INDEX r ON t (a DESC NULLS LAST)").unwrap();
+    e.execute("CREATE INDEX r ON t (a DESC NULLS LAST)")
+        .unwrap();
     e.execute(r#"CREATE INDEX rc ON t (c COLLATE "C" DESC)"#)
         .unwrap();
     let before = def(&mut e, "r");

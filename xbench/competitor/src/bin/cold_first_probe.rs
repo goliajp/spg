@@ -186,7 +186,9 @@ fn main() {
         "INSERT INTO c2 SELECT gg, gg % 50 FROM generate_series(1, {n}) gg"
     ))
     .unwrap();
-    let sql2 = sql.replace("FROM c ", "FROM c2 ").replace("FROM c\n", "FROM c2\n");
+    let sql2 = sql
+        .replace("FROM c ", "FROM c2 ")
+        .replace("FROM c\n", "FROM c2\n");
     print!("second table, first four:");
     for _ in 0..4 {
         let t = Instant::now();

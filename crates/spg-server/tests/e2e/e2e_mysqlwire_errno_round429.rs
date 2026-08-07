@@ -102,7 +102,8 @@ fn ok_query(s: &mut TcpStream, sql: &str) {
     send_query(s, sql);
     let (_seq, reply) = read_packet(s);
     assert_ne!(
-        reply[0], 0xff,
+        reply[0],
+        0xff,
         "{sql} should have succeeded, got ERR: {:?}",
         String::from_utf8_lossy(&reply)
     );
@@ -113,7 +114,8 @@ fn err_of(s: &mut TcpStream, sql: &str) -> (u16, String) {
     send_query(s, sql);
     let (_seq, err) = read_packet(s);
     assert_eq!(
-        err[0], 0xff,
+        err[0],
+        0xff,
         "{sql} should have failed, got {:?}",
         String::from_utf8_lossy(&err)
     );

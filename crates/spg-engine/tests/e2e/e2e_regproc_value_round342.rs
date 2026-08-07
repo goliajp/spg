@@ -52,7 +52,10 @@ fn fixture() -> Engine {
 fn pg_proc_joins_on_a_regproc() {
     let mut e = fixture();
     assert_eq!(
-        first(&mut e, "SELECT proname FROM pg_proc WHERE oid = 'ff'::regproc"),
+        first(
+            &mut e,
+            "SELECT proname FROM pg_proc WHERE oid = 'ff'::regproc"
+        ),
         Value::text("ff"),
     );
     // …and by signature, which is what regprocedure carries.
@@ -81,7 +84,10 @@ fn it_renders_as_the_name_and_casts_to_the_oid() {
         first(&mut e, "SELECT 'ff'::regproc"),
         Value::RegProc(_, _)
     ));
-    assert_eq!(first(&mut e, "SELECT 'ff'::regproc::text"), Value::text("ff"));
+    assert_eq!(
+        first(&mut e, "SELECT 'ff'::regproc::text"),
+        Value::text("ff")
+    );
     assert_eq!(
         first(&mut e, "SELECT 'ff'::regproc::oid > 0"),
         Value::Bool(true)
@@ -120,7 +126,10 @@ fn pg_typeof_tells_regproc_from_regprocedure() {
         Value::text("regproc")
     );
     assert_eq!(
-        first(&mut e, "SELECT pg_typeof(to_regprocedure('g(integer,text)'))"),
+        first(
+            &mut e,
+            "SELECT pg_typeof(to_regprocedure('g(integer,text)'))"
+        ),
         Value::text("regprocedure"),
     );
 }
@@ -130,7 +139,9 @@ fn pg_typeof_tells_regproc_from_regprocedure() {
 fn a_regproc_and_a_bare_string_are_different_arguments() {
     let mut e = fixture();
     let def = first(&mut e, "SELECT pg_get_functiondef('ff'::regproc)");
-    let Value::Text(t) = &def else { panic!("{def:?}") };
+    let Value::Text(t) = &def else {
+        panic!("{def:?}")
+    };
     assert!(t.contains("CREATE OR REPLACE FUNCTION public.ff"), "{t}");
     // PG 18.4 on the bare string, verbatim.
     assert_eq!(

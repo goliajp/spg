@@ -50,7 +50,10 @@ fn round516_per_type_larger_and_smaller() {
     assert_eq!(text(&mut e, "SELECT oidlarger(1::oid, 2::oid)"), "2");
     assert_eq!(text(&mut e, "SELECT oidsmaller(1::oid, 2::oid)"), "1");
     assert_eq!(
-        text(&mut e, "SELECT bpchar_larger('a'::bpchar, 'b'::bpchar)::text"),
+        text(
+            &mut e,
+            "SELECT bpchar_larger('a'::bpchar, 'b'::bpchar)::text"
+        ),
         "b"
     );
     assert_eq!(
@@ -94,11 +97,26 @@ fn round516_network_larger_orders_by_the_network_comparison() {
 #[test]
 fn round516_numeric_catalog_spellings() {
     let mut e = engine();
-    assert_eq!(text(&mut e, "SELECT numeric_sqrt(4.0)::text"), "2.000000000000000");
-    assert_eq!(text(&mut e, "SELECT numeric_div_trunc(7.0, 2.0)::text"), "3");
-    assert_eq!(text(&mut e, "SELECT numeric_log(10.0, 100.0)::text"), "2.0000000000000000");
-    assert_eq!(text(&mut e, "SELECT round(numeric_exp(1.0), 4)::text"), "2.7183");
-    assert_eq!(text(&mut e, "SELECT numeric_ln(2.0)::text"), "0.6931471805599453");
+    assert_eq!(
+        text(&mut e, "SELECT numeric_sqrt(4.0)::text"),
+        "2.000000000000000"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT numeric_div_trunc(7.0, 2.0)::text"),
+        "3"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT numeric_log(10.0, 100.0)::text"),
+        "2.0000000000000000"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT round(numeric_exp(1.0), 4)::text"),
+        "2.7183"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT numeric_ln(2.0)::text"),
+        "0.6931471805599453"
+    );
     assert_eq!(text(&mut e, "SELECT textlen('abc')"), "3");
 }
 
@@ -106,7 +124,10 @@ fn round516_numeric_catalog_spellings() {
 #[test]
 fn round516_int8inc_int8dec_and_nameconcatoid() {
     let mut e = engine();
-    assert_eq!(text(&mut e, "SELECT int8inc(1::bigint), int8dec(1::bigint)"), "2|0");
+    assert_eq!(
+        text(&mut e, "SELECT int8inc(1::bigint), int8dec(1::bigint)"),
+        "2|0"
+    );
     assert_eq!(text(&mut e, "SELECT int8inc(NULL::bigint)"), "NULL");
     assert_eq!(text(&mut e, "SELECT nameconcatoid('abc', 42)"), "abc_42");
 }
@@ -124,7 +145,10 @@ fn round516_geometric_functions_and_to_regcollation() {
         ),
         "true|true"
     );
-    assert_eq!(text(&mut e, "SELECT to_regcollation('\"C\"')::text"), "\"C\"");
+    assert_eq!(
+        text(&mut e, "SELECT to_regcollation('\"C\"')::text"),
+        "\"C\""
+    );
     // The `to_reg*` family answers NULL on a miss where the cast raises.
     assert_eq!(text(&mut e, "SELECT to_regcollation('nosuch')"), "NULL");
     assert!(e.execute("SELECT 'nosuch'::regcollation").is_err());

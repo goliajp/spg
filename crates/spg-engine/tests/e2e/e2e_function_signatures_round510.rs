@@ -43,7 +43,10 @@ fn text(e: &mut Engine, sql: &str) -> String {
 fn round510_random_takes_a_range() {
     let mut e = engine();
     // A degenerate range pins both the value and the inclusivity.
-    assert_eq!(text(&mut e, "SELECT random(1,1), random(5,5), random(2.5,2.5)"), "1|5|2.5");
+    assert_eq!(
+        text(&mut e, "SELECT random(1,1), random(5,5), random(2.5,2.5)"),
+        "1|5|2.5"
+    );
     assert_eq!(
         text(
             &mut e,
@@ -102,7 +105,10 @@ fn round510_length_takes_an_encoding() {
     assert_eq!(text(&mut e, "SELECT length(NULL::bytea, 'UTF8')"), "NULL");
     // Multi-byte: four bytes, two characters.
     assert_eq!(
-        text(&mut e, "SELECT length('\\xc3a9c3a9'::bytea, 'UTF8'), length('\\xc3a9c3a9'::bytea)"),
+        text(
+            &mut e,
+            "SELECT length('\\xc3a9c3a9'::bytea, 'UTF8'), length('\\xc3a9c3a9'::bytea)"
+        ),
         "2|4"
     );
 }
@@ -137,7 +143,10 @@ fn round510_ts_rank_is_strict() {
 #[test]
 fn round510_uuidv7_takes_a_shift() {
     let mut e = engine();
-    assert_eq!(text(&mut e, "SELECT uuidv7(INTERVAL '0') IS NOT NULL"), "true");
+    assert_eq!(
+        text(&mut e, "SELECT uuidv7(INTERVAL '0') IS NOT NULL"),
+        "true"
+    );
     assert_eq!(text(&mut e, "SELECT uuidv7(NULL::interval)"), "NULL");
     // The shift really moves the clock: a day back sorts before a day on.
     assert_eq!(

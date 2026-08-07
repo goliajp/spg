@@ -8,9 +8,7 @@ use spg_engine::{Engine, QueryResult};
 
 fn one(e: &mut Engine, sql: &str) -> String {
     match e.execute(sql).unwrap() {
-        QueryResult::Rows { rows, .. } => {
-            spg_engine::eval::value_to_text(&rows[0].values[0])
-        }
+        QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{other:?}"),
     }
 }
@@ -25,7 +23,8 @@ fn round773_byte_escapes_decode_as_pg() {
     assert_eq!(one(&mut e, r"SELECT E'a\tb'"), "a\tb");
     let err = format!(
         "{}",
-        e.execute(r"SELECT E'\777'").expect_err("0xFF byte must refuse")
+        e.execute(r"SELECT E'\777'")
+            .expect_err("0xFF byte must refuse")
     );
     assert!(
         err.contains("invalid byte sequence for encoding \"UTF8\": 0xff"),

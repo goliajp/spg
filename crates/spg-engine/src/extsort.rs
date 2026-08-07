@@ -45,22 +45,43 @@
 //! and is sorted in memory. That is a ceiling the host opts into, not
 //! one imposed on it.
 
-// Phase B's core, unit-tested and NOT on any query path — the wiring
-// is written and measured but held back on the perf red line.
+// Phase B's core, unit-tested and NOT on any query path — the wiring is
+// written and measured but held on the perf red line.
 //
-// Round 837 wired it: correct on eight ORDER BY shapes, 807 MB down to
-// 117 MB at 400k rows, and 2.16 s wall against PG18's 0.40 s on the
-// same query where PG also spills. Round 840 found why — `FileRun` was
-// unbuffered and a run is written one 4-byte length plus one ~200-byte
-// body at a time, 1.6M syscalls for 400k rows. Buffering both sides cut
-// that 1.06 s to 38 ms and the wired sort to 0.98 s.
+// Numbers, all taken under `docs/BENCH_PROTOCOL.md` (same psql on both
+// sides, a non-indexed sort key so PG really sorts, row counts verified,
+// `Sort Method: external merge  Disk: 85384kB` confirmed in the plan,
+// six interleaved runs with the starting side flipped), 400k rows of
+// 200 bytes at work_mem = 4MB:
 //
-// Still short. The bar is PG's 0.40 s and losing an endpoint is a hard
-// stop here whatever the memory buys, so the wiring waits. What is
-// accounted for: sorter 186 ms (round 839, memory runs), file I/O 38 ms
-// (round 840). The rest is the scan, the projection and the wire — the
-// unspilled path costs 0.83 s on the same query, so most of the gap to
-// PG is NOT the spill and is tracked separately.
+//   PG18                    0.40 - 0.41 s
+//   SPG, sort in memory     0.31 - 0.33 s   (faster than PG)
+//   SPG, sort spilled       0.46 - 0.51 s   (1.15 - 1.28x slower)
+//
+// The ranges do not overlap, so the spill's cost is real here — about
+// +0.15 s — unlike the earlier readings this replaces. Peak RSS over the
+// same run falls from 807 MB to 129 MB, and eight ORDER BY shapes give
+// byte-identical answers spilled and unspilled.
+//
+// Wiring it would turn an endpoint SPG currently WINS into one it loses,
+// which is a hard stop whatever the memory buys.
+//
+// Where the cost is NOT, each measured rather than argued:
+//
+//   the codec, and the k-way merge's O(n*k) head scan       round 839
+//   the row clone into the sorter (16 ms), the extra pass   round 843
+//     over the rows (15 ms)
+//   the number of runs — 29 runs merge no slower than 2,    round 844
+//     so a heap or loser tree buys nothing
+//   the merge's per-row allocation — removing two of them   round 845
+//     per row, 800k in all, changed nothing measurable
+//
+// Seven guesses, seven refutations. What is left of the sorter's 186 ms
+// is decoding a row and cloning it back out, which is the work spilling
+// exists to do; the honest reading is that this is not a hot spot with a
+// mistake in it. The comparison worth closing is server-side and smaller
+// than the wall clock suggests: 224 ms of spill machinery against PG's
+// 152 ms.
 #![allow(dead_code)]
 
 use alloc::boxed::Box;
@@ -235,7 +256,8 @@ impl<'a> ExternalSorter<'a> {
                     None => best = Some(i),
                     Some(b) => {
                         let (bk, _) = readers[b].head.as_ref().expect("checked above");
-                        if cmp_multi_key_in(keys, bk, self.descs, &[]) == core::cmp::Ordering::Less {
+                        if cmp_multi_key_in(keys, bk, self.descs, &[]) == core::cmp::Ordering::Less
+                        {
                             best = Some(i);
                         }
                     }
@@ -244,8 +266,7 @@ impl<'a> ExternalSorter<'a> {
             let Some(i) = best else { break };
             let (_, record) = readers[i].head.take().expect("chosen head is present");
             out.push(project(&record)?);
-            readers[i].head =
-                Self::next_row(&mut *readers[i].run, &self.record_schema, &keys_of)?;
+            readers[i].head = Self::next_row(&mut *readers[i].run, &self.record_schema, &keys_of)?;
         }
         Ok(out)
     }
@@ -365,6 +386,117 @@ mod tests {
 
     fn project_identity(src: &Row<'static>) -> Result<Row<'static>, EngineError> {
         Ok(src.clone())
+    }
+
+    /// r844 — does the merge cost scale with the number of RUNS?
+    ///
+    /// Round 839 cleared the O(n·k) merge as the cause of a 1.33 s gap,
+    /// and that was right. The gap is 72 ms now — SPG's spill machinery
+    /// costs 224 ms against PG's 152 ms — and at that size a term
+    /// dismissed as small deserves pricing rather than remembering.
+    /// Picking each output row scans every run's head, so k runs cost
+    /// n·k comparisons: 400k × 20 at a 4 MB budget.
+    ///
+    /// Same rows, three budgets, so k falls while n stays put. If the
+    /// merge is flat in k, a loser tree buys nothing and the 72 ms is
+    /// elsewhere.
+    ///
+    /// `cargo test -p spg-engine --release --lib r844 -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn r844_merge_cost_against_run_count() {
+        extern crate std;
+        use spg_storage::{ColumnSchema, DataType, Value};
+        use std::time::Instant;
+
+        const ROWS: usize = 400_000;
+        let pad: alloc::string::String = "y".repeat(200);
+        let cols = alloc::vec![
+            ColumnSchema::new("id", DataType::Int, false),
+            ColumnSchema::new("pad", DataType::Text, false),
+        ];
+        let descs = [false];
+
+        for budget_mb in [4usize, 16, 64] {
+            let mut s =
+                ExternalSorter::new(Some(mem_run), budget_mb * 1024 * 1024, cols.clone(), &descs);
+            for i in 0..ROWS {
+                let r = Row::new(alloc::vec![
+                    Value::Int(i32::try_from((i * 7919) % ROWS).unwrap()),
+                    Value::text(pad.clone()),
+                ]);
+                let k = keys_of(&r).unwrap();
+                s.push(k, r).unwrap();
+            }
+            let runs = s.runs.len() + usize::from(!s.batch.is_empty());
+            let t = Instant::now();
+            let out = s.finish(keys_of, |src| Ok(src.clone())).unwrap();
+            std::eprintln!(
+                "R844 budget={budget_mb}MB runs={runs} merge={:?} rows={}",
+                t.elapsed(),
+                out.len()
+            );
+            assert_eq!(out.len(), ROWS);
+        }
+    }
+
+    /// r843 — the +0.15 s the wiring costs is not in the sorter, so it is
+    /// in what the wiring does AROUND it. Three candidates, priced here
+    /// against the same 400k rows the wall-clock runs use.
+    ///
+    /// The wired path does per row: clone the source row into the
+    /// sorter, and later project it after the merge. The unwired path
+    /// projects during the scan and never clones. So the delta should be
+    /// one clone per row plus whatever moving the projection costs — this
+    /// prices the clone, which is the part with no equivalent on the
+    /// other side.
+    ///
+    /// `cargo test -p spg-engine --release --lib r843 -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn r843_price_the_wirings_extra_work() {
+        extern crate std;
+        use spg_storage::{ColumnSchema, DataType, Value};
+        use std::time::Instant;
+
+        const ROWS: usize = 400_000;
+        let pad: alloc::string::String = "y".repeat(200);
+        let rows: Vec<Row<'static>> = (0..ROWS)
+            .map(|i| {
+                Row::new(alloc::vec![
+                    Value::Int(i32::try_from(i).unwrap()),
+                    Value::text(pad.clone()),
+                ])
+            })
+            .collect();
+
+        // What the spill path adds: one full-row clone per row, on the
+        // way into the sorter.
+        let t0 = Instant::now();
+        let mut sink: Vec<Row<'static>> = Vec::with_capacity(ROWS);
+        for r in &rows {
+            sink.push(r.clone());
+        }
+        let clone_cost = t0.elapsed();
+        std::hint::black_box(&sink);
+
+        // And it holds the output as a second Vec while the merge fills
+        // it — priced separately because it is the same shape the
+        // unspilled path already pays.
+        let t1 = Instant::now();
+        let out: Vec<Row<'static>> = sink.iter().map(Clone::clone).collect();
+        let second_pass = t1.elapsed();
+        std::hint::black_box(&out);
+
+        let cols = alloc::vec![
+            ColumnSchema::new("id", DataType::Int, false),
+            ColumnSchema::new("pad", DataType::Text, false),
+        ];
+        std::hint::black_box(&cols);
+
+        std::eprintln!(
+            "R843 rows={ROWS} source_row_clone={clone_cost:?} extra_pass={second_pass:?}"
+        );
     }
 
     /// r839 — where does a spilled sort spend its time? Counter-first,
@@ -517,6 +649,10 @@ mod tests {
             })
             .collect();
         assert_eq!(pads, alloc::vec!["pad-0", "pad-1", "pad-2"]);
-        assert_eq!(out[0].values.len(), 1, "same output shape as the spilled path");
+        assert_eq!(
+            out[0].values.len(),
+            1,
+            "same output shape as the spilled path"
+        );
     }
 }

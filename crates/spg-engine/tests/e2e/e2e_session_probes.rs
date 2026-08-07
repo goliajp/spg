@@ -83,7 +83,10 @@ fn event_trigger_readers_return_null() {
         "pg_event_trigger_table_rewrite_reason()",
     ] {
         let sql = format!("SELECT {f}");
-        let m = e.execute(&sql).expect_err("PG refuses this outside a trigger").to_string();
+        let m = e
+            .execute(&sql)
+            .expect_err("PG refuses this outside a trigger")
+            .to_string();
         assert!(
             m.contains("can only be called in") && m.contains("event trigger"),
             "SELECT {f}: said {m:?}"

@@ -52,15 +52,14 @@ fn case_branches_must_share_a_type() {
         ),
     ] {
         let got = err(&mut e, sql);
-        assert_eq!(
-            got,
-            format!("eval: type mismatch: {want}"),
-            "{sql}"
-        );
+        assert_eq!(got, format!("eval: type mismatch: {want}"), "{sql}");
     }
     // An untyped literal adopts the other branches' type; a value that will
     // not convert is reported as itself.
-    assert_eq!(text(&mut e, "SELECT CASE WHEN true THEN 1 ELSE '2' END"), "1");
+    assert_eq!(
+        text(&mut e, "SELECT CASE WHEN true THEN 1 ELSE '2' END"),
+        "1"
+    );
     let got = err(&mut e, "SELECT CASE WHEN true THEN 1 ELSE 'a' END");
     assert!(
         got.contains("invalid input syntax for type integer: \"a\""),
@@ -72,9 +71,15 @@ fn case_branches_must_share_a_type() {
         "{got}"
     );
     // Same-family branches still resolve, and a CASE with no ELSE is NULL.
-    assert_eq!(text(&mut e, "SELECT CASE WHEN true THEN 1 ELSE 2.5 END"), "1");
     assert_eq!(
-        text(&mut e, "SELECT pg_typeof(CASE WHEN true THEN 1 ELSE 2.5 END)::text"),
+        text(&mut e, "SELECT CASE WHEN true THEN 1 ELSE 2.5 END"),
+        "1"
+    );
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT pg_typeof(CASE WHEN true THEN 1 ELSE 2.5 END)::text"
+        ),
         "numeric"
     );
     assert_eq!(text(&mut e, "SELECT CASE WHEN false THEN 1 END"), "NULL");
@@ -115,17 +120,27 @@ fn coalesce_greatest_and_least_share_the_rule() {
     );
     // The working shapes are untouched.
     assert_eq!(text(&mut e, "SELECT coalesce(1,'2')"), "1");
-    assert_eq!(text(&mut e, "SELECT pg_typeof(coalesce(1,'2'))::text"), "integer");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(coalesce(1,'2'))::text"),
+        "integer"
+    );
     assert_eq!(text(&mut e, "SELECT coalesce(NULL,1)"), "1");
-    assert_eq!(text(&mut e, "SELECT pg_typeof(coalesce(1,2.5))::text"), "numeric");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(coalesce(1,2.5))::text"),
+        "numeric"
+    );
     assert_eq!(text(&mut e, "SELECT greatest('a','b')"), "b");
-    assert_eq!(text(&mut e, "SELECT pg_typeof(least(1,2.5))::text"), "numeric");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(least(1,2.5))::text"),
+        "numeric"
+    );
 }
 
 #[test]
 fn only_confidently_typed_branches_are_judged() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE ev (id int, payload jsonb)").unwrap();
+    e.execute("CREATE TABLE ev (id int, payload jsonb)")
+        .unwrap();
     e.execute("INSERT INTO ev VALUES (1,'{\"user\":{\"h\":{\"a\":\"b\"}}}')")
         .unwrap();
     // A general expression's type is a best-effort hint, not a contract:

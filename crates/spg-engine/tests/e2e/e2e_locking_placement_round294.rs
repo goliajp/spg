@@ -38,8 +38,10 @@ fn ok(e: &mut Engine, sql: &str) -> usize {
 
 fn fixture() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE s1 (id int primary key, v int)").unwrap();
-    e.execute("CREATE TABLE s2 (id int primary key, w int)").unwrap();
+    e.execute("CREATE TABLE s1 (id int primary key, v int)")
+        .unwrap();
+    e.execute("CREATE TABLE s2 (id int primary key, w int)")
+        .unwrap();
     e.execute("INSERT INTO s1 VALUES (1,10),(2,20)").unwrap();
     e.execute("INSERT INTO s2 VALUES (1,100)").unwrap();
     e
@@ -94,7 +96,10 @@ fn of_must_name_a_relation_from_the_from_clause() {
     // A real one passes — the list is genuinely captured, not ignored.
     assert_eq!(ok(&mut e, "SELECT * FROM s1 FOR UPDATE OF s1"), 2);
     assert_eq!(
-        ok(&mut e, "SELECT * FROM s1 JOIN s2 USING (id) FOR UPDATE OF s1"),
+        ok(
+            &mut e,
+            "SELECT * FROM s1 JOIN s2 USING (id) FOR UPDATE OF s1"
+        ),
         1,
     );
 }
@@ -107,12 +112,21 @@ fn the_allowed_shapes_still_run() {
     assert_eq!(ok(&mut e, "SELECT * FROM s1 ORDER BY id FOR UPDATE"), 2);
     assert_eq!(ok(&mut e, "SELECT * FROM s1 LIMIT 1 FOR UPDATE"), 1);
     assert_eq!(ok(&mut e, "SELECT 1 FOR UPDATE"), 1);
-    assert_eq!(ok(&mut e, "SELECT * FROM (SELECT * FROM s1) x FOR UPDATE"), 2);
     assert_eq!(
-        ok(&mut e, "WITH c AS (SELECT * FROM s1) SELECT * FROM c FOR UPDATE"),
+        ok(&mut e, "SELECT * FROM (SELECT * FROM s1) x FOR UPDATE"),
+        2
+    );
+    assert_eq!(
+        ok(
+            &mut e,
+            "WITH c AS (SELECT * FROM s1) SELECT * FROM c FOR UPDATE"
+        ),
         2,
     );
-    assert_eq!(ok(&mut e, "SELECT * FROM s1 JOIN s2 USING (id) FOR UPDATE"), 1);
+    assert_eq!(
+        ok(&mut e, "SELECT * FROM s1 JOIN s2 USING (id) FOR UPDATE"),
+        1
+    );
 }
 
 #[test]

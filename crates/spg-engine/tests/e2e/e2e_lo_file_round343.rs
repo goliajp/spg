@@ -134,5 +134,8 @@ fn alloc_fmt(oid: u32) -> String {
 fn exporting_a_missing_object_is_pgs_error() {
     let e = spg_engine::Engine::new();
     let err = e.lo_export_bytes(99_999).unwrap_err();
-    assert_eq!(format!("{err}"), "unsupported: large object 99999 does not exist");
+    assert_eq!(
+        format!("{err}"),
+        "unsupported: large object 99999 does not exist"
+    );
 }

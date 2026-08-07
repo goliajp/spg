@@ -21,7 +21,10 @@ fn backreference_and_lookahead_match_pg() {
     assert_eq!(one(&mut e, "SELECT 'abcabc' ~ '(abc)\\1'"), "Bool(true)");
     assert_eq!(one(&mut e, "SELECT 'abcdef' ~ '(abc)\\1'"), "Bool(false)");
     assert_eq!(
-        one(&mut e, "SELECT regexp_replace('foofoo bar', '(foo)\\1', 'X')"),
+        one(
+            &mut e,
+            "SELECT regexp_replace('foofoo bar', '(foo)\\1', 'X')"
+        ),
         "Text(\"X bar\")"
     );
     assert_eq!(one(&mut e, "SELECT 'foobar' ~ 'foo(?=bar)'"), "Bool(true)");

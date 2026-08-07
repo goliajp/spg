@@ -102,8 +102,7 @@ fn round559_mvcc_visibility_is_respected() {
     // Its own write counts for itself…
     assert_eq!(
         match e.execute_in("SELECT count(*) FROM c", t1).unwrap() {
-            QueryResult::Rows { rows, .. } =>
-                spg_engine::eval::value_to_text(&rows[0].values[0]),
+            QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
             other => panic!("{other:?}"),
         },
         "101"
@@ -112,8 +111,7 @@ fn round559_mvcc_visibility_is_respected() {
     e.execute_in("BEGIN", t2).unwrap();
     assert_eq!(
         match e.execute_in("SELECT count(*) FROM c", t2).unwrap() {
-            QueryResult::Rows { rows, .. } =>
-                spg_engine::eval::value_to_text(&rows[0].values[0]),
+            QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
             other => panic!("{other:?}"),
         },
         "100"
@@ -128,15 +126,15 @@ fn round559_mvcc_visibility_is_respected() {
 fn round559_a_frozen_view_keeps_its_count() {
     let mut e = engine();
     let (t1, t2) = (TxId(81), TxId(82));
-    e.execute_in("BEGIN ISOLATION LEVEL REPEATABLE READ", t1).unwrap();
+    e.execute_in("BEGIN ISOLATION LEVEL REPEATABLE READ", t1)
+        .unwrap();
     e.execute_in("SELECT count(*) FROM c", t1).unwrap();
     e.execute_in("BEGIN", t2).unwrap();
     e.execute_in("INSERT INTO c VALUES (300, 0)", t2).unwrap();
     e.execute_in("COMMIT", t2).unwrap();
     assert_eq!(
         match e.execute_in("SELECT count(*) FROM c", t1).unwrap() {
-            QueryResult::Rows { rows, .. } =>
-                spg_engine::eval::value_to_text(&rows[0].values[0]),
+            QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
             other => panic!("{other:?}"),
         },
         "100",
@@ -150,17 +148,29 @@ fn round559_a_frozen_view_keeps_its_count() {
 #[test]
 fn round559_other_shapes_are_untouched() {
     let mut e = engine();
-    assert_eq!(rows(&mut e, "SELECT count(*) FROM c WHERE k = 1"), vec!["10"]);
     assert_eq!(
-        rows(&mut e, "SELECT count(*) FROM c GROUP BY k ORDER BY k LIMIT 1"),
+        rows(&mut e, "SELECT count(*) FROM c WHERE k = 1"),
+        vec!["10"]
+    );
+    assert_eq!(
+        rows(
+            &mut e,
+            "SELECT count(*) FROM c GROUP BY k ORDER BY k LIMIT 1"
+        ),
         vec!["10"]
     );
     assert_eq!(rows(&mut e, "SELECT count(DISTINCT k) FROM c"), vec!["10"]);
     assert_eq!(rows(&mut e, "SELECT count(id) FROM c"), vec!["100"]);
-    assert_eq!(rows(&mut e, "SELECT count(*), sum(k) FROM c"), vec!["100|450"]);
+    assert_eq!(
+        rows(&mut e, "SELECT count(*), sum(k) FROM c"),
+        vec!["100|450"]
+    );
     // A join, a subquery source, and a catalog all keep the old route.
     assert_eq!(
-        rows(&mut e, "SELECT count(*) FROM (SELECT id FROM c WHERE id <= 5) s"),
+        rows(
+            &mut e,
+            "SELECT count(*) FROM (SELECT id FROM c WHERE id <= 5) s"
+        ),
         vec!["5"]
     );
     assert!(!rows(&mut e, "SELECT count(*) FROM pg_class").is_empty());

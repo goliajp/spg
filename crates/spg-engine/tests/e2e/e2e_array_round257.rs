@@ -74,33 +74,41 @@ fn array_position_takes_a_start_subscript() {
 fn slice_assignment_follows_pgs_rules() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE sl (id int, a int[])").unwrap();
-    e.execute("INSERT INTO sl VALUES (1, ARRAY[1,2,3,4,5])").unwrap();
+    e.execute("INSERT INTO sl VALUES (1, ARRAY[1,2,3,4,5])")
+        .unwrap();
     // In-place replacement.
-    e.execute("UPDATE sl SET a[2:3] = ARRAY[20,30] WHERE id=1").unwrap();
+    e.execute("UPDATE sl SET a[2:3] = ARRAY[20,30] WHERE id=1")
+        .unwrap();
     assert_eq!(one(&mut e, "SELECT a FROM sl WHERE id=1"), "{1,20,30,4,5}");
     // A source shorter than the slice is refused, and changes nothing.
     let got = err(&mut e, "UPDATE sl SET a[2:3] = ARRAY[7] WHERE id=1");
     assert!(got.contains("source array too small"), "{got}");
     assert_eq!(one(&mut e, "SELECT a FROM sl WHERE id=1"), "{1,20,30,4,5}");
     // A longer source is truncated to the slice.
-    e.execute("UPDATE sl SET a[2:3] = ARRAY[8,9,10] WHERE id=1").unwrap();
+    e.execute("UPDATE sl SET a[2:3] = ARRAY[8,9,10] WHERE id=1")
+        .unwrap();
     assert_eq!(one(&mut e, "SELECT a FROM sl WHERE id=1"), "{1,8,9,4,5}");
     // A slice past the end extends, NULL-padding the hole.
-    e.execute("UPDATE sl SET a[7:8] = ARRAY[70,80] WHERE id=1").unwrap();
+    e.execute("UPDATE sl SET a[7:8] = ARRAY[70,80] WHERE id=1")
+        .unwrap();
     assert_eq!(
         one(&mut e, "SELECT a FROM sl WHERE id=1"),
         "{1,8,9,4,5,NULL,70,80}"
     );
     // A NULL array becomes a fresh one.
     e.execute("INSERT INTO sl VALUES (2, NULL)").unwrap();
-    e.execute("UPDATE sl SET a[1:2] = ARRAY[1,2] WHERE id=2").unwrap();
+    e.execute("UPDATE sl SET a[1:2] = ARRAY[1,2] WHERE id=2")
+        .unwrap();
     assert_eq!(one(&mut e, "SELECT a FROM sl WHERE id=2"), "{1,2}");
     // The open form runs to the end.
-    e.execute("INSERT INTO sl VALUES (3, ARRAY[1,2,3])").unwrap();
-    e.execute("UPDATE sl SET a[2:] = ARRAY[9,9] WHERE id=3").unwrap();
+    e.execute("INSERT INTO sl VALUES (3, ARRAY[1,2,3])")
+        .unwrap();
+    e.execute("UPDATE sl SET a[2:] = ARRAY[9,9] WHERE id=3")
+        .unwrap();
     assert_eq!(one(&mut e, "SELECT a FROM sl WHERE id=3"), "{1,9,9}");
     // Several subscript writes to one column still merge into one array.
-    e.execute("UPDATE sl SET a[1] = 100, a[3] = 300 WHERE id=3").unwrap();
+    e.execute("UPDATE sl SET a[1] = 100, a[3] = 300 WHERE id=3")
+        .unwrap();
     assert_eq!(one(&mut e, "SELECT a FROM sl WHERE id=3"), "{100,9,300}");
 }
 
@@ -115,7 +123,10 @@ fn distinct_collection_aggregates_emit_sorted_values() {
         ("SELECT string_agg(DISTINCT s, ',') FROM d", "a,b"),
         ("SELECT json_agg(DISTINCT x) FROM d", "[1, 2, null]"),
         // An explicit ORDER BY still wins.
-        ("SELECT array_agg(DISTINCT x ORDER BY x DESC) FROM d", "{NULL,2,1}"),
+        (
+            "SELECT array_agg(DISTINCT x ORDER BY x DESC) FROM d",
+            "{NULL,2,1}",
+        ),
         // Plain array_agg keeps input order; count is unaffected.
         ("SELECT array_agg(x) FROM d", "{2,1,2,NULL}"),
         ("SELECT count(DISTINCT x) FROM d", "2"),

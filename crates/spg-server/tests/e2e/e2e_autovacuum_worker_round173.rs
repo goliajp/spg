@@ -129,7 +129,10 @@ fn crossing_statement_no_longer_vacuums_inline() {
         d >= 1200,
         "server statement path must not vacuum inline (dead={d})"
     );
-    assert_eq!(as_i64(&run_select(&mut s, "SELECT count(*) FROM av")[0][0]), 300);
+    assert_eq!(
+        as_i64(&run_select(&mut s, "SELECT count(*) FROM av")[0][0]),
+        300
+    );
 }
 
 #[test]
@@ -153,5 +156,8 @@ fn worker_reclaims_without_further_dml() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(as_i64(&run_select(&mut s, "SELECT count(*) FROM av")[0][0]), 300);
+    assert_eq!(
+        as_i64(&run_select(&mut s, "SELECT count(*) FROM av")[0][0]),
+        300
+    );
 }

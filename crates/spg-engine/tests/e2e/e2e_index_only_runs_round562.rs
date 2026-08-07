@@ -126,11 +126,18 @@ fn round562_updates_move_positions() {
     e.execute("CREATE INDEX uk ON u (k)").unwrap();
     // Move a scattered set past the end of the range; the new versions
     // live at positions 500.. while the tombstones stay where they were.
-    e.execute("UPDATE u SET k = k + 10000 WHERE k % 5 = 0").unwrap();
+    e.execute("UPDATE u SET k = k + 10000 WHERE k % 5 = 0")
+        .unwrap();
 
     let expected: Vec<i64> = (1..=500).filter(|k| k % 5 != 0).collect();
-    assert_eq!(sorted(&mut e, "SELECT k FROM u WHERE k BETWEEN 1 AND 9999"), expected);
-    let moved: Vec<i64> = (1..=500).filter(|k| k % 5 == 0).map(|k| k + 10000).collect();
+    assert_eq!(
+        sorted(&mut e, "SELECT k FROM u WHERE k BETWEEN 1 AND 9999"),
+        expected
+    );
+    let moved: Vec<i64> = (1..=500)
+        .filter(|k| k % 5 == 0)
+        .map(|k| k + 10000)
+        .collect();
     assert_eq!(sorted(&mut e, "SELECT k FROM u WHERE k > 9999"), moved);
 }
 
@@ -146,13 +153,11 @@ fn round562_mvcc_across_leaves() {
     e.execute_in("BEGIN", t1).unwrap();
     e.execute_in("DELETE FROM m WHERE k % 2 = 0", t1).unwrap();
 
-    let seen = |e: &mut Engine, tx: TxId| match e
-        .execute_in("SELECT k FROM m WHERE k > 0", tx)
-        .unwrap()
-    {
-        QueryResult::Rows { rows, .. } => rows.len(),
-        other => panic!("{other:?}"),
-    };
+    let seen =
+        |e: &mut Engine, tx: TxId| match e.execute_in("SELECT k FROM m WHERE k > 0", tx).unwrap() {
+            QueryResult::Rows { rows, .. } => rows.len(),
+            other => panic!("{other:?}"),
+        };
     assert_eq!(seen(&mut e, t1), 400, "its own delete");
     e.execute_in("BEGIN", t2).unwrap();
     assert_eq!(seen(&mut e, t2), 800, "not another transaction's");

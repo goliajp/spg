@@ -298,12 +298,7 @@ impl CompiledExpr {
         };
         if !matches!(
             op,
-            BinOp::Eq
-                | BinOp::NotEq
-                | BinOp::Lt
-                | BinOp::LtEq
-                | BinOp::Gt
-                | BinOp::GtEq
+            BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
         ) {
             return None;
         }
@@ -405,13 +400,8 @@ fn unparseable_numeric_literal_cmp(lhs: &Expr, rhs: &Expr, ctx: &EvalContext<'_>
         ) {
             return false;
         }
-        crate::conversions::coerce_value(
-            spg_storage::Value::text(text.as_str()),
-            desc.ty,
-            "",
-            0,
-        )
-        .is_err()
+        crate::conversions::coerce_value(spg_storage::Value::text(text.as_str()), desc.ty, "", 0)
+            .is_err()
     };
     check(lhs, rhs) || check(rhs, lhs)
 }
@@ -498,15 +488,11 @@ fn can_raise_at_run_time(e: &Expr) -> bool {
             ) || can_raise_at_run_time(lhs)
                 || can_raise_at_run_time(rhs)
         }
-        Expr::Unary { op, expr } => {
-            !matches!(op, UnOp::Not) || can_raise_at_run_time(expr)
-        }
+        Expr::Unary { op, expr } => !matches!(op, UnOp::Not) || can_raise_at_run_time(expr),
         Expr::IsNull { expr, .. } | Expr::BoolTest { expr, .. } => can_raise_at_run_time(expr),
-        Expr::Like {
-            expr,
-            pattern,
-            ..
-        } => can_raise_at_run_time(expr) || can_raise_at_run_time(pattern),
+        Expr::Like { expr, pattern, .. } => {
+            can_raise_at_run_time(expr) || can_raise_at_run_time(pattern)
+        }
         Expr::InList { expr, list, .. } => {
             can_raise_at_run_time(expr) || list.iter().any(can_raise_at_run_time)
         }
@@ -652,8 +638,7 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             // LIKE, IN and count(DISTINCT …) all give byte-equality's
             // answer under a deterministic collation.
             if matches!(op, BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq)
-                && operand_declares_a_collation(lhs, ctx)
-                | operand_declares_a_collation(rhs, ctx)
+                && operand_declares_a_collation(lhs, ctx) | operand_declares_a_collation(rhs, ctx)
             {
                 steps.push(Step::Subtree(e.clone()));
                 return;
@@ -750,48 +735,48 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 return;
             }
             match literal_text_pattern(pattern) {
-            Some(pat) if fully_compilable(expr) => {
-                // v7.36 (perf — mailrs Phase 1, get_contacts hot
-                // inner) — trivial all-`%` pattern (`%`, `%%`, …)
-                // matches every non-NULL text. Collapse the LIKE
-                // into a `lhs IS NOT NULL` check: emit the operand
-                // then `IsNull { negated: !*negated }`. For ILIKE
-                // `%%` on 25 k rows the per-row `like_match_inner`
-                // → 2-char walk (~30 ns each) becomes a tag check
-                // (~3 ns); the operand still gets evaluated for the
-                // NULL semantics that SQL `LIKE` requires.
-                if !pat.is_empty() && pat.chars().all(|c| c == '%') {
+                Some(pat) if fully_compilable(expr) => {
+                    // v7.36 (perf — mailrs Phase 1, get_contacts hot
+                    // inner) — trivial all-`%` pattern (`%`, `%%`, …)
+                    // matches every non-NULL text. Collapse the LIKE
+                    // into a `lhs IS NOT NULL` check: emit the operand
+                    // then `IsNull { negated: !*negated }`. For ILIKE
+                    // `%%` on 25 k rows the per-row `like_match_inner`
+                    // → 2-char walk (~30 ns each) becomes a tag check
+                    // (~3 ns); the operand still gets evaluated for the
+                    // NULL semantics that SQL `LIKE` requires.
+                    if !pat.is_empty() && pat.chars().all(|c| c == '%') {
+                        compile_into(expr, ctx, steps);
+                        steps.push(Step::AnyTextMatch { negated: *negated });
+                        return;
+                    }
                     compile_into(expr, ctx, steps);
-                    steps.push(Step::AnyTextMatch { negated: *negated });
-                    return;
-                }
-                compile_into(expr, ctx, steps);
-                let chars: alloc::vec::Vec<char> = if *case_insensitive {
-                    pat.to_lowercase().chars().collect()
-                } else {
-                    pat.chars().collect()
-                };
-                // v7.39 — `%[k×_]lit[m×_]%` runs on the substring fast
-                // path (see Step::LikeSubstring).
-                if let Some((k, needle, m)) = like_substring_shape(&chars) {
-                    steps.push(Step::LikeSubstring {
-                        needle,
-                        k_before: k,
-                        m_after: m,
+                    let chars: alloc::vec::Vec<char> = if *case_insensitive {
+                        pat.to_lowercase().chars().collect()
+                    } else {
+                        pat.chars().collect()
+                    };
+                    // v7.39 — `%[k×_]lit[m×_]%` runs on the substring fast
+                    // path (see Step::LikeSubstring).
+                    if let Some((k, needle, m)) = like_substring_shape(&chars) {
+                        steps.push(Step::LikeSubstring {
+                            needle,
+                            k_before: k,
+                            m_after: m,
+                            negated: *negated,
+                            case_insensitive: *case_insensitive,
+                        });
+                        return;
+                    }
+                    steps.push(Step::Like {
+                        pattern: chars,
                         negated: *negated,
                         case_insensitive: *case_insensitive,
                     });
-                    return;
                 }
-                steps.push(Step::Like {
-                    pattern: chars,
-                    negated: *negated,
-                    case_insensitive: *case_insensitive,
-                });
+                _ => steps.push(Step::Subtree(e.clone())),
             }
-            _ => steps.push(Step::Subtree(e.clone())),
-            }
-        },
+        }
         // v7.39 (round 594) — a literal-pattern regex compiles here instead
         // of once per row. `s ~ 'p'` and `s ~* 'p'` both lower to
         // `regexp_like`, so this one shape covers the operators too. A
@@ -905,9 +890,8 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
         } if !ctx.mysql_dialect
             && ((matches!(op, spg_sql::ast::BinOp::Eq) && *is_any)
                 || (matches!(op, spg_sql::ast::BinOp::NotEq) && !*is_any))
-            && array_literal_items(array).is_some_and(|it| {
-                !it.is_empty() && crate::build_in_list_set(it).is_some()
-            })
+            && array_literal_items(array)
+                .is_some_and(|it| !it.is_empty() && crate::build_in_list_set(it).is_some())
             && fully_compilable(expr) =>
         {
             let items = array_literal_items(array).expect("checked above");
@@ -1669,10 +1653,7 @@ fn array_literal_items(e: &Expr) -> Option<&[Expr]> {
 /// the row, evaluated once. `None` for anything that depends on a row, or
 /// that fails to evaluate — the latter so its error still comes from the row
 /// loop, in the interpreter's own wording, rather than from planning.
-pub(crate) fn constant_projection_value(
-    e: &Expr,
-    ctx: &EvalContext<'_>,
-) -> Option<Value<'static>> {
+pub(crate) fn constant_projection_value(e: &Expr, ctx: &EvalContext<'_>) -> Option<Value<'static>> {
     if matches!(e, Expr::Literal(_)) || !constant_expr(e) {
         return None;
     }
@@ -1720,7 +1701,10 @@ fn regex_literal_parts(args: &[Expr]) -> Option<(&str, bool)> {
 /// The verdict `Step::Regex` produces. `None` means the operand is not text,
 /// which is the caller's cue to fall through to the interpreter for its own
 /// coercion and wording.
-fn regex_verdict(cell: &Value<'_>, re: &crate::eval::CompiledRe) -> Option<Result<Value<'static>, EvalError>> {
+fn regex_verdict(
+    cell: &Value<'_>,
+    re: &crate::eval::CompiledRe,
+) -> Option<Result<Value<'static>, EvalError>> {
     let text = match cell {
         Value::Null => return Some(Ok(Value::Null)),
         Value::Text(t) | Value::BpChar(t) => t.as_ref(),

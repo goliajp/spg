@@ -124,12 +124,18 @@ fn round608_strpos_reports_character_positions() {
          'テ' the 4th, and 'ç' the 3rd of ábç"
     );
     assert_eq!(
-        vals(&mut e, "SELECT strpos('aaa','aa'), strpos('','x'), strpos('',''), strpos('x','')"),
+        vals(
+            &mut e,
+            "SELECT strpos('aaa','aa'), strpos('','x'), strpos('',''), strpos('x','')"
+        ),
         vec!["1|0|1|1"],
         "leftmost match, and the empty-needle rule at both ends"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, strpos('abcabc', s), position(s in 'abcabc') FROM st ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, strpos('abcabc', s), position(s in 'abcabc') FROM st ORDER BY id"
+        ),
         vec![
             "1|0|0",
             "2|1|1",
@@ -143,7 +149,10 @@ fn round608_strpos_reports_character_positions() {
         "the operand can be the needle as easily as the haystack"
     );
     assert_eq!(
-        vals(&mut e, "SELECT strpos(123::TEXT,'2'), replace(456::TEXT,'5','x'), lpad(7::TEXT,3,'0')"),
+        vals(
+            &mut e,
+            "SELECT strpos(123::TEXT,'2'), replace(456::TEXT,'5','x'), lpad(7::TEXT,3,'0')"
+        ),
         vec!["2|4x6|007"],
         "a non-text operand still renders through the owned path"
     );
@@ -190,7 +199,10 @@ fn round608_padding_counts_characters() {
         "a multi-character fill cycles; an EMPTY fill leaves the input alone"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, lpad(s,10,'日本'), rpad(s,10,'日本') FROM st ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, lpad(s,10,'日本'), rpad(s,10,'日本') FROM st ORDER BY id"
+        ),
         vec![
             "1|日本日本日本row1|row1日本日本日本",
             "2|日本日本日本日本日本|日本日本日本日本日本",
@@ -204,12 +216,21 @@ fn round608_padding_counts_characters() {
         "the cycle counts characters of the fill too, and can stop mid-cycle"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, lpad(s,8), rpad(s,8), lpad(s,0,'x'), rpad(s,-1,'x') FROM st WHERE id IN (1,4)"),
-        vec!["1|    row1|row1    ||", "4| 日本語テキスト|日本語テキスト ||"],
+        vals(
+            &mut e,
+            "SELECT id, lpad(s,8), rpad(s,8), lpad(s,0,'x'), rpad(s,-1,'x') FROM st WHERE id IN (1,4)"
+        ),
+        vec![
+            "1|    row1|row1    ||",
+            "4| 日本語テキスト|日本語テキスト ||"
+        ],
         "the fill defaults to a space; a non-positive target is the empty string"
     );
     assert_eq!(
-        vals(&mut e, "SELECT lpad('',5,'z'), rpad('',5,'z'), lpad('abc',3,'z'), rpad('abc',3,'z')"),
+        vals(
+            &mut e,
+            "SELECT lpad('',5,'z'), rpad('',5,'z'), lpad('abc',3,'z'), rpad('abc',3,'z')"
+        ),
         vec!["zzzzz|zzzzz|abc|abc"]
     );
     assert_eq!(
@@ -240,7 +261,10 @@ fn round608_replace_and_split_part() {
         "an empty `from` is a no-op; an empty `to` deletes"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, replace(s,'日','X'), replace(s,'ábç','Y') FROM st ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, replace(s,'日','X'), replace(s,'ábç','Y') FROM st ORDER BY id"
+        ),
         vec![
             "1|row1|row1",
             "2||",
@@ -253,7 +277,10 @@ fn round608_replace_and_split_part() {
         ]
     );
     assert_eq!(
-        vals(&mut e, "SELECT replace('aaa','aa','b'), replace('abab','ab','ba')"),
+        vals(
+            &mut e,
+            "SELECT replace('aaa','aa','b'), replace('abab','ab','ba')"
+        ),
         vec!["ba|baba"],
         "non-overlapping, left to right, with no re-scan of what was inserted"
     );
@@ -292,7 +319,10 @@ fn round608_replace_and_split_part() {
 fn round608_concat_borrows() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id, s || 'x', 'y' || s, s || s, s || NULL FROM st ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, s || 'x', 'y' || s, s || s, s || NULL FROM st ORDER BY id"
+        ),
         vec![
             "1|row1x|yrow1|row1row1|NULL",
             "2|x|y||NULL",
@@ -306,8 +336,14 @@ fn round608_concat_borrows() {
         "a NULL operand still poisons"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, s || 5, 5 || s, s || 1.50, s || true FROM st WHERE id IN (1,4)"),
-        vec!["1|row15|5row1|row11.50|row1true", "4|日本語テキスト5|5日本語テキスト|日本語テキスト1.50|日本語テキストtrue"],
+        vals(
+            &mut e,
+            "SELECT id, s || 5, 5 || s, s || 1.50, s || true FROM st WHERE id IN (1,4)"
+        ),
+        vec![
+            "1|row15|5row1|row11.50|row1true",
+            "4|日本語テキスト5|5日本語テキスト|日本語テキスト1.50|日本語テキストtrue"
+        ],
         "a non-text operand renders through the owned path on either side"
     );
     assert_eq!(
@@ -338,12 +374,18 @@ fn round608_scale() {
     e.execute("INSERT INTO big SELECT gg, 'row' || gg FROM generate_series(1, 20000) gg")
         .unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE strpos(s, '234') > 0"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE strpos(s, '234') > 0"
+        ),
         vec!["40"],
         "checked against live PG18, which answers 40 for the same table"
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE strpos(s,'234') = position('234' in s)"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE strpos(s,'234') = position('234' in s)"
+        ),
         vec!["20000"],
         "the two spellings agree on every row"
     );
@@ -352,15 +394,24 @@ fn round608_scale() {
         vec!["20000"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE length(lpad(s,12,'0')) = 12"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE length(lpad(s,12,'0')) = 12"
+        ),
         vec!["20000"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE replace(s,'row','') = id::TEXT"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE replace(s,'row','') = id::TEXT"
+        ),
         vec!["20000"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE split_part(s || 'X' || id, 'X', 2) = id::TEXT"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE split_part(s || 'X' || id, 'X', 2) = id::TEXT"
+        ),
         vec!["20000"]
     );
 }

@@ -77,11 +77,17 @@ fn round621_every_source_expands_a_target_list_srf() {
         );
     }
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]), g FROM generate_series(3,4) g"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]), g FROM generate_series(3,4) g"
+        ),
         vec!["1|3", "2|3", "1|4", "2|4"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]), g FROM generate_series(3,4) g ORDER BY 1,2"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]), g FROM generate_series(3,4) g ORDER BY 1,2"
+        ),
         vec!["1|3", "1|4", "2|3", "2|4"]
     );
 }
@@ -96,7 +102,10 @@ fn round621_generate_series_resolves_a_positional_key() {
         "`ORDER BY 1` means the first OUTPUT column, not the literal 1"
     );
     assert_eq!(
-        vals(&mut e, "SELECT g FROM generate_series(1,3) g ORDER BY 1 DESC"),
+        vals(
+            &mut e,
+            "SELECT g FROM generate_series(1,3) g ORDER BY 1 DESC"
+        ),
         vec!["3", "2", "1"]
     );
 }
@@ -106,7 +115,10 @@ fn round621_generate_series_resolves_a_positional_key() {
 fn round621_the_sources_that_already_worked() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6]) y ORDER BY 1,2"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6]) y ORDER BY 1,2"
+        ),
         vec!["1|5", "1|6", "2|5", "2|6"]
     );
     e.execute("CREATE TABLE t1 (x INT)").unwrap();
@@ -116,16 +128,25 @@ fn round621_the_sources_that_already_worked() {
         vec!["1|3", "2|3", "1|4", "2|4"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]), x FROM (VALUES (3),(4)) v(x) ORDER BY 1 LIMIT 3"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]), x FROM (VALUES (3),(4)) v(x) ORDER BY 1 LIMIT 3"
+        ),
         vec!["1|3", "1|4", "2|3"],
         "LIMIT counts the expanded rows"
     );
     assert_eq!(
-        vals(&mut e, "SELECT DISTINCT unnest(ARRAY[1,1,2]) FROM (VALUES (3),(4)) v(x) ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT DISTINCT unnest(ARRAY[1,1,2]) FROM (VALUES (3),(4)) v(x) ORDER BY 1"
+        ),
         vec!["1", "2"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]) FROM (VALUES (3),(4)) v(x) WHERE x = 4"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]) FROM (VALUES (3),(4)) v(x) WHERE x = 4"
+        ),
         vec!["1", "2"],
         "WHERE filters the SOURCE rows, before the expansion"
     );

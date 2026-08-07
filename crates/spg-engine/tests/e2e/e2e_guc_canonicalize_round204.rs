@@ -59,8 +59,7 @@ fn enum_guc_rejects_bad_value() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("invalid value for parameter")
-            && err.contains("client_min_messages"),
+        err.contains("invalid value for parameter") && err.contains("client_min_messages"),
         "{err}"
     );
 }

@@ -53,9 +53,12 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn engine() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE w555 (id INT, k INT, pad TEXT)").unwrap();
-    e.execute("INSERT INTO w555 SELECT g, g % 100, repeat('x', 20) FROM generate_series(1, 5000) g")
+    e.execute("CREATE TABLE w555 (id INT, k INT, pad TEXT)")
         .unwrap();
+    e.execute(
+        "INSERT INTO w555 SELECT g, g % 100, repeat('x', 20) FROM generate_series(1, 5000) g",
+    )
+    .unwrap();
     e
 }
 
@@ -65,9 +68,15 @@ fn engine() -> Engine {
 fn round555_tiny_work_mem_changes_no_answer() {
     let mut e = engine();
     e.execute("SET work_mem = '64kB'").unwrap();
-    assert_eq!(rows(&mut e, "SELECT current_setting('work_mem')"), vec!["64kB"]);
     assert_eq!(
-        rows(&mut e, "SELECT count(*) FROM (SELECT id FROM w555 ORDER BY pad, id) s"),
+        rows(&mut e, "SELECT current_setting('work_mem')"),
+        vec!["64kB"]
+    );
+    assert_eq!(
+        rows(
+            &mut e,
+            "SELECT count(*) FROM (SELECT id FROM w555 ORDER BY pad, id) s"
+        ),
         vec!["5000"]
     );
     assert_eq!(
@@ -78,7 +87,10 @@ fn round555_tiny_work_mem_changes_no_answer() {
         vec!["100"]
     );
     assert_eq!(
-        rows(&mut e, "SELECT count(*) FROM (SELECT DISTINCT k, pad FROM w555) d"),
+        rows(
+            &mut e,
+            "SELECT count(*) FROM (SELECT DISTINCT k, pad FROM w555) d"
+        ),
         vec!["100"]
     );
     // The first five by the sort key, with the bound in force.
@@ -104,7 +116,10 @@ fn round555_explain_names_the_sort_method() {
     // PG prints this under ANALYZE and not under a plain EXPLAIN — it is
     // a measured runtime fact, not a plan property. A plain EXPLAIN must
     // stay exactly as PG's is.
-    let plain = plan(&mut e, "EXPLAIN SELECT id FROM w555 ORDER BY pad, id LIMIT 5");
+    let plain = plan(
+        &mut e,
+        "EXPLAIN SELECT id FROM w555 ORDER BY pad, id LIMIT 5",
+    );
     assert!(
         !plain.iter().any(|l| l.contains("Sort Method")),
         "a plain EXPLAIN has no Sort Method line in PG: {plain:?}"
@@ -119,7 +134,10 @@ fn round555_explain_names_the_sort_method() {
             .any(|l| l.contains("Sort Method: top-N heapsort")),
         "{bounded:?}"
     );
-    let full = plan(&mut e, "EXPLAIN ANALYZE SELECT id FROM w555 ORDER BY pad, id");
+    let full = plan(
+        &mut e,
+        "EXPLAIN ANALYZE SELECT id FROM w555 ORDER BY pad, id",
+    );
     assert!(
         full.iter().any(|l| l.contains("Sort Method: quicksort")),
         "{full:?}"
@@ -136,6 +154,9 @@ fn round555_explain_names_the_sort_method() {
 fn round555_work_mem_still_validates() {
     let mut e = Engine::new();
     e.execute("SET work_mem = '8MB'").unwrap();
-    assert_eq!(rows(&mut e, "SELECT current_setting('work_mem')"), vec!["8MB"]);
+    assert_eq!(
+        rows(&mut e, "SELECT current_setting('work_mem')"),
+        vec!["8MB"]
+    );
     assert!(e.execute("SET work_mem = 'bogus'").is_err());
 }

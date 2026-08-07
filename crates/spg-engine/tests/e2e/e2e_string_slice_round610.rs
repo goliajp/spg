@@ -71,7 +71,10 @@ fn seed() -> Engine {
 fn round610_left_and_right() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id, left(s,3), left(s,0), left(s,99), left(s,-2) FROM lt ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, left(s,3), left(s,0), left(s,99), left(s,-2) FROM lt ORDER BY id"
+        ),
         vec![
             "1|abc||abcdef|abcd",
             "2||||",
@@ -83,7 +86,10 @@ fn round610_left_and_right() {
         "left(s,-2) drops the last two CHARACTERS"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, right(s,3), right(s,0), right(s,99), right(s,-2) FROM lt ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, right(s,3), right(s,0), right(s,99), right(s,-2) FROM lt ORDER BY id"
+        ),
         vec![
             "1|def||abcdef|cdef",
             "2||||",
@@ -95,7 +101,10 @@ fn round610_left_and_right() {
         "right(s,-2) drops the first two"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, left(s,1), right(s,1), left(s,-99), right(s,-99) FROM lt ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, left(s,1), right(s,1), left(s,-99), right(s,-99) FROM lt ORDER BY id"
+        ),
         vec![
             "1|a|f||",
             "2||||",
@@ -107,16 +116,25 @@ fn round610_left_and_right() {
         "a drop bigger than the string leaves nothing"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, length(left(s,3)), length(right(s,3)) FROM lt ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, length(left(s,3)), length(right(s,3)) FROM lt ORDER BY id"
+        ),
         vec!["1|3|3", "2|0|0", "3|NULL|NULL", "4|3|3", "5|3|3", "6|1|1"],
         "three characters is three whatever their byte width"
     );
     assert_eq!(
-        vals(&mut e, "SELECT left('日本語テキスト',2), right('日本語テキスト',2), left('ábç',2), right('ábç',2)"),
+        vals(
+            &mut e,
+            "SELECT left('日本語テキスト',2), right('日本語テキスト',2), left('ábç',2), right('ábç',2)"
+        ),
         vec!["日本|スト|áb|bç"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT left('',1), right('',1), left(123::TEXT,2), right(456::TEXT,2)"),
+        vals(
+            &mut e,
+            "SELECT left('',1), right('',1), left(123::TEXT,2), right(456::TEXT,2)"
+        ),
         vec!["||12|56"]
     );
 }
@@ -143,7 +161,10 @@ fn round610_substring() {
         "no FOR takes the rest"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, substr(s,2,3), substr(s,1,0), substr(s,99,3), substr(s,0,3) FROM lt ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, substr(s,2,3), substr(s,1,0), substr(s,99,3), substr(s,0,3) FROM lt ORDER BY id"
+        ),
         vec![
             "1|bcd|||ab",
             "2||||",
@@ -155,7 +176,10 @@ fn round610_substring() {
         "start 0 spends one of the three on the position before the string"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, substr(s,-1,3), substr(s,-5,3), substring(s from 0 for 3) FROM lt ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, substr(s,-1,3), substr(s,-5,3), substring(s from 0 for 3) FROM lt ORDER BY id"
+        ),
         vec![
             "1|a||ab",
             "2|||",
@@ -167,7 +191,10 @@ fn round610_substring() {
         "a negative start counts toward the string and the length is spent getting there"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, substring(s from 2 for 99), substr(s,2,0), substr(s,3) FROM lt ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, substring(s from 2 for 99), substr(s,2,0), substr(s,3) FROM lt ORDER BY id"
+        ),
         vec![
             "1|bcdef||cdef",
             "2|||",
@@ -178,15 +205,24 @@ fn round610_substring() {
         ]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, length(substr(s,2,3)), length(substring(s from 2)) FROM lt ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, length(substr(s,2,3)), length(substring(s from 2)) FROM lt ORDER BY id"
+        ),
         vec!["1|3|5", "2|0|0", "3|NULL|NULL", "4|3|6", "5|2|2", "6|0|0"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT substr('日本語テキスト',2,3), substr('ábç',2,1), substring('ábç' from 3)"),
+        vals(
+            &mut e,
+            "SELECT substr('日本語テキスト',2,3), substr('ábç',2,1), substring('ábç' from 3)"
+        ),
         vec!["本語テ|b|ç"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT substr('',1,1), substring('' from 1 for 1), substr(789::TEXT,2,1)"),
+        vals(
+            &mut e,
+            "SELECT substr('',1,1), substring('' from 1 for 1), substr(789::TEXT,2,1)"
+        ),
         vec!["||8"]
     );
 }
@@ -196,11 +232,24 @@ fn round610_substring() {
 fn round610_slices_in_use() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id, left(s,3)||'|'||right(s,3) FROM lt ORDER BY id"),
-        vec!["1|abc|def", "2||", "3|NULL", "4|日本語|キスト", "5|ábç|ábç", "6|x|x"]
+        vals(
+            &mut e,
+            "SELECT id, left(s,3)||'|'||right(s,3) FROM lt ORDER BY id"
+        ),
+        vec![
+            "1|abc|def",
+            "2||",
+            "3|NULL",
+            "4|日本語|キスト",
+            "5|ábç|ábç",
+            "6|x|x"
+        ]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM lt WHERE left(s,1) = 'a' OR right(s,1) = 'x' ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id FROM lt WHERE left(s,1) = 'a' OR right(s,1) = 'x' ORDER BY id"
+        ),
         vec!["1", "6"]
     );
 }
@@ -217,21 +266,33 @@ fn round610_scale() {
         vec!["20000"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE substr(s,4) = id::TEXT"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE substr(s,4) = id::TEXT"
+        ),
         vec!["20000"],
         "the tail after 'row' is the id on every row"
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE right(s, length(id::TEXT)) = id::TEXT"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE right(s, length(id::TEXT)) = id::TEXT"
+        ),
         vec!["20000"]
     );
     assert_eq!(
         vals(&mut e, "SELECT count(DISTINCT left(s,4)) FROM big"),
-        vals(&mut e, "SELECT count(DISTINCT substring(s from 1 for 4)) FROM big"),
+        vals(
+            &mut e,
+            "SELECT count(DISTINCT substring(s from 1 for 4)) FROM big"
+        ),
         "the two spellings agree"
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE left(s,-3) || right(s,3) = s"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE left(s,-3) || right(s,3) = s"
+        ),
         vec!["20000"],
         "the negative-count halves put the string back together"
     );

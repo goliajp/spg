@@ -140,7 +140,10 @@ mod tests {
     #[test]
     fn en_us_reproduces_the_rules_measured_from_pg() {
         // Primary weight ignores case; the tertiary one puts lowercase first.
-        assert_eq!(sorted("en_US.utf8", vec!["b", "A", "a", "B"]), ["a", "A", "b", "B"]);
+        assert_eq!(
+            sorted("en_US.utf8", vec!["b", "A", "a", "B"]),
+            ["a", "A", "b", "B"]
+        );
         assert_eq!(compare("en_US.utf8", "a", "A"), Some(Ordering::Less));
         // Accents are SECONDARY: primary treats é as e, so a shorter string
         // wins before the accent is ever consulted.
@@ -148,7 +151,10 @@ mod tests {
             sorted("en_US.utf8", vec!["f", "ê", "E", "é", "e"]),
             ["e", "E", "é", "ê", "f"]
         );
-        assert_eq!(compare("en_US.utf8", "résumé", "resumes"), Some(Ordering::Less));
+        assert_eq!(
+            compare("en_US.utf8", "résumé", "resumes"),
+            Some(Ordering::Less)
+        );
         // Digits before letters. Punctuation's place among them is a
         // quaternary question once nothing else separates the values — see
         // `all_punctuation_values_now_match_pg`.
@@ -160,9 +166,15 @@ mod tests {
         let g = sorted("en_US.utf8", vec!["aB", "ab", "a-b", "a b"]);
         assert_eq!(g[3], "aB", "case outranks punctuation: {g:?}");
         // No numeric-aware ordering: a10 sorts between a1 and a2.
-        assert_eq!(sorted("en_US.utf8", vec!["a2", "a10", "a1"]), ["a1", "a10", "a2"]);
+        assert_eq!(
+            sorted("en_US.utf8", vec!["a2", "a10", "a1"]),
+            ["a1", "a10", "a2"]
+        );
         // Latin, then Kana, then Han.
-        assert_eq!(sorted("en_US.utf8", vec!["中", "あ", "z", "Z"]), ["z", "Z", "あ", "中"]);
+        assert_eq!(
+            sorted("en_US.utf8", vec!["中", "あ", "z", "Z"]),
+            ["z", "Z", "あ", "中"]
+        );
     }
 
     /// C and POSIX are byte order, and are answered without ICU.
@@ -219,8 +231,14 @@ mod tests {
         // primary level, so their RELATIVE order is a quaternary question —
         // the residual below. What is asserted is that they group together
         // ahead of `demarco`, which is the property the collation buys.
-        let g = sorted("en_US.utf8", vec!["de luca", "deluca", "de-luca", "demarco"]);
-        assert_eq!(g[3], "demarco", "the de-luca variants group before demarco: {g:?}");
+        let g = sorted(
+            "en_US.utf8",
+            vec!["de luca", "deluca", "de-luca", "demarco"],
+        );
+        assert_eq!(
+            g[3], "demarco",
+            "the de-luca variants group before demarco: {g:?}"
+        );
     }
 
     /// The one case that stays wrong, pinned as wrong so it is not mistaken
@@ -261,8 +279,7 @@ mod tests {
     #[test]
     fn survey_pg18_collation_coverage() {
         let all = super::survey::PG18_COLLATIONS;
-        let unsupported: Vec<&str> =
-            all.iter().copied().filter(|n| !is_supported(n)).collect();
+        let unsupported: Vec<&str> = all.iter().copied().filter(|n| !is_supported(n)).collect();
         let supported = all.len() - unsupported.len();
         assert_eq!(
             unsupported,

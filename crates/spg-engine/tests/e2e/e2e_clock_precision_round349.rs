@@ -56,8 +56,14 @@ fn the_clock_family_answers_in_both_dialects() {
     for mysql in [false, true] {
         let mut e = engine(mysql);
         assert_eq!(one(&mut e, "SELECT NOW()"), Value::Timestamp(FIXED));
-        assert_eq!(one(&mut e, "SELECT CURRENT_TIMESTAMP"), Value::Timestamp(FIXED));
-        assert_eq!(one(&mut e, "SELECT CURDATE()"), one(&mut e, "SELECT CURRENT_DATE"));
+        assert_eq!(
+            one(&mut e, "SELECT CURRENT_TIMESTAMP"),
+            Value::Timestamp(FIXED)
+        );
+        assert_eq!(
+            one(&mut e, "SELECT CURDATE()"),
+            one(&mut e, "SELECT CURRENT_DATE")
+        );
         assert_eq!(one(&mut e, "SELECT CURTIME()"), Value::text("12:34:56"));
     }
 }
@@ -79,7 +85,10 @@ fn pg_precision_spellings_work() {
     // (PG18-measured); 12:34:56.541 of the fixed clock, UTC session.
     assert_eq!(
         one(&mut e, "SELECT CURRENT_TIME(3)"),
-        Value::TimeTz { us: 45_296_541_000, offset_secs: 0 }
+        Value::TimeTz {
+            us: 45_296_541_000,
+            offset_secs: 0
+        }
     );
     assert_eq!(
         one(&mut e, "SELECT CURRENT_TIMESTAMP(0)"),
@@ -95,9 +104,18 @@ fn pg_precision_spellings_work() {
 #[test]
 fn now_with_a_precision_is_mysql_only() {
     let mut m = engine(true);
-    assert_eq!(one(&mut m, "SELECT NOW(3)"), Value::Timestamp(1_784_723_696_541_000));
-    assert_eq!(one(&mut m, "SELECT NOW(0)"), Value::Timestamp(1_784_723_696_000_000));
-    assert_eq!(one(&mut m, "SELECT CURTIME(3)"), Value::text("12:34:56.541"));
+    assert_eq!(
+        one(&mut m, "SELECT NOW(3)"),
+        Value::Timestamp(1_784_723_696_541_000)
+    );
+    assert_eq!(
+        one(&mut m, "SELECT NOW(0)"),
+        Value::Timestamp(1_784_723_696_000_000)
+    );
+    assert_eq!(
+        one(&mut m, "SELECT CURTIME(3)"),
+        Value::text("12:34:56.541")
+    );
 
     let mut p = engine(false);
     assert_eq!(

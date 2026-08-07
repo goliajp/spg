@@ -147,3 +147,6 @@ unnecessary_cast         = "allow"
 checked_conversions      = "allow"
 doc_markdown             = "allow"
 ptr_arg                  = "allow"
+# Cosmetic, and the workspace allows it for the same reason (Cargo.toml).
+# Landed when rustfmt/clippy moved to 1.97 and flagged a probe's main().
+too_many_lines           = "allow"

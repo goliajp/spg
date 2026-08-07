@@ -44,11 +44,17 @@ fn one(e: &mut Engine, sql: &str) -> String {
 fn an_array_of_timestamptz_keeps_the_type_and_the_offset() {
     let mut e = engine();
     assert_eq!(
-        one(&mut e, "SELECT pg_typeof(ARRAY['2020-01-01 10:00:00+02'::timestamptz])"),
+        one(
+            &mut e,
+            "SELECT pg_typeof(ARRAY['2020-01-01 10:00:00+02'::timestamptz])"
+        ),
         "timestamp with time zone[]"
     );
     assert_eq!(
-        one(&mut e, "SELECT ARRAY['2020-01-01 10:00:00+02'::timestamptz]"),
+        one(
+            &mut e,
+            "SELECT ARRAY['2020-01-01 10:00:00+02'::timestamptz]"
+        ),
         "{\"2020-01-01 08:00:00+00\"}"
     );
     // Two elements, both converted and both carrying the offset.
@@ -68,7 +74,10 @@ fn an_array_of_timestamptz_keeps_the_type_and_the_offset() {
 fn a_plain_timestamp_array_is_left_alone() {
     let mut e = engine();
     assert_eq!(
-        one(&mut e, "SELECT pg_typeof(ARRAY['2020-01-01 10:00:00'::timestamp])"),
+        one(
+            &mut e,
+            "SELECT pg_typeof(ARRAY['2020-01-01 10:00:00'::timestamp])"
+        ),
         "timestamp without time zone[]"
     );
     assert_eq!(
@@ -90,10 +99,14 @@ fn a_plain_timestamp_array_is_left_alone() {
 #[test]
 fn a_timestamptz_array_column_accepts_and_returns_it() {
     let mut e = engine();
-    e.execute("CREATE TABLE ta (id int, ts timestamptz[])").unwrap();
+    e.execute("CREATE TABLE ta (id int, ts timestamptz[])")
+        .unwrap();
     e.execute("INSERT INTO ta VALUES (1, ARRAY['2020-01-01 10:00:00+02'::timestamptz])")
         .unwrap();
-    assert_eq!(one(&mut e, "SELECT ts FROM ta"), "{\"2020-01-01 08:00:00+00\"}");
+    assert_eq!(
+        one(&mut e, "SELECT ts FROM ta"),
+        "{\"2020-01-01 08:00:00+00\"}"
+    );
     assert_eq!(
         one(&mut e, "SELECT pg_typeof(ts) FROM ta"),
         "timestamp with time zone[]"
@@ -107,7 +120,8 @@ fn a_timestamptz_array_column_accepts_and_returns_it() {
 #[test]
 fn an_inserted_timestamptz_literal_is_converted_not_truncated() {
     let mut e = engine();
-    e.execute("CREATE TABLE ts (id int, t timestamptz)").unwrap();
+    e.execute("CREATE TABLE ts (id int, t timestamptz)")
+        .unwrap();
     e.execute("INSERT INTO ts VALUES (1, '2020-01-01 10:00:00+02'::timestamptz)")
         .unwrap();
     assert_eq!(one(&mut e, "SELECT t FROM ts"), "2020-01-01 08:00:00");

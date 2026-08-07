@@ -1590,9 +1590,9 @@ fn eval_with_new_old_and_locals(
                 return;
             };
             let mut stmt = spg_sql::ast::Statement::Select((**sel).clone());
-            if let Err(e) =
-                substitute_trigger_context_in_statement(&mut stmt, new_row, old_row, locals, columns)
-            {
+            if let Err(e) = substitute_trigger_context_in_statement(
+                &mut stmt, new_row, old_row, locals, columns,
+            ) {
                 failure = Some(e);
                 return;
             }

@@ -23,10 +23,8 @@ fn seeded() -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TABLE ct (id int, name text, note text, f float8)")
         .unwrap();
-    e.execute(
-        "INSERT INTO ct VALUES (1, 'plain', NULL, 1.5), (2, 'with,comma', 'q\"uote', 2.25)",
-    )
-    .unwrap();
+    e.execute("INSERT INTO ct VALUES (1, 'plain', NULL, 1.5), (2, 'with,comma', 'q\"uote', 2.25)")
+        .unwrap();
     e
 }
 
@@ -57,7 +55,10 @@ fn force_quote_columns_and_star() {
     // `*` forces every column; NULLs stay bare (PG).
     assert_eq!(
         lines(&mut e, "COPY ct TO STDOUT (FORMAT csv, FORCE_QUOTE *)"),
-        ["\"1\",\"plain\",,\"1.5\"", "\"2\",\"with,comma\",\"q\"\"uote\",\"2.25\""]
+        [
+            "\"1\",\"plain\",,\"1.5\"",
+            "\"2\",\"with,comma\",\"q\"\"uote\",\"2.25\""
+        ]
     );
 }
 
@@ -120,7 +121,10 @@ fn the_copy_core_is_unchanged() {
         ["plain,1", "\"with,comma\",2"]
     );
     assert_eq!(
-        lines(&mut e, "COPY (SELECT id FROM ct ORDER BY id) TO STDOUT (FORMAT csv, FORCE_QUOTE *)"),
+        lines(
+            &mut e,
+            "COPY (SELECT id FROM ct ORDER BY id) TO STDOUT (FORMAT csv, FORCE_QUOTE *)"
+        ),
         ["\"1\"", "\"2\""]
     );
 }

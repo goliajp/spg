@@ -42,7 +42,10 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 #[test]
 fn round621_pg_operator_exists() {
     let mut e = Engine::new();
-    assert_eq!(vals(&mut e, "SELECT count(*) > 0 FROM pg_operator"), vec!["true"]);
+    assert_eq!(
+        vals(&mut e, "SELECT count(*) > 0 FROM pg_operator"),
+        vec!["true"]
+    );
     assert_eq!(
         vals(
             &mut e,
@@ -143,13 +146,19 @@ fn round621_the_operator_families() {
         );
     }
     assert!(
-        !vals(&mut e, "SELECT oprname FROM pg_operator WHERE oprname = '->>' AND oprleft = 3802")
-            .is_empty(),
+        !vals(
+            &mut e,
+            "SELECT oprname FROM pg_operator WHERE oprname = '->>' AND oprleft = 3802"
+        )
+        .is_empty(),
         "jsonb ->> text"
     );
     assert!(
-        !vals(&mut e, "SELECT oprname FROM pg_operator WHERE oprname = '&&' AND oprleft = 1007")
-            .is_empty(),
+        !vals(
+            &mut e,
+            "SELECT oprname FROM pg_operator WHERE oprname = '&&' AND oprleft = 1007"
+        )
+        .is_empty(),
         "array overlap"
     );
 }

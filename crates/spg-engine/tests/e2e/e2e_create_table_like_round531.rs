@@ -133,7 +133,8 @@ fn round531_generated_and_identity_need_their_option() {
     )
     .unwrap();
     e.execute("CREATE TABLE g1 (LIKE gsrc)").unwrap();
-    e.execute("CREATE TABLE g2 (LIKE gsrc INCLUDING ALL)").unwrap();
+    e.execute("CREATE TABLE g2 (LIKE gsrc INCLUDING ALL)")
+        .unwrap();
     // Bare: `c` is a plain column, so it takes a written value.
     e.execute("INSERT INTO g1 (id, b, c) VALUES (1, 5, 99)")
         .unwrap();
@@ -154,21 +155,30 @@ fn round621_including_indexes_copies_them() {
     let mut e = engine();
     e.execute("CREATE INDEX src_b ON src(b)").unwrap();
     e.execute("CREATE UNIQUE INDEX src_a ON src(a)").unwrap();
-    e.execute("CREATE TABLE k4 (LIKE src INCLUDING INDEXES)").unwrap();
+    e.execute("CREATE TABLE k4 (LIKE src INCLUDING INDEXES)")
+        .unwrap();
     assert_eq!(
-        rows(&mut e, "SELECT count(*) FROM pg_indexes WHERE tablename = 'k4'"),
+        rows(
+            &mut e,
+            "SELECT count(*) FROM pg_indexes WHERE tablename = 'k4'"
+        ),
         vec!["3"],
         "the PK's index, the plain one and the unique one all copy"
     );
     // The unique one still enforces on the copy.
-    e.execute("INSERT INTO k4 (id, a, b) VALUES (1, 'x', 1)").unwrap();
+    e.execute("INSERT INTO k4 (id, a, b) VALUES (1, 'x', 1)")
+        .unwrap();
     assert!(
-        e.execute("INSERT INTO k4 (id, a, b) VALUES (2, 'x', 2)").is_err(),
+        e.execute("INSERT INTO k4 (id, a, b) VALUES (2, 'x', 2)")
+            .is_err(),
         "the copied UNIQUE index is a real constraint, not a name"
     );
     // And the source keeps its own names — no collision between the two.
     assert_eq!(
-        rows(&mut e, "SELECT count(*) FROM pg_indexes WHERE tablename = 'src'"),
+        rows(
+            &mut e,
+            "SELECT count(*) FROM pg_indexes WHERE tablename = 'src'"
+        ),
         vec!["3"]
     );
 }

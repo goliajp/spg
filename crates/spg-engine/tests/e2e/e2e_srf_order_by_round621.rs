@@ -54,26 +54,41 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 fn round621_order_by_sorts_the_expanded_rows() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y ORDER BY 1"
+        ),
         vec!["1|5", "1|6", "1|7", "2|5", "2|6", "2|7"],
         "six rows, sorted by the SRF's own column — three, unsorted, before"
     );
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y ORDER BY 2"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y ORDER BY 2"
+        ),
         vec!["1|5", "2|5", "1|6", "2|6", "1|7", "2|7"],
         "and by the source column"
     );
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y ORDER BY 1,2"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y ORDER BY 1,2"
+        ),
         vec!["1|5", "1|6", "1|7", "2|5", "2|6", "2|7"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y ORDER BY y"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y ORDER BY y"
+        ),
         vec!["1|5", "2|5", "1|6", "2|6", "1|7", "2|7"],
         "a key named rather than positional"
     );
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y ORDER BY 1 DESC"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y ORDER BY 1 DESC"
+        ),
         vec!["2|5", "2|6", "2|7", "1|5", "1|6", "1|7"]
     );
 }
@@ -83,16 +98,25 @@ fn round621_order_by_sorts_the_expanded_rows() {
 fn round621_with_limit_offset_and_distinct() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y ORDER BY 1 LIMIT 4"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y ORDER BY 1 LIMIT 4"
+        ),
         vec!["1|5", "1|6", "1|7", "2|5"],
         "LIMIT takes the first four OF THE SORTED SIX, not of a truncated three"
     );
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y ORDER BY 1 OFFSET 4"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y ORDER BY 1 OFFSET 4"
+        ),
         vec!["2|6", "2|7"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT DISTINCT unnest(ARRAY[1,1,2]) FROM unnest(ARRAY[5,6]) y ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT DISTINCT unnest(ARRAY[1,1,2]) FROM unnest(ARRAY[5,6]) y ORDER BY 1"
+        ),
         vec!["1", "2"]
     );
 }
@@ -102,7 +126,10 @@ fn round621_with_limit_offset_and_distinct() {
 fn round621_what_was_already_right() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y"
+        ),
         vec!["1|5", "2|5", "1|6", "2|6", "1|7", "2|7"],
         "no ORDER BY — this was correct before and is the reason the \
          expansion was ruled out"
@@ -114,7 +141,10 @@ fn round621_what_was_already_right() {
          always did"
     );
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y LIMIT 4"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]), y FROM unnest(ARRAY[5,6,7]) y LIMIT 4"
+        ),
         vec!["1|5", "2|5", "1|6", "2|6"],
         "LIMIT without ORDER BY"
     );

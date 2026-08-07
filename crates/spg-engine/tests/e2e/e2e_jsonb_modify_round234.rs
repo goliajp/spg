@@ -40,17 +40,29 @@ fn err(e: &mut Engine, sql: &str) -> String {
 fn empty_path_is_a_no_op() {
     let mut e = Engine::new();
     // PG returns the document untouched rather than replacing it.
-    assert_eq!(text(&mut e, "SELECT jsonb_set('{\"a\":1}','{}','9')"), "{\"a\": 1}");
+    assert_eq!(
+        text(&mut e, "SELECT jsonb_set('{\"a\":1}','{}','9')"),
+        "{\"a\": 1}"
+    );
     assert_eq!(text(&mut e, "SELECT jsonb_set('[1,2]','{}','9')"), "[1, 2]");
     assert_eq!(
         text(&mut e, "SELECT jsonb_set('{\"a\":1}','{}','9',true)"),
         "{\"a\": 1}"
     );
-    assert_eq!(text(&mut e, "SELECT jsonb_insert('{\"a\":1}','{}','9')"), "{\"a\": 1}");
-    assert_eq!(text(&mut e, "SELECT jsonb_insert('[1,2]','{}','9')"), "[1, 2]");
+    assert_eq!(
+        text(&mut e, "SELECT jsonb_insert('{\"a\":1}','{}','9')"),
+        "{\"a\": 1}"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT jsonb_insert('[1,2]','{}','9')"),
+        "[1, 2]"
+    );
     assert_eq!(text(&mut e, "SELECT '[1,2]'::jsonb #- '{}'"), "[1, 2]");
     // A non-empty path still does its job.
-    assert_eq!(text(&mut e, "SELECT jsonb_set('{\"a\":1}','{a}','9')"), "{\"a\": 9}");
+    assert_eq!(
+        text(&mut e, "SELECT jsonb_set('{\"a\":1}','{a}','9')"),
+        "{\"a\": 9}"
+    );
 }
 
 #[test]
@@ -90,9 +102,15 @@ fn integer_index_is_meaningless_on_an_object() {
     );
     // The shapes that DO make sense keep working: a key off an object, an
     // index off an array, and a key that isn't there (a no-op in PG).
-    assert_eq!(text(&mut e, "SELECT '{\"a\":1,\"b\":2}'::jsonb - 'a'"), "{\"b\": 2}");
+    assert_eq!(
+        text(&mut e, "SELECT '{\"a\":1,\"b\":2}'::jsonb - 'a'"),
+        "{\"b\": 2}"
+    );
     assert_eq!(text(&mut e, "SELECT '[1,2,3]'::jsonb - 1"), "[1, 3]");
-    assert_eq!(text(&mut e, "SELECT '{\"a\":1}'::jsonb - 'zz'"), "{\"a\": 1}");
+    assert_eq!(
+        text(&mut e, "SELECT '{\"a\":1}'::jsonb - 'zz'"),
+        "{\"a\": 1}"
+    );
     assert_eq!(text(&mut e, "SELECT '[1,2]'::jsonb - 'a'"), "[1, 2]");
 }
 
@@ -102,7 +120,10 @@ fn the_rest_of_the_modification_family_is_unchanged() {
     // Regression guard for the sweep's clean cases — these all matched PG
     // before this round and must still.
     for (sql, want) in [
-        ("SELECT jsonb_set('{\"a\":{\"b\":1}}','{a,b}','9')", "{\"a\": {\"b\": 9}}"),
+        (
+            "SELECT jsonb_set('{\"a\":{\"b\":1}}','{a,b}','9')",
+            "{\"a\": {\"b\": 9}}",
+        ),
         (
             "SELECT jsonb_set('{\"a\":{\"b\":1}}','{a,c}','9',true)",
             "{\"a\": {\"b\": 1, \"c\": 9}}",
@@ -111,14 +132,26 @@ fn the_rest_of_the_modification_family_is_unchanged() {
             "SELECT jsonb_set('{\"a\":{\"b\":1}}','{a,c}','9',false)",
             "{\"a\": {\"b\": 1}}",
         ),
-        ("SELECT jsonb_insert('{\"a\":[1,2]}','{a,1}','9')", "{\"a\": [1, 9, 2]}"),
+        (
+            "SELECT jsonb_insert('{\"a\":[1,2]}','{a,1}','9')",
+            "{\"a\": [1, 9, 2]}",
+        ),
         (
             "SELECT jsonb_insert('{\"a\":[1,2]}','{a,1}','9',true)",
             "{\"a\": [1, 2, 9]}",
         ),
-        ("SELECT '{\"a\":{\"b\":1}}'::jsonb #- '{a,b}'", "{\"a\": {}}"),
-        ("SELECT jsonb_strip_nulls('{\"a\":null,\"b\":1}')", "{\"b\": 1}"),
-        ("SELECT '{\"a\":1}'::jsonb || '{\"b\":2}'::jsonb", "{\"a\": 1, \"b\": 2}"),
+        (
+            "SELECT '{\"a\":{\"b\":1}}'::jsonb #- '{a,b}'",
+            "{\"a\": {}}",
+        ),
+        (
+            "SELECT jsonb_strip_nulls('{\"a\":null,\"b\":1}')",
+            "{\"b\": 1}",
+        ),
+        (
+            "SELECT '{\"a\":1}'::jsonb || '{\"b\":2}'::jsonb",
+            "{\"a\": 1, \"b\": 2}",
+        ),
     ] {
         assert_eq!(text(&mut e, sql), want, "{sql}");
     }

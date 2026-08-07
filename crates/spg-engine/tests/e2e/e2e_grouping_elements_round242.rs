@@ -50,7 +50,10 @@ fn mixed_and_composite_elements_expand_like_pg() {
     let mut e = seeded();
     // Plain key × ROLLUP — the product {(a,b),(a)}.
     assert_eq!(
-        rows(&mut e, "SELECT a, b, sum(c) FROM s GROUP BY a, ROLLUP (b) ORDER BY a, b NULLS LAST"),
+        rows(
+            &mut e,
+            "SELECT a, b, sum(c) FROM s GROUP BY a, ROLLUP (b) ORDER BY a, b NULLS LAST"
+        ),
         ["x|p|1", "x|q|2", "x||3", "y|p|4", "y|q|8", "y||12"]
     );
     // Composite unit: (a, b) rolls up together — no (a)-only set.
@@ -87,7 +90,10 @@ fn group_by_distinct_drops_duplicate_sets() {
     );
     // Without DISTINCT the duplicate sets stay (probed against PG).
     assert_eq!(
-        rows(&mut e, "SELECT a, sum(c) FROM s GROUP BY GROUPING SETS ((a), (a)) ORDER BY a"),
+        rows(
+            &mut e,
+            "SELECT a, sum(c) FROM s GROUP BY GROUPING SETS ((a), (a)) ORDER BY a"
+        ),
         ["x|3", "x|3", "y|12", "y|12"]
     );
 }
@@ -97,7 +103,10 @@ fn grouping_over_a_plain_group_by_is_zero() {
     let mut e = seeded();
     // Used to die at eval with "unknown function `grouping`".
     assert_eq!(
-        rows(&mut e, "SELECT grouping(a) FROM s GROUP BY a ORDER BY 1 LIMIT 1"),
+        rows(
+            &mut e,
+            "SELECT grouping(a) FROM s GROUP BY a ORDER BY 1 LIMIT 1"
+        ),
         ["0"]
     );
     // A non-key argument (or no GROUP BY at all) is PG's 42803.
@@ -144,7 +153,10 @@ fn the_lone_element_expansions_are_unchanged() {
         ["x|3", "y|12"]
     );
     assert_eq!(
-        rows(&mut e, "SELECT count(*) FROM s GROUP BY GROUPING SETS ((), ())"),
+        rows(
+            &mut e,
+            "SELECT count(*) FROM s GROUP BY GROUPING SETS ((), ())"
+        ),
         ["4", "4"]
     );
 }

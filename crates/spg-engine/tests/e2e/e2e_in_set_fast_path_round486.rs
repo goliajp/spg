@@ -109,7 +109,10 @@ fn round486_double_negation_agrees() {
     // different route than `= true`.
     let mut e = seeded();
     assert_eq!(
-        ids(&mut e, "SELECT id FROM r WHERE NOT (g NOT IN (1,3,5)) ORDER BY id"),
+        ids(
+            &mut e,
+            "SELECT id FROM r WHERE NOT (g NOT IN (1,3,5)) ORDER BY id"
+        ),
         "1;3;5"
     );
 }

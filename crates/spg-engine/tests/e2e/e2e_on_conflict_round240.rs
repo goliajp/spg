@@ -23,7 +23,8 @@ fn seeded() -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id int PRIMARY KEY, v int, tag text UNIQUE)")
         .unwrap();
-    e.execute("INSERT INTO t VALUES (1,10,'a'),(2,20,'b')").unwrap();
+    e.execute("INSERT INTO t VALUES (1,10,'a'),(2,20,'b')")
+        .unwrap();
     e
 }
 
@@ -55,8 +56,10 @@ fn bare_on_conflict_arbitrates_on_every_constraint() {
     // A table with no unique anything still accepts the bare form — no
     // arbiter simply means no conflict is possible (probed).
     e.execute("CREATE TABLE nu (a int)").unwrap();
-    e.execute("INSERT INTO nu VALUES (1) ON CONFLICT DO NOTHING").unwrap();
-    e.execute("INSERT INTO nu VALUES (1) ON CONFLICT DO NOTHING").unwrap();
+    e.execute("INSERT INTO nu VALUES (1) ON CONFLICT DO NOTHING")
+        .unwrap();
+    e.execute("INSERT INTO nu VALUES (1) ON CONFLICT DO NOTHING")
+        .unwrap();
     assert_eq!(one(&mut e, "SELECT count(*) FROM nu"), "2");
 }
 
@@ -85,7 +88,10 @@ fn conflict_target_must_match_a_unique_constraint() {
 #[test]
 fn bare_do_update_requires_a_target() {
     let mut e = seeded();
-    let got = err(&mut e, "INSERT INTO t VALUES (1,1,'q') ON CONFLICT DO UPDATE SET v = 0");
+    let got = err(
+        &mut e,
+        "INSERT INTO t VALUES (1,1,'q') ON CONFLICT DO UPDATE SET v = 0",
+    );
     assert!(
         got.contains("ON CONFLICT DO UPDATE requires inference specification or constraint name"),
         "{got}"
@@ -102,8 +108,10 @@ fn index_predicate_parses_and_alias_binds_the_target_row() {
     assert_eq!(one(&mut e, "SELECT v FROM t WHERE id = 1"), "10");
     // `INSERT INTO t AS me` — the alias is how DO UPDATE reads the
     // existing row.
-    e.execute("INSERT INTO t AS me (id,v) VALUES (1,1) ON CONFLICT (id) DO UPDATE SET v = me.v + 1")
-        .unwrap();
+    e.execute(
+        "INSERT INTO t AS me (id,v) VALUES (1,1) ON CONFLICT (id) DO UPDATE SET v = me.v + 1",
+    )
+    .unwrap();
     assert_eq!(one(&mut e, "SELECT v FROM t WHERE id = 1"), "11");
 }
 

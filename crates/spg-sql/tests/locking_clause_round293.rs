@@ -20,8 +20,7 @@ fn locking(sql: &str) -> Option<(LS, LW, Vec<String>)> {
     let Statement::Select(s) = stmt else {
         panic!("expected a SELECT from {sql}");
     };
-    s.locking
-        .map(|c| (c.strength, c.policy, c.of_tables))
+    s.locking.map(|c| (c.strength, c.policy, c.of_tables))
 }
 
 #[test]

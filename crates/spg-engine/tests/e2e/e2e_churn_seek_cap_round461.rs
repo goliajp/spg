@@ -45,7 +45,8 @@ fn round461_churned_table_still_seeks_instead_of_scanning() {
     // Autovacuum off is the server's exposure: it runs the reclaim in a
     // background worker, which a tight delete-reinsert loop outruns.
     e.set_autovacuum(false);
-    e.execute("CREATE TABLE wb(id INT PRIMARY KEY, g INT)").unwrap();
+    e.execute("CREATE TABLE wb(id INT PRIMARY KEY, g INT)")
+        .unwrap();
     for chunk in 0..5i64 {
         e.execute(&insert_sql(chunk * 1000, 1000)).unwrap();
     }
@@ -79,13 +80,15 @@ fn round461_a_wide_range_still_declines_the_seek() {
     // The other half of the contract: the cap still has to refuse a seek
     // that would return most of the table, or it stops being a cap.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE wb(id INT PRIMARY KEY, g INT)").unwrap();
+    e.execute("CREATE TABLE wb(id INT PRIMARY KEY, g INT)")
+        .unwrap();
     for chunk in 0..5i64 {
         e.execute(&insert_sql(chunk * 1000, 1000)).unwrap();
     }
     let before = stat(&mut e, "seq_tup_read");
     // Every row matches.
-    e.execute("DELETE FROM wb WHERE id >= 0 AND id < 5000").unwrap();
+    e.execute("DELETE FROM wb WHERE id >= 0 AND id < 5000")
+        .unwrap();
     assert!(
         stat(&mut e, "seq_tup_read") - before > 0,
         "a whole-table range must still take the scan"

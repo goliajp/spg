@@ -69,7 +69,10 @@ fn err(e: &mut Engine, sql: &str) -> String {
 fn round626_to_char_all_literal_pattern() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT to_char(1,'YYYY'), to_char(1.5,'xyz'), to_char(1,'Q')"),
+        vals(
+            &mut e,
+            "SELECT to_char(1,'YYYY'), to_char(1.5,'xyz'), to_char(1,'Q')"
+        ),
         vec!["YYYY|xyz|Q"],
         "an all-literal numeric template is echoed, as PG does"
     );
@@ -79,7 +82,10 @@ fn round626_to_char_all_literal_pattern() {
     assert_eq!(vals(&mut e, "SELECT to_char(12,'DAY')"), vec![" .AY"]);
     // And the shape that made it a crash rather than a wrong answer: the
     // connection has to survive.
-    assert_eq!(vals(&mut e, "SELECT to_char(1,'YYYY'), 1+1"), vec!["YYYY|2"]);
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(1,'YYYY'), 1+1"),
+        vec!["YYYY|2"]
+    );
 }
 
 /// sum and avg over a SMALLINT, which is what broke.
@@ -93,7 +99,10 @@ fn round626_sum_avg_take_smallint() {
     );
     e.execute("CREATE TABLE q (n SMALLINT)").unwrap();
     e.execute("INSERT INTO q VALUES (1),(2),(3)").unwrap();
-    assert_eq!(vals(&mut e, "SELECT sum(n), min(n), max(n), count(n) FROM q"), vec!["6|1|3|3"]);
+    assert_eq!(
+        vals(&mut e, "SELECT sum(n), min(n), max(n), count(n) FROM q"),
+        vec!["6|1|3|3"]
+    );
     assert_eq!(
         vals(&mut e, "SELECT pg_typeof(sum(n)) FROM q"),
         vec!["bigint"],
@@ -101,7 +110,10 @@ fn round626_sum_avg_take_smallint() {
     );
     // The wider family still sums.
     assert_eq!(
-        vals(&mut e, "SELECT sum(1), sum(1::BIGINT), sum(1.5), sum(1.5::REAL)"),
+        vals(
+            &mut e,
+            "SELECT sum(1), sum(1::BIGINT), sum(1.5), sum(1.5::REAL)"
+        ),
         vec!["1|1|1.5|1.5"]
     );
 }
@@ -117,7 +129,10 @@ fn round626_string_agg_takes_bpchar() {
         vec!["ab,cd"],
         "a bpchar's text form drops its padding, as PG's own cast does"
     );
-    assert_eq!(vals(&mut e, "SELECT string_agg('x'::CHAR(2), ',')"), vec!["x"]);
+    assert_eq!(
+        vals(&mut e, "SELECT string_agg('x'::CHAR(2), ',')"),
+        vec!["x"]
+    );
 }
 
 /// min/max refuse the types PG has no signature for.
@@ -127,7 +142,10 @@ fn round626_min_max_reject_unordered_types() {
     for (sql, ty) in [
         ("SELECT min(TRUE)", "boolean"),
         ("SELECT max(TRUE)", "boolean"),
-        ("SELECT min('00000000-0000-0000-0000-000000000000'::UUID)", "uuid"),
+        (
+            "SELECT min('00000000-0000-0000-0000-000000000000'::UUID)",
+            "uuid",
+        ),
         // SPG stores jsonb as its json value, so the message names `json`
         // where PG names `jsonb`. Both refuse; the conflation of the two
         // types is its own item.
@@ -147,7 +165,8 @@ fn round626_min_max_reject_unordered_types() {
     // dispatched arm passed the bare-literal cases above while these still
     // answered.
     e.execute("CREATE TABLE b (f BOOL, g INT)").unwrap();
-    e.execute("INSERT INTO b VALUES (TRUE,1),(FALSE,1)").unwrap();
+    e.execute("INSERT INTO b VALUES (TRUE,1),(FALSE,1)")
+        .unwrap();
     assert!(err(&mut e, "SELECT min(f) FROM b").contains("does not exist"));
     assert!(err(&mut e, "SELECT max(f) FROM b").contains("does not exist"));
     assert!(err(&mut e, "SELECT g, min(f) FROM b GROUP BY g").contains("does not exist"));
@@ -173,7 +192,10 @@ fn round626_min_max_still_take_what_pg_orders() {
         vec!["1 day|01:02:03|2020-01-01 00:00:00"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT min('10.0.0.1'::INET), max('\\x41'::BYTEA), min(ARRAY[1])"),
+        vals(
+            &mut e,
+            "SELECT min('10.0.0.1'::INET), max('\\x41'::BYTEA), min(ARRAY[1])"
+        ),
         vec!["10.0.0.1|\\x41|{1}"],
         "inet, bytea and arrays are all ordered in PG"
     );

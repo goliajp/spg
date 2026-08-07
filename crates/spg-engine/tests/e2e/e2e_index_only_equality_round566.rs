@@ -41,7 +41,8 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn engine() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE q566 (id INT, g INT, t TEXT)").unwrap();
+    e.execute("CREATE TABLE q566 (id INT, g INT, t TEXT)")
+        .unwrap();
     e.execute("INSERT INTO q566 SELECT gg, gg % 10, 'x' FROM generate_series(1, 500) gg")
         .unwrap();
     e.execute("CREATE INDEX q566g ON q566 (g)").unwrap();
@@ -62,8 +63,14 @@ fn round566_equality_returns_every_duplicate() {
     // Written the other way round.
     assert_eq!(vals(&mut e, "SELECT g FROM q566 WHERE 7 = g").len(), 50);
     // And with the column qualified, and the output aliased.
-    assert_eq!(vals(&mut e, "SELECT q.g FROM q566 q WHERE q.g = 7").len(), 50);
-    assert_eq!(vals(&mut e, "SELECT g AS n FROM q566 WHERE g = 7").len(), 50);
+    assert_eq!(
+        vals(&mut e, "SELECT q.g FROM q566 q WHERE q.g = 7").len(),
+        50
+    );
+    assert_eq!(
+        vals(&mut e, "SELECT g AS n FROM q566 WHERE g = 7").len(),
+        50
+    );
 }
 
 /// `col = NULL` is never true — an index that stores NULL keys must not
@@ -85,7 +92,8 @@ fn round566_equality_to_null_matches_nothing() {
 #[test]
 fn round566_visibility_holds_for_equality() {
     let mut e = engine();
-    e.execute("DELETE FROM q566 WHERE g = 7 AND id <= 200").unwrap();
+    e.execute("DELETE FROM q566 WHERE g = 7 AND id <= 200")
+        .unwrap();
     assert_eq!(vals(&mut e, "SELECT g FROM q566 WHERE g = 7").len(), 30);
     // An UPDATE tombstones the old version and appends a new one.
     e.execute("UPDATE q566 SET g = 7 WHERE g = 3").unwrap();
@@ -94,7 +102,8 @@ fn round566_visibility_holds_for_equality() {
 
     let (t1, t2) = (TxId(41), TxId(42));
     e.execute_in("BEGIN", t1).unwrap();
-    e.execute_in("INSERT INTO q566 VALUES (9001, 7, 'z')", t1).unwrap();
+    e.execute_in("INSERT INTO q566 VALUES (9001, 7, 'z')", t1)
+        .unwrap();
     let seen = |e: &mut Engine, tx: TxId| match e
         .execute_in("SELECT g FROM q566 WHERE g = 7", tx)
         .unwrap()
@@ -144,7 +153,10 @@ fn round566_types_follow_the_same_rule() {
         ),
         vec!["22222222-2222-2222-2222-222222222222"]
     );
-    assert_eq!(vals(&mut e, "SELECT b FROM t566 WHERE b = true"), vec!["true"]);
+    assert_eq!(
+        vals(&mut e, "SELECT b FROM t566 WHERE b = true"),
+        vec!["true"]
+    );
     assert_eq!(vals(&mut e, "SELECT s FROM t566 WHERE s = 'b'"), vec!["b"]);
     assert_eq!(
         vals(&mut e, "SELECT pg_typeof(s) FROM t566 WHERE s = 'b'"),
@@ -181,7 +193,10 @@ fn round566_types_follow_the_same_rule() {
     .iter()
     .map(|q| vals(&mut e, q))
     .collect();
-    assert_eq!(with_index, without_index, "an index may not change an answer");
+    assert_eq!(
+        with_index, without_index,
+        "an index may not change an answer"
+    );
 }
 
 /// An enum column keeps its label — equality does not depend on the

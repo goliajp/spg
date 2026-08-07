@@ -49,7 +49,8 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn engine() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t571 (id INT, g INT, t TEXT)").unwrap();
+    e.execute("CREATE TABLE t571 (id INT, g INT, t TEXT)")
+        .unwrap();
     e.execute("INSERT INTO t571 SELECT gg, gg % 7, 'row' || gg FROM generate_series(1, 5000) gg")
         .unwrap();
     e
@@ -61,7 +62,10 @@ fn round571_topk_answers_after_many_trims() {
     let mut e = engine();
     assert_eq!(
         vals(&mut e, "SELECT id FROM t571 ORDER BY id DESC LIMIT 10"),
-        (4991..=5000).rev().map(|i| i.to_string()).collect::<Vec<_>>()
+        (4991..=5000)
+            .rev()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         vals(&mut e, "SELECT id FROM t571 ORDER BY id LIMIT 10"),
@@ -86,7 +90,10 @@ fn round571_topk_answers_after_many_trims() {
         .map(|i| format!("{i}|6"))
         .collect();
     assert_eq!(
-        vals(&mut e, "SELECT id, g FROM t571 ORDER BY g DESC, id DESC LIMIT 3"),
+        vals(
+            &mut e,
+            "SELECT id, g FROM t571 ORDER BY g DESC, id DESC LIMIT 3"
+        ),
         want
     );
 }
@@ -128,7 +135,10 @@ fn round571_null_sort_keys_survive_recycling() {
     assert_eq!(asc, vec!["1", "2", "4", "5"]);
     let desc = vals(&mut e, "SELECT v FROM n571 ORDER BY v DESC LIMIT 4");
     assert_eq!(desc, vec!["NULL", "NULL", "NULL", "NULL"]);
-    let nulls_last = vals(&mut e, "SELECT v FROM n571 ORDER BY v DESC NULLS LAST LIMIT 3");
+    let nulls_last = vals(
+        &mut e,
+        "SELECT v FROM n571 ORDER BY v DESC NULLS LAST LIMIT 3",
+    );
     assert_eq!(nulls_last, vec!["2999", "2998", "2996"]);
 }
 
@@ -138,17 +148,27 @@ fn round571_null_sort_keys_survive_recycling() {
 fn round571_offset_and_the_shapes_that_do_not_stream() {
     let mut e = engine();
     assert_eq!(
-        vals(&mut e, "SELECT id FROM t571 ORDER BY id DESC LIMIT 3 OFFSET 5"),
+        vals(
+            &mut e,
+            "SELECT id FROM t571 ORDER BY id DESC LIMIT 3 OFFSET 5"
+        ),
         vec!["4995", "4994", "4993"]
     );
     // DISTINCT builds its keys after the dup probe and never pools.
     assert_eq!(
-        vals(&mut e, "SELECT DISTINCT g FROM t571 ORDER BY g DESC LIMIT 3"),
+        vals(
+            &mut e,
+            "SELECT DISTINCT g FROM t571 ORDER BY g DESC LIMIT 3"
+        ),
         vec!["6", "5", "4"]
     );
     // WITH TIES is excluded from streaming, so the whole set is ordered.
     assert_eq!(
-        vals(&mut e, "SELECT g FROM t571 ORDER BY g DESC FETCH FIRST 1 ROW WITH TIES").len(),
+        vals(
+            &mut e,
+            "SELECT g FROM t571 ORDER BY g DESC FETCH FIRST 1 ROW WITH TIES"
+        )
+        .len(),
         714,
         "5000 rows, g = gg % 7, so 714 of them are 6"
     );

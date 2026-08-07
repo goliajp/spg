@@ -42,7 +42,10 @@ fn age_xid_measures_a_real_distance() {
     let (spg_storage::Value::Int(far), spg_storage::Value::Int(near)) = (far, near) else {
         panic!("age(xid) should be an integer, as on PG");
     };
-    assert!(far >= near, "an older xid must not be nearer: {far} vs {near}");
+    assert!(
+        far >= near,
+        "an older xid must not be nearer: {far} vs {near}"
+    );
     assert_eq!(near, 0, "an xid past the counter saturates at 0");
 }
 
@@ -78,8 +81,7 @@ fn age_refuses_a_bare_integer_the_way_pg_does() {
         err(&mut e, "SELECT age(12345::int)")
     );
     assert!(
-        err(&mut e, "SELECT mxid_age(12345)")
-            .contains("function mxid_age(integer) does not exist"),
+        err(&mut e, "SELECT mxid_age(12345)").contains("function mxid_age(integer) does not exist"),
         "{}",
         err(&mut e, "SELECT mxid_age(12345)")
     );

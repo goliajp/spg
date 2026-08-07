@@ -34,7 +34,10 @@ fn json(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn json_object_variadic() {
     let mut e = mysql();
-    assert_eq!(json(&mut e, "SELECT JSON_OBJECT('k', 1, 'v', 2)"), r#"{"k": 1, "v": 2}"#);
+    assert_eq!(
+        json(&mut e, "SELECT JSON_OBJECT('k', 1, 'v', 2)"),
+        r#"{"k": 1, "v": 2}"#
+    );
     assert_eq!(json(&mut e, "SELECT JSON_OBJECT()"), "{}");
 }
 
@@ -42,7 +45,10 @@ fn json_object_variadic() {
 #[test]
 fn null_value_kept() {
     let mut e = mysql();
-    assert_eq!(json(&mut e, "SELECT JSON_OBJECT('a', NULL)"), r#"{"a": null}"#);
+    assert_eq!(
+        json(&mut e, "SELECT JSON_OBJECT('a', NULL)"),
+        r#"{"a": null}"#
+    );
 }
 
 /// A nested JSON value nests.

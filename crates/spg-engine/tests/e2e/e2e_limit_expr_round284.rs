@@ -35,7 +35,7 @@ fn err(e: &mut Engine, tail: &str) -> String {
         // v7.39 (round 323, V24) — the `parse error at token #N: ` wrapper
         // this used to unpick is gone; only the engine's own layer prefix
         // is left, and the message under it is PG's verbatim.
-        Err(x) => format!("{x}").trim_start_matches("parse: ").to_string()
+        Err(x) => format!("{x}").trim_start_matches("parse: ").to_string(),
     }
 }
 

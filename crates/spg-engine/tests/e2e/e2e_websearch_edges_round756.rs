@@ -14,9 +14,7 @@ use spg_engine::{Engine, QueryResult};
 fn one(e: &mut Engine, input: &str) -> String {
     let sql = format!("SELECT websearch_to_tsquery('simple', $q${input}$q$)");
     match e.execute(&sql).unwrap() {
-        QueryResult::Rows { rows, .. } => {
-            spg_engine::eval::value_to_text(&rows[0].values[0])
-        }
+        QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{other:?}"),
     }
 }

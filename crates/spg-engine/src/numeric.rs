@@ -480,7 +480,11 @@ pub(crate) fn check_precision_text(
         _ => return Ok(()),
     };
     let body = text.trim_start_matches('-');
-    let int_part = body.split('.').next().unwrap_or(body).trim_start_matches('0');
+    let int_part = body
+        .split('.')
+        .next()
+        .unwrap_or(body)
+        .trim_start_matches('0');
     // PG's limit is 10^(precision - scale); a NEGATIVE scale therefore
     // ALLOWS more integer digits, not fewer.
     let allowed = usize::try_from(i32::from(precision) - i32::from(scale)).unwrap_or(0);

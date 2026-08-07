@@ -63,7 +63,13 @@ fn round652_a_plain_add_scans_the_rows_already_there() {
     // negative rows. A half-applied ALTER would show up right here.
     e.execute("INSERT INTO nv VALUES (-9)").unwrap();
     assert_eq!(one(&mut e, "SELECT count(*) FROM nv"), "3");
-    assert_eq!(one(&mut e, "SELECT count(*) FROM pg_constraint WHERE conname='nv_pos'"), "0");
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT count(*) FROM pg_constraint WHERE conname='nv_pos'"
+        ),
+        "0"
+    );
 }
 
 /// An unnamed CHECK gets the synthesised name in the message, the same
@@ -134,7 +140,8 @@ fn round652_d_validate_runs_the_deferred_scan() {
     // The DELETE tombstones the row rather than removing it; the scan has
     // to skip tombstones or this second VALIDATE would refuse too.
     e.execute("DELETE FROM nv WHERE a < 0").unwrap();
-    e.execute("ALTER TABLE nv VALIDATE CONSTRAINT nv_pos").unwrap();
+    e.execute("ALTER TABLE nv VALIDATE CONSTRAINT nv_pos")
+        .unwrap();
     assert_eq!(
         one(
             &mut e,
@@ -159,7 +166,8 @@ fn round652_e_validate_edges() {
     e.execute("CREATE TABLE nv(a int)").unwrap();
     e.execute("ALTER TABLE nv ADD CONSTRAINT nv_pos CHECK (a > 0)")
         .unwrap();
-    e.execute("ALTER TABLE nv VALIDATE CONSTRAINT nv_pos").unwrap();
+    e.execute("ALTER TABLE nv VALIDATE CONSTRAINT nv_pos")
+        .unwrap();
 
     let msg = err(&mut e, "ALTER TABLE nv VALIDATE CONSTRAINT nope");
     assert!(
@@ -173,7 +181,10 @@ fn round652_e_validate_edges() {
 #[test]
 fn round652_f_not_valid_is_an_alter_only_suffix() {
     let mut e = Engine::new();
-    assert!(e.execute("CREATE TABLE nv(a int CHECK (a > 0) NOT VALID)").is_err());
+    assert!(
+        e.execute("CREATE TABLE nv(a int CHECK (a > 0) NOT VALID)")
+            .is_err()
+    );
     assert!(
         e.execute("CREATE TABLE nv2(a int, CONSTRAINT c CHECK (a > 0) NOT VALID)")
             .is_err()
@@ -237,7 +248,10 @@ fn round652_h_a_reg_array_is_an_oid_array() {
         "bigint[]"
     );
     assert_eq!(
-        one(&mut e, "SELECT (ARRAY['int4'::regtype])[1] = 'int4'::regtype::oid"),
+        one(
+            &mut e,
+            "SELECT (ARRAY['int4'::regtype])[1] = 'int4'::regtype::oid"
+        ),
         "true"
     );
 }

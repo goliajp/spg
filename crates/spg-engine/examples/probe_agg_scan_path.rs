@@ -22,8 +22,12 @@ fn main() {
     eng.execute("CREATE TABLE h (id INT NOT NULL, g INT NOT NULL, v INT NOT NULL)")
         .unwrap();
     for i in 1..=n {
-        eng.execute(&format!("INSERT INTO h VALUES ({i}, {}, {})", i % 100, val_for(i)))
-            .unwrap();
+        eng.execute(&format!(
+            "INSERT INTO h VALUES ({i}, {}, {})",
+            i % 100,
+            val_for(i)
+        ))
+        .unwrap();
     }
     println!("| query | scans entered | direct proj fires |");
     println!("|-------|--------------:|------------------:|");

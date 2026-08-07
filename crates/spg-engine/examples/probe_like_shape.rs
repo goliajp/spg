@@ -15,10 +15,13 @@ fn main() {
     eng.execute("CREATE TABLE t (id INT, s TEXT, c CHAR(6), n INT)")
         .unwrap();
     for i in 0..20 {
-        eng.execute(&format!("INSERT INTO t VALUES ({i}, 'user_{i:04}', 'ab', {i})"))
-            .unwrap();
+        eng.execute(&format!(
+            "INSERT INTO t VALUES ({i}, 'user_{i:04}', 'ab', {i})"
+        ))
+        .unwrap();
     }
-    eng.execute("INSERT INTO t VALUES (99, NULL, NULL, NULL)").unwrap();
+    eng.execute("INSERT INTO t VALUES (99, NULL, NULL, NULL)")
+        .unwrap();
     println!("| spelling | fastpred fires | ids |");
     println!("|----------|---------------:|-----|");
     for sql in [

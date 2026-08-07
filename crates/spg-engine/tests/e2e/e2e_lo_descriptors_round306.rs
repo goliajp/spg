@@ -50,8 +50,14 @@ fn seeded() -> (Engine, String) {
 fn descriptors_number_from_zero_and_track_position() {
     let (mut e, oid) = seeded();
     e.execute("BEGIN").unwrap();
-    assert_eq!(val(&mut e, &format!("SELECT lo_open({oid}, {INV_READ})")), "0");
-    assert_eq!(val(&mut e, &format!("SELECT lo_open({oid}, {INV_READ})")), "1");
+    assert_eq!(
+        val(&mut e, &format!("SELECT lo_open({oid}, {INV_READ})")),
+        "0"
+    );
+    assert_eq!(
+        val(&mut e, &format!("SELECT lo_open({oid}, {INV_READ})")),
+        "1"
+    );
     // Reading advances the position.
     assert_eq!(val(&mut e, "SELECT loread(0, 4)"), "\\x00010203");
     assert_eq!(val(&mut e, "SELECT lo_tell(0)"), "4");
@@ -75,8 +81,7 @@ fn seek_takes_all_three_whence_values() {
     assert_eq!(val(&mut e, "SELECT lo_tell64(0)"), "2");
     // A target before the start is refused, quoting the target.
     assert!(
-        err(&mut e, "SELECT lo_lseek(0, -5, 0)")
-            .contains("invalid large object seek target: -5")
+        err(&mut e, "SELECT lo_lseek(0, -5, 0)").contains("invalid large object seek target: -5")
     );
     e.execute("ROLLBACK").unwrap();
 }
@@ -182,12 +187,18 @@ fn descriptors_do_not_outlive_their_transaction() {
     // And in autocommit the implicit transaction ends with the
     // statement, so the handle is gone by the next one — PG hands back
     // a descriptor here too, it is simply already dead.
-    assert_eq!(val(&mut e, &format!("SELECT lo_open({oid}, {INV_READ})")), "0");
+    assert_eq!(
+        val(&mut e, &format!("SELECT lo_open({oid}, {INV_READ})")),
+        "0"
+    );
     assert!(err(&mut e, "SELECT loread(0, 1)").contains("invalid large-object descriptor: 0"));
 
     // Numbering restarts from 0 in the next transaction.
     e.execute("BEGIN").unwrap();
-    assert_eq!(val(&mut e, &format!("SELECT lo_open({oid}, {INV_READ})")), "0");
+    assert_eq!(
+        val(&mut e, &format!("SELECT lo_open({oid}, {INV_READ})")),
+        "0"
+    );
     e.execute("COMMIT").unwrap();
 }
 

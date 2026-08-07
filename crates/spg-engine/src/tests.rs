@@ -2186,7 +2186,8 @@ fn an_authenticated_superuser_still_bypasses() {
     let mut e = Engine::new();
     e.create_user("su", "pw", crate::users::Role::Admin, [8u8; 16])
         .expect("create su");
-    e.role_ddl_users_mut().set_attributes("su", true, true, true);
+    e.role_ddl_users_mut()
+        .set_attributes("su", true, true, true);
     e.set_session_user("su");
     e.set_session_authenticated();
     assert!(
@@ -2907,4 +2908,3 @@ fn another_slots_transaction_does_not_stop_autoanalyze_counting() {
 
     e.execute_in("COMMIT", holder).unwrap();
 }
-

@@ -36,7 +36,10 @@ fn one(e: &mut Engine, sql: &str) -> String {
 fn the_boundary_case_takes_the_longer_form() {
     let mut e = Engine::new();
     assert_eq!(one(&mut e, "SELECT 1e23::float8"), "9.999999999999999e+22");
-    assert_eq!(one(&mut e, "SELECT (-1e23)::float8"), "-9.999999999999999e+22");
+    assert_eq!(
+        one(&mut e, "SELECT (-1e23)::float8"),
+        "-9.999999999999999e+22"
+    );
 }
 
 #[test]
@@ -56,7 +59,10 @@ fn the_ordinary_values_are_unchanged() {
         ("SELECT 1e100::float8", "1e+100"),
         ("SELECT 3.14159265358979::float8", "3.14159265358979"),
         ("SELECT 1.0/3.0::float8", "0.3333333333333333"),
-        ("SELECT 123456789012345678::float8", "1.2345678901234568e+17"),
+        (
+            "SELECT 123456789012345678::float8",
+            "1.2345678901234568e+17",
+        ),
         ("SELECT 9007199254740993::float8", "9.007199254740992e+15"),
     ] {
         assert_eq!(one(&mut e, sql), want, "{sql}");

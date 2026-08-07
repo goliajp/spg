@@ -200,7 +200,10 @@ fn explain_format_text_default_unchanged() {
     e.execute("CREATE TABLE t (id INT)").unwrap();
     // v7.39 (round 224) — a filtered query so the PG-shaped plan has a
     // Filter attr line (a bare scan is one line).
-    let plan = plan_text(&mut e, "EXPLAIN (FORMAT text) SELECT * FROM t WHERE id = 1 ORDER BY id");
+    let plan = plan_text(
+        &mut e,
+        "EXPLAIN (FORMAT text) SELECT * FROM t WHERE id = 1 ORDER BY id",
+    );
     assert!(
         plan.contains("Seq Scan on t"),
         "TEXT format body broken: {plan}"

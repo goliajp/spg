@@ -241,7 +241,10 @@ fn the_other_encode_paths_flush_too() {
         "the SCALARSQ path returns every row"
     );
 
-    let materialised = q(&mut s, "SELECT pad FROM big WHERE id IN (SELECT id FROM big)");
+    let materialised = q(
+        &mut s,
+        "SELECT pad FROM big WHERE id IN (SELECT id FROM big)",
+    );
     assert_eq!(sqlstate(&materialised), None);
     assert_eq!(
         col0(&materialised).len(),
@@ -386,4 +389,3 @@ fn a_cancel_mid_drain_keeps_the_flushed_rows_and_ends_in_57014() {
     assert_eq!(sqlstate(&after), None);
     assert_eq!(col0(&after), vec!["400000"]);
 }
-

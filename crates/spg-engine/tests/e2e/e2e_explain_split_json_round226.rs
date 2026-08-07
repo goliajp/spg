@@ -85,7 +85,10 @@ fn format_json_emits_pg_node_objects() {
     assert_eq!(out.len(), 1, "JSON is one row");
     let j = &out[0];
     // v7.39 (round 228) — PG pretty-prints the array/Plan wrapper.
-    assert!(j.starts_with("[\n  {\n    \"Plan\": {"), "PG array/Plan wrapper: {j}");
+    assert!(
+        j.starts_with("[\n  {\n    \"Plan\": {"),
+        "PG array/Plan wrapper: {j}"
+    );
     assert!(j.contains("\"Node Type\": \"Index Scan\""), "{j}");
     assert!(j.contains("\"Index Name\": \"p1_pkey\""), "{j}");
     assert!(j.contains("\"Relation Name\": \"p1\""), "{j}");
@@ -106,7 +109,10 @@ fn format_json_nests_children_under_plans() {
     // "Hashed", with the scan nested under "Plans" as the Outer child.
     assert!(j.contains("\"Node Type\": \"Aggregate\""), "{j}");
     assert!(j.contains("\"Strategy\": \"Hashed\""), "{j}");
-    assert!(j.contains("\"Group Key\": [\"v\"]"), "key list is an array: {j}");
+    assert!(
+        j.contains("\"Group Key\": [\"v\"]"),
+        "key list is an array: {j}"
+    );
     assert!(j.contains("\"Plans\": ["), "{j}");
     assert!(j.contains("\"Parent Relationship\": \"Outer\""), "{j}");
     assert!(j.contains("\"Node Type\": \"Seq Scan\""), "{j}");

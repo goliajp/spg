@@ -56,7 +56,10 @@ fn plan(e: &mut Engine, sql: &str) -> Vec<String> {
 #[test]
 fn round551_explain_names_the_serving_index() {
     let mut e = engine();
-    let range = plan(&mut e, "EXPLAIN SELECT * FROM e551 WHERE k BETWEEN 10 AND 12");
+    let range = plan(
+        &mut e,
+        "EXPLAIN SELECT * FROM e551 WHERE k BETWEEN 10 AND 12",
+    );
     assert!(
         range[0].contains("Index Scan using e551k on e551"),
         "named the wrong index: {range:?}"
@@ -73,7 +76,10 @@ fn round551_explain_names_the_serving_index() {
 #[test]
 fn round551_no_duplicate_filter_under_an_index_cond() {
     let mut e = engine();
-    let range = plan(&mut e, "EXPLAIN SELECT * FROM e551 WHERE k BETWEEN 10 AND 12");
+    let range = plan(
+        &mut e,
+        "EXPLAIN SELECT * FROM e551 WHERE k BETWEEN 10 AND 12",
+    );
     assert_eq!(
         range.iter().filter(|l| l.contains("Index Cond:")).count(),
         1,
