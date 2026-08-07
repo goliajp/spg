@@ -42,13 +42,16 @@ fn round653_the_functions_the_engine_answers_are_listed() {
         ("cardinality", vec!["cardinality|1|int4"]),
         ("array_length", vec!["array_length|2|int4"]),
         ("jsonb_set", vec!["jsonb_set|4|jsonb"]),
-        ("regexp_replace", vec![
-            "regexp_replace|3|text",
-            "regexp_replace|4|text",
-            "regexp_replace|4|text",
-            "regexp_replace|5|text",
-            "regexp_replace|6|text",
-        ]),
+        (
+            "regexp_replace",
+            vec![
+                "regexp_replace|3|text",
+                "regexp_replace|4|text",
+                "regexp_replace|4|text",
+                "regexp_replace|5|text",
+                "regexp_replace|6|text",
+            ],
+        ),
     ] {
         assert_eq!(
             vals(
@@ -113,11 +116,17 @@ fn round653_pg_lsn_functions_accept_pg_lsn() {
         vec!["0/2"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT pg_lsn_smaller('0/1'::pg_lsn, '0/2'::pg_lsn)"),
+        vals(
+            &mut e,
+            "SELECT pg_lsn_smaller('0/1'::pg_lsn, '0/2'::pg_lsn)"
+        ),
         vec!["0/1"]
     );
     // The text spelling kept working.
-    assert_eq!(vals(&mut e, "SELECT pg_lsn_larger('0/1', '0/2')"), vec!["0/2"]);
+    assert_eq!(
+        vals(&mut e, "SELECT pg_lsn_larger('0/1', '0/2')"),
+        vec!["0/2"]
+    );
 }
 
 /// The eleven types the new rows needed. Each is one the engine really
@@ -126,12 +135,18 @@ fn round653_pg_lsn_functions_accept_pg_lsn() {
 fn round653_the_new_types_are_types_the_engine_produces() {
     let mut e = Engine::new();
     assert_eq!(vals(&mut e, "SELECT point(1,2)"), vec!["(1,2)"]);
-    assert_eq!(vals(&mut e, "SELECT 'pg_class'::regclass"), vec!["pg_class"]);
+    assert_eq!(
+        vals(&mut e, "SELECT 'pg_class'::regclass"),
+        vec!["pg_class"]
+    );
     assert_eq!(
         vals(&mut e, "SELECT range_merge(int4range(1,3), int4range(5,7))"),
         vec!["[1,7)"]
     );
-    assert_eq!(vals(&mut e, "SELECT array_append(ARRAY[1,2], 3)"), vec!["{1,2,3}"]);
+    assert_eq!(
+        vals(&mut e, "SELECT array_append(ARRAY[1,2], 3)"),
+        vec!["{1,2,3}"]
+    );
     assert_eq!(
         vals(
             &mut e,

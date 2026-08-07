@@ -24,7 +24,9 @@ fn mysql() -> Engine {
 fn num(e: &mut Engine, sql: &str) -> i128 {
     match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err}")) {
         QueryResult::Rows { rows, .. } => match &rows[0].values[0] {
-            Value::Numeric { scaled, scale: 0, .. } => *scaled,
+            Value::Numeric {
+                scaled, scale: 0, ..
+            } => *scaled,
             Value::Int(n) => i128::from(*n),
             Value::BigInt(n) => i128::from(*n),
             other => panic!("`{sql}` not an integer: {other:?}"),

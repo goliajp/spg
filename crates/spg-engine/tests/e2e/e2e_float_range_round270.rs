@@ -36,10 +36,16 @@ fn a_value_on_a_half_ulp_boundary_takes_the_longer_form() {
     // 1.5e10 is EXACTLY half an ulp below the float4 15000000512, so it
     // round-trips (ties-to-even) but is not strictly inside the
     // interval. PG prints the longer form; SPG printed 1.5e+10.
-    assert_eq!(one(&mut e, "SELECT '15000000512'::real::text"), "1.5000001e+10");
+    assert_eq!(
+        one(&mut e, "SELECT '15000000512'::real::text"),
+        "1.5000001e+10"
+    );
     assert_eq!(one(&mut e, "SELECT '1.5e10'::real::text"), "1.5000001e+10");
     // Both texts still name the same float4.
-    assert_eq!(one(&mut e, "SELECT '1.5e10'::real = 15000000512::real"), "true");
+    assert_eq!(
+        one(&mut e, "SELECT '1.5e10'::real = 15000000512::real"),
+        "true"
+    );
 }
 
 #[test]

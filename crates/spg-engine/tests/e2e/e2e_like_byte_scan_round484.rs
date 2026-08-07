@@ -127,12 +127,18 @@ fn round484_overlapping_candidates_and_the_wildcard_budget() {
 fn round484_negation_and_null_are_unchanged() {
     let mut e = seeded();
     assert_eq!(
-        rows(&mut e, "SELECT id FROM t WHERE s NOT LIKE '%0%' ORDER BY id"),
+        rows(
+            &mut e,
+            "SELECT id FROM t WHERE s NOT LIKE '%0%' ORDER BY id"
+        ),
         "3;4;5;6;7;8"
     );
     e.execute("INSERT INTO t VALUES (9, NULL)").unwrap();
     // A NULL matches neither LIKE nor NOT LIKE.
-    assert_eq!(rows(&mut e, "SELECT count(*) FROM t WHERE s LIKE '%a%'"), "3");
+    assert_eq!(
+        rows(&mut e, "SELECT count(*) FROM t WHERE s LIKE '%a%'"),
+        "3"
+    );
     assert_eq!(
         rows(&mut e, "SELECT count(*) FROM t WHERE s NOT LIKE '%a%'"),
         "5"

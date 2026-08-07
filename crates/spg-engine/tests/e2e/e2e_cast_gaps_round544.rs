@@ -53,7 +53,10 @@ fn one(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn round544_timetz_to_time() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT '10:20:30+09'::timetz::time"), "10:20:30");
+    assert_eq!(
+        one(&mut e, "SELECT '10:20:30+09'::timetz::time"),
+        "10:20:30"
+    );
     assert_eq!(
         one(&mut e, "SELECT '10:20:30.5+09'::timetz::time"),
         "10:20:30.5"
@@ -119,7 +122,8 @@ fn round544_bytea_to_integer() {
     }
     // Wider than the target is refused rather than truncated.
     assert!(
-        e.execute("SELECT '\\x0000000000000005'::bytea::int4").is_err(),
+        e.execute("SELECT '\\x0000000000000005'::bytea::int4")
+            .is_err(),
         "eight bytes must not fit an int4"
     );
 }

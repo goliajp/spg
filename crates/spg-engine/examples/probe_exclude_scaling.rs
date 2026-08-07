@@ -79,7 +79,10 @@ fn bench_update(n: usize) -> f64 {
 }
 
 fn main() {
-    println!("{:>8}  {:>10}  {:>12}  {:>8}", "N", "total_s", "us/insert", "ratio");
+    println!(
+        "{:>8}  {:>10}  {:>12}  {:>8}",
+        "N", "total_s", "us/insert", "ratio"
+    );
     let mut prev: Option<(usize, f64)> = None;
     for &n in &[1000usize, 2000, 4000, 8000] {
         let t = bench(n);

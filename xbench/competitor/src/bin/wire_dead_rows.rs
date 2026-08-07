@@ -66,7 +66,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("# round 462 — dead rows carried through the panel sequence");
     println!("# {} runs per shape, {N}-row seeded table", RUNS);
-    println!("{:<22} {:>12} {:>12}", "after shape", "dead rows", "shape ms");
+    println!(
+        "{:<22} {:>12} {:>12}",
+        "after shape", "dead rows", "shape ms"
+    );
     println!("{:<22} {:>12} {:>12}", "(seed)", dead(&mut conn), "-");
 
     let mut next_base = N + 1_000_000;

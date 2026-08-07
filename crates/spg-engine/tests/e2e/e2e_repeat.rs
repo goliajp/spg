@@ -140,7 +140,10 @@ fn repeat_numeric_input_coerced() {
         .execute("SELECT repeat(7, 3)")
         .expect_err("PG has no repeat(integer, integer)")
         .to_string();
-    assert!(m.contains("function repeat(integer, integer) does not exist"), "{m}");
+    assert!(
+        m.contains("function repeat(integer, integer) does not exist"),
+        "{m}"
+    );
 }
 
 #[test]

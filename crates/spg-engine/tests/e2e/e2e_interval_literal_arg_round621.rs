@@ -71,11 +71,17 @@ fn round621_a_bare_literal_is_an_interval_here() {
         "the spelling that always worked answers the same"
     );
     assert_eq!(
-        vals(&mut e, "SELECT justify_days('35 days'), justify_hours('27 hours')"),
+        vals(
+            &mut e,
+            "SELECT justify_days('35 days'), justify_hours('27 hours')"
+        ),
         vec!["1 mon 5 days|1 day 03:00:00"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT justify_interval('1 year 15 months 100 hours')"),
+        vals(
+            &mut e,
+            "SELECT justify_interval('1 year 15 months 100 hours')"
+        ),
         vec!["2 years 3 mons 4 days 04:00:00"],
         "months and hours both carry"
     );

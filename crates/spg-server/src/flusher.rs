@@ -164,7 +164,11 @@ fn run(state: &ServerState, config: FlusherConfig) {
                 .and_then(|f| f.metadata().ok().map(|m| m.len()))
         });
         if let Some(len) = wal_len
-            && len <= state.metrics.last_durable_wal_offset.load(Ordering::Relaxed)
+            && len
+                <= state
+                    .metrics
+                    .last_durable_wal_offset
+                    .load(Ordering::Relaxed)
         {
             continue;
         }

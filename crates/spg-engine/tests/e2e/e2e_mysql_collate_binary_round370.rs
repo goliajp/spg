@@ -49,10 +49,16 @@ fn explicit_binary_column_is_byte_wise_everywhere() {
     let mut e = seed("CREATE TABLE t (t VARCHAR(10) COLLATE utf8mb4_bin)");
     assert_eq!(count(&mut e, "SELECT COUNT(*) FROM t WHERE t = 'a'"), 1);
     assert_eq!(count(&mut e, "SELECT COUNT(*) FROM t WHERE t IN ('A')"), 1);
-    assert_eq!(count(&mut e, "SELECT COUNT(*) FROM t WHERE t LIKE 'bar'"), 1);
+    assert_eq!(
+        count(&mut e, "SELECT COUNT(*) FROM t WHERE t LIKE 'bar'"),
+        1
+    );
     assert_eq!(count(&mut e, "SELECT COUNT(DISTINCT t) FROM t"), 4);
     assert_eq!(
-        count(&mut e, "SELECT COUNT(*) FROM (SELECT t FROM t GROUP BY t) g"),
+        count(
+            &mut e,
+            "SELECT COUNT(*) FROM (SELECT t FROM t GROUP BY t) g"
+        ),
         4
     );
 }
@@ -63,10 +69,16 @@ fn default_column_still_folds() {
     let mut e = seed("CREATE TABLE t (t VARCHAR(10))");
     assert_eq!(count(&mut e, "SELECT COUNT(*) FROM t WHERE t = 'a'"), 2);
     assert_eq!(count(&mut e, "SELECT COUNT(*) FROM t WHERE t IN ('A')"), 2);
-    assert_eq!(count(&mut e, "SELECT COUNT(*) FROM t WHERE t LIKE 'bar'"), 2);
+    assert_eq!(
+        count(&mut e, "SELECT COUNT(*) FROM t WHERE t LIKE 'bar'"),
+        2
+    );
     assert_eq!(count(&mut e, "SELECT COUNT(DISTINCT t) FROM t"), 2);
     assert_eq!(
-        count(&mut e, "SELECT COUNT(*) FROM (SELECT t FROM t GROUP BY t) g"),
+        count(
+            &mut e,
+            "SELECT COUNT(*) FROM (SELECT t FROM t GROUP BY t) g"
+        ),
         2
     );
 }

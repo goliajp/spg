@@ -46,7 +46,15 @@ fn named_window_copy_inherits_partitioning() {
     let mut e = seeded();
     // `w2 AS (w1 ORDER BY v)` and `OVER (w1 ORDER BY v)` both take w1's
     // PARTITION BY and add the ordering. Values verified against PG18.4.
-    let want = ["BigInt(10)", "BigInt(50)", "BigInt(50)", "BigInt(5)", "BigInt(35)", "BigInt(35)", "BigInt(65)"];
+    let want = [
+        "BigInt(10)",
+        "BigInt(50)",
+        "BigInt(50)",
+        "BigInt(5)",
+        "BigInt(35)",
+        "BigInt(35)",
+        "BigInt(65)",
+    ];
     assert_eq!(
         col1(
             &mut e,
@@ -70,7 +78,15 @@ fn named_window_copy_inherits_partitioning() {
             "SELECT id, sum(v) OVER (w1 ROWS 1 PRECEDING) FROM w \
              WINDOW w1 AS (PARTITION BY g ORDER BY v) ORDER BY id"
         ),
-        ["BigInt(10)", "BigInt(30)", "BigInt(40)", "BigInt(5)", "BigInt(20)", "BigInt(30)", "BigInt(45)"]
+        [
+            "BigInt(10)",
+            "BigInt(30)",
+            "BigInt(40)",
+            "BigInt(5)",
+            "BigInt(20)",
+            "BigInt(30)",
+            "BigInt(45)"
+        ]
     );
 }
 
@@ -118,13 +134,19 @@ fn window_calls_rejected_in_where_and_having() {
         &mut e,
         "SELECT rank() OVER (ORDER BY v) FROM w WHERE rank() OVER (ORDER BY v) = 1",
     );
-    assert!(got.contains("window functions are not allowed in WHERE"), "{got}");
+    assert!(
+        got.contains("window functions are not allowed in WHERE"),
+        "{got}"
+    );
     assert!(!got.contains("rewrite bug"), "no internal wording: {got}");
     let got = err(
         &mut e,
         "SELECT id FROM w GROUP BY id HAVING row_number() OVER () = 1",
     );
-    assert!(got.contains("window functions are not allowed in HAVING"), "{got}");
+    assert!(
+        got.contains("window functions are not allowed in HAVING"),
+        "{got}"
+    );
 }
 
 #[test]
@@ -163,7 +185,15 @@ fn impossible_frames_are_rejected_not_silently_empty() {
             "SELECT sum(v) OVER (ORDER BY v ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) \
              FROM w ORDER BY 1"
         ),
-        ["BigInt(30)", "BigInt(50)", "BigInt(70)", "BigInt(85)", "BigInt(100)", "BigInt(110)", "BigInt(115)"]
+        [
+            "BigInt(30)",
+            "BigInt(50)",
+            "BigInt(70)",
+            "BigInt(85)",
+            "BigInt(100)",
+            "BigInt(110)",
+            "BigInt(115)"
+        ]
     );
 }
 
@@ -175,9 +205,7 @@ fn range_offset_refusals_name_pgs_two_cases() {
         "SELECT sum(v) OVER (ORDER BY g RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w",
     );
     assert!(
-        got.contains(
-            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type text"
-        ),
+        got.contains("RANGE with offset PRECEDING/FOLLOWING is not supported for column type text"),
         "{got}"
     );
     let got = err(
@@ -185,9 +213,7 @@ fn range_offset_refusals_name_pgs_two_cases() {
         "SELECT sum(v) OVER (ORDER BY v, g RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w",
     );
     assert!(
-        got.contains(
-            "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column"
-        ),
+        got.contains("RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column"),
         "{got}"
     );
 }

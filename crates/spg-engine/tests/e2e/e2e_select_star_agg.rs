@@ -81,7 +81,9 @@ fn star_and_aggregate_with_group_by() {
     setup(&mut e);
     // v7.39 (round 763, F31-C1) — the "known gap" closed: the
     // wildcard expands to the grouped columns and the shape answers.
-    let r = e.execute("SELECT *, count(*) FROM t GROUP BY id, name").unwrap();
+    let r = e
+        .execute("SELECT *, count(*) FROM t GROUP BY id, name")
+        .unwrap();
     let spg_engine::QueryResult::Rows { rows, .. } = r else {
         panic!("expected rows");
     };

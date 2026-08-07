@@ -36,14 +36,20 @@ fn err(e: &mut Engine, sql: &str) -> String {
 fn sssss_and_zone_tokens() {
     let mut e = Engine::new();
     assert_eq!(
-        one(&mut e, "SELECT to_char(TIMESTAMP '2024-03-05 14:30:45', 'SSSS SSSSS')"),
+        one(
+            &mut e,
+            "SELECT to_char(TIMESTAMP '2024-03-05 14:30:45', 'SSSS SSSSS')"
+        ),
         "52245 52245"
     );
     // SPG stores and renders every timestamp in UTC; the zone tokens
     // answer for it (a session-zone-aware answer is the renderer's same
     // architecture step — recorded).
     assert_eq!(
-        one(&mut e, "SELECT to_char(TIMESTAMPTZ '2024-03-05 14:30:45+00', 'TZ OF TZH:TZM')"),
+        one(
+            &mut e,
+            "SELECT to_char(TIMESTAMPTZ '2024-03-05 14:30:45+00', 'TZ OF TZH:TZM')"
+        ),
         "UTC +00 +00:00"
     );
 }
@@ -51,8 +57,14 @@ fn sssss_and_zone_tokens() {
 #[test]
 fn to_char_accepts_time() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT to_char(TIME '14:30:45', 'HH24:MI:SS')"), "14:30:45");
-    assert_eq!(one(&mut e, "SELECT to_char(TIME '02:30:45', 'HH12:MI AM')"), "02:30 AM");
+    assert_eq!(
+        one(&mut e, "SELECT to_char(TIME '14:30:45', 'HH24:MI:SS')"),
+        "14:30:45"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT to_char(TIME '02:30:45', 'HH12:MI AM')"),
+        "02:30 AM"
+    );
 }
 
 #[test]
@@ -70,7 +82,10 @@ fn to_date_validates_the_calendar() {
         "{got}"
     );
     // Leap-year Feb 29 is legal; non-leap is not.
-    assert_eq!(one(&mut e, "SELECT to_date('2024-02-29', 'YYYY-MM-DD')"), "2024-02-29");
+    assert_eq!(
+        one(&mut e, "SELECT to_date('2024-02-29', 'YYYY-MM-DD')"),
+        "2024-02-29"
+    );
     let got = err(&mut e, "SELECT to_date('2023-02-29', 'YYYY-MM-DD')");
     assert!(got.contains("out of range: \"2023-02-29\""), "{got}");
 }
@@ -78,15 +93,24 @@ fn to_date_validates_the_calendar() {
 #[test]
 fn non_fx_parsing_is_whitespace_elastic() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT to_date('  05  03 2024', 'DD MM YYYY')"), "2024-03-05");
-    assert_eq!(one(&mut e, "SELECT to_date('05 03 2024', 'DD  MM  YYYY')"), "2024-03-05");
+    assert_eq!(
+        one(&mut e, "SELECT to_date('  05  03 2024', 'DD MM YYYY')"),
+        "2024-03-05"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT to_date('05 03 2024', 'DD  MM  YYYY')"),
+        "2024-03-05"
+    );
 }
 
 #[test]
 fn to_timestamp_is_timestamptz_and_core_unchanged() {
     let mut e = Engine::new();
     assert_eq!(
-        one(&mut e, "SELECT pg_typeof(to_timestamp('2024-03-05','YYYY-MM-DD'))::text"),
+        one(
+            &mut e,
+            "SELECT pg_typeof(to_timestamp('2024-03-05','YYYY-MM-DD'))::text"
+        ),
         "timestamp with time zone"
     );
     // Regression guard over the sweep's clean cases.
@@ -95,7 +119,10 @@ fn to_timestamp_is_timestamptz_and_core_unchanged() {
             "SELECT to_char(TIMESTAMP '2024-03-05 14:30:45', 'Day, DD Month YYYY')",
             "Tuesday  , 05 March     2024",
         ),
-        ("SELECT to_char(DATE '2024-03-05', 'DDD IW ID D WW W Q')", "065 10 2 3 10 1 1"),
+        (
+            "SELECT to_char(DATE '2024-03-05', 'DDD IW ID D WW W Q')",
+            "065 10 2 3 10 1 1",
+        ),
         (
             "SELECT to_char(TIMESTAMP '2024-03-05 14:30:45.123456', 'MS US FF3')",
             "123 123456 123",

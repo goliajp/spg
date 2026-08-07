@@ -28,7 +28,8 @@ fn pg() -> Engine {
 fn mysql() -> Engine {
     let mut e = Engine::new();
     e.execute("SET sql_mode='STRICT_TRANS_TABLES'").unwrap();
-    e.execute("CREATE TABLE lbl (a INT, s VARCHAR(20))").unwrap();
+    e.execute("CREATE TABLE lbl (a INT, s VARCHAR(20))")
+        .unwrap();
     e.execute("INSERT INTO lbl VALUES (1, 'x')").unwrap();
     e
 }
@@ -94,16 +95,16 @@ fn round507_pg_unary_plus_is_refused_on_non_numbers() {
     for (sql, want) in [
         ("SELECT + TRUE", "operator does not exist: + boolean"),
         ("SELECT + 'x'::text", "operator does not exist: + text"),
-        ("SELECT + INTERVAL '1 day'", "operator does not exist: + interval"),
+        (
+            "SELECT + INTERVAL '1 day'",
+            "operator does not exist: + interval",
+        ),
     ] {
         let got = err(&mut e, sql);
         assert!(got.contains(want), "{sql}: expected {want:?}, got {got}");
     }
     // Unary minus DOES take an interval — the asymmetry is PG's, not a slip.
-    assert_eq!(
-        text(&mut e, "SELECT (- INTERVAL '1 day')::text"),
-        "-1 days"
-    );
+    assert_eq!(text(&mut e, "SELECT (- INTERVAL '1 day')::text"), "-1 days");
 }
 
 /// MariaDB's unary plus is a pure no-op: it takes anything and returns it,

@@ -70,9 +70,7 @@ fn grouping_still_groups() {
 #[test]
 fn it_composes_as_a_subquery() {
     let mut e = fixture();
-    let r = e
-        .execute("SELECT count(*) FROM (SELECT FROM t) s")
-        .unwrap();
+    let r = e.execute("SELECT count(*) FROM (SELECT FROM t) s").unwrap();
     let QueryResult::Rows { rows, .. } = r else {
         panic!()
     };

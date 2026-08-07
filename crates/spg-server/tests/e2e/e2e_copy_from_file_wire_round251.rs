@@ -205,11 +205,17 @@ fn file_copy_lands_with_options_and_is_atomic() {
         .spawn();
     let _guard = common::ChildGuard(raw);
     let mut s = pg_connect(addrs.pgwire.as_ref().unwrap());
-    assert_eq!(exec(&mut s, "CREATE TABLE ct (id int, name text, v int)").1, None);
+    assert_eq!(
+        exec(&mut s, "CREATE TABLE ct (id int, name text, v int)").1,
+        None
+    );
     // Happy path: engine option grammar (FORMAT csv, HEADER) applies.
     let (tag, err) = exec(
         &mut s,
-        &format!("COPY ct FROM '{}' WITH (FORMAT csv, HEADER)", good.display()),
+        &format!(
+            "COPY ct FROM '{}' WITH (FORMAT csv, HEADER)",
+            good.display()
+        ),
     );
     assert_eq!(err, None);
     assert_eq!(tag.as_deref(), Some("COPY 3"));
@@ -221,7 +227,10 @@ fn file_copy_lands_with_options_and_is_atomic() {
     );
     let (code, msg) = err.expect("bad row must fail");
     assert_eq!(code, "22P02", "{msg}");
-    assert!(msg.contains("invalid input syntax for type integer: \"notanint\""), "{msg}");
+    assert!(
+        msg.contains("invalid input syntax for type integer: \"notanint\""),
+        "{msg}"
+    );
     assert_eq!(first_cell(&mut s, "SELECT count(*) FROM ct"), "3");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -313,7 +322,11 @@ fn non_admin_role_gets_pgs_42501() {
         let mut s = scram_login(addr, "admin", "admin-pw");
         assert_eq!(exec(&mut s, "CREATE TABLE ct (id int)").1, None);
         assert_eq!(
-            exec(&mut s, "CREATE USER 'bi' WITH PASSWORD 'bi-pw' ROLE 'readwrite'").1,
+            exec(
+                &mut s,
+                "CREATE USER 'bi' WITH PASSWORD 'bi-pw' ROLE 'readwrite'"
+            )
+            .1,
             None
         );
     }
@@ -324,7 +337,10 @@ fn non_admin_role_gets_pgs_42501() {
     let (_, err) = exec(&mut s, &format!("COPY ct FROM '{}'", csv.display()));
     let (code, msg) = err.expect("non-admin file COPY must fail");
     assert_eq!(code, "42501", "{msg}");
-    assert!(msg.contains("permission denied to COPY from a file"), "{msg}");
+    assert!(
+        msg.contains("permission denied to COPY from a file"),
+        "{msg}"
+    );
     // Admin can.
     let mut s = scram_login(addr, "admin", "admin-pw");
     let (tag, err) = exec(&mut s, &format!("COPY ct FROM '{}'", csv.display()));
@@ -348,7 +364,10 @@ fn copy_to_file_over_the_wire_writes_and_gates() {
     let _guard = common::ChildGuard(raw);
     let mut s = pg_connect(addrs.pgwire.as_ref().unwrap());
     assert_eq!(exec(&mut s, "CREATE TABLE ct (id int, name text)").1, None);
-    assert_eq!(exec(&mut s, "INSERT INTO ct VALUES (1,'a'),(2,NULL)").1, None);
+    assert_eq!(
+        exec(&mut s, "INSERT INTO ct VALUES (1,'a'),(2,NULL)").1,
+        None
+    );
     let (tag, err) = exec(&mut s, &format!("COPY ct TO '{}'", out.display()));
     assert_eq!(err, None);
     assert_eq!(tag.as_deref(), Some("COPY 2"));
@@ -386,12 +405,19 @@ fn non_admin_role_gets_42501_on_copy_to_file() {
         let mut s = scram_login(addr, "admin", "admin-pw");
         assert_eq!(exec(&mut s, "CREATE TABLE ct (id int)").1, None);
         assert_eq!(
-            exec(&mut s, "CREATE USER 'bi2' WITH PASSWORD 'bi-pw' ROLE 'readwrite'").1,
+            exec(
+                &mut s,
+                "CREATE USER 'bi2' WITH PASSWORD 'bi-pw' ROLE 'readwrite'"
+            )
+            .1,
             None
         );
     }
     let mut s = scram_login(addr, "bi2", "bi-pw");
-    let (_, err) = exec(&mut s, &format!("COPY ct TO '{}'", dir.join("x.txt").display()));
+    let (_, err) = exec(
+        &mut s,
+        &format!("COPY ct TO '{}'", dir.join("x.txt").display()),
+    );
     let (code, msg) = err.expect("non-admin COPY TO file must fail");
     assert_eq!(code, "42501", "{msg}");
     assert!(msg.contains("permission denied to COPY to a file"), "{msg}");

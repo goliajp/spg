@@ -52,16 +52,17 @@ fn regproc_resolves_a_user_function() {
         first(&mut e, "SELECT 'ff'::regproc"),
         Value::RegProc(_, _)
     ));
-    assert_eq!(first(&mut e, "SELECT 'ff'::regproc::text"), Value::text("ff"));
+    assert_eq!(
+        first(&mut e, "SELECT 'ff'::regproc::text"),
+        Value::text("ff")
+    );
     // A name that is no function is still PG's error…
     assert_eq!(
         err(&mut e, "SELECT 'nosuchfn'::regproc"),
         "eval: type mismatch: function \"nosuchfn\" does not exist",
     );
     // …and an overloaded built-in still reports the ambiguity.
-    assert!(
-        err(&mut e, "SELECT 'lower'::regproc").contains("more than one function named"),
-    );
+    assert!(err(&mut e, "SELECT 'lower'::regproc").contains("more than one function named"),);
 }
 
 /// regprocedure carries the argument list, so an overload IS
@@ -103,7 +104,10 @@ fn to_regproc_and_to_regprocedure_answer_for_user_functions() {
         first(&mut e, "SELECT to_regprocedure('ff(integer)')::text"),
         Value::text("ff(integer)"),
     );
-    assert_eq!(first(&mut e, "SELECT to_regprocedure('ff(text)')"), Value::Null);
+    assert_eq!(
+        first(&mut e, "SELECT to_regprocedure('ff(text)')"),
+        Value::Null
+    );
 }
 
 /// The whole point of resolving the cast: the function's definition
@@ -115,7 +119,10 @@ fn pg_get_functiondef_takes_a_regproc() {
     let Value::Text(def) = &by_regproc else {
         panic!("{by_regproc:?}");
     };
-    assert!(def.contains("CREATE OR REPLACE FUNCTION public.ff(a integer)"), "{def}");
+    assert!(
+        def.contains("CREATE OR REPLACE FUNCTION public.ff(a integer)"),
+        "{def}"
+    );
     // The oid form — what every existing caller uses — is unchanged.
     assert_eq!(
         first(
@@ -124,5 +131,8 @@ fn pg_get_functiondef_takes_a_regproc() {
         ),
         by_regproc,
     );
-    assert_eq!(first(&mut e, "SELECT pg_get_functiondef(999999)"), Value::Null);
+    assert_eq!(
+        first(&mut e, "SELECT pg_get_functiondef(999999)"),
+        Value::Null
+    );
 }

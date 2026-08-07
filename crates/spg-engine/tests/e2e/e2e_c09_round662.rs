@@ -104,7 +104,10 @@ fn round662_real_narrows_to_six_significant_digits_as_numeric() {
 fn round662_to_char_accepts_real_and_routes_through_numeric() {
     let mut e = Engine::new();
     assert_eq!(one(&mut e, "SELECT to_char(1.5::real, '9.9')"), " 1.5");
-    assert_eq!(one(&mut e, "SELECT to_char(2.5::float4, '99.99')"), "  2.50");
+    assert_eq!(
+        one(&mut e, "SELECT to_char(2.5::float4, '99.99')"),
+        "  2.50"
+    );
     assert_eq!(
         one(&mut e, "SELECT to_char(12345.678::real, 'FM999999.99')"),
         "12345.7"
@@ -186,7 +189,10 @@ fn round663_timezone_takes_an_interval_and_a_time() {
         ),
         "2020-01-01 02:00:00"
     );
-    assert_eq!(one(&mut e, "SELECT timezone('UTC', TIME '12:00')"), "12:00:00+00");
+    assert_eq!(
+        one(&mut e, "SELECT timezone('UTC', TIME '12:00')"),
+        "12:00:00+00"
+    );
     // The text form is unchanged.
     assert_eq!(
         one(
@@ -196,9 +202,10 @@ fn round663_timezone_takes_an_interval_and_a_time() {
         "2020-01-01 00:00:00"
     );
     // Months or days in the interval are not an offset.
-    assert!(e
-        .execute("SELECT timezone(INTERVAL '1 day', TIMESTAMPTZ '2020-01-01 00:00:00+00')")
-        .is_err());
+    assert!(
+        e.execute("SELECT timezone(INTERVAL '1 day', TIMESTAMPTZ '2020-01-01 00:00:00+00')")
+            .is_err()
+    );
 }
 
 /// And the privilege functions could not see a system catalog at all:
@@ -232,7 +239,8 @@ fn round663_privilege_checks_can_see_the_system_catalogs() {
         "false"
     );
     // A name that is neither a user table nor a catalog still errors.
-    assert!(e
-        .execute("SELECT has_column_privilege('no_such_rel'::regclass, 'x', 'SELECT')")
-        .is_err());
+    assert!(
+        e.execute("SELECT has_column_privilege('no_such_rel'::regclass, 'x', 'SELECT')")
+            .is_err()
+    );
 }

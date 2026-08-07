@@ -288,7 +288,10 @@ fn metrics_hot_tier_used_grows_after_insert() {
     crate::common::wait_until(Duration::from_secs(5), || {
         let (code, b) = http_get(&http, "/metrics");
         body = b;
-        code == 200 && body.lines().any(|l| l.starts_with("spg_hot_tier_bytes_used "))
+        code == 200
+            && body
+                .lines()
+                .any(|l| l.starts_with("spg_hot_tier_bytes_used "))
     });
     let line = body
         .lines()

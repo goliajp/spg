@@ -38,11 +38,15 @@ fn seeded() -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TABLE r752a (id INT, g INT)").unwrap();
     e.execute("CREATE TABLE r752b (id INT, g INT)").unwrap();
-    e.execute("INSERT INTO r752a SELECT gg, gg % 5 FROM generate_series(1, 30) gg").unwrap();
-    e.execute("INSERT INTO r752a VALUES (NULL, 1), (NULL, 2)").unwrap();
-    e.execute("INSERT INTO r752b SELECT gg, gg % 7 FROM generate_series(1, 20) gg").unwrap();
+    e.execute("INSERT INTO r752a SELECT gg, gg % 5 FROM generate_series(1, 30) gg")
+        .unwrap();
+    e.execute("INSERT INTO r752a VALUES (NULL, 1), (NULL, 2)")
+        .unwrap();
+    e.execute("INSERT INTO r752b SELECT gg, gg % 7 FROM generate_series(1, 20) gg")
+        .unwrap();
     // Duplicate inner matches: a semi join must not multiply outer rows.
-    e.execute("INSERT INTO r752b SELECT gg, gg % 7 FROM generate_series(5, 9) gg").unwrap();
+    e.execute("INSERT INTO r752b SELECT gg, gg % 7 FROM generate_series(5, 9) gg")
+        .unwrap();
     e.execute("INSERT INTO r752b VALUES (NULL, 3)").unwrap();
     e
 }

@@ -181,7 +181,10 @@ fn cursor_names_do_not_collide_across_connections() {
     }
 
     ok(&mut a, "BEGIN");
-    ok(&mut a, "DECLARE c CURSOR FOR SELECT id FROM t WHERE id <= 3 ORDER BY id");
+    ok(
+        &mut a,
+        "DECLARE c CURSOR FOR SELECT id FROM t WHERE id <= 3 ORDER BY id",
+    );
     ok(&mut b, "BEGIN");
     let msgs = exchange(
         &mut b,

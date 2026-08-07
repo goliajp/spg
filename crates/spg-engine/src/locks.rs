@@ -263,7 +263,6 @@ impl LockTable {
     }
 }
 
-
 /// v7.39 (round 295, E3 Phase 1b) — the locking pre-pass.
 ///
 /// Runs under `&mut self` from the write dispatch, BEFORE the ordinary
@@ -346,8 +345,8 @@ impl crate::Engine {
             alloc::vec::Vec::new();
         for (idx, row) in table.scan_visible(&snap) {
             if let Some(pred) = &stmt.where_ {
-                let keep = crate::eval::eval_expr(pred, row, &ctx)
-                    .map_err(crate::EngineError::Eval)?;
+                let keep =
+                    crate::eval::eval_expr(pred, row, &ctx).map_err(crate::EngineError::Eval)?;
                 if !matches!(keep, spg_storage::Value::Bool(true)) {
                     continue;
                 }

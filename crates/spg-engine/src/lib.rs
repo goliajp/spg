@@ -34,20 +34,18 @@ macro_rules! bump_counter {
     }};
 }
 
-mod collate;
-mod collate_derive;
 mod acl;
 pub mod aggregate;
 pub(crate) mod amcheck;
-pub(crate) mod extsort;
 mod bytebudget;
 mod cancel;
 mod clock;
+mod collate;
+mod collate_derive;
 mod constraints;
-mod cursor;
-mod notify;
 mod conversions;
 pub mod copy;
+mod cursor;
 mod ddl;
 pub mod describe;
 mod dml;
@@ -56,17 +54,20 @@ pub mod eval;
 mod execute;
 mod explain;
 mod expr_analysis;
+pub(crate) mod extsort;
 pub mod fts;
+mod guc_catalog;
 mod index_access;
 mod join;
 mod join_using;
 mod joinfold;
-mod limit_expr;
 pub mod json;
 pub mod largeobject;
+mod limit_expr;
 pub mod locks;
 mod maintenance;
 pub mod memoize;
+mod notify;
 mod numeric;
 mod orderby;
 mod partition;
@@ -82,18 +83,17 @@ mod rules;
 pub mod scalarsq_streaming;
 mod select;
 pub mod selectivity;
-mod guc_catalog;
 mod sequence;
 mod session;
 mod show;
 mod spg_admin;
 pub mod statistics;
 pub mod subquery;
-pub mod tempstore;
 pub mod subscriptions;
 mod substitute;
 mod system_catalog;
 mod table_access;
+pub mod tempstore;
 pub mod testkit;
 mod transaction;
 pub(crate) use transaction::{TxStmtClass, classify_stmt_for_tx};
@@ -108,6 +108,7 @@ pub use execute::StreamItem;
 use bytebudget::*;
 pub(crate) use clock::{rewrite_clock_calls, value_to_literal};
 use constraints::*;
+pub use constraints::{UNIQ_PROBE_CALLS, UNIQ_PROBE_LOCATORS};
 use conversions::*;
 pub use conversions::{
     format_bigint_2d_text_pub, format_bit_string, format_circle, format_hstore_text, format_inet,
@@ -123,17 +124,15 @@ pub(crate) use envelope::{EnvelopeParse, build_envelope, split_envelope};
 use expr_analysis::*;
 use index_access::*;
 pub use join::{ANTI_JOIN_FAST_PATH_FIRED, ANTI_JOIN_FAST_PATH_TRIED};
-pub use constraints::{UNIQ_PROBE_CALLS, UNIQ_PROBE_LOCATORS};
-pub use select::{DISTINCT_DUP_DROPPED, PROJ_DIRECT_FIRE, PROJ_ROW_BUILT, SCAN_PATH_ENTERED};
-pub use sequence::MUTATING_CALL_NEEDLES;
 pub(crate) use orderby::{
     OrderKey, apply_offset_and_limit, apply_offset_and_limit_tagged, build_order_keys,
     canonical_value_repr, cmp_multi_key, expand_group_by_all, order_by_value_cmp,
-    order_by_value_cmp_in,
-    render_histogram_bounds, resolve_order_by_position, sort_by_keys,
+    order_by_value_cmp_in, render_histogram_bounds, resolve_order_by_position, sort_by_keys,
     sort_values_for_histogram, topk_trim, value_cmp, value_to_f64,
 };
+pub use select::{DISTINCT_DUP_DROPPED, PROJ_DIRECT_FIRE, PROJ_ROW_BUILT, SCAN_PATH_ENTERED};
 pub(crate) use select::{build_projection, infer_column_types, value_to_order_key};
+pub use sequence::MUTATING_CALL_NEEDLES;
 pub(crate) use show::render_create_table;
 pub use subquery::{
     BATCHED_SCALAR_FALL_THROUGH_COUNT, BATCHED_SCALAR_KEYED_FIRE_COUNT,
@@ -2105,7 +2104,8 @@ impl Engine {
                 subscriptions: sub_bytes,
                 statistics: stats_bytes,
             } => {
-                let mut catalog = Catalog::deserialize(catalog_bytes).map_err(EngineError::Storage)?;
+                let mut catalog =
+                    Catalog::deserialize(catalog_bytes).map_err(EngineError::Storage)?;
                 crate::ddl::rebuild_all_excl_indexes(&mut catalog);
                 let users = users::deserialize_users(user_bytes)
                     .map_err(|e| EngineError::Unsupported(alloc::format!("users restore: {e}")))?;
@@ -2133,10 +2133,10 @@ impl Engine {
                     parallel_runner: ParallelRunnerSlot::default(),
                     tx_catalogs: BTreeMap::new(),
                     table_last_commit: BTreeMap::new(),
-            commit_seq: 0,
+                    commit_seq: 0,
                     current_tx: None,
                     backslash_escapes: false,
-            mysql_strict: true,
+                    mysql_strict: true,
                     lo_descriptors: BTreeMap::new(),
                     lo_next_fd: 0,
                     prepared_statements: alloc::collections::BTreeMap::new(),
@@ -2158,7 +2158,7 @@ impl Engine {
                     salt_fn: None,
                     max_query_rows: None,
                     max_query_bytes: None,
-            temp_run_factory: None,
+                    temp_run_factory: None,
                     users,
                     publications,
                     subscriptions,
@@ -2172,12 +2172,12 @@ impl Engine {
                     slow_query_logger: None,
                     session_params: BTreeMap::new(),
                     cursors: BTreeMap::new(),
-            last_insert_id: core::sync::atomic::AtomicI64::new(0),
-            row_count: 0,
-            user_vars: BTreeMap::new(),
-            temp_tables: BTreeSet::new(),
-            temp_sequences: BTreeSet::new(),
-            temp_views: BTreeSet::new(),
+                    last_insert_id: core::sync::atomic::AtomicI64::new(0),
+                    row_count: 0,
+                    user_vars: BTreeMap::new(),
+                    temp_tables: BTreeSet::new(),
+                    temp_sequences: BTreeSet::new(),
+                    temp_views: BTreeSet::new(),
                     listen_channels: BTreeSet::new(),
                     tx_pending_notifies: Vec::new(),
                     delivered_notifies: Vec::new(),
@@ -2186,8 +2186,8 @@ impl Engine {
                     xact_rollback: core::sync::atomic::AtomicU64::new(0),
                     backend_count_fn: None,
                     backend_pid_fn: None,
-            wal_lsn_fn: None,
-            backend_signal_fn: None,
+                    wal_lsn_fn: None,
+                    backend_signal_fn: None,
                     tz_offset_fn: None,
                     tz_localize_fn: None,
                     tz_canon_fn: None,
@@ -2201,7 +2201,7 @@ impl Engine {
                     local_guc_saves: Vec::new(),
                     render_style: crate::eval::RenderStyle::default(),
                     savepoint_guc_marks: Vec::new(),
-                            trigger_recursion_depth: 0,
+                    trigger_recursion_depth: 0,
                     rule_rewrite_active: false,
                     foreign_key_checks: true,
                     meta_views_materialised: false,
@@ -2261,7 +2261,9 @@ impl Engine {
             lo_descriptors: core::mem::take(&mut self.lo_descriptors),
             lo_next_fd: self.lo_next_fd,
             cursors: core::mem::take(&mut self.cursors),
-            last_insert_id: self.last_insert_id.load(core::sync::atomic::Ordering::Relaxed),
+            last_insert_id: self
+                .last_insert_id
+                .load(core::sync::atomic::Ordering::Relaxed),
             row_count: self.row_count,
             user_vars: core::mem::take(&mut self.user_vars),
             temp_tables: core::mem::take(&mut self.temp_tables),
@@ -2280,8 +2282,10 @@ impl Engine {
         self.lo_descriptors = incoming.lo_descriptors;
         self.lo_next_fd = incoming.lo_next_fd;
         self.cursors = incoming.cursors;
-        self.last_insert_id
-            .store(incoming.last_insert_id, core::sync::atomic::Ordering::Relaxed);
+        self.last_insert_id.store(
+            incoming.last_insert_id,
+            core::sync::atomic::Ordering::Relaxed,
+        );
         self.row_count = incoming.row_count;
         self.user_vars = incoming.user_vars;
         self.temp_tables = incoming.temp_tables;
@@ -2668,7 +2672,9 @@ impl Engine {
     /// ROLE r; ROLLBACK` leaves nothing behind — the shadow drops with
     /// the TxState — and COMMIT installs the shadow wholesale.
     pub(crate) fn role_ddl_users_mut(&mut self) -> &mut crate::users::UserStore {
-        let tx_slot = self.current_tx.filter(|tx| self.tx_catalogs.contains_key(tx));
+        let tx_slot = self
+            .current_tx
+            .filter(|tx| self.tx_catalogs.contains_key(tx));
         match tx_slot {
             Some(tx) => {
                 if self
@@ -2857,8 +2863,7 @@ impl Engine {
                     self.matview_delta_buf.remove(&mv);
                 } else {
                     buf.push(ch.clone());
-                    MATVIEW_FANOUT_BUFFERED
-                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    MATVIEW_FANOUT_BUFFERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
         }

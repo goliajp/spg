@@ -79,7 +79,8 @@ fn the_columns_round_trip() {
     // backslash itself, and MySQL's own `X'…'` literal is a separate
     // divergence, recorded but not fixed here).
     let mut p = Engine::new();
-    p.execute("CREATE TABLE d (b BLOB, v VARBINARY(10))").unwrap();
+    p.execute("CREATE TABLE d (b BLOB, v VARBINARY(10))")
+        .unwrap();
     p.execute("INSERT INTO d VALUES ('\\x414243'::bytea, '\\x00ff'::bytea)")
         .unwrap();
     assert_eq!(one(&mut p, "SELECT length(b) FROM d"), Value::Int(3));
@@ -110,7 +111,8 @@ fn the_sizes_collapse_onto_one_type() {
 #[test]
 fn pg_float_precision_is_untouched() {
     let mut p = Engine::new();
-    p.execute("CREATE TABLE f1 (a FLOAT(24), b FLOAT(53))").unwrap();
+    p.execute("CREATE TABLE f1 (a FLOAT(24), b FLOAT(53))")
+        .unwrap();
     assert!(
         p.execute("CREATE TABLE f2 (a FLOAT(10,2))").is_err(),
         "PG has no (m,d) form"

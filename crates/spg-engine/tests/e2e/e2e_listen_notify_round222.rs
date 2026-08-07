@@ -23,10 +23,7 @@ fn autocommit_notify_delivers_to_listener() {
     );
     // No payload → empty string (PG's default).
     e.execute("NOTIFY mychan").unwrap();
-    assert_eq!(
-        drained(&mut e),
-        vec![("mychan".to_string(), String::new())]
-    );
+    assert_eq!(drained(&mut e), vec![("mychan".to_string(), String::new())]);
 }
 
 #[test]

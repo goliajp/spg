@@ -19,8 +19,7 @@
 
 use spg_engine::{Engine, QueryResult};
 use spg_storage::{
-    function_signature_key, function_signature_key_legacy, resolve_stored_function_key,
-    FunctionDef,
+    FunctionDef, function_signature_key, function_signature_key_legacy, resolve_stored_function_key,
 };
 
 /// Every multi-word bare type PG accepts, each paired with its named
@@ -31,7 +30,10 @@ fn a_bare_multiword_type_keys_like_its_named_spelling() {
         ("(double precision)", "(x double precision)"),
         ("(character varying)", "(s character varying)"),
         ("(bit varying)", "(b bit varying)"),
-        ("(timestamp with time zone)", "(ts timestamp with time zone)"),
+        (
+            "(timestamp with time zone)",
+            "(ts timestamp with time zone)",
+        ),
         (
             "(timestamp without time zone)",
             "(ts timestamp without time zone)",
@@ -39,7 +41,10 @@ fn a_bare_multiword_type_keys_like_its_named_spelling() {
         ("(time with time zone)", "(t time with time zone)"),
         ("(time without time zone)", "(t time without time zone)"),
         ("(national character)", "(n national character)"),
-        ("(national character varying)", "(n national character varying)"),
+        (
+            "(national character varying)",
+            "(n national character varying)",
+        ),
         // A modifier must not change the answer either.
         ("(bit varying(8))", "(b bit varying(8))"),
         // Several arguments, one of them multi-word.
@@ -81,8 +86,14 @@ fn ordinary_types_are_unaffected() {
 /// written before this round contain.
 #[test]
 fn the_legacy_formula_reproduces_the_old_keys() {
-    assert_eq!(function_signature_key_legacy("f", "(double precision)"), "f(precision)");
-    assert_eq!(function_signature_key_legacy("g", "(character varying)"), "g(varying)");
+    assert_eq!(
+        function_signature_key_legacy("f", "(double precision)"),
+        "f(precision)"
+    );
+    assert_eq!(
+        function_signature_key_legacy("g", "(character varying)"),
+        "g(varying)"
+    );
     assert_eq!(
         function_signature_key_legacy("h", "(timestamp with time zone)"),
         "h(with time zone)"

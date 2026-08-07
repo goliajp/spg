@@ -39,7 +39,10 @@ fn one(e: &mut Engine, sql: &str) -> Value<'static> {
 fn binary_keeps_the_value() {
     let mut e = mysql();
     assert_eq!(one(&mut e, "SELECT BINARY 'abc'"), Value::text("abc"));
-    assert_eq!(one(&mut e, "SELECT HEX(BINARY 'abc')"), Value::text("616263"));
+    assert_eq!(
+        one(&mut e, "SELECT HEX(BINARY 'abc')"),
+        Value::text("616263")
+    );
     assert_eq!(one(&mut e, "SELECT LENGTH(BINARY 'héllo')"), Value::Int(6));
     assert_eq!(one(&mut e, "SELECT BINARY NULL"), Value::Null);
 }

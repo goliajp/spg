@@ -24,7 +24,8 @@ fn one(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn round722_plain_named_casts_compile_and_answer_as_pg() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE c722 (id INT, s TEXT, t TIMESTAMP)").unwrap();
+    e.execute("CREATE TABLE c722 (id INT, s TEXT, t TIMESTAMP)")
+        .unwrap();
     e.execute(
         "INSERT INTO c722 SELECT gg, 'row' || gg, \
          TIMESTAMP '2020-01-01 00:00:00' + (gg % 9) * INTERVAL '1 day' \
@@ -35,13 +36,19 @@ fn round722_plain_named_casts_compile_and_answer_as_pg() {
         ("SELECT sum(id::NUMERIC) FROM c722", "5050"),
         // typmod rides through: numeric(10,2) keeps two decimal places.
         ("SELECT sum(id::NUMERIC(10,2)) FROM c722", "5050.00"),
-        ("SELECT sum(id::NUMERIC / 5) FROM c722", "1010.00000000000000000000"),
+        (
+            "SELECT sum(id::NUMERIC / 5) FROM c722",
+            "1010.00000000000000000000",
+        ),
         ("SELECT sum(id::REAL) FROM c722", "5050"),
         ("SELECT max((id % 2)::BOOLEAN::INT) FROM c722", "1"),
         ("SELECT count(DISTINCT t::DATE) FROM c722", "9"),
         ("SELECT min(s::VARCHAR(4)) FROM c722", "row1"),
         // A literal through the plain lane inside arithmetic.
-        ("SELECT sum(('5')::NUMERIC + id) FROM c722 WHERE id <= 10", "105"),
+        (
+            "SELECT sum(('5')::NUMERIC + id) FROM c722 WHERE id <= 10",
+            "105",
+        ),
     ] {
         assert_eq!(one(&mut e, sql), want, "{sql}");
     }
@@ -51,5 +58,8 @@ fn round722_plain_named_casts_compile_and_answer_as_pg() {
         e.execute("SELECT count(s::NUMERIC) FROM c722")
             .expect_err("text that is not a number refuses")
     );
-    assert!(err.contains("invalid input syntax for type numeric"), "{err}");
+    assert!(
+        err.contains("invalid input syntax for type numeric"),
+        "{err}"
+    );
 }

@@ -57,21 +57,33 @@ fn round633_smallint_widens() {
         vec!["1|1"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT (-32768)::SMALLINT::INT, 32767::SMALLINT::BIGINT"),
+        vals(
+            &mut e,
+            "SELECT (-32768)::SMALLINT::INT, 32767::SMALLINT::BIGINT"
+        ),
         vec!["-32768|32767"],
         "both ends of the range"
     );
     // Through a column, which is where it would have been met in practice.
     e.execute("CREATE TABLE w (n SMALLINT)").unwrap();
     e.execute("INSERT INTO w VALUES (7),(8)").unwrap();
-    assert_eq!(vals(&mut e, "SELECT sum(n::BIGINT), max(n::INT) FROM w"), vec!["15|8"]);
+    assert_eq!(
+        vals(&mut e, "SELECT sum(n::BIGINT), max(n::INT) FROM w"),
+        vec!["15|8"]
+    );
     // The rest of the numeric matrix, which already worked.
     assert_eq!(
-        vals(&mut e, "SELECT 1::SMALLINT::NUMERIC, 1::SMALLINT::REAL, 1::SMALLINT::TEXT"),
+        vals(
+            &mut e,
+            "SELECT 1::SMALLINT::NUMERIC, 1::SMALLINT::REAL, 1::SMALLINT::TEXT"
+        ),
         vec!["1|1|1"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT 1::INT::SMALLINT, 1::BIGINT::SMALLINT, 1::INT::BIGINT"),
+        vals(
+            &mut e,
+            "SELECT 1::INT::SMALLINT, 1::BIGINT::SMALLINT, 1::INT::BIGINT"
+        ),
         vec!["1|1|1"]
     );
 }

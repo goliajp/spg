@@ -95,7 +95,10 @@ fn summary_and_timing_options_follow_pg() {
         &mut e,
         "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT * FROM t",
     );
-    assert!(!lines[0].contains("actual time="), "no node time: {lines:?}");
+    assert!(
+        !lines[0].contains("actual time="),
+        "no node time: {lines:?}"
+    );
     assert!(
         lines.iter().any(|l| l.starts_with("Execution Time: ")),
         "TIMING OFF keeps the summary (PG): {lines:?}"
@@ -110,7 +113,10 @@ fn summary_and_timing_options_follow_pg() {
         "SUMMARY OFF drops it: {lines:?}"
     );
     // TIMING ON puts the measured time on the top node only.
-    let lines = plan(&mut e, "EXPLAIN (ANALYZE, COSTS OFF, SUMMARY OFF) SELECT * FROM t");
+    let lines = plan(
+        &mut e,
+        "EXPLAIN (ANALYZE, COSTS OFF, SUMMARY OFF) SELECT * FROM t",
+    );
     assert!(
         lines[0].contains("actual time=") && lines[0].contains("loops=1"),
         "top node carries the measured time: {lines:?}"

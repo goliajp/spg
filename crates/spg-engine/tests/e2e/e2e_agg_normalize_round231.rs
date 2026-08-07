@@ -49,7 +49,10 @@ fn every_is_an_alias_for_bool_and_everywhere() {
         .unwrap();
     // Used to abort the query with a classifier panic.
     assert_eq!(
-        text(&mut e, "SELECT every(v > 5) OVER (PARTITION BY g)::text FROM w"),
+        text(
+            &mut e,
+            "SELECT every(v > 5) OVER (PARTITION BY g)::text FROM w"
+        ),
         "true"
     );
     assert_eq!(
@@ -99,7 +102,10 @@ fn range_agg_returns_a_normalized_multirange() {
 fn text_to_multirange_cast_normalizes_like_the_constructor() {
     let mut e = Engine::new();
     assert_eq!(
-        text(&mut e, "SELECT '{[1,3),[3,5),[9,10)}'::int4multirange::text"),
+        text(
+            &mut e,
+            "SELECT '{[1,3),[3,5),[9,10)}'::int4multirange::text"
+        ),
         "{[1,5),[9,10)}"
     );
     // Same answer the constructor already gave.

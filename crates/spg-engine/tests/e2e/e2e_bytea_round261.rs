@@ -44,10 +44,16 @@ fn err(e: &mut Engine, sql: &str) -> String {
 fn base64_decoding_validates_the_sequence() {
     let mut e = Engine::new();
     // Well-formed lengths pass; whitespace is skipped anywhere.
-    assert_eq!(one(&mut e, "SELECT decode('SGVsbG8=', 'base64')"), "\\x48656c6c6f");
+    assert_eq!(
+        one(&mut e, "SELECT decode('SGVsbG8=', 'base64')"),
+        "\\x48656c6c6f"
+    );
     assert_eq!(one(&mut e, "SELECT decode('SGVs', 'base64')"), "\\x48656c");
     assert_eq!(one(&mut e, "SELECT decode('', 'base64')"), "\\x");
-    assert_eq!(one(&mut e, "SELECT decode('SGVs bG8=', 'base64')"), "\\x48656c6c6f");
+    assert_eq!(
+        one(&mut e, "SELECT decode('SGVs bG8=', 'base64')"),
+        "\\x48656c6c6f"
+    );
     // Wrong significant-character counts are refused — each of these
     // used to return a value.
     for sql in [
@@ -82,9 +88,18 @@ fn hex_decoding_skips_whitespace_and_names_the_digit() {
     assert_eq!(one(&mut e, "SELECT decode('41 42', 'hex')"), "\\x4142");
     assert_eq!(one(&mut e, "SELECT decode('', 'hex')"), "\\x");
     for (sql, want) in [
-        ("SELECT decode('zz', 'hex')", "invalid hexadecimal digit: \"z\""),
-        ("SELECT decode('4g', 'hex')", "invalid hexadecimal digit: \"g\""),
-        ("SELECT decode('0x41', 'hex')", "invalid hexadecimal digit: \"x\""),
+        (
+            "SELECT decode('zz', 'hex')",
+            "invalid hexadecimal digit: \"z\"",
+        ),
+        (
+            "SELECT decode('4g', 'hex')",
+            "invalid hexadecimal digit: \"g\"",
+        ),
+        (
+            "SELECT decode('0x41', 'hex')",
+            "invalid hexadecimal digit: \"x\"",
+        ),
         (
             "SELECT decode('4', 'hex')",
             "invalid hexadecimal data: odd number of digits",
@@ -98,7 +113,10 @@ fn hex_decoding_skips_whitespace_and_names_the_digit() {
 #[test]
 fn escape_and_encoding_errors_take_pgs_wordings() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT decode('Hello', 'escape')"), "\\x48656c6c6f");
+    assert_eq!(
+        one(&mut e, "SELECT decode('Hello', 'escape')"),
+        "\\x48656c6c6f"
+    );
     assert_eq!(one(&mut e, "SELECT decode('\\\\', 'escape')"), "\\x5c");
     // One generic message covers every malformed escape input.
     for sql in [
@@ -107,7 +125,10 @@ fn escape_and_encoding_errors_take_pgs_wordings() {
         "SELECT decode('\\', 'escape')",
     ] {
         let got = err(&mut e, sql);
-        assert!(got.contains("invalid input syntax for type bytea"), "{sql} → {got}");
+        assert!(
+            got.contains("invalid input syntax for type bytea"),
+            "{sql} → {got}"
+        );
     }
     let got = err(&mut e, "SELECT encode('\\x41'::bytea, 'nope')");
     assert!(got.contains("unrecognized encoding: \"nope\""), "{got}");
@@ -122,22 +143,49 @@ fn the_bytea_core_is_unchanged() {
         ("SELECT '\\x48656c6c6f'::bytea", "\\x48656c6c6f"),
         ("SELECT length('\\x48656c6c6f'::bytea)", "5"),
         ("SELECT encode('\\x48656c6c6f'::bytea, 'hex')", "48656c6c6f"),
-        ("SELECT encode('\\x48656c6c6f'::bytea, 'base64')", "SGVsbG8="),
+        (
+            "SELECT encode('\\x48656c6c6f'::bytea, 'base64')",
+            "SGVsbG8=",
+        ),
         ("SELECT encode('\\x00ff41'::bytea, 'escape')", "\\000\\377A"),
         ("SELECT get_byte('\\x48656c6c6f'::bytea, 0)", "72"),
-        ("SELECT set_byte('\\x48656c6c6f'::bytea, 0, 74)", "\\x4a656c6c6f"),
+        (
+            "SELECT set_byte('\\x48656c6c6f'::bytea, 0, 74)",
+            "\\x4a656c6c6f",
+        ),
         ("SELECT get_bit('\\x48'::bytea, 3)", "1"),
-        ("SELECT substring('\\x48656c6c6f'::bytea from 2 for 3)", "\\x656c6c"),
-        ("SELECT position('\\x6c'::bytea in '\\x48656c6c6f'::bytea)", "3"),
-        ("SELECT overlay('\\x48656c6c6f'::bytea placing '\\x41'::bytea from 2)", "\\x48416c6c6f"),
-        ("SELECT '\\x4865'::bytea || '\\x6c6c6f'::bytea", "\\x48656c6c6f"),
-        ("SELECT btrim('\\x0048656c6c6f00'::bytea, '\\x00'::bytea)", "\\x48656c6c6f"),
+        (
+            "SELECT substring('\\x48656c6c6f'::bytea from 2 for 3)",
+            "\\x656c6c",
+        ),
+        (
+            "SELECT position('\\x6c'::bytea in '\\x48656c6c6f'::bytea)",
+            "3",
+        ),
+        (
+            "SELECT overlay('\\x48656c6c6f'::bytea placing '\\x41'::bytea from 2)",
+            "\\x48416c6c6f",
+        ),
+        (
+            "SELECT '\\x4865'::bytea || '\\x6c6c6f'::bytea",
+            "\\x48656c6c6f",
+        ),
+        (
+            "SELECT btrim('\\x0048656c6c6f00'::bytea, '\\x00'::bytea)",
+            "\\x48656c6c6f",
+        ),
         ("SELECT bit_count('\\x48656c6c6f'::bytea)", "20"),
         ("SELECT reverse('\\x48656c6c6f'::bytea)", "\\x6f6c6c6548"),
-        ("SELECT convert_from('\\x48656c6c6f'::bytea, 'UTF8')", "Hello"),
+        (
+            "SELECT convert_from('\\x48656c6c6f'::bytea, 'UTF8')",
+            "Hello",
+        ),
         ("SELECT pg_typeof(get_byte('\\x41'::bytea, 0))", "integer"),
         // Round-trips.
-        ("SELECT encode(decode('SGVsbG8=','base64'),'escape')", "Hello"),
+        (
+            "SELECT encode(decode('SGVsbG8=','base64'),'escape')",
+            "Hello",
+        ),
         ("SELECT encode('\\x41'::bytea, 'HEX')", "41"),
         ("SELECT encode('\\x41'::bytea, 'Base64')", "QQ=="),
     ] {

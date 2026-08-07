@@ -63,14 +63,17 @@ fn one(e: &mut Engine, sql: &str) -> String {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t1 (id INT, k INT, s TEXT)").unwrap();
-    e.execute("CREATE TABLE t2 (id INT, k INT, s TEXT)").unwrap();
+    e.execute("CREATE TABLE t1 (id INT, k INT, s TEXT)")
+        .unwrap();
+    e.execute("CREATE TABLE t2 (id INT, k INT, s TEXT)")
+        .unwrap();
     e.execute("CREATE TABLE t3 (id INT, k INT)").unwrap();
     e.execute("INSERT INTO t1 VALUES (1,10,'a'),(2,20,'b'),(3,NULL,'c'),(4,10,'d'),(5,30,NULL)")
         .unwrap();
     e.execute("INSERT INTO t2 VALUES (1,10,'a'),(2,99,'x'),(3,NULL,'y'),(6,10,'z')")
         .unwrap();
-    e.execute("INSERT INTO t3 VALUES (1,10),(2,20),(7,70)").unwrap();
+    e.execute("INSERT INTO t3 VALUES (1,10),(2,20),(7,70)")
+        .unwrap();
     e
 }
 
@@ -105,14 +108,19 @@ fn round588_ansi89_equality_joins() {
         assert_eq!(
             vals(
                 &mut e,
-                &format!("SELECT a.id FROM {from} WHERE b.id = a.id AND a.s IS NOT NULL ORDER BY 1")
+                &format!(
+                    "SELECT a.id FROM {from} WHERE b.id = a.id AND a.s IS NOT NULL ORDER BY 1"
+                )
             ),
             vec!["1", "2", "3"],
             "{from} reversed"
         );
     }
     assert_eq!(
-        vals(&mut e, "SELECT t1.id FROM t1, t2 WHERE t1.id = t2.id ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT t1.id FROM t1, t2 WHERE t1.id = t2.id ORDER BY 1"
+        ),
         vec!["1", "2", "3"]
     );
 }
@@ -125,7 +133,10 @@ fn round588_null_keys_match_nothing() {
     // t1.k: 10, 20, NULL, 10, 30 — t2.k: 10, 99, NULL, 10.
     // The two NULLs must not meet; 10 pairs 2 x 2.
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM t1 a, t2 b WHERE a.k = b.k ORDER BY 1, 2"),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM t1 a, t2 b WHERE a.k = b.k ORDER BY 1, 2"
+        ),
         vec!["1|1", "1|6", "4|1", "4|6"]
     );
     assert_eq!(
@@ -201,8 +212,11 @@ fn round588_only_top_level_column_equalities_promote() {
         "an OR is one conjunct and is not an equi-key"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, b.id FROM t1 a, t2 b WHERE a.id < b.id ORDER BY 1, 2")
-            .len(),
+        vals(
+            &mut e,
+            "SELECT a.id, b.id FROM t1 a, t2 b WHERE a.id < b.id ORDER BY 1, 2"
+        )
+        .len(),
         8,
         "a non-equality is still a nested-loop filter"
     );
@@ -341,7 +355,10 @@ fn round588_explain_follows_the_executor() {
 fn round588_aggregates_and_scale() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT count(*), sum(a.id) FROM t1 a, t2 b WHERE a.k = b.k"),
+        vals(
+            &mut e,
+            "SELECT count(*), sum(a.id) FROM t1 a, t2 b WHERE a.k = b.k"
+        ),
         vec!["4|10"]
     );
     let mut e = Engine::new();
@@ -356,7 +373,10 @@ fn round588_aggregates_and_scale() {
         "99"
     );
     assert_eq!(
-        one(&mut e, "SELECT count(*) FROM big a, big b WHERE a.id = b.id"),
+        one(
+            &mut e,
+            "SELECT count(*) FROM big a, big b WHERE a.id = b.id"
+        ),
         "20000"
     );
     // The g key repeats 400 times over 50 values, so the product is

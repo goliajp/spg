@@ -38,7 +38,8 @@ fn ids(e: &mut Engine, sql: &str) -> String {
 
 fn seeded() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE r (id INT, s TEXT, c CHAR(6))").unwrap();
+    e.execute("CREATE TABLE r (id INT, s TEXT, c CHAR(6))")
+        .unwrap();
     e.execute(
         "INSERT INTO r VALUES \
          (1, 'user_0005', 'ab'), \
@@ -114,11 +115,17 @@ fn round488_all_percent_pattern_is_three_valued() {
         "NULL"
     );
     assert_eq!(
-        ids(&mut e, "SELECT (s NOT LIKE '%')::text AS a FROM r WHERE id = 4"),
+        ids(
+            &mut e,
+            "SELECT (s NOT LIKE '%')::text AS a FROM r WHERE id = 4"
+        ),
         "NULL"
     );
     assert_eq!(
-        ids(&mut e, "SELECT ((s LIKE '%') IS NULL)::text AS a FROM r WHERE id = 4"),
+        ids(
+            &mut e,
+            "SELECT ((s LIKE '%') IS NULL)::text AS a FROM r WHERE id = 4"
+        ),
         "true"
     );
     // Every all-% spelling, and ILIKE too.
@@ -133,7 +140,10 @@ fn round488_all_percent_pattern_is_three_valued() {
         "true"
     );
     assert_eq!(
-        ids(&mut e, "SELECT (s NOT LIKE '%')::text AS a FROM r WHERE id = 6"),
+        ids(
+            &mut e,
+            "SELECT (s NOT LIKE '%')::text AS a FROM r WHERE id = 6"
+        ),
         "false"
     );
 }

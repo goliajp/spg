@@ -95,7 +95,10 @@ fn alter_table_owner_and_cluster_reject_unknown_names() {
     let err = e
         .execute("ALTER TABLE t OWNER TO nonexistent_role")
         .expect_err("PG: role \"nonexistent_role\" does not exist");
-    assert!(format!("{err}").contains("role \"nonexistent_role\" does not exist"), "{err}");
+    assert!(
+        format!("{err}").contains("role \"nonexistent_role\" does not exist"),
+        "{err}"
+    );
 
     let err = e
         .execute("ALTER TABLE t CLUSTER ON no_such_index")

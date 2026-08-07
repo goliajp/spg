@@ -3743,7 +3743,9 @@ impl Database {
                     spg_storage::DataType::BigInt,
                     false,
                 )],
-                rows: vec![spg_storage::Row::new(vec![spg_storage::Value::BigInt(value)])],
+                rows: vec![spg_storage::Row::new(vec![spg_storage::Value::BigInt(
+                    value,
+                )])],
             });
         }
         if sql_head_is_copy(sql)
@@ -3816,9 +3818,9 @@ impl Database {
     /// the GUC.
     fn session_synchronous_commit(&self) -> bool {
         match self.engine.session_param("synchronous_commit") {
-            Some(v) => !(v.eq_ignore_ascii_case("off")
-                || v == "0"
-                || v.eq_ignore_ascii_case("false")),
+            Some(v) => {
+                !(v.eq_ignore_ascii_case("off") || v == "0" || v.eq_ignore_ascii_case("false"))
+            }
             None => synchronous_commit_on(),
         }
     }
@@ -3970,8 +3972,7 @@ impl Database {
                 // read, but a writable CTE (`WITH … INSERT/…`) is a
                 // mutation: it must reach the tx buffer / autocommit
                 // record or replay silently loses it.
-                let persistable =
-                    |sql: &str| !sql_is_read_only(sql) || sql_is_dmlish(sql);
+                let persistable = |sql: &str| !sql_is_read_only(sql) || sql_is_dmlish(sql);
                 if let Some(buf) = &mut self.tx_wal {
                     if persistable(canonical) {
                         buf.statements.push(canonical.to_string());

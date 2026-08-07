@@ -696,9 +696,9 @@ pub(super) fn format_string(
                         detail: "format(): NULL is not a valid identifier (%I)".into(),
                     });
                 }
-                Some(v) => alloc::borrow::Cow::Owned(pg_quote_ident(
-                    &value_to_format_text_styled(v, style),
-                )),
+                Some(v) => alloc::borrow::Cow::Owned(pg_quote_ident(&value_to_format_text_styled(
+                    v, style,
+                ))),
             },
             'L' => match arg {
                 None | Some(Value::Null) => alloc::borrow::Cow::Borrowed("NULL"),
@@ -1322,11 +1322,7 @@ fn check_eeee_format(fmt: &str) -> Result<(), EvalError> {
 /// currency symbol, which is not a defect at all — the oracle container
 /// runs `lc_monetary = en_US.utf8` while SPG advertises `C`, and PG under
 /// `SET lc_monetary='C'` answers byte-for-byte what SPG does.
-fn to_char_numeric(
-    n: f64,
-    exact: Option<(i128, u16)>,
-    fmt: &str,
-) -> Result<String, EvalError> {
+fn to_char_numeric(n: f64, exact: Option<(i128, u16)>, fmt: &str) -> Result<String, EvalError> {
     let fill_mode = fmt.len() >= 2 && fmt[..2].eq_ignore_ascii_case("FM");
     let pat = if fill_mode { &fmt[2..] } else { fmt };
 
@@ -1388,7 +1384,12 @@ fn to_char_numeric(
             // simply echoed the `B` in front of them, because the literal
             // peel claimed it. Measured: `[B    0]` vs PG `[    0]`,
             // `[C 1234]` and `[ 1234C]` vs PG `[ 1234]` for both.
-            Some(c) if matches!(c.to_ascii_uppercase(), 'S' | 'L' | 'D' | 'G' | 'V' | 'B' | 'C') => {
+            Some(c)
+                if matches!(
+                    c.to_ascii_uppercase(),
+                    'S' | 'L' | 'D' | 'G' | 'V' | 'B' | 'C'
+                ) =>
+            {
                 Some(1)
             }
             Some(c) if c.is_ascii_digit() || matches!(c, '.' | ',' | '$' | '%') => Some(1),
@@ -1481,7 +1482,10 @@ fn to_char_numeric(
             String::from(rest)
         };
         let col = if n < 0.0 { " " } else { "+" };
-        return Ok(alloc::format!("{col}{}", to_char_numeric(n, exact, &rest_fmt)?));
+        return Ok(alloc::format!(
+            "{col}{}",
+            to_char_numeric(n, exact, &rest_fmt)?
+        ));
     }
     // `RN` / `rn`: Roman numerals (handled before the digit-slot machinery).
     if pat.eq_ignore_ascii_case("RN") {
@@ -1494,7 +1498,12 @@ fn to_char_numeric(
     }
     // `V`: scale — multiply by 10^(digits after V) and drop the decimal.
     if let Some(vpos) = pat.find(['V', 'v']) {
-        return Ok(to_char_v_scale(n, &pat[..vpos], &pat[vpos + 1..], fill_mode));
+        return Ok(to_char_v_scale(
+            n,
+            &pat[..vpos],
+            &pat[vpos + 1..],
+            fill_mode,
+        ));
     }
     // `PR` suffix: PG's accounting-negative notation — a negative value is
     // wrapped in angle brackets with no minus sign (`<1234.50>`), a

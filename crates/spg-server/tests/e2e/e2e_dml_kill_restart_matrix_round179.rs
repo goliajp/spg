@@ -138,11 +138,9 @@ const SHAPES: &[Shape] = &[
             "INSERT INTO {t}_src VALUES (1, 5)",
             "INSERT INTO {t}_src VALUES (2, 6)",
         ],
-        writes: &[
-            "MERGE INTO {t} m USING {t}_src s ON m.id = s.id \
+        writes: &["MERGE INTO {t} m USING {t}_src s ON m.id = s.id \
              WHEN MATCHED THEN UPDATE SET v = s.v \
-             WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)",
-        ],
+             WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)"],
         verify: "SELECT id FROM {t}",
         expect: 2,
     },
@@ -154,12 +152,10 @@ const SHAPES: &[Shape] = &[
             "INSERT INTO {t}_src VALUES (1, 5)",
             "INSERT INTO {t}_src VALUES (2, 6)",
         ],
-        writes: &[
-            "MERGE INTO {t} m USING {t}_src s ON m.id = s.id \
+        writes: &["MERGE INTO {t} m USING {t}_src s ON m.id = s.id \
              WHEN MATCHED THEN UPDATE SET v = s.v \
              WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v) \
-             RETURNING *",
-        ],
+             RETURNING *"],
         verify: "SELECT id FROM {t}",
         expect: 2,
     },

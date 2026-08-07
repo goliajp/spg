@@ -21,9 +21,7 @@ fn round753_positions_clamp_at_16383_like_pg() {
         .execute(&format!("SELECT to_tsvector('simple', '{doc}')::text"))
         .unwrap()
     {
-        QueryResult::Rows { rows, .. } => {
-            spg_engine::eval::value_to_text(&rows[0].values[0])
-        }
+        QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{other:?}"),
     };
     // Positions are the digit runs OUTSIDE the quoted lexemes (which

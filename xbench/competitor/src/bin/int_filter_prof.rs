@@ -24,6 +24,8 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(2000);
     for _ in 0..iters {
-        let _ = eng.execute("SELECT count(*) FROM hi WHERE g = 5").expect("q");
+        let _ = eng
+            .execute("SELECT count(*) FROM hi WHERE g = 5")
+            .expect("q");
     }
 }

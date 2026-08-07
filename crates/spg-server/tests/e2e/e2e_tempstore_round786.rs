@@ -65,7 +65,6 @@ fn round786_without_a_factory_the_ceiling_is_unchanged() {
     );
 }
 
-
 /// r840 — is the spill's cost the file, or the way it is written?
 ///
 /// Round 839 timed the sorter over memory-backed runs at 186 ms for

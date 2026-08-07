@@ -81,7 +81,10 @@ fn declared_precision_truncates() {
 #[test]
 fn full_precision_keeps_microseconds() {
     let mut e = seeded();
-    assert_eq!(one(&mut e, "SELECT d6 FROM c"), "2020-01-01 00:00:00.256789");
+    assert_eq!(
+        one(&mut e, "SELECT d6 FROM c"),
+        "2020-01-01 00:00:00.256789"
+    );
 }
 
 /// UPDATE goes through the same truncation as INSERT.
@@ -89,8 +92,10 @@ fn full_precision_keeps_microseconds() {
 fn update_truncates_too() {
     let mut e = mysql();
     e.execute("CREATE TABLE u(d1 DATETIME(1))").unwrap();
-    e.execute("INSERT INTO u VALUES('2020-01-01 00:00:00')").unwrap();
-    e.execute("UPDATE u SET d1 = '2020-01-01 00:00:00.256789'").unwrap();
+    e.execute("INSERT INTO u VALUES('2020-01-01 00:00:00')")
+        .unwrap();
+    e.execute("UPDATE u SET d1 = '2020-01-01 00:00:00.256789'")
+        .unwrap();
     assert_eq!(one(&mut e, "SELECT d1 FROM u"), "2020-01-01 00:00:00.2");
 }
 
@@ -115,7 +120,8 @@ fn precision_survives_and_keeps_applying() {
 fn stored_instant_is_exact_regardless_of_renderer() {
     let mut e = mysql();
     e.execute("CREATE TABLE p(d3 DATETIME(3))").unwrap();
-    e.execute("INSERT INTO p VALUES('2020-01-01 00:00:00.25')").unwrap();
+    e.execute("INSERT INTO p VALUES('2020-01-01 00:00:00.25')")
+        .unwrap();
     assert_eq!(one(&mut e, "SELECT d3 FROM p"), "2020-01-01 00:00:00.25");
     // The same value through the fsp-aware renderer is MariaDB's text.
     assert_eq!(

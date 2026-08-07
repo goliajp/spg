@@ -65,11 +65,16 @@ fn err(e: &mut Engine, sql: &str) -> String {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE pk1 (id INT PRIMARY KEY, s TEXT, g INT)").unwrap();
-    e.execute("CREATE TABLE pk2 (a INT, b INT, s TEXT, PRIMARY KEY (a,b))").unwrap();
-    e.execute("CREATE TABLE uq1 (id INT UNIQUE, s TEXT)").unwrap();
-    e.execute("INSERT INTO pk1 VALUES (1,'x',10),(2,'y',20),(3,'z',10)").unwrap();
-    e.execute("INSERT INTO pk2 VALUES (1,1,'p'),(1,2,'q'),(2,1,'r')").unwrap();
+    e.execute("CREATE TABLE pk1 (id INT PRIMARY KEY, s TEXT, g INT)")
+        .unwrap();
+    e.execute("CREATE TABLE pk2 (a INT, b INT, s TEXT, PRIMARY KEY (a,b))")
+        .unwrap();
+    e.execute("CREATE TABLE uq1 (id INT UNIQUE, s TEXT)")
+        .unwrap();
+    e.execute("INSERT INTO pk1 VALUES (1,'x',10),(2,'y',20),(3,'z',10)")
+        .unwrap();
+    e.execute("INSERT INTO pk2 VALUES (1,1,'p'),(1,2,'q'),(2,1,'r')")
+        .unwrap();
     e.execute("INSERT INTO uq1 VALUES (1,'x'),(2,'y')").unwrap();
     e
 }
@@ -97,8 +102,7 @@ fn round620_an_ungrouped_column_says_so() {
         );
     }
     assert!(
-        err(&mut e, "SELECT s, count(*) FROM pk1 p GROUP BY p.g")
-            .contains(r#"column "p.s""#),
+        err(&mut e, "SELECT s, count(*) FROM pk1 p GROUP BY p.g").contains(r#"column "p.s""#),
         "the alias is what PG qualifies it with when there is one"
     );
 }
@@ -129,36 +133,57 @@ fn round620_grouping_by_a_primary_key() {
         vec!["x|1", "y|1", "z|1"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, s, g, count(*) FROM pk1 GROUP BY id ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT id, s, g, count(*) FROM pk1 GROUP BY id ORDER BY 1"
+        ),
         vec!["1|x|10|1", "2|y|20|1", "3|z|10|1"],
         "every other column, not just one"
     );
     assert_eq!(
-        vals(&mut e, "SELECT upper(s) || g::TEXT, count(*) FROM pk1 GROUP BY id ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT upper(s) || g::TEXT, count(*) FROM pk1 GROUP BY id ORDER BY 1"
+        ),
         vec!["X10|1", "Y20|1", "Z10|1"],
         "inside an expression"
     );
     assert_eq!(
-        vals(&mut e, "SELECT CASE WHEN g > 15 THEN s ELSE 'lo' END, count(*) FROM pk1 GROUP BY id ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT CASE WHEN g > 15 THEN s ELSE 'lo' END, count(*) FROM pk1 GROUP BY id ORDER BY 1"
+        ),
         vec!["lo|1", "lo|1", "y|1"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT s, count(*) FROM pk1 GROUP BY pk1.id ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT s, count(*) FROM pk1 GROUP BY pk1.id ORDER BY 1"
+        ),
         vec!["x|1", "y|1", "z|1"],
         "the key grouped by its qualified spelling"
     );
     assert_eq!(
-        vals(&mut e, "SELECT s, count(*) FROM pk1 p GROUP BY p.id ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT s, count(*) FROM pk1 p GROUP BY p.id ORDER BY 1"
+        ),
         vec!["x|1", "y|1", "z|1"],
         "and under an alias"
     );
     assert_eq!(
-        vals(&mut e, "SELECT s, count(*) FROM pk1 GROUP BY id HAVING count(*) = 1 ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT s, count(*) FROM pk1 GROUP BY id HAVING count(*) = 1 ORDER BY 1"
+        ),
         vec!["x|1", "y|1", "z|1"],
         "with a HAVING, which the check also walks"
     );
     assert_eq!(
-        vals(&mut e, "SELECT (SELECT count(*) FROM uq1), count(*) FROM pk1 GROUP BY id ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT (SELECT count(*) FROM uq1), count(*) FROM pk1 GROUP BY id ORDER BY 1"
+        ),
         vec!["2|1", "2|1", "2|1"],
         "an uncorrelated subquery in the select list is nobody's business here"
     );
@@ -169,11 +194,17 @@ fn round620_grouping_by_a_primary_key() {
 fn round620_composite_primary_key() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT s, count(*) FROM pk2 GROUP BY a, b ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT s, count(*) FROM pk2 GROUP BY a, b ORDER BY 1"
+        ),
         vec!["p|1", "q|1", "r|1"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT s, count(*) FROM pk2 GROUP BY b, a ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT s, count(*) FROM pk2 GROUP BY b, a ORDER BY 1"
+        ),
         vec!["p|1", "q|1", "r|1"],
         "order of the grouping list is irrelevant"
     );

@@ -62,7 +62,10 @@ fn seeded() -> Engine {
 #[test]
 fn fraction_pads_to_declared_precision() {
     let mut e = seeded();
-    assert_eq!(wire_row(&mut e, "SELECT d3 FROM c"), vec!["2020-01-01 00:00:00.250"]);
+    assert_eq!(
+        wire_row(&mut e, "SELECT d3 FROM c"),
+        vec!["2020-01-01 00:00:00.250"]
+    );
     assert_eq!(
         wire_row(&mut e, "SELECT d6 FROM c"),
         vec!["2020-01-01 00:00:00.250000"]
@@ -74,14 +77,18 @@ fn fraction_pads_to_declared_precision() {
 #[test]
 fn precision_zero_prints_no_fraction() {
     let mut e = seeded();
-    assert_eq!(wire_row(&mut e, "SELECT d0 FROM c"), vec!["2020-01-01 00:00:00"]);
+    assert_eq!(
+        wire_row(&mut e, "SELECT d0 FROM c"),
+        vec!["2020-01-01 00:00:00"]
+    );
 }
 
 /// A whole second still shows the declared digits, all zeros.
 #[test]
 fn whole_second_still_pads() {
     let mut e = mysql();
-    e.execute("CREATE TABLE w(d3 DATETIME(3), d6 DATETIME(6))").unwrap();
+    e.execute("CREATE TABLE w(d3 DATETIME(3), d6 DATETIME(6))")
+        .unwrap();
     e.execute("INSERT INTO w VALUES('2020-01-01 00:00:00','2020-01-01 00:00:00')")
         .unwrap();
     assert_eq!(
@@ -123,7 +130,8 @@ fn precision_rides_the_projection() {
 fn untouched_where_no_precision_is_declared() {
     let mut e = mysql();
     e.execute("CREATE TABLE n(i INT, d DATETIME(3))").unwrap();
-    e.execute("INSERT INTO n VALUES(7,'2020-01-01 00:00:00.25')").unwrap();
+    e.execute("INSERT INTO n VALUES(7,'2020-01-01 00:00:00.25')")
+        .unwrap();
     assert_eq!(
         wire_row(&mut e, "SELECT i, d FROM n"),
         vec!["7", "2020-01-01 00:00:00.250"]

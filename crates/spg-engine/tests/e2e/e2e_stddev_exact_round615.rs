@@ -131,7 +131,10 @@ fn round615_edges() {
         "pop over one row is a bare 0, not a padded zero"
     );
     assert_eq!(
-        vals(&mut e, "SELECT stddev(i) IS NULL, variance(i) IS NULL FROM sv WHERE g = 99"),
+        vals(
+            &mut e,
+            "SELECT stddev(i) IS NULL, variance(i) IS NULL FROM sv WHERE g = 99"
+        ),
         vec!["true|true"],
         "no rows"
     );
@@ -145,12 +148,21 @@ fn round615_edges() {
         "a constant column has zero variance, spelled 0"
     );
     assert_eq!(
-        vals(&mut e, "SELECT variance(v) FROM (VALUES (1::INT),(2),(4)) t(v)"),
-        vals(&mut e, "SELECT variance(v) FROM (VALUES (1::NUMERIC),(2),(4)) t(v)"),
+        vals(
+            &mut e,
+            "SELECT variance(v) FROM (VALUES (1::INT),(2),(4)) t(v)"
+        ),
+        vals(
+            &mut e,
+            "SELECT variance(v) FROM (VALUES (1::NUMERIC),(2),(4)) t(v)"
+        ),
         "the i128 path and the BigNumeric path agree on the same numbers"
     );
     assert_eq!(
-        vals(&mut e, "SELECT variance(v), stddev(v) FROM (VALUES (1::NUMERIC),(2),(4)) t(v)"),
+        vals(
+            &mut e,
+            "SELECT variance(v), stddev(v) FROM (VALUES (1::NUMERIC),(2),(4)) t(v)"
+        ),
         vec!["2.3333333333333333|1.5275252316519467"]
     );
 }
@@ -160,7 +172,10 @@ fn round615_edges() {
 fn round615_grouped() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT g, stddev(i), variance(i), count(i) FROM sv GROUP BY g ORDER BY g"),
+        vals(
+            &mut e,
+            "SELECT g, stddev(i), variance(i), count(i) FROM sv GROUP BY g ORDER BY g"
+        ),
         vec![
             "1|1.00000000000000000000|1.00000000000000000000|3",
             "2|14.1421356237309505|200.0000000000000000|2",
@@ -176,7 +191,10 @@ fn round615_grouped() {
 fn round615_magnitudes() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT stddev(x), variance(x) FROM (SELECT generate_series(1,1000) x) q"),
+        vals(
+            &mut e,
+            "SELECT stddev(x), variance(x) FROM (SELECT generate_series(1,1000) x) q"
+        ),
         vec!["288.8194360957494|83416.666666666667"]
     );
     assert_eq!(
@@ -218,7 +236,10 @@ fn round615_scale() {
         vec!["33335000.000000000000"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM (SELECT g, stddev(id) FROM big GROUP BY g) q"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM (SELECT g, stddev(id) FROM big GROUP BY g) q"
+        ),
         vec!["50"]
     );
     assert_eq!(

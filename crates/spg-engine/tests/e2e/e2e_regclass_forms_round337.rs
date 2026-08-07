@@ -55,7 +55,10 @@ fn relation_size_reads_the_regclass_spelling() {
         matches!(by_name, Value::BigInt(n) if n > 0),
         "a table with rows is not zero bytes: {by_name:?}"
     );
-    assert_eq!(first(&mut e, "SELECT pg_relation_size('t'::regclass)"), by_name);
+    assert_eq!(
+        first(&mut e, "SELECT pg_relation_size('t'::regclass)"),
+        by_name
+    );
     let total = first(&mut e, "SELECT pg_total_relation_size('t'::regclass)");
     assert!(matches!(total, Value::BigInt(n) if n > 0), "{total:?}");
 }

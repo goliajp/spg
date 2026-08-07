@@ -85,4 +85,3 @@ fn round627_char_length_refuses_what_length_takes() {
         vec!["3|2|2"]
     );
 }
-

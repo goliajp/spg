@@ -17,8 +17,5 @@ fn round766_similarity_returns_real() {
         spg_engine::eval::value_to_text(&rows[0].values[0]),
         "0.33333334"
     );
-    assert_eq!(
-        spg_engine::eval::value_to_text(&rows[0].values[1]),
-        "real"
-    );
+    assert_eq!(spg_engine::eval::value_to_text(&rows[0].values[1]), "real");
 }

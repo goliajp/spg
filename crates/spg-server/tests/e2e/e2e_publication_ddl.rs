@@ -98,7 +98,10 @@ fn create_publication_roundtrip_basic() {
     // with PG's sentence (PG18-measured); IF EXISTS skips quietly.
     send_query(&mut s, "DROP PUBLICATION pub_a");
     let err = expect_err(&mut s);
-    assert!(err.contains("publication \"pub_a\" does not exist"), "got: {err}");
+    assert!(
+        err.contains("publication \"pub_a\" does not exist"),
+        "got: {err}"
+    );
     send_query(&mut s, "DROP PUBLICATION IF EXISTS pub_a");
     let affected = expect_cc(&mut s);
     assert_eq!(affected, 0, "IF EXISTS on absent publication affected=0");

@@ -1280,7 +1280,14 @@ pub(crate) fn order_by_collations(
 /// ever guaranteed. A no-op when `keep == 0` (LIMIT 0 is handled by the
 /// caller's truncation).
 pub(crate) fn topk_trim(tagged: &mut Vec<(Vec<OrderKey>, Row)>, keep: usize, descs: &[bool]) {
-    topk_trim_recycling(tagged, keep, descs, &mut Vec::new(), &mut Vec::new(), &mut None);
+    topk_trim_recycling(
+        tagged,
+        keep,
+        descs,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut None,
+    );
 }
 
 /// v7.39 (round 571) — the same trim, handing the dropped rows' value
@@ -1511,8 +1518,11 @@ pub(crate) fn build_order_keys_bound(
     keys.clear();
     keys.reserve(order_by.len());
     for (i, o) in order_by.iter().enumerate() {
-        let borrowed: Option<&Value<'static>> =
-            bound.get(i).copied().flatten().and_then(|p| row.values.get(p));
+        let borrowed: Option<&Value<'static>> = bound
+            .get(i)
+            .copied()
+            .flatten()
+            .and_then(|p| row.values.get(p));
         let owned: Value<'static>;
         // Borrowed when the key is a bound column, owned when it had to
         // be evaluated — either way the body below only reads it, so

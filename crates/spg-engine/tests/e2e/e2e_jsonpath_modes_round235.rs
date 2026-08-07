@@ -86,11 +86,17 @@ fn strict_mode_reports_what_lax_skips() {
     // Strict paths that DO resolve still answer, and a filter that matches
     // nothing is empty rather than an error in either mode.
     assert_eq!(
-        one(&mut e, "SELECT jsonb_path_query('{\"a\":{\"b\":1}}','strict $.a.b')"),
+        one(
+            &mut e,
+            "SELECT jsonb_path_query('{\"a\":{\"b\":1}}','strict $.a.b')"
+        ),
         "1"
     );
     assert_eq!(
-        one(&mut e, "SELECT jsonb_path_query('[[1,2]]','strict $[*][*]')"),
+        one(
+            &mut e,
+            "SELECT jsonb_path_query('[[1,2]]','strict $[*][*]')"
+        ),
         "1"
     );
     assert_eq!(
@@ -106,7 +112,10 @@ fn strict_mode_reports_what_lax_skips() {
 fn lax_mode_wraps_and_unwraps() {
     let mut e = Engine::new();
     // A member accessor looks inside an array.
-    assert_eq!(one(&mut e, "SELECT jsonb_path_query('[{\"a\":1}]','lax $.a')"), "1");
+    assert_eq!(
+        one(&mut e, "SELECT jsonb_path_query('[{\"a\":1}]','lax $.a')"),
+        "1"
+    );
     // An array accessor treats a non-array as one element.
     assert_eq!(one(&mut e, "SELECT jsonb_path_query('1','lax $[*]')"), "1");
     assert_eq!(
@@ -115,12 +124,24 @@ fn lax_mode_wraps_and_unwraps() {
     );
     assert_eq!(one(&mut e, "SELECT jsonb_path_query('1','lax $[0]')"), "1");
     // Past the end of that one-element array there is nothing — no error.
-    assert_eq!(one(&mut e, "SELECT jsonb_path_query('1','lax $[1]')"), "<none>");
+    assert_eq!(
+        one(&mut e, "SELECT jsonb_path_query('1','lax $[1]')"),
+        "<none>"
+    );
     // The misses strict complains about are simply empty in lax.
-    assert_eq!(one(&mut e, "SELECT jsonb_path_query('{\"a\":1}','lax $.b')"), "<none>");
-    assert_eq!(one(&mut e, "SELECT jsonb_path_query('[1,2]','lax $[5]')"), "<none>");
+    assert_eq!(
+        one(&mut e, "SELECT jsonb_path_query('{\"a\":1}','lax $.b')"),
+        "<none>"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT jsonb_path_query('[1,2]','lax $[5]')"),
+        "<none>"
+    );
     // Lax is the default when no mode word is given.
-    assert_eq!(one(&mut e, "SELECT jsonb_path_query('[{\"a\":1}]','$.a')"), "1");
+    assert_eq!(
+        one(&mut e, "SELECT jsonb_path_query('[{\"a\":1}]','$.a')"),
+        "1"
+    );
 }
 
 #[test]
@@ -128,10 +149,16 @@ fn only_the_error_suppressing_forms_answer_null() {
     let mut e = Engine::new();
     // Suppress → NULL.
     assert_eq!(
-        one(&mut e, "SELECT jsonb_path_match('{\"a\":1}','strict $.b == 1')"),
+        one(
+            &mut e,
+            "SELECT jsonb_path_match('{\"a\":1}','strict $.b == 1')"
+        ),
         "NULL"
     );
-    assert_eq!(one(&mut e, "SELECT '{\"a\":1}'::jsonb @? 'strict $.b'"), "NULL");
+    assert_eq!(
+        one(&mut e, "SELECT '{\"a\":1}'::jsonb @? 'strict $.b'"),
+        "NULL"
+    );
     assert_eq!(
         one(&mut e, "SELECT '{\"a\":1}'::jsonb @@ 'strict $.b == 1'"),
         "NULL"
@@ -143,9 +170,18 @@ fn only_the_error_suppressing_forms_answer_null() {
         "SELECT jsonb_path_query_array('{\"a\":1}','strict $.b')",
     ] {
         let got = err(&mut e, sql);
-        assert!(got.contains("JSON object does not contain key"), "{sql}: {got}");
+        assert!(
+            got.contains("JSON object does not contain key"),
+            "{sql}: {got}"
+        );
     }
     // The lax forms of the same calls keep their old answers.
-    assert_eq!(one(&mut e, "SELECT jsonb_path_exists('{\"a\":1}','$.b')"), "false");
-    assert_eq!(one(&mut e, "SELECT jsonb_path_exists('{\"a\":1}','$.a')"), "true");
+    assert_eq!(
+        one(&mut e, "SELECT jsonb_path_exists('{\"a\":1}','$.b')"),
+        "false"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT jsonb_path_exists('{\"a\":1}','$.a')"),
+        "true"
+    );
 }

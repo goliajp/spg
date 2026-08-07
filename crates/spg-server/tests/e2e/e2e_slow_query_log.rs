@@ -176,7 +176,10 @@ fn slow_query_log_fires_above_threshold_and_silent_below() {
                 .split("\"elapsed_us\":")
                 .nth(1)
                 .and_then(|rest| {
-                    rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+                    rest.split(|c: char| !c.is_ascii_digit())
+                        .next()?
+                        .parse()
+                        .ok()
                 })
                 .unwrap_or_else(|| panic!("unparseable slow-query line: {line}"));
             assert!(

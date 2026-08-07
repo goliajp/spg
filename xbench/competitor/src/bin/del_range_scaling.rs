@@ -113,9 +113,11 @@ fn stat(e: &mut Engine, col: &str) -> i64 {
         ))
         .unwrap()
     {
-        spg_engine::QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0])
-            .parse()
-            .unwrap_or(-1),
+        spg_engine::QueryResult::Rows { rows, .. } => {
+            spg_engine::eval::value_to_text(&rows[0].values[0])
+                .parse()
+                .unwrap_or(-1)
+        }
         _ => -1,
     }
 }
@@ -134,7 +136,10 @@ fn seek_fired(total: i64) {
     let cases: Vec<(&str, String)> = vec![
         (
             "SELECT range",
-            format!("SELECT count(*) FROM wb WHERE id >= {seg} AND id < {}", seg + 1),
+            format!(
+                "SELECT count(*) FROM wb WHERE id >= {seg} AND id < {}",
+                seg + 1
+            ),
         ),
         (
             "UPDATE range",
@@ -184,12 +189,8 @@ fn main() {
     println!();
     println!("# DELETE cost vs table size (embedded), median of 21");
     println!("# all range predicates below match exactly ONE row");
-    println!(
-        "| table rows | DEL range | UPD range | DEL equality | UPD equality | SEL range |"
-    );
-    println!(
-        "|-----------:|----------:|----------:|-------------:|-------------:|----------:|"
-    );
+    println!("| table rows | DEL range | UPD range | DEL equality | UPD equality | SEL range |");
+    println!("|-----------:|----------:|----------:|-------------:|-------------:|----------:|");
     for total in [10_000i64, 50_000, 200_000] {
         let (_r, eq, r1, sel, upd, upd_eq) = run(total);
         println!(

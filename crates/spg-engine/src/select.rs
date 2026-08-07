@@ -23,19 +23,18 @@ use crate::{
     apply_offset_and_limit, apply_offset_and_limit_tagged, approx_row_bytes, build_order_keys,
     collect_meta_view_names, collect_qualified_refs, collect_scalar_subqueries,
     collect_window_nodes, compute_window_partition, eval, expr_tree_has_subquery,
-    materialise_in_order, materialise_meta_view, memoize, order_by_value_cmp_in,
-    partition_key_cmp, rewrite_window_to_columns, select_has_window,
-    select_references_meta_view, select_refers_to, sort_by_keys, synth_info_key_column_usage,
-    synth_info_referential_constraints, synth_info_routines, synth_info_statistics,
-    synth_information_schema_columns, synth_information_schema_tables, synth_mysql_db,
-    synth_mysql_user, synth_pg_attribute, synth_pg_class, synth_pg_constraint, synth_pg_database,
-    synth_pg_extension, synth_pg_index_raw, synth_pg_indexes, synth_pg_namespace, synth_pg_proc,
-    synth_pg_roles, synth_pg_sequence, synth_pg_settings, synth_pg_timezone_abbrevs,
-    synth_pg_operator, synth_pg_timezone_names, synth_pg_trigger, synth_pg_type,
-    synth_pg_views, topk_trim, try_gin_jsonb_seek, try_gin_seek, try_index_seek, try_nsw_knn,
-    try_pk_walk_top_n, try_trgm_seek, value_is_bigint, value_is_integer, value_to_i64,
+    materialise_in_order, materialise_meta_view, memoize, order_by_value_cmp_in, partition_key_cmp,
+    rewrite_window_to_columns, select_has_window, select_references_meta_view, select_refers_to,
+    sort_by_keys, synth_info_key_column_usage, synth_info_referential_constraints,
+    synth_info_routines, synth_info_statistics, synth_information_schema_columns,
+    synth_information_schema_tables, synth_mysql_db, synth_mysql_user, synth_pg_attribute,
+    synth_pg_class, synth_pg_constraint, synth_pg_database, synth_pg_extension, synth_pg_index_raw,
+    synth_pg_indexes, synth_pg_namespace, synth_pg_operator, synth_pg_proc, synth_pg_roles,
+    synth_pg_sequence, synth_pg_settings, synth_pg_timezone_abbrevs, synth_pg_timezone_names,
+    synth_pg_trigger, synth_pg_type, synth_pg_views, topk_trim, try_gin_jsonb_seek, try_gin_seek,
+    try_index_seek, try_nsw_knn, try_pk_walk_top_n, try_trgm_seek, value_is_bigint,
+    value_is_integer, value_to_i64,
 };
-
 
 /// v7.39 (round 618) — a recursive term that can be run over the working set
 /// directly, instead of through a whole query execution per round.
@@ -384,39 +383,41 @@ impl Engine {
                     }
                 }
             } else {
-            for (i, row) in filtered.iter().enumerate() {
-                let pkey: Vec<Value<'static>> = partition_by
-                    .iter()
-                    .enumerate()
-                    .map(|(k, p)| match p_bound[k].and_then(|pos| row.values.get(pos)) {
-                        Some(v) => Ok(v.clone()),
-                        None => eval::eval_expr(p, row, &ctx),
-                    })
-                    .collect::<Result<_, _>>()?;
-                // v7.39 (read01 round 54) — a window's ORDER BY over an enum
-                // column must sort by MEMBER order (enumsortorder), not the
-                // label's text. Enum values are Text at runtime, so the raw
-                // value key sorted alphabetically — `row_number() OVER (ORDER
-                // BY mood)` numbered the rows happy,ok,sad. Substitute the
-                // member ordinal, the same key the top-level ORDER BY uses.
-                // (Closes the enum-order knife's recorded window residual.)
-                let okey: Vec<(Value, bool, Option<bool>)> = order_by
-                    .iter()
-                    .enumerate()
-                    .map(|(k, (e, desc, nf))| -> Result<_, EngineError> {
-                        let v = match o_bound[k].and_then(|pos| row.values.get(pos)) {
-                            Some(v) => v.clone(),
-                            None => eval::eval_expr(e, row, &ctx)?,
-                        };
-                        let v = match crate::orderby::enum_order_ordinal(e, &v, &ctx) {
-                            Some(ord) => Value::Float(ord),
-                            None => v,
-                        };
-                        Ok((v, *desc, *nf))
-                    })
-                    .collect::<Result<_, _>>()?;
-                indexed.push((pkey, okey, i));
-            }
+                for (i, row) in filtered.iter().enumerate() {
+                    let pkey: Vec<Value<'static>> = partition_by
+                        .iter()
+                        .enumerate()
+                        .map(
+                            |(k, p)| match p_bound[k].and_then(|pos| row.values.get(pos)) {
+                                Some(v) => Ok(v.clone()),
+                                None => eval::eval_expr(p, row, &ctx),
+                            },
+                        )
+                        .collect::<Result<_, _>>()?;
+                    // v7.39 (read01 round 54) — a window's ORDER BY over an enum
+                    // column must sort by MEMBER order (enumsortorder), not the
+                    // label's text. Enum values are Text at runtime, so the raw
+                    // value key sorted alphabetically — `row_number() OVER (ORDER
+                    // BY mood)` numbered the rows happy,ok,sad. Substitute the
+                    // member ordinal, the same key the top-level ORDER BY uses.
+                    // (Closes the enum-order knife's recorded window residual.)
+                    let okey: Vec<(Value, bool, Option<bool>)> = order_by
+                        .iter()
+                        .enumerate()
+                        .map(|(k, (e, desc, nf))| -> Result<_, EngineError> {
+                            let v = match o_bound[k].and_then(|pos| row.values.get(pos)) {
+                                Some(v) => v.clone(),
+                                None => eval::eval_expr(e, row, &ctx)?,
+                            };
+                            let v = match crate::orderby::enum_order_ordinal(e, &v, &ctx) {
+                                Some(ord) => Value::Float(ord),
+                                None => v,
+                            };
+                            Ok((v, *desc, *nf))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    indexed.push((pkey, okey, i));
+                }
             }
             // Sort by (partition_key, order_key). Partition key uses
             // a stable encoded form; order key respects ASC/DESC.
@@ -689,10 +690,7 @@ impl Engine {
     /// extended-protocol client reading `pg_stat_user_tables` got rows
     /// with no column metadata. Sharing the materialisation means a
     /// view added here is described correctly the day it is added.
-    pub(crate) fn meta_view_catalog(
-        &self,
-        stmt: &SelectStatement,
-    ) -> Result<Catalog, EngineError> {
+    pub(crate) fn meta_view_catalog(&self, stmt: &SelectStatement) -> Result<Catalog, EngineError> {
         let mut needed: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
         collect_meta_view_names(stmt, &mut needed);
         let mut catalog = self.active_catalog().clone();
@@ -702,8 +700,10 @@ impl Engine {
             }
             match view.as_str() {
                 "__spg_info_columns" => {
-                    let (schema, rows) =
-                        synth_information_schema_columns(self.active_catalog(), self.backslash_escapes);
+                    let (schema, rows) = synth_information_schema_columns(
+                        self.active_catalog(),
+                        self.backslash_escapes,
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 "__spg_info_tables" => {
@@ -894,9 +894,8 @@ impl Engine {
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 "__spg_pg_largeobject_metadata" => {
-                    let (schema, rows) = crate::system_catalog::synth_pg_largeobject_metadata(
-                        self.active_catalog(),
-                    );
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_largeobject_metadata(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.23 (23.7-a) — pg_catalog.pg_statistic_ext.
@@ -1262,9 +1261,7 @@ impl Engine {
                 }
                 // v7.39 (round 541) — the catalogs PG has that SPG is
                 // genuinely empty of. Table-driven; see EMPTY_PG_CATALOGS.
-                other
-                    if crate::system_catalog::synth_empty_pg_catalog(other).is_some() =>
-                {
+                other if crate::system_catalog::synth_empty_pg_catalog(other).is_some() => {
                     let (schema, rows) =
                         crate::system_catalog::synth_empty_pg_catalog(other).expect("just checked");
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
@@ -2191,16 +2188,15 @@ impl Engine {
                     // SELECT (`SELECT 'ok'::mood AS x`, which is what a
                     // VALUES row lowers to) is an EXPRESSION, so it landed
                     // here and the derived table forgot the enum.
-                    let (ty, nullable) =
-                        build_projection(
-                            core::slice::from_ref(item),
-                            schema_cols,
-                            table_alias,
-                            self.backslash_escapes,
-                        )
-                            .ok()
-                            .and_then(|p| p.into_iter().next())
-                            .map_or((DataType::Text, true), |p| (p.ty, p.nullable));
+                    let (ty, nullable) = build_projection(
+                        core::slice::from_ref(item),
+                        schema_cols,
+                        table_alias,
+                        self.backslash_escapes,
+                    )
+                    .ok()
+                    .and_then(|p| p.into_iter().next())
+                    .map_or((DataType::Text, true), |p| (p.ty, p.nullable));
                     out.push(ColumnSchema::new(name, ty, nullable));
                 }
             }
@@ -2430,7 +2426,9 @@ impl Engine {
             return None;
         }
         let cols = &table.schema().columns;
-        let pos = cols.iter().position(|s| s.name.eq_ignore_ascii_case(&c.name))?;
+        let pos = cols
+            .iter()
+            .position(|s| s.name.eq_ignore_ascii_case(&c.name))?;
         let out = alias.clone().unwrap_or_else(|| cols[pos].name.clone());
         Some((table, alias_name, pos, out))
     }
@@ -2478,10 +2476,17 @@ impl Engine {
         ) else {
             return Ok(None);
         };
-        let schema = alloc::vec![ColumnSchema::new(out_name, cols[pos].ty, cols[pos].nullable)];
+        let schema = alloc::vec![ColumnSchema::new(
+            out_name,
+            cols[pos].ty,
+            cols[pos].nullable
+        )];
         Ok(Some(QueryResult::Rows {
             columns: schema,
-            rows: values.into_iter().map(|v| Row::new(alloc::vec![v])).collect(),
+            rows: values
+                .into_iter()
+                .map(|v| Row::new(alloc::vec![v]))
+                .collect(),
         }))
     }
 
@@ -2511,7 +2516,11 @@ impl Engine {
         };
         let where_ = stmt.where_.as_ref().expect("shape checked it");
         let cols = &table.schema().columns;
-        let schema = alloc::vec![ColumnSchema::new(out_name, cols[pos].ty, cols[pos].nullable)];
+        let schema = alloc::vec![ColumnSchema::new(
+            out_name,
+            cols[pos].ty,
+            cols[pos].nullable
+        )];
         let snapshot = self.current_snapshot();
         // The header goes out only once the walk has agreed to run — a
         // shape rejection after it would leave the client with a
@@ -2638,12 +2647,10 @@ impl Engine {
                     .iter()
                     .zip(s.order_by.iter())
                     .all(|(d, o)| *d == o.expr && !o.desc && o.nulls_first.is_none());
-            let colls_plain = crate::orderby::order_by_collations(
-                &s.order_by,
-                &self.ev_ctx(&[], None),
-            )
-            .map(|cs| cs.iter().all(Option::is_none))
-            .unwrap_or(false);
+            let colls_plain =
+                crate::orderby::order_by_collations(&s.order_by, &self.ev_ctx(&[], None))
+                    .map(|cs| cs.iter().all(Option::is_none))
+                    .unwrap_or(false);
             let top1_tail = if prefix_matches && colls_plain && s.group_by.is_none() {
                 let tail = s.order_by.len() - hidden;
                 for (j, o) in s.order_by[hidden..].iter().enumerate() {
@@ -2664,7 +2671,10 @@ impl Engine {
             // resolved a second way here.
             let deferrable = matches!(
                 (&s.limit, &s.offset),
-                (None | Some(spg_sql::ast::LimitExpr::Literal(_)), None | Some(spg_sql::ast::LimitExpr::Literal(_)))
+                (
+                    None | Some(spg_sql::ast::LimitExpr::Literal(_)),
+                    None | Some(spg_sql::ast::LimitExpr::Literal(_))
+                )
             );
             let deferred = if deferrable {
                 (s.limit.take(), s.offset.take())
@@ -2719,8 +2729,7 @@ impl Engine {
             let tail = don_top1 - 1;
             key_start = columns.len().saturating_sub(don_hidden + tail);
             let ord_start = key_start + don_hidden;
-            let tail_dirs: alloc::vec::Vec<(bool, Option<bool>)> = orig_order_by
-                [don_hidden..]
+            let tail_dirs: alloc::vec::Vec<(bool, Option<bool>)> = orig_order_by[don_hidden..]
                 .iter()
                 .map(|o| (o.desc, o.nulls_first))
                 .collect();
@@ -3289,125 +3298,121 @@ impl Engine {
                     alloc::vec::Vec<DataType>,
                     alloc::vec::Vec<Row<'static>>,
                 )> = None;
-                let (elem_dtype, rows): (DataType, alloc::vec::Vec<Row<'static>>) =
-                    match unnest_src {
-                        Value::Null => (DataType::Text, alloc::vec::Vec::new()),
-                        Value::TextArray(items) => {
-                            let rows = items
-                                .into_iter()
-                                .map(|item| {
-                                    Row::new(alloc::vec![match item {
-                                        Some(s) => Value::text(s),
-                                        None => Value::Null,
-                                    }])
-                                })
-                                .collect();
-                            (DataType::Text, rows)
-                        }
-                        Value::IntArray(items) => {
-                            let rows = items
-                                .into_iter()
-                                .map(|item| {
-                                    Row::new(alloc::vec![match item {
-                                        Some(n) => Value::Int(n),
-                                        None => Value::Null,
-                                    }])
-                                })
-                                .collect();
-                            (DataType::Int, rows)
-                        }
-                        Value::BigIntArray(items) => {
-                            let rows = items
-                                .into_iter()
-                                .map(|item| {
-                                    Row::new(alloc::vec![match item {
-                                        Some(n) => Value::BigInt(n),
-                                        None => Value::Null,
-                                    }])
-                                })
-                                .collect();
-                            (DataType::BigInt, rows)
-                        }
-                        Value::Multirange { kind, ranges } => {
-                            let rows = ranges
-                                .iter()
-                                .map(|sp| {
-                                    Row::new(alloc::vec![Value::Range {
-                                        kind,
-                                        lower: sp.lower.clone(),
-                                        upper: sp.upper.clone(),
-                                        lower_inc: sp.lower_inc,
-                                        upper_inc: sp.upper_inc,
-                                        empty: false,
-                                    }])
-                                })
-                                .collect();
-                            (DataType::Range(kind), rows)
-                        }
-                        // v7.39 (round 758, F31-B8a) — unnest(tsvector):
-                        // one row per lexeme, PG18-measured columns
-                        // lexeme | positions | weights (`a | {1,3} |
-                        // {D,D}`); a position-less lexeme (a stripped
-                        // vector) reads NULL in both array columns.
-                        Value::TsVector(lexemes) => {
-                            composite_names = Some(&["lexeme", "positions", "weights"]);
-                            let rows = lexemes
-                                .iter()
-                                .map(|l| {
-                                    let (pos, wts) = if l.positions.is_empty() {
-                                        (Value::Null, Value::Null)
-                                    } else {
-                                        let letter = match l.weight {
-                                            3 => "A",
-                                            2 => "B",
-                                            1 => "C",
-                                            _ => "D",
-                                        };
-                                        (
-                                            Value::SmallIntArray(
-                                                l.positions
-                                                    .iter()
-                                                    .map(|p| {
-                                                        Some(i16::try_from(*p).unwrap_or(i16::MAX))
-                                                    })
-                                                    .collect(),
-                                            ),
-                                            Value::TextArray(
-                                                l.positions
-                                                    .iter()
-                                                    .map(|_| Some(letter.into()))
-                                                    .collect(),
-                                            ),
-                                        )
+                let (elem_dtype, rows): (DataType, alloc::vec::Vec<Row<'static>>) = match unnest_src
+                {
+                    Value::Null => (DataType::Text, alloc::vec::Vec::new()),
+                    Value::TextArray(items) => {
+                        let rows = items
+                            .into_iter()
+                            .map(|item| {
+                                Row::new(alloc::vec![match item {
+                                    Some(s) => Value::text(s),
+                                    None => Value::Null,
+                                }])
+                            })
+                            .collect();
+                        (DataType::Text, rows)
+                    }
+                    Value::IntArray(items) => {
+                        let rows = items
+                            .into_iter()
+                            .map(|item| {
+                                Row::new(alloc::vec![match item {
+                                    Some(n) => Value::Int(n),
+                                    None => Value::Null,
+                                }])
+                            })
+                            .collect();
+                        (DataType::Int, rows)
+                    }
+                    Value::BigIntArray(items) => {
+                        let rows = items
+                            .into_iter()
+                            .map(|item| {
+                                Row::new(alloc::vec![match item {
+                                    Some(n) => Value::BigInt(n),
+                                    None => Value::Null,
+                                }])
+                            })
+                            .collect();
+                        (DataType::BigInt, rows)
+                    }
+                    Value::Multirange { kind, ranges } => {
+                        let rows = ranges
+                            .iter()
+                            .map(|sp| {
+                                Row::new(alloc::vec![Value::Range {
+                                    kind,
+                                    lower: sp.lower.clone(),
+                                    upper: sp.upper.clone(),
+                                    lower_inc: sp.lower_inc,
+                                    upper_inc: sp.upper_inc,
+                                    empty: false,
+                                }])
+                            })
+                            .collect();
+                        (DataType::Range(kind), rows)
+                    }
+                    // v7.39 (round 758, F31-B8a) — unnest(tsvector):
+                    // one row per lexeme, PG18-measured columns
+                    // lexeme | positions | weights (`a | {1,3} |
+                    // {D,D}`); a position-less lexeme (a stripped
+                    // vector) reads NULL in both array columns.
+                    Value::TsVector(lexemes) => {
+                        composite_names = Some(&["lexeme", "positions", "weights"]);
+                        let rows = lexemes
+                            .iter()
+                            .map(|l| {
+                                let (pos, wts) = if l.positions.is_empty() {
+                                    (Value::Null, Value::Null)
+                                } else {
+                                    let letter = match l.weight {
+                                        3 => "A",
+                                        2 => "B",
+                                        1 => "C",
+                                        _ => "D",
                                     };
-                                    Row::new(alloc::vec![
-                                        Value::text(l.word.clone()),
-                                        pos,
-                                        wts
-                                    ])
-                                })
-                                .collect();
-                            return_multi = Some((
-                                alloc::vec![
-                                    DataType::Text,
-                                    DataType::SmallIntArray,
-                                    DataType::TextArray
-                                ],
-                                rows,
-                            ));
-                            (DataType::Text, alloc::vec::Vec::new())
-                        }
-                        other => {
-                            // v7.39 (round 622, S05a) — see table_access.rs:
-                            // the same sentence, and it is a type mismatch.
-                            return Err(EngineError::Eval(EvalError::TypeMismatch {
-                                detail: alloc::format!(
-                                    "unnest() expects an array argument, got {}",
-                                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
-                                ),
-                            }));
-                        }
-                    };
+                                    (
+                                        Value::SmallIntArray(
+                                            l.positions
+                                                .iter()
+                                                .map(|p| {
+                                                    Some(i16::try_from(*p).unwrap_or(i16::MAX))
+                                                })
+                                                .collect(),
+                                        ),
+                                        Value::TextArray(
+                                            l.positions
+                                                .iter()
+                                                .map(|_| Some(letter.into()))
+                                                .collect(),
+                                        ),
+                                    )
+                                };
+                                Row::new(alloc::vec![Value::text(l.word.clone()), pos, wts])
+                            })
+                            .collect();
+                        return_multi = Some((
+                            alloc::vec![
+                                DataType::Text,
+                                DataType::SmallIntArray,
+                                DataType::TextArray
+                            ],
+                            rows,
+                        ));
+                        (DataType::Text, alloc::vec::Vec::new())
+                    }
+                    other => {
+                        // v7.39 (round 622, S05a) — see table_access.rs:
+                        // the same sentence, and it is a type mismatch.
+                        return Err(EngineError::Eval(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "unnest() expects an array argument, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                            ),
+                        }));
+                    }
+                };
                 if let Some(m) = return_multi {
                     m
                 } else {
@@ -3435,7 +3440,9 @@ impl Engine {
                     .cloned()
                     .unwrap_or_else(|| {
                         if let Some(names) = composite_names {
-                            names.get(i).map_or_else(|| "unnest".to_string(), |n| (*n).to_string())
+                            names
+                                .get(i)
+                                .map_or_else(|| "unnest".to_string(), |n| (*n).to_string())
                         } else if n_vals == 1 {
                             alias.clone()
                         } else {
@@ -3529,7 +3536,8 @@ impl Engine {
             return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
-        let projection = build_projection(&stmt.items, &schema_cols, &alias, self.backslash_escapes)?;
+        let projection =
+            build_projection(&stmt.items, &schema_cols, &alias, self.backslash_escapes)?;
         let mut projected_rows: alloc::vec::Vec<Row<'static>> =
             alloc::vec::Vec::with_capacity(filtered.len());
         // v7.19 P5 — Set-Returning-Function in projection
@@ -3615,9 +3623,7 @@ impl Engine {
                     let keys: Result<Vec<Value<'static>>, EngineError> = order_by
                         .iter()
                         .zip(out_cols.iter())
-                        .map(|(ob, oc)| {
-                            srf_order_key(ob, *oc, out, &filtered[src], &scan_ctx)
-                        })
+                        .map(|(ob, oc)| srf_order_key(ob, *oc, out, &filtered[src], &scan_ctx))
                         .collect();
                     Ok((k, keys?))
                 })
@@ -3776,7 +3782,8 @@ impl Engine {
             return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
-        let projection = build_projection(&stmt.items, &schema_cols, &alias, self.backslash_escapes)?;
+        let projection =
+            build_projection(&stmt.items, &schema_cols, &alias, self.backslash_escapes)?;
         // v7.39 (round 621) — and here, for the same reason.
         let srf_idxs = self.srf_target_idxs(&projection);
         let mut src_of_row: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
@@ -4223,7 +4230,13 @@ impl Engine {
                 .into_iter()
                 .filter_map(|i| table.rows().get(i).map(Cow::Borrowed))
                 .collect();
-            return materialise_in_order(stmt, schema_cols, alias, &ordered, self.backslash_escapes);
+            return materialise_in_order(
+                stmt,
+                schema_cols,
+                alias,
+                &ordered,
+                self.backslash_escapes,
+            );
         }
 
         // v7.34.5 — ORDER BY <indexed col> [DESC|ASC] LIMIT N drives
@@ -4518,8 +4531,7 @@ impl Engine {
         else {
             unreachable!("caller guards Regular");
         };
-        let matches =
-            crate::json::json_table_path(item, path, vars).map_err(EngineError::Eval)?;
+        let matches = crate::json::json_table_path(item, path, vars).map_err(EngineError::Eval)?;
         if *exists {
             return Ok(Value::Bool(!matches.is_empty()));
         }
@@ -4816,11 +4828,29 @@ impl Engine {
                     )));
                 }
                 const TYPES: &[T] = &[
-                    T::AsciiWord, T::Word, T::NumWord, T::Email, T::Url, T::Host,
-                    T::SFloat, T::Version, T::HwordNumPart, T::HwordPart,
-                    T::HwordAsciiPart, T::Blank, T::Tag, T::Protocol, T::NumHword,
-                    T::AsciiHword, T::Hword, T::UrlPath, T::File, T::Float,
-                    T::Int, T::Uint, T::Entity,
+                    T::AsciiWord,
+                    T::Word,
+                    T::NumWord,
+                    T::Email,
+                    T::Url,
+                    T::Host,
+                    T::SFloat,
+                    T::Version,
+                    T::HwordNumPart,
+                    T::HwordPart,
+                    T::HwordAsciiPart,
+                    T::Blank,
+                    T::Tag,
+                    T::Protocol,
+                    T::NumHword,
+                    T::AsciiHword,
+                    T::Hword,
+                    T::UrlPath,
+                    T::File,
+                    T::Float,
+                    T::Int,
+                    T::Uint,
+                    T::Entity,
                 ];
                 let rows = TYPES
                     .iter()
@@ -5041,7 +5071,8 @@ impl Engine {
             return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
-        let projection = build_projection(&stmt.items, &schema_cols, &alias, self.backslash_escapes)?;
+        let projection =
+            build_projection(&stmt.items, &schema_cols, &alias, self.backslash_escapes)?;
         let mut projected_rows: alloc::vec::Vec<Row<'static>> =
             alloc::vec::Vec::with_capacity(filtered.len());
         for row in &filtered {
@@ -5266,7 +5297,8 @@ impl Engine {
             return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
-        let projection = build_projection(&stmt.items, &schema_cols, alias, self.backslash_escapes)?;
+        let projection =
+            build_projection(&stmt.items, &schema_cols, alias, self.backslash_escapes)?;
         // v7.39 (round 621) — a target-list SRF expands here too. This tail
         // serves VALUES, a derived table and `ROWS FROM (…)`, and knew nothing
         // about them: `SELECT unnest(ARRAY[1,2]), x FROM (VALUES (3),(4)) v(x)`
@@ -5441,7 +5473,7 @@ impl Engine {
                         let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
                         c.user_enum_type = p.user_enum_type;
                         c.collation_name = p.collation_name;
-                c.mysql_fsp = p.mysql_fsp;
+                        c.mysql_fsp = p.mysql_fsp;
                         c
                     })
                     .collect();
@@ -5466,7 +5498,7 @@ impl Engine {
                     let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
                     c.user_enum_type = p.user_enum_type;
                     c.collation_name = p.collation_name;
-                c.mysql_fsp = p.mysql_fsp;
+                    c.mysql_fsp = p.mysql_fsp;
                     c
                 })
                 .collect();
@@ -5982,20 +6014,22 @@ impl Engine {
                     // and the caller then dropped it, once per row; round
                     // 478's profile put that pair above the comparison
                     // itself.
-                    Ok(
-                        eval::compiled::eval_compiled_pred(
-                            cw,
-                            row,
-                            &ctx,
-                            eval_stack,
-                            ctx.mysql_dialect,
-                        )
-                        .map_err(EngineError::Eval)?,
+                    Ok(eval::compiled::eval_compiled_pred(
+                        cw,
+                        row,
+                        &ctx,
+                        eval_stack,
+                        ctx.mysql_dialect,
                     )
+                    .map_err(EngineError::Eval)?)
                 }
                 (None, Some(w)) => {
                     let cond = self.eval_expr_with_correlated(w, row, &ctx, cancel, Some(memo))?;
-                    Ok(crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)?)
+                    Ok(crate::eval::predicate_is_true(
+                        &cond,
+                        "WHERE",
+                        ctx.mysql_dialect,
+                    )?)
                 }
                 (None, None) => Ok(true),
             }
@@ -6283,9 +6317,7 @@ impl Engine {
         // error still comes from the row loop in the interpreter's wording.
         let proj_const: Vec<Option<Value<'static>>> = projection
             .iter()
-            .map(|p| {
-                crate::eval::compiled::constant_projection_value(&p.expr, &ctx)
-            })
+            .map(|p| crate::eval::compiled::constant_projection_value(&p.expr, &ctx))
             .collect();
         let any_proj_const = proj_const.iter().any(Option::is_some);
         crate::bump_counter!(crate::select::SCAN_PATH_ENTERED);
@@ -6477,7 +6509,10 @@ impl Engine {
                         let bucket = seen_distinct
                             .entry(norm_hash_row(&out, &distinct_hb, ctx.mysql_dialect))
                             .or_default();
-                        if bucket.iter().any(|&i| row_eq_norm(&tagged[i].1, &out, ctx.mysql_dialect)) {
+                        if bucket
+                            .iter()
+                            .any(|&i| row_eq_norm(&tagged[i].1, &out, ctx.mysql_dialect))
+                        {
                             continue;
                         }
                         bucket.push(tagged.len());
@@ -6993,7 +7028,8 @@ impl Engine {
         let ctx = EvalContext::new(combined_schema, None)
             .with_catalog(self.active_catalog())
             .with_session(&joined_sess);
-        let projection = build_projection(&stmt.items, combined_schema, "", self.backslash_escapes)?;
+        let projection =
+            build_projection(&stmt.items, combined_schema, "", self.backslash_escapes)?;
         // Every projection item must be a bound qualified column —
         // anything that needs `eval_expr_with_correlated` keeps the
         // materialising path.
@@ -7185,7 +7221,8 @@ impl Engine {
             return self.finish_agg_result(agg, stmt, cancel);
         }
 
-        let projection = build_projection(&stmt.items, combined_schema, "", self.backslash_escapes)?;
+        let projection =
+            build_projection(&stmt.items, combined_schema, "", self.backslash_escapes)?;
         // v7.39 (round 734) — a set-returning projection over a JOIN.
         // This executor's projection loop treats every item as a scalar,
         // so `SELECT unnest(ARRAY[a.id, b.g]) FROM a JOIN b …` died with
@@ -7197,8 +7234,7 @@ impl Engine {
         // columns resolve identically in both executors.
         if !self.srf_target_idxs(&projection).is_empty() {
             let refs = deferred.row_refs();
-            let rows: Vec<Row<'static>> =
-                refs.iter().map(|r| r.as_row().into_owned()).collect();
+            let rows: Vec<Row<'static>> = refs.iter().map(|r| r.as_row().into_owned()).collect();
             let mut s2 = stmt.clone();
             s2.where_ = None;
             let schema = combined_schema.clone();
@@ -7330,7 +7366,10 @@ impl Engine {
                 let bucket = seen_distinct
                     .entry(norm_hash_row(&out_row, &distinct_hb, ctx.mysql_dialect))
                     .or_default();
-                if bucket.iter().any(|&i| row_eq_norm(&tagged[i].1, &out_row, ctx.mysql_dialect)) {
+                if bucket
+                    .iter()
+                    .any(|&i| row_eq_norm(&tagged[i].1, &out_row, ctx.mysql_dialect))
+                {
                     continue;
                 }
                 bucket.push(tagged.len());
@@ -7691,7 +7730,7 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
         limit: None,
         offset: None,
         limit_with_ties: false,
-            window_check_exprs: Vec::new(),
+        window_check_exprs: Vec::new(),
         ..stmt.clone()
     };
     let derived = TableRef {
@@ -7787,7 +7826,10 @@ impl<'r> PeerIndex<'r> {
         let mut buckets: hashbrown::HashMap<u64, Vec<usize>> =
             hashbrown::HashMap::with_capacity(rows.len());
         for (i, r) in rows.iter().enumerate() {
-            buckets.entry(norm_hash_row(r, &bh, mysql)).or_default().push(i);
+            buckets
+                .entry(norm_hash_row(r, &bh, mysql))
+                .or_default()
+                .push(i);
         }
         Self {
             bh,
@@ -7799,10 +7841,9 @@ impl<'r> PeerIndex<'r> {
 
     fn contains(&self, r: &Row<'static>) -> bool {
         let h = norm_hash_row(r, &self.bh, self.mysql);
-        self.buckets.get(&h).is_some_and(|b| {
-            b.iter()
-                .any(|&i| row_eq_norm(&self.rows[i], r, self.mysql))
-        })
+        self.buckets
+            .get(&h)
+            .is_some_and(|b| b.iter().any(|&i| row_eq_norm(&self.rows[i], r, self.mysql)))
     }
 
     /// Remove ONE occurrence, so the multiset forms cancel row for row the
@@ -7834,11 +7875,7 @@ fn dedup_rows(rows: Vec<Row<'static>>, mysql: bool) -> Vec<Row<'static>> {
 /// order is preserved, and correctness needs only the one-way guarantee
 /// "row_eq_norm-Equal ⇒ equal hash" (collisions are re-checked exactly).
 /// Small inputs keep the linear scan — no hasher setup for a 10-row page.
-fn dedup_by_row<T>(
-    items: Vec<T>,
-    row_of: impl Fn(&T) -> &Row<'static>,
-    mysql: bool,
-) -> Vec<T> {
+fn dedup_by_row<T>(items: Vec<T>, row_of: impl Fn(&T) -> &Row<'static>, mysql: bool) -> Vec<T> {
     if items.len() <= 32 {
         let mut out: Vec<T> = Vec::with_capacity(items.len());
         for it in items {
@@ -8126,13 +8163,10 @@ fn mysql_dedup_fold(v: &Value) -> Option<String> {
 /// and a never-called-function probe rules out code layout — so the
 /// question is whether that shape reaches this code at all, which is a
 /// number, not an inference.
-pub static SCAN_PATH_ENTERED: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-pub static PROJ_DIRECT_FIRE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static SCAN_PATH_ENTERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PROJ_DIRECT_FIRE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-pub static PROJ_ROW_BUILT: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+pub static PROJ_ROW_BUILT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static DISTINCT_DUP_DROPPED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
@@ -8392,8 +8426,7 @@ pub(crate) const CTID_COLUMN: &str = "ctid";
 /// v7.39 (round 512) — PG's system columns, in the order they are appended.
 /// All six are reserved names there, which is what lets `*` skip them and
 /// lets a scan tell them from a user column without a flag.
-pub(crate) const SYSTEM_COLUMNS: [&str; 6] =
-    ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"];
+pub(crate) const SYSTEM_COLUMNS: [&str; 6] = ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"];
 
 /// Is this name one of them?
 pub(crate) fn is_system_column(name: &str) -> bool {
@@ -8475,7 +8508,10 @@ fn references_ctid(stmt: &SelectStatement) -> bool {
         _ => false,
     }) || stmt.where_.as_ref().is_some_and(in_expr)
         || stmt.order_by.iter().any(|o| in_expr(&o.expr))
-        || stmt.group_by.as_ref().is_some_and(|g| g.iter().any(in_expr))
+        || stmt
+            .group_by
+            .as_ref()
+            .is_some_and(|g| g.iter().any(in_expr))
         || stmt.having.as_ref().is_some_and(in_expr)
 }
 
@@ -8539,7 +8575,10 @@ pub(crate) fn resolve_projection_column<'a>(
 /// a `LIMIT 2` that should have answered two groups answered one.
 fn apply_deferred_limit(
     rows: alloc::vec::Vec<Row<'static>>,
-    deferred: &(Option<spg_sql::ast::LimitExpr>, Option<spg_sql::ast::LimitExpr>),
+    deferred: &(
+        Option<spg_sql::ast::LimitExpr>,
+        Option<spg_sql::ast::LimitExpr>,
+    ),
 ) -> alloc::vec::Vec<Row<'static>> {
     let count = |e: &Option<spg_sql::ast::LimitExpr>| match e {
         Some(spg_sql::ast::LimitExpr::Literal(n)) => Some(*n as usize),
@@ -10738,7 +10777,10 @@ fn validate_locking_clause(stmt: &SelectStatement) -> Result<(), EngineError> {
     }
     // `FOR UPDATE OF t` must name a relation that is actually in FROM.
     for want in &lock.of_tables {
-        if !locking_from_names(stmt).iter().any(|n| n.eq_ignore_ascii_case(want)) {
+        if !locking_from_names(stmt)
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(want))
+        {
             return Err(EngineError::Unsupported(alloc::format!(
                 "relation \"{want}\" in {verb} clause not found in FROM clause"
             )));
@@ -11034,9 +11076,7 @@ fn expand_projection_srfs(
     let all_pure = projection
         .iter()
         .enumerate()
-        .all(|(i, p)| {
-            eval::fully_compilable(plan.rewritten[i].as_ref().unwrap_or(&p.expr))
-        })
+        .all(|(i, p)| eval::fully_compilable(plan.rewritten[i].as_ref().unwrap_or(&p.expr)))
         && plan.nodes.iter().all(|n| match n {
             Expr::FunctionCall { args, .. } => args.iter().all(eval::fully_compilable),
             other => eval::fully_compilable(other),
@@ -11629,7 +11669,6 @@ fn branch_unknown_mask(stmt: &SelectStatement) -> Vec<bool> {
         .collect()
 }
 
-
 /// v7.39 (round 233) — retype one branch column's cells, reporting the
 /// conversion failure the way PG does rather than leaving the column
 /// half-converted. Used when the other branch typed an untyped literal.
@@ -11667,10 +11706,7 @@ fn coerce_branch_column(
 /// * every outer column reference must resolve inside q's output list —
 ///   a name that does not is an ERROR today, and flattening would
 ///   silently legalise it against the base table.
-fn try_flatten_derived(
-    stmt: &SelectStatement,
-    primary: &TableRef,
-) -> Option<SelectStatement> {
+fn try_flatten_derived(stmt: &SelectStatement, primary: &TableRef) -> Option<SelectStatement> {
     use spg_sql::ast::SelectItem;
     let inner = primary.lateral_subquery.as_deref()?;
     // Outer shape.
@@ -11739,7 +11775,10 @@ fn try_flatten_derived(
         }
         let out_name = alias.clone().unwrap_or_else(|| c.name.clone());
         // A duplicated output name would make substitution ambiguous.
-        if map.insert(out_name.to_ascii_lowercase(), c.clone()).is_some() {
+        if map
+            .insert(out_name.to_ascii_lowercase(), c.clone())
+            .is_some()
+        {
             return None;
         }
     }
@@ -11837,10 +11876,7 @@ fn try_flatten_derived(
 /// ORDER BY is count-invariant and OFFSET k drops exactly min(k, n)
 /// rows. Admission mirrors the flatten's conservatism; a LIMIT, a
 /// DISTINCT, an SRF, or an unprovable inner shape stays put.
-fn try_count_over_offset(
-    stmt: &SelectStatement,
-    primary: &TableRef,
-) -> Option<SelectStatement> {
+fn try_count_over_offset(stmt: &SelectStatement, primary: &TableRef) -> Option<SelectStatement> {
     use spg_sql::ast::{Expr as E, LimitExpr, SelectItem};
     let inner = primary.lateral_subquery.as_deref()?;
     // Outer: exactly `SELECT count(*)`, nothing else.
@@ -11894,9 +11930,7 @@ fn try_count_over_offset(
                         args: alloc::vec![],
                     }),
                     op: spg_sql::ast::BinOp::Sub,
-                    rhs: alloc::boxed::Box::new(E::Literal(
-                        spg_sql::ast::Literal::Integer(k)
-                    )),
+                    rhs: alloc::boxed::Box::new(E::Literal(spg_sql::ast::Literal::Integer(k))),
                 },
                 E::Literal(spg_sql::ast::Literal::Integer(0)),
             ],
@@ -12011,7 +12045,11 @@ fn try_count_over_const_unnest(
     let SelectItem::Expr { expr: item, .. } = &inner.items[0] else {
         return None;
     };
-    let E::FunctionCall { name: fname, args: fargs } = item else {
+    let E::FunctionCall {
+        name: fname,
+        args: fargs,
+    } = item
+    else {
         return None;
     };
     if !fname.eq_ignore_ascii_case("unnest") || fargs.len() != 1 {

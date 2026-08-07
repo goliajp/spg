@@ -116,16 +116,28 @@ fn field_notation_on_a_domain_or_enum_names_the_type() {
 fn resolving_fields_and_pg_typeof_are_unchanged() {
     let mut e = fixture();
     assert_eq!(
-        one(&mut e, "SELECT (r).a FROM (SELECT ROW('x'::text,9)::rc9 AS r) s"),
+        one(
+            &mut e,
+            "SELECT (r).a FROM (SELECT ROW('x'::text,9)::rc9 AS r) s"
+        ),
         "x"
     );
     assert_eq!(
-        one(&mut e, "SELECT pg_typeof(r) FROM (SELECT ROW('x'::text,9)::rc9 AS r) s"),
+        one(
+            &mut e,
+            "SELECT pg_typeof(r) FROM (SELECT ROW('x'::text,9)::rc9 AS r) s"
+        ),
         "rc9"
     );
-    assert_eq!(one(&mut e, "SELECT pg_typeof(d) FROM (SELECT 5::pos9 AS d) s"), "pos9");
     assert_eq!(
-        one(&mut e, "SELECT pg_typeof(m) FROM (SELECT 'ok'::mood9 AS m) s"),
+        one(&mut e, "SELECT pg_typeof(d) FROM (SELECT 5::pos9 AS d) s"),
+        "pos9"
+    );
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT pg_typeof(m) FROM (SELECT 'ok'::mood9 AS m) s"
+        ),
         "mood9"
     );
 }
@@ -142,6 +154,9 @@ fn enum_member_ordering_still_holds_through_a_projection() {
     e.execute("INSERT INTO tm9 VALUES ('glad'),('sad'),('ok')")
         .unwrap();
     assert_eq!(one(&mut e, "SELECT m FROM tm9 ORDER BY m"), "sad");
-    assert_eq!(one(&mut e, "SELECT m FROM (SELECT m FROM tm9) s ORDER BY m"), "sad");
+    assert_eq!(
+        one(&mut e, "SELECT m FROM (SELECT m FROM tm9) s ORDER BY m"),
+        "sad"
+    );
     assert_eq!(one(&mut e, "SELECT min(m) FROM tm9"), "sad");
 }

@@ -75,20 +75,32 @@ fn seed() -> Engine {
 fn round597_any_all_three_valued_logic() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id, id = ANY (ARRAY[1,3,5]) FROM an ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, id = ANY (ARRAY[1,3,5]) FROM an ORDER BY id"
+        ),
         vec!["1|true", "2|false", "3|true", "4|false", "5|true"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, id = ANY (ARRAY[1,NULL,5]) FROM an ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, id = ANY (ARRAY[1,NULL,5]) FROM an ORDER BY id"
+        ),
         vec!["1|true", "2|NULL", "3|NULL", "4|NULL", "5|true"],
         "a NULL element makes a non-match NULL, not false"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, id <> ALL (ARRAY[1,3]) FROM an ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, id <> ALL (ARRAY[1,3]) FROM an ORDER BY id"
+        ),
         vec!["1|false", "2|true", "3|false", "4|true", "5|true"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, id <> ALL (ARRAY[1,NULL]) FROM an ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, id <> ALL (ARRAY[1,NULL]) FROM an ORDER BY id"
+        ),
         vec!["1|false", "2|NULL", "3|NULL", "4|NULL", "5|NULL"],
         "NOT IN semantics: only a positive match escapes the NULL"
     );
@@ -138,7 +150,10 @@ fn round597_any_all_three_valued_logic() {
 fn round597_element_types_and_spellings() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id, s = ANY (ARRAY['a','d']) FROM an ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, s = ANY (ARRAY['a','d']) FROM an ORDER BY id"
+        ),
         vec!["1|true", "2|false", "3|NULL", "4|true", "5|false"]
     );
     assert_eq!(
@@ -163,12 +178,18 @@ fn round597_element_types_and_spellings() {
         vec!["2", "4"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, id = ANY ('{1,3}'::INT[]) FROM an ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, id = ANY ('{1,3}'::INT[]) FROM an ORDER BY id"
+        ),
         vec!["1|true", "2|false", "3|true", "4|false", "5|false"],
         "the elements live in a string here, so this keeps the folded-array path"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, id = ANY (ARRAY[2,2,2]) FROM an ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, id = ANY (ARRAY[2,2,2]) FROM an ORDER BY id"
+        ),
         vec!["1|false", "2|true", "3|false", "4|false", "5|false"],
         "duplicates collapse into the set without changing the answer"
     );
@@ -214,12 +235,18 @@ fn round597_other_operators() {
 fn round597_non_constant_arrays_keep_the_interpreter() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id FROM an WHERE id = ANY (ARRAY[id, 1]) ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id FROM an WHERE id = ANY (ARRAY[id, 1]) ORDER BY id"
+        ),
         vec!["1", "2", "3", "4", "5"],
         "the array names the row's own column"
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM an WHERE id = ANY (ARRAY[b, b+1])"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM an WHERE id = ANY (ARRAY[b, b+1])"
+        ),
         vec!["4"]
     );
 }
@@ -230,15 +257,24 @@ fn round597_non_constant_arrays_keep_the_interpreter() {
 fn round597_filters_and_scale() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id FROM an WHERE id = ANY (ARRAY[2,4]) ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id FROM an WHERE id = ANY (ARRAY[2,4]) ORDER BY id"
+        ),
         vec!["2", "4"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM an WHERE NOT (id = ANY (ARRAY[2,4])) ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id FROM an WHERE NOT (id = ANY (ARRAY[2,4])) ORDER BY id"
+        ),
         vec!["1", "3", "5"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM an WHERE id <> ALL (ARRAY[2,4]) ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id FROM an WHERE id <> ALL (ARRAY[2,4]) ORDER BY id"
+        ),
         vec!["1", "3", "5"]
     );
     assert_eq!(
@@ -258,7 +294,10 @@ fn round597_filters_and_scale() {
             &mut e2,
             "SELECT count(*) FROM big WHERE id = ANY (ARRAY[1,2,3,4,5,6,7,8,9,10])"
         ),
-        vals(&mut e2, "SELECT count(*) FROM big WHERE id IN (1,2,3,4,5,6,7,8,9,10)")
+        vals(
+            &mut e2,
+            "SELECT count(*) FROM big WHERE id IN (1,2,3,4,5,6,7,8,9,10)"
+        )
     );
     assert_eq!(
         vals(

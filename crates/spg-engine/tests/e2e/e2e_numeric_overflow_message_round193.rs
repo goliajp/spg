@@ -41,8 +41,7 @@ fn column_assignment_overflow_same_shape() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("numeric field overflow")
-            && err.contains("precision 4, scale 1"),
+        err.contains("numeric field overflow") && err.contains("precision 4, scale 1"),
         "{err}"
     );
 }

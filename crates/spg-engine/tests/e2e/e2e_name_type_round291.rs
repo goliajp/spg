@@ -41,7 +41,10 @@ fn a_name_column_can_be_declared() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE nmt (a name)").unwrap();
     e.execute("INSERT INTO nmt VALUES ('hello')").unwrap();
-    assert_eq!(one(&mut e, "SELECT a, pg_typeof(a), length(a) FROM nmt"), "hello|name|5");
+    assert_eq!(
+        one(&mut e, "SELECT a, pg_typeof(a), length(a) FROM nmt"),
+        "hello|name|5"
+    );
 }
 
 #[test]
@@ -60,7 +63,10 @@ fn it_compares_and_concatenates_as_text_does() {
     assert_eq!(one(&mut e, "SELECT 'Abc'::name = 'abc'::name"), "false");
     assert_eq!(one(&mut e, "SELECT 'abc'::name || 'def'"), "abcdef");
     // Concatenation yields text, not name — PG's operator resolution.
-    assert_eq!(one(&mut e, "SELECT pg_typeof('abc'::name || 'def')"), "text");
+    assert_eq!(
+        one(&mut e, "SELECT pg_typeof('abc'::name || 'def')"),
+        "text"
+    );
     assert_eq!(one(&mut e, "SELECT pg_typeof(upper('abc'::name))"), "text");
 }
 
@@ -70,7 +76,8 @@ fn it_truncates_at_namedatalen_minus_one() {
     assert_eq!(one(&mut e, "SELECT length(repeat('x', 100)::name)"), "63");
     // …and a column truncates on the way in, silently, as PG does.
     e.execute("CREATE TABLE nmt2 (a name)").unwrap();
-    e.execute("INSERT INTO nmt2 SELECT repeat('y', 100)").unwrap();
+    e.execute("INSERT INTO nmt2 SELECT repeat('y', 100)")
+        .unwrap();
     assert_eq!(one(&mut e, "SELECT length(a) FROM nmt2"), "63");
 }
 

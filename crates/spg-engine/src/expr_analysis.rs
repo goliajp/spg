@@ -40,7 +40,10 @@ pub(crate) fn select_refers_to(stmt: &SelectStatement, target: &str) -> bool {
 
 pub(crate) fn from_refers_to(from: &FromClause, target: &str) -> bool {
     table_ref_refers_to(&from.primary, target)
-        || from.joins.iter().any(|j| table_ref_refers_to(&j.table, target))
+        || from
+            .joins
+            .iter()
+            .any(|j| table_ref_refers_to(&j.table, target))
 }
 
 /// v7.39 (round 186) — a derived / lateral subquery can carry the

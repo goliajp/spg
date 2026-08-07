@@ -73,12 +73,12 @@ fn round509_an_unknown_cast_target_errors_even_for_null() {
 fn round509_every_real_type_name_still_casts_null() {
     let mut e = engine();
     for sql in [
-        "SELECT NULL::int4",            // the builtin table
-        "SELECT NULL::timestamp(3)",    // a temporal precision
-        "SELECT NULL::bit(4)",          // a bit width
-        "SELECT NULL::anyarray",        // a pseudotype
-        "SELECT NULL::record",          // the anonymous composite
-        "SELECT NULL::pr",              // a table's row type
+        "SELECT NULL::int4",         // the builtin table
+        "SELECT NULL::timestamp(3)", // a temporal precision
+        "SELECT NULL::bit(4)",       // a bit width
+        "SELECT NULL::anyarray",     // a pseudotype
+        "SELECT NULL::record",       // the anonymous composite
+        "SELECT NULL::pr",           // a table's row type
     ] {
         assert_eq!(text(&mut e, sql), "NULL", "{sql}");
     }

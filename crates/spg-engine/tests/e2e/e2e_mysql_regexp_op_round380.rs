@@ -46,7 +46,10 @@ fn regexp_and_rlike_match() {
     let mut e = mysql();
     assert_eq!(scalar(&mut e, "SELECT 'abc' REGEXP 'b'"), Value::Bool(true));
     assert_eq!(scalar(&mut e, "SELECT 'abc' RLIKE '^a'"), Value::Bool(true));
-    assert_eq!(scalar(&mut e, "SELECT 'abc' REGEXP 'z'"), Value::Bool(false));
+    assert_eq!(
+        scalar(&mut e, "SELECT 'abc' REGEXP 'z'"),
+        Value::Bool(false)
+    );
     // Case-insensitive under the default collation.
     assert_eq!(
         scalar(&mut e, "SELECT 'ABC' REGEXP 'abc'"),
@@ -75,8 +78,14 @@ fn regexp_in_where() {
     e.execute("CREATE TABLE t (s VARCHAR(20))").unwrap();
     e.execute("INSERT INTO t VALUES ('apple'), ('banana'), ('cherry')")
         .unwrap();
-    assert_eq!(count(&mut e, "SELECT COUNT(*) FROM t WHERE s REGEXP 'an'"), 1);
-    assert_eq!(count(&mut e, "SELECT COUNT(*) FROM t WHERE s REGEXP 'e'"), 2);
+    assert_eq!(
+        count(&mut e, "SELECT COUNT(*) FROM t WHERE s REGEXP 'an'"),
+        1
+    );
+    assert_eq!(
+        count(&mut e, "SELECT COUNT(*) FROM t WHERE s REGEXP 'e'"),
+        2
+    );
     assert_eq!(
         count(&mut e, "SELECT COUNT(*) FROM t WHERE s NOT RLIKE 'a'"),
         1

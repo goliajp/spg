@@ -26,7 +26,8 @@ use spg_engine::{Engine, QueryResult};
 
 fn seeded() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TYPE mp AS ENUM ('sad','ok','happy')").unwrap();
+    e.execute("CREATE TYPE mp AS ENUM ('sad','ok','happy')")
+        .unwrap();
     e.execute("CREATE TABLE ep (id int, m mp)").unwrap();
     e.execute("INSERT INTO ep VALUES (1,'happy'),(2,'sad'),(3,'ok'),(4,'ok')")
         .unwrap();
@@ -61,9 +62,15 @@ fn pg_typeof_names_the_enum_not_its_label_type() {
     assert_eq!(one(&mut e, "SELECT pg_typeof('ok'::mp)"), "mp");
     assert_eq!(one(&mut e, "SELECT pg_typeof(ARRAY['ok'::mp])"), "mp[]");
     // Through a derived table too.
-    assert_eq!(one(&mut e, "SELECT pg_typeof(x) FROM (SELECT 'ok'::mp AS x) t"), "mp");
     assert_eq!(
-        one(&mut e, "SELECT pg_typeof(m) FROM (VALUES ('happy'::mp)) t(m)"),
+        one(&mut e, "SELECT pg_typeof(x) FROM (SELECT 'ok'::mp AS x) t"),
+        "mp"
+    );
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT pg_typeof(m) FROM (VALUES ('happy'::mp)) t(m)"
+        ),
         "mp"
     );
 }
@@ -74,15 +81,24 @@ fn a_derived_table_keeps_member_order() {
     // These all sorted by LABEL before: happy < ok < sad alphabetically,
     // where the member order is sad < ok < happy.
     assert_eq!(
-        col(&mut e, "SELECT m FROM (VALUES ('happy'::mp),('sad'::mp)) t(m) ORDER BY m"),
+        col(
+            &mut e,
+            "SELECT m FROM (VALUES ('happy'::mp),('sad'::mp)) t(m) ORDER BY m"
+        ),
         ["sad", "happy"]
     );
     assert_eq!(
-        one(&mut e, "SELECT max(m) FROM (VALUES ('sad'::mp),('happy'::mp)) t(m)"),
+        one(
+            &mut e,
+            "SELECT max(m) FROM (VALUES ('sad'::mp),('happy'::mp)) t(m)"
+        ),
         "happy"
     );
     assert_eq!(
-        one(&mut e, "SELECT min(m) FROM (VALUES ('ok'::mp),('happy'::mp)) t(m)"),
+        one(
+            &mut e,
+            "SELECT min(m) FROM (VALUES ('ok'::mp),('happy'::mp)) t(m)"
+        ),
         "ok"
     );
     assert_eq!(
@@ -106,7 +122,10 @@ fn a_derived_table_keeps_member_order() {
 fn distinct_aggregates_sort_by_member_order() {
     let mut e = seeded();
     // Round 257's DISTINCT sort regressed this to text order.
-    assert_eq!(one(&mut e, "SELECT array_agg(DISTINCT m) FROM ep"), "{sad,ok,happy}");
+    assert_eq!(
+        one(&mut e, "SELECT array_agg(DISTINCT m) FROM ep"),
+        "{sad,ok,happy}"
+    );
     // A DISTINCT aggregate over the LABELS is a text sort, as PG has it.
     assert_eq!(
         one(&mut e, "SELECT string_agg(DISTINCT m::text, ',') FROM ep"),
@@ -126,11 +145,17 @@ fn the_enum_core_is_unchanged() {
         ("SELECT 'ok'::mp::text", "ok"),
         ("SELECT max(m) FROM ep", "happy"),
         ("SELECT min(m) FROM ep", "sad"),
-        ("SELECT array_agg(m ORDER BY m) FROM ep", "{sad,ok,ok,happy}"),
+        (
+            "SELECT array_agg(m ORDER BY m) FROM ep",
+            "{sad,ok,ok,happy}",
+        ),
     ] {
         assert_eq!(one(&mut e, sql), want, "{sql}");
     }
-    assert_eq!(col(&mut e, "SELECT m FROM ep ORDER BY m"), ["sad", "ok", "ok", "happy"]);
+    assert_eq!(
+        col(&mut e, "SELECT m FROM ep ORDER BY m"),
+        ["sad", "ok", "ok", "happy"]
+    );
     // An unknown label is refused.
     assert!(e.execute("SELECT 'nope'::mp").is_err());
 }

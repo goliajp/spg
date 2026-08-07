@@ -103,9 +103,15 @@ fn round665_count_still_answers_from_inside_the_struct() {
     assert_eq!(one(&mut e, "SELECT count(*) FROM acc"), "3");
     assert_eq!(one(&mut e, "SELECT count(i) FROM acc"), "3");
     assert_eq!(one(&mut e, "SELECT count(DISTINCT g) FROM acc"), "2");
-    assert_eq!(one(&mut e, "SELECT avg(i) FROM acc"), "200.0000000000000000");
     assert_eq!(
-        one(&mut e, "SELECT g, count(*), avg(i) FROM acc GROUP BY g ORDER BY g"),
+        one(&mut e, "SELECT avg(i) FROM acc"),
+        "200.0000000000000000"
+    );
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT g, count(*), avg(i) FROM acc GROUP BY g ORDER BY g"
+        ),
         "1|2|150.0000000000000000,2|1|300.0000000000000000"
     );
     // NULLs are skipped by count(col) but not count(*) — the two read the
@@ -123,7 +129,10 @@ fn round665_the_length_shortcut_still_takes_its_own_path() {
     seed(&mut e);
     assert_eq!(one(&mut e, "SELECT sum(length(t)) FROM acc"), "12");
     assert_eq!(
-        one(&mut e, "SELECT g, sum(length(t)) FROM acc GROUP BY g ORDER BY g"),
+        one(
+            &mut e,
+            "SELECT g, sum(length(t)) FROM acc GROUP BY g ORDER BY g"
+        ),
         "1|6,2|6"
     );
     // Fused beside a numeric sum, so both loops run over one scan.

@@ -2258,7 +2258,7 @@ fn apply_jsonpath_mode(
                         }
                         _ => {
                             return err(
-                                "jsonpath array accessor can only be applied to an array".into(),
+                                "jsonpath array accessor can only be applied to an array".into()
                             );
                         }
                     },
@@ -2273,7 +2273,7 @@ fn apply_jsonpath_mode(
                         }
                         _ => {
                             return err(
-                                "jsonpath array accessor can only be applied to an array".into(),
+                                "jsonpath array accessor can only be applied to an array".into()
                             );
                         }
                     },
@@ -2476,7 +2476,10 @@ pub fn parse_path_vars(v: &Value) -> Result<Option<JsonValue>, EvalError> {
             Ok(Some(parsed))
         }
         other => Err(EvalError::TypeMismatch {
-            detail: alloc::format!("jsonpath vars must be jsonb, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+            detail: alloc::format!(
+                "jsonpath vars must be jsonb, got {}",
+                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+            ),
         }),
     }
 }
@@ -4688,10 +4691,34 @@ mod round619_number_fast_path {
         let mut cases: Vec<String> = Vec::new();
         for sign in ["", "-"] {
             for body in [
-                "0", "1", "7", "10", "123", "0123", "00", "000", "9223372036854775807",
-                "170141183460469231731687303715884105727", "1.0", "1.5", "0.5", ".5", "1.",
-                "1e3", "1E3", "1e-3", "1.5e2", "1.50", "100", "0.0", "0.00", "10.010",
-                "1e0", "1e+3", "0e0", "12345678901234567890.12345678901234567890",
+                "0",
+                "1",
+                "7",
+                "10",
+                "123",
+                "0123",
+                "00",
+                "000",
+                "9223372036854775807",
+                "170141183460469231731687303715884105727",
+                "1.0",
+                "1.5",
+                "0.5",
+                ".5",
+                "1.",
+                "1e3",
+                "1E3",
+                "1e-3",
+                "1.5e2",
+                "1.50",
+                "100",
+                "0.0",
+                "0.00",
+                "10.010",
+                "1e0",
+                "1e+3",
+                "0e0",
+                "12345678901234567890.12345678901234567890",
             ] {
                 cases.push(alloc::format!("{sign}{body}"));
             }
@@ -4728,5 +4755,4 @@ mod round619_number_fast_path {
             assert_eq!(fast, general, "{src}");
         }
     }
-
 }

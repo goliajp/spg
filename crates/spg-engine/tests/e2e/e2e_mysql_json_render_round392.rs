@@ -31,15 +31,27 @@ fn json(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn set_insert_replace() {
     let mut e = mysql();
-    assert_eq!(json(&mut e, r#"SELECT JSON_SET('{"a":1}','$.b',2)"#), r#"{"a": 1, "b": 2}"#);
-    assert_eq!(json(&mut e, r#"SELECT JSON_INSERT('{"a":1}','$.b',2)"#), r#"{"a": 1, "b": 2}"#);
-    assert_eq!(json(&mut e, r#"SELECT JSON_REPLACE('{"a":1}','$.a',9)"#), r#"{"a": 9}"#);
+    assert_eq!(
+        json(&mut e, r#"SELECT JSON_SET('{"a":1}','$.b',2)"#),
+        r#"{"a": 1, "b": 2}"#
+    );
+    assert_eq!(
+        json(&mut e, r#"SELECT JSON_INSERT('{"a":1}','$.b',2)"#),
+        r#"{"a": 1, "b": 2}"#
+    );
+    assert_eq!(
+        json(&mut e, r#"SELECT JSON_REPLACE('{"a":1}','$.a',9)"#),
+        r#"{"a": 9}"#
+    );
 }
 
 #[test]
 fn remove() {
     let mut e = mysql();
-    assert_eq!(json(&mut e, r#"SELECT JSON_REMOVE('{"a":1,"b":2}','$.a')"#), r#"{"b": 2}"#);
+    assert_eq!(
+        json(&mut e, r#"SELECT JSON_REMOVE('{"a":1,"b":2}','$.a')"#),
+        r#"{"b": 2}"#
+    );
 }
 
 #[test]
@@ -58,8 +70,14 @@ fn merge() {
 #[test]
 fn array_append_insert() {
     let mut e = mysql();
-    assert_eq!(json(&mut e, r#"SELECT JSON_ARRAY_APPEND('[1,2]','$',3)"#), "[1, 2, 3]");
-    assert_eq!(json(&mut e, r#"SELECT JSON_ARRAY_INSERT('[1,2]','$[0]',9)"#), "[9, 1, 2]");
+    assert_eq!(
+        json(&mut e, r#"SELECT JSON_ARRAY_APPEND('[1,2]','$',3)"#),
+        "[1, 2, 3]"
+    );
+    assert_eq!(
+        json(&mut e, r#"SELECT JSON_ARRAY_INSERT('[1,2]','$[0]',9)"#),
+        "[9, 1, 2]"
+    );
 }
 
 /// A nested document keeps the spacing at every level.
@@ -67,7 +85,10 @@ fn array_append_insert() {
 fn nested() {
     let mut e = mysql();
     assert_eq!(
-        json(&mut e, r#"SELECT JSON_REPLACE('{"a":1,"c":{"d":3}}','$.a',9)"#),
+        json(
+            &mut e,
+            r#"SELECT JSON_REPLACE('{"a":1,"c":{"d":3}}','$.a',9)"#
+        ),
         r#"{"a": 9, "c": {"d": 3}}"#
     );
 }

@@ -47,8 +47,10 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE za (id INT, g INT, s TEXT)").unwrap();
-    e.execute("CREATE TABLE zb (id INT, g INT, s TEXT)").unwrap();
+    e.execute("CREATE TABLE za (id INT, g INT, s TEXT)")
+        .unwrap();
+    e.execute("CREATE TABLE zb (id INT, g INT, s TEXT)")
+        .unwrap();
     // za rows 3 and 5 have a NULL correlation key; row 4 has a non-NULL key
     // that matches nothing, which is the case that was always right.
     e.execute("INSERT INTO za VALUES (1,10,'a'),(2,20,'b'),(3,NULL,NULL),(4,99,'z'),(5,NULL,'q')")
@@ -65,26 +67,41 @@ fn seed() -> Engine {
 fn round620_count_over_a_null_key_is_zero() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT a.id, (SELECT count(*) FROM zb b WHERE b.g = a.g) FROM za a ORDER BY a.id"),
+        vals(
+            &mut e,
+            "SELECT a.id, (SELECT count(*) FROM zb b WHERE b.g = a.g) FROM za a ORDER BY a.id"
+        ),
         vec!["1|2", "2|1", "3|0", "4|0", "5|0"],
         "rows 3 and 5 have a NULL key: the empty set, so 0 — NOT the two \
          NULL-keyed rows sitting in zb, and NOT NULL"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, (SELECT count(b.id) FROM zb b WHERE b.g = a.g) FROM za a ORDER BY a.id"),
+        vals(
+            &mut e,
+            "SELECT a.id, (SELECT count(b.id) FROM zb b WHERE b.g = a.g) FROM za a ORDER BY a.id"
+        ),
         vec!["1|2", "2|1", "3|0", "4|0", "5|0"],
         "count(col) has the same empty-set value as count(*)"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, (SELECT count(b.s) FROM zb b WHERE b.g = a.g) FROM za a ORDER BY a.id"),
+        vals(
+            &mut e,
+            "SELECT a.id, (SELECT count(b.s) FROM zb b WHERE b.g = a.g) FROM za a ORDER BY a.id"
+        ),
         vec!["1|2", "2|1", "3|0", "4|0", "5|0"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, (SELECT count(DISTINCT b.g) FROM zb b WHERE b.g = a.g) FROM za a ORDER BY a.id"),
+        vals(
+            &mut e,
+            "SELECT a.id, (SELECT count(DISTINCT b.g) FROM zb b WHERE b.g = a.g) FROM za a ORDER BY a.id"
+        ),
         vec!["1|1", "2|1", "3|0", "4|0", "5|0"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, (SELECT count(*) FROM zb b WHERE b.g = a.g AND b.id > 0) FROM za a ORDER BY a.id"),
+        vals(
+            &mut e,
+            "SELECT a.id, (SELECT count(*) FROM zb b WHERE b.g = a.g AND b.id > 0) FROM za a ORDER BY a.id"
+        ),
         vec!["1|2", "2|1", "3|0", "4|0", "5|0"],
         "a correlated key beside an uncorrelated filter"
     );
@@ -96,19 +113,31 @@ fn round620_count_over_a_null_key_is_zero() {
 fn round620_other_aggregates_still_answer_null() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT a.id, (SELECT sum(b.id) FROM zb b WHERE b.g = a.g) FROM za a ORDER BY a.id"),
+        vals(
+            &mut e,
+            "SELECT a.id, (SELECT sum(b.id) FROM zb b WHERE b.g = a.g) FROM za a ORDER BY a.id"
+        ),
         vec!["1|3", "2|3", "3|NULL", "4|NULL", "5|NULL"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, (SELECT min(b.id) FROM zb b WHERE b.g = a.g) FROM za a ORDER BY a.id"),
+        vals(
+            &mut e,
+            "SELECT a.id, (SELECT min(b.id) FROM zb b WHERE b.g = a.g) FROM za a ORDER BY a.id"
+        ),
         vec!["1|1", "2|3", "3|NULL", "4|NULL", "5|NULL"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, (SELECT max(b.id) FROM zb b WHERE b.g = a.g) FROM za a ORDER BY a.id"),
+        vals(
+            &mut e,
+            "SELECT a.id, (SELECT max(b.id) FROM zb b WHERE b.g = a.g) FROM za a ORDER BY a.id"
+        ),
         vec!["1|2", "2|3", "3|NULL", "4|NULL", "5|NULL"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, (SELECT string_agg(b.s, ',') FROM zb b WHERE b.g = a.g) FROM za a ORDER BY a.id"),
+        vals(
+            &mut e,
+            "SELECT a.id, (SELECT string_agg(b.s, ',') FROM zb b WHERE b.g = a.g) FROM za a ORDER BY a.id"
+        ),
         vec!["1|a,a", "2|x", "3|NULL", "4|NULL", "5|NULL"]
     );
 }
@@ -119,17 +148,26 @@ fn round620_other_aggregates_still_answer_null() {
 fn round620_key_shapes() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT a.id, (SELECT count(*) FROM zb b WHERE b.s = a.s) FROM za a ORDER BY a.id"),
+        vals(
+            &mut e,
+            "SELECT a.id, (SELECT count(*) FROM zb b WHERE b.s = a.s) FROM za a ORDER BY a.id"
+        ),
         vec!["1|2", "2|0", "3|0", "4|0", "5|0"],
         "a text key — row 3's is NULL, and zb has a NULL-s row too"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, (SELECT count(*) FROM zb b WHERE b.g = a.g + 0) FROM za a ORDER BY a.id"),
+        vals(
+            &mut e,
+            "SELECT a.id, (SELECT count(*) FROM zb b WHERE b.g = a.g + 0) FROM za a ORDER BY a.id"
+        ),
         vec!["1|2", "2|1", "3|0", "4|0", "5|0"],
         "a computed key, which stays NULL through the arithmetic"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, (SELECT count(*) FROM zb b WHERE b.id = a.g) FROM za a ORDER BY a.id"),
+        vals(
+            &mut e,
+            "SELECT a.id, (SELECT count(*) FROM zb b WHERE b.id = a.g) FROM za a ORDER BY a.id"
+        ),
         vec!["1|0", "2|0", "3|0", "4|0", "5|0"],
         "a key that matches nothing for any row — NULL and non-NULL alike"
     );
@@ -140,24 +178,36 @@ fn round620_key_shapes() {
 fn round620_what_the_value_feeds() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT a.id, coalesce((SELECT count(*) FROM zb b WHERE b.g = a.g), -1) FROM za a ORDER BY a.id"),
+        vals(
+            &mut e,
+            "SELECT a.id, coalesce((SELECT count(*) FROM zb b WHERE b.g = a.g), -1) FROM za a ORDER BY a.id"
+        ),
         vec!["1|2", "2|1", "3|0", "4|0", "5|0"],
         "a COALESCE around it never fires now — the -1 was the workaround the \
          bug forced on callers"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id FROM za a WHERE (SELECT count(*) FROM zb b WHERE b.g = a.g) = 0 ORDER BY a.id"),
+        vals(
+            &mut e,
+            "SELECT a.id FROM za a WHERE (SELECT count(*) FROM zb b WHERE b.g = a.g) = 0 ORDER BY a.id"
+        ),
         vec!["3", "4", "5"],
         "in a predicate: NULL = 0 is unknown, so rows 3 and 5 used to be \
          dropped from this result entirely"
     );
     assert_eq!(
-        vals(&mut e, "SELECT a.id, (SELECT count(*) FROM zb b WHERE b.g = a.g) + 100 FROM za a ORDER BY a.id"),
+        vals(
+            &mut e,
+            "SELECT a.id, (SELECT count(*) FROM zb b WHERE b.g = a.g) + 100 FROM za a ORDER BY a.id"
+        ),
         vec!["1|102", "2|101", "3|100", "4|100", "5|100"],
         "in arithmetic, where a NULL used to poison the whole expression"
     );
     assert_eq!(
-        vals(&mut e, "SELECT sum((SELECT count(*) FROM zb b WHERE b.g = a.g)) FROM za a"),
+        vals(
+            &mut e,
+            "SELECT sum((SELECT count(*) FROM zb b WHERE b.g = a.g)) FROM za a"
+        ),
         vec!["3"],
         "and under an outer aggregate"
     );

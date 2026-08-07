@@ -542,8 +542,16 @@ fn the_ok_packet_reports_the_transaction_state() {
 
     // ROLLBACK closes it the same way.
     assert_eq!(status_of(&mut s, "BEGIN"), AUTOCOMMIT | IN_TRANS);
-    assert_eq!(status_of(&mut s, "ROLLBACK"), AUTOCOMMIT, "ROLLBACK clears it");
-    assert_eq!(status_of_select(&mut s, "SELECT 1"), AUTOCOMMIT, "idle again");
+    assert_eq!(
+        status_of(&mut s, "ROLLBACK"),
+        AUTOCOMMIT,
+        "ROLLBACK clears it"
+    );
+    assert_eq!(
+        status_of_select(&mut s, "SELECT 1"),
+        AUTOCOMMIT,
+        "idle again"
+    );
 }
 
 /// A result set's terminating packet carries the flags too — measured
@@ -577,7 +585,11 @@ fn com_ping_reports_the_transaction_state() {
     exec_ok(&mut s, "BEGIN");
     write_packet(&mut s, 0, &[0x0e]);
     let (_seq, pkt) = read_packet(&mut s);
-    assert_eq!(ok_status(&pkt), AUTOCOMMIT | IN_TRANS, "ping inside a block");
+    assert_eq!(
+        ok_status(&pkt),
+        AUTOCOMMIT | IN_TRANS,
+        "ping inside a block"
+    );
     exec_ok(&mut s, "ROLLBACK");
 }
 
@@ -607,7 +619,10 @@ fn auth_open_mode_with_id(addr: &str) -> (TcpStream, u32) {
     let (_seqno, greeting) = read_packet(&mut s);
     // HandshakeV10: protocol_version(1) + server_version NUL-string +
     // connection_id (4, LE).
-    let nul = 1 + greeting[1..].iter().position(|&b| b == 0).expect("version NUL");
+    let nul = 1 + greeting[1..]
+        .iter()
+        .position(|&b| b == 0)
+        .expect("version NUL");
     let idpos = nul + 1;
     let conn_id = u32::from_le_bytes(greeting[idpos..idpos + 4].try_into().unwrap());
     write_packet(&mut s, 1, &build_handshake_response("anyone"));
@@ -705,13 +720,21 @@ fn show_processlist_lists_the_live_connections() {
     let a_row = find(a_id);
     let b_row = find(b_id);
 
-    assert_eq!(a_row[4].as_deref(), Some("Query"), "the asker is running one");
+    assert_eq!(
+        a_row[4].as_deref(),
+        Some("Query"),
+        "the asker is running one"
+    );
     assert_eq!(
         a_row[7].as_deref(),
         Some("SHOW PROCESSLIST"),
         "its own Info is the statement it is running"
     );
-    assert_eq!(b_row[4].as_deref(), Some("Sleep"), "B is between statements");
+    assert_eq!(
+        b_row[4].as_deref(),
+        Some("Sleep"),
+        "B is between statements"
+    );
     assert_eq!(b_row[7], None, "an idle connection has no Info");
 }
 
@@ -846,9 +869,7 @@ fn kill_of_your_own_connection_reports_1927_and_closes() {
         use std::io::Write;
         let payload = [0x03, b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1'];
         let hdr = [payload.len() as u8, 0, 0, 0];
-        let wrote = s
-            .write_all(&hdr)
-            .and_then(|()| s.write_all(&payload));
+        let wrote = s.write_all(&hdr).and_then(|()| s.write_all(&payload));
         if wrote.is_ok() {
             let mut hdr = [0u8; 4];
             assert!(
@@ -1010,7 +1031,11 @@ fn the_status_flags_drop_autocommit_when_it_is_off() {
     let (_guard, addr) = spawn();
     let mut s = auth_open_mode(&addr);
     assert_eq!(status_of_select(&mut s, "SELECT 1"), AUTOCOMMIT);
-    assert_eq!(status_of(&mut s, "SET autocommit=0"), 0, "the bit is cleared");
+    assert_eq!(
+        status_of(&mut s, "SET autocommit=0"),
+        0,
+        "the bit is cleared"
+    );
     exec_ok(&mut s, "CREATE TABLE ac2 (id INT NOT NULL)");
     // Inside the implicit block the transaction bit is on and AUTOCOMMIT
     // stays off.

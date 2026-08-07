@@ -79,7 +79,10 @@ fn basic_and_defaults() {
 fn explicit_default_keyword() {
     let mut e = seeded();
     e.execute("INSERT INTO t SET a = DEFAULT, b = 'z'").unwrap();
-    assert_eq!(row(&mut e, "SELECT a, b FROM t WHERE b = 'z'"), vec!["7", "z"]);
+    assert_eq!(
+        row(&mut e, "SELECT a, b FROM t WHERE b = 'z'"),
+        vec!["7", "z"]
+    );
 }
 
 /// Values may be arbitrary expressions.
@@ -98,17 +101,23 @@ fn expression_values() {
 #[test]
 fn composes_with_upsert_forms() {
     let mut e = seeded();
-    e.execute("INSERT INTO t SET id = 1, a = 1, b = 'x'").unwrap();
+    e.execute("INSERT INTO t SET id = 1, a = 1, b = 'x'")
+        .unwrap();
     // ON DUPLICATE KEY UPDATE
     e.execute("INSERT INTO t SET id = 1, a = 99 ON DUPLICATE KEY UPDATE a = 99")
         .unwrap();
     assert_eq!(row(&mut e, "SELECT a FROM t WHERE id = 1"), vec!["99"]);
     // IGNORE skips the conflicting row.
-    e.execute("INSERT IGNORE INTO t SET id = 1, a = 1000").unwrap();
+    e.execute("INSERT IGNORE INTO t SET id = 1, a = 1000")
+        .unwrap();
     assert_eq!(row(&mut e, "SELECT a FROM t WHERE id = 1"), vec!["99"]);
     // REPLACE takes the incoming row.
-    e.execute("REPLACE INTO t SET id = 1, a = 5, b = 'r'").unwrap();
-    assert_eq!(row(&mut e, "SELECT a, b FROM t WHERE id = 1"), vec!["5", "r"]);
+    e.execute("REPLACE INTO t SET id = 1, a = 5, b = 'r'")
+        .unwrap();
+    assert_eq!(
+        row(&mut e, "SELECT a, b FROM t WHERE id = 1"),
+        vec!["5", "r"]
+    );
 }
 
 /// AUTO_INCREMENT / LAST_INSERT_ID behave as they do for the VALUES form.
@@ -124,7 +133,8 @@ fn last_insert_id_tracks() {
 #[test]
 fn row_count_and_returning() {
     let mut e = mysql();
-    e.execute("CREATE TABLE t(id INT PRIMARY KEY, a INT)").unwrap();
+    e.execute("CREATE TABLE t(id INT PRIMARY KEY, a INT)")
+        .unwrap();
     e.execute("INSERT INTO t SET id = 1, a = 10").unwrap();
     assert_eq!(row_count(&mut e), 1);
     // Conflict that changes nothing -> 0.
@@ -137,14 +147,18 @@ fn row_count_and_returning() {
     assert_eq!(row_count(&mut e), 2);
     // RETURNING works on the SET form too.
     e.execute("CREATE TABLE s(v INT)").unwrap();
-    assert_eq!(row(&mut e, "INSERT INTO s SET v = 5 RETURNING v"), vec!["5"]);
+    assert_eq!(
+        row(&mut e, "INSERT INTO s SET v = 5 RETURNING v"),
+        vec!["5"]
+    );
 }
 
 /// A PostgreSQL session has no SET-form INSERT.
 #[test]
 fn postgres_rejects() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t(id INT PRIMARY KEY, a INT)").unwrap();
+    e.execute("CREATE TABLE t(id INT PRIMARY KEY, a INT)")
+        .unwrap();
     assert!(
         e.execute("INSERT INTO t SET id = 1, a = 10").is_err(),
         "PG has no SET-form INSERT"

@@ -149,7 +149,10 @@ fn a_script_that_fails_halfway_leaves_nothing_behind() {
         &mut s,
         "INSERT INTO t VALUES (1); INSERT INTO t VALUES (1);",
     );
-    assert!(sqlstate(&msgs).is_some(), "the second insert violates the key");
+    assert!(
+        sqlstate(&msgs).is_some(),
+        "the second insert violates the key"
+    );
 
     assert_eq!(
         one_value(&mut s, "SELECT count(*) FROM t"),

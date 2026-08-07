@@ -124,9 +124,15 @@ fn the_named_composite_forms_still_work() {
     // placed ahead of the catalog lookups would have swallowed these.
     let mut e = fixture();
     assert_eq!(one(&mut e, "SELECT (ROW('a'::text,1)::rc9).a"), "a");
-    assert_eq!(one(&mut e, "SELECT pg_typeof(ROW('a'::text,1)::rc9)"), "rc9");
     assert_eq!(
-        one(&mut e, "SELECT (r).a, (r).b FROM (SELECT ROW('x'::text,9)::rc9 AS r) s"),
+        one(&mut e, "SELECT pg_typeof(ROW('a'::text,1)::rc9)"),
+        "rc9"
+    );
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT (r).a, (r).b FROM (SELECT ROW('x'::text,9)::rc9 AS r) s"
+        ),
         "x|9",
     );
     assert_eq!(

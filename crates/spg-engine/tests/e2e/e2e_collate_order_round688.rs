@@ -59,7 +59,11 @@ const BYTES: &str = "Banana,Zebra,_under,apple,cherry,Ápple";
 fn round688_every_ordinary_shape_honours_the_collation() {
     let mut e = Engine::new();
     seed(&mut e);
-    assert_eq!(rows(&mut e, "SELECT loc FROM pa ORDER BY loc"), EN_US, "scan");
+    assert_eq!(
+        rows(&mut e, "SELECT loc FROM pa ORDER BY loc"),
+        EN_US,
+        "scan"
+    );
     assert_eq!(
         rows(&mut e, "SELECT DISTINCT loc FROM pa ORDER BY loc"),
         EN_US,

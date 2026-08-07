@@ -548,7 +548,8 @@ impl Engine {
                             key_vals.push(v);
                         }
                         // NULL key component → never matches → not present.
-                        let present = !any_null && set.contains(&aggregate::encode_canonical_key(&key_vals));
+                        let present =
+                            !any_null && set.contains(&aggregate::encode_canonical_key(&key_vals));
                         let bit = if *negated { !present } else { present };
                         *e = Expr::Literal(Literal::Bool(bit));
                         return Ok(());
@@ -4625,7 +4626,6 @@ fn planned_exists_bit(
     Ok(if negated { !present } else { present })
 }
 
-
 /// v7.34.2 — per-row splice for the planned EXISTS sets. Walks the
 /// (cloned) host expression in the SAME pre-order as
 /// `collect_exists_subqueries`, increments `idx` past each EXISTS
@@ -4745,7 +4745,6 @@ fn expr_may_use_in_set(e: &Expr) -> bool {
     }
 }
 
-
 /// v7.39 (round 275) — is this cast target one of the integer widths
 /// whose values all live in the same `InListSet::Int`?
 fn cast_target_is_integer(target: &spg_sql::ast::CastTarget) -> bool {
@@ -4783,12 +4782,10 @@ pub(crate) fn build_in_list_set(list: &[Expr]) -> Option<memoize::InListSetEntry
         // `InListSet::Int`, so the cast carries nothing the set needs.
         let lit = match item {
             Expr::Literal(lit) => lit,
-            Expr::Cast { expr, target } if cast_target_is_integer(target) => {
-                match expr.as_ref() {
-                    Expr::Literal(inner) => inner,
-                    _ => return None,
-                }
-            }
+            Expr::Cast { expr, target } if cast_target_is_integer(target) => match expr.as_ref() {
+                Expr::Literal(inner) => inner,
+                _ => return None,
+            },
             _ => return None,
         };
         match lit {
@@ -5034,7 +5031,9 @@ fn substitute_in_expr(
         }
     }
     match e {
-        Expr::NamedArg { expr, .. } => substitute_in_expr(expr, row, ctx, outer_alias, cat, visible),
+        Expr::NamedArg { expr, .. } => {
+            substitute_in_expr(expr, row, ctx, outer_alias, cat, visible)
+        }
         Expr::Variadic(expr) => substitute_in_expr(expr, row, ctx, outer_alias, cat, visible),
         Expr::AggregateOrdered { call, order_by, .. } => {
             substitute_in_expr(call, row, ctx, outer_alias, cat, visible);
@@ -5062,7 +5061,9 @@ fn substitute_in_expr(
                 substitute_in_expr(a, row, ctx, outer_alias, cat, visible);
             }
         }
-        Expr::Extract { source, .. } => substitute_in_expr(source, row, ctx, outer_alias, cat, visible),
+        Expr::Extract { source, .. } => {
+            substitute_in_expr(source, row, ctx, outer_alias, cat, visible)
+        }
         Expr::WindowFunction {
             args,
             partition_by,

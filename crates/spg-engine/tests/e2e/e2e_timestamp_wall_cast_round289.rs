@@ -95,12 +95,18 @@ fn timestamptz_still_normalises_to_utc() {
         "2020-01-01 08:00:00",
     );
     assert_eq!(
-        one(&mut e, "SELECT '2020-01-01 10:00:00 America/New_York'::timestamptz"),
+        one(
+            &mut e,
+            "SELECT '2020-01-01 10:00:00 America/New_York'::timestamptz"
+        ),
         "2020-01-01 15:00:00",
     );
     // July is EDT, not EST — the zone database is consulted per instant.
     assert_eq!(
-        one(&mut e, "SELECT '2020-07-01 10:00:00 America/New_York'::timestamptz"),
+        one(
+            &mut e,
+            "SELECT '2020-07-01 10:00:00 America/New_York'::timestamptz"
+        ),
         "2020-07-01 14:00:00",
     );
 }
@@ -127,6 +133,9 @@ fn the_era_and_sentinel_spellings_survive_the_refactor() {
 fn a_malformed_trailer_is_still_a_parse_error() {
     // Ignoring the zone must not become "ignore whatever trails".
     let mut e = Engine::new();
-    assert!(e.execute("SELECT '2020-01-01 10:00:00 xyz'::timestamp").is_err());
+    assert!(
+        e.execute("SELECT '2020-01-01 10:00:00 xyz'::timestamp")
+            .is_err()
+    );
     assert!(e.execute("SELECT 'not a timestamp'::timestamp").is_err());
 }

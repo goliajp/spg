@@ -1085,22 +1085,22 @@ fn handle_pg_simple_query(
     // r178 — plain autocommit DML goes through the commit barrier
     // (group fsync, already persisted by the leader); everything else
     // keeps the inline execute + persist_wire_write flow.
-    let (result, queue_persisted) =
-        match try_queue_plain_dml(state, sql, role, *tx_state, settings) {
-            Some(r) => (r, true),
-            None => (
-                execute_with_role(
-                    state,
-                    sql,
-                    role,
-                    cancel,
-                    matches!(*tx_state, b'T' | b'E'),
-                    conn_state.tx_id,
-                    settings,
-                ),
-                false,
+    let (result, queue_persisted) = match try_queue_plain_dml(state, sql, role, *tx_state, settings)
+    {
+        Some(r) => (r, true),
+        None => (
+            execute_with_role(
+                state,
+                sql,
+                role,
+                cancel,
+                matches!(*tx_state, b'T' | b'E'),
+                conn_state.tx_id,
+                settings,
             ),
-        };
+            false,
+        ),
+    };
     conn_state
         .wait_event
         .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1169,7 +1169,11 @@ fn handle_pg_simple_query(
             };
             send_command_complete(wbuf, &tag)?;
             // Sync tx state from engine after writes.
-            *tx_state = if state.engine.read().is_ok_and(|e| e.is_tx_open(conn_state.tx_id)) {
+            *tx_state = if state
+                .engine
+                .read()
+                .is_ok_and(|e| e.is_tx_open(conn_state.tx_id))
+            {
                 b'T'
             } else {
                 b'I'
@@ -1186,7 +1190,11 @@ fn handle_pg_simple_query(
             // and stays there until ROLLBACK. We track
             // best-effort: if engine still in TX, mark
             // 'E'; otherwise 'I'.
-            *tx_state = if state.engine.read().is_ok_and(|e| e.is_tx_open(conn_state.tx_id)) {
+            *tx_state = if state
+                .engine
+                .read()
+                .is_ok_and(|e| e.is_tx_open(conn_state.tx_id))
+            {
                 b'E'
             } else {
                 b'I'
@@ -1360,22 +1368,22 @@ fn handle_pg_simple_query_one_into_wbuf(
     // r178 — same commit-barrier routing as the single-statement
     // handler; per-statement of a multi-statement script each split
     // statement is a candidate on its own.
-    let (result, queue_persisted) =
-        match try_queue_plain_dml(state, sql, role, *tx_state, settings) {
-            Some(r) => (r, true),
-            None => (
-                execute_with_role(
-                    state,
-                    sql,
-                    role,
-                    cancel,
-                    matches!(*tx_state, b'T' | b'E'),
-                    conn_state.tx_id,
-                    settings,
-                ),
-                false,
+    let (result, queue_persisted) = match try_queue_plain_dml(state, sql, role, *tx_state, settings)
+    {
+        Some(r) => (r, true),
+        None => (
+            execute_with_role(
+                state,
+                sql,
+                role,
+                cancel,
+                matches!(*tx_state, b'T' | b'E'),
+                conn_state.tx_id,
+                settings,
             ),
-        };
+            false,
+        ),
+    };
     conn_state
         .wait_event
         .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1409,7 +1417,11 @@ fn handle_pg_simple_query_one_into_wbuf(
         Ok(QueryResult::CommandOk { affected, .. }) => {
             let tag = command_tag(sql, affected);
             send_command_complete(wbuf, &tag)?;
-            *tx_state = if state.engine.read().is_ok_and(|e| e.is_tx_open(conn_state.tx_id)) {
+            *tx_state = if state
+                .engine
+                .read()
+                .is_ok_and(|e| e.is_tx_open(conn_state.tx_id))
+            {
                 b'T'
             } else {
                 b'I'
@@ -1418,7 +1430,11 @@ fn handle_pg_simple_query_one_into_wbuf(
         Err(e) => {
             let (sqlstate, msg) = engine_error_to_wire_conn(&e, conn_state);
             send_error_pos(wbuf, sqlstate, &msg, parse_error_position(&e, sql))?;
-            *tx_state = if state.engine.read().is_ok_and(|e| e.is_tx_open(conn_state.tx_id)) {
+            *tx_state = if state
+                .engine
+                .read()
+                .is_ok_and(|e| e.is_tx_open(conn_state.tx_id))
+            {
                 b'E'
             } else {
                 b'I'
@@ -1488,7 +1504,13 @@ fn dispatch_pg_simple_query_multi(
         if script && !implicit_tx && *tx_state == b'I' && i + 1 < stmts.len() {
             let mut discard = Vec::new();
             handle_pg_simple_query_one_into_wbuf(
-                b"BEGIN", state, conn_state, role, tx_state, settings, &mut discard,
+                b"BEGIN",
+                state,
+                conn_state,
+                role,
+                tx_state,
+                settings,
+                &mut discard,
             )?;
             implicit_tx = true;
         }
@@ -1536,7 +1558,13 @@ fn dispatch_pg_simple_query_multi(
         };
         let mut discard = Vec::new();
         handle_pg_simple_query_one_into_wbuf(
-            closing, state, conn_state, role, tx_state, settings, &mut discard,
+            closing,
+            state,
+            conn_state,
+            role,
+            tx_state,
+            settings,
+            &mut discard,
         )?;
     }
     send_ready_for_query(wbuf, *tx_state)?;
@@ -2485,8 +2513,7 @@ fn trace_frontend_message(msg_type: u8, body: &[u8], tx_state: u8) {
     };
     eprintln!(
         "[pgwire-trace] tx={} {} {head}",
-        tx_state as char,
-        msg_type as char
+        tx_state as char, msg_type as char
     );
 }
 
@@ -2533,10 +2560,7 @@ pub(crate) fn persist_wire_write(
         // different connection had a transaction open, breaking
         // synchronous_commit=on. (Same global-vs-slot confusion r298
         // fixed for the aborted flag and pgwire's streaming gate.)
-        let in_tx = state
-            .engine
-            .read()
-            .is_ok_and(|e| e.is_tx_open(tx_id));
+        let in_tx = state.engine.read().is_ok_and(|e| e.is_tx_open(tx_id));
         crate::append_wal(state, sql, crate::session_sync_commit(state) && !in_tx)?;
     } else if *modified_catalog && state.db_path.is_some() {
         // No-WAL mode: capture the current committed state.
@@ -3831,84 +3855,81 @@ fn handle_execute(
         .and_then(parse_timeout_ms)
         .unwrap_or(0)
         > 0;
-    let (result, queue_persisted) = if *tx_state == b'I'
-        && state.wal.is_some()
-        && plain_dml
-        && !timeout_set
-    {
-        if matches!(role, Role::ReadOnly) {
-            return Err(proto("permission denied: readonly role".to_string()));
-        }
-        // r198 — a parameterless statement's bind-final SQL IS the
-        // Parse text; skip the AST deep-clone + re-render (~2 ms on
-        // a 1000-row VALUES batch).
-        let bind_sql = if portal.params.is_empty() {
-            stmt.sql.clone()
-        } else {
-            let mut bind_ast = stmt.ast.clone();
-            spg_engine::substitute_placeholders(&mut bind_ast, &portal.params)
-                .map_err(|e| proto(format!("Execute: bind-final render failed: {e}")))?;
-            bind_ast.to_string()
-        };
-        // Fresh per-task flag — same reasoning as the simple-query
-        // route (no watchdog on this path; timeout sessions excluded).
-        let queue_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (result, wal_outcome) =
-            crate::commit_queue_execute(state, bind_sql.clone(), &queue_flag);
-        if let Err(e) = wal_outcome {
-            return Err(proto(format!("Execute: durability append failed: {e}")));
-        }
-        if matches!(&result, Ok(QueryResult::CommandOk { .. }))
-            && state.audit_path.is_some()
-            && let Err(e) = crate::append_audit_pub(state, &bind_sql)
-        {
-            return Err(proto(format!("Execute: audit append failed: {e}")));
-        }
-        (result, true)
-    } else {
-        let result = {
-            // execute_prepared takes &mut self for symmetry with the
-            // simple-query path, so both read and write hold the write
-            // lock for the duration (single-writer transactional state).
-            let mut eng = state
-                .engine
-                .write()
-                .map_err(|_| proto("Execute: engine lock poisoned".to_string()))?;
-            // Role gate — same shape as `execute_with_role`.
-            if needs_write && matches!(role, Role::ReadOnly) {
+    let (result, queue_persisted) =
+        if *tx_state == b'I' && state.wal.is_some() && plain_dml && !timeout_set {
+            if matches!(role, Role::ReadOnly) {
                 return Err(proto("permission denied: readonly role".to_string()));
             }
-            // v7.39 (round 443) — bind the statement to THIS connection's
-            // transaction slot.
-            //
-            // `execute_prepared_with_cancel` hardcodes `IMPLICIT_TX`, so a
-            // `BEGIN` arriving over the extended protocol registered its
-            // transaction on slot 0 instead of the connection's. Nothing
-            // downstream could then see it: `is_tx_open(conn tx_id)` stayed
-            // false, so ReadyForQuery kept reporting 'I', every following
-            // DML took the `tx_state == b'I'` group-commit route, and the
-            // client's COMMIT closed a slot that held none of the writes.
-            // The WAL still recorded BEGIN / … / COMMIT as text, so a
-            // restart replayed the rows the live engine had never applied —
-            // measured in round 442 as a disk image that disagrees with
-            // memory.
-            //
-            // Every client that prepares statements — sqlx's `query()`,
-            // JDBC, psycopg3, the ORMs on top of them — is on this path.
-            //
-            // The slot-taking entry point has existed since round 303, which
-            // added it for mysql-wire; its doc comment says pgwire "achieves
-            // [the same] by rendering bind-final SQL through execute_in",
-            // and that was true of the simple-query path only.
-            eng.execute_prepared_in_with_cancel(
-                stmt.ast.clone(),
-                &portal.params,
-                conn_state.tx_id,
-                cancel,
-            )
+            // r198 — a parameterless statement's bind-final SQL IS the
+            // Parse text; skip the AST deep-clone + re-render (~2 ms on
+            // a 1000-row VALUES batch).
+            let bind_sql = if portal.params.is_empty() {
+                stmt.sql.clone()
+            } else {
+                let mut bind_ast = stmt.ast.clone();
+                spg_engine::substitute_placeholders(&mut bind_ast, &portal.params)
+                    .map_err(|e| proto(format!("Execute: bind-final render failed: {e}")))?;
+                bind_ast.to_string()
+            };
+            // Fresh per-task flag — same reasoning as the simple-query
+            // route (no watchdog on this path; timeout sessions excluded).
+            let queue_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (result, wal_outcome) =
+                crate::commit_queue_execute(state, bind_sql.clone(), &queue_flag);
+            if let Err(e) = wal_outcome {
+                return Err(proto(format!("Execute: durability append failed: {e}")));
+            }
+            if matches!(&result, Ok(QueryResult::CommandOk { .. }))
+                && state.audit_path.is_some()
+                && let Err(e) = crate::append_audit_pub(state, &bind_sql)
+            {
+                return Err(proto(format!("Execute: audit append failed: {e}")));
+            }
+            (result, true)
+        } else {
+            let result = {
+                // execute_prepared takes &mut self for symmetry with the
+                // simple-query path, so both read and write hold the write
+                // lock for the duration (single-writer transactional state).
+                let mut eng = state
+                    .engine
+                    .write()
+                    .map_err(|_| proto("Execute: engine lock poisoned".to_string()))?;
+                // Role gate — same shape as `execute_with_role`.
+                if needs_write && matches!(role, Role::ReadOnly) {
+                    return Err(proto("permission denied: readonly role".to_string()));
+                }
+                // v7.39 (round 443) — bind the statement to THIS connection's
+                // transaction slot.
+                //
+                // `execute_prepared_with_cancel` hardcodes `IMPLICIT_TX`, so a
+                // `BEGIN` arriving over the extended protocol registered its
+                // transaction on slot 0 instead of the connection's. Nothing
+                // downstream could then see it: `is_tx_open(conn tx_id)` stayed
+                // false, so ReadyForQuery kept reporting 'I', every following
+                // DML took the `tx_state == b'I'` group-commit route, and the
+                // client's COMMIT closed a slot that held none of the writes.
+                // The WAL still recorded BEGIN / … / COMMIT as text, so a
+                // restart replayed the rows the live engine had never applied —
+                // measured in round 442 as a disk image that disagrees with
+                // memory.
+                //
+                // Every client that prepares statements — sqlx's `query()`,
+                // JDBC, psycopg3, the ORMs on top of them — is on this path.
+                //
+                // The slot-taking entry point has existed since round 303, which
+                // added it for mysql-wire; its doc comment says pgwire "achieves
+                // [the same] by rendering bind-final SQL through execute_in",
+                // and that was true of the simple-query path only.
+                eng.execute_prepared_in_with_cancel(
+                    stmt.ast.clone(),
+                    &portal.params,
+                    conn_state.tx_id,
+                    cancel,
+                )
+            };
+            (result, false)
         };
-        (result, false)
-    };
     // v7.33 (A1) — persist the write to the WAL (or the no-WAL snapshot)
     // BEFORE acking it. Pre-7.33 `handle_execute` persisted nothing, so
     // server-mode prepared writes were lost on crash. Render the
@@ -3995,7 +4016,11 @@ fn handle_execute(
             // text — text is owned by Parse, not Execute.
             let tag = command_tag_for_ast(&stmt.ast, affected);
             send_command_complete(stream, &tag).map_err(|e| proto(e.to_string()))?;
-            *tx_state = if state.engine.read().is_ok_and(|e| e.is_tx_open(conn_state.tx_id)) {
+            *tx_state = if state
+                .engine
+                .read()
+                .is_ok_and(|e| e.is_tx_open(conn_state.tx_id))
+            {
                 b'T'
             } else {
                 b'I'
@@ -5446,12 +5471,10 @@ fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
                 Err(bad) => Some(CopyIntent::BadOption(bad)),
             }
         }
-        ("to", "stdout") => {
-            match parse_copy_options_checked(trimmed) {
-                Ok(opts) => Some(CopyIntent::To(table, opts)),
-                Err(bad) => Some(CopyIntent::BadOption(bad)),
-            }
-        }
+        ("to", "stdout") => match parse_copy_options_checked(trimmed) {
+            Ok(opts) => Some(CopyIntent::To(table, opts)),
+            Err(bad) => Some(CopyIntent::BadOption(bad)),
+        },
         _ => None,
     }
 }
@@ -5836,7 +5859,10 @@ fn handle_copy_from_file(
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
             let msg = format!("{e}");
-            let code = if msg.contains("does not exist") && msg.contains("relation") && !msg.contains("column") {
+            let code = if msg.contains("does not exist")
+                && msg.contains("relation")
+                && !msg.contains("column")
+            {
                 "42P01"
             } else if msg.contains("specified more than once") {
                 "42701"
@@ -5895,7 +5921,11 @@ fn handle_copy_from_file(
             .engine
             .write()
             .map_err(|_| "engine rwlock poisoned".to_string())
-            .and_then(|mut e| e.execute_in(sql, tx_id).map(|_| ()).map_err(|err| format!("{err}")))
+            .and_then(|mut e| {
+                e.execute_in(sql, tx_id)
+                    .map(|_| ())
+                    .map_err(|err| format!("{err}"))
+            })
     };
     if wrap {
         if let Err(e) = run(state, "BEGIN") {
@@ -6023,8 +6053,7 @@ fn handle_copy_from_stdin(
     // v7.39 (round 283) — ask about THIS connection's slot, not "is any
     // transaction open anywhere", which with one shared engine was every
     // other client's transaction too.
-    let wrap = !opts.on_error_set_null
-        && !state.engine.read().is_ok_and(|e| e.is_tx_open(tx_id));
+    let wrap = !opts.on_error_set_null && !state.engine.read().is_ok_and(|e| e.is_tx_open(tx_id));
     if wrap {
         if let Err(e) = state
             .engine
@@ -6041,7 +6070,10 @@ fn handle_copy_from_stdin(
             return Ok(());
         }
         if let Err(e) = crate::append_wal(state, "BEGIN", false) {
-            let _ = state.engine.write().map(|mut en| en.execute_in("ROLLBACK", tx_id));
+            let _ = state
+                .engine
+                .write()
+                .map(|mut en| en.execute_in("ROLLBACK", tx_id));
             send_error(stream, "53100", &format!("{e}"))?;
             drain_copy_in_frames(stream)?;
             return Ok(());
@@ -6051,7 +6083,10 @@ fn handle_copy_from_stdin(
     // below, so the failed COPY leaves nothing — including on replay.
     let rollback_wrap = |state: &Arc<ServerState>| {
         if wrap {
-            let _ = state.engine.write().map(|mut e| e.execute_in("ROLLBACK", tx_id));
+            let _ = state
+                .engine
+                .write()
+                .map(|mut e| e.execute_in("ROLLBACK", tx_id));
             let _ = crate::append_wal(state, "ROLLBACK", false);
         }
     };
@@ -8164,10 +8199,10 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::BigIntArray => 1016, // PG `_int8` (BIGINT[]) — v7.11.12 Epic 3
         // v7.39 (round 694) — PG `_oid`.
         DataType::OidArray => 1028,
-        DataType::TsVector => 3614,    // PG `tsvector` — v7.12.0 G-CRIT-3
-        DataType::TsQuery => 3615,     // PG `tsquery` — v7.12.0 G-CRIT-3
-        DataType::Uuid => 2950,        // PG `uuid` — v7.17.0 Phase 3 P0-25
-        DataType::Time => 1083,        // PG `time` — v7.17.0 Phase 3 P0-32
+        DataType::TsVector => 3614, // PG `tsvector` — v7.12.0 G-CRIT-3
+        DataType::TsQuery => 3615,  // PG `tsquery` — v7.12.0 G-CRIT-3
+        DataType::Uuid => 2950,     // PG `uuid` — v7.17.0 Phase 3 P0-25
+        DataType::Time => 1083,     // PG `time` — v7.17.0 Phase 3 P0-32
         // v7.17.0 Phase 3 P0-33 — MySQL YEAR has no dedicated PG
         // OID; advertise as INT4 (23) so libpq / sqlx render it
         // as an integer.

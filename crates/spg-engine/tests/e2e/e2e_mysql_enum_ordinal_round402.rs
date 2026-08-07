@@ -22,7 +22,8 @@ fn mysql() -> Engine {
 
 fn setup() -> Engine {
     let mut e = mysql();
-    e.execute("CREATE TABLE en(e ENUM('low','mid','high'))").unwrap();
+    e.execute("CREATE TABLE en(e ENUM('low','mid','high'))")
+        .unwrap();
     e.execute("INSERT INTO en VALUES ('high'),('low'),('mid')")
         .unwrap();
     e
@@ -59,8 +60,14 @@ fn texts(e: &mut Engine, sql: &str) -> Vec<String> {
 #[test]
 fn numeric_context_is_ordinal() {
     let mut e = setup();
-    assert_eq!(ints(&mut e, "SELECT e + 0 FROM en ORDER BY e"), vec![1, 2, 3]);
-    assert_eq!(ints(&mut e, "SELECT e * 1 FROM en ORDER BY e"), vec![1, 2, 3]);
+    assert_eq!(
+        ints(&mut e, "SELECT e + 0 FROM en ORDER BY e"),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        ints(&mut e, "SELECT e * 1 FROM en ORDER BY e"),
+        vec![1, 2, 3]
+    );
 }
 
 /// `WHERE e + 0 <op> n` filters by ordinal (the compiled filter path).
@@ -71,7 +78,10 @@ fn where_by_ordinal() {
         texts(&mut e, "SELECT e FROM en WHERE e + 0 > 1 ORDER BY e"),
         vec!["mid", "high"]
     );
-    assert_eq!(texts(&mut e, "SELECT e FROM en WHERE e + 0 = 2"), vec!["mid"]);
+    assert_eq!(
+        texts(&mut e, "SELECT e FROM en WHERE e + 0 = 2"),
+        vec!["mid"]
+    );
 }
 
 /// A plain read keeps the text; a string comparison is unchanged.

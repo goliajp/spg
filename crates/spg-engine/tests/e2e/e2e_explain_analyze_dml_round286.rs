@@ -65,10 +65,7 @@ fn analyze_on_an_insert_actually_inserts() {
 fn analyze_on_update_and_delete_take_effect_too() {
     let mut e = fixture();
     plan(&mut e, "EXPLAIN ANALYZE UPDATE pt9 SET v='q' WHERE id=1");
-    let QueryResult::Rows { rows, .. } = e
-        .execute("SELECT v FROM pt9 WHERE id=1")
-        .unwrap()
-    else {
+    let QueryResult::Rows { rows, .. } = e.execute("SELECT v FROM pt9 WHERE id=1").unwrap() else {
         panic!("expected Rows");
     };
     assert_eq!(spg_engine::eval::value_to_text(&rows[0].values[0]), "q");
@@ -81,9 +78,18 @@ fn analyze_on_update_and_delete_take_effect_too() {
 fn the_root_node_names_the_verb_and_the_table() {
     let mut e = fixture();
     for (sql, head) in [
-        ("EXPLAIN ANALYZE INSERT INTO pt9 VALUES (20,'x')", "Insert on pt9"),
-        ("EXPLAIN ANALYZE UPDATE pt9 SET v='z' WHERE id=1", "Update on pt9"),
-        ("EXPLAIN ANALYZE DELETE FROM pt9 WHERE id=3", "Delete on pt9"),
+        (
+            "EXPLAIN ANALYZE INSERT INTO pt9 VALUES (20,'x')",
+            "Insert on pt9",
+        ),
+        (
+            "EXPLAIN ANALYZE UPDATE pt9 SET v='z' WHERE id=1",
+            "Update on pt9",
+        ),
+        (
+            "EXPLAIN ANALYZE DELETE FROM pt9 WHERE id=3",
+            "Delete on pt9",
+        ),
     ] {
         let lines = plan(&mut e, sql);
         assert!(lines[0].starts_with(head), "{sql}: {:?}", lines[0]);

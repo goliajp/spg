@@ -55,7 +55,10 @@ fn comparison_folds_case_and_accent() {
     assert_eq!(scalar(&mut e, "SELECT 'a' = 'A'"), Value::Bool(true));
     assert_eq!(scalar(&mut e, "SELECT 'Bar' = 'Bär'"), Value::Bool(true));
     // BINARY on either side turns folding back off.
-    assert_eq!(scalar(&mut e, "SELECT BINARY 'a' = 'A'"), Value::Bool(false));
+    assert_eq!(
+        scalar(&mut e, "SELECT BINARY 'a' = 'A'"),
+        Value::Bool(false)
+    );
     assert_eq!(
         scalar(&mut e, "SELECT 'Bar' = BINARY 'Bär'"),
         Value::Bool(false)
@@ -78,10 +81,7 @@ fn every_read_clause_folds_consistently() {
         Value::BigInt(3)
     );
     // LIKE with no wildcards is a folded equality.
-    assert_eq!(
-        scalar(&mut e, "SELECT 'Foo' LIKE 'foo'"),
-        Value::Bool(true)
-    );
+    assert_eq!(scalar(&mut e, "SELECT 'Foo' LIKE 'foo'"), Value::Bool(true));
     // DISTINCT collapses to 2 folded groups (foo*, bar*).
     assert_eq!(
         scalar(&mut e, "SELECT COUNT(DISTINCT t) FROM ci4"),
@@ -106,7 +106,10 @@ fn every_read_clause_folds_consistently() {
 #[test]
 fn aggregate_order_by_folds() {
     let mut e = mysql();
-    let g = text(&mut e, "SELECT GROUP_CONCAT(t ORDER BY t SEPARATOR ',') FROM ci4");
+    let g = text(
+        &mut e,
+        "SELECT GROUP_CONCAT(t ORDER BY t SEPARATOR ',') FROM ci4",
+    );
     let parts: Vec<&str> = g.split(',').collect();
     assert_eq!(parts.len(), 5, "all five rows present: {g}");
     let is_bar = |s: &str| s.eq_ignore_ascii_case("bar") || s == "Bär";

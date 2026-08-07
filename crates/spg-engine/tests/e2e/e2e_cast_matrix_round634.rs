@@ -71,7 +71,10 @@ fn round634_bpchar_reaches_the_text_targets() {
 fn round634_bytea_reads_big_endian() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT '\\x3132'::BYTEA::SMALLINT, '\\x31'::BYTEA::SMALLINT"),
+        vals(
+            &mut e,
+            "SELECT '\\x3132'::BYTEA::SMALLINT, '\\x31'::BYTEA::SMALLINT"
+        ),
         vec!["12594|49"]
     );
     assert_eq!(vals(&mut e, "SELECT ''::BYTEA::SMALLINT"), vec!["0"]);
@@ -81,7 +84,10 @@ fn round634_bytea_reads_big_endian() {
     );
     // The wider targets take what fits.
     assert_eq!(
-        vals(&mut e, "SELECT '\\x313233'::BYTEA::INT, '\\x3132'::BYTEA::BIGINT"),
+        vals(
+            &mut e,
+            "SELECT '\\x313233'::BYTEA::INT, '\\x3132'::BYTEA::BIGINT"
+        ),
         vec!["3224115|12594"]
     );
 }
@@ -90,7 +96,10 @@ fn round634_bytea_reads_big_endian() {
 fn round634_an_oid_reaches_regproc() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT 1::INT::REGPROC, 1::SMALLINT::REGPROC, 1::BIGINT::REGPROC"),
+        vals(
+            &mut e,
+            "SELECT 1::INT::REGPROC, 1::SMALLINT::REGPROC, 1::BIGINT::REGPROC"
+        ),
         vec!["1|1|1"],
         "an oid with no matching entry renders as the number, as in PG"
     );
@@ -110,9 +119,15 @@ fn round634_an_oid_reaches_regproc() {
 #[test]
 fn round634_time_and_timestamp_reach_timetz() {
     let mut e = Engine::new();
-    assert_eq!(vals(&mut e, "SELECT TIME '01:02:03'::TIMETZ"), vec!["01:02:03+00"]);
     assert_eq!(
-        vals(&mut e, "SELECT TIMESTAMPTZ '2020-01-02 03:04:05+00'::TIMETZ"),
+        vals(&mut e, "SELECT TIME '01:02:03'::TIMETZ"),
+        vec!["01:02:03+00"]
+    );
+    assert_eq!(
+        vals(
+            &mut e,
+            "SELECT TIMESTAMPTZ '2020-01-02 03:04:05+00'::TIMETZ"
+        ),
         vec!["03:04:05+00"]
     );
     assert_eq!(
@@ -121,5 +136,8 @@ fn round634_time_and_timestamp_reach_timetz() {
         "before the epoch, where a plain remainder would go negative"
     );
     // The text entry point is unchanged.
-    assert_eq!(vals(&mut e, "SELECT '01:02:03+00'::TIMETZ"), vec!["01:02:03+00"]);
+    assert_eq!(
+        vals(&mut e, "SELECT '01:02:03+00'::TIMETZ"),
+        vec!["01:02:03+00"]
+    );
 }

@@ -127,14 +127,14 @@ fn bit_string_round_trip() {
 
     // And a bare BIT really is bit(1), so the same value is refused.
     let mut narrow = Engine::new();
-    narrow
-        .execute("CREATE TABLE n (b BIT NOT NULL)")
-        .unwrap();
-    let msg = format!("{:?}", narrow.execute("INSERT INTO n VALUES (B'101010111100')").unwrap_err());
-    assert!(
-        msg.contains("does not match type bit(1)"),
-        "{msg}",
+    narrow.execute("CREATE TABLE n (b BIT NOT NULL)").unwrap();
+    let msg = format!(
+        "{:?}",
+        narrow
+            .execute("INSERT INTO n VALUES (B'101010111100')")
+            .unwrap_err()
     );
+    assert!(msg.contains("does not match type bit(1)"), "{msg}");
 }
 
 #[test]

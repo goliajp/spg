@@ -696,11 +696,7 @@ fn shortest_real_sci(x: f32) -> String {
 /// finite non-zero value.
 fn next_f32(x: f32, up: bool) -> f32 {
     let bits = x.to_bits();
-    let stepped = if (x > 0.0) == up {
-        bits + 1
-    } else {
-        bits - 1
-    };
+    let stepped = if (x > 0.0) == up { bits + 1 } else { bits - 1 };
     f32::from_bits(stepped)
 }
 
@@ -1289,7 +1285,6 @@ fn timestamp_sentinel(s: &str) -> Option<i64> {
     None
 }
 
-
 /// v7.15.0 — Parse `HH:MM:SS[.frac][<tz>]` and return
 /// `(day_micros, tz_offset_micros)` where `day_micros` is the
 /// local-clock seconds-of-day in microseconds and
@@ -1353,7 +1348,11 @@ fn classify_datetime_input(text: &str) -> (DatetimeInputProblem, bool) {
     // The date part is everything before the first space or `T`.
     let date_part = t.split([' ', 'T']).next().unwrap_or("");
     let fields: alloc::vec::Vec<&str> = date_part.split('-').collect();
-    if fields.len() != 3 || fields.iter().any(|f| f.is_empty() || !f.chars().all(|c| c.is_ascii_digit())) {
+    if fields.len() != 3
+        || fields
+            .iter()
+            .any(|f| f.is_empty() || !f.chars().all(|c| c.is_ascii_digit()))
+    {
         return (DatetimeInputProblem::Syntax, false);
     }
     // Shaped like a date; a month or day outside its universal range is
@@ -2014,7 +2013,9 @@ fn sci_to_digits_exp(sci: &str) -> Option<(u128, i32)> {
     };
     let mut digits: u128 = 0;
     for c in int_part.chars().chain(frac_part.chars()) {
-        digits = digits.checked_mul(10)?.checked_add(u128::from(c as u8 - b'0'))?;
+        digits = digits
+            .checked_mul(10)?
+            .checked_add(u128::from(c as u8 - b'0'))?;
     }
     Some((digits, exp - i32::try_from(frac_part.len()).ok()?))
 }

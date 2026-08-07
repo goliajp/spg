@@ -59,10 +59,8 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE dt (id INT, ts TIMESTAMP, d DATE, tm TIME, iv INTERVAL, s TEXT)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE dt (id INT, ts TIMESTAMP, d DATE, tm TIME, iv INTERVAL, s TEXT)")
+        .unwrap();
     e.execute(
         "INSERT INTO dt VALUES \
          (1,'2020-01-02 03:04:05','2020-01-02','03:04:05','1 day 2 hours','x'),\
@@ -111,7 +109,12 @@ fn round595_extract_fields() {
             "SELECT id, extract(year FROM d), extract(hour FROM tm), extract(day FROM iv), \
              extract(month FROM iv) FROM dt ORDER BY id"
         ),
-        vec!["1|2020|3|1|0", "2|1999|23|0|3", "3|NULL|NULL|NULL|NULL", "4|2024|0|-1|0"],
+        vec![
+            "1|2020|3|1|0",
+            "2|1999|23|0|3",
+            "3|NULL|NULL|NULL|NULL",
+            "4|2024|0|-1|0"
+        ],
         "date, time and interval sources"
     );
     assert_eq!(
@@ -161,8 +164,16 @@ fn round595_session_deterministic_functions() {
         "including the blank-padded day name"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, date_part('year', ts), date_part('epoch', ts) FROM dt ORDER BY id"),
-        vec!["1|2020|1577934245", "2|1999|946684799", "3|NULL|NULL", "4|2024|1709208000"]
+        vals(
+            &mut e,
+            "SELECT id, date_part('year', ts), date_part('epoch', ts) FROM dt ORDER BY id"
+        ),
+        vec![
+            "1|2020|1577934245",
+            "2|1999|946684799",
+            "3|NULL|NULL",
+            "4|2024|1709208000"
+        ]
     );
     assert_eq!(
         vals(
@@ -184,11 +195,17 @@ fn round595_session_deterministic_functions() {
 fn round595_filters_and_composition() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id FROM dt WHERE extract(year FROM ts) = 2020 ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id FROM dt WHERE extract(year FROM ts) = 2020 ORDER BY id"
+        ),
         vec!["1"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM dt WHERE extract(month FROM ts) * 2 = 24 ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id FROM dt WHERE extract(month FROM ts) * 2 = 24 ORDER BY id"
+        ),
         vec!["2"],
         "the extracted value feeding arithmetic"
     );
@@ -241,7 +258,10 @@ fn round595_scale_agrees() {
     // year), so every row is 2020 — checked against the row count rather
     // than by hand.
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE extract(year FROM t) = 2020"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE extract(year FROM t) = 2020"
+        ),
         vals(&mut e, "SELECT count(*) FROM big")
     );
     // The month boundaries have to agree with a plain comparison.
@@ -257,7 +277,13 @@ fn round595_scale_agrees() {
         )
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE to_char(t, 'YYYY') = '2020'"),
-        vals(&mut e, "SELECT count(*) FROM big WHERE extract(year FROM t) = 2020")
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE to_char(t, 'YYYY') = '2020'"
+        ),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE extract(year FROM t) = 2020"
+        )
     );
 }

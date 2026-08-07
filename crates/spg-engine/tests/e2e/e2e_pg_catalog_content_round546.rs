@@ -78,7 +78,10 @@ fn round546_pg_language_lists_what_runs() {
     );
     // `c` is PG's fourth and is deliberately absent.
     assert_eq!(
-        rows(&mut e, "SELECT count(*) FROM pg_language WHERE lanname = 'c'"),
+        rows(
+            &mut e,
+            "SELECT count(*) FROM pg_language WHERE lanname = 'c'"
+        ),
         vec!["0"]
     );
     // The join every function browser makes.

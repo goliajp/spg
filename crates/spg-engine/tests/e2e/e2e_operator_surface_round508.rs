@@ -53,7 +53,10 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn round508_at_prefix_is_absolute_value() {
     let mut e = engine();
-    assert_eq!(text(&mut e, "SELECT @ -5, @ -5.5, @ (-3)::float8, @ 7"), "5|5.5|3|7");
+    assert_eq!(
+        text(&mut e, "SELECT @ -5, @ -5.5, @ (-3)::float8, @ 7"),
+        "5|5.5|3|7"
+    );
     assert_eq!(text(&mut e, "SELECT pg_typeof(@ -5)"), "integer");
     assert_eq!(text(&mut e, "SELECT @ NULL::int4"), "NULL");
 }
@@ -65,11 +68,17 @@ fn round508_at_prefix_is_absolute_value() {
 fn round508_hash_and_at_minus_at_are_npoints_and_length() {
     let mut e = engine();
     assert_eq!(
-        text(&mut e, "SELECT # path '((0,0),(1,1),(2,0))', # polygon '((0,0),(1,1),(2,0))'"),
+        text(
+            &mut e,
+            "SELECT # path '((0,0),(1,1),(2,0))', # polygon '((0,0),(1,1),(2,0))'"
+        ),
         "3|3"
     );
     assert_eq!(
-        text(&mut e, "SELECT @-@ lseg '((0,0),(3,4))', @-@ path '((0,0),(3,4))'"),
+        text(
+            &mut e,
+            "SELECT @-@ lseg '((0,0),(3,4))', @-@ path '((0,0),(3,4))'"
+        ),
         "5|10"
     );
 }
@@ -119,7 +128,10 @@ fn round508_intersects() {
         "true|false"
     );
     assert_eq!(
-        text(&mut e, "SELECT path '((0,0),(2,2))' ?# path '((0,2),(2,0))'"),
+        text(
+            &mut e,
+            "SELECT path '((0,0),(2,2))' ?# path '((0,2),(2,0))'"
+        ),
         "true"
     );
 }

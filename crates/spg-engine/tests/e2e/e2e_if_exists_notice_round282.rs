@@ -22,7 +22,8 @@
 use spg_engine::Engine;
 
 fn notices(e: &mut Engine, sql: &str) -> Vec<String> {
-    e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+    e.execute(sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
     e.take_notices().into_iter().map(|n| n.message).collect()
 }
 

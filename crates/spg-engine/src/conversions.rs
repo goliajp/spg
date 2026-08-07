@@ -2529,9 +2529,7 @@ fn type_name_to_data_type_lower(n: &str) -> Option<DataType> {
         // exception and takes BigIntArray, because an OID renders as its
         // number.
         "oid_array" => DataType::OidArray,
-        "name_array" | "regtype_array" | "regclass_array" | "regproc_array" => {
-            DataType::TextArray
-        }
+        "name_array" | "regtype_array" | "regclass_array" | "regproc_array" => DataType::TextArray,
         // TIME [WITHOUT TIME ZONE] — first-class since the codec
         // carries Value::Time; the coerce path parses HH:MM:SS.
         "time" | "time without time zone" => DataType::Time,
@@ -2953,7 +2951,11 @@ fn column_int_bounds(schema: &ColumnSchema) -> Option<(i128, i128)> {
         DataType::BigInt => (i128::from(i64::MIN), i128::from(i64::MAX)),
         _ => return None,
     };
-    Some(if schema.is_unsigned { (0, hi) } else { (lo, hi) })
+    Some(if schema.is_unsigned {
+        (0, hi)
+    } else {
+        (lo, hi)
+    })
 }
 
 /// v7.39 (round 434) — bend a value so a MySQL `INSERT IGNORE` can store it.
@@ -3004,7 +3006,9 @@ pub(crate) fn mysql_ignore_fit(v: Value<'static>, schema: &ColumnSchema) -> Valu
         Value::Int(n) => Some(i128::from(n)),
         Value::BigInt(n) => Some(i128::from(n)),
         // v7.39 (round 471) — a BIGINT UNSIGNED cell arrives as Numeric.
-        Value::Numeric { scaled, scale: 0, .. } => Some(scaled),
+        Value::Numeric {
+            scaled, scale: 0, ..
+        } => Some(scaled),
         _ => None,
     };
     if let Some(n) = as_int
@@ -3590,15 +3594,15 @@ fn coerce_untyped_value(
         (
             Value::RegClass(oid, _) | Value::RegProc(oid, _) | Value::RegType(oid, _),
             DataType::BigInt | DataType::Oid,
-        ) => {
-            Ok(Value::BigInt(*oid))
-        }
-        (Value::RegClass(oid, _) | Value::RegProc(oid, _) | Value::RegType(oid, _), DataType::Int) => {
-            Ok(Value::Int(i32::try_from(*oid).unwrap_or(i32::MAX)))
-        }
-        (Value::RegClass(_, name) | Value::RegProc(_, name) | Value::RegType(_, name), DataType::Text) => {
-            Ok(Value::text(alloc::string::String::from(name.as_ref())))
-        }
+        ) => Ok(Value::BigInt(*oid)),
+        (
+            Value::RegClass(oid, _) | Value::RegProc(oid, _) | Value::RegType(oid, _),
+            DataType::Int,
+        ) => Ok(Value::Int(i32::try_from(*oid).unwrap_or(i32::MAX))),
+        (
+            Value::RegClass(_, name) | Value::RegProc(_, name) | Value::RegType(_, name),
+            DataType::Text,
+        ) => Ok(Value::text(alloc::string::String::from(name.as_ref()))),
         // v7.39 (read01 round 55) — SPG stores a composite-typed column as
         // JSON (an object keyed by field name), so a real Composite value —
         // which is what `ROW(1,2)::pt` now produces — coerces into it. Before
@@ -3815,7 +3819,6 @@ pub(crate) fn normalize_composite_for_column(
     crate::eval::apply_composite_cast_pub(v, def, catalog).map_err(EngineError::Eval)
 }
 
-
 /// Coerce a `jsonb` value to a scalar numeric/bool `expected`. Returns `None`
 /// when `expected` is not one of those targets (so the caller falls through to
 /// the ordinary coercion table).
@@ -3894,9 +3897,11 @@ pub(crate) fn mysql_bytes_for_column(
                 big_literal_to_value(&alloc::format!("{acc}"))
             }
         }
-        DataType::Text | DataType::Varchar(_) | DataType::Char(_) => {
-            Value::text(b.iter().map(|&x| x as char).collect::<alloc::string::String>())
-        }
+        DataType::Text | DataType::Varchar(_) | DataType::Char(_) => Value::text(
+            b.iter()
+                .map(|&x| x as char)
+                .collect::<alloc::string::String>(),
+        ),
         _ => v,
     }
 }
@@ -3929,9 +3934,7 @@ fn try_coerce_time_family(
     }
     match v {
         Value::TimeTz { us, .. } => Some(Ok(Value::Time(*us))),
-        Value::Interval { micros, .. } => {
-            Some(Ok(Value::Time(micros.rem_euclid(DAY_US))))
-        }
+        Value::Interval { micros, .. } => Some(Ok(Value::Time(micros.rem_euclid(DAY_US)))),
         _ => None,
     }
 }
@@ -4333,9 +4336,9 @@ pub(crate) fn coerce_value(
             // v7.39 (round 270) — a numeric-looking text outside the
             // double range is "out of range", not "invalid input
             // syntax"; PG quotes the source either way.
-            Some(Value::Float(parse_float8(&s).ok_or_else(|| {
-                float_text_error(&s, "double precision")
-            })?))
+            Some(Value::Float(
+                parse_float8(&s).ok_or_else(|| float_text_error(&s, "double precision"))?,
+            ))
         }
         // v7.38 (read01, T-float4) — coerce to REAL narrows to f32.
         (Value::Int(n), DataType::Real) => Some(Value::Real(n as f32)),
@@ -4479,9 +4482,7 @@ pub(crate) fn coerce_value(
             Some(b) => Some(Value::Uuid(b)),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type uuid: {s:?}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for type uuid: {s:?}"),
                 }));
             }
         },
@@ -4507,7 +4508,9 @@ pub(crate) fn coerce_value(
                     let core = s.trim().split('.').next().unwrap_or("");
                     !core.is_empty()
                         && core.split(':').count() >= 2
-                        && core.split(':').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+                        && core
+                            .split(':')
+                            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
                 };
                 let detail = if time_shaped {
                     alloc::format!("date/time field value out of range: {s:?}")
@@ -4533,9 +4536,7 @@ pub(crate) fn coerce_value(
             Ok(n) => Some(coerce_int_to_year(n, col_name)?),
             Err(_) => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type year: {s:?}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for type year: {s:?}"),
                 }));
             }
         },
@@ -4554,24 +4555,27 @@ pub(crate) fn coerce_value(
         // time zone to USER-DEFINED", the target having fallen through to
         // the user-type lookup. The session offset is zero here, which is
         // what SPG's timetz values already carry.
-        (Value::Time(t), DataType::TimeTz) => Some(Value::TimeTz { us: t, offset_secs: 0 }),
+        (Value::Time(t), DataType::TimeTz) => Some(Value::TimeTz {
+            us: t,
+            offset_secs: 0,
+        }),
         (Value::Timestamp(t), DataType::TimeTz) => Some(Value::TimeTz {
             us: t.rem_euclid(86_400_000_000),
             offset_secs: 0,
         }),
-        (Value::Text(s), DataType::TimeTz) => match parse_timetz_str(&s)
-            .or_else(|| parse_time_str(s.trim()).map(|us| (us, 0)))
-        {
-            Some((us, offset_secs)) => Some(Value::TimeTz { us, offset_secs }),
-            None => {
-                return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type time with time zone: \
+        (Value::Text(s), DataType::TimeTz) => {
+            match parse_timetz_str(&s).or_else(|| parse_time_str(s.trim()).map(|us| (us, 0))) {
+                Some((us, offset_secs)) => Some(Value::TimeTz { us, offset_secs }),
+                None => {
+                    return Err(EngineError::Eval(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "invalid input syntax for type time with time zone: \
                          {s:?}"
-                    ),
-                }));
+                        ),
+                    }));
+                }
             }
-        },
+        }
         // TIMETZ → Text canonical `HH:MM:SS[.ffffff]±HH[:MM]`.
         (Value::TimeTz { us, offset_secs }, DataType::Text) => {
             Some(Value::text(eval::format_timetz(us, offset_secs)))
@@ -4583,9 +4587,7 @@ pub(crate) fn coerce_value(
             Some(c) => Some(Value::Money(c)),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type money: {s:?}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for type money: {s:?}"),
                 }));
             }
         },
@@ -4726,9 +4728,7 @@ pub(crate) fn coerce_value(
             }),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type interval: {s:?}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for type interval: {s:?}"),
                 }));
             }
         },
@@ -4786,51 +4786,51 @@ pub(crate) fn coerce_value(
             }
             Some(Value::BitString { nbits, bytes })
         }
-        (Value::Text(s), bit_ty @ (DataType::Bit(_) | DataType::BitVarying(_))) => match parse_bit_string_text(&s) {
-            Some((nbits, bytes)) => {
-                // v7.39 (round 325, V57) — the DECLARED width applies to a
-                // string literal too. It was checked only on the
-                // `B'…'` bit-literal path, so `INSERT INTO t(b)
-                // VALUES ('10')` into a `BIT(3)` column was accepted and
-                // stored two bits wide — a column that promises a fixed
-                // width silently holding another one. PG 18.4:
-                // `bit string length 2 does not match type bit(3)`, and
-                // `bit string too long for type bit varying(3)` past a
-                // varying cap.
-                match bit_ty {
-                    // A bare `bit` is `bit(1)` in PG, as the arm above.
-                    DataType::Bit(n) => {
-                        let want = if n == 0 { 1 } else { n };
-                        if nbits != want {
+        (Value::Text(s), bit_ty @ (DataType::Bit(_) | DataType::BitVarying(_))) => {
+            match parse_bit_string_text(&s) {
+                Some((nbits, bytes)) => {
+                    // v7.39 (round 325, V57) — the DECLARED width applies to a
+                    // string literal too. It was checked only on the
+                    // `B'…'` bit-literal path, so `INSERT INTO t(b)
+                    // VALUES ('10')` into a `BIT(3)` column was accepted and
+                    // stored two bits wide — a column that promises a fixed
+                    // width silently holding another one. PG 18.4:
+                    // `bit string length 2 does not match type bit(3)`, and
+                    // `bit string too long for type bit varying(3)` past a
+                    // varying cap.
+                    match bit_ty {
+                        // A bare `bit` is `bit(1)` in PG, as the arm above.
+                        DataType::Bit(n) => {
+                            let want = if n == 0 { 1 } else { n };
+                            if nbits != want {
+                                return Err(EngineError::Unsupported(alloc::format!(
+                                    "bit string length {nbits} does not match type bit({want})"
+                                )));
+                            }
+                        }
+                        DataType::BitVarying(n) if n != 0 && nbits > n => {
                             return Err(EngineError::Unsupported(alloc::format!(
-                                "bit string length {nbits} does not match type bit({want})"
+                                "bit string too long for type bit varying({n})"
                             )));
                         }
+                        _ => {}
                     }
-                    DataType::BitVarying(n) if n != 0 && nbits > n => {
-                        return Err(EngineError::Unsupported(alloc::format!(
-                            "bit string too long for type bit varying({n})"
-                        )));
-                    }
-                    _ => {}
+                    Some(Value::bit_string(nbits, bytes))
                 }
-                Some(Value::bit_string(nbits, bytes))
+                None => {
+                    // v7.39 (read01 varbit.c) — PG names the first bad digit.
+                    let bad = s.chars().find(|c| *c != '0' && *c != '1');
+                    return Err(EngineError::Eval(EvalError::TypeMismatch {
+                        detail: match bad {
+                            Some(c) => {
+                                alloc::format!("\"{c}\" is not a valid binary digit")
+                            }
+                            None => alloc::format!("invalid input syntax for BIT: {s:?}"),
+                        },
+                    }));
+                }
             }
-            None => {
-                // v7.39 (read01 varbit.c) — PG names the first bad digit.
-                let bad = s.chars().find(|c| *c != '0' && *c != '1');
-                return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: match bad {
-                        Some(c) => {
-                            alloc::format!("\"{c}\" is not a valid binary digit")
-                        }
-                        None => alloc::format!(
-                            "invalid input syntax for BIT: {s:?}"
-                        ),
-                    },
-                }));
-            }
-        },
+        }
         (Value::Text(s), DataType::Xml) => {
             // v7.38 (read01 P6.38) — `::xml` (PG's CONTENT mode) requires the
             // text to be well-formed: element tags must be balanced and
@@ -4887,10 +4887,7 @@ pub(crate) fn coerce_value(
             };
             if !fits {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "{} out of range",
-                        pg_type_name_for_error(expected)
-                    ),
+                    detail: alloc::format!("{} out of range", pg_type_name_for_error(expected)),
                 }));
             }
             made
@@ -4965,9 +4962,7 @@ pub(crate) fn coerce_value(
             Some(p) => Some(Value::Point(p)),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type point: {s:?}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for type point: {s:?}"),
                 }));
             }
         },
@@ -4975,9 +4970,7 @@ pub(crate) fn coerce_value(
             Some((p1, p2)) => Some(Value::Lseg(p1, p2)),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type lseg: {s:?}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for type lseg: {s:?}"),
                 }));
             }
         },
@@ -4985,9 +4978,7 @@ pub(crate) fn coerce_value(
             Some((ur, ll)) => Some(Value::PgBox(ur, ll)),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type box: {s:?}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for type box: {s:?}"),
                 }));
             }
         },
@@ -5022,9 +5013,7 @@ pub(crate) fn coerce_value(
             Some((center, radius)) => Some(Value::Circle { center, radius }),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type circle: {s:?}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for type circle: {s:?}"),
                 }));
             }
         },
@@ -5032,9 +5021,7 @@ pub(crate) fn coerce_value(
             Some((points, closed)) => Some(Value::Path { points, closed }),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type path: {s:?}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for type path: {s:?}"),
                 }));
             }
         },
@@ -5055,9 +5042,7 @@ pub(crate) fn coerce_value(
             Some(points) => Some(Value::Polygon(points)),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type polygon: {s:?}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for type polygon: {s:?}"),
                 }));
             }
         },
@@ -5103,9 +5088,7 @@ pub(crate) fn coerce_value(
             }),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for multirange type: {s:?}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for multirange type: {s:?}"),
                 }));
             }
         },
@@ -5118,9 +5101,7 @@ pub(crate) fn coerce_value(
             Some(pairs) => Some(Value::Hstore(pairs)),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for type hstore: {s:?}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for type hstore: {s:?}"),
                 }));
             }
         },
@@ -5132,9 +5113,7 @@ pub(crate) fn coerce_value(
             Ok(m) => Some(Value::IntArray2D(m)),
             Err(e) => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for INT[][]: {s:?}: {e}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for INT[][]: {s:?}: {e}"),
                 }));
             }
         },
@@ -5142,9 +5121,7 @@ pub(crate) fn coerce_value(
             Ok(m) => Some(Value::BigIntArray2D(m)),
             Err(e) => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for BIGINT[][]: {s:?}: {e}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for BIGINT[][]: {s:?}: {e}"),
                 }));
             }
         },
@@ -5152,9 +5129,7 @@ pub(crate) fn coerce_value(
             Ok(m) => Some(Value::TextArray2D(m)),
             Err(e) => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "invalid input syntax for TEXT[][]: {s:?}: {e}"
-                    ),
+                    detail: alloc::format!("invalid input syntax for TEXT[][]: {s:?}: {e}"),
                 }));
             }
         },
@@ -5608,9 +5583,7 @@ pub(crate) fn coerce_value(
         // literal form that simply did not exist for the temporal arrays.
         (
             Value::Text(s),
-            dt @ (DataType::TimestampArray
-            | DataType::TimestamptzArray
-            | DataType::IntervalArray),
+            dt @ (DataType::TimestampArray | DataType::TimestamptzArray | DataType::IntervalArray),
         ) => {
             let items = decode_text_array_literal(&s).map_err(|_| {
                 EngineError::Eval(EvalError::TypeMismatch {
@@ -5689,9 +5662,7 @@ pub(crate) fn coerce_value(
         (Value::Text(s), DataType::TsVector) => {
             let lexs = eval::decode_tsvector_external(&s).map_err(|e| {
                 EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "cannot parse {s:?} as TSVECTOR: {e}"
-                    ),
+                    detail: alloc::format!("cannot parse {s:?} as TSVECTOR: {e}"),
                 })
             })?;
             Some(Value::TsVector(lexs))
@@ -5728,9 +5699,7 @@ pub(crate) fn coerce_value(
         // one. `rem_euclid` rather than `%` so a pre-epoch timestamp gives
         // a time in [0, 24h) instead of a negative one. A timestamptz value
         // is carried in the same variant, so it comes through here too.
-        (Value::Timestamp(t), DataType::Time) => {
-            Some(Value::Time(t.rem_euclid(86_400_000_000)))
-        }
+        (Value::Timestamp(t), DataType::Time) => Some(Value::Time(t.rem_euclid(86_400_000_000))),
         // v7.39 (read01 numeric.c) — a NumericBig is already an unconstrained
         // NUMERIC ('…0.5::numeric' where the mantissa exceeds i128); pass it
         // through. A declared numeric(p, s) still falls to the typed error.
@@ -5818,9 +5787,7 @@ pub(crate) fn coerce_value(
         // "expected REAL, got NUMERIC(0)" storage mismatch.
         (Value::NumericBig(b), DataType::Real) => {
             let text = b.to_decimal_str();
-            let x: f32 = text
-                .parse()
-                .map_err(|_| real_out_of_range(&text))?;
+            let x: f32 = text.parse().map_err(|_| real_out_of_range(&text))?;
             if !x.is_finite() || (x == 0.0 && float_text_is_nonzero(&text)) {
                 return Err(real_out_of_range(&text));
             }
@@ -6029,12 +5996,14 @@ pub(crate) fn coerce_value(
         }
         _ => None,
     };
-    coerced.ok_or_else(|| EngineError::Storage(StorageError::TypeMismatch {
-        column: col_name.into(),
-        expected,
-        actual,
-        position,
-    }))
+    coerced.ok_or_else(|| {
+        EngineError::Storage(StorageError::TypeMismatch {
+            column: col_name.into(),
+            expected,
+            actual,
+            position,
+        })
+    })
 }
 
 /// v7.38 (read01, T3.C3) — a lexer-validated big decimal literal → NumericBig,

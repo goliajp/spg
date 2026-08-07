@@ -26,7 +26,8 @@ fn stat(e: &mut Engine, col: &str) -> i64 {
 
 fn seeded(rows: i64) -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t(id INT PRIMARY KEY, g INT)").unwrap();
+    e.execute("CREATE TABLE t(id INT PRIMARY KEY, g INT)")
+        .unwrap();
     let mut sql = String::from("INSERT INTO t VALUES ");
     for k in 0..rows {
         if k > 0 {

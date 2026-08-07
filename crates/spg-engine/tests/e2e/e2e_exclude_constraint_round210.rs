@@ -30,9 +30,7 @@ fn overlap_rejected_with_pg_message() {
         "main: {err}"
     );
     assert!(
-        err.contains(
-            "Key (during)=([3,7)) conflicts with existing key (during)=([1,5))."
-        ),
+        err.contains("Key (during)=([3,7)) conflicts with existing key (during)=([1,5))."),
         "detail: {err}"
     );
 }

@@ -103,17 +103,33 @@ fn cursor_command_tags_match_pg() {
     exec_tag(&mut s, "INSERT INTO c VALUES (1),(2),(3),(4),(5)");
     assert_eq!(exec_tag(&mut s, "BEGIN").0, "BEGIN");
     assert_eq!(
-        exec_tag(&mut s, "DECLARE cur SCROLL CURSOR FOR SELECT id FROM c ORDER BY id").0,
+        exec_tag(
+            &mut s,
+            "DECLARE cur SCROLL CURSOR FOR SELECT id FROM c ORDER BY id"
+        )
+        .0,
         "DECLARE CURSOR"
     );
     // FETCH streams DataRows and tags FETCH <n>.
-    assert_eq!(exec_tag(&mut s, "FETCH 3 FROM cur"), ("FETCH 3".to_string(), 3));
+    assert_eq!(
+        exec_tag(&mut s, "FETCH 3 FROM cur"),
+        ("FETCH 3".to_string(), 3)
+    );
     // Past-the-remaining fetch: only 2 left.
-    assert_eq!(exec_tag(&mut s, "FETCH 5 FROM cur"), ("FETCH 2".to_string(), 2));
+    assert_eq!(
+        exec_tag(&mut s, "FETCH 5 FROM cur"),
+        ("FETCH 2".to_string(), 2)
+    );
     // Exhausted: FETCH 0 rows.
-    assert_eq!(exec_tag(&mut s, "FETCH NEXT FROM cur"), ("FETCH 0".to_string(), 0));
+    assert_eq!(
+        exec_tag(&mut s, "FETCH NEXT FROM cur"),
+        ("FETCH 0".to_string(), 0)
+    );
     // MOVE reports the skip count, streams nothing.
-    assert_eq!(exec_tag(&mut s, "MOVE BACKWARD 2 FROM cur"), ("MOVE 2".to_string(), 0));
+    assert_eq!(
+        exec_tag(&mut s, "MOVE BACKWARD 2 FROM cur"),
+        ("MOVE 2".to_string(), 0)
+    );
     assert_eq!(exec_tag(&mut s, "CLOSE cur").0, "CLOSE CURSOR");
     assert_eq!(exec_tag(&mut s, "CLOSE ALL").0, "CLOSE CURSOR ALL");
     assert_eq!(exec_tag(&mut s, "COMMIT").0, "COMMIT");

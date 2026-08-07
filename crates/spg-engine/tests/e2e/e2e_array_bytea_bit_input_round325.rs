@@ -103,8 +103,7 @@ fn a_bad_element_is_the_element_types_own_error() {
 #[test]
 fn cast_and_coercion_agree_on_a_bad_array() {
     let mut e = fixture();
-    let expected =
-        "malformed array literal: \"abc\" DETAIL: Array value must start with \"{\" or dimension information.";
+    let expected = "malformed array literal: \"abc\" DETAIL: Array value must start with \"{\" or dimension information.";
     assert_eq!(err(&mut e, "SELECT 'abc'::int[]"), expected);
     assert_eq!(err(&mut e, "INSERT INTO t (x) VALUES ('abc')"), expected);
     // …including bigint[], whose message began with a stray `BIG`.

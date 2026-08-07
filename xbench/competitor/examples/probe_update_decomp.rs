@@ -23,7 +23,12 @@ fn seed(db: &mut spg_embedded::Database, table: &str, ddl: &str, extra_idx: bool
             if k > 0 {
                 sql.push(',');
             }
-            let _ = write!(sql, "({id}, {}, {})", id % 100, (id * 2_654_435_761) % 100_000);
+            let _ = write!(
+                sql,
+                "({id}, {}, {})",
+                id % 100,
+                (id * 2_654_435_761) % 100_000
+            );
         }
         db.execute(&sql).unwrap();
         i += 1000;
@@ -54,19 +59,61 @@ fn main() {
     let mut db = spg_embedded::Database::open_in_memory();
 
     // Variant A — the write_heavy shape: PK + v index.
-    seed(&mut db, "wa", "CREATE TABLE wa (id INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL)", true);
+    seed(
+        &mut db,
+        "wa",
+        "CREATE TABLE wa (id INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL)",
+        true,
+    );
     // Variant B — PK only, no v index.
-    seed(&mut db, "wb2", "CREATE TABLE wb2 (id INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL)", false);
+    seed(
+        &mut db,
+        "wb2",
+        "CREATE TABLE wb2 (id INT PRIMARY KEY, g INT NOT NULL, v INT NOT NULL)",
+        false,
+    );
     // Variant C — bare table: no PK, no index at all.
-    seed(&mut db, "wc", "CREATE TABLE wc (id INT NOT NULL, g INT NOT NULL, v INT NOT NULL)", false);
+    seed(
+        &mut db,
+        "wc",
+        "CREATE TABLE wc (id INT NOT NULL, g INT NOT NULL, v INT NOT NULL)",
+        false,
+    );
 
     let upd = |t: &str| format!("UPDATE {t} SET g = g + 1 WHERE v BETWEEN 20000 AND 40000");
-    println!("scan-only  count BETWEEN     : {:8.3} ms", bench(&mut db, "SELECT count(*) FROM wa WHERE v BETWEEN 20000 AND 40000"));
-    println!("A pk+vidx  update_range_20k  : {:8.3} ms", bench(&mut db, &upd("wa")));
-    println!("B pk-only  update_range_20k  : {:8.3} ms", bench(&mut db, &upd("wb2")));
-    println!("C bare     update_range_20k  : {:8.3} ms", bench(&mut db, &upd("wc")));
+    println!(
+        "scan-only  count BETWEEN     : {:8.3} ms",
+        bench(
+            &mut db,
+            "SELECT count(*) FROM wa WHERE v BETWEEN 20000 AND 40000"
+        )
+    );
+    println!(
+        "A pk+vidx  update_range_20k  : {:8.3} ms",
+        bench(&mut db, &upd("wa"))
+    );
+    println!(
+        "B pk-only  update_range_20k  : {:8.3} ms",
+        bench(&mut db, &upd("wb2"))
+    );
+    println!(
+        "C bare     update_range_20k  : {:8.3} ms",
+        bench(&mut db, &upd("wc"))
+    );
     // SET-eval floor: same rows matched, assignment to a constant.
-    println!("C bare     SET g=0 same range: {:8.3} ms", bench(&mut db, "UPDATE wc SET g = 0 WHERE v BETWEEN 20000 AND 40000"));
+    println!(
+        "C bare     SET g=0 same range: {:8.3} ms",
+        bench(
+            &mut db,
+            "UPDATE wc SET g = 0 WHERE v BETWEEN 20000 AND 40000"
+        )
+    );
     // Narrow range for linearity.
-    println!("A pk+vidx  update 2k range   : {:8.3} ms", bench(&mut db, "UPDATE wa SET g = g + 1 WHERE v BETWEEN 20000 AND 22000"));
+    println!(
+        "A pk+vidx  update 2k range   : {:8.3} ms",
+        bench(
+            &mut db,
+            "UPDATE wa SET g = g + 1 WHERE v BETWEEN 20000 AND 22000"
+        )
+    );
 }

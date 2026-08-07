@@ -42,7 +42,10 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 #[test]
 fn round639_pg_operator_lists_what_the_engine_evaluates() {
     let mut e = Engine::new();
-    assert_eq!(vals(&mut e, "SELECT count(*) FROM pg_operator"), vec!["330"]);
+    assert_eq!(
+        vals(&mut e, "SELECT count(*) FROM pg_operator"),
+        vec!["330"]
+    );
     // Cross-type arithmetic, which the same-type loops never produced.
     assert_eq!(
         vals(
@@ -85,7 +88,10 @@ fn round639_only_the_unary_rows_have_no_left_type() {
         "the unary minus per numeric type — 330 - 324"
     );
     assert_eq!(
-        vals(&mut e, "SELECT DISTINCT oprname, oprkind FROM pg_operator WHERE oprleft = 0"),
+        vals(
+            &mut e,
+            "SELECT DISTINCT oprname, oprkind FROM pg_operator WHERE oprleft = 0"
+        ),
         vec!["-|l"]
     );
 }

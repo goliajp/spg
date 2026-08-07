@@ -39,7 +39,8 @@ fn err(e: &mut Engine, sql: &str) -> String {
 
 fn deferred_fixture() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE dparent (id int primary key)").unwrap();
+    e.execute("CREATE TABLE dparent (id int primary key)")
+        .unwrap();
     e.execute(
         "CREATE TABLE dchild (id int primary key, pid int \
          REFERENCES dparent(id) DEFERRABLE INITIALLY DEFERRED)",
@@ -170,7 +171,9 @@ fn the_timing_survives_a_catalog_round_trip() {
     restored
         .execute("INSERT INTO dchild VALUES (1, 100)")
         .unwrap();
-    restored.execute("INSERT INTO dparent VALUES (100)").unwrap();
+    restored
+        .execute("INSERT INTO dparent VALUES (100)")
+        .unwrap();
     restored.execute("COMMIT").unwrap();
     assert_eq!(one(&mut restored, "SELECT count(*) FROM dchild"), "1");
 }

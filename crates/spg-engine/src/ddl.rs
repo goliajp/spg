@@ -149,9 +149,7 @@ impl Engine {
             // v7.39 (round 431) — `ALTER TABLE t DROP {INDEX|KEY} name`
             // shares the standalone DROP INDEX path, so the two spellings
             // cannot diverge on the not-found / IF EXISTS behaviour.
-            T::DropIndex { name, if_exists } => {
-                self.exec_drop_index(name, if_exists).map(|_| ())
-            }
+            T::DropIndex { name, if_exists } => self.exec_drop_index(name, if_exists).map(|_| ()),
             T::AddColumn {
                 column,
                 if_not_exists,
@@ -819,8 +817,7 @@ impl Engine {
                     PartitionRole::Hash {
                         modulus, remainder, ..
                     } => {
-                        crate::partition::pg_compatible_hash(&key)
-                            .rem_euclid(u64::from(*modulus))
+                        crate::partition::pg_compatible_hash(&key).rem_euclid(u64::from(*modulus))
                             == u64::from(*remainder)
                     }
                     // A DEFAULT partition takes whatever no sibling claims, so
@@ -1609,7 +1606,9 @@ impl Engine {
                         candidate
                     }
                 };
-                table.add_index(idx_name, leading).map_err(EngineError::Storage)?;
+                table
+                    .add_index(idx_name, leading)
+                    .map_err(EngineError::Storage)?;
             }
             spg_sql::ast::TableConstraint::FulltextIndex { name, columns } => {
                 // v7.17.0 Phase 2.2 — ALTER TABLE ADD
@@ -1665,8 +1664,7 @@ impl Engine {
                         })?;
                     els.push((pos, op));
                 }
-                let ex_name =
-                    name.unwrap_or_else(|| alloc::format!("{tbl}_{cols_joined}_excl"));
+                let ex_name = name.unwrap_or_else(|| alloc::format!("{tbl}_{cols_joined}_excl"));
                 table
                     .schema_mut()
                     .exclusion_constraints
@@ -2152,11 +2150,9 @@ impl Engine {
                 // exist` here, not `index "x" …`. An index IS a relation
                 // there, and the wire classifier reads the relation wording
                 // for 42P01; SPG's own spelling missed both.
-                Err(StorageError::IndexNotFound { .. }) => {
-                    Err(EngineError::Unsupported(alloc::format!(
-                        "relation \"{idx_name}\" does not exist"
-                    )))
-                }
+                Err(StorageError::IndexNotFound { .. }) => Err(EngineError::Unsupported(
+                    alloc::format!("relation \"{idx_name}\" does not exist"),
+                )),
                 Err(e) => Err(EngineError::Storage(e)),
             };
         }
@@ -2374,102 +2370,107 @@ impl Engine {
                 .add_gin_fulltext_index(stmt.name.clone(), &col)
                 .map_err(EngineError::Storage)?;
         } else {
-        match stmt.method {
-            IndexMethod::BTree => {
-                table.add_index(stmt.name.clone(), &stmt.column)?;
-                // v7.38 P0 元机制 A — index has been pushed onto
-                // the table's index vector. Tests use this point
-                // to race a sealed index against a concurrent
-                // read.
-                crate::injection_point!("index_build_post_seal", &stmt.name);
-            }
-            IndexMethod::Hnsw => {
-                if !included_positions.is_empty() {
-                    return Err(EngineError::Unsupported(
-                        "INCLUDE columns are not supported on HNSW indexes".into(),
-                    ));
-                }
-                table.add_nsw_index(stmt.name.clone(), &stmt.column, spg_storage::NSW_DEFAULT_M)?;
-            }
-            // v6.7.1 — BRIN. Pure metadata; no in-memory data.
-            IndexMethod::Brin => {
-                if !included_positions.is_empty() {
-                    return Err(EngineError::Unsupported(
-                        "INCLUDE columns are not supported on BRIN indexes".into(),
-                    ));
-                }
-                table.add_brin_index(stmt.name.clone(), &stmt.column)?;
-            }
-            // v7.12.3 — GIN inverted index. Real posting-list-backed
-            // GIN when the indexed column is `tsvector`; falls back
-            // to a BTree on the leading column for any other column
-            // type so v7.9.26b's `pg_dump` compatibility (GIN on
-            // JSONB etc. silently loading as BTree) is preserved.
-            // Operators see the real GIN only where it matters; old
-            // schemas keep loading.
-            IndexMethod::Gin => {
-                if !included_positions.is_empty() {
-                    return Err(EngineError::Unsupported(
-                        "INCLUDE columns are not supported on GIN indexes".into(),
-                    ));
-                }
-                let col_pos = table
-                    .schema()
-                    .column_position(&stmt.column)
-                    .ok_or_else(|| {
-                        EngineError::Storage(StorageError::ColumnNotFound {
-                            column: stmt.column.clone(),
-                        })
-                    })?;
-                let col_ty = table.schema().columns[col_pos].ty;
-                // v7.15.0 — `gin_trgm_ops` on a TEXT/VARCHAR
-                // column dispatches to the real trigram-shingle
-                // GIN build (LIKE / similarity acceleration).
-                // Other GIN opclasses fall through to the regular
-                // tsvector-vs-BTree split below.
-                let is_trgm = stmt
-                    .opclass
-                    .as_deref()
-                    .is_some_and(|op| op.eq_ignore_ascii_case("gin_trgm_ops"));
-                if is_trgm
-                    && matches!(
-                        col_ty,
-                        spg_storage::DataType::Text | spg_storage::DataType::Varchar(_)
-                    )
-                {
-                    table
-                        .add_gin_trgm_index(stmt.name.clone(), &stmt.column)
-                        .map_err(EngineError::Storage)?;
-                } else if col_ty == spg_storage::DataType::TsVector {
-                    table
-                        .add_gin_index(stmt.name.clone(), &stmt.column)
-                        .map_err(EngineError::Storage)?;
-                } else if matches!(
-                    col_ty,
-                    spg_storage::DataType::Json | spg_storage::DataType::Jsonb
-                ) {
-                    // v7.37.8(sentori Epic 5 P2)— real JSONB-GIN
-                    // posting list. Pre-7.37.8 the same DDL loaded
-                    // as a BTree fallback so `pg_dump` scripts that
-                    // named GIN on JSONB stayed loadable but the
-                    // posting-list acceleration was missing; the
-                    // sentori dashboard's `labels @> '...'` queries
-                    // fell back to full scan. The planner picks
-                    // this index up via the `@>` seek in
-                    // `index_access::try_gin_jsonb_seek`.
-                    table
-                        .add_gin_jsonb_index(stmt.name.clone(), &stmt.column)
-                        .map_err(EngineError::Storage)?;
-                } else {
-                    // v7.9.26b BTree fallback — the catalog still
-                    // gets an index entry on the leading column so
-                    // pg_dump scripts that name GIN on other column
-                    // types load clean; query-time gain stays opt-in
-                    // for tsvector / JSONB callers.
+            match stmt.method {
+                IndexMethod::BTree => {
                     table.add_index(stmt.name.clone(), &stmt.column)?;
+                    // v7.38 P0 元机制 A — index has been pushed onto
+                    // the table's index vector. Tests use this point
+                    // to race a sealed index against a concurrent
+                    // read.
+                    crate::injection_point!("index_build_post_seal", &stmt.name);
+                }
+                IndexMethod::Hnsw => {
+                    if !included_positions.is_empty() {
+                        return Err(EngineError::Unsupported(
+                            "INCLUDE columns are not supported on HNSW indexes".into(),
+                        ));
+                    }
+                    table.add_nsw_index(
+                        stmt.name.clone(),
+                        &stmt.column,
+                        spg_storage::NSW_DEFAULT_M,
+                    )?;
+                }
+                // v6.7.1 — BRIN. Pure metadata; no in-memory data.
+                IndexMethod::Brin => {
+                    if !included_positions.is_empty() {
+                        return Err(EngineError::Unsupported(
+                            "INCLUDE columns are not supported on BRIN indexes".into(),
+                        ));
+                    }
+                    table.add_brin_index(stmt.name.clone(), &stmt.column)?;
+                }
+                // v7.12.3 — GIN inverted index. Real posting-list-backed
+                // GIN when the indexed column is `tsvector`; falls back
+                // to a BTree on the leading column for any other column
+                // type so v7.9.26b's `pg_dump` compatibility (GIN on
+                // JSONB etc. silently loading as BTree) is preserved.
+                // Operators see the real GIN only where it matters; old
+                // schemas keep loading.
+                IndexMethod::Gin => {
+                    if !included_positions.is_empty() {
+                        return Err(EngineError::Unsupported(
+                            "INCLUDE columns are not supported on GIN indexes".into(),
+                        ));
+                    }
+                    let col_pos =
+                        table
+                            .schema()
+                            .column_position(&stmt.column)
+                            .ok_or_else(|| {
+                                EngineError::Storage(StorageError::ColumnNotFound {
+                                    column: stmt.column.clone(),
+                                })
+                            })?;
+                    let col_ty = table.schema().columns[col_pos].ty;
+                    // v7.15.0 — `gin_trgm_ops` on a TEXT/VARCHAR
+                    // column dispatches to the real trigram-shingle
+                    // GIN build (LIKE / similarity acceleration).
+                    // Other GIN opclasses fall through to the regular
+                    // tsvector-vs-BTree split below.
+                    let is_trgm = stmt
+                        .opclass
+                        .as_deref()
+                        .is_some_and(|op| op.eq_ignore_ascii_case("gin_trgm_ops"));
+                    if is_trgm
+                        && matches!(
+                            col_ty,
+                            spg_storage::DataType::Text | spg_storage::DataType::Varchar(_)
+                        )
+                    {
+                        table
+                            .add_gin_trgm_index(stmt.name.clone(), &stmt.column)
+                            .map_err(EngineError::Storage)?;
+                    } else if col_ty == spg_storage::DataType::TsVector {
+                        table
+                            .add_gin_index(stmt.name.clone(), &stmt.column)
+                            .map_err(EngineError::Storage)?;
+                    } else if matches!(
+                        col_ty,
+                        spg_storage::DataType::Json | spg_storage::DataType::Jsonb
+                    ) {
+                        // v7.37.8(sentori Epic 5 P2)— real JSONB-GIN
+                        // posting list. Pre-7.37.8 the same DDL loaded
+                        // as a BTree fallback so `pg_dump` scripts that
+                        // named GIN on JSONB stayed loadable but the
+                        // posting-list acceleration was missing; the
+                        // sentori dashboard's `labels @> '...'` queries
+                        // fell back to full scan. The planner picks
+                        // this index up via the `@>` seek in
+                        // `index_access::try_gin_jsonb_seek`.
+                        table
+                            .add_gin_jsonb_index(stmt.name.clone(), &stmt.column)
+                            .map_err(EngineError::Storage)?;
+                    } else {
+                        // v7.9.26b BTree fallback — the catalog still
+                        // gets an index entry on the leading column so
+                        // pg_dump scripts that name GIN on other column
+                        // types load clean; query-time gain stays opt-in
+                        // for tsvector / JSONB callers.
+                        table.add_index(stmt.name.clone(), &stmt.column)?;
+                    }
                 }
             }
-        }
         }
         if !included_positions.is_empty()
             && let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name)
@@ -3279,7 +3280,8 @@ impl Engine {
                                 // would overlap partition "a"`.
                                 let _ = crate::partition::bound_to_diag(new_b);
                                 return Err(EngineError::Unsupported(alloc::format!(
-                                    "partition \"{}\" would overlap partition \"{sib}\"", stmt.name,
+                                    "partition \"{}\" would overlap partition \"{sib}\"",
+                                    stmt.name,
                                 )));
                             }
                         }
@@ -3525,15 +3527,16 @@ impl Engine {
     ) -> Result<TableSchema, EngineError> {
         // v7.39 (round 711) — the inline PK's timing clause, captured
         // before `columns` is consumed into the schema below.
-        let inline_pk_timing: (bool, bool) = columns
-            .iter()
-            .filter(|c| c.is_primary_key)
-            .fold((false, false), |acc, c| {
-                (
-                    acc.0 | c.constraint_deferrable,
-                    acc.1 | c.constraint_initially_deferred,
-                )
-            });
+        let inline_pk_timing: (bool, bool) =
+            columns
+                .iter()
+                .filter(|c| c.is_primary_key)
+                .fold((false, false), |acc, c| {
+                    (
+                        acc.0 | c.constraint_deferrable,
+                        acc.1 | c.constraint_initially_deferred,
+                    )
+                });
         // v7.9.19 — table-level constraints: PRIMARY KEY (a, b, ...)
         // and UNIQUE (a, b, ...). Each builds a BTree index on the
         // leading column (the existing single-column storage tier)
@@ -3634,22 +3637,24 @@ impl Engine {
                 //     domain default (probed: 42, and a column default
                 //     of 7 overrides it).
                 if let Some(d) = col.default.take() {
-                    col.default =
-                        Some(crate::conversions::coerce_value(d, base_type, &col.name, 0)?);
+                    col.default = Some(crate::conversions::coerce_value(
+                        d, base_type, &col.name, 0,
+                    )?);
                 } else if let Some(src) = dom_default {
                     let expr = spg_sql::parser::parse_expression(&src).map_err(|e| {
                         EngineError::Storage(spg_storage::StorageError::Corrupt(alloc::format!(
                             "domain default {src:?} failed to re-parse: {e:?}"
                         )))
                     })?;
-                    let empty: alloc::vec::Vec<spg_storage::ColumnSchema> =
-                        alloc::vec::Vec::new();
+                    let empty: alloc::vec::Vec<spg_storage::ColumnSchema> = alloc::vec::Vec::new();
                     let ctx = crate::eval::EvalContext::new(&empty, None);
-                    let row = spg_storage::Row { values: alloc::vec::Vec::new() };
-                    let v = crate::eval::eval_expr(&expr, &row, &ctx)
-                        .map_err(EngineError::Eval)?;
-                    col.default =
-                        Some(crate::conversions::coerce_value(v, base_type, &col.name, 0)?);
+                    let row = spg_storage::Row {
+                        values: alloc::vec::Vec::new(),
+                    };
+                    let v = crate::eval::eval_expr(&expr, &row, &ctx).map_err(EngineError::Eval)?;
+                    col.default = Some(crate::conversions::coerce_value(
+                        v, base_type, &col.name, 0,
+                    )?);
                 }
                 continue;
             }
@@ -4547,7 +4552,9 @@ impl Engine {
                     .join(","),
                 None => alloc::string::String::new(),
             };
-            self.notice(alloc::format!("function {name}({sig}) does not exist, skipping"));
+            self.notice(alloc::format!(
+                "function {name}({sig}) does not exist, skipping"
+            ));
         }
         Ok(QueryResult::CommandOk {
             affected: usize::from(removed),
@@ -5052,7 +5059,8 @@ impl Engine {
                 }
                 let expr = alloc::format!("{check}");
                 let mut def = dom.clone();
-                def.checks.push(spg_storage::DomainCheck { name: cname, expr });
+                def.checks
+                    .push(spg_storage::DomainCheck { name: cname, expr });
                 self.replace_domain(name, def)?;
             }
             A::DropConstraint {
@@ -5109,7 +5117,9 @@ impl Engine {
                     let cat = self.active_catalog();
                     let mut offender: Option<(alloc::string::String, alloc::string::String)> = None;
                     'outer: for tname in cat.table_names() {
-                        let Some(table) = cat.get(&tname) else { continue };
+                        let Some(table) = cat.get(&tname) else {
+                            continue;
+                        };
                         let cols = table.schema().columns.clone();
                         let idxs: alloc::vec::Vec<usize> = cols
                             .iter()
@@ -5180,7 +5190,6 @@ impl Engine {
             .create_domain_type(def)
             .map_err(EngineError::Storage)
     }
-
 
     /// v7.17.0 Phase 1.5 — `CREATE DOMAIN name AS base [DEFAULT
     /// expr] [NOT NULL] [CHECK (expr)]*` engine path. Stores the
@@ -5508,7 +5517,12 @@ impl Engine {
         // found putting `corrupt on-disk format:` in front of a plain typo.
         // `Unsupported` carries no banner, and the wire's classifier reads
         // `relation "…" does not exist` for 42P01 already.
-        let source = match self.active_catalog().materialized_views().get(name).cloned() {
+        let source = match self
+            .active_catalog()
+            .materialized_views()
+            .get(name)
+            .cloned()
+        {
             Some(s) => s,
             None => {
                 let exists = self.active_catalog().get(name).is_some();
@@ -5577,7 +5591,10 @@ impl Engine {
                 && self.matview_maintainable.contains_key(name)
                 && self.matview_refresh_watermark.contains_key(name)
                 && !self.matview_delta_overflow.contains(name)
-                && self.matview_delta_buf.get(name).is_some_and(|b| !b.is_empty())
+                && self
+                    .matview_delta_buf
+                    .get(name)
+                    .is_some_and(|b| !b.is_empty())
             {
                 let buf = self.matview_delta_buf.remove(name).expect("checked above");
                 // v7.39 (round 738) — ordered application: Insert /
@@ -5590,8 +5607,7 @@ impl Engine {
                     crate::MATVIEW_DELTA_APPLIED
                         .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 } else {
-                    crate::MATVIEW_DELTA_BAILED
-                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    crate::MATVIEW_DELTA_BAILED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 if let Some(applied) = outcome {
                     let current: alloc::vec::Vec<(String, u64)> = dep_tables
@@ -5962,8 +5978,7 @@ pub(crate) fn eval_runtime_default_free(
                 ctx = ctx.with_session(sv);
             }
             let row = spg_storage::Row::new(alloc::vec::Vec::new());
-            let v = eval::eval_expr(&expr, &row, &ctx)
-                .map_err(|e| EngineError::Eval(e))?;
+            let v = eval::eval_expr(&expr, &row, &ctx).map_err(|e| EngineError::Eval(e))?;
             return coerce_value(v, ty, "DEFAULT", 0);
         }
     };
@@ -6261,7 +6276,9 @@ fn column_def_to_schema(c: ColumnDef, mysql: bool) -> Result<ColumnSchema, Engin
     // flag is what tells them apart.
     let is_text_col = matches!(
         ty,
-        spg_storage::DataType::Text | spg_storage::DataType::Varchar(_) | spg_storage::DataType::Char(_)
+        spg_storage::DataType::Text
+            | spg_storage::DataType::Varchar(_)
+            | spg_storage::DataType::Char(_)
     );
     // v7.39 (round 676) — carry the collation NAME as written, which
     // `Collation` below cannot: it folds C / POSIX / en_US / default into
@@ -6574,9 +6591,7 @@ impl Engine {
                             let SelectItem::Expr { expr, .. } = item else {
                                 unreachable!("registration admits Expr items only");
                             };
-                            vals.push(
-                                eval::eval_expr(expr, row, &ctx).map_err(EngineError::Eval)?,
-                            );
+                            vals.push(eval::eval_expr(expr, row, &ctx).map_err(EngineError::Eval)?);
                         }
                     }
                     let cat = self.active_catalog_mut();
@@ -6621,9 +6636,7 @@ impl Engine {
                         let cat = self.active_catalog_mut();
                         let table = cat.get_mut(name).ok_or_else(|| {
                             EngineError::Storage(spg_storage::StorageError::Corrupt(
-                                alloc::format!(
-                                    "materialized view {name:?} backing table missing"
-                                ),
+                                alloc::format!("materialized view {name:?} backing table missing"),
                             ))
                         })?;
                         let _ = table.mark_row_deleted(pos, v);
@@ -6650,8 +6663,7 @@ impl Engine {
                         .and_then(|(_, m)| m.get(&rowid.0).copied());
                     match (old_pos, keep) {
                         (Some(pos), true) => {
-                            let mut vals =
-                                alloc::vec::Vec::with_capacity(body.items.len());
+                            let mut vals = alloc::vec::Vec::with_capacity(body.items.len());
                             {
                                 let ctx = self.ev_ctx(&base_cols, Some(alias.as_str()));
                                 let r = spg_storage::Row::new(new_row.clone());
@@ -6695,8 +6707,7 @@ impl Engine {
                             applied += 1;
                         }
                         (None, true) => {
-                            let mut vals =
-                                alloc::vec::Vec::with_capacity(body.items.len());
+                            let mut vals = alloc::vec::Vec::with_capacity(body.items.len());
                             {
                                 let ctx = self.ev_ctx(&base_cols, Some(alias.as_str()));
                                 let r = spg_storage::Row::new(new_row.clone());

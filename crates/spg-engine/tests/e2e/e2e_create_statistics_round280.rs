@@ -38,7 +38,8 @@ fn err(e: &mut Engine, sql: &str) -> String {
 
 fn fixture() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE stt (a int, b int, c text)").unwrap();
+    e.execute("CREATE TABLE stt (a int, b int, c text)")
+        .unwrap();
     e
 }
 

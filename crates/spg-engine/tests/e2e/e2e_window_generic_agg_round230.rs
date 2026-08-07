@@ -46,16 +46,41 @@ fn err(e: &mut Engine, sql: &str) -> String {
 fn collection_aggregates_run_as_windows() {
     let mut e = seeded();
     assert_eq!(
-        col(&mut e, "SELECT id, string_agg(g,',') OVER (PARTITION BY g ORDER BY v) FROM w ORDER BY id"),
+        col(
+            &mut e,
+            "SELECT id, string_agg(g,',') OVER (PARTITION BY g ORDER BY v) FROM w ORDER BY id"
+        ),
         ["a", "a,a,a", "a,a,a", "b", "b,b,b", "b,b,b", "b,b,b,b"]
     );
     assert_eq!(
-        col(&mut e, "SELECT id, array_agg(v) OVER (PARTITION BY g ORDER BY v)::text FROM w ORDER BY id"),
-        ["{10}", "{10,20,20}", "{10,20,20}", "{5}", "{5,15,15}", "{5,15,15}", "{5,15,15,30}"]
+        col(
+            &mut e,
+            "SELECT id, array_agg(v) OVER (PARTITION BY g ORDER BY v)::text FROM w ORDER BY id"
+        ),
+        [
+            "{10}",
+            "{10,20,20}",
+            "{10,20,20}",
+            "{5}",
+            "{5,15,15}",
+            "{5,15,15}",
+            "{5,15,15,30}"
+        ]
     );
     assert_eq!(
-        col(&mut e, "SELECT id, json_agg(v) OVER (PARTITION BY g ORDER BY v)::text FROM w ORDER BY id"),
-        ["[10]", "[10, 20, 20]", "[10, 20, 20]", "[5]", "[5, 15, 15]", "[5, 15, 15]", "[5, 15, 15, 30]"]
+        col(
+            &mut e,
+            "SELECT id, json_agg(v) OVER (PARTITION BY g ORDER BY v)::text FROM w ORDER BY id"
+        ),
+        [
+            "[10]",
+            "[10, 20, 20]",
+            "[10, 20, 20]",
+            "[5]",
+            "[5, 15, 15]",
+            "[5, 15, 15]",
+            "[5, 15, 15, 30]"
+        ]
     );
 }
 
@@ -63,16 +88,27 @@ fn collection_aggregates_run_as_windows() {
 fn boolean_bit_and_stat_aggregates_run_as_windows() {
     let mut e = seeded();
     assert_eq!(
-        col(&mut e, "SELECT id, bool_or(v>10) OVER (PARTITION BY g)::text FROM w ORDER BY id"),
+        col(
+            &mut e,
+            "SELECT id, bool_or(v>10) OVER (PARTITION BY g)::text FROM w ORDER BY id"
+        ),
         ["true", "true", "true", "true", "true", "true", "true"]
     );
     assert_eq!(
-        col(&mut e, "SELECT id, bool_and(v>10) OVER (PARTITION BY g)::text FROM w ORDER BY id"),
-        ["false", "false", "false", "false", "false", "false", "false"]
+        col(
+            &mut e,
+            "SELECT id, bool_and(v>10) OVER (PARTITION BY g)::text FROM w ORDER BY id"
+        ),
+        [
+            "false", "false", "false", "false", "false", "false", "false"
+        ]
     );
     // stddev/variance keep PG's exact NUMERIC result, not an f64.
     assert_eq!(
-        col(&mut e, "SELECT id, stddev(v) OVER (PARTITION BY g)::text FROM w ORDER BY id"),
+        col(
+            &mut e,
+            "SELECT id, stddev(v) OVER (PARTITION BY g)::text FROM w ORDER BY id"
+        ),
         [
             "5.7735026918962576",
             "5.7735026918962576",
@@ -84,11 +120,17 @@ fn boolean_bit_and_stat_aggregates_run_as_windows() {
         ]
     );
     assert_eq!(
-        col(&mut e, "SELECT id, bit_or(v) OVER (PARTITION BY g)::text FROM w ORDER BY id"),
+        col(
+            &mut e,
+            "SELECT id, bit_or(v) OVER (PARTITION BY g)::text FROM w ORDER BY id"
+        ),
         ["30", "30", "30", "31", "31", "31", "31"]
     );
     assert_eq!(
-        col(&mut e, "SELECT id, any_value(v) OVER (PARTITION BY g)::text FROM w ORDER BY id"),
+        col(
+            &mut e,
+            "SELECT id, any_value(v) OVER (PARTITION BY g)::text FROM w ORDER BY id"
+        ),
         ["10", "10", "10", "5", "5", "5", "5"]
     );
 }
@@ -113,7 +155,15 @@ fn generic_aggregates_honour_frame_exclude_and_filter() {
              ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW)::text \
              FROM w ORDER BY id"
         ),
-        ["{20,20}", "{10,20}", "{10,20}", "{15,15,30}", "{5,15,30}", "{5,15,30}", "{5,15,15}"]
+        [
+            "{20,20}",
+            "{10,20}",
+            "{10,20}",
+            "{15,15,30}",
+            "{5,15,30}",
+            "{5,15,30}",
+            "{5,15,15}"
+        ]
     );
     // FILTER restricts which frame rows contribute.
     assert_eq!(
@@ -122,7 +172,15 @@ fn generic_aggregates_honour_frame_exclude_and_filter() {
             "SELECT id, array_agg(v) FILTER (WHERE v > 10) OVER (PARTITION BY g)::text \
              FROM w ORDER BY id"
         ),
-        ["{20,20}", "{20,20}", "{20,20}", "{15,15,30}", "{15,15,30}", "{15,15,30}", "{15,15,30}"]
+        [
+            "{20,20}",
+            "{20,20}",
+            "{20,20}",
+            "{15,15,30}",
+            "{15,15,30}",
+            "{15,15,30}",
+            "{15,15,30}"
+        ]
     );
 }
 
@@ -132,9 +190,18 @@ fn distinct_and_aggregate_order_by_are_refused_not_ignored() {
     // Both modifiers used to be parsed and silently dropped, so
     // `count(DISTINCT v) OVER (…)` answered the plain count (3 / 4 here,
     // where the distinct counts are 2 / 3). PG implements neither.
-    let got = err(&mut e, "SELECT count(DISTINCT v) OVER (PARTITION BY g) FROM w");
-    assert!(got.contains("DISTINCT is not implemented for window functions"), "{got}");
-    let got = err(&mut e, "SELECT array_agg(v ORDER BY v DESC) OVER (PARTITION BY g) FROM w");
+    let got = err(
+        &mut e,
+        "SELECT count(DISTINCT v) OVER (PARTITION BY g) FROM w",
+    );
+    assert!(
+        got.contains("DISTINCT is not implemented for window functions"),
+        "{got}"
+    );
+    let got = err(
+        &mut e,
+        "SELECT array_agg(v ORDER BY v DESC) OVER (PARTITION BY g) FROM w",
+    );
     assert!(
         got.contains("aggregate ORDER BY is not implemented for window functions"),
         "{got}"

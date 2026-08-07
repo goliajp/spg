@@ -89,14 +89,23 @@ fn distinct_on_must_lead_the_ordering() {
         "{got}"
     );
     let got = err(&mut e, "SELECT DISTINCT ON (a) a, b FROM t ORDER BY b, a");
-    assert!(got.contains("must match initial ORDER BY expressions"), "{got}");
+    assert!(
+        got.contains("must match initial ORDER BY expressions"),
+        "{got}"
+    );
     // Probed against PG18.4: a leading match is enough, the ON list need
     // not be exhausted, and once it is the remaining keys are free.
     ok(&mut e, "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b");
-    ok(&mut e, "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a DESC, b");
+    ok(
+        &mut e,
+        "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a DESC, b",
+    );
     ok(&mut e, "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY a");
     ok(&mut e, "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY b");
-    ok(&mut e, "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY b, a");
+    ok(
+        &mut e,
+        "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY b, a",
+    );
     ok(&mut e, "SELECT DISTINCT ON (b) a, b FROM t ORDER BY b, a");
     // No ORDER BY at all is legal.
     ok(&mut e, "SELECT DISTINCT ON (a) a, b FROM t");

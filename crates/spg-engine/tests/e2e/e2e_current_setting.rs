@@ -195,7 +195,10 @@ fn set_validates_known_typed_gucs() {
     //   SPG before round 501: SET  (accepted, and the setting the caller
     //          believed they had made was never made — round 500)
     let unknown = e.execute("SET some_random_guc='whatever'");
-    assert!(unknown.is_err(), "unknown GUC should be rejected: {unknown:?}");
+    assert!(
+        unknown.is_err(),
+        "unknown GUC should be rejected: {unknown:?}"
+    );
     // A dotted name stays accepted: PG treats it as a customised option
     // and extensions rely on that.
     e.execute("SET myapp.thing='whatever'").unwrap();

@@ -239,7 +239,10 @@ fn left_numeric_input_coerced() {
         .execute("SELECT left(12345, 3)")
         .expect_err("PG has no left(integer, integer)")
         .to_string();
-    assert!(m.contains("function left(integer, integer) does not exist"), "{m}");
+    assert!(
+        m.contains("function left(integer, integer) does not exist"),
+        "{m}"
+    );
 }
 
 // ── INTEGRATION ─────────────────────────────────────────────────

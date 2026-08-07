@@ -781,7 +781,9 @@ fn resolve_group_by_aliases(
             continue;
         };
         if c.qualifier.is_some()
-            || schema_cols.iter().any(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+            || schema_cols
+                .iter()
+                .any(|sc| sc.name.eq_ignore_ascii_case(&c.name))
         {
             out.push(key);
             continue;
@@ -865,7 +867,9 @@ pub(crate) fn run(
     let group_keys_all_resolve = group_exprs.iter().all(|g| match g {
         Expr::Column(c) => {
             c.qualifier.is_some()
-                || schema_cols.iter().any(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+                || schema_cols
+                    .iter()
+                    .any(|sc| sc.name.eq_ignore_ascii_case(&c.name))
         }
         _ => true,
     });
@@ -882,18 +886,14 @@ pub(crate) fn run(
                 _ => None,
             })
             .or_else(|| {
-                stmt.order_by
-                    .iter()
-                    .find_map(|o| {
-                        first_ungrouped_column(&o.expr, &group_exprs, schema_cols, &licensed)
-                    })
+                stmt.order_by.iter().find_map(|o| {
+                    first_ungrouped_column(&o.expr, &group_exprs, schema_cols, &licensed)
+                })
             })
             .or_else(|| {
                 stmt.having
                     .as_ref()
-                    .and_then(|h| {
-                        first_ungrouped_column(h, &group_exprs, schema_cols, &licensed)
-                    })
+                    .and_then(|h| first_ungrouped_column(h, &group_exprs, schema_cols, &licensed))
             });
         if let Some(c) = offender {
             // PG qualifies the column with the alias when there is one, and
@@ -945,7 +945,12 @@ pub(crate) fn run(
             o.expr = wrap_loose_group_columns(taken, &group_exprs, schema_cols, claim);
         }
         if let Some(h) = s.having.take() {
-            s.having = Some(wrap_loose_group_columns(h, &group_exprs, schema_cols, claim));
+            s.having = Some(wrap_loose_group_columns(
+                h,
+                &group_exprs,
+                schema_cols,
+                claim,
+            ));
         }
         loose_stmt = s;
         &loose_stmt
@@ -1203,16 +1208,17 @@ pub(crate) fn run(
 fn ordered_set_arg_type_name(e: &Expr, columns: &[ColumnSchema]) -> String {
     if matches!(
         e,
-        Expr::Literal(spg_sql::ast::Literal::String(_)) | Expr::Literal(spg_sql::ast::Literal::Null)
+        Expr::Literal(spg_sql::ast::Literal::String(_))
+            | Expr::Literal(spg_sql::ast::Literal::Null)
     ) {
         return String::from("unknown");
     }
     match e {
         Expr::Cast { .. } | Expr::Column(_) | Expr::Literal(_) => {
-            crate::describe::describe_expr(e, columns)
-                .map_or_else(|| String::from("unknown"), |s| {
-                    crate::conversions::pg_type_name_for_error(s.ty)
-                })
+            crate::describe::describe_expr(e, columns).map_or_else(
+                || String::from("unknown"),
+                |s| crate::conversions::pg_type_name_for_error(s.ty),
+            )
         }
         _ => String::from("unknown"),
     }
@@ -1224,11 +1230,7 @@ fn ordered_set_arg_type_name(e: &Expr, columns: &[ColumnSchema]) -> String {
 /// `function f(…) does not exist` (42883), not a bespoke message. Probed
 /// live: `percentile_cont(numeric, text)`, `rank(integer, integer,
 /// text)`, `mode(integer, integer)`.
-fn ordered_set_signature_error(
-    name: &str,
-    spec: &AggSpec,
-    columns: &[ColumnSchema],
-) -> EvalError {
+fn ordered_set_signature_error(name: &str, spec: &AggSpec, columns: &[ColumnSchema]) -> EvalError {
     let mut parts: Vec<String> = Vec::new();
     if let Some(d) = &spec.direct_arg {
         parts.push(ordered_set_arg_type_name(d, columns));
@@ -1314,10 +1316,7 @@ fn validate_within_group(
                 // WITHIN GROUP wording stands.
                 if spec.direct_arg.is_none() && is_hypothetical_set_name(&spec.name) {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!(
-                            "window function {} requires an OVER clause",
-                            spec.name
-                        ),
+                        detail: format!("window function {} requires an OVER clause", spec.name),
                     });
                 }
                 return Err(EvalError::TypeMismatch {
@@ -1551,9 +1550,10 @@ fn fused_layout(
             && s.filter.is_none()
             && !s.first_ordered
             && arg_pos[i].is_some()
-            && s.order_by.iter().enumerate().all(|(k, _)| {
-                order_pos[i].get(k).copied().flatten().is_some()
-            })
+            && s.order_by
+                .iter()
+                .enumerate()
+                .all(|(k, _)| order_pos[i].get(k).copied().flatten().is_some())
             && match s.name.as_str() {
                 "string_agg" => matches!(&arg2_literal_val[i], Some(Value::Text(_))),
                 "array_agg" => s.arg2.is_none() && s.enum_labels.is_none(),
@@ -1713,7 +1713,12 @@ fn merge_fused(a: &mut FusedAcc, b: &mut FusedAcc) {
         // v7.39 (read01 numeric.c) — fold the shard's bignum spill first,
         // then its i128 lane (zero if the shard promoted).
         if let Some(bb) = &b.num.sum_big {
-            sum_add_bignum(&mut a.num.sum_num_scaled, &mut a.num.sum_num_scale, &mut a.num.sum_big, bb);
+            sum_add_bignum(
+                &mut a.num.sum_num_scaled,
+                &mut a.num.sum_num_scale,
+                &mut a.num.sum_big,
+                bb,
+            );
         }
         sum_add_exact(
             &mut a.num.sum_num_scaled,
@@ -2055,7 +2060,12 @@ fn acc_cell(a: &mut NumAcc, v: &Value<'_>) -> Result<(), EvalError> {
         }
         // v7.39 (read01 numeric.c) — a NumericBig input promotes to the spill.
         Value::NumericBig(b) => {
-            sum_add_bignum(&mut a.sum_num_scaled, &mut a.sum_num_scale, &mut a.sum_big, b);
+            sum_add_bignum(
+                &mut a.sum_num_scaled,
+                &mut a.sum_num_scale,
+                &mut a.sum_big,
+                b,
+            );
             a.use_numeric = true;
             a.count += 1;
         }
@@ -2077,7 +2087,10 @@ fn acc_cell(a: &mut NumAcc, v: &Value<'_>) -> Result<(), EvalError> {
         }
         other => {
             return Err(EvalError::TypeMismatch {
-                detail: format!("sum/avg need numeric, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+                detail: format!(
+                    "sum/avg need numeric, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                ),
             });
         }
     }
@@ -2230,14 +2243,19 @@ fn accumulate_groups(
     // not fold. The clause lowers to a `binary` cast the parser emits.
     let mysql_fold_groups: bool = ctx.mysql_dialect
         && !group_pos.iter().any(|&p| is_binary_key_col(p))
-        && !group_exprs.iter().any(|e| crate::eval::is_binary_coerced(e));
+        && !group_exprs
+            .iter()
+            .any(|e| crate::eval::is_binary_coerced(e));
     let distinct_fold: Vec<bool> = agg_specs
         .iter()
         .enumerate()
         .map(|(i, spec)| {
             ctx.mysql_dialect
                 && !is_binary_key_col(arg_pos[i])
-                && !spec.arg.as_ref().is_some_and(|e| crate::eval::is_binary_coerced(e))
+                && !spec
+                    .arg
+                    .as_ref()
+                    .is_some_and(|e| crate::eval::is_binary_coerced(e))
         })
         .collect();
     // v7.37.x (mailrs Track A 100k attack) — dedicated tight loop
@@ -2463,7 +2481,13 @@ fn accumulate_groups(
     // - remaining ops run in one tight pass, no update_state.
     // Finalize writes the same AggState fields as the single-spec path.
     if single_anon_group
-        && let Some((spec_src, unique_ops)) = fused_layout(agg_specs, &arg_pos, &arg_compiled, &order_pos, &arg2_literal_val)
+        && let Some((spec_src, unique_ops)) = fused_layout(
+            agg_specs,
+            &arg_pos,
+            &arg_compiled,
+            &order_pos,
+            &arg2_literal_val,
+        )
     {
         let mut accs: Vec<FusedAcc> = fused_accs(&unique_ops, ctx.mysql_dialect);
         // v7.39 (parallel-agg P1) — shard the row scan across the
@@ -2484,61 +2508,61 @@ fn accumulate_groups(
                           accs: &mut Vec<FusedAcc>,
                           fctx: &EvalContext<'_>|
          -> Result<(), EvalError> {
-                // One Step-VM stack per shard call, reused across every
-                // row and every compiled op.
-                let mut stack: Vec<Value<'_>> = Vec::new();
-                for row in rows.range(range.start, range.end).iter() {
-                    for (si, op) in unique_ops.iter().enumerate() {
-                        match op {
-                            FusedOp::CountCol(p) => {
-                                if !matches!(row.get(*p), Some(Value::Null) | None) {
-                                    accs[si].num.count += 1;
-                                }
+            // One Step-VM stack per shard call, reused across every
+            // row and every compiled op.
+            let mut stack: Vec<Value<'_>> = Vec::new();
+            for row in rows.range(range.start, range.end).iter() {
+                for (si, op) in unique_ops.iter().enumerate() {
+                    match op {
+                        FusedOp::CountCol(p) => {
+                            if !matches!(row.get(*p), Some(Value::Null) | None) {
+                                accs[si].num.count += 1;
                             }
-                            FusedOp::AccCol(p) => {
-                                {
-                                    let a = &mut accs[si];
-                                    acc_cell(&mut a.num, row.get(*p).unwrap_or(&Value::Null))
-                                }?;
+                        }
+                        FusedOp::AccCol(p) => {
+                            {
+                                let a = &mut accs[si];
+                                acc_cell(&mut a.num, row.get(*p).unwrap_or(&Value::Null))
+                            }?;
+                        }
+                        FusedOp::Extreme { pos, max, .. } => {
+                            fused_extreme_cell(
+                                &mut accs[si],
+                                row.get(*pos).unwrap_or(&Value::Null),
+                                *max,
+                            )?;
+                        }
+                        FusedOp::CountExpr(sp) => {
+                            let c = arg_compiled[*sp].as_ref().expect("gated compiled");
+                            let v = eval::eval_compiled_ref(c, row, fctx, &mut stack)?;
+                            if !matches!(v, Value::Null) {
+                                accs[si].num.count += 1;
                             }
-                            FusedOp::Extreme { pos, max, .. } => {
-                                fused_extreme_cell(
-                                    &mut accs[si],
-                                    row.get(*pos).unwrap_or(&Value::Null),
-                                    *max,
-                                )?;
-                            }
-                            FusedOp::CountExpr(sp) => {
-                                let c = arg_compiled[*sp].as_ref().expect("gated compiled");
-                                let v = eval::eval_compiled_ref(c, row, fctx, &mut stack)?;
-                                if !matches!(v, Value::Null) {
-                                    accs[si].num.count += 1;
-                                }
-                            }
-                            FusedOp::AccExpr(sp) => {
-                                let c = arg_compiled[*sp].as_ref().expect("gated compiled");
-                                let v = eval::eval_compiled_ref(c, row, fctx, &mut stack)?;
-                                acc_cell(&mut accs[si].num, &v)?;
-                            }
-                            FusedOp::ExtremeExpr { spec, max, .. } => {
-                                let c = arg_compiled[*spec].as_ref().expect("gated compiled");
-                                let v = eval::eval_compiled_ref(c, row, fctx, &mut stack)?;
-                                fused_extreme_cell(&mut accs[si], &v, *max)?;
-                            }
-                            FusedOp::Collect { spec, string_kind } => {
-                                collect_cell(
-                                    &mut accs[si],
-                                    &row,
-                                    arg_pos[*spec].expect("gated bound"),
-                                    &order_pos[*spec],
-                                    *string_kind,
-                                )?;
-                            }
+                        }
+                        FusedOp::AccExpr(sp) => {
+                            let c = arg_compiled[*sp].as_ref().expect("gated compiled");
+                            let v = eval::eval_compiled_ref(c, row, fctx, &mut stack)?;
+                            acc_cell(&mut accs[si].num, &v)?;
+                        }
+                        FusedOp::ExtremeExpr { spec, max, .. } => {
+                            let c = arg_compiled[*spec].as_ref().expect("gated compiled");
+                            let v = eval::eval_compiled_ref(c, row, fctx, &mut stack)?;
+                            fused_extreme_cell(&mut accs[si], &v, *max)?;
+                        }
+                        FusedOp::Collect { spec, string_kind } => {
+                            collect_cell(
+                                &mut accs[si],
+                                &row,
+                                arg_pos[*spec].expect("gated bound"),
+                                &order_pos[*spec],
+                                *string_kind,
+                            )?;
                         }
                     }
                 }
-                Ok(())
-            };
+            }
+            Ok(())
+        };
         if !unique_ops.is_empty() {
             let par = runner.filter(|_| rows.len() >= crate::PARALLEL_MIN_ROWS);
             if let Some(r) = par {
@@ -2556,8 +2580,7 @@ fn accumulate_groups(
                 let results = r.run_shards(n_shards, &|i| {
                     let lo = i * chunk;
                     let hi = ((i + 1) * chunk).min(rows.len());
-                    let mut local: Vec<FusedAcc> =
-                        fused_accs(ops, mysql_for_accs);
+                    let mut local: Vec<FusedAcc> = fused_accs(ops, mysql_for_accs);
                     // Shard-local minimal context (the outer one is not
                     // Sync); see the fused_scan comment.
                     let mut sctx = EvalContext::new(schema_cols, table_alias);
@@ -2567,8 +2590,7 @@ fn accumulate_groups(
                         Some(c) => sctx.with_catalog(c),
                         None => sctx,
                     };
-                    let out: ShardOut =
-                        fused_scan(lo..hi, &mut local, &sctx).map(|()| local);
+                    let out: ShardOut = fused_scan(lo..hi, &mut local, &sctx).map(|()| local);
                     alloc::boxed::Box::new(out)
                 });
                 for boxed in results {
@@ -2584,7 +2606,13 @@ fn accumulate_groups(
                 fused_scan(0..rows.len(), &mut accs, &ctx)?;
             }
         }
-        fill_states_from_fused(&mut order[0].1, &spec_src, &mut accs, rows.len() as i64, &arg2_literal_val);
+        fill_states_from_fused(
+            &mut order[0].1,
+            &spec_src,
+            &mut accs,
+            rows.len() as i64,
+            &arg2_literal_val,
+        );
         return Ok(order);
     }
     // v7.39 (parallel-agg P3) — parallel GROUP BY fast path: a single
@@ -2599,7 +2627,13 @@ fn accumulate_groups(
         && group_exprs.len() == 1
         && rows.len() >= crate::PARALLEL_MIN_ROWS
         && let Some(r) = runner
-        && let Some((spec_src, unique_ops)) = fused_layout(agg_specs, &arg_pos, &arg_compiled, &order_pos, &arg2_literal_val)
+        && let Some((spec_src, unique_ops)) = fused_layout(
+            agg_specs,
+            &arg_pos,
+            &arg_compiled,
+            &order_pos,
+            &arg2_literal_val,
+        )
         && !unique_ops.is_empty()
     {
         crate::PARALLEL_AGG_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2662,9 +2696,8 @@ fn accumulate_groups(
                         }
                         None => {
                             m.null_rows += 1;
-                            m.null_slot.get_or_insert_with(|| {
-                                fused_accs(ops, mysql_for_accs)
-                            })
+                            m.null_slot
+                                .get_or_insert_with(|| fused_accs(ops, mysql_for_accs))
                         }
                     };
                     for (oi, op) in ops.iter().enumerate() {
@@ -2679,7 +2712,7 @@ fn accumulate_groups(
                                     let a = &mut slots[oi];
                                     acc_cell(&mut a.num, row.get(*p).unwrap_or(&Value::Null))
                                 }
-                                    .map_err(Some)?;
+                                .map_err(Some)?;
                             }
                             FusedOp::Extreme { pos, max, .. } => {
                                 fused_extreme_cell(
@@ -2781,13 +2814,25 @@ fn accumulate_groups(
                 let (mut accs, group_rows) = merged.remove(&k).expect("key recorded");
                 let mut states: Vec<AggState> =
                     (0..agg_specs.len()).map(|_| AggState::default()).collect();
-                fill_states_from_fused(&mut states, &spec_src, &mut accs, group_rows, &arg2_literal_val);
+                fill_states_from_fused(
+                    &mut states,
+                    &spec_src,
+                    &mut accs,
+                    group_rows,
+                    &arg2_literal_val,
+                );
                 order.push((alloc::vec![kv], states));
             }
             if let Some((mut accs, group_rows)) = merged_null {
                 let mut states: Vec<AggState> =
                     (0..agg_specs.len()).map(|_| AggState::default()).collect();
-                fill_states_from_fused(&mut states, &spec_src, &mut accs, group_rows, &arg2_literal_val);
+                fill_states_from_fused(
+                    &mut states,
+                    &spec_src,
+                    &mut accs,
+                    group_rows,
+                    &arg2_literal_val,
+                );
                 order.push((alloc::vec![Value::Null], states));
             }
             return Ok(order);
@@ -2874,7 +2919,10 @@ fn accumulate_groups(
                     }
                     other => {
                         return Err(EvalError::TypeMismatch {
-                            detail: format!("length() needs text, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+                            detail: format!(
+                                "length() needs text, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                            ),
                         });
                     }
                 };
@@ -2952,8 +3000,13 @@ fn accumulate_groups(
                 let upd = match &st.extreme {
                     None => true,
                     Some(prev) => {
-                        extreme_cmp_in(agg_specs[0].enum_labels.as_deref(), agg_specs[0].arg_collation.as_deref(), av, prev, ctx.mysql_dialect)
-                            == core::cmp::Ordering::Greater
+                        extreme_cmp_in(
+                            agg_specs[0].enum_labels.as_deref(),
+                            agg_specs[0].arg_collation.as_deref(),
+                            av,
+                            prev,
+                            ctx.mysql_dialect,
+                        ) == core::cmp::Ordering::Greater
                     }
                 };
                 if upd {
@@ -3073,8 +3126,13 @@ fn accumulate_groups(
                         let better = match &st.first_best {
                             None => true,
                             Some((bk, _)) => {
-                                cmp_order_keys(&spec.order_by, &spec.order_enum_labels, &keys, bk, ctx.mysql_dialect)
-                                    == core::cmp::Ordering::Less
+                                cmp_order_keys(
+                                    &spec.order_by,
+                                    &spec.order_enum_labels,
+                                    &keys,
+                                    bk,
+                                    ctx.mysql_dialect,
+                                ) == core::cmp::Ordering::Less
                             }
                         };
                         if better {
@@ -3130,7 +3188,11 @@ fn accumulate_groups(
                             continue;
                         }
                     } else {
-                        encode_key_refs_into_in(core::slice::from_ref(&arg_ref), &mut dkeybuf, distinct_fold[i]);
+                        encode_key_refs_into_in(
+                            core::slice::from_ref(&arg_ref),
+                            &mut dkeybuf,
+                            distinct_fold[i],
+                        );
                         if entry.1[i].seen.contains(dkeybuf.as_str()) {
                             continue;
                         }
@@ -3166,8 +3228,13 @@ fn accumulate_groups(
                             let upd = match &st.extreme {
                                 None => true,
                                 Some(prev) => {
-                                    extreme_cmp_in(spec.enum_labels.as_deref(), spec.arg_collation.as_deref(), arg_ref, prev, ctx.mysql_dialect)
-                                        == core::cmp::Ordering::Greater
+                                    extreme_cmp_in(
+                                        spec.enum_labels.as_deref(),
+                                        spec.arg_collation.as_deref(),
+                                        arg_ref,
+                                        prev,
+                                        ctx.mysql_dialect,
+                                    ) == core::cmp::Ordering::Greater
                                 }
                             };
                             if upd {
@@ -3192,8 +3259,13 @@ fn accumulate_groups(
                             let upd = match &st.extreme {
                                 None => true,
                                 Some(prev) => {
-                                    extreme_cmp_in(spec.enum_labels.as_deref(), spec.arg_collation.as_deref(), arg_ref, prev, ctx.mysql_dialect)
-                                        == core::cmp::Ordering::Less
+                                    extreme_cmp_in(
+                                        spec.enum_labels.as_deref(),
+                                        spec.arg_collation.as_deref(),
+                                        arg_ref,
+                                        prev,
+                                        ctx.mysql_dialect,
+                                    ) == core::cmp::Ordering::Less
                                 }
                             };
                             if upd {
@@ -3507,8 +3579,13 @@ fn accumulate_groups(
                         let better = match &st.first_best {
                             None => true,
                             Some((bk, _)) => {
-                                cmp_order_keys(&spec.order_by, &spec.order_enum_labels, &keys, bk, ctx.mysql_dialect)
-                                    == core::cmp::Ordering::Less
+                                cmp_order_keys(
+                                    &spec.order_by,
+                                    &spec.order_enum_labels,
+                                    &keys,
+                                    bk,
+                                    ctx.mysql_dialect,
+                                ) == core::cmp::Ordering::Less
                             }
                         };
                         if better {
@@ -3540,7 +3617,11 @@ fn accumulate_groups(
                             continue;
                         }
                     } else {
-                        encode_key_refs_into_in(core::slice::from_ref(&arg_ref), &mut dkeybuf, distinct_fold[i]);
+                        encode_key_refs_into_in(
+                            core::slice::from_ref(&arg_ref),
+                            &mut dkeybuf,
+                            distinct_fold[i],
+                        );
                         if entry.1[i].seen.contains(dkeybuf.as_str()) {
                             continue;
                         }
@@ -3576,8 +3657,13 @@ fn accumulate_groups(
                             let upd = match &st.extreme {
                                 None => true,
                                 Some(prev) => {
-                                    extreme_cmp_in(spec.enum_labels.as_deref(), spec.arg_collation.as_deref(), arg_ref, prev, ctx.mysql_dialect)
-                                        == core::cmp::Ordering::Greater
+                                    extreme_cmp_in(
+                                        spec.enum_labels.as_deref(),
+                                        spec.arg_collation.as_deref(),
+                                        arg_ref,
+                                        prev,
+                                        ctx.mysql_dialect,
+                                    ) == core::cmp::Ordering::Greater
                                 }
                             };
                             if upd {
@@ -3602,8 +3688,13 @@ fn accumulate_groups(
                             let upd = match &st.extreme {
                                 None => true,
                                 Some(prev) => {
-                                    extreme_cmp_in(spec.enum_labels.as_deref(), spec.arg_collation.as_deref(), arg_ref, prev, ctx.mysql_dialect)
-                                        == core::cmp::Ordering::Less
+                                    extreme_cmp_in(
+                                        spec.enum_labels.as_deref(),
+                                        spec.arg_collation.as_deref(),
+                                        arg_ref,
+                                        prev,
+                                        ctx.mysql_dialect,
+                                    ) == core::cmp::Ordering::Less
                                 }
                             };
                             if upd {
@@ -3765,8 +3856,13 @@ fn accumulate_groups(
                     let better = match &st.first_best {
                         None => true,
                         Some((bk, _)) => {
-                            cmp_order_keys(&spec.order_by, &spec.order_enum_labels, &keys, bk, ctx.mysql_dialect)
-                                == core::cmp::Ordering::Less
+                            cmp_order_keys(
+                                &spec.order_by,
+                                &spec.order_enum_labels,
+                                &keys,
+                                bk,
+                                ctx.mysql_dialect,
+                            ) == core::cmp::Ordering::Less
                         }
                     };
                     if better {
@@ -3968,7 +4064,11 @@ fn finalize_synth_rows(
                 let mut out: Vec<Row<'static>> = Vec::with_capacity(hi - lo);
                 for (gvals, states) in &order[lo..hi] {
                     out.push(finalize_one_group(
-                        gvals, states, agg_specs, synth_schema, &sctx,
+                        gvals,
+                        states,
+                        agg_specs,
+                        synth_schema,
+                        &sctx,
                     )?);
                 }
                 Ok(out)
@@ -4031,76 +4131,75 @@ fn finalize_synth_rows(
             // them.
             let st_sorted;
             let kw = agg_specs[i].order_by.len();
-            let st_final: &AggState =
-                if kw > 0 && st.item_keys.len() == st.items.len() * kw {
-                    let mut idx: Vec<usize> = (0..st.items.len()).collect();
-                    let ob = &agg_specs[i].order_by;
-                    idx.sort_by(|&x, &y| {
-                        cmp_order_keys(
-                            ob,
-                            &agg_specs[i].order_enum_labels,
-                            &st.item_keys[x * kw..(x + 1) * kw],
-                            &st.item_keys[y * kw..(y + 1) * kw],
-                            ctx.mysql_dialect,
-                        )
-                    });
-                    // Permute by MOVE out of the clone — the old form
-                    // cloned every item a second time on top of
-                    // `st.clone()`'s first (5000 Strings twice per group).
-                    let mut sorted = st.clone();
-                    let mut new_items: Vec<Value<'static>> = Vec::with_capacity(idx.len());
+            let st_final: &AggState = if kw > 0 && st.item_keys.len() == st.items.len() * kw {
+                let mut idx: Vec<usize> = (0..st.items.len()).collect();
+                let ob = &agg_specs[i].order_by;
+                idx.sort_by(|&x, &y| {
+                    cmp_order_keys(
+                        ob,
+                        &agg_specs[i].order_enum_labels,
+                        &st.item_keys[x * kw..(x + 1) * kw],
+                        &st.item_keys[y * kw..(y + 1) * kw],
+                        ctx.mysql_dialect,
+                    )
+                });
+                // Permute by MOVE out of the clone — the old form
+                // cloned every item a second time on top of
+                // `st.clone()`'s first (5000 Strings twice per group).
+                let mut sorted = st.clone();
+                let mut new_items: Vec<Value<'static>> = Vec::with_capacity(idx.len());
+                for &j in &idx {
+                    new_items.push(core::mem::replace(&mut sorted.items[j], Value::Null));
+                }
+                // v7.39 (round 762, F31-C2) — the per-row separators
+                // travel with their items through the sort.
+                if sorted.item_seps.len() == sorted.items.len() {
+                    let mut new_seps: Vec<Option<String>> = Vec::with_capacity(idx.len());
                     for &j in &idx {
-                        new_items.push(core::mem::replace(&mut sorted.items[j], Value::Null));
+                        new_seps.push(core::mem::take(&mut sorted.item_seps[j]));
                     }
-                    // v7.39 (round 762, F31-C2) — the per-row separators
-                    // travel with their items through the sort.
-                    if sorted.item_seps.len() == sorted.items.len() {
-                        let mut new_seps: Vec<Option<String>> = Vec::with_capacity(idx.len());
-                        for &j in &idx {
-                            new_seps.push(core::mem::take(&mut sorted.item_seps[j]));
-                        }
-                        sorted.item_seps = new_seps;
+                    sorted.item_seps = new_seps;
+                }
+                sorted.items = new_items;
+                st_sorted = sorted;
+                &st_sorted
+            } else if agg_specs[i].distinct && st.items.len() > 1 {
+                // v7.39 (round 257) — PG dedups a DISTINCT aggregate by
+                // SORTING its input, so the collection aggregates emit
+                // their values in sort order (probed across array_agg /
+                // string_agg / json_agg, ints and text, NULLs last):
+                // `array_agg(DISTINCT x)` over 2,1,2 is `{1,2}`, where
+                // SPG kept first-seen order and answered `{2,1}`. An
+                // explicit ORDER BY takes the branch above instead, and
+                // the scalar aggregates (count / sum / …) are
+                // order-insensitive, so this only moves the collections.
+                // v7.39 (round 258) — an ENUM input sorts by MEMBER
+                // ORDER, not by its text (`{sad,ok,happy}`, not
+                // `{happy,ok,sad}`); `spec.enum_labels` already
+                // carries the aggregate argument's labels for exactly
+                // this. Round 257 shipped this sort with the generic
+                // value comparison and regressed enum columns.
+                let labels = agg_specs[i].enum_labels.as_deref();
+                let mut sorted = st.clone();
+                // v7.39 (round 762, F31-C2) — DISTINCT re-sorts items
+                // alone; per-row separators cannot follow, so the
+                // constant-separator path applies (the last row's).
+                sorted.item_seps.clear();
+                sorted.items.sort_by(|a, b| {
+                    if let Some(labels) = labels
+                        && !matches!(a, Value::Null)
+                        && !matches!(b, Value::Null)
+                        && let Some(ord) = crate::eval::enum_ord_cmp(labels, a, b)
+                    {
+                        return ord;
                     }
-                    sorted.items = new_items;
-                    st_sorted = sorted;
-                    &st_sorted
-                } else if agg_specs[i].distinct && st.items.len() > 1 {
-                    // v7.39 (round 257) — PG dedups a DISTINCT aggregate by
-                    // SORTING its input, so the collection aggregates emit
-                    // their values in sort order (probed across array_agg /
-                    // string_agg / json_agg, ints and text, NULLs last):
-                    // `array_agg(DISTINCT x)` over 2,1,2 is `{1,2}`, where
-                    // SPG kept first-seen order and answered `{2,1}`. An
-                    // explicit ORDER BY takes the branch above instead, and
-                    // the scalar aggregates (count / sum / …) are
-                    // order-insensitive, so this only moves the collections.
-                    // v7.39 (round 258) — an ENUM input sorts by MEMBER
-                    // ORDER, not by its text (`{sad,ok,happy}`, not
-                    // `{happy,ok,sad}`); `spec.enum_labels` already
-                    // carries the aggregate argument's labels for exactly
-                    // this. Round 257 shipped this sort with the generic
-                    // value comparison and regressed enum columns.
-                    let labels = agg_specs[i].enum_labels.as_deref();
-                    let mut sorted = st.clone();
-                    // v7.39 (round 762, F31-C2) — DISTINCT re-sorts items
-                    // alone; per-row separators cannot follow, so the
-                    // constant-separator path applies (the last row's).
-                    sorted.item_seps.clear();
-                    sorted.items.sort_by(|a, b| {
-                        if let Some(labels) = labels
-                            && !matches!(a, Value::Null)
-                            && !matches!(b, Value::Null)
-                            && let Some(ord) = crate::eval::enum_ord_cmp(labels, a, b)
-                        {
-                            return ord;
-                        }
-                        crate::order_by_value_cmp_in(false, Some(false), a, b, ctx.mysql_dialect)
-                    });
-                    st_sorted = sorted;
-                    &st_sorted
-                } else {
-                    st
-                };
+                    crate::order_by_value_cmp_in(false, Some(false), a, b, ctx.mysql_dialect)
+                });
+                st_sorted = sorted;
+                &st_sorted
+            } else {
+                st
+            };
             // Ordered-set aggregates compute from the sorted items + the
             // direct fraction; everything else uses the running state.
             let v = if is_within_group_name(&agg_specs[i].name) {
@@ -4437,13 +4536,16 @@ fn project_groups(
             for (i, rewritten) in items_rewritten.iter().enumerate() {
                 match (srf_items[i], rewritten) {
                     (true, Some(r)) => {
-                        lists.push(crate::select::top_level_srf_output(r, &srow, &synth_ctx)
-                            .map_err(|e| match e {
-                                crate::EngineError::Eval(ev) => ev,
-                                other => EvalError::TypeMismatch {
-                                    detail: alloc::format!("{other}"),
+                        lists.push(
+                            crate::select::top_level_srf_output(r, &srow, &synth_ctx).map_err(
+                                |e| match e {
+                                    crate::EngineError::Eval(ev) => ev,
+                                    other => EvalError::TypeMismatch {
+                                        detail: alloc::format!("{other}"),
+                                    },
                                 },
-                            })?);
+                            )?,
+                        );
                     }
                     _ => lists.push(Vec::new()),
                 }
@@ -4452,7 +4554,9 @@ fn project_groups(
             for k in 0..n {
                 let mut vals = values.clone();
                 for (i, list) in lists.iter().enumerate() {
-                    if srf_items[i] && let Some(slot) = vals.get_mut(i) {
+                    if srf_items[i]
+                        && let Some(slot) = vals.get_mut(i)
+                    {
                         *slot = list.get(k).cloned().unwrap_or(Value::Null);
                     }
                 }
@@ -4744,8 +4848,13 @@ fn stddev_exact_pair(
     spg_storage::bignum::BigNumeric,
 )> {
     use spg_storage::bignum::BigNumeric as BN;
-    let fast = (!st.stddev_i_spent && (st.stddev_i_sum != 0 || st.stddev_i_sum_sq != 0))
-        .then(|| (BN::from_i128(st.stddev_i_sum, 0), BN::from_i128(st.stddev_i_sum_sq, 0)));
+    let fast =
+        (!st.stddev_i_spent && (st.stddev_i_sum != 0 || st.stddev_i_sum_sq != 0)).then(|| {
+            (
+                BN::from_i128(st.stddev_i_sum, 0),
+                BN::from_i128(st.stddev_i_sum_sq, 0),
+            )
+        });
     match (st.stddev_sum.as_ref(), st.stddev_sum_sq.as_ref(), fast) {
         (Some(s), Some(sq), Some((fs, fsq))) => Some((s.add(&fs), sq.add(&fsq))),
         (Some(s), Some(sq), None) => Some((s.clone(), sq.clone())),
@@ -5077,7 +5186,9 @@ pub(crate) fn update_state(
             match &st.extreme {
                 None => st.extreme = Some(v.clone().into_owned()),
                 Some(cur) => {
-                    if extreme_cmp_in(enum_labels, arg_collation, v, cur, mysql) == core::cmp::Ordering::Less {
+                    if extreme_cmp_in(enum_labels, arg_collation, v, cur, mysql)
+                        == core::cmp::Ordering::Less
+                    {
                         st.extreme = Some(v.clone().into_owned());
                     }
                 }
@@ -5105,7 +5216,10 @@ pub(crate) fn update_state(
             } = v
             else {
                 return Err(EvalError::TypeMismatch {
-                    detail: format!("range_agg requires a range value, got {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
+                    detail: format!(
+                        "range_agg requires a range value, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(v.data_type())
+                    ),
                 });
             };
             // Initialise the accumulator on first sight (even for
@@ -5160,7 +5274,9 @@ pub(crate) fn update_state(
             match &st.extreme {
                 None => st.extreme = Some(v.clone().into_owned()),
                 Some(cur) => {
-                    if extreme_cmp_in(enum_labels, arg_collation, v, cur, mysql) == core::cmp::Ordering::Greater {
+                    if extreme_cmp_in(enum_labels, arg_collation, v, cur, mysql)
+                        == core::cmp::Ordering::Greater
+                    {
                         st.extreme = Some(v.clone().into_owned());
                     }
                 }
@@ -5206,7 +5322,10 @@ pub(crate) fn update_state(
                 st.num.count += 1;
             } else {
                 return Err(EvalError::TypeMismatch {
-                    detail: format!("string_agg requires text value, got {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
+                    detail: format!(
+                        "string_agg requires text value, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(v.data_type())
+                    ),
                 });
             }
         }
@@ -5233,7 +5352,10 @@ pub(crate) fn update_state(
                 Value::Bool(b) => *b,
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!("bool_and requires bool, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+                        detail: format!(
+                            "bool_and requires bool, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                        ),
                     });
                 }
             };
@@ -5249,7 +5371,10 @@ pub(crate) fn update_state(
                 Value::Bool(b) => *b,
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!("bool_or requires bool, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+                        detail: format!(
+                            "bool_or requires bool, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                        ),
                     });
                 }
             };
@@ -5315,7 +5440,10 @@ pub(crate) fn update_state(
             }
             let Some(x) = agg_value_to_f64(v) else {
                 return Err(EvalError::TypeMismatch {
-                    detail: format!("{name} needs numeric, got {}", crate::conversions::pg_type_name_for_error_opt(v.data_type())),
+                    detail: format!(
+                        "{name} needs numeric, got {}",
+                        crate::conversions::pg_type_name_for_error_opt(v.data_type())
+                    ),
                 });
             };
             st.num.count += 1;
@@ -5333,7 +5461,10 @@ pub(crate) fn update_state(
                 Value::BigInt(n) => *n,
                 other => {
                     return Err(EvalError::TypeMismatch {
-                        detail: format!("{name} needs integer, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+                        detail: format!(
+                            "{name} needs integer, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                        ),
                     });
                 }
             };
@@ -5539,7 +5670,8 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
                 // PG rejects it. Pinned at eight shapes in
                 // `e2e_avg_money_round664`.
                 let n = i128::from(st.num.count);
-                let q = (st.num.sum_money * 2 + if st.num.sum_money >= 0 { n } else { -n }) / (2 * n);
+                let q =
+                    (st.num.sum_money * 2 + if st.num.sum_money >= 0 { n } else { -n }) / (2 * n);
                 Value::Money(q as i64)
             } else if st.num.use_numeric {
                 // v7.38 (read01, T6.P3) — avg of a special is that special
@@ -5564,8 +5696,11 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
                         i128::from(st.num.sum_int),
                         0,
                     );
-                    let (scaled, scale) =
-                        crate::numeric::numeric_avg(sum_scaled, sum_scale, i128::from(st.num.count));
+                    let (scaled, scale) = crate::numeric::numeric_avg(
+                        sum_scaled,
+                        sum_scale,
+                        i128::from(st.num.count),
+                    );
                     Value::Numeric {
                         scaled,
                         scale,
@@ -5578,8 +5713,11 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
                 // v7.38 (read01, T4) — avg over integer input is exact NUMERIC
                 // (PG: avg(int)/avg(bigint) → numeric), at PG's division display
                 // scale. sum(int) is unaffected (it reads sum_int as BigInt).
-                let (scaled, scale) =
-                    crate::numeric::numeric_avg(i128::from(st.num.sum_int), 0, i128::from(st.num.count));
+                let (scaled, scale) = crate::numeric::numeric_avg(
+                    i128::from(st.num.sum_int),
+                    0,
+                    i128::from(st.num.count),
+                );
                 Value::Numeric {
                     scaled,
                     scale,
@@ -5622,13 +5760,12 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
             });
             // v7.39 (round 762, F31-C2) — per-row separators, when the
             // accumulate path carried them (aligned with items).
-            let per_row: Option<&[Option<String>]> = if !st.item_seps.is_empty()
-                && st.item_seps.len() == st.items.len()
-            {
-                Some(&st.item_seps)
-            } else {
-                None
-            };
+            let per_row: Option<&[Option<String>]> =
+                if !st.item_seps.is_empty() && st.item_seps.len() == st.items.len() {
+                    Some(&st.item_seps)
+                } else {
+                    None
+                };
             let mut out = String::new();
             for (i, item) in st.items.iter().enumerate() {
                 if i > 0 {
@@ -5690,8 +5827,7 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
             // POPULATION statistics (`STDDEV` = `STDDEV_POP`, `VARIANCE` =
             // `VAR_POP` on MariaDB 11), where PG's bare forms are the
             // SAMPLE ones. `_samp` / `_pop` are explicit and unchanged.
-            let pop = name.ends_with("_pop")
-                || (mysql && (name == "stddev" || name == "variance"));
+            let pop = name.ends_with("_pop") || (mysql && (name == "stddev" || name == "variance"));
             if !pop && n < 2 {
                 // var_samp / stddev (samp) with n == 1 → NULL.
                 return Value::Null;
@@ -6044,7 +6180,13 @@ fn finalize_ordered_set(
                 .map_or((false, None), |o| (o.desc, o.nulls_first));
             let cmp_i = |i: usize| -> core::cmp::Ordering {
                 if multi {
-                    cmp_order_keys(order_by, &[], &st.item_keys[i * kw..(i + 1) * kw], &hv, mysql)
+                    cmp_order_keys(
+                        order_by,
+                        &[],
+                        &st.item_keys[i * kw..(i + 1) * kw],
+                        &hv,
+                        mysql,
+                    )
                 } else {
                     crate::order_by_value_cmp_in(desc, nulls_first, &items[i], h, mysql)
                 }
@@ -6348,9 +6490,9 @@ fn first_ungrouped_column<'a>(
     }
     let rec = |x: &'a Expr| first_ungrouped_column(x, group_exprs, columns, licensed);
     match e {
-        Expr::Column(c) => (column_ref_is_input(c, columns)
-            && !column_is_key_determined(c, licensed))
-        .then_some(c),
+        Expr::Column(c) => {
+            (column_ref_is_input(c, columns) && !column_is_key_determined(c, licensed)).then_some(c)
+        }
         // An aggregate's arguments are exactly what does not need grouping.
         Expr::FunctionCall { name, .. } if is_aggregate_name(&name.to_ascii_lowercase()) => None,
         Expr::AggregateOrdered { .. } => None,
@@ -6371,11 +6513,7 @@ fn first_ungrouped_column<'a>(
         } => operand
             .as_deref()
             .and_then(rec)
-            .or_else(|| {
-                branches
-                    .iter()
-                    .find_map(|(w, t)| rec(w).or_else(|| rec(t)))
-            })
+            .or_else(|| branches.iter().find_map(|(w, t)| rec(w).or_else(|| rec(t))))
             .or_else(|| else_branch.as_deref().and_then(rec)),
         _ => None,
     }
@@ -6391,11 +6529,16 @@ fn first_ungrouped_column<'a>(
 fn column_ref_is_input(c: &spg_sql::ast::ColumnName, columns: &[ColumnSchema]) -> bool {
     if let Some(q) = &c.qualifier {
         let composite = alloc::format!("{q}.{}", c.name);
-        if columns.iter().any(|col| col.name.eq_ignore_ascii_case(&composite)) {
+        if columns
+            .iter()
+            .any(|col| col.name.eq_ignore_ascii_case(&composite))
+        {
             return true;
         }
     }
-    columns.iter().any(|col| col.name.eq_ignore_ascii_case(&c.name))
+    columns
+        .iter()
+        .any(|col| col.name.eq_ignore_ascii_case(&c.name))
 }
 
 /// v7.39 (round 620) — the qualifiers whose PRIMARY KEY is wholly present in
@@ -6429,7 +6572,9 @@ fn qualifiers_grouped_by_primary_key(
         if tr.unnest_expr.is_some() {
             continue;
         }
-        let Some(table) = cat.get(&tr.name) else { continue };
+        let Some(table) = cat.get(&tr.name) else {
+            continue;
+        };
         let schema = table.schema();
         let Some(pk) = schema
             .uniqueness_constraints
@@ -6468,7 +6613,10 @@ fn qualifiers_grouped_by_primary_key(
 }
 
 /// True when this column reference is licensed by one of those keys.
-fn column_is_key_determined(c: &spg_sql::ast::ColumnName, licensed: &[alloc::string::String]) -> bool {
+fn column_is_key_determined(
+    c: &spg_sql::ast::ColumnName,
+    licensed: &[alloc::string::String],
+) -> bool {
     let q = c.qualifier.as_deref().unwrap_or("");
     licensed.iter().any(|l| l.eq_ignore_ascii_case(q))
 }
@@ -6656,7 +6804,10 @@ fn substitute_having_aliases(e: Expr, aliases: &[(String, Expr)]) -> Expr {
             else_branch,
         } => Expr::Case {
             operand: operand.map(|o| Box::new(sub(*o))),
-            branches: branches.into_iter().map(|(w, t)| (sub(w), sub(t))).collect(),
+            branches: branches
+                .into_iter()
+                .map(|(w, t)| (sub(w), sub(t)))
+                .collect(),
             else_branch: else_branch.map(|b| Box::new(sub(*b))),
         },
         Expr::Cast { expr, target } => Expr::Cast {
@@ -7221,7 +7372,6 @@ pub(crate) fn push_canonical_key(out: &mut String, v: &Value) {
     }
 }
 
-
 /// v7.39 (round 596) — a whole key encoded the canonical way, for the two
 /// sides of a decorrelated EXISTS: the set is built from the inner column's
 /// values and probed with the outer EXPRESSION's, and those need not share a
@@ -7398,8 +7548,7 @@ fn extreme_cmp_in(
     // PAD SPACE), matching ORDER BY (round 411).
     if mysql {
         if let (Value::Text(x), Value::Text(y)) | (Value::BpChar(x), Value::BpChar(y)) = (a, b) {
-            return spg_storage::mysql_compare_fold(x)
-                .cmp(&spg_storage::mysql_compare_fold(y));
+            return spg_storage::mysql_compare_fold(x).cmp(&spg_storage::mysql_compare_fold(y));
         }
     }
     value_cmp(a, b)
@@ -7513,15 +7662,41 @@ mod value_cmp_mixed_numeric_tests {
     #[test]
     fn every_aggregate_name_classifies() {
         const NAMES: &[&str] = &[
-            "count", "count_star", "sum", "min", "max", "avg", "any_value",
-            "range_agg", "range_intersect_agg", "string_agg", "group_concat",
-            "xmlagg", "array_agg", "bool_and", "bool_or", "every", "stddev",
-            "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop",
-            "bit_and", "bit_or", "bit_xor", "json_agg", "jsonb_agg",
-            "json_object_agg", "jsonb_object_agg",
+            "count",
+            "count_star",
+            "sum",
+            "min",
+            "max",
+            "avg",
+            "any_value",
+            "range_agg",
+            "range_intersect_agg",
+            "string_agg",
+            "group_concat",
+            "xmlagg",
+            "array_agg",
+            "bool_and",
+            "bool_or",
+            "every",
+            "stddev",
+            "stddev_samp",
+            "stddev_pop",
+            "variance",
+            "var_samp",
+            "var_pop",
+            "bit_and",
+            "bit_or",
+            "bit_xor",
+            "json_agg",
+            "jsonb_agg",
+            "json_object_agg",
+            "jsonb_object_agg",
         ];
         for n in NAMES {
-            assert!(super::is_aggregate_name(n), "{n} should be an aggregate name");
+            assert!(
+                super::is_aggregate_name(n),
+                "{n} should be an aggregate name"
+            );
             // Panics if the classifier doesn't know it.
             let _ = super::classify_agg_name(super::canonical_agg_name(n));
         }

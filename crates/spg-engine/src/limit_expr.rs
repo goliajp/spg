@@ -26,9 +26,7 @@
 use alloc::string::String;
 use alloc::vec;
 
-use spg_sql::ast::{
-    CteBody, Expr, LimitExpr, SelectItem, SelectStatement, Statement,
-};
+use spg_sql::ast::{CteBody, Expr, LimitExpr, SelectItem, SelectStatement, Statement};
 use spg_storage::Value;
 
 use crate::eval::EvalError;
@@ -176,7 +174,9 @@ impl Engine {
         // The row-count expression can itself hold a subquery with its
         // own non-constant clause; settle those first.
         self.resolve_limits_in_expr(&mut e, cancel)?;
-        *slot = self.eval_row_count(&e, label, cancel)?.map(LimitExpr::Literal);
+        *slot = self
+            .eval_row_count(&e, label, cancel)?
+            .map(LimitExpr::Literal);
         Ok(())
     }
 

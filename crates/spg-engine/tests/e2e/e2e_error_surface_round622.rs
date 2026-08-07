@@ -110,10 +110,14 @@ fn round622_partition_parent_system_columns_are_the_childs() {
         .unwrap();
     e.execute("CREATE TABLE pm_b PARTITION OF pm FOR VALUES FROM (10) TO (20)")
         .unwrap();
-    e.execute("INSERT INTO pm VALUES (1,1),(5,3),(11,2)").unwrap();
+    e.execute("INSERT INTO pm VALUES (1,1),(5,3),(11,2)")
+        .unwrap();
 
     assert_eq!(
-        vals(&mut e, "SELECT id, tableoid::regclass::TEXT FROM pm ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, tableoid::regclass::TEXT FROM pm ORDER BY id"
+        ),
         vec!["1|pm_a", "5|pm_a", "11|pm_b"],
         "each row names the child it lives in, never the synthetic CTE"
     );
@@ -155,7 +159,10 @@ fn round622_partition_parent_system_columns_are_the_childs() {
     assert_eq!(vals(&mut e, "SELECT count(*) FROM pm"), vec!["3"]);
     // Reading a child directly was always right, and stays right.
     assert_eq!(
-        vals(&mut e, "SELECT id, tableoid::regclass::TEXT FROM pm_a ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, tableoid::regclass::TEXT FROM pm_a ORDER BY id"
+        ),
         vec!["1|pm_a", "5|pm_a"]
     );
 }

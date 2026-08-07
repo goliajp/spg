@@ -51,7 +51,11 @@ fn seed() -> Engine {
 fn round621_by_is_a_column_name() {
     let mut e = seed();
     assert_eq!(vals(&mut e, "SELECT by, id FROM r1"), vec![r"\x01|1"]);
-    assert_eq!(vals(&mut e, "SELECT r1.by FROM r1"), vec![r"\x01"], "qualified");
+    assert_eq!(
+        vals(&mut e, "SELECT r1.by FROM r1"),
+        vec![r"\x01"],
+        "qualified"
+    );
     assert_eq!(
         vals(&mut e, "SELECT by FROM r1 WHERE by IS NOT NULL"),
         vec![r"\x01"],
@@ -90,7 +94,10 @@ fn round621_the_positions_a_keyword_table_does_not_cover() {
         "a table alias, likewise"
     );
     assert_eq!(
-        vals(&mut e, "SELECT string_agg(by::TEXT, ',' ORDER BY id) FROM r1"),
+        vals(
+            &mut e,
+            "SELECT string_agg(by::TEXT, ',' ORDER BY id) FROM r1"
+        ),
         vec![r"\x01"],
         "and inside an ordered aggregate, where BY appears as both"
     );
@@ -101,13 +108,17 @@ fn round621_the_positions_a_keyword_table_does_not_cover() {
 fn round621_the_clauses_still_work() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE k (a INT, b INT)").unwrap();
-    e.execute("INSERT INTO k VALUES (1,10),(1,20),(2,30)").unwrap();
+    e.execute("INSERT INTO k VALUES (1,10),(1,20),(2,30)")
+        .unwrap();
     assert_eq!(
         vals(&mut e, "SELECT a, count(*) FROM k GROUP BY a ORDER BY a"),
         vec!["1|2", "2|1"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT sum(b) OVER (PARTITION BY a ORDER BY b) FROM k ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT sum(b) OVER (PARTITION BY a ORDER BY b) FROM k ORDER BY 1"
+        ),
         vec!["10", "30", "30"]
     );
     assert_eq!(
@@ -122,7 +133,8 @@ fn round621_the_other_two_letter_keywords_are_untouched() {
     let mut e = Engine::new();
     for word in ["as", "in", "on", "or", "to", "is"] {
         assert!(
-            e.execute(&format!("CREATE TABLE bad_{word} ({word} INT)")).is_err(),
+            e.execute(&format!("CREATE TABLE bad_{word} ({word} INT)"))
+                .is_err(),
             "`{word}` is reserved in PG and must stay a keyword here"
         );
     }
@@ -130,7 +142,10 @@ fn round621_the_other_two_letter_keywords_are_untouched() {
     e.execute("CREATE TABLE q (x INT)").unwrap();
     e.execute("INSERT INTO q VALUES (1),(2)").unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT x AS y FROM q WHERE x IN (1) AND x IS NOT NULL"),
+        vals(
+            &mut e,
+            "SELECT x AS y FROM q WHERE x IN (1) AND x IS NOT NULL"
+        ),
         vec!["1"]
     );
 }

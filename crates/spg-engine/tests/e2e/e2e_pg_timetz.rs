@@ -171,7 +171,9 @@ fn timetz_missing_offset_takes_the_session_zone() {
     let mut eng = engine_with(&["CREATE TABLE t (id INT NOT NULL, started TIMETZ)"]);
     eng.execute("INSERT INTO t VALUES (1, '14:30:45')").unwrap();
     let r = eng.execute("SELECT started::text FROM t").unwrap();
-    let spg_engine::QueryResult::Rows { rows, .. } = r else { panic!() };
+    let spg_engine::QueryResult::Rows { rows, .. } = r else {
+        panic!()
+    };
     assert_eq!(
         spg_engine::eval::value_to_text(&rows[0].values[0]),
         "14:30:45+00"

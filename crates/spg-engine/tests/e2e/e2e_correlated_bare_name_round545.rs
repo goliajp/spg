@@ -44,8 +44,10 @@ fn engine() -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TABLE oa (aid INT, v TEXT)").unwrap();
     e.execute("CREATE TABLE ob (bid INT, w TEXT)").unwrap();
-    e.execute("INSERT INTO oa VALUES (1, 'x'), (2, 'y')").unwrap();
-    e.execute("INSERT INTO ob VALUES (1, 'B1'), (2, 'B2')").unwrap();
+    e.execute("INSERT INTO oa VALUES (1, 'x'), (2, 'y')")
+        .unwrap();
+    e.execute("INSERT INTO ob VALUES (1, 'B1'), (2, 'B2')")
+        .unwrap();
     e
 }
 
@@ -107,7 +109,8 @@ fn round545_bare_correlation_is_evaluated_per_row() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE oa (aid INT, v TEXT)").unwrap();
     e.execute("CREATE TABLE ob (bid INT, w TEXT)").unwrap();
-    e.execute("INSERT INTO oa VALUES (1, 'x'), (2, 'y')").unwrap();
+    e.execute("INSERT INTO oa VALUES (1, 'x'), (2, 'y')")
+        .unwrap();
     // Only the first outer row has a match.
     e.execute("INSERT INTO ob VALUES (1, 'B1')").unwrap();
     assert_eq!(
@@ -132,7 +135,8 @@ fn round545_a_shared_name_resolves_inward() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE sa (k INT, v TEXT)").unwrap();
     e.execute("CREATE TABLE sb (k INT, w TEXT)").unwrap();
-    e.execute("INSERT INTO sa VALUES (1, 'x'), (2, 'y')").unwrap();
+    e.execute("INSERT INTO sa VALUES (1, 'x'), (2, 'y')")
+        .unwrap();
     e.execute("INSERT INTO sb VALUES (1, 'B1')").unwrap();
     // `k = 1` is sb's k, so the count is the same for every outer row.
     assert_eq!(
@@ -162,7 +166,10 @@ fn round545_an_unknown_name_is_still_an_error() {
 fn round545_uncorrelated_stays_uncorrelated() {
     let mut e = engine();
     assert_eq!(
-        rows(&mut e, "SELECT v, (SELECT count(*) FROM ob) FROM oa ORDER BY v"),
+        rows(
+            &mut e,
+            "SELECT v, (SELECT count(*) FROM ob) FROM oa ORDER BY v"
+        ),
         vec!["x|2", "y|2"]
     );
     assert_eq!(

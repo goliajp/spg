@@ -95,7 +95,10 @@ fn a_window_array_agg_keeps_the_zone_identity() {
 #[test]
 fn the_other_temporal_element_types_are_unchanged() {
     let mut e = fixture();
-    assert_eq!(text(&mut e, "SELECT pg_typeof(array_agg(c)) FROM t"), "date[]");
+    assert_eq!(
+        text(&mut e, "SELECT pg_typeof(array_agg(c)) FROM t"),
+        "date[]"
+    );
     assert_eq!(
         text(&mut e, "SELECT pg_typeof(array_agg(d)) FROM t"),
         "interval[]",

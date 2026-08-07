@@ -137,7 +137,10 @@ fn round502_timezone_catalogues_list_canonical_zones() {
     );
     for bad in ["posix/UTC", "right/UTC"] {
         assert_eq!(
-            text_of(&mut e, &format!("SELECT count(*) FROM pg_timezone_names WHERE name = '{bad}'")),
+            text_of(
+                &mut e,
+                &format!("SELECT count(*) FROM pg_timezone_names WHERE name = '{bad}'")
+            ),
             "0",
             "{bad} should not be listed"
         );
@@ -153,11 +156,17 @@ fn round502_timezone_catalogues_list_canonical_zones() {
 
     // Values match PG18 for zones whose offset does not move.
     assert_eq!(
-        text_of(&mut e, "SELECT abbrev FROM pg_timezone_names WHERE name = 'Asia/Tokyo'"),
+        text_of(
+            &mut e,
+            "SELECT abbrev FROM pg_timezone_names WHERE name = 'Asia/Tokyo'"
+        ),
         "JST"
     );
     assert_eq!(
-        text_of(&mut e, "SELECT is_dst::text FROM pg_timezone_names WHERE name = 'Asia/Tokyo'"),
+        text_of(
+            &mut e,
+            "SELECT is_dst::text FROM pg_timezone_names WHERE name = 'Asia/Tokyo'"
+        ),
         "false"
     );
     // And the abbreviation view is keyed by designation, deduplicated.

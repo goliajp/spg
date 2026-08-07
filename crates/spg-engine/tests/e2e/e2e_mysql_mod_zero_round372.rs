@@ -71,7 +71,12 @@ fn postgres_session_errors_on_modulo_by_zero() {
 fn round503_division_by_zero_is_null_in_mysql_and_raises_in_pg() {
     let mut my = Engine::new();
     my.set_backslash_escapes(true);
-    for sql in ["SELECT 1/0", "SELECT 5 DIV 0", "SELECT 5 % 0", "SELECT 1.5/0"] {
+    for sql in [
+        "SELECT 1/0",
+        "SELECT 5 DIV 0",
+        "SELECT 5 % 0",
+        "SELECT 1.5/0",
+    ] {
         match my.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}")) {
             QueryResult::Rows { rows, .. } => assert_eq!(
                 spg_engine::eval::value_to_text(&rows[0].values[0]),

@@ -153,7 +153,10 @@ fn conditional_do_instead_command_splits_the_statement() {
         "CREATE RULE ri AS ON INSERT TO t WHERE NEW.id < 0 DO INSTEAD INSERT INTO r VALUES (NEW.id)",
     )
     .expect("PG accepts this rule");
-    match e.execute("INSERT INTO t VALUES (1), (-1), (2), (-2)").unwrap() {
+    match e
+        .execute("INSERT INTO t VALUES (1), (-1), (2), (-2)")
+        .unwrap()
+    {
         QueryResult::CommandOk { affected, .. } => assert_eq!(affected, 2),
         other => panic!("{other:?}"),
     }

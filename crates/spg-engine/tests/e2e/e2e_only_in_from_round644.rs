@@ -56,7 +56,8 @@ fn seeded() -> Engine {
         .unwrap();
     e.execute("CREATE TABLE po2 PARTITION OF po FOR VALUES FROM (10) TO (20)")
         .unwrap();
-    e.execute("INSERT INTO po VALUES (1,'a'), (11,'b')").unwrap();
+    e.execute("INSERT INTO po VALUES (1,'a'), (11,'b')")
+        .unwrap();
     e
 }
 
@@ -75,7 +76,10 @@ fn round644_only_does_not_descend_into_partitions() {
 fn round644_only_survives_a_sibling_reference_to_the_same_parent() {
     let mut e = seeded();
     assert_eq!(
-        one(&mut e, "SELECT count(*) FROM ONLY po a JOIN po b ON a.k = b.k"),
+        one(
+            &mut e,
+            "SELECT count(*) FROM ONLY po a JOIN po b ON a.k = b.k"
+        ),
         "0"
     );
     // Both sides unqualified is the whole tree joined to itself.
@@ -85,7 +89,10 @@ fn round644_only_survives_a_sibling_reference_to_the_same_parent() {
     );
     // …and ONLY on the right alone is equally empty.
     assert_eq!(
-        one(&mut e, "SELECT count(*) FROM po a JOIN ONLY po b ON a.k = b.k"),
+        one(
+            &mut e,
+            "SELECT count(*) FROM po a JOIN ONLY po b ON a.k = b.k"
+        ),
         "0"
     );
 }

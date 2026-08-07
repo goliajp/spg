@@ -82,7 +82,10 @@ pub fn parse_lo_file_call(sql: &str) -> Option<LoFileCall> {
 /// PG's wording for a file it could not read.
 #[must_use]
 pub fn could_not_open(path: &str, os_error: &str) -> String {
-    alloc::format!("could not open server file \"{path}\": {}", trim_os(os_error))
+    alloc::format!(
+        "could not open server file \"{path}\": {}",
+        trim_os(os_error)
+    )
 }
 
 /// PG's wording for a file it could not write.

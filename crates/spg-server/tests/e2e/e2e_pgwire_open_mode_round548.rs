@@ -130,11 +130,7 @@ fn round548_a_group_role_does_not_close_the_server() {
         0,
         "a declared password must arm the guard"
     );
-    assert_ne!(
-        auth_request(&pg, "alice"),
-        0,
-        "…for the account itself too"
-    );
+    assert_ne!(auth_request(&pg, "alice"), 0, "…for the account itself too");
 
     let _ = child.0.kill();
 }

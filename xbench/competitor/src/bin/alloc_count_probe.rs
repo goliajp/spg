@@ -49,7 +49,11 @@
 // `unsafe`: `GlobalAlloc` is an unsafe trait and every method forwards
 // to `System`. Confined to this probe binary; nothing in the engine or
 // the server relaxes the workspace rule.
-#![allow(unsafe_code, clippy::undocumented_unsafe_blocks, clippy::multiple_unsafe_ops_per_block)]
+#![allow(
+    unsafe_code,
+    clippy::undocumented_unsafe_blocks,
+    clippy::multiple_unsafe_ops_per_block
+)]
 
 use spg_engine::Engine;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -135,8 +139,12 @@ fn main() {
         return;
     }
     println!("{n} rows a side\n");
-    println!("| query                      |    allocs |    frees |      MB |     ms | allocs/row |");
-    println!("|----------------------------|----------:|---------:|--------:|-------:|-----------:|");
+    println!(
+        "| query                      |    allocs |    frees |      MB |     ms | allocs/row |"
+    );
+    println!(
+        "|----------------------------|----------:|---------:|--------:|-------:|-----------:|"
+    );
     for (label, sql) in [
         (
             "single scan, count",
@@ -160,10 +168,22 @@ fn main() {
         ),
         // v7.39 (round 580) — the shape that survives round 579's warm
         // re-measurement as a real loss: ORDER BY + LIMIT at 2.47x.
-        ("order by desc limit 1", "SELECT id FROM j ORDER BY id DESC LIMIT 1"),
-        ("order by desc limit 10", "SELECT id FROM j ORDER BY id DESC LIMIT 10"),
-        ("order by asc limit 10", "SELECT id FROM j ORDER BY id LIMIT 10"),
-        ("order by two keys", "SELECT id FROM j ORDER BY g DESC, id DESC LIMIT 10"),
+        (
+            "order by desc limit 1",
+            "SELECT id FROM j ORDER BY id DESC LIMIT 1",
+        ),
+        (
+            "order by desc limit 10",
+            "SELECT id FROM j ORDER BY id DESC LIMIT 10",
+        ),
+        (
+            "order by asc limit 10",
+            "SELECT id FROM j ORDER BY id LIMIT 10",
+        ),
+        (
+            "order by two keys",
+            "SELECT id FROM j ORDER BY g DESC, id DESC LIMIT 10",
+        ),
         ("max(id), same answer", "SELECT max(id) FROM j"),
     ] {
         let (allocs, bytes, frees, ms) = measure(&mut e, sql);

@@ -47,7 +47,10 @@ fn round522_acldefault_matches_pg_for_every_object_type() {
         ("p", "{postgres=sA/postgres}"),
     ] {
         assert_eq!(
-            text(&mut e, &format!("SELECT acldefault('{code}'::\"char\", 10)")),
+            text(
+                &mut e,
+                &format!("SELECT acldefault('{code}'::\"char\", 10)")
+            ),
             expect,
             "acldefault('{code}')"
         );
@@ -69,7 +72,10 @@ fn round522_acldefault_keeps_the_public_entry() {
         ("d", "{=Tc/postgres,postgres=CTc/postgres}"),
     ] {
         assert_eq!(
-            text(&mut e, &format!("SELECT acldefault('{code}'::\"char\", 10)")),
+            text(
+                &mut e,
+                &format!("SELECT acldefault('{code}'::\"char\", 10)")
+            ),
             expect,
             "acldefault('{code}')"
         );
@@ -89,8 +95,14 @@ fn round522_acldefault_names_the_owner_from_the_oid() {
         "{999=arwdDxtm/999}"
     );
     // NULL in either argument is NULL, not an error.
-    assert_eq!(text(&mut e, "SELECT acldefault(NULL::\"char\", 10)"), "NULL");
-    assert_eq!(text(&mut e, "SELECT acldefault('r'::\"char\", NULL)"), "NULL");
+    assert_eq!(
+        text(&mut e, "SELECT acldefault(NULL::\"char\", 10)"),
+        "NULL"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT acldefault('r'::\"char\", NULL)"),
+        "NULL"
+    );
 }
 
 /// PG declares `acldefault` over `"char"`, so the canonical call passes
@@ -155,9 +167,7 @@ fn round522_pg_settings_reports_raw_counts_and_units() {
         assert_eq!(
             text(
                 &mut e,
-                &format!(
-                    "SELECT setting, unit, vartype FROM pg_settings WHERE name = '{name}'"
-                )
+                &format!("SELECT setting, unit, vartype FROM pg_settings WHERE name = '{name}'")
             ),
             expect,
             "pg_settings row for {name}"

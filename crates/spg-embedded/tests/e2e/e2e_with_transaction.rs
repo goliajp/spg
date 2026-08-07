@@ -225,7 +225,10 @@ fn nested_with_transaction_follows_pg_and_does_not_error() {
         })?;
         Ok(())
     });
-    assert!(result.is_ok(), "PG does not reject a nested BEGIN: {result:?}");
+    assert!(
+        result.is_ok(),
+        "PG does not reject a nested BEGIN: {result:?}"
+    );
     let got = db.query("SELECT id FROM t ORDER BY id").unwrap();
     assert_eq!(got.len(), 2, "both rows are committed, as in PG");
 }

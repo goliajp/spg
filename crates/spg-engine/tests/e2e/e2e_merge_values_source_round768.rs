@@ -29,7 +29,8 @@ fn grid(e: &mut Engine, sql: &str) -> String {
 fn round768_merge_values_source_answers_as_pg() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE d5t (id INT, v TEXT)").unwrap();
-    e.execute("INSERT INTO d5t VALUES (1, 'old'), (2, 'keep')").unwrap();
+    e.execute("INSERT INTO d5t VALUES (1, 'old'), (2, 'keep')")
+        .unwrap();
     e.execute(
         "MERGE INTO d5t t USING (VALUES (1, 'new'), (3, 'ins')) s(id, v) ON t.id = s.id \
          WHEN MATCHED THEN UPDATE SET v = s.v \

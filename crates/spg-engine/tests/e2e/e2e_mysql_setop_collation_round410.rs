@@ -45,24 +45,57 @@ fn one_text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn union_folds() {
     let mut e = mysql();
-    assert_eq!(count(&mut e, "SELECT COUNT(*) FROM (SELECT 'a' x UNION SELECT 'a ') u"), 1);
-    assert_eq!(count(&mut e, "SELECT COUNT(*) FROM (SELECT 'a' x UNION SELECT 'A') u"), 1);
-    assert_eq!(count(&mut e, "SELECT COUNT(*) FROM (SELECT 'e' x UNION SELECT 'é') u"), 1);
     assert_eq!(
-        count(&mut e, "SELECT COUNT(*) FROM (SELECT 'a' x UNION SELECT 'a  ' UNION SELECT 'A') u"),
+        count(
+            &mut e,
+            "SELECT COUNT(*) FROM (SELECT 'a' x UNION SELECT 'a ') u"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &mut e,
+            "SELECT COUNT(*) FROM (SELECT 'a' x UNION SELECT 'A') u"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &mut e,
+            "SELECT COUNT(*) FROM (SELECT 'e' x UNION SELECT 'é') u"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &mut e,
+            "SELECT COUNT(*) FROM (SELECT 'a' x UNION SELECT 'a  ' UNION SELECT 'A') u"
+        ),
         1
     );
     // Genuinely different strings are still kept.
-    assert_eq!(count(&mut e, "SELECT COUNT(*) FROM (SELECT 'ab' x UNION SELECT 'ac') u"), 2);
+    assert_eq!(
+        count(
+            &mut e,
+            "SELECT COUNT(*) FROM (SELECT 'ab' x UNION SELECT 'ac') u"
+        ),
+        2
+    );
     // Numbers still dedup as before.
-    assert_eq!(count(&mut e, "SELECT COUNT(*) FROM (SELECT 1 x UNION SELECT 1) u"), 1);
+    assert_eq!(
+        count(&mut e, "SELECT COUNT(*) FROM (SELECT 1 x UNION SELECT 1) u"),
+        1
+    );
 }
 
 /// UNION keeps the first occurrence's original value.
 #[test]
 fn union_keeps_first_original() {
     let mut e = mysql();
-    assert_eq!(one_text(&mut e, "SELECT x FROM (SELECT 'A' x UNION SELECT 'a') u"), "A");
+    assert_eq!(
+        one_text(&mut e, "SELECT x FROM (SELECT 'A' x UNION SELECT 'a') u"),
+        "A"
+    );
 }
 
 /// SELECT DISTINCT, INTERSECT, EXCEPT fold too.
@@ -70,15 +103,25 @@ fn union_keeps_first_original() {
 fn distinct_intersect_except_fold() {
     let mut e = mysql();
     e.execute("CREATE TABLE ps(v VARCHAR(10))").unwrap();
-    e.execute("INSERT INTO ps VALUES('a'),('a '),('A'),('b')").unwrap();
-    assert_eq!(count(&mut e, "SELECT COUNT(*) FROM (SELECT DISTINCT v FROM ps) t"), 2);
+    e.execute("INSERT INTO ps VALUES('a'),('a '),('A'),('b')")
+        .unwrap();
     assert_eq!(
-        count(&mut e, "SELECT COUNT(*) FROM (SELECT v FROM ps INTERSECT SELECT 'a') t"),
+        count(&mut e, "SELECT COUNT(*) FROM (SELECT DISTINCT v FROM ps) t"),
+        2
+    );
+    assert_eq!(
+        count(
+            &mut e,
+            "SELECT COUNT(*) FROM (SELECT v FROM ps INTERSECT SELECT 'a') t"
+        ),
         1
     );
     // {a,a ,A,b} EXCEPT {a} folds a/a /A away -> only b.
     assert_eq!(
-        count(&mut e, "SELECT COUNT(*) FROM (SELECT v FROM ps EXCEPT SELECT 'a') t"),
+        count(
+            &mut e,
+            "SELECT COUNT(*) FROM (SELECT v FROM ps EXCEPT SELECT 'a') t"
+        ),
         1
     );
 }
@@ -88,8 +131,20 @@ fn distinct_intersect_except_fold() {
 #[test]
 fn postgres_byte_exact() {
     let mut e = Engine::new();
-    assert_eq!(count(&mut e, "SELECT COUNT(*) FROM (SELECT 'a' x UNION SELECT 'a ') u"), 2);
-    assert_eq!(count(&mut e, "SELECT COUNT(*) FROM (SELECT 'a' x UNION SELECT 'A') u"), 2);
+    assert_eq!(
+        count(
+            &mut e,
+            "SELECT COUNT(*) FROM (SELECT 'a' x UNION SELECT 'a ') u"
+        ),
+        2
+    );
+    assert_eq!(
+        count(
+            &mut e,
+            "SELECT COUNT(*) FROM (SELECT 'a' x UNION SELECT 'A') u"
+        ),
+        2
+    );
     assert_eq!(
         count(
             &mut e,

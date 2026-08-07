@@ -46,12 +46,18 @@ fn one(e: &mut Engine, sql: &str) -> Value<'static> {
 fn separator_is_honoured() {
     let mut e = fixture();
     assert_eq!(
-        one(&mut e, "SELECT GROUP_CONCAT(t SEPARATOR '|') FROM gc WHERE g=1"),
+        one(
+            &mut e,
+            "SELECT GROUP_CONCAT(t SEPARATOR '|') FROM gc WHERE g=1"
+        ),
         Value::text("c|a|b|a"),
     );
     // The empty separator really is empty, not "fall back to a comma".
     assert_eq!(
-        one(&mut e, "SELECT GROUP_CONCAT(t SEPARATOR '') FROM gc WHERE g=1"),
+        one(
+            &mut e,
+            "SELECT GROUP_CONCAT(t SEPARATOR '') FROM gc WHERE g=1"
+        ),
         Value::text("caba"),
     );
     // …and it composes with ORDER BY, which comes first.
@@ -91,7 +97,10 @@ fn the_defaults_are_unchanged() {
         "default separator is a comma, in insertion order"
     );
     assert_eq!(
-        one(&mut e, "SELECT GROUP_CONCAT(t ORDER BY n) FROM gc WHERE g=1"),
+        one(
+            &mut e,
+            "SELECT GROUP_CONCAT(t ORDER BY n) FROM gc WHERE g=1"
+        ),
         Value::text("a,a,b,c"),
     );
     assert_eq!(

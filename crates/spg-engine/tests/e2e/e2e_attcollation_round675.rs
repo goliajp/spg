@@ -67,10 +67,7 @@ fn round675_the_oids_join_pg_collation() {
     let mut e = Engine::new();
     seed(&mut e);
     assert_eq!(
-        rows(
-            &mut e,
-            "SELECT collname FROM pg_collation WHERE oid = 100"
-        ),
+        rows(&mut e, "SELECT collname FROM pg_collation WHERE oid = 100"),
         "default"
     );
     assert_eq!(

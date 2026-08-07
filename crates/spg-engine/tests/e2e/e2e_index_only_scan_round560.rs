@@ -61,7 +61,8 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn engine() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE i (id INT, k INT, pad TEXT)").unwrap();
+    e.execute("CREATE TABLE i (id INT, k INT, pad TEXT)")
+        .unwrap();
     e.execute("INSERT INTO i SELECT g, g, 'x' FROM generate_series(1, 200) g")
         .unwrap();
     e.execute("CREATE INDEX ik ON i (k)").unwrap();
@@ -77,7 +78,10 @@ fn round560_index_only_range_answers() {
         vec!["5", "6", "7", "8", "9"]
     );
     // One-sided ranges too.
-    assert_eq!(rows(&mut e, "SELECT k FROM i WHERE k > 197"), vec!["198", "199", "200"]);
+    assert_eq!(
+        rows(&mut e, "SELECT k FROM i WHERE k > 197"),
+        vec!["198", "199", "200"]
+    );
     assert_eq!(rows(&mut e, "SELECT k FROM i WHERE k < 3"), vec!["1", "2"]);
     // An alias on the output, and a qualifier on the input.
     assert_eq!(
@@ -100,7 +104,8 @@ fn round560_the_declared_type_survives() {
         vec!["integer"]
     );
     e.execute("CREATE TABLE b (v BIGINT, t TEXT)").unwrap();
-    e.execute("INSERT INTO b VALUES (10, 'a'), (20, 'b')").unwrap();
+    e.execute("INSERT INTO b VALUES (10, 'a'), (20, 'b')")
+        .unwrap();
     e.execute("CREATE INDEX bv ON b (v)").unwrap();
     e.execute("CREATE INDEX bt ON b (t)").unwrap();
     assert_eq!(
@@ -136,14 +141,14 @@ fn round560_mvcc_visibility() {
     let mut e = engine();
     let (t1, t2) = (TxId(91), TxId(92));
     e.execute_in("BEGIN", t1).unwrap();
-    e.execute_in("INSERT INTO i VALUES (500, 500, 'z')", t1).unwrap();
-    let seen = |e: &mut Engine, tx: TxId| match e
-        .execute_in("SELECT k FROM i WHERE k > 400", tx)
-        .unwrap()
-    {
-        QueryResult::Rows { rows, .. } => rows.len(),
-        other => panic!("{other:?}"),
-    };
+    e.execute_in("INSERT INTO i VALUES (500, 500, 'z')", t1)
+        .unwrap();
+    let seen =
+        |e: &mut Engine, tx: TxId| match e.execute_in("SELECT k FROM i WHERE k > 400", tx).unwrap()
+        {
+            QueryResult::Rows { rows, .. } => rows.len(),
+            other => panic!("{other:?}"),
+        };
     assert_eq!(seen(&mut e, t1), 1, "its own insert");
     e.execute_in("BEGIN", t2).unwrap();
     assert_eq!(seen(&mut e, t2), 0, "not another transaction's");
@@ -168,7 +173,10 @@ fn round560_other_shapes_are_untouched() {
     assert_eq!(rows(&mut e, "SELECT id FROM i WHERE id = 5"), vec!["5"]);
     // ORDER BY / LIMIT / DISTINCT keep their own machinery.
     assert_eq!(
-        rows(&mut e, "SELECT k FROM i WHERE k BETWEEN 5 AND 9 ORDER BY k DESC LIMIT 2"),
+        rows(
+            &mut e,
+            "SELECT k FROM i WHERE k BETWEEN 5 AND 9 ORDER BY k DESC LIMIT 2"
+        ),
         vec!["9", "8"]
     );
     assert_eq!(

@@ -54,9 +54,18 @@ fn extraction_functions_read_yyyymmdd() {
 fn cast_and_arithmetic_functions() {
     let mut e = mysql();
     assert_eq!(scalar(&mut e, "SELECT DATE(20200105)"), "2020-01-05");
-    assert_eq!(scalar(&mut e, "SELECT TIMESTAMP(20200105)"), "2020-01-05 00:00:00");
-    assert_eq!(scalar(&mut e, "SELECT DATE_ADD(20200101, INTERVAL 1 DAY)"), "2020-01-02");
-    assert_eq!(scalar(&mut e, "SELECT DATE_SUB(20200105, INTERVAL 1 DAY)"), "2020-01-04");
+    assert_eq!(
+        scalar(&mut e, "SELECT TIMESTAMP(20200105)"),
+        "2020-01-05 00:00:00"
+    );
+    assert_eq!(
+        scalar(&mut e, "SELECT DATE_ADD(20200101, INTERVAL 1 DAY)"),
+        "2020-01-02"
+    );
+    assert_eq!(
+        scalar(&mut e, "SELECT DATE_SUB(20200105, INTERVAL 1 DAY)"),
+        "2020-01-04"
+    );
     assert_eq!(scalar(&mut e, "SELECT DATEDIFF(20200110, 20200105)"), "5");
     assert_eq!(
         scalar(&mut e, "SELECT DATE_FORMAT(20200105, '%Y-%m-%d')"),
@@ -107,8 +116,14 @@ fn malformed_int_returns_null() {
 #[test]
 fn int_plus_interval_day() {
     let mut e = mysql();
-    assert_eq!(scalar(&mut e, "SELECT 200101 + INTERVAL 1 DAY"), "2020-01-02");
-    assert_eq!(scalar(&mut e, "SELECT 20200105 - INTERVAL 1 DAY"), "2020-01-04");
+    assert_eq!(
+        scalar(&mut e, "SELECT 200101 + INTERVAL 1 DAY"),
+        "2020-01-02"
+    );
+    assert_eq!(
+        scalar(&mut e, "SELECT 20200105 - INTERVAL 1 DAY"),
+        "2020-01-04"
+    );
 }
 
 /// A PostgreSQL session keeps the strict type error (integer never reads as

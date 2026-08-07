@@ -55,13 +55,19 @@ fn text(e: &mut Engine, sql: &str) -> String {
 fn round534_preset_options_report_their_values() {
     let mut e = engine();
     assert_eq!(text(&mut e, "SELECT current_setting('block_size')"), "8192");
-    assert_eq!(text(&mut e, "SELECT current_setting('max_index_keys')"), "32");
+    assert_eq!(
+        text(&mut e, "SELECT current_setting('max_index_keys')"),
+        "32"
+    );
     assert_eq!(
         text(&mut e, "SELECT current_setting('integer_datetimes')"),
         "on"
     );
     // And they cast, which an empty string did not.
-    assert_eq!(text(&mut e, "SELECT current_setting('block_size')::int"), "8192");
+    assert_eq!(
+        text(&mut e, "SELECT current_setting('block_size')::int"),
+        "8192"
+    );
 }
 
 /// A tunable SPG does not act on still reports its compiled-in default.
@@ -74,7 +80,10 @@ fn round534_unmodelled_tunables_report_their_defaults() {
     );
     assert_eq!(text(&mut e, "SELECT current_setting('fsync')"), "on");
     assert_eq!(
-        text(&mut e, "SELECT current_setting('default_statistics_target')"),
+        text(
+            &mut e,
+            "SELECT current_setting('default_statistics_target')"
+        ),
         "100"
     );
 }
@@ -143,7 +152,10 @@ fn round534_pg_settings_stays_curated() {
     );
     // The ones it does read are there.
     assert_eq!(
-        text(&mut e, "SELECT count(*) FROM pg_settings WHERE name = 'work_mem'"),
+        text(
+            &mut e,
+            "SELECT count(*) FROM pg_settings WHERE name = 'work_mem'"
+        ),
         "1"
     );
 }

@@ -55,10 +55,7 @@ fn round648_regtype_says_it_is_a_regtype() {
     assert_eq!(one(&mut e, "SELECT pg_typeof('text'::regtype)"), "regtype");
     // Its two siblings were already right; the point is that all three
     // now agree on the shape.
-    assert_eq!(
-        one(&mut e, "SELECT 'pg_class'::regclass::oid"),
-        "1259"
-    );
+    assert_eq!(one(&mut e, "SELECT 'pg_class'::regclass::oid"), "1259");
 }
 
 #[test]

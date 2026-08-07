@@ -73,28 +73,43 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 fn round619_object_canonical_form() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, r#"SELECT '{"a":1}'::JSONB, '{"b":2,"a":1}'::JSONB, '{"aa":1,"b":2}'::JSONB"#),
+        vals(
+            &mut e,
+            r#"SELECT '{"a":1}'::JSONB, '{"b":2,"a":1}'::JSONB, '{"aa":1,"b":2}'::JSONB"#
+        ),
         vec![r#"{"a": 1}|{"a": 1, "b": 2}|{"b": 2, "aa": 1}"#],
         "keys sort by LENGTH first, then bytes — the one-entry shortcut must \
          not change that for its neighbours"
     );
     assert_eq!(
-        vals(&mut e, r#"SELECT '{"k":1,"k":2,"k":3}'::JSONB, '{}'::JSONB, '[]'::JSONB"#),
+        vals(
+            &mut e,
+            r#"SELECT '{"k":1,"k":2,"k":3}'::JSONB, '{}'::JSONB, '[]'::JSONB"#
+        ),
         vec![r#"{"k": 3}|{}|[]"#],
         "duplicate keys are last-wins, and an empty object takes the shortcut"
     );
     assert_eq!(
-        vals(&mut e, r#"SELECT '[1,2,{"b":1,"a":2}]'::JSONB, '{"x":[1,{"z":1,"y":2}]}'::JSONB"#),
+        vals(
+            &mut e,
+            r#"SELECT '[1,2,{"b":1,"a":2}]'::JSONB, '{"x":[1,{"z":1,"y":2}]}'::JSONB"#
+        ),
         vec![r#"[1, 2, {"a": 2, "b": 1}]|{"x": [1, {"y": 2, "z": 1}]}"#],
         "nested, where the one-entry object contains a sorting one"
     );
     assert_eq!(
-        vals(&mut e, r#"SELECT '"a\"b"'::JSONB, '"c\\d"'::JSONB, '"日本"'::JSONB, '""'::JSONB"#),
+        vals(
+            &mut e,
+            r#"SELECT '"a\"b"'::JSONB, '"c\\d"'::JSONB, '"日本"'::JSONB, '""'::JSONB"#
+        ),
         vec![r#""a\"b"|"c\\d"|"日本"|"""#],
         "strings are re-escaped, not passed through"
     );
     assert_eq!(
-        vals(&mut e, "SELECT 'true'::JSONB, 'false'::JSONB, 'null'::JSONB"),
+        vals(
+            &mut e,
+            "SELECT 'true'::JSONB, 'false'::JSONB, 'null'::JSONB"
+        ),
         vec!["true|false|null"]
     );
 }
@@ -104,17 +119,26 @@ fn round619_object_canonical_form() {
 fn round619_number_canonical_form() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT '1'::JSONB, '-1'::JSONB, '0'::JSONB, '-0'::JSONB"),
+        vals(
+            &mut e,
+            "SELECT '1'::JSONB, '-1'::JSONB, '0'::JSONB, '-0'::JSONB"
+        ),
         vec!["1|-1|0|0"],
         "`-0` canonicalises to `0`, so it is NOT a pass-through"
     );
     assert_eq!(
-        vals(&mut e, "SELECT '1.0'::JSONB, '1.50'::JSONB, '0.5'::JSONB, '1e3'::JSONB, '1E3'::JSONB, '1e-3'::JSONB"),
+        vals(
+            &mut e,
+            "SELECT '1.0'::JSONB, '1.50'::JSONB, '0.5'::JSONB, '1e3'::JSONB, '1E3'::JSONB, '1e-3'::JSONB"
+        ),
         vec!["1.0|1.50|0.5|1000|1000|0.001"],
         "a scale is kept and an exponent is expanded — neither takes the shortcut"
     );
     assert_eq!(
-        vals(&mut e, "SELECT '-0.0'::JSONB, '10.010'::JSONB, '1e+3'::JSONB"),
+        vals(
+            &mut e,
+            "SELECT '-0.0'::JSONB, '10.010'::JSONB, '1e+3'::JSONB"
+        ),
         vec!["0.0|10.010|1000"]
     );
     assert_eq!(
@@ -132,31 +156,49 @@ fn round619_number_canonical_form() {
 fn round619_builders_and_accessors() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT to_jsonb(1), to_jsonb(1.50), to_jsonb('x'::TEXT), to_jsonb(true)"),
+        vals(
+            &mut e,
+            "SELECT to_jsonb(1), to_jsonb(1.50), to_jsonb('x'::TEXT), to_jsonb(true)"
+        ),
         vec![r#"1|1.50|"x"|true"#]
     );
     assert_eq!(
-        vals(&mut e, "SELECT jsonb_build_object('a',1), jsonb_build_object('b',2,'a',1), jsonb_build_object('k',1,'k',2)"),
+        vals(
+            &mut e,
+            "SELECT jsonb_build_object('a',1), jsonb_build_object('b',2,'a',1), jsonb_build_object('k',1,'k',2)"
+        ),
         vec![r#"{"a": 1}|{"a": 1, "b": 2}|{"k": 2}"#]
     );
     assert_eq!(
-        vals(&mut e, r#"SELECT ('{"a":'||42||'}')::JSONB, ('{"a":'||42||'}')::JSONB ->> 'a'"#),
+        vals(
+            &mut e,
+            r#"SELECT ('{"a":'||42||'}')::JSONB, ('{"a":'||42||'}')::JSONB ->> 'a'"#
+        ),
         vec![r#"{"a": 42}|42"#],
         "the shape Phase A decomposed"
     );
     assert_eq!(
-        vals(&mut e, r#"SELECT '{"a":1}'::JSONB::TEXT, length('{"a":1}'::JSONB::TEXT)"#),
+        vals(
+            &mut e,
+            r#"SELECT '{"a":1}'::JSONB::TEXT, length('{"a":1}'::JSONB::TEXT)"#
+        ),
         vec![r#"{"a": 1}|8"#],
         "the canonical text is what the length counts"
     );
     assert_eq!(
-        vals(&mut e, r#"SELECT jsonb_set('{"a":1,"b":2}','{a}','9'), jsonb_insert('{"a":1}','{b}','2')"#),
+        vals(
+            &mut e,
+            r#"SELECT jsonb_set('{"a":1,"b":2}','{a}','9'), jsonb_insert('{"a":1}','{b}','2')"#
+        ),
         vec![r#"{"a": 9, "b": 2}|{"a": 1, "b": 2}"#],
         "a mutator's result is canonicalised too — and one grows a one-entry \
          object into a two-entry one"
     );
     assert_eq!(
-        vals(&mut e, r#"SELECT '{"a":1}'::JSONB = '{"a":1.0}'::JSONB, '{"a":1}'::JSONB @> '{"a":1}'::JSONB"#),
+        vals(
+            &mut e,
+            r#"SELECT '{"a":1}'::JSONB = '{"a":1.0}'::JSONB, '{"a":1}'::JSONB @> '{"a":1}'::JSONB"#
+        ),
         vec!["true|true"],
         "equality reads the canonical form, so 1 and 1.0 compare equal"
     );
@@ -170,16 +212,25 @@ fn round619_scale() {
     e.execute("INSERT INTO big SELECT gg FROM generate_series(1, 20000) gg")
         .unwrap();
     assert_eq!(
-        vals(&mut e, r#"SELECT count(DISTINCT (('{"a":'||id||'}')::JSONB)::TEXT) FROM big"#),
+        vals(
+            &mut e,
+            r#"SELECT count(DISTINCT (('{"a":'||id||'}')::JSONB)::TEXT) FROM big"#
+        ),
         vec!["20000"],
         "every row canonicalises to its own text"
     );
     assert_eq!(
-        vals(&mut e, r#"SELECT count(*) FROM big WHERE (('{"a":'||id||'}')::JSONB ->> 'a')::INT = id"#),
+        vals(
+            &mut e,
+            r#"SELECT count(*) FROM big WHERE (('{"a":'||id||'}')::JSONB ->> 'a')::INT = id"#
+        ),
         vec!["20000"]
     );
     assert_eq!(
-        vals(&mut e, r#"SELECT count(*) FROM big WHERE jsonb_build_object('a', id) = ('{"a":'||id||'}')::JSONB"#),
+        vals(
+            &mut e,
+            r#"SELECT count(*) FROM big WHERE jsonb_build_object('a', id) = ('{"a":'||id||'}')::JSONB"#
+        ),
         vec!["20000"],
         "the builder and the cast agree on the canonical form"
     );

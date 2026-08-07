@@ -61,7 +61,8 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE ct (id INT, s TEXT, n NUMERIC, d DATE, b BOOLEAN)").unwrap();
+    e.execute("CREATE TABLE ct (id INT, s TEXT, n NUMERIC, d DATE, b BOOLEAN)")
+        .unwrap();
     e.execute(
         "INSERT INTO ct VALUES (1,'ab',1.50,'2020-01-02',true),(2,NULL,NULL,NULL,NULL),\
          (3,'日本',3.0,'1999-12-31',false),(4,'',0.25,'2000-02-29',NULL)",
@@ -75,7 +76,10 @@ fn seed() -> Engine {
 fn round612_nulls_are_skipped() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id, concat(s, id), concat(s, n, d), concat(s) FROM ct ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, concat(s, id), concat(s, n, d), concat(s) FROM ct ORDER BY id"
+        ),
         vec![
             "1|ab1|ab1.502020-01-02|ab",
             "2|2||",
@@ -98,16 +102,25 @@ fn round612_nulls_are_skipped() {
         "a skipped NULL takes its separator with it; an EMPTY argument does not"
     );
     assert_eq!(
-        vals(&mut e, "SELECT concat_ws(NULL, 'a','b') IS NULL, concat_ws('', 'a','b'), concat_ws('--','a',NULL,'b')"),
+        vals(
+            &mut e,
+            "SELECT concat_ws(NULL, 'a','b') IS NULL, concat_ws('', 'a','b'), concat_ws('--','a',NULL,'b')"
+        ),
         vec!["true|ab|a--b"],
         "a NULL SEPARATOR does poison"
     );
     assert_eq!(
-        vals(&mut e, "SELECT concat_ws('-'), concat(NULL), concat_ws('-', NULL, NULL)"),
+        vals(
+            &mut e,
+            "SELECT concat_ws('-'), concat(NULL), concat_ws('-', NULL, NULL)"
+        ),
         vec!["||"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT concat_ws('-', 'a', '', 'b'), concat('', 'x', '')"),
+        vals(
+            &mut e,
+            "SELECT concat_ws('-', 'a', '', 'b'), concat('', 'x', '')"
+        ),
         vec!["a--b|x"],
         "an empty argument still gets its separators"
     );
@@ -118,26 +131,41 @@ fn round612_nulls_are_skipped() {
 fn round612_rendering() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id, concat(b, s), concat_ws('|', b, s) FROM ct ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, concat(b, s), concat_ws('|', b, s) FROM ct ORDER BY id"
+        ),
         vec!["1|tab|t|ab", "2||", "3|f日本|f|日本", "4||"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT concat('a', 1, 2.50, true, '2020-01-02'::DATE), concat_ws(',', 'a', 1, 2.50, true)"),
+        vals(
+            &mut e,
+            "SELECT concat('a', 1, 2.50, true, '2020-01-02'::DATE), concat_ws(',', 'a', 1, 2.50, true)"
+        ),
         vec!["a12.50t2020-01-02|a,1,2.50,t"]
     );
     e.execute("SET DateStyle = 'SQL, DMY'").unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT concat('d=', '2020-01-02'::DATE), concat_ws('|','d','2020-01-02'::DATE)"),
+        vals(
+            &mut e,
+            "SELECT concat('d=', '2020-01-02'::DATE), concat_ws('|','d','2020-01-02'::DATE)"
+        ),
         vec!["d=02/01/2020|d|02/01/2020"],
         "the render follows the session, so the borrow must not bypass it"
     );
     e.execute("SET DateStyle = 'ISO, MDY'").unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT concat('日本','語'), concat_ws('・','日','本','語')"),
+        vals(
+            &mut e,
+            "SELECT concat('日本','語'), concat_ws('・','日','本','語')"
+        ),
         vec!["日本語|日・本・語"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, concat_ws(s, 'x', 'y') FROM ct ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, concat_ws(s, 'x', 'y') FROM ct ORDER BY id"
+        ),
         vec!["1|xaby", "2|NULL", "3|x日本y", "4|xy"],
         "the separator can be the column, including an empty one"
     );
@@ -148,12 +176,18 @@ fn round612_rendering() {
 fn round612_lengths_and_agreement() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id, length(concat(s, s, s)), length(concat_ws('..', s, s, s)) FROM ct ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, length(concat(s, s, s)), length(concat_ws('..', s, s, s)) FROM ct ORDER BY id"
+        ),
         vec!["1|6|10", "2|0|0", "3|6|10", "4|0|4"],
         "counted in characters, so the multi-byte row has to agree"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, concat(s, id) = s || id::TEXT FROM ct WHERE s IS NOT NULL ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, concat(s, id) = s || id::TEXT FROM ct WHERE s IS NOT NULL ORDER BY id"
+        ),
         vec!["1|true", "3|true", "4|true"],
         "concat agrees with the || it spells, where no argument is NULL"
     );
@@ -167,20 +201,32 @@ fn round612_scale() {
     e.execute("INSERT INTO big SELECT gg, 'row' || gg FROM generate_series(1, 20000) gg")
         .unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE concat(s, '/', id) = s || '/' || id"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE concat(s, '/', id) = s || '/' || id"
+        ),
         vec!["20000"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(DISTINCT concat_ws('|', s, id)) FROM big"),
+        vals(
+            &mut e,
+            "SELECT count(DISTINCT concat_ws('|', s, id)) FROM big"
+        ),
         vec!["20000"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE length(concat_ws('--', s, s)) = 2 * length(s) + 2"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE length(concat_ws('--', s, s)) = 2 * length(s) + 2"
+        ),
         vec!["20000"],
         "the separator lands exactly once between two non-NULL arguments"
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE concat_ws('-', NULL, s, NULL) = s"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE concat_ws('-', NULL, s, NULL) = s"
+        ),
         vec!["20000"],
         "and NULLs leave no separators behind"
     );

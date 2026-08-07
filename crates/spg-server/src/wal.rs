@@ -374,8 +374,7 @@ pub(crate) fn append_durability_marker(state: &ServerState) -> std::io::Result<u
 /// when you need it.
 /// v7.39 (round 476) — the WAL file, so `pg_current_wal_lsn()` can report
 /// its byte position.
-pub(crate) static WAL_PATH: std::sync::OnceLock<std::path::PathBuf> =
-    std::sync::OnceLock::new();
+pub(crate) static WAL_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
 /// The WAL byte position, as `Engine::set_wal_lsn_fn` wants it.
 ///
@@ -393,10 +392,8 @@ pub(crate) fn wal_lsn_position() -> u64 {
         .map_or(0, |m| m.len())
 }
 
-pub(crate) static WAL_APPENDS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub(crate) static WAL_FSYNCS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static WAL_APPENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static WAL_FSYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// v7.39 (round 438) — one stderr line per fsync when `SPG_WAL_TRACE=1`.
 /// Off by default (one relaxed load of a `OnceLock<bool>`), so a perf run
@@ -465,9 +462,8 @@ pub(crate) fn wal_sync(f: &std::fs::File) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let force_full = *FULL.get_or_init(|| {
-            std::env::var("SPG_WAL_FULLFSYNC").is_ok_and(|v| v != "0")
-        });
+        let force_full =
+            *FULL.get_or_init(|| std::env::var("SPG_WAL_FULLFSYNC").is_ok_and(|v| v != "0"));
         if !force_full {
             use std::os::fd::AsRawFd as _;
             // libc has no F_BARRIERFSYNC constant; Apple's fcntl.h says 85.
@@ -899,7 +895,8 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
                     Ok(b) => b,
                     Err(e) => {
                         let _ = task.ack.send(CommitResult {
-                            result: Err(spg_engine::EngineError::Unsupported(format!(                                "WAL encode failed: {e}"
+                            result: Err(spg_engine::EngineError::Unsupported(format!(
+                                "WAL encode failed: {e}"
                             ))),
                             wal_outcome: Err(e),
                         });

@@ -54,7 +54,10 @@ fn the_rounding_happens_once() {
 fn the_result_carries_display_scale_zero() {
     let mut e = Engine::new();
     assert_eq!(one(&mut e, "SELECT scale(1234.5::numeric(10,-2))"), "0");
-    assert_eq!(one(&mut e, "SELECT pg_typeof(1234.5::numeric(10,-2))"), "numeric");
+    assert_eq!(
+        one(&mut e, "SELECT pg_typeof(1234.5::numeric(10,-2))"),
+        "numeric"
+    );
     // It is an ordinary numeric afterwards.
     assert_eq!(one(&mut e, "SELECT 1234.5::numeric(10,-2) + 1"), "1201");
 }
@@ -86,8 +89,10 @@ fn a_column_can_declare_one() {
 #[test]
 fn information_schema_reports_it_the_way_pg_does() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t (a numeric(10,-2), b numeric(10,-5), c numeric(10,-1000), d numeric(10,3))")
-        .unwrap();
+    e.execute(
+        "CREATE TABLE t (a numeric(10,-2), b numeric(10,-5), c numeric(10,-1000), d numeric(10,3))",
+    )
+    .unwrap();
     // PG reports a negative declared scale as 2048 + scale here, which
     // three measured points confirm: -2 → 2046, -5 → 2043, -1000 → 1048.
     let r = e
@@ -119,9 +124,7 @@ fn the_scale_bounds_are_pgs() {
         err(&mut e, "SELECT 1.5::numeric(10,-1001)"),
         "NUMERIC scale -1001 must be between -1000 and 1000",
     );
-    assert!(
-        e.execute("CREATE TABLE t (a numeric(10,-1001))").is_err(),
-    );
+    assert!(e.execute("CREATE TABLE t (a numeric(10,-1001))").is_err(),);
     // The legal extreme parses.
     e.execute("CREATE TABLE u (a numeric(10,-1000))").unwrap();
 }

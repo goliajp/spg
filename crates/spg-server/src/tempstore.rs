@@ -180,7 +180,9 @@ pub fn sweep_orphans(dir: &Path) -> usize {
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.starts_with(RUN_PREFIX) && !name.starts_with(&mine) && fs::remove_file(e.path()).is_ok()
+        if name.starts_with(RUN_PREFIX)
+            && !name.starts_with(&mine)
+            && fs::remove_file(e.path()).is_ok()
         {
             removed += 1;
         }

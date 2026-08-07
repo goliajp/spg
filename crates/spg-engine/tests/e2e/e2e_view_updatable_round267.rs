@@ -56,13 +56,16 @@ fn matrix_engine() -> Engine {
         .unwrap();
     e.execute("CREATE VIEW nj AS SELECT nt.a, nt2.x FROM nt JOIN nt2 ON nt.a = nt2.x")
         .unwrap();
-    e.execute("CREATE VIEW nd AS SELECT DISTINCT a FROM nt").unwrap();
-    e.execute("CREATE VIEW nl AS SELECT a FROM nt LIMIT 5").unwrap();
+    e.execute("CREATE VIEW nd AS SELECT DISTINCT a FROM nt")
+        .unwrap();
+    e.execute("CREATE VIEW nl AS SELECT a FROM nt LIMIT 5")
+        .unwrap();
     e.execute("CREATE VIEW ne AS SELECT a, a + 1 AS a2 FROM nt")
         .unwrap();
     e.execute("CREATE VIEW nu AS SELECT a FROM nt UNION SELECT x FROM nt2")
         .unwrap();
-    e.execute("CREATE VIEW nw AS SELECT a FROM nt WHERE a > 0").unwrap();
+    e.execute("CREATE VIEW nw AS SELECT a FROM nt WHERE a > 0")
+        .unwrap();
     e.execute("CREATE VIEW nv AS SELECT a FROM nw").unwrap();
     e
 }
@@ -101,7 +104,8 @@ fn order_by_does_not_block_updatability() {
     // round, so an INSERT PG accepts failed here.
     let mut e = Engine::new();
     e.execute("CREATE TABLE ot (a int)").unwrap();
-    e.execute("CREATE VIEW ob AS SELECT a FROM ot ORDER BY a").unwrap();
+    e.execute("CREATE VIEW ob AS SELECT a FROM ot ORDER BY a")
+        .unwrap();
     assert_eq!(
         lines(
             &mut e,
@@ -117,7 +121,8 @@ fn order_by_does_not_block_updatability() {
 fn a_write_through_a_simple_view_reaches_the_base_table() {
     // The capability the catalog used to deny.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE ut (a int PRIMARY KEY, b text)").unwrap();
+    e.execute("CREATE TABLE ut (a int PRIMARY KEY, b text)")
+        .unwrap();
     e.execute("CREATE VIEW uv AS SELECT a, b FROM ut").unwrap();
     e.execute("INSERT INTO uv VALUES (1, 'x')").unwrap();
     e.execute("UPDATE uv SET b = 'y' WHERE a = 1").unwrap();
@@ -195,7 +200,10 @@ fn when_several_reasons_apply_pg_names_exactly_one() {
         .unwrap();
     let detail = |e: &mut Engine, sql: &str| {
         let m = err(e, sql);
-        m.split(" DETAIL: ").nth(1).unwrap().split(" HINT")
+        m.split(" DETAIL: ")
+            .nth(1)
+            .unwrap()
+            .split(" HINT")
             .next()
             .unwrap()
             .to_string()
@@ -233,7 +241,8 @@ fn merge_names_merge_in_the_hint() {
     // trigger, not a rewrite rule.
     let mut e = Engine::new();
     e.execute("CREATE TABLE gt (a int)").unwrap();
-    e.execute("CREATE VIEW gv AS SELECT DISTINCT a FROM gt").unwrap();
+    e.execute("CREATE VIEW gv AS SELECT DISTINCT a FROM gt")
+        .unwrap();
     let m = err(
         &mut e,
         "MERGE INTO gv t USING (SELECT 1 AS k) s ON t.a = s.k \
@@ -250,9 +259,11 @@ fn merge_names_merge_in_the_hint() {
 #[test]
 fn information_schema_tables_lists_views() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE vt (a int PRIMARY KEY, b text)").unwrap();
+    e.execute("CREATE TABLE vt (a int PRIMARY KEY, b text)")
+        .unwrap();
     e.execute("CREATE TABLE vt2 (x int, y text)").unwrap();
-    e.execute("CREATE VIEW v_simple AS SELECT a, b FROM vt").unwrap();
+    e.execute("CREATE VIEW v_simple AS SELECT a, b FROM vt")
+        .unwrap();
     e.execute("CREATE VIEW v_agg AS SELECT b, count(*) AS c FROM vt GROUP BY b")
         .unwrap();
     e.execute("CREATE VIEW v_join AS SELECT vt.a, vt2.y FROM vt JOIN vt2 ON vt.a = vt2.x")

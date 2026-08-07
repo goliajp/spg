@@ -55,11 +55,11 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<String>> {
 fn non_grouped_column_is_first_value() {
     let mut e = setup();
     assert_eq!(
-        rows(&mut e, "SELECT grp, name, n FROM g GROUP BY grp ORDER BY grp"),
-        vec![
-            vec!["1", "a", "10"],
-            vec!["2", "c", "5"],
-        ]
+        rows(
+            &mut e,
+            "SELECT grp, name, n FROM g GROUP BY grp ORDER BY grp"
+        ),
+        vec![vec!["1", "a", "10"], vec!["2", "c", "5"],]
     );
 }
 
@@ -68,11 +68,11 @@ fn non_grouped_column_is_first_value() {
 fn with_aggregate() {
     let mut e = setup();
     assert_eq!(
-        rows(&mut e, "SELECT grp, name, SUM(n) FROM g GROUP BY grp ORDER BY grp"),
-        vec![
-            vec!["1", "a", "30"],
-            vec!["2", "c", "20"],
-        ]
+        rows(
+            &mut e,
+            "SELECT grp, name, SUM(n) FROM g GROUP BY grp ORDER BY grp"
+        ),
+        vec![vec!["1", "a", "30"], vec!["2", "c", "20"],]
     );
 }
 
@@ -81,7 +81,10 @@ fn with_aggregate() {
 fn function_over_non_grouped() {
     let mut e = setup();
     assert_eq!(
-        rows(&mut e, "SELECT grp, UPPER(name) FROM g GROUP BY grp ORDER BY grp"),
+        rows(
+            &mut e,
+            "SELECT grp, UPPER(name) FROM g GROUP BY grp ORDER BY grp"
+        ),
         vec![vec!["1", "A"], vec!["2", "C"]]
     );
 }
@@ -91,7 +94,10 @@ fn function_over_non_grouped() {
 fn strict_query_unchanged() {
     let mut e = setup();
     assert_eq!(
-        rows(&mut e, "SELECT grp, COUNT(*) FROM g GROUP BY grp ORDER BY grp"),
+        rows(
+            &mut e,
+            "SELECT grp, COUNT(*) FROM g GROUP BY grp ORDER BY grp"
+        ),
         vec![vec!["1", "2"], vec!["2", "2"]]
     );
 }
@@ -100,7 +106,8 @@ fn strict_query_unchanged() {
 #[test]
 fn postgres_strict() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE g(grp INT, name VARCHAR(10))").unwrap();
+    e.execute("CREATE TABLE g(grp INT, name VARCHAR(10))")
+        .unwrap();
     e.execute("INSERT INTO g VALUES (1,'a')").unwrap();
     assert!(
         e.execute("SELECT grp, name FROM g GROUP BY grp").is_err(),

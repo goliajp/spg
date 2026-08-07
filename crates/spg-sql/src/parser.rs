@@ -20,12 +20,11 @@ use core::mem;
 use crate::ast::{
     AssignTarget, BinOp, CastTarget, Collation, ColumnDef, ColumnName, ColumnTypeName,
     CreateFunctionStatement, CreateIndexStatement, CreatePublicationStatement,
-    CreateSubscriptionStatement, CreateTableStatement, CreateTriggerStatement,
-    DiscardTarget, Expr, ExtractField, FunctionAttrs, FunctionParallel, FunctionVolatility,
-    FkAction, ForeignKeyConstraint, FrameBound, FrameExclusion, FrameKind, FromClause, FromJoin,
-    FunctionArg, FunctionArgMode, FunctionArgType, FunctionBody, FunctionReturn, GrantObject,
-    GrantPriv, GrantStatement, IndexMethod, InsertStatement, IsolationLevel, JoinKind, Literal,
-    MysqlIntWidth,
+    CreateSubscriptionStatement, CreateTableStatement, CreateTriggerStatement, DiscardTarget, Expr,
+    ExtractField, FkAction, ForeignKeyConstraint, FrameBound, FrameExclusion, FrameKind,
+    FromClause, FromJoin, FunctionArg, FunctionArgMode, FunctionArgType, FunctionAttrs,
+    FunctionBody, FunctionParallel, FunctionReturn, FunctionVolatility, GrantObject, GrantPriv,
+    GrantStatement, IndexMethod, InsertStatement, IsolationLevel, JoinKind, Literal, MysqlIntWidth,
     NullTreatment, OrderBy, Overriding, PlPgSqlBlock, PlPgSqlDeclare, PlPgSqlStmt,
     PublicationScope, RaiseLevel, RangeKindAst, ReturnTarget, SelectItem, SelectStatement,
     Statement, TableRef, TriggerEvent, TriggerForEach, TriggerTiming, UnOp, UnionKind, VecEncoding,
@@ -592,10 +591,13 @@ fn shape_lex_error(e: &lexer::LexError, input: &str) -> ParseError {
         // the character itself and names it, which is the same shape.
         K::UnknownChar(c) => alloc::format!("syntax error at or near \"{c}\""),
         // The number-literal kinds already carry PG's `at or near` form.
-        other => alloc::format!("{}", lexer::LexError {
-            kind: other.clone(),
-            pos: e.pos,
-        }),
+        other => alloc::format!(
+            "{}",
+            lexer::LexError {
+                kind: other.clone(),
+                pos: e.pos,
+            }
+        ),
     };
     ParseError {
         message,
@@ -744,10 +746,10 @@ struct Parser {
 /// rewritten; a name that is neither reaches the ordinary resolver,
 /// which reports that the relation does not exist — PG's answer.
 const SYNTHESISED_PG_CATALOGS: &[&str] = &[
-        "pg_am",
-        "pg_attrdef",
-        "pg_attribute",
-        "pg_cast",
+    "pg_am",
+    "pg_attrdef",
+    "pg_attribute",
+    "pg_cast",
     "pg_db_role_setting",
     "pg_conversion",
     "pg_default_acl",
@@ -759,14 +761,14 @@ const SYNTHESISED_PG_CATALOGS: &[&str] = &[
     "pg_group",
     "pg_authid",
     "pg_class",
-        "pg_collation",
-        "pg_constraint",
-        "pg_database",
-        "pg_depend",
-        // v7.39 (read01 round 50) — COMMENT ON store, PG's pg_description.
-        "pg_description",
-        "pg_enum",
-        "pg_extension",
+    "pg_collation",
+    "pg_constraint",
+    "pg_database",
+    "pg_depend",
+    // v7.39 (read01 round 50) — COMMENT ON store, PG's pg_description.
+    "pg_description",
+    "pg_enum",
+    "pg_extension",
     // v7.39 (round 541) — pg_dump reads it for every relation of kind
     // 'f'. SPG has no foreign tables, so it is empty, which is also
     // what PG reports on a database that has none.
@@ -801,71 +803,72 @@ const SYNTHESISED_PG_CATALOGS: &[&str] = &[
     "pg_transform",
     "pg_user_mapping",
     "pg_user_mappings",
-        "pg_index",
-        "pg_indexes",
-        "pg_inherits",
-        // v7.39 (round 650) — the text-search catalogs SPG can fill
-        // honestly. `pg_ts_config_map` is deliberately NOT here: it maps
-        // token types to dictionaries and SPG has no token-type model,
-        // the same gap that leaves `ts_token_type` / `ts_debug` unbuilt.
-        "pg_ts_config",
-        "pg_ts_config_map",
-        "pg_ts_dict",
-        "pg_ts_parser",
-        "pg_ts_template",
-        "pg_matviews",
-        "pg_namespace",
-        // v7.39 (round 621)
-        "pg_operator",
-        "pg_policies",
-        "pg_policy",
-        "pg_proc",
-        "pg_publication",
-        "pg_replication_slots",
-        "pg_roles",
-        // v7.39 (round 143) — the rewrite-rule listing view.
-        // v7.39 (round 312) — and the rule catalogue itself, which
-        // `pg_get_ruledef(oid)` resolves against.
-        "pg_rewrite",
-        "pg_rules",
-        "pg_sequence",
-        "pg_settings",
-        "pg_stat_archiver",
-        "pg_stat_bgwriter",
-        "pg_stat_checkpointer",
-        "pg_stat_database",
-        "pg_stat_io",
-        "pg_stat_progress_analyze",
-        "pg_auth_members",
-        "pg_stat_progress_create_index",
-        "pg_stat_progress_vacuum",
-        "pg_stat_replication",
-        "pg_stat_slru",
-        "pg_stat_subscription_stats",
-        "pg_stat_user_functions",
-        "pg_stat_user_indexes",
-        "pg_stat_user_tables",
-        "pg_stat_wal",
-        "pg_prepared_statements",
-        "pg_largeobject",
-        "pg_largeobject_metadata",
-        "pg_statistic",
-        "pg_statistic_ext",
-        "pg_subscription",
-        "pg_tables",
-        "pg_tablespace",
-        // v7.39 (round 502) — the timezone catalogues. SPG resolved
-        // named zones correctly but could not list them, so a client
-        // populating a timezone picker got "relation does not exist".
-        "pg_timezone_abbrevs",
-        "pg_timezone_names",
-        "pg_trigger",
-        "pg_type",
-        "pg_user",
-        "pg_views",
+    "pg_index",
+    "pg_indexes",
+    "pg_inherits",
+    // v7.39 (round 650) — the text-search catalogs SPG can fill
+    // honestly. `pg_ts_config_map` is deliberately NOT here: it maps
+    // token types to dictionaries and SPG has no token-type model,
+    // the same gap that leaves `ts_token_type` / `ts_debug` unbuilt.
+    "pg_ts_config",
+    "pg_ts_config_map",
+    "pg_ts_dict",
+    "pg_ts_parser",
+    "pg_ts_template",
+    "pg_matviews",
+    "pg_namespace",
+    // v7.39 (round 621)
+    "pg_operator",
+    "pg_policies",
+    "pg_policy",
+    "pg_proc",
+    "pg_publication",
+    "pg_replication_slots",
+    "pg_roles",
+    // v7.39 (round 143) — the rewrite-rule listing view.
+    // v7.39 (round 312) — and the rule catalogue itself, which
+    // `pg_get_ruledef(oid)` resolves against.
+    "pg_rewrite",
+    "pg_rules",
+    "pg_sequence",
+    "pg_settings",
+    "pg_stat_archiver",
+    "pg_stat_bgwriter",
+    "pg_stat_checkpointer",
+    "pg_stat_database",
+    "pg_stat_io",
+    "pg_stat_progress_analyze",
+    "pg_auth_members",
+    "pg_stat_progress_create_index",
+    "pg_stat_progress_vacuum",
+    "pg_stat_replication",
+    "pg_stat_slru",
+    "pg_stat_subscription_stats",
+    "pg_stat_user_functions",
+    "pg_stat_user_indexes",
+    "pg_stat_user_tables",
+    "pg_stat_wal",
+    "pg_prepared_statements",
+    "pg_largeobject",
+    "pg_largeobject_metadata",
+    "pg_statistic",
+    "pg_statistic_ext",
+    "pg_subscription",
+    "pg_tables",
+    "pg_tablespace",
+    // v7.39 (round 502) — the timezone catalogues. SPG resolved
+    // named zones correctly but could not list them, so a client
+    // populating a timezone picker got "relation does not exist".
+    "pg_timezone_abbrevs",
+    "pg_timezone_names",
+    "pg_trigger",
+    "pg_type",
+    "pg_user",
+    "pg_views",
 ];
 
 const MAX_NEST_DEPTH: usize = 64;
+
 
 /// v7.39 (read01 geo_ops.c) — prefix `@@` desugar target, out-of-line so
 /// the constructor's temporaries stay off `parse_unary`'s recursion frame.
@@ -1065,7 +1068,10 @@ impl Parser {
         // restore. The list is consumed (the comment store keys by name;
         // overload-precise comments are the function-predicate follow-up).
         if matches!(self.peek(), Token::LParen)
-            && matches!(kind.as_str(), "function" | "procedure" | "aggregate" | "routine")
+            && matches!(
+                kind.as_str(),
+                "function" | "procedure" | "aggregate" | "routine"
+            )
         {
             let mut depth = 0usize;
             loop {
@@ -1608,9 +1614,9 @@ impl Parser {
                         break;
                     }
                     other => {
-                        return Err(
-                            self.err(alloc::format!("expected ',' or ')' in PREPARE parameter list, got {other:?}"))
-                        );
+                        return Err(self.err(alloc::format!(
+                            "expected ',' or ')' in PREPARE parameter list, got {other:?}"
+                        )));
                     }
                 }
             }
@@ -4111,9 +4117,10 @@ impl Parser {
         let mut scroll: Option<bool> = None;
         loop {
             match self.peek() {
-                Token::Ident(s) if s.eq_ignore_ascii_case("binary")
-                    || s.eq_ignore_ascii_case("insensitive")
-                    || s.eq_ignore_ascii_case("asensitive") =>
+                Token::Ident(s)
+                    if s.eq_ignore_ascii_case("binary")
+                        || s.eq_ignore_ascii_case("insensitive")
+                        || s.eq_ignore_ascii_case("asensitive") =>
                 {
                     self.advance();
                 }
@@ -4121,8 +4128,7 @@ impl Parser {
                     self.advance();
                     scroll = Some(true);
                 }
-                Token::Not | Token::Ident(_)
-                    if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("no")) =>
+                Token::Not | Token::Ident(_) if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("no")) =>
                 {
                     self.advance(); // NO
                     if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("scroll")) {
@@ -4138,10 +4144,7 @@ impl Parser {
             }
         }
         if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("cursor")) {
-            return Err(self.err(format!(
-                "expected CURSOR in DECLARE, got {:?}",
-                self.peek()
-            )));
+            return Err(self.err(format!("expected CURSOR in DECLARE, got {:?}", self.peek())));
         }
         self.advance();
         let mut hold = false;
@@ -4315,9 +4318,9 @@ impl Parser {
                     "dependencies" => String::from("f"),
                     "mcv" => String::from("m"),
                     other => {
-                        return Err(self.err(alloc::format!(
-                            "unrecognized statistics kind \"{other}\""
-                        )));
+                        return Err(
+                            self.err(alloc::format!("unrecognized statistics kind \"{other}\""))
+                        );
                     }
                 });
                 match self.advance() {
@@ -5808,7 +5811,10 @@ impl Parser {
                             false
                         };
                         let cn = self.expect_ident_like()?;
-                        A::DropConstraint { name: cn, if_exists }
+                        A::DropConstraint {
+                            name: cn,
+                            if_exists,
+                        }
                     }
                     Token::Default => {
                         self.advance();
@@ -5860,9 +5866,7 @@ impl Parser {
                 A::RenameTo(self.expect_ident_like()?)
             }
             other => {
-                return Err(self.err(alloc::format!(
-                    "unsupported ALTER DOMAIN action {other:?}"
-                )));
+                return Err(self.err(alloc::format!("unsupported ALTER DOMAIN action {other:?}")));
             }
         };
         Ok(Statement::AlterDomain { name, action })
@@ -8536,7 +8540,6 @@ impl Parser {
             if_exists,
         }))
     }
-
 }
 fn wrap_from_leaves(
     e: &mut Expr,
@@ -8559,9 +8562,9 @@ fn wrap_from_leaves(
             wrap_from_leaves(lhs, names, make, refs);
             wrap_from_leaves(rhs, names, make, refs);
         }
-        Expr::Unary { expr, .. }
-        | Expr::Cast { expr, .. }
-        | Expr::IsNull { expr, .. } => wrap_from_leaves(expr, names, make, refs),
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            wrap_from_leaves(expr, names, make, refs)
+        }
         Expr::FunctionCall { args, .. } => {
             for a in args.iter_mut() {
                 wrap_from_leaves(a, names, make, refs);
@@ -8614,7 +8617,9 @@ fn expr_refs_tables(e: &Expr, names: &[String]) -> bool {
             branches,
             else_branch,
         } => {
-            operand.as_deref().is_some_and(|o| expr_refs_tables(o, names))
+            operand
+                .as_deref()
+                .is_some_and(|o| expr_refs_tables(o, names))
                 || branches
                     .iter()
                     .any(|(w, t)| expr_refs_tables(w, names) || expr_refs_tables(t, names))
@@ -9135,7 +9140,7 @@ impl Parser {
                 limit: None,
                 offset: None,
                 limit_with_ties: false,
-            window_check_exprs: Vec::new(),
+                window_check_exprs: Vec::new(),
             };
             // v7.37 D.30 — replace each FROM-qualified column *leaf* in the
             // assignment RHS with a correlated scalar subquery, instead of
@@ -9235,9 +9240,9 @@ impl Parser {
             self.advance();
             let tok = self.advance();
             let Token::Integer(n) = tok else {
-                return Err(
-                    self.err(alloc::format!("expected integer after {what} LIMIT, got {tok:?}"))
-                );
+                return Err(self.err(alloc::format!(
+                    "expected integer after {what} LIMIT, got {tok:?}"
+                )));
             };
             // MySQL rejects the `LIMIT offset, count` form here — only a
             // single row count is legal on a DML statement.
@@ -9271,20 +9276,19 @@ impl Parser {
         // repeated in the list, which the source-list peel below handles.)
         // More than one name is a multi-TARGET delete, which SPG does not
         // model; it is refused rather than half-applied.
-        let mysql_pre_target: Option<String> = if self.mysql_dialect
-            && !matches!(self.peek(), Token::From)
-        {
-            let first = self.expect_ident_like()?;
-            if matches!(self.peek(), Token::Comma) {
-                return Err(self.err(alloc::format!(
-                    "multi-table DELETE can only delete from one table; \
+        let mysql_pre_target: Option<String> =
+            if self.mysql_dialect && !matches!(self.peek(), Token::From) {
+                let first = self.expect_ident_like()?;
+                if matches!(self.peek(), Token::Comma) {
+                    return Err(self.err(alloc::format!(
+                        "multi-table DELETE can only delete from one table; \
                      `DELETE {first}, …` names several"
-                )));
-            }
-            Some(first)
-        } else {
-            None
-        };
+                    )));
+                }
+                Some(first)
+            } else {
+                None
+            };
         if !matches!(self.peek(), Token::From) {
             return Err(self.err(format!("expected FROM after DELETE, got {:?}", self.peek())));
         }
@@ -9310,8 +9314,7 @@ impl Parser {
         } else {
             match self.peek() {
                 Token::Ident(s) | Token::QuotedIdent(s)
-                    if !s.eq_ignore_ascii_case("using")
-                        && !s.eq_ignore_ascii_case("returning") =>
+                    if !s.eq_ignore_ascii_case("using") && !s.eq_ignore_ascii_case("returning") =>
                 {
                     let a = s.clone();
                     self.advance();
@@ -9370,8 +9373,8 @@ impl Parser {
             // repeats the TARGET as the first USING entry (PG's spelling
             // lists only the extra sources). Peel it so the source subquery
             // does not re-scan — and shadow — the target table.
-            let primary_is_target = fc.primary.name.eq_ignore_ascii_case(&table)
-                && fc.primary.alias.is_none();
+            let primary_is_target =
+                fc.primary.name.eq_ignore_ascii_case(&table) && fc.primary.alias.is_none();
             if self.mysql_dialect && primary_is_target && !fc.joins.is_empty() {
                 let head = fc.joins.remove(0);
                 mysql_outer = matches!(head.kind, crate::ast::JoinKind::Left);
@@ -9445,7 +9448,7 @@ impl Parser {
                     limit: None,
                     offset: None,
                     limit_with_ties: false,
-            window_check_exprs: Vec::new(),
+                    window_check_exprs: Vec::new(),
                 }))
             };
             let refs = |e: &Expr| expr_refs_tables(e, &names);
@@ -9486,7 +9489,7 @@ impl Parser {
                         limit: None,
                         offset: None,
                         limit_with_ties: false,
-            window_check_exprs: Vec::new(),
+                        window_check_exprs: Vec::new(),
                     }),
                     negated: false,
                 })
@@ -9650,9 +9653,7 @@ impl Parser {
             // BY TARGET is the default (a synonym); BY SOURCE flips the clause
             // to fire for target rows no source row matches.
             let mut matched = matched;
-            if matches!(matched, crate::ast::MergeMatched::NotMatched)
-                && self.peek_is_by()
-            {
+            if matches!(matched, crate::ast::MergeMatched::NotMatched) && self.peek_is_by() {
                 self.advance();
                 match self.peek() {
                     Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("source") => {
@@ -10078,8 +10079,10 @@ impl Parser {
                 return Ok(Statement::AlterSystem { parameter });
             }
             Token::Ident(s) | Token::QuotedIdent(s)
-                if matches!(s.to_ascii_lowercase().as_str(), "role" | "user" | "database")
-                    && self.peeks_db_role_setting() =>
+                if matches!(
+                    s.to_ascii_lowercase().as_str(),
+                    "role" | "user" | "database"
+                ) && self.peeks_db_role_setting() =>
             {
                 let is_database = s.eq_ignore_ascii_case("database");
                 return self.parse_db_role_setting(is_database);
@@ -10187,9 +10190,9 @@ impl Parser {
                 let oid = match self.advance() {
                     Token::Integer(n) => alloc::format!("{n}"),
                     other => {
-                        return Err(self.err(alloc::format!(
-                            "expected large object oid, got {other:?}"
-                        )));
+                        return Err(
+                            self.err(alloc::format!("expected large object oid, got {other:?}"))
+                        );
                     }
                 };
                 self.consume_until_statement_boundary();
@@ -12246,7 +12249,9 @@ impl Parser {
         // unchanged; callers that rely on FOR UPDATE for read-
         // through-write ordering still get the right answer
         // because SPG serialises writes anyway.
-        head.locking = self.consume_optional_for_lock_clauses().map(alloc::boxed::Box::new);
+        head.locking = self
+            .consume_optional_for_lock_clauses()
+            .map(alloc::boxed::Box::new);
         Ok(())
     }
 
@@ -12671,7 +12676,6 @@ impl Parser {
         }
     }
 
-
     /// v7.39 (round 242) — one grouping element of PG's GROUP BY grammar,
     /// as the list of key sets it contributes. A bare expression is one
     /// single-key set; `ROLLUP (u1, …, un)` the n+1 unit-prefixes (largest
@@ -12681,9 +12685,7 @@ impl Parser {
     /// ROLLUP/CUBE member in parentheses is a composite UNIT: its keys
     /// move together.
     fn parse_grouping_element(&mut self) -> Result<Vec<Vec<Expr>>, ParseError> {
-        let is_kw = |t: &Token, kw: &str| {
-            matches!(t, Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case(kw))
-        };
+        let is_kw = |t: &Token, kw: &str| matches!(t, Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case(kw));
         // ROLLUP ( … ) / CUBE ( … )
         if (is_kw(self.peek(), "rollup") || is_kw(self.peek(), "cube"))
             && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
@@ -13000,7 +13002,7 @@ impl Parser {
                     limit: None,
                     offset: None,
                     limit_with_ties: false,
-            window_check_exprs: Vec::new(),
+                    window_check_exprs: Vec::new(),
                 };
             }
             if !matches!(self.peek(), Token::RParen) {
@@ -13453,7 +13455,10 @@ impl Parser {
                 }
                 self.advance();
                 // v7.39 (round 229) — PG rejects a redefinition outright.
-                if window_defs.iter().any(|(n, _)| n.eq_ignore_ascii_case(&wname)) {
+                if window_defs
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case(&wname))
+                {
                     return Err(self.err(alloc::format!("window \"{wname}\" is already defined")));
                 }
                 let def = self.parse_over_clause()?;
@@ -13900,10 +13905,7 @@ impl Parser {
     /// `#[inline(never)]` because the CREATE TABLE frame sits on the
     /// parse chain the nesting sentinel is tuned against.
     #[inline(never)]
-    fn parse_create_table_like(
-        &mut self,
-        at: usize,
-    ) -> Result<crate::ast::LikeSpec, ParseError> {
+    fn parse_create_table_like(&mut self, at: usize) -> Result<crate::ast::LikeSpec, ParseError> {
         self.advance(); // LIKE
         let source = self.expect_ident_like()?;
         let mut options = crate::ast::LikeOptions::default();
@@ -13940,9 +13942,7 @@ impl Parser {
                 // No storage model to copy into.
                 "storage" | "statistics" | "compression" => {}
                 other => {
-                    return Err(self.err(alloc::format!(
-                        "unrecognized LIKE option {other:?}"
-                    )));
+                    return Err(self.err(alloc::format!("unrecognized LIKE option {other:?}")));
                 }
             }
         }
@@ -14908,9 +14908,7 @@ impl Parser {
         true
     }
 
-    fn parse_table_level_exclude(
-        &mut self,
-    ) -> Result<crate::ast::TableConstraint, ParseError> {
+    fn parse_table_level_exclude(&mut self) -> Result<crate::ast::TableConstraint, ParseError> {
         self.advance(); // EXCLUDE
         // Optional `USING <method>`.
         let mut method = None;
@@ -14919,9 +14917,9 @@ impl Parser {
             method = Some(match self.advance() {
                 Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
                 other => {
-                    return Err(
-                        self.err(alloc::format!("expected index method after USING, got {other:?}"))
-                    );
+                    return Err(self.err(alloc::format!(
+                        "expected index method after USING, got {other:?}"
+                    )));
                 }
             });
         }
@@ -14937,9 +14935,9 @@ impl Parser {
             let col = match self.advance() {
                 Token::Ident(s) | Token::QuotedIdent(s) => s,
                 other => {
-                    return Err(
-                        self.err(alloc::format!("expected column name in EXCLUDE, got {other:?}"))
-                    );
+                    return Err(self.err(alloc::format!(
+                        "expected column name in EXCLUDE, got {other:?}"
+                    )));
                 }
             };
             if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("with")) {
@@ -15145,8 +15143,15 @@ impl Parser {
         if columns.is_empty() {
             return Err(self.err("FOREIGN KEY requires at least one column".into()));
         }
-        let (parent_table, parent_columns, on_delete, on_update, match_type, deferrable, initially_deferred) =
-            self.parse_references_tail(columns.len())?;
+        let (
+            parent_table,
+            parent_columns,
+            on_delete,
+            on_update,
+            match_type,
+            deferrable,
+            initially_deferred,
+        ) = self.parse_references_tail(columns.len())?;
         Ok(ForeignKeyConstraint {
             name,
             columns,
@@ -15862,8 +15867,15 @@ impl Parser {
         if !inline_references {
             return Ok((col, None));
         }
-        let (parent_table, parent_columns, on_delete, on_update, match_type, deferrable, initially_deferred) =
-            self.parse_references_tail(1)?;
+        let (
+            parent_table,
+            parent_columns,
+            on_delete,
+            on_update,
+            match_type,
+            deferrable,
+            initially_deferred,
+        ) = self.parse_references_tail(1)?;
         let fk = ForeignKeyConstraint {
             name: declared_name,
             columns: vec![col.name.clone()],
@@ -18238,7 +18250,7 @@ impl Parser {
                 limit: None,
                 offset: None,
                 limit_with_ties: false,
-            window_check_exprs: Vec::new(),
+                window_check_exprs: Vec::new(),
             });
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
@@ -18393,7 +18405,7 @@ impl Parser {
                 limit: None,
                 offset: None,
                 limit_with_ties: false,
-            window_check_exprs: Vec::new(),
+                window_check_exprs: Vec::new(),
             };
             return Ok(TableRef {
                 name: alias.clone(),
@@ -18695,7 +18707,7 @@ impl Parser {
                 limit: None,
                 offset: None,
                 limit_with_ties: false,
-            window_check_exprs: Vec::new(),
+                window_check_exprs: Vec::new(),
             };
             return Ok(TableRef {
                 name: table_alias.clone(),
@@ -19965,9 +19977,9 @@ impl Parser {
                 let vname = match self.advance() {
                     Token::Ident(s) | Token::QuotedIdent(s) => s,
                     other => {
-                        return Err(
-                            self.err(alloc::format!("expected PASSING variable name, got {other:?}"))
-                        );
+                        return Err(self.err(alloc::format!(
+                            "expected PASSING variable name, got {other:?}"
+                        )));
                     }
                 };
                 passing.push((vname, e));
@@ -19991,7 +20003,9 @@ impl Parser {
         }
         self.advance();
         let alias_ident = self.parse_optional_alias()?;
-        let name = alias_ident.clone().unwrap_or_else(|| String::from("json_table"));
+        let name = alias_ident
+            .clone()
+            .unwrap_or_else(|| String::from("json_table"));
         Ok(TableRef {
             name,
             alias: alias_ident,
@@ -20029,7 +20043,9 @@ impl Parser {
     fn parse_json_string_literal(&mut self, what: &str) -> Result<String, ParseError> {
         match self.advance() {
             Token::String(s) => Ok(s),
-            other => Err(self.err(alloc::format!("expected {what} string literal, got {other:?}"))),
+            other => Err(self.err(alloc::format!(
+                "expected {what} string literal, got {other:?}"
+            ))),
         }
     }
 
@@ -20114,9 +20130,7 @@ impl Parser {
             self.advance();
             path = self.parse_json_string_literal("column PATH")?;
         }
-        if !exists
-            && matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("format"))
-        {
+        if !exists && matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("format")) {
             // `FORMAT JSON` after PATH (alternate placement).
             self.advance();
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("json")) {
@@ -20278,10 +20292,7 @@ impl Parser {
     /// sits to the LEFT of the first join — the FROM primary, or the UPDATE
     /// target in the MySQL multi-table form. It only feeds the `USING (…)`
     /// desugaring, which needs a name for the left side of each equality.
-    fn parse_from_joins(
-        &mut self,
-        left_primary_qual: &str,
-    ) -> Result<Vec<FromJoin>, ParseError> {
+    fn parse_from_joins(&mut self, left_primary_qual: &str) -> Result<Vec<FromJoin>, ParseError> {
         let mut joins = Vec::new();
         loop {
             // `, <table>` — cross-product with no ON.
@@ -21559,17 +21570,17 @@ impl Parser {
                 }
                 for c in body.chars() {
                     if !c.is_ascii_hexdigit() {
-                        return Some(Err(self.err(alloc::format!(
-                            "invalid hexadecimal digit {c:?} in X'…'"
-                        ))));
+                        return Some(Err(
+                            self.err(alloc::format!("invalid hexadecimal digit {c:?} in X'…'"))
+                        ));
                     }
                 }
                 return Some(self.finish_postfix_casts(hex_literal_to_bytea_expr(&body)));
             }
             if let Some(bad) = body.chars().find(|c| *c != '0' && *c != '1') {
-                return Some(Err(self.err(alloc::format!(
-                    "invalid binary digit {bad:?} in b'…'"
-                ))));
+                return Some(Err(
+                    self.err(alloc::format!("invalid binary digit {bad:?} in b'…'"))
+                ));
             }
             return Some(self.finish_postfix_casts(bits_literal_to_bytea_expr(&body)));
         }
@@ -22093,9 +22104,7 @@ impl Parser {
                 // `::timestamp[]` named the wrong target in its own error
                 // message and lost the zone-less identity on the way.
                 CastTarget::Timestamp => Some(CastTarget::Named("timestamp_array".to_string())),
-                CastTarget::Timestamptz => {
-                    Some(CastTarget::Named("timestamptz_array".to_string()))
-                }
+                CastTarget::Timestamptz => Some(CastTarget::Named("timestamptz_array".to_string())),
                 CastTarget::Uuid => Some(CastTarget::Named("uuid_array".to_string())),
                 CastTarget::Json | CastTarget::Jsonb => {
                     Some(CastTarget::Named("jsonb_array".to_string()))
@@ -22282,7 +22291,8 @@ impl Parser {
                     continue;
                 }
                 let mysql_ci = self.mysql_dialect
-                    && (lc.ends_with("_ci") || matches!(lc.as_str(), "case_insensitive" | "nocase"));
+                    && (lc.ends_with("_ci")
+                        || matches!(lc.as_str(), "case_insensitive" | "nocase"));
                 // v7.39 (round 691/692) — inside an ORDER BY key EVERY name
                 // goes to the lowering channel, the byte-order spellings
                 // included. Round 691 recorded only the names the old
@@ -24026,10 +24036,8 @@ impl Parser {
                     depth = depth.saturating_sub(1);
                     if depth == 0 {
                         return !saw_top_level_comma
-                            && mysql_interval_unit(
-                                self.tokens.get(i + 1).unwrap_or(&Token::Eof),
-                            )
-                            .is_some();
+                            && mysql_interval_unit(self.tokens.get(i + 1).unwrap_or(&Token::Eof))
+                                .is_some();
                     }
                 }
                 // A comma directly inside the outermost parens means the
@@ -24097,9 +24105,8 @@ impl Parser {
                 )));
             };
             self.advance(); // the unit
-            let (months, days, micros) = scale_mysql_interval(&text, unit).ok_or_else(|| {
-                self.err(alloc::format!("cannot read INTERVAL {text} {unit}"))
-            })?;
+            let (months, days, micros) = scale_mysql_interval(&text, unit)
+                .ok_or_else(|| self.err(alloc::format!("cannot read INTERVAL {text} {unit}")))?;
             return Ok(Expr::Literal(Literal::Interval {
                 months,
                 days,
@@ -25335,7 +25342,8 @@ impl Parser {
                             let saved_coll = self.order_key_collation.take();
                             let parsed = self.parse_expr(0);
                             self.in_order_by_key = saved_flag;
-                            let collation = core::mem::replace(&mut self.order_key_collation, saved_coll);
+                            let collation =
+                                core::mem::replace(&mut self.order_key_collation, saved_coll);
                             let expr = parsed?;
                             let desc = if matches!(self.peek(), Token::Desc) {
                                 self.advance();
@@ -26061,10 +26069,7 @@ fn make_interval_call(qty: Expr, unit: &str) -> Expr {
     match unit {
         "year" => args[0] = qty,
         "quarter" => {
-            args[1] = scaled(
-                crate::ast::BinOp::Mul,
-                Expr::Literal(Literal::Integer(3)),
-            );
+            args[1] = scaled(crate::ast::BinOp::Mul, Expr::Literal(Literal::Integer(3)));
         }
         "month" => args[1] = qty,
         "week" => args[2] = qty,
@@ -26764,7 +26769,6 @@ fn select_mentions_table(s: &crate::ast::SelectStatement, name: &str) -> bool {
     s.unions.iter().any(|(_, u)| select_mentions_table(u, name))
 }
 
-
 /// v7.39 (round 284) — fold a constant `LIMIT` / `OFFSET` expression to a
 /// row count, the way PG evaluates one before applying it.
 ///
@@ -26781,13 +26785,20 @@ fn fold_limit_constant(e: &crate::ast::Expr) -> Option<Result<i128, alloc::strin
         }
         // PG coerces a string by its CONTENT, and fails on the value.
         Expr::Literal(Literal::String(t)) => Some(t.trim().parse::<i64>().map_or_else(
-            |_| Err(alloc::format!("invalid input syntax for type bigint: \"{t}\"")),
+            |_| {
+                Err(alloc::format!(
+                    "invalid input syntax for type bigint: \"{t}\""
+                ))
+            },
             |n| Ok(i128::from(n)),
         )),
         Expr::Literal(Literal::Bool(_)) => Some(Err(
             "argument of {L} must be type bigint, not type boolean".into(),
         )),
-        Expr::Unary { op: UnOp::Neg, expr } => match fold_limit_constant(expr)? {
+        Expr::Unary {
+            op: UnOp::Neg,
+            expr,
+        } => match fold_limit_constant(expr)? {
             Ok(v) => Some(Ok(-v)),
             e @ Err(_) => Some(e),
         },

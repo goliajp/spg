@@ -75,7 +75,10 @@ fn round475_gin_on_to_tsvector_builds_a_fulltext_index() {
     // PG18: CREATE INDEX gx ON public.g USING gin (to_tsvector('simple'::regconfig, doc))
     // SPG renders the config literal without PG's ::regconfig annotation.
     assert_eq!(
-        scalar(&mut e, "SELECT indexdef FROM pg_indexes WHERE tablename = 'g'"),
+        scalar(
+            &mut e,
+            "SELECT indexdef FROM pg_indexes WHERE tablename = 'g'"
+        ),
         "CREATE INDEX gx ON public.g USING gin (to_tsvector('simple', doc))"
     );
 }

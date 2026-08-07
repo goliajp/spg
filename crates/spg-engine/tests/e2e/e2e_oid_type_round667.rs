@@ -95,7 +95,10 @@ fn round667_pg_typeof_prefers_the_declared_type_for_oid_and_no_one_new() {
     // And the types whose value DOES know itself still answer from the
     // value — a general "prefer declared" switch would break these.
     assert_eq!(one(&mut e, "SELECT pg_typeof(1::int2)"), "smallint");
-    assert_eq!(one(&mut e, "SELECT pg_typeof(1::float8)"), "double precision");
+    assert_eq!(
+        one(&mut e, "SELECT pg_typeof(1::float8)"),
+        "double precision"
+    );
     assert_eq!(one(&mut e, "SELECT pg_typeof(1::numeric)"), "numeric");
     assert_eq!(one(&mut e, "SELECT pg_typeof(1::bigint)"), "bigint");
 }
@@ -109,10 +112,14 @@ fn round667_the_reg_family_still_coerces_to_oid() {
     let mut e = Engine::new();
     assert_eq!(one(&mut e, "SELECT 'text'::regtype::oid"), "25");
     assert_eq!(one(&mut e, "SELECT 'pg_class'::regclass::oid"), "1259");
-    assert_eq!(one(&mut e, "SELECT pg_typeof('pg_class'::regclass)"), "regclass");
+    assert_eq!(
+        one(&mut e, "SELECT pg_typeof('pg_class'::regclass)"),
+        "regclass"
+    );
     // Into a declared OID column, which is the shape that broke.
     e.execute("CREATE TABLE o5(o OID)").unwrap();
-    e.execute("INSERT INTO o5 SELECT 'text'::regtype::oid").unwrap();
+    e.execute("INSERT INTO o5 SELECT 'text'::regtype::oid")
+        .unwrap();
     assert_eq!(one(&mut e, "SELECT o FROM o5"), "25");
 }
 
@@ -133,7 +140,10 @@ fn round667_the_reg_family_still_coerces_to_oid() {
 fn round667_xid_is_untouched() {
     let mut e = Engine::new();
     assert_eq!(
-        one(&mut e, "SELECT pg_typeof(relfrozenxid) FROM pg_class LIMIT 1"),
+        one(
+            &mut e,
+            "SELECT pg_typeof(relfrozenxid) FROM pg_class LIMIT 1"
+        ),
         "xid"
     );
     e.execute("CREATE TABLE x1(x XID)").unwrap();

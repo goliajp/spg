@@ -45,7 +45,10 @@ fn text(e: &mut Engine, sql: &str) -> String {
 fn round517_to_regtypemod_packs_the_modifier() {
     let mut e = engine();
     assert_eq!(text(&mut e, "SELECT to_regtypemod('varchar(32)')"), "36");
-    assert_eq!(text(&mut e, "SELECT to_regtypemod('numeric(10,2)')"), "655366");
+    assert_eq!(
+        text(&mut e, "SELECT to_regtypemod('numeric(10,2)')"),
+        "655366"
+    );
     // A type with no modifier is -1; a name that is not a type is NULL.
     assert_eq!(text(&mut e, "SELECT to_regtypemod('int')"), "-1");
     assert_eq!(text(&mut e, "SELECT to_regtypemod('nosuch')"), "NULL");
@@ -88,12 +91,18 @@ fn round517_txid_visible_in_snapshot() {
 fn round517_setweight_can_name_the_lexemes() {
     let mut e = engine();
     assert_eq!(
-        text(&mut e, "SELECT setweight('cat:1 dog:2'::tsvector, 'B', '{cat}')::text"),
+        text(
+            &mut e,
+            "SELECT setweight('cat:1 dog:2'::tsvector, 'B', '{cat}')::text"
+        ),
         "'cat':1B 'dog':2"
     );
     // Two arguments still weight everything.
     assert_eq!(
-        text(&mut e, "SELECT setweight('cat:1 dog:2'::tsvector, 'B')::text"),
+        text(
+            &mut e,
+            "SELECT setweight('cat:1 dog:2'::tsvector, 'B')::text"
+        ),
         "'cat':1B 'dog':2B"
     );
 }
@@ -104,7 +113,10 @@ fn round517_setweight_can_name_the_lexemes() {
 #[test]
 fn round517_the_is_visible_family() {
     let mut e = engine();
-    assert_eq!(text(&mut e, "SELECT pg_collation_is_visible(100::oid)"), "true");
+    assert_eq!(
+        text(&mut e, "SELECT pg_collation_is_visible(100::oid)"),
+        "true"
+    );
     assert_eq!(
         text(&mut e, "SELECT pg_collation_is_visible(999999::oid)"),
         "NULL"
@@ -114,10 +126,20 @@ fn round517_the_is_visible_family() {
         "pg_conversion_is_visible",
         "pg_statistics_obj_is_visible",
     ] {
-        assert_eq!(text(&mut e, &format!("SELECT {f}(100::oid)")), "NULL", "{f}");
+        assert_eq!(
+            text(&mut e, &format!("SELECT {f}(100::oid)")),
+            "NULL",
+            "{f}"
+        );
     }
     // Only ANOTHER session's temp schema is other-temp, and none is
     // reachable by oid here.
-    assert_eq!(text(&mut e, "SELECT pg_is_other_temp_schema(11::oid)"), "false");
-    assert_eq!(text(&mut e, "SELECT pg_is_other_temp_schema(NULL::oid)"), "NULL");
+    assert_eq!(
+        text(&mut e, "SELECT pg_is_other_temp_schema(11::oid)"),
+        "false"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT pg_is_other_temp_schema(NULL::oid)"),
+        "NULL"
+    );
 }

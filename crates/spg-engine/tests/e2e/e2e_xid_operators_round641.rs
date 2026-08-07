@@ -62,10 +62,22 @@ fn err(e: &mut Engine, sql: &str) -> String {
 fn round641_xid_has_no_ordering_operator() {
     let mut e = Engine::new();
     for (sql, want) in [
-        ("SELECT '1'::xid < '2'::xid", "operator does not exist: xid < xid"),
-        ("SELECT '1'::xid <= '2'::xid", "operator does not exist: xid <= xid"),
-        ("SELECT '1'::xid > '2'::xid", "operator does not exist: xid > xid"),
-        ("SELECT '1'::xid >= '2'::xid", "operator does not exist: xid >= xid"),
+        (
+            "SELECT '1'::xid < '2'::xid",
+            "operator does not exist: xid < xid",
+        ),
+        (
+            "SELECT '1'::xid <= '2'::xid",
+            "operator does not exist: xid <= xid",
+        ),
+        (
+            "SELECT '1'::xid > '2'::xid",
+            "operator does not exist: xid > xid",
+        ),
+        (
+            "SELECT '1'::xid >= '2'::xid",
+            "operator does not exist: xid >= xid",
+        ),
         // BETWEEN is `>=` and `<=`, and fails on the first of them.
         (
             "SELECT '2'::xid BETWEEN '1'::xid AND '3'::xid",
@@ -73,7 +85,10 @@ fn round641_xid_has_no_ordering_operator() {
         ),
         // Ordering against an integer is refused too — only equality
         // crosses the type boundary.
-        ("SELECT '1'::xid < 2", "operator does not exist: xid < integer"),
+        (
+            "SELECT '1'::xid < 2",
+            "operator does not exist: xid < integer",
+        ),
     ] {
         assert!(
             err(&mut e, sql).contains(want),
@@ -110,7 +125,8 @@ fn round641_xid_has_equality_including_against_an_integer() {
 fn round641_no_extreme_of_a_transaction_id() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE xo (a xid)").unwrap();
-    e.execute("INSERT INTO xo VALUES ('3'), ('1'), ('2')").unwrap();
+    e.execute("INSERT INTO xo VALUES ('3'), ('1'), ('2')")
+        .unwrap();
     assert!(err(&mut e, "SELECT min(a) FROM xo").contains("function min(xid) does not exist"));
     assert!(err(&mut e, "SELECT max(a) FROM xo").contains("function max(xid) does not exist"));
     // GREATEST / LEAST get PG's other wording, because PG looks for a
@@ -127,9 +143,18 @@ fn round641_no_extreme_of_a_transaction_id() {
     }
     // Equality-only shapes keep working: hash grouping, DISTINCT, and a
     // hash join on the id all need nothing but `=`.
-    assert_eq!(one(&mut e, "SELECT a FROM xo GROUP BY a ORDER BY a::text"), "1,2,3");
-    assert_eq!(one(&mut e, "SELECT count(*) FROM (SELECT DISTINCT a FROM xo) q"), "3");
-    assert_eq!(one(&mut e, "SELECT count(*) FROM xo x JOIN xo y ON x.a = y.a"), "3");
+    assert_eq!(
+        one(&mut e, "SELECT a FROM xo GROUP BY a ORDER BY a::text"),
+        "1,2,3"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT count(*) FROM (SELECT DISTINCT a FROM xo) q"),
+        "3"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT count(*) FROM xo x JOIN xo y ON x.a = y.a"),
+        "3"
+    );
 }
 
 #[test]
@@ -155,5 +180,11 @@ fn round641_the_refusals_are_xids_alone() {
     assert_eq!(one(&mut e, "SELECT 1 < 2"), "true");
     assert_eq!(one(&mut e, "SELECT 'a' < 'b'"), "true");
     assert_eq!(one(&mut e, "SELECT greatest(1, 2)"), "2");
-    assert_eq!(one(&mut e, "SELECT min(x) FROM (SELECT 1 x UNION ALL SELECT 2) q"), "1");
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT min(x) FROM (SELECT 1 x UNION ALL SELECT 2) q"
+        ),
+        "1"
+    );
 }

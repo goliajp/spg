@@ -22,18 +22,24 @@ fn err(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn round754_drop_publication_missing_refuses_if_exists_skips() {
     let mut e = Engine::new();
-    assert!(err(&mut e, "DROP PUBLICATION nosuch_pub")
-        .contains("publication \"nosuch_pub\" does not exist"));
+    assert!(
+        err(&mut e, "DROP PUBLICATION nosuch_pub")
+            .contains("publication \"nosuch_pub\" does not exist")
+    );
     e.execute("DROP PUBLICATION IF EXISTS nosuch_pub").unwrap();
-    assert!(err(&mut e, "DROP SUBSCRIPTION nosuch_sub")
-        .contains("subscription \"nosuch_sub\" does not exist"));
+    assert!(
+        err(&mut e, "DROP SUBSCRIPTION nosuch_sub")
+            .contains("subscription \"nosuch_sub\" does not exist")
+    );
     e.execute("DROP SUBSCRIPTION IF EXISTS nosuch_sub").unwrap();
     // The real thing still drops.
     e.execute("CREATE TABLE p754 (id INT)").unwrap();
-    e.execute("CREATE PUBLICATION p754pub FOR TABLE p754").unwrap();
+    e.execute("CREATE PUBLICATION p754pub FOR TABLE p754")
+        .unwrap();
     e.execute("DROP PUBLICATION p754pub").unwrap();
-    assert!(err(&mut e, "DROP PUBLICATION p754pub")
-        .contains("publication \"p754pub\" does not exist"));
+    assert!(
+        err(&mut e, "DROP PUBLICATION p754pub").contains("publication \"p754pub\" does not exist")
+    );
 }
 
 #[test]
@@ -46,17 +52,30 @@ fn round754_for_tables_spellings_answer_as_pg() {
             .contains("invalid publication object list"),
     );
     // IN SCHEMA public folds to the all-tables scope.
-    e.execute("CREATE PUBLICATION pubs FOR TABLES IN SCHEMA public").unwrap();
+    e.execute("CREATE PUBLICATION pubs FOR TABLES IN SCHEMA public")
+        .unwrap();
     assert!(matches!(
         e.publications().get("pubs"),
         Some(spg_sql::ast::PublicationScope::AllTables)
     ));
     // Any other schema does not exist in SPG's single-schema world.
-    assert!(err(&mut e, "CREATE PUBLICATION bad2 FOR TABLES IN SCHEMA myschema")
-        .contains("schema \"myschema\" does not exist"));
+    assert!(
+        err(
+            &mut e,
+            "CREATE PUBLICATION bad2 FOR TABLES IN SCHEMA myschema"
+        )
+        .contains("schema \"myschema\" does not exist")
+    );
     // Unknown relations refuse on both listing forms.
-    assert!(err(&mut e, "CREATE PUBLICATION bad3 FOR TABLE nosuch_table")
-        .contains("relation \"nosuch_table\" does not exist"));
-    assert!(err(&mut e, "CREATE PUBLICATION bad4 FOR ALL TABLES EXCEPT nosuch_table")
-        .contains("relation \"nosuch_table\" does not exist"));
+    assert!(
+        err(&mut e, "CREATE PUBLICATION bad3 FOR TABLE nosuch_table")
+            .contains("relation \"nosuch_table\" does not exist")
+    );
+    assert!(
+        err(
+            &mut e,
+            "CREATE PUBLICATION bad4 FOR ALL TABLES EXCEPT nosuch_table"
+        )
+        .contains("relation \"nosuch_table\" does not exist")
+    );
 }

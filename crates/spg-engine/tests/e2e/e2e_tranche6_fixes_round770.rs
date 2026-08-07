@@ -35,15 +35,20 @@ fn one(e: &mut Engine, sql: &str) -> String {
 fn round770_read_uncommitted_keeps_its_label() {
     let mut e = Engine::new();
     e.execute("BEGIN ISOLATION LEVEL READ UNCOMMITTED").unwrap();
-    assert_eq!(one(&mut e, "SHOW transaction_isolation"), "read uncommitted");
+    assert_eq!(
+        one(&mut e, "SHOW transaction_isolation"),
+        "read uncommitted"
+    );
     e.execute("COMMIT").unwrap();
 }
 
 #[test]
 fn round770_partition_overlap_speaks_pg() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE p770 (id INT) PARTITION BY LIST (id)").unwrap();
-    e.execute("CREATE TABLE p770a PARTITION OF p770 FOR VALUES IN (1, 2)").unwrap();
+    e.execute("CREATE TABLE p770 (id INT) PARTITION BY LIST (id)")
+        .unwrap();
+    e.execute("CREATE TABLE p770a PARTITION OF p770 FOR VALUES IN (1, 2)")
+        .unwrap();
     let err = format!(
         "{}",
         e.execute("CREATE TABLE p770b PARTITION OF p770 FOR VALUES IN (2, 3)")
@@ -58,8 +63,10 @@ fn round770_partition_overlap_speaks_pg() {
 #[test]
 fn round770_partition_root_null_for_plain_tables() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE p770 (id INT) PARTITION BY LIST (id)").unwrap();
-    e.execute("CREATE TABLE p770a PARTITION OF p770 FOR VALUES IN (1)").unwrap();
+    e.execute("CREATE TABLE p770 (id INT) PARTITION BY LIST (id)")
+        .unwrap();
+    e.execute("CREATE TABLE p770a PARTITION OF p770 FOR VALUES IN (1)")
+        .unwrap();
     e.execute("CREATE TABLE plain770 (x INT)").unwrap();
     assert_eq!(
         one(

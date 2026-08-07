@@ -61,7 +61,10 @@ fn round471_the_upper_half_stores_and_reads_back_exactly() {
 fn round471_arithmetic_and_aggregates_carry_the_full_range() {
     let mut e = my();
     // i64::MAX + 1 — the value that used to be `bigint out of range`.
-    assert_eq!(one(&mut e, "SELECT u + 1 FROM b WHERE id=3"), "9223372036854775808");
+    assert_eq!(
+        one(&mut e, "SELECT u + 1 FROM b WHERE id=3"),
+        "9223372036854775808"
+    );
     assert_eq!(
         one(&mut e, "SELECT u - 1 FROM b WHERE id=1"),
         "18446744073709551614"
@@ -83,7 +86,10 @@ fn round471_comparison_and_ordering_are_unsigned() {
     // 18446744073709551615 sorting below 0.
     let mut e = my();
     assert_eq!(
-        one(&mut e, "SELECT id FROM b WHERE u > 9223372036854775807 ORDER BY id"),
+        one(
+            &mut e,
+            "SELECT id FROM b WHERE u > 9223372036854775807 ORDER BY id"
+        ),
         "1;2"
     );
     assert_eq!(one(&mut e, "SELECT id FROM b ORDER BY u DESC"), "1;2;3;4");
@@ -123,7 +129,10 @@ fn round471_it_still_reports_as_a_bigint() {
         "SHOW CREATE said: {create}"
     );
     // A signed BIGINT is untouched by any of this.
-    assert!(create.contains("`s` bigint(20)"), "SHOW CREATE said: {create}");
+    assert!(
+        create.contains("`s` bigint(20)"),
+        "SHOW CREATE said: {create}"
+    );
 }
 
 #[test]

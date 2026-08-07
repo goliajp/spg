@@ -24,11 +24,26 @@ fn one(e: &mut Engine, sql: &str) -> String {
 fn main() {
     let mut e = Engine::new();
     e.set_current_session(1);
-    println!("A take   : {}", one(&mut e, "SELECT pg_try_advisory_lock(4981)"));
+    println!(
+        "A take   : {}",
+        one(&mut e, "SELECT pg_try_advisory_lock(4981)")
+    );
     e.set_current_session(2);
-    println!("B take   : {} (PG: false)", one(&mut e, "SELECT pg_try_advisory_lock(4981)"));
-    println!("B unlock : {} (PG: false)", one(&mut e, "SELECT pg_advisory_unlock(4981)"));
+    println!(
+        "B take   : {} (PG: false)",
+        one(&mut e, "SELECT pg_try_advisory_lock(4981)")
+    );
+    println!(
+        "B unlock : {} (PG: false)",
+        one(&mut e, "SELECT pg_advisory_unlock(4981)")
+    );
     e.set_current_session(1);
-    println!("A take#2 : {} (PG: true, re-entrant)", one(&mut e, "SELECT pg_try_advisory_lock(4981)"));
-    println!("A unlock : {} (PG: true)", one(&mut e, "SELECT pg_advisory_unlock(4981)"));
+    println!(
+        "A take#2 : {} (PG: true, re-entrant)",
+        one(&mut e, "SELECT pg_try_advisory_lock(4981)")
+    );
+    println!(
+        "A unlock : {} (PG: true)",
+        one(&mut e, "SELECT pg_advisory_unlock(4981)")
+    );
 }

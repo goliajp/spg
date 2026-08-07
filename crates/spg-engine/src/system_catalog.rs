@@ -357,7 +357,8 @@ pub(crate) fn synth_information_schema_columns(
             let ordinal = (i + 1) as i32;
             let mut row = info_column_row(&tname, ordinal, col, None, mysql);
             if mysql {
-                row.values.push(Value::text(crate::show::render_mysql_type(col)));
+                row.values
+                    .push(Value::text(crate::show::render_mysql_type(col)));
             }
             rows.push(row);
         }
@@ -384,14 +385,14 @@ pub(crate) fn synth_information_schema_columns(
             let writable = updatable && simple.iter().any(|n| n == &col.name);
             let mut row = info_column_row(vname, ordinal, col, Some(writable), mysql);
             if mysql {
-                row.values.push(Value::text(crate::show::render_mysql_type(col)));
+                row.values
+                    .push(Value::text(crate::show::render_mysql_type(col)));
             }
             rows.push(row);
         }
     }
     (schema, rows)
 }
-
 
 /// v7.39 (round 268) — one `information_schema.columns` row. Tables and
 /// views both come through here so the two can never describe the same
@@ -404,195 +405,194 @@ fn info_column_row(
     view_updatable: Option<bool>,
     mysql: bool,
 ) -> Row<'static> {
-        // column_default: v7.38 (read01) — the deparsed source text of the
-        // DEFAULT expression (cached at CREATE TABLE), matching PG's
-        // pg_get_expr output. Falls back to the serial nextval
-        // spelling, else NULL.
-        let default_text: Value<'static> = if let Some(txt) = &col.default_text {
-            Value::text(txt.clone())
-        } else if col.auto_increment {
-            Value::text(alloc::format!(
-                "nextval('{rel}_{}_seq'::regclass)",
-                col.name
-            ))
+    // column_default: v7.38 (read01) — the deparsed source text of the
+    // DEFAULT expression (cached at CREATE TABLE), matching PG's
+    // pg_get_expr output. Falls back to the serial nextval
+    // spelling, else NULL.
+    let default_text: Value<'static> = if let Some(txt) = &col.default_text {
+        Value::text(txt.clone())
+    } else if col.auto_increment {
+        Value::text(alloc::format!(
+            "nextval('{rel}_{}_seq'::regclass)",
+            col.name
+        ))
+    } else {
+        Value::Null
+    };
+    let (num_prec, num_scale): (Value<'static>, Value<'static>) = match col.ty {
+        DataType::SmallInt => (Value::Int(16), Value::Int(0)),
+        DataType::Int => (Value::Int(32), Value::Int(0)),
+        DataType::BigInt => (Value::Int(64), Value::Int(0)),
+        DataType::Float => (Value::Int(53), Value::Null),
+        // v7.39 (round 269) — real carries 24 bits of mantissa.
+        DataType::Real => (Value::Int(24), Value::Null),
+        // v7.39 (round 272) — an UNCONSTRAINED `numeric` (the 0/0
+        // sentinel) has no precision to report; PG leaves both NULL
+        // there, and reporting 0 said the column holds nothing.
+        DataType::Numeric { precision: 0, .. } => (Value::Null, Value::Null),
+        DataType::Numeric { precision, scale } => (
+            Value::Int(i32::from(precision)),
+            // v7.39 (round 273) — PG reports a NEGATIVE declared scale
+            // as 2048 + scale here (measured: -2 → 2046, -5 → 2043,
+            // -1000 → 1048). Its typmod is stored masked and
+            // information_schema reads the raw field.
+            Value::Int(if scale < 0 {
+                2048 + i32::from(scale)
+            } else {
+                i32::from(scale)
+            }),
+        ),
+        _ => (Value::Null, Value::Null),
+    };
+    // udt_name is PG's internal typname (int4, not integer).
+    let udt: &str = match col.ty {
+        DataType::SmallInt => "int2",
+        DataType::Int => "int4",
+        DataType::BigInt => "int8",
+        DataType::Float => "float8",
+        DataType::Real => "float4",
+        DataType::Bool => "bool",
+        DataType::Text => "text",
+        DataType::Bytes => "bytea",
+        // v7.39 (round 620) — `Jsonb` is its OWN variant beside `Json`,
+        // and this table only had the latter, so every JSONB column
+        // reported itself as `text` here while `pg_attribute.atttypid`
+        // said 3802 right next to it. Two mappings for the same question,
+        // disagreeing. And `json` is `json`, not `jsonb`.
+        DataType::Json => "json",
+        DataType::Jsonb => "jsonb",
+        DataType::Uuid => "uuid",
+        DataType::Date => "date",
+        DataType::Timestamp => "timestamp",
+        // v7.38 (T-tstz Phase 1) — these fell to the `text` catch-all
+        // and mis-reported themselves. PG18.4 udt_name, verified:
+        // timestamptz / time / interval / numeric.
+        DataType::Timestamptz => "timestamptz",
+        DataType::Time => "time",
+        DataType::Interval => "interval",
+        DataType::Numeric { .. } => "numeric",
+        // v7.39 (round 248) — varchar/char kept falling into the
+        // text catch-all, and an array's udt_name is PG's
+        // underscore-prefixed element name (`_text`).
+        DataType::Varchar(_) => "varchar",
+        DataType::Char(_) => "bpchar",
+        DataType::Char1 => "char",
+        DataType::TextArray => "_text",
+        DataType::IntArray => "_int4",
+        DataType::BigIntArray => "_int8",
+        DataType::SmallIntArray => "_int2",
+        DataType::FloatArray => "_float8",
+        DataType::NumericArray => "_numeric",
+        DataType::BoolArray => "_bool",
+        DataType::DateArray => "_date",
+        DataType::TimestampArray => "_timestamp",
+        DataType::TimestamptzArray => "_timestamptz",
+        DataType::UuidArray => "_uuid",
+        // v7.39 (round 620) — two more element types whose arrays fell
+        // into the text catch-all and named themselves `text`.
+        DataType::BytesArray => "_bytea",
+        DataType::JsonArray => "_json",
+        _ => "text",
+    };
+    // v7.39 (round 248) — datetime_precision: PG reports 6 for the
+    // microsecond-carrying types and 0 for date.
+    let dt_prec: Value<'static> = match col.ty {
+        DataType::Date => Value::Int(0),
+        DataType::Time | DataType::Timestamp | DataType::Timestamptz | DataType::Interval => {
+            Value::Int(6)
+        }
+        _ => Value::Null,
+    };
+    Row::new(alloc::vec![
+        Value::text("spg"),
+        Value::text("public"),
+        Value::text(rel.to_string()),
+        Value::text(col.name.clone()),
+        Value::Int(ordinal),
+        // A view's columns are all nullable in PG, even over a NOT
+        // NULL base column: the rows are a query result and the base
+        // constraint is not carried through.
+        Value::text::<&str>(if view_updatable.is_some() || col.nullable {
+            "YES"
+        } else {
+            "NO"
+        }),
+        // v7.39 (round 360, M18) — the `data_type` name is dialect's:
+        // MariaDB reports `int` / `datetime` / `decimal` / `double`
+        // where PG reports `integer` / `timestamp without time zone`
+        // / `numeric` / `double precision` (both measured). A MySQL
+        // reflection tool (SQLAlchemy's mysql dialect, JDBC) reads
+        // this to pick the column's Python/Java type, so the PG name
+        // on a MySQL session sent it down the wrong branch.
+        Value::text(if mysql {
+            mysql_data_type_text(col.ty, col.mysql_int_width)
+        } else {
+            pg_data_type_text(col.ty)
+        }),
+        default_text,
+        // v7.39 (round 248) — a declared varchar(n)/char(n) reports
+        // its limit; TEXT stays unbounded NULL.
+        match col.ty {
+            DataType::Varchar(n) | DataType::Char(n) => {
+                i32::try_from(n).map(Value::Int).unwrap_or(Value::Null)
+            }
+            _ => Value::Null,
+        },
+        num_prec.clone(),
+        // NUMERIC states its precision in decimal digits; every
+        // other numeric type states it in bits.
+        match col.ty {
+            DataType::Numeric { .. } => Value::Int(10),
+            _ if matches!(num_prec, Value::Null) => Value::Null,
+            _ => Value::Int(2),
+        },
+        num_scale,
+        // v7.39 (round 676) — the EXPLICIT collation, or NULL.
+        //
+        // Round 675 filled this from the type, mirroring
+        // `pg_attribute.attcollation`, and that was wrong: measured on
+        // PG18, a plain `TEXT` column reports NULL here while its
+        // attcollation is 100. The two columns do not answer the same
+        // question — attcollation names the collation in force,
+        // information_schema names the one the DDL wrote down.
+        // v7.39 (round 679) — report the name the DDL wrote, whatever it
+        // was. Round 676 whitelisted C / POSIX / default and answered
+        // NULL for anything else, on the reasoning that naming a
+        // collation SPG cannot perform would claim too much. Measured
+        // against PG, that is backwards: information_schema reports what
+        // the DDL DECLARED, and a client reading it back to regenerate
+        // DDL needs the name it wrote. What must not overclaim is the
+        // BEHAVIOUR, and round 679 makes that explicit instead — a
+        // WARNING at CREATE TABLE saying the column is ordered by bytes.
+        match col.collation_name.as_deref() {
+            Some(n) => Value::text::<&str>(n),
+            None => Value::Null,
+        },
+        Value::text::<&str>(udt),
+        // v7.39 (round 248) — a SERIAL column is NOT identity in PG
+        // (is_identity keys off GENERATED … AS IDENTITY). SPG only
+        // records the ALWAYS flavour, so BY DEFAULT identity reports
+        // NO here — recorded residual (needs a catalog field).
+        Value::text::<&str>(if col.identity_always { "YES" } else { "NO" }),
+        if col.identity_always {
+            Value::text::<&str>("ALWAYS")
         } else {
             Value::Null
-        };
-        let (num_prec, num_scale): (Value<'static>, Value<'static>) = match col.ty {
-            DataType::SmallInt => (Value::Int(16), Value::Int(0)),
-            DataType::Int => (Value::Int(32), Value::Int(0)),
-            DataType::BigInt => (Value::Int(64), Value::Int(0)),
-            DataType::Float => (Value::Int(53), Value::Null),
-            // v7.39 (round 269) — real carries 24 bits of mantissa.
-            DataType::Real => (Value::Int(24), Value::Null),
-            // v7.39 (round 272) — an UNCONSTRAINED `numeric` (the 0/0
-            // sentinel) has no precision to report; PG leaves both NULL
-            // there, and reporting 0 said the column holds nothing.
-            DataType::Numeric { precision: 0, .. } => (Value::Null, Value::Null),
-            DataType::Numeric { precision, scale } => (
-                Value::Int(i32::from(precision)),
-                // v7.39 (round 273) — PG reports a NEGATIVE declared scale
-                // as 2048 + scale here (measured: -2 → 2046, -5 → 2043,
-                // -1000 → 1048). Its typmod is stored masked and
-                // information_schema reads the raw field.
-                Value::Int(if scale < 0 {
-                    2048 + i32::from(scale)
-                } else {
-                    i32::from(scale)
-                }),
-            ),
-            _ => (Value::Null, Value::Null),
-        };
-        // udt_name is PG's internal typname (int4, not integer).
-        let udt: &str = match col.ty {
-            DataType::SmallInt => "int2",
-            DataType::Int => "int4",
-            DataType::BigInt => "int8",
-            DataType::Float => "float8",
-            DataType::Real => "float4",
-            DataType::Bool => "bool",
-            DataType::Text => "text",
-            DataType::Bytes => "bytea",
-            // v7.39 (round 620) — `Jsonb` is its OWN variant beside `Json`,
-            // and this table only had the latter, so every JSONB column
-            // reported itself as `text` here while `pg_attribute.atttypid`
-            // said 3802 right next to it. Two mappings for the same question,
-            // disagreeing. And `json` is `json`, not `jsonb`.
-            DataType::Json => "json",
-            DataType::Jsonb => "jsonb",
-            DataType::Uuid => "uuid",
-            DataType::Date => "date",
-            DataType::Timestamp => "timestamp",
-            // v7.38 (T-tstz Phase 1) — these fell to the `text` catch-all
-            // and mis-reported themselves. PG18.4 udt_name, verified:
-            // timestamptz / time / interval / numeric.
-            DataType::Timestamptz => "timestamptz",
-            DataType::Time => "time",
-            DataType::Interval => "interval",
-            DataType::Numeric { .. } => "numeric",
-            // v7.39 (round 248) — varchar/char kept falling into the
-            // text catch-all, and an array's udt_name is PG's
-            // underscore-prefixed element name (`_text`).
-            DataType::Varchar(_) => "varchar",
-            DataType::Char(_) => "bpchar",
-            DataType::Char1 => "char",
-            DataType::TextArray => "_text",
-            DataType::IntArray => "_int4",
-            DataType::BigIntArray => "_int8",
-            DataType::SmallIntArray => "_int2",
-            DataType::FloatArray => "_float8",
-            DataType::NumericArray => "_numeric",
-            DataType::BoolArray => "_bool",
-            DataType::DateArray => "_date",
-            DataType::TimestampArray => "_timestamp",
-            DataType::TimestamptzArray => "_timestamptz",
-            DataType::UuidArray => "_uuid",
-            // v7.39 (round 620) — two more element types whose arrays fell
-            // into the text catch-all and named themselves `text`.
-            DataType::BytesArray => "_bytea",
-            DataType::JsonArray => "_json",
-            _ => "text",
-        };
-        // v7.39 (round 248) — datetime_precision: PG reports 6 for the
-        // microsecond-carrying types and 0 for date.
-        let dt_prec: Value<'static> = match col.ty {
-            DataType::Date => Value::Int(0),
-            DataType::Time
-            | DataType::Timestamp
-            | DataType::Timestamptz
-            | DataType::Interval => Value::Int(6),
-            _ => Value::Null,
-        };
-    Row::new(alloc::vec![
-            Value::text("spg"),
-            Value::text("public"),
-            Value::text(rel.to_string()),
-            Value::text(col.name.clone()),
-            Value::Int(ordinal),
-            // A view's columns are all nullable in PG, even over a NOT
-            // NULL base column: the rows are a query result and the base
-            // constraint is not carried through.
-            Value::text::<&str>(if view_updatable.is_some() || col.nullable {
-                "YES"
-            } else {
-                "NO"
-            }),
-            // v7.39 (round 360, M18) — the `data_type` name is dialect's:
-            // MariaDB reports `int` / `datetime` / `decimal` / `double`
-            // where PG reports `integer` / `timestamp without time zone`
-            // / `numeric` / `double precision` (both measured). A MySQL
-            // reflection tool (SQLAlchemy's mysql dialect, JDBC) reads
-            // this to pick the column's Python/Java type, so the PG name
-            // on a MySQL session sent it down the wrong branch.
-            Value::text(if mysql {
-                mysql_data_type_text(col.ty, col.mysql_int_width)
-            } else {
-                pg_data_type_text(col.ty)
-            }),
-            default_text,
-            // v7.39 (round 248) — a declared varchar(n)/char(n) reports
-            // its limit; TEXT stays unbounded NULL.
-            match col.ty {
-                DataType::Varchar(n) | DataType::Char(n) => {
-                    i32::try_from(n).map(Value::Int).unwrap_or(Value::Null)
-                }
-                _ => Value::Null,
-            },
-            num_prec.clone(),
-            // NUMERIC states its precision in decimal digits; every
-            // other numeric type states it in bits.
-            match col.ty {
-                DataType::Numeric { .. } => Value::Int(10),
-                _ if matches!(num_prec, Value::Null) => Value::Null,
-                _ => Value::Int(2),
-            },
-            num_scale,
-            // v7.39 (round 676) — the EXPLICIT collation, or NULL.
-            //
-            // Round 675 filled this from the type, mirroring
-            // `pg_attribute.attcollation`, and that was wrong: measured on
-            // PG18, a plain `TEXT` column reports NULL here while its
-            // attcollation is 100. The two columns do not answer the same
-            // question — attcollation names the collation in force,
-            // information_schema names the one the DDL wrote down.
-            // v7.39 (round 679) — report the name the DDL wrote, whatever it
-            // was. Round 676 whitelisted C / POSIX / default and answered
-            // NULL for anything else, on the reasoning that naming a
-            // collation SPG cannot perform would claim too much. Measured
-            // against PG, that is backwards: information_schema reports what
-            // the DDL DECLARED, and a client reading it back to regenerate
-            // DDL needs the name it wrote. What must not overclaim is the
-            // BEHAVIOUR, and round 679 makes that explicit instead — a
-            // WARNING at CREATE TABLE saying the column is ordered by bytes.
-            match col.collation_name.as_deref() {
-                Some(n) => Value::text::<&str>(n),
-                None => Value::Null,
-            },
-            Value::text::<&str>(udt),
-            // v7.39 (round 248) — a SERIAL column is NOT identity in PG
-            // (is_identity keys off GENERATED … AS IDENTITY). SPG only
-            // records the ALWAYS flavour, so BY DEFAULT identity reports
-            // NO here — recorded residual (needs a catalog field).
-            Value::text::<&str>(if col.identity_always { "YES" } else { "NO" }),
-            if col.identity_always {
-                Value::text::<&str>("ALWAYS")
-            } else {
-                Value::Null
-            },
-            dt_prec,
-            Value::text::<&str>(match view_updatable {
-                Some(false) => "NO",
-                _ => "YES",
-            }),
-            Value::text::<&str>(if col.generated_stored_expr.is_some() {
-                "ALWAYS"
-            } else {
-                "NEVER"
-            }),
-            match &col.generated_stored_expr {
-                Some(src) => Value::text(src.clone()),
-                None => Value::Null,
-            },
+        },
+        dt_prec,
+        Value::text::<&str>(match view_updatable {
+            Some(false) => "NO",
+            _ => "YES",
+        }),
+        Value::text::<&str>(if col.generated_stored_expr.is_some() {
+            "ALWAYS"
+        } else {
+            "NEVER"
+        }),
+        match &col.generated_stored_expr {
+            Some(src) => Value::text(src.clone()),
+            None => Value::Null,
+        },
     ])
 }
 
@@ -3126,14 +3126,14 @@ pub(crate) fn synth_pg_class(
         rows.push(Row::new(alloc::vec![
             Value::BigInt(this_oid),
             Value::text(tname.clone()),
-            Value::BigInt(2200),  // public namespace
-            Value::BigInt(0),     // reltype (composite type OID; SPG no composite)
-            Value::BigInt(0),     // reloftype
-            Value::BigInt(10),    // relowner — PG postgres superuser OID
-            Value::BigInt(0),     // relam (table AM; 0 == default heap)
-            Value::BigInt(this_oid),   // relfilenode shares oid in SPG (no separate fork)
-            Value::BigInt(0),     // reltablespace (0 == default)
-            Value::Int(relpages), // hot_bytes in 8 KiB PG-page units
+            Value::BigInt(2200),     // public namespace
+            Value::BigInt(0),        // reltype (composite type OID; SPG no composite)
+            Value::BigInt(0),        // reloftype
+            Value::BigInt(10),       // relowner — PG postgres superuser OID
+            Value::BigInt(0),        // relam (table AM; 0 == default heap)
+            Value::BigInt(this_oid), // relfilenode shares oid in SPG (no separate fork)
+            Value::BigInt(0),        // reltablespace (0 == default)
+            Value::Int(relpages),    // hot_bytes in 8 KiB PG-page units
             Value::Float(reltuples),
             Value::Int(0),    // relallvisible — visibility map lands in 15.17
             Value::BigInt(0), // reltoastrelid (SPG no TOAST)
@@ -3163,10 +3163,10 @@ pub(crate) fn synth_pg_class(
             ),
             Value::Bool(has_triggers),
             Value::Bool(parents_with_children.contains(&tname.to_ascii_lowercase())),
-            Value::Bool(schema_ref.row_security),       // relrowsecurity (v7.39 RLS)
+            Value::Bool(schema_ref.row_security), // relrowsecurity (v7.39 RLS)
             Value::Bool(schema_ref.force_row_security), // relforcerowsecurity
-            Value::Bool(true),                          // relispopulated
-            Value::text("d"),                           // relreplident — 'd' default
+            Value::Bool(true),                    // relispopulated
+            Value::text("d"),                     // relreplident — 'd' default
             Value::Bool(is_partition),
             // v7.39 (read01 round 57) — relacl for real: NULL while no GRANT
             // has ever run, then the aclitem array PG prints.
@@ -3200,16 +3200,12 @@ pub(crate) fn synth_pg_class(
         if let Some(v) = cat.views_all().get(stored) {
             match v.check_option {
                 1 => {
-                    view_reloptions.insert(
-                        alloc::string::String::from(vname),
-                        "check_option=local",
-                    );
+                    view_reloptions
+                        .insert(alloc::string::String::from(vname), "check_option=local");
                 }
                 2 => {
-                    view_reloptions.insert(
-                        alloc::string::String::from(vname),
-                        "check_option=cascaded",
-                    );
+                    view_reloptions
+                        .insert(alloc::string::String::from(vname), "check_option=cascaded");
                 }
                 _ => {}
             }
@@ -3525,8 +3521,7 @@ fn splice_pg_class_v18_row(
     );
     row.values
         .insert(PG_CLASS_RELISPARTITION + 1, Value::BigInt(0)); // relrewrite
-    row.values
-        .insert(PG_CLASS_RELALLVISIBLE + 1, Value::Int(0)); // relallfrozen
+    row.values.insert(PG_CLASS_RELALLVISIBLE + 1, Value::Int(0)); // relallfrozen
 }
 
 /// v7.16.2 + v7.37.24 (24.8b) — synthesise `pg_catalog.pg_attribute`.
@@ -3703,7 +3698,10 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Bool(false), // attisdropped
                 Value::Bool(true),  // attislocal — true (not inherited)
                 Value::Int(0),      // attinhcount
-                Value::BigInt(pg_attr_collation_named(col.ty, col.collation_name.as_deref())), // attcollation
+                Value::BigInt(pg_attr_collation_named(
+                    col.ty,
+                    col.collation_name.as_deref()
+                )), // attcollation
                 crate::acl::render_acl_list(&col.acl).map_or(Value::Null, Value::text),
                 // v7.39 (round 543) — PG18's tail, measured on a plain
                 // table: attcompression empty, atthasmissing false,
@@ -3807,19 +3805,19 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::text(if typlen > 0 { "p" } else { "x" }),
                 Value::text("i"),
                 Value::Bool(!col.nullable),
-                Value::Bool(false), // atthasdef
-                Value::text(""),    // attidentity
-                Value::text(""),    // attgenerated
-                Value::Bool(false), // attisdropped
-                Value::Bool(true),  // attislocal
-                Value::Int(0),      // attinhcount
+                Value::Bool(false),                       // atthasdef
+                Value::text(""),                          // attidentity
+                Value::text(""),                          // attgenerated
+                Value::Bool(false),                       // attisdropped
+                Value::Bool(true),                        // attislocal
+                Value::Int(0),                            // attinhcount
                 Value::BigInt(pg_attr_collation(col.ty)), // attcollation
-                Value::Null,        // attacl
-                Value::text(""),    // attcompression
-                Value::Bool(false), // atthasmissing
-                Value::Null,        // attoptions
-                Value::Null,        // attfdwoptions
-                Value::Null,        // attmissingval
+                Value::Null,                              // attacl
+                Value::text(""),                          // attcompression
+                Value::Bool(false),                       // atthasmissing
+                Value::Null,                              // attoptions
+                Value::Null,                              // attfdwoptions
+                Value::Null,                              // attmissingval
             ]));
         }
         push_system_attributes(&mut rows, *oid);
@@ -3983,38 +3981,38 @@ pub(crate) fn user_type_oids(
 }
 
 pub(crate) const ARRAY_TYPE_OIDS: &[(i64, &str, i64)] = &[
-        (1000, "_bool", 16),
-        (1001, "_bytea", 17),
-        (1002, "_char", 18),
-        (1003, "_name", 19),
-        (1016, "_int8", 20),
-        (1005, "_int2", 21),
-        (1007, "_int4", 23),
-        (1008, "_regproc", 24),
-        (1009, "_text", 25),
-        (1028, "_oid", 26),
-        (199, "_json", 114),
-        (143, "_xml", 142),
-        (1021, "_float4", 700),
-        (1022, "_float8", 701),
-        (651, "_cidr", 650),
-        (1041, "_inet", 869),
-        (1040, "_macaddr", 829),
-        (1014, "_bpchar", 1042),
-        (1015, "_varchar", 1043),
-        (1182, "_date", 1082),
-        (1183, "_time", 1083),
-        (1115, "_timestamp", 1114),
-        (1185, "_timestamptz", 1184),
-        (1187, "_interval", 1186),
-        (1270, "_timetz", 1266),
-        (1231, "_numeric", 1700),
-        (791, "_money", 790),
-        (2951, "_uuid", 2950),
-        (3807, "_jsonb", 3802),
-        (3643, "_tsvector", 3614),
-        (3645, "_tsquery", 3615),
-    ];
+    (1000, "_bool", 16),
+    (1001, "_bytea", 17),
+    (1002, "_char", 18),
+    (1003, "_name", 19),
+    (1016, "_int8", 20),
+    (1005, "_int2", 21),
+    (1007, "_int4", 23),
+    (1008, "_regproc", 24),
+    (1009, "_text", 25),
+    (1028, "_oid", 26),
+    (199, "_json", 114),
+    (143, "_xml", 142),
+    (1021, "_float4", 700),
+    (1022, "_float8", 701),
+    (651, "_cidr", 650),
+    (1041, "_inet", 869),
+    (1040, "_macaddr", 829),
+    (1014, "_bpchar", 1042),
+    (1015, "_varchar", 1043),
+    (1182, "_date", 1082),
+    (1183, "_time", 1083),
+    (1115, "_timestamp", 1114),
+    (1185, "_timestamptz", 1184),
+    (1187, "_interval", 1186),
+    (1270, "_timetz", 1266),
+    (1231, "_numeric", 1700),
+    (791, "_money", 790),
+    (2951, "_uuid", 2950),
+    (3807, "_jsonb", 3802),
+    (3643, "_tsvector", 3614),
+    (3645, "_tsquery", 3615),
+];
 
 /// v7.39 (round 621) — synthesise `pg_catalog.pg_operator`.
 ///
@@ -4133,37 +4131,37 @@ pub(crate) fn synth_pg_operator(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
     // `bytea !~~ bytea`, `text @@ text`, and the four bpchar pattern
     // operators `~<~ ~<=~ ~>~ ~>=~`.
     const EXTRA_OPS: &[(&str, i64, i64, i64)] = &[
-        ("!~", 1042, 25, 16), // bpchar !~ text -> bool
-        ("!~*", 1042, 25, 16), // bpchar !~* text -> bool
-        ("!~~", 1042, 25, 16), // bpchar !~~ text -> bool
-        ("!~~*", 1042, 25, 16), // bpchar !~~* text -> bool
+        ("!~", 1042, 25, 16),    // bpchar !~ text -> bool
+        ("!~*", 1042, 25, 16),   // bpchar !~* text -> bool
+        ("!~~", 1042, 25, 16),   // bpchar !~~ text -> bool
+        ("!~~*", 1042, 25, 16),  // bpchar !~~* text -> bool
         ("%", 1700, 1700, 1700), // numeric % numeric -> numeric
-        ("&", 869, 869, 869), // inet & inet -> inet
-        ("&&", 869, 869, 16), // inet && inet -> bool
-        ("*", 700, 701, 701), // float4 * float8 -> float8
-        ("*", 701, 700, 701), // float8 * float4 -> float8
-        ("*", 701, 1186, 1186), // float8 * interval -> interval
-        ("*", 21, 23, 23), // int2 * int4 -> int4
-        ("*", 21, 20, 20), // int2 * int8 -> int8
-        ("*", 23, 21, 23), // int4 * int2 -> int4
-        ("*", 23, 20, 20), // int4 * int8 -> int8
-        ("*", 20, 21, 20), // int8 * int2 -> int8
-        ("*", 20, 23, 20), // int8 * int4 -> int8
-        ("*", 1186, 701, 1186), // interval * float8 -> interval
-        ("+", 1082, 23, 1082), // date + int4 -> date
+        ("&", 869, 869, 869),    // inet & inet -> inet
+        ("&&", 869, 869, 16),    // inet && inet -> bool
+        ("*", 700, 701, 701),    // float4 * float8 -> float8
+        ("*", 701, 700, 701),    // float8 * float4 -> float8
+        ("*", 701, 1186, 1186),  // float8 * interval -> interval
+        ("*", 21, 23, 23),       // int2 * int4 -> int4
+        ("*", 21, 20, 20),       // int2 * int8 -> int8
+        ("*", 23, 21, 23),       // int4 * int2 -> int4
+        ("*", 23, 20, 20),       // int4 * int8 -> int8
+        ("*", 20, 21, 20),       // int8 * int2 -> int8
+        ("*", 20, 23, 20),       // int8 * int4 -> int8
+        ("*", 1186, 701, 1186),  // interval * float8 -> interval
+        ("+", 1082, 23, 1082),   // date + int4 -> date
         ("+", 1082, 1186, 1114), // date + interval -> timestamp
         ("+", 1082, 1083, 1114), // date + time -> timestamp
-        ("+", 700, 701, 701), // float4 + float8 -> float8
-        ("+", 701, 700, 701), // float8 + float4 -> float8
-        ("+", 869, 20, 869), // inet + int8 -> inet
-        ("+", 21, 23, 23), // int2 + int4 -> int4
-        ("+", 21, 20, 20), // int2 + int8 -> int8
-        ("+", 23, 1082, 1082), // int4 + date -> date
-        ("+", 23, 21, 23), // int4 + int2 -> int4
-        ("+", 23, 20, 20), // int4 + int8 -> int8
-        ("+", 20, 869, 869), // int8 + inet -> inet
-        ("+", 20, 21, 20), // int8 + int2 -> int8
-        ("+", 20, 23, 20), // int8 + int4 -> int8
+        ("+", 700, 701, 701),    // float4 + float8 -> float8
+        ("+", 701, 700, 701),    // float8 + float4 -> float8
+        ("+", 869, 20, 869),     // inet + int8 -> inet
+        ("+", 21, 23, 23),       // int2 + int4 -> int4
+        ("+", 21, 20, 20),       // int2 + int8 -> int8
+        ("+", 23, 1082, 1082),   // int4 + date -> date
+        ("+", 23, 21, 23),       // int4 + int2 -> int4
+        ("+", 23, 20, 20),       // int4 + int8 -> int8
+        ("+", 20, 869, 869),     // int8 + inet -> inet
+        ("+", 20, 21, 20),       // int8 + int2 -> int8
+        ("+", 20, 23, 20),       // int8 + int4 -> int8
         ("+", 1186, 1082, 1114), // interval + date -> timestamp
         ("+", 1186, 1186, 1186), // interval + interval -> interval
         ("+", 1186, 1083, 1083), // interval + time -> time
@@ -4171,137 +4169,137 @@ pub(crate) fn synth_pg_operator(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         ("+", 1083, 1082, 1114), // time + date -> timestamp
         ("+", 1083, 1186, 1083), // time + interval -> time
         ("+", 1114, 1186, 1114), // timestamp + interval -> timestamp
-        ("-", 1082, 1082, 23), // date - date -> int4
-        ("-", 1082, 23, 1082), // date - int4 -> date
+        ("-", 1082, 1082, 23),   // date - date -> int4
+        ("-", 1082, 23, 1082),   // date - int4 -> date
         ("-", 1082, 1186, 1114), // date - interval -> timestamp
-        ("-", 700, 701, 701), // float4 - float8 -> float8
-        ("-", 701, 700, 701), // float8 - float4 -> float8
-        ("-", 869, 869, 20), // inet - inet -> int8
-        ("-", 869, 20, 869), // inet - int8 -> inet
-        ("-", 21, 23, 23), // int2 - int4 -> int4
-        ("-", 21, 20, 20), // int2 - int8 -> int8
-        ("-", 23, 21, 23), // int4 - int2 -> int4
-        ("-", 23, 20, 20), // int4 - int8 -> int8
-        ("-", 20, 21, 20), // int8 - int2 -> int8
-        ("-", 20, 23, 20), // int8 - int4 -> int8
+        ("-", 700, 701, 701),    // float4 - float8 -> float8
+        ("-", 701, 700, 701),    // float8 - float4 -> float8
+        ("-", 869, 869, 20),     // inet - inet -> int8
+        ("-", 869, 20, 869),     // inet - int8 -> inet
+        ("-", 21, 23, 23),       // int2 - int4 -> int4
+        ("-", 21, 20, 20),       // int2 - int8 -> int8
+        ("-", 23, 21, 23),       // int4 - int2 -> int4
+        ("-", 23, 20, 20),       // int4 - int8 -> int8
+        ("-", 20, 21, 20),       // int8 - int2 -> int8
+        ("-", 20, 23, 20),       // int8 - int4 -> int8
         ("-", 1186, 1186, 1186), // interval - interval -> interval
-        ("-", 3802, 25, 3802), // jsonb - text -> jsonb
+        ("-", 3802, 25, 3802),   // jsonb - text -> jsonb
         ("-", 1083, 1186, 1083), // time - interval -> time
         ("-", 1083, 1083, 1186), // time - time -> interval
         ("-", 1114, 1186, 1114), // timestamp - interval -> timestamp
         ("-", 1114, 1114, 1186), // timestamp - timestamp -> interval
-        ("->", 114, 23, 114), // json -> int4 -> json
-        ("->", 3802, 23, 3802), // jsonb -> int4 -> jsonb
-        ("->>", 114, 23, 25), // json ->> int4 -> text
-        ("->>", 3802, 23, 25), // jsonb ->> int4 -> text
-        ("/", 700, 701, 701), // float4 / float8 -> float8
-        ("/", 701, 700, 701), // float8 / float4 -> float8
-        ("/", 21, 23, 23), // int2 / int4 -> int4
-        ("/", 21, 20, 20), // int2 / int8 -> int8
-        ("/", 23, 21, 23), // int4 / int2 -> int4
-        ("/", 23, 20, 20), // int4 / int8 -> int8
-        ("/", 20, 21, 20), // int8 / int2 -> int8
-        ("/", 20, 23, 20), // int8 / int4 -> int8
-        ("/", 1186, 701, 1186), // interval / float8 -> interval
-        ("<", 1082, 1114, 16), // date < timestamp -> bool
-        ("<", 700, 701, 16), // float4 < float8 -> bool
-        ("<", 701, 700, 16), // float8 < float4 -> bool
-        ("<", 869, 869, 16), // inet < inet -> bool
-        ("<", 21, 23, 16), // int2 < int4 -> bool
-        ("<", 21, 20, 16), // int2 < int8 -> bool
-        ("<", 23, 21, 16), // int4 < int2 -> bool
-        ("<", 23, 20, 16), // int4 < int8 -> bool
-        ("<", 20, 21, 16), // int8 < int2 -> bool
-        ("<", 20, 23, 16), // int8 < int4 -> bool
-        ("<", 3802, 3802, 16), // jsonb < jsonb -> bool
-        ("<", 1083, 1083, 16), // time < time -> bool
-        ("<", 1114, 1082, 16), // timestamp < date -> bool
-        ("<<", 869, 869, 16), // inet << inet -> bool
-        ("<<", 21, 23, 21), // int2 << int4 -> int2
-        ("<<", 23, 23, 23), // int4 << int4 -> int4
-        ("<<", 20, 23, 20), // int8 << int4 -> int8
-        ("<<=", 869, 869, 16), // inet <<= inet -> bool
-        ("<=", 1082, 1114, 16), // date <= timestamp -> bool
-        ("<=", 700, 701, 16), // float4 <= float8 -> bool
-        ("<=", 701, 700, 16), // float8 <= float4 -> bool
-        ("<=", 869, 869, 16), // inet <= inet -> bool
-        ("<=", 21, 23, 16), // int2 <= int4 -> bool
-        ("<=", 21, 20, 16), // int2 <= int8 -> bool
-        ("<=", 23, 21, 16), // int4 <= int2 -> bool
-        ("<=", 23, 20, 16), // int4 <= int8 -> bool
-        ("<=", 20, 21, 16), // int8 <= int2 -> bool
-        ("<=", 20, 23, 16), // int8 <= int4 -> bool
-        ("<=", 3802, 3802, 16), // jsonb <= jsonb -> bool
-        ("<=", 1083, 1083, 16), // time <= time -> bool
-        ("<=", 1114, 1082, 16), // timestamp <= date -> bool
-        ("<>", 1082, 1114, 16), // date <> timestamp -> bool
-        ("<>", 700, 701, 16), // float4 <> float8 -> bool
-        ("<>", 701, 700, 16), // float8 <> float4 -> bool
-        ("<>", 869, 869, 16), // inet <> inet -> bool
-        ("<>", 21, 23, 16), // int2 <> int4 -> bool
-        ("<>", 21, 20, 16), // int2 <> int8 -> bool
-        ("<>", 23, 21, 16), // int4 <> int2 -> bool
-        ("<>", 23, 20, 16), // int4 <> int8 -> bool
-        ("<>", 20, 21, 16), // int8 <> int2 -> bool
-        ("<>", 20, 23, 16), // int8 <> int4 -> bool
-        ("<>", 3802, 3802, 16), // jsonb <> jsonb -> bool
-        ("<>", 1083, 1083, 16), // time <> time -> bool
-        ("<>", 1114, 1082, 16), // timestamp <> date -> bool
-        ("=", 1082, 1114, 16), // date = timestamp -> bool
-        ("=", 700, 701, 16), // float4 = float8 -> bool
-        ("=", 701, 700, 16), // float8 = float4 -> bool
-        ("=", 869, 869, 16), // inet = inet -> bool
-        ("=", 21, 23, 16), // int2 = int4 -> bool
-        ("=", 21, 20, 16), // int2 = int8 -> bool
-        ("=", 23, 21, 16), // int4 = int2 -> bool
-        ("=", 23, 20, 16), // int4 = int8 -> bool
-        ("=", 20, 21, 16), // int8 = int2 -> bool
-        ("=", 20, 23, 16), // int8 = int4 -> bool
-        ("=", 3802, 3802, 16), // jsonb = jsonb -> bool
-        ("=", 1083, 1083, 16), // time = time -> bool
-        ("=", 1114, 1082, 16), // timestamp = date -> bool
-        (">", 1082, 1114, 16), // date > timestamp -> bool
-        (">", 700, 701, 16), // float4 > float8 -> bool
-        (">", 701, 700, 16), // float8 > float4 -> bool
-        (">", 869, 869, 16), // inet > inet -> bool
-        (">", 21, 23, 16), // int2 > int4 -> bool
-        (">", 21, 20, 16), // int2 > int8 -> bool
-        (">", 23, 21, 16), // int4 > int2 -> bool
-        (">", 23, 20, 16), // int4 > int8 -> bool
-        (">", 20, 21, 16), // int8 > int2 -> bool
-        (">", 20, 23, 16), // int8 > int4 -> bool
-        (">", 3802, 3802, 16), // jsonb > jsonb -> bool
-        (">", 1083, 1083, 16), // time > time -> bool
-        (">", 1114, 1082, 16), // timestamp > date -> bool
-        (">=", 1082, 1114, 16), // date >= timestamp -> bool
-        (">=", 700, 701, 16), // float4 >= float8 -> bool
-        (">=", 701, 700, 16), // float8 >= float4 -> bool
-        (">=", 869, 869, 16), // inet >= inet -> bool
-        (">=", 21, 23, 16), // int2 >= int4 -> bool
-        (">=", 21, 20, 16), // int2 >= int8 -> bool
-        (">=", 23, 21, 16), // int4 >= int2 -> bool
-        (">=", 23, 20, 16), // int4 >= int8 -> bool
-        (">=", 20, 21, 16), // int8 >= int2 -> bool
-        (">=", 20, 23, 16), // int8 >= int4 -> bool
-        (">=", 3802, 3802, 16), // jsonb >= jsonb -> bool
-        (">=", 1083, 1083, 16), // time >= time -> bool
-        (">=", 1114, 1082, 16), // timestamp >= date -> bool
-        (">>", 869, 869, 16), // inet >> inet -> bool
-        (">>", 21, 23, 21), // int2 >> int4 -> int2
-        (">>", 23, 23, 23), // int4 >> int4 -> int4
-        (">>", 20, 23, 20), // int8 >> int4 -> int8
-        (">>=", 869, 869, 16), // inet >>= inet -> bool
-        ("^", 701, 701, 701), // float8 ^ float8 -> float8
+        ("->", 114, 23, 114),    // json -> int4 -> json
+        ("->", 3802, 23, 3802),  // jsonb -> int4 -> jsonb
+        ("->>", 114, 23, 25),    // json ->> int4 -> text
+        ("->>", 3802, 23, 25),   // jsonb ->> int4 -> text
+        ("/", 700, 701, 701),    // float4 / float8 -> float8
+        ("/", 701, 700, 701),    // float8 / float4 -> float8
+        ("/", 21, 23, 23),       // int2 / int4 -> int4
+        ("/", 21, 20, 20),       // int2 / int8 -> int8
+        ("/", 23, 21, 23),       // int4 / int2 -> int4
+        ("/", 23, 20, 20),       // int4 / int8 -> int8
+        ("/", 20, 21, 20),       // int8 / int2 -> int8
+        ("/", 20, 23, 20),       // int8 / int4 -> int8
+        ("/", 1186, 701, 1186),  // interval / float8 -> interval
+        ("<", 1082, 1114, 16),   // date < timestamp -> bool
+        ("<", 700, 701, 16),     // float4 < float8 -> bool
+        ("<", 701, 700, 16),     // float8 < float4 -> bool
+        ("<", 869, 869, 16),     // inet < inet -> bool
+        ("<", 21, 23, 16),       // int2 < int4 -> bool
+        ("<", 21, 20, 16),       // int2 < int8 -> bool
+        ("<", 23, 21, 16),       // int4 < int2 -> bool
+        ("<", 23, 20, 16),       // int4 < int8 -> bool
+        ("<", 20, 21, 16),       // int8 < int2 -> bool
+        ("<", 20, 23, 16),       // int8 < int4 -> bool
+        ("<", 3802, 3802, 16),   // jsonb < jsonb -> bool
+        ("<", 1083, 1083, 16),   // time < time -> bool
+        ("<", 1114, 1082, 16),   // timestamp < date -> bool
+        ("<<", 869, 869, 16),    // inet << inet -> bool
+        ("<<", 21, 23, 21),      // int2 << int4 -> int2
+        ("<<", 23, 23, 23),      // int4 << int4 -> int4
+        ("<<", 20, 23, 20),      // int8 << int4 -> int8
+        ("<<=", 869, 869, 16),   // inet <<= inet -> bool
+        ("<=", 1082, 1114, 16),  // date <= timestamp -> bool
+        ("<=", 700, 701, 16),    // float4 <= float8 -> bool
+        ("<=", 701, 700, 16),    // float8 <= float4 -> bool
+        ("<=", 869, 869, 16),    // inet <= inet -> bool
+        ("<=", 21, 23, 16),      // int2 <= int4 -> bool
+        ("<=", 21, 20, 16),      // int2 <= int8 -> bool
+        ("<=", 23, 21, 16),      // int4 <= int2 -> bool
+        ("<=", 23, 20, 16),      // int4 <= int8 -> bool
+        ("<=", 20, 21, 16),      // int8 <= int2 -> bool
+        ("<=", 20, 23, 16),      // int8 <= int4 -> bool
+        ("<=", 3802, 3802, 16),  // jsonb <= jsonb -> bool
+        ("<=", 1083, 1083, 16),  // time <= time -> bool
+        ("<=", 1114, 1082, 16),  // timestamp <= date -> bool
+        ("<>", 1082, 1114, 16),  // date <> timestamp -> bool
+        ("<>", 700, 701, 16),    // float4 <> float8 -> bool
+        ("<>", 701, 700, 16),    // float8 <> float4 -> bool
+        ("<>", 869, 869, 16),    // inet <> inet -> bool
+        ("<>", 21, 23, 16),      // int2 <> int4 -> bool
+        ("<>", 21, 20, 16),      // int2 <> int8 -> bool
+        ("<>", 23, 21, 16),      // int4 <> int2 -> bool
+        ("<>", 23, 20, 16),      // int4 <> int8 -> bool
+        ("<>", 20, 21, 16),      // int8 <> int2 -> bool
+        ("<>", 20, 23, 16),      // int8 <> int4 -> bool
+        ("<>", 3802, 3802, 16),  // jsonb <> jsonb -> bool
+        ("<>", 1083, 1083, 16),  // time <> time -> bool
+        ("<>", 1114, 1082, 16),  // timestamp <> date -> bool
+        ("=", 1082, 1114, 16),   // date = timestamp -> bool
+        ("=", 700, 701, 16),     // float4 = float8 -> bool
+        ("=", 701, 700, 16),     // float8 = float4 -> bool
+        ("=", 869, 869, 16),     // inet = inet -> bool
+        ("=", 21, 23, 16),       // int2 = int4 -> bool
+        ("=", 21, 20, 16),       // int2 = int8 -> bool
+        ("=", 23, 21, 16),       // int4 = int2 -> bool
+        ("=", 23, 20, 16),       // int4 = int8 -> bool
+        ("=", 20, 21, 16),       // int8 = int2 -> bool
+        ("=", 20, 23, 16),       // int8 = int4 -> bool
+        ("=", 3802, 3802, 16),   // jsonb = jsonb -> bool
+        ("=", 1083, 1083, 16),   // time = time -> bool
+        ("=", 1114, 1082, 16),   // timestamp = date -> bool
+        (">", 1082, 1114, 16),   // date > timestamp -> bool
+        (">", 700, 701, 16),     // float4 > float8 -> bool
+        (">", 701, 700, 16),     // float8 > float4 -> bool
+        (">", 869, 869, 16),     // inet > inet -> bool
+        (">", 21, 23, 16),       // int2 > int4 -> bool
+        (">", 21, 20, 16),       // int2 > int8 -> bool
+        (">", 23, 21, 16),       // int4 > int2 -> bool
+        (">", 23, 20, 16),       // int4 > int8 -> bool
+        (">", 20, 21, 16),       // int8 > int2 -> bool
+        (">", 20, 23, 16),       // int8 > int4 -> bool
+        (">", 3802, 3802, 16),   // jsonb > jsonb -> bool
+        (">", 1083, 1083, 16),   // time > time -> bool
+        (">", 1114, 1082, 16),   // timestamp > date -> bool
+        (">=", 1082, 1114, 16),  // date >= timestamp -> bool
+        (">=", 700, 701, 16),    // float4 >= float8 -> bool
+        (">=", 701, 700, 16),    // float8 >= float4 -> bool
+        (">=", 869, 869, 16),    // inet >= inet -> bool
+        (">=", 21, 23, 16),      // int2 >= int4 -> bool
+        (">=", 21, 20, 16),      // int2 >= int8 -> bool
+        (">=", 23, 21, 16),      // int4 >= int2 -> bool
+        (">=", 23, 20, 16),      // int4 >= int8 -> bool
+        (">=", 20, 21, 16),      // int8 >= int2 -> bool
+        (">=", 20, 23, 16),      // int8 >= int4 -> bool
+        (">=", 3802, 3802, 16),  // jsonb >= jsonb -> bool
+        (">=", 1083, 1083, 16),  // time >= time -> bool
+        (">=", 1114, 1082, 16),  // timestamp >= date -> bool
+        (">>", 869, 869, 16),    // inet >> inet -> bool
+        (">>", 21, 23, 21),      // int2 >> int4 -> int2
+        (">>", 23, 23, 23),      // int4 >> int4 -> int4
+        (">>", 20, 23, 20),      // int8 >> int4 -> int8
+        (">>=", 869, 869, 16),   // inet >>= inet -> bool
+        ("^", 701, 701, 701),    // float8 ^ float8 -> float8
         ("^", 1700, 1700, 1700), // numeric ^ numeric -> numeric
-        ("^@", 25, 25, 16), // text ^@ text -> bool
-        ("~", 1042, 25, 16), // bpchar ~ text -> bool
-        ("~*", 1042, 25, 16), // bpchar ~* text -> bool
-        ("~<=~", 25, 25, 16), // text ~<=~ text -> bool
-        ("~<~", 25, 25, 16), // text ~<~ text -> bool
-        ("~>=~", 25, 25, 16), // text ~>=~ text -> bool
-        ("~>~", 25, 25, 16), // text ~>~ text -> bool
-        ("~~", 1042, 25, 16), // bpchar ~~ text -> bool
-        ("~~*", 1042, 25, 16), // bpchar ~~* text -> bool
+        ("^@", 25, 25, 16),      // text ^@ text -> bool
+        ("~", 1042, 25, 16),     // bpchar ~ text -> bool
+        ("~*", 1042, 25, 16),    // bpchar ~* text -> bool
+        ("~<=~", 25, 25, 16),    // text ~<=~ text -> bool
+        ("~<~", 25, 25, 16),     // text ~<~ text -> bool
+        ("~>=~", 25, 25, 16),    // text ~>=~ text -> bool
+        ("~>~", 25, 25, 16),     // text ~>~ text -> bool
+        ("~~", 1042, 25, 16),    // bpchar ~~ text -> bool
+        ("~~*", 1042, 25, 16),   // bpchar ~~* text -> bool
     ];
     for (name, l, r, res) in EXTRA_OPS {
         push(&mut rows, &mut oid, name, "b", *l, *r, *res, false, false);
@@ -4888,7 +4886,11 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             Value::text::<String>(name.into()),
             // v7.39 (round 661) — `pg_catalog` only for what PG18 really
             // has; SPG's own surface goes to `spg_catalog`.
-            Value::BigInt(if SPG_ONLY_PROCS.contains(&name) { 13500 } else { 11 }),
+            Value::BigInt(if SPG_ONLY_PROCS.contains(&name) {
+                13500
+            } else {
+                11
+            }),
             Value::BigInt(10), // proowner
             Value::BigInt(12), // prolang = internal
             Value::Float(1.0), // procost
@@ -4906,16 +4908,16 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             Value::SmallInt(0), // pronargdefaults
             Value::BigInt(rettype),
             Value::text(argtypes),
-            Value::Null, // proallargtypes
-            Value::Null, // proargmodes
-            Value::Null, // proargnames — a builtin's are not catalogued
-            Value::Null, // proargdefaults
-            Value::Null, // protrftypes
+            Value::Null,                        // proallargtypes
+            Value::Null,                        // proargmodes
+            Value::Null,                        // proargnames — a builtin's are not catalogued
+            Value::Null,                        // proargdefaults
+            Value::Null,                        // protrftypes
             Value::text::<String>(name.into()), // prosrc
-            Value::Null, // probin
-            Value::Null, // prosqlbody
-            Value::Null, // proconfig
-            Value::Null, // proacl — a builtin's is never set
+            Value::Null,                        // probin
+            Value::Null,                        // prosqlbody
+            Value::Null,                        // proconfig
+            Value::Null,                        // proacl — a builtin's is never set
         ]));
     }
     // v7.39 (read01 round 61) — and one row per USER-DEFINED function. They were
@@ -4968,12 +4970,12 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             // CREATE FUNCTION records and every named-argument caller
             // reads from here.
             declared_arg_names(&def.args_repr),
-            Value::Null, // proargdefaults
-            Value::Null, // protrftypes
+            Value::Null,                   // proargdefaults
+            Value::Null,                   // protrftypes
             Value::text(def.body.clone()), // prosrc — the real body
-            Value::Null, // probin
-            Value::Null, // prosqlbody
-            Value::Null, // proconfig
+            Value::Null,                   // probin
+            Value::Null,                   // prosqlbody
+            Value::Null,                   // proconfig
             crate::acl::render_acl_list(&def.acl).map_or(Value::Null, Value::text),
         ]));
     }
@@ -5191,7 +5193,6 @@ pub(crate) const PG_PROC_FUNCS: &[(i64, &str, &str, i32, i64)] = &[
     (3112, "first_value", "w", 1, 2283),
     (3113, "last_value", "w", 1, 2283),
     (3114, "nth_value", "w", 2, 2283),
-
     // v7.39 (round 638, F20) — the functions SPG implements that this table
     // did not list. It had 90 rows against PG's 3415, so a tool asking
     // "does this function exist" was told no for almost everything the
@@ -5329,10 +5330,22 @@ pub(crate) const PG_PROC_FUNCS: &[(i64, &str, &str, i32, i64)] = &[
     (3057, "pg_stat_get_autoanalyze_count", "f", 1, 20),
     (3055, "pg_stat_get_autovacuum_count", "f", 1, 20),
     (1391, "pg_stat_get_backend_start", "f", 1, 1114),
-    (900031, "pg_stat_get_bgwriter_buf_written_checkpoints", "f", 0, 20),
+    (
+        900031,
+        "pg_stat_get_bgwriter_buf_written_checkpoints",
+        "f",
+        0,
+        20,
+    ),
     (2772, "pg_stat_get_bgwriter_buf_written_clean", "f", 0, 20),
     (2773, "pg_stat_get_bgwriter_maxwritten_clean", "f", 0, 20),
-    (900032, "pg_stat_get_bgwriter_requested_checkpoints", "f", 0, 20),
+    (
+        900032,
+        "pg_stat_get_bgwriter_requested_checkpoints",
+        "f",
+        0,
+        20,
+    ),
     (900033, "pg_stat_get_bgwriter_timed_checkpoints", "f", 0, 20),
     (1934, "pg_stat_get_blocks_fetched", "f", 1, 20),
     (1935, "pg_stat_get_blocks_hit", "f", 1, 20),
@@ -5344,9 +5357,27 @@ pub(crate) const PG_PROC_FUNCS: &[(i64, &str, &str, i32, i64)] = &[
     (2771, "pg_stat_get_checkpointer_buffers_written", "f", 0, 20),
     (2770, "pg_stat_get_checkpointer_num_requested", "f", 0, 20),
     (2769, "pg_stat_get_checkpointer_num_timed", "f", 0, 20),
-    (6329, "pg_stat_get_checkpointer_restartpoints_performed", "f", 0, 20),
-    (6328, "pg_stat_get_checkpointer_restartpoints_requested", "f", 0, 20),
-    (6327, "pg_stat_get_checkpointer_restartpoints_timed", "f", 0, 20),
+    (
+        6329,
+        "pg_stat_get_checkpointer_restartpoints_performed",
+        "f",
+        0,
+        20,
+    ),
+    (
+        6328,
+        "pg_stat_get_checkpointer_restartpoints_requested",
+        "f",
+        0,
+        20,
+    ),
+    (
+        6327,
+        "pg_stat_get_checkpointer_restartpoints_timed",
+        "f",
+        0,
+        20,
+    ),
     (6314, "pg_stat_get_checkpointer_stat_reset_time", "f", 0, 20),
     (3161, "pg_stat_get_checkpointer_sync_time", "f", 0, 20),
     (3160, "pg_stat_get_checkpointer_write_time", "f", 0, 20),
@@ -5392,7 +5423,13 @@ pub(crate) const PG_PROC_FUNCS: &[(i64, &str, &str, i32, i64)] = &[
     (3177, "pg_stat_get_mod_since_analyze", "f", 1, 20),
     (1928, "pg_stat_get_numscans", "f", 1, 20),
     (6248, "pg_stat_get_recovery_prefetch", "f", 0, 20),
-    (900041, "pg_stat_get_recovery_prefetch_reset_time", "f", 0, 20),
+    (
+        900041,
+        "pg_stat_get_recovery_prefetch_reset_time",
+        "f",
+        0,
+        20,
+    ),
     (900042, "pg_stat_get_seq_scan", "f", 0, 20),
     (900043, "pg_stat_get_seq_scan_pos", "f", 0, 20),
     (900044, "pg_stat_get_seq_tup_read", "f", 0, 20),
@@ -6702,10 +6739,10 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::BigInt(2200),
                 Value::text::<String>(kind.into()),
                 // v7.39 (round 711) — real, now that the flags are stored.
-                Value::Bool(uc.deferrable), // condeferrable
+                Value::Bool(uc.deferrable),         // condeferrable
                 Value::Bool(uc.initially_deferred), // condeferred
-                Value::Bool(true), // conenforced
-                Value::Bool(true),  // convalidated
+                Value::Bool(true),                  // conenforced
+                Value::Bool(true),                  // convalidated
                 Value::BigInt(conrelid),
                 Value::BigInt(0),  // contypid
                 Value::BigInt(0),  // conindid — pending UC↔index plumb-through
@@ -6717,15 +6754,16 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Bool(true), // conislocal
                 Value::Int(0),     // coninhcount
                 Value::Bool(true),
-                Value::Bool(false) /* conperiod */, // connoinherit
+                Value::Bool(false), /* conperiod */
+                // connoinherit
                 Value::text(conkey_display),
                 Value::text(String::new()),
-                Value::Null /* conpfeqop */,
-                Value::Null /* conppeqop */,
-                Value::Null /* conffeqop */,
-                Value::Null /* confdelsetcols */,
-                Value::Null /* conexclop */,
-                Value::Null /* conbin */,
+                Value::Null, /* conpfeqop */
+                Value::Null, /* conppeqop */
+                Value::Null, /* conffeqop */
+                Value::Null, /* confdelsetcols */
+                Value::Null, /* conexclop */
+                Value::Null, /* conbin */
             ]));
         }
         // Single-column unique indices that don't have a UC entry.
@@ -6754,7 +6792,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text::<String>(kind.into()),
                 Value::Bool(false),
                 Value::Bool(false),
-                Value::Bool(true) /* conenforced */,
+                Value::Bool(true), /* conenforced */
                 Value::Bool(true),
                 Value::BigInt(conrelid),
                 Value::BigInt(0),
@@ -6767,15 +6805,15 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Bool(true),
                 Value::Int(0),
                 Value::Bool(true),
-                Value::Bool(false) /* conperiod */,
+                Value::Bool(false), /* conperiod */
                 Value::text(conkey_display),
                 Value::text(String::new()),
-                Value::Null /* conpfeqop */,
-                Value::Null /* conppeqop */,
-                Value::Null /* conffeqop */,
-                Value::Null /* confdelsetcols */,
-                Value::Null /* conexclop */,
-                Value::Null /* conbin */,
+                Value::Null, /* conpfeqop */
+                Value::Null, /* conppeqop */
+                Value::Null, /* conffeqop */
+                Value::Null, /* confdelsetcols */
+                Value::Null, /* conexclop */
+                Value::Null, /* conbin */
             ]));
         }
         // Foreign keys.
@@ -6799,7 +6837,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text("f"),
                 Value::Bool(false),
                 Value::Bool(false),
-                Value::Bool(true) /* conenforced */,
+                Value::Bool(true), /* conenforced */
                 Value::Bool(true),
                 Value::BigInt(conrelid),
                 Value::BigInt(0),
@@ -6812,15 +6850,15 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Bool(true),
                 Value::Int(0),
                 Value::Bool(true),
-                Value::Bool(false) /* conperiod */,
+                Value::Bool(false), /* conperiod */
                 Value::text(conkey),
                 Value::text(confkey),
-                Value::Null /* conpfeqop */,
-                Value::Null /* conppeqop */,
-                Value::Null /* conffeqop */,
-                Value::Null /* confdelsetcols */,
-                Value::Null /* conexclop */,
-                Value::Null /* conbin */,
+                Value::Null, /* conpfeqop */
+                Value::Null, /* conppeqop */
+                Value::Null, /* conffeqop */
+                Value::Null, /* confdelsetcols */
+                Value::Null, /* conexclop */
+                Value::Null, /* conbin */
             ]));
         }
         // v7.37 U5 — CHECK constraints (contype 'c'). Previously
@@ -6834,7 +6872,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text("c"),
                 Value::Bool(false),
                 Value::Bool(false),
-                Value::Bool(true) /* conenforced */,
+                Value::Bool(true), /* conenforced */
                 // v7.39 (round 652) — convalidated. `f` for a CHECK added
                 // NOT VALID: the rows already in the table were never
                 // scanned against it. pg_dump reads this column to decide
@@ -6851,15 +6889,15 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Bool(true),
                 Value::Int(0),
                 Value::Bool(true),
-                Value::Bool(false) /* conperiod */,
+                Value::Bool(false), /* conperiod */
                 Value::text(String::new()),
                 Value::text(String::new()),
-                Value::Null /* conpfeqop */,
-                Value::Null /* conppeqop */,
-                Value::Null /* conffeqop */,
-                Value::Null /* confdelsetcols */,
-                Value::Null /* conexclop */,
-                Value::text(check_src.expr.clone()) /* conbin */,
+                Value::Null,                         /* conpfeqop */
+                Value::Null,                         /* conppeqop */
+                Value::Null,                         /* conffeqop */
+                Value::Null,                         /* confdelsetcols */
+                Value::Null,                         /* conexclop */
+                Value::text(check_src.expr.clone()), /* conbin */
             ]));
         }
         // v7.39 (round 210, EXCLUDE Phase 1) — exclusion constraints
@@ -6878,7 +6916,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text("x"),
                 Value::Bool(false),
                 Value::Bool(false),
-                Value::Bool(true) /* conenforced */,
+                Value::Bool(true), /* conenforced */
                 Value::Bool(true),
                 Value::BigInt(conrelid),
                 Value::BigInt(0),
@@ -6891,15 +6929,15 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Bool(true),
                 Value::Int(0),
                 Value::Bool(true),
-                Value::Bool(false) /* conperiod */,
+                Value::Bool(false), /* conperiod */
                 Value::text(conkey_display),
                 Value::text(String::new()),
-                Value::Null /* conpfeqop */,
-                Value::Null /* conppeqop */,
-                Value::Null /* conffeqop */,
-                Value::Null /* confdelsetcols */,
-                Value::Null /* conexclop */,
-                Value::Null /* conbin */,
+                Value::Null, /* conpfeqop */
+                Value::Null, /* conppeqop */
+                Value::Null, /* conffeqop */
+                Value::Null, /* confdelsetcols */
+                Value::Null, /* conexclop */
+                Value::Null, /* conbin */
             ]));
         }
         // v7.37 U6 — NOT NULL constraints (contype 'n', PG 18). PG
@@ -6926,7 +6964,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text("n"),
                 Value::Bool(false),
                 Value::Bool(false),
-                Value::Bool(true) /* conenforced */,
+                Value::Bool(true), /* conenforced */
                 Value::Bool(true),
                 Value::BigInt(conrelid),
                 Value::BigInt(0),
@@ -6939,15 +6977,15 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Bool(true),
                 Value::Int(0),
                 Value::Bool(true),
-                Value::Bool(false) /* conperiod */,
+                Value::Bool(false), /* conperiod */
                 Value::text(conkey_display),
                 Value::text(String::new()),
-                Value::Null /* conpfeqop */,
-                Value::Null /* conppeqop */,
-                Value::Null /* conffeqop */,
-                Value::Null /* confdelsetcols */,
-                Value::Null /* conexclop */,
-                Value::Null /* conbin */,
+                Value::Null, /* conpfeqop */
+                Value::Null, /* conppeqop */
+                Value::Null, /* conffeqop */
+                Value::Null, /* confdelsetcols */
+                Value::Null, /* conexclop */
+                Value::Null, /* conbin */
             ]));
         }
     }
@@ -7022,7 +7060,7 @@ pub(crate) fn synth_pg_database(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
         // wraparound monitor is watching, and SPG has one to give.
         // v7.39 (round 640) — an `xid`, same as pg_class.relfrozenxid.
         Value::Xid(u32::try_from(engine.vacuum_oldest_active()).unwrap_or(u32::MAX)),
-        Value::BigInt(1), // datminmxid — SPG has no multixact
+        Value::BigInt(1),    // datminmxid — SPG has no multixact
         Value::BigInt(1663), // dattablespace — pg_default
         Value::text("C"),
         Value::text("C"),
@@ -7255,42 +7293,340 @@ const EMPTY_PG_CATALOGS: &[(&str, &[(&str, DataType)])] = &[
     // v7.39 (round 546) — two more PG catalogs SPG is genuinely empty
     // of: it has no ALTER DEFAULT PRIVILEGES and one encoding, so there
     // are no conversions between any.
-    ("pg_default_acl", &[("oid", DataType::BigInt), ("defaclrole", DataType::BigInt), ("defaclnamespace", DataType::BigInt), ("defaclobjtype", DataType::Text), ("defaclacl", DataType::TextArray)]),
-    ("pg_conversion", &[("oid", DataType::BigInt), ("conname", DataType::Text), ("connamespace", DataType::BigInt), ("conowner", DataType::BigInt), ("conforencoding", DataType::Int), ("contoencoding", DataType::Int), ("conproc", DataType::BigInt), ("condefault", DataType::Bool)]),
-    ("pg_event_trigger", &[("oid", DataType::BigInt), ("evtname", DataType::Text), ("evtevent", DataType::Text), ("evtowner", DataType::BigInt), ("evtfoid", DataType::BigInt), ("evtenabled", DataType::Text), ("evttags", DataType::TextArray)]),
-    ("pg_file_settings", &[("sourcefile", DataType::Text), ("sourceline", DataType::Int), ("seqno", DataType::Int), ("name", DataType::Text), ("setting", DataType::Text), ("applied", DataType::Bool), ("error", DataType::Text)]),
-    ("pg_foreign_data_wrapper", &[("oid", DataType::BigInt), ("fdwname", DataType::Text), ("fdwowner", DataType::BigInt), ("fdwhandler", DataType::BigInt), ("fdwvalidator", DataType::BigInt), ("fdwacl", DataType::TextArray), ("fdwoptions", DataType::TextArray)]),
-    ("pg_foreign_server", &[("oid", DataType::BigInt), ("srvname", DataType::Text), ("srvowner", DataType::BigInt), ("srvfdw", DataType::BigInt), ("srvtype", DataType::Text), ("srvversion", DataType::Text), ("srvacl", DataType::TextArray), ("srvoptions", DataType::TextArray)]),
-    ("pg_hba_file_rules", &[("rule_number", DataType::Int), ("file_name", DataType::Text), ("line_number", DataType::Int), ("type", DataType::Text), ("database", DataType::TextArray), ("user_name", DataType::TextArray), ("address", DataType::Text), ("netmask", DataType::Text), ("auth_method", DataType::Text), ("options", DataType::TextArray), ("error", DataType::Text)]),
-    ("pg_ident_file_mappings", &[("map_number", DataType::Int), ("file_name", DataType::Text), ("line_number", DataType::Int), ("map_name", DataType::Text), ("sys_name", DataType::Text), ("pg_username", DataType::Text), ("error", DataType::Text)]),
-    ("pg_init_privs", &[("objoid", DataType::BigInt), ("classoid", DataType::BigInt), ("objsubid", DataType::Int), ("privtype", DataType::Text), ("initprivs", DataType::TextArray)]),
-    ("pg_parameter_acl", &[("oid", DataType::BigInt), ("parname", DataType::Text), ("paracl", DataType::TextArray)]),
-    ("pg_prepared_xacts", &[("transaction", DataType::BigInt), ("gid", DataType::Text), ("prepared", DataType::Timestamptz), ("owner", DataType::Text), ("database", DataType::Text)]),
-    ("pg_publication_namespace", &[("oid", DataType::BigInt), ("pnpubid", DataType::BigInt), ("pnnspid", DataType::BigInt)]),
-    ("pg_publication_rel", &[("oid", DataType::BigInt), ("prpubid", DataType::BigInt), ("prrelid", DataType::BigInt), ("prqual", DataType::Text), ("prattrs", DataType::Text)]),
-    ("pg_publication_tables", &[("pubname", DataType::Text), ("schemaname", DataType::Text), ("tablename", DataType::Text), ("attnames", DataType::TextArray), ("rowfilter", DataType::Text)]),
-    ("pg_replication_origin", &[("roident", DataType::BigInt), ("roname", DataType::Text)]),
-    ("pg_replication_origin_status", &[("local_id", DataType::BigInt), ("external_id", DataType::Text), ("remote_lsn", DataType::Text), ("local_lsn", DataType::Text)]),
-    ("pg_seclabel", &[("objoid", DataType::BigInt), ("classoid", DataType::BigInt), ("objsubid", DataType::Int), ("provider", DataType::Text), ("label", DataType::Text)]),
-    ("pg_seclabels", &[("objoid", DataType::BigInt), ("classoid", DataType::BigInt), ("objsubid", DataType::Int), ("objtype", DataType::Text), ("objnamespace", DataType::BigInt), ("objname", DataType::Text), ("provider", DataType::Text), ("label", DataType::Text)]),
-    ("pg_shdepend", &[("dbid", DataType::BigInt), ("classid", DataType::BigInt), ("objid", DataType::BigInt), ("objsubid", DataType::Int), ("refclassid", DataType::BigInt), ("refobjid", DataType::BigInt), ("deptype", DataType::Text)]),
-    ("pg_shdescription", &[("objoid", DataType::BigInt), ("classoid", DataType::BigInt), ("description", DataType::Text)]),
-    ("pg_shmem_allocations", &[("name", DataType::Text), ("off", DataType::BigInt), ("size", DataType::BigInt), ("allocated_size", DataType::BigInt)]),
-    ("pg_shmem_allocations_numa", &[("name", DataType::Text), ("numa_node", DataType::Int), ("size", DataType::BigInt)]),
-    ("pg_shseclabel", &[("objoid", DataType::BigInt), ("classoid", DataType::BigInt), ("provider", DataType::Text), ("label", DataType::Text)]),
-    ("pg_statistic_ext_data", &[("stxoid", DataType::BigInt), ("stxdinherit", DataType::Bool), ("stxdndistinct", DataType::Text), ("stxddependencies", DataType::Text), ("stxdmcv", DataType::Text), ("stxdexpr", DataType::TextArray)]),
-    ("pg_stats_ext", &[("schemaname", DataType::Text), ("tablename", DataType::Text), ("statistics_schemaname", DataType::Text), ("statistics_name", DataType::Text), ("statistics_owner", DataType::Text), ("attnames", DataType::TextArray), ("exprs", DataType::TextArray), ("kinds", DataType::TextArray), ("inherited", DataType::Bool), ("n_distinct", DataType::Text), ("dependencies", DataType::Text), ("most_common_vals", DataType::TextArray), ("most_common_val_nulls", DataType::BoolArray), ("most_common_freqs", DataType::FloatArray), ("most_common_base_freqs", DataType::FloatArray)]),
-    ("pg_stats_ext_exprs", &[("schemaname", DataType::Text), ("tablename", DataType::Text), ("statistics_schemaname", DataType::Text), ("statistics_name", DataType::Text), ("statistics_owner", DataType::Text), ("expr", DataType::Text), ("inherited", DataType::Bool), ("null_frac", DataType::Float), ("avg_width", DataType::Int), ("n_distinct", DataType::Float), ("most_common_vals", DataType::TextArray), ("most_common_freqs", DataType::FloatArray), ("histogram_bounds", DataType::TextArray), ("correlation", DataType::Float), ("most_common_elems", DataType::TextArray), ("most_common_elem_freqs", DataType::FloatArray), ("elem_count_histogram", DataType::FloatArray)]),
-    ("pg_subscription_rel", &[("srsubid", DataType::BigInt), ("srrelid", DataType::BigInt), ("srsubstate", DataType::Text), ("srsublsn", DataType::Text)]),
-    ("pg_transform", &[("oid", DataType::BigInt), ("trftype", DataType::BigInt), ("trflang", DataType::BigInt), ("trffromsql", DataType::Text), ("trftosql", DataType::Text)]),
-    ("pg_user_mapping", &[("oid", DataType::BigInt), ("umuser", DataType::BigInt), ("umserver", DataType::BigInt), ("umoptions", DataType::TextArray)]),
-    ("pg_user_mappings", &[("umid", DataType::BigInt), ("srvid", DataType::BigInt), ("srvname", DataType::Text), ("umuser", DataType::BigInt), ("usename", DataType::Text), ("umoptions", DataType::TextArray)]),
+    (
+        "pg_default_acl",
+        &[
+            ("oid", DataType::BigInt),
+            ("defaclrole", DataType::BigInt),
+            ("defaclnamespace", DataType::BigInt),
+            ("defaclobjtype", DataType::Text),
+            ("defaclacl", DataType::TextArray),
+        ],
+    ),
+    (
+        "pg_conversion",
+        &[
+            ("oid", DataType::BigInt),
+            ("conname", DataType::Text),
+            ("connamespace", DataType::BigInt),
+            ("conowner", DataType::BigInt),
+            ("conforencoding", DataType::Int),
+            ("contoencoding", DataType::Int),
+            ("conproc", DataType::BigInt),
+            ("condefault", DataType::Bool),
+        ],
+    ),
+    (
+        "pg_event_trigger",
+        &[
+            ("oid", DataType::BigInt),
+            ("evtname", DataType::Text),
+            ("evtevent", DataType::Text),
+            ("evtowner", DataType::BigInt),
+            ("evtfoid", DataType::BigInt),
+            ("evtenabled", DataType::Text),
+            ("evttags", DataType::TextArray),
+        ],
+    ),
+    (
+        "pg_file_settings",
+        &[
+            ("sourcefile", DataType::Text),
+            ("sourceline", DataType::Int),
+            ("seqno", DataType::Int),
+            ("name", DataType::Text),
+            ("setting", DataType::Text),
+            ("applied", DataType::Bool),
+            ("error", DataType::Text),
+        ],
+    ),
+    (
+        "pg_foreign_data_wrapper",
+        &[
+            ("oid", DataType::BigInt),
+            ("fdwname", DataType::Text),
+            ("fdwowner", DataType::BigInt),
+            ("fdwhandler", DataType::BigInt),
+            ("fdwvalidator", DataType::BigInt),
+            ("fdwacl", DataType::TextArray),
+            ("fdwoptions", DataType::TextArray),
+        ],
+    ),
+    (
+        "pg_foreign_server",
+        &[
+            ("oid", DataType::BigInt),
+            ("srvname", DataType::Text),
+            ("srvowner", DataType::BigInt),
+            ("srvfdw", DataType::BigInt),
+            ("srvtype", DataType::Text),
+            ("srvversion", DataType::Text),
+            ("srvacl", DataType::TextArray),
+            ("srvoptions", DataType::TextArray),
+        ],
+    ),
+    (
+        "pg_hba_file_rules",
+        &[
+            ("rule_number", DataType::Int),
+            ("file_name", DataType::Text),
+            ("line_number", DataType::Int),
+            ("type", DataType::Text),
+            ("database", DataType::TextArray),
+            ("user_name", DataType::TextArray),
+            ("address", DataType::Text),
+            ("netmask", DataType::Text),
+            ("auth_method", DataType::Text),
+            ("options", DataType::TextArray),
+            ("error", DataType::Text),
+        ],
+    ),
+    (
+        "pg_ident_file_mappings",
+        &[
+            ("map_number", DataType::Int),
+            ("file_name", DataType::Text),
+            ("line_number", DataType::Int),
+            ("map_name", DataType::Text),
+            ("sys_name", DataType::Text),
+            ("pg_username", DataType::Text),
+            ("error", DataType::Text),
+        ],
+    ),
+    (
+        "pg_init_privs",
+        &[
+            ("objoid", DataType::BigInt),
+            ("classoid", DataType::BigInt),
+            ("objsubid", DataType::Int),
+            ("privtype", DataType::Text),
+            ("initprivs", DataType::TextArray),
+        ],
+    ),
+    (
+        "pg_parameter_acl",
+        &[
+            ("oid", DataType::BigInt),
+            ("parname", DataType::Text),
+            ("paracl", DataType::TextArray),
+        ],
+    ),
+    (
+        "pg_prepared_xacts",
+        &[
+            ("transaction", DataType::BigInt),
+            ("gid", DataType::Text),
+            ("prepared", DataType::Timestamptz),
+            ("owner", DataType::Text),
+            ("database", DataType::Text),
+        ],
+    ),
+    (
+        "pg_publication_namespace",
+        &[
+            ("oid", DataType::BigInt),
+            ("pnpubid", DataType::BigInt),
+            ("pnnspid", DataType::BigInt),
+        ],
+    ),
+    (
+        "pg_publication_rel",
+        &[
+            ("oid", DataType::BigInt),
+            ("prpubid", DataType::BigInt),
+            ("prrelid", DataType::BigInt),
+            ("prqual", DataType::Text),
+            ("prattrs", DataType::Text),
+        ],
+    ),
+    (
+        "pg_publication_tables",
+        &[
+            ("pubname", DataType::Text),
+            ("schemaname", DataType::Text),
+            ("tablename", DataType::Text),
+            ("attnames", DataType::TextArray),
+            ("rowfilter", DataType::Text),
+        ],
+    ),
+    (
+        "pg_replication_origin",
+        &[("roident", DataType::BigInt), ("roname", DataType::Text)],
+    ),
+    (
+        "pg_replication_origin_status",
+        &[
+            ("local_id", DataType::BigInt),
+            ("external_id", DataType::Text),
+            ("remote_lsn", DataType::Text),
+            ("local_lsn", DataType::Text),
+        ],
+    ),
+    (
+        "pg_seclabel",
+        &[
+            ("objoid", DataType::BigInt),
+            ("classoid", DataType::BigInt),
+            ("objsubid", DataType::Int),
+            ("provider", DataType::Text),
+            ("label", DataType::Text),
+        ],
+    ),
+    (
+        "pg_seclabels",
+        &[
+            ("objoid", DataType::BigInt),
+            ("classoid", DataType::BigInt),
+            ("objsubid", DataType::Int),
+            ("objtype", DataType::Text),
+            ("objnamespace", DataType::BigInt),
+            ("objname", DataType::Text),
+            ("provider", DataType::Text),
+            ("label", DataType::Text),
+        ],
+    ),
+    (
+        "pg_shdepend",
+        &[
+            ("dbid", DataType::BigInt),
+            ("classid", DataType::BigInt),
+            ("objid", DataType::BigInt),
+            ("objsubid", DataType::Int),
+            ("refclassid", DataType::BigInt),
+            ("refobjid", DataType::BigInt),
+            ("deptype", DataType::Text),
+        ],
+    ),
+    (
+        "pg_shdescription",
+        &[
+            ("objoid", DataType::BigInt),
+            ("classoid", DataType::BigInt),
+            ("description", DataType::Text),
+        ],
+    ),
+    (
+        "pg_shmem_allocations",
+        &[
+            ("name", DataType::Text),
+            ("off", DataType::BigInt),
+            ("size", DataType::BigInt),
+            ("allocated_size", DataType::BigInt),
+        ],
+    ),
+    (
+        "pg_shmem_allocations_numa",
+        &[
+            ("name", DataType::Text),
+            ("numa_node", DataType::Int),
+            ("size", DataType::BigInt),
+        ],
+    ),
+    (
+        "pg_shseclabel",
+        &[
+            ("objoid", DataType::BigInt),
+            ("classoid", DataType::BigInt),
+            ("provider", DataType::Text),
+            ("label", DataType::Text),
+        ],
+    ),
+    (
+        "pg_statistic_ext_data",
+        &[
+            ("stxoid", DataType::BigInt),
+            ("stxdinherit", DataType::Bool),
+            ("stxdndistinct", DataType::Text),
+            ("stxddependencies", DataType::Text),
+            ("stxdmcv", DataType::Text),
+            ("stxdexpr", DataType::TextArray),
+        ],
+    ),
+    (
+        "pg_stats_ext",
+        &[
+            ("schemaname", DataType::Text),
+            ("tablename", DataType::Text),
+            ("statistics_schemaname", DataType::Text),
+            ("statistics_name", DataType::Text),
+            ("statistics_owner", DataType::Text),
+            ("attnames", DataType::TextArray),
+            ("exprs", DataType::TextArray),
+            ("kinds", DataType::TextArray),
+            ("inherited", DataType::Bool),
+            ("n_distinct", DataType::Text),
+            ("dependencies", DataType::Text),
+            ("most_common_vals", DataType::TextArray),
+            ("most_common_val_nulls", DataType::BoolArray),
+            ("most_common_freqs", DataType::FloatArray),
+            ("most_common_base_freqs", DataType::FloatArray),
+        ],
+    ),
+    (
+        "pg_stats_ext_exprs",
+        &[
+            ("schemaname", DataType::Text),
+            ("tablename", DataType::Text),
+            ("statistics_schemaname", DataType::Text),
+            ("statistics_name", DataType::Text),
+            ("statistics_owner", DataType::Text),
+            ("expr", DataType::Text),
+            ("inherited", DataType::Bool),
+            ("null_frac", DataType::Float),
+            ("avg_width", DataType::Int),
+            ("n_distinct", DataType::Float),
+            ("most_common_vals", DataType::TextArray),
+            ("most_common_freqs", DataType::FloatArray),
+            ("histogram_bounds", DataType::TextArray),
+            ("correlation", DataType::Float),
+            ("most_common_elems", DataType::TextArray),
+            ("most_common_elem_freqs", DataType::FloatArray),
+            ("elem_count_histogram", DataType::FloatArray),
+        ],
+    ),
+    (
+        "pg_subscription_rel",
+        &[
+            ("srsubid", DataType::BigInt),
+            ("srrelid", DataType::BigInt),
+            ("srsubstate", DataType::Text),
+            ("srsublsn", DataType::Text),
+        ],
+    ),
+    (
+        "pg_transform",
+        &[
+            ("oid", DataType::BigInt),
+            ("trftype", DataType::BigInt),
+            ("trflang", DataType::BigInt),
+            ("trffromsql", DataType::Text),
+            ("trftosql", DataType::Text),
+        ],
+    ),
+    (
+        "pg_user_mapping",
+        &[
+            ("oid", DataType::BigInt),
+            ("umuser", DataType::BigInt),
+            ("umserver", DataType::BigInt),
+            ("umoptions", DataType::TextArray),
+        ],
+    ),
+    (
+        "pg_user_mappings",
+        &[
+            ("umid", DataType::BigInt),
+            ("srvid", DataType::BigInt),
+            ("srvname", DataType::Text),
+            ("umuser", DataType::BigInt),
+            ("usename", DataType::Text),
+            ("umoptions", DataType::TextArray),
+        ],
+    ),
 ];
 
 /// Look up an empty catalog by its `__spg_pg_`-rewritten name.
-pub(crate) fn synth_empty_pg_catalog(
-    view: &str,
-) -> Option<(Vec<ColumnSchema>, Vec<Row<'static>>)> {
+pub(crate) fn synth_empty_pg_catalog(view: &str) -> Option<(Vec<ColumnSchema>, Vec<Row<'static>>)> {
     let bare = view.strip_prefix("__spg_pg_")?;
     let (_, cols) = EMPTY_PG_CATALOGS
         .iter()
@@ -7373,7 +7709,12 @@ pub(crate) fn synth_pg_group(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'st
             let list: Vec<Option<alloc::string::String>> = members
                 .iter()
                 .filter(|m| matches!(&m.values[1], Value::BigInt(o) if *o == oid))
-                .map(|m| Some(alloc::format!("{}", crate::eval::value_to_text(&m.values[2]))))
+                .map(|m| {
+                    Some(alloc::format!(
+                        "{}",
+                        crate::eval::value_to_text(&m.values[2])
+                    ))
+                })
                 .collect();
             Row::new(alloc::vec![
                 r.values[0].clone(),
@@ -7699,135 +8040,135 @@ pub(crate) fn synth_pg_cast() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     // context and the method rather than the function. Recorded as a
     // divergence rather than invented.
     const CASTS: &[(i64, i64, &str, &str)] = &[
-    (16, 23, "e", "f"), // bool -> int4
-    (16, 25, "a", "f"), // bool -> text
-    (16, 1042, "a", "f"), // bool -> bpchar
-    (16, 1043, "a", "f"), // bool -> varchar
-    (17, 20, "e", "f"), // bytea -> int8
-    (17, 21, "e", "f"), // bytea -> int2
-    (17, 23, "e", "f"), // bytea -> int4
-    (18, 23, "e", "f"), // char -> int4
-    (18, 25, "i", "f"), // char -> text
-    (18, 1042, "a", "f"), // char -> bpchar
-    (18, 1043, "a", "f"), // char -> varchar
-    (19, 25, "i", "f"), // name -> text
-    (19, 1042, "a", "f"), // name -> bpchar
-    (19, 1043, "a", "f"), // name -> varchar
-    (20, 17, "e", "f"), // int8 -> bytea
-    (20, 21, "a", "f"), // int8 -> int2
-    (20, 23, "a", "f"), // int8 -> int4
-    (20, 24, "i", "f"), // int8 -> regproc
-    (20, 26, "i", "f"), // int8 -> oid
-    (20, 700, "i", "f"), // int8 -> float4
-    (20, 701, "i", "f"), // int8 -> float8
-    (20, 790, "a", "f"), // int8 -> money
-    (20, 1560, "e", "f"), // int8 -> bit
-    (20, 1700, "i", "f"), // int8 -> numeric
-    (21, 17, "e", "f"), // int2 -> bytea
-    (21, 20, "i", "f"), // int2 -> int8
-    (21, 23, "i", "f"), // int2 -> int4
-    (21, 24, "i", "f"), // int2 -> regproc
-    (21, 26, "i", "f"), // int2 -> oid
-    (21, 700, "i", "f"), // int2 -> float4
-    (21, 701, "i", "f"), // int2 -> float8
-    (21, 1700, "i", "f"), // int2 -> numeric
-    (23, 16, "e", "f"), // int4 -> bool
-    (23, 17, "e", "f"), // int4 -> bytea
-    (23, 18, "e", "f"), // int4 -> char
-    (23, 20, "i", "f"), // int4 -> int8
-    (23, 21, "a", "f"), // int4 -> int2
-    (23, 24, "i", "b"), // int4 -> regproc
-    (23, 26, "i", "b"), // int4 -> oid
-    (23, 700, "i", "f"), // int4 -> float4
-    (23, 701, "i", "f"), // int4 -> float8
-    (23, 790, "a", "f"), // int4 -> money
-    (23, 1560, "e", "f"), // int4 -> bit
-    (23, 1700, "i", "f"), // int4 -> numeric
-    (24, 20, "a", "f"), // regproc -> int8
-    (24, 23, "a", "b"), // regproc -> int4
-    (24, 26, "i", "b"), // regproc -> oid
-    (25, 18, "a", "f"), // text -> char
-    (25, 19, "i", "f"), // text -> name
-    (25, 142, "e", "f"), // text -> xml
-    (25, 1042, "i", "b"), // text -> bpchar
-    (25, 1043, "i", "b"), // text -> varchar
-    (26, 20, "a", "f"), // oid -> int8
-    (26, 23, "a", "b"), // oid -> int4
-    (26, 24, "i", "b"), // oid -> regproc
-    (114, 3802, "a", "i"), // json -> jsonb
-    (142, 25, "a", "b"), // xml -> text
-    (142, 1042, "a", "b"), // xml -> bpchar
-    (142, 1043, "a", "b"), // xml -> varchar
-    (650, 25, "a", "f"), // cidr -> text
-    (650, 869, "i", "b"), // cidr -> inet
-    (650, 1042, "a", "f"), // cidr -> bpchar
-    (650, 1043, "a", "f"), // cidr -> varchar
-    (700, 20, "a", "f"), // float4 -> int8
-    (700, 21, "a", "f"), // float4 -> int2
-    (700, 23, "a", "f"), // float4 -> int4
-    (700, 701, "i", "f"), // float4 -> float8
-    (700, 1700, "a", "f"), // float4 -> numeric
-    (701, 20, "a", "f"), // float8 -> int8
-    (701, 21, "a", "f"), // float8 -> int2
-    (701, 23, "a", "f"), // float8 -> int4
-    (701, 700, "a", "f"), // float8 -> float4
-    (701, 1700, "a", "f"), // float8 -> numeric
-    (790, 1700, "a", "f"), // money -> numeric
-    (869, 25, "a", "f"), // inet -> text
-    (869, 650, "a", "f"), // inet -> cidr
-    (869, 1042, "a", "f"), // inet -> bpchar
-    (869, 1043, "a", "f"), // inet -> varchar
-    (1042, 18, "a", "f"), // bpchar -> char
-    (1042, 19, "i", "f"), // bpchar -> name
-    (1042, 25, "i", "f"), // bpchar -> text
-    (1042, 142, "e", "f"), // bpchar -> xml
-    (1042, 1042, "i", "f"), // bpchar -> bpchar
-    (1042, 1043, "i", "f"), // bpchar -> varchar
-    (1043, 18, "a", "f"), // varchar -> char
-    (1043, 19, "i", "f"), // varchar -> name
-    (1043, 25, "i", "b"), // varchar -> text
-    (1043, 142, "e", "f"), // varchar -> xml
-    (1043, 1042, "i", "b"), // varchar -> bpchar
-    (1043, 1043, "i", "f"), // varchar -> varchar
-    (1082, 1114, "i", "f"), // date -> timestamp
-    (1082, 1184, "i", "f"), // date -> timestamptz
-    (1083, 1083, "i", "f"), // time -> time
-    (1083, 1186, "i", "f"), // time -> interval
-    (1083, 1266, "i", "f"), // time -> timetz
-    (1114, 1082, "a", "f"), // timestamp -> date
-    (1114, 1083, "a", "f"), // timestamp -> time
-    (1114, 1114, "i", "f"), // timestamp -> timestamp
-    (1114, 1184, "i", "f"), // timestamp -> timestamptz
-    (1184, 1082, "a", "f"), // timestamptz -> date
-    (1184, 1083, "a", "f"), // timestamptz -> time
-    (1184, 1114, "a", "f"), // timestamptz -> timestamp
-    (1184, 1184, "i", "f"), // timestamptz -> timestamptz
-    (1184, 1266, "a", "f"), // timestamptz -> timetz
-    (1186, 1083, "a", "f"), // interval -> time
-    (1186, 1186, "i", "f"), // interval -> interval
-    (1266, 1083, "a", "f"), // timetz -> time
-    (1266, 1266, "i", "f"), // timetz -> timetz
-    (1560, 20, "e", "f"), // bit -> int8
-    (1560, 23, "e", "f"), // bit -> int4
-    (1560, 1560, "i", "f"), // bit -> bit
-    (1560, 1562, "i", "b"), // bit -> varbit
-    (1562, 1560, "i", "b"), // varbit -> bit
-    (1562, 1562, "i", "f"), // varbit -> varbit
-    (1700, 20, "a", "f"), // numeric -> int8
-    (1700, 21, "a", "f"), // numeric -> int2
-    (1700, 23, "a", "f"), // numeric -> int4
-    (1700, 700, "i", "f"), // numeric -> float4
-    (1700, 701, "i", "f"), // numeric -> float8
-    (1700, 790, "a", "f"), // numeric -> money
-    (1700, 1700, "i", "f"), // numeric -> numeric
-    (3802, 16, "e", "f"), // jsonb -> bool
-    (3802, 20, "e", "f"), // jsonb -> int8
-    (3802, 21, "e", "f"), // jsonb -> int2
-    (3802, 23, "e", "f"), // jsonb -> int4
-    (3802, 114, "a", "i"), // jsonb -> json
-    (3802, 700, "e", "f"), // jsonb -> float4
-    (3802, 701, "e", "f"), // jsonb -> float8
-    (3802, 1700, "e", "f"), // jsonb -> numeric
+        (16, 23, "e", "f"),     // bool -> int4
+        (16, 25, "a", "f"),     // bool -> text
+        (16, 1042, "a", "f"),   // bool -> bpchar
+        (16, 1043, "a", "f"),   // bool -> varchar
+        (17, 20, "e", "f"),     // bytea -> int8
+        (17, 21, "e", "f"),     // bytea -> int2
+        (17, 23, "e", "f"),     // bytea -> int4
+        (18, 23, "e", "f"),     // char -> int4
+        (18, 25, "i", "f"),     // char -> text
+        (18, 1042, "a", "f"),   // char -> bpchar
+        (18, 1043, "a", "f"),   // char -> varchar
+        (19, 25, "i", "f"),     // name -> text
+        (19, 1042, "a", "f"),   // name -> bpchar
+        (19, 1043, "a", "f"),   // name -> varchar
+        (20, 17, "e", "f"),     // int8 -> bytea
+        (20, 21, "a", "f"),     // int8 -> int2
+        (20, 23, "a", "f"),     // int8 -> int4
+        (20, 24, "i", "f"),     // int8 -> regproc
+        (20, 26, "i", "f"),     // int8 -> oid
+        (20, 700, "i", "f"),    // int8 -> float4
+        (20, 701, "i", "f"),    // int8 -> float8
+        (20, 790, "a", "f"),    // int8 -> money
+        (20, 1560, "e", "f"),   // int8 -> bit
+        (20, 1700, "i", "f"),   // int8 -> numeric
+        (21, 17, "e", "f"),     // int2 -> bytea
+        (21, 20, "i", "f"),     // int2 -> int8
+        (21, 23, "i", "f"),     // int2 -> int4
+        (21, 24, "i", "f"),     // int2 -> regproc
+        (21, 26, "i", "f"),     // int2 -> oid
+        (21, 700, "i", "f"),    // int2 -> float4
+        (21, 701, "i", "f"),    // int2 -> float8
+        (21, 1700, "i", "f"),   // int2 -> numeric
+        (23, 16, "e", "f"),     // int4 -> bool
+        (23, 17, "e", "f"),     // int4 -> bytea
+        (23, 18, "e", "f"),     // int4 -> char
+        (23, 20, "i", "f"),     // int4 -> int8
+        (23, 21, "a", "f"),     // int4 -> int2
+        (23, 24, "i", "b"),     // int4 -> regproc
+        (23, 26, "i", "b"),     // int4 -> oid
+        (23, 700, "i", "f"),    // int4 -> float4
+        (23, 701, "i", "f"),    // int4 -> float8
+        (23, 790, "a", "f"),    // int4 -> money
+        (23, 1560, "e", "f"),   // int4 -> bit
+        (23, 1700, "i", "f"),   // int4 -> numeric
+        (24, 20, "a", "f"),     // regproc -> int8
+        (24, 23, "a", "b"),     // regproc -> int4
+        (24, 26, "i", "b"),     // regproc -> oid
+        (25, 18, "a", "f"),     // text -> char
+        (25, 19, "i", "f"),     // text -> name
+        (25, 142, "e", "f"),    // text -> xml
+        (25, 1042, "i", "b"),   // text -> bpchar
+        (25, 1043, "i", "b"),   // text -> varchar
+        (26, 20, "a", "f"),     // oid -> int8
+        (26, 23, "a", "b"),     // oid -> int4
+        (26, 24, "i", "b"),     // oid -> regproc
+        (114, 3802, "a", "i"),  // json -> jsonb
+        (142, 25, "a", "b"),    // xml -> text
+        (142, 1042, "a", "b"),  // xml -> bpchar
+        (142, 1043, "a", "b"),  // xml -> varchar
+        (650, 25, "a", "f"),    // cidr -> text
+        (650, 869, "i", "b"),   // cidr -> inet
+        (650, 1042, "a", "f"),  // cidr -> bpchar
+        (650, 1043, "a", "f"),  // cidr -> varchar
+        (700, 20, "a", "f"),    // float4 -> int8
+        (700, 21, "a", "f"),    // float4 -> int2
+        (700, 23, "a", "f"),    // float4 -> int4
+        (700, 701, "i", "f"),   // float4 -> float8
+        (700, 1700, "a", "f"),  // float4 -> numeric
+        (701, 20, "a", "f"),    // float8 -> int8
+        (701, 21, "a", "f"),    // float8 -> int2
+        (701, 23, "a", "f"),    // float8 -> int4
+        (701, 700, "a", "f"),   // float8 -> float4
+        (701, 1700, "a", "f"),  // float8 -> numeric
+        (790, 1700, "a", "f"),  // money -> numeric
+        (869, 25, "a", "f"),    // inet -> text
+        (869, 650, "a", "f"),   // inet -> cidr
+        (869, 1042, "a", "f"),  // inet -> bpchar
+        (869, 1043, "a", "f"),  // inet -> varchar
+        (1042, 18, "a", "f"),   // bpchar -> char
+        (1042, 19, "i", "f"),   // bpchar -> name
+        (1042, 25, "i", "f"),   // bpchar -> text
+        (1042, 142, "e", "f"),  // bpchar -> xml
+        (1042, 1042, "i", "f"), // bpchar -> bpchar
+        (1042, 1043, "i", "f"), // bpchar -> varchar
+        (1043, 18, "a", "f"),   // varchar -> char
+        (1043, 19, "i", "f"),   // varchar -> name
+        (1043, 25, "i", "b"),   // varchar -> text
+        (1043, 142, "e", "f"),  // varchar -> xml
+        (1043, 1042, "i", "b"), // varchar -> bpchar
+        (1043, 1043, "i", "f"), // varchar -> varchar
+        (1082, 1114, "i", "f"), // date -> timestamp
+        (1082, 1184, "i", "f"), // date -> timestamptz
+        (1083, 1083, "i", "f"), // time -> time
+        (1083, 1186, "i", "f"), // time -> interval
+        (1083, 1266, "i", "f"), // time -> timetz
+        (1114, 1082, "a", "f"), // timestamp -> date
+        (1114, 1083, "a", "f"), // timestamp -> time
+        (1114, 1114, "i", "f"), // timestamp -> timestamp
+        (1114, 1184, "i", "f"), // timestamp -> timestamptz
+        (1184, 1082, "a", "f"), // timestamptz -> date
+        (1184, 1083, "a", "f"), // timestamptz -> time
+        (1184, 1114, "a", "f"), // timestamptz -> timestamp
+        (1184, 1184, "i", "f"), // timestamptz -> timestamptz
+        (1184, 1266, "a", "f"), // timestamptz -> timetz
+        (1186, 1083, "a", "f"), // interval -> time
+        (1186, 1186, "i", "f"), // interval -> interval
+        (1266, 1083, "a", "f"), // timetz -> time
+        (1266, 1266, "i", "f"), // timetz -> timetz
+        (1560, 20, "e", "f"),   // bit -> int8
+        (1560, 23, "e", "f"),   // bit -> int4
+        (1560, 1560, "i", "f"), // bit -> bit
+        (1560, 1562, "i", "b"), // bit -> varbit
+        (1562, 1560, "i", "b"), // varbit -> bit
+        (1562, 1562, "i", "f"), // varbit -> varbit
+        (1700, 20, "a", "f"),   // numeric -> int8
+        (1700, 21, "a", "f"),   // numeric -> int2
+        (1700, 23, "a", "f"),   // numeric -> int4
+        (1700, 700, "i", "f"),  // numeric -> float4
+        (1700, 701, "i", "f"),  // numeric -> float8
+        (1700, 790, "a", "f"),  // numeric -> money
+        (1700, 1700, "i", "f"), // numeric -> numeric
+        (3802, 16, "e", "f"),   // jsonb -> bool
+        (3802, 20, "e", "f"),   // jsonb -> int8
+        (3802, 21, "e", "f"),   // jsonb -> int2
+        (3802, 23, "e", "f"),   // jsonb -> int4
+        (3802, 114, "a", "i"),  // jsonb -> json
+        (3802, 700, "e", "f"),  // jsonb -> float4
+        (3802, 701, "e", "f"),  // jsonb -> float8
+        (3802, 1700, "e", "f"), // jsonb -> numeric
     ];
     let mut rows: Vec<Row<'static>> = Vec::with_capacity(CASTS.len());
     for (i, (src, tgt, ctx, meth)) in CASTS.iter().enumerate() {
@@ -7989,7 +8330,9 @@ pub(crate) fn render_function_def(f: &spg_storage::FunctionDef) -> alloc::string
 /// v7.39 (round 322, V46) — the declared attribute words in PG's print
 /// order. Shared by `pg_get_functiondef`; empty when everything is at its
 /// default.
-pub(crate) fn function_attr_words(f: &spg_storage::FunctionDef) -> alloc::vec::Vec<alloc::string::String> {
+pub(crate) fn function_attr_words(
+    f: &spg_storage::FunctionDef,
+) -> alloc::vec::Vec<alloc::string::String> {
     let mut out = alloc::vec::Vec::new();
     match f.volatility {
         spg_storage::FN_IMMUTABLE => out.push(alloc::string::String::from("IMMUTABLE")),
@@ -8036,7 +8379,10 @@ fn render_fn_number(v: f64) -> alloc::string::String {
 /// the type word is canonicalised, and anything unrecognised is left
 /// alone rather than guessed at.
 fn canonical_arg_list(args_repr: &str) -> alloc::string::String {
-    let inner = args_repr.trim().trim_start_matches('(').trim_end_matches(')');
+    let inner = args_repr
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
     if inner.trim().is_empty() {
         return alloc::string::String::new();
     }
@@ -8061,7 +8407,10 @@ fn canonical_arg_list(args_repr: &str) -> alloc::string::String {
 /// form, for `pg_proc.proargnames`. NULL when the function takes none,
 /// as PG's is.
 fn declared_arg_names(args_repr: &str) -> Value<'static> {
-    let inner = args_repr.trim().trim_start_matches('(').trim_end_matches(')');
+    let inner = args_repr
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
     if inner.trim().is_empty() {
         return Value::Null;
     }
@@ -8081,7 +8430,10 @@ fn declared_arg_names(args_repr: &str) -> Value<'static> {
 }
 
 pub(crate) fn canonical_arg_types(args_repr: &str) -> alloc::string::String {
-    let inner = args_repr.trim().trim_start_matches('(').trim_end_matches(')');
+    let inner = args_repr
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
     if inner.trim().is_empty() {
         return alloc::string::String::new();
     }
@@ -8089,7 +8441,9 @@ pub(crate) fn canonical_arg_types(args_repr: &str) -> alloc::string::String {
         .split(',')
         .map(|part| {
             let part = part.trim();
-            let ty = part.split_once(char::is_whitespace).map_or(part, |(_, t)| t);
+            let ty = part
+                .split_once(char::is_whitespace)
+                .map_or(part, |(_, t)| t);
             canonical_type_word(ty.trim())
         })
         .collect::<alloc::vec::Vec<_>>()
@@ -8164,10 +8518,7 @@ fn render_rule_action(cmd: &str, cat: Option<&Catalog>) -> alloc::string::String
             let Some(vpos) = rendered.find(" VALUES ") else {
                 return rendered;
             };
-            alloc::format!(
-                "{head}\n  VALUES {}",
-                &rendered[vpos + " VALUES ".len()..]
-            )
+            alloc::format!("{head}\n  VALUES {}", &rendered[vpos + " VALUES ".len()..])
         }
         Statement::Update(upd) if upd.ctes.is_empty() => {
             let sets: alloc::vec::Vec<alloc::string::String> = upd
@@ -8814,8 +9165,8 @@ pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
         // `boot_val` / `reset_val` are raw too (measured: they stay
         // `4096` across a `SET work_mem = '8MB'`).
         let raw = |v: &str| crate::session::guc_raw_setting(name, v);
-        let unit = crate::session::guc_unit(name)
-            .map_or(Value::Null, |u| Value::text::<String>(u.into()));
+        let unit =
+            crate::session::guc_unit(name).map_or(Value::Null, |u| Value::text::<String>(u.into()));
         let setting = raw(&setting).unwrap_or(setting);
         let boot_raw = raw(boot).unwrap_or_else(|| boot.into());
         rows.push(Row::new(alloc::vec![
@@ -8833,9 +9184,9 @@ pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
             Value::Null, // enumvals
             Value::text(boot_raw.clone()),
             Value::text(boot_raw), // reset_val = boot_val
-            Value::Null,                        // sourcefile
-            Value::Null,                        // sourceline
-            Value::Bool(false),                 // pending_restart
+            Value::Null,           // sourcefile
+            Value::Null,           // sourceline
+            Value::Bool(false),    // pending_restart
         ]));
     };
     for &(name, val, cat, vartype, context) in defaults {
@@ -9425,9 +9776,7 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::text(indcollation),
                 Value::text(indclass),
                 Value::text(indoption),
-                idx.expression
-                    .clone()
-                    .map_or(Value::Null, Value::text), // indexprs
+                idx.expression.clone().map_or(Value::Null, Value::text), // indexprs
                 idx.partial_predicate
                     .clone()
                     .map_or(Value::Null, Value::text), // indpred
@@ -9539,8 +9888,14 @@ static PG_CATALOG_NAME_COLUMNS: &[(&str, &[&str])] = &[
     ("pg_database", &["datname"]),
     ("pg_enum", &["enumlabel"]),
     ("pg_extension", &["extname"]),
-    ("pg_indexes", &["indexname", "schemaname", "tablename", "tablespace"]),
-    ("pg_matviews", &["matviewname", "matviewowner", "schemaname", "tablespace"]),
+    (
+        "pg_indexes",
+        &["indexname", "schemaname", "tablename", "tablespace"],
+    ),
+    (
+        "pg_matviews",
+        &["matviewname", "matviewowner", "schemaname", "tablespace"],
+    ),
     ("pg_namespace", &["nspname"]),
     ("pg_policies", &["policyname", "schemaname", "tablename"]),
     ("pg_policy", &["polname"]),
@@ -9557,11 +9912,17 @@ static PG_CATALOG_NAME_COLUMNS: &[(&str, &[&str])] = &[
     ("pg_stat_replication", &["usename"]),
     ("pg_stat_subscription_stats", &["subname"]),
     ("pg_stat_user_functions", &["funcname", "schemaname"]),
-    ("pg_stat_user_indexes", &["indexrelname", "relname", "schemaname"]),
+    (
+        "pg_stat_user_indexes",
+        &["indexrelname", "relname", "schemaname"],
+    ),
     ("pg_stat_user_tables", &["relname", "schemaname"]),
     ("pg_statistic_ext", &["stxname"]),
     ("pg_subscription", &["subname", "subslotname"]),
-    ("pg_tables", &["schemaname", "tablename", "tableowner", "tablespace"]),
+    (
+        "pg_tables",
+        &["schemaname", "tablename", "tableowner", "tablespace"],
+    ),
     ("pg_tablespace", &["spcname"]),
     ("pg_trigger", &["tgname", "tgnewtable", "tgoldtable"]),
     ("pg_type", &["typname"]),
@@ -9676,10 +10037,7 @@ fn apply_information_schema_domains(view: &str, columns: &mut [ColumnSchema]) {
             continue;
         };
         c.user_domain_type = Some(alloc::string::String::from(*domain));
-        if let Some((_, base)) = INFORMATION_SCHEMA_DOMAINS
-            .iter()
-            .find(|(n, _)| n == domain)
-        {
+        if let Some((_, base)) = INFORMATION_SCHEMA_DOMAINS.iter().find(|(n, _)| n == domain) {
             c.ty = *base;
         }
     }
@@ -9761,7 +10119,11 @@ fn catalog_relation_columns(name: &str, cat: &Catalog) -> Option<Vec<ColumnSchem
         "pg_attrdef" => synth_pg_attrdef(cat).0,
         "pg_attribute" => pg_attribute_schema(),
         "pg_cast" => synth_pg_cast().0,
-        "pg_class" => { let mut c = pg_class_schema(); splice_pg_class_v18_schema(&mut c); c }
+        "pg_class" => {
+            let mut c = pg_class_schema();
+            splice_pg_class_v18_schema(&mut c);
+            c
+        }
         "pg_collation" => synth_pg_collation(cat).0,
         "pg_constraint" => synth_pg_constraint(cat).0,
         "pg_depend" => synth_pg_depend(cat).0,
@@ -9792,7 +10154,10 @@ fn relation_oid_for_meta_view(name: &str) -> i64 {
     let bare = name
         .strip_prefix("__spg_pg_")
         .map(|b| alloc::format!("pg_{b}"))
-        .or_else(|| name.strip_prefix("__spg_info_").map(alloc::string::String::from))
+        .or_else(|| {
+            name.strip_prefix("__spg_info_")
+                .map(alloc::string::String::from)
+        })
         .unwrap_or_else(|| alloc::string::String::from(name));
     // The well-known oids PG assigns its catalogs; anything else — an
     // information_schema view, a pg_stat_* view — has no fixed oid and
@@ -9864,7 +10229,8 @@ pub(crate) fn materialise_meta_view(
         row.values.truncate(sys_start);
         // One block, offsets from 1, as PG numbers them; a catalog row
         // is frozen, which is what PG reports for one too.
-        row.values.push(Value::text(alloc::format!("(0,{})", i + 1)));
+        row.values
+            .push(Value::text(alloc::format!("(0,{})", i + 1)));
         row.values.push(Value::text("2")); // xmin — FrozenTransactionId
         row.values.push(Value::text("0")); // cmin
         row.values.push(Value::text("0")); // xmax

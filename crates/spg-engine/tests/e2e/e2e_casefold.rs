@@ -38,7 +38,10 @@ fn casefold_unicode() {
     // rather than PG's `casefold`, and asserted accordingly. Case FOLDING is
     // position-blind on purpose: its job is to make two spellings of a word
     // compare equal, so no final-sigma rule applies. Measured on PG18.
-    assert_eq!(text(&first(&mut e, "SELECT casefold('İSTANBUL')")), "istanbul");
+    assert_eq!(
+        text(&first(&mut e, "SELECT casefold('İSTANBUL')")),
+        "istanbul"
+    );
     assert_eq!(text(&first(&mut e, "SELECT casefold('ΣΟΦΟΣ')")), "σοφοσ");
     // An already-lowered final sigma is left as it is.
     assert_eq!(text(&first(&mut e, "SELECT casefold('σοφος')")), "σοφος");

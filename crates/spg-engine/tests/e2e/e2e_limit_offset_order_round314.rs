@@ -74,8 +74,14 @@ fn a_repeated_or_doubled_clause_is_refused() {
 #[test]
 fn the_existing_spellings_are_unchanged() {
     let mut e = fixture();
-    assert_eq!(rows(&mut e, "SELECT g FROM g39 ORDER BY g LIMIT 2"), ["1", "2"]);
-    assert_eq!(rows(&mut e, "SELECT g FROM g39 ORDER BY g OFFSET 8"), ["9", "10"]);
+    assert_eq!(
+        rows(&mut e, "SELECT g FROM g39 ORDER BY g LIMIT 2"),
+        ["1", "2"]
+    );
+    assert_eq!(
+        rows(&mut e, "SELECT g FROM g39 ORDER BY g OFFSET 8"),
+        ["9", "10"]
+    );
     assert_eq!(
         rows(&mut e, "SELECT g FROM g39 ORDER BY g LIMIT ALL OFFSET 8"),
         ["9", "10"]
@@ -86,7 +92,10 @@ fn the_existing_spellings_are_unchanged() {
         ["3", "4", "5"]
     );
     assert_eq!(
-        rows(&mut e, "SELECT g FROM g39 ORDER BY g FETCH FIRST 2 ROWS ONLY"),
+        rows(
+            &mut e,
+            "SELECT g FROM g39 ORDER BY g FETCH FIRST 2 ROWS ONLY"
+        ),
         ["1", "2"]
     );
     // WITH TIES rides on the same clause and still applies.

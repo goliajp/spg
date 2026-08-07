@@ -43,7 +43,8 @@ fn seeded(cycles: usize) -> Engine {
     // No background reclamation: this is the server's exposure, and the
     // shape the counters were taken under.
     e.set_autovacuum(false);
-    e.execute("CREATE TABLE t (id INT PRIMARY KEY, g INT)").unwrap();
+    e.execute("CREATE TABLE t (id INT PRIMARY KEY, g INT)")
+        .unwrap();
     let mut vals = String::from("INSERT INTO t VALUES ");
     for i in 0..2000 {
         if i > 0 {
@@ -53,7 +54,8 @@ fn seeded(cycles: usize) -> Engine {
     }
     e.execute(&vals).unwrap();
     for c in 0..cycles {
-        e.execute("DELETE FROM t WHERE id >= 100 AND id < 200").unwrap();
+        e.execute("DELETE FROM t WHERE id >= 100 AND id < 200")
+            .unwrap();
         let mut re = String::from("INSERT INTO t VALUES ");
         for i in 100..200 {
             if i > 100 {
@@ -71,7 +73,11 @@ fn round493_churned_key_reads_the_same_through_index_and_scan() {
     for cycles in [0usize, 1, 20, 60] {
         let mut e = seeded(cycles);
         // Equality on the PK — the uniqueness/seek path.
-        let expect_g = if cycles == 0 { 150 % 7 } else { (cycles - 1) % 7 };
+        let expect_g = if cycles == 0 {
+            150 % 7
+        } else {
+            (cycles - 1) % 7
+        };
         assert_eq!(
             one(&mut e, "SELECT g FROM t WHERE id = 150"),
             expect_g.to_string(),
@@ -79,7 +85,10 @@ fn round493_churned_key_reads_the_same_through_index_and_scan() {
         );
         // Range on the PK — the seek path.
         assert_eq!(
-            one(&mut e, "SELECT count(*) FROM t WHERE id >= 100 AND id < 200"),
+            one(
+                &mut e,
+                "SELECT count(*) FROM t WHERE id >= 100 AND id < 200"
+            ),
             "100",
             "cycles={cycles}"
         );
@@ -87,11 +96,18 @@ fn round493_churned_key_reads_the_same_through_index_and_scan() {
         // live entry had been pruned, the index paths above would go quiet
         // while this one still found the row.
         assert_eq!(
-            one(&mut e, "SELECT count(*) FROM t WHERE id + 0 >= 100 AND id + 0 < 200"),
+            one(
+                &mut e,
+                "SELECT count(*) FROM t WHERE id + 0 >= 100 AND id + 0 < 200"
+            ),
             "100",
             "cycles={cycles}"
         );
-        assert_eq!(one(&mut e, "SELECT count(*) FROM t"), "2000", "cycles={cycles}");
+        assert_eq!(
+            one(&mut e, "SELECT count(*) FROM t"),
+            "2000",
+            "cycles={cycles}"
+        );
     }
 }
 
@@ -103,7 +119,8 @@ fn round493_rollback_restores_a_churned_key() {
     let mut e = seeded(20);
     assert_eq!(one(&mut e, "SELECT g FROM t WHERE id = 150"), "5");
     e.execute("BEGIN").unwrap();
-    e.execute("DELETE FROM t WHERE id >= 100 AND id < 200").unwrap();
+    e.execute("DELETE FROM t WHERE id >= 100 AND id < 200")
+        .unwrap();
     let mut re = String::from("INSERT INTO t VALUES ");
     for i in 100..200 {
         if i > 100 {
@@ -116,7 +133,10 @@ fn round493_rollback_restores_a_churned_key() {
     e.execute("ROLLBACK").unwrap();
     assert_eq!(one(&mut e, "SELECT g FROM t WHERE id = 150"), "5");
     assert_eq!(
-        one(&mut e, "SELECT count(*) FROM t WHERE id >= 100 AND id < 200"),
+        one(
+            &mut e,
+            "SELECT count(*) FROM t WHERE id >= 100 AND id < 200"
+        ),
         "100"
     );
     assert_eq!(one(&mut e, "SELECT count(*) FROM t"), "2000");

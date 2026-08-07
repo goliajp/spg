@@ -20,16 +20,16 @@
 //!
 //! Pass `-` (or omit) to skip any positional after the first.
 
-mod tempstore;
 mod alloc_budget;
-mod backup;
 mod autovacuum;
+mod backup;
 mod flusher;
 mod freezer;
 mod manifest;
 mod observability;
 mod prefetch;
 mod pubsub;
+mod tempstore;
 
 thread_local! {
     /// v6.7.6 — single-cell handoff for the prefetch hit count.
@@ -1383,8 +1383,9 @@ fn run(
     // predicate) drives `autovacuum_tick` on its naptime cadence.
     // The two must move together — inline-off without the worker
     // would let dead rows grow without bound.
-    let autovacuum_enabled = !std::env::var("SPG_AUTOVACUUM")
-        .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"));
+    let autovacuum_enabled = !std::env::var("SPG_AUTOVACUUM").is_ok_and(|v| {
+        v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+    });
     if autovacuum_enabled {
         engine.set_autovacuum_inline(false);
     } else {
@@ -2868,8 +2869,7 @@ fn handle_query_op(
                 // statements skip: the base catalog only moves at
                 // COMMIT, and an uncommitted tx must not persist.
                 Ok(QueryResult::Rows { .. })
-                    if sql_is_dmlish(&sql)
-                        && !engine.is_tx_open(spg_engine::IMPLICIT_TX) =>
+                    if sql_is_dmlish(&sql) && !engine.is_tx_open(spg_engine::IMPLICIT_TX) =>
                 {
                     Some(engine.snapshot())
                 }

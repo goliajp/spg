@@ -35,7 +35,8 @@ fn rows_of(r: QueryResult) -> Vec<Vec<String>> {
 fn seeded() -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TABLE c (id int)").unwrap();
-    e.execute("INSERT INTO c VALUES (1),(2),(3),(4),(5)").unwrap();
+    e.execute("INSERT INTO c VALUES (1),(2),(3),(4),(5)")
+        .unwrap();
     e
 }
 
@@ -91,14 +92,35 @@ fn scroll_directions_match_pg() {
     e.execute("DECLARE sc SCROLL CURSOR FOR SELECT id FROM c ORDER BY id")
         .unwrap();
     let one = |e: &mut Engine, sql: &str| rows_of(e.execute(sql).unwrap());
-    assert_eq!(one(&mut e, "FETCH LAST FROM sc"), vec![vec!["5".to_string()]]);
-    assert_eq!(one(&mut e, "FETCH PRIOR FROM sc"), vec![vec!["4".to_string()]]);
-    assert_eq!(one(&mut e, "FETCH ABSOLUTE 2 FROM sc"), vec![vec!["2".to_string()]]);
-    assert_eq!(one(&mut e, "FETCH BACKWARD 1 FROM sc"), vec![vec!["1".to_string()]]);
+    assert_eq!(
+        one(&mut e, "FETCH LAST FROM sc"),
+        vec![vec!["5".to_string()]]
+    );
+    assert_eq!(
+        one(&mut e, "FETCH PRIOR FROM sc"),
+        vec![vec!["4".to_string()]]
+    );
+    assert_eq!(
+        one(&mut e, "FETCH ABSOLUTE 2 FROM sc"),
+        vec![vec!["2".to_string()]]
+    );
+    assert_eq!(
+        one(&mut e, "FETCH BACKWARD 1 FROM sc"),
+        vec![vec!["1".to_string()]]
+    );
     // ABSOLUTE 0 = before first → 0 rows; RELATIVE 2 from there → row 2.
-    assert_eq!(one(&mut e, "FETCH ABSOLUTE 0 FROM sc"), Vec::<Vec<String>>::new());
-    assert_eq!(one(&mut e, "FETCH RELATIVE 2 FROM sc"), vec![vec!["2".to_string()]]);
-    assert_eq!(one(&mut e, "FETCH FIRST FROM sc"), vec![vec!["1".to_string()]]);
+    assert_eq!(
+        one(&mut e, "FETCH ABSOLUTE 0 FROM sc"),
+        Vec::<Vec<String>>::new()
+    );
+    assert_eq!(
+        one(&mut e, "FETCH RELATIVE 2 FROM sc"),
+        vec![vec!["2".to_string()]]
+    );
+    assert_eq!(
+        one(&mut e, "FETCH FIRST FROM sc"),
+        vec![vec!["1".to_string()]]
+    );
     e.execute("COMMIT").unwrap();
 }
 
@@ -180,7 +202,8 @@ fn hold_cursor_survives_later_rollback() {
 fn duplicate_declare_rejected() {
     let mut e = seeded();
     e.execute("BEGIN").unwrap();
-    e.execute("DECLARE dup CURSOR FOR SELECT id FROM c").unwrap();
+    e.execute("DECLARE dup CURSOR FOR SELECT id FROM c")
+        .unwrap();
     let err = e
         .execute("DECLARE dup CURSOR FOR SELECT id FROM c")
         .unwrap_err()

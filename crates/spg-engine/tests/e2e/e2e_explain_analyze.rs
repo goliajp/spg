@@ -97,7 +97,9 @@ fn scan_reports_catalog_row_count() {
         "scan reports actual output rows; got {from_line:?}"
     );
     assert!(
-        lines.iter().any(|l| l.contains("Rows Removed by Filter: 30")),
+        lines
+            .iter()
+            .any(|l| l.contains("Rows Removed by Filter: 30")),
         "PG's removed-rows line: {lines:?}"
     );
 }

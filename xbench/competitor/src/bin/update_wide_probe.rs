@@ -50,10 +50,26 @@ fn best_ms_wide(with_v_index: bool, pad_len: usize, sql: &str) -> f64 {
 fn main() {
     println!("== round 556: is it index maintenance?  (no: 9% at most)");
     for (label, idx, sql) in [
-        ("A v-index, SET v (the filter col)", true, "UPDATE h SET v = v + 1 WHERE v < 50000"),
-        ("B v-index, SET pad (not indexed) ", true, "UPDATE h SET pad = 'y' WHERE v < 50000"),
-        ("C no v-index, SET v              ", false, "UPDATE h SET v = v + 1 WHERE v < 50000"),
-        ("D v-index, SET v, 500 rows       ", true, "UPDATE h SET v = v + 1 WHERE g = 50"),
+        (
+            "A v-index, SET v (the filter col)",
+            true,
+            "UPDATE h SET v = v + 1 WHERE v < 50000",
+        ),
+        (
+            "B v-index, SET pad (not indexed) ",
+            true,
+            "UPDATE h SET pad = 'y' WHERE v < 50000",
+        ),
+        (
+            "C no v-index, SET v              ",
+            false,
+            "UPDATE h SET v = v + 1 WHERE v < 50000",
+        ),
+        (
+            "D v-index, SET v, 500 rows       ",
+            true,
+            "UPDATE h SET v = v + 1 WHERE g = 50",
+        ),
     ] {
         println!("{label}  {:>9.2} ms", best_ms(idx, sql));
     }
@@ -79,16 +95,35 @@ fn main() {
     println!("| pad bytes | UPDATE 10k rows ms | us/row |");
     for pad in [1usize, 100, 400, 1000] {
         let ms = best_ms_wide(true, pad, "UPDATE h SET v = v + 1 WHERE v <= 10000");
-        println!("| {pad:>9} | {ms:>18.2} | {:>6.2} |", ms * 1000.0 / 10_000.0);
+        println!(
+            "| {pad:>9} | {ms:>18.2} | {:>6.2} |",
+            ms * 1000.0 / 10_000.0
+        );
     }
 
     println!();
     println!("== round 557: SET v = <constant> makes 10k IDENTICAL index keys");
     for (label, idx, sql) in [
-        ("v INDEXED,   SET v = 1        (10k dupes)", true, "UPDATE h SET v = 1 WHERE v <= 10000"),
-        ("v UNindexed, SET v = 1        (10k dupes)", false, "UPDATE h SET v = 1 WHERE v <= 10000"),
-        ("v INDEXED,   SET v = v + 1    (distinct) ", true, "UPDATE h SET v = v + 1 WHERE v <= 10000"),
-        ("v UNindexed, SET v = v + 1    (distinct) ", false, "UPDATE h SET v = v + 1 WHERE v <= 10000"),
+        (
+            "v INDEXED,   SET v = 1        (10k dupes)",
+            true,
+            "UPDATE h SET v = 1 WHERE v <= 10000",
+        ),
+        (
+            "v UNindexed, SET v = 1        (10k dupes)",
+            false,
+            "UPDATE h SET v = 1 WHERE v <= 10000",
+        ),
+        (
+            "v INDEXED,   SET v = v + 1    (distinct) ",
+            true,
+            "UPDATE h SET v = v + 1 WHERE v <= 10000",
+        ),
+        (
+            "v UNindexed, SET v = v + 1    (distinct) ",
+            false,
+            "UPDATE h SET v = v + 1 WHERE v <= 10000",
+        ),
     ] {
         println!("{label}  {:>9.2} ms", best_ms(idx, sql));
     }
@@ -96,9 +131,18 @@ fn main() {
     println!();
     println!("== round 557: is it the SET expression?");
     for (label, sql) in [
-        ("SET v = v + 1 (reads the old value)", "UPDATE h SET v = v + 1 WHERE v <= 10000"),
-        ("SET v = 1     (a constant)         ", "UPDATE h SET v = 1 WHERE v <= 10000"),
-        ("SET pad = 'y' (a constant, no idx) ", "UPDATE h SET pad = 'y' WHERE v <= 10000"),
+        (
+            "SET v = v + 1 (reads the old value)",
+            "UPDATE h SET v = v + 1 WHERE v <= 10000",
+        ),
+        (
+            "SET v = 1     (a constant)         ",
+            "UPDATE h SET v = 1 WHERE v <= 10000",
+        ),
+        (
+            "SET pad = 'y' (a constant, no idx) ",
+            "UPDATE h SET pad = 'y' WHERE v <= 10000",
+        ),
     ] {
         println!("{label}  {:>9.2} ms", best_ms(true, sql));
     }

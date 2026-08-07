@@ -340,49 +340,49 @@ pub(crate) fn common_type(types: &[DataType]) -> Option<DataType> {
 /// v7.39 (round 609) — a literal's type and nullability, split out so the
 /// type-only entry point below reads it without building a shape name.
 fn literal_type(lit: &spg_sql::ast::Literal) -> Option<(DataType, bool)> {
-            use spg_sql::ast::Literal as L;
-            let (ty, nullable) = match lit {
-                L::Null => (DataType::Text, true),
-                // Array literals only enter the AST via the
-                // prepared-bind path; surface as TEXT (no array
-                // DataType in the describe surface yet).
-                L::TextArray(_) | L::IntArray(_) | L::BigIntArray(_) => (DataType::Text, false),
-                // PG-canonical literal-int typing: `pg_typeof(1) =
-                // integer`, `pg_typeof(2147483648) = bigint`. The
-                // engine's runtime Value::Int(i32) flows naturally
-                // into INT columns; widening to BIGINT happens in
-                // coerce_value only when the column type asks for
-                // it. Bisected to P0-4: pre-fix every literal was
-                // BigInt, which let `WITH RECURSIVE t(n) AS (SELECT
-                // 1 …)` infer the working table column as BIGINT
-                // while the second-iteration INSERT path produced a
-                // Value::Int(1) — type mismatch.
-                L::Integer(n) => {
-                    if i32::try_from(*n).is_ok() {
-                        (DataType::Int, false)
-                    } else {
-                        (DataType::BigInt, false)
-                    }
-                }
-                L::Float(_) => (DataType::Float, false),
-                L::Numeric { .. } => (
-                    DataType::Numeric {
-                        precision: 0,
-                        scale: 0,
-                    },
-                    false,
-                ),
-                L::NumericBig(_) => (
-                    DataType::Numeric {
-                        precision: 0,
-                        scale: 0,
-                    },
-                    false,
-                ),
-                L::String(_) => (DataType::Text, false),
-                L::Bool(_) => (DataType::Bool, false),
-                L::Vector(_) | L::Interval { .. } => return None,
-            };
+    use spg_sql::ast::Literal as L;
+    let (ty, nullable) = match lit {
+        L::Null => (DataType::Text, true),
+        // Array literals only enter the AST via the
+        // prepared-bind path; surface as TEXT (no array
+        // DataType in the describe surface yet).
+        L::TextArray(_) | L::IntArray(_) | L::BigIntArray(_) => (DataType::Text, false),
+        // PG-canonical literal-int typing: `pg_typeof(1) =
+        // integer`, `pg_typeof(2147483648) = bigint`. The
+        // engine's runtime Value::Int(i32) flows naturally
+        // into INT columns; widening to BIGINT happens in
+        // coerce_value only when the column type asks for
+        // it. Bisected to P0-4: pre-fix every literal was
+        // BigInt, which let `WITH RECURSIVE t(n) AS (SELECT
+        // 1 …)` infer the working table column as BIGINT
+        // while the second-iteration INSERT path produced a
+        // Value::Int(1) — type mismatch.
+        L::Integer(n) => {
+            if i32::try_from(*n).is_ok() {
+                (DataType::Int, false)
+            } else {
+                (DataType::BigInt, false)
+            }
+        }
+        L::Float(_) => (DataType::Float, false),
+        L::Numeric { .. } => (
+            DataType::Numeric {
+                precision: 0,
+                scale: 0,
+            },
+            false,
+        ),
+        L::NumericBig(_) => (
+            DataType::Numeric {
+                precision: 0,
+                scale: 0,
+            },
+            false,
+        ),
+        L::String(_) => (DataType::Text, false),
+        L::Bool(_) => (DataType::Bool, false),
+        L::Vector(_) | L::Interval { .. } => return None,
+    };
     Some((ty, nullable))
 }
 
@@ -915,8 +915,8 @@ fn function_return_shape(
             });
         }
         // Pass-through math: derive the type from the first arg.
-        "max" | "min" | "abs" | "floor" | "ceil" | "ceiling" | "round"
-        | "trunc" | "mod" | "power" | "pow" | "sqrt" | "sign" => {
+        "max" | "min" | "abs" | "floor" | "ceil" | "ceiling" | "round" | "trunc" | "mod"
+        | "power" | "pow" | "sqrt" | "sign" => {
             // Use the first arg's shape; fall back to Float for math
             // that can promote (e.g. mod(2, 3) → Float? No — keep
             // Int. The caller's coerce_value handles promotion at
@@ -1300,9 +1300,9 @@ pub(crate) fn upgrade_timestamptz_array(
         return v;
     };
     if items.is_empty()
-        || !items.iter().all(|e| {
-            describe_expr(e, columns).is_some_and(|s| s.ty == DataType::Timestamptz)
-        })
+        || !items
+            .iter()
+            .all(|e| describe_expr(e, columns).is_some_and(|s| s.ty == DataType::Timestamptz))
     {
         return Value::TimestampArray(elems);
     }

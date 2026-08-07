@@ -56,7 +56,8 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE ac (id INT, b BIGINT, s TEXT)").unwrap();
+    e.execute("CREATE TABLE ac (id INT, b BIGINT, s TEXT)")
+        .unwrap();
     e.execute("INSERT INTO ac VALUES (1,1,'a'),(2,2,'b'),(3,NULL,NULL),(4,4,'d'),(5,5,'e')")
         .unwrap();
     e
@@ -67,20 +68,32 @@ fn seed() -> Engine {
 fn round604_cast_array_membership() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id, id = ANY ('{1,3,5}'::INT[]) FROM ac ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, id = ANY ('{1,3,5}'::INT[]) FROM ac ORDER BY id"
+        ),
         vec!["1|true", "2|false", "3|true", "4|false", "5|true"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, id = ANY ('{1,NULL,5}'::INT[]) FROM ac ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, id = ANY ('{1,NULL,5}'::INT[]) FROM ac ORDER BY id"
+        ),
         vec!["1|true", "2|NULL", "3|NULL", "4|NULL", "5|true"],
         "a NULL element makes a non-match NULL, not false"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, id <> ALL ('{1,3}'::INT[]) FROM ac ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, id <> ALL ('{1,3}'::INT[]) FROM ac ORDER BY id"
+        ),
         vec!["1|false", "2|true", "3|false", "4|true", "5|true"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, id <> ALL ('{1,NULL}'::INT[]) FROM ac ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, id <> ALL ('{1,NULL}'::INT[]) FROM ac ORDER BY id"
+        ),
         vec!["1|false", "2|NULL", "3|NULL", "4|NULL", "5|NULL"]
     );
     assert_eq!(
@@ -112,7 +125,10 @@ fn round604_cast_array_membership() {
         "an empty array is decided by emptiness alone"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, id = ANY ('{2,2,2}'::INT[]) FROM ac ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, id = ANY ('{2,2,2}'::INT[]) FROM ac ORDER BY id"
+        ),
         vec!["1|false", "2|true", "3|false", "4|false", "5|false"],
         "duplicates collapse into the set without changing the answer"
     );
@@ -123,21 +139,33 @@ fn round604_cast_array_membership() {
 fn round604_element_families() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id, s = ANY ('{a,d}'::TEXT[]) FROM ac ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, s = ANY ('{a,d}'::TEXT[]) FROM ac ORDER BY id"
+        ),
         vec!["1|true", "2|false", "3|NULL", "4|true", "5|false"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, b = ANY ('{1,4}'::INT[]) FROM ac ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, b = ANY ('{1,4}'::INT[]) FROM ac ORDER BY id"
+        ),
         vec!["1|true", "2|false", "3|NULL", "4|true", "5|false"],
         "a BIGINT column against an INT array"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, id = ANY ('{1,4}'::BIGINT[]) FROM ac ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, id = ANY ('{1,4}'::BIGINT[]) FROM ac ORDER BY id"
+        ),
         vec!["1|true", "2|false", "3|false", "4|true", "5|false"],
         "and the reverse"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, id = ANY ('{1.0,4.0}'::NUMERIC[]) FROM ac ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, id = ANY ('{1.0,4.0}'::NUMERIC[]) FROM ac ORDER BY id"
+        ),
         vec!["1|true", "2|false", "3|false", "4|true", "5|false"],
         "a NUMERIC array is not a family the set answers, so it keeps the walk"
     );
@@ -178,11 +206,17 @@ fn round604_spellings_agree() {
         vec!["5"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ac WHERE id = ANY ('{2,4}'::INT[]) ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id FROM ac WHERE id = ANY ('{2,4}'::INT[]) ORDER BY id"
+        ),
         vec!["2", "4"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM ac WHERE NOT (id = ANY ('{2,4}'::INT[])) ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id FROM ac WHERE NOT (id = ANY ('{2,4}'::INT[])) ORDER BY id"
+        ),
         vec!["1", "3", "5"]
     );
 }
@@ -195,15 +229,27 @@ fn round604_scale() {
     e.execute("INSERT INTO big SELECT gg FROM generate_series(1, 20000) gg")
         .unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE id = ANY ('{1,2,3,4,5,6,7,8,9,10}'::INT[])"),
-        vals(&mut e, "SELECT count(*) FROM big WHERE id IN (1,2,3,4,5,6,7,8,9,10)")
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE id = ANY ('{1,2,3,4,5,6,7,8,9,10}'::INT[])"
+        ),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE id IN (1,2,3,4,5,6,7,8,9,10)"
+        )
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE id <> ALL ('{1,2,3,4,5}'::INT[])"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE id <> ALL ('{1,2,3,4,5}'::INT[])"
+        ),
         vec!["19995"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE id = ANY ('{99999}'::INT[])"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE id = ANY ('{99999}'::INT[])"
+        ),
         vec!["0"]
     );
 }

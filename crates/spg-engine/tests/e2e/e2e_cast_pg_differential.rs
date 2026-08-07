@@ -4365,7 +4365,10 @@ fn update_on_partition_parent_nonkey() {
         "1:17,2:15,3:8"
     );
     assert_eq!(
-        g(&mut e, "SELECT string_agg(id::text,',' ORDER BY id) FROM t_hi"),
+        g(
+            &mut e,
+            "SELECT string_agg(id::text,',' ORDER BY id) FROM t_hi"
+        ),
         "1,2",
         "the row is IN the destination partition, not merely reporting the value"
     );

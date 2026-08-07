@@ -56,7 +56,10 @@ fn spawn_spgs(dir: &std::path::Path) -> Result<(Child, String), Box<dyn std::err
         if n == 0 {
             break;
         }
-        if let Some(rest) = line.trim_end().strip_prefix("spg-server: pg-wire listening on ") {
+        if let Some(rest) = line
+            .trim_end()
+            .strip_prefix("spg-server: pg-wire listening on ")
+        {
             let addr = rest.to_string();
             // Keep draining stderr so the server never blocks on a full
             // pipe once real traffic starts logging.

@@ -836,9 +836,17 @@ pub(crate) fn compute_window_partition(
         // bit_and / json_agg / range_agg and the rest all arrive for free,
         // with the same NULL handling and result typing they have in a
         // GROUP BY.
-        other if crate::aggregate::is_aggregate_name(other) => {
-            generic_aggregate_window(other, args, ordered, frame, &filter_pass, slice, filtered_rows, ctx, out_vals)
-        }
+        other if crate::aggregate::is_aggregate_name(other) => generic_aggregate_window(
+            other,
+            args,
+            ordered,
+            frame,
+            &filter_pass,
+            slice,
+            filtered_rows,
+            ctx,
+            out_vals,
+        ),
         // Neither a window function nor an aggregate: PG resolves the call
         // like any other and reports the missing function (42883).
         other => Err(EngineError::Unsupported(alloc::format!(
@@ -873,8 +881,16 @@ fn generic_aggregate_window(
             .collect::<Result<_, _>>()
             .map_err(EngineError::Eval)
     };
-    let arg1 = if args.is_empty() { Vec::new() } else { eval_arg(0)? };
-    let arg2 = if args.len() > 1 { Some(eval_arg(1)?) } else { None };
+    let arg1 = if args.is_empty() {
+        Vec::new()
+    } else {
+        eval_arg(0)?
+    };
+    let arg2 = if args.len() > 1 {
+        Some(eval_arg(1)?)
+    } else {
+        None
+    };
     let name = crate::aggregate::canonical_agg_name(name);
     let kind = crate::aggregate::classify_agg_name(name);
     let eff = effective_frame(frame, ordered)?;
@@ -916,7 +932,11 @@ fn generic_aggregate_window(
         // timestamptz rides as `Value::Timestamp` at runtime, so the array
         // `array_agg(x) OVER (…)` builds is a TimestampArray; the
         // ARGUMENT's static type is what says otherwise.
-        let v = match (v, args.first().and_then(|a| crate::describe::describe_expr(a, ctx.columns))) {
+        let v = match (
+            v,
+            args.first()
+                .and_then(|a| crate::describe::describe_expr(a, ctx.columns)),
+        ) {
             (Value::TimestampArray(items), Some(shape))
                 if shape.ty == spg_storage::DataType::Timestamptz =>
             {

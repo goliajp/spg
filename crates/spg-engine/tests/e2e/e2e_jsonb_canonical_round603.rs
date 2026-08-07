@@ -99,7 +99,10 @@ fn round603_scalar_canonical_forms() {
         "escaping, and a bigint past 2^53"
     );
     assert_eq!(
-        vals(&mut e, "SELECT to_jsonb(9007199254740993::BIGINT) FROM jb WHERE id = 1"),
+        vals(
+            &mut e,
+            "SELECT to_jsonb(9007199254740993::BIGINT) FROM jb WHERE id = 1"
+        ),
         vec!["9007199254740993"],
         "no float rounding on the way through"
     );
@@ -123,7 +126,10 @@ fn round603_rich_values_keep_the_round_trip() {
         "NUMERIC keeps its scale, a float exponent is expanded, arrays and dates unchanged"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, to_json(id), to_json(s), to_json(n) FROM jb ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, to_json(id), to_json(s), to_json(n) FROM jb ORDER BY id"
+        ),
         vec![
             "1|1|\"x\"|1.500",
             r#"2|2|"quote\"and\\backslash"|0.000"#,
@@ -140,7 +146,10 @@ fn round603_rich_values_keep_the_round_trip() {
 fn round603_build_object_canonical() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id, jsonb_build_object('a', id, 'b', s) FROM jb ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, jsonb_build_object('a', id, 'b', s) FROM jb ORDER BY id"
+        ),
         vec![
             r#"1|{"a": 1, "b": "x"}"#,
             r#"2|{"a": 2, "b": "quote\"and\\backslash"}"#,
@@ -157,7 +166,10 @@ fn round603_build_object_canonical() {
         "keys sort by length then bytes"
     );
     assert_eq!(
-        vals(&mut e, "SELECT jsonb_build_object('k', 1, 'k', 2, 'k', 3) FROM jb WHERE id = 1"),
+        vals(
+            &mut e,
+            "SELECT jsonb_build_object('k', 1, 'k', 2, 'k', 3) FROM jb WHERE id = 1"
+        ),
         vec![r#"{"k": 3}"#],
         "duplicate keys are last-wins"
     );
@@ -170,7 +182,10 @@ fn round603_build_object_canonical() {
         "escaping in keys and values"
     );
     assert_eq!(
-        vals(&mut e, "SELECT jsonb_build_object(7, 'seven', 10, 'ten') FROM jb WHERE id = 1"),
+        vals(
+            &mut e,
+            "SELECT jsonb_build_object(7, 'seven', 10, 'ten') FROM jb WHERE id = 1"
+        ),
         vec![r#"{"7": "seven", "10": "ten"}"#],
         "a numeric key becomes its decimal string, and then sorts as one"
     );
@@ -196,7 +211,10 @@ fn round603_build_object_canonical() {
         "a nested jsonb argument is already JSON, so it falls back too"
     );
     assert_eq!(
-        vals(&mut e, "SELECT json_build_object('a', 1, 'b', 2) FROM jb WHERE id = 1"),
+        vals(
+            &mut e,
+            "SELECT json_build_object('a', 1, 'b', 2) FROM jb WHERE id = 1"
+        ),
         vec![r#"{"a" : 1, "b" : 2}"#],
         "json_build_object keeps its own spacing and is untouched"
     );
@@ -207,7 +225,10 @@ fn round603_build_object_canonical() {
 fn round603_null_argument_is_null() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT to_jsonb(NULL::INT) IS NULL, to_json(NULL::TEXT) IS NULL"),
+        vals(
+            &mut e,
+            "SELECT to_jsonb(NULL::INT) IS NULL, to_json(NULL::TEXT) IS NULL"
+        ),
         vec!["true|true"]
     );
     assert_eq!(
@@ -216,7 +237,10 @@ fn round603_null_argument_is_null() {
         "a JSON null VALUE is not a NULL argument"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, jsonb_build_object('v', b, 'f', bo) FROM jb ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, jsonb_build_object('v', b, 'f', bo) FROM jb ORDER BY id"
+        ),
         vec![
             r#"1|{"f": true, "v": 9007199254740993}"#,
             r#"2|{"f": false, "v": -1}"#,
@@ -233,7 +257,10 @@ fn round603_null_argument_is_null() {
 fn round603_built_values_behave_as_jsonb() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT id, (jsonb_build_object('a', id) ->> 'a')::INT FROM jb ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, (jsonb_build_object('a', id) ->> 'a')::INT FROM jb ORDER BY id"
+        ),
         vec!["1|1", "2|2", "3|3", "4|4"]
     );
     assert_eq!(

@@ -36,7 +36,8 @@ fn a_views_columns_are_listed_with_their_types() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE vt (a int NOT NULL, b text, c numeric(8,2))")
         .unwrap();
-    e.execute("CREATE VIEW v1 AS SELECT a, b, c FROM vt").unwrap();
+    e.execute("CREATE VIEW v1 AS SELECT a, b, c FROM vt")
+        .unwrap();
     // PG 18.4: is_nullable is YES even for `a`, which is NOT NULL on the
     // base table — a view's rows are a query result and PG does not
     // carry the base constraint through.
@@ -73,7 +74,8 @@ fn a_views_columns_are_listed_with_their_types() {
 fn a_join_view_resolves_across_both_sides() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE jt (a int)").unwrap();
-    e.execute("CREATE TABLE jt2 (x int, y varchar(30))").unwrap();
+    e.execute("CREATE TABLE jt2 (x int, y varchar(30))")
+        .unwrap();
     e.execute("CREATE VIEW jv AS SELECT jt.a, jt2.y FROM jt JOIN jt2 ON jt.a = jt2.x")
         .unwrap();
     // PG 18.4: a|integer||32|0 and y|character varying|30||

@@ -81,7 +81,10 @@ fn trigger_fn_names_and_binary_upgrade_return_null() {
         "tsvector_update_trigger()",
     ] {
         let sql = format!("SELECT {f}");
-        let m = e.execute(&sql).expect_err("PG refuses a scalar call").to_string();
+        let m = e
+            .execute(&sql)
+            .expect_err("PG refuses a scalar call")
+            .to_string();
         assert!(
             m.contains("trigger"),
             "SELECT {f}: wanted a trigger-manager rejection, said {m:?}"

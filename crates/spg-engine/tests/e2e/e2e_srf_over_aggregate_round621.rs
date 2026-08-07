@@ -48,7 +48,8 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 fn seed() -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TABLE ag (x INT, g INT)").unwrap();
-    e.execute("INSERT INTO ag VALUES (3,1),(4,1),(5,2)").unwrap();
+    e.execute("INSERT INTO ag VALUES (3,1),(4,1),(5,2)")
+        .unwrap();
     e
 }
 
@@ -87,7 +88,10 @@ fn round621_unnest_of_an_aggregate() {
         "a group turned back into rows"
     );
     assert_eq!(
-        vals(&mut e, "SELECT g, unnest(array_agg(x)) FROM ag GROUP BY g ORDER BY 1,2"),
+        vals(
+            &mut e,
+            "SELECT g, unnest(array_agg(x)) FROM ag GROUP BY g ORDER BY 1,2"
+        ),
         vec!["1|3", "1|4", "2|5"],
         "per group, and the group key repeats across its own expansion"
     );
@@ -98,21 +102,33 @@ fn round621_unnest_of_an_aggregate() {
 fn round621_with_group_by_having_and_order_by() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT g, unnest(ARRAY[1,2]), count(*) FROM ag GROUP BY g ORDER BY 1,2"),
+        vals(
+            &mut e,
+            "SELECT g, unnest(ARRAY[1,2]), count(*) FROM ag GROUP BY g ORDER BY 1,2"
+        ),
         vec!["1|1|2", "1|2|2", "2|1|1", "2|2|1"],
         "every group expands, and the aggregate is per group"
     );
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]), count(*) FROM ag ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]), count(*) FROM ag ORDER BY 1"
+        ),
         vec!["1|3", "2|3"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]), count(*) FROM ag HAVING count(*) > 0"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]), count(*) FROM ag HAVING count(*) > 0"
+        ),
         vec!["1|3", "2|3"],
         "HAVING filters the GROUP, before the expansion"
     );
     assert_eq!(
-        vals(&mut e, "SELECT unnest(ARRAY[1,2]), count(*) FROM ag HAVING count(*) > 99"),
+        vals(
+            &mut e,
+            "SELECT unnest(ARRAY[1,2]), count(*) FROM ag HAVING count(*) > 99"
+        ),
         Vec::<String>::new(),
         "and a group it removes expands to nothing at all"
     );
@@ -122,7 +138,10 @@ fn round621_with_group_by_having_and_order_by() {
 #[test]
 fn round621_the_non_srf_aggregate_is_untouched() {
     let mut e = seed();
-    assert_eq!(vals(&mut e, "SELECT count(*), sum(x) FROM ag"), vec!["3|12"]);
+    assert_eq!(
+        vals(&mut e, "SELECT count(*), sum(x) FROM ag"),
+        vec!["3|12"]
+    );
     assert_eq!(
         vals(&mut e, "SELECT g, count(*) FROM ag GROUP BY g ORDER BY 1"),
         vec!["1|2", "2|1"]

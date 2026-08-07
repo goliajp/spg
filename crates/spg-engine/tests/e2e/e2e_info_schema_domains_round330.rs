@@ -35,7 +35,8 @@ fn cells(e: &mut Engine, sql: &str) -> Vec<Vec<Value<'static>>> {
 
 fn fixture() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE v48 (id INT NOT NULL, nm TEXT)").unwrap();
+    e.execute("CREATE TABLE v48 (id INT NOT NULL, nm TEXT)")
+        .unwrap();
     e
 }
 

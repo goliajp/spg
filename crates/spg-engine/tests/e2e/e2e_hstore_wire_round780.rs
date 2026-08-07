@@ -11,9 +11,7 @@ use spg_engine::{Engine, QueryResult};
 
 fn one(e: &mut Engine, sql: &str) -> String {
     match e.execute(sql).unwrap() {
-        QueryResult::Rows { rows, .. } => {
-            spg_engine::eval::value_to_text(&rows[0].values[0])
-        }
+        QueryResult::Rows { rows, .. } => spg_engine::eval::value_to_text(&rows[0].values[0]),
         other => panic!("{other:?}"),
     }
 }
@@ -22,7 +20,10 @@ fn one(e: &mut Engine, sql: &str) -> String {
 fn round780_hstore_resolves_by_name() {
     let mut e = Engine::new();
     e.execute("CREATE EXTENSION IF NOT EXISTS hstore").unwrap();
-    assert_eq!(one(&mut e, "SELECT 'a=>1, b=>2'::hstore"), "\"a\"=>\"1\", \"b\"=>\"2\"");
+    assert_eq!(
+        one(&mut e, "SELECT 'a=>1, b=>2'::hstore"),
+        "\"a\"=>\"1\", \"b\"=>\"2\""
+    );
     // PG keeps the FIRST occurrence of a duplicate key.
     assert_eq!(one(&mut e, "SELECT 'a=>1, a=>2'::hstore"), "\"a\"=>\"1\"");
     assert_eq!(one(&mut e, "SELECT ''::hstore"), "");
@@ -30,6 +31,9 @@ fn round780_hstore_resolves_by_name() {
     // A declared column round-trips and reports its type.
     e.execute("CREATE TABLE d1t (h hstore)").unwrap();
     e.execute("INSERT INTO d1t VALUES ('x=>1, y=>2')").unwrap();
-    assert_eq!(one(&mut e, "SELECT h FROM d1t"), "\"x\"=>\"1\", \"y\"=>\"2\"");
+    assert_eq!(
+        one(&mut e, "SELECT h FROM d1t"),
+        "\"x\"=>\"1\", \"y\"=>\"2\""
+    );
     assert_eq!(one(&mut e, "SELECT pg_typeof(h) FROM d1t"), "hstore");
 }

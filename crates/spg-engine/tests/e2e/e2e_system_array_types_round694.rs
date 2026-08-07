@@ -56,9 +56,15 @@ fn round694_the_regtype_round_trip_f22_was_filed_for() {
         ),
         "25|23|text"
     );
-    assert_eq!(one(&mut e, "SELECT 25::oid::regtype, 23::regtype"), "text|integer");
     assert_eq!(
-        one(&mut e, "SELECT 'pg_class'::regclass::oid, 'pg_class'::regclass::text"),
+        one(&mut e, "SELECT 25::oid::regtype, 23::regtype"),
+        "text|integer"
+    );
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT 'pg_class'::regclass::oid, 'pg_class'::regclass::text"
+        ),
         "1259|pg_class"
     );
 }
@@ -69,7 +75,10 @@ fn round694_the_system_array_casts_exist() {
     let mut e = Engine::new();
     // regtype[] canonicalises every element, as the scalar does: int4 →
     // integer. That is why it cannot simply keep the literal.
-    assert_eq!(one(&mut e, "SELECT '{text,int4}'::regtype[]"), "{text,integer}");
+    assert_eq!(
+        one(&mut e, "SELECT '{text,int4}'::regtype[]"),
+        "{text,integer}"
+    );
     assert_eq!(one(&mut e, "SELECT '{pg_class}'::regclass[]"), "{pg_class}");
     assert_eq!(one(&mut e, "SELECT '{1,2}'::oid[]"), "{1,2}");
     assert_eq!(one(&mut e, "SELECT '{a}'::name[]"), "{a}");

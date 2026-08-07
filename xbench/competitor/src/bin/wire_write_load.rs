@@ -63,6 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples.push(run_shape(*shape, next_base, &mut exec));
         next_base += 10_000;
     }
-    println!("{want}: {iters} iterations, median {:.3} ms", median_ms(samples));
+    println!(
+        "{want}: {iters} iterations, median {:.3} ms",
+        median_ms(samples)
+    );
     Ok(())
 }

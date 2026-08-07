@@ -72,7 +72,10 @@ fn round528_group_by_alias_of_an_expression() {
 fn round528_group_by_alias_of_a_column_or_constant() {
     let mut e = engine();
     assert_eq!(
-        rows(&mut e, "SELECT v AS w, count(*) FROM ga GROUP BY w ORDER BY w"),
+        rows(
+            &mut e,
+            "SELECT v AS w, count(*) FROM ga GROUP BY w ORDER BY w"
+        ),
         vec!["1|1", "2|1", "5|1"]
     );
     assert_eq!(
@@ -108,18 +111,14 @@ fn round528_an_input_column_outranks_the_alias() {
         .execute("SELECT v AS ts, count(*) FROM ga GROUP BY ts")
         .expect_err("grouping by the input column leaves v ungrouped");
     assert!(
-        format!("{err}")
-            .contains(r#"column "ga.v" must appear in the GROUP BY clause"#),
+        format!("{err}").contains(r#"column "ga.v" must appear in the GROUP BY clause"#),
         "message was {err}"
     );
     // And a name that is neither is still a missing column.
     let err = e
         .execute("SELECT v FROM ga GROUP BY nosuch")
         .expect_err("no such name");
-    assert!(
-        format!("{err}").contains("nosuch"),
-        "message was {err}"
-    );
+    assert!(format!("{err}").contains("nosuch"), "message was {err}");
 }
 
 /// PG's wording for the one alias that cannot be grouped by.
@@ -140,7 +139,10 @@ fn round528_aggregate_alias_is_refused_pgs_way() {
 #[test]
 fn round528_column_and_ordinal_grouping_unchanged() {
     let mut e = engine();
-    assert_eq!(rows(&mut e, "SELECT v FROM ga GROUP BY v ORDER BY v").len(), 3);
+    assert_eq!(
+        rows(&mut e, "SELECT v FROM ga GROUP BY v ORDER BY v").len(),
+        3
+    );
     assert_eq!(
         rows(&mut e, "SELECT v AS w FROM ga GROUP BY 1 ORDER BY 1").len(),
         3

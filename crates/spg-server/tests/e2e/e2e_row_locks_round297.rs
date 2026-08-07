@@ -185,7 +185,10 @@ fn skip_locked_hands_back_the_next_free_row() {
     let (_child, addr, _a) = boot_with_holder("queue");
     let mut b = open(&addr);
     assert_eq!(
-        query_all(&mut b, "SELECT id FROM lk ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED"),
+        query_all(
+            &mut b,
+            "SELECT id FROM lk ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED"
+        ),
         vec!["2"],
     );
 }
@@ -204,20 +207,33 @@ fn skip_locked_covers_every_row_source() {
     );
     // PK-ordered top-N
     assert_eq!(
-        query_all(&mut b, "SELECT id FROM lk ORDER BY id LIMIT 2 FOR UPDATE SKIP LOCKED"),
+        query_all(
+            &mut b,
+            "SELECT id FROM lk ORDER BY id LIMIT 2 FOR UPDATE SKIP LOCKED"
+        ),
         vec!["2", "3"],
     );
     assert_eq!(
-        query_all(&mut b, "SELECT id FROM lk ORDER BY id DESC LIMIT 1 FOR UPDATE SKIP LOCKED"),
+        query_all(
+            &mut b,
+            "SELECT id FROM lk ORDER BY id DESC LIMIT 1 FOR UPDATE SKIP LOCKED"
+        ),
         vec!["4"],
     );
     // index seek onto the locked row — empty, not the row
     assert!(
-        query_all(&mut b, "SELECT id FROM lk WHERE id = 1 FOR UPDATE SKIP LOCKED").is_empty(),
+        query_all(
+            &mut b,
+            "SELECT id FROM lk WHERE id = 1 FOR UPDATE SKIP LOCKED"
+        )
+        .is_empty(),
     );
     // …and onto a free one
     assert_eq!(
-        query_all(&mut b, "SELECT id FROM lk WHERE id = 3 FOR UPDATE SKIP LOCKED"),
+        query_all(
+            &mut b,
+            "SELECT id FROM lk WHERE id = 3 FOR UPDATE SKIP LOCKED"
+        ),
         vec!["3"],
     );
 }
@@ -258,7 +274,10 @@ fn a_weaker_strength_still_conflicts_with_the_exclusive_holder() {
     let (_child, addr, _a) = boot_with_holder("share");
     let mut b = open(&addr);
     assert_eq!(
-        query_all(&mut b, "SELECT id FROM lk ORDER BY id LIMIT 1 FOR SHARE SKIP LOCKED"),
+        query_all(
+            &mut b,
+            "SELECT id FROM lk ORDER BY id LIMIT 1 FOR SHARE SKIP LOCKED"
+        ),
         vec!["2"],
     );
 }
@@ -268,13 +287,19 @@ fn the_locks_release_at_commit() {
     let (_child, addr, mut a) = boot_with_holder("release");
     let mut b = open(&addr);
     assert_eq!(
-        query_all(&mut b, "SELECT id FROM lk ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED"),
+        query_all(
+            &mut b,
+            "SELECT id FROM lk ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED"
+        ),
         vec!["2"],
     );
     query_all(&mut a, "COMMIT");
     // Row 1 is free again.
     assert_eq!(
-        query_all(&mut b, "SELECT id FROM lk ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED"),
+        query_all(
+            &mut b,
+            "SELECT id FROM lk ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED"
+        ),
         vec!["1"],
     );
 }

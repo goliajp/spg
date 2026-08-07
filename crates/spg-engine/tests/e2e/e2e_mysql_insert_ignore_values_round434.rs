@@ -85,7 +85,8 @@ fn round434_numeric_prefix_is_a_rounded_float_not_a_digit_scan() {
 fn round434_over_long_string_truncates() {
     let mut e = mysql();
     e.execute("CREATE TABLE t(s VARCHAR(3))").unwrap();
-    e.execute("INSERT IGNORE INTO t VALUES ('toolong')").unwrap();
+    e.execute("INSERT IGNORE INTO t VALUES ('toolong')")
+        .unwrap();
     assert_eq!(cells(&mut e, "SELECT s FROM t"), "too");
 }
 
@@ -139,7 +140,8 @@ fn round434_shapes_spg_cannot_represent_stay_loud() {
     // MariaDB stores '0000-00-00' / the ENUM error-member here. SPG has
     // neither, so it must keep raising rather than store something else.
     let mut e = mysql();
-    e.execute("CREATE TABLE t(d DATE, en ENUM('a','b'))").unwrap();
+    e.execute("CREATE TABLE t(d DATE, en ENUM('a','b'))")
+        .unwrap();
     e.execute("INSERT IGNORE INTO t(d) VALUES ('2020-02-30')")
         .expect_err("no zero-date representation");
     e.execute("INSERT IGNORE INTO t(en) VALUES ('zzz')")

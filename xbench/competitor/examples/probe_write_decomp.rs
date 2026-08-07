@@ -15,7 +15,12 @@ fn batch_sql(base: i64, rows: i64) -> String {
         if k > 0 {
             sql.push(',');
         }
-        let _ = write!(sql, "({id}, {}, {})", id % 100, (id * 2_654_435_761) % 100_000);
+        let _ = write!(
+            sql,
+            "({id}, {}, {})",
+            id % 100,
+            (id * 2_654_435_761) % 100_000
+        );
     }
     sql
 }
@@ -47,9 +52,11 @@ fn main() {
     let sql = batch_sql(10_000_000, 1000);
     let parse_ms = median(
         (0..11)
-            .map(|_| time_ms(|| {
-                let _ = spg_sql::parser::parse_statement(&sql).unwrap();
-            }))
+            .map(|_| {
+                time_ms(|| {
+                    let _ = spg_sql::parser::parse_statement(&sql).unwrap();
+                })
+            })
             .collect(),
     );
     println!("parse_1k_values      : {parse_ms:8.3} ms");
@@ -65,7 +72,11 @@ fn main() {
                 let ms = time_ms(|| {
                     mem.execute(&sql).unwrap();
                 });
-                mem.execute(&format!("DELETE FROM wb WHERE id >= {base} AND id < {}", base + 1000)).unwrap();
+                mem.execute(&format!(
+                    "DELETE FROM wb WHERE id >= {base} AND id < {}",
+                    base + 1000
+                ))
+                .unwrap();
                 base += 10_000;
                 ms
             })
@@ -74,9 +85,12 @@ fn main() {
     println!("mem_insert_batch_1k  : {mem_batch:8.3} ms");
     let mem_update_range = median(
         (0..11)
-            .map(|_| time_ms(|| {
-                mem.execute("UPDATE wb SET g = g + 1 WHERE v BETWEEN 20000 AND 40000").unwrap();
-            }))
+            .map(|_| {
+                time_ms(|| {
+                    mem.execute("UPDATE wb SET g = g + 1 WHERE v BETWEEN 20000 AND 40000")
+                        .unwrap();
+                })
+            })
             .collect(),
     );
     println!("mem_update_range_20k : {mem_update_range:8.3} ms");
@@ -115,13 +129,20 @@ fn main() {
                 let ms = time_ms(|| {
                     dur.execute(&sql).unwrap();
                 });
-                dur.execute(&format!("DELETE FROM wb WHERE id >= {base} AND id < {}", base + 1000)).unwrap();
+                dur.execute(&format!(
+                    "DELETE FROM wb WHERE id >= {base} AND id < {}",
+                    base + 1000
+                ))
+                .unwrap();
                 base += 10_000;
                 ms
             })
             .collect(),
     );
-    println!("dur_insert_batch_1k  : {dur_batch:8.3} ms  (fsync component ≈ {:.3} ms)", dur_batch - mem_batch);
+    println!(
+        "dur_insert_batch_1k  : {dur_batch:8.3} ms  (fsync component ≈ {:.3} ms)",
+        dur_batch - mem_batch
+    );
     // single-statement no-op-ish write for the pure fsync floor
     let mut k = 20_000_000_i64;
     let dur_single = median(

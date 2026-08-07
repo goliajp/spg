@@ -98,13 +98,10 @@ impl Engine {
                 if idx.is_unique != unique_pass {
                     continue;
                 }
-                let col = t
-                    .schema()
-                    .columns
-                    .get(idx.column_position)
-                    .map_or_else(|| alloc::format!("col{}", idx.column_position), |c| {
-                        alloc::format!("`{}`", c.name)
-                    });
+                let col = t.schema().columns.get(idx.column_position).map_or_else(
+                    || alloc::format!("col{}", idx.column_position),
+                    |c| alloc::format!("`{}`", c.name),
+                );
                 // An index that merely backs a declared UNIQUE constraint
                 // was already printed by the loop above.
                 let backs_constraint = t

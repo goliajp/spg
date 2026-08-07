@@ -67,7 +67,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let inside = cell(&mut a, "SELECT nextval('q1')").await;
         run(&mut a, "ROLLBACK").await;
         let after = cell(&mut a, "SELECT nextval('q1')").await;
-        println!("| S1 | nextval 1, BEGIN, nextval, ROLLBACK, nextval | 1/2/3 | {first}/{inside}/{after} |");
+        println!(
+            "| S1 | nextval 1, BEGIN, nextval, ROLLBACK, nextval | 1/2/3 | {first}/{inside}/{after} |"
+        );
     }
 
     // S2 — two sessions must never receive the same sequence value, even
@@ -82,7 +84,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run(&mut a, "ROLLBACK").await;
         let b2 = cell(&mut b, "SELECT nextval('q2')").await;
         let dup = a1 == b1 || a1 == b2 || b1 == b2;
-        println!("| S2 | A-in-tx, B, A rolls back, B again | 1/2/3 no dup | {a1}/{b1}/{b2} dup={dup} |");
+        println!(
+            "| S2 | A-in-tx, B, A rolls back, B again | 1/2/3 no dup | {a1}/{b1}/{b2} dup={dup} |"
+        );
     }
 
     // S3 — a savepoint rollback must not take another session's commit
@@ -137,7 +141,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let a_commit = run(&mut a, "COMMIT").await;
         let mut c = fresh(&url).await?;
         let n = cell(&mut c, "SELECT count(*)::int FROM s5").await;
-        println!("| S5 | both INSERT pk 1 (A in RR) | 1 row | {n} rows, A ins={a_ins} B ins={b_ins} A commit={a_commit} |");
+        println!(
+            "| S5 | both INSERT pk 1 (A in RR) | 1 row | {n} rows, A ins={a_ins} B ins={b_ins} A commit={a_commit} |"
+        );
     }
 
     // S6 — DROP in one session while another writes the SAME table.
@@ -152,7 +158,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let a_commit = run(&mut a, "COMMIT").await;
         let mut c = fresh(&url).await?;
         let exists = cell(&mut c, "SELECT count(*)::int FROM s6").await;
-        println!("| S6 | A writes s6, B DROPs it, A commits | table gone | {exists} (B drop={b_drop}, A commit={a_commit}) |");
+        println!(
+            "| S6 | A writes s6, B DROPs it, A commits | table gone | {exists} (B drop={b_drop}, A commit={a_commit}) |"
+        );
     }
 
     // S7 — currval is per-session state, not shared.

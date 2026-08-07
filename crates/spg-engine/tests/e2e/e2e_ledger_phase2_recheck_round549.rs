@@ -55,7 +55,8 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<String> {
 fn round549_s3_temp_objects_are_temporary() {
     let mut e = Engine::new();
     e.execute("CREATE TEMPORARY SEQUENCE tseq").unwrap();
-    e.execute("CREATE TEMPORARY VIEW tv AS SELECT 1 AS x").unwrap();
+    e.execute("CREATE TEMPORARY VIEW tv AS SELECT 1 AS x")
+        .unwrap();
     assert_eq!(
         rows(
             &mut e,
@@ -110,9 +111,10 @@ fn round549_s1_integer_overflow_raises() {
             );
         }
         // And a sum that fits is untouched.
-        assert_eq!(rows(&mut e, "SELECT 9223372036854775807 + 0"), vec![
-            "9223372036854775807"
-        ]);
+        assert_eq!(
+            rows(&mut e, "SELECT 9223372036854775807 + 0"),
+            vec!["9223372036854775807"]
+        );
         // The literal types as PG types it — which is the whole fix.
         assert_eq!(
             rows(&mut e, "SELECT pg_typeof(-9223372036854775808)"),

@@ -93,7 +93,12 @@ fn round535_schema_target_is_checked_as_a_schema() {
 #[test]
 fn round535_whole_database_forms_name_nothing() {
     let mut e = engine();
-    for sql in ["REINDEX SYSTEM postgres", "CLUSTER", "CLUSTER VERBOSE", "VACUUM"] {
+    for sql in [
+        "REINDEX SYSTEM postgres",
+        "CLUSTER",
+        "CLUSTER VERBOSE",
+        "VACUUM",
+    ] {
         e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err}"));
     }
 }

@@ -220,8 +220,14 @@ fn current_user_is_the_connections_own_login() {
     let mut a = open(&addr, "alice", "shop");
     let mut b = open(&addr, "bob", "shop");
 
-    assert_eq!(scalar(&mut a, "SELECT current_user").as_deref(), Some("alice"));
-    assert_eq!(scalar(&mut b, "SELECT current_user").as_deref(), Some("bob"));
+    assert_eq!(
+        scalar(&mut a, "SELECT current_user").as_deref(),
+        Some("alice")
+    );
+    assert_eq!(
+        scalar(&mut b, "SELECT current_user").as_deref(),
+        Some("bob")
+    );
     assert_eq!(
         scalar(&mut a, "SELECT current_user").as_deref(),
         Some("alice"),

@@ -70,6 +70,28 @@ byte, and most of it was the client.
 - Use wall clock for what a client actually experiences.
 - Say which one a number is. They answer different questions.
 
+### 6. Read the machine's load before, and again after
+
+The testbed is shared. Another project's test binary took 1193% CPU for
+six minutes and pushed the load average to 33, and every benchmark taken
+in that window slowed down together — including two that the change under
+test could not reach: an unchanged probe went from 15.1 ms to 38.6 ms,
+2.6x, measuring nothing but the neighbour.
+
+That is the tell, and it is worth more than the load number itself:
+
+- Keep an unchanged benchmark in the same run as a **control**. If the
+  control moves, the run is contaminated and none of it counts, however
+  plausible the changed number looks.
+- `uptime` before and after. Load above roughly the core count means
+  re-measure later rather than reason about the reading.
+- Sweep your own leftovers first — a probe's server that outlived its
+  `kill` was still resident an hour later.
+
+Rule 4 does not cover this. Interleaving handles drift *between* two
+sides measured in one window; it cannot rescue a window where everything
+moved at once.
+
 ## Before quoting a number in a decision
 
 - [ ] Same client both sides?
@@ -77,6 +99,7 @@ byte, and most of it was the client.
 - [ ] Plan contains the operator being measured?
 - [ ] n ≥ 3, interleaved, spread reported?
 - [ ] Server-side vs wall clock stated?
+- [ ] Machine quiet, and an unchanged control held still?
 
 A number that fails any of these is not evidence. Re-measure or say it
 is unknown — an honest "not measured" costs one round; a decision made

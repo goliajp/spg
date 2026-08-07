@@ -71,17 +71,47 @@ fn round625_string_functions_require_text() {
     let mut e = Engine::new();
     for (sql, want) in [
         ("SELECT btrim(1)", "function btrim(integer) does not exist"),
-        ("SELECT ltrim(1.5)", "function ltrim(numeric) does not exist"),
-        ("SELECT rtrim(TRUE)", "function rtrim(boolean) does not exist"),
-        ("SELECT lpad(1,5)", "function lpad(integer, integer) does not exist"),
-        ("SELECT repeat(1,2)", "function repeat(integer, integer) does not exist"),
-        ("SELECT strpos(1,'a')", "function strpos(integer, text) does not exist"),
-        ("SELECT left(1,1)", "function left(integer, integer) does not exist"),
-        ("SELECT right(1,1)", "function right(integer, integer) does not exist"),
-        ("SELECT translate(1,'a','b')", "function translate(integer, text, text) does not exist"),
-        ("SELECT quote_ident(1)", "function quote_ident(integer) does not exist"),
+        (
+            "SELECT ltrim(1.5)",
+            "function ltrim(numeric) does not exist",
+        ),
+        (
+            "SELECT rtrim(TRUE)",
+            "function rtrim(boolean) does not exist",
+        ),
+        (
+            "SELECT lpad(1,5)",
+            "function lpad(integer, integer) does not exist",
+        ),
+        (
+            "SELECT repeat(1,2)",
+            "function repeat(integer, integer) does not exist",
+        ),
+        (
+            "SELECT strpos(1,'a')",
+            "function strpos(integer, text) does not exist",
+        ),
+        (
+            "SELECT left(1,1)",
+            "function left(integer, integer) does not exist",
+        ),
+        (
+            "SELECT right(1,1)",
+            "function right(integer, integer) does not exist",
+        ),
+        (
+            "SELECT translate(1,'a','b')",
+            "function translate(integer, text, text) does not exist",
+        ),
+        (
+            "SELECT quote_ident(1)",
+            "function quote_ident(integer) does not exist",
+        ),
         // PG resolves `trim` to pg_catalog.btrim and says so.
-        ("SELECT trim(1)", "function pg_catalog.btrim(integer) does not exist"),
+        (
+            "SELECT trim(1)",
+            "function pg_catalog.btrim(integer) does not exist",
+        ),
     ] {
         let m = err(&mut e, sql);
         assert!(m.ends_with(want), "{sql}: wanted {want:?}, said {m:?}");
@@ -89,8 +119,14 @@ fn round625_string_functions_require_text() {
     // Every non-text type, on one of them — this is the shape the
     // enumeration found eight times per function.
     for lit in [
-        "1", "1.5", "TRUE", "ARRAY[1]", "'{\"a\":1}'::JSONB",
-        "DATE '2020-01-01'", "INTERVAL '1 day'", "'\\x41'::BYTEA",
+        "1",
+        "1.5",
+        "TRUE",
+        "ARRAY[1]",
+        "'{\"a\":1}'::JSONB",
+        "DATE '2020-01-01'",
+        "INTERVAL '1 day'",
+        "'\\x41'::BYTEA",
     ] {
         // one-argument btrim, which PG refuses for every one of these
         // INCLUDING bytea — its bytea overload is the two-argument form.
@@ -113,22 +149,37 @@ fn round625_string_functions_still_take_text() {
         vec!["x|x|x"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT lpad('x',3,'-'), repeat('ab',2), left('abc',2), right('abc',2)"),
+        vals(
+            &mut e,
+            "SELECT lpad('x',3,'-'), repeat('ab',2), left('abc',2), right('abc',2)"
+        ),
         vec!["--x|abab|ab|bc"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT replace('aXa','X','b'), strpos('abc','b'), split_part('a,b',',',2)"),
+        vals(
+            &mut e,
+            "SELECT replace('aXa','X','b'), strpos('abc','b'), split_part('a,b',',',2)"
+        ),
         vec!["aba|2|b"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT translate('abc','ab','xy'), quote_ident('a b'), trim('  z  ')"),
+        vals(
+            &mut e,
+            "SELECT translate('abc','ab','xy'), quote_ident('a b'), trim('  z  ')"
+        ),
         vec!["xyc|\"a b\"|z"]
     );
     // A CHAR(n) argument is normalised to text before the guard, so the
     // padded type still passes — as it does in PG.
-    assert_eq!(vals(&mut e, "SELECT btrim('x'::CHAR(3)), btrim('y'::VARCHAR)"), vec!["x|y"]);
+    assert_eq!(
+        vals(&mut e, "SELECT btrim('x'::CHAR(3)), btrim('y'::VARCHAR)"),
+        vec!["x|y"]
+    );
     // NULL carries no type; PG resolves it through unknown and answers NULL.
-    assert_eq!(vals(&mut e, "SELECT btrim(NULL) IS NULL, repeat(NULL,2) IS NULL"), vec!["true|true"]);
+    assert_eq!(
+        vals(&mut e, "SELECT btrim(NULL) IS NULL, repeat(NULL,2) IS NULL"),
+        vec!["true|true"]
+    );
     // PG's bytea overloads are the TWO-argument forms, and they answer.
     assert_eq!(
         vals(
@@ -139,9 +190,14 @@ fn round625_string_functions_still_take_text() {
         "refusing these is what the first cut of the guard did"
     );
     // Columns of the right type are the ordinary case.
-    e.execute("CREATE TABLE s (t TEXT, c CHAR(4), v VARCHAR(8))").unwrap();
-    e.execute("INSERT INTO s VALUES ('  a  ', 'b', ' c ')").unwrap();
-    assert_eq!(vals(&mut e, "SELECT btrim(t), btrim(c), btrim(v) FROM s"), vec!["a|b|c"]);
+    e.execute("CREATE TABLE s (t TEXT, c CHAR(4), v VARCHAR(8))")
+        .unwrap();
+    e.execute("INSERT INTO s VALUES ('  a  ', 'b', ' c ')")
+        .unwrap();
+    assert_eq!(
+        vals(&mut e, "SELECT btrim(t), btrim(c), btrim(v) FROM s"),
+        vec!["a|b|c"]
+    );
 }
 
 /// The IS TRUE family requires a boolean, with PG's sentence.
@@ -149,13 +205,34 @@ fn round625_string_functions_still_take_text() {
 fn round625_is_true_family_requires_boolean() {
     let mut e = Engine::new();
     for (sql, want) in [
-        ("SELECT 1 IS TRUE", "argument of IS TRUE must be type boolean, not type integer"),
-        ("SELECT 1 IS FALSE", "argument of IS FALSE must be type boolean, not type integer"),
-        ("SELECT 1 IS NOT TRUE", "argument of IS NOT TRUE must be type boolean, not type integer"),
-        ("SELECT 1 IS NOT FALSE", "argument of IS NOT FALSE must be type boolean, not type integer"),
-        ("SELECT 1 IS UNKNOWN", "argument of IS UNKNOWN must be type boolean, not type integer"),
-        ("SELECT 1 IS NOT UNKNOWN", "argument of IS NOT UNKNOWN must be type boolean, not type integer"),
-        ("SELECT 'x'::TEXT IS TRUE", "argument of IS TRUE must be type boolean, not type text"),
+        (
+            "SELECT 1 IS TRUE",
+            "argument of IS TRUE must be type boolean, not type integer",
+        ),
+        (
+            "SELECT 1 IS FALSE",
+            "argument of IS FALSE must be type boolean, not type integer",
+        ),
+        (
+            "SELECT 1 IS NOT TRUE",
+            "argument of IS NOT TRUE must be type boolean, not type integer",
+        ),
+        (
+            "SELECT 1 IS NOT FALSE",
+            "argument of IS NOT FALSE must be type boolean, not type integer",
+        ),
+        (
+            "SELECT 1 IS UNKNOWN",
+            "argument of IS UNKNOWN must be type boolean, not type integer",
+        ),
+        (
+            "SELECT 1 IS NOT UNKNOWN",
+            "argument of IS NOT UNKNOWN must be type boolean, not type integer",
+        ),
+        (
+            "SELECT 'x'::TEXT IS TRUE",
+            "argument of IS TRUE must be type boolean, not type text",
+        ),
     ] {
         let m = err(&mut e, sql);
         assert!(m.ends_with(want), "{sql}: wanted {want:?}, said {m:?}");
@@ -163,11 +240,17 @@ fn round625_is_true_family_requires_boolean() {
     // What the family is actually for still works, including the two NULL
     // cases PG answers rather than rejects.
     assert_eq!(
-        vals(&mut e, "SELECT TRUE IS TRUE, FALSE IS TRUE, TRUE IS NOT TRUE"),
+        vals(
+            &mut e,
+            "SELECT TRUE IS TRUE, FALSE IS TRUE, TRUE IS NOT TRUE"
+        ),
         vec!["true|false|false"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT NULL IS TRUE, NULL IS UNKNOWN, NULL IS NOT UNKNOWN"),
+        vals(
+            &mut e,
+            "SELECT NULL IS TRUE, NULL IS UNKNOWN, NULL IS NOT UNKNOWN"
+        ),
         vec!["false|true|false"]
     );
     assert_eq!(

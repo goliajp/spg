@@ -44,14 +44,29 @@ fn text(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn round518_visibility_probes_look_the_object_up() {
     let mut e = engine();
-    assert_eq!(text(&mut e, "SELECT pg_table_is_visible('t'::regclass)"), "true");
-    assert_eq!(text(&mut e, "SELECT pg_table_is_visible(999999::oid)"), "NULL");
-    assert_eq!(text(&mut e, "SELECT pg_type_is_visible(999999::oid)"), "NULL");
-    assert_eq!(text(&mut e, "SELECT pg_function_is_visible(999999::oid)"), "NULL");
+    assert_eq!(
+        text(&mut e, "SELECT pg_table_is_visible('t'::regclass)"),
+        "true"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT pg_table_is_visible(999999::oid)"),
+        "NULL"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT pg_type_is_visible(999999::oid)"),
+        "NULL"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT pg_function_is_visible(999999::oid)"),
+        "NULL"
+    );
     // A regclass VALUE exists only because the cast resolved it, so it is
     // visible whatever this engine's oid tables know about the number —
     // getting that wrong is what a first cut did.
-    assert_eq!(text(&mut e, "SELECT pg_table_is_visible('t'::regclass)"), "true");
+    assert_eq!(
+        text(&mut e, "SELECT pg_table_is_visible('t'::regclass)"),
+        "true"
+    );
 }
 
 /// The encoding table, both directions. They differ in how they fail, which
@@ -83,8 +98,14 @@ fn round518_encoding_conversions_read_a_table() {
 #[test]
 fn round518_relation_filenode_needs_a_relation() {
     let mut e = engine();
-    assert_eq!(text(&mut e, "SELECT pg_relation_filenode(999999::oid)"), "NULL");
-    assert_ne!(text(&mut e, "SELECT pg_relation_filenode('t'::regclass)"), "NULL");
+    assert_eq!(
+        text(&mut e, "SELECT pg_relation_filenode(999999::oid)"),
+        "NULL"
+    );
+    assert_ne!(
+        text(&mut e, "SELECT pg_relation_filenode('t'::regclass)"),
+        "NULL"
+    );
 }
 
 /// The snapshot a caller is about to be compared against, in PG's own

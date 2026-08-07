@@ -34,7 +34,8 @@ fn col(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn setup() -> Engine {
     let mut e = mysql();
-    e.execute("CREATE TABLE en(e ENUM('low','mid','high'))").unwrap();
+    e.execute("CREATE TABLE en(e ENUM('low','mid','high'))")
+        .unwrap();
     e.execute("INSERT INTO en VALUES ('high'),('low'),('mid')")
         .unwrap();
     e

@@ -224,7 +224,10 @@ fn set_transaction_isolation_level_takes_effect() {
     let mut s = open(&addr);
 
     assert_eq!(tag(&mut s, "BEGIN"), "BEGIN");
-    assert_eq!(tag(&mut s, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"), "SET");
+    assert_eq!(
+        tag(&mut s, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+        "SET"
+    );
     assert_eq!(
         scalar(&mut s, "SHOW transaction_isolation").as_deref(),
         Some("serializable"),
@@ -240,7 +243,10 @@ fn vacuum_and_analyze_reach_the_engine() {
     let (_guard, addr) = spawn();
     let mut s = open(&addr);
 
-    assert_eq!(tag(&mut s, "CREATE TABLE t (id INT NOT NULL)"), "CREATE TABLE");
+    assert_eq!(
+        tag(&mut s, "CREATE TABLE t (id INT NOT NULL)"),
+        "CREATE TABLE"
+    );
     for i in 0..50 {
         let _ = tag(&mut s, &format!("INSERT INTO t VALUES ({i})"));
     }
@@ -249,10 +255,13 @@ fn vacuum_and_analyze_reach_the_engine() {
     // Dead versions exist; VACUUM reclaims them. `pg_stat_user_tables`
     // is the observable — a canned no-op cannot move it.
     let dead = |s: &mut TcpStream| -> i64 {
-        scalar(s, "SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname = 't'")
-            .expect("n_dead_tup")
-            .parse()
-            .unwrap()
+        scalar(
+            s,
+            "SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname = 't'",
+        )
+        .expect("n_dead_tup")
+        .parse()
+        .unwrap()
     };
     let dead_before = dead(&mut s);
     assert!(dead_before > 0, "the DELETE left dead versions");
@@ -280,7 +289,10 @@ fn discard_all_wipes_the_session() {
 
     assert_eq!(tag(&mut s, "SET application_name = 'x'"), "SET");
     assert_eq!(tag(&mut s, "PREPARE p AS SELECT 1"), "PREPARE");
-    assert_eq!(scalar(&mut s, "SHOW application_name").as_deref(), Some("x"));
+    assert_eq!(
+        scalar(&mut s, "SHOW application_name").as_deref(),
+        Some("x")
+    );
 
     assert_eq!(tag(&mut s, "DISCARD ALL"), "DISCARD ALL");
 

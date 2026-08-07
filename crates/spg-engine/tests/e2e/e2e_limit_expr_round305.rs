@@ -101,8 +101,14 @@ fn evaluated_row_count_coerces_like_a_constant_one() {
         3
     );
     // NULL is PG's "no limit" — not zero rows.
-    assert_eq!(rows(&mut e, "SELECT id FROM t23 LIMIT (SELECT NULL)").len(), 10);
-    assert_eq!(rows(&mut e, "SELECT id FROM t23 OFFSET (SELECT NULL)").len(), 10);
+    assert_eq!(
+        rows(&mut e, "SELECT id FROM t23 LIMIT (SELECT NULL)").len(),
+        10
+    );
+    assert_eq!(
+        rows(&mut e, "SELECT id FROM t23 OFFSET (SELECT NULL)").len(),
+        10
+    );
     // A subquery that returns no row is NULL, so also "no limit".
     assert_eq!(
         rows(&mut e, "SELECT id FROM t23 LIMIT (SELECT 1 WHERE false)").len(),
@@ -122,8 +128,7 @@ fn rejected_row_counts_keep_pgs_wording() {
         err(&mut e, "SELECT id FROM t23 ORDER BY id LIMIT id")
     );
     assert!(
-        err(&mut e, "SELECT id FROM t23 LIMIT (SELECT -1)")
-            .contains("LIMIT must not be negative")
+        err(&mut e, "SELECT id FROM t23 LIMIT (SELECT -1)").contains("LIMIT must not be negative")
     );
     assert!(
         err(&mut e, "SELECT id FROM t23 OFFSET (SELECT -1)")
@@ -206,7 +211,11 @@ fn nested_positions_all_apply_their_row_count() {
 fn fetch_first_takes_a_parenthesised_expression() {
     let mut e = seeded();
     assert_eq!(
-        rows(&mut e, "SELECT id FROM t23 ORDER BY id FETCH FIRST (1+1) ROWS ONLY").len(),
+        rows(
+            &mut e,
+            "SELECT id FROM t23 ORDER BY id FETCH FIRST (1+1) ROWS ONLY"
+        )
+        .len(),
         2
     );
     assert_eq!(
@@ -227,9 +236,13 @@ fn fetch_first_takes_a_parenthesised_expression() {
 #[test]
 fn ordinary_constant_row_counts_still_apply() {
     let mut e = seeded();
-    assert_eq!(rows(&mut e, "SELECT id FROM t23 ORDER BY id LIMIT 2"), ["1", "2"]);
-    assert_eq!(rows(&mut e, "SELECT id FROM t23 ORDER BY id OFFSET 8"), ["9", "10"]);
+    assert_eq!(
+        rows(&mut e, "SELECT id FROM t23 ORDER BY id LIMIT 2"),
+        ["1", "2"]
+    );
+    assert_eq!(
+        rows(&mut e, "SELECT id FROM t23 ORDER BY id OFFSET 8"),
+        ["9", "10"]
+    );
     assert!(rows(&mut e, "SELECT id FROM t23 LIMIT 0").is_empty());
 }
-
-

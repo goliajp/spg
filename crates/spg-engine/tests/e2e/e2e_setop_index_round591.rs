@@ -64,8 +64,10 @@ fn one(e: &mut Engine, sql: &str) -> String {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE sa (a INT, b TEXT, c NUMERIC(10,2))").unwrap();
-    e.execute("CREATE TABLE sb (a INT, b TEXT, c NUMERIC(10,2))").unwrap();
+    e.execute("CREATE TABLE sa (a INT, b TEXT, c NUMERIC(10,2))")
+        .unwrap();
+    e.execute("CREATE TABLE sb (a INT, b TEXT, c NUMERIC(10,2))")
+        .unwrap();
     e.execute(
         "INSERT INTO sa VALUES (1,'x',1.00),(1,'x',1.00),(2,'y',2.50),(3,NULL,NULL),\
          (3,NULL,NULL),(4,'z',0.00),(NULL,NULL,NULL)",
@@ -123,7 +125,10 @@ fn round591_set_operators_over_duplicates_and_nulls() {
         "and the same the other way round"
     );
     assert_eq!(
-        vals(&mut e, "SELECT * FROM (SELECT b FROM sa INTERSECT SELECT b FROM sb) q ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT * FROM (SELECT b FROM sa INTERSECT SELECT b FROM sb) q ORDER BY 1"
+        ),
         vec!["x", "y", "NULL"],
         "and a NULL on both sides is a value that meets its twin"
     );
@@ -163,11 +168,17 @@ fn round591_equal_values_share_a_bucket() {
     // a UNION keeps both — the hash may collide them, the comparator splits
     // them.
     assert_eq!(
-        vals(&mut e, "SELECT * FROM (SELECT 'a ' UNION SELECT 'a') q ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT * FROM (SELECT 'a ' UNION SELECT 'a') q ORDER BY 1"
+        ),
         vec!["a", "a "]
     );
     assert_eq!(
-        one(&mut e, "SELECT count(*) FROM (SELECT 'a '::TEXT INTERSECT SELECT 'a'::TEXT) q"),
+        one(
+            &mut e,
+            "SELECT count(*) FROM (SELECT 'a '::TEXT INTERSECT SELECT 'a'::TEXT) q"
+        ),
         "0"
     );
 }

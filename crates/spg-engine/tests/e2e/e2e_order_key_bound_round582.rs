@@ -57,11 +57,10 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn engine() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE s582 (id INT, g INT, t TEXT)").unwrap();
-    e.execute(
-        "INSERT INTO s582 SELECT gg, 1000 - gg, 'r' || gg FROM generate_series(1, 3000) gg",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE s582 (id INT, g INT, t TEXT)")
+        .unwrap();
+    e.execute("INSERT INTO s582 SELECT gg, 1000 - gg, 'r' || gg FROM generate_series(1, 3000) gg")
+        .unwrap();
     e
 }
 
@@ -119,7 +118,10 @@ fn round582_expressions_keep_the_old_path() {
         vec!["3000", "2999", "2998"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM s582 ORDER BY length(t) DESC, id LIMIT 3"),
+        vals(
+            &mut e,
+            "SELECT id FROM s582 ORDER BY length(t) DESC, id LIMIT 3"
+        ),
         vec!["1000", "1001", "1002"],
         "four-character labels first, then by id"
     );
@@ -143,16 +145,17 @@ fn round582_expressions_keep_the_old_path() {
 #[test]
 fn round582_types_sort_the_same_read_directly() {
     let mut e = Engine::new();
-    e.execute(
-        "CREATE TABLE t582 (i INT, b BIGINT, f FLOAT, n NUMERIC, s TEXT, d DATE, o BOOL)",
-    )
-    .unwrap();
+    e.execute("CREATE TABLE t582 (i INT, b BIGINT, f FLOAT, n NUMERIC, s TEXT, d DATE, o BOOL)")
+        .unwrap();
     e.execute(
         "INSERT INTO t582 SELECT gg, gg::BIGINT * 1000000000, gg / 7.0, gg * 1.5, 'r' || gg, \
          DATE '2026-01-01' + gg, gg % 2 = 0 FROM generate_series(1, 2000) gg",
     )
     .unwrap();
-    assert_eq!(vals(&mut e, "SELECT i FROM t582 ORDER BY i DESC LIMIT 2"), vec!["2000", "1999"]);
+    assert_eq!(
+        vals(&mut e, "SELECT i FROM t582 ORDER BY i DESC LIMIT 2"),
+        vec!["2000", "1999"]
+    );
     assert_eq!(
         vals(&mut e, "SELECT i FROM t582 ORDER BY b DESC LIMIT 2"),
         vec!["2000", "1999"]

@@ -49,11 +49,17 @@ fn extract_is_numeric_and_date_part_is_float8() {
         "674.6666666666666667"
     );
     assert_eq!(
-        one(&mut e, "SELECT pg_typeof(extract(year from timestamp '2024-03-15'))"),
+        one(
+            &mut e,
+            "SELECT pg_typeof(extract(year from timestamp '2024-03-15'))"
+        ),
         "numeric"
     );
     assert_eq!(
-        one(&mut e, "SELECT pg_typeof(date_part('year', timestamp '2024-03-15'))"),
+        one(
+            &mut e,
+            "SELECT pg_typeof(date_part('year', timestamp '2024-03-15'))"
+        ),
         "double precision"
     );
     assert_eq!(
@@ -62,11 +68,17 @@ fn extract_is_numeric_and_date_part_is_float8() {
     );
     // Fraction-bearing fields keep their scales.
     assert_eq!(
-        one(&mut e, "SELECT extract(epoch FROM timestamp '2024-03-15 14:30:45.123456')"),
+        one(
+            &mut e,
+            "SELECT extract(epoch FROM timestamp '2024-03-15 14:30:45.123456')"
+        ),
         "1710513045.123456"
     );
     assert_eq!(
-        one(&mut e, "SELECT extract(second FROM interval '1 minute 30.0005 seconds')"),
+        one(
+            &mut e,
+            "SELECT extract(second FROM interval '1 minute 30.0005 seconds')"
+        ),
         "30.000500"
     );
 }
@@ -76,11 +88,17 @@ fn julian_carries_the_day_fraction() {
     let mut e = Engine::new();
     // PG renders the numeric division's scale-20 form for timestamps…
     assert_eq!(
-        one(&mut e, "SELECT extract(julian FROM timestamp '2024-03-15 12:00:00')"),
+        one(
+            &mut e,
+            "SELECT extract(julian FROM timestamp '2024-03-15 12:00:00')"
+        ),
         "2460385.50000000000000000000"
     );
     // …and the bare integer for dates.
-    assert_eq!(one(&mut e, "SELECT extract(julian FROM date '2024-03-15')"), "2460385");
+    assert_eq!(
+        one(&mut e, "SELECT extract(julian FROM date '2024-03-15')"),
+        "2460385"
+    );
 }
 
 #[test]
@@ -88,28 +106,55 @@ fn field_type_validity_matches_pg() {
     let mut e = Engine::new();
     // DATE has no time-of-day (was silently 0).
     let got = err(&mut e, "SELECT extract(hour FROM date '2024-03-15')");
-    assert!(got.contains("unit \"hour\" not supported for type date"), "{got}");
+    assert!(
+        got.contains("unit \"hour\" not supported for type date"),
+        "{got}"
+    );
     // Plain timestamp has no timezone (was silently 0).
-    let got = err(&mut e, "SELECT extract(timezone FROM timestamp '2024-03-15 14:30:45')");
+    let got = err(
+        &mut e,
+        "SELECT extract(timezone FROM timestamp '2024-03-15 14:30:45')",
+    );
     assert!(
         got.contains("unit \"timezone\" not supported for type timestamp without time zone"),
         "{got}"
     );
     // Interval: week IS supported (days/7, toward zero); dow is not.
-    assert_eq!(one(&mut e, "SELECT extract(week FROM interval '30 days')"), "4");
-    assert_eq!(one(&mut e, "SELECT extract(week FROM interval '13 days')"), "1");
-    assert_eq!(one(&mut e, "SELECT extract(week FROM interval '-8 days')"), "-1");
+    assert_eq!(
+        one(&mut e, "SELECT extract(week FROM interval '30 days')"),
+        "4"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT extract(week FROM interval '13 days')"),
+        "1"
+    );
+    assert_eq!(
+        one(&mut e, "SELECT extract(week FROM interval '-8 days')"),
+        "-1"
+    );
     let got = err(&mut e, "SELECT extract(dow FROM interval '3 days')");
-    assert!(got.contains("unit \"dow\" not supported for type interval"), "{got}");
+    assert!(
+        got.contains("unit \"dow\" not supported for type interval"),
+        "{got}"
+    );
     // Unknown field: runtime, with the source type (was a parse error).
-    let got = err(&mut e, "SELECT extract(nosuch FROM timestamp '2024-03-15 00:00:00')");
+    let got = err(
+        &mut e,
+        "SELECT extract(nosuch FROM timestamp '2024-03-15 00:00:00')",
+    );
     assert!(
         got.contains("unit \"nosuch\" not recognized for type timestamp without time zone"),
         "{got}"
     );
     let got = err(&mut e, "SELECT extract(nosuch FROM interval '3 days')");
-    assert!(got.contains("unit \"nosuch\" not recognized for type interval"), "{got}");
-    let got = err(&mut e, "SELECT date_part('nosuch', timestamp '2024-03-15 00:00:00')");
+    assert!(
+        got.contains("unit \"nosuch\" not recognized for type interval"),
+        "{got}"
+    );
+    let got = err(
+        &mut e,
+        "SELECT date_part('nosuch', timestamp '2024-03-15 00:00:00')",
+    );
     assert!(
         got.contains("unit \"nosuch\" not recognized for type timestamp without time zone"),
         "{got}"
@@ -129,42 +174,75 @@ fn timetz_extracts_and_compact_offsets_parse() {
         "45045.500000"
     );
     assert_eq!(
-        one(&mut e, "SELECT extract(microsecond FROM timetz '14:30:45.5+02')"),
+        one(
+            &mut e,
+            "SELECT extract(microsecond FROM timetz '14:30:45.5+02')"
+        ),
         "45500000"
     );
     // Signed offset parts; the compact '-0930' spelling parses.
     assert_eq!(
-        one(&mut e, "SELECT extract(timezone_hour FROM timetz '14:30:45-0930')"),
+        one(
+            &mut e,
+            "SELECT extract(timezone_hour FROM timetz '14:30:45-0930')"
+        ),
         "-9"
     );
     assert_eq!(
-        one(&mut e, "SELECT extract(timezone_minute FROM timetz '14:30:45-0930')"),
+        one(
+            &mut e,
+            "SELECT extract(timezone_minute FROM timetz '14:30:45-0930')"
+        ),
         "-30"
     );
     assert_eq!(
-        one(&mut e, "SELECT extract(timezone FROM timetz '14:30:45+0230')"),
+        one(
+            &mut e,
+            "SELECT extract(timezone FROM timetz '14:30:45+0230')"
+        ),
         "9000"
     );
     // The three-digit compact form is 0:MM (probed: '+023' = 00:23).
-    assert_eq!(one(&mut e, "SELECT timetz '14:30:45+023'"), "14:30:45+00:23");
+    assert_eq!(
+        one(&mut e, "SELECT timetz '14:30:45+023'"),
+        "14:30:45+00:23"
+    );
 }
 
 #[test]
 fn the_component_core_is_pinned() {
     let mut e = Engine::new();
     for (sql, want) in [
-        ("SELECT extract(dow FROM timestamp '2024-03-15 14:30:45')", "5"),
-        ("SELECT extract(isodow FROM timestamp '2024-03-17 14:30:45')", "7"),
-        ("SELECT extract(week FROM timestamp '2024-01-01 00:00:00')", "1"),
+        (
+            "SELECT extract(dow FROM timestamp '2024-03-15 14:30:45')",
+            "5",
+        ),
+        (
+            "SELECT extract(isodow FROM timestamp '2024-03-17 14:30:45')",
+            "7",
+        ),
+        (
+            "SELECT extract(week FROM timestamp '2024-01-01 00:00:00')",
+            "1",
+        ),
         ("SELECT extract(week FROM date '2005-01-01')", "53"),
-        ("SELECT extract(isoyear FROM timestamp '2024-01-01 00:00:00')", "2024"),
+        (
+            "SELECT extract(isoyear FROM timestamp '2024-01-01 00:00:00')",
+            "2024",
+        ),
         ("SELECT extract(century FROM date '2000-12-31')", "20"),
         ("SELECT extract(century FROM date '0001-01-01')", "1"),
         ("SELECT extract(millennium FROM date '2000-12-31')", "2"),
         ("SELECT extract(decade FROM date '1999-12-31')", "199"),
         ("SELECT extract(quarter FROM interval '14 months')", "1"),
-        ("SELECT extract(month FROM interval '3 years 14 months')", "2"),
-        ("SELECT extract(epoch FROM timestamptz '2024-03-15 14:30:45+00')", "1710513045.000000"),
+        (
+            "SELECT extract(month FROM interval '3 years 14 months')",
+            "2",
+        ),
+        (
+            "SELECT extract(epoch FROM timestamptz '2024-03-15 14:30:45+00')",
+            "1710513045.000000",
+        ),
         (
             "SELECT date_bin('15 minutes', timestamp '2024-03-15 14:37:45', timestamp '2001-01-01 00:00:00')",
             "2024-03-15 14:30:00",

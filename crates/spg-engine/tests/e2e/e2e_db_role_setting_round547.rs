@@ -50,8 +50,10 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<String> {
 #[test]
 fn round547_the_four_scopes() {
     let mut e = Engine::new();
-    e.execute("ALTER ROLE postgres SET work_mem = '8MB'").unwrap();
-    e.execute("ALTER DATABASE spg SET work_mem = '7MB'").unwrap();
+    e.execute("ALTER ROLE postgres SET work_mem = '8MB'")
+        .unwrap();
+    e.execute("ALTER DATABASE spg SET work_mem = '7MB'")
+        .unwrap();
     e.execute("ALTER ROLE postgres IN DATABASE spg SET work_mem = '6MB'")
         .unwrap();
     e.execute("ALTER ROLE ALL SET work_mem = '9MB'").unwrap();
@@ -73,7 +75,8 @@ fn round547_the_four_scopes() {
 #[test]
 fn round547_reset_semantics() {
     let mut e = Engine::new();
-    e.execute("ALTER ROLE postgres SET work_mem = '8MB'").unwrap();
+    e.execute("ALTER ROLE postgres SET work_mem = '8MB'")
+        .unwrap();
     e.execute("ALTER ROLE postgres SET statement_timeout = '5s'")
         .unwrap();
     e.execute("ALTER ROLE postgres RESET work_mem").unwrap();
@@ -82,7 +85,8 @@ fn round547_reset_semantics() {
         vec!["{statement_timeout=5s}"]
     );
     // The other scopes survive a RESET ALL of this one.
-    e.execute("ALTER DATABASE spg SET work_mem = '7MB'").unwrap();
+    e.execute("ALTER DATABASE spg SET work_mem = '7MB'")
+        .unwrap();
     e.execute("ALTER ROLE ALL SET work_mem = '9MB'").unwrap();
     e.execute("ALTER ROLE postgres RESET ALL").unwrap();
     assert_eq!(
@@ -135,7 +139,8 @@ fn round547_both_spellings() {
 #[test]
 fn round547_settings_survive_a_reload() {
     let mut e = Engine::new();
-    e.execute("ALTER ROLE postgres SET work_mem = '8MB'").unwrap();
+    e.execute("ALTER ROLE postgres SET work_mem = '8MB'")
+        .unwrap();
     e.execute("ALTER ROLE ALL SET statement_timeout = '5s'")
         .unwrap();
     let snapshot = e.catalog().serialize();

@@ -42,14 +42,16 @@ fn rows(e: &mut Engine, sql: &str) -> String {
 fn seeded() -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TYPE pt AS (a INT, b TEXT)").unwrap();
-    e.execute("CREATE TABLE t (id INT, g INT, s TEXT, p pt)").unwrap();
+    e.execute("CREATE TABLE t (id INT, g INT, s TEXT, p pt)")
+        .unwrap();
     e.execute(
         "INSERT INTO t VALUES (1, 10, 'x', ROW(1,'one')), (2, NULL, NULL, NULL), \
          (3, 30, 'z', ROW(3,'three'))",
     )
     .unwrap();
     e.execute("CREATE TABLE u (id INT, g INT)").unwrap();
-    e.execute("INSERT INTO u VALUES (1, 100), (2, 200)").unwrap();
+    e.execute("INSERT INTO u VALUES (1, 100), (2, 200)")
+        .unwrap();
     e
 }
 
@@ -58,7 +60,10 @@ fn round487_every_spelling_binds_the_same_column() {
     let mut e = seeded();
     // PG18: 10, NULL, 30 for all three spellings.
     assert_eq!(rows(&mut e, "SELECT g FROM t ORDER BY id"), "10;NULL;30");
-    assert_eq!(rows(&mut e, "SELECT x.g FROM t x ORDER BY x.id"), "10;NULL;30");
+    assert_eq!(
+        rows(&mut e, "SELECT x.g FROM t x ORDER BY x.id"),
+        "10;NULL;30"
+    );
     assert_eq!(rows(&mut e, "SELECT g FROM t x ORDER BY id"), "10;NULL;30");
 }
 
@@ -95,7 +100,10 @@ fn round487_composite_column_still_rehydrates() {
         rows(&mut e, "SELECT p::text AS pt FROM t ORDER BY id"),
         "(1,one);NULL;(3,three)"
     );
-    assert_eq!(rows(&mut e, "SELECT (p).b AS f FROM t ORDER BY id"), "one;NULL;three");
+    assert_eq!(
+        rows(&mut e, "SELECT (p).b AS f FROM t ORDER BY id"),
+        "one;NULL;three"
+    );
 }
 
 #[test]

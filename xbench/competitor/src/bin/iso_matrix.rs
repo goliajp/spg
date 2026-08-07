@@ -41,8 +41,10 @@ async fn fresh(url: &str) -> Result<AnyConnection, sqlx::Error> {
 async fn reset(c: &mut AnyConnection) -> Result<(), sqlx::Error> {
     c.execute("DROP TABLE IF EXISTS m1").await?;
     c.execute("DROP TABLE IF EXISTS m2").await?;
-    c.execute("CREATE TABLE m1 (id INT PRIMARY KEY, v INT)").await?;
-    c.execute("CREATE TABLE m2 (id INT PRIMARY KEY, v INT)").await?;
+    c.execute("CREATE TABLE m1 (id INT PRIMARY KEY, v INT)")
+        .await?;
+    c.execute("CREATE TABLE m2 (id INT PRIMARY KEY, v INT)")
+        .await?;
     c.execute("INSERT INTO m1 VALUES (1, 10), (2, 20)").await?;
     c.execute("INSERT INTO m2 VALUES (1, 10)").await?;
     Ok(())

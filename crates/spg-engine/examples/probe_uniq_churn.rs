@@ -41,7 +41,8 @@ fn main() {
     e.execute("CREATE TABLE wb(id INT PRIMARY KEY, g INT, v INT)")
         .unwrap();
     for chunk in 0..(TOTAL / 1000) {
-        e.execute(&batch(chunk * 1000 + 1, chunk * 1000 + 1001)).unwrap();
+        e.execute(&batch(chunk * 1000 + 1, chunk * 1000 + 1001))
+            .unwrap();
     }
     println!("| cycle | reinsert ms | probes | locators | per probe |");
     println!("|------:|------------:|-------:|---------:|----------:|");

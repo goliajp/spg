@@ -55,20 +55,53 @@ fn mixed_range_and_multirange_operands_resolve() {
     let mut e = Engine::new();
     for (sql, want) in [
         // && in every operand combination (the mixed ones errored).
-        ("SELECT int4multirange(int4range(1,5), int4range(7,9)) && int4range(4,8)", "t"),
-        ("SELECT int4range(4,8) && int4multirange(int4range(1,5))", "t"),
-        ("SELECT int4multirange(int4range(1,5)) && int4multirange(int4range(4,9))", "t"),
+        (
+            "SELECT int4multirange(int4range(1,5), int4range(7,9)) && int4range(4,8)",
+            "t",
+        ),
+        (
+            "SELECT int4range(4,8) && int4multirange(int4range(1,5))",
+            "t",
+        ),
+        (
+            "SELECT int4multirange(int4range(1,5)) && int4multirange(int4range(4,9))",
+            "t",
+        ),
         // Containment across the mix (these answered a silent false).
-        ("SELECT int4range(1,9) @> int4multirange(int4range(2,3))", "t"),
-        ("SELECT int4multirange(int4range(2,3)) <@ int4range(1,9)", "t"),
-        ("SELECT int4multirange(int4range(1,5)) @> int4range(2,3)", "t"),
-        ("SELECT int4multirange(int4range(1,5)) @> int4multirange(int4range(2,3))", "t"),
+        (
+            "SELECT int4range(1,9) @> int4multirange(int4range(2,3))",
+            "t",
+        ),
+        (
+            "SELECT int4multirange(int4range(2,3)) <@ int4range(1,9)",
+            "t",
+        ),
+        (
+            "SELECT int4multirange(int4range(1,5)) @> int4range(2,3)",
+            "t",
+        ),
+        (
+            "SELECT int4multirange(int4range(1,5)) @> int4multirange(int4range(2,3))",
+            "t",
+        ),
         // Adjacency across the mix.
-        ("SELECT int4multirange(int4range(1,3)) -|- int4range(3,5)", "t"),
-        ("SELECT int4range(1,3) -|- int4multirange(int4range(3,5))", "t"),
+        (
+            "SELECT int4multirange(int4range(1,3)) -|- int4range(3,5)",
+            "t",
+        ),
+        (
+            "SELECT int4range(1,3) -|- int4multirange(int4range(3,5))",
+            "t",
+        ),
         // Positional across the mix.
-        ("SELECT int4multirange(int4range(1,3), int4range(9,11)) << int4range(20,25)", "t"),
-        ("SELECT int4range(1,3) << int4multirange(int4range(9,11), int4range(20,25))", "t"),
+        (
+            "SELECT int4multirange(int4range(1,3), int4range(9,11)) << int4range(20,25)",
+            "t",
+        ),
+        (
+            "SELECT int4range(1,3) << int4multirange(int4range(9,11), int4range(20,25))",
+            "t",
+        ),
     ] {
         assert_eq!(one(&mut e, sql), want, "{sql}");
     }
@@ -80,16 +113,43 @@ fn positional_operators_read_a_multirange_as_its_hull() {
     for (sql, want) in [
         // THE discriminating case: an any-element rule would say `t`
         // (the first element is adjacent), the hull rule says `f`.
-        ("SELECT int4multirange(int4range(1,3), int4range(9,11)) -|- int4multirange(int4range(3,5))", "f"),
-        ("SELECT int4multirange(int4range(1,3), int4range(5,7)) -|- int4multirange(int4range(7,9))", "t"),
-        ("SELECT int4multirange(int4range(1,3), int4range(5,7)) << int4multirange(int4range(9,11))", "t"),
-        ("SELECT int4multirange(int4range(1,3), int4range(9,11)) << int4multirange(int4range(5,7))", "f"),
-        ("SELECT int4multirange(int4range(6,9)) >> int4multirange(int4range(1,3))", "t"),
-        ("SELECT int4multirange(int4range(1,3), int4range(9,11)) &< int4multirange(int4range(5,20))", "t"),
-        ("SELECT int4multirange(int4range(1,3), int4range(9,11)) &> int4multirange(int4range(0,5))", "t"),
+        (
+            "SELECT int4multirange(int4range(1,3), int4range(9,11)) -|- int4multirange(int4range(3,5))",
+            "f",
+        ),
+        (
+            "SELECT int4multirange(int4range(1,3), int4range(5,7)) -|- int4multirange(int4range(7,9))",
+            "t",
+        ),
+        (
+            "SELECT int4multirange(int4range(1,3), int4range(5,7)) << int4multirange(int4range(9,11))",
+            "t",
+        ),
+        (
+            "SELECT int4multirange(int4range(1,3), int4range(9,11)) << int4multirange(int4range(5,7))",
+            "f",
+        ),
+        (
+            "SELECT int4multirange(int4range(6,9)) >> int4multirange(int4range(1,3))",
+            "t",
+        ),
+        (
+            "SELECT int4multirange(int4range(1,3), int4range(9,11)) &< int4multirange(int4range(5,20))",
+            "t",
+        ),
+        (
+            "SELECT int4multirange(int4range(1,3), int4range(9,11)) &> int4multirange(int4range(0,5))",
+            "t",
+        ),
         // An empty multirange has no hull: false, never an error.
-        ("SELECT int4multirange() << int4multirange(int4range(1,5))", "f"),
-        ("SELECT int4multirange() -|- int4multirange(int4range(1,5))", "f"),
+        (
+            "SELECT int4multirange() << int4multirange(int4range(1,5))",
+            "f",
+        ),
+        (
+            "SELECT int4multirange() -|- int4multirange(int4range(1,5))",
+            "f",
+        ),
     ] {
         assert_eq!(one(&mut e, sql), want, "{sql}");
     }
@@ -99,13 +159,25 @@ fn positional_operators_read_a_multirange_as_its_hull() {
 fn multirange_types_are_named_and_constructible() {
     let mut e = Engine::new();
     for (sql, want) in [
-        ("SELECT pg_typeof(int4multirange(int4range(1,5)))", "int4multirange"),
-        ("SELECT pg_typeof(nummultirange(numrange(1,5)))", "nummultirange"),
-        ("SELECT pg_typeof(datemultirange(daterange('2024-01-01','2024-02-01')))", "datemultirange"),
+        (
+            "SELECT pg_typeof(int4multirange(int4range(1,5)))",
+            "int4multirange",
+        ),
+        (
+            "SELECT pg_typeof(nummultirange(numrange(1,5)))",
+            "nummultirange",
+        ),
+        (
+            "SELECT pg_typeof(datemultirange(daterange('2024-01-01','2024-02-01')))",
+            "datemultirange",
+        ),
         // The polymorphic constructor takes its kind from the argument.
         ("SELECT multirange(int4range(1,5))", "{[1,5)}"),
         ("SELECT multirange(numrange(1,5))", "{[1,5)}"),
-        ("SELECT pg_typeof(multirange(numrange(1,5)))", "nummultirange"),
+        (
+            "SELECT pg_typeof(multirange(numrange(1,5)))",
+            "nummultirange",
+        ),
         // …and the cast is the same promotion.
         ("SELECT int4range(1,5)::int4multirange", "{[1,5)}"),
         ("SELECT 'empty'::int4range::int4multirange", "{}"),
@@ -128,9 +200,18 @@ fn range_literal_errors_separate_structure_from_element() {
     // Structure is fine, the BOUND is not of the element type — PG
     // reports the element's own input error, per element type.
     for (sql, want) in [
-        ("SELECT '[a,b)'::int4range", "invalid input syntax for type integer: \"a\""),
-        ("SELECT '[1,x)'::int8range", "invalid input syntax for type bigint: \"x\""),
-        ("SELECT '[q,2)'::numrange", "invalid input syntax for type numeric: \"q\""),
+        (
+            "SELECT '[a,b)'::int4range",
+            "invalid input syntax for type integer: \"a\"",
+        ),
+        (
+            "SELECT '[1,x)'::int8range",
+            "invalid input syntax for type bigint: \"x\"",
+        ),
+        (
+            "SELECT '[q,2)'::numrange",
+            "invalid input syntax for type numeric: \"q\"",
+        ),
         (
             "SELECT '[zzz,2024-01-01)'::daterange",
             "invalid input syntax for type date: \"zzz\"",
@@ -191,11 +272,26 @@ fn the_range_core_is_unchanged() {
         ("SELECT int4range(1,5) + int4range(4,10)", "[1,10)"),
         ("SELECT int4range(1,5) * int4range(4,10)", "[4,5)"),
         ("SELECT int4range(1,10) - int4range(5,20)", "[1,5)"),
-        ("SELECT range_merge(int4range(1,3), int4range(6,9))", "[1,9)"),
-        ("SELECT int4multirange(int4range(1,5)) + int4multirange(int4range(7,9))", "{[1,5),[7,9)}"),
-        ("SELECT int4multirange(int4range(1,9)) - int4multirange(int4range(3,5))", "{[1,3),[5,9)}"),
-        ("SELECT int4multirange(int4range(1,9)) * int4multirange(int4range(3,5))", "{[3,5)}"),
-        ("SELECT range_merge(int4multirange(int4range(1,3), int4range(6,9)))", "[1,9)"),
+        (
+            "SELECT range_merge(int4range(1,3), int4range(6,9))",
+            "[1,9)",
+        ),
+        (
+            "SELECT int4multirange(int4range(1,5)) + int4multirange(int4range(7,9))",
+            "{[1,5),[7,9)}",
+        ),
+        (
+            "SELECT int4multirange(int4range(1,9)) - int4multirange(int4range(3,5))",
+            "{[1,3),[5,9)}",
+        ),
+        (
+            "SELECT int4multirange(int4range(1,9)) * int4multirange(int4range(3,5))",
+            "{[3,5)}",
+        ),
+        (
+            "SELECT range_merge(int4multirange(int4range(1,3), int4range(6,9)))",
+            "[1,9)",
+        ),
     ] {
         if want == "ERR" {
             let got = err(&mut e, sql);

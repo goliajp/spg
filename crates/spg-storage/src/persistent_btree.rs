@@ -632,7 +632,10 @@ fn rotate_from_left<K: Ord + Clone, V: Clone>(
             children: lc,
         } => (
             le.pop().expect("sibling has entries to spare"),
-            Some(lc.pop().expect("internal node has entries.len()+1 children")),
+            Some(
+                lc.pop()
+                    .expect("internal node has entries.len()+1 children"),
+            ),
         ),
     };
     let separator = core::mem::replace(&mut entries[i - 1], moved_entry);
@@ -646,7 +649,10 @@ fn rotate_from_left<K: Ord + Clone, V: Clone>(
             children: cc,
         } => {
             ce.insert(0, separator);
-            cc.insert(0, moved_child.expect("sibling of an internal node is internal"));
+            cc.insert(
+                0,
+                moved_child.expect("sibling of an internal node is internal"),
+            );
         }
     }
 }
@@ -1111,7 +1117,9 @@ mod tests {
     /// Deterministic sequence — no rand dependency, and a failure is
     /// reproducible from the seed alone.
     fn lcg(state: &mut u64) -> u64 {
-        *state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
         *state >> 33
     }
 
@@ -1142,7 +1150,11 @@ mod tests {
                 check_map(&pb);
                 // Everything not yet removed must still be reachable.
                 for j in (i + 1)..n {
-                    assert_eq!(pb.get(&j), Some(&(j * 3)), "n={n} lost {j} after removing {i}");
+                    assert_eq!(
+                        pb.get(&j),
+                        Some(&(j * 3)),
+                        "n={n} lost {j} after removing {i}"
+                    );
                 }
             }
             assert!(pb.is_empty());
@@ -1172,10 +1184,18 @@ mod tests {
         for step in 0..4000 {
             let k = (lcg(&mut seed) % 300) as i64;
             if lcg(&mut seed) % 3 == 0 {
-                assert_eq!(pb.remove_mut(&k), model.remove(&k), "step {step} remove {k}");
+                assert_eq!(
+                    pb.remove_mut(&k),
+                    model.remove(&k),
+                    "step {step} remove {k}"
+                );
             } else {
                 let v = (lcg(&mut seed) % 1000) as i64;
-                assert_eq!(pb.insert_mut(k, v), model.insert(k, v), "step {step} insert {k}");
+                assert_eq!(
+                    pb.insert_mut(k, v),
+                    model.insert(k, v),
+                    "step {step} insert {k}"
+                );
             }
             assert_eq!(pb.len(), model.len(), "step {step}");
             if step % 97 == 0 {
@@ -1463,10 +1483,7 @@ mod tests {
             for _ in 0..2000 {
                 let probe = (rng.next() as i64).rem_euclid(KEY_RANGE + 40) - 20;
                 let got = pb.predecessor(&probe).map(|(k, v)| (*k, *v));
-                let want = oracle
-                    .range(..probe)
-                    .next_back()
-                    .map(|(k, v)| (*k, *v));
+                let want = oracle.range(..probe).next_back().map(|(k, v)| (*k, *v));
                 assert_eq!(got, want, "predecessor drift n={n_inserts} probe={probe}");
             }
         }

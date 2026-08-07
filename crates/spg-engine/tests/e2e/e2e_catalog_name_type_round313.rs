@@ -24,11 +24,10 @@ use spg_engine::{Engine, QueryResult};
 
 fn typeof_of(e: &mut Engine, sql: &str) -> String {
     match e.execute(sql).unwrap_or_else(|x| panic!("{sql}: {x:?}")) {
-        QueryResult::Rows { rows, .. } => rows
-            .first()
-            .map_or_else(|| panic!("{sql}: no rows"), |r| {
-                spg_engine::eval::value_to_text(&r.values[0])
-            }),
+        QueryResult::Rows { rows, .. } => rows.first().map_or_else(
+            || panic!("{sql}: no rows"),
+            |r| spg_engine::eval::value_to_text(&r.values[0]),
+        ),
         other => panic!("{sql}: {other:?}"),
     }
 }
@@ -46,8 +45,14 @@ fn fixture() -> Engine {
 fn identifier_columns_report_name() {
     let mut e = fixture();
     for (sql, what) in [
-        ("SELECT pg_typeof(relname) FROM pg_class LIMIT 1", "pg_class.relname"),
-        ("SELECT pg_typeof(typname) FROM pg_type LIMIT 1", "pg_type.typname"),
+        (
+            "SELECT pg_typeof(relname) FROM pg_class LIMIT 1",
+            "pg_class.relname",
+        ),
+        (
+            "SELECT pg_typeof(typname) FROM pg_type LIMIT 1",
+            "pg_type.typname",
+        ),
         (
             "SELECT pg_typeof(attname) FROM pg_attribute LIMIT 1",
             "pg_attribute.attname",
@@ -56,13 +61,22 @@ fn identifier_columns_report_name() {
             "SELECT pg_typeof(nspname) FROM pg_namespace LIMIT 1",
             "pg_namespace.nspname",
         ),
-        ("SELECT pg_typeof(proname) FROM pg_proc LIMIT 1", "pg_proc.proname"),
+        (
+            "SELECT pg_typeof(proname) FROM pg_proc LIMIT 1",
+            "pg_proc.proname",
+        ),
         (
             "SELECT pg_typeof(conname) FROM pg_constraint LIMIT 1",
             "pg_constraint.conname",
         ),
-        ("SELECT pg_typeof(rolname) FROM pg_roles LIMIT 1", "pg_roles.rolname"),
-        ("SELECT pg_typeof(amname) FROM pg_am LIMIT 1", "pg_am.amname"),
+        (
+            "SELECT pg_typeof(rolname) FROM pg_roles LIMIT 1",
+            "pg_roles.rolname",
+        ),
+        (
+            "SELECT pg_typeof(amname) FROM pg_am LIMIT 1",
+            "pg_am.amname",
+        ),
     ] {
         assert_eq!(typeof_of(&mut e, sql), "name", "{what}");
     }
@@ -116,7 +130,10 @@ fn non_identifier_columns_are_left_alone() {
     // A `*namespace` is an oid in PG, and stays an integer here — the
     // point is that it did not become `name`.
     assert_ne!(
-        typeof_of(&mut e, "SELECT pg_typeof(relnamespace) FROM pg_class LIMIT 1"),
+        typeof_of(
+            &mut e,
+            "SELECT pg_typeof(relnamespace) FROM pg_class LIMIT 1"
+        ),
         "name"
     );
     assert_ne!(
@@ -142,9 +159,7 @@ fn a_name_column_still_behaves_like_the_string_it_holds() {
     }
     // LIKE, ORDER BY and a join across two retyped columns all still work.
     match e
-        .execute(
-            "SELECT count(*) FROM pg_tables WHERE tablename LIKE 't3%'",
-        )
+        .execute("SELECT count(*) FROM pg_tables WHERE tablename LIKE 't3%'")
         .unwrap()
     {
         QueryResult::Rows { rows, .. } => {
@@ -173,10 +188,7 @@ fn information_schema_reports_its_own_domain_family() {
     // …and NOT `name`, which is the pg_catalog family this round 313 test
     // is otherwise about.
     assert_eq!(
-        typeof_of(
-            &mut e,
-            "SELECT pg_typeof(relname) FROM pg_class LIMIT 1"
-        ),
+        typeof_of(&mut e, "SELECT pg_typeof(relname) FROM pg_class LIMIT 1"),
         "name"
     );
 }

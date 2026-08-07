@@ -68,19 +68,31 @@ fn every_clause_honours_the_override() {
     e.execute("INSERT INTO ci VALUES ('a'),('A'),('b'),('B')")
         .unwrap();
     assert_eq!(
-        count(&mut e, "SELECT COUNT(*) FROM ci WHERE t = 'a' COLLATE utf8mb4_bin"),
+        count(
+            &mut e,
+            "SELECT COUNT(*) FROM ci WHERE t = 'a' COLLATE utf8mb4_bin"
+        ),
         1
     );
     assert_eq!(
-        count(&mut e, "SELECT COUNT(*) FROM ci WHERE t IN ('A' COLLATE utf8mb4_bin)"),
+        count(
+            &mut e,
+            "SELECT COUNT(*) FROM ci WHERE t IN ('A' COLLATE utf8mb4_bin)"
+        ),
         1
     );
     assert_eq!(
-        count(&mut e, "SELECT COUNT(*) FROM ci WHERE t LIKE 'a' COLLATE utf8mb4_bin"),
+        count(
+            &mut e,
+            "SELECT COUNT(*) FROM ci WHERE t LIKE 'a' COLLATE utf8mb4_bin"
+        ),
         1
     );
     assert_eq!(
-        count(&mut e, "SELECT COUNT(DISTINCT t COLLATE utf8mb4_bin) FROM ci"),
+        count(
+            &mut e,
+            "SELECT COUNT(DISTINCT t COLLATE utf8mb4_bin) FROM ci"
+        ),
         4
     );
     // Without the override the dialect default still folds.

@@ -83,7 +83,10 @@ fn branches_within_a_type_family_still_unify() {
     // Numeric family widens; string family collapses to text; date/time
     // family widens. (Probed: int ∪ bigint → bigint, text ∪ varchar →
     // text, date ∪ timestamp → timestamp.)
-    assert_eq!(col(&mut e, "SELECT 1 UNION SELECT 2::bigint ORDER BY 1"), ["1", "2"]);
+    assert_eq!(
+        col(&mut e, "SELECT 1 UNION SELECT 2::bigint ORDER BY 1"),
+        ["1", "2"]
+    );
     assert_eq!(
         col(&mut e, "SELECT 1 UNION SELECT 2.5 ORDER BY 1"),
         ["1", "2.5"]
@@ -104,15 +107,24 @@ fn branches_within_a_type_family_still_unify() {
         2
     );
     // The everyday shape must keep working.
-    assert_eq!(col(&mut e, "SELECT a FROM t UNION SELECT a FROM t ORDER BY 1"), ["1", "2", "3"]);
+    assert_eq!(
+        col(&mut e, "SELECT a FROM t UNION SELECT a FROM t ORDER BY 1"),
+        ["1", "2", "3"]
+    );
 }
 
 #[test]
 fn an_untyped_literal_takes_the_other_branchs_type() {
     let mut e = seeded();
     // Converts: the literal becomes an integer, in both directions.
-    assert_eq!(col(&mut e, "SELECT 1 UNION SELECT '2' ORDER BY 1"), ["1", "2"]);
-    assert_eq!(col(&mut e, "SELECT '2' UNION SELECT 1 ORDER BY 1"), ["1", "2"]);
+    assert_eq!(
+        col(&mut e, "SELECT 1 UNION SELECT '2' ORDER BY 1"),
+        ["1", "2"]
+    );
+    assert_eq!(
+        col(&mut e, "SELECT '2' UNION SELECT 1 ORDER BY 1"),
+        ["1", "2"]
+    );
     // Doesn't convert: PG reports the value, not a type mismatch — the
     // distinction the AST-level unknown check exists for.
     for sql in [
@@ -139,7 +151,10 @@ fn an_untyped_literal_takes_the_other_branchs_type() {
     got.sort();
     assert_eq!(got, ["", "1"]);
     // Two untyped branches stay text.
-    assert_eq!(col(&mut e, "SELECT 'a' UNION SELECT 'b' ORDER BY 1"), ["a", "b"]);
+    assert_eq!(
+        col(&mut e, "SELECT 'a' UNION SELECT 'b' ORDER BY 1"),
+        ["a", "b"]
+    );
     // A chain resolves left to right.
     let got = err(&mut e, "SELECT 1 UNION SELECT NULL UNION SELECT 'x'");
     assert!(

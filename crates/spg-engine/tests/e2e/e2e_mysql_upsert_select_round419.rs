@@ -43,7 +43,8 @@ fn int_of(e: &mut Engine, sql: &str) -> i64 {
 #[test]
 fn on_duplicate_key_over_select_takes_excluded() {
     let mut e = mysql();
-    e.execute("CREATE TABLE t1(a INT PRIMARY KEY, b INT)").unwrap();
+    e.execute("CREATE TABLE t1(a INT PRIMARY KEY, b INT)")
+        .unwrap();
     e.execute("INSERT INTO t1 VALUES(1,10)").unwrap();
     e.execute("INSERT INTO t1 SELECT 1, 99 ON DUPLICATE KEY UPDATE b = VALUES(b)")
         .unwrap();
@@ -55,7 +56,8 @@ fn on_duplicate_key_over_select_takes_excluded() {
 #[test]
 fn on_duplicate_key_over_select_reads_existing() {
     let mut e = mysql();
-    e.execute("CREATE TABLE t2(a INT PRIMARY KEY, b INT)").unwrap();
+    e.execute("CREATE TABLE t2(a INT PRIMARY KEY, b INT)")
+        .unwrap();
     e.execute("INSERT INTO t2 VALUES(5,50)").unwrap();
     e.execute("INSERT INTO t2 SELECT 5, 1 ON DUPLICATE KEY UPDATE b = b + 100")
         .unwrap();
@@ -66,7 +68,8 @@ fn on_duplicate_key_over_select_reads_existing() {
 #[test]
 fn replace_into_select_replaces() {
     let mut e = mysql();
-    e.execute("CREATE TABLE r1(a INT PRIMARY KEY, b INT)").unwrap();
+    e.execute("CREATE TABLE r1(a INT PRIMARY KEY, b INT)")
+        .unwrap();
     e.execute("INSERT INTO r1 VALUES(1,1)").unwrap();
     e.execute("REPLACE INTO r1 SELECT 1, 2").unwrap();
     assert_eq!(int_of(&mut e, "SELECT b FROM r1"), 2);
@@ -77,7 +80,8 @@ fn replace_into_select_replaces() {
 #[test]
 fn insert_ignore_select_skips() {
     let mut e = mysql();
-    e.execute("CREATE TABLE s1(a INT PRIMARY KEY, b INT)").unwrap();
+    e.execute("CREATE TABLE s1(a INT PRIMARY KEY, b INT)")
+        .unwrap();
     e.execute("INSERT INTO s1 VALUES(1,1)").unwrap();
     e.execute("INSERT IGNORE INTO s1 SELECT 1, 99").unwrap();
     assert_eq!(int_of(&mut e, "SELECT b FROM s1"), 1);
@@ -87,7 +91,8 @@ fn insert_ignore_select_skips() {
 #[test]
 fn on_duplicate_key_over_with_source() {
     let mut e = mysql();
-    e.execute("CREATE TABLE w1(a INT PRIMARY KEY, b INT)").unwrap();
+    e.execute("CREATE TABLE w1(a INT PRIMARY KEY, b INT)")
+        .unwrap();
     e.execute("INSERT INTO w1 VALUES(1,1)").unwrap();
     e.execute(
         "INSERT INTO w1 WITH c AS (SELECT 1 x, 7 y) SELECT x, y FROM c \
@@ -101,7 +106,8 @@ fn on_duplicate_key_over_with_source() {
 #[test]
 fn values_forms_unchanged() {
     let mut e = mysql();
-    e.execute("CREATE TABLE v1(a INT PRIMARY KEY, b INT)").unwrap();
+    e.execute("CREATE TABLE v1(a INT PRIMARY KEY, b INT)")
+        .unwrap();
     e.execute("INSERT INTO v1 VALUES(1,1)").unwrap();
     e.execute("INSERT INTO v1 VALUES(1,42) ON DUPLICATE KEY UPDATE b = VALUES(b)")
         .unwrap();
@@ -117,7 +123,8 @@ fn values_forms_unchanged() {
 #[test]
 fn postgres_on_conflict_over_select_unchanged() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE p1(a INT PRIMARY KEY, b INT)").unwrap();
+    e.execute("CREATE TABLE p1(a INT PRIMARY KEY, b INT)")
+        .unwrap();
     e.execute("INSERT INTO p1 VALUES(1,1)").unwrap();
     e.execute("INSERT INTO p1 SELECT 1, 5 ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b")
         .unwrap();

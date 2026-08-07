@@ -130,7 +130,10 @@ fn explain_shows_aggregate_and_grouping() {
         blob.contains("HashAggregate"),
         "missing HashAggregate: {blob}"
     );
-    assert!(blob.contains("Group Key: region"), "missing Group Key: {blob}");
+    assert!(
+        blob.contains("Group Key: region"),
+        "missing Group Key: {blob}"
+    );
     assert!(blob.contains("Filter:"), "missing HAVING filter: {blob}");
 }
 

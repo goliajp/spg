@@ -57,16 +57,31 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 #[test]
 fn round631_sign_elements_with_slots() {
     let mut e = Engine::new();
-    assert_eq!(vals(&mut e, "SELECT to_char(1,'9MI'), to_char(-1,'9MI')"), vec!["1 |1-"]);
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(1,'9MI'), to_char(-1,'9MI')"),
+        vec!["1 |1-"]
+    );
     assert_eq!(
         vals(&mut e, "SELECT to_char(1,'9PL'), to_char(-1,'9PL')"),
         vec![" 1+|-1 "],
         "PL is a plus column: the minus goes to the leading position and PL blanks"
     );
-    assert_eq!(vals(&mut e, "SELECT to_char(1,'9SG'), to_char(-1,'9SG')"), vec!["1+|1-"]);
-    assert_eq!(vals(&mut e, "SELECT to_char(1,'9S'), to_char(-1,'9S')"), vec!["1+|1-"]);
-    assert_eq!(vals(&mut e, "SELECT to_char(1,'S9'), to_char(-1,'S9')"), vec!["+1|-1"]);
-    assert_eq!(vals(&mut e, "SELECT to_char(1,'9PR'), to_char(-1,'9PR')"), vec![" 1 |<1>"]);
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(1,'9SG'), to_char(-1,'9SG')"),
+        vec!["1+|1-"]
+    );
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(1,'9S'), to_char(-1,'9S')"),
+        vec!["1+|1-"]
+    );
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(1,'S9'), to_char(-1,'S9')"),
+        vec!["+1|-1"]
+    );
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(1,'9PR'), to_char(-1,'9PR')"),
+        vec![" 1 |<1>"]
+    );
 }
 
 /// …and with none, where they used to vanish.
@@ -78,14 +93,23 @@ fn round631_sign_elements_without_slots() {
         vec![" |-"],
         "the sign was lost entirely — the overflow branch returned before it"
     );
-    assert_eq!(vals(&mut e, "SELECT to_char(1,'PL'), to_char(-1,'PL')"), vec!["+| "]);
-    assert_eq!(vals(&mut e, "SELECT to_char(1,'SG'), to_char(-1,'SG')"), vec!["+|-"]);
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(1,'PL'), to_char(-1,'PL')"),
+        vec!["+| "]
+    );
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(1,'SG'), to_char(-1,'SG')"),
+        vec!["+|-"]
+    );
     assert_eq!(
         vals(&mut e, "SELECT to_char(1,'S'), to_char(-1,'S')"),
         vec!["|"],
         "a lone trailing S prints nothing, unlike a lone SG"
     );
-    assert_eq!(vals(&mut e, "SELECT to_char(1,'PR'), to_char(-1,'PR')"), vec!["|"]);
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(1,'PR'), to_char(-1,'PR')"),
+        vec!["|"]
+    );
 }
 
 /// The half that made the one-sided fix wrong: no slots means no digits.
@@ -93,17 +117,35 @@ fn round631_sign_elements_without_slots() {
 fn round631_no_numeric_field_prints_no_digits() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT to_char(1,'B'), to_char(1,'C'), to_char(1234,'B')"),
+        vals(
+            &mut e,
+            "SELECT to_char(1,'B'), to_char(1,'C'), to_char(1234,'B')"
+        ),
         vec!["||"],
         "round 630's attempt printed the digits here"
     );
-    assert_eq!(vals(&mut e, "SELECT to_char(1,'L'), to_char(1,'G')"), vec![" | "]);
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(1,'L'), to_char(1,'G')"),
+        vec![" | "]
+    );
     // A decimal separator IS a numeric field, so these still render.
-    assert_eq!(vals(&mut e, "SELECT to_char(1,'D'), to_char(12,'DAY')"), vec![" .| .AY"]);
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(1,'D'), to_char(12,'DAY')"),
+        vec![" .| .AY"]
+    );
     // And nothing about the ordinary pictures moved.
     assert_eq!(
-        vals(&mut e, "SELECT to_char(1234.5,'9999.9'), to_char(-1234.5,'9999.9'), to_char(1234,'9,999')"),
+        vals(
+            &mut e,
+            "SELECT to_char(1234.5,'9999.9'), to_char(-1234.5,'9999.9'), to_char(1234,'9,999')"
+        ),
         vec![" 1234.5|-1234.5| 1,234"]
     );
-    assert_eq!(vals(&mut e, "SELECT to_char(1234.5,'FM9999.9'), to_char(0,'B9999.99')"), vec!["1234.5|     .00"]);
+    assert_eq!(
+        vals(
+            &mut e,
+            "SELECT to_char(1234.5,'FM9999.9'), to_char(0,'B9999.99')"
+        ),
+        vec!["1234.5|     .00"]
+    );
 }

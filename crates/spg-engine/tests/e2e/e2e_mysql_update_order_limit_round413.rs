@@ -33,9 +33,12 @@ fn ints(e: &mut Engine, sql: &str) -> Vec<i64> {
 }
 
 fn seed(e: &mut Engine, table: &str) {
-    e.execute(&alloc::format!("CREATE TABLE {table}(n INT)")).unwrap();
-    e.execute(&alloc::format!("INSERT INTO {table} VALUES(1),(2),(3),(4),(5)"))
+    e.execute(&alloc::format!("CREATE TABLE {table}(n INT)"))
         .unwrap();
+    e.execute(&alloc::format!(
+        "INSERT INTO {table} VALUES(1),(2),(3),(4),(5)"
+    ))
+    .unwrap();
 }
 
 /// ORDER BY ASC + LIMIT picks the smallest matched rows.
@@ -43,9 +46,13 @@ fn seed(e: &mut Engine, table: &str) {
 fn asc_limit_picks_smallest() {
     let mut e = mysql();
     seed(&mut e, "ut");
-    e.execute("UPDATE ut SET n = n + 100 ORDER BY n LIMIT 2").unwrap();
+    e.execute("UPDATE ut SET n = n + 100 ORDER BY n LIMIT 2")
+        .unwrap();
     // rows 1, 2 became 101, 102; 3, 4, 5 unchanged.
-    assert_eq!(ints(&mut e, "SELECT n FROM ut ORDER BY n"), vec![3, 4, 5, 101, 102]);
+    assert_eq!(
+        ints(&mut e, "SELECT n FROM ut ORDER BY n"),
+        vec![3, 4, 5, 101, 102]
+    );
 }
 
 /// ORDER BY DESC + LIMIT picks the largest matched rows.
@@ -53,9 +60,13 @@ fn asc_limit_picks_smallest() {
 fn desc_limit_picks_largest() {
     let mut e = mysql();
     seed(&mut e, "ut");
-    e.execute("UPDATE ut SET n = n + 100 ORDER BY n DESC LIMIT 2").unwrap();
+    e.execute("UPDATE ut SET n = n + 100 ORDER BY n DESC LIMIT 2")
+        .unwrap();
     // rows 4, 5 became 104, 105; 1, 2, 3 unchanged.
-    assert_eq!(ints(&mut e, "SELECT n FROM ut ORDER BY n"), vec![1, 2, 3, 104, 105]);
+    assert_eq!(
+        ints(&mut e, "SELECT n FROM ut ORDER BY n"),
+        vec![1, 2, 3, 104, 105]
+    );
 }
 
 /// LIMIT without ORDER BY updates that many arbitrary rows (matched-count
@@ -65,8 +76,14 @@ fn limit_alone_bounds_count() {
     let mut e = mysql();
     seed(&mut e, "ut");
     e.execute("UPDATE ut SET n = n + 100 LIMIT 2").unwrap();
-    assert_eq!(ints(&mut e, "SELECT COUNT(*) FROM ut WHERE n > 100"), vec![2]);
-    assert_eq!(ints(&mut e, "SELECT COUNT(*) FROM ut WHERE n <= 5"), vec![3]);
+    assert_eq!(
+        ints(&mut e, "SELECT COUNT(*) FROM ut WHERE n > 100"),
+        vec![2]
+    );
+    assert_eq!(
+        ints(&mut e, "SELECT COUNT(*) FROM ut WHERE n <= 5"),
+        vec![3]
+    );
 }
 
 /// WHERE filters BEFORE ORDER BY / LIMIT (top-N of the filtered set).
@@ -77,7 +94,10 @@ fn where_then_order_limit() {
     e.execute("UPDATE ut SET n = n + 100 WHERE n > 2 ORDER BY n LIMIT 2")
         .unwrap();
     // WHERE keeps {3,4,5}; ORDER BY n LIMIT 2 picks 3, 4 -> 103, 104.
-    assert_eq!(ints(&mut e, "SELECT n FROM ut ORDER BY n"), vec![1, 2, 5, 103, 104]);
+    assert_eq!(
+        ints(&mut e, "SELECT n FROM ut ORDER BY n"),
+        vec![1, 2, 5, 103, 104]
+    );
 }
 
 /// A PostgreSQL session has no UPDATE ORDER BY clause and rejects the
@@ -88,7 +108,8 @@ fn postgres_rejects() {
     e.execute("CREATE TABLE ut(n INT)").unwrap();
     e.execute("INSERT INTO ut VALUES(1),(2),(3)").unwrap();
     assert!(
-        e.execute("UPDATE ut SET n = n + 100 ORDER BY n LIMIT 1").is_err(),
+        e.execute("UPDATE ut SET n = n + 100 ORDER BY n LIMIT 1")
+            .is_err(),
         "PG has no UPDATE ORDER BY"
     );
 }

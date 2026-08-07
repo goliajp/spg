@@ -61,7 +61,8 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 fn seed() -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TABLE cf (id INT, s TEXT)").unwrap();
-    e.execute("INSERT INTO cf VALUES (1,'a'),(2,'b'),(3,NULL)").unwrap();
+    e.execute("INSERT INTO cf VALUES (1,'a'),(2,'b'),(3,NULL)")
+        .unwrap();
     e
 }
 
@@ -81,12 +82,22 @@ fn round605_constant_projection_items() {
         ]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, 2+3*4, 10/4, 'a' = 'b', NOT true FROM cf ORDER BY id"),
-        vec!["1|14|2|false|false", "2|14|2|false|false", "3|14|2|false|false"],
+        vals(
+            &mut e,
+            "SELECT id, 2+3*4, 10/4, 'a' = 'b', NOT true FROM cf ORDER BY id"
+        ),
+        vec![
+            "1|14|2|false|false",
+            "2|14|2|false|false",
+            "3|14|2|false|false"
+        ],
         "integer division truncates, and a constant comparison is a constant"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, 'abc' || 'def', ('x')::TEXT FROM cf ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, 'abc' || 'def', ('x')::TEXT FROM cf ORDER BY id"
+        ),
         vec!["1|abcdef|x", "2|abcdef|x", "3|abcdef|x"]
     );
     assert_eq!(
@@ -94,15 +105,14 @@ fn round605_constant_projection_items() {
             &mut e,
             "SELECT id, NULL::INT, (NULL::INT) + 1, NULL || 'x' FROM cf ORDER BY id"
         ),
-        vec![
-            "1|NULL|NULL|NULL",
-            "2|NULL|NULL|NULL",
-            "3|NULL|NULL|NULL",
-        ],
+        vec!["1|NULL|NULL|NULL", "2|NULL|NULL|NULL", "3|NULL|NULL|NULL",],
         "a constant NULL stays NULL through arithmetic and concatenation"
     );
     assert_eq!(
-        vals(&mut e, "SELECT id, ARRAY[1,2,3], ('{1,2}')::INT[] FROM cf ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id, ARRAY[1,2,3], ('{1,2}')::INT[] FROM cf ORDER BY id"
+        ),
         vec!["1|{1,2,3}|{1,2}", "2|{1,2,3}|{1,2}", "3|{1,2,3}|{1,2}"]
     );
 }
@@ -119,7 +129,10 @@ fn round605_constants_beside_columns() {
         vec!["1|7|1-x", "2|8|2-x", "3|9|3-x"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT id FROM cf WHERE id < ('3')::INT ORDER BY id"),
+        vals(
+            &mut e,
+            "SELECT id FROM cf WHERE id < ('3')::INT ORDER BY id"
+        ),
         vec!["1", "2"]
     );
     assert_eq!(
@@ -154,7 +167,8 @@ fn round605_failing_constants_keep_their_error() {
         "division by zero still raises"
     );
     assert!(
-        e.execute("SELECT id, ('abc')::INT FROM cf ORDER BY id").is_err(),
+        e.execute("SELECT id, ('abc')::INT FROM cf ORDER BY id")
+            .is_err(),
         "an impossible cast still raises"
     );
     assert_eq!(
@@ -174,7 +188,10 @@ fn round605_failing_constants_keep_their_error() {
 fn round605_volatile_and_session_dependent_are_not_folded() {
     let mut e = seed();
     assert_eq!(
-        vals(&mut e, "SELECT count(DISTINCT x) FROM (SELECT random() x FROM cf) q"),
+        vals(
+            &mut e,
+            "SELECT count(DISTINCT x) FROM (SELECT random() x FROM cf) q"
+        ),
         vec!["3"],
         "three rows, three different values — a folded random() would give one"
     );
@@ -201,12 +218,18 @@ fn round605_volatile_and_session_dependent_are_not_folded() {
     );
     e.execute("SET intervalstyle = 'postgres'").unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT ('1 day 2 hours')::INTERVAL::TEXT FROM cf WHERE id = 1"),
+        vals(
+            &mut e,
+            "SELECT ('1 day 2 hours')::INTERVAL::TEXT FROM cf WHERE id = 1"
+        ),
         vec!["1 day 02:00:00"]
     );
     e.execute("SET intervalstyle = 'iso_8601'").unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT ('1 day 2 hours')::INTERVAL::TEXT FROM cf WHERE id = 1"),
+        vals(
+            &mut e,
+            "SELECT ('1 day 2 hours')::INTERVAL::TEXT FROM cf WHERE id = 1"
+        ),
         vec!["P1DT2H"]
     );
 }
@@ -219,7 +242,10 @@ fn round605_scale() {
     e.execute("INSERT INTO big SELECT gg FROM generate_series(1, 20000) gg")
         .unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT count(DISTINCT x) FROM (SELECT ('abc'||'def') x FROM big) q"),
+        vals(
+            &mut e,
+            "SELECT count(DISTINCT x) FROM (SELECT ('abc'||'def') x FROM big) q"
+        ),
         vec!["1"]
     );
     assert_eq!(
@@ -228,7 +254,10 @@ fn round605_scale() {
         "the folded predicate keeps the same rows as the literal one"
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE id = ANY (ARRAY[1,2,3])"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE id = ANY (ARRAY[1,2,3])"
+        ),
         vec!["3"]
     );
 }

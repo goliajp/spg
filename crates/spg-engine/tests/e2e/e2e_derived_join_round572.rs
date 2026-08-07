@@ -65,7 +65,8 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn engine() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE d572 (id INT, g INT, t TEXT)").unwrap();
+    e.execute("CREATE TABLE d572 (id INT, g INT, t TEXT)")
+        .unwrap();
     e.execute("INSERT INTO d572 SELECT gg, gg % 5, 'r' || gg FROM generate_series(1, 200) gg")
         .unwrap();
     e
@@ -161,7 +162,9 @@ fn round572_correlated_laterals_still_run_per_row() {
             "SELECT a.id, s.g FROM d572 a, LATERAL generate_series(1, a.g) AS s(g) \
              WHERE a.id <= 4 ORDER BY a.id, s.g"
         ),
-        vec!["1|1", "2|1", "2|2", "3|1", "3|2", "3|3", "4|1", "4|2", "4|3", "4|4"]
+        vec![
+            "1|1", "2|1", "2|2", "3|1", "3|2", "3|3", "4|1", "4|2", "4|3", "4|4"
+        ]
     );
 }
 

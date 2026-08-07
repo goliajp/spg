@@ -114,7 +114,9 @@ fn main() {
         "SELECT max(g) FROM a",
     ] {
         let ms = median(&mut e, sql, 7);
-        let label = sql.trim_start_matches("SELECT ").trim_end_matches(" FROM a");
+        let label = sql
+            .trim_start_matches("SELECT ")
+            .trim_end_matches(" FROM a");
         println!(
             "| {label:20} | {ms:6.2} | {:6.1} |",
             ms * 1_000_000.0 / n as f64

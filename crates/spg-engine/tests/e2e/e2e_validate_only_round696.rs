@@ -119,7 +119,10 @@ fn round696_the_session_identity_is_a_role() {
             .collect::<Vec<_>>(),
         other => panic!("{other:?}"),
     };
-    assert!(listed.contains(&me), "pg_roles should list {me}: {listed:?}");
+    assert!(
+        listed.contains(&me),
+        "pg_roles should list {me}: {listed:?}"
+    );
     // A name that is not a role still is not one.
     assert!(err_of(&mut e, "SET ROLE nosuch696").contains("nosuch696"));
 }

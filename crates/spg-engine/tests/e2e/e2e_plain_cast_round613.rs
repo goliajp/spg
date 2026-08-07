@@ -69,7 +69,10 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 fn round613_character_varying_is_varchar() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT 'ab'::CHARACTER VARYING, 'ab'::character varying"),
+        vals(
+            &mut e,
+            "SELECT 'ab'::CHARACTER VARYING, 'ab'::character varying"
+        ),
         vec!["ab|ab"],
         "not 'a' — the fold was missing and it became a bare `character`"
     );
@@ -79,7 +82,10 @@ fn round613_character_varying_is_varchar() {
         "and the typmod still reaches the resolver"
     );
     assert_eq!(
-        vals(&mut e, "SELECT 'ab'::CHARACTER, 'ab'::CHARACTER(4)||'|', 'ab'::char||'|'"),
+        vals(
+            &mut e,
+            "SELECT 'ab'::CHARACTER, 'ab'::CHARACTER(4)||'|', 'ab'::char||'|'"
+        ),
         vec!["a|ab||a|"],
         "a bare CHARACTER is still char(1), which is what made the bug silent"
     );
@@ -90,7 +96,10 @@ fn round613_character_varying_is_varchar() {
 fn round613_plain_spellings() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT 'ab'::VARCHAR, 'ab'::varchar, 'ab'::TEXT, 'ab'::text"),
+        vals(
+            &mut e,
+            "SELECT 'ab'::VARCHAR, 'ab'::varchar, 'ab'::TEXT, 'ab'::text"
+        ),
         vec!["ab|ab|ab|ab"]
     );
     assert_eq!(
@@ -101,7 +110,10 @@ fn round613_plain_spellings() {
         vec!["42|42|42|42|42|42"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT 42::int2, 42::SMALLINT, 42::int4, 42::INTEGER, 42::int8"),
+        vals(
+            &mut e,
+            "SELECT 42::int2, 42::SMALLINT, 42::int4, 42::INTEGER, 42::int8"
+        ),
         vec!["42|42|42|42|42"]
     );
     assert_eq!(
@@ -113,12 +125,18 @@ fn round613_plain_spellings() {
         vec!["true|true|2020-01-02|00000000-0000-0000-0000-000000000001"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT 42::VARCHAR, 1.50::VARCHAR, true::VARCHAR, '2020-01-02'::DATE::VARCHAR"),
+        vals(
+            &mut e,
+            "SELECT 42::VARCHAR, 1.50::VARCHAR, true::VARCHAR, '2020-01-02'::DATE::VARCHAR"
+        ),
         vec!["42|1.50|true|2020-01-02"],
         "a non-text source is stringified on the way in"
     );
     assert_eq!(
-        vals(&mut e, "SELECT NULL::VARCHAR IS NULL, NULL::NUMERIC IS NULL, NULL::date IS NULL"),
+        vals(
+            &mut e,
+            "SELECT NULL::VARCHAR IS NULL, NULL::NUMERIC IS NULL, NULL::date IS NULL"
+        ),
         vec!["true|true|true"]
     );
 }
@@ -128,21 +146,33 @@ fn round613_plain_spellings() {
 fn round613_typmod_spellings() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT 'abcdef'::VARCHAR(3), 'ab'::CHAR(4)||'|', 'ab'::bpchar||'|'"),
+        vals(
+            &mut e,
+            "SELECT 'abcdef'::VARCHAR(3), 'ab'::CHAR(4)||'|', 'ab'::bpchar||'|'"
+        ),
         vec!["abc|ab||ab|"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT 1.23456::NUMERIC(10,2), 1.23456::decimal(10,2), 1.23456::NUMERIC(10, 2)"),
+        vals(
+            &mut e,
+            "SELECT 1.23456::NUMERIC(10,2), 1.23456::decimal(10,2), 1.23456::NUMERIC(10, 2)"
+        ),
         vec!["1.23|1.23|1.23"],
         "including a space after the comma"
     );
     assert_eq!(
-        vals(&mut e, "SELECT '日本語'::VARCHAR(2), '日本語'::CHAR(2), 'ábç'::VARCHAR(2)"),
+        vals(
+            &mut e,
+            "SELECT '日本語'::VARCHAR(2), '日本語'::CHAR(2), 'ábç'::VARCHAR(2)"
+        ),
         vec!["日本|日本|áb"],
         "the length cap counts characters"
     );
     assert_eq!(
-        vals(&mut e, "SELECT ''::VARCHAR(3), ''::CHAR(3)||'|', 'abc'::VARCHAR(3), 'abc'::CHAR(3)||'|'"),
+        vals(
+            &mut e,
+            "SELECT ''::VARCHAR(3), ''::CHAR(3)||'|', 'abc'::VARCHAR(3), 'abc'::CHAR(3)||'|'"
+        ),
         vec!["|||abc|abc|"]
     );
     assert!(
@@ -175,7 +205,10 @@ fn round613_names_with_their_own_arm() {
     assert!(e.execute("SELECT 'abc'::regproc").is_err());
     assert!(e.execute("SELECT 1::nosuchtype").is_err());
     assert_eq!(
-        vals(&mut e, "SELECT 'Infinity'::NUMERIC, 'NaN'::numeric, 1e10::NUMERIC, 0.1::real::numeric"),
+        vals(
+            &mut e,
+            "SELECT 'Infinity'::NUMERIC, 'NaN'::numeric, 1e10::NUMERIC, 0.1::real::numeric"
+        ),
         vec!["Infinity|NaN|10000000000|0.1"],
         "the NUMERIC specials are unchanged by the shortcut"
     );
@@ -189,7 +222,10 @@ fn round613_scale() {
     e.execute("INSERT INTO big SELECT gg, 'row' || gg FROM generate_series(1, 20000) gg")
         .unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT count(s::VARCHAR), count(s::VARCHAR(4)), count(s::TEXT) FROM big"),
+        vals(
+            &mut e,
+            "SELECT count(s::VARCHAR), count(s::VARCHAR(4)), count(s::TEXT) FROM big"
+        ),
         vec!["20000|20000|20000"]
     );
     assert_eq!(
@@ -198,12 +234,18 @@ fn round613_scale() {
         "the length cap cuts where `left` does"
     );
     assert_eq!(
-        vals(&mut e, "SELECT sum(id::NUMERIC), sum(id::NUMERIC(10,2)) FROM big"),
+        vals(
+            &mut e,
+            "SELECT sum(id::NUMERIC), sum(id::NUMERIC(10,2)) FROM big"
+        ),
         vec!["200010000|200010000.00"],
         "checked against live PG18, which answers the same"
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE s::CHARACTER VARYING = s"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE s::CHARACTER VARYING = s"
+        ),
         vec!["20000"],
         "the folded spelling is the same value the column already holds"
     );

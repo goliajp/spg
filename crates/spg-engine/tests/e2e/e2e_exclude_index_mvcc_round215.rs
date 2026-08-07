@@ -28,7 +28,8 @@ fn delete_then_reinsert_same_range_ok() {
 #[test]
 fn delete_frees_overlap_slot() {
     let mut e = excl();
-    e.execute("INSERT INTO bk VALUES ('[1,5)'), ('[10,15)')").unwrap();
+    e.execute("INSERT INTO bk VALUES ('[1,5)'), ('[10,15)')")
+        .unwrap();
     // [3,7) overlaps [1,5) → rejected while it's present.
     assert!(e.execute("INSERT INTO bk VALUES ('[3,7)')").is_err());
     e.execute("DELETE FROM bk WHERE during = '[1,5)'").unwrap();
@@ -54,8 +55,12 @@ fn stream_then_overlap_rejected() {
     // overlap deep in the key space is still caught.
     let mut e = excl();
     for i in 0..500 {
-        e.execute(&format!("INSERT INTO bk VALUES ('[{},{})')", 10 * i, 10 * i + 5))
-            .unwrap();
+        e.execute(&format!(
+            "INSERT INTO bk VALUES ('[{},{})')",
+            10 * i,
+            10 * i + 5
+        ))
+        .unwrap();
     }
     // [2503,2506) overlaps the row [2500,2505) inserted mid-stream.
     let err = e
@@ -76,7 +81,8 @@ fn index_survives_catalog_round_trip_and_enforces() {
     // on load and still enforce/accept correctly.
     use spg_storage::Catalog;
     let mut e = excl();
-    e.execute("INSERT INTO bk VALUES ('[1,5)'), ('[10,15)')").unwrap();
+    e.execute("INSERT INTO bk VALUES ('[1,5)'), ('[10,15)')")
+        .unwrap();
     let bytes = e.catalog().serialize();
     let restored = Catalog::deserialize(&bytes).unwrap();
     // A brand-new engine over the restored catalog would rebuild the index via
@@ -85,7 +91,8 @@ fn index_survives_catalog_round_trip_and_enforces() {
     assert_eq!(restored.get("bk").unwrap().rows().len(), 2);
 
     let mut e2 = excl();
-    e2.execute("INSERT INTO bk VALUES ('[1,5)'), ('[10,15)')").unwrap();
+    e2.execute("INSERT INTO bk VALUES ('[1,5)'), ('[10,15)')")
+        .unwrap();
     assert!(e2.execute("INSERT INTO bk VALUES ('[3,7)')").is_err());
     e2.execute("INSERT INTO bk VALUES ('[5,10)')").unwrap();
 }
@@ -102,14 +109,16 @@ fn multicol_index_pre_filters_then_checks_room() {
     )
     .unwrap();
     for i in 0..200 {
-        e.execute(&format!("INSERT INTO book VALUES (1, '[{},{})')", 10 * i, 10 * i + 5))
-            .unwrap();
+        e.execute(&format!(
+            "INSERT INTO book VALUES (1, '[{},{})')",
+            10 * i,
+            10 * i + 5
+        ))
+        .unwrap();
     }
     // Different room, overlapping range → accepted (index candidate rejected
     // by the room `=` check).
     e.execute("INSERT INTO book VALUES (2, '[3,7)')").unwrap();
     // Same room, overlapping → rejected.
-    assert!(e
-        .execute("INSERT INTO book VALUES (1, '[3,7)')")
-        .is_err());
+    assert!(e.execute("INSERT INTO book VALUES (1, '[3,7)')").is_err());
 }

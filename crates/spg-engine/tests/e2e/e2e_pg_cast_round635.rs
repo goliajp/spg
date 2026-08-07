@@ -44,12 +44,18 @@ fn round635_pg_cast_has_the_registry() {
     assert_eq!(vals(&mut e, "SELECT count(*) FROM pg_cast"), vec!["129"]);
     // The three contexts, in PG's proportions for this set.
     assert_eq!(
-        vals(&mut e, "SELECT castcontext, count(*) FROM pg_cast GROUP BY 1 ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT castcontext, count(*) FROM pg_cast GROUP BY 1 ORDER BY 1"
+        ),
         vec!["a|53", "e|24", "i|52"]
     );
     // …and the three methods.
     assert_eq!(
-        vals(&mut e, "SELECT castmethod, count(*) FROM pg_cast GROUP BY 1 ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT castmethod, count(*) FROM pg_cast GROUP BY 1 ORDER BY 1"
+        ),
         vec!["b|16", "f|111", "i|2"]
     );
 }
@@ -108,5 +114,8 @@ fn round635_pg_type_lists_the_bit_family() {
         vec!["bit|1560|-1|V", "varbit|1562|-1|V"]
     );
     // The values were always there; only the catalog entry was missing.
-    assert_eq!(vals(&mut e, "SELECT B'0110', B'01'::VARBIT"), vec!["0110|01"]);
+    assert_eq!(
+        vals(&mut e, "SELECT B'0110', B'01'::VARBIT"),
+        vec!["0110|01"]
+    );
 }

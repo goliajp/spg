@@ -342,10 +342,7 @@ fn drop_database_answers_as_pg_does() {
         Some("55006"),
         "PG 18.4: 55006 object_in_use for the open database"
     );
-    assert_eq!(
-        message(&current),
-        "cannot drop the currently open database"
-    );
+    assert_eq!(message(&current), "cannot drop the currently open database");
 }
 
 /// It belongs to the round-794 family too: PG refuses DROP DATABASE
@@ -364,4 +361,3 @@ fn drop_database_is_refused_inside_a_transaction() {
     );
     q(&mut s, "ROLLBACK");
 }
-

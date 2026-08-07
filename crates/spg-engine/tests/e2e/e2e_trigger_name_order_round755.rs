@@ -21,7 +21,8 @@ fn log_rows(e: &mut Engine) -> Vec<String> {
 fn round755_insert_triggers_fire_in_name_order() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE f755t (id INT)").unwrap();
-    e.execute("CREATE TABLE f755log (seq SERIAL, who TEXT)").unwrap();
+    e.execute("CREATE TABLE f755log (seq SERIAL, who TEXT)")
+        .unwrap();
     e.execute(
         "CREATE FUNCTION f755_z() RETURNS trigger AS $$ BEGIN \
          INSERT INTO f755log(who) VALUES ('z_trig'); RETURN NEW; END $$ LANGUAGE plpgsql",
@@ -33,10 +34,14 @@ fn round755_insert_triggers_fire_in_name_order() {
     )
     .unwrap();
     // Created in REVERSE name order — the firing must not follow it.
-    e.execute("CREATE TRIGGER z_trig BEFORE INSERT ON f755t FOR EACH ROW EXECUTE FUNCTION f755_z()")
-        .unwrap();
-    e.execute("CREATE TRIGGER a_trig BEFORE INSERT ON f755t FOR EACH ROW EXECUTE FUNCTION f755_a()")
-        .unwrap();
+    e.execute(
+        "CREATE TRIGGER z_trig BEFORE INSERT ON f755t FOR EACH ROW EXECUTE FUNCTION f755_z()",
+    )
+    .unwrap();
+    e.execute(
+        "CREATE TRIGGER a_trig BEFORE INSERT ON f755t FOR EACH ROW EXECUTE FUNCTION f755_a()",
+    )
+    .unwrap();
     e.execute("INSERT INTO f755t VALUES (1)").unwrap();
     assert_eq!(log_rows(&mut e), ["a_trig", "z_trig"], "PG fires by name");
 }
@@ -45,7 +50,8 @@ fn round755_insert_triggers_fire_in_name_order() {
 fn round755_update_triggers_fire_in_name_order() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE f755t (id INT)").unwrap();
-    e.execute("CREATE TABLE f755log (seq SERIAL, who TEXT)").unwrap();
+    e.execute("CREATE TABLE f755log (seq SERIAL, who TEXT)")
+        .unwrap();
     e.execute(
         "CREATE FUNCTION f755_z() RETURNS trigger AS $$ BEGIN \
          INSERT INTO f755log(who) VALUES ('z_trig'); RETURN NEW; END $$ LANGUAGE plpgsql",

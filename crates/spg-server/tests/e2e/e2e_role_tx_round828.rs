@@ -177,10 +177,18 @@ fn a_role_created_in_a_rolled_back_transaction_never_existed() {
     // A sees its own uncommitted role; B must not — B's view is the
     // committed store, which is also what the auth path reads.
     assert_eq!(role_count(&mut a, "r828_rb"), "1", "creator sees it in-tx");
-    assert_eq!(role_count(&mut b, "r828_rb"), "0", "another session must not");
+    assert_eq!(
+        role_count(&mut b, "r828_rb"),
+        "0",
+        "another session must not"
+    );
 
     ok(&mut a, "ROLLBACK");
-    assert_eq!(role_count(&mut a, "r828_rb"), "0", "rollback leaves nothing");
+    assert_eq!(
+        role_count(&mut a, "r828_rb"),
+        "0",
+        "rollback leaves nothing"
+    );
     assert_eq!(role_count(&mut b, "r828_rb"), "0");
 }
 

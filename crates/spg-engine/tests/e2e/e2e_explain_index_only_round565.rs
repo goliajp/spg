@@ -48,7 +48,8 @@ fn plan(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn engine() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE p565 (id INT, k INT, pad TEXT)").unwrap();
+    e.execute("CREATE TABLE p565 (id INT, k INT, pad TEXT)")
+        .unwrap();
     e.execute("INSERT INTO p565 SELECT g, g, 'x' FROM generate_series(1, 300) g")
         .unwrap();
     e.execute("CREATE INDEX p565k ON p565 (k)").unwrap();
@@ -58,7 +59,10 @@ fn engine() -> Engine {
 #[test]
 fn round565_index_only_range_is_named() {
     let mut e = engine();
-    let p = plan(&mut e, "EXPLAIN SELECT k FROM p565 WHERE k BETWEEN 1 AND 100");
+    let p = plan(
+        &mut e,
+        "EXPLAIN SELECT k FROM p565 WHERE k BETWEEN 1 AND 100",
+    );
     assert!(
         p[0].starts_with("Index Only Scan using p565k on p565"),
         "{p:?}"
@@ -78,11 +82,11 @@ fn round565_analyze_adds_heap_fetches() {
         &mut e,
         "EXPLAIN ANALYZE SELECT k FROM p565 WHERE k BETWEEN 1 AND 100",
     );
-    assert!(p[0].starts_with("Index Only Scan using p565k on p565"), "{p:?}");
     assert!(
-        p.iter().any(|l| l.trim() == "Heap Fetches: 0"),
+        p[0].starts_with("Index Only Scan using p565k on p565"),
         "{p:?}"
     );
+    assert!(p.iter().any(|l| l.trim() == "Heap Fetches: 0"), "{p:?}");
 }
 
 /// Everything the executor would NOT answer from the index alone keeps
@@ -96,12 +100,18 @@ fn round565_other_shapes_stay_index_scan() {
     // Projecting a different column reads the row. On a narrow range the
     // seek is worth taking and the plan says Index Scan; either way it
     // must never claim to answer out of the index alone.
-    let fetch = head(&mut e, "EXPLAIN SELECT id FROM p565 WHERE k BETWEEN 1 AND 2");
+    let fetch = head(
+        &mut e,
+        "EXPLAIN SELECT id FROM p565 WHERE k BETWEEN 1 AND 2",
+    );
     assert!(fetch.contains("Index Scan using p565k on p565"), "{fetch}");
     assert!(!fetch.contains("Index Only Scan"), "{fetch}");
     assert!(
-        !head(&mut e, "EXPLAIN SELECT id FROM p565 WHERE k BETWEEN 1 AND 100")
-            .contains("Index Only Scan")
+        !head(
+            &mut e,
+            "EXPLAIN SELECT id FROM p565 WHERE k BETWEEN 1 AND 100"
+        )
+        .contains("Index Only Scan")
     );
     // Equality reached the fast path in round 566 — the degenerate
     // range — so it names what PG names.
@@ -124,13 +134,19 @@ fn round565_other_shapes_stay_index_scan() {
     }
     // Two projected columns.
     assert!(
-        !head(&mut e, "EXPLAIN SELECT k, id FROM p565 WHERE k BETWEEN 1 AND 100")
-            .contains("Index Only Scan")
+        !head(
+            &mut e,
+            "EXPLAIN SELECT k, id FROM p565 WHERE k BETWEEN 1 AND 100"
+        )
+        .contains("Index Only Scan")
     );
     // An expression over the column is not the bare column.
     assert!(
-        !head(&mut e, "EXPLAIN SELECT k + 1 FROM p565 WHERE k BETWEEN 1 AND 100")
-            .contains("Index Only Scan")
+        !head(
+            &mut e,
+            "EXPLAIN SELECT k + 1 FROM p565 WHERE k BETWEEN 1 AND 100"
+        )
+        .contains("Index Only Scan")
     );
 }
 
@@ -151,8 +167,14 @@ fn round565_unrestorable_type_is_not_named_index_only() {
 
     // Text does restore.
     e.execute("CREATE INDEX d565t ON d565 (t)").unwrap();
-    let p = plan(&mut e, "EXPLAIN SELECT t FROM d565 WHERE t BETWEEN 'a' AND 'b'");
-    assert!(p[0].starts_with("Index Only Scan using d565t on d565"), "{p:?}");
+    let p = plan(
+        &mut e,
+        "EXPLAIN SELECT t FROM d565 WHERE t BETWEEN 'a' AND 'b'",
+    );
+    assert!(
+        p[0].starts_with("Index Only Scan using d565t on d565"),
+        "{p:?}"
+    );
 }
 
 /// The JSON form carries the node type too — a visualiser reading it

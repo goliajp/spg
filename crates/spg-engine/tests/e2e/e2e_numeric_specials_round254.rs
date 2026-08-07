@@ -94,9 +94,18 @@ fn specials_survive_the_unary_math_family() {
     }
     // The two cells where PG itself raises.
     for (sql, want) in [
-        ("SELECT sqrt('-Infinity'::numeric)", "cannot take square root of a negative number"),
-        ("SELECT ln('-Infinity'::numeric)", "cannot take logarithm of a negative number"),
-        ("SELECT log('-Infinity'::numeric)", "cannot take logarithm of a negative number"),
+        (
+            "SELECT sqrt('-Infinity'::numeric)",
+            "cannot take square root of a negative number",
+        ),
+        (
+            "SELECT ln('-Infinity'::numeric)",
+            "cannot take logarithm of a negative number",
+        ),
+        (
+            "SELECT log('-Infinity'::numeric)",
+            "cannot take logarithm of a negative number",
+        ),
         (
             "SELECT width_bucket('NaN'::numeric, 0, 10, 5)",
             "operand, lower bound, and upper bound cannot be NaN",
@@ -151,14 +160,35 @@ fn specials_cross_casts_in_both_directions() {
     }
     // The integer targets refuse; PG names an infinity without its sign.
     for (sql, want) in [
-        ("SELECT 'NaN'::numeric::int", "cannot convert NaN to integer"),
-        ("SELECT 'Infinity'::numeric::int", "cannot convert infinity to integer"),
-        ("SELECT '-Infinity'::numeric::int", "cannot convert infinity to integer"),
-        ("SELECT 'NaN'::numeric::bigint", "cannot convert NaN to bigint"),
-        ("SELECT '-Infinity'::numeric::bigint", "cannot convert infinity to bigint"),
+        (
+            "SELECT 'NaN'::numeric::int",
+            "cannot convert NaN to integer",
+        ),
+        (
+            "SELECT 'Infinity'::numeric::int",
+            "cannot convert infinity to integer",
+        ),
+        (
+            "SELECT '-Infinity'::numeric::int",
+            "cannot convert infinity to integer",
+        ),
+        (
+            "SELECT 'NaN'::numeric::bigint",
+            "cannot convert NaN to bigint",
+        ),
+        (
+            "SELECT '-Infinity'::numeric::bigint",
+            "cannot convert infinity to bigint",
+        ),
         // …and a declared precision overflows on an infinity.
-        ("SELECT 'Infinity'::numeric::numeric(10,2)", "numeric field overflow"),
-        ("SELECT 'Infinity'::float8::numeric(10,2)", "numeric field overflow"),
+        (
+            "SELECT 'Infinity'::numeric::numeric(10,2)",
+            "numeric field overflow",
+        ),
+        (
+            "SELECT 'Infinity'::float8::numeric(10,2)",
+            "numeric field overflow",
+        ),
     ] {
         let got = err(&mut e, sql);
         assert!(got.contains(want), "{sql} → {got}");
@@ -199,14 +229,25 @@ fn div_is_numeric_and_the_error_wordings_are_pgs() {
     // mod stays integer (PG has the integer overloads).
     assert_eq!(one(&mut e, "SELECT pg_typeof(mod(9,4))"), "integer");
     // Bare "division by zero" — the div(): / mod(): prefixes were leaks.
-    for sql in ["SELECT div(1, 0)", "SELECT mod(1, 0)", "SELECT 1/0", "SELECT 1.0/0"] {
+    for sql in [
+        "SELECT div(1, 0)",
+        "SELECT mod(1, 0)",
+        "SELECT 1/0",
+        "SELECT 1.0/0",
+    ] {
         let got = err(&mut e, sql);
         assert!(got.contains("division by zero"), "{sql} → {got}");
-        assert!(!got.contains("div():") && !got.contains("mod():"), "{sql} → {got}");
+        assert!(
+            !got.contains("div():") && !got.contains("mod():"),
+            "{sql} → {got}"
+        );
     }
     // An unknown function names the call signature, like PG.
     let got = err(&mut e, "SELECT nosuchfn(1)");
-    assert!(got.contains("function nosuchfn(integer) does not exist"), "{got}");
+    assert!(
+        got.contains("function nosuchfn(integer) does not exist"),
+        "{got}"
+    );
     let got = err(&mut e, "SELECT nosuchfn()");
     assert!(got.contains("function nosuchfn() does not exist"), "{got}");
 }
@@ -237,7 +278,10 @@ fn the_finite_math_core_is_unchanged() {
     }
     for (sql, want) in [
         ("SELECT 2147483647::int + 1", "integer out of range"),
-        ("SELECT 9223372036854775807::bigint + 1", "bigint out of range"),
+        (
+            "SELECT 9223372036854775807::bigint + 1",
+            "bigint out of range",
+        ),
         ("SELECT 1e308::float8 * 10", "value out of range: overflow"),
     ] {
         let got = err(&mut e, sql);

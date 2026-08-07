@@ -61,16 +61,25 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 fn round628_lone_letters_are_literals() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT to_char(1,'MON'), to_char(1,'HH'), to_char(1,'E')"),
+        vals(
+            &mut e,
+            "SELECT to_char(1,'MON'), to_char(1,'HH'), to_char(1,'E')"
+        ),
         vec!["MON|HH|E"],
         "PG echoes each of these; they were swallowed to a space"
     );
     assert_eq!(
-        vals(&mut e, "SELECT to_char(1,'P'), to_char(1,'M'), to_char(1,'T'), to_char(1,'R')"),
+        vals(
+            &mut e,
+            "SELECT to_char(1,'P'), to_char(1,'M'), to_char(1,'T'), to_char(1,'R')"
+        ),
         vec!["P|M|T|R"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT to_char(1,'xEy'), to_char(1,'xMy'), to_char(1,'xHy')"),
+        vals(
+            &mut e,
+            "SELECT to_char(1,'xEy'), to_char(1,'xMy'), to_char(1,'xHy')"
+        ),
         vec!["xEy|xMy|xHy"]
     );
 }
@@ -84,11 +93,29 @@ fn round628_keywords_still_format() {
         vec!["        MCCXXXV"],
         "RN would echo as text if the suffix scan mistook its N for a literal"
     );
-    assert_eq!(vals(&mut e, "SELECT to_char(1234.5,'EEEE')"), vec![" 1e+03"]);
-    assert_eq!(vals(&mut e, "SELECT to_char(-1234.5,'9999.9PR')"), vec!["<1234.5>"]);
-    assert_eq!(vals(&mut e, "SELECT to_char(-1234.5,'9999.9MI')"), vec!["1234.5-"]);
-    assert_eq!(vals(&mut e, "SELECT to_char(1234.5,'FM9999.9')"), vec!["1234.5"]);
-    assert_eq!(vals(&mut e, "SELECT to_char(1234,'9,999'), to_char(1234,'9G999')"), vec![" 1,234| 1,234"]);
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(1234.5,'EEEE')"),
+        vec![" 1e+03"]
+    );
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(-1234.5,'9999.9PR')"),
+        vec!["<1234.5>"]
+    );
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(-1234.5,'9999.9MI')"),
+        vec!["1234.5-"]
+    );
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(1234.5,'FM9999.9')"),
+        vec!["1234.5"]
+    );
+    assert_eq!(
+        vals(
+            &mut e,
+            "SELECT to_char(1234,'9,999'), to_char(1234,'9G999')"
+        ),
+        vec![" 1,234| 1,234"]
+    );
 }
 
 /// The all-literal pattern round 626 stopped crashing on, still literal.
@@ -96,7 +123,10 @@ fn round628_keywords_still_format() {
 fn round628_all_literal_patterns_survive() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT to_char(1,'YYYY'), to_char(1.5,'xyz'), to_char(1,'Q')"),
+        vals(
+            &mut e,
+            "SELECT to_char(1,'YYYY'), to_char(1.5,'xyz'), to_char(1,'Q')"
+        ),
         vec!["YYYY|xyz|Q"]
     );
     assert_eq!(vals(&mut e, "SELECT to_char(12,'DAY')"), vec![" .AY"]);

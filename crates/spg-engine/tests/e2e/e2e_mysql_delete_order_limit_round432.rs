@@ -129,7 +129,11 @@ fn round432_offset_form_is_rejected() {
         format!("{err}").contains("offset"),
         "expected an offset-rejection message, got {err}"
     );
-    assert_eq!(ids(&mut e), "1,2,3,4,5", "the rejected statement must not delete");
+    assert_eq!(
+        ids(&mut e),
+        "1,2,3,4,5",
+        "the rejected statement must not delete"
+    );
 }
 
 #[test]
@@ -161,7 +165,8 @@ fn round432_affected_count_is_the_narrowed_set() {
 fn round432_pg_dialect_still_rejects_the_clause() {
     // PG has no ORDER BY / LIMIT on DELETE; a PG session must keep erroring.
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("INSERT INTO t VALUES (1,1),(2,2)").unwrap();
     let err = e
         .execute("DELETE FROM t ORDER BY v LIMIT 1")

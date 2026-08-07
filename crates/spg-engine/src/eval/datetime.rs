@@ -50,11 +50,7 @@ pub(super) fn mysql_compound_extract(name: &str, v: &Value) -> Option<Value<'sta
         "hour_second" => hh * 10_000 + mi * 100 + ss,
         "minute_second" => mi * 100 + ss,
         "day_microsecond" => {
-            d * 1_000_000_000_000
-                + hh * 10_000_000_000
-                + mi * 100_000_000
-                + ss * 1_000_000
-                + us
+            d * 1_000_000_000_000 + hh * 10_000_000_000 + mi * 100_000_000 + ss * 1_000_000 + us
         }
         "hour_microsecond" => hh * 10_000_000_000 + mi * 100_000_000 + ss * 1_000_000 + us,
         "minute_microsecond" => mi * 100_000_000 + ss * 1_000_000 + us,
@@ -367,8 +363,8 @@ pub(super) fn extract_field(
         F::Julian => {
             if matches!(*v, Value::Timestamp(_)) {
                 let jd = i128::from(days) + 2_440_588;
-                let scaled =
-                    jd * 10_i128.pow(20) + i128::from(day_micros) * 10_i128.pow(20) / 86_400_000_000;
+                let scaled = jd * 10_i128.pow(20)
+                    + i128::from(day_micros) * 10_i128.pow(20) / 86_400_000_000;
                 return Ok(Value::Numeric {
                     scaled,
                     scale: 20,
@@ -601,7 +597,10 @@ pub(super) fn age(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             Value::Timestamp(t) => Ok(*t),
             Value::Date(d) => Ok(i64::from(*d) * 86_400_000_000),
             other => Err(EvalError::TypeMismatch {
-                detail: format!("age() needs DATE or TIMESTAMP, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
+                detail: format!(
+                    "age() needs DATE or TIMESTAMP, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                ),
             }),
         }
     };
@@ -941,11 +940,7 @@ pub(crate) fn mysql_calc_week(days: i32, mode: u32) -> (i32, u32) {
     // etc. (this is MySQL's `week_mode`).
     let mode = {
         let m = mode & 7;
-        if m & 1 == 0 {
-            m ^ 4
-        } else {
-            m
-        }
+        if m & 1 == 0 { m ^ 4 } else { m }
     };
     let monday_first = mode & 1 != 0;
     let mut week_year = mode & 2 != 0;
@@ -968,13 +963,7 @@ pub(crate) fn mysql_calc_week(days: i32, mode: u32) -> (i32, u32) {
     // Does the year's first week start with a leading partial (so the
     // year's first `wd` days belong to the previous week)? Mirrors MySQL's
     // `(first_weekday && weekday != 0) || (!first_weekday && weekday >= 4)`.
-    let partial_before = |wd: i32| -> bool {
-        if first_weekday {
-            wd != 0
-        } else {
-            wd >= 4
-        }
-    };
+    let partial_before = |wd: i32| -> bool { if first_weekday { wd != 0 } else { wd >= 4 } };
     let (mut year, mo, d) = civil_from_days(days);
     let mut first_daynr = days_from_civil(year, 1, 1);
     let mut wd = weekday(first_daynr);
@@ -1190,9 +1179,11 @@ pub(super) fn date_trunc(
         };
         let z = zone.trim();
         let ts = text_or_temporal_micros(&args[1], "date_trunc")?;
-        let off = ctx.zone_offset_at(z, ts).ok_or_else(|| EvalError::TypeMismatch {
-            detail: format!("date_trunc({z:?}): time zone not recognized"),
-        })?;
+        let off = ctx
+            .zone_offset_at(z, ts)
+            .ok_or_else(|| EvalError::TypeMismatch {
+                detail: format!("date_trunc({z:?}): time zone not recognized"),
+            })?;
         let local = Value::Timestamp(ts + off);
         let truncated = date_trunc(&[args[0].clone(), local], ctx)?;
         let Value::Timestamp(tl) = truncated else {
@@ -1938,14 +1929,23 @@ pub(super) fn timezone_pg(
     // offset with no zone database behind it. SPG demanded text and refused
     // the form outright. Normalise it to the `+HH:MM` spelling the text path
     // already understands, so one implementation serves both.
-    if let Value::Interval { months, days, micros } = &args[0] {
+    if let Value::Interval {
+        months,
+        days,
+        micros,
+    } = &args[0]
+    {
         if *months != 0 || *days != 0 {
             return Err(EvalError::TypeMismatch {
                 detail: "interval time zone must not include months or days".into(),
             });
         }
         let total_min = *micros / 60_000_000;
-        let (sign, mag) = if total_min < 0 { ('-', -total_min) } else { ('+', total_min) };
+        let (sign, mag) = if total_min < 0 {
+            ('-', -total_min)
+        } else {
+            ('+', total_min)
+        };
         let spelled = format!("{sign}{:02}:{:02}", mag / 60, mag % 60);
         let mut rewritten = args.to_vec();
         rewritten[0] = Value::text(spelled);

@@ -76,12 +76,18 @@ fn round511_wildcard_does_not_expand_ctid() {
 fn round511_tid_orders_numerically_not_as_text() {
     let mut e = engine();
     seed(&mut e, 12, 1);
-    assert_eq!(text(&mut e, "SELECT min(ctid), max(ctid) FROM d"), "(0,1)|(0,12)");
+    assert_eq!(
+        text(&mut e, "SELECT min(ctid), max(ctid) FROM d"),
+        "(0,1)|(0,12)"
+    );
     // Numerically `(0,2) < (0,10)` and `(0,10) > (0,9)`. Under a text form
     // BOTH would answer the other way round, which is the failure mode this
     // pins against.
     assert_eq!(
-        text(&mut e, "SELECT '(0,2)'::tid < '(0,10)'::tid, '(0,10)'::tid > '(0,9)'::tid"),
+        text(
+            &mut e,
+            "SELECT '(0,2)'::tid < '(0,10)'::tid, '(0,10)'::tid > '(0,9)'::tid"
+        ),
         "true|true"
     );
     assert_eq!(
@@ -100,8 +106,14 @@ fn round511_a_row_can_be_named_by_its_ctid() {
     let mut e = engine();
     seed(&mut e, 3, 5);
     e.execute("INSERT INTO d VALUES (99)").unwrap();
-    assert_eq!(text(&mut e, "SELECT k FROM d WHERE ctid = '(0,4)'::tid"), "99");
-    assert_eq!(text(&mut e, "SELECT ctid = '(0,1)'::tid FROM d LIMIT 1"), "true");
+    assert_eq!(
+        text(&mut e, "SELECT k FROM d WHERE ctid = '(0,4)'::tid"),
+        "99"
+    );
+    assert_eq!(
+        text(&mut e, "SELECT ctid = '(0,1)'::tid FROM d LIMIT 1"),
+        "true"
+    );
 }
 
 /// The SELECT half of the idiom `ctid` exists for. It needs the tid to
@@ -133,6 +145,7 @@ fn round511_the_dedup_idiom_selects_correctly() {
 fn round511_the_dml_paths_carry_ctid() {
     let mut e = engine();
     seed(&mut e, 2, 1);
-    e.execute("DELETE FROM d WHERE ctid = '(0,1)'::tid").unwrap();
+    e.execute("DELETE FROM d WHERE ctid = '(0,1)'::tid")
+        .unwrap();
     assert_eq!(text(&mut e, "SELECT count(*) FROM d"), "1");
 }

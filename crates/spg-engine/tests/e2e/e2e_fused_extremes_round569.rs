@@ -64,7 +64,10 @@ fn engine() -> Engine {
 #[test]
 fn round569_extremes_answer() {
     let mut e = engine();
-    assert_eq!(vals(&mut e, "SELECT min(id), max(id) FROM f569"), vec!["1|400"]);
+    assert_eq!(
+        vals(&mut e, "SELECT min(id), max(id) FROM f569"),
+        vec!["1|400"]
+    );
     assert_eq!(vals(&mut e, "SELECT min(g), max(g) FROM f569"), vec!["0|9"]);
     assert_eq!(
         vals(&mut e, "SELECT min(t), max(t) FROM f569"),
@@ -81,7 +84,10 @@ fn round569_extremes_answer() {
     );
     // Alongside the aggregates that were already fused.
     assert_eq!(
-        vals(&mut e, "SELECT count(*), sum(id), min(id), max(id) FROM f569"),
+        vals(
+            &mut e,
+            "SELECT count(*), sum(id), min(id), max(id) FROM f569"
+        ),
         vec!["400|80200|1|400"]
     );
     // Two extremes over the SAME column must not share one accumulator.
@@ -105,10 +111,16 @@ fn round569_nulls_follow_pg() {
     );
     e.execute("CREATE TABLE a569 (v INT)").unwrap();
     e.execute("INSERT INTO a569 VALUES (NULL), (NULL)").unwrap();
-    assert_eq!(vals(&mut e, "SELECT min(v), max(v) FROM a569"), vec!["NULL|NULL"]);
+    assert_eq!(
+        vals(&mut e, "SELECT min(v), max(v) FROM a569"),
+        vec!["NULL|NULL"]
+    );
     // An empty table answers NULL too.
     e.execute("CREATE TABLE e569 (v INT)").unwrap();
-    assert_eq!(vals(&mut e, "SELECT min(v), max(v) FROM e569"), vec!["NULL|NULL"]);
+    assert_eq!(
+        vals(&mut e, "SELECT min(v), max(v) FROM e569"),
+        vec!["NULL|NULL"]
+    );
 }
 
 /// GROUP BY shares the same fused ops, so the answers must match the

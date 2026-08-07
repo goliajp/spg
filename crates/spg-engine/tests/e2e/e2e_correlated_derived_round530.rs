@@ -28,7 +28,8 @@ fn engine() -> Engine {
     let mut e = Engine::new();
     e.execute("CREATE TABLE a (id INT, v INT)").unwrap();
     e.execute("CREATE TABLE b (id INT, d INT)").unwrap();
-    e.execute("INSERT INTO a VALUES (1,10),(2,20),(3,30)").unwrap();
+    e.execute("INSERT INTO a VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     e.execute("INSERT INTO b VALUES (1,100),(3,300)").unwrap();
     e
 }

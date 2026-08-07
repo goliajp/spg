@@ -97,8 +97,7 @@ fn round468_pg_raises_on_a_position_that_is_not_an_integer() {
             panic!("`{sql}` answered; PG raises");
         };
         assert!(
-            msg.contains("invalid input syntax for type integer")
-                && msg.contains(bad),
+            msg.contains("invalid input syntax for type integer") && msg.contains(bad),
             "`{sql}` gave: {msg}"
         );
     }
@@ -116,7 +115,10 @@ fn round468_pg_keeps_the_regex_reading_of_substring() {
         other => panic!("{other:?}"),
     }
     // Out of range is an empty result in PG, not an error.
-    assert_eq!(one(&mut e, "SELECT substr('abcdef','99')").as_deref(), Ok(""));
+    assert_eq!(
+        one(&mut e, "SELECT substr('abcdef','99')").as_deref(),
+        Ok("")
+    );
 }
 
 #[test]

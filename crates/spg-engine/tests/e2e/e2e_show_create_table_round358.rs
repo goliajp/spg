@@ -85,8 +85,14 @@ fn it_renders_mariadbs_shape() {
 fn nothing_is_dropped_any_more() {
     let mut e = fixture();
     let out = ddl(&mut e, "sc");
-    assert!(out.contains("NOT NULL DEFAULT 7"), "a column default: {out}");
-    assert!(out.contains("KEY `idx_n` (`n`)"), "a secondary index: {out}");
+    assert!(
+        out.contains("NOT NULL DEFAULT 7"),
+        "a column default: {out}"
+    );
+    assert!(
+        out.contains("KEY `idx_n` (`n`)"),
+        "a secondary index: {out}"
+    );
     assert!(
         out.contains("UNIQUE KEY `uq_v` (`v`)"),
         "a unique index, as UNIQUE: {out}"
@@ -104,7 +110,8 @@ fn nothing_is_dropped_any_more() {
 fn the_auto_increment_option_is_the_real_next_value() {
     let mut e = fixture();
     assert!(ddl(&mut e, "sc").contains("AUTO_INCREMENT=3"));
-    e.execute("INSERT INTO sc (n,b,v) VALUES (9,9,'c')").unwrap();
+    e.execute("INSERT INTO sc (n,b,v) VALUES (9,9,'c')")
+        .unwrap();
     assert!(ddl(&mut e, "sc").contains("AUTO_INCREMENT=4"));
 }
 
@@ -114,7 +121,8 @@ fn the_auto_increment_option_is_the_real_next_value() {
 fn the_shape_without_an_identity_column() {
     let mut e = Engine::new();
     e.execute("SET sql_mode='STRICT_TRANS_TABLES'").unwrap();
-    e.execute("CREATE TABLE p (a INT NOT NULL, b TEXT)").unwrap();
+    e.execute("CREATE TABLE p (a INT NOT NULL, b TEXT)")
+        .unwrap();
     let out = ddl(&mut e, "p");
     assert!(!out.contains("AUTO_INCREMENT"), "{out}");
     assert!(out.contains("`a` int(11) NOT NULL,"), "{out}");

@@ -144,9 +144,7 @@ fn composite_used_as_column_type_takes_a_record_literal() {
     // The record literal is the accepted spelling, and it round-trips.
     e.execute(r#"INSERT INTO customers VALUES (1, '("Main",90210)')"#)
         .unwrap();
-    let r = e
-        .execute("SELECT home FROM customers ORDER BY id")
-        .unwrap();
+    let r = e.execute("SELECT home FROM customers ORDER BY id").unwrap();
     let rows = match r {
         spg_engine::QueryResult::Rows { rows, .. } => rows,
         _ => panic!("expected rows"),

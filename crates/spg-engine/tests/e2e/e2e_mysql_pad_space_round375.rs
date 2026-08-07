@@ -66,7 +66,10 @@ fn where_distinct_group_collapse_padding() {
     assert_eq!(count(&mut e, "SELECT COUNT(*) FROM s WHERE t = 'a'"), 3);
     assert_eq!(count(&mut e, "SELECT COUNT(DISTINCT t) FROM s"), 2);
     assert_eq!(
-        count(&mut e, "SELECT COUNT(*) FROM (SELECT t FROM s GROUP BY t) g"),
+        count(
+            &mut e,
+            "SELECT COUNT(*) FROM (SELECT t FROM s GROUP BY t) g"
+        ),
         2
     );
 }

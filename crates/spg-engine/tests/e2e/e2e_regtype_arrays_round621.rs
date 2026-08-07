@@ -47,15 +47,24 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 fn round621_an_array_oid_reads_back_as_a_type() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT 1007::regtype::text, 1009::regtype::text, 1016::regtype::text, 1005::regtype::text"),
+        vals(
+            &mut e,
+            "SELECT 1007::regtype::text, 1009::regtype::text, 1016::regtype::text, 1005::regtype::text"
+        ),
         vec!["integer[]|text[]|bigint[]|smallint[]"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT 1000::regtype::text, 1022::regtype::text, 1231::regtype::text, 1001::regtype::text"),
+        vals(
+            &mut e,
+            "SELECT 1000::regtype::text, 1022::regtype::text, 1231::regtype::text, 1001::regtype::text"
+        ),
         vec!["boolean[]|double precision[]|numeric[]|bytea[]"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT 1182::regtype::text, 1115::regtype::text, 1185::regtype::text, 2951::regtype::text"),
+        vals(
+            &mut e,
+            "SELECT 1182::regtype::text, 1115::regtype::text, 1185::regtype::text, 2951::regtype::text"
+        ),
         vec!["date[]|timestamp without time zone[]|timestamp with time zone[]|uuid[]"],
         "the element's canonical spelling carries its spaces into the array's"
     );
@@ -70,7 +79,10 @@ fn round621_an_array_oid_reads_back_as_a_type() {
 fn round621_the_scalars_are_untouched() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT 25::regtype::text, 23::regtype::text, 1042::regtype::text, 1043::regtype::text"),
+        vals(
+            &mut e,
+            "SELECT 25::regtype::text, 23::regtype::text, 1042::regtype::text, 1043::regtype::text"
+        ),
         vec!["text|integer|character|character varying"]
     );
     assert_eq!(
@@ -89,7 +101,10 @@ fn round621_the_scalars_are_untouched() {
 fn round621_a_name_with_brackets_resolves() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT 'integer[]'::regtype::text, 'text[]'::regtype::text"),
+        vals(
+            &mut e,
+            "SELECT 'integer[]'::regtype::text, 'text[]'::regtype::text"
+        ),
         vec!["integer[]|text[]"]
     );
     assert_eq!(
@@ -98,7 +113,8 @@ fn round621_a_name_with_brackets_resolves() {
         "an alias canonicalises inside the brackets too"
     );
     let mut e2 = Engine::new();
-    e2.execute("CREATE TABLE rt (a INT[], b TEXT[], c INT)").unwrap();
+    e2.execute("CREATE TABLE rt (a INT[], b TEXT[], c INT)")
+        .unwrap();
     assert_eq!(
         vals(
             &mut e2,

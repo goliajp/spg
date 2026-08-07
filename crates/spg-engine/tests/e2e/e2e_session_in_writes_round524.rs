@@ -103,7 +103,10 @@ fn round524_written_dates_use_the_session_order() {
     e.execute("SET DateStyle = 'ISO, DMY'").unwrap();
     e.execute("CREATE TABLE d (a DATE, b TIMESTAMP)").unwrap();
     // The reading a SELECT gives.
-    assert_eq!(text(&mut e, "SELECT '01/02/2020'::date::text"), "2020-02-01");
+    assert_eq!(
+        text(&mut e, "SELECT '01/02/2020'::date::text"),
+        "2020-02-01"
+    );
     // …is the one the write stores.
     e.execute("INSERT INTO d VALUES ('01/02/2020', '01/02/2020 10:00')")
         .unwrap();
@@ -164,7 +167,10 @@ fn round524_update_to_timestamptz_reads_the_session_zone() {
         ("'2020-01-01 00:00:00'", "2020-01-01 00:00:00+09"),
         ("TIMESTAMP '2020-01-01 00:00:00'", "2020-01-01 00:00:00+09"),
         // Already an instant — not shifted a second time.
-        ("TIMESTAMPTZ '2020-01-01 00:00:00Z'", "2020-01-01 09:00:00+09"),
+        (
+            "TIMESTAMPTZ '2020-01-01 00:00:00Z'",
+            "2020-01-01 09:00:00+09",
+        ),
         ("'2020-01-01 00:00:00+05'", "2020-01-01 04:00:00+09"),
     ] {
         e.execute(&format!("UPDATE u SET a = {rhs}")).unwrap();

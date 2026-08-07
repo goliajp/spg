@@ -29,9 +29,15 @@ fn ordered(e: &mut Engine) -> String {
 #[test]
 fn round713_alter_column_type_collate_recollates() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE c713 (t TEXT COLLATE \"en_US\")").unwrap();
-    e.execute("INSERT INTO c713 VALUES ('a'), ('B'), ('c')").unwrap();
-    assert_eq!(ordered(&mut e), "a B c", "en_US case-blind order, as declared");
+    e.execute("CREATE TABLE c713 (t TEXT COLLATE \"en_US\")")
+        .unwrap();
+    e.execute("INSERT INTO c713 VALUES ('a'), ('B'), ('c')")
+        .unwrap();
+    assert_eq!(
+        ordered(&mut e),
+        "a B c",
+        "en_US case-blind order, as declared"
+    );
     // The clause re-collates: C is byte order.
     e.execute("ALTER TABLE c713 ALTER COLUMN t TYPE text COLLATE \"C\"")
         .unwrap();
@@ -39,11 +45,20 @@ fn round713_alter_column_type_collate_recollates() {
     // …and back.
     e.execute("ALTER TABLE c713 ALTER COLUMN t TYPE text COLLATE \"en_US\"")
         .unwrap();
-    assert_eq!(ordered(&mut e), "a B c", "en_US again after the second ALTER");
+    assert_eq!(
+        ordered(&mut e),
+        "a B c",
+        "en_US again after the second ALTER"
+    );
     // No clause is a RESET to the type default (C here — the recorded
     // datcollate difference), not a keep of en_US.
-    e.execute("ALTER TABLE c713 ALTER COLUMN t TYPE text").unwrap();
-    assert_eq!(ordered(&mut e), "B a c", "absent clause resets, never keeps");
+    e.execute("ALTER TABLE c713 ALTER COLUMN t TYPE text")
+        .unwrap();
+    assert_eq!(
+        ordered(&mut e),
+        "B a c",
+        "absent clause resets, never keeps"
+    );
 }
 
 /// The S05h question that motivated the probe: with an INDEX on the
@@ -53,9 +68,11 @@ fn round713_alter_column_type_collate_recollates() {
 #[test]
 fn round713_recollation_with_an_index_on_the_column() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE c713 (t TEXT COLLATE \"en_US\")").unwrap();
+    e.execute("CREATE TABLE c713 (t TEXT COLLATE \"en_US\")")
+        .unwrap();
     e.execute("CREATE INDEX c713_t ON c713(t)").unwrap();
-    e.execute("INSERT INTO c713 VALUES ('a'), ('B'), ('c')").unwrap();
+    e.execute("INSERT INTO c713 VALUES ('a'), ('B'), ('c')")
+        .unwrap();
     assert_eq!(ordered(&mut e), "a B c");
     e.execute("ALTER TABLE c713 ALTER COLUMN t TYPE text COLLATE \"C\"")
         .unwrap();

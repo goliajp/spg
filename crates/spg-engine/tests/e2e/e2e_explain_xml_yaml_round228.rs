@@ -135,7 +135,10 @@ fn index_scan_carries_pg_scan_keys() {
     let mut e = seeded();
     // PG spells an index descent Scan Direction "Forward" + Index Name,
     // and puts the cost keys before Disabled.
-    let y = body(&mut e, "EXPLAIN (FORMAT YAML) SELECT * FROM r228 WHERE id = 2");
+    let y = body(
+        &mut e,
+        "EXPLAIN (FORMAT YAML) SELECT * FROM r228 WHERE id = 2",
+    );
     for want in [
         "Node Type: \"Index Scan\"",
         "Scan Direction: \"Forward\"",

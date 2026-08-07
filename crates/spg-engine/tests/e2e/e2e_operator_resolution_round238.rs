@@ -71,8 +71,14 @@ fn comparing_constructs_inherit_operator_resolution() {
 fn arithmetic_and_unary_errors_use_pgs_phrasing() {
     let mut e = Engine::new();
     for (sql, want) in [
-        ("SELECT 1 + 'a'::text", "operator does not exist: integer + text"),
-        ("SELECT 'a'::text - 1", "operator does not exist: text - integer"),
+        (
+            "SELECT 1 + 'a'::text",
+            "operator does not exist: integer + text",
+        ),
+        (
+            "SELECT 'a'::text - 1",
+            "operator does not exist: text - integer",
+        ),
         ("SELECT -'a'::text", "operator does not exist: - text"),
         ("SELECT - true", "operator does not exist: - boolean"),
     ] {
@@ -90,10 +96,22 @@ fn arithmetic_and_unary_errors_use_pgs_phrasing() {
 fn boolean_connectives_type_check_before_short_circuiting() {
     let mut e = Engine::new();
     for (sql, want) in [
-        ("SELECT true AND 1", "argument of AND must be type boolean, not type integer"),
-        ("SELECT false AND 1", "argument of AND must be type boolean, not type integer"),
-        ("SELECT 1 OR true", "argument of OR must be type boolean, not type integer"),
-        ("SELECT true OR 1", "argument of OR must be type boolean, not type integer"),
+        (
+            "SELECT true AND 1",
+            "argument of AND must be type boolean, not type integer",
+        ),
+        (
+            "SELECT false AND 1",
+            "argument of AND must be type boolean, not type integer",
+        ),
+        (
+            "SELECT 1 OR true",
+            "argument of OR must be type boolean, not type integer",
+        ),
+        (
+            "SELECT true OR 1",
+            "argument of OR must be type boolean, not type integer",
+        ),
     ] {
         let got = err(&mut e, sql);
         assert!(got.contains(want), "{sql}\n  want {want:?}\n  got  {got:?}");

@@ -107,8 +107,7 @@ fn round620_atttypid_names_the_declared_type() {
             "b|1043", // varchar — was 25
             "c|1007", "d|25", "e|1700", "f|1184", "g|16", "h|17", "i|2950", "j|3802", "k|21",
             "l|20", "m|700", // float4 — was 0, which joins to nothing
-            "n|701", "o|1082", "p|1083", "q|1186", "r|1042", "s|114", "t|1009", "u|1001",
-            "v|199",
+            "n|701", "o|1082", "p|1083", "q|1186", "r|1042", "s|114", "t|1009", "u|1001", "v|199",
         ]
     );
 }
@@ -128,8 +127,7 @@ fn round620_atttypmod_carries_the_declared_length() {
             "b|12",     // varchar(8)
             "d|-1",     // text has no modifier
             "e|655366", // numeric(10,2) -> ((10 << 16) | 2) + 4
-            "m|-1",
-            "r|5", // bare CHAR is char(1)
+            "m|-1", "r|5", // bare CHAR is char(1)
         ]
     );
     assert_eq!(
@@ -164,7 +162,7 @@ fn round620_udt_name_agrees_with_atttypid() {
         vec![
             "a|character|bpchar",
             "b|character varying|varchar",
-            "j|jsonb|jsonb",  // was text
+            "j|jsonb|jsonb", // was text
             "m|real|float4",
             "s|json|json",    // was jsonb, in both columns
             "u|ARRAY|_bytea", // was text

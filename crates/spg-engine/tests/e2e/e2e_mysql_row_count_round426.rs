@@ -56,8 +56,10 @@ fn affected(e: &mut Engine, sql: &str) -> usize {
 
 fn seeded() -> Engine {
     let mut e = mysql();
-    e.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    e.execute("INSERT INTO t VALUES(1,10),(2,20),(3,30)").unwrap();
+    e.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    e.execute("INSERT INTO t VALUES(1,10),(2,20),(3,30)")
+        .unwrap();
     e
 }
 
@@ -65,9 +67,11 @@ fn seeded() -> Engine {
 #[test]
 fn ddl_then_insert() {
     let mut e = mysql();
-    e.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     assert_eq!(row_count(&mut e), 0);
-    e.execute("INSERT INTO t VALUES(1,10),(2,20),(3,30)").unwrap();
+    e.execute("INSERT INTO t VALUES(1,10),(2,20),(3,30)")
+        .unwrap();
     assert_eq!(row_count(&mut e), 3);
 }
 
@@ -129,8 +133,10 @@ fn mysql_update_tag_counts_changed() {
 #[test]
 fn postgres_update_tag_counts_matched() {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    e.execute("INSERT INTO t VALUES(1,10),(2,20),(3,30)").unwrap();
+    e.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    e.execute("INSERT INTO t VALUES(1,10),(2,20),(3,30)")
+        .unwrap();
     assert_eq!(affected(&mut e, "UPDATE t SET v = v WHERE 1 = 1"), 3);
 }
 
@@ -139,7 +145,8 @@ fn postgres_update_tag_counts_matched() {
 #[test]
 fn upsert_counts_match_mariadb() {
     let mut e = mysql();
-    e.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    e.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     e.execute("INSERT INTO t VALUES(1,10),(2,20)").unwrap();
     // A conflict that CHANGED the row counts as delete+insert.
     e.execute("INSERT INTO t VALUES(2,999) ON DUPLICATE KEY UPDATE v = 999")

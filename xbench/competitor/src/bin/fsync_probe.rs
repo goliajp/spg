@@ -12,7 +12,9 @@ use std::io::Write;
 use std::time::Instant;
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "/tmp/fsync_probe.log".into());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/tmp/fsync_probe.log".into());
     let n: usize = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())

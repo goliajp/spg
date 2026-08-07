@@ -78,15 +78,24 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 fn round607_case_and_alias_resolve_the_same() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT 1::NUMERIC, 1::numeric, 1::NuMeRiC, 1::DECIMAL, 1::decimal"),
+        vals(
+            &mut e,
+            "SELECT 1::NUMERIC, 1::numeric, 1::NuMeRiC, 1::DECIMAL, 1::decimal"
+        ),
         vec!["1|1|1|1|1"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT 1.5::REAL, 1.5::real, 1.5::FLOAT4, 1.5::float8, 1.5::FLOAT8"),
+        vals(
+            &mut e,
+            "SELECT 1.5::REAL, 1.5::real, 1.5::FLOAT4, 1.5::float8, 1.5::FLOAT8"
+        ),
         vec!["1.5|1.5|1.5|1.5|1.5"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT 42::TEXT, 42::text, 42::INT4, 42::int8, 42::BIGINT"),
+        vals(
+            &mut e,
+            "SELECT 42::TEXT, 42::text, 42::INT4, 42::int8, 42::BIGINT"
+        ),
         vec!["42|42|42|42|42"]
     );
     assert_eq!(
@@ -97,14 +106,23 @@ fn round607_case_and_alias_resolve_the_same() {
         vals(&mut e, "SELECT 't'::BOOL, 't'::bool, 't'::BOOLEAN"),
         vec!["true|true|true"]
     );
-    assert_eq!(vals(&mut e, r#"SELECT 'x'::bpchar, 'x'::BPCHAR, 'x'::"char""#), vec!["x|x|x"]);
+    assert_eq!(
+        vals(&mut e, r#"SELECT 'x'::bpchar, 'x'::BPCHAR, 'x'::"char""#),
+        vec!["x|x|x"]
+    );
     assert_eq!(
         vals(&mut e, "SELECT '2020-01-02'::DATE, '2020-01-02'::date"),
         vec!["2020-01-02|2020-01-02"]
     );
-    assert_eq!(vals(&mut e, "SELECT '1 day'::INTERVAL, '1 day'::interval"), vec!["1 day|1 day"]);
     assert_eq!(
-        vals(&mut e, r#"SELECT '{"a":1}'::JSONB, '{"a":1}'::jsonb, '1'::JSON"#),
+        vals(&mut e, "SELECT '1 day'::INTERVAL, '1 day'::interval"),
+        vec!["1 day|1 day"]
+    );
+    assert_eq!(
+        vals(
+            &mut e,
+            r#"SELECT '{"a":1}'::JSONB, '{"a":1}'::jsonb, '1'::JSON"#
+        ),
         vec![r#"{"a": 1}|{"a": 1}|1"#]
     );
     assert_eq!(
@@ -144,7 +162,10 @@ fn round607_typmods_still_parse() {
         "the fractional-seconds typmod rounds"
     );
     assert_eq!(
-        vals(&mut e, "SELECT '03:04:05.678'::TIME(1), '03:04:05.678'::time(0)"),
+        vals(
+            &mut e,
+            "SELECT '03:04:05.678'::TIME(1), '03:04:05.678'::time(0)"
+        ),
         vec!["03:04:05.7|03:04:06"]
     );
     assert_eq!(
@@ -153,7 +174,10 @@ fn round607_typmods_still_parse() {
         "the bit widths, which are read from the name before anything else"
     );
     assert_eq!(
-        vals(&mut e, "SELECT 'a'::VARCHAR(3), 'abcdef'::varchar(3), 'ab'::CHAR(4)||'|'"),
+        vals(
+            &mut e,
+            "SELECT 'a'::VARCHAR(3), 'abcdef'::varchar(3), 'ab'::CHAR(4)||'|'"
+        ),
         vec!["a|abc|ab|"],
         "a length cap truncates; the engine renders CHAR without its padding"
     );
@@ -164,11 +188,17 @@ fn round607_typmods_still_parse() {
 fn round607_arrays_pseudotypes_and_unknown_names() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT '{1,2}'::INT[], '{1,2}'::int4[], '{1.5}'::NUMERIC[]"),
+        vals(
+            &mut e,
+            "SELECT '{1,2}'::INT[], '{1,2}'::int4[], '{1.5}'::NUMERIC[]"
+        ),
         vec!["{1,2}|{1,2}|{1.5}"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT NULL::NUMERIC IS NULL, NULL::real IS NULL, NULL::anyarray IS NULL"),
+        vals(
+            &mut e,
+            "SELECT NULL::NUMERIC IS NULL, NULL::real IS NULL, NULL::anyarray IS NULL"
+        ),
         vec!["true|true|true"],
         "a pseudotype IS a type name, so a NULL passes through it"
     );
@@ -202,11 +232,17 @@ fn round607_arrays_pseudotypes_and_unknown_names() {
 fn round607_numeric_values_are_unchanged() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT 'Infinity'::NUMERIC, 'NaN'::numeric, 'nan'::NUMERIC"),
+        vals(
+            &mut e,
+            "SELECT 'Infinity'::NUMERIC, 'NaN'::numeric, 'nan'::NUMERIC"
+        ),
         vec!["Infinity|NaN|NaN"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT 1e10::NUMERIC, 0.1::real::numeric, 3.14::NUMERIC"),
+        vals(
+            &mut e,
+            "SELECT 1e10::NUMERIC, 0.1::real::numeric, 3.14::NUMERIC"
+        ),
         vec!["10000000000|0.1|3.14"],
         "a float keeps its shortest round-trip decimal"
     );
@@ -229,7 +265,10 @@ fn round607_scale() {
     e.execute("INSERT INTO big SELECT gg FROM generate_series(1, 20000) gg")
         .unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT count(id::NUMERIC), sum(id::NUMERIC) FROM big"),
+        vals(
+            &mut e,
+            "SELECT count(id::NUMERIC), sum(id::NUMERIC) FROM big"
+        ),
         vec!["20000|200010000"]
     );
     assert_eq!(
@@ -246,7 +285,10 @@ fn round607_scale() {
         vec!["1|20000"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE id::NUMERIC / 7 > 100"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE id::NUMERIC / 7 > 100"
+        ),
         vec!["19300"]
     );
 }

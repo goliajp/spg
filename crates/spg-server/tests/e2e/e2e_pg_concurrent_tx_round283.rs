@@ -179,7 +179,10 @@ fn two_connections_can_hold_transactions_at_the_same_time() {
     query_one(&mut b, "COMMIT");
 
     let mut c = open(&addr);
-    assert_eq!(query_one(&mut c, "SELECT count(*) FROM t"), Some("2".into()));
+    assert_eq!(
+        query_one(&mut c, "SELECT count(*) FROM t"),
+        Some("2".into())
+    );
 }
 
 #[test]
@@ -192,9 +195,15 @@ fn one_connections_uncommitted_write_is_invisible_to_another() {
     query_one(&mut a, "BEGIN");
     query_one(&mut a, "INSERT INTO t VALUES (1, 10)");
     // The slots are separate, so B must not read A's uncommitted row.
-    assert_eq!(query_one(&mut b, "SELECT count(*) FROM t"), Some("0".into()));
+    assert_eq!(
+        query_one(&mut b, "SELECT count(*) FROM t"),
+        Some("0".into())
+    );
     query_one(&mut a, "COMMIT");
-    assert_eq!(query_one(&mut b, "SELECT count(*) FROM t"), Some("1".into()));
+    assert_eq!(
+        query_one(&mut b, "SELECT count(*) FROM t"),
+        Some("1".into())
+    );
 }
 
 #[test]
@@ -212,7 +221,10 @@ fn a_rollback_on_one_connection_leaves_the_other_alone() {
     query_one(&mut b, "COMMIT");
 
     let mut c = open(&addr);
-    assert_eq!(query_one(&mut c, "SELECT count(*) FROM t"), Some("1".into()));
+    assert_eq!(
+        query_one(&mut c, "SELECT count(*) FROM t"),
+        Some("1".into())
+    );
     assert_eq!(
         query_one(&mut c, "SELECT v FROM t WHERE id = 2"),
         Some("20".into()),
@@ -283,12 +295,18 @@ fn a_disconnect_mid_transaction_does_not_strand_the_slot() {
         query_one(&mut doomed, "INSERT INTO t VALUES (7, 70)");
         // dropped without COMMIT or ROLLBACK
     }
-    assert_eq!(query_one(&mut a, "SELECT count(*) FROM t"), Some("0".into()));
+    assert_eq!(
+        query_one(&mut a, "SELECT count(*) FROM t"),
+        Some("0".into())
+    );
     // …and the engine still accepts new transactions afterwards.
     query_one(&mut a, "BEGIN");
     query_one(&mut a, "INSERT INTO t VALUES (8, 80)");
     query_one(&mut a, "COMMIT");
-    assert_eq!(query_one(&mut a, "SELECT count(*) FROM t"), Some("1".into()));
+    assert_eq!(
+        query_one(&mut a, "SELECT count(*) FROM t"),
+        Some("1".into())
+    );
 }
 
 /// v7.39 (round 494) — a transaction that changed nothing installs nothing.
@@ -319,23 +337,44 @@ fn a_readonly_repeatable_read_commit_does_not_revert_another_connection() {
     query_one(&mut a, "INSERT INTO t VALUES (1, 10), (2, 20)");
 
     query_one(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
-    assert_eq!(query_one(&mut a, "SELECT v FROM t WHERE id = 1"), Some("10".into()));
+    assert_eq!(
+        query_one(&mut a, "SELECT v FROM t WHERE id = 1"),
+        Some("10".into())
+    );
 
     query_one(&mut b, "UPDATE t SET v = 99 WHERE id = 1");
     query_one(&mut b, "INSERT INTO t VALUES (3, 30)");
 
     // A's own view stays frozen while it is open — that part always worked,
     // and it is what makes the clobber below silent.
-    assert_eq!(query_one(&mut a, "SELECT v FROM t WHERE id = 1"), Some("10".into()));
-    assert_eq!(query_one(&mut a, "SELECT count(*) FROM t"), Some("2".into()));
+    assert_eq!(
+        query_one(&mut a, "SELECT v FROM t WHERE id = 1"),
+        Some("10".into())
+    );
+    assert_eq!(
+        query_one(&mut a, "SELECT count(*) FROM t"),
+        Some("2".into())
+    );
     query_one(&mut a, "COMMIT");
 
     // PG18: 99 and 3 rows, for every connection.
-    assert_eq!(query_one(&mut a, "SELECT v FROM t WHERE id = 1"), Some("99".into()));
-    assert_eq!(query_one(&mut a, "SELECT count(*) FROM t"), Some("3".into()));
-    assert_eq!(query_one(&mut b, "SELECT v FROM t WHERE id = 1"), Some("99".into()));
+    assert_eq!(
+        query_one(&mut a, "SELECT v FROM t WHERE id = 1"),
+        Some("99".into())
+    );
+    assert_eq!(
+        query_one(&mut a, "SELECT count(*) FROM t"),
+        Some("3".into())
+    );
+    assert_eq!(
+        query_one(&mut b, "SELECT v FROM t WHERE id = 1"),
+        Some("99".into())
+    );
     let mut c = open(&addr);
-    assert_eq!(query_one(&mut c, "SELECT count(*) FROM t"), Some("3".into()));
+    assert_eq!(
+        query_one(&mut c, "SELECT count(*) FROM t"),
+        Some("3".into())
+    );
 }
 
 /// The same for ROLLBACK, which discards the shadow rather than installing
@@ -349,10 +388,16 @@ fn a_readonly_rollback_leaves_another_connections_commit_alone() {
     query_one(&mut a, "CREATE TABLE t (id int primary key, v int)");
     query_one(&mut a, "INSERT INTO t VALUES (1, 10)");
     query_one(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
-    assert_eq!(query_one(&mut a, "SELECT v FROM t WHERE id = 1"), Some("10".into()));
+    assert_eq!(
+        query_one(&mut a, "SELECT v FROM t WHERE id = 1"),
+        Some("10".into())
+    );
     query_one(&mut b, "UPDATE t SET v = 77 WHERE id = 1");
     query_one(&mut a, "ROLLBACK");
-    assert_eq!(query_one(&mut a, "SELECT v FROM t WHERE id = 1"), Some("77".into()));
+    assert_eq!(
+        query_one(&mut a, "SELECT v FROM t WHERE id = 1"),
+        Some("77".into())
+    );
 }
 
 /// The skip must not swallow a transaction that DID write, nor one whose
@@ -371,13 +416,19 @@ fn a_transaction_that_did_write_still_installs_its_work() {
     query_one(&mut a, "BEGIN");
     query_one(&mut a, "UPDATE t SET v = 55 WHERE id = 1");
     query_one(&mut a, "COMMIT");
-    assert_eq!(query_one(&mut a, "SELECT v FROM t WHERE id = 1"), Some("55".into()));
+    assert_eq!(
+        query_one(&mut a, "SELECT v FROM t WHERE id = 1"),
+        Some("55".into())
+    );
 
     query_one(&mut a, "BEGIN");
     query_one(&mut a, "CREATE TABLE made_in_tx (a int)");
     query_one(&mut a, "COMMIT");
     query_one(&mut a, "INSERT INTO made_in_tx VALUES (1)");
-    assert_eq!(query_one(&mut a, "SELECT count(*) FROM made_in_tx"), Some("1".into()));
+    assert_eq!(
+        query_one(&mut a, "SELECT count(*) FROM made_in_tx"),
+        Some("1".into())
+    );
 
     assert_eq!(query_one(&mut a, "SELECT nextval('s1')"), Some("1".into()));
     query_one(&mut a, "BEGIN");
@@ -414,8 +465,14 @@ fn a_set_inside_a_transaction_does_not_revert_another_connection() {
 
     // PG18: both writes survive.
     let mut c = open(&addr);
-    assert_eq!(query_one(&mut c, "SELECT v FROM t WHERE id = 1"), Some("99".into()));
-    assert_eq!(query_one(&mut c, "SELECT v FROM t WHERE id = 2"), Some("111".into()));
+    assert_eq!(
+        query_one(&mut c, "SELECT v FROM t WHERE id = 1"),
+        Some("99".into())
+    );
+    assert_eq!(
+        query_one(&mut c, "SELECT v FROM t WHERE id = 2"),
+        Some("111".into())
+    );
 }
 
 /// v7.39 (round 496) — DDL inside a transaction must not cost another
@@ -448,10 +505,16 @@ fn ddl_inside_a_transaction_does_not_revert_another_connection() {
 
     let mut c = open(&addr);
     // B's write survives...
-    assert_eq!(query_one(&mut c, "SELECT v FROM t WHERE id = 1"), Some("99".into()));
+    assert_eq!(
+        query_one(&mut c, "SELECT v FROM t WHERE id = 1"),
+        Some("99".into())
+    );
     // ...and A's DDL landed.
     query_one(&mut c, "INSERT INTO made_in_tx VALUES (1)");
-    assert_eq!(query_one(&mut c, "SELECT count(*) FROM made_in_tx"), Some("1".into()));
+    assert_eq!(
+        query_one(&mut c, "SELECT count(*) FROM made_in_tx"),
+        Some("1".into())
+    );
 }
 
 /// A DROP inside the transaction still drops, and still leaves the other
@@ -471,8 +534,14 @@ fn a_drop_inside_a_transaction_keeps_its_effect_and_spares_the_rest() {
     query_one(&mut a, "COMMIT");
 
     let mut c = open(&addr);
-    assert_eq!(query_one(&mut c, "SELECT v FROM keep WHERE id = 1"), Some("99".into()));
-    assert!(query_err(&mut c, "SELECT count(*) FROM goes").is_some(), "goes should be gone");
+    assert_eq!(
+        query_one(&mut c, "SELECT v FROM keep WHERE id = 1"),
+        Some("99".into())
+    );
+    assert!(
+        query_err(&mut c, "SELECT count(*) FROM goes").is_some(),
+        "goes should be gone"
+    );
 }
 
 /// v7.39 (round 497) — a sequence's value is not transactional.
@@ -528,7 +597,10 @@ fn a_sequence_created_in_a_rolled_back_transaction_does_not_survive() {
     let mut a = open(&addr);
     query_one(&mut a, "BEGIN");
     query_one(&mut a, "CREATE SEQUENCE made");
-    assert_eq!(query_one(&mut a, "SELECT nextval('made')"), Some("1".into()));
+    assert_eq!(
+        query_one(&mut a, "SELECT nextval('made')"),
+        Some("1".into())
+    );
     query_one(&mut a, "ROLLBACK");
     assert!(
         query_err(&mut a, "SELECT nextval('made')").is_some(),
@@ -543,12 +615,24 @@ fn a_sequence_created_and_committed_keeps_its_counter() {
     let mut a = open(&addr);
     query_one(&mut a, "BEGIN");
     query_one(&mut a, "CREATE SEQUENCE made2");
-    assert_eq!(query_one(&mut a, "SELECT nextval('made2')"), Some("1".into()));
-    assert_eq!(query_one(&mut a, "SELECT nextval('made2')"), Some("2".into()));
+    assert_eq!(
+        query_one(&mut a, "SELECT nextval('made2')"),
+        Some("1".into())
+    );
+    assert_eq!(
+        query_one(&mut a, "SELECT nextval('made2')"),
+        Some("2".into())
+    );
     query_one(&mut a, "COMMIT");
-    assert_eq!(query_one(&mut a, "SELECT nextval('made2')"), Some("3".into()));
+    assert_eq!(
+        query_one(&mut a, "SELECT nextval('made2')"),
+        Some("3".into())
+    );
     let mut b = open(&addr);
-    assert_eq!(query_one(&mut b, "SELECT nextval('made2')"), Some("4".into()));
+    assert_eq!(
+        query_one(&mut b, "SELECT nextval('made2')"),
+        Some("4".into())
+    );
 }
 
 /// v7.39 (round 498) — an advisory lock is exclusive across connections.
@@ -577,19 +661,46 @@ fn an_advisory_lock_is_exclusive_across_connections() {
     let mut a = open(&addr);
     let mut b = open(&addr);
 
-    assert_eq!(query_one(&mut a, "SELECT pg_try_advisory_lock(4981)"), Some("t".into()));
+    assert_eq!(
+        query_one(&mut a, "SELECT pg_try_advisory_lock(4981)"),
+        Some("t".into())
+    );
     // PG18: false. Before this round: true, on the read path.
-    assert_eq!(query_one(&mut b, "SELECT pg_try_advisory_lock(4981)"), Some("f".into()));
-    assert_eq!(query_one(&mut b, "SELECT pg_try_advisory_lock(4981)"), Some("f".into()));
+    assert_eq!(
+        query_one(&mut b, "SELECT pg_try_advisory_lock(4981)"),
+        Some("f".into())
+    );
+    assert_eq!(
+        query_one(&mut b, "SELECT pg_try_advisory_lock(4981)"),
+        Some("f".into())
+    );
     // And B cannot release what it never took.
-    assert_eq!(query_one(&mut b, "SELECT pg_advisory_unlock(4981)"), Some("f".into()));
+    assert_eq!(
+        query_one(&mut b, "SELECT pg_advisory_unlock(4981)"),
+        Some("f".into())
+    );
     // A's own second take is re-entrant, and it takes two unlocks.
-    assert_eq!(query_one(&mut a, "SELECT pg_try_advisory_lock(4981)"), Some("t".into()));
-    assert_eq!(query_one(&mut a, "SELECT pg_advisory_unlock(4981)"), Some("t".into()));
-    assert_eq!(query_one(&mut b, "SELECT pg_try_advisory_lock(4981)"), Some("f".into()));
-    assert_eq!(query_one(&mut a, "SELECT pg_advisory_unlock(4981)"), Some("t".into()));
+    assert_eq!(
+        query_one(&mut a, "SELECT pg_try_advisory_lock(4981)"),
+        Some("t".into())
+    );
+    assert_eq!(
+        query_one(&mut a, "SELECT pg_advisory_unlock(4981)"),
+        Some("t".into())
+    );
+    assert_eq!(
+        query_one(&mut b, "SELECT pg_try_advisory_lock(4981)"),
+        Some("f".into())
+    );
+    assert_eq!(
+        query_one(&mut a, "SELECT pg_advisory_unlock(4981)"),
+        Some("t".into())
+    );
     // Fully released — now B may have it.
-    assert_eq!(query_one(&mut b, "SELECT pg_try_advisory_lock(4981)"), Some("t".into()));
+    assert_eq!(
+        query_one(&mut b, "SELECT pg_try_advisory_lock(4981)"),
+        Some("t".into())
+    );
 }
 
 /// `lastval()` reads the session's own last sequence, so it needs the same
@@ -626,12 +737,14 @@ fn currval_and_lastval_are_not_defined_in_a_session_that_never_called_nextval() 
 
     let cv = query_err(&mut b, "SELECT currval('cv')");
     assert!(
-        cv.as_deref().is_some_and(|e| e.contains("not yet defined in this session")),
+        cv.as_deref()
+            .is_some_and(|e| e.contains("not yet defined in this session")),
         "B's currval -> {cv:?}"
     );
     let lv = query_err(&mut b, "SELECT lastval()");
     assert!(
-        lv.as_deref().is_some_and(|e| e.contains("not yet defined in this session")),
+        lv.as_deref()
+            .is_some_and(|e| e.contains("not yet defined in this session")),
         "B's lastval -> {lv:?}"
     );
 }
@@ -664,7 +777,8 @@ fn currval_of_a_missing_sequence_reports_the_sequence() {
     let mut a = open(&addr);
     let e = query_err(&mut a, "SELECT currval('no_such_seq')");
     assert!(
-        e.as_deref().is_some_and(|m| !m.contains("not yet defined in this session")),
+        e.as_deref()
+            .is_some_and(|m| !m.contains("not yet defined in this session")),
         "should name the missing relation -> {e:?}"
     );
 }

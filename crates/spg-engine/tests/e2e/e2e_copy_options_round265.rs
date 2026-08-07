@@ -65,7 +65,6 @@ fn csv_opts(extra: impl FnOnce(&mut spg_sql::ast::CopyOptions)) -> spg_sql::ast:
     o
 }
 
-
 #[test]
 fn force_not_null_and_force_null_change_csv_null_reading() {
     let mut e = seeded();
@@ -107,17 +106,30 @@ fn the_direction_and_mode_rules_are_pgs() {
     text_opts.force_not_null = Some(vec!["s".to_string()]);
     let got = format!(
         "{}",
-        e.copy_from_buffer("fnn2", None, &text_opts, CSV).unwrap_err()
+        e.copy_from_buffer("fnn2", None, &text_opts, CSV)
+            .unwrap_err()
     );
-    assert!(got.contains("COPY FORCE_NOT_NULL requires CSV mode"), "{got}");
+    assert!(
+        got.contains("COPY FORCE_NOT_NULL requires CSV mode"),
+        "{got}"
+    );
     // Then the direction.
-    let got = err(&mut e, "COPY fnn2 TO STDOUT WITH (FORMAT csv, FORCE_NOT_NULL (s))");
+    let got = err(
+        &mut e,
+        "COPY fnn2 TO STDOUT WITH (FORMAT csv, FORCE_NOT_NULL (s))",
+    );
     assert!(
         got.contains("COPY FORCE_NOT_NULL cannot be used with COPY TO"),
         "{got}"
     );
-    let got = err(&mut e, "COPY fnn2 TO STDOUT WITH (FORMAT csv, FORCE_NULL (s))");
-    assert!(got.contains("COPY FORCE_NULL cannot be used with COPY TO"), "{got}");
+    let got = err(
+        &mut e,
+        "COPY fnn2 TO STDOUT WITH (FORMAT csv, FORCE_NULL (s))",
+    );
+    assert!(
+        got.contains("COPY FORCE_NULL cannot be used with COPY TO"),
+        "{got}"
+    );
     let got = err(&mut e, "COPY fnn2 TO STDOUT WITH (FORCE_QUOTE (s))");
     assert!(got.contains("COPY FORCE_QUOTE requires CSV mode"), "{got}");
 }
@@ -128,5 +140,8 @@ fn unknown_options_and_formats_take_pgs_wordings() {
     let got = err(&mut e, "COPY fnn2 TO STDOUT WITH (NOSUCHOPT true)");
     assert!(got.contains("option \"nosuchopt\" not recognized"), "{got}");
     let got = err(&mut e, "COPY fnn2 TO STDOUT WITH (FORMAT nosuchfmt)");
-    assert!(got.contains("COPY format \"nosuchfmt\" not recognized"), "{got}");
+    assert!(
+        got.contains("COPY format \"nosuchfmt\" not recognized"),
+        "{got}"
+    );
 }

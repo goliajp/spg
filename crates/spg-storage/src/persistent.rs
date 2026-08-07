@@ -559,7 +559,10 @@ mod tests {
         }
         let older = pv.clone();
         let newer = pv.push(999).set(0, 111).unwrap();
-        assert_eq!(older.iter().copied().collect::<Vec<_>>(), (0..40).collect::<Vec<_>>());
+        assert_eq!(
+            older.iter().copied().collect::<Vec<_>>(),
+            (0..40).collect::<Vec<_>>()
+        );
         let seen: Vec<usize> = newer.iter().copied().collect();
         assert_eq!(seen.len(), 41);
         assert_eq!(seen[0], 111);

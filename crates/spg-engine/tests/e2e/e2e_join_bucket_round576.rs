@@ -77,7 +77,10 @@ fn round576_duplicate_int_keys_keep_every_row() {
     e.execute("INSERT INTO r576 VALUES (10,7),(11,7),(12,7),(13,8),(14,8),(15,9)")
         .unwrap();
     assert_eq!(
-        one(&mut e, "SELECT count(*) FROM l576 a JOIN r576 b ON a.k = b.k"),
+        one(
+            &mut e,
+            "SELECT count(*) FROM l576 a JOIN r576 b ON a.k = b.k"
+        ),
         "6",
         "3 + 2 + 1 pairs"
     );
@@ -105,11 +108,15 @@ fn round576_duplicate_text_keys_keep_every_row() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE lt576 (id INT, k TEXT)").unwrap();
     e.execute("CREATE TABLE rt576 (id INT, k TEXT)").unwrap();
-    e.execute("INSERT INTO lt576 VALUES (1,'a'), (2,'b')").unwrap();
+    e.execute("INSERT INTO lt576 VALUES (1,'a'), (2,'b')")
+        .unwrap();
     e.execute("INSERT INTO rt576 VALUES (10,'a'),(11,'a'),(12,'a'),(13,'b')")
         .unwrap();
     assert_eq!(
-        one(&mut e, "SELECT count(*) FROM lt576 a JOIN rt576 b ON a.k = b.k"),
+        one(
+            &mut e,
+            "SELECT count(*) FROM lt576 a JOIN rt576 b ON a.k = b.k"
+        ),
         "4"
     );
     assert_eq!(
@@ -121,7 +128,8 @@ fn round576_duplicate_text_keys_keep_every_row() {
     );
     // A two-column key takes the same map.
     e.execute("CREATE TABLE l2576 (a INT, b TEXT)").unwrap();
-    e.execute("CREATE TABLE r2576 (a INT, b TEXT, id INT)").unwrap();
+    e.execute("CREATE TABLE r2576 (a INT, b TEXT, id INT)")
+        .unwrap();
     e.execute("INSERT INTO l2576 VALUES (1,'x')").unwrap();
     e.execute("INSERT INTO r2576 VALUES (1,'x',100),(1,'x',101),(1,'y',102)")
         .unwrap();
@@ -141,11 +149,15 @@ fn round576_null_keys_match_nothing() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE ln576 (id INT, k INT)").unwrap();
     e.execute("CREATE TABLE rn576 (id INT, k INT)").unwrap();
-    e.execute("INSERT INTO ln576 VALUES (1, NULL), (2, 5)").unwrap();
+    e.execute("INSERT INTO ln576 VALUES (1, NULL), (2, 5)")
+        .unwrap();
     e.execute("INSERT INTO rn576 VALUES (10, NULL), (11, NULL), (12, 5)")
         .unwrap();
     assert_eq!(
-        one(&mut e, "SELECT count(*) FROM ln576 a JOIN rn576 b ON a.k = b.k"),
+        one(
+            &mut e,
+            "SELECT count(*) FROM ln576 a JOIN rn576 b ON a.k = b.k"
+        ),
         "1",
         "only the 5 = 5 pair"
     );
@@ -170,7 +182,10 @@ fn round576_outer_joins_see_every_build_row() {
     e.execute("INSERT INTO ro576 VALUES (10,7),(11,7),(12,99)")
         .unwrap();
     assert_eq!(
-        one(&mut e, "SELECT count(*) FROM lo576 a RIGHT JOIN ro576 b ON a.k = b.k"),
+        one(
+            &mut e,
+            "SELECT count(*) FROM lo576 a RIGHT JOIN ro576 b ON a.k = b.k"
+        ),
         "3",
         "two matches plus the unmatched build row"
     );
@@ -197,7 +212,10 @@ fn round576_scale_with_duplicates() {
         .unwrap();
     // 500 distinct keys; left has 4 rows each, right has 6 → 500*4*6.
     assert_eq!(
-        one(&mut e, "SELECT count(*) FROM ls576 a JOIN rs576 b ON a.k = b.k"),
+        one(
+            &mut e,
+            "SELECT count(*) FROM ls576 a JOIN rs576 b ON a.k = b.k"
+        ),
         "12000"
     );
     assert_eq!(

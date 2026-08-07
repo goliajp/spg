@@ -50,7 +50,10 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 fn round632_group_separator_is_positional() {
     let mut e = Engine::new();
     assert_eq!(
-        vals(&mut e, "SELECT to_char(12,'9G9'), to_char(1,'9G9'), to_char(123,'9G99')"),
+        vals(
+            &mut e,
+            "SELECT to_char(12,'9G9'), to_char(1,'9G9'), to_char(123,'9G99')"
+        ),
         vec![" 1,2|   1| 1,23"]
     );
     assert_eq!(
@@ -60,12 +63,18 @@ fn round632_group_separator_is_positional() {
     );
     // A literal comma behaves the same way.
     assert_eq!(
-        vals(&mut e, "SELECT to_char(1234,'9,999'), to_char(1234567,'9G999G999')"),
+        vals(
+            &mut e,
+            "SELECT to_char(1234,'9,999'), to_char(1234567,'9G999G999')"
+        ),
         vec![" 1,234| 1,234,567"]
     );
     // FM trims the blanks but keeps the separator between real digits.
     assert_eq!(
-        vals(&mut e, "SELECT to_char(12,'FM9G9'), to_char(1,'FM9G9'), to_char(1234,'FM9G999')"),
+        vals(
+            &mut e,
+            "SELECT to_char(12,'FM9G9'), to_char(1,'FM9G9'), to_char(1234,'FM9G999')"
+        ),
         vec!["1,2|1|1,234"]
     );
 }
@@ -89,6 +98,9 @@ fn round632_lone_v_prints_nothing() {
     let mut e = Engine::new();
     assert_eq!(vals(&mut e, "SELECT to_char(1,'V')"), vec![""]);
     // The forms that do have slots are unchanged.
-    assert_eq!(vals(&mut e, "SELECT to_char(1,'9V'), to_char(1,'V9')"), vec![" 1| #"]);
+    assert_eq!(
+        vals(&mut e, "SELECT to_char(1,'9V'), to_char(1,'V9')"),
+        vec![" 1| #"]
+    );
     assert_eq!(vals(&mut e, "SELECT to_char(1,'9V9')"), vec![" 10"]);
 }

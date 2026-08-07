@@ -39,7 +39,10 @@ fn pair(e: &mut Engine, sql: &str) -> (String, String) {
     match e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err}")) {
         QueryResult::Rows { rows, .. } => {
             let r = &rows[0].values;
-            (spg_engine::eval::value_to_text(&r[0]), spg_engine::eval::value_to_text(&r[1]))
+            (
+                spg_engine::eval::value_to_text(&r[0]),
+                spg_engine::eval::value_to_text(&r[1]),
+            )
         }
         other => panic!("{other:?}"),
     }
@@ -50,23 +53,34 @@ fn pair(e: &mut Engine, sql: &str) -> (String, String) {
 fn min_max_folds() {
     let mut e = mysql();
     e.execute("CREATE TABLE t(v VARCHAR(10))").unwrap();
-    e.execute("INSERT INTO t VALUES('Zebra'),('apple'),('Mango'),('Émile')").unwrap();
-    assert_eq!(pair(&mut e, "SELECT MIN(v), MAX(v) FROM t"),
-               ("apple".to_string(), "Zebra".to_string()));
+    e.execute("INSERT INTO t VALUES('Zebra'),('apple'),('Mango'),('Émile')")
+        .unwrap();
+    assert_eq!(
+        pair(&mut e, "SELECT MIN(v), MAX(v) FROM t"),
+        ("apple".to_string(), "Zebra".to_string())
+    );
 }
 
 /// GREATEST / LEAST fold text (a < B < c under fold).
 #[test]
 fn greatest_least_folds() {
     let mut e = mysql();
-    assert_eq!(pair(&mut e, "SELECT LEAST('a','B','c'), GREATEST('a','B','c')"),
-               ("a".to_string(), "c".to_string()));
     assert_eq!(
-        pair(&mut e, "SELECT LEAST('Zebra','apple','Mango'), GREATEST('Zebra','apple','Mango')"),
+        pair(&mut e, "SELECT LEAST('a','B','c'), GREATEST('a','B','c')"),
+        ("a".to_string(), "c".to_string())
+    );
+    assert_eq!(
+        pair(
+            &mut e,
+            "SELECT LEAST('Zebra','apple','Mango'), GREATEST('Zebra','apple','Mango')"
+        ),
         ("apple".to_string(), "Zebra".to_string())
     );
     assert_eq!(
-        pair(&mut e, "SELECT LEAST('Émile','apple','Mango'), GREATEST('Émile','apple','Mango')"),
+        pair(
+            &mut e,
+            "SELECT LEAST('Émile','apple','Mango'), GREATEST('Émile','apple','Mango')"
+        ),
         ("apple".to_string(), "Mango".to_string())
     );
 }
@@ -75,12 +89,33 @@ fn greatest_least_folds() {
 #[test]
 fn case_when_folds() {
     let mut e = mysql();
-    assert_eq!(scalar(&mut e, "SELECT CASE 'A' WHEN 'a' THEN 'match' ELSE 'no' END"), "match");
-    assert_eq!(scalar(&mut e, "SELECT CASE 'é' WHEN 'e' THEN 'match' ELSE 'no' END"), "match");
-    assert_eq!(scalar(&mut e, "SELECT CASE 'A ' WHEN 'a' THEN 'match' ELSE 'no' END"), "match");
+    assert_eq!(
+        scalar(
+            &mut e,
+            "SELECT CASE 'A' WHEN 'a' THEN 'match' ELSE 'no' END"
+        ),
+        "match"
+    );
+    assert_eq!(
+        scalar(
+            &mut e,
+            "SELECT CASE 'é' WHEN 'e' THEN 'match' ELSE 'no' END"
+        ),
+        "match"
+    );
+    assert_eq!(
+        scalar(
+            &mut e,
+            "SELECT CASE 'A ' WHEN 'a' THEN 'match' ELSE 'no' END"
+        ),
+        "match"
+    );
     // A downstream WHEN branch also folds.
     assert_eq!(
-        scalar(&mut e, "SELECT CASE 'foo' WHEN 'bar' THEN 1 WHEN 'FOO' THEN 2 ELSE 0 END"),
+        scalar(
+            &mut e,
+            "SELECT CASE 'foo' WHEN 'bar' THEN 1 WHEN 'FOO' THEN 2 ELSE 0 END"
+        ),
         "2"
     );
 }
@@ -90,10 +125,21 @@ fn case_when_folds() {
 fn postgres_byte_exact() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t(v VARCHAR(10))").unwrap();
-    e.execute("INSERT INTO t VALUES('Zebra'),('apple'),('Mango')").unwrap();
-    assert_eq!(pair(&mut e, "SELECT MIN(v), MAX(v) FROM t"),
-               ("Mango".to_string(), "apple".to_string()));
-    assert_eq!(pair(&mut e, "SELECT least('a','B','c'), greatest('a','B','c')"),
-               ("B".to_string(), "c".to_string()));
-    assert_eq!(scalar(&mut e, "SELECT CASE 'A' WHEN 'a' THEN 'match' ELSE 'no' END"), "no");
+    e.execute("INSERT INTO t VALUES('Zebra'),('apple'),('Mango')")
+        .unwrap();
+    assert_eq!(
+        pair(&mut e, "SELECT MIN(v), MAX(v) FROM t"),
+        ("Mango".to_string(), "apple".to_string())
+    );
+    assert_eq!(
+        pair(&mut e, "SELECT least('a','B','c'), greatest('a','B','c')"),
+        ("B".to_string(), "c".to_string())
+    );
+    assert_eq!(
+        scalar(
+            &mut e,
+            "SELECT CASE 'A' WHEN 'a' THEN 'match' ELSE 'no' END"
+        ),
+        "no"
+    );
 }

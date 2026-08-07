@@ -37,8 +37,10 @@ use spg_engine::{Engine, QueryResult};
 
 fn seeded() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE DOMAIN pbase2 AS int CHECK (VALUE > 0)").unwrap();
-    e.execute("CREATE DOMAIN pchild2 AS pbase2 CHECK (VALUE % 2 = 0)").unwrap();
+    e.execute("CREATE DOMAIN pbase2 AS int CHECK (VALUE > 0)")
+        .unwrap();
+    e.execute("CREATE DOMAIN pchild2 AS pbase2 CHECK (VALUE % 2 = 0)")
+        .unwrap();
     e.execute("CREATE DOMAIN wd2 AS int DEFAULT 42").unwrap();
     e
 }
@@ -97,7 +99,10 @@ fn pg_typeof_names_the_domain() {
     assert_eq!(one(&mut e, "SELECT pg_typeof(p) FROM pt LIMIT 1"), "pbase2");
     // The gate holds: a builtin cast still reports PG's spelling, not
     // the cast's literal target text.
-    assert_eq!(one(&mut e, "SELECT pg_typeof(1::float8)"), "double precision");
+    assert_eq!(
+        one(&mut e, "SELECT pg_typeof(1::float8)"),
+        "double precision"
+    );
     assert_eq!(one(&mut e, "SELECT pg_typeof(1::int2)"), "smallint");
 }
 
@@ -111,7 +116,8 @@ fn domain_and_column_defaults_both_apply() {
     e.execute("INSERT INTO pt (id, p) VALUES (1, 5)").unwrap();
     assert_eq!(one(&mut e, "SELECT w, v FROM pt WHERE id=1"), "42|7");
     // An EXPLICIT NULL stays NULL — the default only fills an omission.
-    e.execute("INSERT INTO pt (id, w, p) VALUES (2, NULL, 5)").unwrap();
+    e.execute("INSERT INTO pt (id, w, p) VALUES (2, NULL, 5)")
+        .unwrap();
     assert_eq!(one(&mut e, "SELECT w FROM pt WHERE id=2"), "NULL");
     // The domain's CHECK still guards the column.
     let got = err(&mut e, "INSERT INTO pt (id, p) VALUES (3, -1)");
@@ -122,19 +128,29 @@ fn domain_and_column_defaults_both_apply() {
 #[test]
 fn the_single_level_domain_core_is_unchanged() {
     let mut e = Engine::new();
-    e.execute("CREATE DOMAIN posint AS int CHECK (VALUE > 0)").unwrap();
+    e.execute("CREATE DOMAIN posint AS int CHECK (VALUE > 0)")
+        .unwrap();
     e.execute("CREATE DOMAIN shortname AS text NOT NULL CHECK (length(VALUE) <= 5)")
         .unwrap();
     assert_eq!(one(&mut e, "SELECT 5::posint"), "5");
     assert_eq!(one(&mut e, "SELECT 'abc'::shortname"), "abc");
     for (sql, want) in [
-        ("SELECT (-1)::posint", "value for domain posint violates check constraint"),
-        ("SELECT 0::posint", "value for domain posint violates check constraint"),
+        (
+            "SELECT (-1)::posint",
+            "value for domain posint violates check constraint",
+        ),
+        (
+            "SELECT 0::posint",
+            "value for domain posint violates check constraint",
+        ),
         (
             "SELECT 'toolongvalue'::shortname",
             "value for domain shortname violates check constraint",
         ),
-        ("SELECT NULL::shortname", "domain shortname does not allow null values"),
+        (
+            "SELECT NULL::shortname",
+            "domain shortname does not allow null values",
+        ),
     ] {
         let got = err(&mut e, sql);
         assert!(got.contains(want), "{sql} → {got}");

@@ -50,15 +50,24 @@ fn err(e: &mut Engine, sql: &str) -> String {
 fn a_named_zone_is_discarded_by_the_zoneless_types() {
     let mut e = engine();
     assert_eq!(
-        one(&mut e, "SELECT '2020-01-01 10:00:00 America/New_York'::timestamp"),
+        one(
+            &mut e,
+            "SELECT '2020-01-01 10:00:00 America/New_York'::timestamp"
+        ),
         "2020-01-01 10:00:00"
     );
     assert_eq!(
-        one(&mut e, "SELECT '2020-01-01 10:00:00 America/New_York'::date"),
+        one(
+            &mut e,
+            "SELECT '2020-01-01 10:00:00 America/New_York'::date"
+        ),
         "2020-01-01"
     );
     assert_eq!(
-        one(&mut e, "SELECT '2020-01-01 10:00:00 America/New_York'::time"),
+        one(
+            &mut e,
+            "SELECT '2020-01-01 10:00:00 America/New_York'::time"
+        ),
         "10:00:00"
     );
     // A date-only literal with a zone lands at midnight.
@@ -69,7 +78,10 @@ fn a_named_zone_is_discarded_by_the_zoneless_types() {
     // Discarding is unconditional — a summer instant is not shifted
     // either, even though the zone's offset differs there.
     assert_eq!(
-        one(&mut e, "SELECT '2020-07-01 10:00:00 America/New_York'::timestamp"),
+        one(
+            &mut e,
+            "SELECT '2020-07-01 10:00:00 America/New_York'::timestamp"
+        ),
         "2020-07-01 10:00:00"
     );
     // Abbreviations and multi-segment zone names both resolve.
@@ -86,7 +98,10 @@ fn a_named_zone_is_discarded_by_the_zoneless_types() {
     );
     // The zone name is matched case-insensitively.
     assert_eq!(
-        one(&mut e, "SELECT '2020-01-01 10:00:00 america/new_york'::timestamp"),
+        one(
+            &mut e,
+            "SELECT '2020-01-01 10:00:00 america/new_york'::timestamp"
+        ),
         "2020-01-01 10:00:00"
     );
 }
@@ -148,7 +163,10 @@ fn a_bare_time_literal_still_refuses_a_named_zone() {
 fn timestamptz_still_converts_rather_than_discarding() {
     let mut e = engine();
     assert_eq!(
-        one(&mut e, "SELECT '2020-01-01 10:00:00 America/New_York'::timestamptz"),
+        one(
+            &mut e,
+            "SELECT '2020-01-01 10:00:00 America/New_York'::timestamptz"
+        ),
         "2020-01-01 15:00:00"
     );
     // And round 289's numeric-offset behaviour is untouched.

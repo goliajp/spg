@@ -36,16 +36,24 @@ fn both_crates_read_the_same_list() {
         "national character varying",
         "bit varying",
     ] {
-        assert!(spg_sql::parser::is_multiword_type_phrase(phrase), "{phrase}");
+        assert!(
+            spg_sql::parser::is_multiword_type_phrase(phrase),
+            "{phrase}"
+        );
         assert!(spg_storage::is_multiword_type_phrase(phrase), "{phrase}");
     }
     for phrase in ["integer", "x integer", "time", "text"] {
-        assert!(!spg_sql::parser::is_multiword_type_phrase(phrase), "{phrase}");
+        assert!(
+            !spg_sql::parser::is_multiword_type_phrase(phrase),
+            "{phrase}"
+        );
         assert!(!spg_storage::is_multiword_type_phrase(phrase), "{phrase}");
     }
     // A modifier is peeled before the match — the copy that did not peel
     // is what this round removed.
-    assert!(spg_sql::parser::is_multiword_type_phrase("character varying(9)"));
+    assert!(spg_sql::parser::is_multiword_type_phrase(
+        "character varying(9)"
+    ));
 }
 
 /// The wall the third copy hid: PG takes a modifier on a parameter type.
@@ -58,13 +66,10 @@ fn a_parameter_type_may_carry_a_modifier() {
         .expect("…and a precision one");
     // PG drops it: pg_get_function_arguments reports the bare type.
     assert!(
-        text(&mut e, "SELECT pg_get_functiondef('m1'::regproc)")
-            .contains("m1(character varying)"),
+        text(&mut e, "SELECT pg_get_functiondef('m1'::regproc)").contains("m1(character varying)"),
         "the modifier is not retained",
     );
-    assert!(
-        text(&mut e, "SELECT pg_get_functiondef('m2'::regproc)").contains("m2(numeric)"),
-    );
+    assert!(text(&mut e, "SELECT pg_get_functiondef('m2'::regproc)").contains("m2(numeric)"),);
 }
 
 /// The distinction the list exists for is untouched: a leading word that
@@ -77,11 +82,9 @@ fn a_bare_multiword_type_is_still_not_a_parameter_name() {
     e.execute("CREATE FUNCTION m4(x double precision) RETURNS int LANGUAGE sql AS 'SELECT 1'")
         .unwrap();
     assert!(
-        text(&mut e, "SELECT pg_get_functiondef('m3'::regproc)")
-            .contains("m3(double precision)"),
+        text(&mut e, "SELECT pg_get_functiondef('m3'::regproc)").contains("m3(double precision)"),
     );
     assert!(
-        text(&mut e, "SELECT pg_get_functiondef('m4'::regproc)")
-            .contains("m4(x double precision)"),
+        text(&mut e, "SELECT pg_get_functiondef('m4'::regproc)").contains("m4(x double precision)"),
     );
 }

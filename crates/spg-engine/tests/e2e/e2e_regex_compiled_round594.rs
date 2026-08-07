@@ -72,7 +72,8 @@ fn ids(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn seed() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE rx (id INT, s TEXT, n INT)").unwrap();
+    e.execute("CREATE TABLE rx (id INT, s TEXT, n INT)")
+        .unwrap();
     e.execute(
         "INSERT INTO rx VALUES (1,'abc',10),(2,'ABC',20),(3,'a1b2c3',30),(4,'',40),(5,NULL,50),\
          (6,'aaa',60),(7,'x.y',70),(8,'line1\nline2',80),(9,'  pad  ',90),(10,'ab',100),\
@@ -125,7 +126,10 @@ fn round594_operator_spellings() {
 fn round594_pattern_features() {
     let mut e = seed();
     assert_eq!(
-        ids(&mut e, "SELECT id FROM rx WHERE s ~ '[0-9]{1,2}' ORDER BY id"),
+        ids(
+            &mut e,
+            "SELECT id FROM rx WHERE s ~ '[0-9]{1,2}' ORDER BY id"
+        ),
         vec!["3", "8"]
     );
     assert_eq!(
@@ -138,7 +142,10 @@ fn round594_pattern_features() {
         "a backreference still forces the capturing matcher"
     );
     assert_eq!(
-        ids(&mut e, "SELECT id FROM rx WHERE s ~ 'line1.line2' ORDER BY id"),
+        ids(
+            &mut e,
+            "SELECT id FROM rx WHERE s ~ 'line1.line2' ORDER BY id"
+        ),
         vec!["8"],
         "`.` matches a newline, as PG's does"
     );
@@ -169,7 +176,10 @@ fn round594_pattern_features() {
         vec!["1", "2", "3", "6", "7", "8", "9", "10", "11", "12"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT substring(s FROM 'a.*?c') FROM rx WHERE id = 3"),
+        vals(
+            &mut e,
+            "SELECT substring(s FROM 'a.*?c') FROM rx WHERE id = 3"
+        ),
         vec!["a1b2c"],
         "a lazy quantifier through a different entry point"
     );
@@ -181,7 +191,10 @@ fn round594_pattern_features() {
 fn round594_non_literal_patterns_keep_the_interpreter() {
     let mut e = seed();
     assert_eq!(
-        ids(&mut e, "SELECT id FROM rx WHERE s ~ ('^' || 'a') ORDER BY id"),
+        ids(
+            &mut e,
+            "SELECT id FROM rx WHERE s ~ ('^' || 'a') ORDER BY id"
+        ),
         vec!["1", "3", "6", "10", "11", "12"],
         "a concatenated pattern gives the same answer as the literal one"
     );
@@ -220,11 +233,17 @@ fn round594_every_position_agrees() {
         ]
     );
     assert_eq!(
-        ids(&mut e, "SELECT id FROM rx WHERE s ~ '^a' AND n > 20 ORDER BY id"),
+        ids(
+            &mut e,
+            "SELECT id FROM rx WHERE s ~ '^a' AND n > 20 ORDER BY id"
+        ),
         vec!["3", "6", "10", "11", "12"]
     );
     assert_eq!(
-        ids(&mut e, "SELECT id FROM rx WHERE s ~ '^x' OR n = 10 ORDER BY id"),
+        ids(
+            &mut e,
+            "SELECT id FROM rx WHERE s ~ '^x' OR n = 10 ORDER BY id"
+        ),
         vec!["1", "7"]
     );
     assert_eq!(
@@ -258,7 +277,10 @@ fn round594_scale_agrees_with_the_interpreter() {
     assert_eq!(lit, built);
     assert_eq!(lit, vec!["10"]);
     assert_eq!(
-        vals(&mut e, "SELECT count(*) FROM big WHERE s !~ '^row1234[0-9]$'"),
+        vals(
+            &mut e,
+            "SELECT count(*) FROM big WHERE s !~ '^row1234[0-9]$'"
+        ),
         vec!["19990"]
     );
     assert_eq!(

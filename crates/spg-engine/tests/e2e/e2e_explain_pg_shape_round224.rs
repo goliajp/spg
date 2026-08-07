@@ -25,7 +25,8 @@ fn plan(e: &mut Engine, sql: &str) -> Vec<String> {
 
 fn seeded() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE t1 (id int PRIMARY KEY, v int)").unwrap();
+    e.execute("CREATE TABLE t1 (id int PRIMARY KEY, v int)")
+        .unwrap();
     e.execute("CREATE TABLE t2 (id int PRIMARY KEY, t1_id int)")
         .unwrap();
     e.execute("INSERT INTO t1 VALUES (1,2),(2,4)").unwrap();
@@ -35,7 +36,10 @@ fn seeded() -> Engine {
 #[test]
 fn scan_shapes() {
     let mut e = seeded();
-    assert_eq!(plan(&mut e, "EXPLAIN (COSTS OFF) SELECT * FROM t1"), vec!["Seq Scan on t1"]);
+    assert_eq!(
+        plan(&mut e, "EXPLAIN (COSTS OFF) SELECT * FROM t1"),
+        vec!["Seq Scan on t1"]
+    );
     // SPG's real decision: the PK index serves id=5 (PG's small-table
     // planner would seq-scan — the SHAPE grammar is what's aligned).
     assert_eq!(
@@ -57,7 +61,10 @@ fn sort_limit_nesting_matches_pg_indentation() {
     //              Sort Key: v
     //              ->  Seq Scan on t1
     assert_eq!(
-        plan(&mut e, "EXPLAIN (COSTS OFF) SELECT * FROM t1 ORDER BY v LIMIT 3"),
+        plan(
+            &mut e,
+            "EXPLAIN (COSTS OFF) SELECT * FROM t1 ORDER BY v LIMIT 3"
+        ),
         vec![
             "Limit",
             "  ->  Sort",
@@ -75,21 +82,16 @@ fn aggregate_shapes() {
         vec!["Aggregate", "  ->  Seq Scan on t1"]
     );
     assert_eq!(
-        plan(&mut e, "EXPLAIN (COSTS OFF) SELECT v, count(*) FROM t1 GROUP BY v"),
-        vec![
-            "HashAggregate",
-            "  Group Key: v",
-            "  ->  Seq Scan on t1",
-        ]
+        plan(
+            &mut e,
+            "EXPLAIN (COSTS OFF) SELECT v, count(*) FROM t1 GROUP BY v"
+        ),
+        vec!["HashAggregate", "  Group Key: v", "  ->  Seq Scan on t1",]
     );
     // DISTINCT plans as a HashAggregate over the select list (PG shape).
     assert_eq!(
         plan(&mut e, "EXPLAIN (COSTS OFF) SELECT DISTINCT v FROM t1"),
-        vec![
-            "HashAggregate",
-            "  Group Key: v",
-            "  ->  Seq Scan on t1",
-        ]
+        vec!["HashAggregate", "  Group Key: v", "  ->  Seq Scan on t1",]
     );
 }
 
@@ -119,14 +121,13 @@ fn append_and_window_shapes() {
             &mut e,
             "EXPLAIN (COSTS OFF) SELECT * FROM t1 UNION ALL SELECT * FROM t1"
         ),
-        vec![
-            "Append",
-            "  ->  Seq Scan on t1",
-            "  ->  Seq Scan on t1",
-        ]
+        vec!["Append", "  ->  Seq Scan on t1", "  ->  Seq Scan on t1",]
     );
     assert_eq!(
-        plan(&mut e, "EXPLAIN (COSTS OFF) SELECT sum(v) OVER (ORDER BY id) FROM t1"),
+        plan(
+            &mut e,
+            "EXPLAIN (COSTS OFF) SELECT sum(v) OVER (ORDER BY id) FROM t1"
+        ),
         vec!["WindowAgg", "  ->  Seq Scan on t1"]
     );
 }

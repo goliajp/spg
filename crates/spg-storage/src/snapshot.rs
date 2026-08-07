@@ -180,7 +180,10 @@ pub struct Snapshot {
     /// alone performs the visibility test in ten places. A row that
     /// someone else holds is, for this statement, exactly as
     /// unavailable as a row the snapshot cannot see.
-    pub locked_out: Option<(crate::row_header::RelId, alloc::collections::BTreeSet<usize>)>,
+    pub locked_out: Option<(
+        crate::row_header::RelId,
+        alloc::collections::BTreeSet<usize>,
+    )>,
 }
 
 impl Snapshot {

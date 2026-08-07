@@ -66,7 +66,14 @@ fn varchar_length_and_udt_names() {
             "SELECT column_name, udt_name FROM information_schema.columns \
              WHERE table_name='ist' ORDER BY ordinal_position"
         ),
-        ["id|int4", "name|varchar", "score|numeric", "tags|_text", "created|timestamptz", "flag|bool"]
+        [
+            "id|int4",
+            "name|varchar",
+            "score|numeric",
+            "tags|_text",
+            "created|timestamptz",
+            "flag|bool"
+        ]
     );
 }
 

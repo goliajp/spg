@@ -68,16 +68,25 @@ fn round621_a_guard_guards() {
     e.execute("CREATE TABLE gd (x INT)").unwrap();
     e.execute("INSERT INTO gd VALUES (1),(0),(2)").unwrap();
     assert_eq!(
-        vals(&mut e, "SELECT x FROM gd WHERE x <> 0 AND 10/x > 1 ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT x FROM gd WHERE x <> 0 AND 10/x > 1 ORDER BY 1"
+        ),
         vec!["1", "2"]
     );
     assert_eq!(
-        vals(&mut e, "SELECT x FROM gd WHERE x = 0 OR 10/x > 1 ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT x FROM gd WHERE x = 0 OR 10/x > 1 ORDER BY 1"
+        ),
         vec!["0", "1", "2"],
         "the OR spelling of the same guard"
     );
     assert_eq!(
-        vals(&mut e, "SELECT x FROM gd WHERE NOT (x = 0) AND 1/x > 0 ORDER BY 1"),
+        vals(
+            &mut e,
+            "SELECT x FROM gd WHERE NOT (x = 0) AND 1/x > 0 ORDER BY 1"
+        ),
         vec!["1"],
         "the guard behind a NOT. Only row 1: `1/2` is INTEGER division and is \
          0, so row 2 fails the predicate on its merits — this expectation was \
@@ -116,7 +125,10 @@ fn round621_the_left_side_decides_or_it_does_not() {
          right side is needed"
     );
     assert_eq!(
-        vals(&mut e, "SELECT false AND NULL, true OR NULL, NULL AND false, NULL OR true"),
+        vals(
+            &mut e,
+            "SELECT false AND NULL, true OR NULL, NULL AND false, NULL OR true"
+        ),
         vec!["false|true|false|true"],
         "the three-valued rules are untouched"
     );
@@ -169,7 +181,8 @@ fn round621_what_must_not_be_type_read() {
     );
     assert_eq!(vals(&mut e, "SELECT (false AND NULL)::TEXT"), vec!["false"]);
     let mut e2 = Engine::new();
-    e2.execute("CREATE TABLE bc (a BOOLEAN, b BOOLEAN)").unwrap();
+    e2.execute("CREATE TABLE bc (a BOOLEAN, b BOOLEAN)")
+        .unwrap();
     e2.execute("INSERT INTO bc VALUES (true,false),(false,true)")
         .unwrap();
     assert_eq!(

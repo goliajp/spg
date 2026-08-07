@@ -28,7 +28,8 @@ use spg_sql::ast::{CopyFormat, CopyOptions};
 
 fn seeded() -> Engine {
     let mut e = Engine::new();
-    e.execute("CREATE TABLE ct (id int, name text, v int)").unwrap();
+    e.execute("CREATE TABLE ct (id int, name text, v int)")
+        .unwrap();
     e
 }
 
@@ -37,7 +38,10 @@ fn text_opts() -> CopyOptions {
 }
 
 fn csv_opts() -> CopyOptions {
-    CopyOptions { format: CopyFormat::Csv, ..CopyOptions::default() }
+    CopyOptions {
+        format: CopyFormat::Csv,
+        ..CopyOptions::default()
+    }
 }
 
 fn rows(e: &mut Engine, sql: &str) -> Vec<String> {
@@ -61,7 +65,12 @@ fn text_format_decodes_tabs_nulls_and_the_terminator() {
     let mut e = seeded();
     // Tab-separated, \N nulls, backslash escapes inside a cell.
     let r = e
-        .copy_from_buffer("ct", None, &text_opts(), "1\ta\t10\n2\tb\t\\N\n3\tc\\ttab\t30\n")
+        .copy_from_buffer(
+            "ct",
+            None,
+            &text_opts(),
+            "1\ta\t10\n2\tb\t\\N\n3\tc\\ttab\t30\n",
+        )
         .unwrap();
     assert!(matches!(r, QueryResult::CommandOk { affected: 3, .. }));
     assert_eq!(
@@ -89,9 +98,16 @@ fn csv_format_honours_header_delimiter_null_and_quoting() {
     );
     // HEADER skips the first record.
     e.execute("DELETE FROM ct").unwrap();
-    let opts = CopyOptions { header: true, ..csv_opts() };
-    e.copy_from_buffer("ct", None, &opts, "id,name,v\n7,h1,70\n8,h2,80\n").unwrap();
-    assert_eq!(rows(&mut e, "SELECT * FROM ct ORDER BY id"), ["7|h1|70", "8|h2|80"]);
+    let opts = CopyOptions {
+        header: true,
+        ..csv_opts()
+    };
+    e.copy_from_buffer("ct", None, &opts, "id,name,v\n7,h1,70\n8,h2,80\n")
+        .unwrap();
+    assert_eq!(
+        rows(&mut e, "SELECT * FROM ct ORDER BY id"),
+        ["7|h1|70", "8|h2|80"]
+    );
     // Custom DELIMITER / NULL; multi-line and doubled-quote cells.
     e.execute("DELETE FROM ct").unwrap();
     let opts = CopyOptions {
@@ -108,7 +124,12 @@ fn csv_format_honours_header_delimiter_null_and_quoting() {
     .unwrap();
     assert_eq!(
         rows(&mut e, "SELECT id, name, v FROM ct ORDER BY id"),
-        ["1|a|10", "2|q;uote|NULL", "3|multi\nline|30", "4|em\"bed|40"]
+        [
+            "1|a|10",
+            "2|q;uote|NULL",
+            "3|multi\nline|30",
+            "4|em\"bed|40"
+        ]
     );
 }
 
@@ -117,16 +138,23 @@ fn field_count_takes_pgs_wordings() {
     let mut e = seeded();
     // Too few fields — used to be silently accepted (short INSERT).
     for (opts, data) in [(text_opts(), "1\ta\n"), (csv_opts(), "1,a\n")] {
-        let got = format!("{}", e.copy_from_buffer("ct", None, &opts, data).unwrap_err());
+        let got = format!(
+            "{}",
+            e.copy_from_buffer("ct", None, &opts, data).unwrap_err()
+        );
         assert!(got.contains("missing data for column \"v\""), "{got}");
     }
     // Too many fields against an explicit column list.
     let cols = ["id".to_string(), "name".to_string()];
     let got = format!(
         "{}",
-        e.copy_from_buffer("ct", Some(&cols), &csv_opts(), "7,h1,70\n").unwrap_err()
+        e.copy_from_buffer("ct", Some(&cols), &csv_opts(), "7,h1,70\n")
+            .unwrap_err()
     );
-    assert!(got.contains("extra data after last expected column"), "{got}");
+    assert!(
+        got.contains("extra data after last expected column"),
+        "{got}"
+    );
     assert_eq!(rows(&mut e, "SELECT count(*) FROM ct"), ["0"]);
 }
 
@@ -138,7 +166,10 @@ fn a_bad_row_aborts_the_whole_copy() {
         e.copy_from_buffer("ct", None, &csv_opts(), "1,a,10\n2,b,notanint\n")
             .unwrap_err()
     );
-    assert!(got.contains("invalid input syntax for type integer: \"notanint\""), "{got}");
+    assert!(
+        got.contains("invalid input syntax for type integer: \"notanint\""),
+        "{got}"
+    );
     // PG: COPY is all-or-nothing — row 1 must NOT survive.
     assert_eq!(rows(&mut e, "SELECT count(*) FROM ct"), ["0"]);
 }
@@ -152,12 +183,21 @@ fn pre_file_checks_run_in_pgs_order() {
     assert!(got.contains("relation \"nope\" does not exist"), "{got}");
     let cols = ["id".to_string(), "nope".to_string()];
     let got = format!("{}", e.copy_target_columns("ct", Some(&cols)).unwrap_err());
-    assert!(got.contains("column \"nope\" of relation \"ct\" does not exist"), "{got}");
+    assert!(
+        got.contains("column \"nope\" of relation \"ct\" does not exist"),
+        "{got}"
+    );
     let cols = ["id".to_string(), "id".to_string()];
     let got = format!("{}", e.copy_target_columns("ct", Some(&cols)).unwrap_err());
-    assert!(got.contains("column \"id\" specified more than once"), "{got}");
+    assert!(
+        got.contains("column \"id\" specified more than once"),
+        "{got}"
+    );
     // The happy path resolves the schema order.
-    assert_eq!(e.copy_target_columns("ct", None).unwrap(), ["id", "name", "v"]);
+    assert_eq!(
+        e.copy_target_columns("ct", None).unwrap(),
+        ["id", "name", "v"]
+    );
 }
 
 #[test]
@@ -167,7 +207,8 @@ fn the_raw_statement_parses_and_the_engine_names_the_host_contract() {
     // the file, so executing it directly names the host contract.
     let got = format!(
         "{}",
-        e.execute("COPY ct FROM '/tmp/nope.csv' WITH (FORMAT csv)").unwrap_err()
+        e.execute("COPY ct FROM '/tmp/nope.csv' WITH (FORMAT csv)")
+            .unwrap_err()
     );
     assert!(got.contains("copy_from_buffer"), "{got}");
     // parse_copy_from_file round-trips table / columns / path / options.
@@ -176,7 +217,10 @@ fn the_raw_statement_parses_and_the_engine_names_the_host_contract() {
     )
     .expect("should parse");
     assert_eq!(spec.table, "ct");
-    assert_eq!(spec.columns.as_deref(), Some(&["id".to_string(), "name".to_string()][..]));
+    assert_eq!(
+        spec.columns.as_deref(),
+        Some(&["id".to_string(), "name".to_string()][..])
+    );
     assert_eq!(spec.path, "/x/y.csv");
     assert!(spec.options.header);
     assert_eq!(spec.options.delimiter, Some(';'));

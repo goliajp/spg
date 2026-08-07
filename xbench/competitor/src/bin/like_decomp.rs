@@ -29,7 +29,11 @@ const N: i64 = 50_000;
 
 /// (label, sql, what it isolates)
 const STAGES: &[(&str, &str, &str)] = &[
-    ("scan_only", "SELECT count(*) FROM ht", "row iteration, no predicate"),
+    (
+        "scan_only",
+        "SELECT count(*) FROM ht",
+        "row iteration, no predicate",
+    ),
     (
         "eq_filter",
         "SELECT count(*) FROM ht WHERE s = 'user_0005'",
@@ -57,7 +61,11 @@ const STAGES: &[(&str, &str, &str)] = &[
     ),
     // Is the step from scan to predicate about TEXT, or about predicates?
     // `hi` carries the same row count with an INT payload.
-    ("int_scan", "SELECT count(*) FROM hi", "int table, no predicate"),
+    (
+        "int_scan",
+        "SELECT count(*) FROM hi",
+        "int table, no predicate",
+    ),
     (
         "int_filter",
         "SELECT count(*) FROM hi WHERE g = 5",

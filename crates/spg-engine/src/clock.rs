@@ -360,9 +360,7 @@ fn clock_replacement_for(e: &Expr, now: i64, mysql: bool, tz_offset: i64) -> Opt
                 // dispatcher reports it (MariaDB 11: `Too big precision
                 // specified for 'current_timestamp'. Maximum is 6`), rather
                 // than silently handing back full microseconds.
-                Some(Expr::Literal(spg_sql::ast::Literal::Integer(n)))
-                    if (0..=6).contains(n) =>
-                {
+                Some(Expr::Literal(spg_sql::ast::Literal::Integer(n))) if (0..=6).contains(n) => {
                     Some(*n)
                 }
                 _ => return None,
@@ -516,7 +514,11 @@ fn clock_replacement_for(e: &Expr, now: i64, mysql: bool, tz_offset: i64) -> Opt
         );
         let target = if matches!(shape, ClockShape::TimeOfDayTz) {
             let off_secs = tz_offset.div_euclid(1_000_000);
-            let (sign, a) = if off_secs < 0 { ('-', -off_secs) } else { ('+', off_secs) };
+            let (sign, a) = if off_secs < 0 {
+                ('-', -off_secs)
+            } else {
+                ('+', off_secs)
+            };
             text.push(sign);
             text.push_str(&alloc::format!("{:02}", a / 3600));
             if (a / 60) % 60 != 0 {

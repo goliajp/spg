@@ -123,7 +123,11 @@ fn a_view_has_pg_attribute_rows() {
         "SELECT attname, attnum FROM pg_attribute \
           WHERE attrelid = 'vv'::regclass ORDER BY attnum",
     );
-    assert_eq!(r.len(), 1, "pg_attribute had no columns for the view: {r:?}");
+    assert_eq!(
+        r.len(),
+        1,
+        "pg_attribute had no columns for the view: {r:?}"
+    );
     assert_eq!(r[0][0], Value::text("id"));
     assert_eq!(r[0][1], Value::SmallInt(1));
     // information_schema knew this all along — the two must agree.
@@ -160,13 +164,19 @@ fn a_materialized_view_reports_its_own_relkind() {
 fn relhasrules_answers_for_real() {
     let mut e = fixture();
     assert_eq!(
-        one(&mut e, "SELECT relhasrules FROM pg_class WHERE relname = 't'"),
+        one(
+            &mut e,
+            "SELECT relhasrules FROM pg_class WHERE relname = 't'"
+        ),
         Value::Bool(false),
     );
     e.execute("CREATE RULE r_noop AS ON DELETE TO t DO INSTEAD NOTHING")
         .unwrap();
     assert_eq!(
-        one(&mut e, "SELECT relhasrules FROM pg_class WHERE relname = 't'"),
+        one(
+            &mut e,
+            "SELECT relhasrules FROM pg_class WHERE relname = 't'"
+        ),
         Value::Bool(true),
     );
 }

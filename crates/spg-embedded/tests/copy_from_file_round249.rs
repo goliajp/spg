@@ -51,7 +51,8 @@ fn copy_from_file_lands_and_survives_reopen() {
     std::fs::write(&csv, "id,name,v\n1,a,10\n2,\"b,comma\",\n3,c,30\n").unwrap();
     {
         let mut db = Database::open_path(&path).unwrap();
-        db.execute("CREATE TABLE ct (id int, name text, v int)").unwrap();
+        db.execute("CREATE TABLE ct (id int, name text, v int)")
+            .unwrap();
         let r = db
             .execute(&format!(
                 "COPY ct FROM '{}' WITH (FORMAT csv, HEADER)",
@@ -69,7 +70,10 @@ fn copy_from_file_lands_and_survives_reopen() {
         assert_eq!(count(&mut db, "SELECT count(*) FROM ct"), 3);
         match db.execute("SELECT name FROM ct WHERE id = 2").unwrap() {
             spg_engine::QueryResult::Rows { rows, .. } => {
-                assert_eq!(rows[0].values[0], spg_storage::Value::Text("b,comma".into()));
+                assert_eq!(
+                    rows[0].values[0],
+                    spg_storage::Value::Text("b,comma".into())
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -85,11 +89,15 @@ fn a_bad_row_leaves_nothing_even_across_reopen() {
     std::fs::write(&csv, "1,a,10\n2,b,notanint\n").unwrap();
     {
         let mut db = Database::open_path(&path).unwrap();
-        db.execute("CREATE TABLE ct (id int, name text, v int)").unwrap();
+        db.execute("CREATE TABLE ct (id int, name text, v int)")
+            .unwrap();
         let got = format!(
             "{}",
-            db.execute(&format!("COPY ct FROM '{}' WITH (FORMAT csv)", csv.display()))
-                .unwrap_err()
+            db.execute(&format!(
+                "COPY ct FROM '{}' WITH (FORMAT csv)",
+                csv.display()
+            ))
+            .unwrap_err()
         );
         assert!(
             got.contains("invalid input syntax for type integer: \"notanint\""),
@@ -115,13 +123,15 @@ fn missing_file_and_missing_relation_take_pgs_wordings() {
     // a missing table on a missing file names the relation.
     let got = format!(
         "{}",
-        db.execute("COPY nope FROM '/definitely/not/here.csv'").unwrap_err()
+        db.execute("COPY nope FROM '/definitely/not/here.csv'")
+            .unwrap_err()
     );
     assert!(got.contains("relation \"nope\" does not exist"), "{got}");
     // A missing file on a real table: PG's wording, no os-error suffix.
     let got = format!(
         "{}",
-        db.execute("COPY ct FROM '/definitely/not/here.csv'").unwrap_err()
+        db.execute("COPY ct FROM '/definitely/not/here.csv'")
+            .unwrap_err()
     );
     assert!(
         got.contains("could not open file \"/definitely/not/here.csv\" for reading:"),
@@ -136,9 +146,14 @@ fn text_format_and_explicit_columns_work_on_the_file_endpoint() {
     let txt = dir.join("in.txt");
     std::fs::write(&txt, "1\tx\n2\t\\N\n").unwrap();
     let mut db = Database::open_in_memory();
-    db.execute("CREATE TABLE ct (id int, name text, v int DEFAULT 7)").unwrap();
-    db.execute(&format!("COPY ct (id, name) FROM '{}'", txt.display())).unwrap();
-    match db.execute("SELECT id, name, v FROM ct ORDER BY id").unwrap() {
+    db.execute("CREATE TABLE ct (id int, name text, v int DEFAULT 7)")
+        .unwrap();
+    db.execute(&format!("COPY ct (id, name) FROM '{}'", txt.display()))
+        .unwrap();
+    match db
+        .execute("SELECT id, name, v FROM ct ORDER BY id")
+        .unwrap()
+    {
         spg_engine::QueryResult::Rows { rows, .. } => {
             let render: Vec<String> = rows
                 .iter()
@@ -169,7 +184,8 @@ fn copy_to_file_writes_pg_identical_bytes() {
     let out = dir.join("out.csv");
     let mut db = Database::open_in_memory();
     db.execute("CREATE TABLE ct (id int, name text)").unwrap();
-    db.execute("INSERT INTO ct VALUES (1,'a'),(2,NULL)").unwrap();
+    db.execute("INSERT INTO ct VALUES (1,'a'),(2,NULL)")
+        .unwrap();
     let r = db
         .execute(&format!(
             "COPY ct TO '{}' WITH (FORMAT csv, HEADER)",
@@ -183,12 +199,14 @@ fn copy_to_file_writes_pg_identical_bytes() {
     );
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "id,name\n1,a\n2,\n");
     // Overwrite works (PG semantics).
-    db.execute(&format!("COPY ct (id) TO '{}'", out.display())).unwrap();
+    db.execute(&format!("COPY ct (id) TO '{}'", out.display()))
+        .unwrap();
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "1\n2\n");
     // Unwritable path takes PG's wording, no os-error suffix.
     let got = format!(
         "{}",
-        db.execute("COPY ct TO '/definitely/not/here/out.csv'").unwrap_err()
+        db.execute("COPY ct TO '/definitely/not/here/out.csv'")
+            .unwrap_err()
     );
     assert!(
         got.contains("could not open file \"/definitely/not/here/out.csv\" for writing:"),

@@ -37,12 +37,18 @@ fn err(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn round670_spg_advertises_c_consistently() {
     let mut e = Engine::new();
-    assert_eq!(one(&mut e, "SELECT datcollate FROM pg_database LIMIT 1"), "C");
+    assert_eq!(
+        one(&mut e, "SELECT datcollate FROM pg_database LIMIT 1"),
+        "C"
+    );
     assert_eq!(one(&mut e, "SELECT datctype FROM pg_database LIMIT 1"), "C");
     assert_eq!(one(&mut e, "SELECT current_setting('lc_monetary')"), "C");
     // And the catalog offers only the collations it can actually perform.
     assert_eq!(
-        one(&mut e, "SELECT string_agg(collname, ',' ORDER BY collname) FROM pg_collation"),
+        one(
+            &mut e,
+            "SELECT string_agg(collname, ',' ORDER BY collname) FROM pg_collation"
+        ),
         "C,POSIX,default"
     );
 }

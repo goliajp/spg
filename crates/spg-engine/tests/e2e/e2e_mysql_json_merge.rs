@@ -72,7 +72,10 @@ fn merge_preserve_vectors() {
         "{\"name\": [\"x\", \"y\"]}"
     );
     // Scalars combine into an array; deprecated json_merge alias.
-    assert_eq!(text(&first(&mut e, "SELECT json_merge('1', '2')")), "[1, 2]");
+    assert_eq!(
+        text(&first(&mut e, "SELECT json_merge('1', '2')")),
+        "[1, 2]"
+    );
 }
 
 #[test]

@@ -747,9 +747,7 @@ fn extract_join_keys<'a>(
                 residual.push(sub);
                 continue;
             }
-            if let Some((p, e)) =
-                match_equi_probe_expr(sub, peer, combined_schema, consumed_cols)
-            {
+            if let Some((p, e)) = match_equi_probe_expr(sub, peer, combined_schema, consumed_cols) {
                 eq_probe_exprs.push((p, e, sub));
                 residual.push(sub);
                 continue;
@@ -958,9 +956,7 @@ fn expr_mentions_a_column(e: &Expr) -> bool {
     match e {
         Expr::Column(_) => true,
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => expr_mentions_a_column(expr),
-        Expr::Binary { lhs, rhs, .. } => {
-            expr_mentions_a_column(lhs) || expr_mentions_a_column(rhs)
-        }
+        Expr::Binary { lhs, rhs, .. } => expr_mentions_a_column(lhs) || expr_mentions_a_column(rhs),
         _ => false,
     }
 }
@@ -1736,7 +1732,8 @@ impl Engine {
                         for r in residual {
                             let cond =
                                 self.eval_expr_with_correlated(r, &combined, ctx, cancel, None)?;
-                            if !crate::eval::predicate_is_true(&cond, "JOIN/ON", ctx.mysql_dialect)? {
+                            if !crate::eval::predicate_is_true(&cond, "JOIN/ON", ctx.mysql_dialect)?
+                            {
                                 k = false;
                                 break;
                             }
@@ -1990,10 +1987,7 @@ impl Engine {
                         );
                         all.get()
                     };
-                    if peer_only
-                        && eval::fully_compilable(r)
-                        && expr_mentions_a_column(r)
-                    {
+                    if peer_only && eval::fully_compilable(r) && expr_mentions_a_column(r) {
                         build_preds.push(eval::compile_expr(r, &peer_ctx_probe));
                         false
                     } else {
@@ -2437,7 +2431,11 @@ impl Engine {
                     }
                 }
             } else if any_int_lane {
-                let lpos = if int_keyed { eq_pairs[0].0 } else { eq_exprs[0].0 };
+                let lpos = if int_keyed {
+                    eq_pairs[0].0
+                } else {
+                    eq_exprs[0].0
+                };
                 match tuple_value(&pipe.sources, &pipe.offsets, tuple, lpos) {
                     Some(Value::BigInt(n)) => Some(*n),
                     Some(Value::Int(n)) => Some(i64::from(*n)),
@@ -2462,7 +2460,9 @@ impl Engine {
                     aggregate::encode_key_refs_into(&probebuf, &mut keystr);
                     for (lpos, _, _) in eq_exprs {
                         match tuple_value(&pipe.sources, &pipe.offsets, tuple, *lpos) {
-                            Some(v) if !matches!(v, Value::Null) => aggregate::push_canonical_key(&mut keystr, v),
+                            Some(v) if !matches!(v, Value::Null) => {
+                                aggregate::push_canonical_key(&mut keystr, v)
+                            }
                             _ => {
                                 left_has_null = true;
                                 break;
@@ -2479,7 +2479,9 @@ impl Engine {
                             &pipe.offsets,
                             tuple,
                         )? {
-                            Some(k) => aggregate::push_canonical_key(&mut keystr, &Value::BigInt(k)),
+                            Some(k) => {
+                                aggregate::push_canonical_key(&mut keystr, &Value::BigInt(k))
+                            }
                             None => {
                                 left_has_null = true;
                                 break;
@@ -2517,7 +2519,8 @@ impl Engine {
                         for r in residual {
                             let cond =
                                 self.eval_expr_with_correlated(r, &combined, ctx, cancel, None)?;
-                            if !crate::eval::predicate_is_true(&cond, "JOIN/ON", ctx.mysql_dialect)? {
+                            if !crate::eval::predicate_is_true(&cond, "JOIN/ON", ctx.mysql_dialect)?
+                            {
                                 ok = false;
                                 break;
                             }
@@ -3673,7 +3676,8 @@ impl Engine {
         // Already in ORDER BY order from the walk.
         let mut output = plain_sink;
         apply_offset_and_limit(&mut output, stmt.offset_literal(), stmt.limit_literal());
-        let projection = build_projection(&stmt.items, &combined_schema, "", self.backslash_escapes)?;
+        let projection =
+            build_projection(&stmt.items, &combined_schema, "", self.backslash_escapes)?;
         let mut proj_memo = memoize::MemoizeCache::default();
         let mut rows: Vec<Row<'static>> = Vec::with_capacity(output.len());
         for row in &output {
@@ -3975,7 +3979,8 @@ impl Engine {
             heap.into_sorted_vec().into_iter().map(|e| e.row).collect()
         };
         apply_offset_and_limit(&mut output, stmt.offset_literal(), stmt.limit_literal());
-        let projection = build_projection(&stmt.items, &combined_schema, "", self.backslash_escapes)?;
+        let projection =
+            build_projection(&stmt.items, &combined_schema, "", self.backslash_escapes)?;
         let mut proj_memo = memoize::MemoizeCache::default();
         let mut rows: Vec<Row<'static>> = Vec::with_capacity(output.len());
         for row in &output {
@@ -4542,11 +4547,7 @@ fn analyse_join_eq(
 /// over the inner alias>` (commuted accepted). The expression allowlist
 /// mirrors `int_only_key_expr`: inner-qualified columns, integer
 /// literals, Add/Sub/Mul.
-fn analyse_join_eq_expr(
-    on: &Expr,
-    outer_alias: &str,
-    inner_alias: &str,
-) -> Option<(String, Expr)> {
+fn analyse_join_eq_expr(on: &Expr, outer_alias: &str, inner_alias: &str) -> Option<(String, Expr)> {
     use spg_sql::ast::BinOp;
     let Expr::Binary {
         lhs,

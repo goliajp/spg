@@ -31,7 +31,10 @@
 use spg_engine::Engine;
 
 fn err_of(e: &mut Engine, sql: &str) -> String {
-    format!("{}", e.execute(sql).expect_err(&format!("PG18 refuses: {sql}")))
+    format!(
+        "{}",
+        e.execute(sql).expect_err(&format!("PG18 refuses: {sql}"))
+    )
 }
 
 /// PG's wording for a missing column, whichever layer notices it.
@@ -80,5 +83,7 @@ fn round701_the_duplicate_name_shapes() {
         err_of(&mut e, "ALTER TABLE t701 ADD COLUMN i INT")
             .contains("column \"i\" of relation \"t701\" already exists")
     );
-    assert!(err_of(&mut e, "CREATE TABLE t701(i INT)").contains("relation \"t701\" already exists"));
+    assert!(
+        err_of(&mut e, "CREATE TABLE t701(i INT)").contains("relation \"t701\" already exists")
+    );
 }

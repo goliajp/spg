@@ -26,8 +26,7 @@ use crate::conversions::literal_expr_to_value;
 /// children, and it is the question the FROM-clause fan-out actually
 /// wants — `is_partition_parent` answers a narrower one.
 pub(crate) fn has_children(catalog: &Catalog, table_name: &str) -> bool {
-    is_partition_parent(catalog, table_name)
-        || !children_of_parent(catalog, table_name).is_empty()
+    is_partition_parent(catalog, table_name) || !children_of_parent(catalog, table_name).is_empty()
 }
 
 /// v7.39 (round 645) — does this relation have INHERITANCE children

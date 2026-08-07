@@ -114,7 +114,6 @@ pub fn parse_copy_from_stdin_head(sql: &str) -> Option<CopyFromSpec> {
     Some(CopyFromSpec { table, columns })
 }
 
-
 /// v7.39 (round 252) — a parsed `COPY … TO '<file>'` (table or query
 /// form). The HOST renders via `Engine::copy_to_buffer` and writes
 /// `path` itself.
@@ -667,10 +666,7 @@ pub fn encode_copy_csv_cells_opts(
         match cell {
             None => out.push_str(null_str),
             Some(s) => {
-                let forced = force_quote
-                    .and_then(|f| f.get(i))
-                    .copied()
-                    .unwrap_or(false);
+                let forced = force_quote.and_then(|f| f.get(i)).copied().unwrap_or(false);
                 let needs_quote = forced
                     || s.as_str() == null_str
                     || s.chars().any(|c| {

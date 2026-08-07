@@ -150,8 +150,11 @@ fn exclude_catalog_reflection_over_wire() {
         None
     );
     assert_eq!(
-        exec_first_value(&mut s, "SELECT contype FROM pg_constraint WHERE contype = 'x'")
-            .as_deref(),
+        exec_first_value(
+            &mut s,
+            "SELECT contype FROM pg_constraint WHERE contype = 'x'"
+        )
+        .as_deref(),
         Some("x")
     );
     assert_eq!(
@@ -180,7 +183,10 @@ fn exclusion_violation_wire_fields_match_pg() {
         ),
         None
     );
-    assert_eq!(exec_error_fields(&mut s, "INSERT INTO ov VALUES ('[1,5)')"), None);
+    assert_eq!(
+        exec_error_fields(&mut s, "INSERT INTO ov VALUES ('[1,5)')"),
+        None
+    );
     // [3,7) overlaps [1,5) → 23P01.
     let f = exec_error_fields(&mut s, "INSERT INTO ov VALUES ('[3,7)')")
         .expect("overlap must raise an ErrorResponse");

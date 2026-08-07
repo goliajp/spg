@@ -43,15 +43,24 @@ fn every_specifier_matches() {
     let mut e = mysql();
     let d = "'2024-01-15 14:05:09.123456'";
     assert_eq!(
-        text(&mut e, &format!("SELECT DATE_FORMAT({d},'%Y|%y|%m|%c|%d|%e|%H|%k|%h|%I|%i|%s|%f')")),
+        text(
+            &mut e,
+            &format!("SELECT DATE_FORMAT({d},'%Y|%y|%m|%c|%d|%e|%H|%k|%h|%I|%i|%s|%f')")
+        ),
         "2024|24|01|1|15|15|14|14|02|02|05|09|123456",
     );
     assert_eq!(
-        text(&mut e, &format!("SELECT DATE_FORMAT({d},'%W|%a|%M|%b|%j|%p|%r|%T|%D')")),
+        text(
+            &mut e,
+            &format!("SELECT DATE_FORMAT({d},'%W|%a|%M|%b|%j|%p|%r|%T|%D')")
+        ),
         "Monday|Mon|January|Jan|015|PM|02:05:09 PM|14:05:09|15th",
     );
     assert_eq!(
-        text(&mut e, &format!("SELECT DATE_FORMAT({d},'%U|%u|%V|%v|%X|%x|%w')")),
+        text(
+            &mut e,
+            &format!("SELECT DATE_FORMAT({d},'%U|%u|%V|%v|%X|%x|%w')")
+        ),
         "02|03|02|03|2024|2024|1",
     );
     // `%%` is a literal percent; an unknown specifier keeps its letter.

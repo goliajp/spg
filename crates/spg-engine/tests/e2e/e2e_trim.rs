@@ -281,7 +281,10 @@ fn trim_numeric_input_coerced_to_text() {
         .execute("SELECT trim(42)")
         .expect_err("PG rejects trim(integer)")
         .to_string();
-    assert!(m.contains("function pg_catalog.btrim(integer) does not exist"), "{m}");
+    assert!(
+        m.contains("function pg_catalog.btrim(integer) does not exist"),
+        "{m}"
+    );
 }
 
 // ── INSIDE WHERE / INSERT ────────────────────────────────────────

@@ -79,7 +79,10 @@ fn the_numeric_form_is_read() {
 #[test]
 fn junk_is_null_not_an_error() {
     let mut e = mysql();
-    assert_eq!(one(&mut e, "SELECT UNIX_TIMESTAMP('not a date')"), Value::Null);
+    assert_eq!(
+        one(&mut e, "SELECT UNIX_TIMESTAMP('not a date')"),
+        Value::Null
+    );
     assert_eq!(one(&mut e, "SELECT UNIX_TIMESTAMP('')"), Value::Null);
     assert_eq!(one(&mut e, "SELECT UNIX_TIMESTAMP(NULL)"), Value::Null);
 }
@@ -89,8 +92,14 @@ fn junk_is_null_not_an_error() {
 fn it_round_trips_through_from_unixtime() {
     let mut e = mysql();
     assert_eq!(
-        one(&mut e, "SELECT FROM_UNIXTIME(UNIX_TIMESTAMP('2024-01-15 10:30:45'))"),
+        one(
+            &mut e,
+            "SELECT FROM_UNIXTIME(UNIX_TIMESTAMP('2024-01-15 10:30:45'))"
+        ),
         Value::Timestamp(1_705_314_645_000_000),
     );
-    assert_eq!(one(&mut e, "SELECT UNIX_TIMESTAMP() > 0"), Value::Bool(true));
+    assert_eq!(
+        one(&mut e, "SELECT UNIX_TIMESTAMP() > 0"),
+        Value::Bool(true)
+    );
 }

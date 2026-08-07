@@ -29,7 +29,8 @@ fn seeded() -> Engine {
     // No background reclamation: this is the server's exposure, and the
     // shape the counters were taken under.
     e.set_autovacuum(false);
-    e.execute("CREATE TABLE t (id INT PRIMARY KEY, g INT)").unwrap();
+    e.execute("CREATE TABLE t (id INT PRIMARY KEY, g INT)")
+        .unwrap();
     let mut vals = String::from("INSERT INTO t VALUES ");
     for i in 0..2000 {
         if i > 0 {
@@ -52,7 +53,9 @@ fn round493_a_held_snapshot_stops_the_pruning() {
     let counted = {
         let before = UNIQ_PROBE_CALLS.load(Relaxed);
         let mut probe = Engine::new();
-        probe.execute("CREATE TABLE c (id INT PRIMARY KEY)").unwrap();
+        probe
+            .execute("CREATE TABLE c (id INT PRIMARY KEY)")
+            .unwrap();
         probe.execute("INSERT INTO c VALUES (1)").unwrap();
         UNIQ_PROBE_CALLS.load(Relaxed) > before
     };
@@ -66,7 +69,8 @@ fn round493_a_held_snapshot_stops_the_pruning() {
 
     let churn = |e: &mut Engine, rounds: usize| {
         for c in 0..rounds {
-            e.execute("DELETE FROM t WHERE id >= 100 AND id < 200").unwrap();
+            e.execute("DELETE FROM t WHERE id >= 100 AND id < 200")
+                .unwrap();
             let mut re = String::from("INSERT INTO t VALUES ");
             for i in 100..200 {
                 if i > 100 {
@@ -82,7 +86,8 @@ fn round493_a_held_snapshot_stops_the_pruning() {
             UNIQ_PROBE_CALLS.load(Relaxed),
             UNIQ_PROBE_LOCATORS.load(Relaxed),
         );
-        e.execute("DELETE FROM t WHERE id >= 100 AND id < 200").unwrap();
+        e.execute("DELETE FROM t WHERE id >= 100 AND id < 200")
+            .unwrap();
         let mut re = String::from("INSERT INTO t VALUES ");
         for i in 100..200 {
             if i > 100 {
@@ -102,13 +107,17 @@ fn round493_a_held_snapshot_stops_the_pruning() {
     let mut free = seeded();
     churn(&mut free, 20);
     let pruned = locators_per_probe(&mut free);
-    assert!(pruned < 3.0, "expected pruning, got {pruned} locators per probe");
+    assert!(
+        pruned < 3.0,
+        "expected pruning, got {pruned} locators per probe"
+    );
 
     // Snapshot held in another session: the horizon drops to it and the
     // same churn must leave every version in place.
     let mut held = seeded();
     held.set_current_session(1);
-    held.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
+    held.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .unwrap();
     let _ = held.execute("SELECT count(*) FROM t").unwrap();
     held.set_current_session(2);
     churn(&mut held, 20);

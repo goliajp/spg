@@ -43,7 +43,10 @@ fn strip_removes_positions() {
         "'cat' 'dog' 'fish'"
     );
     // Already stripped — unchanged.
-    assert_eq!(text(&first(&mut e, "SELECT strip('cat dog')")), "'cat' 'dog'");
+    assert_eq!(
+        text(&first(&mut e, "SELECT strip('cat dog')")),
+        "'cat' 'dog'"
+    );
 }
 
 #[test]
