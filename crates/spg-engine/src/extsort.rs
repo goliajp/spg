@@ -15,60 +15,48 @@
 //! merge the runs back k-way. Peak is then the budget plus one decoded
 //! row per run, whatever the input size.
 //!
-//! A spilled record is `key_values ++ projected_values` under a schema
-//! built the same way; on decode the leading values split off, get
-//! packed into keys through the caller's own packer, and the remainder
-//! is the output row. Values are what the row codec already encodes, so
-//! there is no second format to keep in step with it.
+//! A spilled record is the caller's SOURCE row, under the scan's own
+//! schema. Keys come back through `build_order_keys_bound` over that
+//! row — the identical call the scan makes — so no key can be missing,
+//! and the projection runs once after the merge instead of before the
+//! spill. `push` takes `(keys, record)`; `finish` takes `keys_of` and
+//! `project`.
 //!
-//! Round 833 first tried storing rows ALONE and re-deriving keys from
-//! the decoded row. That cannot work: the rows a sort spills are
-//! PROJECTED, and an ORDER BY key need not be projected — `SELECT pad
-//! FROM big ORDER BY id` sorts on something the row no longer carries.
-//! Its three unit tests passed regardless, because their key happened
-//! to be a projected column; the case that exposes it leads the tests
-//! now.
+//! Two earlier shapes were tried and are recorded because each looked
+//! right until it met the call site. Round 833 stored rows alone and
+//! re-derived keys from the decoded row: impossible, because the rows
+//! were PROJECTED and an ORDER BY key need not be projected (`SELECT
+//! pad FROM big ORDER BY id`). Its three unit tests passed anyway,
+//! their key having happened to be a projected column — the case that
+//! exposes it leads the tests now. Round 835 then spilled key values as
+//! leading hidden columns, which `encode_row_body_dense` cannot encode
+//! in general: it is schema-driven, an ORDER BY operand is an arbitrary
+//! expression, and the tree has no expression type inference to ask for
+//! its `DataType`. Spilling the source row removes both problems rather
+//! than working around either.
 //!
-//! ⚠️ **Wiring found a second obstacle, and it points at a simpler
-//! design than this one** (round 836; recorded here rather than left to
-//! be rediscovered).
-//!
-//! `encode_row_body_dense` is schema-driven: every column needs a
-//! declared `DataType`. The projected columns have one, but an ORDER BY
-//! operand is an arbitrary expression, and the tree has no expression
-//! type inference to ask — so the key columns of the schema above
-//! cannot be built for the general case.
-//!
-//! Spilling the SOURCE row instead removes the problem rather than
-//! working around it. Its schema is the scan's own `schema_cols`, types
-//! and all; keys come back through `build_order_keys_bound` over that
-//! row — the identical call the scan makes, so no key can be missing by
-//! construction; and the projection runs once, after the merge, instead
-//! of before the spill. No key columns, no type inference, no hidden
-//! values. The costs are honest ones: a wide source row spills more
-//! bytes than a narrow projection would (I/O, not peak memory, which
-//! stays bounded by the budget either way), and a projection containing
-//! a correlated subquery evaluates after the merge rather than during
-//! the scan.
-//!
-//! That would make `push` take `(keys, record)` and `finish` take a
-//! `project` alongside `keys_of`, and the key-values plumbing below
-//! becomes unnecessary. Left as it stands until the wiring lands, so the
-//! change arrives with the call site that proves it.
+//! The costs are honest ones: a wide source row spills more bytes than
+//! a narrow projection would (I/O, not peak memory, which the budget
+//! bounds either way), and a projection containing a correlated
+//! subquery evaluates after the merge rather than during the scan.
 //!
 //! With no factory (an embedded engine with nowhere to put a file) this
 //! degrades to exactly today's behaviour: everything stays in the batch
 //! and is sorted in memory. That is a ceiling the host opts into, not
 //! one imposed on it.
 
-// Phase B's core, unit-tested and not yet on any query path — the same
-// shape Phase A shipped `TempRun` in (round 786). The wiring is a
-// separate surgery: the sites that sort today receive a `Vec<Row>` that
-// the scan has already materialised, so handing it to this changes
-// nothing about peak memory. What has to move first is row PRODUCTION,
-// so rows reach the sorter one at a time; until then, wiring it in
-// would buy a `Sort Method: external merge` line and no ceiling, which
-// is the kind of half-measure that reads as done.
+// Phase B's core, unit-tested and not on any query path YET — the same
+// shape Phase A shipped `TempRun` in (round 786).
+//
+// Round 837 wired it and measured the result before keeping it. It is
+// correct: eight ORDER BY shapes give byte-identical answers spilled
+// and unspilled, and peak fell from 807 MB to 117 MB at 400k rows. It
+// is also 5.4x slower than PG18 on the same query where PG also spills
+// (PG: `Sort Method: external merge  Disk: 85384kB`, 152 ms server-side
+// and 0.40 s to the client; SPG spilled: 2.16 s, against 0.83 s
+// unspilled). Losing an endpoint to PG by 5x is a hard stop here, and
+// hiding the wiring behind an env var is explicitly not allowed, so the
+// wiring came back out and this waits for a merge that can meet 0.40 s.
 #![allow(dead_code)]
 
 use alloc::boxed::Box;
@@ -373,6 +361,60 @@ mod tests {
 
     fn project_identity(src: &Row<'static>) -> Result<Row<'static>, EngineError> {
         Ok(src.clone())
+    }
+
+    /// r839 — where does a spilled sort spend its time? Counter-first,
+    /// on the sorter alone: no scan, no wire. A MEMORY-backed run, so
+    /// what this measures is codec plus merge, with disk I/O removed —
+    /// if the cost is already here, the disk is not the problem.
+    ///
+    /// `cargo test -p spg-engine --release --lib r839 -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn r839_profile_spill_phases() {
+        extern crate std;
+        use spg_storage::{ColumnSchema, DataType, Value};
+        use std::time::Instant;
+
+        const ROWS: usize = 400_000;
+        const WORK_MEM: usize = 4 * 1024 * 1024;
+
+        let cols = alloc::vec![
+            ColumnSchema::new("id", DataType::Int, false),
+            ColumnSchema::new("pad", DataType::Text, false),
+        ];
+        let pad: alloc::string::String = "y".repeat(200);
+        let descs = [false];
+
+        // Build the inputs first, so generation is outside the timings.
+        let t0 = Instant::now();
+        let rows: Vec<Row<'static>> = (0..ROWS)
+            .map(|i| {
+                Row::new(alloc::vec![
+                    Value::Int(i32::try_from((i * 7919) % ROWS).unwrap()),
+                    Value::text(pad.clone()),
+                ])
+            })
+            .collect();
+        let build = t0.elapsed();
+
+        let mut s = ExternalSorter::new(Some(mem_run), WORK_MEM, cols, &descs);
+        let t1 = Instant::now();
+        for r in rows {
+            let k = keys_of(&r).unwrap();
+            s.push(k, r).unwrap();
+        }
+        let push_phase = t1.elapsed();
+
+        let t2 = Instant::now();
+        let out = s.finish(keys_of, |src| Ok(src.clone())).unwrap();
+        let merge_phase = t2.elapsed();
+
+        std::eprintln!(
+            "R839 rows={ROWS} build={build:?} push_spill={push_phase:?} merge_project={merge_phase:?} out={}",
+            out.len()
+        );
+        assert_eq!(out.len(), ROWS);
     }
 
     /// The case the first two designs got wrong: the ORDER BY key is not
