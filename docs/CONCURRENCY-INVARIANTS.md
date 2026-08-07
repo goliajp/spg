@@ -170,6 +170,63 @@ silently disables auto-checkpoint.
   — pure-idle window, no SQL, asserts `self_wake_fire_count()`
   advanced ≥ 2 ticks.
 
+## 6. Per-connection witness on a shared engine (rounds 794-797)
+
+**What.** Anything the server asks about "is this in a transaction"
+must ask about the connection running the statement — `current_tx`
+plus `is_tx_open(tx_id)` — and never the engine-wide
+`in_transaction()`, which is true while *any* connection holds one.
+
+**Why.** Every connection shares one `Engine`. The global predicate
+turns one client's open transaction into a fact about all of them,
+and the failures are silent and depend on unrelated traffic. Four
+were measured, each with a second connection idling in a BEGIN as the
+only difference:
+
+- an autocommit `CREATE USER` refused with "not allowed inside a
+  transaction" (round 794);
+- a DDL acked but never persisted or audited — after `kill -9` the
+  table it created was gone (round 795);
+- 200 autocommit inserts counted as zero modified rows, so the table
+  never reached the analyze threshold (round 796);
+- `DROP VIEW` acked and the view back after a restart (round 797) —
+  six sites a textual fix had walked past, which is why the audit that
+  found them read every `in_transaction()` call site by hand rather than
+  matching the pattern again. (Round 795 reported "38 sites replaced" —
+  an accurate count of its matches, and not of the occurrences, which is
+  how six DROP statements spelling the same condition
+  `removed > 0 && !self.in_transaction()` survived it.)
+
+**Where.**
+- `crates/spg-engine/src/execute.rs::Engine::catalog_change_is_committed`
+  — the named predicate; `modified_catalog` flows from it.
+- `crates/spg-engine/src/execute.rs::Engine::require_no_transaction_block`
+  — same witness for PG's PreventInTransactionBlock family.
+- `crates/spg-engine/src/ddl.rs::Engine::exec_create_user` /
+  `exec_drop_user` — role DDL.
+- `crates/spg-engine/src/dml.rs` — the auto-analyze counters.
+
+**Not every use is wrong.** Audited and correct as engine-wide:
+the freezer tick (COMMIT writes a transaction's slot catalog back over
+the base one and would clobber a freeze), WAL replay at startup (no
+connections yet), CHECKPOINT and COMPACT refusing while any
+transaction is in flight, and `poison_tx_rebase`, which re-derives the
+slot itself and no-ops when this connection has none.
+
+**How tested.**
+- `crates/spg-server/tests/e2e/e2e_catalog_commit_witness_round795.rs`
+  — a DDL issued while another connection holds a transaction is in
+  `spg_audit_chain`, survives `kill -9`, and a DROP stays dropped.
+- `crates/spg-server/tests/e2e/e2e_prevent_in_transaction_round794.rs::another_connections_transaction_does_not_block_autocommit_ddl`
+  — the holder's transaction does not reach the worker, and the holder
+  itself is still refused.
+- `crates/spg-engine/src/tests.rs::another_slots_transaction_does_not_stop_autoanalyze_counting`
+  — failed before the fix and passes after, so it is its own negative
+  control.
+
+Every pin here opens a second connection or slot on purpose: this class
+of bug cannot reproduce on one.
+
 ## Maintenance
 
 Add new invariants below this section when introducing them. The
