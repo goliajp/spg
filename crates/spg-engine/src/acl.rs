@@ -549,12 +549,15 @@ impl Engine {
         for m in members {
             self.acl_check_role_exists(m)?;
         }
+        // v7.37 (round 828) — memberships are role catalog state too:
+        // routed through the TX shadow so GRANT/REVOKE roll back.
+        let store = self.role_ddl_users_mut();
         for r in roles {
             for m in members {
                 if grant {
-                    self.users.add_member(r, m);
+                    store.add_member(r, m);
                 } else {
-                    self.users.drop_member(r, m);
+                    store.drop_member(r, m);
                 }
             }
         }

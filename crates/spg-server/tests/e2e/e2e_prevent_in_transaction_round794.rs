@@ -268,14 +268,35 @@ fn another_connections_transaction_does_not_block_autocommit_ddl() {
         message(&dropped)
     );
 
-    // And the connection that really is in a transaction still gets the
-    // refusal, so the guard was narrowed rather than removed.
-    let refused = q(&mut holder, "CREATE USER u794b PASSWORD 'x'");
-    assert!(
-        sqlstate(&refused).is_some(),
-        "the holder IS in a transaction and role DDL is refused there"
+    // v7.37 (round 828) — the same-connection arm changed sides. This
+    // used to assert the refusal, proving round 794 narrowed the guard
+    // rather than removing it. Round 828 removed it on purpose: PG
+    // treats roles as ordinary catalog rows, and role DDL now runs in
+    // the transaction and rolls back with it. What this arm holds now
+    // is the same claim in its PG-faithful form — accepted in the
+    // transaction, gone after ROLLBACK. The full matrix lives in
+    // e2e_role_tx_round828.
+    let accepted = q(&mut holder, "CREATE USER u794b PASSWORD 'x'");
+    assert_eq!(
+        sqlstate(&accepted),
+        None,
+        "role DDL runs inside a transaction now, as in PG, got: {}",
+        message(&accepted)
     );
     q(&mut holder, "ROLLBACK");
+    let after = q(
+        &mut holder,
+        "SELECT count(*) FROM pg_roles WHERE rolname = 'u794b'",
+    );
+    let count = after
+        .iter()
+        .find(|m| m.ty == b'D')
+        .map(|m| {
+            let len = i32::from_be_bytes([m.body[2], m.body[3], m.body[4], m.body[5]]);
+            String::from_utf8_lossy(&m.body[6..6 + len as usize]).into_owned()
+        })
+        .expect("one count row");
+    assert_eq!(count, "0", "and it rolls back with the transaction");
 }
 
 /// r806 — `DROP DATABASE` parses at last, and answers the way PG does.

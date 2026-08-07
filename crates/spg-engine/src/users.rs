@@ -957,7 +957,10 @@ impl Engine {
         role: Role,
         salt: [u8; 16],
     ) -> Result<(), UserError> {
-        self.users.create(name, password, role, salt)?;
+        // v7.37 (round 828) — through the role router: inside a
+        // transaction this writes the TX's shadow store, so ROLLBACK
+        // undoes it and COMMIT publishes it, exactly like the catalog.
+        self.role_ddl_users_mut().create(name, password, role, salt)?;
         // v4.8: also derive SCRAM-SHA-256 secrets so PG-wire SASL
         // auth can verify without re-running PBKDF2 per attempt.
         // Uses a fresh salt from the host RNG (falls back to a
@@ -974,13 +977,13 @@ impl Engine {
             },
             |f| f(),
         );
-        self.users
+        self.role_ddl_users_mut()
             .enable_scram(name, password, scram_salt, SCRAM_DEFAULT_ITERS)?;
         Ok(())
     }
 
     pub fn drop_user(&mut self, name: &str) -> Result<(), UserError> {
-        self.users.drop(name)
+        self.role_ddl_users_mut().drop(name)
     }
 
     /// v7.39 (round 750) — the engine half of `ALTER ROLE … PASSWORD`:
@@ -1001,7 +1004,7 @@ impl Engine {
             },
             |f| f(),
         );
-        self.users.set_password(name, password, salt)?;
+        self.role_ddl_users_mut().set_password(name, password, salt)?;
         if let Some(p) = password {
             let scram_salt = self.salt_fn.map_or_else(
                 || {
@@ -1012,7 +1015,7 @@ impl Engine {
                 },
                 |f| f(),
             );
-            self.users
+            self.role_ddl_users_mut()
                 .enable_scram(name, p, scram_salt, SCRAM_DEFAULT_ITERS)?;
         }
         Ok(())
