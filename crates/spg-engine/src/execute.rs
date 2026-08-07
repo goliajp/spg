@@ -717,17 +717,54 @@ impl Engine {
                 "streaming SELECT got a non-Rows result",
             )));
         };
-        emit(StreamItem::Header(&columns))?;
-        let mut cell_refs: Vec<&Value> = Vec::with_capacity(columns.len());
-        for row in &rows {
-            cell_refs.clear();
-            for v in &row.values {
-                cell_refs.push(v);
-            }
-            emit(StreamItem::Row(&cell_refs))?;
-        }
-        Ok(rows.len())
+        emit_materialised(&columns, &rows, cancel, emit)
     }
+}
+
+/// Hand an already-materialised result to a streaming consumer: one
+/// `Header`, then every row, checking for cancellation as it goes.
+///
+/// v7.37 (round 824) — this loop existed three times, in
+/// `exec_select_streaming` and twice in the read-only entry points, and
+/// none of the three checked cancellation. A `statement_timeout` — and
+/// `CancelRequest`, which shares the token — therefore did not bound any
+/// shape the streaming path declines: arithmetic and function
+/// projections, `ORDER BY`, `DISTINCT`. Measured over 200k rows of 200
+/// bytes under a 120ms timeout, every one of them ran to completion,
+/// all 200000 rows, no error.
+///
+/// The loop reads like the cheap half of the work, since the rows
+/// already exist. It is not: handing them to `emit` is what encodes them
+/// and pushes them at the socket, and that is most of the elapsed time
+/// (first row out at 30ms of 400ms). So the interruption a client asked
+/// for never happened, and it never happened for the shapes most likely
+/// to need it.
+///
+/// It is one function now so that the next copy cannot go missing the
+/// check — which is how all three came to be missing it.
+pub(crate) fn emit_materialised<F>(
+    columns: &[ColumnSchema],
+    rows: &[spg_storage::Row<'static>],
+    cancel: CancelToken<'_>,
+    emit: &mut F,
+) -> Result<usize, EngineError>
+where
+    F: FnMut(StreamItem<'_>) -> Result<(), EngineError>,
+{
+    emit(StreamItem::Header(columns))?;
+    let mut cell_refs: Vec<&Value> = Vec::with_capacity(columns.len());
+    for (i, row) in rows.iter().enumerate() {
+        // Same cadence as the streaming path's own check.
+        if i.is_multiple_of(256) {
+            cancel.check()?;
+        }
+        cell_refs.clear();
+        for v in &row.values {
+            cell_refs.push(v);
+        }
+        emit(StreamItem::Row(&cell_refs))?;
+    }
+    Ok(rows.len())
 }
 
 /// v7.37 — one item in the streaming SELECT emit channel. The
