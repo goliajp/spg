@@ -280,6 +280,32 @@ fn fold_session_identity(e: &mut Expr, role: &str) {
 
 /// A FROM operand that is a bare RLS-enabled base table (not already a
 /// subquery / SRF).
+impl Engine {
+    /// v7.37 (round 830) — does this SELECT read a table whose policies bind
+    /// for this session? The streaming executor asks before it claims a
+    /// statement: policy injection happens further down, in
+    /// `exec_bare_select_cancel`, so a shape the streaming path accepts
+    /// never meets it.
+    ///
+    /// That was invisible while `is_superuser` answered true for every
+    /// session without an explicit SET ROLE — nothing was enforced anywhere,
+    /// so nothing could be bypassed. With authenticated identities carrying
+    /// privilege it became measurable immediately: `SELECT upper(val) FROM
+    /// sec` returned the policy's two rows while `SELECT val FROM sec`
+    /// returned all three, same session, same table.
+    pub(crate) fn select_reads_policy_subject_table(&self, stmt: &SelectStatement) -> bool {
+        if self.is_superuser() {
+            return false;
+        }
+        let Some(from) = &stmt.from else {
+            return false;
+        };
+        let cat = self.active_catalog();
+        is_rls_base(&from.primary, cat)
+            || from.joins.iter().any(|j| is_rls_base(&j.table, cat))
+    }
+}
+
 fn is_rls_base(tref: &TableRef, cat: &Catalog) -> bool {
     tref.lateral_subquery.is_none()
         && tref.unnest_expr.is_none()

@@ -2134,6 +2134,62 @@ fn epic_p_panic_inside_emit_callback_is_caught() {
 }
 
 // ---------------------------------------------------------------
+// v7.37 (round 830) — an authenticated login identity carries privilege
+// ---------------------------------------------------------------
+
+/// Whether a session bypasses row security is `is_superuser`, and it used
+/// to answer true for every session that had not issued `SET ROLE` — so a
+/// client authenticated as an ordinary role read straight past every
+/// policy. Measured through psql over SCRAM before the fix: a role with
+/// `rolsuper = f` saw all three rows of a table whose policy admits two.
+///
+/// The old default was right for what it was written for and still is:
+/// in open mode the server takes any startup packet as admin, so the
+/// name is a label, and letting a label carry privilege would let a
+/// client name itself into a role. These three cases are that
+/// distinction — the wire pins in `e2e_rls_authenticated_round830` reach
+/// the same decision through `SET ROLE`, which is the half a raw-protocol
+/// harness can drive; this is the half that needs a checked credential.
+#[test]
+fn an_authenticated_ordinary_role_is_a_policy_subject() {
+    let mut e = Engine::new();
+    e.create_user("alice", "pw", crate::users::Role::ReadWrite, [7u8; 16])
+        .expect("create alice");
+    e.role_ddl_users_mut()
+        .set_attributes("alice", true, true, false);
+
+    // Unverified: the name is a label, and the session keeps the admin
+    // default. This is open mode, and it must not change.
+    e.set_session_user("alice");
+    assert!(
+        e.is_superuser(),
+        "an unverified startup name must not turn a session into a policy subject"
+    );
+
+    // Verified against a stored credential: the role's own attributes
+    // decide, and this one is not a superuser.
+    e.set_session_authenticated();
+    assert!(
+        !e.is_superuser(),
+        "an authenticated ordinary role is subject to policies and grants"
+    );
+}
+
+#[test]
+fn an_authenticated_superuser_still_bypasses() {
+    let mut e = Engine::new();
+    e.create_user("su", "pw", crate::users::Role::Admin, [8u8; 16])
+        .expect("create su");
+    e.role_ddl_users_mut().set_attributes("su", true, true, true);
+    e.set_session_user("su");
+    e.set_session_authenticated();
+    assert!(
+        e.is_superuser(),
+        "authenticating as a SUPERUSER role changes nothing"
+    );
+}
+
+// ---------------------------------------------------------------
 // v7.37.15 Phase C.2 — transaction status oracle
 // ---------------------------------------------------------------
 

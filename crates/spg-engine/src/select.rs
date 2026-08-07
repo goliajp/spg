@@ -6821,6 +6821,22 @@ impl Engine {
         let Some(from) = &stmt.from else {
             return Ok(None);
         };
+        // v7.37 (round 830) — decline anything a row-security policy binds
+        // for this session. Policies are injected in
+        // `exec_bare_select_cancel`, below this path, so a statement claimed
+        // here would read the table unfiltered: measured, `SELECT val FROM
+        // sec` returned all three rows to a session whose policy allows two,
+        // while `SELECT upper(val) FROM sec` — declined by the shape gates
+        // and so materialised — returned the correct two.
+        //
+        // Declining sends it to the path that enforces. Teaching this one to
+        // inject the predicate itself would keep the streaming benefit for
+        // RLS tables and is the better end state; it is not what a
+        // correctness fix should carry, and the fall-back is exactly as
+        // correct, only slower.
+        if self.select_reads_policy_subject_table(stmt) {
+            return Ok(None);
+        }
         // v7.39 (round 790) — single-table SELECTs stream too. This
         // gate said "joins only" because the path was written for
         // mailrs's joined PROJ shape; a plain `SELECT <cols> FROM t`

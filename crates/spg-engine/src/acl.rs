@@ -265,12 +265,63 @@ impl Engine {
             return true;
         }
         let role = as_role.unwrap_or_else(|| self.current_role());
+        // v7.37 (round 830) — SPG's coarse role is the BASELINE privilege of
+        // an account, and per-table GRANTs add to it. That contract predates
+        // the aclitem work and is what `CREATE USER … ROLE 'readwrite'`
+        // sells: a readwrite account may read and write, without anyone
+        // having to GRANT it each table.
+        //
+        // It only started mattering here now. Until this round every
+        // session without an explicit SET ROLE was a superuser and returned
+        // above, so the coarse role never had to be consulted; making an
+        // authenticated identity carry privilege sent readwrite accounts
+        // down this path for the first time, and a `CREATE USER bi ROLE
+        // 'readwrite'` could no longer INSERT into a table admin created —
+        // measured, and exactly what a customer using coarse roles would
+        // have hit. RLS is unaffected either way: it filters ROWS, and this
+        // decides access to the TABLE.
+        let baseline = self.coarse_role_privs(role);
         let Some(t) = self.active_catalog().get(table) else {
             return true;
         };
         let owner = self.table_owner(t.schema()).to_string();
         let roles = self.users.effective_roles(role);
-        privs_of_roles(t.schema(), &owner, &roles) & wanted == wanted
+        (privs_of_roles(t.schema(), &owner, &roles) | baseline) & wanted == wanted
+    }
+
+    /// v7.37 (round 830) — the table privileges the ACCOUNT THIS SESSION
+    /// AUTHENTICATED AS carries everywhere. `ReadWrite` is the DML set PG
+    /// spells SELECT/INSERT/UPDATE/DELETE and `ReadOnly` is SELECT; `Admin`
+    /// never reaches here, being a superuser.
+    ///
+    /// Scope is the whole point, and getting it wrong was measured. The
+    /// baseline belongs to the account, not to any role a statement happens
+    /// to be judged against: `SET ROLE x` is an explicit request to act with
+    /// x's own grants, which is PG's semantics and what the round-57 pins
+    /// hold — they were locked against a live PG18 oracle, and a first
+    /// version of this that keyed on the role being judged rather than the
+    /// authenticated identity dismantled six of them, `SET ROLE bob`
+    /// silently regaining table access the ACL denies it.
+    ///
+    /// So: only when no SET ROLE is in effect AND the login identity was
+    /// verified. Unverified sessions are superusers anyway (see
+    /// `is_superuser`) and never reach this.
+    fn coarse_role_privs(&self, role: &str) -> u16 {
+        use spg_storage::priv_bits;
+        if !self.session_is_authenticated()
+            || !role.eq_ignore_ascii_case(self.session_user())
+            || self.session_params.contains_key(crate::session::CURRENT_ROLE_KEY)
+        {
+            return 0;
+        }
+        match self.effective_users().get(role).map(|r| r.role) {
+            Some(crate::users::Role::Admin) => priv_bits::ALL,
+            Some(crate::users::Role::ReadWrite) => {
+                priv_bits::SELECT | priv_bits::INSERT | priv_bits::UPDATE | priv_bits::DELETE
+            }
+            Some(crate::users::Role::ReadOnly) => priv_bits::SELECT,
+            None => 0,
+        }
     }
 
     /// Enforce `wanted` on `table`, PG's message and all.

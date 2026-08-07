@@ -1719,10 +1719,6 @@ fn run_pg_session(
     if let Ok(mut e) = state.engine.write() {
         e.set_current_session(conn_state.pid);
         if !user.is_empty() {
-            // The REPORTED identity only: privilege semantics still key on
-            // an explicit SET ROLE (see Engine::is_superuser), so naming a
-            // non-admin login here cannot silently turn a connection into
-            // an RLS subject.
             e.set_session_user(&user);
         }
         if !startup_db.is_empty() {
@@ -1821,6 +1817,20 @@ fn run_pg_session(
     } else {
         Role::Admin
     };
+    // v7.37 (round 830) — the session bag was seeded with the REPORTED
+    // identity before any of this ran; now that a credential has actually
+    // been demanded (`has_users`) and accepted, mark the identity as
+    // CHECKED. In open mode any startup is accepted as admin, so the name
+    // there is a label and keying privilege on it would let a client name
+    // itself into a role. A verified name is an identity, and its role's
+    // own attributes decide what it may see — the only way an RLS policy
+    // or a GRANT binds to the connection that made it.
+    if has_users && !user.is_empty() {
+        if let Ok(mut e) = state.engine.write() {
+            e.set_current_session(conn_state.pid);
+            e.set_session_authenticated();
+        }
+    }
 
     // AuthenticationOk
     send_msg(stream, b'R', &0u32.to_be_bytes())?;
