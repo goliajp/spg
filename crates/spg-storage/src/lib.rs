@@ -7992,6 +7992,17 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
 const FILE_VERSION: u8 = 89;
+
+/// v7.37 (round 833) — the codec version to decode a row that
+/// [`encode_row_body_dense`] has just produced.
+///
+/// That encoder always writes the newest form, and every decoder gate is
+/// a `codec_version >= N` feature test, so a freshly encoded row must be
+/// read at the current version. Cold segments carry their own version in
+/// their header and keep passing that; this is for in-process round
+/// trips — sort runs on temp storage — where the bytes never outlive the
+/// build that wrote them.
+pub const CURRENT_ROW_CODEC_VERSION: u8 = FILE_VERSION;
 /// First version that appends the trailing CRC32C integrity trailer.
 const FILE_VERSION_CRC_TRAILER: u8 = 54;
 /// Oldest format version [`Catalog::deserialize`] still accepts. v8 is the

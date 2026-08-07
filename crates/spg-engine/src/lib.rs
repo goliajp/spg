@@ -39,6 +39,7 @@ mod collate_derive;
 mod acl;
 pub mod aggregate;
 pub(crate) mod amcheck;
+pub(crate) mod extsort;
 mod bytebudget;
 mod cancel;
 mod clock;
