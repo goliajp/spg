@@ -249,12 +249,20 @@ fn drop_subscription_stops_the_worker() {
     // Drop the subscription. The worker should shut down within
     // ~500 ms (the SUB_READ_TIMEOUT poll cadence).
     exec_ok(&mut sub_client, "DROP SUBSCRIPTION sub_a");
-    std::thread::sleep(Duration::from_millis(800));
+    // v7.37 (round 827) — the worker's exit is not observable from SQL,
+    // so this wait stays a sleep, anchored: the worker notices the drop
+    // within its 500ms SUB_READ_TIMEOUT poll cadence, and 1500ms is 3x
+    // that. Too short here is a REAL false failure (rows published
+    // before the worker died would be applied), which is why the old
+    // 1.6x margin was in the flake ledger.
+    std::thread::sleep(Duration::from_millis(1500));
 
     // Now publish more rows. The subscriber must NOT pick them up.
     for i in 2..6 {
         exec_ok(&mut pub_client, &format!("INSERT INTO t VALUES ({i})"));
     }
+    // Deliberately fixed: a negative window ("the rows must NOT
+    // arrive") has no event to poll for; too short only weakens it.
     std::thread::sleep(Duration::from_millis(800));
     let got = select_int(&mut sub_client, "SELECT count(*) FROM t");
     assert_eq!(

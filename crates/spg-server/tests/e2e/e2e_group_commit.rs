@@ -166,7 +166,8 @@ fn single_client_group_of_one_no_latency_tax() {
     }
 
     // Restart and confirm durability — every CC must replay.
-    thread::sleep(Duration::from_millis(150));
+    // v7.37 (round 827) — no sleep: ChildGuard::drop above did
+    // kill+wait, and wait() IS the event (process reaped, files free).
     let (raw, addrs2) = local_spawn(&db, &wal, &[]);
     let _c2 = common::ChildGuard(raw);
     let mut s2 = common::connect_to(&addrs2.native);
@@ -248,7 +249,7 @@ fn four_client_concurrent_inserts_all_durable() {
     }
 
     // Durability across restart — replay should yield the same total.
-    thread::sleep(Duration::from_millis(150));
+    // v7.37 (round 827) — no sleep: ChildGuard::drop did kill+wait.
     let (raw, addrs2) = local_spawn(&db, &wal, &[]);
     let _c2 = common::ChildGuard(raw);
     let mut s2 = common::connect_to(&addrs2.native);

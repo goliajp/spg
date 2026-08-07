@@ -87,6 +87,10 @@ fn freezer_no_op_when_no_freezable_table() {
         ..Default::default()
     };
     let _h = Database::spawn_background_freezer(Arc::clone(&shared), opts);
+    // v7.37 (round 827) — deliberately fixed: the property is that the
+    // freezer ticks (50ms cadence, so several times over) WITHOUT
+    // firing, and not-firing has no event to poll for. A short window
+    // only weakens the claim; it cannot fail a healthy freezer.
     std::thread::sleep(Duration::from_millis(300));
     // The freezer didn't crash; cold_segment_count stays 0.
     assert_eq!(

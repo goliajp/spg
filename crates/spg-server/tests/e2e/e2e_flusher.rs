@@ -98,11 +98,16 @@ fn flusher_metric_rises_under_async_commit_off() {
         ("SPG_FLUSHER_INTERVAL_US", "1000"),
     ]);
     let mut child = common::ChildGuard(raw);
-    thread::sleep(Duration::from_millis(200));
-    let v = flusher_iterations(addrs.http.as_ref().unwrap());
+    // v7.37 (round 827) — poll the counter to the floor instead of
+    // giving it 200ms and hoping the scheduler ran the flusher enough.
+    let mut v = 0;
+    common::wait_until(Duration::from_secs(5), || {
+        v = flusher_iterations(addrs.http.as_ref().unwrap());
+        v >= 10
+    });
     assert!(
         v >= 10,
-        "expected flusher_iterations_total >= 10 after 200ms at 1ms cadence, got {v}"
+        "expected flusher_iterations_total >= 10 at 1ms cadence, got {v}"
     );
 }
 
@@ -116,8 +121,12 @@ fn flusher_env_var_recognizes_off_false_zero() {
             ("SPG_FLUSHER_INTERVAL_US", "500"),
         ]);
         let mut child = common::ChildGuard(raw);
-        thread::sleep(Duration::from_millis(100));
-        let v = flusher_iterations(addrs.http.as_ref().unwrap());
+        // Same conversion as above: poll to the floor.
+        let mut v = 0;
+        common::wait_until(Duration::from_secs(5), || {
+            v = flusher_iterations(addrs.http.as_ref().unwrap());
+            v >= 5
+        });
         assert!(
             v >= 5,
             "SPG_SYNCHRONOUS_COMMIT={val:?} must enable the flusher; got iterations={v}"

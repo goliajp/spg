@@ -390,11 +390,9 @@ fn netsplit_disconnect_then_heal_resyncs_without_loss_or_dup() {
     // RECONNECT_DELAY (500 ms) and replays from the offset it last
     // applied. No duplicates because the master sends only [pos..].
     proxy_ctrl.heal();
-    // Give the follower's reconnect loop time to kick (500 ms
-    // RECONNECT_DELAY) before we start polling — saves a few rounds
-    // of "table not found" or "stuck at 10" probes inside the
-    // catchup loop.
-    thread::sleep(Duration::from_millis(600));
+    // v7.37 (round 827) — no head-start sleep: the catchup loop below
+    // polls to a deadline and a few early "not yet" probes cost less
+    // than 600ms of unconditional waiting.
     let post_heal = wait_for_count(
         &follower_addrs.native,
         "SELECT count(*) FROM t",
@@ -584,11 +582,14 @@ fn follower_metrics_expose_replication_lag_after_status_frame() {
         5,
         Instant::now() + CATCHUP_TIMEOUT,
     );
-    // Give the status frame timer (50 ms cadence on the master) at
-    // least a few iterations to land.
-    thread::sleep(Duration::from_millis(300));
-
-    let metrics = http_get(follower_addrs.http.as_ref().unwrap(), "/metrics");
+    // v7.37 (round 827) — poll for the series instead of giving the
+    // 50ms status-frame timer "a few iterations" of flat sleep.
+    let mut metrics = String::new();
+    crate::common::wait_until(Duration::from_secs(5), || {
+        metrics = http_get(follower_addrs.http.as_ref().unwrap(), "/metrics");
+        metrics.contains("spg_replication_lag_bytes")
+            && metrics.contains("spg_replication_lag_seconds")
+    });
     assert!(
         metrics.contains("spg_replication_lag_bytes"),
         "/metrics missing lag_bytes series; got:\n{metrics}"

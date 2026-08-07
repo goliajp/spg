@@ -307,21 +307,38 @@ fn a_bare_for_update_waits_for_the_holder_and_then_proceeds() {
     let mut b = open(&addr);
 
     // B blocks on row 1. Hand it to a thread so this one can commit A.
+    //
+    // v7.37 (round 827) — the thread signals right before it sends the
+    // query, and the release waits for that signal plus one short dwell
+    // for the query's single wire hop. The old version slept a flat
+    // 300ms from BEFORE the spawn and asserted B waited at least 250ms
+    // — so whenever a loaded box delayed the thread past the sleep, B
+    // arrived at a row already free, returned instantly, and the test
+    // failed with the lock behaving perfectly. (pg_locks would be the
+    // observable here, but it is an empty surface until B2.5 lands.)
+    let (sending_tx, sending_rx) = std::sync::mpsc::channel::<()>();
     let handle = std::thread::spawn(move || {
-        let started = std::time::Instant::now();
+        sending_tx.send(()).expect("main alive");
         let got = query_all(&mut b, "SELECT id FROM lk WHERE id = 1 FOR UPDATE");
-        (got, started.elapsed())
+        (got, std::time::Instant::now())
     });
 
-    // Give the waiter time to actually block, then release.
-    std::thread::sleep(Duration::from_millis(300));
+    sending_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("waiter thread reached its query");
+    // The one hop that stays unobservable: signal → engine lock queue.
+    std::thread::sleep(Duration::from_millis(100));
+    let commit_at = std::time::Instant::now();
     query_all(&mut a, "COMMIT");
 
-    let (got, waited) = handle.join().expect("waiter thread");
+    let (got, done_at) = handle.join().expect("waiter thread");
     assert_eq!(got, vec!["1"], "the waiter gets the row once it is free");
+    // The row was HELD when B asked: B can only have finished after the
+    // commit that freed it. This is the contract itself, with no clock
+    // arithmetic that a scheduler can falsify.
     assert!(
-        waited >= Duration::from_millis(250),
-        "it should have WAITED, not returned immediately: {waited:?}",
+        done_at >= commit_at,
+        "the waiter returned before the holder committed",
     );
 }
 
@@ -363,15 +380,27 @@ fn a_deadlock_kills_one_side_and_lets_the_other_through() {
 
     // A reaches for B's row; it will block, then the cycle closes when
     // B reaches for A's.
+    //
+    // v7.37 (round 827) — the assertions below accept either victim, so
+    // the cycle forms whichever query lands first and no ordering sleep
+    // is load-bearing. What replaces it: A's thread signals right
+    // before sending, plus one short dwell — the same construction as
+    // the waiter test above — so the common path stays the documented
+    // one (A blocks first) without a flat 200ms bet on the scheduler.
     let addr2 = addr.clone();
+    let (sending_tx, sending_rx) = std::sync::mpsc::channel::<()>();
     let waiter = std::thread::spawn(move || {
         let _ = addr2;
+        sending_tx.send(()).expect("main alive");
         (
             query_err(&mut a, "SELECT id FROM dl WHERE id = 2 FOR UPDATE"),
             a,
         )
     });
-    std::thread::sleep(Duration::from_millis(200));
+    sending_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("A's thread reached its query");
+    std::thread::sleep(Duration::from_millis(100));
     let b_err = query_err(&mut b, "SELECT id FROM dl WHERE id = 1 FOR UPDATE");
     // The victim keeps its locks until it ends the block — that is PG's
     // behaviour too (an aborted transaction still holds what it took).

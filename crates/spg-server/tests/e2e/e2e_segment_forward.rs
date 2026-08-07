@@ -543,6 +543,9 @@ fn resumable_after_disconnect() {
             std::thread::sleep(Duration::from_millis(100));
         }
         // Give the master a moment to push any extra frames.
+        // v7.37 (round 827) — deliberately fixed: the assertion below is
+        // that NOTHING new appears, and absence has no event to poll
+        // for. Too short only narrows the window it watches.
         std::thread::sleep(Duration::from_millis(500));
     }
 
