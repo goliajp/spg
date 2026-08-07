@@ -152,17 +152,37 @@ fn slow_query_log_fires_above_threshold_and_silent_below() {
     send(&mut s, &build_query("CREATE TABLE t (id INT NOT NULL)"));
     drain_to_cc(&mut s);
 
-    // Fast probe — must produce no slow-query log line.
+    // Negative probe. The contract is "logged if and only if elapsed
+    // reached the threshold", and the half this checks is that nothing
+    // UNDER the threshold is logged.
+    //
+    // v7.37 (round 826) — it used to assert the marker never appears,
+    // which quietly assumes `SELECT 7` finishes inside 5ms of WALL
+    // time. On a loaded box it does not: with a gate run on the same
+    // host this probe measured 11026µs, was logged — correctly — and
+    // the assertion failed a test whose feature was working. So allow
+    // the line, and hold it to the contract: if it was logged, its own
+    // elapsed_us must say why.
     let fast_marker = "SELECT 7 as fast_marker_for_negative_check";
     send(&mut s, &build_query(fast_marker));
     drain_to_cc(&mut s);
     thread::sleep(Duration::from_millis(100));
     {
         let captured = stderr_buf.lock().unwrap().clone();
-        assert!(
-            !captured.contains(fast_marker),
-            "fast query should not appear in slow-query log; stderr:\n{captured}"
-        );
+        if let Some(line) = captured.lines().find(|l| l.contains(fast_marker)) {
+            let elapsed: u64 = line
+                .split("\"elapsed_us\":")
+                .nth(1)
+                .and_then(|rest| {
+                    rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+                })
+                .unwrap_or_else(|| panic!("unparseable slow-query line: {line}"));
+            assert!(
+                elapsed >= 5000,
+                "a query below the threshold was logged as slow \
+                 (elapsed_us={elapsed} < 5000):\n{line}"
+            );
+        }
     }
 
     // Slow probe — recursive CTE that takes well above 5 ms even
@@ -176,33 +196,34 @@ fn slow_query_log_fires_above_threshold_and_silent_below() {
 
     // Give the Drop guard a moment to flush its eprintln onto the
     // captured stderr buffer.
+    //
+    // v7.37 (round 826) — wait for EVERY field the assertions need, not
+    // just for the line to have started. The capture thread reads the
+    // child's stderr through a pipe, so half a line is a perfectly
+    // normal thing to observe; a full-load gate run caught this poll
+    // waking between `elapsed_us` and `role`, satisfying the old
+    // two-substring condition, and then failing the `role` assertion on
+    // a line whose remainder arrived microseconds later. Poll until the
+    // whole payload is there; the deadline turns a genuinely missing
+    // field into the same failure it always was.
     let deadline = Instant::now() + Duration::from_secs(3);
+    let wanted = [
+        "\"event\":\"slow_query\"",
+        "WITH RECURSIVE",
+        "\"sql\":\"",
+        "\"elapsed_us\":",
+        "\"role\":\"",
+        // Threshold echoes back so operators can correlate.
+        "\"threshold_us\":5000",
+    ];
     loop {
         let captured = stderr_buf.lock().unwrap().clone();
-        if captured.contains("\"event\":\"slow_query\"") && captured.contains("WITH RECURSIVE") {
-            // Sanity: required fields are present and well-formed.
-            assert!(
-                captured.contains("\"sql\":\""),
-                "missing sql field:\n{captured}"
-            );
-            assert!(
-                captured.contains("\"elapsed_us\":"),
-                "missing elapsed_us field:\n{captured}"
-            );
-            assert!(
-                captured.contains("\"role\":\""),
-                "missing role field:\n{captured}"
-            );
-            // Threshold echoes back so operators can correlate.
-            assert!(
-                captured.contains("\"threshold_us\":5000"),
-                "missing/wrong threshold_us field:\n{captured}"
-            );
+        if wanted.iter().all(|w| captured.contains(w)) {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "slow-query log never showed up; stderr:\n{captured}"
+            "slow-query log incomplete after 3s; wanted all of {wanted:?}; stderr:\n{captured}"
         );
         thread::sleep(Duration::from_millis(50));
     }

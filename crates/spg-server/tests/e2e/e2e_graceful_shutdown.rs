@@ -110,32 +110,41 @@ fn graceful_shutdown_drains_inflight_and_refuses_new_conns_and_exits_zero() {
     exec_ok(&mut bootstrap, "CREATE TABLE g (id INT NOT NULL)");
     drop(bootstrap);
 
-    // Open the conn that will be "in-flight" when SIGTERM lands.
-    // The query is a recursive CTE chosen to take ~100-500ms so
-    // SIGTERM has a real window to interrupt; it's also CPU-bound
-    // so a non-trivial chunk of work is genuinely mid-flight.
+    // Open the conn that will be "in-flight" when SIGTERM lands. A wide
+    // streaming result (about 20 MB) rather than a compute-only shape,
+    // so the statement is verifiably mid-delivery when the signal
+    // arrives, and stays in flight well past it.
     let mut inflight = TcpStream::connect(&addrs.native).expect("inflight connect");
     inflight.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-    let slow_sql = "WITH RECURSIVE seq(n) AS (\
-                    SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<20000\
-                    ) SELECT count(*) FROM seq";
+    let slow_sql = "SELECT g, repeat('y', 200) FROM generate_series(1, 100000) g";
     send(&mut inflight, &build_query(slow_sql));
-    // Yield briefly so the server thread has actually entered the
-    // engine before SIGTERM lands.
-    thread::sleep(Duration::from_millis(50));
+
+    // v7.37 (round 826) — SIGTERM waits for evidence, not for a timer.
+    // This used to sleep 50ms and hope the server thread had entered
+    // the engine; when it had not, the drain saw a connection with no
+    // statement to drain and closed it, and this side's next read blew
+    // up. That is the flake the full-load suite produced twice — a
+    // loaded box can hold a thread past any fixed sleep, and with the
+    // sleep at zero it is 9 failures in 10 runs. The first frame
+    // arriving IS the entered-the-engine event the sleep was guessing
+    // at: after it, there is a statement in flight for the drain to
+    // honour, by construction.
+    let first = read_frame(&mut inflight);
+    assert!(
+        !matches!(first.op, Op::ErrorResponse | Op::Error),
+        "the in-flight query errored before SIGTERM was even sent"
+    );
 
     send_sigterm(&c.0);
 
     // 1. In-flight query must complete cleanly. Read frames until
-    //    CommandComplete; any ErrorResponse fails the test.
-    let mut saw_cc = false;
-    for _ in 0..16 {
+    //    CommandComplete; any ErrorResponse fails the test. No frame
+    //    cap: the result is deliberately many frames long, and READ_
+    //    TIMEOUT already bounds a server that stops mid-result.
+    loop {
         let f = read_frame(&mut inflight);
         match f.op {
-            Op::CommandComplete => {
-                saw_cc = true;
-                break;
-            }
+            Op::CommandComplete => break,
             Op::ErrorResponse | Op::Error => {
                 let msg = spg_wire::parse_error_response(&f).unwrap_or("<undecodable>");
                 panic!("in-flight query got error during shutdown: {msg}");
@@ -144,7 +153,6 @@ fn graceful_shutdown_drains_inflight_and_refuses_new_conns_and_exits_zero() {
             _ => {}
         }
     }
-    assert!(saw_cc, "in-flight query never returned CC");
     drop(inflight);
 
     // 2. New connections after SIGTERM must be refused. The TCP
@@ -154,11 +162,23 @@ fn graceful_shutdown_drains_inflight_and_refuses_new_conns_and_exits_zero() {
     //    closes when the process exits. Either is a "refusal".
     let refused = TcpStream::connect(&addrs.native).is_err();
     let drained_by_exit = !refused && {
-        // OS-level accept happened (kernel SYN backlog) but the
-        // server isn't reading. Wait briefly; if the child exits
-        // first the socket dies, which is also acceptable.
-        thread::sleep(Duration::from_millis(100));
-        c.0.try_wait().ok().flatten().is_some()
+        // OS-level accept happened (kernel SYN backlog) but the server
+        // isn't reading; the child exiting kills that socket, which is
+        // also a refusal. v7.37 (round 826) — this gave the child a
+        // single 100ms nap to be gone, on a path whose stated budget is
+        // the whole shutdown deadline: a drain still finishing at
+        // 101ms failed the test with everything behaving correctly.
+        // Poll to the same deadline step 3 uses instead.
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if c.0.try_wait().ok().flatten().is_some() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     };
     assert!(
         refused || drained_by_exit,
