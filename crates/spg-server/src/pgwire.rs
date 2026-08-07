@@ -4593,7 +4593,18 @@ pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
     let code =
         // v7.37.17 (Phase E3) — isolation switch after the tx's first
         // query: PG's 25001 ACTIVE_SQL_TRANSACTION.
-        if msg.contains("must be called before any query")
+        if msg.contains("cannot drop the currently open database") {
+            // PG 18.4, measured: 55006 OBJECT_IN_USE.
+            "55006"
+        } else if msg.contains("database \"") && msg.ends_with("does not exist") {
+            // `contains`, not `starts_with`: EngineError::Unsupported's
+            // Display prefixes "unsupported: ", so every arm in this
+            // function only ever sees the wording as a substring.
+            // PG 18.4, measured: 3D000 INVALID_CATALOG_NAME — a distinct
+            // code from the 42P01 an unknown table gets, and clients that
+            // branch on it are asking about the database specifically.
+            "3D000"
+        } else if msg.contains("must be called before any query")
             // PG's PreventInTransactionBlock family — VACUUM, ALTER
             // SYSTEM, CREATE DATABASE, the CONCURRENTLY index forms,
             // DISCARD ALL. All 25001, all phrased this way.

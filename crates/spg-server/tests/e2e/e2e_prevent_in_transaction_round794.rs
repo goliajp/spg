@@ -278,3 +278,69 @@ fn another_connections_transaction_does_not_block_autocommit_ddl() {
     q(&mut holder, "ROLLBACK");
 }
 
+/// r806 — `DROP DATABASE` parses at last, and answers the way PG does.
+///
+/// `CREATE DATABASE` has parsed since v7.14; this did not, so
+/// `DROP DATABASE IF EXISTS x` — how every teardown script and
+/// pg_dumpall preamble opens — came back as a syntax error, which is the
+/// one failure `IF EXISTS` cannot soften. SPG serves a single database,
+/// and PG never lets the statement succeed on one either: the name is
+/// either unknown or the database you are connected to. Both wordings
+/// and both SQLSTATEs were read off PG 18.4 rather than recalled —
+/// 3D000 for an unknown name is not the 42P01 an unknown table gets, and
+/// a client that branches on the code (create-if-absent bootstraps do)
+/// would be misled by the wrong one.
+#[test]
+fn drop_database_answers_as_pg_does() {
+    let (_child, addrs) = spawn();
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+
+    let unknown = q(&mut s, "DROP DATABASE nope806");
+    assert_eq!(
+        sqlstate(&unknown).as_deref(),
+        Some("3D000"),
+        "PG 18.4: 3D000 invalid_catalog_name"
+    );
+    assert_eq!(
+        message(&unknown),
+        "database \"nope806\" does not exist",
+        "and PG's wording, verbatim"
+    );
+
+    let skipped = q(&mut s, "DROP DATABASE IF EXISTS nope806");
+    assert_eq!(
+        sqlstate(&skipped),
+        None,
+        "IF EXISTS turns it into a notice, got: {}",
+        message(&skipped)
+    );
+
+    let current = q(&mut s, "DROP DATABASE spg");
+    assert_eq!(
+        sqlstate(&current).as_deref(),
+        Some("55006"),
+        "PG 18.4: 55006 object_in_use for the open database"
+    );
+    assert_eq!(
+        message(&current),
+        "cannot drop the currently open database"
+    );
+}
+
+/// It belongs to the round-794 family too: PG refuses DROP DATABASE
+/// inside a transaction block exactly as it refuses CREATE DATABASE.
+#[test]
+fn drop_database_is_refused_inside_a_transaction() {
+    let (_child, addrs) = spawn();
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+
+    q(&mut s, "BEGIN");
+    let msgs = q(&mut s, "DROP DATABASE nope806");
+    assert_eq!(sqlstate(&msgs).as_deref(), Some("25001"));
+    assert_eq!(
+        message(&msgs),
+        "DROP DATABASE cannot run inside a transaction block"
+    );
+    q(&mut s, "ROLLBACK");
+}
+

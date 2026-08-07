@@ -204,6 +204,11 @@ pub enum Statement {
     ///
     /// `None` is `RESET ALL`, which names no parameter.
     AlterSystem { parameter: Option<String> },
+    /// `DROP DATABASE [IF EXISTS] <name>`. SPG is single-database, so
+    /// this never succeeds; the name and the flag are carried so the
+    /// engine can answer with PG's wording for the two cases PG itself
+    /// has — an unknown name, or the database you are connected to.
+    DropDatabase { name: String, if_exists: bool },
     /// A statement SPG accepts as a no-op but PG refuses inside a
     /// transaction block — today `CREATE DATABASE` / `DROP DATABASE`,
     /// which are no-ops here because SPG is single-database.
@@ -4927,6 +4932,7 @@ impl Statement {
             // Same shape: a no-op here, a writer to PG, so a read-only
             // session refuses it as PG's would.
             Statement::NoOpPreventedInTransaction { .. } => false,
+            Statement::DropDatabase { .. } => false,
             // v7.39 (round 696) — they perform nothing, so nothing is
             // written; PG classes LOCK and the OWNED BY pair as writers and
             // a read-only session refuses them there.
@@ -5320,6 +5326,13 @@ impl fmt::Display for Statement {
                     f.write_str(t)?;
                 }
                 Ok(())
+            }
+            Self::DropDatabase { name, if_exists } => {
+                f.write_str("DROP DATABASE ")?;
+                if *if_exists {
+                    f.write_str("IF EXISTS ")?;
+                }
+                f.write_str(name)
             }
             Self::NoOpPreventedInTransaction { what } => f.write_str(what),
             Self::SetConstraints { names, deferred } => {
