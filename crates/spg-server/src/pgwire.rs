@@ -983,7 +983,17 @@ fn handle_pg_simple_query(
                         send_row_description(wbuf, &columns)
                             .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))?;
                         wrote_header = true;
-                        for row in &rows {
+                        for (i, row) in rows.iter().enumerate() {
+                            // v7.37 (round 824) — the engine's own fallback
+                            // loop was missing this check; so was this one,
+                            // which serves the shapes routed here directly
+                            // (subqueries and aggregates). Measured the same
+                            // way: `SELECT pad FROM big WHERE id IN (SELECT
+                            // id FROM big)` over 200k rows ran all of them to
+                            // completion under a 120ms timeout.
+                            if i.is_multiple_of(256) {
+                                cancel.check()?;
+                            }
                             let before = wbuf.len();
                             encode_data_row(
                                 wbuf,

@@ -316,7 +316,16 @@ impl Engine {
                 "execute_readonly_select_with_arena fallback got a non-Rows result".into(),
             ));
         };
-        for row in &rows {
+        for (i, row) in rows.iter().enumerate() {
+            // v7.37 (round 824) — the fourth copy of this loop, and the
+            // fourth one missing a cancellation check. It cannot share
+            // `emit_materialised` because its consumer takes columns and
+            // values rather than a `StreamItem`, but it owes the same
+            // guarantee: `SELECT id + 0 FROM big` lands here, and under a
+            // 120ms timeout it delivered all 200000 rows in 400ms.
+            if i.is_multiple_of(256) {
+                cancel.check()?;
+            }
             // `&[Value<'static>]` satisfies `&[Value<'a>]` via
             // covariance of `Cow<'a, str>` in `'a`.
             emit(&columns, &row.values)?;
@@ -356,16 +365,7 @@ impl Engine {
                 "streaming SELECT got a non-Rows result".into(),
             ));
         };
-        emit(crate::StreamItem::Header(&columns))?;
-        let mut cell_refs: Vec<&Value> = Vec::with_capacity(columns.len());
-        for row in &rows {
-            cell_refs.clear();
-            for v in &row.values {
-                cell_refs.push(v);
-            }
-            emit(crate::StreamItem::Row(&cell_refs))?;
-        }
-        Ok(rows.len())
+        crate::execute::emit_materialised(&columns, &rows, cancel, &mut emit)
     }
 
     pub fn execute_readonly_select_streaming<F>(
@@ -417,16 +417,7 @@ impl Engine {
                 "streaming SELECT got a non-Rows result".into(),
             ));
         };
-        emit(crate::StreamItem::Header(&columns))?;
-        let mut cell_refs: Vec<&Value> = Vec::with_capacity(columns.len());
-        for row in &rows {
-            cell_refs.clear();
-            for v in &row.values {
-                cell_refs.push(v);
-            }
-            emit(crate::StreamItem::Row(&cell_refs))?;
-        }
-        Ok(rows.len())
+        crate::execute::emit_materialised(&columns, &rows, cancel, &mut emit)
     }
 
     /// v4.5 — read path with cooperative cancellation. Token's
