@@ -64,3 +64,69 @@ fn round786_without_a_factory_the_ceiling_is_unchanged() {
         "expected the budget refusal, got {err}"
     );
 }
+
+
+/// r840 — is the spill's cost the file, or the way it is written?
+///
+/// Round 839 timed the sorter over memory-backed runs at 186 ms for
+/// 400k rows and cleared the codec and the merge. What it excluded was
+/// real file I/O, and the access pattern is the suspect: the sorter
+/// appends a 4-byte length and then a ~208-byte body per row, and reads
+/// them back the same way, against a `File` with no buffering on either
+/// side. That is four syscalls a row — 1.6M for this volume.
+///
+/// `cargo test -p spg-server --release --test e2e r840 -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn r840_file_run_access_pattern_cost() {
+    use std::time::Instant;
+    const ROWS: usize = 400_000;
+    let body = vec![b'y'; 208];
+
+    let dir = std::env::temp_dir().join(format!("spg-r840-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut run = crate::tempstore_shim::create_run_in(&dir).expect("factory");
+    let t0 = Instant::now();
+    for _ in 0..ROWS {
+        let len = u32::try_from(body.len()).unwrap();
+        run.append(&len.to_le_bytes()).unwrap();
+        run.append(&body).unwrap();
+    }
+    run.seal().unwrap();
+    let write_phase = t0.elapsed();
+
+    let t1 = Instant::now();
+    let mut hdr = [0u8; 4];
+    let mut buf = vec![0u8; 208];
+    let mut got = 0usize;
+    loop {
+        let mut filled = 0;
+        while filled < 4 {
+            let n = run.read(&mut hdr[filled..]).unwrap();
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        if filled == 0 {
+            break;
+        }
+        let len = u32::from_le_bytes(hdr) as usize;
+        let mut filled = 0;
+        while filled < len {
+            let n = run.read(&mut buf[filled..len]).unwrap();
+            assert!(n > 0, "short read");
+            filled += n;
+        }
+        got += 1;
+    }
+    let read_phase = t1.elapsed();
+
+    eprintln!(
+        "R840 rows={ROWS} bytes={} write={write_phase:?} read={read_phase:?} read_back={got}",
+        (ROWS * 212) / (1024 * 1024)
+    );
+    assert_eq!(got, ROWS);
+    let _ = std::fs::remove_dir_all(&dir);
+}

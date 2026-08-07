@@ -45,18 +45,22 @@
 //! and is sorted in memory. That is a ceiling the host opts into, not
 //! one imposed on it.
 
-// Phase B's core, unit-tested and not on any query path YET — the same
-// shape Phase A shipped `TempRun` in (round 786).
+// Phase B's core, unit-tested and NOT on any query path — the wiring
+// is written and measured but held back on the perf red line.
 //
-// Round 837 wired it and measured the result before keeping it. It is
-// correct: eight ORDER BY shapes give byte-identical answers spilled
-// and unspilled, and peak fell from 807 MB to 117 MB at 400k rows. It
-// is also 5.4x slower than PG18 on the same query where PG also spills
-// (PG: `Sort Method: external merge  Disk: 85384kB`, 152 ms server-side
-// and 0.40 s to the client; SPG spilled: 2.16 s, against 0.83 s
-// unspilled). Losing an endpoint to PG by 5x is a hard stop here, and
-// hiding the wiring behind an env var is explicitly not allowed, so the
-// wiring came back out and this waits for a merge that can meet 0.40 s.
+// Round 837 wired it: correct on eight ORDER BY shapes, 807 MB down to
+// 117 MB at 400k rows, and 2.16 s wall against PG18's 0.40 s on the
+// same query where PG also spills. Round 840 found why — `FileRun` was
+// unbuffered and a run is written one 4-byte length plus one ~200-byte
+// body at a time, 1.6M syscalls for 400k rows. Buffering both sides cut
+// that 1.06 s to 38 ms and the wired sort to 0.98 s.
+//
+// Still short. The bar is PG's 0.40 s and losing an endpoint is a hard
+// stop here whatever the memory buys, so the wiring waits. What is
+// accounted for: sorter 186 ms (round 839, memory runs), file I/O 38 ms
+// (round 840). The rest is the scan, the projection and the wire — the
+// unspilled path costs 0.83 s on the same query, so most of the gap to
+// PG is NOT the spill and is tracked separately.
 #![allow(dead_code)]
 
 use alloc::boxed::Box;

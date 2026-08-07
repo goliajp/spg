@@ -31,10 +31,36 @@ pub fn temp_dir() -> PathBuf {
     std::env::var_os("SPG_TEMP_DIR").map_or_else(std::env::temp_dir, PathBuf::from)
 }
 
+/// How much a run buffers before it touches the file, in either
+/// direction.
+///
+/// v7.37 (round 840) — a run is written and read one RECORD at a time: a
+/// 4-byte length then a ~200-byte body, four syscalls per row. Against
+/// an unbuffered `File` that cost 823 ms to write and 233 ms to read
+/// 80 MB of 400k rows — about 97 MB/s, which is nothing to do with the
+/// disk and everything to do with 1.6M syscalls. It is the whole of the
+/// gap that kept the external merge sort from being wired (round 837
+/// measured the spilled sort 5.4x slower than PG18; round 839 cleared
+/// the codec and the merge at 186 ms combined).
+///
+/// 256 KiB is the usual plateau for this: large enough that per-record
+/// syscalls disappear, small enough that a query with many runs open at
+/// once does not pay for it in memory — and the sorter's own budget
+/// bounds how many that is.
+const RUN_BUF_BYTES: usize = 256 * 1024;
+
 /// A single spill run backed by one file.
+///
+/// Buffered on both sides. The write buffer is flushed by `seal`, which
+/// is also what rewinds the file, so a read can never see a partial
+/// write.
 pub struct FileRun {
     pub(crate) path: PathBuf,
     file: File,
+    /// Pending bytes, either not yet written or already read ahead.
+    buf: Vec<u8>,
+    /// How far into `buf` the reader has got. Unused while writing.
+    read_pos: usize,
     written: u64,
     sealed: bool,
 }
@@ -42,14 +68,25 @@ pub struct FileRun {
 impl TempRun for FileRun {
     fn append(&mut self, bytes: &[u8]) -> Result<(), TempStoreError> {
         debug_assert!(!self.sealed, "append after seal");
-        self.file
-            .write_all(bytes)
-            .map_err(|e| io_err("writing spill run", &e))?;
+        self.buf.extend_from_slice(bytes);
+        if self.buf.len() >= RUN_BUF_BYTES {
+            self.file
+                .write_all(&self.buf)
+                .map_err(|e| io_err("writing spill run", &e))?;
+            self.buf.clear();
+        }
         self.written += bytes.len() as u64;
         Ok(())
     }
 
     fn seal(&mut self) -> Result<(), TempStoreError> {
+        if !self.buf.is_empty() {
+            self.file
+                .write_all(&self.buf)
+                .map_err(|e| io_err("writing spill run", &e))?;
+            self.buf.clear();
+        }
+        self.read_pos = 0;
         self.file
             .flush()
             .map_err(|e| io_err("flushing spill run", &e))?;
@@ -64,9 +101,22 @@ impl TempRun for FileRun {
 
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, TempStoreError> {
         debug_assert!(self.sealed, "read before seal");
-        self.file
-            .read(buf)
-            .map_err(|e| io_err("reading spill run", &e))
+        if self.read_pos == self.buf.len() {
+            self.buf.resize(RUN_BUF_BYTES, 0);
+            let got = self
+                .file
+                .read(&mut self.buf)
+                .map_err(|e| io_err("reading spill run", &e))?;
+            self.buf.truncate(got);
+            self.read_pos = 0;
+            if got == 0 {
+                return Ok(0);
+            }
+        }
+        let n = core::cmp::min(buf.len(), self.buf.len() - self.read_pos);
+        buf[..n].copy_from_slice(&self.buf[self.read_pos..self.read_pos + n]);
+        self.read_pos += n;
+        Ok(n)
     }
 
     fn bytes_written(&self) -> u64 {
@@ -111,6 +161,8 @@ pub fn create_run_in(dir: &Path) -> Result<FileRun, TempStoreError> {
     Ok(FileRun {
         path,
         file,
+        buf: Vec::with_capacity(RUN_BUF_BYTES),
+        read_pos: 0,
         written: 0,
         sealed: false,
     })
