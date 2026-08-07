@@ -242,10 +242,14 @@ fn every_materialising_shape_can_be_interrupted_once_its_rows_are_flowing() {
     let (mut s, key) = open_with_key(addr);
     seed(&mut s);
 
-    // Each of these is declined by the streaming path for its own reason,
-    // and each reached a different one of the four loops that had no
-    // check. The subquery is the one that goes through pgwire's own
-    // materialised loop rather than the engine's.
+    // Each of these was declined by the streaming path for its own reason
+    // when this was written, and each reached a different one of the four
+    // loops that had no check. Round 831 gave joinless single-table
+    // SELECTs a streaming walk, so the arithmetic and function
+    // projections now take that instead — and are still interrupted,
+    // by the check in the new walk. What the list pins is the contract,
+    // which holds whichever path a shape ends up on; the subquery is the
+    // one that goes through pgwire's own materialised loop.
     let shapes = [
         "SELECT id + 0 FROM big",
         "SELECT upper(pad) FROM big",
