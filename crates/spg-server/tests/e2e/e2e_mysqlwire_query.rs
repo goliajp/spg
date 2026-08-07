@@ -832,12 +832,32 @@ fn kill_of_your_own_connection_reports_1927_and_closes() {
     assert_eq!((errno, sqlstate.as_str()), (1927, "70100"));
     assert_eq!(msg, "Connection was killed");
 
-    send_query(&mut s, "SELECT 1");
-    let mut hdr = [0u8; 4];
-    assert!(
-        s.read_exact(&mut hdr).is_err(),
-        "the connection must be closed after killing itself"
-    );
+    // The server has closed the socket, correctly. Which syscall
+    // observes that is a race this test must not lose: the follow-up
+    // write usually slips into the void and the read then sees EOF, but
+    // under load the scheduler can stall this thread mid-`write_packet`
+    // — between its header and payload writes — long enough for the
+    // server's RST to land, and then the PAYLOAD write takes EPIPE.
+    // `send_query` would panic on that, and did, exactly once per few
+    // full-load suite runs; a 300ms stall between the two writes
+    // reproduces it 3 in 3. Both outcomes are the closure this test
+    // exists to observe, so both pass.
+    {
+        use std::io::Write;
+        let payload = [0x03, b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1'];
+        let hdr = [payload.len() as u8, 0, 0, 0];
+        let wrote = s
+            .write_all(&hdr)
+            .and_then(|()| s.write_all(&payload));
+        if wrote.is_ok() {
+            let mut hdr = [0u8; 4];
+            assert!(
+                s.read_exact(&mut hdr).is_err(),
+                "the connection must be closed after killing itself"
+            );
+        }
+        // A write error IS the closed connection announcing itself.
+    }
 }
 
 /// `KILL QUERY <self>` only stops a running statement — the connection

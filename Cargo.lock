@@ -1971,6 +1971,7 @@ version = "7.37.12"
 dependencies = [
  "bumpalo",
  "criterion",
+ "libc",
  "spg-crypto",
  "spg-sql",
 ]

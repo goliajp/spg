@@ -29,6 +29,43 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// v7.37 (round 826) — a clock for the transient gates that measures the
+/// work instead of the machine. The three ms-budget gates below ran on
+/// wall time, and their budgets leave about 1.5x over a quiet mini
+/// (pb_insert_mut: 29-35 ms of 50; push_mut: 51 of 75, 2026-06-11) —
+/// which is margin against the code, not against the testbed. The gate
+/// runner shares that testbed with whatever else the session is doing,
+/// and one full-load run blew pb_insert_mut's budget for a reason that
+/// was never a regression. `perf_lock()` cannot help: it serialises the
+/// tests in THIS process, not the neighbours.
+///
+/// Thread CPU time is what the loop actually burned. For these pure
+/// in-memory loops it reads the same as wall time on a quiet machine,
+/// and under load it stays put while wall time inflates without bound —
+/// so the budgets keep their meaning (500 ns/insert and so on) without
+/// assuming anyone else is idle. The two statistical gates (catalog,
+/// hnsw) keep wall-clock means: they average over iterations, and their
+/// margins have held.
+#[cfg(unix)]
+// The one unsafe block in the gates: a libc clock read into a local.
+#[allow(unsafe_code)]
+fn thread_cpu_now() -> Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut ts) };
+    assert_eq!(rc, 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+#[cfg(not(unix))]
+fn thread_cpu_now() -> Duration {
+    // No thread-CPU clock — fall back to wall time and its caveats.
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+}
+
 fn perf_lock() -> MutexGuard<'static, ()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();
     let guard = L
@@ -157,12 +194,12 @@ fn hnsw_search_under_budget() {
 #[test]
 fn pv_push_1m_under_200ms() {
     let _perf = perf_lock();
-    let start = Instant::now();
+    let start = thread_cpu_now();
     let mut pv: PersistentVec<u64> = PersistentVec::new();
     for i in 0..1_000_000_u64 {
         pv = pv.push(i);
     }
-    let elapsed = start.elapsed();
+    let elapsed = thread_cpu_now().saturating_sub(start);
     std::hint::black_box(&pv);
     let budget_ms: u128 = 200;
     let elapsed_ms = elapsed.as_millis();
@@ -186,11 +223,11 @@ fn pb_insert_mut_100k_under_50ms() {
     // Pre-build a small workload key range to mix inserts + replaces, matching
     // the secondary-index access pattern (most keys 1 entry, some replacements
     // when batched re-indexing happens).
-    let start = Instant::now();
+    let start = thread_cpu_now();
     for i in 0..100_000_i64 {
         pb.insert_mut(i, i.wrapping_mul(0x9E37_79B9));
     }
-    let elapsed = start.elapsed();
+    let elapsed = thread_cpu_now().saturating_sub(start);
     std::hint::black_box(&pb);
     let budget_ms: u128 = 50;
     let elapsed_ms = elapsed.as_millis();
@@ -211,12 +248,12 @@ fn pb_insert_mut_100k_under_50ms() {
 #[test]
 fn pv_push_mut_1m_under_50ms() {
     let _perf = perf_lock();
-    let start = Instant::now();
+    let start = thread_cpu_now();
     let mut pv: PersistentVec<u64> = PersistentVec::new();
     for i in 0..1_000_000_u64 {
         pv.push_mut(i);
     }
-    let elapsed = start.elapsed();
+    let elapsed = thread_cpu_now().saturating_sub(start);
     std::hint::black_box(&pv);
     let budget_ms: u128 = 75;
     let elapsed_ms = elapsed.as_millis();
