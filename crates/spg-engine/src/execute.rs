@@ -1693,6 +1693,36 @@ impl Engine {
                     modified_catalog: false,
                 })
             }
+            Statement::DropDatabase { name, if_exists } => {
+                // PG refuses this inside a transaction block; so does
+                // CREATE DATABASE, and both go through the same guard.
+                self.require_no_transaction_block("DROP DATABASE")?;
+                // SPG serves one database, so the name is either the one
+                // this session is connected to or a name that does not
+                // exist here. PG has wording for both and never lets
+                // either succeed, which is the whole behaviour.
+                let is_current = self
+                    .session_param("spg.database")
+                    .unwrap_or("spg")
+                    .eq_ignore_ascii_case(&name);
+                if is_current {
+                    return Err(EngineError::Unsupported(alloc::string::String::from(
+                        "cannot drop the currently open database",
+                    )));
+                }
+                if if_exists {
+                    self.notice(alloc::format!(
+                        "database \"{name}\" does not exist, skipping"
+                    ));
+                    return Ok(QueryResult::CommandOk {
+                        affected: 0,
+                        modified_catalog: false,
+                    });
+                }
+                Err(EngineError::Unsupported(alloc::format!(
+                    "database \"{name}\" does not exist"
+                )))
+            }
             Statement::NoOpPreventedInTransaction { what } => {
                 self.require_no_transaction_block(&what)?;
                 Ok(QueryResult::CommandOk {

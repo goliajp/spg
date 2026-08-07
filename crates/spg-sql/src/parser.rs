@@ -2806,6 +2806,26 @@ impl Parser {
                         let name = self.expect_ident_or_string()?;
                         Ok(Statement::DropUser { name, if_exists })
                     }
+                    // v7.39 (round 806) — DROP DATABASE [IF EXISTS] <name>.
+                    // CREATE DATABASE has parsed since v7.14 and this did
+                    // not, so `DROP DATABASE IF EXISTS x` — what every
+                    // teardown script and pg_dumpall preamble opens with —
+                    // came back as a syntax error, which IF EXISTS cannot
+                    // soften. The name is carried so the engine can answer
+                    // the way PG does; PG never lets this succeed on a
+                    // single-database server, since the name is either
+                    // unknown ("database … does not exist", or a notice
+                    // under IF EXISTS) or the one you are connected to
+                    // ("cannot drop the currently open database").
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("database") =>
+                    {
+                        self.advance();
+                        let if_exists = self.consume_if_exists();
+                        let name = self.expect_ident_or_string()?;
+                        self.consume_until_statement_boundary();
+                        Ok(Statement::DropDatabase { name, if_exists })
+                    }
                     // v7.12.4 — DROP TRIGGER [IF EXISTS] name ON table.
                     Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("trigger") => {
                         self.advance();
