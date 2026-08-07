@@ -4984,6 +4984,15 @@ pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
         // every one of them is "no candidate matches this call". The
         // input-syntax family (22P02 / 22007) is already answered by its
         // own rules above and does not reach here.
+        // v7.37 (round 823) — a bare column name that matches more than one
+        // relation in a join. SPG raised it through TypeMismatch, so it landed
+        // on 42883 UNDEFINED_FUNCTION below — a client dispatching on SQLSTATE
+        // was told "no such function" for what is a name-resolution problem.
+        // PG18, measured over `SELECT v FROM a x JOIN b y ON x.id=y.id` where
+        // both relations have `v`, answers 42702 AMBIGUOUS_COLUMN. The message
+        // is PG's own sentence now, so this keys on it.
+        } else if msg.contains("column reference") && msg.contains("is ambiguous") {
+            "42702"
         } else if matches!(
             e,
             EngineError::Eval(spg_engine::eval::EvalError::TypeMismatch { .. })

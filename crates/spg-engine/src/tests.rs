@@ -1997,9 +1997,21 @@ fn epic_p_panic_in_no_params_select_is_caught_and_engine_survives() {
 // the streaming firewall covers the streaming phase, not just setup: the
 // engine drives the `emit` callback synchronously (push model) inside the
 // single statement-boundary `catch_unwind`, so an unwind anywhere in the
-// streaming phase is caught here. A single-table SELECT (no joins) takes
-// the materialising fall-back inside `exec_select_streaming`, where the
-// armed `planner_first_row_fetch` point fires before any row is emitted.
+// streaming phase is caught here.
+//
+// This one arms `planner_first_row_fetch`, which lives in
+// `exec_select_cancel_inner` — the materialising fall-back — so it fires
+// during setup, before any row is emitted. It needs a shape that still
+// takes that fall-back: `SELECT *` used to, and since r823 does not.
+// Making `find_column_pos` resolve unqualified names (which the general
+// resolver always did) let a plain projection bind, so it now streams,
+// and an injection point on the materialising path is simply never
+// reached — the test read as a firewall failure when nothing about the
+// firewall had changed. An arithmetic projection still materialises.
+//
+// The emit-phase half — an unwind raised once rows are already flowing —
+// is what `epic_p_panic_inside_emit_callback_is_caught` below covers, and
+// it matters more now that ordinary projections stream.
 #[cfg(feature = "injection-points")]
 #[test]
 fn epic_p_panic_in_streaming_select_is_caught_and_engine_survives() {
@@ -2012,7 +2024,7 @@ fn epic_p_panic_in_streaming_select_is_caught_and_engine_survives() {
         .unwrap();
 
     let sel = e
-        .prepare_select_streaming("SELECT * FROM inj_panic_stream")
+        .prepare_select_streaming("SELECT id + 0 FROM inj_panic_stream")
         .unwrap();
 
     let store = e.injection_store();
@@ -2052,6 +2064,70 @@ fn epic_p_panic_in_streaming_select_is_caught_and_engine_survives() {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1, "committed baseline row must survive");
             assert_eq!(rows[0].values[0], Value::Int(1));
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
+
+// v7.37 (round 823) — the other half of the streaming firewall: an unwind
+// raised AFTER rows are already flowing, rather than during setup.
+//
+// The test above can only reach the setup phase, because the injection
+// point it arms sits on the materialising path. Nothing pinned what
+// happens when the streaming phase itself unwinds — and r823 moved
+// ordinary projections like `SELECT *` onto that phase, so the untested
+// half is now the common one.
+//
+// No new injection point is needed to raise it: the `emit` callback is
+// supplied by the caller and driven synchronously by the engine, so a
+// panic inside it unwinds through exactly the code the firewall claims to
+// cover, at exactly the moment rows are being produced.
+#[cfg(feature = "injection-points")]
+#[test]
+fn epic_p_panic_inside_emit_callback_is_caught() {
+    extern crate std;
+    use std::sync::RwLock;
+
+    let mut e = crate::Engine::new();
+    e.execute("CREATE TABLE inj_panic_emit (id INT)").unwrap();
+    e.execute("INSERT INTO inj_panic_emit VALUES (1),(2),(3)")
+        .unwrap();
+
+    // A plain projection, which since r823 streams rather than
+    // materialising — the shape this is here to cover.
+    let sel = e
+        .prepare_select_streaming("SELECT * FROM inj_panic_emit")
+        .unwrap();
+    let lock = RwLock::new(e);
+
+    {
+        let mut g = lock.write().expect("engine lock not poisoned pre-panic");
+        let _scope = g.enter_injection_scope();
+        let seen = core::cell::Cell::new(0usize);
+        let r = g.execute_prepared_select_streaming(&sel, CancelToken::none(), |_item| {
+            seen.set(seen.get() + 1);
+            // Unwind once the result is genuinely in flight.
+            assert!(seen.get() < 2, "emit callback panics mid-result");
+            Ok(())
+        });
+        match r {
+            Err(EngineError::Internal(msg)) => {
+                assert!(msg.contains("aborted"), "unexpected internal msg: {msg}");
+            }
+            other => panic!("expected Err(Internal) from the emit callback, got {other:?}"),
+        }
+        assert!(
+            seen.get() >= 1,
+            "the panic must happen after emitting started, not before"
+        );
+    } // guard drops WITHOUT an escaping unwind → lock stays un-poisoned
+
+    let mut g = lock
+        .write()
+        .expect("engine lock poisoned by caught panic (emit callback)");
+    match g.execute("SELECT id FROM inj_panic_emit").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 3, "committed rows must survive");
         }
         other => panic!("expected Rows, got {other:?}"),
     }

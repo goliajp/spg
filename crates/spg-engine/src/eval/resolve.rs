@@ -271,7 +271,37 @@ pub(crate) fn find_column_pos(c: &ColumnName, ctx: &EvalContext<'_>) -> Option<u
             return Some(pos);
         }
     }
-    ctx.columns.iter().position(|s| s.name == c.name)
+    if let Some(pos) = ctx.columns.iter().position(|s| s.name == c.name) {
+        return Some(pos);
+    }
+    // v7.37 (round 823) — the bare-name fallback `resolve_column` has carried
+    // since the joined schemas landed was MISSING here, so the two disagreed
+    // on exactly one shape: an unqualified column in a joined/deferred
+    // context, where the synthesised schema names columns "alias.column" and
+    // the plain `s.name == c.name` above therefore never matches.
+    //
+    // The disagreement was not cosmetic. `try_exec_joined_streaming` binds its
+    // projection through this function, so `SELECT pad FROM big b` — the
+    // commonest projection there is — failed to bind, fell back to the
+    // materialising path, and stopped honouring statement_timeout: measured at
+    // 400000 rows / 0.81s with a 120ms timeout set, while `b.pad` over the same
+    // table cancelled at ~65k rows in 0.14s.
+    //
+    // Same rule as `resolve_column`: match a single composite column ending in
+    // ".<name>". Ambiguity returns None rather than picking one, which sends
+    // the caller down the general path — that path raises the ambiguity error
+    // PG raises. Zero-alloc suffix compare, like `composite_eq` next door,
+    // because the bind-once callers are on hot-path setup.
+    let suffix_at = |s: &str| s.len().checked_sub(c.name.len() + 1);
+    let mut matches = ctx.columns.iter().enumerate().filter(|(_, s)| {
+        suffix_at(&s.name).is_some_and(|dot| {
+            s.name.as_bytes()[dot] == b'.' && s.name[dot + 1..] == *c.name
+        })
+    });
+    match (matches.next(), matches.next()) {
+        (Some((pos, _)), None) => Some(pos),
+        _ => None,
+    }
 }
 
 pub(super) fn resolve_column_borrowed<'r, 'a>(
@@ -391,7 +421,7 @@ pub(super) fn resolve_column(
     match (first, extra) {
         (Some((pos, _)), None) => rehydrate_cell(pos, row, ctx),
         (Some(_), Some(_)) => Err(EvalError::TypeMismatch {
-            detail: alloc::format!("ambiguous column reference: {}", c.name),
+            detail: alloc::format!("column reference \"{}\" is ambiguous", c.name),
         }),
         _ => {
             // v7.38 (read01, T9) — whole-row reference: a bare name equal to
