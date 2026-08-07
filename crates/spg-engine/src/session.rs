@@ -26,6 +26,19 @@ pub(crate) const CURRENT_ROLE_KEY: &str = "__spg_current_role";
 /// effect. Absent (embedded engine, or a wire that never set it) = LOGIN_ROLE.
 pub(crate) const SESSION_USER_KEY: &str = "__spg_session_user";
 
+/// v7.37 (round 830) — reserved `session_params` key marking the login
+/// identity as VERIFIED: the connection presented a credential the server
+/// checked (SCRAM or cleartext), rather than merely naming itself in the
+/// startup packet. Absent = unverified, which is the embedded engine and
+/// the server's open mode.
+///
+/// The distinction is what lets a login name carry privilege. Open mode
+/// accepts any startup as the admin role, so a name there is a label and
+/// nothing more — keying privilege on it would let anyone pick their own.
+/// A checked credential is a different thing, and it is the only
+/// configuration where roles and their policies mean anything at all.
+pub(crate) const SESSION_AUTHENTICATED_KEY: &str = "__spg_session_authenticated";
+
 /// v7.39 (RLS) — the login identity (superuser). SPG's embedded engine and
 /// its default server session both authenticate as this.
 pub(crate) const LOGIN_ROLE: &str = "admin";
@@ -52,6 +65,23 @@ impl Engine {
     pub fn set_session_user(&mut self, user: &str) {
         self.session_params
             .insert(String::from(SESSION_USER_KEY), String::from(user));
+    }
+
+    /// v7.37 (round 830) — record that this connection's login identity was
+    /// verified against a stored credential. The server calls it once per
+    /// connection, right after `set_session_user`, when it demanded a
+    /// password; open-mode connections never do.
+    pub fn set_session_authenticated(&mut self) {
+        self.session_params.insert(
+            String::from(SESSION_AUTHENTICATED_KEY),
+            String::from("1"),
+        );
+    }
+
+    /// Was this session's login identity checked against a credential?
+    #[must_use]
+    pub(crate) fn session_is_authenticated(&self) -> bool {
+        self.session_params.contains_key(SESSION_AUTHENTICATED_KEY)
     }
 
     /// v7.39 (RLS) — the effective session role: the `SET ROLE` override, or
@@ -82,6 +112,28 @@ impl Engine {
         // through membership, so this reads the role itself, not its set.
         match self.session_params.get(CURRENT_ROLE_KEY) {
             Some(r) => self.role_is_superuser(r),
+            // v7.37 (round 830) — with no SET ROLE in effect, the login
+            // identity decides IF it was verified. Measured before this:
+            // psql authenticated as a role with rolsuper = f, over a table
+            // with row security enabled and a USING policy in place, read
+            // every row including another owner's — for every projection
+            // shape, because the predicate was never injected at all.
+            //
+            // The unconditional `true` this replaces was deliberate and is
+            // still right for the case it was written for: in open mode the
+            // startup `user` is unverified, so letting it carry privilege
+            // would mean anyone could name themselves into a role. What
+            // changed is that the name is no longer always unverified — once
+            // a credentialed LOGIN role exists the server demands SCRAM, and
+            // that is exactly the configuration where policies and grants
+            // are supposed to bind.
+            //
+            // `role_is_superuser` still exempts the admin and bootstrap
+            // logins and any role created SUPERUSER, so authenticating as an
+            // administrator changes nothing.
+            None if self.session_is_authenticated() => {
+                self.role_is_superuser(self.session_user())
+            }
             None => true,
         }
     }
