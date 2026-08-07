@@ -4124,18 +4124,14 @@ impl Engine {
         &mut self,
         s: &CreateUserStatement,
     ) -> Result<QueryResult, EngineError> {
-        // The witness is THIS connection's slot. `in_transaction()` is
-        // global on a shared engine, so it refused an autocommit
-        // CREATE USER merely because a DIFFERENT connection had a
-        // transaction open — measured, round 794: connection B in
-        // autocommit got "not allowed inside a transaction" while A
-        // held one. Fourth time this trap has been sprung (session
-        // bag, advisory locks, transaction slots were the others).
-        if self.current_tx.is_some_and(|tx| self.is_tx_open(tx)) {
-            return Err(EngineError::Unsupported(
-                "CREATE USER is not allowed inside a transaction".into(),
-            ));
-        }
+        // v7.37 (round 828) — no transaction guard any more. PG treats
+        // roles as ordinary catalog rows: BEGIN; CREATE ROLE r;
+        // ROLLBACK leaves nothing, COMMIT publishes (measured against
+        // PG18: count 0 after rollback, 1 after commit). The per-slot
+        // guard that stood here since round 794 refused the statement
+        // outright, which no drop-in client expects. Writes now go
+        // through the TX role shadow (`role_ddl_users_mut`), so both
+        // halves of PG's behaviour hold.
         let role = users::Role::parse(&s.role).ok_or_else(|| {
             EngineError::Unsupported(alloc::format!("invalid role: {:?}", s.role))
         })?;
@@ -4155,7 +4151,7 @@ impl Engine {
         // so the SQL path also derives the SCRAM-SHA-256 verifier. Without
         // this, a `CREATE USER … PASSWORD` user had `scram = None` and silently
         // fell back to cleartext pgwire auth.
-        if self.users.contains(&s.name) {
+        if self.effective_users().contains(&s.name) {
             return Err(EngineError::Unsupported(alloc::format!(
                 "role \"{}\" already exists",
                 s.name
@@ -4181,9 +4177,9 @@ impl Engine {
         // above substitutes an unguessable credential for a bare
         // CREATE ROLE, and the wire's open-vs-authenticated decision
         // has to tell the two apart.
-        self.users
+        self.role_ddl_users_mut()
             .set_password_declared(&s.name, !s.password.is_empty());
-        self.users.set_attributes(
+        self.role_ddl_users_mut().set_attributes(
             &s.name,
             s.login.unwrap_or(s.is_user),
             s.inherit.unwrap_or(true),
@@ -4201,14 +4197,9 @@ impl Engine {
         name: &str,
         if_exists: bool,
     ) -> Result<QueryResult, EngineError> {
-        // Per-slot, for the reason spelled out in `exec_create_user`.
-        if self.current_tx.is_some_and(|tx| self.is_tx_open(tx)) {
-            return Err(EngineError::Unsupported(
-                "DROP USER is not allowed inside a transaction".into(),
-            ));
-        }
+        // v7.37 (round 828) — transactional now; see exec_create_user.
         // v7.39 (read01 round 58) — PG's IF EXISTS skip NOTICE.
-        if if_exists && !self.users.contains(name) {
+        if if_exists && !self.effective_users().contains(name) {
             self.notice(alloc::format!("role {name:?} does not exist, skipping"));
             return Ok(QueryResult::CommandOk {
                 affected: 0,
@@ -4241,7 +4232,7 @@ impl Engine {
                 depends.join(", ")
             )));
         }
-        self.users
+        self.role_ddl_users_mut()
             .drop(name)
             .map_err(|e| EngineError::Unsupported(alloc::format!("DROP USER: {e}")))?;
         Ok(QueryResult::CommandOk {

@@ -6071,7 +6071,7 @@ pub(crate) fn synth_mysql_user(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'
         Value::text("localhost"),
         Value::text("Y"),
     ]));
-    for (name, _) in engine.users.iter() {
+    for (name, _) in engine.effective_users().iter() {
         if name != "root" {
             rows.push(Row::new(alloc::vec![
                 Value::text(name.to_string()),
@@ -7071,7 +7071,7 @@ pub(crate) fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'st
     // v7.39 (read01 round 58) — the three attributes are REAL now. They used to
     // be hard-coded (`false, true, true`) because SPG had no role attributes;
     // a `CREATE ROLE devs NOLOGIN` would still have reported rolcanlogin=true.
-    for (i, (name, rec)) in engine.users.iter().enumerate() {
+    for (i, (name, rec)) in engine.effective_users().iter().enumerate() {
         rows.push(pg_roles_row(
             oid + (i as i64) + 1,
             name,

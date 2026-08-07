@@ -539,12 +539,26 @@ struct TxState {
     /// installs it over `Engine.catalog`. `Catalog::clone()` is O(1)
     /// since v4.40 (`PersistentVec` rows + `PersistentBTreeMap` indices).
     catalog: Catalog,
+    /// v7.37 (round 828) — the TX's shadow copy of the user store,
+    /// following exactly the catalog's model one field up: created
+    /// lazily by the first role DDL inside the TX (an ordinary TX
+    /// never pays the clone), written through for the rest of the TX,
+    /// installed over `Engine.users` at COMMIT, discarded on ROLLBACK.
+    /// PG treats roles as ordinary catalog rows — `BEGIN; CREATE ROLE
+    /// r; ROLLBACK` leaves no role — and SPG used to refuse the
+    /// statement instead, which no drop-in client expects.
+    ///
+    /// Other sessions and the auth path keep reading the committed
+    /// store, so an uncommitted role can neither log in nor be seen
+    /// elsewhere — the isolation PG gives via its catalog MVCC.
+    users: Option<crate::users::UserStore>,
     /// Per-TX savepoint stack. Each entry pairs the savepoint name with
-    /// a clone of `catalog` at the moment `SAVEPOINT <name>` fired.
+    /// a clone of `catalog` (and of the role shadow, which subtransactions
+    /// roll back too) at the moment `SAVEPOINT <name>` fired.
     /// `ROLLBACK TO <name>` restores from the entry and pops everything
     /// after it; `RELEASE <name>` discards the entry and everything
     /// after; COMMIT/ROLLBACK clears the whole stack.
-    savepoints: Vec<(String, Catalog)>,
+    savepoints: Vec<(String, Catalog, Option<crate::users::UserStore>)>,
     /// v7.37.15 (Phase E) — cached MVCC snapshot for REPEATABLE
     /// READ / SERIALIZABLE. Captured at `exec_begin` time when the
     /// session's `current_isolation_level` is RR/SER; read paths
@@ -1626,7 +1640,7 @@ impl Engine {
         // Every pg_dump names it (`OWNER TO postgres`), so the ALTER
         // TABLE OWNER check added this round would have refused the one
         // role that appears in essentially every dump.
-        self.users.contains(name)
+        self.effective_users().contains(name)
             || name.eq_ignore_ascii_case("admin")
             || name.eq_ignore_ascii_case("postgres")
     }
@@ -2629,6 +2643,50 @@ impl Engine {
     /// this is false for the autocommit id.
     pub fn is_tx_open(&self, tx_id: TxId) -> bool {
         self.tx_catalogs.contains_key(&tx_id)
+    }
+
+    /// v7.37 (round 828) — the user store THIS session should read:
+    /// its transaction's role shadow when one exists, the committed
+    /// store otherwise. The auth path and other sessions read
+    /// `self.users` directly on purpose — an uncommitted role must not
+    /// be visible to them, let alone able to log in.
+    pub(crate) fn effective_users(&self) -> &crate::users::UserStore {
+        if let Some(tx) = self.current_tx
+            && let Some(state) = self.tx_catalogs.get(&tx)
+            && let Some(shadow) = &state.users
+        {
+            return shadow;
+        }
+        &self.users
+    }
+
+    /// v7.37 (round 828) — the store role DDL writes to: the TX's role
+    /// shadow (created from the committed store on first use) inside a
+    /// transaction, the committed store in autocommit. Every mutation
+    /// of roles or memberships goes through here, so `BEGIN; CREATE
+    /// ROLE r; ROLLBACK` leaves nothing behind — the shadow drops with
+    /// the TxState — and COMMIT installs the shadow wholesale.
+    pub(crate) fn role_ddl_users_mut(&mut self) -> &mut crate::users::UserStore {
+        let tx_slot = self.current_tx.filter(|tx| self.tx_catalogs.contains_key(tx));
+        match tx_slot {
+            Some(tx) => {
+                if self
+                    .tx_catalogs
+                    .get(&tx)
+                    .is_some_and(|state| state.users.is_none())
+                {
+                    let committed = self.users.clone();
+                    if let Some(state) = self.tx_catalogs.get_mut(&tx) {
+                        state.users = Some(committed);
+                    }
+                }
+                self.tx_catalogs
+                    .get_mut(&tx)
+                    .and_then(|state| state.users.as_mut())
+                    .expect("role shadow ensured just above for an open tx slot")
+            }
+            None => &mut self.users,
+        }
     }
 
     /// v4.41.1 allocate a fresh TX handle. Used by spg-server dispatch

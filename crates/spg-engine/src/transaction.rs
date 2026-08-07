@@ -553,6 +553,7 @@ impl Engine {
                     c.clear_dirty_tables();
                     c
                 },
+                users: None,
                 savepoints: Vec::new(),
                 cached_snapshot,
                 touched_tables: alloc::collections::BTreeSet::new(),
@@ -843,7 +844,7 @@ impl Engine {
                 return Err(EngineError::SerializationFailure(detail));
             }
         }
-        let state = self
+        let mut state = self
             .tx_catalogs
             .remove(&tx_id)
             .ok_or_else(|| EngineError::NoActiveTransaction)?;
@@ -880,6 +881,16 @@ impl Engine {
         // before the install and restored after, for the sequences that
         // still exist; one the transaction CREATED is absent from the save
         // and keeps the value it was given.
+        // v7.37 (round 828) — the role shadow installs on its own
+        // terms, not behind `shadow_dirty`: that flag means "a &mut
+        // Catalog was handed out", and a transaction whose only DDL
+        // was CREATE/ALTER/DROP ROLE or GRANT membership never dirties
+        // the catalog — its commit skipped this whole block and the
+        // committed roles vanished (measured: count 0 after COMMIT).
+        // The shadow exists only if role DDL ran, so this is precise.
+        if let Some(shadow) = state.users.take() {
+            self.users = shadow;
+        }
         let live_counters = self.catalog.sequence_counters();
         if state.shadow_dirty {
             // v7.39 (round 496) — a frozen-view tx that could NOT use the
@@ -1016,9 +1027,12 @@ impl Engine {
         // PG re-uses an existing savepoint name by dropping the older
         // entry and pushing a fresh one — match that behaviour so
         // application code can `SAVEPOINT sp; ...; SAVEPOINT sp` freely.
-        state.savepoints.retain(|(n, _)| n != &name);
+        state.savepoints.retain(|(n, ..)| n != &name);
         let snapshot = state.catalog.clone();
-        state.savepoints.push((name.clone(), snapshot));
+        // v7.37 (round 828) — the role shadow rolls back with the
+        // subtransaction too, so it is part of the bookmark.
+        let users_snapshot = state.users.clone();
+        state.savepoints.push((name.clone(), snapshot, users_snapshot));
         self.savepoint_guc_marks.retain(|(n, _)| n != &name);
         self.savepoint_guc_marks.push((name, guc_depth));
         Ok(QueryResult::CommandOk {
@@ -1042,7 +1056,7 @@ impl Engine {
         let pos = state
             .savepoints
             .iter()
-            .rposition(|(n, _)| n == name)
+            .rposition(|(n, ..)| n == name)
             .ok_or_else(|| {
                 EngineError::Unsupported(alloc::format!("savepoint not found: {name}"))
             })?;
@@ -1050,8 +1064,11 @@ impl Engine {
         // `RELEASE` or further `ROLLBACK TO` is still allowed. Everything
         // after it is discarded.
         let snapshot = state.savepoints[pos].1.clone();
+        let users_snapshot = state.savepoints[pos].2.clone();
         state.savepoints.truncate(pos + 1);
         state.catalog = snapshot;
+        // v7.37 (round 828) — roles made after the savepoint go with it.
+        state.users = users_snapshot;
         // r196 — the restored shadow predates any rebase that ran
         // after the savepoint; invalidate the epoch gate so the next
         // statement re-folds concurrent commits into it.
@@ -1086,7 +1103,7 @@ impl Engine {
         let pos = state
             .savepoints
             .iter()
-            .rposition(|(n, _)| n == name)
+            .rposition(|(n, ..)| n == name)
             .ok_or_else(|| {
                 EngineError::Unsupported(alloc::format!("savepoint not found: {name}"))
             })?;

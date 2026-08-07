@@ -925,7 +925,7 @@ impl Engine {
     pub(crate) fn exec_spg_database_ddl(&self) -> QueryResult {
         let columns = alloc::vec![ColumnSchema::new("ddl", DataType::Text, false)];
         let mut out = String::new();
-        for (name, rec) in self.users.iter() {
+        for (name, rec) in self.effective_users().iter() {
             out.push_str(&alloc::format!(
                 "CREATE USER {name} WITH PASSWORD '<redacted>' ROLE '{}';\n",
                 rec.role.as_str(),
