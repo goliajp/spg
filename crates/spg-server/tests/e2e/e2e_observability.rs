@@ -282,9 +282,14 @@ fn metrics_hot_tier_used_grows_after_insert() {
             s.read_exact(&mut payload).unwrap();
         }
     }
-    thread::sleep(Duration::from_millis(50));
-    let (code, body) = http_get(&http, "/metrics");
-    assert_eq!(code, 200);
+    // v7.37 (round 827) — poll /metrics for the gauge instead of
+    // betting 50ms on the exporter's refresh landing first.
+    let mut body = String::new();
+    crate::common::wait_until(Duration::from_secs(5), || {
+        let (code, b) = http_get(&http, "/metrics");
+        body = b;
+        code == 200 && body.lines().any(|l| l.starts_with("spg_hot_tier_bytes_used "))
+    });
     let line = body
         .lines()
         .find(|l| l.starts_with("spg_hot_tier_bytes_used "))

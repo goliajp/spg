@@ -164,7 +164,7 @@ fn chaos_kill_minus_9_mid_write_recovers_committed_writes() {
         let _ = c.0.kill();
         let _ = c.0.wait();
     }
-    thread::sleep(Duration::from_millis(200));
+    // v7.37 (round 827) — no sleep: `wait()` IS the event (see above).
 
     // Restart on fresh port, same files. WAL replay should put the
     // engine back to exactly `committed` rows.
@@ -200,7 +200,12 @@ fn chaos_wal_tail_truncation_drops_partial_record_no_panic() {
             exec_ok(&mut s, &format!("INSERT INTO t VALUES ({i})"));
         }
     }
-    thread::sleep(Duration::from_millis(100));
+    // v7.37 (round 827) — same proxy as the bit-flip test below, same
+    // conversion: wait for the WAL to be substantial before mutilating
+    // it, or the chop lands on a half-written file.
+    common::wait_until(Duration::from_secs(5), || {
+        std::fs::metadata(&wal).map(|m| m.len() > 64).unwrap_or(false)
+    });
 
     // Chop a few bytes off the WAL — guaranteed to land inside
     // the last record. Replay must drop the torn entry and keep
@@ -291,7 +296,9 @@ fn chaos_disk_full_returns_clean_error_and_keeps_serving() {
     drop(s);
     let _ = c.0.kill();
     let _ = c.0.wait();
-    thread::sleep(Duration::from_millis(200));
+    // v7.37 (round 827) — no sleep: `wait()` IS the event. The process is
+    // reaped, its locks are gone, and what it wrote lives in the kernel
+    // page cache, visible to the next open immediately.
     let (raw, addrs2) = local_spawn(&db, &wal, &[]);
     let mut c2 = common::ChildGuard(raw);
     let mut s2 = common::connect_to(&addrs2.native);
@@ -334,7 +341,11 @@ fn chaos_wal_bit_flip_caught_by_crc32_refuses_to_replay() {
             );
         }
     }
-    thread::sleep(Duration::from_millis(100));
+    // v7.37 (round 827) — wait for the observable (the WAL has real
+    // content on disk) instead of sleeping a fixed proxy for it.
+    common::wait_until(Duration::from_secs(5), || {
+        std::fs::metadata(&wal).map(|m| m.len() > 64).unwrap_or(false)
+    });
 
     // Flip a single bit roughly in the middle of the file. v4.37
     // WAL records carry an 8-byte header (length + CRC) followed
@@ -454,7 +465,9 @@ fn chaos_disk_full_no_preflight_rolls_back_in_memory_to_match_durable_state() {
     drop(s);
     let _ = c.0.kill();
     let _ = c.0.wait();
-    thread::sleep(Duration::from_millis(200));
+    // v7.37 (round 827) — no sleep: `wait()` IS the event. The process is
+    // reaped, its locks are gone, and what it wrote lives in the kernel
+    // page cache, visible to the next open immediately.
     let (raw, addrs2) = local_spawn(&db, &wal, &[]);
     let _c2 = common::ChildGuard(raw);
     let mut s2 = common::connect_to(&addrs2.native);
@@ -587,7 +600,9 @@ fn chaos_disk_full_multi_client_group_rollback_all_writers() {
     drop(probe);
     let _ = c.0.kill();
     let _ = c.0.wait();
-    thread::sleep(Duration::from_millis(200));
+    // v7.37 (round 827) — no sleep: `wait()` IS the event. The process is
+    // reaped, its locks are gone, and what it wrote lives in the kernel
+    // page cache, visible to the next open immediately.
     let (raw, addrs2) = local_spawn(&db, &wal, &[]);
     let _c2 = common::ChildGuard(raw);
     let mut s2 = common::connect_to(&addrs2.native);

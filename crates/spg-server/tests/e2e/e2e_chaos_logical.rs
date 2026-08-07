@@ -263,6 +263,7 @@ fn subscription_survives_netsplit_heal_cycle() {
     thread::sleep(Duration::from_millis(100));
 
     exec_ok(&mut p_client, "CREATE TABLE t (id INT NOT NULL)");
+    exec_ok(&mut p_client, "CREATE TABLE hs (id INT NOT NULL)");
     exec_ok(&mut p_client, "CREATE PUBLICATION pub_t FOR ALL TABLES");
 
     let (s_raw, s_addrs) = spawn_subscriber(&dir_s.join("s.db"), &dir_s.join("s.wal"));
@@ -270,12 +271,42 @@ fn subscription_survives_netsplit_heal_cycle() {
     let mut s_client = common::connect_to(&s_addrs.native);
     s_client.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     exec_ok(&mut s_client, "CREATE TABLE t (id INT NOT NULL)");
+    exec_ok(&mut s_client, "CREATE TABLE hs (id INT NOT NULL)");
     let (h, port) = proxy_addr.split_once(':').unwrap();
     exec_ok(
         &mut s_client,
         &format!("CREATE SUBSCRIPTION sub_t CONNECTION 'host={h} port={port}' PUBLICATION pub_t"),
     );
-    thread::sleep(Duration::from_millis(500));
+    // v7.37 (round 827) — the fixed sleep this replaces was load-
+    // bearing: rows published before the worker connects never
+    // replicate, so a too-short sleep silently loses the head of
+    // phase 1 (removing it lost ~20 rows; the poll then timed out at
+    // 480, permanently short). One sentinel row cannot probe the
+    // handshake either — published immediately, it falls into the same
+    // dead window and is lost, measured and permanent. And
+    // `last_received_pos` stays 0 until the first data row lands, so
+    // it is no connect signal. What works is publishing the probe
+    // REPEATEDLY into a separate handshake table until one arrives:
+    // the first probe row that replicates proves the worker is
+    // connected, and every `t` row published after that will follow.
+    let mut hs_probe = common::connect_to(&s_addrs.native);
+    hs_probe.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let connected = {
+        let deadline = Instant::now() + CATCHUP_TIMEOUT;
+        let mut n = 0;
+        loop {
+            exec_ok(&mut p_client, &format!("INSERT INTO hs VALUES ({n})"));
+            n += 1;
+            thread::sleep(Duration::from_millis(100));
+            if select_int(&mut hs_probe, "SELECT count(*) FROM hs") > 0 {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+        }
+    };
+    assert!(connected, "no handshake row ever replicated");
 
     // Phase 1 — pre-split writes (500 rows).
     for i in 0..500 {
@@ -346,6 +377,7 @@ fn subscription_survives_two_split_heal_cycles() {
     thread::sleep(Duration::from_millis(100));
 
     exec_ok(&mut p_client, "CREATE TABLE t (id INT NOT NULL)");
+    exec_ok(&mut p_client, "CREATE TABLE hs (id INT NOT NULL)");
     exec_ok(&mut p_client, "CREATE PUBLICATION pub_t FOR ALL TABLES");
 
     let (s_raw, s_addrs) = spawn_subscriber(&dir_s.join("s.db"), &dir_s.join("s.wal"));
@@ -353,12 +385,33 @@ fn subscription_survives_two_split_heal_cycles() {
     let mut s_client = common::connect_to(&s_addrs.native);
     s_client.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     exec_ok(&mut s_client, "CREATE TABLE t (id INT NOT NULL)");
+    exec_ok(&mut s_client, "CREATE TABLE hs (id INT NOT NULL)");
     let (h, port) = proxy_addr.split_once(':').unwrap();
     exec_ok(
         &mut s_client,
         &format!("CREATE SUBSCRIPTION sub_t CONNECTION 'host={h} port={port}' PUBLICATION pub_t"),
     );
-    thread::sleep(Duration::from_millis(500));
+    // v7.37 (round 827) — same load-bearing handshake as the test
+    // above, same repeated-probe conversion (see there for why one
+    // sentinel and last_received_pos both cannot work).
+    let mut hs_probe = common::connect_to(&s_addrs.native);
+    hs_probe.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let connected = {
+        let deadline = Instant::now() + CATCHUP_TIMEOUT;
+        let mut n = 0;
+        loop {
+            exec_ok(&mut p_client, &format!("INSERT INTO hs VALUES ({n})"));
+            n += 1;
+            thread::sleep(Duration::from_millis(100));
+            if select_int(&mut hs_probe, "SELECT count(*) FROM hs") > 0 {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+        }
+    };
+    assert!(connected, "no handshake row ever replicated");
 
     let mut written = 0;
     for cycle in 0..2 {
@@ -375,6 +428,10 @@ fn subscription_survives_two_split_heal_cycles() {
             exec_ok(&mut p_client, &format!("INSERT INTO t VALUES ({written})"));
             written += 1;
         }
+        // v7.37 (round 827) — deliberately fixed: this is dwell time
+        // INSIDE the split, giving the subscriber a real window to try
+        // and fail. There is no event to poll for; too short only
+        // narrows the window, and the post-heal target is polled.
         thread::sleep(Duration::from_millis(400));
 
         // Heal.
@@ -391,3 +448,4 @@ fn subscription_survives_two_split_heal_cycles() {
         );
     }
 }
+

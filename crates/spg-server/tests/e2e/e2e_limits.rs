@@ -121,11 +121,27 @@ fn max_connections_rejects_overflow_with_clear_error() {
     s1.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     s2.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
+    // Before the overflow probe, prove the server has REGISTERED both
+    // slot-holders, not merely that the kernel accepted their sockets.
+    // v7.37 (round 827) — a round-trip on each is that proof; the flat
+    // 50ms this replaces raced the accept loop under load, and losing
+    // the race hands s3 a free slot and fails the overflow assertion.
+    let mut s1 = s1;
+    let mut s2 = s2;
+    let round_trip = |s: &mut TcpStream| {
+        send(s, &build_query("SELECT 1"));
+        loop {
+            let f = read_frame(s);
+            if matches!(f.op, Op::CommandComplete | Op::ErrorResponse | Op::Error) {
+                break;
+            }
+        }
+    };
+    round_trip(&mut s1);
+    round_trip(&mut s2);
+
     // The third client gets accepted at the TCP layer but the
     // server should immediately send an error frame and close.
-    // Allow a small window for the server thread to notice + reply
-    // before we read.
-    thread::sleep(Duration::from_millis(50));
     let mut s3 = TcpStream::connect(&addr).unwrap();
     s3.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     let f = read_frame(&mut s3);
@@ -138,17 +154,26 @@ fn max_connections_rejects_overflow_with_clear_error() {
 
     // Existing clients still work after overflow.
     drop(s3);
-    let mut s1 = s1; // shadow to allow send
     send(&mut s1, &build_query("CREATE TABLE t (id INT NOT NULL)"));
     assert_eq!(read_frame(&mut s1).op, Op::CommandComplete);
 
-    // Once one slot frees, a fresh client can connect again.
+    // Once one slot frees, a fresh client can connect again. The
+    // server noticing s2's close is not observable from outside, so
+    // v7.37 (round 827) retries the whole probe to a deadline instead
+    // of betting 50ms on it; the assertion on the final reply is
+    // unchanged.
     drop(s2);
-    thread::sleep(Duration::from_millis(50));
-    let mut s4 = TcpStream::connect(&addr).unwrap();
-    s4.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-    send(&mut s4, &build_query("SELECT * FROM t"));
-    let f = read_frame(&mut s4);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let f = loop {
+        let mut s4 = TcpStream::connect(&addr).unwrap();
+        s4.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+        send(&mut s4, &build_query("SELECT * FROM t"));
+        let f = read_frame(&mut s4);
+        if f.op != Op::ErrorResponse || std::time::Instant::now() >= deadline {
+            break f;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
     assert_eq!(
         f.op,
         Op::RowDescription,

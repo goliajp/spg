@@ -224,7 +224,7 @@ fn restore_drill_full_plus_incremental_recovers_row_count() {
     );
     let _ = rec_child.0.kill();
     let _ = rec_child.0.wait();
-    thread::sleep(Duration::from_millis(200));
+    // v7.37 (round 827) — no sleep: wait() IS the event.
 
     // ---- Step 2 variant: PITR via SPG_REPLAY_UPTO=0 ----
     // Snapshot-only recovery from the same files. The full

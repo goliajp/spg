@@ -166,6 +166,8 @@ fn slow_query_log_fires_above_threshold_and_silent_below() {
     let fast_marker = "SELECT 7 as fast_marker_for_negative_check";
     send(&mut s, &build_query(fast_marker));
     drain_to_cc(&mut s);
+    // Deliberately fixed: this waits for a line that in the healthy
+    // case never arrives — absence has no event to poll for.
     thread::sleep(Duration::from_millis(100));
     {
         let captured = stderr_buf.lock().unwrap().clone();

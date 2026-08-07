@@ -348,6 +348,13 @@ fn cycle_detection_aborts_loop() {
         ),
     );
     // Give the worker time to attempt + fail multiple handshakes.
+    //
+    // v7.37 (round 827) — deliberately a fixed sleep, not a poll. This
+    // waits for something NOT to happen (a buggy cascade re-applying
+    // rows), and there is no event to poll for when the correct
+    // behaviour is silence. Too short a window can only weaken the
+    // test toward a false pass; it cannot produce a spurious failure,
+    // because the rows asserted on were CC'd synchronously above.
     std::thread::sleep(Duration::from_millis(1500));
 
     // Insert 3 rows. Publisher-path INSERT lands them in our table.
@@ -355,6 +362,7 @@ fn cycle_detection_aborts_loop() {
     for i in 0..3 {
         exec_ok(&mut client, &format!("INSERT INTO t VALUES ({i})"));
     }
+    // Same deliberate negative window as above.
     std::thread::sleep(Duration::from_millis(1500));
 
     // Row count must be exactly 3.
@@ -422,11 +430,13 @@ fn cluster_id_persists_across_restart() {
                 "CREATE SUBSCRIPTION sub_self CONNECTION 'host={h} port={p}' PUBLICATION pub_t"
             ),
         );
-        std::thread::sleep(Duration::from_millis(500));
     }
 
     // The sidecar file is at <wal_path>.cluster_id — must exist.
+    // v7.37 (round 827) — poll for it instead of sleeping a fixed
+    // 500ms proxy for "the first boot has written it by now".
     let sidecar = dir.join("s.wal.cluster_id");
+    common::wait_until(Duration::from_secs(5), || sidecar.exists());
     assert!(
         sidecar.exists(),
         "cluster_id sidecar missing after first boot"
@@ -453,6 +463,7 @@ fn cluster_id_persists_across_restart() {
     for i in 0..3 {
         exec_ok(&mut client, &format!("INSERT INTO t VALUES ({i})"));
     }
+    // Same deliberate negative window as above.
     std::thread::sleep(Duration::from_millis(1500));
     let got = select_int(&mut client, "SELECT count(*) FROM t");
     assert_eq!(got, 3, "post-restart self-loop must still be detected");
