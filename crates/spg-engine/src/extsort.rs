@@ -15,33 +15,46 @@
 //! merge the runs back k-way. Peak is then the budget plus one decoded
 //! row per run, whatever the input size.
 //!
-//! Runs store ROWS only, not keys. An `OrderKey` is a rich enum whose
-//! encoding would be a second format to keep in step with the first,
-//! and the caller already owns the definition of the keys — it hands in
-//! a closure, and the merge re-derives them from each decoded row. The
-//! cost is one key evaluation per row per merge, paid only when a sort
-//! actually spills.
+//! A spilled record is `key_values ++ projected_values` under a schema
+//! built the same way; on decode the leading values split off, get
+//! packed into keys through the caller's own packer, and the remainder
+//! is the output row. Values are what the row codec already encodes, so
+//! there is no second format to keep in step with it.
 //!
-//! ⚠️ **That last paragraph does not survive contact with the real call
-//! site, and this module has not been wired because of it** (round 834
-//! found it while planning the wiring; recorded here rather than left
-//! to be rediscovered).
+//! Round 833 first tried storing rows ALONE and re-deriving keys from
+//! the decoded row. That cannot work: the rows a sort spills are
+//! PROJECTED, and an ORDER BY key need not be projected — `SELECT pad
+//! FROM big ORDER BY id` sorts on something the row no longer carries.
+//! Its three unit tests passed regardless, because their key happened
+//! to be a projected column; the case that exposes it leads the tests
+//! now.
 //!
-//! The rows this would spill are PROJECTED, and an ORDER BY key need
-//! not appear in the projection: `SELECT pad FROM big ORDER BY id`
-//! projects `pad` and sorts on `id`. Re-deriving keys from a decoded
-//! projected row is therefore impossible in general, and the closure
-//! above can only work when every key happens to be projected.
+//! ⚠️ **Wiring found a second obstacle, and it points at a simpler
+//! design than this one** (round 836; recorded here rather than left to
+//! be rediscovered).
 //!
-//! The fix keeps the no-second-format property: spill the key VALUES as
-//! leading hidden columns — `key_values ++ projected_values`, under a
-//! schema built the same way — and on decode split them off, rebuild the
-//! keys with `build_order_keys_bound` over a `Row` of just those values
-//! (the shape the SRF branch of `run_single_table_scan` already uses),
-//! and hand back the remainder as the output row. Values are what the
-//! row codec already encodes, so nothing new has to be kept in step.
-//! The unit tests below pass because their key IS a projected column,
-//! which is exactly the case that hid this.
+//! `encode_row_body_dense` is schema-driven: every column needs a
+//! declared `DataType`. The projected columns have one, but an ORDER BY
+//! operand is an arbitrary expression, and the tree has no expression
+//! type inference to ask — so the key columns of the schema above
+//! cannot be built for the general case.
+//!
+//! Spilling the SOURCE row instead removes the problem rather than
+//! working around it. Its schema is the scan's own `schema_cols`, types
+//! and all; keys come back through `build_order_keys_bound` over that
+//! row — the identical call the scan makes, so no key can be missing by
+//! construction; and the projection runs once, after the merge, instead
+//! of before the spill. No key columns, no type inference, no hidden
+//! values. The costs are honest ones: a wide source row spills more
+//! bytes than a narrow projection would (I/O, not peak memory, which
+//! stays bounded by the budget either way), and a projection containing
+//! a correlated subquery evaluates after the merge rather than during
+//! the scan.
+//!
+//! That would make `push` take `(keys, record)` and `finish` take a
+//! `project` alongside `keys_of`, and the key-values plumbing below
+//! becomes unnecessary. Left as it stands until the wiring lands, so the
+//! change arrives with the call site that proves it.
 //!
 //! With no factory (an embedded engine with nowhere to put a file) this
 //! degrades to exactly today's behaviour: everything stays in the batch
@@ -71,10 +84,8 @@ use crate::tempstore::TempRun;
 /// merge walks it with.
 struct RunReader {
     run: Box<dyn TempRun>,
-    /// The row at this run's head, and its keys. `None` once drained.
+    /// The record at this run's head, and its keys. `None` once drained.
     head: Option<(Vec<OrderKey>, Row<'static>)>,
-    /// How many leading values of a spilled record are key values.
-    n_keys: usize,
 }
 
 /// Read exactly `n` bytes, or `None` at a clean end of stream.
@@ -102,33 +113,29 @@ fn read_exact(run: &mut dyn TempRun, n: usize) -> Result<Option<Vec<u8>>, Engine
 pub(crate) struct ExternalSorter<'a> {
     factory: Option<crate::TempRunFactory>,
     budget_bytes: usize,
-    spill_schema: TableSchema,
-    n_keys: usize,
+    /// The schema of the RECORD a run stores — the caller's source row,
+    /// whose types are already declared.
+    record_schema: TableSchema,
     descs: &'a [bool],
-    batch: Vec<(Vec<OrderKey>, Vec<spg_storage::Value<'static>>, Row<'static>)>,
+    batch: Vec<(Vec<OrderKey>, Row<'static>)>,
     batch_bytes: usize,
     runs: Vec<Box<dyn TempRun>>,
 }
 
 impl<'a> ExternalSorter<'a> {
-    /// `key_cols` describes the ORDER BY operands, `out_cols` the
-    /// projected result. A spilled record is the two concatenated, which
-    /// is what lets a key that was never projected survive the trip.
+    /// `record_cols` describes the rows handed to `push` — the scan's
+    /// own source columns, not the projection. Sorting works on records
+    /// that still carry every column the ORDER BY might name.
     pub(crate) fn new(
         factory: Option<crate::TempRunFactory>,
         budget_bytes: usize,
-        key_cols: Vec<spg_storage::ColumnSchema>,
-        out_cols: Vec<spg_storage::ColumnSchema>,
+        record_cols: Vec<spg_storage::ColumnSchema>,
         descs: &'a [bool],
     ) -> Self {
-        let n_keys = key_cols.len();
-        let mut all = key_cols;
-        all.extend(out_cols);
         Self {
             factory,
             budget_bytes,
-            spill_schema: TableSchema::new("spg_sort_run", all),
-            n_keys,
+            record_schema: TableSchema::new("spg_sort_run", record_cols),
             descs,
             batch: Vec::new(),
             batch_bytes: 0,
@@ -142,18 +149,15 @@ impl<'a> ExternalSorter<'a> {
         !self.runs.is_empty()
     }
 
-    /// `key_values` are the raw ORDER BY operands for this row, in
-    /// clause order. They ride along so a spilled row can be re-keyed
-    /// without the key having to be part of the projection — see the
-    /// module header.
+    /// `record` is the row the caller wants back in order — the source
+    /// row, so a spilled record can always be re-keyed.
     pub(crate) fn push(
         &mut self,
         keys: Vec<OrderKey>,
-        key_values: Vec<spg_storage::Value<'static>>,
-        row: Row<'static>,
+        record: Row<'static>,
     ) -> Result<(), EngineError> {
-        self.batch_bytes += crate::bytebudget::approx_values_bytes(&row.values);
-        self.batch.push((keys, key_values, row));
+        self.batch_bytes += crate::bytebudget::approx_values_bytes(&record.values);
+        self.batch.push((keys, record));
         // Spilling needs somewhere to spill to. Without a factory this
         // is the old unbounded behaviour, deliberately.
         if self.factory.is_some() && self.batch_bytes >= self.budget_bytes {
@@ -170,21 +174,11 @@ impl<'a> ExternalSorter<'a> {
         let Some(factory) = self.factory else {
             return Ok(());
         };
-        // `sort_by_keys` wants (keys, payload) pairs; the key values ride
-        // in the payload so the sort is unchanged by their presence.
-        let mut pairs: Vec<(Vec<OrderKey>, (Vec<spg_storage::Value<'static>>, Row<'static>))> =
-            core::mem::take(&mut self.batch)
-                .into_iter()
-                .map(|(k, kv, r)| (k, (kv, r)))
-                .collect();
-        pairs.sort_by(|a, b| cmp_multi_key_in(&a.0, &b.0, self.descs, &[]));
+        crate::orderby::sort_by_keys(&mut self.batch, self.descs);
         let mut run = factory()
             .map_err(|e| EngineError::Internal(alloc::format!("temp run create: {e:?}")))?;
-        for (_, (key_values, row)) in pairs {
-            let mut vals = key_values;
-            vals.extend(row.values.iter().cloned());
-            let row = Row::new(vals);
-            let bytes = spg_storage::encode_row_body_dense(&row, &self.spill_schema);
+        for (_, row) in core::mem::take(&mut self.batch) {
+            let bytes = spg_storage::encode_row_body_dense(&row, &self.record_schema);
             let len = u32::try_from(bytes.len()).map_err(|_| {
                 EngineError::Internal(alloc::string::String::from("row too large to spill"))
             })?;
@@ -203,16 +197,29 @@ impl<'a> ExternalSorter<'a> {
     /// Every row, in order. `keys_of` re-derives a spilled row's keys —
     /// the same function the caller used on the way in, so a run needs
     /// to carry only the row.
-    pub(crate) fn finish<K>(mut self, keys_of: K) -> Result<Vec<Row<'static>>, EngineError>
+    /// Every row, in order, projected.
+    ///
+    /// `keys_of` re-derives a spilled record's keys — the caller passes
+    /// the same call the scan used, over the same source row, so no key
+    /// can be missing. `project` turns a record into the output row, and
+    /// runs once per row whether or not the sort spilled.
+    pub(crate) fn finish<K, P>(
+        mut self,
+        keys_of: K,
+        project: P,
+    ) -> Result<Vec<Row<'static>>, EngineError>
     where
         K: Fn(&Row<'static>) -> Result<Vec<OrderKey>, EngineError>,
+        P: Fn(&Row<'static>) -> Result<Row<'static>, EngineError>,
     {
         if self.runs.is_empty() {
-            // Never spilled: one in-memory sort, exactly as before. The
-            // key values were carried but never needed.
-            self.batch
-                .sort_by(|a, b| cmp_multi_key_in(&a.0, &b.0, self.descs, &[]));
-            return Ok(self.batch.into_iter().map(|(_, _, r)| r).collect());
+            // Never spilled: one in-memory sort, exactly as before.
+            crate::orderby::sort_by_keys(&mut self.batch, self.descs);
+            return self
+                .batch
+                .into_iter()
+                .map(|(_, r)| project(&r))
+                .collect::<Result<Vec<_>, _>>();
         }
         // Whatever is still held becomes the last run, so the merge has
         // one kind of input rather than two.
@@ -220,12 +227,8 @@ impl<'a> ExternalSorter<'a> {
 
         let mut readers: Vec<RunReader> = Vec::with_capacity(self.runs.len());
         for mut run in core::mem::take(&mut self.runs) {
-            let head = Self::next_row(&mut *run, &self.spill_schema, self.n_keys, &keys_of)?;
-            readers.push(RunReader {
-                run,
-                head,
-                n_keys: self.n_keys,
-            });
+            let head = Self::next_row(&mut *run, &self.record_schema, &keys_of)?;
+            readers.push(RunReader { run, head });
         }
 
         let mut out: Vec<Row<'static>> = Vec::new();
@@ -247,22 +250,19 @@ impl<'a> ExternalSorter<'a> {
                 }
             }
             let Some(i) = best else { break };
-            let (_, row) = readers[i].head.take().expect("chosen head is present");
-            out.push(row);
-            let n_keys = readers[i].n_keys;
+            let (_, record) = readers[i].head.take().expect("chosen head is present");
+            out.push(project(&record)?);
             readers[i].head =
-                Self::next_row(&mut *readers[i].run, &self.spill_schema, n_keys, &keys_of)?;
+                Self::next_row(&mut *readers[i].run, &self.record_schema, &keys_of)?;
         }
         Ok(out)
     }
 
-    /// `keys_of` receives a `Row` of just the KEY values — not the
-    /// output row — so it can pack them with the same comparator the
-    /// scan used, whether or not those columns were projected.
+    /// `keys_of` receives the decoded SOURCE row, which still carries
+    /// every column an ORDER BY could name.
     fn next_row<K>(
         run: &mut dyn TempRun,
         schema: &TableSchema,
-        n_keys: usize,
         keys_of: &K,
     ) -> Result<Option<(Vec<OrderKey>, Row<'static>)>, EngineError>
     where
@@ -283,10 +283,8 @@ impl<'a> ExternalSorter<'a> {
             spg_storage::CURRENT_ROW_CODEC_VERSION,
         )
         .map_err(|e| EngineError::Internal(alloc::format!("temp run row decode: {e:?}")))?;
-        let mut vals = row.values;
-        let out = Row::new(vals.split_off(n_keys));
-        let keys = keys_of(&Row::new(vals))?;
-        Ok(Some((keys, out)))
+        let keys = keys_of(&row)?;
+        Ok(Some((keys, row)))
     }
 }
 
@@ -334,14 +332,26 @@ mod tests {
         }))
     }
 
-    fn key_cols() -> Vec<ColumnSchema> {
-        alloc::vec![ColumnSchema::new("k", DataType::Int, false)]
+    /// The scan's own columns: a spilled record keeps them ALL, so the
+    /// ORDER BY can name one the projection drops.
+    fn record_cols() -> Vec<ColumnSchema> {
+        alloc::vec![
+            ColumnSchema::new("id", DataType::Int, false),
+            ColumnSchema::new("pad", DataType::Text, false),
+        ]
     }
 
-    /// Pack a key value the way the scan's comparator does. Standing in
-    /// for `build_order_keys_bound`, which needs an evaluation context.
-    fn keys_of(key_row: &Row<'static>) -> Result<Vec<OrderKey>, EngineError> {
-        match &key_row.values[0] {
+    fn record(id: i32) -> Row<'static> {
+        Row::new(alloc::vec![
+            Value::Int(id),
+            Value::text(alloc::format!("pad-{id}")),
+        ])
+    }
+
+    /// Pack the key from the SOURCE row, standing in for
+    /// `build_order_keys_bound` (which needs an evaluation context).
+    fn keys_of(src: &Row<'static>) -> Result<Vec<OrderKey>, EngineError> {
+        match &src.values[0] {
             Value::Int(n) => Ok(alloc::vec![OrderKey::Int(i128::from(*n))]),
             other => Err(EngineError::Internal(alloc::format!("bad key: {other:?}"))),
         }
@@ -356,24 +366,30 @@ mod tests {
             .collect()
     }
 
-    /// The case that matters and that the first version of these tests
-    /// missed: the ORDER BY key is NOT in the projection. `SELECT pad
-    /// FROM big ORDER BY id` is exactly this shape, and a run that
-    /// stored only the projected row could not be re-keyed at all.
+    /// Project away the key column, so the output carries `pad` alone.
+    fn project_pad_only(src: &Row<'static>) -> Result<Row<'static>, EngineError> {
+        Ok(Row::new(alloc::vec![src.values[1].clone()]))
+    }
+
+    fn project_identity(src: &Row<'static>) -> Result<Row<'static>, EngineError> {
+        Ok(src.clone())
+    }
+
+    /// The case the first two designs got wrong: the ORDER BY key is not
+    /// in the projection. `SELECT pad FROM big ORDER BY id` is this
+    /// shape. Spilling the SOURCE row makes it work by construction —
+    /// the key is still there to be read.
     #[test]
     fn a_key_that_was_never_projected_still_orders_the_merge() {
-        let out_cols = alloc::vec![ColumnSchema::new("pad", DataType::Text, false)];
         let descs = [false];
-        let mut s = ExternalSorter::new(Some(mem_run), 1, key_cols(), out_cols, &descs);
+        let mut s = ExternalSorter::new(Some(mem_run), 1, record_cols(), &descs);
         for id in [7, 3, 9, 1, 8, 2, 6, 4, 5, 0] {
-            let key_values = alloc::vec![Value::Int(id)];
-            let keys = keys_of(&Row::new(key_values.clone())).unwrap();
-            // The projected row carries the payload ONLY — no id.
-            let row = Row::new(alloc::vec![Value::text(alloc::format!("pad-{id}"))]);
-            s.push(keys, key_values, row).unwrap();
+            let r = record(id);
+            let k = keys_of(&r).unwrap();
+            s.push(k, r).unwrap();
         }
         assert!(s.spilled(), "a 1-byte budget must have produced runs");
-        let out = s.finish(keys_of).unwrap();
+        let out = s.finish(keys_of, project_pad_only).unwrap();
         let pads: Vec<alloc::string::String> = out
             .iter()
             .map(|r| match &r.values[0] {
@@ -387,30 +403,26 @@ mod tests {
                 "pad-0", "pad-1", "pad-2", "pad-3", "pad-4", "pad-5", "pad-6", "pad-7", "pad-8",
                 "pad-9"
             ],
-            "ordered by the unprojected key, and the output row carries only the projection"
+            "ordered by the unprojected key"
         );
-        assert_eq!(out[0].values.len(), 1, "the key column must not leak into the result");
+        assert_eq!(
+            out[0].values.len(),
+            1,
+            "the key column must not leak into the result"
+        );
     }
 
     #[test]
     fn a_spilled_sort_returns_exactly_what_an_in_memory_sort_would() {
-        let out_cols = alloc::vec![
-            ColumnSchema::new("id", DataType::Int, false),
-            ColumnSchema::new("pad", DataType::Text, false),
-        ];
         let descs = [false];
-        let mut s = ExternalSorter::new(Some(mem_run), 1, key_cols(), out_cols, &descs);
+        let mut s = ExternalSorter::new(Some(mem_run), 1, record_cols(), &descs);
         for id in [7, 3, 9, 1, 8, 2, 6, 4, 5, 0] {
-            let key_values = alloc::vec![Value::Int(id)];
-            let keys = keys_of(&Row::new(key_values.clone())).unwrap();
-            let row = Row::new(alloc::vec![
-                Value::Int(id),
-                Value::text(alloc::format!("pad-{id}")),
-            ]);
-            s.push(keys, key_values, row).unwrap();
+            let r = record(id);
+            let k = keys_of(&r).unwrap();
+            s.push(k, r).unwrap();
         }
-        assert!(s.spilled(), "a 1-byte budget must have produced runs");
-        let out = s.finish(keys_of).unwrap();
+        assert!(s.spilled());
+        let out = s.finish(keys_of, project_identity).unwrap();
         assert_eq!(ids_of(&out, 0), alloc::vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         assert_eq!(
             out[0].values[1],
@@ -421,37 +433,44 @@ mod tests {
 
     #[test]
     fn descending_order_survives_the_merge() {
-        let out_cols = alloc::vec![ColumnSchema::new("id", DataType::Int, false)];
         let descs = [true];
-        let mut s = ExternalSorter::new(Some(mem_run), 1, key_cols(), out_cols, &descs);
+        let mut s = ExternalSorter::new(Some(mem_run), 1, record_cols(), &descs);
         for id in [3, 1, 2] {
-            let key_values = alloc::vec![Value::Int(id)];
-            let keys = keys_of(&Row::new(key_values.clone())).unwrap();
-            s.push(keys, key_values, Row::new(alloc::vec![Value::Int(id)]))
-                .unwrap();
+            let r = record(id);
+            let k = keys_of(&r).unwrap();
+            s.push(k, r).unwrap();
         }
         assert!(s.spilled());
         assert_eq!(
-            ids_of(&s.finish(keys_of).unwrap(), 0),
+            ids_of(&s.finish(keys_of, project_identity).unwrap(), 0),
             alloc::vec![3, 2, 1],
             "DESC must survive the k-way merge"
         );
     }
 
     /// No factory: the old behaviour, byte for byte. A host with nowhere
-    /// to spill must not start failing sorts it used to answer.
+    /// to spill must not start failing sorts it used to answer — and the
+    /// projection still runs, so the result shape does not depend on
+    /// whether a spill happened.
     #[test]
     fn without_a_factory_the_sort_stays_in_memory_and_still_sorts() {
-        let out_cols = alloc::vec![ColumnSchema::new("id", DataType::Int, false)];
         let descs = [false];
-        let mut s = ExternalSorter::new(None, 1, key_cols(), out_cols, &descs);
+        let mut s = ExternalSorter::new(None, 1, record_cols(), &descs);
         for id in [2, 0, 1] {
-            let key_values = alloc::vec![Value::Int(id)];
-            let keys = keys_of(&Row::new(key_values.clone())).unwrap();
-            s.push(keys, key_values, Row::new(alloc::vec![Value::Int(id)]))
-                .unwrap();
+            let r = record(id);
+            let k = keys_of(&r).unwrap();
+            s.push(k, r).unwrap();
         }
         assert!(!s.spilled(), "nothing to spill to means nothing spilled");
-        assert_eq!(ids_of(&s.finish(keys_of).unwrap(), 0), alloc::vec![0, 1, 2]);
+        let out = s.finish(keys_of, project_pad_only).unwrap();
+        let pads: Vec<alloc::string::String> = out
+            .iter()
+            .map(|r| match &r.values[0] {
+                Value::Text(t) => t.to_string(),
+                other => panic!("pad column, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(pads, alloc::vec!["pad-0", "pad-1", "pad-2"]);
+        assert_eq!(out[0].values.len(), 1, "same output shape as the spilled path");
     }
 }
