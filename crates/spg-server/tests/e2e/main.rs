@@ -61,6 +61,7 @@ mod e2e_bare_column_streaming_round823;
 mod e2e_materialised_cancel_round824;
 mod e2e_role_tx_round828;
 mod e2e_rls_authenticated_round830;
+mod e2e_ssi_write_skew_round832;
 #[allow(unused_mut, unused_variables)]
 mod e2e_auth;
 #[allow(unused_mut, unused_variables, clippy::uninlined_format_args)]
