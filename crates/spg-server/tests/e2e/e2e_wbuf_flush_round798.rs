@@ -133,6 +133,13 @@ fn col0(msgs: &[PgMessage]) -> Vec<String> {
     out
 }
 
+fn message_of(msgs: &[PgMessage]) -> String {
+    msgs.iter()
+        .find(|m| m.ty == b'E')
+        .map(|m| String::from_utf8_lossy(&m.body).into_owned())
+        .unwrap_or_default()
+}
+
 fn sqlstate(msgs: &[PgMessage]) -> Option<String> {
     let m = msgs.iter().find(|m| m.ty == b'E')?;
     let mut i = 0;
@@ -242,3 +249,141 @@ fn the_other_encode_paths_flush_too() {
         "the materialised path returns every row"
     );
 }
+
+/// Handshake capturing BackendKeyData — the (pid, secret) pair a
+/// CancelRequest must echo.
+fn open_with_key(addr: &str) -> (TcpStream, u32, u32) {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    send_startup(&mut s);
+    let mut key = None;
+    loop {
+        let m = read_message(&mut s);
+        match m.ty {
+            b'K' => {
+                let pid = u32::from_be_bytes(m.body[0..4].try_into().unwrap());
+                let secret = u32::from_be_bytes(m.body[4..8].try_into().unwrap());
+                key = Some((pid, secret));
+            }
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    let (pid, secret) = key.expect("BackendKeyData before ReadyForQuery");
+    (s, pid, secret)
+}
+
+fn send_cancel(addr: &str, pid: u32, secret: u32) {
+    let mut c = TcpStream::connect(addr).unwrap();
+    let mut buf = Vec::with_capacity(16);
+    buf.extend_from_slice(&16u32.to_be_bytes());
+    buf.extend_from_slice(&80877102u32.to_be_bytes());
+    buf.extend_from_slice(&pid.to_be_bytes());
+    buf.extend_from_slice(&secret.to_be_bytes());
+    c.write_all(&buf).unwrap();
+    // The server closes this connection once the cancel is processed —
+    // reading to EOF is the acknowledgement, so no sleep is needed
+    // between cancelling and draining (r824 established this).
+    let _ = c.read(&mut [0u8; 1]);
+}
+
+/// The one mid-stream failure a streaming SELECT can actually have
+/// (round 798 measured that everything else fails at setup), and the
+/// wire contract the incremental flush changes: rows already flushed
+/// stay on the wire, followed by 57014, and never a CommandComplete.
+///
+/// The construction is deterministic rather than timed. The client
+/// reads a little and then STOPS: TCP backpressure fills the socket
+/// buffers (a few hundred KB) and blocks the server mid-flush, far
+/// short of the ~8 MB result. The cancel flag is set while the server
+/// is stalled; the moment the client drains again, the server unblocks
+/// and the next per-row cancel check fails. Rows-then-error is thereby
+/// guaranteed, not raced for.
+#[test]
+fn a_cancel_mid_drain_keeps_the_flushed_rows_and_ends_in_57014() {
+    let (_child, addrs) = spawn("cancel");
+    let addr = addrs.pgwire.as_ref().unwrap().clone();
+    let (mut s, pid, secret) = open_with_key(&addr);
+    // Not seed()'s 8 MB: macOS loopback buffering autotunes far enough
+    // to swallow that whole, and the first run of this test measured
+    // exactly that — rows=40000, complete=true, no backpressure ever.
+    // ~80 MB encoded cannot fit anywhere, so the server MUST block.
+    // Seeding must be CHECKED: a swallowed INSERT error here once left
+    // the table empty, the SELECT answered with two frames, and the
+    // fixed 20-frame read below sat on frame 3 for the full timeout —
+    // a 30 s stall that pointed at everything except the actual error.
+    let c = q(&mut s, "CREATE TABLE big (id INT PRIMARY KEY, pad TEXT)");
+    assert_eq!(sqlstate(&c), None, "create failed: {}", message_of(&c));
+    for start in [1u32, 100_001, 200_001, 300_001] {
+        let ins = q(
+            &mut s,
+            &format!(
+                "INSERT INTO big SELECT g, repeat('y', 200) FROM \
+                 generate_series({start},{}) g",
+                start + 99_999
+            ),
+        );
+        assert_eq!(
+            sqlstate(&ins),
+            None,
+            "insert from {start} failed: {}",
+            message_of(&ins)
+        );
+    }
+
+    send_query(&mut s, "SELECT pad FROM big");
+    // Read a few frames so rows are provably on the wire, then stall.
+    // Bounded by what actually arrives — never a fixed count, which is
+    // exactly how the seeding failure above turned into a silent hang.
+    let mut early_rows = 0usize;
+    while early_rows < 15 {
+        let m = read_message(&mut s);
+        match m.ty {
+            b'D' => early_rows += 1,
+            b'E' => panic!(
+                "the SELECT errored before any stall: {}",
+                String::from_utf8_lossy(&m.body)
+            ),
+            b'Z' => panic!("the SELECT finished in under 15 rows"),
+            _ => {}
+        }
+    }
+
+    send_cancel(&addr, pid, secret);
+
+    // Drain: more rows (whatever was already encoded), then the error.
+    let mut rows = early_rows;
+    let mut error: Option<PgMessage> = None;
+    let mut complete = false;
+    loop {
+        let m = read_message(&mut s);
+        match m.ty {
+            b'D' => rows += 1,
+            b'E' => error = Some(m),
+            b'C' => complete = true,
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    let e = error.unwrap_or_else(|| {
+        panic!(
+            "no ErrorResponse: the query ignored the cancel and finished \
+             (rows={rows}, complete={complete}) — either the flag never \
+             reached this session or the drain outran the flag"
+        )
+    });
+    let text = String::from_utf8_lossy(&e.body).to_string();
+    assert!(text.contains("57014"), "PG's query_canceled, got {text:?}");
+    assert!(
+        rows < 400_000,
+        "the query must not have finished; {rows} rows arrived"
+    );
+    assert!(!complete, "a cancelled SELECT owes no CommandComplete");
+
+    // And the connection is still usable — PG's cancel kills the
+    // statement, not the session.
+    let after = q(&mut s, "SELECT count(*) FROM big");
+    assert_eq!(sqlstate(&after), None);
+    assert_eq!(col0(&after), vec!["400000"]);
+}
+
