@@ -145,8 +145,21 @@ not gated on those).
 - `TRUNCATE [TABLE] [ONLY] <name>[, ...]
                      [RESTART IDENTITY | CONTINUE IDENTITY]
                      [CASCADE | RESTRICT]` — clears rows via
-  Table::truncate(); RESTART IDENTITY parsed but SequenceDef restart
-  queues with v7.38.
+  Table::truncate().
+  > **Verified round 930 — this claimed LESS than it does.** The line
+  > said "RESTART IDENTITY parsed but SequenceDef restart queues with
+  > v7.38". Measured against PG18 on a `SERIAL` primary key: after
+  > `TRUNCATE tr1 RESTART IDENTITY`, the next inserted row gets id 1 on
+  > both engines. The restart happens. All ten syntax forms are accepted
+  > too — bare, `TABLE`, `ONLY`, multi-table, both IDENTITY spellings,
+  > both of CASCADE/RESTRICT, and all of them combined.
+  >
+  > Recorded because the direction is unusual and costs something
+  > different: the other corrections in this document found claims better
+  > than the truth, and a reader discounts those. A claim WORSE than the
+  > truth sends someone to build what is already there. Scope: `SERIAL`
+  > only; `GENERATED … AS IDENTITY` is untested and this note says nothing
+  > about it. Ledger item 32.
 - `SHOW ALL` returns a `(name, setting, description)` inventory — 21
   rows as of round 868, measured. The count is not pinned here: it
   grows whenever a GUC is added, and a number written down is a
