@@ -45,6 +45,17 @@ attributes}`.
 
 ### Type completeness
 
+> **Verified round 870.** Ten of the types below were exercised with real
+> values against PG18 — inet, cidr, macaddr, varbit, point, xml, money,
+> "char", int4[], int4multirange — and every one matched value for
+> value, so this section's claim holds.
+>
+> One thing does not: `pg_typeof(NULL::t)` answers `unknown` where PG
+> names the type. It is not a type gap — the same casts work with real
+> values — but a client introspecting a nullable expression sees
+> `unknown`. Not confined to exotic types either: `NULL::text` is wrong
+> while `NULL::uuid` and `NULL::int4` are right. Ledger item 27.
+
 PG 18 builtin scalar coverage: 100% (v7.37.5 milestone). UUID +
 INTERVAL + 13 array-of-scalar + 6 multirange + 7 geometry + INET /
 CIDR / MACADDR / MACADDR8 / BIT / VARBIT / XML / "char" / MONEY[] all

@@ -3699,12 +3699,20 @@ fn eval_function_call_positional(
     // v7.37.16 — pg_typeof of a NULL cell reports the COLUMN's
     // static type when it has one (PG: `VALUES (NULL),(1.5)`
     // types the column numeric and its NULL row's pg_typeof says
-    // numeric, not unknown). TEXT is excluded because a NULL
-    // literal *describes* as TEXT (the unknown stand-in), so a
-    // bare `pg_typeof(NULL)` keeps reporting "unknown". Known
-    // residual: a genuine text column's NULL cell therefore also
-    // reports unknown (needs a real Unknown type to fix).
+    // numeric, not unknown).
+    //
+    // A BARE `NULL` stays "unknown", as PG has it. That used to fall
+    // out of TEXT being absent from the name table — a NULL literal
+    // describes as TEXT, so the lookup returned None and the caller
+    // reported unknown. Round 871 filled that table in, which silently
+    // took the bare-NULL behaviour with it and broke
+    // `pg_typeof_null_returns_unknown`. The rule is now stated rather
+    // than emergent: an untyped NULL literal is unknown, a NULL that
+    // was cast reports what it was cast to.
     if args.len() == 1 && name.eq_ignore_ascii_case("pg_typeof") {
+        if matches!(&args[0], Expr::Literal(spg_sql::ast::Literal::Null)) {
+            return Ok(Value::text::<alloc::string::String>("unknown".into()));
+        }
         let v = eval_expr(&args[0], row, ctx)?;
         if matches!(v, Value::Null)
             && let Some(shape) = crate::describe::describe_expr(&args[0], ctx.columns)
@@ -5198,6 +5206,68 @@ pub(crate) fn pg_typeof_name_for_datatype(t: spg_storage::DataType) -> Option<&'
         D::OidArray => "oid[]",
         D::Uuid => "uuid",
         D::Interval => "interval",
+        // v7.39 (round 871) — the rest of what a NULL cast can be
+        // annotated with. This table decided which types survived
+        // `pg_typeof(NULL::t)`: the twenty above answered, everything
+        // else fell to `_ => None` and reported `unknown`. That reads
+        // as a NULL problem and is not one — `NULL::uuid` was right all
+        // along while `NULL::text` was wrong, because one was listed
+        // and the other was not.
+        //
+        // Names are PG18's own, taken from running `pg_typeof` there
+        // rather than from memory: `bit varying` not `varbit`, `bit`
+        // for any width, `character varying`, `"char"` quoted.
+        D::Text => "text",
+        D::Multirange(k) => match k {
+            spg_storage::RangeKind::Int4 => "int4multirange",
+            spg_storage::RangeKind::Int8 => "int8multirange",
+            spg_storage::RangeKind::Num => "nummultirange",
+            spg_storage::RangeKind::Ts => "tsmultirange",
+            spg_storage::RangeKind::TsTz => "tstzmultirange",
+            spg_storage::RangeKind::Date => "datemultirange",
+        },
+        D::Varchar(_) => "character varying",
+        // PG names `char(n)` "character"; the one-byte internal type
+        // spelled `"char"` is a DIFFERENT type there, and SPG maps both
+        // onto `Char(u32)` — so this arm must answer for the declared
+        // one. Round 871's first attempt said `"char"` here and would
+        // have reported `char(5)` as the internal type.
+        D::Char(_) => "character",
+        D::Json => "json",
+        D::Jsonb => "jsonb",
+        D::Bytes => "bytea",
+        D::Inet => "inet",
+        D::Cidr => "cidr",
+        D::Macaddr => "macaddr",
+        D::Macaddr8 => "macaddr8",
+        D::Bit(_) => "bit",
+        D::BitVarying(_) => "bit varying",
+        D::Xml => "xml",
+        D::Money => "money",
+        D::Point => "point",
+        D::Lseg => "lseg",
+        D::Path => "path",
+        D::PgBox => "box",
+        D::Polygon => "polygon",
+        D::Line => "line",
+        D::Circle => "circle",
+        D::TextArray => "text[]",
+        D::IntArray => "integer[]",
+        D::BigIntArray => "bigint[]",
+        D::SmallIntArray => "smallint[]",
+        D::FloatArray => "double precision[]",
+        D::NumericArray => "numeric[]",
+        D::BoolArray => "boolean[]",
+        D::DateArray => "date[]",
+        D::TimestampArray => "timestamp without time zone[]",
+        D::TimestamptzArray => "timestamp with time zone[]",
+        D::UuidArray => "uuid[]",
+        D::JsonArray => "json[]",
+        D::JsonbArray => "jsonb[]",
+        D::BytesArray => "bytea[]",
+        D::VarcharArray => "character varying[]",
+        D::CharArray => "\"char\"[]",
+        D::IntervalArray => "interval[]",
         _ => return None,
     })
 }

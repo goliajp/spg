@@ -1166,6 +1166,7 @@ mod e2e_pg_timetz;
 mod e2e_pg_type_view;
 mod e2e_pg_type_widened;
 mod e2e_pg_typeof;
+mod e2e_pg_typeof_null_round871;
 mod e2e_pg_views_view;
 mod e2e_pgdump_compat;
 mod e2e_plan_cache;
