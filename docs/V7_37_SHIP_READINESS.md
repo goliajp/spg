@@ -110,7 +110,20 @@ not gated on those).
   > and rejects `SUGGEST` outright, where SPG accepts all three — more
   > permissive, not less, and `SUGGEST` is SPG's own. Ledger item 30.
 - Partition DDL: LIST + RANGE + HASH strategies; ATTACH / DETACH /
-  DETACH CONCURRENTLY all live; pruning on `=` predicates.
+  DETACH CONCURRENTLY all live.
+  > **Verified round 928 — the DDL holds, the pruning clause does not.**
+  > All three strategies create parents and children, rows read back
+  > through the parent (2 / 2 / 3), and ATTACH / DETACH / DETACH
+  > CONCURRENTLY are all accepted.
+  >
+  > "Pruning on `=` predicates" is NOT true for RANGE. On a table split
+  > 1..100 / 100..200, `WHERE id = 5` plans as
+  > `Append -> Seq Scan on pr1 (Filter) -> Seq Scan on pr2 (Filter)` —
+  > both partitions scanned, the predicate applied as a filter to each.
+  > PG drops the second one from the plan entirely. Measured on RANGE
+  > only; LIST and HASH are untested and this note claims nothing about
+  > them. The clause is removed from the line above rather than softened,
+  > because a reader takes it as a capability. Ledger item 31.
 - CREATE STATISTICS parse-accepted (v7.17.0 Phase 8 + 23.7
   rationale).
 - pg_dump-compat ALTER TABLE residuals (18.18): RESET / OF /
