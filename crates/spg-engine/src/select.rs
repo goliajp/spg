@@ -4423,6 +4423,24 @@ impl Engine {
         if let Some(done) = self.try_from_shape_paths(stmt, from, cancel)? {
             return Ok(done);
         }
+        // NOT hooked up. `try_spill_sorted_scan` is written, correct and
+        // tested — eight ORDER BY shapes byte-identical spilled against
+        // in-memory, with 103 runs opened to prove the spill ran — and it
+        // loses on wall clock, which is a hard stop whatever the memory
+        // buys. Measured round 865, same psql client both sides, same
+        // machine, row counts verified, and both sides confirmed to be
+        // doing an external merge rather than an indexed walk:
+        //
+        //   PG18        178.7 - 187.0 ms   Sort Method: external merge, 85 MB
+        //   SPG spilled 269.7 - 299.6 ms   33 spill files at peak
+        //
+        // Non-overlapping, about 1.55x. Re-enable by restoring the call
+        // below once that closes; nothing else has to change, which is
+        // the point of it being a separate path.
+        //
+        //   if let Some(done) = self.try_spill_sorted_scan(stmt, from, cancel)? {
+        //       return Ok(done);
+        //   }
         let primary = &from.primary;
         // v7.39 (round 244) — a sequence is selectable as a one-row relation
         // in PG (`SELECT last_value FROM seq` — psql's \d and several ORMs
@@ -6990,6 +7008,136 @@ impl Engine {
     /// Returns `Ok(None)` for anything this cannot serve, and the caller
     /// falls through to the deferred-join path exactly as before: a
     /// missing table, or a cold tier whose hydration the fallback handles.
+    /// Sort a single-table scan through the external sorter, so the
+    /// answer's size is bounded by `work_mem` and not by the input.
+    ///
+    /// Sorting held every row twice — the scan's `Vec<Row>` and the
+    /// sort's `Vec<(keys, Row)>` beside it — with nothing bounding
+    /// either: 807 MB at 400k rows, whatever `work_mem` said. A large
+    /// enough ORDER BY took the server down, which is a liveness
+    /// problem before it is a performance one.
+    ///
+    /// A SEPARATE walk rather than a change to `run_single_table_scan`,
+    /// following what round 831 did for the joinless shape. That
+    /// function is 552 lines whose projection loop is entangled with
+    /// DISTINCT (which indexes back into the tagged vector) and with
+    /// streaming top-N (whose boundary moves as the scan runs); both
+    /// assume the projection has already happened when a row is
+    /// pushed, which is exactly what spilling has to defer. Two earlier
+    /// attempts tried to rework that loop and were reverted. Here the
+    /// existing path is untouched and this one only claims shapes it
+    /// can serve, so a decline costs nothing.
+    ///
+    /// Records are SOURCE rows, not projected ones: `finish` re-derives
+    /// keys from what it decodes, and an ORDER BY key need not be in
+    /// the projection — `SELECT pad FROM big ORDER BY id` (round 835).
+    fn try_spill_sorted_scan(
+        &self,
+        stmt: &SelectStatement,
+        from: &FromClause,
+        cancel: CancelToken<'_>,
+    ) -> Result<Option<QueryResult>, EngineError> {
+        // Shapes this walk does not serve. Each one either needs the
+        // whole tagged vector addressable (DISTINCT probes back into
+        // it, WITH TIES re-reads its tail) or is already bounded
+        // without spilling (a LIMIT makes the partial sort O(keep)).
+        if !self.can_spill()
+            || stmt.order_by.is_empty()
+            || stmt.distinct
+            || stmt.limit_with_ties
+            || stmt.limit_literal().is_some()
+            || !from.joins.is_empty()
+            || from.primary.lateral_subquery.is_some()
+            || from.primary.unnest_expr.is_some()
+            || from.primary.generate_series_args.is_some()
+            || select_has_window(stmt)
+        {
+            return Ok(None);
+        }
+        let Some(table) = self.active_catalog().get(&from.primary.name) else {
+            return Ok(None);
+        };
+        // Cold-tier rows live outside `rows()`; this walk would drop
+        // them silently, the same reason round 831's walk declines.
+        if table.has_cold_rows_fast() {
+            return Ok(None);
+        }
+
+        let alias = from
+            .primary
+            .alias
+            .as_deref()
+            .unwrap_or(from.primary.name.as_str());
+        let cols = table.schema().columns.clone();
+        let sess = self.dml_session();
+        let ctx = EvalContext::new(&cols, Some(alias))
+            .with_catalog(self.active_catalog())
+            .with_session(&sess);
+        let projection = build_projection(&stmt.items, &cols, alias, self.backslash_escapes)?;
+        let order_by = stmt.order_by.clone();
+        // The same one-shot resolution the general path does (round
+        // 582): each ORDER BY column is bound once, not once per row.
+        let order_bound = crate::orderby::order_by_bound_positions(&order_by, &cols, Some(alias));
+        let descs: Vec<bool> = order_by.iter().map(|o| o.desc).collect();
+
+        let mut sorter = crate::extsort::ExternalSorter::new(
+            self.temp_run_factory,
+            self.session_work_mem_bytes(),
+            cols.clone(),
+            &descs,
+        );
+        let snapshot = self.current_snapshot();
+        for (i, row) in table.scan_visible_from(0, &snapshot) {
+            if i.is_multiple_of(256) {
+                cancel.check()?;
+            }
+            if let Some(w) = &stmt.where_ {
+                let cond = crate::eval::eval_expr(w, row, &ctx).map_err(EngineError::Eval)?;
+                if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
+                    continue;
+                }
+            }
+            let mut keys = Vec::new();
+            crate::orderby::build_order_keys_bound(&order_by, &order_bound, row, &ctx, &mut keys)?;
+            sorter.push(keys, row.clone().into_owned())?;
+        }
+
+        let key_ctx = &ctx;
+        let rows = sorter.finish(
+            |src| {
+                let mut buf = Vec::new();
+                crate::orderby::build_order_keys_bound(
+                    &order_by,
+                    &order_bound,
+                    src,
+                    key_ctx,
+                    &mut buf,
+                )?;
+                Ok(buf)
+            },
+            |src| {
+                let mut values = Vec::with_capacity(projection.len());
+                for p in &projection {
+                    values.push(
+                        crate::eval::eval_expr(&p.expr, src, key_ctx).map_err(EngineError::Eval)?,
+                    );
+                }
+                Ok(Row::new(values))
+            },
+        )?;
+
+        let columns: Vec<ColumnSchema> = projection
+            .iter()
+            .map(|p| {
+                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
+                c.user_enum_type = p.user_enum_type.clone();
+                c.mysql_fsp = p.mysql_fsp;
+                c
+            })
+            .collect();
+        Ok(Some(QueryResult::Rows { columns, rows }))
+    }
+
     fn try_stream_single_table<F>(
         &self,
         stmt: &SelectStatement,
