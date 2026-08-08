@@ -26,9 +26,43 @@
 
 ### Catalog completeness
 
-37 PG-shape catalog views land in v7.37, each with the
-PG-canonical column set so dashboards / ORMs / pg_dump round-trip
-without errors:
+> **Verified round 893 — the second half of this claim does not hold.**
+> Every catalog named below exists and is selectable on SPG (0 missing),
+> and the list is 38 entries, not 37. But "the PG-canonical column set"
+> is true for 23 of them and false for 13: those are shaped to PG 16/17
+> and PG 18 has since added or renamed columns SPG does not carry.
+> Checked by reading `SELECT * FROM <cat> LIMIT 0`'s header on both sides.
+>
+> The gap is client-visible, not cosmetic — `SELECT last_seq_scan FROM
+> pg_stat_user_tables` is a PG18 monitoring query and it ERRORS here:
+>
+> - `pg_statistic` — no `stakind1-5` / `staop1-5` / `stacoll1-5` /
+>   `stanumbers*` / `stavalues*`
+> - `pg_stat_user_tables` — no `last_seq_scan`, `last_idx_scan`,
+>   `n_tup_hot_upd`, `n_tup_newpage_upd`, `n_mod_since_analyze`
+> - `pg_stat_user_indexes` — no `last_idx_scan`
+> - `pg_stat_io` — carries PG17's `op_bytes`; PG18's `read_bytes` /
+>   `write_bytes` / `extend_bytes` absent
+> - `pg_stat_replication` — no `usesysid`, `client_hostname`,
+>   `client_port`, `backend_start`, `backend_xmin`, `write_lag`,
+>   `flush_lag`, `replay_lag`, `sync_priority`
+> - `pg_stat_progress_vacuum` — PG16 names (`max_dead_tuples`,
+>   `num_dead_tuples`) where PG18 has `max_dead_tuple_bytes`,
+>   `dead_tuple_bytes`, `num_dead_item_ids`, `indexes_total`,
+>   `indexes_processed`
+> - `pg_stat_progress_analyze` — no `delay_time`
+> - `pg_replication_slots`, `information_schema.table_constraints`
+>   (`nulls_distinct`), `information_schema.domains`,
+>   `information_schema.attributes` — each short of PG18's set
+>
+> Two entries are NOT defects: `pg_stat_statements` differs only because
+> the reference container has no such extension installed, and
+> `pg_stat_bgwriter` differs because SPG still carries the checkpoint
+> columns PG18 moved to `pg_stat_checkpointer` — SPG has more there, not
+> less. Ledger item 29.
+
+38 PG-shape catalog views land in v7.37, each selectable, 23 of them
+with the PG-canonical column set (see the note above for the other 13):
 
 `pg_class`, `pg_attribute`, `pg_index`, `pg_constraint`, `pg_proc`,
 `pg_type`, `pg_enum`, `pg_namespace`, `pg_database`, `pg_roles`,
