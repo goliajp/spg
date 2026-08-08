@@ -586,6 +586,28 @@ impl Engine {
         parse_pg_duration_ms(raw).filter(|ms| *ms > 0)
     }
 
+    /// `work_mem` in BYTES, which is what a sort has to compare against.
+    ///
+    /// The GUC has been accepted, unit-normalised and rendered since
+    /// round 204, and never read: nothing in the engine turned it into a
+    /// budget, so a sort's memory was bounded by the row count and not
+    /// by the setting. Round 863 added this so the external sort has a
+    /// ceiling to spill at.
+    ///
+    /// PG's default is 4 MB, and the same default applies when the
+    /// session has not set it or the stored value will not parse.
+    #[must_use]
+    pub fn session_work_mem_bytes(&self) -> usize {
+        const DEFAULT_KB: usize = 4 * 1024;
+        let kb = self
+            .session_param("work_mem")
+            .and_then(parse_pg_mem_kb)
+            .and_then(|kb| usize::try_from(kb).ok())
+            .filter(|kb| *kb > 0)
+            .unwrap_or(DEFAULT_KB);
+        kb.saturating_mul(1024)
+    }
+
     /// v7.39 (round 621) — does a message of this severity reach the client?
     ///
     /// `client_min_messages` was validated on the way in and then never read,
@@ -1092,5 +1114,51 @@ mod tests {
             // silently taken as some default.
             assert!(e.execute("SET client_min_messages = bogus_zz").is_err());
         }
+    }
+
+    /// `work_mem` had been accepted, normalised and rendered since round
+    /// 204 without anything reading it, so a sort's memory answered to
+    /// the row count and not to the setting. These pin the read that
+    /// round 863 added, including that it is the SAME number whichever
+    /// spelling the session used — PG canonicalises at store time and
+    /// the byte value has to follow.
+    ///
+    /// Round 863 checked these bite: with the accessor made to ignore
+    /// the session, the `64MB` case drops to the 4MB default and this
+    /// goes red. The fallback test below stays green either way, which
+    /// is why it is not the one carrying the claim.
+    #[test]
+    fn work_mem_reads_back_as_bytes() {
+        let mut e = crate::Engine::new();
+        assert_eq!(
+            e.session_work_mem_bytes(),
+            4 * 1024 * 1024,
+            "an untouched session gets PG's 4MB default"
+        );
+
+        e.execute("SET work_mem = '64MB'").unwrap();
+        assert_eq!(e.session_work_mem_bytes(), 64 * 1024 * 1024);
+
+        // Bare integers are kB, PG's base unit for this GUC.
+        e.execute("SET work_mem = '65536'").unwrap();
+        assert_eq!(
+            e.session_work_mem_bytes(),
+            64 * 1024 * 1024,
+            "'65536' and '64MB' are the same setting and must be the same bytes"
+        );
+
+        e.execute("SET work_mem = '1024kB'").unwrap();
+        assert_eq!(e.session_work_mem_bytes(), 1024 * 1024);
+    }
+
+    #[test]
+    fn work_mem_that_cannot_be_read_falls_back_to_the_default() {
+        let mut e = crate::Engine::new();
+        // A rejected SET leaves the previous value in place; the point
+        // here is that the accessor never hands back 0, which would
+        // make a sort spill on its first row.
+        let _ = e.execute("SET work_mem = 'not_a_size'");
+        assert_eq!(e.session_work_mem_bytes(), 4 * 1024 * 1024);
+        assert!(e.session_work_mem_bytes() > 0);
     }
 }
