@@ -106,6 +106,33 @@ fn open(addr: &str) -> TcpStream {
     s
 }
 
+/// Like `open`, also returning the BackendKeyData a CancelRequest needs.
+fn open_with_key(addr: &str) -> (TcpStream, (u32, u32)) {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    send_startup(&mut s);
+    let msgs = read_until_ready(&mut s);
+    let k = msgs
+        .iter()
+        .find(|m| m.ty == b'K')
+        .expect("BackendKeyData in the handshake");
+    let pid = u32::from_be_bytes([k.body[0], k.body[1], k.body[2], k.body[3]]);
+    let secret = u32::from_be_bytes([k.body[4], k.body[5], k.body[6], k.body[7]]);
+    (s, (pid, secret))
+}
+
+/// A CancelRequest arrives on its own connection, as PG's protocol says.
+fn send_cancel(addr: &str, (pid, secret): (u32, u32)) {
+    let mut c = TcpStream::connect(addr).unwrap();
+    let mut out = Vec::new();
+    out.extend_from_slice(&16_u32.to_be_bytes());
+    out.extend_from_slice(&80_877_102_u32.to_be_bytes());
+    out.extend_from_slice(&pid.to_be_bytes());
+    out.extend_from_slice(&secret.to_be_bytes());
+    c.write_all(&out).unwrap();
+    let _ = c.read(&mut [0u8; 1]);
+}
+
 fn col0(msgs: &[PgMessage]) -> Vec<String> {
     let mut out = Vec::new();
     for m in msgs.iter().filter(|m| m.ty == b'D') {
@@ -256,6 +283,31 @@ fn a_bare_column_that_matches_two_relations_is_ambiguous_not_undefined() {
     );
 }
 
+/// ⚠️ What this pins, and what it does NOT.
+///
+/// The name promises the bare projection STREAMS rather than being built
+/// whole. Round 856 put that to a negative control — every streaming
+/// entry disabled at once, `try_stream_single_table` and both call sites
+/// of `try_exec_joined_streaming` — and the test went on passing, in
+/// this form and in the form it had before.
+///
+/// The reason is that round 824 gave the materialising path
+/// `emit_materialised`, which hands rows to the consumer one at a time.
+/// Both paths therefore look the same on the wire: rows arrive early,
+/// and a cancel lands between two of them. The premise that the wire can
+/// tell them apart stopped holding the day that landed, and this test
+/// has been passing for the wrong reason since.
+///
+/// So take it for what it does hold: the projection answers, the first
+/// row arrives long before the last, a cancel mid-flight ends in 57014
+/// with part of the result delivered and no CommandComplete, and the
+/// session survives. All true, all worth keeping, none of it specific to
+/// streaming.
+///
+/// The observable that DOES separate them is peak memory — round 831
+/// measured this exact query at +117 MB materialised against +0 MB
+/// streamed — and pinning that needs a test that watches the server's
+/// RSS, which is a different shape from this file.
 #[test]
 fn a_bare_projection_streams_so_a_timeout_can_still_interrupt_it() {
     let (_child, addrs) = spawn("streaming");
@@ -303,35 +355,61 @@ fn a_bare_projection_streams_so_a_timeout_can_still_interrupt_it() {
          whole before any of it was sent"
     );
 
-    // Aim the deadline at the middle of the emitting phase rather than at
-    // a fraction of the total. A quarter of the total is 20ms here, which
-    // lands before the first row exists, and the cancellation then looks
-    // exactly like the materialising one it is supposed to rule out.
-    let budget = std::cmp::max(20, first_ms + (full_ms - first_ms) / 2);
-    ok(&mut s, &format!("SET statement_timeout = '{budget}'"));
-    let cut = q(&mut s, "SELECT pad FROM big");
+    // Cancel in response to something OBSERVED rather than at a moment
+    // guessed from an earlier run's clock.
+    //
+    // The budget used to be derived from the calibration run above and
+    // then applied to this one. When the machine's load moved between
+    // the two — a neighbouring build taking twelve cores, in the run
+    // that exposed this — the second pass finished inside a budget sized
+    // for a slower first pass, and the test reported a defect that was
+    // not there. Round 824 met the same thing on its own file and
+    // switched to a CancelRequest; this file kept the deadline, which is
+    // the whole of why it was still flaky.
+    let pg = addrs.pgwire.as_ref().unwrap();
+    let (mut c, key) = open_with_key(pg);
+    send_query(&mut c, "SELECT pad FROM big");
+    let mut delivered = 0usize;
+    while delivered < 1_000 {
+        let m = read_message(&mut c);
+        match m.ty {
+            b'D' => delivered += 1,
+            b'E' => panic!("the scan errored before rows flowed: {}", message_of(&[m])),
+            b'Z' => panic!("the scan finished before {delivered} rows could be read"),
+            _ => {}
+        }
+    }
+    send_cancel(pg, key);
+    let mut code = None;
+    let mut complete = false;
+    loop {
+        let m = read_message(&mut c);
+        match m.ty {
+            b'D' => delivered += 1,
+            b'C' => complete = true,
+            b'E' => code = sqlstate(&[m]),
+            b'Z' => break,
+            _ => {}
+        }
+    }
 
     assert_eq!(
-        sqlstate(&cut).as_deref(),
+        code.as_deref(),
         Some("57014"),
-        "a quarter of the time the whole scan needs must not be enough"
+        "rows were already flowing, so the cancel has to land between two \
+         of them and end the statement"
     );
-    let delivered = col0(&cut).len();
-    // This is the assertion that distinguishes the two paths. Both of
-    // them end in 57014; only the streaming one has already handed the
-    // client rows when it does, because the materialising path reaches
-    // its cancellation check before the first row is encoded.
-    assert!(
-        delivered > 0,
-        "a bare projection that materialises cancels with nothing sent; \
-         it must stream, and so arrive partly delivered"
-    );
+    // What distinguishes the two paths. Both end in 57014; only the
+    // streaming one has already handed the client rows when it does,
+    // because the materialising path reaches its cancellation check
+    // before the first row is encoded — and would have sent the whole
+    // result before this cancel could arrive at all.
     assert!(
         delivered < ROWS,
         "cancelled after {delivered} of {ROWS} rows — it ran to completion instead"
     );
     assert!(
-        !cut.iter().any(|m| m.ty == b'C'),
+        !complete,
         "a cancelled statement reports no CommandComplete"
     );
 
