@@ -35,7 +35,9 @@ pub use self::bloom::{BloomError, BloomFilter};
 // low-level write/read primitives stay crate-visible for the
 // `Catalog::serialize`/`deserialize` methods that remain in this file.
 pub(crate) use self::codec::*;
-pub use self::codec::{decode_row_body_dense, encode_row_body_dense, row_body_encoded_len};
+pub use self::codec::{
+    decode_row_body_dense, encode_row_body_dense, encode_row_body_dense_into, row_body_encoded_len,
+};
 // v7.31 monster tier-3 cut 2 — HNSW algorithms moved to `nsw`; the
 // public vector-search surface keeps its `spg_storage::*` paths via
 // these re-exports, and `nsw_insert_at` stays crate-visible for the

@@ -99,6 +99,44 @@
 // streaming one is flat to within its run buffers (k x 256 KiB), which
 // is the whole of the growth left in it.
 //
+// Round 883 then took the ~12 ms that was still between this and the
+// materialising path, and rather more. A build that pushed a null
+// payload of the same arity — same keys, same record count, same merge —
+// ran 93 ms faster, and ablation split that three ways:
+//
+//   projection + 80 MB of wire   ~16 ms   `SELECT pad` vs `SELECT id`,
+//                                          same sort, same spill
+//   the whole spill round trip   <=15 ms  work_mem 4MB vs 4GB, runs
+//                                          witnessed 33 vs 0, RANGES
+//                                          OVERLAP so this is a ceiling
+//   the per-row clone            ~62 ms   what is left
+//
+// 16 + 15 + 62 = 93, which is the check. So the batch became an arena:
+// rows encoded back to back into one buffer as the scan hands them over
+// (borrowed, never cloned into an owned `Row`), keys flattened beside
+// them at a fixed stride, and a permutation sorted instead of the rows.
+// Spilling writes the arena out in that order and re-encodes nothing;
+// the budget meter is `arena.len()` rather than a per-row walk over the
+// values. Freeing is one buffer, not 400k.
+//
+// Same protocol, quiet machine, six rounds, starting side flipped:
+//
+//   round 882 (clone, streaming)   234.2 - 245.9 ms
+//   round 883 (arena)              177.5 - 184.5 ms
+//   PG18                           201.8 - 293.7 ms
+//
+// The arena's range sits entirely below PG's, so this endpoint is faster
+// than PG18 rather than level with it. The estimate that predicted it
+// (240 - 62 = 178) is the first in this stretch to survive measurement;
+// the five before it were all refuted, and the difference is that this
+// one was three separately checkable quantities rather than one guess.
+//
+// What it costs: the in-memory case now round-trips through the codec
+// where it used to keep `Row`s, so any value the dense encoding cannot
+// carry faithfully would show up in sorts that never spill, not only in
+// ones that do. That is the risk the gates are covering, not an argument
+// that the codec is complete.
+//
 // Where the cost is NOT, each measured rather than argued:
 //
 //   the codec, and the k-way merge's O(n*k) head scan       round 839
@@ -289,8 +327,26 @@ pub(crate) struct ExternalSorter<'a> {
     /// whose types are already declared.
     record_schema: TableSchema,
     descs: &'a [bool],
-    batch: Vec<(Vec<OrderKey>, Row<'static>)>,
-    batch_bytes: usize,
+    /// The batch, held the way PG holds one: the rows encoded back to
+    /// back in ONE buffer, the keys flattened beside them, and nothing
+    /// allocated per row.
+    ///
+    /// It used to be `Vec<(Vec<OrderKey>, Row<'static>)>`, which cost an
+    /// owned deep copy of every row on the way in — a `Vec` and a
+    /// `String` per text cell — and freed them one at a time on the way
+    /// out. Round 883 priced that clone at ~62 ms of a ~240 ms 400k-row
+    /// sort by ablation, against ~16 ms for the projection and the 80 MB
+    /// of wire and ~15 ms for the whole spill round trip.
+    arena: Vec<u8>,
+    /// Where row `i`'s body ENDS in `arena`; it starts at `ends[i - 1]`,
+    /// or 0 for the first. Byte offsets rather than slices so the arena
+    /// can grow underneath them.
+    ends: Vec<u32>,
+    /// Row `i`'s sort keys are `keys[i * key_stride ..][.. key_stride]`.
+    keys: Vec<OrderKey>,
+    /// Fixed by the first push: every row of one sort has the same
+    /// number of keys, because they come from the same ORDER BY.
+    key_stride: usize,
     runs: Vec<Box<dyn TempRun>>,
 }
 
@@ -309,8 +365,10 @@ impl<'a> ExternalSorter<'a> {
             budget_bytes,
             record_schema: TableSchema::new("spg_sort_run", record_cols),
             descs,
-            batch: Vec::new(),
-            batch_bytes: 0,
+            arena: Vec::new(),
+            ends: Vec::new(),
+            keys: Vec::new(),
+            key_stride: 0,
             runs: Vec::new(),
         }
     }
@@ -322,47 +380,106 @@ impl<'a> ExternalSorter<'a> {
     }
 
     /// `record` is the row the caller wants back in order — the source
-    /// row, so a spilled record can always be re-keyed.
+    /// row, so a spilled record can always be re-keyed. It is BORROWED:
+    /// the batch keeps its encoded bytes, not the row.
+    ///
+    /// `keys` is drained rather than consumed, so one caller-owned `Vec`
+    /// serves every row and keeps its capacity.
     pub(crate) fn push(
         &mut self,
-        keys: Vec<OrderKey>,
-        record: Row<'static>,
+        keys: &mut Vec<OrderKey>,
+        record: &Row<'_>,
     ) -> Result<(), EngineError> {
-        self.batch_bytes += crate::bytebudget::approx_values_bytes(&record.values);
-        self.batch.push((keys, record));
+        if self.ends.is_empty() {
+            self.key_stride = keys.len();
+        }
+        debug_assert_eq!(
+            keys.len(),
+            self.key_stride,
+            "every row of one sort carries the same number of keys"
+        );
+        self.keys.append(keys);
+        spg_storage::encode_row_body_dense_into(record, &self.record_schema, &mut self.arena);
+        let end = u32::try_from(self.arena.len()).map_err(|_| {
+            EngineError::Internal(alloc::string::String::from("sort batch larger than 4 GiB"))
+        })?;
+        self.ends.push(end);
         // Spilling needs somewhere to spill to. Without a factory this
         // is the old unbounded behaviour, deliberately.
-        if self.factory.is_some() && self.batch_bytes >= self.budget_bytes {
+        //
+        // The meter is exact and O(1) now: what the batch holds IS the
+        // arena, where it used to be a per-row walk over the values
+        // estimating what their `String`s cost.
+        if self.factory.is_some() && self.batch_bytes() >= self.budget_bytes {
             self.spill_batch()?;
         }
         Ok(())
     }
 
+    /// What the batch is holding, in bytes.
+    fn batch_bytes(&self) -> usize {
+        self.arena.len()
+            + self.keys.len() * core::mem::size_of::<OrderKey>()
+            + self.ends.len() * core::mem::size_of::<u32>()
+    }
+
+    /// Row `i`'s body, as a span into `arena`.
+    fn span(&self, i: usize) -> (usize, usize) {
+        let start = if i == 0 { 0 } else { self.ends[i - 1] as usize };
+        (start, self.ends[i] as usize)
+    }
+
+    /// The batch's row indices, in sorted order.
+    ///
+    /// A permutation rather than a sort of the rows themselves: the rows
+    /// are bytes in one buffer and moving them would cost more than the
+    /// indirection saves.
+    fn sorted_order(&self) -> Vec<u32> {
+        let mut order: Vec<u32> = (0..self.ends.len() as u32).collect();
+        if self.key_stride == 0 {
+            return order;
+        }
+        let (keys, stride, descs) = (&self.keys, self.key_stride, self.descs);
+        order.sort_by(|&a, &b| {
+            let (a, b) = (a as usize * stride, b as usize * stride);
+            cmp_multi_key_in(&keys[a..a + stride], &keys[b..b + stride], descs, &[])
+        });
+        order
+    }
+
+    fn clear_batch(&mut self) {
+        self.arena.clear();
+        self.ends.clear();
+        self.keys.clear();
+    }
+
     /// Sort what is held and write it out as one run, freeing the rows.
     fn spill_batch(&mut self) -> Result<(), EngineError> {
-        if self.batch.is_empty() {
+        if self.ends.is_empty() {
             return Ok(());
         }
         let Some(factory) = self.factory else {
             return Ok(());
         };
-        crate::orderby::sort_by_keys(&mut self.batch, self.descs);
+        let order = self.sorted_order();
         let mut run = factory()
             .map_err(|e| EngineError::Internal(alloc::format!("temp run create: {e:?}")))?;
-        for (_, row) in core::mem::take(&mut self.batch) {
-            let bytes = spg_storage::encode_row_body_dense(&row, &self.record_schema);
-            let len = u32::try_from(bytes.len()).map_err(|_| {
+        // The bytes are already encoded — a run is the arena written out
+        // in sorted order, so spilling re-encodes nothing.
+        for i in order {
+            let (start, end) = self.span(i as usize);
+            let len = u32::try_from(end - start).map_err(|_| {
                 EngineError::Internal(alloc::string::String::from("row too large to spill"))
             })?;
             run.append(&len.to_le_bytes())
                 .map_err(|e| EngineError::Internal(alloc::format!("temp run append: {e:?}")))?;
-            run.append(&bytes)
+            run.append(&self.arena[start..end])
                 .map_err(|e| EngineError::Internal(alloc::format!("temp run append: {e:?}")))?;
         }
         run.seal()
             .map_err(|e| EngineError::Internal(alloc::format!("temp run seal: {e:?}")))?;
         self.runs.push(run);
-        self.batch_bytes = 0;
+        self.clear_batch();
         Ok(())
     }
 
@@ -415,11 +532,18 @@ impl<'a> ExternalSorter<'a> {
         // the same reason PG projects through one reused slot.
         let mut scratch: Vec<Value<'static>> = Vec::new();
         if self.runs.is_empty() {
-            // Never spilled: one in-memory sort, exactly as before.
-            crate::orderby::sort_by_keys(&mut self.batch, self.descs);
-            for (_, r) in core::mem::take(&mut self.batch) {
+            // Never spilled: sort the batch where it lies and decode each
+            // row as it is handed over.
+            for i in self.sorted_order() {
+                let (start, end) = self.span(i as usize);
+                let (row, _) = spg_storage::decode_row_body_dense(
+                    &self.arena[start..end],
+                    &self.record_schema,
+                    spg_storage::CURRENT_ROW_CODEC_VERSION,
+                )
+                .map_err(|e| EngineError::Internal(alloc::format!("sort batch decode: {e:?}")))?;
                 scratch.clear();
-                project(&r, &mut scratch)?;
+                project(&row, &mut scratch)?;
                 emit(&scratch)?;
                 emitted += 1;
             }
@@ -611,8 +735,8 @@ mod tests {
         let mut s = ExternalSorter::new(Some(mem_run), 4096, record_cols(), &descs);
         for i in 0..5000i32 {
             let r = record((i * 7919) % 5000);
-            let k = keys_of(&r).unwrap();
-            s.push(k, r).unwrap();
+            let mut k = keys_of(&r).unwrap();
+            s.push(&mut k, &r).unwrap();
         }
 
         let projected = Cell::new(0usize);
@@ -654,8 +778,8 @@ mod tests {
             let mut b = ExternalSorter::new(Some(mem_run), budget, record_cols(), &descs);
             for i in 0..2000i32 {
                 let r = record((i * 7919) % 2000);
-                a.push(keys_of(&r).unwrap(), r.clone()).unwrap();
-                b.push(keys_of(&r).unwrap(), r).unwrap();
+                a.push(&mut keys_of(&r).unwrap(), &r).unwrap();
+                b.push(&mut keys_of(&r).unwrap(), &r).unwrap();
             }
             let spilled = !a.runs.is_empty();
             assert_eq!(
@@ -723,10 +847,10 @@ mod tests {
                     Value::Int(i32::try_from((i * 7919) % rows).unwrap()),
                     Value::text(pad.clone()),
                 ]);
-                let k = keys_of(&r).unwrap();
-                s.push(k, r).unwrap();
+                let mut k = keys_of(&r).unwrap();
+                s.push(&mut k, &r).unwrap();
             }
-            let runs = s.runs.len() + usize::from(!s.batch.is_empty());
+            let runs = s.runs.len() + usize::from(!s.ends.is_empty());
             let t = Instant::now();
             let out = s.finish(keys_of, |src| Ok(src.clone())).unwrap();
             let el = t.elapsed();
@@ -975,8 +1099,8 @@ mod tests {
                     Value::Int(i32::try_from((i * 7919) % ROWS).unwrap()),
                     Value::text(pad.clone()),
                 ]);
-                let k = keyfn(&r).unwrap();
-                s.push(k, r).unwrap();
+                let mut k = keyfn(&r).unwrap();
+                s.push(&mut k, &r).unwrap();
             }
             let t = Instant::now();
             let out = if narrow {
@@ -1029,10 +1153,10 @@ mod tests {
                     Value::Int(i32::try_from((i * 7919) % ROWS).unwrap()),
                     Value::text(pad.clone()),
                 ]);
-                let k = keys_of(&r).unwrap();
-                s.push(k, r).unwrap();
+                let mut k = keys_of(&r).unwrap();
+                s.push(&mut k, &r).unwrap();
             }
-            let runs = s.runs.len() + usize::from(!s.batch.is_empty());
+            let runs = s.runs.len() + usize::from(!s.ends.is_empty());
             let t = Instant::now();
             let out = s.finish(keys_of, |src| Ok(src.clone())).unwrap();
             std::eprintln!(
@@ -1141,8 +1265,8 @@ mod tests {
         let mut s = ExternalSorter::new(Some(mem_run), WORK_MEM, cols, &descs);
         let t1 = Instant::now();
         for r in rows {
-            let k = keys_of(&r).unwrap();
-            s.push(k, r).unwrap();
+            let mut k = keys_of(&r).unwrap();
+            s.push(&mut k, &r).unwrap();
         }
         let push_phase = t1.elapsed();
 
@@ -1167,8 +1291,8 @@ mod tests {
         let mut s = ExternalSorter::new(Some(mem_run), 1, record_cols(), &descs);
         for id in [7, 3, 9, 1, 8, 2, 6, 4, 5, 0] {
             let r = record(id);
-            let k = keys_of(&r).unwrap();
-            s.push(k, r).unwrap();
+            let mut k = keys_of(&r).unwrap();
+            s.push(&mut k, &r).unwrap();
         }
         assert!(s.spilled(), "a 1-byte budget must have produced runs");
         let out = s.finish(keys_of, project_pad_only).unwrap();
@@ -1200,8 +1324,8 @@ mod tests {
         let mut s = ExternalSorter::new(Some(mem_run), 1, record_cols(), &descs);
         for id in [7, 3, 9, 1, 8, 2, 6, 4, 5, 0] {
             let r = record(id);
-            let k = keys_of(&r).unwrap();
-            s.push(k, r).unwrap();
+            let mut k = keys_of(&r).unwrap();
+            s.push(&mut k, &r).unwrap();
         }
         assert!(s.spilled());
         let out = s.finish(keys_of, project_identity).unwrap();
@@ -1219,8 +1343,8 @@ mod tests {
         let mut s = ExternalSorter::new(Some(mem_run), 1, record_cols(), &descs);
         for id in [3, 1, 2] {
             let r = record(id);
-            let k = keys_of(&r).unwrap();
-            s.push(k, r).unwrap();
+            let mut k = keys_of(&r).unwrap();
+            s.push(&mut k, &r).unwrap();
         }
         assert!(s.spilled());
         assert_eq!(
@@ -1240,8 +1364,8 @@ mod tests {
         let mut s = ExternalSorter::new(None, 1, record_cols(), &descs);
         for id in [2, 0, 1] {
             let r = record(id);
-            let k = keys_of(&r).unwrap();
-            s.push(k, r).unwrap();
+            let mut k = keys_of(&r).unwrap();
+            s.push(&mut k, &r).unwrap();
         }
         assert!(!s.spilled(), "nothing to spill to means nothing spilled");
         let out = s.finish(keys_of, project_pad_only).unwrap();

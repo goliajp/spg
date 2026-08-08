@@ -7155,6 +7155,9 @@ impl Engine {
             &descs,
         );
         let snapshot = self.current_snapshot();
+        // One key buffer for the whole scan: `push` drains it and leaves
+        // the capacity behind.
+        let mut keys: Vec<OrderKey> = Vec::new();
         for (i, row) in table.scan_visible_from(0, &snapshot) {
             if i.is_multiple_of(256) {
                 cancel.check()?;
@@ -7165,9 +7168,9 @@ impl Engine {
                     continue;
                 }
             }
-            let mut keys = Vec::new();
+            keys.clear();
             crate::orderby::build_order_keys_bound(&order_by, &order_bound, row, &ctx, &mut keys)?;
-            sorter.push(keys, row.clone().into_owned())?;
+            sorter.push(&mut keys, row)?;
         }
 
         let key_ctx = &ctx;
@@ -7327,6 +7330,9 @@ impl Engine {
             &descs,
         );
         let snapshot = self.current_snapshot();
+        // One key buffer for the whole scan: `push` drains it and leaves
+        // the capacity behind.
+        let mut keys: Vec<OrderKey> = Vec::new();
         for (i, row) in table.scan_visible_from(0, &snapshot) {
             if i.is_multiple_of(256) {
                 cancel.check()?;
@@ -7337,9 +7343,9 @@ impl Engine {
                     continue;
                 }
             }
-            let mut keys = Vec::new();
+            keys.clear();
             crate::orderby::build_order_keys_bound(&order_by, &order_bound, row, &ctx, &mut keys)?;
-            sorter.push(keys, row.clone().into_owned())?;
+            sorter.push(&mut keys, row)?;
         }
 
         let columns: Vec<ColumnSchema> = projection

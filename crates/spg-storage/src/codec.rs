@@ -1820,15 +1820,32 @@ fn value_body_encoded_len(v: &Value<'_>, _ty: DataType) -> usize {
 /// is expected to have been validated by `Table::insert` (the
 /// engine's INSERT path) before reaching this function.
 pub fn encode_row_body_dense(row: &Row<'_>, schema: &TableSchema) -> Vec<u8> {
+    let bitmap_bytes = schema.columns.len().div_ceil(8);
+    // 8 B per fixed-width cell is a reasonable average; the buffer
+    // grows past this for variable-width Text/Vector cells.
+    let mut out = Vec::with_capacity(bitmap_bytes + schema.columns.len() * 8);
+    encode_row_body_dense_into(row, schema, &mut out);
+    out
+}
+
+/// v7.37 (round 883) — [`encode_row_body_dense`] appending to a buffer
+/// the caller owns.
+///
+/// The body was always written relative to `out.len()`, so this is the
+/// same encoding, not a variant of it. What it buys is a caller that
+/// encodes many rows back to back into ONE growing buffer: the sorter
+/// holds its batch that way, which is what lets it stop cloning each
+/// row into an owned `Row` first. Measured on a 400k-row spilled sort,
+/// that clone was ~62 ms of a ~240 ms query — the largest single item on
+/// the endpoint, and the step PG does not have, writing its tuple
+/// straight into sort memory instead.
+pub fn encode_row_body_dense_into(row: &Row<'_>, schema: &TableSchema, out: &mut Vec<u8>) {
     debug_assert_eq!(
         row.values.len(),
         schema.columns.len(),
         "dense encode: row arity must match schema"
     );
     let bitmap_bytes = schema.columns.len().div_ceil(8);
-    // 8 B per fixed-width cell is a reasonable average; the buffer
-    // grows past this for variable-width Text/Vector cells.
-    let mut out = Vec::with_capacity(bitmap_bytes + schema.columns.len() * 8);
     let bitmap_offset = out.len();
     out.resize(bitmap_offset + bitmap_bytes, 0);
     for (i, v) in row.values.iter().enumerate() {
@@ -1840,9 +1857,8 @@ pub fn encode_row_body_dense(row: &Row<'_>, schema: &TableSchema) -> Vec<u8> {
         if matches!(v, Value::Null) {
             continue;
         }
-        write_value_body(&mut out, v, schema.columns[col_idx].ty);
+        write_value_body(out, v, schema.columns[col_idx].ty);
     }
-    out
 }
 
 /// Inverse of [`encode_row_body_dense`]. Reads one row's body from
