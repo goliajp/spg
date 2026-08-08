@@ -36,6 +36,20 @@ fn read_packet(stream: &mut TcpStream) -> (u8, Vec<u8>) {
     (seqno, payload)
 }
 
+/// Like `send_query`, but hands back the write error instead of
+/// panicking: a connection the server has already closed refuses the
+/// write, and for a test about closure that is an answer, not a fault.
+fn write_query(stream: &mut TcpStream, sql: &str) -> std::io::Result<()> {
+    let mut payload = Vec::with_capacity(1 + sql.len());
+    payload.push(0x03); // COM_QUERY
+    payload.extend_from_slice(sql.as_bytes());
+    let len = u32::try_from(payload.len()).expect("query fits a packet");
+    let hdr = [len as u8, (len >> 8) as u8, (len >> 16) as u8, 0u8];
+    stream.write_all(&hdr)?;
+    stream.write_all(&payload)?;
+    Ok(())
+}
+
 fn write_packet(stream: &mut TcpStream, seqno: u8, payload: &[u8]) {
     let len = payload.len() as u32;
     let hdr = [len as u8, (len >> 8) as u8, (len >> 16) as u8, seqno];
@@ -834,11 +848,23 @@ fn kill_connection_drops_the_named_connection() {
     assert_eq!(errno, 1094, "the id is no longer live");
 
     // The victim's socket really is closed — a further exchange fails.
-    send_query(&mut victim, "SELECT 1");
+    //
+    // Either half may be the one to report it. A closed TCP connection
+    // refuses the write with EPIPE if the close has already landed, and
+    // refuses the read if it lands while the request is in flight; which
+    // of the two happens is a question of how busy the machine is, not
+    // of whether the connection is gone. Round 858's gate saw the write
+    // side, twice, on a box under load, where the same test passes alone
+    // and passes 540-for-540 twice through the whole e2e suite.
+    //
+    // So the assertion is that the exchange fails, not that it fails in
+    // a particular half.
     let mut hdr = [0u8; 4];
+    let exchange_failed =
+        write_query(&mut victim, "SELECT 1").is_err() || victim.read_exact(&mut hdr).is_err();
     assert!(
-        victim.read_exact(&mut hdr).is_err(),
-        "the killed connection must be closed"
+        exchange_failed,
+        "the killed connection must be closed, on write or on read"
     );
 
     // And the killer is untouched.

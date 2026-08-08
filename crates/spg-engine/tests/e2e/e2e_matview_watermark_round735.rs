@@ -288,13 +288,13 @@ fn round740_delta_engages_at_server_scale() {
     e.execute("UPDATE big740 SET g = 99 WHERE id = 10").unwrap();
     e.execute("DELETE FROM big740 WHERE id IN (20, 21)")
         .unwrap();
-    let t0 = std::time::Instant::now();
     e.execute("REFRESH MATERIALIZED VIEW mvb740").unwrap();
-    let delta_ms = t0.elapsed().as_micros() as f64 / 1000.0;
-    assert!(
-        delta_ms < 20.0,
-        "the delta refresh must be far under the ~180ms full recompute, got {delta_ms}ms"
-    );
+    // Which path ran is what matters, and the counter below says so
+    // outright. A wall-clock stand-in used to sit here — "under 20 ms,
+    // where the full recompute takes ~180" — which asks the machine
+    // rather than the engine: it reports a defect when the box is busy
+    // and misses one whenever the box is fast enough to recompute 500k
+    // rows inside the budget.
     assert!(
         spg_engine::MATVIEW_DELTA_APPLIED.load(Ordering::Relaxed) > applied0,
         "500k-scale refresh must take the delta path (bailed delta: {})",

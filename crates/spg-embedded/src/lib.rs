@@ -1666,8 +1666,22 @@ pub(crate) static FSYNC_PANIC_OBSERVED: std::sync::atomic::AtomicBool =
 /// a single chokepoint to hook.
 #[inline]
 fn wal_sync_data(f: &mut File) -> std::io::Result<()> {
+    WAL_FSYNC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     f.sync_data()
 }
+
+/// How many times the WAL has been fsynced, for tests that need to say
+/// what group-commit actually promises: N concurrent writes cost far
+/// fewer than N durable syncs.
+///
+/// Round 858 — `group_commit.rs` asserted that instead through the
+/// clock, "64 inserts in under 128 ms, since serial would be ~256". A
+/// wall-clock stand-in for batching answers the machine rather than the
+/// engine: it fails on a busy box that batches perfectly, and passes on
+/// a fast disk that batches nothing. The count does not move when the
+/// machine does. Same shape as `MATVIEW_DELTA_APPLIED` next door in
+/// spg-engine, and the chokepoint above was kept for exactly this.
+pub static WAL_FSYNC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn chunk_filename(unix_us: i64, leading_lsn: u64) -> String {
     // Negative timestamps shouldn't happen in practice (we sit
