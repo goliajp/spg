@@ -2472,6 +2472,23 @@ fn type_name_to_data_type_lower(n: &str) -> Option<DataType> {
         "bit" => DataType::Bit(0),
         "varbit" | "bit varying" => DataType::BitVarying(0),
         "xml" => DataType::Xml,
+        // v7.37 (round 894) — the four names a QUOTED cast could not
+        // reach. `::tsvector` parses as a keyword arm and works;
+        // `::"tsvector"` becomes `CastTarget::Named("tsvector")` and lands
+        // here, where these four were absent, so PG18's own spelling
+        // answered `type "tsvector" does not exist`. Everything a client
+        // generates with quoted identifiers — ORMs, pg_dump output — takes
+        // that path. Enumerated against PG18: of its 75 builtin scalar and
+        // range types, PG accepts every one quoted and SPG rejected exactly
+        // these.
+        "tsvector" => DataType::TsVector,
+        "tsquery" => DataType::TsQuery,
+        // `regclass` / `regtype` are the other two PG18 accepts quoted and
+        // SPG does not, but they have no `DataType` of their own — they
+        // live as `Value::RegClass` / `Value::RegType` and their casts are
+        // special-cased at value level. Routing them here would need that
+        // path, not a name-to-DataType row, so they stay open rather than
+        // guessed at.
         "money" => DataType::Money,
         "char1" => DataType::Char1,
         // Geometry (v7.37.5 ε).

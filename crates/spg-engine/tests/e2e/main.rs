@@ -1174,6 +1174,7 @@ mod e2e_plan_cache;
 mod e2e_plan_cache_invalidation;
 mod e2e_power;
 mod e2e_query_clause_pg_differential;
+mod e2e_quoted_type_cast_round894;
 mod e2e_random;
 mod e2e_recursive_cte_values;
 mod e2e_recursive_cte_wellformed_round145;
