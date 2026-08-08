@@ -388,6 +388,167 @@ mod tests {
         Ok(src.clone())
     }
 
+    /// r853 — is the merge's remaining time the linear head scan after all?
+    ///
+    /// Round 844 concluded it was not, from 29 runs merging no slower
+    /// than 2. That comparison was confounded and the test said so at
+    /// the time: the 2-run reading uses a 64 MB budget, so `finish`
+    /// sorts a ~95k-row final batch in memory before merging anything,
+    /// and that sort hid whatever the head scan was doing.
+    ///
+    /// With keys (~0 ms), the output clone (~13 ms) and decoding
+    /// (~13 ms) all priced, the ~93 ms left has nowhere else to be:
+    /// picking each output row scans every run's head, which at a 4 MB
+    /// budget is 400k x 29 = 11.6M comparisons.
+    ///
+    /// Priced directly here. A loser tree would make it
+    /// 400k x log2(29) ~ 2M.
+    ///
+    /// `cargo test -p spg-engine --release --lib r853 -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn r853_price_the_head_scan() {
+        extern crate std;
+        use std::time::Instant;
+
+        const ROWS: usize = 400_000;
+        const RUNS: usize = 29;
+        let descs = [false];
+
+        // One key per run head, as the merge holds them.
+        let heads: Vec<Vec<OrderKey>> = (0..RUNS)
+            .map(|i| alloc::vec![OrderKey::Int(i128::try_from(i * 7919).unwrap())])
+            .collect();
+
+        // What the merge does per output row: scan every head, keep the
+        // smallest.
+        let t = Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..ROWS {
+            let mut best = 0usize;
+            for (i, k) in heads.iter().enumerate().skip(1) {
+                if cmp_multi_key_in(k, &heads[best], &descs, &[]) == core::cmp::Ordering::Less {
+                    best = i;
+                }
+            }
+            sink += best;
+        }
+        let linear = t.elapsed();
+
+        // What a loser tree would do: log2(RUNS) comparisons per row.
+        let depth = usize::BITS as usize - RUNS.leading_zeros() as usize;
+        let t = Instant::now();
+        let mut sink2 = 0usize;
+        for _ in 0..ROWS {
+            let mut best = 0usize;
+            for step in 0..depth {
+                let i = (step + 1) % RUNS;
+                if cmp_multi_key_in(&heads[i], &heads[best], &descs, &[])
+                    == core::cmp::Ordering::Less
+                {
+                    best = i;
+                }
+            }
+            sink2 += best;
+        }
+        let treeish = t.elapsed();
+
+        std::eprintln!(
+            "R853 linear({RUNS} heads)={linear:?} tree-depth({depth})={treeish:?} \
+             cmps={} vs {} sink={sink}/{sink2}",
+            ROWS * (RUNS - 1),
+            ROWS * depth
+        );
+    }
+
+    /// r852 — of the merge's 93 ms that is not keys and not the output
+    /// clone, how much is DECODING?
+    ///
+    /// A spilled record comes back as bytes and has to become a `Row`
+    /// again, which allocates and fills an owned `String` for the 200
+    /// byte column, once per row. PG reads a tuple off its tape and
+    /// passes it along without rebuilding it field by field, and spends
+    /// about 70 ms on the whole of spilling where this merge phase
+    /// alone spends 105 ms — so the rebuild is the candidate.
+    ///
+    /// Priced against the alternative that is not a design change:
+    /// reading the same bytes back and not decoding them. The
+    /// difference is what decoding costs; what is left is the read
+    /// itself, which no design avoids.
+    ///
+    /// `cargo test -p spg-engine --release --lib r852 -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn r852_price_the_decode() {
+        extern crate std;
+        use spg_storage::{ColumnSchema, DataType, Value};
+        use std::time::Instant;
+
+        const ROWS: usize = 400_000;
+        let pad: alloc::string::String = "y".repeat(200);
+        let schema = TableSchema::new(
+            "spg_sort_run",
+            alloc::vec![
+                ColumnSchema::new("id", DataType::Int, false),
+                ColumnSchema::new("pad", DataType::Text, false),
+            ],
+        );
+
+        // Lay the rows out exactly as a run does: length-prefixed bodies
+        // in one buffer.
+        let mut tape: Vec<u8> = Vec::new();
+        for i in 0..ROWS {
+            let row = Row::new(alloc::vec![
+                Value::Int(i32::try_from(i).unwrap()),
+                Value::text(pad.clone()),
+            ]);
+            let body = spg_storage::encode_row_body_dense(&row, &schema);
+            tape.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
+            tape.extend_from_slice(&body);
+        }
+        std::eprintln!("R852 tape={} bytes for {ROWS} rows", tape.len());
+
+        // (a) walk the tape, decode every row.
+        let t = Instant::now();
+        let mut at = 0usize;
+        let mut decoded = 0usize;
+        while at < tape.len() {
+            let len =
+                u32::from_le_bytes([tape[at], tape[at + 1], tape[at + 2], tape[at + 3]]) as usize;
+            at += 4;
+            let (row, _) = spg_storage::decode_row_body_dense(
+                &tape[at..at + len],
+                &schema,
+                spg_storage::CURRENT_ROW_CODEC_VERSION,
+            )
+            .unwrap();
+            core::hint::black_box(&row);
+            at += len;
+            decoded += 1;
+        }
+        let with_decode = t.elapsed();
+
+        // (b) walk the same tape, touch the same bytes, decode nothing.
+        let t = Instant::now();
+        let mut at = 0usize;
+        let mut seen = 0usize;
+        while at < tape.len() {
+            let len =
+                u32::from_le_bytes([tape[at], tape[at + 1], tape[at + 2], tape[at + 3]]) as usize;
+            at += 4;
+            core::hint::black_box(&tape[at..at + len]);
+            at += len;
+            seen += 1;
+        }
+        let walk_only = t.elapsed();
+
+        std::eprintln!(
+            "R852 decode+walk={with_decode:?} walk_only={walk_only:?} rows={decoded}/{seen}"
+        );
+        assert_eq!(decoded, ROWS);
+        assert_eq!(seen, ROWS);
+    }
+
     /// r851 — how much of the merge is RE-DERIVING the sort keys?
     ///
     /// Every earlier reading of this used a `keys_of` that reads
