@@ -283,6 +283,90 @@ fn a_bare_column_that_matches_two_relations_is_ambiguous_not_undefined() {
     );
 }
 
+/// The observable that DOES separate streaming from materialising:
+/// what the server's memory does while the answer is being sent.
+///
+/// Round 856 established that the wire cannot tell them apart — round
+/// 824's `emit_materialised` hands rows to the consumer one at a time,
+/// so both paths deliver early and both cancel between rows. Memory is
+/// where they differ, because one of them holds the whole result while
+/// the other holds a row.
+///
+/// 200k rows of 200 bytes is a 40 MB answer. A path that builds it
+/// whole cannot do so in under 20 MB; a path that walks it barely moves.
+/// The threshold is half the result, so it is the SHAPE of the query
+/// that decides this, not the speed of the machine — the same reason
+/// round 857 preferred an order to a ratio.
+///
+/// Round 859 checked it: with every streaming entry gated off, the
+/// server grew 89 MiB for a 38 MiB answer — about 2.3x the result, the
+/// shape of whole rows collected into a `Vec<Row>` and then encoded —
+/// and this goes red. Under the streaming walk it stays under 20.
+#[test]
+fn a_bare_projection_walks_the_table_instead_of_copying_it() {
+    let (child, addrs) = spawn("rss");
+    let pid = child.0.id();
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+    ok(&mut s, "CREATE TABLE big (id INT PRIMARY KEY, pad TEXT)");
+    const ROWS: usize = 200_000;
+    ok(
+        &mut s,
+        &format!("INSERT INTO big SELECT g, repeat('y', 200) FROM generate_series(1,{ROWS}) g"),
+    );
+
+    // Settle first: the insert's own buffers are not what is being
+    // measured, and a baseline taken while they drain would flatter the
+    // reading.
+    for _ in 0..20 {
+        if col0(&ok(&mut s, "SELECT count(*) FROM big")) == vec![ROWS.to_string()] {
+            break;
+        }
+    }
+    let base_kib = common::rss_kib_of(pid);
+    assert!(base_kib > 0, "could not read the server's RSS");
+
+    // Sample while the rows are in flight. The peak is the point: a
+    // materialising path is at its widest with the result assembled and
+    // nothing sent yet, which a reading taken afterwards would miss
+    // entirely.
+    let peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = {
+        let (peak, stop) = (peak.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let now = common::rss_kib_of(pid);
+                peak.fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
+
+    send_query(&mut s, "SELECT pad FROM big");
+    let mut rows = 0usize;
+    loop {
+        let m = read_message(&mut s);
+        match m.ty {
+            b'D' => rows += 1,
+            b'E' => panic!("the scan errored: {}", message_of(&[m])),
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    sampler.join().unwrap();
+    assert_eq!(rows, ROWS, "the whole table came back");
+
+    let peak_kib = peak.load(std::sync::atomic::Ordering::Relaxed);
+    let grew_mib = peak_kib.saturating_sub(base_kib) / 1024;
+    assert!(
+        grew_mib < 20,
+        "the server grew {grew_mib} MiB while sending a {} MiB result: it \
+         built the answer whole instead of walking the table",
+        (ROWS * 200) / (1024 * 1024)
+    );
+}
+
 /// ⚠️ What this pins, and what it does NOT.
 ///
 /// The name promises the bare projection STREAMS rather than being built
