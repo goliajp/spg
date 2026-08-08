@@ -26,7 +26,13 @@
 //! for its own reason, and together they say something about the paths:
 //!
 //!   * `ORDER BY` sorts the whole result before encoding anything, so
-//!     the error arrived with the buffer still empty;
+//!     the error arrived with the buffer still empty. NOTE (round 882):
+//!     that stopped being true for the shape the bounded sort serves —
+//!     a single-table `ORDER BY` with no LIMIT/DISTINCT/join now emits
+//!     each row as the k-way merge produces it, so rows CAN already be
+//!     on the wire when a later one fails. Nothing here depends on the
+//!     old behaviour, and the cancellation case below is now reachable
+//!     through this shape;
 //!   * putting the failing expression in the projection took the query
 //!     off the streaming path altogether — an arithmetic projection
 //!     materialises, and failed there, before a row reached the wire;

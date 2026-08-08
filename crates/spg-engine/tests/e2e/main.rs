@@ -1208,6 +1208,7 @@ mod e2e_show_misc_mysql;
 mod e2e_sign;
 mod e2e_slow_query;
 mod e2e_snapshot;
+mod e2e_sorted_stream_children_round882;
 mod e2e_spg_stat_query;
 mod e2e_spg_stat_views;
 mod e2e_split_part;
