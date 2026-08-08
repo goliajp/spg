@@ -664,6 +664,18 @@ Size formatting (the post-7.37.12 branch real):
 - `pg_bytes_pretty` — alias for pg_size_pretty;
 - `pg_object_size` / `pg_relation_size_pretty` → 0.
 
+> **Verified round 872.** Fourteen statements covering ~40 of the
+> functions below — the interval canonicalizers, both size formatters,
+> trig/hyperbolic/inverse, log/exp, the rounding family, gcd/lcm/
+> factorial/width_bucket — matched PG18 value for value, with one
+> exception that is not a defect: `cbrt(27)` answers 3 here and
+> 3.0000000000000004 on the PG container. That build's `cbrt(27)`
+> equals `exp(ln(27)/3)` to the last bit while its cbrt(8), cbrt(64)
+> and cbrt(1000) are exact, so it falls back to the approximation at
+> that point; SPG calls the same `libm::cbrt` PG's source does. Recorded
+> as an environment difference rather than an advantage — another PG
+> build may not show it. Ledger item 28.
+
 Real trig (the post-7.37.12 branch via libm):
 - `sin/cos/tan/asin/acos/atan/atan2` (radian);
 - `sinh/cosh/tanh/asinh/acosh/atanh` (hyperbolic);

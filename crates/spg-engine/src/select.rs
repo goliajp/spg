@@ -4489,6 +4489,14 @@ impl Engine {
         //   if let Some(done) = self.try_spill_sorted_scan(stmt, from, cancel)? {
         //       return Ok(done);
         //   }
+        //
+        // v7.37 (round 882) — this walk stays unhooked, but its streaming
+        // twin `try_spill_sorted_stream` IS hooked, above the ORDER BY
+        // bail in `try_exec_joined_streaming`. Collecting the answer was
+        // most of what this one cost: handing rows over as the merge
+        // produces them holds peak to the budget plus one row, and the
+        // wall clock lands inside PG18's range rather than 1.55x outside
+        // it. Numbers in `extsort.rs`'s header.
         let primary = &from.primary;
         // v7.39 (round 244) — a sequence is selectable as a one-row relation
         // in PG (`SELECT last_value FROM seq` — psql's \d and several ORMs
@@ -7102,6 +7110,18 @@ impl Engine {
         {
             return Ok(None);
         }
+        // A parent's rows are its children's. These walks scan the named
+        // relation alone, so a partitioned or inherited parent comes back
+        // short — and silently: the corpus caught `SELECT id FROM pr
+        // ORDER BY id` and `SELECT k FROM pl ORDER BY k` returning the
+        // parent's own rows instead of the partitions'. `ONLY` is exactly
+        // the case that does not fan out, so it stays, which is the test
+        // the FROM-clause fan-out itself makes.
+        if !from.primary.only
+            && crate::partition::has_children(self.active_catalog(), &from.primary.name)
+        {
+            return Ok(None);
+        }
         let Some(table) = self.active_catalog().get(&from.primary.name) else {
             return Ok(None);
         };
@@ -7184,6 +7204,192 @@ impl Engine {
             })
             .collect();
         Ok(Some(QueryResult::Rows { columns, rows }))
+    }
+
+    /// v7.37 (round 882) — the bounded sort of `try_spill_sorted_scan`,
+    /// handing each row to the consumer instead of collecting the answer.
+    ///
+    /// That walk bounds the SORT and then returns `QueryResult::Rows`,
+    /// which holds every output row. Measured at `work_mem = 4 MB` over
+    /// 200-byte rows, RSS above the server's own baseline while the
+    /// query runs grew +30 MB at 100k rows, +68 MB at 200k and +137 MB
+    /// at 400k — linear — while the spill underneath worked correctly
+    /// (9 / 17 / 33 runs, witnessed DURING the query; `FileRun::drop`
+    /// removes each file, so a count taken afterwards reads 0 whatever
+    /// happened, and an earlier reading of "no spill at all" was that
+    /// blind witness). The growth is the collected result, not the sort.
+    ///
+    /// Emitting makes peak the budget, one buffer per run and a single
+    /// row — the state a merge already holds at every step. It also
+    /// frees each projected row as the next is built rather than
+    /// accumulating them, which is where the time is: a profile of the
+    /// collecting walk put the allocator at 586 samples, more than every
+    /// sort comparison combined (420), against 19 for `push` itself.
+    fn try_spill_sorted_stream<F>(
+        &self,
+        stmt: &SelectStatement,
+        from: &FromClause,
+        cancel: CancelToken<'_>,
+        emit: &mut F,
+    ) -> Result<Option<usize>, EngineError>
+    where
+        F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
+    {
+        // The shapes `try_spill_sorted_scan` declines, plus the ones the
+        // streaming executor does not carry (a LIMIT is already bounded
+        // by a partial sort; the rest need the answer addressable).
+        if !self.can_spill()
+            || stmt.order_by.is_empty()
+            || stmt.distinct
+            || stmt.limit_with_ties
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+            || stmt.having.is_some()
+            || stmt.group_by.is_some()
+            || !stmt.unions.is_empty()
+            || !from.joins.is_empty()
+            || from.primary.lateral_subquery.is_some()
+            || from.primary.unnest_expr.is_some()
+            || from.primary.as_of_segment.is_some()
+            || from.primary.generate_series_args.is_some()
+            || select_has_window(stmt)
+            || aggregate::uses_aggregate(stmt)
+        {
+            return Ok(None);
+        }
+        if stmt
+            .items
+            .iter()
+            .any(|i| matches!(i, SelectItem::Expr { expr, .. } if is_top_level_unnest(expr)))
+        {
+            return Ok(None);
+        }
+        // Everything `exec_bare_select_cancel` does before it scans runs
+        // BELOW this path, so a statement claimed here skips it. Three of
+        // those were missed on the way in and each was caught by a
+        // different gate — the ORDER BY rules by an e2e (`SELECT a FROM t
+        // ORDER BY 2` sorted happily instead of raising 42P10), the
+        // cancellation check by another, the partition fan-out by the
+        // differential corpus. What is reconciled, item by item: with-ties
+        // needs ORDER BY (gated above), USING/NATURAL and RLS join
+        // rewrites (joins gated above), the single-table RLS predicate
+        // (the dispatcher declines a policy-subject table before this is
+        // reached), the meta-view dispatch (those names are not in the
+        // catalog, so the lookup below declines). These three are calls,
+        // so the message and SQLSTATE are the ones the fall-back gives —
+        // `select_has_window` above reads the select list and ORDER BY but
+        // not WHERE, which is the case the third one covers.
+        crate::orderby::check_order_by_legality(stmt)?;
+        crate::orderby::check_order_by_positions(stmt)?;
+        crate::window::reject_window_in_row_clauses(stmt)?;
+        // A parent's rows are its children's. These walks scan the named
+        // relation alone, so a partitioned or inherited parent comes back
+        // short — and silently: the corpus caught `SELECT id FROM pr
+        // ORDER BY id` and `SELECT k FROM pl ORDER BY k` returning the
+        // parent's own rows instead of the partitions'. `ONLY` is exactly
+        // the case that does not fan out, so it stays, which is the test
+        // the FROM-clause fan-out itself makes.
+        if !from.primary.only
+            && crate::partition::has_children(self.active_catalog(), &from.primary.name)
+        {
+            return Ok(None);
+        }
+        let Some(table) = self.active_catalog().get(&from.primary.name) else {
+            return Ok(None);
+        };
+        // Cold-tier rows live outside `rows()`; this walk would drop
+        // them silently, the same reason round 831's walk declines.
+        if table.has_cold_rows_fast() {
+            return Ok(None);
+        }
+
+        let alias = from
+            .primary
+            .alias
+            .as_deref()
+            .unwrap_or(from.primary.name.as_str());
+        let cols = table.schema().columns.clone();
+        let sess = self.dml_session();
+        let ctx = EvalContext::new(&cols, Some(alias))
+            .with_catalog(self.active_catalog())
+            .with_session(&sess);
+        let projection = build_projection(&stmt.items, &cols, alias, self.backslash_escapes)?;
+        let order_by = stmt.order_by.clone();
+        // The same one-shot resolution the general path does (round
+        // 582): each ORDER BY column is bound once, not once per row.
+        let order_bound = crate::orderby::order_by_bound_positions(&order_by, &cols, Some(alias));
+        let descs: Vec<bool> = order_by.iter().map(|o| o.desc).collect();
+
+        let mut sorter = crate::extsort::ExternalSorter::new(
+            self.temp_run_factory,
+            self.session_work_mem_bytes(),
+            cols.clone(),
+            &descs,
+        );
+        let snapshot = self.current_snapshot();
+        for (i, row) in table.scan_visible_from(0, &snapshot) {
+            if i.is_multiple_of(256) {
+                cancel.check()?;
+            }
+            if let Some(w) = &stmt.where_ {
+                let cond = crate::eval::eval_expr(w, row, &ctx).map_err(EngineError::Eval)?;
+                if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
+                    continue;
+                }
+            }
+            let mut keys = Vec::new();
+            crate::orderby::build_order_keys_bound(&order_by, &order_bound, row, &ctx, &mut keys)?;
+            sorter.push(keys, row.clone().into_owned())?;
+        }
+
+        let columns: Vec<ColumnSchema> = projection
+            .iter()
+            .map(|p| {
+                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
+                c.user_enum_type = p.user_enum_type.clone();
+                c.mysql_fsp = p.mysql_fsp;
+                c
+            })
+            .collect();
+        emit(crate::StreamItem::Header(&columns))?;
+
+        let key_ctx = &ctx;
+        let mut emitted_since_check = 0usize;
+        let n = sorter.finish_each(
+            |src| {
+                let mut buf = Vec::new();
+                crate::orderby::build_order_keys_bound(
+                    &order_by,
+                    &order_bound,
+                    src,
+                    key_ctx,
+                    &mut buf,
+                )?;
+                Ok(buf)
+            },
+            |src, values| {
+                for p in &projection {
+                    values.push(
+                        crate::eval::eval_expr(&p.expr, src, key_ctx).map_err(EngineError::Eval)?,
+                    );
+                }
+                Ok(())
+            },
+            |cells| {
+                // The merge is the long half of a big sort, and the scan's
+                // check above stops running once it ends: a cancelled
+                // `SELECT pad FROM big ORDER BY id` delivered all 120k rows
+                // anyway. Same stride as the scan.
+                emitted_since_check += 1;
+                if emitted_since_check >= 256 {
+                    emitted_since_check = 0;
+                    cancel.check()?;
+                }
+                let cell_refs: Vec<&Value> = cells.iter().collect();
+                emit(crate::StreamItem::Row(&cell_refs))
+            },
+        )?;
+        Ok(Some(n))
     }
 
     fn try_stream_single_table<F>(
@@ -7292,6 +7498,14 @@ impl Engine {
         // join. The deferred-join structure handles one source as the
         // degenerate stride-1 case, so the walk below is unchanged.
         let _single_table = from.joins.is_empty();
+        // An ORDER BY that the bounded sort can serve streams; everything
+        // else still falls to the materialising fallback below.
+        if !stmt.order_by.is_empty()
+            && from.joins.is_empty()
+            && let Some(n) = self.try_spill_sorted_stream(stmt, from, cancel, emit)?
+        {
+            return Ok(Some(n));
+        }
         if !stmt.order_by.is_empty()
             || stmt.limit.is_some()
             || stmt.offset.is_some()

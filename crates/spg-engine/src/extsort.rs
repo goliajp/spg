@@ -45,8 +45,12 @@
 //! and is sorted in memory. That is a ceiling the host opts into, not
 //! one imposed on it.
 
-// Phase B's core, unit-tested and NOT on any query path — the wiring is
-// written and measured but held on the perf red line.
+// Phase B's core. `try_spill_sorted_scan`, which collects the answer
+// into a `QueryResult::Rows`, is still NOT on any query path — it was
+// written and measured and held on the perf red line. What IS hooked, as
+// of round 882, is `try_spill_sorted_stream`: the same bounded sort
+// emitting through the streaming executor, which is what `finish_each`
+// below exists to serve.
 //
 // Numbers, all taken under `docs/BENCH_PROTOCOL.md` (same psql on both
 // sides, a non-indexed sort key so PG really sorts, row counts verified,
@@ -63,8 +67,37 @@
 // same run falls from 807 MB to 129 MB, and eight ORDER BY shapes give
 // byte-identical answers spilled and unspilled.
 //
-// Wiring it would turn an endpoint SPG currently WINS into one it loses,
-// which is a hard stop whatever the memory buys.
+// Wiring THAT would turn an endpoint SPG currently WINS into one it
+// loses, which is a hard stop whatever the memory buys. What round 882
+// hooked instead is the streaming twin, and its account is different —
+// four binaries in one interleaved run, quiet machine (load 1.6 - 1.8),
+// six rounds with the order rotating, same 400k x 200-byte table and
+// `work_mem = 4MB` on every side, PG's plan confirmed `external merge`:
+//
+//   SPG materialising (what shipped)     219.6 - 237.8 ms
+//   SPG spilled + streaming              240.8 - 252.9 ms
+//   SPG spilled + streaming + reused buf 233.4 - 243.3 ms
+//   PG18                                 201.8 - 293.7 ms
+//
+// Streaming alone cost about 20 ms against the materialising path, and
+// the ranges did not overlap, so that cost was real. Reusing one
+// projection buffer instead of building a `Vec` per row gave back about
+// 7 ms of it and brings the ranges back into overlap; the median is
+// still ~12 ms above. Against PG the ranges overlap in both windows
+// measured, which under `BENCH_PROTOCOL.md` rule 4 is no measured
+// difference — PG's spread is wide here (201 - 294) where SPG's is tight.
+//
+// What the streaming buys, measured the same way (RSS above the server's
+// own baseline, sampled while the query runs, spill runs counted DURING
+// it):
+//
+//              100k rows      200k rows      400k rows
+//   shipping   +56 MB (0)     +133 MB (0)    +253 MB (0 runs)
+//   streaming  +12 MB (6)     +16 MB (17)    +26 MB (33 runs)
+//
+// The shipping path never spills at all — that is why it is linear. The
+// streaming one is flat to within its run buffers (k x 256 KiB), which
+// is the whole of the growth left in it.
 //
 // Where the cost is NOT, each measured rather than argued:
 //
@@ -82,12 +115,36 @@
 // mistake in it. The comparison worth closing is server-side and smaller
 // than the wall clock suggests: 224 ms of spill machinery against PG's
 // 152 ms.
+//
+// Round 880 put a profiler on it, and that last reading was wrong.
+// Sampling the walk under load, by leaf symbol: the ALLOCATOR takes 586
+// samples (malloc/free/realloc/zone), more than every sort comparison
+// combined (420: `order_key_elem_cmp` 154, quicksort 128, `sift_down`
+// 59, `head_cmp` 42, insert_tail 37), against 19 for `push` itself. The
+// cost is not the codec and not the merge — it is that each row is
+// allocated and freed individually, roughly three of each per row, where
+// PG palloc's into a context and frees it in one go.
+//
+// Two of the eight rounds that reached that conclusion were measuring
+// nothing, and both failures looked like data:
+//
+//   * Timers bracketing `approx_values_bytes` and `Vec::push` inside
+//     `push` reported 7 and 9 ms against 116 for the body they sit in.
+//     `Instant::now()` does not stop LLVM sinking a store past it, so
+//     they timed an emptied position. Ablation — delete the step, time
+//     the whole — cannot be defeated that way and is what round 877
+//     onward used.
+//   * The probe counted spill files after the query, and `FileRun::drop`
+//     removes each one. It read 0 whatever happened. Counting DURING the
+//     query shows 9 / 17 / 33 runs at 100k / 200k / 400k rows: the spill
+//     had been working the whole time, and "work_mem is ineffective"
+//     (round 873) was that blind witness talking.
 #![allow(dead_code)]
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use spg_storage::{Row, TableSchema};
+use spg_storage::{Row, TableSchema, Value};
 
 use crate::EngineError;
 use crate::orderby::{OrderKey, cmp_multi_key_in};
@@ -318,23 +375,55 @@ impl<'a> ExternalSorter<'a> {
     /// the same call the scan used, over the same source row, so no key
     /// can be missing. `project` turns a record into the output row, and
     /// runs once per row whether or not the sort spilled.
-    pub(crate) fn finish<K, P>(
+    /// Sorted rows, one at a time, into `emit` — the shape that bounds
+    /// peak memory.
+    ///
+    /// `finish` holds the whole answer: the budget bounds what the SORT
+    /// costs, but the merged output is collected into one
+    /// `Vec<Row<'static>>` and the caller's `QueryResult::Rows` keeps it,
+    /// so peak still tracks the RESULT. Measured over the spilled walk at
+    /// `work_mem = 4 MB`, 200-byte rows, RSS above the server's own
+    /// baseline while the query runs: +30 MB at 100k rows, +68 MB at
+    /// 200k, +137 MB at 400k — linear, with the spill working correctly
+    /// underneath it (9 / 17 / 33 runs). Round 873 read that growth as
+    /// `work_mem` being ineffective; the runs say otherwise, and the
+    /// growth is the collected result.
+    ///
+    /// Handing each row over instead makes peak the budget plus one run
+    /// buffer per run plus a single row, whatever the answer's size —
+    /// which is what a merge already has in hand at every step. The row
+    /// is passed BY VALUE so `finish` can wrap this without a clone.
+    ///
+    /// Returns how many rows were emitted.
+    pub(crate) fn finish_each<K, P, E>(
         mut self,
         keys_of: K,
         project: P,
-    ) -> Result<Vec<Row<'static>>, EngineError>
+        mut emit: E,
+    ) -> Result<usize, EngineError>
     where
         K: Fn(&Row<'static>) -> Result<Vec<OrderKey>, EngineError>,
-        P: Fn(&Row<'static>) -> Result<Row<'static>, EngineError>,
+        P: Fn(&Row<'static>, &mut Vec<Value<'static>>) -> Result<(), EngineError>,
+        E: FnMut(&[Value<'static>]) -> Result<(), EngineError>,
     {
+        let mut emitted = 0usize;
+        // One buffer for every output row. Building a fresh `Vec` per row
+        // was 400k allocations on the 400k-row sort, and the allocator is
+        // where this walk's time goes (round 880's profile: 586 samples
+        // against 420 for every sort comparison combined). `emit` only
+        // borrows, so the buffer can be refilled rather than rebuilt --
+        // the same reason PG projects through one reused slot.
+        let mut scratch: Vec<Value<'static>> = Vec::new();
         if self.runs.is_empty() {
             // Never spilled: one in-memory sort, exactly as before.
             crate::orderby::sort_by_keys(&mut self.batch, self.descs);
-            return self
-                .batch
-                .into_iter()
-                .map(|(_, r)| project(&r))
-                .collect::<Result<Vec<_>, _>>();
+            for (_, r) in core::mem::take(&mut self.batch) {
+                scratch.clear();
+                project(&r, &mut scratch)?;
+                emit(&scratch)?;
+                emitted += 1;
+            }
+            return Ok(emitted);
         }
         // Whatever is still held becomes the last run, so the merge has
         // one kind of input rather than two.
@@ -350,15 +439,41 @@ impl<'a> ExternalSorter<'a> {
         }
 
         let mut heap = HeadHeap::build(heads.len(), &heads, self.descs);
-        let mut out: Vec<Row<'static>> = Vec::new();
         while let Some(w) = heap.peek() {
             let Some((_, record)) = heads[w].take() else {
                 break;
             };
-            out.push(project(&record)?);
+            scratch.clear();
+            project(&record, &mut scratch)?;
+            emit(&scratch)?;
+            emitted += 1;
             heads[w] = Self::next_row(&mut *runs[w], &self.record_schema, &keys_of)?;
             heap.settle_root(&heads, self.descs);
         }
+        Ok(emitted)
+    }
+
+    pub(crate) fn finish<K, P>(
+        self,
+        keys_of: K,
+        project: P,
+    ) -> Result<Vec<Row<'static>>, EngineError>
+    where
+        K: Fn(&Row<'static>) -> Result<Vec<OrderKey>, EngineError>,
+        P: Fn(&Row<'static>) -> Result<Row<'static>, EngineError>,
+    {
+        let mut out: Vec<Row<'static>> = Vec::new();
+        self.finish_each(
+            keys_of,
+            |src, buf| {
+                buf.extend(project(src)?.values);
+                Ok(())
+            },
+            |cells| {
+                out.push(Row::new(cells.to_vec()));
+                Ok(())
+            },
+        )?;
         Ok(out)
     }
 
@@ -477,6 +592,97 @@ mod tests {
 
     fn project_identity(src: &Row<'static>) -> Result<Row<'static>, EngineError> {
         Ok(src.clone())
+    }
+
+    /// r882 — `finish_each` hands rows over as the merge produces them.
+    ///
+    /// The property that separates streaming from collecting-then-
+    /// replaying is where the work STOPS: an emitter that refuses the
+    /// third row must leave the rest unprojected. A `finish` that built
+    /// the whole answer first would have projected all 5000 before the
+    /// emitter ever saw row one, so the count below pins the shape and
+    /// not just the output. Spilled, so the merge is the thing under
+    /// test — 5000 rows against a 4 KB budget is many runs.
+    #[test]
+    fn finish_each_stops_when_the_consumer_stops() {
+        use core::cell::Cell;
+
+        let descs = [false];
+        let mut s = ExternalSorter::new(Some(mem_run), 4096, record_cols(), &descs);
+        for i in 0..5000i32 {
+            let r = record((i * 7919) % 5000);
+            let k = keys_of(&r).unwrap();
+            s.push(k, r).unwrap();
+        }
+
+        let projected = Cell::new(0usize);
+        let seen = Cell::new(0usize);
+        let err = s
+            .finish_each(
+                keys_of,
+                |src, buf| {
+                    projected.set(projected.get() + 1);
+                    buf.extend(project_identity(src)?.values);
+                    Ok(())
+                },
+                |_cells| {
+                    seen.set(seen.get() + 1);
+                    if seen.get() == 3 {
+                        return Err(EngineError::Internal("consumer stopped".to_string()));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::Internal(ref m) if m == "consumer stopped"));
+        assert_eq!(seen.get(), 3, "the consumer saw exactly three rows");
+        assert_eq!(
+            projected.get(),
+            3,
+            "the merge stopped with the consumer; a collecting finish would \
+             have projected all 5000 first"
+        );
+    }
+
+    /// r882 — and it is the same answer `finish` gives, spilled or not.
+    #[test]
+    fn finish_each_matches_finish_spilled_and_unspilled() {
+        let descs = [false];
+        for budget in [4096usize, 64 * 1024 * 1024] {
+            let mut a = ExternalSorter::new(Some(mem_run), budget, record_cols(), &descs);
+            let mut b = ExternalSorter::new(Some(mem_run), budget, record_cols(), &descs);
+            for i in 0..2000i32 {
+                let r = record((i * 7919) % 2000);
+                a.push(keys_of(&r).unwrap(), r.clone()).unwrap();
+                b.push(keys_of(&r).unwrap(), r).unwrap();
+            }
+            let spilled = !a.runs.is_empty();
+            assert_eq!(
+                spilled,
+                budget == 4096,
+                "budget {budget} should decide whether this spills"
+            );
+
+            let collected = a.finish(keys_of, project_pad_only).unwrap();
+            let mut streamed: Vec<Row<'static>> = Vec::new();
+            let n = b
+                .finish_each(
+                    keys_of,
+                    |src, buf| {
+                        buf.extend(project_pad_only(src)?.values);
+                        Ok(())
+                    },
+                    |cells| {
+                        streamed.push(Row::new(cells.to_vec()));
+                        Ok(())
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(n, 2000);
+            assert_eq!(collected, streamed, "budget {budget}");
+        }
     }
 
     /// r855 — does the merge's per-row cost grow with the NUMBER of runs
