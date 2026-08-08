@@ -931,10 +931,28 @@ fn row_10_x_performance_doc_has_v4_27_baseline() {
     }
 }
 
-/// 6.3 Concurrent read scaling — smoke: 4 parallel reader threads
-/// against the same server complete in < 4× single-threaded time
-/// for the same total work. (Real scaling numbers are in
-/// PERFORMANCE.md §Concurrency; this is the regression gate.)
+/// 6.3 Concurrent reads do not serialise.
+///
+/// Stated as an ORDER rather than a ratio. A long read starts first; a
+/// short read starts after it and has to finish before it. Readers that
+/// serialise cannot do that — the short one would wait out the long one
+/// — and no arithmetic on the clock is involved, so a loaded machine
+/// slows both sides and changes nothing.
+///
+/// Round 857 put it to a negative control — every engine read-lock
+/// acquisition in the native server forced exclusive, nine of them, some
+/// spelled across two lines — and the short read went from 96us to
+/// 68.7ms while still costing 119us on its own. It waits on the lock and
+/// on nothing else, so this does discriminate.
+///
+/// What this replaces: `parallel_4x200 < serial_200 * 4`. That reads as
+/// a scaling claim but is a race against whatever else the box is doing,
+/// and it lost one during round 851's gate — a neighbouring build taking
+/// twelve cores — while passing five for five minutes later on the same
+/// binary. A test that reports a defect only when the machine is busy is
+/// not reporting the defect. Round 824 reached the same conclusion about
+/// deadlines aimed at a phase, and this is the same fix: assert
+/// something that is true or false rather than fast or slow.
 #[test]
 fn row_6_3_concurrent_reads_dont_serialize() {
     let dir = unique_tmpdir("cc");
@@ -945,36 +963,68 @@ fn row_6_3_concurrent_reads_dont_serialize() {
     let mut c = common::ChildGuard(raw);
     let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
-    exec_ok(&mut s, "CREATE TABLE r (id INT NOT NULL, v INT NOT NULL)");
-    for i in 0..200 {
-        exec_ok(&mut s, &format!("INSERT INTO r VALUES ({i}, {})", i * 7));
-    }
+    // PRIMARY KEY, so the short read below is an index seek. Without it
+    // `WHERE id = 7` scans all 400k rows and takes as long as the "slow"
+    // side does — the two become the same query and which finishes first
+    // is a coin toss.
+    exec_ok(
+        &mut s,
+        "CREATE TABLE r (id INT PRIMARY KEY, v INT NOT NULL)",
+    );
+    // One scan of this has to dwarf a single-row lookup by orders of
+    // magnitude — that gap is what makes the ordering below a property
+    // of the work rather than of the machine.
+    exec_ok(
+        &mut s,
+        "INSERT INTO r SELECT g, g * 7 FROM generate_series(1, 400000) g",
+    );
     drop(s);
 
-    let serial = run_reads(&addrs.native, 200);
-
-    let server_addr = addrs.native.clone();
-    let handles: Vec<_> = (0..4)
-        .map(|_| {
-            let a = server_addr.clone();
-            thread::spawn(move || run_reads(&a, 200))
-        })
-        .collect();
-    let parallel_started = Instant::now();
-    for h in handles {
-        let _ = h.join().unwrap();
-    }
-    let parallel_total = parallel_started.elapsed();
-
-    // 4 threads doing 200 reads each = 800 total reads in
-    // `parallel_total`. Serial baseline was 200 reads in `serial`.
-    // If RwLock scaling works, parallel_total should be much less
-    // than 4 * serial (the all-serial outcome).
-    let bound = serial * 4;
-    assert!(
-        parallel_total < bound,
-        "parallel 4×200 reads {parallel_total:?} expected < serial×4 = {bound:?}"
+    // Both connections are open and warm BEFORE either query is sent.
+    // Connecting inside the window would put a TCP handshake on the fast
+    // side's clock and nothing on the slow side's, which is enough on its
+    // own to make the short read finish second — a failure that looks
+    // exactly like the serialisation this is testing for.
+    let mut fast = TcpStream::connect(&addrs.native).unwrap();
+    fast.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    assert_eq!(
+        select_int(&mut fast, "SELECT v FROM r WHERE id = 7"),
+        49,
+        "the short read answers before the window opens too"
     );
+
+    let slow_addr = addrs.native.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let slow = thread::spawn(move || {
+        let mut s = TcpStream::connect(&slow_addr).unwrap();
+        s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+        // Warm this one too, so the window holds two queries and nothing
+        // else.
+        let _ = select_int(&mut s, "SELECT v FROM r WHERE id = 7");
+        tx.send(()).unwrap();
+        // ONE long statement, deliberately. Four hundred short ones
+        // would take and release the lock four hundred times, and a
+        // fast reader would slot in between two of them whether or not
+        // readers can share — the ordering would then hold under
+        // exclusive locking too, and prove nothing.
+        let _ = select_int(&mut s, "SELECT count(*) FROM r WHERE v % 7 = 0");
+        Instant::now()
+    });
+
+    rx.recv().unwrap();
+    let one = select_int(&mut fast, "SELECT v FROM r WHERE id = 7");
+    let fast_done = Instant::now();
+    assert_eq!(one, 49, "the short read answers");
+
+    let slow_done = slow.join().unwrap();
+    assert!(
+        fast_done < slow_done,
+        "a one-row lookup finished only after a full scan did: the scan \
+         held the engine to itself, so reads serialise"
+    );
+
+    // `c` guards the child; dropping it here is what stops the server.
+    drop(c);
 }
 
 // ---- 2.10 v5.3 fast restart at scale (manifest + CHECKPOINT) ----
