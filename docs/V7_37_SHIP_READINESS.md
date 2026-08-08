@@ -102,6 +102,13 @@ not gated on those).
   closed; PG-only forms accept-and-no-op for pg_dump round-trip).
 - EXPLAIN (ANALYZE / BUFFERS / TIMING / SETTINGS / WAL / SUGGEST /
   VERBOSE / FORMAT text|json|xml|yaml) all live.
+  > **Verified round 927.** Every option named here is accepted, and all
+  > four FORMATs render. Two PG18 options NOT named here are refused and
+  > are gaps rather than omissions from this list: `GENERIC_PLAN`
+  > (PG 16+) and `MEMORY` (PG 17+). Also worth recording because it reads
+  > backwards in a probe: PG rejects `TIMING` and `WAL` without ANALYZE
+  > and rejects `SUGGEST` outright, where SPG accepts all three — more
+  > permissive, not less, and `SUGGEST` is SPG's own. Ledger item 30.
 - Partition DDL: LIST + RANGE + HASH strategies; ATTACH / DETACH /
   DETACH CONCURRENTLY all live; pruning on `=` predicates.
 - CREATE STATISTICS parse-accepted (v7.17.0 Phase 8 + 23.7
