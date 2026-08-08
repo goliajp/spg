@@ -95,10 +95,112 @@ use crate::tempstore::TempRun;
 
 /// One sorted run on the host's temp storage, plus the read cursor the
 /// merge walks it with.
-struct RunReader {
-    run: Box<dyn TempRun>,
-    /// The record at this run's head, and its keys. `None` once drained.
-    head: Option<(Vec<OrderKey>, Row<'static>)>,
+/// The record at a run's head, and its keys. `None` once drained.
+type Head = Option<(Vec<OrderKey>, Row<'static>)>;
+
+/// A slot in the tournament that holds no run.
+const NO_RUN: usize = usize::MAX;
+
+/// Order two runs by their heads, with everything that cannot supply a
+/// row sorting last: a drained run, then an empty slot.
+fn head_cmp(heads: &[Head], descs: &[bool], a: usize, b: usize) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    match (a == NO_RUN, b == NO_RUN) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        (false, false) => {}
+    }
+    match (&heads[a], &heads[b]) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some((ka, _)), Some((kb, _))) => cmp_multi_key_in(ka, kb, descs, &[]),
+    }
+}
+
+/// A binary min-heap over the run indices, ordered by their heads.
+///
+/// Picking the next row used to scan every head, which is `k - 1`
+/// comparisons per output row. Round 853 priced that at the run count a
+/// 4 MB budget actually produces — 400k rows over 29 runs is 11.2M
+/// comparisons and 30.4 ms — against 2.0M and 4.2 ms for an O(log k)
+/// structure.
+///
+/// Round 844 had concluded such a structure was not worth having, from
+/// 29 runs merging no slower than 2. That reading was confounded: the
+/// 2-run case gives `finish` a 95k-row final batch to sort in memory
+/// before it merges anything, which is most of what it measured.
+///
+/// A heap rather than a loser tree: the tree needs one comparison per
+/// level to the heap's two, but its construction has an ordering
+/// subtlety that a first attempt here got wrong (each replay overwrote
+/// the previous winner, and the merge returned a single row). The heap
+/// is the structure whose correctness is easy to keep, and it captures
+/// the same order of the win.
+struct HeadHeap {
+    /// Run indices, `heap[0]` being the one whose head sorts first.
+    heap: Vec<usize>,
+}
+
+impl HeadHeap {
+    fn build(k: usize, heads: &[Head], descs: &[bool]) -> Self {
+        let mut h = Self {
+            heap: (0..k).filter(|&i| heads[i].is_some()).collect(),
+        };
+        for start in (0..h.heap.len() / 2).rev() {
+            h.sift_down(start, heads, descs);
+        }
+        h
+    }
+
+    fn peek(&self) -> Option<usize> {
+        self.heap.first().copied()
+    }
+
+    /// The run at the top has a new head — or none left, in which case it
+    /// leaves the heap.
+    fn settle_root(&mut self, heads: &[Head], descs: &[bool]) {
+        let Some(&top) = self.heap.first() else {
+            return;
+        };
+        if heads[top].is_none() {
+            let last = self.heap.pop();
+            if let Some(last) = last
+                && !self.heap.is_empty()
+            {
+                self.heap[0] = last;
+            }
+        }
+        if !self.heap.is_empty() {
+            self.sift_down(0, heads, descs);
+        }
+    }
+
+    fn sift_down(&mut self, mut node: usize, heads: &[Head], descs: &[bool]) {
+        let n = self.heap.len();
+        loop {
+            let (l, r) = (2 * node + 1, 2 * node + 2);
+            let mut best = node;
+            if l < n
+                && head_cmp(heads, descs, self.heap[l], self.heap[best])
+                    == core::cmp::Ordering::Less
+            {
+                best = l;
+            }
+            if r < n
+                && head_cmp(heads, descs, self.heap[r], self.heap[best])
+                    == core::cmp::Ordering::Less
+            {
+                best = r;
+            }
+            if best == node {
+                return;
+            }
+            self.heap.swap(node, best);
+            node = best;
+        }
+    }
 }
 
 /// Read exactly `n` bytes, or `None` at a clean end of stream.
@@ -238,35 +340,24 @@ impl<'a> ExternalSorter<'a> {
         // one kind of input rather than two.
         self.spill_batch()?;
 
-        let mut readers: Vec<RunReader> = Vec::with_capacity(self.runs.len());
-        for mut run in core::mem::take(&mut self.runs) {
-            let head = Self::next_row(&mut *run, &self.record_schema, &keys_of)?;
-            readers.push(RunReader { run, head });
+        // Runs and their heads live side by side rather than in one
+        // struct: the tournament reads every head while one run is being
+        // advanced, which a single `Vec<RunReader>` would not allow.
+        let mut runs: Vec<Box<dyn TempRun>> = core::mem::take(&mut self.runs);
+        let mut heads: Vec<Head> = Vec::with_capacity(runs.len());
+        for run in &mut runs {
+            heads.push(Self::next_row(&mut **run, &self.record_schema, &keys_of)?);
         }
 
+        let mut heap = HeadHeap::build(heads.len(), &heads, self.descs);
         let mut out: Vec<Row<'static>> = Vec::new();
-        loop {
-            // Pick the run whose head sorts first. Linear in the number
-            // of runs, which is the input divided by the budget — a heap
-            // buys nothing at the counts this produces.
-            let mut best: Option<usize> = None;
-            for (i, r) in readers.iter().enumerate() {
-                let Some((keys, _)) = &r.head else { continue };
-                match best {
-                    None => best = Some(i),
-                    Some(b) => {
-                        let (bk, _) = readers[b].head.as_ref().expect("checked above");
-                        if cmp_multi_key_in(keys, bk, self.descs, &[]) == core::cmp::Ordering::Less
-                        {
-                            best = Some(i);
-                        }
-                    }
-                }
-            }
-            let Some(i) = best else { break };
-            let (_, record) = readers[i].head.take().expect("chosen head is present");
+        while let Some(w) = heap.peek() {
+            let Some((_, record)) = heads[w].take() else {
+                break;
+            };
             out.push(project(&record)?);
-            readers[i].head = Self::next_row(&mut *readers[i].run, &self.record_schema, &keys_of)?;
+            heads[w] = Self::next_row(&mut *runs[w], &self.record_schema, &keys_of)?;
+            heap.settle_root(&heads, self.descs);
         }
         Ok(out)
     }
