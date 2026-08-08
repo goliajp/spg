@@ -18553,10 +18553,18 @@ impl Parser {
         // `(` set-op group (its LParen arm) and a leading WITH
         // (parse_with_cte_then_select), so widen the second-token gate to
         // Select | LParen | WITH.
+        // v7.39 (round 869) — `Table` joins that gate. `TABLE t` is
+        // PG's spelling of `SELECT * FROM t` and is accepted wherever a
+        // SELECT is, so `FROM (TABLE t) x` has to parse. The desugaring
+        // has existed since the shorthand landed and `parse_bare_select`
+        // already routes it ("valid anywhere a SELECT head is"); what was
+        // missing is this second-token gate, and the CTE body's dispatch
+        // below. Round 868 found both by putting the shorthand in a
+        // subquery — the top-level forms had been the only ones tested.
         if matches!(self.peek(), Token::LParen)
             && (matches!(
                 self.tokens.get(self.pos + 1),
-                Some(Token::Select | Token::LParen)
+                Some(Token::Select | Token::LParen | Token::Table)
             ) || matches!(self.tokens.get(self.pos + 1),
                     Some(Token::Ident(s) | Token::QuotedIdent(s)) if s.eq_ignore_ascii_case("with")))
         {
@@ -23483,6 +23491,38 @@ impl Parser {
                     };
                     crate::ast::CteBody::Select(s)
                 }
+                // v7.39 (round 869) — `WITH x AS (TABLE t)`. PG spells
+                // `SELECT * FROM t` this way and accepts it wherever a
+                // SELECT goes, so the CTE body dispatch needs its own
+                // arm: this match is keyed on the FIRST token, and
+                // `Token::Table` fell through to a tail that then
+                // rejected what it got. `parse_table_shorthand` has
+                // returned a desugared SelectStatement since the
+                // shorthand landed — only the routing was missing.
+                // Round 868 found this by putting the shorthand in a
+                // subquery; every earlier check used a top-level form.
+                // v7.39 (round 869) — `WITH x AS (TABLE t)`. PG spells
+                // `SELECT * FROM t` this way and accepts it wherever a
+                // SELECT goes, so the CTE body dispatch needs its own
+                // arm: this match is keyed on the FIRST token, and
+                // `Token::Table` fell through to a tail that rejected
+                // what it got. `parse_table_shorthand` has returned a
+                // desugared SelectStatement since the shorthand landed —
+                // only the routing was missing, here and in the derived
+                // table's second-token gate. Round 868 found both by
+                // putting the shorthand in a subquery; every earlier
+                // check had used a top-level form.
+                Token::Table
+                    if matches!(
+                        self.tokens.get(self.pos + 1),
+                        Some(Token::Ident(_) | Token::QuotedIdent(_))
+                    ) =>
+                {
+                    let mut head = self.parse_table_shorthand()?;
+                    self.parse_setop_chain_into(&mut head)?;
+                    self.parse_select_tail_into(&mut head)?;
+                    crate::ast::CteBody::Select(head)
+                }
                 // v7.37.17 (17.6 siblings) — VALUES as a CTE body:
                 // WITH t(a) AS (VALUES (1), (2)) … lowers through
                 // the shared rows helper onto a Select body.
@@ -23554,6 +23594,7 @@ impl Parser {
                         Statement::Merge(s) => {
                             crate::ast::CteBody::Merge(alloc::boxed::Box::new(s))
                         }
+
                         other => {
                             return Err(self.err(format!(
                                 "WITH body must be SELECT / INSERT / UPDATE / DELETE / MERGE, got {other:?}"

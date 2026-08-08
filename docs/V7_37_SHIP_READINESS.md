@@ -267,6 +267,20 @@ they exist (2919 e2e green):
   SYSTEM shares it — no page structure to sample); REPEATABLE
   errors honestly. Scoped through a pending-predicate channel
   parse_bare_select save/restores around nested selects.
+> ⚠️ **`TABLE name` is a statement here, not an expression (round 868).**
+> The three top-level forms work and match PG value for value — `TABLE w`,
+> `TABLE w ORDER BY …`, `TABLE w LIMIT …`. Both nested positions do not:
+>
+> ```
+> SELECT * FROM (TABLE w) t   SPG: syntax error at or near "("      PG: rows
+> WITH x AS (TABLE w) …       SPG: WITH body must be SELECT/…, got  PG: rows
+> ```
+>
+> PG treats `TABLE t` as equivalent to `SELECT * FROM t`, so it is
+> accepted wherever a SELECT is. The second error shows the parser
+> recognises `Table` and then declines it, so this is about where the
+> production is allowed rather than about parsing it.
+
 - **Statement/clause idioms (#355-#357)**: TABLE name shorthand
   (statement head + set-op peer positions via a shared builder);
   COLLATE absorbs the byte-order spellings and errors on locale
