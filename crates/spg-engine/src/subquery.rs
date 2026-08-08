@@ -816,231 +816,321 @@ impl Engine {
     /// Returns the rewritten statement; the caller passes this to the
     /// regular row-loop executor which no longer sees Subquery nodes
     /// in its tree.
+    /// The `Expr::RowCmpSubquery` arm of `subquery_replacement`, lifted out.
+    ///
+    /// `#[inline(never)]`: `subquery_replacement` recurses, and a debug
+    /// build keeps EVERY arm's locals — each of these clones a
+    /// `SelectStatement`, 800 bytes before its contents — in the frame
+    /// whichever arm runs. The frame measured 32,928 bytes and the
+    /// deepest descent of one nested query holds two of them.
+    ///
+    /// Taking `e` whole and re-binding here keeps the original
+    /// bindings and their types exactly; the `else` arm cannot happen,
+    /// since the caller dispatches on this variant.
+    #[inline(never)]
+    fn arm_row_cmp_subquery(
+        &self,
+        e: &Expr,
+        cancel: CancelToken<'_>,
+    ) -> Result<Option<Expr>, EngineError> {
+        let Expr::RowCmpSubquery { row, op, subquery } = e else {
+            return Ok(None);
+        };
+
+        if select_is_correlated(subquery) {
+            return Ok(None);
+        }
+        let mut s = (**subquery).clone();
+        self.resolve_select_subqueries(&mut s, cancel)?;
+        let r = match self.exec_select_cancel(&s, cancel) {
+            Ok(r) => r,
+            Err(e) if is_correlation_error(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let QueryResult::Rows {
+            columns, mut rows, ..
+        } = r
+        else {
+            return Err(EngineError::Unsupported(
+                "row comparison subquery: inner statement did not return rows".into(),
+            ));
+        };
+        // Zero rows → NULL (scalar-subquery rule); >1 rows is an error.
+        if rows.is_empty() {
+            return Ok(Some(Expr::Literal(Literal::Null)));
+        }
+        if rows.len() > 1 {
+            return Err(EngineError::CardinalityViolation);
+        }
+        if columns.len() != row.len() {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "row comparison: left side has {} column(s), subquery returns {}",
+                row.len(),
+                columns.len()
+            )));
+        }
+        let rhs: Vec<Expr> = rows
+            .remove(0)
+            .values
+            .into_iter()
+            .map(value_to_literal_expr)
+            .collect::<Result<_, _>>()?;
+        // Defer the left row's evaluation to the row loop by returning
+        // the built comparison expression (its 3VL is correct).
+        Ok(Some(build_row_comparison(row, *op, &rhs)))
+    }
+
+    /// The `Expr::RowInSubquery` arm of `subquery_replacement`, lifted out.
+    ///
+    /// `#[inline(never)]`: `subquery_replacement` recurses, and a debug
+    /// build keeps EVERY arm's locals — each of these clones a
+    /// `SelectStatement`, 800 bytes before its contents — in the frame
+    /// whichever arm runs. The frame measured 32,928 bytes and the
+    /// deepest descent of one nested query holds two of them.
+    ///
+    /// Taking `e` whole and re-binding here keeps the original
+    /// bindings and their types exactly; the `else` arm cannot happen,
+    /// since the caller dispatches on this variant.
+    #[inline(never)]
+    fn arm_row_in_subquery(
+        &self,
+        e: &Expr,
+        cancel: CancelToken<'_>,
+    ) -> Result<Option<Expr>, EngineError> {
+        let Expr::RowInSubquery {
+            row,
+            subquery,
+            negated,
+        } = e
+        else {
+            return Ok(None);
+        };
+
+        use alloc::boxed::Box;
+        // Correlated → per-row `resolve_correlated_in_expr` handles
+        // it; leave the node in place.
+        if select_is_correlated(subquery) {
+            return Ok(None);
+        }
+        let mut s = (**subquery).clone();
+        self.resolve_select_subqueries(&mut s, cancel)?;
+        let r = match self.exec_select_cancel(&s, cancel) {
+            Ok(r) => r,
+            Err(e) if is_correlation_error(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let QueryResult::Rows { columns, rows, .. } = r else {
+            return Err(EngineError::Unsupported(
+                "row IN-subquery: inner statement did not return rows".into(),
+            ));
+        };
+        if columns.len() != row.len() {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "row IN-subquery: left side has {} column(s), subquery returns {}",
+                row.len(),
+                columns.len()
+            )));
+        }
+        // Uncorrelated: the subquery's rows are now constants, so fold
+        // to `(a=r1c1 AND …) OR (a=r2c1 AND …) …`. This defers the
+        // left row's evaluation to the per-row loop and reproduces
+        // PG's row-IN three-valued logic for free (`=` / AND / OR all
+        // propagate NULL). An empty result is `false`.
+        let mut alts: Vec<Expr> = Vec::with_capacity(rows.len());
+        for r0 in rows {
+            let mut conj: Option<Expr> = None;
+            for (lhs_el, v) in row.iter().zip(r0.values) {
+                let eq = Expr::Binary {
+                    lhs: Box::new(lhs_el.clone()),
+                    op: BinOp::Eq,
+                    rhs: Box::new(value_to_literal_expr(v)?),
+                };
+                conj = Some(match conj {
+                    None => eq,
+                    Some(prev) => Expr::Binary {
+                        lhs: Box::new(prev),
+                        op: BinOp::And,
+                        rhs: Box::new(eq),
+                    },
+                });
+            }
+            if let Some(c) = conj {
+                alts.push(c);
+            }
+        }
+        let combined = match alts.into_iter().reduce(|acc, e| Expr::Binary {
+            lhs: Box::new(acc),
+            op: BinOp::Or,
+            rhs: Box::new(e),
+        }) {
+            Some(c) => c,
+            None => Expr::Literal(Literal::Bool(false)),
+        };
+        let result = if *negated {
+            Expr::Unary {
+                op: UnOp::Not,
+                expr: Box::new(combined),
+            }
+        } else {
+            combined
+        };
+        Ok(Some(result))
+    }
+
+    /// The `Expr::InSubquery` arm of `subquery_replacement`, lifted out.
+    ///
+    /// `#[inline(never)]`: `subquery_replacement` recurses, and a debug
+    /// build keeps EVERY arm's locals — each of these clones a
+    /// `SelectStatement`, 800 bytes before its contents — in the frame
+    /// whichever arm runs. The frame measured 32,928 bytes and the
+    /// deepest descent of one nested query holds two of them.
+    ///
+    /// Taking `e` whole and re-binding here keeps the original
+    /// bindings and their types exactly; the `else` arm cannot happen,
+    /// since the caller dispatches on this variant.
+    #[inline(never)]
+    fn arm_in_subquery(
+        &self,
+        e: &Expr,
+        cancel: CancelToken<'_>,
+    ) -> Result<Option<Expr>, EngineError> {
+        let Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } = e
+        else {
+            return Ok(None);
+        };
+
+        if select_is_correlated(subquery) {
+            return Ok(None);
+        }
+        let mut s = (**subquery).clone();
+        self.resolve_select_subqueries(&mut s, cancel)?;
+        let r = match self.exec_select_cancel(&s, cancel) {
+            Ok(r) => r,
+            Err(e) if is_correlation_error(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let QueryResult::Rows { columns, rows, .. } = r else {
+            return Err(EngineError::Unsupported(
+                "IN-subquery: inner statement did not return rows".into(),
+            ));
+        };
+        if columns.len() != 1 {
+            // v7.39 (round 341, V66) — PG's two wordings, measured
+            // on 18.4: `subquery has too few columns` /
+            // `subquery has too many columns`. SPG named its own
+            // internal shape ("IN-subquery must project exactly
+            // one column; got 0").
+            return Err(EngineError::Unsupported(
+                if columns.is_empty() {
+                    "subquery has too few columns"
+                } else {
+                    "subquery has too many columns"
+                }
+                .into(),
+            ));
+        }
+        // v7.30.2 (mailrs round-25) — flat InList, NOT an OR-Eq
+        // chain: chain depth scaled with the inner result's ROW
+        // COUNT, so one 24k-match search overflowed the worker
+        // stack (recursive eval + recursive Box drop) and
+        // aborted the embedding host process.
+        let mut list: Vec<Expr> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let v = row.values.into_iter().next().unwrap_or(Value::Null);
+            list.push(value_to_literal_expr(v)?);
+        }
+        Ok(Some(Expr::InList {
+            expr: expr.clone(),
+            list,
+            negated: *negated,
+        }))
+    }
+
+    /// The `Expr::Exists` arm of `subquery_replacement`, lifted out for the frame
+    /// reason on `arm_in_subquery`.
+    #[inline(never)]
+    fn arm_exists(&self, e: &Expr, cancel: CancelToken<'_>) -> Result<Option<Expr>, EngineError> {
+        let Expr::Exists { subquery, negated } = e else {
+            return Ok(None);
+        };
+
+        if select_is_correlated(subquery) {
+            return Ok(None);
+        }
+        let mut s = (**subquery).clone();
+        self.resolve_select_subqueries(&mut s, cancel)?;
+        let r = match self.exec_select_cancel(&s, cancel) {
+            Ok(r) => r,
+            Err(e) if is_correlation_error(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let exists = match r {
+            QueryResult::Rows { rows, .. } => !rows.is_empty(),
+            QueryResult::CommandOk { .. } => false,
+        };
+        let bit = if *negated { !exists } else { exists };
+        Ok(Some(Expr::Literal(Literal::Bool(bit))))
+    }
+
+    /// The `Expr::ScalarSubquery` arm of `subquery_replacement`, lifted out for the frame
+    /// reason on `arm_in_subquery`.
+    #[inline(never)]
+    fn arm_scalar_subquery(
+        &self,
+        e: &Expr,
+        cancel: CancelToken<'_>,
+    ) -> Result<Option<Expr>, EngineError> {
+        let Expr::ScalarSubquery(inner) = e else {
+            return Ok(None);
+        };
+
+        // v7.32 (R30) — a correlated subquery is resolved by
+        // the per-row / post-LIMIT correlated path; executing
+        // it here only to catch the correlation error first
+        // materialises (and discards) its whole inner FROM.
+        if select_is_correlated(inner) {
+            return Ok(None);
+        }
+        let mut s = (**inner).clone();
+        // Recurse into the inner SELECT first so nested
+        // subqueries materialise bottom-up.
+        self.resolve_select_subqueries(&mut s, cancel)?;
+        let r = match self.exec_select_cancel(&s, cancel) {
+            Ok(r) => r,
+            Err(e) if is_correlation_error(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let QueryResult::Rows { columns, rows, .. } = r else {
+            return Err(EngineError::Unsupported(
+                "scalar subquery: inner statement did not return rows".into(),
+            ));
+        };
+        scalar_subquery_arity(columns.len())?;
+        let value = match rows.as_slice() {
+            [] => Value::Null,
+            [row] => row.values.first().cloned().unwrap_or(Value::Null),
+            _ => {
+                return Err(EngineError::CardinalityViolation);
+            }
+        };
+        Ok(Some(value_to_literal_expr(value)?))
+    }
+
     pub(crate) fn subquery_replacement(
         &self,
         e: &Expr,
         cancel: CancelToken<'_>,
     ) -> Result<Option<Expr>, EngineError> {
         match e {
-            Expr::ScalarSubquery(inner) => {
-                // v7.32 (R30) — a correlated subquery is resolved by
-                // the per-row / post-LIMIT correlated path; executing
-                // it here only to catch the correlation error first
-                // materialises (and discards) its whole inner FROM.
-                if select_is_correlated(inner) {
-                    return Ok(None);
-                }
-                let mut s = (**inner).clone();
-                // Recurse into the inner SELECT first so nested
-                // subqueries materialise bottom-up.
-                self.resolve_select_subqueries(&mut s, cancel)?;
-                let r = match self.exec_select_cancel(&s, cancel) {
-                    Ok(r) => r,
-                    Err(e) if is_correlation_error(&e) => return Ok(None),
-                    Err(e) => return Err(e),
-                };
-                let QueryResult::Rows { columns, rows, .. } = r else {
-                    return Err(EngineError::Unsupported(
-                        "scalar subquery: inner statement did not return rows".into(),
-                    ));
-                };
-                scalar_subquery_arity(columns.len())?;
-                let value = match rows.as_slice() {
-                    [] => Value::Null,
-                    [row] => row.values.first().cloned().unwrap_or(Value::Null),
-                    _ => {
-                        return Err(EngineError::CardinalityViolation);
-                    }
-                };
-                Ok(Some(value_to_literal_expr(value)?))
-            }
-            Expr::Exists { subquery, negated } => {
-                if select_is_correlated(subquery) {
-                    return Ok(None);
-                }
-                let mut s = (**subquery).clone();
-                self.resolve_select_subqueries(&mut s, cancel)?;
-                let r = match self.exec_select_cancel(&s, cancel) {
-                    Ok(r) => r,
-                    Err(e) if is_correlation_error(&e) => return Ok(None),
-                    Err(e) => return Err(e),
-                };
-                let exists = match r {
-                    QueryResult::Rows { rows, .. } => !rows.is_empty(),
-                    QueryResult::CommandOk { .. } => false,
-                };
-                let bit = if *negated { !exists } else { exists };
-                Ok(Some(Expr::Literal(Literal::Bool(bit))))
-            }
-            Expr::InSubquery {
-                expr,
-                subquery,
-                negated,
-            } => {
-                if select_is_correlated(subquery) {
-                    return Ok(None);
-                }
-                let mut s = (**subquery).clone();
-                self.resolve_select_subqueries(&mut s, cancel)?;
-                let r = match self.exec_select_cancel(&s, cancel) {
-                    Ok(r) => r,
-                    Err(e) if is_correlation_error(&e) => return Ok(None),
-                    Err(e) => return Err(e),
-                };
-                let QueryResult::Rows { columns, rows, .. } = r else {
-                    return Err(EngineError::Unsupported(
-                        "IN-subquery: inner statement did not return rows".into(),
-                    ));
-                };
-                if columns.len() != 1 {
-                    // v7.39 (round 341, V66) — PG's two wordings, measured
-                    // on 18.4: `subquery has too few columns` /
-                    // `subquery has too many columns`. SPG named its own
-                    // internal shape ("IN-subquery must project exactly
-                    // one column; got 0").
-                    return Err(EngineError::Unsupported(
-                        if columns.is_empty() {
-                            "subquery has too few columns"
-                        } else {
-                            "subquery has too many columns"
-                        }
-                        .into(),
-                    ));
-                }
-                // v7.30.2 (mailrs round-25) — flat InList, NOT an OR-Eq
-                // chain: chain depth scaled with the inner result's ROW
-                // COUNT, so one 24k-match search overflowed the worker
-                // stack (recursive eval + recursive Box drop) and
-                // aborted the embedding host process.
-                let mut list: Vec<Expr> = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let v = row.values.into_iter().next().unwrap_or(Value::Null);
-                    list.push(value_to_literal_expr(v)?);
-                }
-                Ok(Some(Expr::InList {
-                    expr: expr.clone(),
-                    list,
-                    negated: *negated,
-                }))
-            }
-            Expr::RowInSubquery {
-                row,
-                subquery,
-                negated,
-            } => {
-                use alloc::boxed::Box;
-                // Correlated → per-row `resolve_correlated_in_expr` handles
-                // it; leave the node in place.
-                if select_is_correlated(subquery) {
-                    return Ok(None);
-                }
-                let mut s = (**subquery).clone();
-                self.resolve_select_subqueries(&mut s, cancel)?;
-                let r = match self.exec_select_cancel(&s, cancel) {
-                    Ok(r) => r,
-                    Err(e) if is_correlation_error(&e) => return Ok(None),
-                    Err(e) => return Err(e),
-                };
-                let QueryResult::Rows { columns, rows, .. } = r else {
-                    return Err(EngineError::Unsupported(
-                        "row IN-subquery: inner statement did not return rows".into(),
-                    ));
-                };
-                if columns.len() != row.len() {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "row IN-subquery: left side has {} column(s), subquery returns {}",
-                        row.len(),
-                        columns.len()
-                    )));
-                }
-                // Uncorrelated: the subquery's rows are now constants, so fold
-                // to `(a=r1c1 AND …) OR (a=r2c1 AND …) …`. This defers the
-                // left row's evaluation to the per-row loop and reproduces
-                // PG's row-IN three-valued logic for free (`=` / AND / OR all
-                // propagate NULL). An empty result is `false`.
-                let mut alts: Vec<Expr> = Vec::with_capacity(rows.len());
-                for r0 in rows {
-                    let mut conj: Option<Expr> = None;
-                    for (lhs_el, v) in row.iter().zip(r0.values) {
-                        let eq = Expr::Binary {
-                            lhs: Box::new(lhs_el.clone()),
-                            op: BinOp::Eq,
-                            rhs: Box::new(value_to_literal_expr(v)?),
-                        };
-                        conj = Some(match conj {
-                            None => eq,
-                            Some(prev) => Expr::Binary {
-                                lhs: Box::new(prev),
-                                op: BinOp::And,
-                                rhs: Box::new(eq),
-                            },
-                        });
-                    }
-                    if let Some(c) = conj {
-                        alts.push(c);
-                    }
-                }
-                let combined = match alts.into_iter().reduce(|acc, e| Expr::Binary {
-                    lhs: Box::new(acc),
-                    op: BinOp::Or,
-                    rhs: Box::new(e),
-                }) {
-                    Some(c) => c,
-                    None => Expr::Literal(Literal::Bool(false)),
-                };
-                let result = if *negated {
-                    Expr::Unary {
-                        op: UnOp::Not,
-                        expr: Box::new(combined),
-                    }
-                } else {
-                    combined
-                };
-                Ok(Some(result))
-            }
-            Expr::RowCmpSubquery { row, op, subquery } => {
-                if select_is_correlated(subquery) {
-                    return Ok(None);
-                }
-                let mut s = (**subquery).clone();
-                self.resolve_select_subqueries(&mut s, cancel)?;
-                let r = match self.exec_select_cancel(&s, cancel) {
-                    Ok(r) => r,
-                    Err(e) if is_correlation_error(&e) => return Ok(None),
-                    Err(e) => return Err(e),
-                };
-                let QueryResult::Rows {
-                    columns, mut rows, ..
-                } = r
-                else {
-                    return Err(EngineError::Unsupported(
-                        "row comparison subquery: inner statement did not return rows".into(),
-                    ));
-                };
-                // Zero rows → NULL (scalar-subquery rule); >1 rows is an error.
-                if rows.is_empty() {
-                    return Ok(Some(Expr::Literal(Literal::Null)));
-                }
-                if rows.len() > 1 {
-                    return Err(EngineError::CardinalityViolation);
-                }
-                if columns.len() != row.len() {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "row comparison: left side has {} column(s), subquery returns {}",
-                        row.len(),
-                        columns.len()
-                    )));
-                }
-                let rhs: Vec<Expr> = rows
-                    .remove(0)
-                    .values
-                    .into_iter()
-                    .map(value_to_literal_expr)
-                    .collect::<Result<_, _>>()?;
-                // Defer the left row's evaluation to the row loop by returning
-                // the built comparison expression (its 3VL is correct).
-                Ok(Some(build_row_comparison(row, *op, &rhs)))
-            }
+            Expr::ScalarSubquery(..) => self.arm_scalar_subquery(e, cancel),
+            Expr::Exists { .. } => self.arm_exists(e, cancel),
+            Expr::InSubquery { .. } => self.arm_in_subquery(e, cancel),
+            Expr::RowInSubquery { .. } => self.arm_row_in_subquery(e, cancel),
+            Expr::RowCmpSubquery { .. } => self.arm_row_cmp_subquery(e, cancel),
             _ => Ok(None),
         }
     }

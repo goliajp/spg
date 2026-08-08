@@ -22,6 +22,12 @@
 # Exit 0 iff every fixture passes both checks.
 
 set -eo pipefail
+# Every `docker` call below needs OrbStack's client, which a
+# non-interactive shell does not have on PATH. `diffcorpus/run.sh`
+# has carried this line since round 666; this harness and
+# dump_compat did not, and the resulting failure named the wrong
+# culprit entirely — see dump_compat/run.sh's wait loop.
+export PATH=/Applications/OrbStack.app/Contents/MacOS/xbin:$PATH
 HERE="$(cd "$(dirname "$0")" && pwd)"
 VERSION="${1:?usage: $0 <spg-tag | local-build>}"
 PORT="${PORT:-6023}"

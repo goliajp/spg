@@ -869,6 +869,64 @@ const SYNTHESISED_PG_CATALOGS: &[&str] = &[
 
 const MAX_NEST_DEPTH: usize = 64;
 
+/// Stack accounting for the nesting budget, test-only.
+///
+/// `MAX_NEST_DEPTH` is a fixed count calibrated against a frame size
+/// that MOVES: a compiler upgrade grew the parser's debug frames and
+/// silently ate the margin until `nesting_budget_errors_cleanly` went
+/// from erroring cleanly to aborting on a stack overflow. A count
+/// cannot notice that on its own, so the budget is measured here and
+/// held to a ceiling.
+///
+/// The reading has to come from a helper whose OWN frame is the same at
+/// every call: debug slot placement does not follow source order, so a
+/// local's address inside the function under test is not that
+/// function's frame boundary. Two earlier probes were wrong that way —
+/// one read `&self.nest_depth`, which is the `Parser`'s address and
+/// never moves at all.
+#[cfg(test)]
+mod frame_meter {
+    extern crate std;
+    use std::cell::Cell;
+
+    // Per-THREAD, not global. `cargo test` runs tests in parallel and
+    // plenty of them parse nested expressions, so shared statics get
+    // stack addresses from several threads at once and the subtraction
+    // below turns into noise — it read 229,772 bytes per level that way,
+    // while passing when the test was run on its own.
+    std::thread_local! {
+        static AT_LO: Cell<usize> = const { Cell::new(0) };
+        static AT_HI: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) const SAMPLE_LO: usize = 4;
+    pub(super) const SAMPLE_HI: usize = 24;
+
+    #[inline(never)]
+    pub(super) fn record(depth: usize) {
+        let anchor = 0u8;
+        let at = core::ptr::from_ref(&anchor) as usize;
+        if depth == SAMPLE_LO {
+            AT_LO.with(|c| c.set(at));
+        } else if depth == SAMPLE_HI {
+            AT_HI.with(|c| c.set(at));
+        }
+    }
+
+    /// Bytes of stack one nesting level costs, averaged over the span.
+    pub(super) fn bytes_per_level() -> usize {
+        let lo = AT_LO.with(Cell::get);
+        let hi = AT_HI.with(Cell::get);
+        assert!(lo > 0 && hi > 0, "meter never sampled: lo={lo} hi={hi}");
+        assert!(lo > hi, "stack grew upwards? lo={lo} hi={hi}");
+        (lo - hi) / (SAMPLE_HI - SAMPLE_LO)
+    }
+
+    pub(super) fn reset() {
+        AT_LO.with(|c| c.set(0));
+        AT_HI.with(|c| c.set(0));
+    }
+}
 
 /// v7.39 (read01 geo_ops.c) — prefix `@@` desugar target, out-of-line so
 /// the constructor's temporaries stay off `parse_unary`'s recursion frame.
@@ -941,6 +999,8 @@ impl Parser {
     /// nesting depth, erroring out cleanly past the budget.
     fn enter_nested(&mut self) -> Result<(), ParseError> {
         self.nest_depth += 1;
+        #[cfg(test)]
+        frame_meter::record(self.nest_depth);
         if self.nest_depth > MAX_NEST_DEPTH {
             self.nest_depth -= 1;
             return Err(self.err(alloc::format!(
@@ -21165,70 +21225,7 @@ impl Parser {
                 _ => None,
             };
             if let Some(is_any) = any_kind {
-                self.advance(); // ident
-                self.advance(); // (
-                // `x op ANY (SELECT …)` — the quantified-subquery
-                // form. `= ANY` is exactly IN; the other operators
-                // lower onto EXISTS over the subquery as a derived
-                // table, comparing against its single projection
-                // aliased __v (x's columns resolve correlated).
-                // ALL is the negated-EXISTS complement; a NULL
-                // element makes PG return NULL where this lowering
-                // returns true — the NOT NULL column case (the
-                // practical one) is exact.
-                if matches!(self.peek(), Token::Select) || self.peek_is_with_kw() {
-                    // v7.39 (round 153) — `ANY (WITH … SELECT …)` is
-                    // legal PG too (round-151 sibling). Out-of-line
-                    // (#[inline(never)] helper) — this sits on
-                    // parse_expr's recursive frame and the two-armed
-                    // SELECT temporary blew the nesting-budget stack.
-                    let mut sub = self.parse_any_all_select_body()?;
-                    if !matches!(self.peek(), Token::RParen) {
-                        return Err(self.err(alloc::format!(
-                            "expected ')' after ANY/ALL subquery, got {:?}",
-                            self.peek()
-                        )));
-                    }
-                    self.advance();
-                    if sub.items.len() != 1 {
-                        return Err(self.err(alloc::format!(
-                            "ANY/ALL subquery must return one column, got {}",
-                            sub.items.len()
-                        )));
-                    }
-                    if is_any && matches!(op, BinOp::Eq) {
-                        lhs = Expr::InSubquery {
-                            expr: Box::new(lhs),
-                            subquery: Box::new(sub),
-                            negated: false,
-                        };
-                        continue;
-                    }
-                    // The engine's subquery resolvers materialise
-                    // the single-column result into an ARRAY the
-                    // existing AnyAll three-valued eval consumes.
-                    lhs = Expr::AnyAll {
-                        expr: Box::new(lhs),
-                        op,
-                        array: Box::new(Expr::ScalarSubquery(Box::new(sub))),
-                        is_any,
-                    };
-                    continue;
-                }
-                let arr = self.parse_expr(0)?;
-                if !matches!(self.peek(), Token::RParen) {
-                    return Err(self.err(alloc::format!(
-                        "expected ')' after ANY/ALL argument, got {:?}",
-                        self.peek()
-                    )));
-                }
-                self.advance();
-                lhs = Expr::AnyAll {
-                    expr: Box::new(lhs),
-                    op,
-                    array: Box::new(arr),
-                    is_any,
-                };
+                lhs = self.parse_any_all_rhs(lhs, op, is_any)?;
                 continue;
             }
             let rhs = self.parse_expr(prec + 1)?;
@@ -21239,6 +21236,84 @@ impl Parser {
             };
         }
         Ok(lhs)
+    }
+
+    /// `x <op> ANY (…)` / `ALL (…)`, both the quantified-subquery form
+    /// and the array form.
+    ///
+    /// `#[inline(never)]` and out of `parse_expr_inner`, which sits on the
+    /// frame chain `MAX_NEST_DEPTH` is tuned against: a debug build gives
+    /// this block's `Expr` temporaries and four `format!` sites slots in
+    /// that frame on every level of `((((1))))`, which never reaches it.
+    #[inline(never)]
+    fn parse_any_all_rhs(
+        &mut self,
+        lhs: Expr,
+        op: BinOp,
+        is_any: bool,
+    ) -> Result<Expr, ParseError> {
+        self.advance(); // ident
+        self.advance(); // (
+        // `x op ANY (SELECT …)` — the quantified-subquery
+        // form. `= ANY` is exactly IN; the other operators
+        // lower onto EXISTS over the subquery as a derived
+        // table, comparing against its single projection
+        // aliased __v (x's columns resolve correlated).
+        // ALL is the negated-EXISTS complement; a NULL
+        // element makes PG return NULL where this lowering
+        // returns true — the NOT NULL column case (the
+        // practical one) is exact.
+        if matches!(self.peek(), Token::Select) || self.peek_is_with_kw() {
+            // v7.39 (round 153) — `ANY (WITH … SELECT …)` is
+            // legal PG too (round-151 sibling). Out-of-line
+            // (#[inline(never)] helper) — this sits on
+            // parse_expr's recursive frame and the two-armed
+            // SELECT temporary blew the nesting-budget stack.
+            let mut sub = self.parse_any_all_select_body()?;
+            if !matches!(self.peek(), Token::RParen) {
+                return Err(self.err(alloc::format!(
+                    "expected ')' after ANY/ALL subquery, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            if sub.items.len() != 1 {
+                return Err(self.err(alloc::format!(
+                    "ANY/ALL subquery must return one column, got {}",
+                    sub.items.len()
+                )));
+            }
+            if is_any && matches!(op, BinOp::Eq) {
+                return Ok(Expr::InSubquery {
+                    expr: Box::new(lhs),
+                    subquery: Box::new(sub),
+                    negated: false,
+                });
+            }
+            // The engine's subquery resolvers materialise
+            // the single-column result into an ARRAY the
+            // existing AnyAll three-valued eval consumes.
+            return Ok(Expr::AnyAll {
+                expr: Box::new(lhs),
+                op,
+                array: Box::new(Expr::ScalarSubquery(Box::new(sub))),
+                is_any,
+            });
+        }
+        let arr = self.parse_expr(0)?;
+        if !matches!(self.peek(), Token::RParen) {
+            return Err(self.err(alloc::format!(
+                "expected ')' after ANY/ALL argument, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        Ok(Expr::AnyAll {
+            expr: Box::new(lhs),
+            op,
+            array: Box::new(arr),
+            is_any,
+        })
     }
 
     /// v7.39 (read01 geo_ops.c) — prefix `@@` (center-of). Out-of-line
@@ -21296,22 +21371,78 @@ impl Parser {
         })
     }
 
+    /// The prefix operators that share one shape: take the token, parse
+    /// an operand at `prec`, wrap it.
+    ///
+    /// `#[inline(never)]`, and one function instead of five arms, for the
+    /// reason the neighbouring `parse_prefix_*` helpers give: `parse_unary`
+    /// sits on the frame chain `MAX_NEST_DEPTH` is tuned against, and a
+    /// debug build gives EVERY arm's locals a slot in the frame, whichever
+    /// arm runs. `((((1))))` reaches none of these arms and was carrying
+    /// five `Expr`-sized locals per level for them anyway.
+    #[inline(never)]
+    fn parse_unary_op(&mut self, op: UnOp, prec: u8) -> Result<Expr, ParseError> {
+        self.advance();
+        let e = self.parse_expr(prec)?;
+        Ok(Expr::Unary {
+            op,
+            expr: Box::new(e),
+        })
+    }
+
+    /// Unary minus. Out-of-line for the frame reason on `parse_unary_op`,
+    /// and separate from it because of the literal folding below and the
+    /// `format!` temporaries that folding needs.
+    #[inline(never)]
+    fn parse_prefix_minus(&mut self) -> Result<Expr, ParseError> {
+        self.advance();
+        // v7.39 (round 549) — fold the sign into an integer literal that
+        // only fits once it is negative.
+        //
+        // `9223372036854775808` is one past i64::MAX, so the lexer hands
+        // it over as a NUMERIC and `-` on a numeric stays numeric. PG
+        // folds the sign first, so `-9223372036854775808` is a bigint
+        // there — and `-9223372036854775808 - 1` raises "bigint out of
+        // range" where SPG quietly answered -9223372036854775809, a value
+        // no bigint can hold. The arithmetic itself was already checked;
+        // only the literal's type was wrong.
+        if let Token::Numeric(lit) = self.peek()
+            && let Ok(folded) = alloc::format!("-{lit}").parse::<i64>()
+        {
+            self.advance();
+            return Ok(Expr::Literal(Literal::Integer(folded)));
+        }
+        // Unary minus binds tighter than `*`/`/` (now at prec 7 after
+        // `<->` slotted into 5 and arithmetic shifted up).
+        let e = self.parse_expr(9)?;
+        Ok(Expr::Unary {
+            op: UnOp::Neg,
+            expr: Box::new(e),
+        })
+    }
+
+    /// tsquery `!!` prefix negation, lowered to the catalog function.
+    /// Binds like unary minus. Out-of-line for the frame reason on
+    /// `parse_unary_op`.
+    #[inline(never)]
+    fn parse_prefix_tsquery_not(&mut self) -> Result<Expr, ParseError> {
+        self.advance();
+        let e = self.parse_expr(9)?;
+        Ok(Expr::FunctionCall {
+            name: String::from("tsquery_not"),
+            args: alloc::vec![e],
+        })
+    }
+
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
         match self.peek() {
-            Token::Not => {
-                self.advance();
-                // NOT binds tighter than AND / XOR / OR but looser than
-                // comparisons — its operand takes everything ≥ the comparison
-                // rung (4), leaving AND (3) / XOR (2) / OR (1) outside so
-                // `NOT a AND b` groups as `(NOT a) AND b`. (v7.39 round 407:
-                // was rung 3, behaviour-identical when 3 was unused; AND now
-                // occupies 3, so this must be 4 to keep NOT tighter than AND.)
-                let e = self.parse_expr(4)?;
-                Ok(Expr::Unary {
-                    op: UnOp::Not,
-                    expr: Box::new(e),
-                })
-            }
+            // NOT binds tighter than AND / XOR / OR but looser than
+            // comparisons — its operand takes everything ≥ the comparison
+            // rung (4), leaving AND (3) / XOR (2) / OR (1) outside so
+            // `NOT a AND b` groups as `(NOT a) AND b`. (v7.39 round 407:
+            // was rung 3, behaviour-identical when 3 was unused; AND now
+            // occupies 3, so this must be 4 to keep NOT tighter than AND.)
+            Token::Not => self.parse_unary_op(UnOp::Not, 4),
             // v7.39 (round 355, M13) — MySQL's `BINARY <expr>` prefix.
             // The body is out-of-line: `parse_unary` is one of the three
             // frames the parser's MAX_NEST_DEPTH is tuned against, and an
@@ -21324,63 +21455,15 @@ impl Parser {
             // v7.39 (round 353, M10) — MySQL's `!`. It binds TIGHTER than
             // arithmetic, unlike NOT: MariaDB answers 1 for `!1 + 1`
             // (`(!1)+1`) and 0 for `NOT 1 + 1` (`NOT (1+1)`), measured.
-            Token::Bang => {
-                self.advance();
-                let e = self.parse_expr(9)?;
-                Ok(Expr::Unary {
-                    op: UnOp::Not,
-                    expr: Box::new(e),
-                })
-            }
-            Token::Minus => {
-                self.advance();
-                // v7.39 (round 549) — fold the sign into an integer
-                // literal that only fits once it is negative.
-                //
-                // `9223372036854775808` is one past i64::MAX, so the
-                // lexer hands it over as a NUMERIC and `-` on a numeric
-                // stays numeric. PG folds the sign first, so
-                // `-9223372036854775808` is a bigint there — and
-                // `-9223372036854775808 - 1` raises "bigint out of
-                // range" where SPG quietly answered
-                // -9223372036854775809, a value no bigint can hold.
-                // The arithmetic itself was already checked; only the
-                // literal's type was wrong.
-                if let Token::Numeric(lit) = self.peek()
-                    && let Ok(folded) = alloc::format!("-{lit}").parse::<i64>()
-                {
-                    self.advance();
-                    return Ok(Expr::Literal(Literal::Integer(folded)));
-                }
-                // Unary minus binds tighter than `*`/`/` (now at prec 7 after
-                // `<->` slotted into 5 and arithmetic shifted up).
-                let e = self.parse_expr(9)?;
-                Ok(Expr::Unary {
-                    op: UnOp::Neg,
-                    expr: Box::new(e),
-                })
-            }
+            Token::Bang => self.parse_unary_op(UnOp::Not, 9),
+            Token::Minus => self.parse_prefix_minus(),
             // v7.39 (round 507) — unary `+`, which SPG did not have. `+1`
             // worked only because the lexer reads it as one signed literal;
             // `+ 1`, `+a`, `+(1)` and `1 + +1` were syntax errors, and both
             // PG18 and MariaDB take all of them. Binds like unary minus.
-            Token::Plus => {
-                self.advance();
-                let e = self.parse_expr(9)?;
-                Ok(Expr::Unary {
-                    op: UnOp::Plus,
-                    expr: Box::new(e),
-                })
-            }
-            Token::Tilde => {
-                self.advance();
-                // Bitwise NOT binds like unary minus.
-                let e = self.parse_expr(9)?;
-                Ok(Expr::Unary {
-                    op: UnOp::BitNot,
-                    expr: Box::new(e),
-                })
-            }
+            Token::Plus => self.parse_unary_op(UnOp::Plus, 9),
+            // Bitwise NOT binds like unary minus.
+            Token::Tilde => self.parse_unary_op(UnOp::BitNot, 9),
             // v7.39 (read01 geo_ops.c) — prefix `@@` is PG's geometric
             // "center of" operator; desugars to center(x). The whole arm
             // is out-of-line: parse_unary sits on the per-nesting-level
@@ -21402,16 +21485,7 @@ impl Parser {
             // same nesting-frame reason as parse_prefix_center.
             Token::JsonKeysAny => self.parse_prefix_geom_axis(true),
             Token::GeomHoriz => self.parse_prefix_geom_axis(false),
-            Token::DoubleBang => {
-                self.advance();
-                // tsquery `!!` prefix negation — lowered to the catalog
-                // function. Binds like unary minus.
-                let e = self.parse_expr(9)?;
-                Ok(Expr::FunctionCall {
-                    name: String::from("tsquery_not"),
-                    args: alloc::vec![e],
-                })
-            }
+            Token::DoubleBang => self.parse_prefix_tsquery_not(),
             _ => self.parse_atom(),
         }
     }
@@ -26921,6 +26995,43 @@ mod tests {
     // v7.30.2 (mailrs round-25 ask 2) — nesting / chain budgets must
     // surface as parse errors, never stack overflows (embed hosts
     // abort on overflow).
+    /// The nesting budget is a COUNT; what it has to fit inside is a
+    /// number of BYTES, and only one of those two is stable across
+    /// compiler versions. Round 847 measured 30,336 bytes per level
+    /// after a toolchain move, which puts 64 levels at 1.94 MB and
+    /// overflows a 2 MiB thread — `nesting_budget_errors_cleanly`
+    /// aborted instead of erroring, which is precisely the outcome it
+    /// exists to rule out.
+    ///
+    /// So the budget is metered rather than assumed. The ceiling leaves
+    /// the depth SPG advertises fitting in a default 2 MiB thread with
+    /// room to spare, in the debug build, where frames are widest.
+    #[test]
+    fn nesting_frame_cost_stays_under_ceiling() {
+        // Room for MAX_NEST_DEPTH levels inside 1.2 MB, so a 2 MiB
+        // thread keeps a margin for whatever called the parser.
+        const CEILING: usize = 1_200_000 / MAX_NEST_DEPTH;
+
+        frame_meter::reset();
+        let depth = frame_meter::SAMPLE_HI + 8;
+        let sql = format!("SELECT {}1{}", "(".repeat(depth), ")".repeat(depth));
+        parse(&sql);
+
+        let per_level = frame_meter::bytes_per_level();
+        {
+            extern crate std;
+            std::eprintln!("nesting frame: {per_level} bytes/level, ceiling {CEILING}");
+        }
+        assert!(
+            per_level <= CEILING,
+            "{per_level} bytes per nesting level exceeds {CEILING}; \
+             {MAX_NEST_DEPTH} levels would want {} bytes. Out-line arms \
+             in parse_expr_inner / parse_unary rather than lowering the \
+             depth or widening the stack.",
+            per_level * MAX_NEST_DEPTH
+        );
+    }
+
     #[test]
     fn nesting_budget_errors_cleanly() {
         let depth = MAX_NEST_DEPTH + 50;
