@@ -754,6 +754,23 @@ fn child_cost(n: &PlanNode) -> (f64, f64, u64, u64) {
 /// this follows it. No Memory figure beside it: PG measures its sort's
 /// peak and SPG does not meter one, and a number that was not measured
 /// is worse than none.
+///
+/// v7.37 (round 884) — a KNOWN DIVERGENCE, recorded here because round
+/// 882 created it. A single-table `ORDER BY` served over the wire now
+/// goes through the bounded sorter and can spill (26 runs and 86 MB on a
+/// 400k-row sort at `work_mem = 4MB`, counted in
+/// `pg_stat_database.temp_files`). EXPLAIN ANALYZE does not see that: it
+/// re-runs the statement through `exec_select_cancel`, the materialising
+/// executor, where the spilling walk is not hooked — so the sort it
+/// measures really is a quicksort, and this line is accurate about the
+/// run it describes while understating what the same SQL does in
+/// production.
+///
+/// Reporting `external merge` here would mean predicting a spill rather
+/// than measuring one, which is what the paragraph above refuses to do.
+/// Closing it properly means making ANALYZE execute the path the query
+/// actually takes; that is a change to what EXPLAIN ANALYZE runs, not to
+/// what it prints, and it is not smuggled in under a `Sort Method` fix.
 fn annotate_sort_method(node: &mut PlanNode, has_limit: bool) {
     if node.head == "Sort"
         && !node.attrs.iter().any(|a| a.starts_with("Sort Method:"))

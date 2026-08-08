@@ -410,7 +410,7 @@ pub type WalLsnFn = fn() -> u64;
 /// `None` (embedded, no connections) ⇒ nothing to signal.
 pub type BackendSignalFn = fn(pid: u32, terminate: bool) -> bool;
 
-pub use tempstore::{TempRun, TempRunFactory, TempStoreError};
+pub use tempstore::{SpillStats, TempRun, TempRunFactory, TempStoreError};
 
 /// v7.39 (tz epic) — host-injected IANA timezone lookups (the no_std
 /// engine can't read the system zoneinfo directory; spg-tzif is the
@@ -1216,6 +1216,9 @@ pub struct Engine {
     /// autocommit path (&self) can count its implicit commit, matching
     /// PG (every successful statement outside a tx block is one
     /// xact_commit — SELECTs included).
+    /// v7.37 (round 884) — what sorts have spilled in this process, for
+    /// `pg_stat_database` and for EXPLAIN ANALYZE's `Sort Method`.
+    pub(crate) spill_stats: crate::tempstore::SpillStats,
     pub(crate) xact_commit: core::sync::atomic::AtomicU64,
     pub(crate) xact_rollback: core::sync::atomic::AtomicU64,
     /// v7.39 (pg_stat knife A) — host-injected live backend count for
@@ -1560,6 +1563,7 @@ impl Engine {
             tx_pending_notifies: Vec::new(),
             delivered_notifies: Vec::new(),
             pending_notices: Vec::new(),
+            spill_stats: crate::tempstore::SpillStats::default(),
             xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
             backend_count_fn: None,
@@ -2048,6 +2052,7 @@ impl Engine {
             tx_pending_notifies: Vec::new(),
             delivered_notifies: Vec::new(),
             pending_notices: Vec::new(),
+            spill_stats: crate::tempstore::SpillStats::default(),
             xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
             backend_count_fn: None,
@@ -2182,6 +2187,7 @@ impl Engine {
                     tx_pending_notifies: Vec::new(),
                     delivered_notifies: Vec::new(),
                     pending_notices: Vec::new(),
+                    spill_stats: crate::tempstore::SpillStats::default(),
                     xact_commit: core::sync::atomic::AtomicU64::new(0),
                     xact_rollback: core::sync::atomic::AtomicU64::new(0),
                     backend_count_fn: None,

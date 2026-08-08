@@ -348,6 +348,8 @@ pub(crate) struct ExternalSorter<'a> {
     /// number of keys, because they come from the same ORDER BY.
     key_stride: usize,
     runs: Vec<Box<dyn TempRun>>,
+    /// Where a spill reports itself, when the host wants to know.
+    stats: Option<&'a crate::tempstore::SpillStats>,
 }
 
 impl<'a> ExternalSorter<'a> {
@@ -370,6 +372,7 @@ impl<'a> ExternalSorter<'a> {
             keys: Vec::new(),
             key_stride: 0,
             runs: Vec::new(),
+            stats: None,
         }
     }
 
@@ -414,6 +417,15 @@ impl<'a> ExternalSorter<'a> {
             self.spill_batch()?;
         }
         Ok(())
+    }
+
+    /// Report every run this sorter writes into `stats`.
+    ///
+    /// Optional so the unit tests and the embedded engine keep the
+    /// four-argument constructor; the server passes its counters.
+    pub(crate) fn with_stats(mut self, stats: &'a crate::tempstore::SpillStats) -> Self {
+        self.stats = Some(stats);
+        self
     }
 
     /// What the batch is holding, in bytes.
@@ -478,6 +490,14 @@ impl<'a> ExternalSorter<'a> {
         }
         run.seal()
             .map_err(|e| EngineError::Internal(alloc::format!("temp run seal: {e:?}")))?;
+        // After seal, so the figure is what the run really holds.
+        if let Some(stats) = self.stats {
+            use core::sync::atomic::Ordering;
+            stats.files.fetch_add(1, Ordering::Relaxed);
+            stats
+                .bytes
+                .fetch_add(run.bytes_written(), Ordering::Relaxed);
+        }
         self.runs.push(run);
         self.clear_batch();
         Ok(())
