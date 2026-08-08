@@ -1,138 +1,166 @@
 #!/usr/bin/env bash
-# v7.37.26 (26.1-26.4) — perf endpoint sweep: SPGS / SPGE / PG18 三栏.
+# perf endpoint sweep — SPGS against PG18, one client, one window.
 #
-# Runs the bundled dogfood-replay corpus + an optional customer
-# fixture corpus through three execution paths and emits a three-
-# column comparison table per endpoint. The two SPG columns are
-# the embedded engine (SPGE) and the wire server (SPGS); PG18 is
-# the reference. Output shape matches the SPG perf-feedback
-# convention (`feedback-spgs-spge-perf-bar.md`):
+# Round 885 rewrote this. What it used to do, and why each part had to
+# change, is worth keeping because the old shape is the shape a perf
+# harness naturally grows into:
 #
-#     endpoint        SPGE     SPGS     PG18    SPGS/PG  verdict
-#     get_contacts    2.3ms    3.1ms    3.0ms   1.03×    tied
-#     count_messages  1.1ms    1.5ms    2.0ms   0.75×    WIN
-#     ...
+#   * It drove SPG with `spgctl query` and PG with `psql`, then compared
+#     wall clock. That is `docs/BENCH_PROTOCOL.md` rule 1, and the rule
+#     exists because the violation once reported SPG at 2.1x slower when
+#     the real figure through one client was 1.15-1.35x — about 0.35 s of
+#     the "loss" was the probe. The panel was measuring two CLIENTS.
+#     SPG speaks the PG wire protocol, so both legs run psql now.
 #
-# Verdict heuristic (per [[feedback-only-look-at-losses]]):
-#   ≤ 0.95×  WIN
-#   ≤ 1.05×  tied
-#   > 1.05×  LOSS (P0 if ≥ 1.20×)
+#   * It judged on the ratio of MEDIANS at a 1.05x threshold. The same
+#     testbed has produced 8-23 differing cells from two runs of the SAME
+#     binary (v7.37 audit, r648-r650), so a 1.05x median threshold
+#     manufactures losses that no change can fix. Verdicts are now
+#     non-overlapping ranges — `BENCH_PROTOCOL.md` rule 4 — and every run
+#     carries a same-binary CONTROL whose differing-cell count IS the
+#     run's resolution. Cells inside that resolution report `unresolved`,
+#     not `tied`: the panel does not get to call something equal when it
+#     cannot tell.
 #
-# Inputs (all required):
-#   PG_URI         — postgres://... for the PG18 leg
-#   SPG_ADDR       — host:port for SPGS leg (default 127.0.0.1:25432)
-#   CORPUS_DIR     — dogfood-replay corpus (default xtests/dogfood_replay/)
-#   N              — runs per endpoint (default 10; median reported)
+#   * It covered the dogfood corpus only. The whole ORDER BY surface was
+#     outside it, which is how 29 losing cells out of 32 went unreported
+#     until a one-off sweep found them (see
+#     `.claude/state/orderby-perf-design-2026-08-09.md`). The shapes are
+#     built in below and run at four sizes.
 #
-# Exit 0 if every endpoint LOSS < 1.20× (no P0); exit 1 otherwise.
+# Inputs:
+#   PG_URI      — postgres://... for the PG18 leg (required)
+#   SPG_URI     — postgres://... for the SPGS leg (required)
+#   N           — timings per side per cell (default 5; rule 4 wants >= 3,
+#                 and 3 has proved too few to separate 10% at this size)
+#   CORPUS_DIR  — extra .sql endpoints to include (optional)
+#   SIZES       — row counts for the built-in shapes (default "1000 10000 50000 400000")
+#
+# Exit 0 when no cell LOSES beyond the run's own resolution; 1 otherwise.
 set -euo pipefail
+cd "$(dirname "$0")/.."
 
 PG_URI="${PG_URI:-}"
-SPG_ADDR="${SPG_ADDR:-127.0.0.1:25432}"
-CORPUS_DIR="${CORPUS_DIR:-./xtests/dogfood_replay}"
-N="${N:-10}"
-SPGCTL="${SPGCTL:-./target/release/spgctl}"
+SPG_URI="${SPG_URI:-}"
+N="${N:-5}"
+SIZES="${SIZES:-1000 10000 50000 400000}"
+CORPUS_DIR="${CORPUS_DIR:-}"
 PSQL="${PSQL:-psql}"
 
-if [[ -z "${PG_URI}" ]]; then
-  echo "fatal: PG_URI must be set" >&2
-  exit 2
-fi
-if [[ ! -d "${CORPUS_DIR}" ]]; then
-  echo "fatal: CORPUS_DIR ${CORPUS_DIR} not a directory" >&2
-  exit 2
-fi
-if [[ ! -x "${SPGCTL}" ]]; then
-  echo "info: building spgctl release" >&2
-  cargo build --release --bin spgctl
-  SPGCTL="./target/release/spgctl"
-fi
+[[ -n "${PG_URI}" ]]  || { echo "fatal: PG_URI must be set" >&2; exit 2; }
+[[ -n "${SPG_URI}" ]] || { echo "fatal: SPG_URI must be set (both legs run psql — rule 1)" >&2; exit 2; }
 
-SCRATCH="$(mktemp -d)"
-trap 'rm -rf "${SCRATCH}"' EXIT
+echo "load before: $(uptime)"
 
-median_ms() {
-  # Reads space-separated millisecond values; prints the median.
-  tr ' ' '\n' | sort -n | awk -v n="${N}" '
-    BEGIN { i = 0 }
-    { v[++i] = $0 }
-    END {
-      mid = int((n + 1) / 2)
-      if (n % 2 == 0) print (v[mid] + v[mid+1]) / 2
-      else            print v[mid]
-    }
-  '
+# One client, both legs. `\timing` reports the round trip psql measures,
+# which excludes process startup — that is the number to compare.
+time_one() { # $1=uri $2=sql $3=work_mem setting
+  "${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "$3" -c '\timing on' -c "$2" 2>&1 |
+    grep -E '^Time:' | tail -1 | sed 's/Time: //; s/ ms//'
+}
+lo() { printf '%s\n' "$@" | sort -g | head -1; }
+hi() { printf '%s\n' "$@" | sort -g | tail -1; }
+
+# a-range strictly above b-range => LOSS; strictly below => win; else the
+# panel cannot tell them apart at this resolution.
+verdict() { # $1=amin $2=amax $3=bmin $4=bmax
+  awk -v amin="$1" -v amax="$2" -v bmin="$3" -v bmax="$4" \
+    'BEGIN { if (amin > bmax) print "LOSS"; else if (amax < bmin) print "win"; else print "unresolved" }'
 }
 
-run_once() {
-  local mode="$1"   # pg / spgs
-  local sql="$2"
-  local t0 t1 us
-  t0="$(/usr/bin/python3 -c 'import time;print(time.monotonic_ns())')"
-  case "${mode}" in
-    pg)
-      "${PSQL}" --no-psqlrc --tuples-only --no-align "${PG_URI}" -c "${sql}" \
-        > /dev/null 2>&1 || true
-      ;;
-    spgs)
-      "${SPGCTL}" query "${sql}" "${SPG_ADDR}" > /dev/null 2>&1 || true
-      ;;
-  esac
-  t1="$(/usr/bin/python3 -c 'import time;print(time.monotonic_ns())')"
-  echo "scale=3; ($t1 - $t0) / 1000000" | bc
+setup_table() { # $1=uri $2=table $3=rows $4=work_mem-setting
+  "${PSQL}" --no-psqlrc -X -q "$1" \
+    -c "DROP TABLE IF EXISTS $2" \
+    -c "CREATE TABLE $2 (id INT PRIMARY KEY, k INT, pad TEXT)" >/dev/null 2>&1
+  "${PSQL}" --no-psqlrc -X -q "$1" \
+    -c "INSERT INTO $2 SELECT g, ((g::bigint*7919)%$3)::int, repeat(chr(97+(g%26)),200) FROM generate_series(1,$3) g" >/dev/null 2>&1
+  local got
+  got="$("${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "SELECT count(*) FROM $2")"
+  # Rule 2: a timing read off an unverified table is not evidence.
+  [[ "${got}" == "$3" ]] || { echo "SETUP FAILED: $2 on $1 has ${got} rows, wanted $3 — refusing to time" >&2; exit 2; }
 }
 
-FAIL=0
-TOTAL=0
+SPG_WM='SET work_mem = 4096'
+PG_WM="SET work_mem='4MB'"
 
-printf "%-30s %8s %8s %8s %10s %s\n" \
-  "endpoint" "SPGE" "SPGS" "PG18" "SPGS/PG" "verdict"
-printf "%-30s %8s %8s %8s %10s %s\n" \
-  "------------------------------" "--------" "--------" "--------" \
-  "----------" "-------"
+SHAPES=(
+  'wide, non-indexed key|SELECT pad FROM @T@ ORDER BY k'
+  'narrow, non-indexed key|SELECT id FROM @T@ ORDER BY k'
+  'indexed key|SELECT pad FROM @T@ ORDER BY id'
+  'top-N LIMIT 10|SELECT pad FROM @T@ ORDER BY k LIMIT 10'
+  'two keys|SELECT pad FROM @T@ ORDER BY k, id'
+  'descending|SELECT pad FROM @T@ ORDER BY k DESC'
+  'distinct then order|SELECT DISTINCT k FROM @T@ ORDER BY k'
+  'filtered then order|SELECT pad FROM @T@ WHERE id % 3 = 0 ORDER BY k'
+)
 
-for sqlfile in "${CORPUS_DIR}"/*.sql; do
-  name="$(basename "${sqlfile}" .sql)"
-  sql="$(cat "${sqlfile}")"
-  TOTAL=$((TOTAL + 1))
+LOSSES=0; CELLS=0; CONTROL_DIFFS=0
 
-  pg_runs=""
-  spgs_runs=""
-  for ((i = 0; i < N; i++)); do
-    pg_runs="${pg_runs} $(run_once pg "${sql}")"
-    spgs_runs="${spgs_runs} $(run_once spgs "${sql}")"
+printf '\n%-8s %-26s %-16s %-16s %s\n' SIZE SHAPE 'SPGS(min-max)' 'PG18(min-max)' VERDICT
+printf '%-8s %-26s %-16s %-16s %s\n' -------- -------------------------- ---------------- ---------------- -------
+
+for rows in ${SIZES}; do
+  T="sweep_${rows}"
+  setup_table "${SPG_URI}" "${T}" "${rows}"
+  setup_table "${PG_URI}"  "${T}" "${rows}"
+
+  for entry in "${SHAPES[@]}"; do
+    name="${entry%%|*}"; sql="${entry#*|}"; sql="${sql//@T@/${T}}"
+    s=(); g=()
+    for ((i = 0; i < N; i++)); do
+      # Rule 4: alternate, and flip which side starts each round.
+      if (( i % 2 == 0 )); then
+        s+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
+        g+=("$(time_one "${PG_URI}"  "${sql}" "${PG_WM}")")
+      else
+        g+=("$(time_one "${PG_URI}"  "${sql}" "${PG_WM}")")
+        s+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
+      fi
+    done
+    smin="$(lo "${s[@]}")"; smax="$(hi "${s[@]}")"
+    gmin="$(lo "${g[@]}")"; gmax="$(hi "${g[@]}")"
+    v="$(verdict "${smin}" "${smax}" "${gmin}" "${gmax}")"
+    [[ "${v}" == LOSS ]] && LOSSES=$((LOSSES + 1))
+    CELLS=$((CELLS + 1))
+    printf '%-8s %-26s %-16s %-16s %s\n' "${rows}" "${name}" "${smin}-${smax}" "${gmin}-${gmax}" "${v}"
   done
-  pg_med="$(echo "${pg_runs}" | median_ms)"
-  spgs_med="$(echo "${spgs_runs}" | median_ms)"
-  spge_med="-"  # SPGE leg requires in-process bench harness; queues with 26.6
+done
 
-  if [[ "${pg_med}" == "0" || -z "${pg_med}" ]]; then
-    ratio="—"
-    verdict="SKIP (PG zero)"
-  else
-    ratio="$(echo "scale=2; ${spgs_med} / ${pg_med}" | bc)"
-    # bash float-compare without bc tail
-    awk_cmp() { awk -v a="$1" -v op="$2" -v b="$3" 'BEGIN { exit !(a op b) }'; }
-    if awk_cmp "${ratio}" "<=" "0.95"; then
-      verdict="WIN"
-    elif awk_cmp "${ratio}" "<=" "1.05"; then
-      verdict="tied"
-    elif awk_cmp "${ratio}" "<" "1.20"; then
-      verdict="LOSS"
-      FAIL=$((FAIL + 1))
+# The control: SPG against ITSELF, same binary, same window. Any cell it
+# calls a difference is the panel's own noise, and that count is the
+# resolution every verdict above has to be read against.
+echo
+echo "control — SPGS against itself, same binary (differing cells here are this run's noise floor):"
+# The control runs on a table this sweep actually built — hardcoding a
+# size meant the control silently queried a missing table whenever SIZES
+# did not contain it, and a control that errors on every cell reports a
+# clean noise floor it never measured.
+CT="sweep_$(set -- ${SIZES}; echo "$1")"
+for entry in "${SHAPES[@]}"; do
+  name="${entry%%|*}"; sql="${entry#*|}"; sql="${sql//@T@/${CT}}"
+  a=(); b=()
+  for ((i = 0; i < N; i++)); do
+    if (( i % 2 == 0 )); then
+      a+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
+      b+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
     else
-      verdict="LOSS-P0"
-      FAIL=$((FAIL + 1))
+      b+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
+      a+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
     fi
+  done
+  cv="$(verdict "$(lo "${a[@]}")" "$(hi "${a[@]}")" "$(lo "${b[@]}")" "$(hi "${b[@]}")")"
+  if [[ "${cv}" != unresolved ]]; then
+    CONTROL_DIFFS=$((CONTROL_DIFFS + 1))
+    printf '  %-26s %s  <- same binary, called %s\n' "${name}" "${cv}" "${cv}"
   fi
-
-  printf "%-30s %8s %8s %8s %10s %s\n" \
-    "${name}" "${spge_med}" "${spgs_med}ms" "${pg_med}ms" "${ratio}×" "${verdict}"
 done
 
 echo
-echo "Summary: ${TOTAL} endpoints, ${FAIL} LOSS or LOSS-P0"
-
-if [[ "${FAIL}" -gt 0 ]]; then
-  exit 1
+echo "load after: $(uptime)"
+echo "cells=${CELLS} losses=${LOSSES} control_false_differences=${CONTROL_DIFFS}"
+if (( CONTROL_DIFFS > 0 )); then
+  echo "WARNING: the control found ${CONTROL_DIFFS} difference(s) between a binary and itself."
+  echo "         Every verdict above is only as good as that. Re-run on a quieter machine"
+  echo "         or raise N before acting on any single cell."
 fi
+(( LOSSES == 0 )) || exit 1
