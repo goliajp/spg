@@ -157,9 +157,11 @@ not gated on those).
   > Recorded because the direction is unusual and costs something
   > different: the other corrections in this document found claims better
   > than the truth, and a reader discounts those. A claim WORSE than the
-  > truth sends someone to build what is already there. Scope: `SERIAL`
-  > only; `GENERATED … AS IDENTITY` is untested and this note says nothing
-  > about it. Ledger item 32.
+  > truth sends someone to build what is already there.
+  >
+  > Round 931 closed the scope this note first left open: it holds for
+  > `GENERATED ALWAYS AS IDENTITY` as well, next id 1 on both engines, so
+  > both identity spellings restart. Ledger item 32.
 - `SHOW ALL` returns a `(name, setting, description)` inventory — 21
   rows as of round 868, measured. The count is not pinned here: it
   grows whenever a GUC is added, and a number written down is a
