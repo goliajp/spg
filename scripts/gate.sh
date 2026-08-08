@@ -18,6 +18,10 @@
 #            incident encoded as a SPG-internal regression gate.
 #            Fast tier skips snapshot-backed fixtures (synthetic
 #            scenarios only); --full runs everything.
+#   perf   SPGS against PG18 across the ORDER BY shape matrix +
+#          the dogfood endpoints. RELEASE-BLOCKING as of round 895:
+#          a measured loss fails the gate. Needs PG_URI + SPG_URI;
+#          refuses (does not skip) without them.
 #   all    everything above, in that order
 #
 # Tiers: the default run is the fast tier. `--full` adds
@@ -25,13 +29,13 @@
 # tests (1M-row gates, SQ8 kNN, exploratory benches). biz has a
 # single tier — its harnesses are corpus-driven, not #[ignore]-split.
 #
-# Usage: scripts/gate.sh <lint|unit|e2e|gates|biz|dogfood|all> [--full]
+# Usage: scripts/gate.sh <lint|unit|e2e|gates|biz|dogfood|perf|all> [--full]
 # Offload to the mini.local testbed: scripts/test-on-mini.sh <same args>
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 usage() {
-    echo "usage: $0 <lint|unit|e2e|gates|biz|dogfood|all> [--full]" >&2
+    echo "usage: $0 <lint|unit|e2e|gates|biz|dogfood|perf|all> [--full]" >&2
     exit 2
 }
 
@@ -138,6 +142,49 @@ run_dogfood() {
     fi
 }
 
+# v7.37 (round 895) — performance against PG18, and it BLOCKS.
+#
+# The owner reversed the old policy on 2026-08-09: a measured loss stops
+# the release whether or not a customer has reported it. The panel this
+# runs judges by non-overlapping ranges and carries a same-binary control
+# that reports its own resolution, so a cell it calls a loss is one it can
+# actually tell apart.
+#
+# It needs a live PG18 and a live SPGS, which a plain checkout does not
+# have. When they are not configured this REFUSES rather than skipping:
+# a silent skip is how the ORDER BY surface stayed outside the panel while
+# 29 of its 32 cells lost. `SKIP_PERF=1` is the deliberate escape hatch and
+# it says so on the way past.
+run_perf() {
+    banner "perf vs PG18 (release-blocking)"
+    if [[ -n "${SKIP_PERF:-}" ]]; then
+        echo "perf: SKIPPED by SKIP_PERF=1 — a release built on this run has"
+        echo "      NOT been checked against PG18."
+        return 0
+    fi
+    if [[ -z "${PG_URI:-}" || -z "${SPG_URI:-}" ]]; then
+        # A routine gate on a checkout has no PG18 to compare against, and
+        # breaking the everyday loop is not what "perf blocks the release"
+        # asks for. It blocks the RELEASE: `release.sh` sets
+        # PERF_REQUIRED=1, and there the same missing configuration is a
+        # hard failure.
+        if [[ -n "${PERF_REQUIRED:-}" ]]; then
+            echo "perf: PG_URI and SPG_URI are unset, so nothing was compared." >&2
+            echo "      Performance blocks the release, so on a release run this" >&2
+            echo "      is a failure and not a skip. Point both at a live PG18 and" >&2
+            echo "      a live SPGS, or set SKIP_PERF=1 to put on the record that" >&2
+            echo "      this build shipped unchecked." >&2
+            return 1
+        fi
+        echo "perf: SKIPPED — PG_URI / SPG_URI unset, so SPGS was not compared"
+        echo "      against PG18. This is fine for a working gate and is NOT"
+        echo "      fine for a release: release.sh sets PERF_REQUIRED=1 and the"
+        echo "      same state fails there."
+        return 0
+    fi
+    scripts/perf-endpoint-sweep.sh
+}
+
 START=$SECONDS
 case "$CATEGORY" in
     lint)    run_lint ;;
@@ -146,7 +193,8 @@ case "$CATEGORY" in
     gates)   run_gates ;;
     biz)     run_biz ;;
     dogfood) run_dogfood ;;
-    all)     run_lint; run_unit; run_e2e; run_gates; run_biz; run_dogfood ;;
+    perf)    run_perf ;;
+    all)     run_lint; run_unit; run_e2e; run_gates; run_biz; run_dogfood; run_perf ;;
     *) usage ;;
 esac
 printf '\n══ gate.sh %s%s: PASS (%ss) ══\n' \

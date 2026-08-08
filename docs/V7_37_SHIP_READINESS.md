@@ -979,12 +979,37 @@ follow as the REPL surface lands.
 Partition-wise join + aggregate join the planner once 17.2 GiST AM
 ships (partition pruning on geometric predicates needs an AM).
 
-### v7.37.26.5 / 26.6 → operational, not release-blocking
+### v7.37.26.5 / 26.6 → performance is release-blocking
 
-TPC-C custom workload + decomposition-agent loss attack run as
-operator actions against losing endpoints from
-`scripts/perf-endpoint-sweep.sh`. No release blocks on a
-to-be-determined LOSS that no customer reports.
+> **Reversed by the owner, 2026-08-09.** This section used to read
+> "operational, not release-blocking", and end: *"No release blocks on a
+> to-be-determined LOSS that no customer reports."* That is no longer the
+> policy. Performance is primary: **a measured loss blocks the release,
+> reported or not.**
+>
+> The old wording was not merely lenient, it was load-bearing in the wrong
+> direction — it is why the entire ORDER BY surface sat outside the
+> standing panel while 29 of its 32 cells lost to PG18 (round 885), with
+> nothing red anywhere. A panel that cannot block is a panel nobody has to
+> answer to.
+>
+> What that requires, and what is true today:
+>
+> - `scripts/perf-endpoint-sweep.sh` judges by non-overlapping ranges and
+>   carries a same-binary control that reports the run's resolution
+>   (round 885). It exits non-zero on any LOSS.
+> - `gate.sh perf` runs it, and `gate.sh all` includes it. On a working
+>   checkout with no PG18 configured it SKIPS loudly and says that the
+>   same state fails on a release; `release.sh` exports `PERF_REQUIRED=1`,
+>   which turns that skip into a hard failure. A release therefore cannot
+>   be cut without SPGS having been compared against a live PG18.
+> - The one way past is `SKIP_PERF=1`, which prints that the build went
+>   out unchecked. It exists so that shipping without the comparison is a
+>   recorded decision rather than something indistinguishable from having
+>   made it.
+
+TPC-C custom workload + decomposition-agent loss attack run against
+losing endpoints from `scripts/perf-endpoint-sweep.sh`.
 
 ## Why this split is honest
 

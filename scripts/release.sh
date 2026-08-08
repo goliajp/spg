@@ -91,8 +91,16 @@ fi
 # G1-G5 cover (TESTING.md five categories). Setting SKIP_FULL=1
 # selects the v7.37.7-and-earlier behaviour for the rare case
 # where the operator already ran gate.sh all externally.
+# v7.37 (round 895) — performance blocks the release, by the owner's
+# decision of 2026-08-09. `PERF_REQUIRED=1` turns gate.sh's perf category
+# from a loud skip into a hard failure, so a release cannot be cut
+# without SPGS having been compared against a live PG18. Unsetting it is
+# not an option here; the escape hatch is SKIP_PERF=1, which announces
+# itself in the log so an unchecked build is visible afterwards rather
+# than indistinguishable from a checked one.
+export PERF_REQUIRED=1
 if [[ "${SKIP_FULL:-0}" == 0 ]]; then
-    banner "preflight gate: gate.sh all (G1-G5)"
+    banner "preflight gate: gate.sh all (G1-G5 + perf)"
     if ! scripts/gate.sh all; then
         echo "preflight: gate.sh all FAILED — release blocked. \
 Re-run with \`SKIP_FULL=1 scripts/release.sh $VERSION\` only after \
