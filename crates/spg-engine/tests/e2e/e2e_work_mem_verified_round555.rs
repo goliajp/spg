@@ -14,6 +14,23 @@
 //! stored, echoed by SHOW, and never consulted. A DBA setting it to
 //! bound memory gets no bound and no error.
 //!
+//! **That last sentence is no longer true, and this note is here so it
+//! is not read as current.** Round 863 made `work_mem` a number the
+//! sorter reads, and round 882 hooked the bounded sort: a single-table
+//! `ORDER BY` over the wire fills to the budget, writes sorted runs to
+//! host temp storage and merges them back, which at 400k rows and
+//! `work_mem = 4MB` is 26 runs and 86 MB, with residency held to +12 MB
+//! against +253 MB before.
+//!
+//! What has NOT changed is what the three tests below exercise. Their
+//! engine is a bare `Engine::new()` with no temp-run factory, so
+//! `can_spill()` is false and these sorts still run wholly in memory —
+//! which is the right shape for them: they pin that a tiny `work_mem`
+//! changes no ANSWER and still validates, on the path where no spill is
+//! available. The spilling path has its own pins in
+//! `e2e_sorted_stream_children_round882` and
+//! `e2e_pg_stat_database_spill_round884`.
+//!
 //! One inference this round made from EXPLAIN was WRONG and measuring
 //! corrected it. `ORDER BY … LIMIT 5` showed a Seq Scan with
 //! `actual rows=600000` feeding a Sort, which read as a full sort of

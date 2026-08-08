@@ -1153,6 +1153,7 @@ mod e2e_pg_stat_archiver_replication;
 mod e2e_pg_stat_bgwriter_tablespace;
 mod e2e_pg_stat_checkpointer_wal;
 mod e2e_pg_stat_database;
+mod e2e_pg_stat_database_spill_round884;
 mod e2e_pg_stat_io_functions;
 mod e2e_pg_stat_progress_views;
 mod e2e_pg_stat_statements;

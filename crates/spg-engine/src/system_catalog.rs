@@ -2213,8 +2213,8 @@ pub(crate) fn synth_pg_stat_user_tables(
 ///   * conflicts / deadlocks (BigInt) — replication-conflict
 ///     count + per-DB deadlock count (always 0 for SPG single-
 ///     writer; shape-stable so monitoring queries don't break)
-///   * temp_files / temp_bytes (BigInt) — disk-spill counters
-///     (0 — SPG aggregate spill lands in v7.37.19 (19.15))
+///   * temp_files / temp_bytes (BigInt) — disk-spill counters, one
+///     file per sort run and the bytes they hold (round 884)
 ///   * blk_read_time / blk_write_time (Float) — accumulated
 ///     I/O wait time (0 until per-statement timing lands)
 pub(crate) fn synth_pg_stat_database(
@@ -2295,9 +2295,32 @@ pub(crate) fn synth_pg_stat_database(
         .cold_reads
         .load(core::sync::atomic::Ordering::Relaxed);
     let blks_hit = tup_returned.saturating_sub(blks_read);
+    // v7.37 (round 884) — the name `current_database()` answers, read from
+    // the same place it reads. `pg_database` was given this treatment in
+    // round 474 for exactly this reason ("so the two cannot drift apart
+    // again"); its sibling here was missed, so
+    // `SELECT ... FROM pg_stat_database WHERE datname = current_database()`
+    // — the shape every monitoring dashboard writes — matched nothing at
+    // all and returned an empty result rather than an error.
+    let datname = eng
+        .session_params
+        .get("spg.database")
+        .cloned()
+        .unwrap_or_else(|| alloc::string::String::from("spg"));
+    // v7.37 (round 884) — real spill counters. PG's `temp_files` counts one
+    // file per sort run and `temp_bytes` what they hold; a monitoring query
+    // watches the pair to find the queries that outgrow `work_mem`. These
+    // read 0 while the sorter was writing 26 runs a query.
+    let (temp_files, temp_bytes) = {
+        use core::sync::atomic::Ordering;
+        (
+            eng.spill_stats.files.load(Ordering::Relaxed),
+            eng.spill_stats.bytes.load(Ordering::Relaxed),
+        )
+    };
     let rows = alloc::vec![Row::new(alloc::vec![
         Value::BigInt(16384),
-        Value::text("spg"),
+        Value::text(datname),
         Value::Int(i32::try_from(backends).unwrap_or(i32::MAX)),
         Value::BigInt(i64::try_from(commits).unwrap_or(i64::MAX)),
         Value::BigInt(i64::try_from(rollbacks).unwrap_or(i64::MAX)),
@@ -2308,24 +2331,24 @@ pub(crate) fn synth_pg_stat_database(
         Value::BigInt(i64::try_from(tup_inserted).unwrap_or(i64::MAX)),
         Value::BigInt(i64::try_from(tup_updated).unwrap_or(i64::MAX)),
         Value::BigInt(i64::try_from(tup_deleted).unwrap_or(i64::MAX)),
-        Value::BigInt(0),  // conflicts (PG: replication-conflict count)
-        Value::BigInt(0),  // temp_files (spill; pending 19.15)
-        Value::BigInt(0),  // temp_bytes
-        Value::BigInt(0),  // deadlocks (SPG single-writer; always 0)
-        Value::BigInt(0),  // checksum_failures
-        Value::Null,       // checksum_last_failure
+        Value::BigInt(0), // conflicts (PG: replication-conflict count)
+        Value::BigInt(i64::try_from(temp_files).unwrap_or(i64::MAX)), // temp_files
+        Value::BigInt(i64::try_from(temp_bytes).unwrap_or(i64::MAX)), // temp_bytes
+        Value::BigInt(0), // deadlocks (SPG single-writer; always 0)
+        Value::BigInt(0), // checksum_failures
+        Value::Null,      // checksum_last_failure
         Value::Float(0.0), // blk_read_time
         Value::Float(0.0), // blk_write_time
         Value::Float(0.0), // session_time
         Value::Float(0.0), // active_time
         Value::Float(0.0), // idle_in_transaction_time
-        Value::BigInt(0),  // sessions
-        Value::BigInt(0),  // sessions_abandoned
-        Value::BigInt(0),  // sessions_fatal
-        Value::BigInt(0),  // sessions_killed
-        Value::BigInt(0),  // parallel_workers_to_launch
-        Value::BigInt(0),  // parallel_workers_launched
-        Value::Null,       // stats_reset (never reset)
+        Value::BigInt(0), // sessions
+        Value::BigInt(0), // sessions_abandoned
+        Value::BigInt(0), // sessions_fatal
+        Value::BigInt(0), // sessions_killed
+        Value::BigInt(0), // parallel_workers_to_launch
+        Value::BigInt(0), // parallel_workers_launched
+        Value::Null,      // stats_reset (never reset)
     ])];
     (schema, rows)
 }

@@ -60,8 +60,10 @@ pub trait TempRun: Send {
     /// Fill `buf` from the current read position. `Ok(0)` is EOF.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, TempStoreError>;
 
-    /// Bytes appended so far — the engine reports these as PG's
-    /// `pg_stat_database.temp_bytes` (hard-coded 0 until Phase D).
+    /// Bytes appended so far. Round 884 wired this to PG's
+    /// `pg_stat_database.temp_bytes`, read after `seal` so the figure is
+    /// what the run really holds; the comment here used to say the
+    /// column was hard-coded 0, and it was.
     fn bytes_written(&self) -> u64;
 }
 
@@ -71,3 +73,21 @@ pub trait TempRun: Send {
 /// not opted in) means spilling is unavailable and the ceiling behaves
 /// as it does today.
 pub type TempRunFactory = fn() -> Result<Box<dyn TempRun>, TempStoreError>;
+
+/// v7.37 (round 884) — what a spill actually cost, for
+/// `pg_stat_database.temp_files` / `temp_bytes` and for EXPLAIN
+/// ANALYZE's `Sort Method`.
+///
+/// PG counts these per backend and rolls them into the per-database
+/// view; a monitoring query watches `temp_bytes` to find the queries
+/// that outgrow `work_mem`. SPG reported 0 for both while it was
+/// spilling 26 runs a query, and EXPLAIN said `quicksort` for a sort
+/// that had gone to disk — both because nothing was counting.
+#[derive(Debug, Default)]
+pub struct SpillStats {
+    /// Runs created. PG counts one temp FILE per run, which is what a
+    /// run is here.
+    pub files: core::sync::atomic::AtomicU64,
+    /// Bytes written across those runs.
+    pub bytes: core::sync::atomic::AtomicU64,
+}

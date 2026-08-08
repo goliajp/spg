@@ -894,12 +894,24 @@ epic. Gates Hot Standby (21.15) + the per-MVCC dependent items
 Hash / GiST / SPGiST / GIN posting tree / GIN fast-update +
 CREATE INDEX CONCURRENTLY. Each AM is a 1-2 week epic.
 
-### v7.37.19 → v7.39 query (24 items)
+### v7.37.19 → v7.39 query (23 items)
+
+> **Round 883 — one item left this list rather than being deferred.**
+> "Sort tape merge" was queued here; it is in v7.37. A sort larger than
+> `work_mem` fills to the budget, sorts, writes a run to host temp
+> storage, and merges the runs back k-way through a heap, emitting each
+> row as the merge produces it. Witnessed at 400k rows of 200 bytes with
+> `work_mem = 4MB`: 26 runs opened DURING the query (a count taken after
+> it reads 0 whatever happened — `FileRun::drop` removes each file), RSS
+> above the server's baseline +12 MB against +253 MB for the path that
+> never spilled, and 177.5 - 184.5 ms against PG18's 201.8 - 293.7 ms on
+> the same table through the same client. Details in
+> `crates/spg-engine/src/extsort.rs`.
 
 GROUPING SETS / ROLLUP / CUBE / JSON_TABLE / XMLTABLE / CREATE
 MATERIALIZED VIEW + REFRESH / window RANGE explicit offset / window
 GROUPS / Exclusion constraint USING gist / view auto-updatable /
-INSTEAD OF trigger / sort tape merge / merge join / bushy join /
+INSTEAD OF trigger / merge join / bushy join /
 parameterized nested-loop / sorted-vs-hashed aggregate /
 EquivalenceClass refinement.
 

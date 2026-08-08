@@ -7153,7 +7153,8 @@ impl Engine {
             self.session_work_mem_bytes(),
             cols.clone(),
             &descs,
-        );
+        )
+        .with_stats(&self.spill_stats);
         let snapshot = self.current_snapshot();
         // One key buffer for the whole scan: `push` drains it and leaves
         // the capacity behind.
@@ -7328,7 +7329,8 @@ impl Engine {
             self.session_work_mem_bytes(),
             cols.clone(),
             &descs,
-        );
+        )
+        .with_stats(&self.spill_stats);
         let snapshot = self.current_snapshot();
         // One key buffer for the whole scan: `push` drains it and leaves
         // the capacity behind.
