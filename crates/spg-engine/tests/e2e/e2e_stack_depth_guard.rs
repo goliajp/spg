@@ -13,12 +13,24 @@ fn deeply_nested_expression_errors_instead_of_crashing() {
         QueryResult::Rows { .. }
     ));
 
-    // A deep-but-legal chain stays under the parser's chained-operator
-    // budget (256) and simply evaluates. (Pre-1.97 toolchains had
-    // eval_expr frames big enough that 150 frames crossed the eval
-    // guard's 768 KiB budget; today they don't — the guard is
-    // exercised parser-independently in eval.rs unit tests.)
-    let ok_and = format!("SELECT {}", "1 = 1 AND ".repeat(150) + "1 = 1");
+    // A deep-but-legal chain simply evaluates.
+    //
+    // How deep "legal" reaches is a property of the build, and both
+    // limits were measured rather than assumed (round 850):
+    //
+    //   release  255 levels — capped by the parser's MAX_BINARY_CHAIN
+    //                         of 256, so the eval guard never fires
+    //   debug    100 levels — capped by the eval guard's 768 KiB, since
+    //                         debug frames are around 2.5x wider
+    //
+    // 80 clears both. The number carries no product meaning: what this
+    // file exists to prove is the pathological cases below erroring
+    // rather than aborting, and PG parity on depth is the parser's
+    // chain budget, not this line. An earlier 150 sat between the two
+    // limits and started failing when a toolchain upgrade widened debug
+    // frames — the guard was working correctly, and the assertion was
+    // the thing that had assumed a build profile.
+    let ok_and = format!("SELECT {}", "1 = 1 AND ".repeat(80) + "1 = 1");
     assert!(matches!(
         e.execute(&ok_and).unwrap(),
         QueryResult::Rows { .. }

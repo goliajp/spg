@@ -3887,6 +3887,463 @@ impl Engine {
         })
     }
 
+    /// The FROM shapes that are not an ordinary table scan — joins, the
+    /// set-returning sources, JSON_TABLE, a derived table, and the rest.
+    ///
+    /// `#[inline(never)]` and out of `exec_bare_select_cancel` for the
+    /// reason round 848 established in the parser: a debug build gives
+    /// EVERY branch's locals a slot in the frame, whichever branch runs.
+    /// `exec_bare_select_cancel` measured 64,784 bytes and a nested query
+    /// stacks several of them; a plain scan reaches none of these
+    /// branches. Moving them out took the frame to 52,336.
+    ///
+    /// `Ok(None)` means "not one of these shapes, carry on".
+    #[inline(never)]
+    fn try_from_shape_paths(
+        &self,
+        stmt: &SelectStatement,
+        from: &spg_sql::ast::FromClause,
+        cancel: CancelToken<'_>,
+    ) -> Result<Option<QueryResult>, EngineError> {
+        if !from.joins.is_empty() {
+            // v7.37.x (docker-fair LEFTJOIN 71 % attack) — LEFT JOIN
+            // elimination: when a LEFT JOIN's right side is referenced
+            // ONLY in the ON equality and the right-side join key is
+            // UNIQUE/PK, the join preserves outer cardinality exactly
+            // and contributes no values used downstream. Drop the
+            // entire join. PG does this on the
+            // `SELECT COUNT(*) FROM A LEFT JOIN B ON B.pk = A.fk` shape
+            // — A's row count is what survives, B never has to be
+            // touched.
+            if let Some(eliminated) = self.try_eliminate_redundant_left_joins(stmt) {
+                return self.exec_bare_select_cancel(&eliminated, cancel).map(Some);
+            }
+            // v7.38 P0 元机制 D — `SPG_TEST_DISABLE_JOINFOLD=1` skips
+            // the v7.32 joinfold rewrite that turns inner JOINs into a
+            // single-table scan when the catalogue can prove key-only
+            // dependency. Tests use this to assert "without joinfold,
+            // the join still executes correctly" (joinfold is a
+            // semantically-equivalent rewrite, not a correctness fix).
+            if !self.env_cfg().disable_joinfold {
+                if let Some(folded) = self.try_fold_inner_joins(stmt, cancel)? {
+                    return self.exec_bare_select_cancel(&folded, cancel).map(Some);
+                }
+            }
+            return self.exec_joined_select(stmt, from, cancel).map(Some);
+        }
+        // v7.11.7 — `FROM unnest(<expr>) [AS] <alias>`. Synthesise a
+        // single-column table at SELECT entry by evaluating the
+        // expression once against the empty row (UNNEST is
+        // uncorrelated in v7.11; correlated / LATERAL unnest is a
+        // v7.12 carve-out). Build a virtual `Table` in a heap-only
+        // catalog, then route to the regular scan path.
+        if from.primary.unnest_expr.is_some() {
+            return self
+                .exec_select_unnest(stmt, &from.primary, cancel)
+                .map(Some);
+        }
+        // v7.37.43-T4.5 — `FROM jsonb_each_text(<expr>)` set-
+        // returning function. Same dispatch shape as unnest but
+        // emits a two-column (key TEXT, value TEXT) row stream.
+        if from.primary.jsonb_each_text_arg.is_some() {
+            return self
+                .exec_select_jsonb_each_text(stmt, &from.primary, cancel)
+                .map(Some);
+        }
+        // v7.39 (read01 partitionfuncs.c) — FROM-position table functions
+        // (pg_partition_tree / pg_partition_ancestors) dispatched by name.
+        // v7.39 (read01 round 74) — `ROWS FROM (f(a), g(b))` whose entries have no
+        // array form. Each function runs; the results zip in LOCKSTEP with the
+        // shorter padded to NULL — the SAME rule the target-list SRFs follow
+        // (round 67), which is why `srf_values` is what evaluates each entry.
+        if from.primary.rows_from.is_some() {
+            let (rows, mut schema_cols) = self.rows_from_rows(&from.primary)?;
+            for (i, new_name) in from.primary.unnest_column_aliases.iter().enumerate() {
+                if let Some(col) = schema_cols.get_mut(i) {
+                    col.name = new_name.clone();
+                }
+            }
+            let alias = from
+                .primary
+                .alias
+                .clone()
+                .unwrap_or_else(|| from.primary.name.clone());
+            return self
+                .exec_select_over_rows(stmt, rows, schema_cols, &alias, cancel)
+                .map(Some);
+        }
+        // v7.39 (round 205, JSON_TABLE) — `FROM JSON_TABLE(doc, '$p'
+        // COLUMNS (...))`. Materialise the row stream + schema by
+        // walking the row path, then run the regular pipeline over it.
+        if let Some(jt) = &from.primary.json_table {
+            let (rows, schema_cols) = self.json_table_rows(jt, None)?;
+            let alias = from
+                .primary
+                .alias
+                .clone()
+                .unwrap_or_else(|| from.primary.name.clone());
+            return self
+                .exec_select_over_rows(stmt, rows, schema_cols, &alias, cancel)
+                .map(Some);
+        }
+        if from.primary.table_fn_call.is_some() {
+            let (rows, mut schema_cols) = self.table_fn_rows(&from.primary)?;
+            // v7.39 (read01 round 68) — WITH ORDINALITY appends a BIGINT counter
+            // (from 1, in output order) AFTER the function's own columns. The
+            // alias list names it like any other, which is why it is appended
+            // BEFORE the renaming pass below.
+            let rows = if from.primary.with_ordinality {
+                schema_cols.push(ColumnSchema::new(
+                    "ordinality".to_string(),
+                    DataType::BigInt,
+                    false,
+                ));
+                rows.into_iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let mut vals = r.values;
+                        vals.push(Value::BigInt(i as i64 + 1));
+                        Row::new(vals)
+                    })
+                    .collect()
+            } else {
+                rows
+            };
+            for (i, new_name) in from.primary.unnest_column_aliases.iter().enumerate() {
+                if let Some(col) = schema_cols.get_mut(i) {
+                    col.name = new_name.clone();
+                }
+            }
+            let alias = from
+                .primary
+                .alias
+                .clone()
+                .unwrap_or_else(|| from.primary.name.clone());
+            return self
+                .exec_select_over_rows(stmt, rows, schema_cols, &alias, cancel)
+                .map(Some);
+        }
+        // v7.37.17 (17.6 siblings) — plain derived table in primary
+        // position: `FROM ( SELECT … ) alias` (no joins). The inner
+        // SELECT materialises once (it is uncorrelated by
+        // construction), then the outer projection / WHERE /
+        // aggregate / ORDER BY pipeline runs over the synthetic
+        // table. Joined derived tables keep riding the LATERAL
+        // machinery in join.rs.
+        if from.joins.is_empty() && from.primary.lateral_subquery.is_some() {
+            // v7.39 (round 727) — flatten first. A simple derived table
+            // (bare-column projection over one stored table, nothing that
+            // changes cardinality or order) used to force the inner
+            // SELECT through the SERIAL row-at-a-time projection pipeline
+            // just to materialise a synthetic table the outer query then
+            // re-scans: `count(*) FROM (SELECT id v FROM d WHERE …) q`
+            // measured 18.6 ms against PG's 5 — and bare count over the
+            // same filter WITHOUT the wrapper is 2 ms here, because it
+            // rides the fused parallel lane. Rewriting to the unwrapped
+            // form is PG's subquery pull-up; the whole tree gets the
+            // fast lanes back.
+            if let Some(flat) = try_flatten_derived(stmt, &from.primary) {
+                return self.exec_select_cancel(&flat, cancel).map(Some);
+            }
+            // v7.39 (round 742) — `SELECT count(*) FROM (SELECT … ORDER
+            // BY … OFFSET k) q` is `greatest(count_of_inner - k, 0)`:
+            // ORDER BY never changes the row count, and OFFSET drops
+            // exactly k. The materialising path sorted 500k rows to
+            // count 10k (57 ms); PG runs its parallel sort anyway
+            // (28 ms). The rewrite skips the sort entirely on both
+            // counts — a plan PG itself does not have.
+            if let Some(rewritten) = try_count_over_offset(stmt, &from.primary) {
+                return self.exec_select_cancel(&rewritten, cancel).map(Some);
+            }
+            // v7.39 (round 743) — `count(*) OVER a derived whose only
+            // item is unnest(ARRAY[k elements])` is `k * count(WHERE)`:
+            // a constant-length array unnests to exactly k rows per
+            // input row, NULL elements included. PG expands the set to
+            // count it (6.6 ms on the panel cell); the identity doesn't.
+            if let Some(rewritten) = try_count_over_const_unnest(stmt, &from.primary) {
+                return self.exec_select_cancel(&rewritten, cancel).map(Some);
+            }
+            return self
+                .exec_select_derived(stmt, &from.primary, cancel)
+                .map(Some);
+        }
+        // v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
+        // [, step])` set-returning source. Dispatch mirrors UNNEST:
+        // materialise the row stream from a single eval pass, then
+        // run the regular projection / WHERE / ORDER BY / LIMIT
+        // pipeline over the synthetic single-column table.
+        if from.primary.generate_series_args.is_some() {
+            return self
+                .exec_select_generate_series(stmt, &from.primary, cancel)
+                .map(Some);
+        }
+        Ok(None)
+    }
+
+    /// Pick an index seek for this WHERE, if any of the four apply:
+    /// BTree equality, GIN `@@`, trigram LIKE, or JSONB `@>`.
+    ///
+    /// `#[inline(never)]` and out of `exec_bare_select_cancel` for the
+    /// frame reason on `try_from_shape_paths`: in a debug build a
+    /// closure's locals belong to the enclosing frame, and this one is
+    /// four seek attempts wide on a function that nests.
+    #[inline(never)]
+    fn pick_indexed_rows<'r>(
+        &'r self,
+        stmt: &SelectStatement,
+        table: &'r spg_storage::Table,
+        schema_cols: &[spg_storage::ColumnSchema],
+        alias: &str,
+        ctx: &crate::eval::EvalContext<'_>,
+        seek_snapshot: &crate::Snapshot,
+    ) -> Option<Vec<Cow<'r, Row<'static>>>> {
+        stmt.where_.as_ref().and_then(|w| {
+            // BTree / col=literal seek first — covers the v7.11.3 multi-
+            // column AND case and the leading-column equality lookup.
+            try_index_seek(
+                w,
+                schema_cols,
+                self.active_catalog(),
+                table,
+                alias,
+                seek_snapshot,
+            )
+            .or_else(|| {
+                // v7.12.3 — GIN-accelerated `WHERE col @@
+                // tsquery` when the column has a `USING gin`
+                // index. Returns an over-approximate candidate
+                // set; the WHERE re-eval loop below verifies
+                // the full `@@` predicate per row.
+                try_gin_seek(
+                    w,
+                    schema_cols,
+                    self.active_catalog(),
+                    table,
+                    alias,
+                    ctx,
+                    seek_snapshot,
+                )
+            })
+            .or_else(|| {
+                // v7.15.0 — trigram-GIN-accelerated
+                // `WHERE col LIKE / ILIKE '<pat>'` when the
+                // column has a `gin_trgm_ops` GIN index.
+                // Over-approximate candidate set; the WHERE
+                // re-eval verifies the LIKE per row.
+                try_trgm_seek(w, schema_cols, table, alias, seek_snapshot)
+            })
+            .or_else(|| {
+                // v7.37.8(sentori Epic 5 P2)— real JSONB-GIN
+                // accelerated `WHERE col @> <jsonb_literal>`
+                // when the column has a `USING gin` index. The
+                // posting-list intersection returns an over-
+                // approximate candidate set; the WHERE re-eval
+                // verifies the full `@>` predicate per row.
+                try_gin_jsonb_seek(w, schema_cols, table, alias, seek_snapshot)
+            })
+        })
+    }
+
+    /// Index-seek fast paths: NSW kNN, the primary-key top-N walk, and
+    /// the two `count(*)` short-circuits. Out-of-line for the frame
+    /// reason on `try_from_shape_paths` — an ordinary scan reaches none
+    /// of them, and in a debug build their locals sit in the frame
+    /// regardless.
+    #[inline(never)]
+    fn try_seek_fast_paths(
+        &self,
+        stmt: &SelectStatement,
+        table: &spg_storage::Table,
+        schema_cols: &[spg_storage::ColumnSchema],
+        alias: &str,
+        seek_snapshot: &crate::Snapshot,
+        cancel: CancelToken<'_>,
+    ) -> Result<Option<QueryResult>, EngineError> {
+        if let Some(nsw_rows) = try_nsw_knn(stmt, table, schema_cols, alias, seek_snapshot) {
+            // NSW kNN dispatches against the hot-tier vector index only
+            // (vector cells aren't promoted to cold segments), so wrap
+            // the returned row indices as `Cow::Borrowed` for the
+            // unified `materialise_in_order` shape.
+            let ordered: Vec<Cow<'_, Row<'static>>> = nsw_rows
+                .into_iter()
+                .filter_map(|i| table.rows().get(i).map(Cow::Borrowed))
+                .collect();
+            return materialise_in_order(
+                stmt,
+                schema_cols,
+                alias,
+                &ordered,
+                self.backslash_escapes,
+            )
+            .map(Some);
+        }
+
+        // v7.34.5 — ORDER BY <indexed col> [DESC|ASC] LIMIT N drives
+        // the scan via the BTree iterator in the requested direction
+        // and stops after `OFFSET + LIMIT` candidates pass WHERE. The
+        // 80 ms `mailrs_prod_plain_limit` baseline at 250 k rows is
+        // the load-bearing consumer; this skips the materialise-every-
+        // row + partial-sort tail entirely. Walker output is already
+        // in ORDER BY order so `materialise_in_order` (no extra sort)
+        // is the natural sink.
+        if let Some(walked) = try_pk_walk_top_n(
+            stmt,
+            self.active_catalog(),
+            table,
+            schema_cols,
+            alias,
+            self,
+            cancel,
+        ) {
+            return materialise_in_order(stmt, schema_cols, alias, &walked, self.backslash_escapes)
+                .map(Some);
+        }
+
+        // Index seek: if WHERE is `col = literal` (or commuted) and the
+        // referenced column has an index, dispatch each locator through
+        // the catalog (hot tier → borrow, cold tier → page-read +
+        // decode) and iterate just those rows. Otherwise fall back to a
+        // v7.37.x (docker-fair INSUBQ attack) — short-circuit COUNT(*)
+        // FROM A WHERE A.pk IN (large literal list). The post-subquery-
+        // replacement shape of INSUBQ. Runs BEFORE `indexed_rows` so
+        // we don't pay the row materialisation cost twice. Returns
+        // a bare `Rows{count}` if the shape matches.
+        if aggregate::uses_aggregate(stmt)
+            && let Some(out) = self.try_count_star_pk_in_list_fast(stmt, table, schema_cols, alias)
+        {
+            return Ok(Some(out));
+        }
+        // v7.38 (perf) — `count(*) WHERE <indexed BETWEEN>`: count the in-range
+        // locators directly, skipping row materialisation + WHERE re-eval.
+        if aggregate::uses_aggregate(stmt)
+            && let Some(out) = self.try_count_star_indexed_range_fast(
+                stmt,
+                table,
+                schema_cols,
+                alias,
+                seek_snapshot,
+            )
+        {
+            return Ok(Some(out));
+        }
+        Ok(None)
+    }
+
+    /// The two rewrites that must happen before the FROM clause is even
+    /// looked at: a meta-view reference needs the catalog views
+    /// materialised, and a windowed projection belongs to the window
+    /// executor. Out-of-line for the frame reason on
+    /// `try_from_shape_paths`.
+    #[inline(never)]
+    fn try_pre_from_paths(
+        &self,
+        stmt: &SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<Option<QueryResult>, EngineError> {
+        if !self.meta_views_materialised && select_references_meta_view(stmt) {
+            return self.exec_select_with_meta_views(stmt, cancel).map(Some);
+        }
+        // v4.12: window-function path. When the projection contains
+        // any `name(args) OVER (...)` we route to the dedicated
+        // executor — partition + sort + per-row window value before
+        // the regular projection.
+        if select_has_window(stmt) {
+            // v7.37 D.23 — window functions run AFTER GROUP BY aggregation.
+            // `SELECT g, sum(v), rank() OVER (ORDER BY sum(v)) FROM t GROUP BY g`
+            // needs the aggregation done first, then windows over the grouped
+            // rows. Rewrite to an aggregate derived subquery + outer window query
+            // (which the window-over-derived path, D.13, executes). Only fires on
+            // the currently-erroring agg+window+GROUP BY shape, so it can't
+            // regress working window-only or aggregate-only queries.
+            if let Some(rewritten) = rewrite_agg_before_window(stmt) {
+                return self.exec_select_cancel(&rewritten, cancel).map(Some);
+            }
+            return self.exec_select_with_window(stmt, cancel).map(Some);
+        }
+        Ok(None)
+    }
+
+    /// A projection naming `ctid` or another system column: the schema
+    /// has to be widened with them before the scan. Out-of-line for the
+    /// frame reason on `try_from_shape_paths`.
+    #[inline(never)]
+    fn try_ctid_projection(
+        &self,
+        stmt: &SelectStatement,
+        primary: &spg_sql::ast::TableRef,
+        table: &spg_storage::Table,
+        schema_cols: &[spg_storage::ColumnSchema],
+        alias: &str,
+        cancel: CancelToken<'_>,
+    ) -> Result<Option<QueryResult>, EngineError> {
+        if references_ctid(stmt) {
+            let snapshot = self.current_snapshot();
+            let mut ext_cols = schema_cols.to_vec();
+            for name in SYSTEM_COLUMNS {
+                ext_cols.push(ColumnSchema::new(name.to_string(), DataType::Text, false));
+            }
+            let table_oid =
+                crate::system_catalog::relation_oid(self.active_catalog(), &primary.name)
+                    .unwrap_or(0);
+            let headers = table.headers();
+            let rows: Vec<Row<'static>> = table
+                .scan_visible(&snapshot)
+                .map(|(i, r)| {
+                    let mut vals = r.values.clone();
+                    // One block, offsets from 1, as PG numbers them.
+                    vals.push(Value::Tid(0, i as u32 + 1));
+                    let h = headers.get(i);
+                    vals.push(Value::Xid(h.map_or(0, |h| h.xmin as u32)));
+                    vals.push(Value::Xid(h.map_or(0, |h| h.xmax as u32)));
+                    // SPG keeps no per-statement command ids; PG shows 0 for
+                    // every row a reader can see, which is every row here.
+                    vals.push(Value::Cid(0));
+                    vals.push(Value::Cid(0));
+                    vals.push(Value::BigInt(table_oid));
+                    Row::new(vals)
+                })
+                .collect();
+            return self
+                .exec_select_over_rows(stmt, rows, ext_cols, alias, cancel)
+                .map(Some);
+        }
+        Ok(None)
+    }
+
+    /// A sequence read as a one-row relation (`SELECT last_value FROM
+    /// seq`), which PG allows and psql's \\d relies on. Out-of-line for
+    /// the frame reason on `try_from_shape_paths`.
+    #[inline(never)]
+    fn try_sequence_relation(
+        &self,
+        stmt: &SelectStatement,
+        primary: &spg_sql::ast::TableRef,
+        cancel: CancelToken<'_>,
+    ) -> Result<Option<QueryResult>, EngineError> {
+        if self.active_catalog().get(&primary.name).is_none()
+            && let Some(seq) = self.active_catalog().sequence(&primary.name)
+        {
+            let rows = alloc::vec![Row::new(alloc::vec![
+                Value::BigInt(seq.last_value),
+                Value::BigInt(0),
+                Value::Bool(seq.is_called),
+            ])];
+            let schema_cols = alloc::vec![
+                ColumnSchema::new("last_value", DataType::BigInt, false),
+                ColumnSchema::new("log_cnt", DataType::BigInt, false),
+                ColumnSchema::new("is_called", DataType::Bool, false),
+            ];
+            let alias = primary
+                .alias
+                .clone()
+                .unwrap_or_else(|| primary.name.clone());
+            return self
+                .exec_select_over_rows(stmt, rows, schema_cols, &alias, cancel)
+                .map(Some);
+        }
+        Ok(None)
+    }
+
     pub(crate) fn exec_bare_select_cancel(
         &self,
         stmt: &SelectStatement,
@@ -3950,25 +4407,8 @@ impl Engine {
         // (bypassing the top-level entry to avoid double
         // subquery walking). Without this dispatch the subquery
         // hits `__spg_info_columns` and reports TableNotFound.
-        if !self.meta_views_materialised && select_references_meta_view(stmt) {
-            return self.exec_select_with_meta_views(stmt, cancel);
-        }
-        // v4.12: window-function path. When the projection contains
-        // any `name(args) OVER (...)` we route to the dedicated
-        // executor — partition + sort + per-row window value before
-        // the regular projection.
-        if select_has_window(stmt) {
-            // v7.37 D.23 — window functions run AFTER GROUP BY aggregation.
-            // `SELECT g, sum(v), rank() OVER (ORDER BY sum(v)) FROM t GROUP BY g`
-            // needs the aggregation done first, then windows over the grouped
-            // rows. Rewrite to an aggregate derived subquery + outer window query
-            // (which the window-over-derived path, D.13, executes). Only fires on
-            // the currently-erroring agg+window+GROUP BY shape, so it can't
-            // regress working window-only or aggregate-only queries.
-            if let Some(rewritten) = rewrite_agg_before_window(stmt) {
-                return self.exec_select_cancel(&rewritten, cancel);
-            }
-            return self.exec_select_with_window(stmt, cancel);
+        if let Some(done) = self.try_pre_from_paths(stmt, cancel)? {
+            return Ok(done);
         }
         // Constant SELECT (no FROM) — evaluate each item once against an
         // empty dummy row. Useful for `SELECT 1`, `SELECT coalesce(...)`,
@@ -3980,186 +4420,15 @@ impl Engine {
         // Multi-table FROM (one or more joined peers) goes through the
         // nested-loop join executor. Single-table FROM stays on the
         // existing scan + index-seek path.
-        if !from.joins.is_empty() {
-            // v7.37.x (docker-fair LEFTJOIN 71 % attack) — LEFT JOIN
-            // elimination: when a LEFT JOIN's right side is referenced
-            // ONLY in the ON equality and the right-side join key is
-            // UNIQUE/PK, the join preserves outer cardinality exactly
-            // and contributes no values used downstream. Drop the
-            // entire join. PG does this on the
-            // `SELECT COUNT(*) FROM A LEFT JOIN B ON B.pk = A.fk` shape
-            // — A's row count is what survives, B never has to be
-            // touched.
-            if let Some(eliminated) = self.try_eliminate_redundant_left_joins(stmt) {
-                return self.exec_bare_select_cancel(&eliminated, cancel);
-            }
-            // v7.38 P0 元机制 D — `SPG_TEST_DISABLE_JOINFOLD=1` skips
-            // the v7.32 joinfold rewrite that turns inner JOINs into a
-            // single-table scan when the catalogue can prove key-only
-            // dependency. Tests use this to assert "without joinfold,
-            // the join still executes correctly" (joinfold is a
-            // semantically-equivalent rewrite, not a correctness fix).
-            if !self.env_cfg().disable_joinfold {
-                if let Some(folded) = self.try_fold_inner_joins(stmt, cancel)? {
-                    return self.exec_bare_select_cancel(&folded, cancel);
-                }
-            }
-            return self.exec_joined_select(stmt, from, cancel);
-        }
-        // v7.11.7 — `FROM unnest(<expr>) [AS] <alias>`. Synthesise a
-        // single-column table at SELECT entry by evaluating the
-        // expression once against the empty row (UNNEST is
-        // uncorrelated in v7.11; correlated / LATERAL unnest is a
-        // v7.12 carve-out). Build a virtual `Table` in a heap-only
-        // catalog, then route to the regular scan path.
-        if from.primary.unnest_expr.is_some() {
-            return self.exec_select_unnest(stmt, &from.primary, cancel);
-        }
-        // v7.37.43-T4.5 — `FROM jsonb_each_text(<expr>)` set-
-        // returning function. Same dispatch shape as unnest but
-        // emits a two-column (key TEXT, value TEXT) row stream.
-        if from.primary.jsonb_each_text_arg.is_some() {
-            return self.exec_select_jsonb_each_text(stmt, &from.primary, cancel);
-        }
-        // v7.39 (read01 partitionfuncs.c) — FROM-position table functions
-        // (pg_partition_tree / pg_partition_ancestors) dispatched by name.
-        // v7.39 (read01 round 74) — `ROWS FROM (f(a), g(b))` whose entries have no
-        // array form. Each function runs; the results zip in LOCKSTEP with the
-        // shorter padded to NULL — the SAME rule the target-list SRFs follow
-        // (round 67), which is why `srf_values` is what evaluates each entry.
-        if from.primary.rows_from.is_some() {
-            let (rows, mut schema_cols) = self.rows_from_rows(&from.primary)?;
-            for (i, new_name) in from.primary.unnest_column_aliases.iter().enumerate() {
-                if let Some(col) = schema_cols.get_mut(i) {
-                    col.name = new_name.clone();
-                }
-            }
-            let alias = from
-                .primary
-                .alias
-                .clone()
-                .unwrap_or_else(|| from.primary.name.clone());
-            return self.exec_select_over_rows(stmt, rows, schema_cols, &alias, cancel);
-        }
-        // v7.39 (round 205, JSON_TABLE) — `FROM JSON_TABLE(doc, '$p'
-        // COLUMNS (...))`. Materialise the row stream + schema by
-        // walking the row path, then run the regular pipeline over it.
-        if let Some(jt) = &from.primary.json_table {
-            let (rows, schema_cols) = self.json_table_rows(jt, None)?;
-            let alias = from
-                .primary
-                .alias
-                .clone()
-                .unwrap_or_else(|| from.primary.name.clone());
-            return self.exec_select_over_rows(stmt, rows, schema_cols, &alias, cancel);
-        }
-        if from.primary.table_fn_call.is_some() {
-            let (rows, mut schema_cols) = self.table_fn_rows(&from.primary)?;
-            // v7.39 (read01 round 68) — WITH ORDINALITY appends a BIGINT counter
-            // (from 1, in output order) AFTER the function's own columns. The
-            // alias list names it like any other, which is why it is appended
-            // BEFORE the renaming pass below.
-            let rows = if from.primary.with_ordinality {
-                schema_cols.push(ColumnSchema::new(
-                    "ordinality".to_string(),
-                    DataType::BigInt,
-                    false,
-                ));
-                rows.into_iter()
-                    .enumerate()
-                    .map(|(i, r)| {
-                        let mut vals = r.values;
-                        vals.push(Value::BigInt(i as i64 + 1));
-                        Row::new(vals)
-                    })
-                    .collect()
-            } else {
-                rows
-            };
-            for (i, new_name) in from.primary.unnest_column_aliases.iter().enumerate() {
-                if let Some(col) = schema_cols.get_mut(i) {
-                    col.name = new_name.clone();
-                }
-            }
-            let alias = from
-                .primary
-                .alias
-                .clone()
-                .unwrap_or_else(|| from.primary.name.clone());
-            return self.exec_select_over_rows(stmt, rows, schema_cols, &alias, cancel);
-        }
-        // v7.37.17 (17.6 siblings) — plain derived table in primary
-        // position: `FROM ( SELECT … ) alias` (no joins). The inner
-        // SELECT materialises once (it is uncorrelated by
-        // construction), then the outer projection / WHERE /
-        // aggregate / ORDER BY pipeline runs over the synthetic
-        // table. Joined derived tables keep riding the LATERAL
-        // machinery in join.rs.
-        if from.joins.is_empty() && from.primary.lateral_subquery.is_some() {
-            // v7.39 (round 727) — flatten first. A simple derived table
-            // (bare-column projection over one stored table, nothing that
-            // changes cardinality or order) used to force the inner
-            // SELECT through the SERIAL row-at-a-time projection pipeline
-            // just to materialise a synthetic table the outer query then
-            // re-scans: `count(*) FROM (SELECT id v FROM d WHERE …) q`
-            // measured 18.6 ms against PG's 5 — and bare count over the
-            // same filter WITHOUT the wrapper is 2 ms here, because it
-            // rides the fused parallel lane. Rewriting to the unwrapped
-            // form is PG's subquery pull-up; the whole tree gets the
-            // fast lanes back.
-            if let Some(flat) = try_flatten_derived(stmt, &from.primary) {
-                return self.exec_select_cancel(&flat, cancel);
-            }
-            // v7.39 (round 742) — `SELECT count(*) FROM (SELECT … ORDER
-            // BY … OFFSET k) q` is `greatest(count_of_inner - k, 0)`:
-            // ORDER BY never changes the row count, and OFFSET drops
-            // exactly k. The materialising path sorted 500k rows to
-            // count 10k (57 ms); PG runs its parallel sort anyway
-            // (28 ms). The rewrite skips the sort entirely on both
-            // counts — a plan PG itself does not have.
-            if let Some(rewritten) = try_count_over_offset(stmt, &from.primary) {
-                return self.exec_select_cancel(&rewritten, cancel);
-            }
-            // v7.39 (round 743) — `count(*) OVER a derived whose only
-            // item is unnest(ARRAY[k elements])` is `k * count(WHERE)`:
-            // a constant-length array unnests to exactly k rows per
-            // input row, NULL elements included. PG expands the set to
-            // count it (6.6 ms on the panel cell); the identity doesn't.
-            if let Some(rewritten) = try_count_over_const_unnest(stmt, &from.primary) {
-                return self.exec_select_cancel(&rewritten, cancel);
-            }
-            return self.exec_select_derived(stmt, &from.primary, cancel);
-        }
-        // v7.17.0 Phase 3.10 — `FROM generate_series(start, stop
-        // [, step])` set-returning source. Dispatch mirrors UNNEST:
-        // materialise the row stream from a single eval pass, then
-        // run the regular projection / WHERE / ORDER BY / LIMIT
-        // pipeline over the synthetic single-column table.
-        if from.primary.generate_series_args.is_some() {
-            return self.exec_select_generate_series(stmt, &from.primary, cancel);
+        if let Some(done) = self.try_from_shape_paths(stmt, from, cancel)? {
+            return Ok(done);
         }
         let primary = &from.primary;
         // v7.39 (round 244) — a sequence is selectable as a one-row relation
         // in PG (`SELECT last_value FROM seq` — psql's \d and several ORMs
         // read it). Synthesize PG's three columns.
-        if self.active_catalog().get(&primary.name).is_none()
-            && let Some(seq) = self.active_catalog().sequence(&primary.name)
-        {
-            let rows = alloc::vec![Row::new(alloc::vec![
-                Value::BigInt(seq.last_value),
-                Value::BigInt(0),
-                Value::Bool(seq.is_called),
-            ])];
-            let schema_cols = alloc::vec![
-                ColumnSchema::new("last_value", DataType::BigInt, false),
-                ColumnSchema::new("log_cnt", DataType::BigInt, false),
-                ColumnSchema::new("is_called", DataType::Bool, false),
-            ];
-            let alias = primary
-                .alias
-                .clone()
-                .unwrap_or_else(|| primary.name.clone());
-            return self.exec_select_over_rows(stmt, rows, schema_cols, &alias, cancel);
+        if let Some(done) = self.try_sequence_relation(stmt, primary, cancel)? {
+            return Ok(done);
         }
         let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
             StorageError::TableNotFound {
@@ -4182,34 +4451,10 @@ impl Engine {
         // also routes the query down the general path, past the index fast
         // paths below — they hand back rows without positions, and a ctid
         // that was sometimes right would be worse than none.
-        if references_ctid(stmt) {
-            let snapshot = self.current_snapshot();
-            let mut ext_cols = schema_cols.clone();
-            for name in SYSTEM_COLUMNS {
-                ext_cols.push(ColumnSchema::new(name.to_string(), DataType::Text, false));
-            }
-            let table_oid =
-                crate::system_catalog::relation_oid(self.active_catalog(), &primary.name)
-                    .unwrap_or(0);
-            let headers = table.headers();
-            let rows: Vec<Row<'static>> = table
-                .scan_visible(&snapshot)
-                .map(|(i, r)| {
-                    let mut vals = r.values.clone();
-                    // One block, offsets from 1, as PG numbers them.
-                    vals.push(Value::Tid(0, i as u32 + 1));
-                    let h = headers.get(i);
-                    vals.push(Value::Xid(h.map_or(0, |h| h.xmin as u32)));
-                    vals.push(Value::Xid(h.map_or(0, |h| h.xmax as u32)));
-                    // SPG keeps no per-statement command ids; PG shows 0 for
-                    // every row a reader can see, which is every row here.
-                    vals.push(Value::Cid(0));
-                    vals.push(Value::Cid(0));
-                    vals.push(Value::BigInt(table_oid));
-                    Row::new(vals)
-                })
-                .collect();
-            return self.exec_select_over_rows(stmt, rows, ext_cols, alias, cancel);
+        if let Some(done) =
+            self.try_ctid_projection(stmt, primary, table, schema_cols, alias, cancel)?
+        {
+            return Ok(done);
         }
         let ctx = self.ev_ctx(schema_cols, Some(alias));
 
@@ -4221,119 +4466,16 @@ impl Engine {
         // and thread it into every index-seek fast path below. No-op
         // today (every hot header is committed-alive).
         let seek_snapshot = self.current_snapshot();
-        if let Some(nsw_rows) = try_nsw_knn(stmt, table, schema_cols, alias, &seek_snapshot) {
-            // NSW kNN dispatches against the hot-tier vector index only
-            // (vector cells aren't promoted to cold segments), so wrap
-            // the returned row indices as `Cow::Borrowed` for the
-            // unified `materialise_in_order` shape.
-            let ordered: Vec<Cow<'_, Row<'static>>> = nsw_rows
-                .into_iter()
-                .filter_map(|i| table.rows().get(i).map(Cow::Borrowed))
-                .collect();
-            return materialise_in_order(
-                stmt,
-                schema_cols,
-                alias,
-                &ordered,
-                self.backslash_escapes,
-            );
-        }
-
-        // v7.34.5 — ORDER BY <indexed col> [DESC|ASC] LIMIT N drives
-        // the scan via the BTree iterator in the requested direction
-        // and stops after `OFFSET + LIMIT` candidates pass WHERE. The
-        // 80 ms `mailrs_prod_plain_limit` baseline at 250 k rows is
-        // the load-bearing consumer; this skips the materialise-every-
-        // row + partial-sort tail entirely. Walker output is already
-        // in ORDER BY order so `materialise_in_order` (no extra sort)
-        // is the natural sink.
-        if let Some(walked) = try_pk_walk_top_n(
-            stmt,
-            self.active_catalog(),
-            table,
-            schema_cols,
-            alias,
-            self,
-            cancel,
-        ) {
-            return materialise_in_order(stmt, schema_cols, alias, &walked, self.backslash_escapes);
-        }
-
-        // Index seek: if WHERE is `col = literal` (or commuted) and the
-        // referenced column has an index, dispatch each locator through
-        // the catalog (hot tier → borrow, cold tier → page-read +
-        // decode) and iterate just those rows. Otherwise fall back to a
-        // v7.37.x (docker-fair INSUBQ attack) — short-circuit COUNT(*)
-        // FROM A WHERE A.pk IN (large literal list). The post-subquery-
-        // replacement shape of INSUBQ. Runs BEFORE `indexed_rows` so
-        // we don't pay the row materialisation cost twice. Returns
-        // a bare `Rows{count}` if the shape matches.
-        if aggregate::uses_aggregate(stmt)
-            && let Some(out) = self.try_count_star_pk_in_list_fast(stmt, table, schema_cols, alias)
+        if let Some(done) =
+            self.try_seek_fast_paths(stmt, table, schema_cols, alias, &seek_snapshot, cancel)?
         {
-            return Ok(out);
-        }
-        // v7.38 (perf) — `count(*) WHERE <indexed BETWEEN>`: count the in-range
-        // locators directly, skipping row materialisation + WHERE re-eval.
-        if aggregate::uses_aggregate(stmt)
-            && let Some(out) = self.try_count_star_indexed_range_fast(
-                stmt,
-                table,
-                schema_cols,
-                alias,
-                &seek_snapshot,
-            )
-        {
-            return Ok(out);
+            return Ok(done);
         }
         // full scan over the hot tier (cold-tier rows are only reached
         // via index seek in v5.1 — full table scans against cold-tier
         // data ship in v5.2 with the freezer's per-segment scan API).
-        let indexed_rows: Option<Vec<Cow<'_, Row<'static>>>> = stmt.where_.as_ref().and_then(|w| {
-            // BTree / col=literal seek first — covers the v7.11.3 multi-
-            // column AND case and the leading-column equality lookup.
-            try_index_seek(
-                w,
-                schema_cols,
-                self.active_catalog(),
-                table,
-                alias,
-                &seek_snapshot,
-            )
-            .or_else(|| {
-                // v7.12.3 — GIN-accelerated `WHERE col @@
-                // tsquery` when the column has a `USING gin`
-                // index. Returns an over-approximate candidate
-                // set; the WHERE re-eval loop below verifies
-                // the full `@@` predicate per row.
-                try_gin_seek(
-                    w,
-                    schema_cols,
-                    self.active_catalog(),
-                    table,
-                    alias,
-                    &ctx,
-                    &seek_snapshot,
-                )
-            })
-            .or_else(|| {
-                // v7.15.0 — trigram-GIN-accelerated
-                // `WHERE col LIKE / ILIKE '<pat>'` when the
-                // column has a `gin_trgm_ops` GIN index.
-                // Over-approximate candidate set; the WHERE
-                // re-eval verifies the LIKE per row.
-                try_trgm_seek(w, schema_cols, table, alias, &seek_snapshot)
-            })
-            .or_else(|| {
-                // v7.37.8(sentori Epic 5 P2)— real JSONB-GIN
-                // accelerated `WHERE col @> <jsonb_literal>`
-                // when the column has a `USING gin` index. The
-                // posting-list intersection returns an over-
-                // approximate candidate set; the WHERE re-eval
-                // verifies the full `@>` predicate per row.
-                try_gin_jsonb_seek(w, schema_cols, table, alias, &seek_snapshot)
-            })
-        });
+        let indexed_rows =
+            self.pick_indexed_rows(stmt, table, schema_cols, alias, &ctx, &seek_snapshot);
 
         // Aggregate path: filter rows first, then hand off to the
         // aggregate executor which does its own projection + ORDER BY.

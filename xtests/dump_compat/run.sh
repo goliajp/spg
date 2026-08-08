@@ -13,6 +13,12 @@
 # Honours $PORT (default 6022) and $CONTAINER (default
 # spg-dump-compat).
 set -euo pipefail
+# Every `docker` call below needs OrbStack's client, which a
+# non-interactive shell does not have on PATH. `diffcorpus/run.sh`
+# has carried this line since round 666; the two harnesses beside
+# it did not, and the failure that caused was invisible — see the
+# wait loop's comment in dump_compat/run.sh.
+export PATH=/Applications/OrbStack.app/Contents/MacOS/xbin:$PATH
 HERE="$(cd "$(dirname "$0")" && pwd)"
 VERSION="${1:?usage: $0 <spg-tag | local-build>}"
 PORT="${PORT:-6022}"
