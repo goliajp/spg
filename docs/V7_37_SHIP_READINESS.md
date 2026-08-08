@@ -1,5 +1,21 @@
 # v7.37 ship readiness — what's in, what's queued
 
+> **Verified round 868, and what that verification covers.** The
+> capability claims below were sampled — 13 scalar/operator claims and a
+> DML slice (TRUNCATE RESTART IDENTITY CASCADE, UPDATE … FROM,
+> DELETE … USING, a writable CTE) — run through the same psql image
+> against SPG and PG18 from one file. Every sampled claim held, value
+> for value. That is a sample of a 924-line document, not a sweep of it.
+>
+> Two things were stale and are corrected:
+>
+> - `SHOW ALL` was written as 13 rows; it returns 21.
+> - Five sections credited work to **v7.37.17**, a version that does not
+>   exist — `git tag` stops at 7.37.12, which is also the workspace
+>   version. The capabilities are real and measured; the version they
+>   were filed under was not. They now read "the post-7.37.12 branch",
+>   which is what they are until something ships.
+
 > Authoritative snapshot of v7.37's ship surface vs the items deferred
 > to v7.38+. The complete-roadmap file
 > (`.claude/notes/v7.37.x-complete-roadmap.md`, gitignored) is an
@@ -49,14 +65,17 @@ not gated on those).
   NOT OF / FORCE RLS / ENABLE/DISABLE ROW LEVEL SECURITY all
   accept-and-no-op.
 
-### Real DML / SQL statements shipped (v7.37.17 autorun slice)
+### Real DML / SQL statements shipped (the post-7.37.12 branch autorun slice)
 
 - `TRUNCATE [TABLE] [ONLY] <name>[, ...]
                      [RESTART IDENTITY | CONTINUE IDENTITY]
                      [CASCADE | RESTRICT]` — clears rows via
   Table::truncate(); RESTART IDENTITY parsed but SequenceDef restart
   queues with v7.38.
-- `SHOW ALL` returns 13-row `(name, setting, description)` inventory.
+- `SHOW ALL` returns a `(name, setting, description)` inventory — 21
+  rows as of round 868, measured. The count is not pinned here: it
+  grows whenever a GUC is added, and a number written down is a
+  number that goes stale. The row SHAPE is what this claims.
 - `SHOW <param>` PG-default fallback for 13 GUCs drivers commonly
   probe (lock_timeout / idle_in_transaction_session_timeout /
   transaction_timeout / statement_timeout / client_min_messages /
@@ -66,7 +85,7 @@ not gated on those).
   effective_cache_size / etc.) — pg_settings row shape widened to
   match.
 
-### Real scalar functions shipped (v7.37.17 autorun slice — expanded)
+### Real scalar functions shipped (the post-7.37.12 branch autorun slice — expanded)
 
 Real implementations, not stubs. Total shipped this cycle:
 ~560 scalar helpers across 220+ commits, verified against
@@ -610,17 +629,17 @@ PG 14+/15+/16+/17+ additions (~30 real):
 - PG 9.6+ `parse_ident(qualname [, strict])`;
 - PG 11+ `starts_with(str, prefix)` + `ends_with` + alias.
 
-Interval canonicalizers (v7.37.17 real):
+Interval canonicalizers (the post-7.37.12 branch real):
 - `justify_days` / `justify_hours` / `justify_interval` — 30d/24h/full
   cascade via div_euclid/rem_euclid.
 
-Size formatting (v7.37.17 real):
+Size formatting (the post-7.37.12 branch real):
 - `pg_size_bytes(text)` — human→BigInt parser (SI + IEC units);
 - `pg_size_pretty(bigint)` — upgraded from stub to real formatter;
 - `pg_bytes_pretty` — alias for pg_size_pretty;
 - `pg_object_size` / `pg_relation_size_pretty` → 0.
 
-Real trig (v7.37.17 via libm):
+Real trig (the post-7.37.12 branch via libm):
 - `sin/cos/tan/asin/acos/atan/atan2` (radian);
 - `sinh/cosh/tanh/asinh/acosh/atanh` (hyperbolic);
 - `sind/cosd/tand/cotd/asind/acosd/atand/atan2d` (degree).
@@ -656,7 +675,7 @@ Original real implementations from earlier in the cycle:
   `clock_timestamp` / `localtime` / `localtimestamp()` (with
   parens) all fold to the engine clock at rewrite time.
 
-### PG scalar function inventory (v7.37.17 autorun slice)
+### PG scalar function inventory (the post-7.37.12 branch autorun slice)
 
 The `eval/functions.rs` dispatcher now covers ~60 more scalar
 helpers common ORMs (Diesel / sqlx / GORM), monitoring exporters
@@ -705,7 +724,7 @@ Sensible defaults so `SELECT` succeeds instead of returning
 - Range: `lower_inc` / `upper_inc` / `lower_inf` / `upper_inf` /
   `isempty`
 
-### `SHOW <param>` / `pg_settings` widened (v7.37.17 autorun slice)
+### `SHOW <param>` / `pg_settings` widened (the post-7.37.12 branch autorun slice)
 
 Both surfaces now report PG-shape defaults for common GUCs
 drivers probe before / after SET:
@@ -723,7 +742,7 @@ drivers probe before / after SET:
 `(name, setting, description)` triples. Session-set overrides
 update the default row (not just as extra rows) in pg_settings.
 
-### pg_dump / pg_dumpall wider parse-accept (v7.37.17 autorun slice)
+### pg_dump / pg_dumpall wider parse-accept (the post-7.37.12 branch autorun slice)
 
 The parser now accepts the following top-level shapes that pg_dump
 and pg_dumpall emit as ownership / cleanup / maintenance
@@ -833,7 +852,7 @@ concurrency / vacuum / isolation levels / regression). Multi-week
 epic. Gates Hot Standby (21.15) + the per-MVCC dependent items
 (22.11 N-hop wait chain, 19.22 EXPLAIN ANALYZE lock-wait, etc.).
 
-### v7.37.17 → v7.39 indexes (9 items)
+### the post-7.37.12 branch → v7.39 indexes (9 items)
 
 Hash / GiST / SPGiST / GIN posting tree / GIN fast-update +
 CREATE INDEX CONCURRENTLY. Each AM is a 1-2 week epic.
