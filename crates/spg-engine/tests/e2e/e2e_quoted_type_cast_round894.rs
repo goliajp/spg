@@ -11,11 +11,9 @@
 //! Scope came from enumerating PG18's catalog rather than guessing: of
 //! its 75 builtin scalar/range types, PG accepts every one quoted and SPG
 //! rejected exactly `tsvector`, `tsquery`, `regclass`, `regtype`. The
-//! first two are fixed here. The other two have no `DataType` of their
-//! own — they live as `Value::RegClass` / `Value::RegType` with casts
-//! special-cased at value level — so they are left failing rather than
-//! guessed at, and the last test pins that they still behave as they did
-//! so the gap cannot close by accident and go unnoticed.
+//! first two were fixed here; round 896 closed `regclass` and `regtype`
+//! by folding their quoted `Named` spelling onto the `CastTarget` variant
+//! that already had an arm. All four now cast under either spelling.
 
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
@@ -62,9 +60,21 @@ fn a_quoted_cast_carries_the_value_the_bare_one_does() {
     );
 }
 
-/// The two still open, pinned so closing them is a deliberate act.
+/// Round 896 closed the other two, and this is the test that made it a
+/// deliberate act rather than a silent flip: it asserted they were still
+/// refused, and it FAILED the moment the fold landed, with its own message
+/// saying to rewrite it here.
+///
+/// They took a different route from `tsvector` / `tsquery`, which is why
+/// round 894 left them rather than guessing. `regclass` and `regtype` have
+/// no `DataType`; they are `CastTarget` variants with their own arm and
+/// `Value::RegClass` / `Value::RegType` behind it. So the quoted `Named`
+/// spelling is FOLDED onto the variant at the top of the cast evaluator —
+/// one implementation, not a second arm that could drift — and the name is
+/// added to the target validator, which runs first and would otherwise
+/// reject it before the fold was reached.
 #[test]
-fn regclass_and_regtype_are_still_quoted_only_by_their_bare_spelling() {
+fn every_reg_type_casts_under_its_quoted_spelling_too() {
     let mut e = Engine::new();
     for ty in ["regclass", "regtype"] {
         assert!(
@@ -72,10 +82,18 @@ fn regclass_and_regtype_are_still_quoted_only_by_their_bare_spelling() {
             "bare ::{ty} works"
         );
         assert!(
-            !scalar_ok(&mut e, &format!("SELECT NULL::\"{ty}\"")),
-            "::\"{ty}\" is still refused — when this starts passing, drop \
-             this test and say so in the ledger rather than letting it flip \
-             silently"
+            scalar_ok(&mut e, &format!("SELECT NULL::\"{ty}\"")),
+            "quoted ::\"{ty}\" should cast the same type"
         );
     }
+    // And the fold reaches the arm, not just the validator: a real value
+    // has to come back resolved, the same either way.
+    assert_eq!(
+        type_of(&mut e, "SELECT ('pg_class'::\"regclass\")::text"),
+        type_of(&mut e, "SELECT ('pg_class'::regclass)::text"),
+    );
+    assert_eq!(
+        type_of(&mut e, "SELECT ('int4'::\"regtype\")::text"),
+        type_of(&mut e, "SELECT ('int4'::regtype)::text"),
+    );
 }

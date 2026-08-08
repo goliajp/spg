@@ -419,6 +419,22 @@ pub fn cast_value_ref_in(
     target: &CastTarget,
     mysql: bool,
 ) -> Result<Value<'static>, EvalError> {
+    // v7.37 (round 896) — the quoted spelling of these two arrives as
+    // `Named`, the bare one as its own variant, and only the variant had an
+    // arm. `::regclass` worked and `::"regclass"` answered `type "regclass"
+    // does not exist` — and quoted identifiers are what an ORM or pg_dump
+    // writes. Folding here rather than adding a second arm keeps one
+    // implementation: whatever the variant does, the quoted form now does.
+    // Round 894 fixed `tsvector` / `tsquery` the same way round and left
+    // these open because this path had not been read; it has now.
+    if let CastTarget::Named(n) = target {
+        if n.eq_ignore_ascii_case("regclass") {
+            return cast_value_ref_in(v, &CastTarget::RegClass, mysql);
+        }
+        if n.eq_ignore_ascii_case("regtype") {
+            return cast_value_ref_in(v, &CastTarget::RegType, mysql);
+        }
+    }
     // v7.39 (round 509) — PG validates the cast TARGET whatever the operand
     // is: `NULL::nosuchtype` is an error there, not NULL. This returned early
     // before ever looking at the target, so a misspelt type name silently
@@ -1412,7 +1428,16 @@ fn is_known_scalar_name(lower: &str) -> bool {
         || OPAQUE_TYPES.contains(&lower)
         || matches!(
             lower,
-            "tid" | "record" | "cstring" | "regnamespace" | "regrole"
+            "tid"
+                | "record"
+                | "cstring"
+                | "regnamespace"
+                | "regrole"
+                // Round 896 — the target validator runs before the arm, so
+                // the quoted spelling has to be a known name here too or it
+                // is rejected before the fold above ever sees it.
+                | "regclass"
+                | "regtype"
         )
 }
 
