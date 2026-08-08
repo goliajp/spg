@@ -479,6 +479,59 @@ mod tests {
         Ok(src.clone())
     }
 
+    /// r855 — does the merge's per-row cost grow with the NUMBER of runs
+    /// even now that picking a row is O(log k)?
+    ///
+    /// About 40 ms of the merge still has no owner. The obvious
+    /// candidate — the `Vec<OrderKey>` allocated per row — is already
+    /// weakened by round 845, which removed two allocations per row,
+    /// 800k in all, and measured nothing.
+    ///
+    /// What has not been checked is locality. Round 852 timed decoding
+    /// along one contiguous tape, which is the friendliest possible
+    /// layout; the merge reads round-robin across k separate buffers,
+    /// touching a different one almost every row.
+    ///
+    /// Budget fixed, row count varied, so k moves while the work done
+    /// per row does not. A flat per-row cost means locality is not it.
+    ///
+    /// `cargo test -p spg-engine --release --lib r855 -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn r855_merge_cost_per_row_against_run_count() {
+        extern crate std;
+        use spg_storage::{ColumnSchema, DataType, Value};
+        use std::time::Instant;
+
+        let pad: alloc::string::String = "y".repeat(200);
+        let cols = alloc::vec![
+            ColumnSchema::new("id", DataType::Int, false),
+            ColumnSchema::new("pad", DataType::Text, false),
+        ];
+        let descs = [false];
+
+        for rows in [50_000usize, 100_000, 200_000, 400_000] {
+            let mut s = ExternalSorter::new(Some(mem_run), 4 * 1024 * 1024, cols.clone(), &descs);
+            for i in 0..rows {
+                let r = Row::new(alloc::vec![
+                    Value::Int(i32::try_from((i * 7919) % rows).unwrap()),
+                    Value::text(pad.clone()),
+                ]);
+                let k = keys_of(&r).unwrap();
+                s.push(k, r).unwrap();
+            }
+            let runs = s.runs.len() + usize::from(!s.batch.is_empty());
+            let t = Instant::now();
+            let out = s.finish(keys_of, |src| Ok(src.clone())).unwrap();
+            let el = t.elapsed();
+            std::eprintln!(
+                "R855 rows={rows} runs={runs} merge={el:?} per_row={:.1}ns",
+                el.as_nanos() as f64 / rows as f64
+            );
+            assert_eq!(out.len(), rows);
+        }
+    }
+
     /// r853 — is the merge's remaining time the linear head scan after all?
     ///
     /// Round 844 concluded it was not, from 29 runs merging no slower
