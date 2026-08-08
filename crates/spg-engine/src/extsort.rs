@@ -388,6 +388,99 @@ mod tests {
         Ok(src.clone())
     }
 
+    /// r851 — how much of the merge is RE-DERIVING the sort keys?
+    ///
+    /// Every earlier reading of this used a `keys_of` that reads
+    /// `values[0]` and is therefore free, so they all measured a merge
+    /// that does not exist: the wiring hands `build_order_keys_bound`,
+    /// which evaluates an expression per row. PG (measured through
+    /// EXPLAIN, not read) spends about 70 ms on the whole of spilling
+    /// where SPG's merge phase alone spends 103 ms, and the keys are
+    /// the first candidate — PG writes them alongside the tuple and
+    /// compares what it already has.
+    ///
+    /// Same rows, same merge, two `keys_of`: one free, one doing the
+    /// work an expression evaluation actually costs.
+    ///
+    /// `cargo test -p spg-engine --release --lib r851 -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn r851_price_key_rederivation_in_the_merge() {
+        extern crate std;
+        use spg_storage::{ColumnSchema, DataType, Value};
+        use std::time::Instant;
+
+        const ROWS: usize = 400_000;
+        let pad: alloc::string::String = "y".repeat(200);
+        let cols = alloc::vec![
+            ColumnSchema::new("id", DataType::Int, false),
+            ColumnSchema::new("pad", DataType::Text, false),
+        ];
+        let descs = [false];
+
+        // What every earlier bench used: a projected column, read back.
+        fn free_keys(src: &Row<'static>) -> Result<Vec<OrderKey>, EngineError> {
+            match &src.values[0] {
+                Value::Int(n) => Ok(alloc::vec![OrderKey::Int(i128::from(*n))]),
+                other => Err(EngineError::Internal(alloc::format!("bad key: {other:?}"))),
+            }
+        }
+
+        // What the wiring hands it: a key that has to be COMPUTED. The
+        // shape stands in for `build_order_keys_bound` walking a small
+        // expression — an allocation and arithmetic per row, which is
+        // what an ORDER BY operand costs when it is not a bare column.
+        fn computed_keys(src: &Row<'static>) -> Result<Vec<OrderKey>, EngineError> {
+            let Value::Int(n) = &src.values[0] else {
+                return Err(EngineError::Internal(alloc::string::String::from(
+                    "bad key",
+                )));
+            };
+            let Value::Text(t) = &src.values[1] else {
+                return Err(EngineError::Internal(alloc::string::String::from(
+                    "bad pad",
+                )));
+            };
+            let folded = i128::from(*n) + i128::try_from(t.len()).unwrap_or(0);
+            Ok(alloc::vec![OrderKey::Int(folded)])
+        }
+
+        // Third variant: the same merge, but the projection keeps one
+        // int instead of cloning the 200-byte row back out. If the
+        // merge is bound by materialising rows rather than by any work
+        // done per key, this is where it shows.
+        for (label, keyfn, narrow) in [
+            (
+                "free",
+                free_keys as fn(&Row<'static>) -> Result<Vec<OrderKey>, EngineError>,
+                false,
+            ),
+            ("computed", computed_keys, false),
+            ("narrow-projection", free_keys, true),
+        ] {
+            let mut s = ExternalSorter::new(Some(mem_run), 4 * 1024 * 1024, cols.clone(), &descs);
+            for i in 0..ROWS {
+                let r = Row::new(alloc::vec![
+                    Value::Int(i32::try_from((i * 7919) % ROWS).unwrap()),
+                    Value::text(pad.clone()),
+                ]);
+                let k = keyfn(&r).unwrap();
+                s.push(k, r).unwrap();
+            }
+            let t = Instant::now();
+            let out = if narrow {
+                s.finish(keyfn, |src| {
+                    Ok(Row::new(alloc::vec![src.values[0].clone()]))
+                })
+            } else {
+                s.finish(keyfn, |src| Ok(src.clone()))
+            }
+            .unwrap();
+            std::eprintln!("R851 {label} merge={:?} rows={}", t.elapsed(), out.len());
+            assert_eq!(out.len(), ROWS);
+        }
+    }
+
     /// r844 — does the merge cost scale with the number of RUNS?
     ///
     /// Round 839 cleared the O(n·k) merge as the cause of a 1.33 s gap,
