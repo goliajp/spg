@@ -1692,7 +1692,30 @@ impl Engine {
             // scans report rows the executor genuinely touched.
             let before = scan_counter_snapshot(self);
             let started = self.clock.map(|f| f());
-            let exec = self.exec_select_cancel(sel, cancel)?;
+            // v7.37 (round 903) — ANALYZE runs the path the QUERY runs.
+            //
+            // This called `exec_select_cancel`, the materialising executor,
+            // while a client's SELECT arrives through
+            // `execute_readonly_select_streaming_prepared`. So the plan
+            // measured one execution and described another. Round 882 made
+            // the divergence visible — a single-table ORDER BY spills over
+            // the wire and does not here, so `Sort Method` said `quicksort`
+            // for a sort that had gone to disk — and rounds 900-902 showed
+            // it is worse than a wrong label: every stage timing read off
+            // ANALYZE was measuring a walk the client does not take.
+            // Scanning 10k rows costs 2.4 ms materialising, and the
+            // streaming walk is not that, so "which stage is slow" could
+            // not be answered from here at all.
+            //
+            // The streaming entry falls back to the materialising one for
+            // whatever it cannot claim, so nothing this used to explain
+            // stops being explained. Rows are counted and dropped, which is
+            // what ANALYZE does with them either way.
+            let exec_rows =
+                self.execute_readonly_select_streaming_prepared(sel, cancel, |item| {
+                    let _ = matches!(item, crate::StreamItem::Row(_));
+                    Ok(())
+                })?;
             let elapsed_micros = match (self.clock, started) {
                 (Some(f), Some(s)) => Some(f().saturating_sub(s)),
                 _ => None,
@@ -1706,11 +1729,7 @@ impl Engine {
                     deltas.insert(k.clone(), d);
                 }
             }
-            let row_count = if let QueryResult::Rows { rows, .. } = &exec {
-                rows.len()
-            } else {
-                0
-            };
+            let row_count = exec_rows;
             // Re-render the tree with the measured blocks attached. Timing
             // rides the top node only (see fill_actuals); TIMING OFF and
             // the test-mode GUC suppress it entirely.
