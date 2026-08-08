@@ -41,6 +41,115 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [Unreleased — feature/v7.37.15-mvcc-cf-ceiling]
+
+Work on the branch since 7.37.12, not versioned yet. Grouped by what it
+changes rather than by round.
+
+### Correctness
+
+- **Row security binds the authenticated session.** `is_superuser()`
+  answered true whenever no `SET ROLE` had been issued, so RLS never
+  engaged for a connection that had authenticated normally — every
+  policy-protected row was readable. Authenticated logins now carry
+  their own role's attributes; the open/embedded default is unchanged.
+  Streaming needed a matching gate, since it takes over before the
+  predicate is injected. (r830)
+- **Coarse roles are baseline privileges.** Making authentication carry
+  privileges exposed that `readwrite` / `readonly` were never registered
+  in any table ACL, so `CREATE USER … ROLE 'readwrite'` could not INSERT
+  into a table its own admin had made. They now grant a baseline that
+  per-table GRANTs add to. (r830)
+- **Bare column names resolve like every other projection.** They took a
+  separate path that could not see a joined context, which is what made
+  them behave differently under a timeout. (r823)
+- **Materialised results check for cancellation.** Four copies of the
+  same delivery loop had no check, so `statement_timeout` and
+  CancelRequest did nothing for the commonest shapes — the delivery is
+  most of the cost, not the computation. Three loops collapsed into
+  `emit_materialised`; the fourth had a different consumer signature and
+  was only found because the first three stopped hiding it. (r824)
+
+### Memory
+
+- **A joinless SELECT walks its table instead of copying it.** The
+  deferred path cloned every surviving row into a Vec first: 117 MB for
+  a 300k-row scan, against 0 once it reads and discards row by row.
+  (r831)
+- **External merge sort, unwired.** Sorting held every row twice with
+  nothing bounding it — 807 MB at 400k rows, whatever `work_mem` said.
+  The sorter spills sorted runs and merges them back in O(log k), and
+  eight ORDER BY shapes give byte-identical answers spilled or not. It
+  is not on any query path: measured against PG, spilling costs SPG
+  ~150 ms where it costs PG ~70-95, and that gap is not closed.
+  (r833-r855)
+
+### Build and gates
+
+- **The gate reports its own exit code.** Every run went through
+  `gate.sh all | tail`, which reads tail's status, so a red lint had
+  been passing for weeks. Fixed, and then the toolchain move it had been
+  hiding was repaired: rustfmt 1.9.0 across 523 files, two new clippy
+  lints, and parser frames that had grown until a 64-level nesting
+  budget no longer fit a 2 MiB stack (30,336 bytes per level, halved to
+  14,752). (r845-r850)
+- **dump_compat and data_compat can run.** Neither had OrbStack's
+  `docker` on PATH, and two redirects hid it so thoroughly that the only
+  message named a server that was, per its own log, listening the whole
+  time. (r850)
+
+### Tests
+
+- Assertions that judged correctness by the clock now judge it by
+  something else: concurrent reads by an order rather than a ratio,
+  group-commit by the fsync count it actually shares, a delta refresh by
+  the counter that says which path ran, and a killed connection by the
+  exchange failing rather than by which half reports it.
+  (r857, r858)
+- The streaming walk is pinned on the server's memory. `emit_materialised`
+  made both paths look identical on the wire, so the test that claimed to
+  prove streaming had been passing with streaming turned off. (r856, r859)
+
+## [7.37.12] — 2026-06-24 (open_path dedup: race closed, and made observable)
+
+- **embedded-tokio**: closed a subscribe-after-publish race in the
+  v7.37.11 `open_path` dedup. A waiter that arrived between the publish
+  and its own subscribe missed the notification and waited out the
+  timeout; `Notify` gave way to `watch`, which carries the value rather
+  than the edge.
+- **embedded-tokio**: counters plus an opt-in stderr line for the dedup,
+  so the next recurrence can be read off the process instead of
+  inferred.
+- **docs**: WAL quarantine and recovery procedure, with its helper
+  script (mailrs cascade 7, P0 #3).
+
+## [7.37.11] — 2026-06-24 (mailrs lock-hang, 6th recurrence — process-wide open_path dedup)
+
+- **embedded-tokio**: two `AsyncDatabase::open_path` calls for the same
+  file in one process no longer race for the lock; the second joins the
+  first's open instead of contending with it. Sixth recurrence of the
+  same customer-visible hang, and the first fix at process scope rather
+  than per-handle.
+
+## [7.37.10] — 2026-06-24 (mailrs cascade 7 — time-based auto-checkpoint)
+
+- **embedded**: auto-checkpoint now also fires on elapsed time, not only
+  on WAL size. A workload that writes steadily but slowly could go
+  arbitrarily long without one, which is what made recovery long enough
+  to look like a hang.
+
+## [7.37.9] — 2026-06-24 (T3 by-ref evaluation + PITR V5 restore)
+
+- **perf**: the Step VM stops allocating to read a value. `Step::Column`
+  and `Step::Lit` push `Cow::Borrowed`; `apply_binary_by_ref` and the
+  relaxed `apply_function*` signatures take stack slices; `Step::Case`
+  threads its sub-program's lifetime instead of copying out. Class C
+  p99 fell 79%.
+- **spgctl**: PITR restore reads V5 row-redo (0x13) records. Restoring a
+  WAL written by the default-on V5 path failed before this.
+- **perf**: diagnostic counters moved behind a `perf-counters` feature,
+  after they were found taxing the release build.
+
 ## [7.37.8] — 2026-06-23 (mailrs lock-hang 4th recurrence — V4 SQL replay tax killed by default-on V5 ROW_REDO)
 
 Hotfix. mailrs reported a 4th distinct lock-hang on prod
