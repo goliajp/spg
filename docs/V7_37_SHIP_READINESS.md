@@ -26,11 +26,19 @@
 
 ### Catalog completeness
 
-> **Verified round 893 — the second half of this claim does not hold.**
-> Every catalog named below exists and is selectable on SPG (0 missing),
-> and the list is 38 entries, not 37. But "the PG-canonical column set"
-> is true for 23 of them and false for 13: those are shaped to PG 16/17
-> and PG 18 has since added or renamed columns SPG does not carry.
+> **Verified round 893, sharpened round 929.** Every catalog named below
+> exists and is selectable on SPG (0 missing), and the list is 38 entries,
+> not 37. But "the PG-canonical column set" is true for 23 of them and
+> false for 13.
+>
+> The 13 are not one thing, and the difference decides whether each is a
+> gap. Each synth function is annotated with the PG level it was written
+> against — `pg_stat_io` says "(PG 16+)", `pg_stat_checkpointer` says
+> "(PG 17+)" — so the catalogs ACCRETED version by version rather than
+> being cut once against PG 18. Where PG 18 SPLIT a view, SPG carries both
+> shapes and is compatible in both directions; where PG 18 RENAMED a
+> column, SPG kept only the old name and a PG 18 client breaks. Providing
+> both is compatibility; providing only the old one is debt.
 > Checked by reading `SELECT * FROM <cat> LIMIT 0`'s header on both sides.
 >
 > The gap is client-visible, not cosmetic — `SELECT last_seq_scan FROM
@@ -55,11 +63,13 @@
 >   (`nulls_distinct`), `information_schema.domains`,
 >   `information_schema.attributes` — each short of PG18's set
 >
-> Two entries are NOT defects: `pg_stat_statements` differs only because
-> the reference container has no such extension installed, and
-> `pg_stat_bgwriter` differs because SPG still carries the checkpoint
-> columns PG18 moved to `pg_stat_checkpointer` — SPG has more there, not
-> less. Ledger item 29.
+> Two entries are NOT defects. `pg_stat_statements` differs only because
+> the reference container has no such extension installed. And
+> `pg_stat_bgwriter` differs because SPG carries the checkpoint columns
+> PG18 moved out — but the reason that is fine is the half round 893
+> missed: SPG ALSO has `pg_stat_checkpointer` (`system_catalog.rs`,
+> "PG 17+"), so both the pre-18 and the 18 spelling resolve. "SPG has
+> more" was the right verdict for the wrong reason. Ledger item 29.
 
 38 PG-shape catalog views land in v7.37, each selectable, 23 of them
 with the PG-canonical column set (see the note above for the other 13):
