@@ -2553,6 +2553,125 @@ impl Engine {
         }
     }
 
+    /// `DISTINCT ON`'s de-duplication, which runs after the inner
+    /// SELECT has produced its rows.
+    ///
+    /// `#[inline(never)]` and out of `exec_select_cancel_as` for the
+    /// reason round 848 established: a debug build gives every branch's
+    /// locals a slot in the frame whichever branch runs, and this one is
+    /// eighty lines of hashing, key slicing and survivor sorting that a
+    /// statement without `DISTINCT ON` never touches. Round 867
+    /// measured `exec_select_cancel_as` holding ~46 KB on a path that
+    /// reaches none of it — the segment that had been blamed on
+    /// `exec_bare_select_cancel`, which turned out to hold 2 KB.
+    #[inline(never)]
+    fn apply_distinct_on(
+        &self,
+        result: QueryResult,
+        don_hidden: usize,
+        don_limit: &(
+            Option<spg_sql::ast::LimitExpr>,
+            Option<spg_sql::ast::LimitExpr>,
+        ),
+        don_top1: usize,
+        orig_order_by: &[spg_sql::ast::OrderBy],
+    ) -> Result<QueryResult, EngineError> {
+        let QueryResult::Rows { columns, rows } = result else {
+            return Ok(result);
+        };
+        // The keys are the hidden trailing columns appended above.
+        // v7.39 (round 729) — top-1 mode: the trailing columns are the
+        // DON keys plus the ORDER tail; keep each group's best in one
+        // hash pass, then sort the SURVIVORS with the original spec.
+        let mut kept: alloc::vec::Vec<Row<'static>>;
+        let key_start;
+        if don_top1 > 0 {
+            let tail = don_top1 - 1;
+            key_start = columns.len().saturating_sub(don_hidden + tail);
+            let ord_start = key_start + don_hidden;
+            let tail_dirs: alloc::vec::Vec<(bool, Option<bool>)> = orig_order_by[don_hidden..]
+                .iter()
+                .map(|o| (o.desc, o.nulls_first))
+                .collect();
+            let mysql = self.backslash_escapes;
+            let better = |a: &Row<'static>, b: &Row<'static>| -> bool {
+                for (k, (desc, nf)) in tail_dirs.iter().enumerate() {
+                    let av = a.values.get(ord_start + k).unwrap_or(&Value::Null);
+                    let bv = b.values.get(ord_start + k).unwrap_or(&Value::Null);
+                    match crate::order_by_value_cmp_in(*desc, *nf, av, bv, mysql) {
+                        core::cmp::Ordering::Less => return true,
+                        core::cmp::Ordering::Greater => return false,
+                        core::cmp::Ordering::Equal => {}
+                    }
+                }
+                false
+            };
+            let mut slot: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
+            let mut best: alloc::vec::Vec<Row<'static>> = alloc::vec::Vec::new();
+            let mut keybuf = String::new();
+            for row in rows {
+                keybuf.clear();
+                for v in row.values.get(key_start..ord_start).unwrap_or(&[]) {
+                    aggregate::push_canonical_key(&mut keybuf, v);
+                }
+                match slot.get(keybuf.as_str()) {
+                    Some(&i) => {
+                        if better(&row, &best[i]) {
+                            best[i] = row;
+                        }
+                    }
+                    None => {
+                        slot.insert(keybuf.clone(), best.len());
+                        best.push(row);
+                    }
+                }
+            }
+            // Survivors sort with the FULL original spec (keys are still
+            // aboard as hidden columns).
+            let full_dirs: alloc::vec::Vec<(bool, Option<bool>)> = orig_order_by
+                .iter()
+                .map(|o| (o.desc, o.nulls_first))
+                .collect();
+            best.sort_by(|a, b| {
+                for (k, (desc, nf)) in full_dirs.iter().enumerate() {
+                    let av = a.values.get(key_start + k).unwrap_or(&Value::Null);
+                    let bv = b.values.get(key_start + k).unwrap_or(&Value::Null);
+                    match crate::order_by_value_cmp_in(*desc, *nf, av, bv, mysql) {
+                        core::cmp::Ordering::Equal => {}
+                        o => return o,
+                    }
+                }
+                core::cmp::Ordering::Equal
+            });
+            for r in &mut best {
+                r.values.truncate(key_start);
+            }
+            kept = best;
+        } else {
+            key_start = columns.len().saturating_sub(don_hidden);
+            let mut seen: alloc::vec::Vec<alloc::vec::Vec<Value<'static>>> = alloc::vec::Vec::new();
+            kept = alloc::vec::Vec::new();
+            for mut row in rows {
+                let key: alloc::vec::Vec<Value<'static>> =
+                    row.values.get(key_start..).unwrap_or(&[]).to_vec();
+                if seen.iter().any(|k| k == &key) {
+                    continue;
+                }
+                seen.push(key);
+                row.values.truncate(key_start);
+                kept.push(row);
+            }
+        }
+        let mut columns = columns;
+        columns.truncate(key_start);
+        // PG limits what DISTINCT ON left, not what fed it.
+        let kept = apply_deferred_limit(kept, don_limit);
+        Ok(QueryResult::Rows {
+            columns,
+            rows: kept,
+        })
+    }
+
     pub(crate) fn exec_select_cancel_as(
         &self,
         stmt: &SelectStatement,
@@ -2716,100 +2835,233 @@ impl Engine {
         if stmt.distinct_on.is_empty() {
             return Ok(result);
         }
-        let QueryResult::Rows { columns, rows } = result else {
-            return Ok(result);
+        self.apply_distinct_on(result, don_hidden, &don_limit, don_top1, &orig_order_by)
+    }
+
+    /// The UNION chain: execute the head as a bare block, then fold each
+    /// peer in with left-associative dedup.
+    ///
+    /// `#[inline(never)]` and out of `exec_select_cancel_inner` for the
+    /// reason round 848 established. A statement with no unions returns
+    /// one line above the call — and every nested subquery on a deep
+    /// path is such a statement, so each level of the recursion carried
+    /// 170 lines of locals it could not reach. Round 867 measured that
+    /// frame at 34,800 bytes, the largest single one on the descent,
+    /// after two earlier attributions had blamed its caller and then its
+    /// callee: the gap between two marks is the frame of everything
+    /// BETWEEN them, and this function had no mark of its own.
+    #[inline(never)]
+    fn exec_union_chain(
+        &self,
+        stmt_ref: &SelectStatement,
+        stmt: &SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        // UNION path: clone-strip the head into a bare block (its own
+        // DISTINCT and any inner ORDER BY are dropped by parser rule —
+        // the wrapper SelectStatement carries them), execute, then chain
+        // peers with left-associative dedup semantics.
+        // v7.39 (round 232) — the wrapper's ORDER BY addresses the head's
+        // output columns; a position past their count is PG's 42P10.
+        crate::orderby::check_order_by_positions(stmt_ref)?;
+        let mut head_unknown = branch_unknown_mask(stmt_ref);
+        let mut head = stmt_ref.clone();
+        head.unions = Vec::new();
+        head.order_by = Vec::new();
+        head.limit = None;
+        let QueryResult::Rows {
+            mut columns,
+            mut rows,
+        } = self.exec_bare_select_cancel(&head, cancel)?
+        else {
+            unreachable!("bare SELECT cannot return CommandOk")
         };
-        // The keys are the hidden trailing columns appended above.
-        // v7.39 (round 729) — top-1 mode: the trailing columns are the
-        // DON keys plus the ORDER tail; keep each group's best in one
-        // hash pass, then sort the SURVIVORS with the original spec.
-        let mut kept: alloc::vec::Vec<Row<'static>>;
-        let key_start;
-        if don_top1 > 0 {
-            let tail = don_top1 - 1;
-            key_start = columns.len().saturating_sub(don_hidden + tail);
-            let ord_start = key_start + don_hidden;
-            let tail_dirs: alloc::vec::Vec<(bool, Option<bool>)> = orig_order_by[don_hidden..]
-                .iter()
-                .map(|o| (o.desc, o.nulls_first))
-                .collect();
-            let mysql = self.backslash_escapes;
-            let better = |a: &Row<'static>, b: &Row<'static>| -> bool {
-                for (k, (desc, nf)) in tail_dirs.iter().enumerate() {
-                    let av = a.values.get(ord_start + k).unwrap_or(&Value::Null);
-                    let bv = b.values.get(ord_start + k).unwrap_or(&Value::Null);
-                    match crate::order_by_value_cmp_in(*desc, *nf, av, bv, mysql) {
-                        core::cmp::Ordering::Less => return true,
-                        core::cmp::Ordering::Greater => return false,
-                        core::cmp::Ordering::Equal => {}
-                    }
-                }
-                false
+        for (kind, peer) in &stmt_ref.unions {
+            // v7.37.17 (17.6 siblings) — a peer carrying its own
+            // unions is a nested INTERSECT group (the parser's
+            // precedence regrouping); recurse through the
+            // union-aware wrapper for it.
+            let peer_result = if peer.unions.is_empty() {
+                self.exec_bare_select_cancel(peer, cancel)?
+            } else {
+                self.exec_select_cancel(peer, cancel)?
             };
-            let mut slot: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
-            let mut best: alloc::vec::Vec<Row<'static>> = alloc::vec::Vec::new();
-            let mut keybuf = String::new();
-            for row in rows {
-                keybuf.clear();
-                for v in row.values.get(key_start..ord_start).unwrap_or(&[]) {
-                    aggregate::push_canonical_key(&mut keybuf, v);
-                }
-                match slot.get(keybuf.as_str()) {
-                    Some(&i) => {
-                        if better(&row, &best[i]) {
-                            best[i] = row;
+            let QueryResult::Rows {
+                columns: peer_cols,
+                rows: mut peer_rows,
+            } = peer_result
+            else {
+                unreachable!("bare SELECT cannot return CommandOk")
+            };
+            if peer_cols.len() != columns.len() {
+                // v7.39 (round 232) — PG's wording, which clients match on.
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "each {} query must have the same number of columns",
+                    set_op_name(*kind)
+                )));
+            }
+            // v7.39 (round 232+233) — PG resolves each result column to one
+            // type before it merges anything, and refuses the query when the
+            // two branches have no common type. SPG's unifier
+            // (`unify_union_columns`) is value-driven and deliberately
+            // conservative — "a column where any cell fails to coerce is left
+            // exactly as it was" — so a mismatch produced a column holding
+            // BOTH types (`SELECT a, b FROM t UNION SELECT b, a FROM t` came
+            // back with integers and text interleaved) instead of an error.
+            //
+            // The check has to read the branch ASTs, not just their schemas:
+            // SPG has no `Unknown` DataType, so a bare `'a'` literal describes
+            // as TEXT and is indistinguishable from a real text column by
+            // schema alone — yet PG treats the two completely differently
+            // (`SELECT 1 UNION SELECT 'a'` is an input-syntax error on the
+            // literal, `SELECT 1 UNION SELECT 'a'::text` is a type mismatch).
+            let peer_unknown = branch_unknown_mask(peer);
+            for i in 0..columns.len() {
+                let hu = head_unknown.get(i).copied().unwrap_or(false);
+                let pu = peer_unknown.get(i).copied().unwrap_or(false);
+                let (ht, pt) = (columns[i].ty, peer_cols[i].ty);
+                match (hu, pu) {
+                    // Both sides carry a real type: they must share a category.
+                    (false, false) => {
+                        if !crate::conversions::types_unify(ht, pt) {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "{} types {} and {} cannot be matched",
+                                set_op_name(*kind),
+                                crate::conversions::pg_type_name_for_error(ht),
+                                crate::conversions::pg_type_name_for_error(pt),
+                            )));
                         }
                     }
-                    None => {
-                        slot.insert(keybuf.clone(), best.len());
-                        best.push(row);
+                    // One side is an untyped literal: it takes the other's
+                    // type, and failing to convert is the error PG reports.
+                    (true, false) => {
+                        coerce_branch_column(&mut rows, i, pt, &columns[i].name)?;
+                        columns[i].ty = pt;
+                        head_unknown[i] = false;
                     }
+                    (false, true) => {
+                        coerce_branch_column(&mut peer_rows, i, ht, &columns[i].name)?;
+                    }
+                    // Both untyped — nothing to resolve against yet.
+                    (true, true) => {}
                 }
             }
-            // Survivors sort with the FULL original spec (keys are still
-            // aboard as hidden columns).
-            let full_dirs: alloc::vec::Vec<(bool, Option<bool>)> = orig_order_by
-                .iter()
-                .map(|o| (o.desc, o.nulls_first))
-                .collect();
-            best.sort_by(|a, b| {
-                for (k, (desc, nf)) in full_dirs.iter().enumerate() {
-                    let av = a.values.get(key_start + k).unwrap_or(&Value::Null);
-                    let bv = b.values.get(key_start + k).unwrap_or(&Value::Null);
-                    match crate::order_by_value_cmp_in(*desc, *nf, av, bv, mysql) {
-                        core::cmp::Ordering::Equal => {}
-                        o => return o,
-                    }
+            // v7.37 D.26 — a UNION result column is nullable when ANY branch is
+            // nullable (PG semantics). Previously the result kept only the head's
+            // nullability, so `VALUES (1),(NULL)` (a UNION-ALL chain seeded by the
+            // non-null `1`) wrongly reported the column NOT NULL, which let
+            // `count(col)`'s NOT-NULL fast-path count the NULL row.
+            for (i, pc) in peer_cols.iter().enumerate() {
+                if pc.nullable {
+                    columns[i].nullable = true;
                 }
-                core::cmp::Ordering::Equal
-            });
-            for r in &mut best {
-                r.values.truncate(key_start);
             }
-            kept = best;
-        } else {
-            key_start = columns.len().saturating_sub(don_hidden);
-            let mut seen: alloc::vec::Vec<alloc::vec::Vec<Value<'static>>> = alloc::vec::Vec::new();
-            kept = alloc::vec::Vec::new();
-            for mut row in rows {
-                let key: alloc::vec::Vec<Value<'static>> =
-                    row.values.get(key_start..).unwrap_or(&[]).to_vec();
-                if seen.iter().any(|k| k == &key) {
-                    continue;
+            // v7.39 (round 410) — under MySQL, set-op dedup / matching folds
+            // text by the session collation (CI + accent + PAD SPACE), like
+            // GROUP BY. PG stays byte-exact.
+            let mysql = self.backslash_escapes;
+            match kind {
+                UnionKind::All => rows.extend(peer_rows),
+                UnionKind::Distinct => {
+                    rows.extend(peer_rows);
+                    rows = dedup_rows(rows, mysql);
                 }
-                seen.push(key);
-                row.values.truncate(key_start);
-                kept.push(row);
+                // v7.37.17 (17.6 siblings) — PG set semantics.
+                // v7.39 (round 591) — all four ask the same question of the
+                // right side, and all four used to answer it by scanning it
+                // once per left row. `PeerIndex` buckets it by the hash
+                // DISTINCT already uses, so the answer is a lookup.
+                // INTERSECT: distinct rows present on both sides.
+                UnionKind::Intersect => {
+                    let idx = PeerIndex::build(&peer_rows, mysql);
+                    rows = dedup_rows(rows, mysql)
+                        .into_iter()
+                        .filter(|r| idx.contains(r))
+                        .collect();
+                }
+                // INTERSECT ALL: multiset intersection — each row
+                // keeps min(left count, right count) occurrences.
+                UnionKind::IntersectAll => {
+                    let mut idx = PeerIndex::build(&peer_rows, mysql);
+                    let mut kept: Vec<Row<'static>> = Vec::new();
+                    for r in rows {
+                        if idx.take_one(&r) {
+                            kept.push(r);
+                        }
+                    }
+                    rows = kept;
+                }
+                // EXCEPT: distinct left rows absent from the right.
+                UnionKind::Except => {
+                    let idx = PeerIndex::build(&peer_rows, mysql);
+                    rows = dedup_rows(rows, mysql)
+                        .into_iter()
+                        .filter(|r| !idx.contains(r))
+                        .collect();
+                }
+                // EXCEPT ALL: multiset subtraction — each right
+                // occurrence cancels one left occurrence.
+                UnionKind::ExceptAll => {
+                    let mut idx = PeerIndex::build(&peer_rows, mysql);
+                    let mut kept: Vec<Row<'static>> = Vec::new();
+                    for r in rows {
+                        if !idx.take_one(&r) {
+                            kept.push(r);
+                        }
+                    }
+                    rows = kept;
+                }
             }
         }
-        let mut columns = columns;
-        columns.truncate(key_start);
-        // PG limits what DISTINCT ON left, not what fed it.
-        let kept = apply_deferred_limit(kept, &don_limit);
-        Ok(QueryResult::Rows {
-            columns,
-            rows: kept,
-        })
+        // PG resolves a UNION / VALUES result column to one common type
+        // and casts every branch to it (`SELECT '2020-01-01'::date UNION
+        // ALL SELECT '2020-01-02'` → both DATE, not DATE + TEXT). SPG
+        // built each branch independently, leaving mixed-type columns
+        // that broke ORDER BY, comparisons, and value-based window
+        // frames. Unify + coerce before the combined ORDER BY sees them.
+        unify_union_columns(&mut columns, &mut rows);
+        // ORDER BY at the top of a UNION applies to the combined result.
+        // Eval against the projected schema (NOT the source table).
+        if !stmt.order_by.is_empty() {
+            // v7.39 (read01 round 54) — the combined-result ctx must carry the
+            // catalog, and the projected columns must keep their enum identity
+            // (`user_enum_type`), or `ORDER BY <enum col>` over a UNION sorts
+            // by TEXT instead of member order — silently wrong rows, not an
+            // error. (Same shape as the enum-order knife's GROUP BY fix.)
+            let synth_ctx = EvalContext::new(&columns, None).with_catalog(self.active_catalog());
+            // v7.37.17 (17.6 siblings) — positional keys (ORDER BY 1)
+            // survive to here when the head projects a Wildcard (the
+            // group-tail wrapper shape): map them onto the Nth
+            // projected column so the combined sort works.
+            let resolved_order: Vec<spg_sql::ast::OrderBy> = stmt
+                .order_by
+                .iter()
+                .map(|o| {
+                    let mut o = o.clone();
+                    if let Expr::Literal(spg_sql::ast::Literal::Integer(n)) = &o.expr
+                        && *n >= 1
+                        && let Ok(idx) = usize::try_from(*n - 1)
+                        && idx < columns.len()
+                    {
+                        o.expr = Expr::Column(spg_sql::ast::ColumnName {
+                            qualifier: None,
+                            name: columns[idx].name.clone(),
+                        });
+                    }
+                    o
+                })
+                .collect();
+            let descs: Vec<bool> = resolved_order.iter().map(|o| o.desc).collect();
+            let mut tagged: Vec<(Vec<OrderKey>, Row)> = Vec::with_capacity(rows.len());
+            for r in rows {
+                let keys = build_order_keys(&resolved_order, &r, &synth_ctx)?;
+                tagged.push((keys, r));
+            }
+            sort_by_keys(&mut tagged, &descs);
+            rows = tagged.into_iter().map(|(_, r)| r).collect();
+        }
+        apply_offset_and_limit(&mut rows, stmt.offset_literal(), stmt.limit_literal());
+        Ok(QueryResult::Rows { columns, rows })
     }
 
     fn exec_select_cancel_inner(
@@ -3032,211 +3284,7 @@ impl Engine {
         if stmt_ref.unions.is_empty() {
             return self.exec_bare_select_cancel(stmt_ref, cancel);
         }
-        // UNION path: clone-strip the head into a bare block (its own
-        // DISTINCT and any inner ORDER BY are dropped by parser rule —
-        // the wrapper SelectStatement carries them), execute, then chain
-        // peers with left-associative dedup semantics.
-        // v7.39 (round 232) — the wrapper's ORDER BY addresses the head's
-        // output columns; a position past their count is PG's 42P10.
-        crate::orderby::check_order_by_positions(stmt_ref)?;
-        let mut head_unknown = branch_unknown_mask(stmt_ref);
-        let mut head = stmt_ref.clone();
-        head.unions = Vec::new();
-        head.order_by = Vec::new();
-        head.limit = None;
-        let QueryResult::Rows {
-            mut columns,
-            mut rows,
-        } = self.exec_bare_select_cancel(&head, cancel)?
-        else {
-            unreachable!("bare SELECT cannot return CommandOk")
-        };
-        for (kind, peer) in &stmt_ref.unions {
-            // v7.37.17 (17.6 siblings) — a peer carrying its own
-            // unions is a nested INTERSECT group (the parser's
-            // precedence regrouping); recurse through the
-            // union-aware wrapper for it.
-            let peer_result = if peer.unions.is_empty() {
-                self.exec_bare_select_cancel(peer, cancel)?
-            } else {
-                self.exec_select_cancel(peer, cancel)?
-            };
-            let QueryResult::Rows {
-                columns: peer_cols,
-                rows: mut peer_rows,
-            } = peer_result
-            else {
-                unreachable!("bare SELECT cannot return CommandOk")
-            };
-            if peer_cols.len() != columns.len() {
-                // v7.39 (round 232) — PG's wording, which clients match on.
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "each {} query must have the same number of columns",
-                    set_op_name(*kind)
-                )));
-            }
-            // v7.39 (round 232+233) — PG resolves each result column to one
-            // type before it merges anything, and refuses the query when the
-            // two branches have no common type. SPG's unifier
-            // (`unify_union_columns`) is value-driven and deliberately
-            // conservative — "a column where any cell fails to coerce is left
-            // exactly as it was" — so a mismatch produced a column holding
-            // BOTH types (`SELECT a, b FROM t UNION SELECT b, a FROM t` came
-            // back with integers and text interleaved) instead of an error.
-            //
-            // The check has to read the branch ASTs, not just their schemas:
-            // SPG has no `Unknown` DataType, so a bare `'a'` literal describes
-            // as TEXT and is indistinguishable from a real text column by
-            // schema alone — yet PG treats the two completely differently
-            // (`SELECT 1 UNION SELECT 'a'` is an input-syntax error on the
-            // literal, `SELECT 1 UNION SELECT 'a'::text` is a type mismatch).
-            let peer_unknown = branch_unknown_mask(peer);
-            for i in 0..columns.len() {
-                let hu = head_unknown.get(i).copied().unwrap_or(false);
-                let pu = peer_unknown.get(i).copied().unwrap_or(false);
-                let (ht, pt) = (columns[i].ty, peer_cols[i].ty);
-                match (hu, pu) {
-                    // Both sides carry a real type: they must share a category.
-                    (false, false) => {
-                        if !crate::conversions::types_unify(ht, pt) {
-                            return Err(EngineError::Unsupported(alloc::format!(
-                                "{} types {} and {} cannot be matched",
-                                set_op_name(*kind),
-                                crate::conversions::pg_type_name_for_error(ht),
-                                crate::conversions::pg_type_name_for_error(pt),
-                            )));
-                        }
-                    }
-                    // One side is an untyped literal: it takes the other's
-                    // type, and failing to convert is the error PG reports.
-                    (true, false) => {
-                        coerce_branch_column(&mut rows, i, pt, &columns[i].name)?;
-                        columns[i].ty = pt;
-                        head_unknown[i] = false;
-                    }
-                    (false, true) => {
-                        coerce_branch_column(&mut peer_rows, i, ht, &columns[i].name)?;
-                    }
-                    // Both untyped — nothing to resolve against yet.
-                    (true, true) => {}
-                }
-            }
-            // v7.37 D.26 — a UNION result column is nullable when ANY branch is
-            // nullable (PG semantics). Previously the result kept only the head's
-            // nullability, so `VALUES (1),(NULL)` (a UNION-ALL chain seeded by the
-            // non-null `1`) wrongly reported the column NOT NULL, which let
-            // `count(col)`'s NOT-NULL fast-path count the NULL row.
-            for (i, pc) in peer_cols.iter().enumerate() {
-                if pc.nullable {
-                    columns[i].nullable = true;
-                }
-            }
-            // v7.39 (round 410) — under MySQL, set-op dedup / matching folds
-            // text by the session collation (CI + accent + PAD SPACE), like
-            // GROUP BY. PG stays byte-exact.
-            let mysql = self.backslash_escapes;
-            match kind {
-                UnionKind::All => rows.extend(peer_rows),
-                UnionKind::Distinct => {
-                    rows.extend(peer_rows);
-                    rows = dedup_rows(rows, mysql);
-                }
-                // v7.37.17 (17.6 siblings) — PG set semantics.
-                // v7.39 (round 591) — all four ask the same question of the
-                // right side, and all four used to answer it by scanning it
-                // once per left row. `PeerIndex` buckets it by the hash
-                // DISTINCT already uses, so the answer is a lookup.
-                // INTERSECT: distinct rows present on both sides.
-                UnionKind::Intersect => {
-                    let idx = PeerIndex::build(&peer_rows, mysql);
-                    rows = dedup_rows(rows, mysql)
-                        .into_iter()
-                        .filter(|r| idx.contains(r))
-                        .collect();
-                }
-                // INTERSECT ALL: multiset intersection — each row
-                // keeps min(left count, right count) occurrences.
-                UnionKind::IntersectAll => {
-                    let mut idx = PeerIndex::build(&peer_rows, mysql);
-                    let mut kept: Vec<Row<'static>> = Vec::new();
-                    for r in rows {
-                        if idx.take_one(&r) {
-                            kept.push(r);
-                        }
-                    }
-                    rows = kept;
-                }
-                // EXCEPT: distinct left rows absent from the right.
-                UnionKind::Except => {
-                    let idx = PeerIndex::build(&peer_rows, mysql);
-                    rows = dedup_rows(rows, mysql)
-                        .into_iter()
-                        .filter(|r| !idx.contains(r))
-                        .collect();
-                }
-                // EXCEPT ALL: multiset subtraction — each right
-                // occurrence cancels one left occurrence.
-                UnionKind::ExceptAll => {
-                    let mut idx = PeerIndex::build(&peer_rows, mysql);
-                    let mut kept: Vec<Row<'static>> = Vec::new();
-                    for r in rows {
-                        if !idx.take_one(&r) {
-                            kept.push(r);
-                        }
-                    }
-                    rows = kept;
-                }
-            }
-        }
-        // PG resolves a UNION / VALUES result column to one common type
-        // and casts every branch to it (`SELECT '2020-01-01'::date UNION
-        // ALL SELECT '2020-01-02'` → both DATE, not DATE + TEXT). SPG
-        // built each branch independently, leaving mixed-type columns
-        // that broke ORDER BY, comparisons, and value-based window
-        // frames. Unify + coerce before the combined ORDER BY sees them.
-        unify_union_columns(&mut columns, &mut rows);
-        // ORDER BY at the top of a UNION applies to the combined result.
-        // Eval against the projected schema (NOT the source table).
-        if !stmt.order_by.is_empty() {
-            // v7.39 (read01 round 54) — the combined-result ctx must carry the
-            // catalog, and the projected columns must keep their enum identity
-            // (`user_enum_type`), or `ORDER BY <enum col>` over a UNION sorts
-            // by TEXT instead of member order — silently wrong rows, not an
-            // error. (Same shape as the enum-order knife's GROUP BY fix.)
-            let synth_ctx = EvalContext::new(&columns, None).with_catalog(self.active_catalog());
-            // v7.37.17 (17.6 siblings) — positional keys (ORDER BY 1)
-            // survive to here when the head projects a Wildcard (the
-            // group-tail wrapper shape): map them onto the Nth
-            // projected column so the combined sort works.
-            let resolved_order: Vec<spg_sql::ast::OrderBy> = stmt
-                .order_by
-                .iter()
-                .map(|o| {
-                    let mut o = o.clone();
-                    if let Expr::Literal(spg_sql::ast::Literal::Integer(n)) = &o.expr
-                        && *n >= 1
-                        && let Ok(idx) = usize::try_from(*n - 1)
-                        && idx < columns.len()
-                    {
-                        o.expr = Expr::Column(spg_sql::ast::ColumnName {
-                            qualifier: None,
-                            name: columns[idx].name.clone(),
-                        });
-                    }
-                    o
-                })
-                .collect();
-            let descs: Vec<bool> = resolved_order.iter().map(|o| o.desc).collect();
-            let mut tagged: Vec<(Vec<OrderKey>, Row)> = Vec::with_capacity(rows.len());
-            for r in rows {
-                let keys = build_order_keys(&resolved_order, &r, &synth_ctx)?;
-                tagged.push((keys, r));
-            }
-            sort_by_keys(&mut tagged, &descs);
-            rows = tagged.into_iter().map(|(_, r)| r).collect();
-        }
-        apply_offset_and_limit(&mut rows, stmt.offset_literal(), stmt.limit_literal());
-        Ok(QueryResult::Rows { columns, rows })
+        self.exec_union_chain(stmt_ref, stmt, cancel)
     }
 
     #[allow(clippy::too_many_lines)]
