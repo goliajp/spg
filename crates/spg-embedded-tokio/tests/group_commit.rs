@@ -12,7 +12,6 @@
 //!   monotonic in the chunk stream).
 
 use spg_embedded_tokio::AsyncDatabase;
-use std::time::Instant;
 
 fn unique_dir(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -32,13 +31,16 @@ async fn concurrent_writes_share_fsync() {
         .await
         .unwrap();
 
-    // 64 concurrent single-row INSERTs. Under v7.19 (one fsync
-    // each, ~4 ms serial) this takes ≥ 64 × 4 ms ≈ 256 ms.
-    // Under group-commit the writes batch: expect well under
-    // half the serial bound. Generous threshold to absorb CI
-    // noise — the real assertion is "not serial".
+    // 64 concurrent single-row INSERTs. Batching them is the whole
+    // point, and what batching MEANS is that they share fsyncs: under
+    // v7.19 each write cost one, so 64 writes cost 64.
+    //
+    // Counted rather than timed. This used to assert "under 128 ms,
+    // since serial would be ~256" — a stand-in that answers the machine
+    // instead of the engine, failing on a busy box that batches
+    // perfectly and passing on a fast disk that batches nothing.
     const N: usize = 64;
-    let t0 = Instant::now();
+    let fsyncs0 = spg_embedded::WAL_FSYNC_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     let mut tasks = Vec::with_capacity(N);
     for i in 0..N {
         let db = db.clone();
@@ -51,7 +53,6 @@ async fn concurrent_writes_share_fsync() {
     for t in tasks {
         t.await.unwrap();
     }
-    let elapsed = t0.elapsed();
 
     // All rows visible.
     let rows = db.query("SELECT COUNT(*) FROM t").await.unwrap();
@@ -62,13 +63,19 @@ async fn concurrent_writes_share_fsync() {
     };
     assert_eq!(count, N as i64);
 
-    // Serial bound would be ≥ N × ~4 ms ≈ 256 ms on this host
-    // (profile_breakdown). Group-commit should land well under
-    // half of that. 128 ms keeps the assertion meaningful while
-    // tolerating slow CI disks.
+    let fsyncs = spg_embedded::WAL_FSYNC_COUNT.load(std::sync::atomic::Ordering::Relaxed) - fsyncs0;
+    // One per write is the un-batched shape. Half that still leaves room
+    // for however the batches happened to land, and no room for "every
+    // write synced on its own".
+    //
+    // Round 858 checked that by holding the write lock across the shared
+    // fsync, so no two writers can meet in a batch — the v7.19 shape.
+    // 64 writes then cost 131 fsyncs, roughly two apiece, and this goes
+    // red. Under batching it is a small fraction of that.
     assert!(
-        elapsed.as_millis() < 128,
-        "64 concurrent INSERTs took {elapsed:?} — group-commit not batching?"
+        fsyncs < N as u64 / 2,
+        "{N} concurrent INSERTs cost {fsyncs} WAL fsyncs — group-commit is \
+         not batching them"
     );
     drop(db);
 }
