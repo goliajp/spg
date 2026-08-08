@@ -1219,6 +1219,7 @@ mod e2e_subquery_pg_differential;
 mod e2e_substring_from_for;
 mod e2e_table_constraints_engine;
 mod e2e_table_shorthand_collate;
+mod e2e_table_shorthand_round869;
 mod e2e_tablesample;
 mod e2e_text_array;
 mod e2e_timestamptz;
