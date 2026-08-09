@@ -444,7 +444,21 @@ pub(crate) fn locate_column(
             // treats `row_to_json(e)` / `to_jsonb(e)` / a bare `SELECT e`.
             // Column resolution above wins, so a real column named like the
             // alias is unaffected.
-            if c.qualifier.is_none() && ctx.table_alias == Some(c.name.as_str()) {
+            // The whole-row reference. Two schema shapes carry it: a
+            // single-table / subquery / CTE scan, which knows its alias
+            // and has bare column names, and a JOIN's combined schema,
+            // which has no alias at all and qualifies every column
+            // `alias.col` — there the alias is identified by the prefix,
+            // which is what `whole_row_composite` already keys on to pick
+            // the fields out. Only the first shape could reach it before,
+            // so `SELECT wr FROM wr JOIN jb ON …` — `(7,z)` on PG18.4 —
+            // raised here (round 961).
+            if c.qualifier.is_none()
+                && (ctx.table_alias == Some(c.name.as_str()) || {
+                    let prefix = alloc::format!("{name}.", name = c.name);
+                    ctx.columns.iter().any(|s| s.name.starts_with(&prefix))
+                })
+            {
                 return Ok(None);
             }
             Err(EvalError::ColumnNotFound {
