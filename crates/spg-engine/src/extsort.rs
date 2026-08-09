@@ -507,20 +507,14 @@ impl<'a> ExternalSorter<'a> {
     /// `(key, row index)` for one integer key per row, or `None` when
     /// some key is not one — every other key type sorts the general way.
     ///
-    /// The NULL sentinels bracket every value, so they take the ends of
-    /// the integer range. A real key holding either end would then be
-    /// indistinguishable from a NULL, which is why one holding either end
-    /// declines the whole batch rather than being assumed not to occur.
+    /// Which keys qualify is [`crate::orderby::inline_int_key`]'s to say,
+    /// and only its: the materialising sort asks the same question, and
+    /// two answers to it would make one ORDER BY depend on which path the
+    /// query took.
     fn inline_int_keys(keys: &[OrderKey]) -> Option<Vec<(i128, u32)>> {
         let mut out: Vec<(i128, u32)> = Vec::with_capacity(keys.len());
         for (i, k) in keys.iter().enumerate() {
-            let v = match k {
-                OrderKey::Int(n) if *n != i128::MIN && *n != i128::MAX => *n,
-                OrderKey::NullSmall => i128::MIN,
-                OrderKey::NullBig => i128::MAX,
-                _ => return None,
-            };
-            out.push((v, i as u32));
+            out.push((crate::orderby::inline_int_key(k)?, i as u32));
         }
         Some(out)
     }

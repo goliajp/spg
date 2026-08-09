@@ -1166,6 +1166,30 @@ pub(crate) fn partial_sort_tagged(
     partial_sort_tagged_in(tagged, keep, descs, &[]);
 }
 
+/// The `i128` that orders an integer key against other integer keys, or
+/// `None` when the key is not one and the general comparator has to run.
+///
+/// The NULL sentinels bracket every value, so they take the ends of the
+/// integer range. That is only sound while no real key can sit on an end,
+/// which is why one that does returns `None` rather than being assumed
+/// not to occur — the integer types `value_to_order_key` produces are all
+/// 64-bit or narrower, so the ends are unreachable in practice and the
+/// check costs one comparison to stop that being an assumption.
+///
+/// Two sort paths use this (round 935's batch sort, round 941's
+/// materialising sort) and the rule lives here once: two copies of "which
+/// keys may travel as a bare integer" is how they would come to disagree,
+/// and disagreeing would mean the same ORDER BY answering differently
+/// depending on which path a query took.
+pub(crate) fn inline_int_key(k: &OrderKey) -> Option<i128> {
+    match k {
+        OrderKey::Int(n) if *n != i128::MIN && *n != i128::MAX => Some(*n),
+        OrderKey::NullSmall => Some(i128::MIN),
+        OrderKey::NullBig => Some(i128::MAX),
+        _ => None,
+    }
+}
+
 /// v7.39 (round 683) — `partial_sort_tagged` honouring one collation per key
 /// position. This is the full-sort half of the single-table scan; the top-N
 /// half compares through `cmp_multi_key_in` directly. Both had to land in
@@ -1189,9 +1213,70 @@ pub(crate) fn partial_sort_tagged_in(
             tagged.truncate(k);
         }
         _ => {
+            if sort_tagged_by_inline_int_key(tagged, descs) {
+                return;
+            }
             tagged.sort_by(cmp);
         }
     }
+}
+
+/// Sort by an integer key carried beside the row's index, rather than by
+/// dragging the rows themselves through the comparator. Returns false
+/// when the keys are not the shape this handles, leaving `tagged` alone.
+///
+/// The full sort here moves `(Vec<OrderKey>, Row)` — 48 bytes a piece —
+/// on every swap, and compares through the generic key comparator. Round
+/// 940 profiled `SELECT DISTINCT k FROM t400k ORDER BY k`, which reaches
+/// this function because the streaming sort declines DISTINCT, and found
+/// 24.5% of the query in that machinery: the comparator at 610 samples,
+/// quicksort at 584, the stable sort's merge at 173. The dedup this
+/// query exists to do was 2.4%.
+///
+/// So the permutation is sorted instead: `(key, index)` pairs, contiguous,
+/// one integer compare each, and the rows move exactly once when the
+/// answer is rebuilt. Round 935 made the same change to the batch sort
+/// and measured -10% end to end; this is the other path.
+///
+/// The rebuild is what makes it worth doing rather than clever: an
+/// n log n number of 48-byte moves becomes n of them.
+fn sort_tagged_by_inline_int_key(tagged: &mut Vec<(Vec<OrderKey>, Row)>, descs: &[bool]) -> bool {
+    if tagged.len() < 2 {
+        return true;
+    }
+    // Multiple keys keep the general path: the second key only decides
+    // ties, and the tie rate is not knowable here.
+    if tagged.iter().any(|(k, _)| k.len() != 1) {
+        return false;
+    }
+    let mut order: Vec<(i128, u32)> = Vec::with_capacity(tagged.len());
+    for (i, (keys, _)) in tagged.iter().enumerate() {
+        match inline_int_key(&keys[0]) {
+            Some(v) => order.push((v, i as u32)),
+            None => return false,
+        }
+    }
+    // Stable, as `sort_by` is: equal keys keep the order they arrived in,
+    // which is the order the scan produced and what DISTINCT's
+    // first-occurrence rule already relies on.
+    if descs.first().copied().unwrap_or(false) {
+        order.sort_by_key(|p| core::cmp::Reverse(p.0));
+    } else {
+        order.sort_by_key(|p| p.0);
+    }
+    // Move each row once, into its place. `Option` is the safe way to
+    // take out of arbitrary positions; it costs no extra memory here
+    // because `Vec`'s non-null pointer gives `Option` its niche.
+    let mut src: Vec<Option<(Vec<OrderKey>, Row)>> =
+        core::mem::take(tagged).into_iter().map(Some).collect();
+    tagged.reserve(src.len());
+    for (_, i) in order {
+        let taken = src[i as usize]
+            .take()
+            .expect("a permutation names each row once");
+        tagged.push(taken);
+    }
+    true
 }
 
 pub(crate) fn sort_by_keys(tagged: &mut [(Vec<OrderKey>, Row)], descs: &[bool]) {
@@ -1819,5 +1904,130 @@ mod value_cmp_mixed_numeric_tests {
             value_cmp(&Value::Float(9.9), &num(25, 1)),
             Ordering::Greater
         );
+    }
+}
+
+#[cfg(test)]
+mod inline_int_key_sort_tests {
+    //! r941 — the materialising sort's inline-integer path has to put the
+    //! rows in exactly the order the general comparator would, in the
+    //! cases it takes and the cases it declines.
+    //!
+    //! The reference is the general comparator itself. A hand-written
+    //! expected order would only be a second chance to make the same
+    //! mistake, and the property that matters is agreement between two
+    //! paths a query can take without knowing which it took.
+
+    use super::*;
+    use alloc::vec;
+
+    fn row(tag: i32) -> Row<'static> {
+        Row::new(vec![Value::Int(tag)])
+    }
+
+    fn tag_of(r: &Row<'static>) -> i32 {
+        match r.values[0] {
+            Value::Int(n) => n,
+            _ => panic!("tag column"),
+        }
+    }
+
+    /// Sort the same input both ways and compare the row order.
+    fn assert_agrees(name: &str, keys: &[Vec<OrderKey>], descs: &[bool]) {
+        let build = || -> Vec<(Vec<OrderKey>, Row<'static>)> {
+            keys.iter()
+                .enumerate()
+                .map(|(i, k)| (k.clone(), row(i as i32)))
+                .collect()
+        };
+
+        let mut fast = build();
+        partial_sort_tagged_in(&mut fast, None, descs, &[]);
+
+        let mut general = build();
+        general.sort_by(|a, b| cmp_multi_key_in(&a.0, &b.0, descs, &[]));
+
+        let got: Vec<i32> = fast.iter().map(|(_, r)| tag_of(r)).collect();
+        let want: Vec<i32> = general.iter().map(|(_, r)| tag_of(r)).collect();
+        assert_eq!(got, want, "{name} (desc={descs:?})");
+    }
+
+    #[test]
+    fn the_inline_path_agrees_with_the_general_comparator() {
+        let int = |n: i128| vec![OrderKey::Int(n)];
+
+        // Duplicates on purpose: both sorts are stable, so equal keys
+        // must come out in the order they went in. DISTINCT's
+        // first-occurrence rule rides on that.
+        let plain = vec![int(5), int(-3), int(5), int(0), int(9), int(-3), int(5)];
+        let with_nulls = vec![
+            int(7),
+            vec![OrderKey::NullBig],
+            int(-2),
+            vec![OrderKey::NullSmall],
+            int(7),
+            vec![OrderKey::NullBig],
+            vec![OrderKey::NullSmall],
+        ];
+        // Declined: a real key sitting where a sentinel would.
+        let at_the_ends = vec![
+            int(3),
+            vec![OrderKey::Int(i128::MAX)],
+            int(-4),
+            vec![OrderKey::Int(i128::MIN)],
+            int(3),
+        ];
+        // Declined: not integer keys.
+        let texts = vec![
+            vec![OrderKey::Text("pear".into())],
+            vec![OrderKey::Text("apple".into())],
+            vec![OrderKey::Text("apple".into())],
+            vec![OrderKey::Num(1.5)],
+        ];
+        // Declined: more than one key.
+        let two = vec![
+            vec![OrderKey::Int(1), OrderKey::Int(9)],
+            vec![OrderKey::Int(1), OrderKey::Int(2)],
+            vec![OrderKey::Int(0), OrderKey::Int(5)],
+            vec![OrderKey::Int(1), OrderKey::Int(2)],
+        ];
+
+        for (name, keys) in [
+            ("plain ints", &plain),
+            ("null sentinels", &with_nulls),
+            ("keys at the ends of the range", &at_the_ends),
+            ("non-integer keys", &texts),
+        ] {
+            assert_agrees(name, keys, &[false]);
+            assert_agrees(name, keys, &[true]);
+        }
+        assert_agrees("two keys", &two, &[false, false]);
+        assert_agrees("two keys, second descending", &two, &[false, true]);
+
+        // Degenerate sizes take the early return; they still have to be
+        // sorted afterwards, which for 0 and 1 rows is trivially true and
+        // for 2 is not.
+        assert_agrees("empty", &[], &[false]);
+        assert_agrees("one row", &[int(1)], &[false]);
+        assert_agrees("two rows", &[int(2), int(1)], &[false]);
+    }
+
+    /// A LIMIT takes the top-N branch, which this change does not touch.
+    /// Pinned so that stays true rather than being remembered.
+    #[test]
+    fn the_top_n_branch_still_keeps_the_smallest_k() {
+        let mut tagged: Vec<(Vec<OrderKey>, Row<'static>)> = (0..20i32)
+            .map(|i| (vec![OrderKey::Int(i128::from((i * 7) % 20))], row(i)))
+            .collect();
+        partial_sort_tagged_in(&mut tagged, Some(3), &[false], &[]);
+        assert_eq!(tagged.len(), 3);
+        let keys: Vec<i128> = tagged
+            .iter()
+            .map(|(k, _)| match k[0] {
+                OrderKey::Int(n) => n,
+                _ => panic!("int key"),
+            })
+            .collect();
+        assert_eq!(keys, vec![0, 1, 2]);
     }
 }
