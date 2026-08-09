@@ -598,11 +598,15 @@ impl<'a> ExternalSorter<'a> {
     /// is passed BY VALUE so `finish` can wrap this without a clone.
     ///
     /// Returns how many rows were emitted.
+    /// `needed[i]` false means neither the projection nor the ORDER BY
+    /// (which the merge re-keys from a decoded row) reads column `i`, so
+    /// the decode may walk past it. `&[]` reads everything.
     pub(crate) fn finish_each<K, P, E>(
         mut self,
         keys_of: K,
         project: P,
         mut emit: E,
+        needed: &[bool],
     ) -> Result<usize, EngineError>
     where
         K: Fn(&Row<'static>) -> Result<Vec<OrderKey>, EngineError>,
@@ -622,10 +626,11 @@ impl<'a> ExternalSorter<'a> {
             // row as it is handed over.
             for i in self.sorted_order() {
                 let (start, end) = self.span(i as usize);
-                let (row, _) = spg_storage::decode_row_body_dense(
+                let (row, _) = spg_storage::decode_row_body_dense_pruned(
                     &self.arena[start..end],
                     &self.record_schema,
                     spg_storage::CURRENT_ROW_CODEC_VERSION,
+                    needed,
                 )
                 .map_err(|e| EngineError::Internal(alloc::format!("sort batch decode: {e:?}")))?;
                 scratch.clear();
@@ -645,7 +650,12 @@ impl<'a> ExternalSorter<'a> {
         let mut runs: Vec<Box<dyn TempRun>> = core::mem::take(&mut self.runs);
         let mut heads: Vec<Head> = Vec::with_capacity(runs.len());
         for run in &mut runs {
-            heads.push(Self::next_row(&mut **run, &self.record_schema, &keys_of)?);
+            heads.push(Self::next_row(
+                &mut **run,
+                &self.record_schema,
+                &keys_of,
+                needed,
+            )?);
         }
 
         let mut heap = HeadHeap::build(heads.len(), &heads, self.descs);
@@ -657,7 +667,7 @@ impl<'a> ExternalSorter<'a> {
             project(&record, &mut scratch)?;
             emit(&scratch)?;
             emitted += 1;
-            heads[w] = Self::next_row(&mut *runs[w], &self.record_schema, &keys_of)?;
+            heads[w] = Self::next_row(&mut *runs[w], &self.record_schema, &keys_of, needed)?;
             heap.settle_root(&heads, self.descs);
         }
         Ok(emitted)
@@ -683,6 +693,7 @@ impl<'a> ExternalSorter<'a> {
                 out.push(Row::new(cells.to_vec()));
                 Ok(())
             },
+            &[],
         )?;
         Ok(out)
     }
@@ -693,6 +704,7 @@ impl<'a> ExternalSorter<'a> {
         run: &mut dyn TempRun,
         schema: &TableSchema,
         keys_of: &K,
+        needed: &[bool],
     ) -> Result<Option<(Vec<OrderKey>, Row<'static>)>, EngineError>
     where
         K: Fn(&Row<'static>) -> Result<Vec<OrderKey>, EngineError>,
@@ -706,10 +718,11 @@ impl<'a> ExternalSorter<'a> {
                 "temp run ended before its row body",
             )));
         };
-        let (row, _) = spg_storage::decode_row_body_dense(
+        let (row, _) = spg_storage::decode_row_body_dense_pruned(
             &body,
             schema,
             spg_storage::CURRENT_ROW_CODEC_VERSION,
+            needed,
         )
         .map_err(|e| EngineError::Internal(alloc::format!("temp run row decode: {e:?}")))?;
         let keys = keys_of(&row)?;
@@ -842,6 +855,7 @@ mod tests {
                     }
                     Ok(())
                 },
+                &[],
             )
             .unwrap_err();
 
@@ -887,6 +901,7 @@ mod tests {
                         streamed.push(Row::new(cells.to_vec()));
                         Ok(())
                     },
+                    &[],
                 )
                 .unwrap();
 

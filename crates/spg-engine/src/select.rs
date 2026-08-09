@@ -7229,6 +7229,61 @@ impl Engine {
     /// accumulating them, which is where the time is: a profile of the
     /// collecting walk put the allocator at 586 samples, more than every
     /// sort comparison combined (420), against 19 for `push` itself.
+    /// v7.37 (round 923) — which of a sort record's columns the output half
+    /// reads. The record is the SOURCE row (round 836), so a narrow projection
+    /// decoded every column: skipping one 200-byte text halves a decode
+    /// (2.17 -> 1.14 ms per pass at 10k rows, priced additively).
+    ///
+    /// Timid on purpose — a wrong mask is a SILENT wrong answer, a pruned
+    /// column reads NULL. Answers only when every projection item is a bare
+    /// column reference AND every ORDER BY key is a bound column; anything
+    /// else returns empty, decoding everything as before.
+    /// `explain.rs`'s `collect_column_refs` is NOT used: its `_ => {}` arm
+    /// drops references from expression kinds it does not enumerate.
+    ///
+    /// ORDER BY columns are included — the merge re-derives keys from the
+    /// decoded row on the spilled path, so pruning one would sort NULLs.
+    pub(crate) fn sort_record_columns_needed(
+        items: &[SelectItem],
+        order_bound: &[Option<usize>],
+        arity: usize,
+        ctx: &EvalContext,
+    ) -> Vec<bool> {
+        let all_bare = items.iter().all(|i| {
+            matches!(
+                i,
+                SelectItem::Expr {
+                    expr: Expr::Column(_),
+                    ..
+                }
+            )
+        });
+        if !all_bare || order_bound.iter().any(Option::is_none) {
+            return Vec::new();
+        }
+        let mut mask = alloc::vec![false; arity];
+        for item in items {
+            if let SelectItem::Expr {
+                expr: Expr::Column(c),
+                ..
+            } = item
+            {
+                match crate::eval::find_column_pos(c, ctx) {
+                    Some(p) if p < arity => mask[p] = true,
+                    _ => return Vec::new(),
+                }
+            }
+        }
+        for p in order_bound.iter().flatten() {
+            if *p < arity {
+                mask[*p] = true;
+            } else {
+                return Vec::new();
+            }
+        }
+        mask
+    }
+
     fn try_spill_sorted_stream<F>(
         &self,
         stmt: &SelectStatement,
@@ -7362,6 +7417,7 @@ impl Engine {
         emit(crate::StreamItem::Header(&columns))?;
 
         let key_ctx = &ctx;
+        let needed = Self::sort_record_columns_needed(&stmt.items, &order_bound, cols.len(), &ctx);
         let mut emitted_since_check = 0usize;
         let n = sorter.finish_each(
             |src| {
@@ -7396,6 +7452,7 @@ impl Engine {
                 let cell_refs: Vec<&Value> = cells.iter().collect();
                 emit(crate::StreamItem::Row(&cell_refs))
             },
+            &needed,
         )?;
         Ok(Some(n))
     }
