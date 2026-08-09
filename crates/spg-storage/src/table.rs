@@ -595,6 +595,34 @@ impl Table {
         self.cold_row_count_stale || self.cold_row_count > 0
     }
 
+    /// r944 — every BTree index a cold row could have been filed under.
+    ///
+    /// The freeze writes a row's locator into exactly ONE index
+    /// (`register_cold_locators` takes a single index name) and the
+    /// freezer picks that index by its own rule, so a reader that guesses
+    /// a different one finds nothing. Round 943 is that bug: the freezer
+    /// chose the first BTree index over any integer column, the scan
+    /// looked at the first index on the primary key's column, and 15
+    /// frozen rows of 40 vanished from a plain `SELECT`.
+    ///
+    /// Union over all of them rather than guessing one. Because each
+    /// row's locator exists in exactly one index, the union yields every
+    /// row once and needs no visited-set.
+    ///
+    /// Deliberately NOT filtered to declared-unique indices. Freezing
+    /// through an index whose keys repeat is a real limitation —
+    /// `resolve_cold_locator` resolves BY KEY and cannot say which of two
+    /// rows sharing one was meant — but that limit belongs to the freeze,
+    /// which builds the segment keyed that way. Filtering it here only
+    /// hides rows that were frozen anyway, which is the bug rather than a
+    /// guard against it; the freezer's own tests freeze tables whose
+    /// integer index carries no uniqueness constraint.
+    pub fn cold_capable_indices(&self) -> impl Iterator<Item = &Index> {
+        self.indices
+            .iter()
+            .filter(|i| matches!(i.kind, IndexKind::BTree(_)))
+    }
+
     /// v6.7.0 — walk every BTree index and count `RowLocator::Cold`
     /// entries; return the MAX across indices. The freeze path
     /// (`freeze_oldest_to_cold`) writes cold locators to ONE

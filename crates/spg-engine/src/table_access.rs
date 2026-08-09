@@ -457,40 +457,54 @@ impl Engine {
         Ok((out, cols))
     }
 
-    /// v7.35.1 — yield every cold-tier row of `table` exactly once
-    /// by walking the BTree index that covers the table's PRIMARY
-    /// KEY. The PK uniqueness contract gives per-row dedup without
-    /// a separate visited-set. Returns an empty Vec when the table
-    /// has no PK-backed BTree (pre-PK tables / ad-hoc heaps stay
-    /// hot-tier-only, so this is harmless on those shapes).
+    /// v7.35.1 — yield every cold-tier row of `table` exactly once.
+    ///
+    /// r944 — it now looks in every index a freeze could have filed a
+    /// locator under, not one guessed index.
+    ///
+    /// It used to require a single-column PRIMARY KEY and then take the
+    /// first BTree index on that column. The freezer picks its index
+    /// separately (`freezer.rs:pick_target`), and when the two chose
+    /// differently the walk found no `Cold` locators and the frozen rows
+    /// simply stopped appearing — no error, a short answer. Measured on
+    /// a table with a PK on `id` and a second index on `id`, frozen
+    /// through the second: a plain `SELECT` returned 25 rows of 40.
+    ///
+    /// A row's locator lives in exactly ONE index
+    /// (`register_cold_locators` takes a single index name), so the
+    /// union over `cold_capable_indices` yields each row once and needs
+    /// no visited-set.
+    ///
+    /// Restricting the union to indices with a declared UNIQUE key was
+    /// tried and reverted: the freezer's own tests freeze tables whose
+    /// integer index carries no such constraint, and filtering them out
+    /// here hides rows that were frozen anyway — the bug, not a guard
+    /// against it. Six gate tests said so.
     pub(crate) fn iter_cold_rows_of_table(&self, table: &Table) -> Vec<Row<'static>> {
+        // A table that has frozen nothing pays nothing. The walk below is
+        // O(index) per index, and the single-table scan runs it once per
+        // query: round 942 profiled 20% of `SELECT pad FROM t400k ORDER
+        // BY k LIMIT 10` inside it, over a table where nothing had ever
+        // been frozen. This gate was unsafe until this round, because
+        // neither freeze path marked the count — with that fixed, the
+        // predicate is conservative again (stale reads as true) and the
+        // skip cannot lose a row.
+        if !table.has_cold_rows_fast() {
+            return Vec::new();
+        }
         let schema = table.schema();
-        // PK column position(s) — single-column PK only for now;
-        // composite PKs would require composite-key resolution
-        // through resolve_cold_locator that the current API
-        // doesn't expose.
-        let Some(pk_col_pos) = schema
-            .uniqueness_constraints
-            .iter()
-            .find(|u| u.is_primary_key && u.columns.len() == 1)
-            .map(|u| u.columns[0])
-        else {
-            return Vec::new();
-        };
-        let Some(idx) = table.indices().iter().find(|i| {
-            i.column_position == pk_col_pos && matches!(i.kind, spg_storage::IndexKind::BTree(_))
-        }) else {
-            return Vec::new();
-        };
         let table_name = schema.name.as_str();
         let catalog = self.active_catalog();
         let mut out = Vec::new();
-        for (key, locators) in idx.iter_asc() {
-            for loc in locators {
-                if let spg_storage::RowLocator::Cold { segment_id, .. } = loc
-                    && let Some(row) = catalog.resolve_cold_locator(table_name, *segment_id, key)
-                {
-                    out.push(row);
+        for idx in table.cold_capable_indices() {
+            for (key, locators) in idx.iter_asc() {
+                for loc in locators {
+                    if let spg_storage::RowLocator::Cold { segment_id, .. } = loc
+                        && let Some(row) =
+                            catalog.resolve_cold_locator(table_name, *segment_id, key)
+                    {
+                        out.push(row);
+                    }
                 }
             }
         }
