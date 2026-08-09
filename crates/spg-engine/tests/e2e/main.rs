@@ -1175,6 +1175,7 @@ mod e2e_pgdump_compat;
 mod e2e_plan_cache;
 mod e2e_plan_cache_invalidation;
 mod e2e_power;
+mod e2e_projection_bind_once_round957;
 mod e2e_query_clause_pg_differential;
 mod e2e_quoted_type_cast_round894;
 mod e2e_random;

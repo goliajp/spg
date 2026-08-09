@@ -777,9 +777,54 @@ where
         for v in &row.values {
             cell_refs.push(v);
         }
-        emit(StreamItem::Row(&cell_refs))?;
+        emit(StreamItem::Row(RowCells::Refs(&cell_refs)))?;
     }
     Ok(rows.len())
+}
+
+/// One row's cells, in whichever shape the producer already holds them.
+///
+/// The channel used to be `&[&Value]` only, which cost a `Vec<&Value>`
+/// per row at the two producers that build their cells into a
+/// contiguous buffer: they had a `&[Value]` in hand and collected a
+/// second vector of pointers into it purely to satisfy the type. That
+/// is one heap allocation and one free per row — measured at 400k rows
+/// (round 957) as **9 ns/row**, which on a narrow scan was 54-56% of
+/// the whole walk and on a wide one 8-19%.
+///
+/// The reason it could not simply reuse one buffer is that the values
+/// buffer is refilled each row, so any pointers into it die at the top
+/// of the next iteration; only an owner of the storage (the
+/// materialising path, whose rows outlive the loop) can hoist the
+/// pointer vector out. Handing the contiguous slice over directly
+/// removes the question instead of answering it.
+///
+/// `Refs` stays for producers whose cells really are scattered (a join
+/// projecting out of several rows).
+#[derive(Debug, Clone, Copy)]
+pub enum RowCells<'a> {
+    Refs(&'a [&'a Value<'static>]),
+    Values(&'a [Value<'static>]),
+}
+
+impl<'a> RowCells<'a> {
+    pub fn len(&self) -> usize {
+        match self {
+            RowCells::Refs(v) => v.len(),
+            RowCells::Values(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, i: usize) -> Option<&'a Value<'static>> {
+        match self {
+            RowCells::Refs(v) => v.get(i).copied(),
+            RowCells::Values(v) => v.get(i),
+        }
+    }
 }
 
 /// v7.37 — one item in the streaming SELECT emit channel. The
@@ -789,7 +834,7 @@ where
 #[derive(Debug)]
 pub enum StreamItem<'a> {
     Header(&'a [ColumnSchema]),
-    Row(&'a [&'a Value<'static>]),
+    Row(RowCells<'a>),
 }
 
 impl Engine {

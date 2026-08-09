@@ -72,7 +72,7 @@ fn streamed(e: &Engine, sql: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     e.execute_readonly_select_streaming(sql, CancelToken::none(), |item| {
         if let StreamItem::Row(cells) = item {
-            out.push(match cells[0] {
+            out.push(match cells.get(0).expect("row has a first cell") {
                 Value::Text(s) => s.to_string(),
                 Value::Int(n) => n.to_string(),
                 other => panic!("unexpected cell {other:?}"),

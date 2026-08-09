@@ -815,13 +815,13 @@ fn handle_pg_simple_query(
                     }
                     r.map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()))
                 }
-                spg_engine::StreamItem::Row(values) => {
+                spg_engine::StreamItem::Row(cells) => {
                     if first_row_size.is_none() {
                         let before = wbuf.len();
-                        let r = encode_data_row_from_refs(
+                        let r = encode_data_row_cells(
                             wbuf,
                             &cols_storage,
-                            values,
+                            cells,
                             &wire_arena,
                             &wire_style,
                             &wire_tz,
@@ -829,10 +829,10 @@ fn handle_pg_simple_query(
                         first_row_size = Some(wbuf.len() - before);
                         return r.map_err(|e| spg_engine::EngineError::Unsupported(e.to_string()));
                     }
-                    encode_data_row_from_refs(
+                    encode_data_row_cells(
                         wbuf,
                         &cols_storage,
-                        values,
+                        cells,
                         &wire_arena,
                         &wire_style,
                         &wire_tz,
@@ -3813,10 +3813,10 @@ fn handle_execute(
                     let _ = &cached_row_desc;
                     Ok(())
                 }
-                spg_engine::StreamItem::Row(values) => encode_data_row_from_refs(
+                spg_engine::StreamItem::Row(cells) => encode_data_row_cells(
                     stream,
                     &cols_storage,
-                    values,
+                    cells,
                     &ext_arena,
                     &wire_style,
                     &wire_tz,
@@ -7859,6 +7859,28 @@ fn encode_data_row_from_refs(
         .map_err(|_| std::io::Error::other("PG message body too large"))?;
     out[frame_start + 1..frame_start + 5].copy_from_slice(&len.to_be_bytes());
     Ok(())
+}
+
+/// v7.37 (round 957) — encode whichever shape the engine held the row's
+/// cells in. Producers that build their cells into one contiguous buffer
+/// hand over the slice; only a producer whose cells are genuinely
+/// scattered (a join reading out of several source rows) still pays for a
+/// vector of pointers. Both arms below already existed and encode cell by
+/// cell identically — this is only the dispatch.
+fn encode_data_row_cells(
+    out: &mut Vec<u8>,
+    cols: &[ColumnSchema],
+    cells: spg_engine::RowCells<'_>,
+    arena: &bumpalo::Bump,
+    style: &spg_engine::eval::RenderStyle,
+    tz: &spg_engine::SessionTz,
+) -> std::io::Result<()> {
+    match cells {
+        spg_engine::RowCells::Refs(v) => encode_data_row_from_refs(out, cols, v, arena, style, tz),
+        spg_engine::RowCells::Values(v) => {
+            encode_data_row_from_values(out, cols, v, arena, style, tz)
+        }
+    }
 }
 
 /// v7.34 (SPGS perf bar) — direct-into-`Vec` DataRow encoder, used by
