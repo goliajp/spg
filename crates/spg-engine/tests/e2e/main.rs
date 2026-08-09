@@ -131,6 +131,7 @@ mod e2e_coalesce_shortcircuit_round609;
 mod e2e_coercion_errors_round90;
 mod e2e_coercion_strictness_round625;
 mod e2e_cold_rows_per_table;
+mod e2e_cold_tier_scan_gate_round943;
 mod e2e_collate;
 mod e2e_collate_derive_round692;
 mod e2e_collate_explicit_round691;
