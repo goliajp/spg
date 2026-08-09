@@ -54,9 +54,22 @@ echo "load before: $(uptime)"
 
 # One client, both legs. `\timing` reports the round trip psql measures,
 # which excludes process startup — that is the number to compare.
+# Each sample is the best of three executions in one session, not one
+# execution. Round 935 measured the difference this makes on this
+# testbed, in the same window, on the same 400k shapes: a run whose
+# samples were single executions carried a baseline spread of 9-25%,
+# and one whose samples were min-of-three carried 1-2%. A panel that
+# blocks the release cannot resolve a 10% regression at the former, and
+# resolves it comfortably at the latter — that round's own 10% change
+# had to be measured OUTSIDE this script for exactly that reason.
+#
+# The minimum is the right statistic here because the thing being
+# compared is how long the work takes, and everything else the machine
+# does can only add. Both legs are treated identically, so no warmth
+# accrues to one side.
 time_one() { # $1=uri $2=sql $3=work_mem setting
-  "${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "$3" -c '\timing on' -c "$2" 2>&1 |
-    grep -E '^Time:' | tail -1 | sed 's/Time: //; s/ ms//'
+  "${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "$3" -c '\timing on' -c "$2" -c "$2" -c "$2" 2>&1 |
+    grep -E '^Time:' | sed 's/Time: //; s/ ms//' | sort -g | head -1
 }
 lo() { printf '%s\n' "$@" | sort -g | head -1; }
 hi() { printf '%s\n' "$@" | sort -g | tail -1; }
