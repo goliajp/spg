@@ -7930,6 +7930,33 @@ impl Engine {
                 })
             })
             .collect();
+        // v7.39 (round 962) — which projection items are whole-row
+        // references, and to which join source. The test is
+        // `locate_column` declining the name, which is the SAME resolver
+        // the evaluation path uses, so this cannot drift from it: a real
+        // column carrying an alias's name resolves to a position and is
+        // not reported here. The source index comes from the alias
+        // prefix, the way the combined schema names its columns.
+        let whole_row_src: Vec<Option<usize>> = projection
+            .iter()
+            .map(|p| {
+                let Expr::Column(c) = &p.expr else {
+                    return None;
+                };
+                if !matches!(eval::locate_column(c, &ctx), Ok(None)) {
+                    return None;
+                }
+                let prefix = alloc::format!("{name}.", name = c.name);
+                let abs = deferred
+                    .combined_schema
+                    .iter()
+                    .position(|s| s.name.starts_with(&prefix))?;
+                deferred
+                    .offsets
+                    .partition_point(|&o| o <= abs)
+                    .checked_sub(1)
+            })
+            .collect();
         // ORDER BY (when present) still evaluates against a materialised
         // Row — keep the order-key encoder correct rather than fork it.
         let need_eval_row = !all_proj_bound || !stmt.order_by.is_empty();
@@ -7993,6 +8020,25 @@ impl Engine {
                             .map(Value::into_owned)
                             .unwrap_or(Value::Null),
                     );
+                } else if let Some(k) = whole_row_src[i]
+                    && tuple[k] == usize::MAX
+                {
+                    // v7.39 (round 962) — a whole-row reference to a side
+                    // an OUTER join null-extended is NULL, not a
+                    // composite whose fields are all NULL. PG18.4 answers
+                    // `SELECT jb FROM wr LEFT JOIN jb ON <no match>` with
+                    // an empty cell; round 961 answered `(,)`.
+                    //
+                    // The evaluator below cannot tell the two apart: it
+                    // reads the MATERIALISED combined row, where a
+                    // null-extended side is indistinguishable from a real
+                    // row whose every column is NULL — and that row is
+                    // `(,)` in PG too, so guessing by "all fields NULL"
+                    // would trade one wrong answer for another. The
+                    // tuple, which is still in hand here, does know:
+                    // `usize::MAX` is the sentinel the join writes for
+                    // exactly this.
+                    values.push(Value::Null);
                 } else {
                     // Eval path — `materialised` is Some whenever any
                     // projection item is non-bound (need_eval_row true).

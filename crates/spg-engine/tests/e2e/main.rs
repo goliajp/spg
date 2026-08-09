@@ -765,6 +765,7 @@ mod e2e_roles_round58;
 mod e2e_rollup;
 mod e2e_rollup_nested_group_col;
 mod e2e_round_negative_ndigits_round98;
+mod e2e_row_is_null_round962;
 mod e2e_rows_from_round74;
 mod e2e_rowtypes_round28;
 mod e2e_rule_conditional_instead_nothing_round141;
