@@ -446,17 +446,83 @@ impl<'a> ExternalSorter<'a> {
     /// A permutation rather than a sort of the rows themselves: the rows
     /// are bytes in one buffer and moving them would cost more than the
     /// indirection saves.
+    ///
+    /// A single integer key carries the key WITH the index instead. The
+    /// general path below sorts `u32`s through a comparator that reads
+    /// two `OrderKey`s out of a separate array: the reads follow the
+    /// permutation rather than memory, and each comparison of two
+    /// integers pays two scattered loads, a slice, and the enum match.
+    /// Round 935's leaf-symbol profile put 27.9% of a 10k `SELECT id
+    /// FROM t ORDER BY k` in that machinery — more, on its own, than
+    /// PG18 spends on the whole sort — while an earlier ablation had
+    /// priced it at zero. The ablation was read under a baseline spread
+    /// wide enough to hide the difference; the profile is what
+    /// contradicted it.
+    ///
+    /// Measured, 400k rows at `work_mem = 4 MB` so the sort spills, six
+    /// interleaved rounds with the starting side flipped, min of three
+    /// per round, server-side `EXPLAIN ANALYZE`, and a same-binary
+    /// control leg in the same run to show the harness reports no
+    /// difference where there is none:
+    ///
+    ///   SELECT id  FROM t ORDER BY k    120.8 - 123.0  ->  107.8 - 110.3 ms
+    ///   SELECT pad FROM t ORDER BY k    126.3 - 128.7  ->  114.0 - 116.4 ms
+    ///
+    /// Neither pair of ranges overlaps, the control leg's does overlap
+    /// the baseline's, and all three legs answer with the same checksum
+    /// ascending and descending. Those are the numbers for THIS code; a
+    /// prototype without the range guard below measured the same two
+    /// shapes at -10.8% and -10.0%, so the guard costs nothing readable.
+    /// The 10k shape came out VOID under the spread rule all three times
+    /// it was run — 5 ms is below what this machine resolves — so it is
+    /// not claimed either way.
     fn sorted_order(&self) -> Vec<u32> {
         let mut order: Vec<u32> = (0..self.ends.len() as u32).collect();
         if self.key_stride == 0 {
             return order;
         }
         let (keys, stride, descs) = (&self.keys, self.key_stride, self.descs);
+        if stride == 1
+            && let Some(mut inline) = Self::inline_int_keys(keys)
+        {
+            // Stable, as the general sort is, so equal keys keep the
+            // order they arrived in.
+            if descs.first().copied().unwrap_or(false) {
+                inline.sort_by_key(|p| core::cmp::Reverse(p.0));
+            } else {
+                inline.sort_by_key(|p| p.0);
+            }
+            for (slot, (_, i)) in order.iter_mut().zip(inline) {
+                *slot = i;
+            }
+            return order;
+        }
         order.sort_by(|&a, &b| {
             let (a, b) = (a as usize * stride, b as usize * stride);
             cmp_multi_key_in(&keys[a..a + stride], &keys[b..b + stride], descs, &[])
         });
         order
+    }
+
+    /// `(key, row index)` for one integer key per row, or `None` when
+    /// some key is not one — every other key type sorts the general way.
+    ///
+    /// The NULL sentinels bracket every value, so they take the ends of
+    /// the integer range. A real key holding either end would then be
+    /// indistinguishable from a NULL, which is why one holding either end
+    /// declines the whole batch rather than being assumed not to occur.
+    fn inline_int_keys(keys: &[OrderKey]) -> Option<Vec<(i128, u32)>> {
+        let mut out: Vec<(i128, u32)> = Vec::with_capacity(keys.len());
+        for (i, k) in keys.iter().enumerate() {
+            let v = match k {
+                OrderKey::Int(n) if *n != i128::MIN && *n != i128::MAX => *n,
+                OrderKey::NullSmall => i128::MIN,
+                OrderKey::NullBig => i128::MAX,
+                _ => return None,
+            };
+            out.push((v, i as u32));
+        }
+        Some(out)
     }
 
     fn clear_batch(&mut self) {
@@ -1402,5 +1468,100 @@ mod tests {
             1,
             "same output shape as the spilled path"
         );
+    }
+
+    /// r935 — the inline integer key has to put the batch in exactly the
+    /// order the general comparator would, in the cases it takes AND in
+    /// the ones it declines.
+    ///
+    /// The reference is the general comparator itself rather than a
+    /// hand-written expectation: the fast path's only job is to agree
+    /// with it, and a hand-written order would just be a second chance
+    /// to make the same mistake.
+    fn assert_order_matches(name: &str, keyrows: &[Vec<OrderKey>], descs: &[bool]) {
+        let mut s = ExternalSorter::new(None, usize::MAX, record_cols(), descs);
+        for (i, k) in keyrows.iter().enumerate() {
+            let r = record(i as i32);
+            s.push(&mut k.clone(), &r).unwrap();
+        }
+        let mut want: Vec<u32> = (0..keyrows.len() as u32).collect();
+        want.sort_by(|&a, &b| {
+            cmp_multi_key_in(&keyrows[a as usize], &keyrows[b as usize], descs, &[])
+        });
+        assert_eq!(s.sorted_order(), want, "{name}");
+    }
+
+    #[test]
+    fn inline_int_key_orders_the_batch_like_the_general_comparator() {
+        let int = |n: i128| alloc::vec![OrderKey::Int(n)];
+        // Duplicates are in here on purpose: both sorts are stable, so
+        // equal keys must come out in the order they were pushed.
+        let plain: Vec<Vec<OrderKey>> = alloc::vec![
+            int(5),
+            int(-3),
+            int(5),
+            int(0),
+            int(i64::MAX as i128),
+            int(-1),
+            int(5),
+        ];
+        let with_nulls: Vec<Vec<OrderKey>> = alloc::vec![
+            int(7),
+            alloc::vec![OrderKey::NullBig],
+            int(-2),
+            alloc::vec![OrderKey::NullSmall],
+            int(7),
+            alloc::vec![OrderKey::NullBig],
+        ];
+        // Declined: a real key sitting where a sentinel would.
+        let at_the_ends: Vec<Vec<OrderKey>> =
+            alloc::vec![int(3), int(i128::MAX), int(-4), int(i128::MIN), int(3)];
+        // Declined: not an integer key at all.
+        let texts: Vec<Vec<OrderKey>> = alloc::vec![
+            alloc::vec![OrderKey::Text("pear".into())],
+            alloc::vec![OrderKey::Text("apple".into())],
+            alloc::vec![OrderKey::Num(1.5)],
+        ];
+        // Declined: more than one key per row.
+        let two_keys: Vec<Vec<OrderKey>> = alloc::vec![
+            alloc::vec![OrderKey::Int(1), OrderKey::Int(9)],
+            alloc::vec![OrderKey::Int(1), OrderKey::Int(2)],
+            alloc::vec![OrderKey::Int(0), OrderKey::Int(5)],
+        ];
+
+        for (name, rows) in [
+            ("plain ints", &plain),
+            ("null sentinels", &with_nulls),
+            ("keys at the ends of the range", &at_the_ends),
+            ("non-integer keys", &texts),
+        ] {
+            assert_order_matches(name, rows, &[false]);
+            assert_order_matches(name, rows, &[true]);
+        }
+        assert_order_matches("two keys", &two_keys, &[false, false]);
+        assert_order_matches("two keys, second descending", &two_keys, &[false, true]);
+    }
+
+    /// And the rows themselves come back in that order, spilled or not —
+    /// `sorted_order` serves both the in-memory walk and the run writer,
+    /// so a fast path that only the unspilled case exercised would leave
+    /// the spilled one unpinned.
+    #[test]
+    fn inline_int_key_holds_when_the_sort_spills() {
+        let descs = [false];
+        for budget in [4096usize, 64 * 1024 * 1024] {
+            let mut s = ExternalSorter::new(Some(mem_run), budget, record_cols(), &descs);
+            for i in 0..2000i32 {
+                let r = record((i * 7919) % 2000);
+                s.push(&mut keys_of(&r).unwrap(), &r).unwrap();
+            }
+            assert_eq!(s.spilled(), budget == 4096, "budget {budget}");
+            let out = s.finish(keys_of, project_identity).unwrap();
+            assert_eq!(
+                ids_of(&out, 0),
+                (0..2000i32).collect::<Vec<i32>>(),
+                "budget {budget}"
+            );
+        }
     }
 }
