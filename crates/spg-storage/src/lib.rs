@@ -6756,6 +6756,19 @@ impl Catalog {
         });
         let t_mut = self.get_mut(table_name).expect("still present");
         t_mut.register_cold_locators(index_name, new_cold)?;
+        // r944 — a freeze has to say that it froze something.
+        //
+        // `has_cold_rows_fast()` reads the cached count, and neither
+        // freeze path touched it, so afterwards it answered "no cold
+        // rows" while cold rows existed. That predicate gates four join
+        // paths, and a gate that wrongly declines the cold-aware path
+        // drops the frozen rows from the answer.
+        //
+        // Marking it stale rather than adding to it: stale reads as
+        // true, which is the safe direction, and this function cannot
+        // know the exact total (rows may already have been cold). ANALYZE
+        // recomputes the number.
+        t_mut.mark_cold_row_count_stale();
 
         Ok(FreezeReport {
             segment_id,
@@ -7203,6 +7216,19 @@ impl Catalog {
         });
         let t_mut = self.get_mut(table_name).expect("still present");
         t_mut.register_cold_locators(index_name, new_cold)?;
+        // r944 — a freeze has to say that it froze something.
+        //
+        // `has_cold_rows_fast()` reads the cached count, and neither
+        // freeze path touched it, so afterwards it answered "no cold
+        // rows" while cold rows existed. That predicate gates four join
+        // paths, and a gate that wrongly declines the cold-aware path
+        // drops the frozen rows from the answer.
+        //
+        // Marking it stale rather than adding to it: stale reads as
+        // true, which is the safe direction, and this function cannot
+        // know the exact total (rows may already have been cold). ANALYZE
+        // recomputes the number.
+        t_mut.mark_cold_row_count_stale();
 
         Ok(FreezeReport {
             segment_id,
