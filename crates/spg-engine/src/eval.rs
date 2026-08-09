@@ -4760,7 +4760,31 @@ fn eval_is_null_arm(
         }
         return Ok(Value::Bool(if negated { all_non_null } else { all_null }));
     }
+    // v7.39 (round 962) — the same field-wise rule for a row-valued
+    // EXPRESSION, not just the `ROW(...)` spelling. P4.11 keyed on the
+    // syntax, so every other way to hold a row got the whole-value test:
+    // measured against PG18.4, `SELECT an IS NULL FROM an` on a row whose
+    // every column is NULL answered `t` there and `f` here, and a column
+    // declared with a composite type behaved the same way. Round 961 made
+    // whole-row references reachable through a projection, which is what
+    // surfaced it.
+    //
+    // Fields are tested exactly as the `ROW(...)` arm tests its
+    // arguments, without recursing — a field that is itself a row is a
+    // non-null value.
     let v = eval_expr(expr, row, ctx)?;
+    if let Value::Composite(fields) = &v {
+        let mut all_null = true;
+        let mut all_non_null = true;
+        for (_, f) in fields {
+            if matches!(f, Value::Null) {
+                all_non_null = false;
+            } else {
+                all_null = false;
+            }
+        }
+        return Ok(Value::Bool(if negated { all_non_null } else { all_null }));
+    }
     let is_null = matches!(v, Value::Null);
     Ok(Value::Bool(if negated { !is_null } else { is_null }))
 }

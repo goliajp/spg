@@ -178,34 +178,35 @@ fn whole_row_reference_works_in_a_join_too() {
 }
 
 #[test]
-fn a_null_extended_side_is_a_composite_of_nulls_not_null() {
+fn a_null_extended_side_is_null_not_a_composite_of_nulls() {
     let mut e = Engine::new();
     run(&mut e, "CREATE TABLE wr (id INT, pad TEXT)");
     run(&mut e, "INSERT INTO wr VALUES (7, 'z')");
     run(&mut e, "CREATE TABLE jb (id INT, w TEXT)");
     run(&mut e, "INSERT INTO jb VALUES (7, 'J')");
 
-    // KNOWN GAP, pinned so it is not mistaken for correct. PG18.4
-    // answers a whole-row reference to the UNMATCHED side of an outer
-    // join with NULL; SPG answers `(,)` — a composite whose fields are
-    // all NULL. Measured on both, round 961.
+    // A whole-row reference to the UNMATCHED side of an outer join is
+    // NULL, as PG18.4 answers it — NOT a composite whose fields are all
+    // NULL, which is what round 961 produced.
     //
-    // The two are only distinguishable with information SPG's combined
-    // row does not carry: which sides were null-extended. One streaming
-    // join walk does know it (`tuple[k] == usize::MAX`, `select.rs`) but
-    // decomposes the projection per column, so a whole-row item never
-    // sees it; the materialising walk fills NULLs with no marker at all.
-    // Closing it means recording null-extension on the combined row,
-    // which is why it is not closed here.
-    //
-    // Distinguishing by "all fields are NULL" would be a guess, not a
-    // fix: a real row whose every column is NULL is `(,)` in PG too.
+    // The join projection loop reads the survivor TUPLE, where the join
+    // writes `usize::MAX` for a null-extended slot, so it can tell;
+    // the evaluator below it reads the materialised combined row, where
+    // it cannot. Guessing by "every field is NULL" would trade one wrong
+    // answer for another — see the control below.
     let rows = streamed(&e, "SELECT jb FROM wr LEFT JOIN jb ON wr.id = jb.id + 99")
         .expect("left join, no match");
-    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows, vec!["Null".to_string()], "{rows:?}");
+
+    // The control that rules the guess out: a REAL row whose every
+    // column is NULL is a composite, in PG18.4 too.
+    let mut e2 = Engine::new();
+    run(&mut e2, "CREATE TABLE an (id INT, q TEXT)");
+    run(&mut e2, "INSERT INTO an VALUES (NULL, NULL)");
+    let all_null = streamed(&e2, "SELECT an FROM an").expect("all-NULL row");
     assert!(
-        rows[0].contains("Composite"),
-        "today: a composite of NULLs; PG18.4: NULL — got {rows:?}"
+        all_null[0].contains("Composite"),
+        "an all-NULL row is still a row: {all_null:?}"
     );
 
     // The matched side is right, and that is what makes the gap narrow.
