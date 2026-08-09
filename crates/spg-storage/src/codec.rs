@@ -1866,6 +1866,56 @@ pub fn encode_row_body_dense_into(row: &Row<'_>, schema: &TableSchema, out: &mut
 /// caller decoding a back-to-back stream of rows can advance its
 /// cursor). Returns `StorageError::Corrupt` on truncation, bad
 /// UTF-8, or unknown cell tags.
+/// v7.37 (round 923) — [`decode_row_body_dense`] that does not build the
+/// columns the caller will not read.
+///
+/// Priced ADDITIVELY, which is why it is trusted: three extra full decodes
+/// per row cost 6.50 ms at 10k rows, three extra PRUNED ones 3.43 ms, so
+/// skipping one 200-byte text halves a decode (2.17 -> 1.14 ms). Three
+/// earlier REMOVAL ablations put the whole decode at 4.3-4.6 ms and were
+/// all inflated, because removing it took downstream work along.
+///
+/// `needed[i]` false means the caller drops column `i`; a `Value::Null`
+/// placeholder keeps the arity so positional access still lands. Only
+/// length-prefixed cells are skipped; fixed-width ones are read normally.
+/// `&[]` is the unpruned decode.
+pub fn decode_row_body_dense_pruned(
+    bytes: &[u8],
+    schema: &TableSchema,
+    codec_version: u8,
+    needed: &[bool],
+) -> Result<(Row<'static>, usize), StorageError> {
+    let mut cur = Cursor::new(bytes).with_codec_version(codec_version);
+    let bitmap_bytes = schema.columns.len().div_ceil(8);
+    let mut bitmap_buf = [0u8; 32];
+    if bitmap_bytes > bitmap_buf.len() {
+        return Err(StorageError::Corrupt(format!(
+            "row NULL bitmap {bitmap_bytes} B exceeds 32 B cap"
+        )));
+    }
+    let slice = cur.take(bitmap_bytes)?;
+    bitmap_buf[..bitmap_bytes].copy_from_slice(slice);
+    let mut values = Vec::with_capacity(schema.columns.len());
+    for (col_idx, col) in schema.columns.iter().enumerate() {
+        if (bitmap_buf[col_idx / 8] >> (col_idx % 8)) & 1 == 1 {
+            values.push(Value::Null);
+            continue;
+        }
+        let wanted = needed.get(col_idx).copied().unwrap_or(true);
+        let skippable = matches!(
+            col.ty,
+            DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::Char(_)
+        );
+        if wanted || !skippable {
+            values.push(cur.read_value_body(col.ty)?);
+        } else {
+            cur.skip_str()?;
+            values.push(Value::Null);
+        }
+    }
+    Ok((Row { values }, cur.pos))
+}
+
 pub fn decode_row_body_dense(
     bytes: &[u8],
     schema: &TableSchema,
@@ -3503,6 +3553,21 @@ impl<'a> Cursor<'a> {
         core::str::from_utf8(bytes)
             .map(String::from)
             .map_err(|_| StorageError::Corrupt("invalid UTF-8 in cell payload".into()))
+    }
+
+    /// v7.37 (round 923) — advance past a length-prefixed cell without
+    /// building it: `read_str` minus the UTF-8 check and the `String`.
+    /// Narrow on purpose — a general skip would mirror forty arms of
+    /// `read_value_body`, and one wrong width desyncs the cursor silently.
+    pub(crate) fn skip_str(&mut self) -> Result<(), StorageError> {
+        let short = self.read_u16()?;
+        let len = if self.codec_version >= 46 && short == STR_LEN_ESCAPE {
+            self.read_u32()? as usize
+        } else {
+            short as usize
+        };
+        self.take(len)?;
+        Ok(())
     }
 
     pub(crate) fn read_str(&mut self) -> Result<String, StorageError> {

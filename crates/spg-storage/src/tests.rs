@@ -5595,3 +5595,96 @@ fn v88_a_table_with_no_collation_pays_two_bytes() {
         None
     );
 }
+
+/// r938 — the pruned decode has to agree with the full one everywhere it
+/// did not prune, and it has to leave the cursor in the same place.
+///
+/// The cursor is the part worth pinning hardest. A sort batch is rows
+/// back to back in one buffer and the caller advances by the returned
+/// position, so a skip that consumes the wrong number of bytes does not
+/// corrupt the row it skipped in — it corrupts every row after it. That
+/// failure would show up far from its cause.
+#[test]
+fn pruned_decode_agrees_with_the_full_decode_and_ends_in_the_same_place() {
+    let schema = TableSchema::new(
+        "rec",
+        vec![
+            ColumnSchema::new("id", DataType::Int, false),
+            ColumnSchema::new("a", DataType::Text, true),
+            ColumnSchema::new("n", DataType::BigInt, true),
+            ColumnSchema::new("b", DataType::Text, true),
+        ],
+    );
+    let rows = vec![
+        Row::new(vec![
+            Value::Int(1),
+            Value::text("short".to_string()),
+            Value::BigInt(7),
+            Value::text("x".repeat(300)),
+        ]),
+        // NULLs ride the bitmap rather than the body, so a masked column
+        // that is also NULL must not consume anything either.
+        Row::new(vec![Value::Int(2), Value::Null, Value::Null, Value::Null]),
+        Row::new(vec![
+            Value::Int(3),
+            Value::text(String::new()),
+            Value::BigInt(-9),
+            Value::text("tail".to_string()),
+        ]),
+    ];
+
+    for mask in [
+        vec![],                           // prune nothing
+        vec![true, false, true, true],    // prune the first text
+        vec![true, true, true, false],    // prune the last text
+        vec![true, false, true, false],   // prune both
+        vec![false, false, false, false], // prune everything prunable
+    ] {
+        // One buffer, rows back to back — the shape the sort batch has.
+        let mut arena = Vec::new();
+        for r in &rows {
+            encode_row_body_dense_into(r, &schema, &mut arena);
+        }
+        let mut at_full = 0usize;
+        let mut at_pruned = 0usize;
+        for (i, _) in rows.iter().enumerate() {
+            let (full, used_full) =
+                decode_row_body_dense(&arena[at_full..], &schema, CURRENT_ROW_CODEC_VERSION)
+                    .unwrap();
+            let (pruned, used_pruned) = decode_row_body_dense_pruned(
+                &arena[at_pruned..],
+                &schema,
+                CURRENT_ROW_CODEC_VERSION,
+                &mask,
+            )
+            .unwrap();
+            assert_eq!(
+                used_full, used_pruned,
+                "row {i} mask {mask:?}: pruning changed how many bytes the row occupies"
+            );
+            assert_eq!(
+                full.values.len(),
+                pruned.values.len(),
+                "row {i} mask {mask:?}: arity has to survive pruning, positions are indexes"
+            );
+            for (c, (f, p)) in full.values.iter().zip(pruned.values.iter()).enumerate() {
+                let kept = mask.get(c).copied().unwrap_or(true);
+                if kept {
+                    assert_eq!(f, p, "row {i} col {c} mask {mask:?}: kept column differs");
+                }
+            }
+            at_full += used_full;
+            at_pruned += used_pruned;
+        }
+        assert_eq!(
+            at_full,
+            arena.len(),
+            "mask {mask:?}: full decode consumed the arena"
+        );
+        assert_eq!(
+            at_pruned,
+            arena.len(),
+            "mask {mask:?}: pruned decode consumed the arena"
+        );
+    }
+}
