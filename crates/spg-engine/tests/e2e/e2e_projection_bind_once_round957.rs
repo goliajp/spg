@@ -121,26 +121,97 @@ fn whole_row_reference_is_not_bound_to_a_position() {
     run(&mut e, "INSERT INTO wr VALUES (7, 'z')");
 
     // `wr` is the FROM alias, not a column: it has no position, so
-    // `locate_column` declines to bind it and the general path answers.
+    // `locate_column` declines to bind it and the general path answers
+    // with the composite of the whole row.
     //
-    // What that path answers today is an ERROR, and PG18 answers
-    // `(7,z)` — measured on both, round 957. The gap is NOT this
-    // binding: it is a THIRD resolver, `resolve_projection_column`
-    // (`select.rs:9166`), which types the projection before any row is
-    // read and has no whole-row branch, so it raises ColumnNotFound
-    // before `resolve_column`'s branch (round T9) can run. Same class as
-    // round 823 — two resolvers for one question, one of them missing a
-    // rule.
-    //
-    // Pinned as-is so that closing that gap is a deliberate change with
-    // this test going green, and so the binding cannot silently start
-    // answering something else in the meantime.
-    let rows = streamed(&e, "SELECT wr FROM wr");
+    // Round 957 found this ERRORING while PG18 answered `(7,z)`, and
+    // round 961 closed it: the gap was a THIRD resolver,
+    // `resolve_projection_column`, which types the projection before any
+    // row is read and had no whole-row branch, so it raised
+    // ColumnNotFound before `resolve_column`'s branch (round T9) could
+    // run. Same class as round 823 — two resolvers for one question, one
+    // of them missing a rule.
+    let rows = streamed(&e, "SELECT wr FROM wr").expect("whole-row reference");
+    assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(
-        rows.is_err(),
-        "whole-row reference: still the pre-binding behaviour, \
-         and still a known gap against PG18's (7,z) — got {rows:?}"
+        rows[0].contains('7') && rows[0].contains('z'),
+        "the whole row, not one of its columns: {rows:?}"
     );
+
+    // A real column named like the alias still wins, which is the
+    // precedence the evaluation side already applied.
+    let mut e2 = Engine::new();
+    run(&mut e2, "CREATE TABLE s (s INT, other TEXT)");
+    run(&mut e2, "INSERT INTO s VALUES (5, 'q')");
+    let shadow = streamed(&e2, "SELECT s FROM s").expect("column shadows the alias");
+    assert_eq!(shadow, vec!["Int(5)".to_string()], "{shadow:?}");
+}
+
+#[test]
+fn whole_row_reference_works_in_a_join_too() {
+    let mut e = Engine::new();
+    run(&mut e, "CREATE TABLE wr (id INT, pad TEXT)");
+    run(&mut e, "INSERT INTO wr VALUES (7, 'z')");
+    run(&mut e, "CREATE TABLE jb (id INT, w TEXT)");
+    run(&mut e, "INSERT INTO jb VALUES (7, 'J')");
+
+    // A join's combined schema carries no alias and qualifies every
+    // column `alias.col`, so both the typing side and the evaluation
+    // side identify the alias by that prefix. Verified against PG18.4
+    // over the wire, round 961: each of these answers identically there.
+    let both = streamed(&e, "SELECT wr, jb FROM wr JOIN jb ON wr.id = jb.id").expect("join");
+    assert_eq!(both.len(), 1, "{both:?}");
+    assert!(
+        both[0].contains('z') && both[0].contains('J'),
+        "each side's whole row, side by side: {both:?}"
+    );
+
+    let aliased =
+        streamed(&e, "SELECT a FROM wr a JOIN jb b ON a.id = b.id").expect("aliased join");
+    assert!(aliased[0].contains('z'), "{aliased:?}");
+
+    // A name that is neither a column nor an alias still errors.
+    assert!(
+        streamed(&e, "SELECT nosuch FROM wr JOIN jb ON wr.id = jb.id").is_err(),
+        "a name matching no alias must not become a whole-row reference"
+    );
+}
+
+#[test]
+fn a_null_extended_side_is_a_composite_of_nulls_not_null() {
+    let mut e = Engine::new();
+    run(&mut e, "CREATE TABLE wr (id INT, pad TEXT)");
+    run(&mut e, "INSERT INTO wr VALUES (7, 'z')");
+    run(&mut e, "CREATE TABLE jb (id INT, w TEXT)");
+    run(&mut e, "INSERT INTO jb VALUES (7, 'J')");
+
+    // KNOWN GAP, pinned so it is not mistaken for correct. PG18.4
+    // answers a whole-row reference to the UNMATCHED side of an outer
+    // join with NULL; SPG answers `(,)` — a composite whose fields are
+    // all NULL. Measured on both, round 961.
+    //
+    // The two are only distinguishable with information SPG's combined
+    // row does not carry: which sides were null-extended. One streaming
+    // join walk does know it (`tuple[k] == usize::MAX`, `select.rs`) but
+    // decomposes the projection per column, so a whole-row item never
+    // sees it; the materialising walk fills NULLs with no marker at all.
+    // Closing it means recording null-extension on the combined row,
+    // which is why it is not closed here.
+    //
+    // Distinguishing by "all fields are NULL" would be a guess, not a
+    // fix: a real row whose every column is NULL is `(,)` in PG too.
+    let rows = streamed(&e, "SELECT jb FROM wr LEFT JOIN jb ON wr.id = jb.id + 99")
+        .expect("left join, no match");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(
+        rows[0].contains("Composite"),
+        "today: a composite of NULLs; PG18.4: NULL — got {rows:?}"
+    );
+
+    // The matched side is right, and that is what makes the gap narrow.
+    let kept = streamed(&e, "SELECT wr FROM wr LEFT JOIN jb ON wr.id = jb.id + 99")
+        .expect("left join, kept side");
+    assert!(kept[0].contains('z'), "{kept:?}");
 }
 
 #[test]

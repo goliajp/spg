@@ -9165,22 +9165,47 @@ fn references_ctid(stmt: &SelectStatement) -> bool {
         || stmt.having.as_ref().is_some_and(in_expr)
 }
 
+/// v7.39 (round 961) — the whole-row schema for `SELECT t FROM t`, which
+/// is a name the projection has to TYPE before any row exists.
+///
+/// Evaluation has answered this since round T9 (`resolve_column` builds a
+/// `Value::Composite` of every column), but the typing side below had no
+/// such branch and raised `column "t" does not exist` first — so the
+/// feature was unreachable through a projection. Measured against PG18.4:
+/// `SELECT wr FROM wr` answers `(7,z)` there and errored here.
+///
+/// The type is `Jsonb` + a composite marker, which is exactly how a
+/// column DECLARED as a composite type is described (`ddl.rs`, round 56):
+/// the value travels as a `Value::Composite` and renders in the canonical
+/// `(7,z)` form. SPG has no catalog entry for a table's implicit row type,
+/// so the marker names the alias and no rehydration keys off it — the
+/// value arrives already built.
+fn whole_row_projection_schema(alias: &str) -> ColumnSchema {
+    let mut s = ColumnSchema::new(
+        alloc::string::String::from(alias),
+        spg_storage::DataType::Jsonb,
+        true,
+    );
+    s.user_composite_type = Some(alloc::string::String::from(alias));
+    s
+}
+
 pub(crate) fn resolve_projection_column<'a>(
     c: &ColumnName,
     schema_cols: &'a [ColumnSchema],
     table_alias: &str,
-) -> Result<&'a ColumnSchema, EngineError> {
+) -> Result<Cow<'a, ColumnSchema>, EngineError> {
     if let Some(q) = &c.qualifier {
         let composite = alloc::format!("{q}.{name}", name = c.name);
         if let Some(s) = schema_cols.iter().find(|s| s.name == composite) {
-            return Ok(s);
+            return Ok(Cow::Borrowed(s));
         }
         // Single-table case: the qualifier may equal the active alias —
         // then look for the bare column name.
         if q == table_alias
             && let Some(s) = schema_cols.iter().find(|s| s.name == c.name)
         {
-            return Ok(s);
+            return Ok(Cow::Borrowed(s));
         }
         // For multi-table schemas the qualifier is unknown only if no
         // column bears the "<q>." prefix. For single-table, the alias
@@ -9198,17 +9223,40 @@ pub(crate) fn resolve_projection_column<'a>(
         }));
     }
     if let Some(s) = schema_cols.iter().find(|s| s.name == c.name) {
-        return Ok(s);
+        return Ok(Cow::Borrowed(s));
     }
     let suffix = alloc::format!(".{name}", name = c.name);
     let mut matches = schema_cols.iter().filter(|s| s.name.ends_with(&suffix));
     let first = matches.next();
     let extra = matches.next();
     match (first, extra) {
-        (Some(s), None) => Ok(s),
+        (Some(s), None) => Ok(Cow::Borrowed(s)),
         (Some(_), Some(_)) => Err(EngineError::Eval(EvalError::TypeMismatch {
             detail: alloc::format!("column reference \"{}\" is ambiguous", c.name),
         })),
+        // The whole-row reference, checked LAST so a real column carrying
+        // the alias's name still wins — the same precedence
+        // `resolve_column` applies on the evaluation side.
+        //
+        // Two schema shapes reach here. A single-table (or subquery, or
+        // CTE) scan carries its alias and bare column names, so the name
+        // has to equal the alias. A JOIN's combined schema carries no
+        // alias at all and qualifies every column `alias.col`, so the
+        // alias is identified by the prefix instead — which is exactly
+        // how `whole_row_composite` picks the fields out on the
+        // evaluation side. Measured: `SELECT wr FROM wr JOIN jb ON …`
+        // answers `(7,z)` on PG18.4 and errored here until this arm
+        // covered the joined shape too.
+        _ if !table_alias.is_empty() && c.name == table_alias => {
+            Ok(Cow::Owned(whole_row_projection_schema(table_alias)))
+        }
+        _ if table_alias.is_empty() && {
+            let prefix = alloc::format!("{name}.", name = c.name);
+            schema_cols.iter().any(|s| s.name.starts_with(&prefix))
+        } =>
+        {
+            Ok(Cow::Owned(whole_row_projection_schema(&c.name)))
+        }
         _ => Err(EngineError::Eval(EvalError::ColumnNotFound {
             name: c.name.clone(),
         })),
