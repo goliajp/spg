@@ -7456,6 +7456,48 @@ impl Engine {
         Ok(Some(n))
     }
 
+    /// One row of the single-table streaming walk: the WHERE test, the
+    /// projection, the emit. Returns whether a row was emitted.
+    ///
+    /// v7.39 (round 970) — factored out because the walk now has two ways
+    /// to reach a row, the sequential scan and an index seek's candidate
+    /// positions, and both must do IDENTICALLY this. A copy in each is how
+    /// two paths for one job drift; this file already carries the cost of
+    /// that lesson twice (rounds 823 and 961, both resolvers).
+    ///
+    /// `#[inline]` so the scan loop keeps the shape round 957 measured it
+    /// in — a shared hot path pays for a new abstraction whether or not it
+    /// uses it, and this one is on the scan.
+    #[inline]
+    fn stream_project_row<F>(
+        row: &spg_storage::Row<'static>,
+        where_: Option<&Expr>,
+        projection: &[ProjectedItem],
+        bound_pos: &[Option<usize>],
+        ctx: &crate::eval::EvalContext<'_>,
+        values: &mut Vec<Value<'static>>,
+        emit: &mut F,
+    ) -> Result<bool, EngineError>
+    where
+        F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
+    {
+        if let Some(w) = where_ {
+            let cond = crate::eval::eval_expr(w, row, ctx).map_err(EngineError::Eval)?;
+            if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
+                return Ok(false);
+            }
+        }
+        values.clear();
+        for (p, bound) in projection.iter().zip(bound_pos) {
+            values.push(match bound {
+                Some(pos) => crate::eval::column_at(*pos, row, ctx).map_err(EngineError::Eval)?,
+                None => crate::eval::eval_expr(&p.expr, row, ctx).map_err(EngineError::Eval)?,
+            });
+        }
+        emit(crate::StreamItem::Row(crate::RowCells::Values(values)))?;
+        Ok(true)
+    }
+
     fn try_stream_single_table<F>(
         &self,
         stmt: &SelectStatement,
@@ -7527,31 +7569,82 @@ impl Engine {
 
         // One snapshot for the whole scan, as the materialising path takes.
         let snapshot = self.current_snapshot();
+
+        // v7.39 (round 970) — ask the indices BEFORE walking the table.
+        //
+        // This walk had no index step at all, and it is preferred over the
+        // materialising path, which does have one (`pick_indexed_rows` ->
+        // `try_index_seek`). So a primary-key point lookup — the commonest
+        // statement there is — read every row: measured on 500k rows,
+        // `SELECT * FROM big WHERE id = 250000` took 14.947 ms against
+        // PG18.4's 0.172 ms, and the cost tracked the TABLE (1k 0.315 ms,
+        // 10k 1.660, 100k 3.518), which is not what O(log n) looks like.
+        //
+        // The control that named it: `... OFFSET 0` — semantically the same
+        // query — answered in 0.159 ms, because OFFSET is one of the shape
+        // gates that declines this walk and sends the statement to the path
+        // that seeks. `LIMIT 1` and `GROUP BY` did the same. The three have
+        // no semantics in common; what they share is making this function
+        // stand down.
+        //
+        // The seek only NARROWS: every candidate still goes through the
+        // full WHERE below, exactly as the mutation paths use it, so a
+        // partial index match cannot change an answer. Positions come back
+        // already visibility-filtered and already capped at a quarter of the
+        // table (round 490), so a seek can never cost more than the scan it
+        // replaces, and `None` means "walk the table" as before.
+        //
+        // Sorted because the scan would have produced table order and the
+        // index produces key order. Without an ORDER BY neither is promised,
+        // but a walk that silently reorders its answer when an index happens
+        // to exist is a difference nobody asked for.
+        let seek_positions: Option<Vec<usize>> = stmt.where_.as_ref().and_then(|w| {
+            crate::index_access::try_index_seek_positions(w, &cols, table, alias, &snapshot)
+        });
+
         let mut values: Vec<Value<'static>> = Vec::with_capacity(projection.len());
         let mut count: usize = 0;
-        for (i, row) in table.scan_visible_from(0, &snapshot) {
-            if i.is_multiple_of(256) {
-                cancel.check()?;
-            }
-            if let Some(w) = &stmt.where_ {
-                let cond = crate::eval::eval_expr(w, row, &ctx).map_err(EngineError::Eval)?;
-                if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
-                    continue;
+        match seek_positions {
+            Some(mut positions) => {
+                positions.sort_unstable();
+                for (n, pos) in positions.into_iter().enumerate() {
+                    if n.is_multiple_of(256) {
+                        cancel.check()?;
+                    }
+                    let Some(row) = table.rows().get(pos) else {
+                        continue;
+                    };
+                    if Self::stream_project_row(
+                        row,
+                        stmt.where_.as_ref(),
+                        &projection,
+                        &bound_pos,
+                        &ctx,
+                        &mut values,
+                        emit,
+                    )? {
+                        count += 1;
+                    }
                 }
             }
-            values.clear();
-            for (p, bound) in projection.iter().zip(&bound_pos) {
-                values.push(match bound {
-                    Some(pos) => {
-                        crate::eval::column_at(*pos, row, &ctx).map_err(EngineError::Eval)?
+            None => {
+                for (i, row) in table.scan_visible_from(0, &snapshot) {
+                    if i.is_multiple_of(256) {
+                        cancel.check()?;
                     }
-                    None => {
-                        crate::eval::eval_expr(&p.expr, row, &ctx).map_err(EngineError::Eval)?
+                    if Self::stream_project_row(
+                        row,
+                        stmt.where_.as_ref(),
+                        &projection,
+                        &bound_pos,
+                        &ctx,
+                        &mut values,
+                        emit,
+                    )? {
+                        count += 1;
                     }
-                });
+                }
             }
-            emit(crate::StreamItem::Row(crate::RowCells::Values(&values)))?;
-            count += 1;
         }
         Ok(Some(count))
     }

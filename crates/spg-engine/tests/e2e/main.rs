@@ -830,6 +830,7 @@ mod e2e_stat_repl_subscription;
 mod e2e_stat_snapshot_timestamp;
 mod e2e_stddev_exact_round615;
 mod e2e_str_to_date;
+mod e2e_stream_index_seek_round970;
 mod e2e_string_agg_per_row_sep_round762;
 mod e2e_string_borrow_round608;
 mod e2e_string_pg_differential;
