@@ -367,11 +367,23 @@ pub(super) fn text_prefix_chars(t: &str, n: i64) -> String {
     }
 }
 
-pub(super) fn resolve_column(
+/// v7.37 (round 957) — where a column reference lands, without reading a
+/// row. `Ok(Some(pos))` is a plain column at that position; `Ok(None)` is
+/// the whole-row reference below, which has to build a composite from the
+/// row and so cannot be reduced to a position.
+///
+/// This exists so that a caller wanting to resolve ONCE for a whole scan
+/// (the projection binding in `try_stream_single_table`) runs the same
+/// lookup order, the same fallbacks and the same errors as the per-row
+/// path — `resolve_column` is now literally this function plus a fetch.
+/// The alternative, a second resolver written to match, is exactly what
+/// round 823 spent a day repairing: `find_column_pos` had been missing
+/// `resolve_column`'s bare-name fallback, so one shape bound on one path
+/// and not the other, and the difference was silent.
+pub(crate) fn locate_column(
     c: &ColumnName,
-    row: &Row<'_>,
     ctx: &EvalContext<'_>,
-) -> Result<Value<'static>, EvalError> {
+) -> Result<Option<usize>, EvalError> {
     if let Some(q) = &c.qualifier {
         // Multi-table evaluation (joins): the synthesised schema uses
         // composite column names "alias.column" so we look that up
@@ -384,7 +396,7 @@ pub(super) fn resolve_column(
             .iter()
             .position(|s| composite_eq(&s.name, q, &c.name))
         {
-            return rehydrate_cell(pos, row, ctx);
+            return Ok(Some(pos));
         }
         // v7.26 (round-20 B) — when the qualifier IS a known table
         // alias in a joined schema (composite "alias.x" columns
@@ -408,7 +420,7 @@ pub(super) fn resolve_column(
         }
     }
     if let Some(pos) = ctx.columns.iter().position(|s| s.name == c.name) {
-        return rehydrate_cell(pos, row, ctx);
+        return Ok(Some(pos));
     }
     // Bare-name fallback for joined schemas: match any single composite
     // column ending in ".<name>"; ambiguity is an error.
@@ -421,7 +433,7 @@ pub(super) fn resolve_column(
     let first = matches.next();
     let extra = matches.next();
     match (first, extra) {
-        (Some((pos, _)), None) => rehydrate_cell(pos, row, ctx),
+        (Some((pos, _)), None) => Ok(Some(pos)),
         (Some(_), Some(_)) => Err(EvalError::TypeMismatch {
             detail: alloc::format!("column reference \"{}\" is ambiguous", c.name),
         }),
@@ -433,12 +445,38 @@ pub(super) fn resolve_column(
             // Column resolution above wins, so a real column named like the
             // alias is unaffected.
             if c.qualifier.is_none() && ctx.table_alias == Some(c.name.as_str()) {
-                return whole_row_composite(row, ctx, &c.name);
+                return Ok(None);
             }
             Err(EvalError::ColumnNotFound {
                 name: c.name.clone(),
             })
         }
+    }
+}
+
+/// The cell a located column holds, rehydrated to the column's declared
+/// shape. Split out of `resolve_column` so a bind-once caller can keep
+/// the position from `locate_column` and still fetch through exactly the
+/// same rehydration (a stored composite arrives as JSON and has to be
+/// rebuilt; reading `row.values[pos]` raw would hand back the JSON).
+pub(crate) fn column_at(
+    pos: usize,
+    row: &Row<'_>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    rehydrate_cell(pos, row, ctx)
+}
+
+pub(super) fn resolve_column(
+    c: &ColumnName,
+    row: &Row<'_>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    match locate_column(c, ctx)? {
+        Some(pos) => rehydrate_cell(pos, row, ctx),
+        // `locate_column` only declines a name it has already checked is
+        // the FROM alias, so this is the whole-row reference.
+        None => whole_row_composite(row, ctx, &c.name),
     }
 }
 

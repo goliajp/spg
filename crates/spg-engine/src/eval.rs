@@ -84,7 +84,9 @@ use resolve::{
     collation_fold_for_compare, compare_is_case_insensitive, composite_eq, eval_expr_cow,
     is_owned_compare_value, resolve_column, resolve_column_borrowed, text_prefix_chars,
 };
-pub(crate) use resolve::{column_collation, find_column_pos, is_binary_coerced};
+pub(crate) use resolve::{
+    column_at, column_collation, find_column_pos, is_binary_coerced, locate_column,
+};
 use strings::{
     TrimSide, format_string, pg_quote_ident, pg_quote_literal, pg_typeof_name, string_left_right,
     string_pad, string_trim, to_char, value_to_format_text,
