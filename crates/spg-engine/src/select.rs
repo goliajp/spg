@@ -206,8 +206,7 @@ impl Engine {
                 alias_opt = Some(alias);
                 // Materialise WHERE-filtered rows owned so the JOIN
                 // and single-table paths share a single downstream
-                // shape. The clone is cheap relative to the window
-                // computation that follows.
+                // shape.
                 let ctx = self.ev_ctx(&schema_cols_owned, alias_opt);
                 let mut owned: Vec<Row<'static>> = Vec::new();
                 let mut emit = |row: &Row<'static>, i: usize| -> Result<(), EngineError> {
@@ -230,16 +229,71 @@ impl Engine {
                 // real per-tx snapshots through this same callsite — no
                 // code change needed here when that lands.
                 let snap = self.current_snapshot();
-                for (i, row) in table.scan_visible(&snap) {
-                    emit(row, i)?;
-                }
-                // v7.36 (cold-tier coverage) — window single-table path
-                // mirrors `run_single_table_scan`: hot iter then cold iter,
-                // both routed through the same `emit` so WHERE / clone /
-                // cancel-poll semantics stay byte-identical.
-                let hot_len = table.row_count();
-                for (offset, row) in self.iter_cold_rows_of_table(table).iter().enumerate() {
-                    emit(row, hot_len + offset)?;
+                // v7.39 (round 975) — ask the indices first, the way the
+                // streaming walk has since round 970. This walk had the
+                // same hole and it is reached by any statement carrying a
+                // window function, so a WHERE that names an indexed column
+                // read the whole table: measured on 400k rows,
+                // `row_number() OVER () … WHERE id = 500` — a ONE-row
+                // answer on a primary key — took 13.762 ms against
+                // PG18.4's 0.151, while the same predicate without the
+                // window took 0.091. The cost was independent of how many
+                // rows survived (999 survivors cost 13.312 ms) and of row
+                // width (13.312 narrow vs 13.327 wide), which is what a
+                // full table walk looks like and what a result-shaped cost
+                // does not.
+                //
+                // The seek only NARROWS — `emit` still applies the whole
+                // WHERE — so no answer can change. Positions arrive
+                // visibility-filtered by the same predicate the scan
+                // applies and capped at a quarter of the table, and `None`
+                // walks the table exactly as before.
+                //
+                // Gated on the table having no cold rows, as the streaming
+                // walk gates itself: the seek reports positions in
+                // `rows()`, and the cold loop below is the other half of
+                // this walk's coverage. With cold rows present the whole
+                // question is handed back to the scan.
+                let seek_positions: Option<Vec<usize>> = if table.has_cold_rows_fast() {
+                    None
+                } else {
+                    stmt.where_.as_ref().and_then(|w| {
+                        crate::index_access::try_index_seek_positions(
+                            w,
+                            &schema_cols_owned,
+                            table,
+                            alias,
+                            &snap,
+                        )
+                    })
+                };
+                match seek_positions {
+                    Some(mut positions) => {
+                        // Table order, which is the order the scan below
+                        // would have produced.
+                        positions.sort_unstable();
+                        for (n, pos) in positions.into_iter().enumerate() {
+                            let Some(row) = table.rows().get(pos) else {
+                                continue;
+                            };
+                            emit(row, n)?;
+                        }
+                    }
+                    None => {
+                        for (i, row) in table.scan_visible(&snap) {
+                            emit(row, i)?;
+                        }
+                        // v7.36 (cold-tier coverage) — window single-table
+                        // path mirrors `run_single_table_scan`: hot iter
+                        // then cold iter, both routed through the same
+                        // `emit` so WHERE / clone / cancel-poll semantics
+                        // stay byte-identical.
+                        let hot_len = table.row_count();
+                        for (offset, row) in self.iter_cold_rows_of_table(table).iter().enumerate()
+                        {
+                            emit(row, hot_len + offset)?;
+                        }
+                    }
                 }
                 filtered = owned;
             }
