@@ -70,6 +70,36 @@ changes rather than by round.
   `emit_materialised`; the fourth had a different consumer signature and
   was only found because the first three stopped hiding it. (r824)
 
+### Performance
+
+- **The sort carries only the columns the query reads.** The prune mask
+  reached the decode but not the encode, so a sort of `SELECT id FROM t
+  ORDER BY k` put every row's whole payload into the batch and out to
+  the spill file: 215 bytes per row against PG18's 18.1 on 400k rows of
+  200-byte payload, and a 30% loss on the endpoint. Stored columns are
+  now masked by writing the unread ones as null, which this encoding
+  already costs nothing for. 111.7-117.7 ms -> 70.3-71.8, against PG18's
+  83.1-104.8. (r995)
+- **The projection stops resolving its columns once per row.** Binding
+  each output column once and handing the scan's own cells over as a
+  slice, rather than rebuilding a vector of references per row: -36.6%
+  on `SELECT pad` over a large table. (r957)
+- **The streaming walk asks the index instead of reading every row.** A
+  primary-key point lookup scanned the table: 14.9 ms on 500k rows
+  against PG18.4's 0.17, now 0.12-0.15. The walk had been added for
+  memory and is preferred over the path that seeks, so adding it quietly
+  took the index away from every single-table point lookup. The same
+  step was missing again in the window path's separate walk (94x, 71x,
+  139x). (r970, r975)
+- **The window path stops cloning rows it is about to borrow, and keys
+  an integer ORDER BY without a heap vector.** 47.4-48.6 ms -> 30.5-31.2
+  and 159.0-167.3 -> 39.1-41.1, with 98 MB less resident. (r976, r979)
+- **DISTINCT sorts on the path the rest of the sorting work had already
+  reached.** (r941)
+- **The sort stops copying every row into the batch**, which was ~62 ms
+  of a ~240 ms 400k-row sort — the largest single item on the endpoint.
+  (r883, r935, r938)
+
 ### Memory
 
 - **A joinless SELECT walks its table instead of copying it.** The
@@ -84,6 +114,26 @@ changes rather than by round.
   ~150 ms where it costs PG ~70-95, and that gap is not closed.
   (r833-r855)
 
+### Catalogs and compatibility
+
+- **`pg_stat_database` answers for its own database, and counts spills.**
+  (r884)
+- **13 of the 38 catalogs were shaped to PG 16/17 rather than PG 18**, and
+  the catalog debt is now tracked apart from the catalog compatibility so
+  neither hides the other. (r893, r929)
+- **`EXPLAIN ANALYZE` runs the path the query runs**, rather than a
+  re-planned stand-in; the option list holds, and two PG18 options are
+  recorded as missing. (r903, r927)
+- **Partition DDL holds; "pruning on = predicates" does not** — recorded
+  rather than claimed. (r928)
+- **`TRUNCATE … RESTART IDENTITY` works**, including restarting a
+  `GENERATED AS IDENTITY` column, which the documentation had claimed
+  less than the code did. (r930, r931)
+- **`TABLE t` is accepted wherever a SELECT is**, not only at the top.
+  (r869)
+- **A cast to a quoted type name resolves the same type.** (r894, r896)
+- **`pg_typeof(NULL::t)` names the type.** (r870, r871)
+
 ### Build and gates
 
 - **The gate reports its own exit code.** Every run went through
@@ -93,10 +143,24 @@ changes rather than by round.
   lints, and parser frames that had grown until a 64-level nesting
   budget no longer fit a 2 MiB stack (30,336 bytes per level, halved to
   14,752). (r845-r850)
+- **Performance blocks the release, and the pipeline enforces it.** The
+  perf category compares SPGS against a live PG18 through one client and
+  fails a release run when a cell loses beyond the run's own resolution;
+  a routine gate without a PG18 to compare against still skips, and says
+  so. The panel it runs had been comparing two CLIENTS, and so had never
+  seen the sort at all. (r885, r895, r936, r937)
 - **dump_compat and data_compat can run.** Neither had OrbStack's
   `docker` on PATH, and two redirects hid it so thoroughly that the only
   message named a server that was, per its own log, listening the whole
   time. (r850)
+
+- **Frozen rows are looked for where the freeze put them.** They went
+  missing, and the reproduction said why. (r943, r944)
+- **A whole-row reference had an evaluator but no way to be typed**, and
+  a null-extended side is a row of NULLs that `IS NULL` only knew in its
+  ROW spelling. (r961, r962)
+- **`work_mem` is read for the first time**, so the bound the sort was
+  given is the bound it uses. (r863)
 
 ### Tests
 
