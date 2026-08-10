@@ -350,6 +350,15 @@ pub(crate) struct ExternalSorter<'a> {
     runs: Vec<Box<dyn TempRun>>,
     /// Where a spill reports itself, when the host wants to know.
     stats: Option<&'a crate::tempstore::SpillStats>,
+    /// Which of the record's columns the caller will actually read, so
+    /// the rest are never stored. `&[]` stores every column.
+    ///
+    /// It lives on the sorter rather than being handed to `push` and to
+    /// `finish_each` separately BECAUSE those two must agree: a column
+    /// stored as null and then decoded as present would read whatever
+    /// bytes followed it. One field, one mask, used by both — the
+    /// mismatch cannot be written.
+    needed: &'a [bool],
 }
 
 impl<'a> ExternalSorter<'a> {
@@ -373,7 +382,24 @@ impl<'a> ExternalSorter<'a> {
             key_stride: 0,
             runs: Vec::new(),
             stats: None,
+            needed: &[],
         }
+    }
+
+    /// Store only the columns `needed` marks, as round 995 measured the
+    /// need for: the sort was carrying 215 bytes of payload per row for a
+    /// query that read eight of them, and spilling all of it.
+    ///
+    /// The mask must be the one the caller's projection and ORDER BY were
+    /// proved against (`sort_record_columns_needed`); a column outside it
+    /// reads NULL, silently. Empty is the unpruned sort.
+    pub(crate) fn with_pruned(mut self, needed: &'a [bool]) -> Self {
+        debug_assert!(
+            needed.is_empty() || needed.len() == self.record_schema.columns.len(),
+            "prune mask must match the record arity"
+        );
+        self.needed = needed;
+        self
     }
 
     /// Did this sort actually spill? Pins read it; so does the decision
@@ -402,7 +428,12 @@ impl<'a> ExternalSorter<'a> {
             "every row of one sort carries the same number of keys"
         );
         self.keys.append(keys);
-        spg_storage::encode_row_body_dense_into(record, &self.record_schema, &mut self.arena);
+        spg_storage::encode_row_body_dense_masked_into(
+            record,
+            &self.record_schema,
+            self.needed,
+            &mut self.arena,
+        );
         let end = u32::try_from(self.arena.len()).map_err(|_| {
             EngineError::Internal(alloc::string::String::from("sort batch larger than 4 GiB"))
         })?;
@@ -600,7 +631,6 @@ impl<'a> ExternalSorter<'a> {
         keys_of: K,
         project: P,
         mut emit: E,
-        needed: &[bool],
     ) -> Result<usize, EngineError>
     where
         K: Fn(&Row<'static>) -> Result<Vec<OrderKey>, EngineError>,
@@ -608,6 +638,8 @@ impl<'a> ExternalSorter<'a> {
         E: FnMut(&[Value<'static>]) -> Result<(), EngineError>,
     {
         let mut emitted = 0usize;
+        // The SAME mask `push` stored with: see the field's note.
+        let needed = self.needed;
         // One buffer for every output row. Building a fresh `Vec` per row
         // was 400k allocations on the 400k-row sort, and the allocator is
         // where this walk's time goes (round 880's profile: 586 samples
@@ -687,7 +719,6 @@ impl<'a> ExternalSorter<'a> {
                 out.push(Row::new(cells.to_vec()));
                 Ok(())
             },
-            &[],
         )?;
         Ok(out)
     }
@@ -811,6 +842,156 @@ mod tests {
         Ok(src.clone())
     }
 
+    /// r995 — the sort STORES only the columns the caller proved it reads.
+    ///
+    /// Before this, the prune mask reached only the decode, so a sort of
+    /// `SELECT id FROM t ORDER BY k` carried every row's whole payload
+    /// into the batch and out to the spill file. Measured against PG18 on
+    /// 400k rows of 200-byte payload: SPG wrote 215 bytes per row where PG
+    /// wrote 18.1, and the endpoint lost by 30%.
+    ///
+    /// Both halves are pinned here because only the pair is meaningful:
+    /// the pruned batch must be SMALL (or the change did nothing) and the
+    /// rows must still come out in the right order carrying the right
+    /// values (or it broke the answer). The unpruned sorter beside it is
+    /// the control — same rows, same pushes, so a shrunken batch can only
+    /// be the mask.
+    #[test]
+    fn pruned_sort_stores_only_what_the_caller_reads() {
+        let descs = [false];
+        // Payload wide enough that carrying it is unmistakable.
+        let cols = alloc::vec![
+            ColumnSchema::new("id", DataType::Int, false),
+            ColumnSchema::new("pad", DataType::Text, false),
+        ];
+        let wide = |id: i32| {
+            Row::new(alloc::vec![
+                Value::Int(id),
+                Value::text(core::iter::repeat_n('x', 200).collect::<alloc::string::String>()),
+            ])
+        };
+
+        let mut full = ExternalSorter::new(None, usize::MAX, cols.clone(), &descs);
+        // `id` is read, `pad` is not.
+        let mask = [true, false];
+        let mut lean = ExternalSorter::new(None, usize::MAX, cols, &descs).with_pruned(&mask);
+        for i in 0..1000i32 {
+            let r = wide((i * 7919) % 1000);
+            let mut k = keys_of(&r).unwrap();
+            full.push(&mut k, &r).unwrap();
+            let mut k = keys_of(&r).unwrap();
+            lean.push(&mut k, &r).unwrap();
+        }
+
+        let (full_bytes, lean_bytes) = (full.arena.len(), lean.arena.len());
+        assert!(
+            full_bytes > 200 * 1000,
+            "control must be carrying the payload, got {full_bytes} B for 1000 rows"
+        );
+        assert!(
+            lean_bytes * 20 < full_bytes,
+            "pruned batch {lean_bytes} B is not decisively smaller than {full_bytes} B"
+        );
+
+        // ... and the answer is unchanged. The dropped column reads NULL,
+        // which is the contract `sort_record_columns_needed` is timid
+        // enough to only ever hand out when nothing reads it.
+        let mut seen: Vec<i32> = Vec::new();
+        let n = lean
+            .finish_each(
+                keys_of,
+                |src, buf| {
+                    assert!(
+                        matches!(src.values[1], Value::Null),
+                        "a pruned column must read NULL, not {:?}",
+                        src.values[1]
+                    );
+                    buf.push(src.values[0].clone());
+                    Ok(())
+                },
+                |cells| {
+                    match cells[0] {
+                        Value::Int(v) => seen.push(v),
+                        ref other => panic!("int expected, got {other:?}"),
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(n, 1000);
+        assert_eq!(seen, (0..1000i32).collect::<Vec<_>>(), "sorted by id");
+    }
+
+    /// r995 — the same pruning on the SPILLED path, where the bytes
+    /// actually reach a file.
+    ///
+    /// The in-memory pin above cannot see this: `finish_each` decodes the
+    /// batch in place when nothing spilled. Here the budget forces runs,
+    /// so what shrinks is what was written out — the thing the endpoint
+    /// measurement was about.
+    #[test]
+    fn pruned_sort_writes_less_to_its_runs() {
+        let descs = [false];
+        let cols = alloc::vec![
+            ColumnSchema::new("id", DataType::Int, false),
+            ColumnSchema::new("pad", DataType::Text, false),
+        ];
+        let wide = |id: i32| {
+            Row::new(alloc::vec![
+                Value::Int(id),
+                Value::text(core::iter::repeat_n('x', 200).collect::<alloc::string::String>()),
+            ])
+        };
+        let mask = [true, false];
+
+        let run_one = |needed: &[bool]| -> (u64, u64, Vec<i32>) {
+            let stats = crate::tempstore::SpillStats::default();
+            let mut s = ExternalSorter::new(Some(mem_run), 4096, cols.clone(), &descs)
+                .with_stats(&stats)
+                .with_pruned(needed);
+            for i in 0..2000i32 {
+                let r = wide((i * 7919) % 2000);
+                let mut k = keys_of(&r).unwrap();
+                s.push(&mut k, &r).unwrap();
+            }
+            assert!(s.spilled(), "a 4 KB budget over 2000 wide rows must spill");
+            let mut seen: Vec<i32> = Vec::new();
+            s.finish_each(
+                keys_of,
+                |src, buf| {
+                    buf.push(src.values[0].clone());
+                    Ok(())
+                },
+                |cells| {
+                    match cells[0] {
+                        Value::Int(v) => seen.push(v),
+                        ref other => panic!("int expected, got {other:?}"),
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            (
+                stats.bytes.load(core::sync::atomic::Ordering::Relaxed),
+                stats.files.load(core::sync::atomic::Ordering::Relaxed),
+                seen,
+            )
+        };
+
+        let (full_bytes, full_files, full_ids) = run_one(&[]);
+        let (lean_bytes, lean_files, lean_ids) = run_one(&mask);
+        assert!(
+            lean_bytes * 20 < full_bytes,
+            "pruned run wrote {lean_bytes} B against the control's {full_bytes} B"
+        );
+        assert!(
+            lean_files < full_files,
+            "fewer bytes must mean fewer runs: {lean_files} against {full_files}"
+        );
+        assert_eq!(full_ids, lean_ids, "pruning must not change the order");
+        assert_eq!(lean_ids, (0..2000i32).collect::<Vec<_>>());
+    }
+
     /// r882 — `finish_each` hands rows over as the merge produces them.
     ///
     /// The property that separates streaming from collecting-then-
@@ -849,7 +1030,6 @@ mod tests {
                     }
                     Ok(())
                 },
-                &[],
             )
             .unwrap_err();
 
@@ -895,7 +1075,6 @@ mod tests {
                         streamed.push(Row::new(cells.to_vec()));
                         Ok(())
                     },
-                    &[],
                 )
                 .unwrap();
 

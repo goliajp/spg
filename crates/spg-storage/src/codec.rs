@@ -1840,21 +1840,58 @@ pub fn encode_row_body_dense(row: &Row<'_>, schema: &TableSchema) -> Vec<u8> {
 /// the endpoint, and the step PG does not have, writing its tuple
 /// straight into sort memory instead.
 pub fn encode_row_body_dense_into(row: &Row<'_>, schema: &TableSchema, out: &mut Vec<u8>) {
+    encode_row_body_dense_masked_into(row, schema, &[], out);
+}
+
+/// v7.37 (round 995) — [`encode_row_body_dense_into`] that does not STORE
+/// the columns the caller will not read.
+///
+/// The pruning that existed before this was on the decode side only, so a
+/// sort of `SELECT id FROM t ORDER BY k` still carried every row's whole
+/// payload through the sort and out to the spill file. Measured against
+/// PG18 on 400k rows: SPG wrote 215 bytes per row where PG wrote 18.1, and
+/// the endpoint lost. Removing the wide column from the TABLE (changing no
+/// code) moved SPG's spill to 13 bytes per row and the loss disappeared,
+/// which is what identified the stored payload rather than the spill
+/// machinery as the cost.
+///
+/// The mechanism is the NULL bitmap this encoding already has: a column
+/// marked null contributes ZERO body bytes, and the decoder hands back
+/// `Value::Null` for it without advancing. So "drop this column" is
+/// exactly "write it as null" — the arity, and therefore every positional
+/// access downstream, is untouched, and no decoder change is needed.
+///
+/// `needed[i]` false means column `i` is stored as null; `&[]` stores
+/// everything. A wrong mask is a SILENT wrong answer (the column reads
+/// NULL), which is why the only caller takes its mask from
+/// `sort_record_columns_needed`, which answers empty for anything it
+/// cannot prove, and holds the SAME mask for the decode.
+pub fn encode_row_body_dense_masked_into(
+    row: &Row<'_>,
+    schema: &TableSchema,
+    needed: &[bool],
+    out: &mut Vec<u8>,
+) {
     debug_assert_eq!(
         row.values.len(),
         schema.columns.len(),
         "dense encode: row arity must match schema"
     );
+    debug_assert!(
+        needed.is_empty() || needed.len() == schema.columns.len(),
+        "dense encode: prune mask must match schema arity"
+    );
+    let dropped = |i: usize| !needed.is_empty() && !needed[i];
     let bitmap_bytes = schema.columns.len().div_ceil(8);
     let bitmap_offset = out.len();
     out.resize(bitmap_offset + bitmap_bytes, 0);
     for (i, v) in row.values.iter().enumerate() {
-        if matches!(v, Value::Null) {
+        if dropped(i) || matches!(v, Value::Null) {
             out[bitmap_offset + i / 8] |= 1 << (i % 8);
         }
     }
     for (col_idx, v) in row.values.iter().enumerate() {
-        if matches!(v, Value::Null) {
+        if dropped(col_idx) || matches!(v, Value::Null) {
             continue;
         }
         write_value_body(out, v, schema.columns[col_idx].ty);
