@@ -957,6 +957,7 @@ mod e2e_window_frame_modes_round122;
 mod e2e_window_generic_agg_round230;
 mod e2e_window_incremental_round589;
 mod e2e_window_index_seek_round975;
+mod e2e_window_int_order_key_round979;
 mod e2e_window_named_errors_round229;
 mod e2e_window_pg_differential;
 mod e2e_window_rowbuf_round592;

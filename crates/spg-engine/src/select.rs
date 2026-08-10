@@ -445,7 +445,99 @@ impl Engine {
                         )
                     )
                 });
-            if int_pkey_fast {
+            // v7.39 (round 979) — the same idea for a single bound INT
+            // window ORDER BY: sort on the i64 instead of on a heap vector
+            // per row.
+            //
+            // Measured at 400k rows (round 978, ablation, answer checked
+            // byte-for-byte against the general path on a key column that
+            // is a permutation): `row_number() OVER (ORDER BY k)` went
+            // 157.057-157.868 ms to 31.253-31.679, which is 79.8% and puts
+            // it on top of the `OVER ()` baseline — the sort essentially
+            // disappears. Round 977 had already shown the cost was
+            // key-shaped rather than row-shaped: the sort's share was
+            // 132.0 ms on a three-integer table and 132.5 with a 200-byte
+            // column added, and a per-row COPY does scale with width
+            // (round 976 measured that at +36 ns/row/200 bytes).
+            //
+            // Gated to ROW_NUMBER, which is the one function that reads
+            // neither key vector — it numbers the order it is handed.
+            // `rank` and `dense_rank` compare adjacent entries' order keys
+            // in `compute_window_partition`, so leaving those vectors
+            // empty would silently give every row rank 1. A wider version
+            // would carry the i64 in the entry and teach those two to use
+            // it; this one is the part that can be shown correct by
+            // construction.
+            let int_okey_fast = partition_by.is_empty()
+                && order_by.len() == 1
+                && frame.is_none()
+                && filter.is_none()
+                && matches!(null_treatment, spg_sql::ast::NullTreatment::Respect)
+                && name.eq_ignore_ascii_case("row_number")
+                && o_bound[0].is_some_and(|pos| {
+                    matches!(
+                        schema_cols.get(pos).map(|c| c.ty),
+                        Some(
+                            spg_storage::DataType::Int
+                                | spg_storage::DataType::BigInt
+                                | spg_storage::DataType::SmallInt
+                        )
+                    )
+                });
+            // Set when a cell in that column turns out not to be an
+            // integer after all. The declared type says it should be, but
+            // "should" is not a thing to sort 400k rows on, so the general
+            // path takes over and this build is discarded.
+            let mut int_okey_bailed = false;
+            if int_okey_fast {
+                let pos = o_bound[0].expect("gated bound");
+                let desc = order_by[0].1;
+                // PG orders NULLs last ascending and first descending
+                // unless the query says otherwise.
+                let nulls_first = order_by[0].2.unwrap_or(desc);
+                let mut keyed: Vec<(bool, i64, usize)> = Vec::with_capacity(n_rows);
+                for (i, row) in filtered.iter().enumerate() {
+                    match row.values.get(pos) {
+                        Some(Value::Int(n)) => keyed.push((false, i64::from(*n), i)),
+                        Some(Value::BigInt(n)) => keyed.push((false, *n, i)),
+                        Some(Value::SmallInt(n)) => keyed.push((false, i64::from(*n), i)),
+                        Some(Value::Null) | None => keyed.push((true, 0, i)),
+                        Some(_) => {
+                            int_okey_bailed = true;
+                            break;
+                        }
+                    }
+                }
+                if !int_okey_bailed {
+                    // `null_rank` puts NULLs on the side the query asked
+                    // for; the row's original index breaks every tie, so
+                    // equal keys keep the order the scan produced — what
+                    // the stable sort below would have given them.
+                    let null_rank = |is_null: bool| -> u8 { u8::from(is_null != nulls_first) };
+                    keyed.sort_unstable_by(|a, b| {
+                        null_rank(a.0)
+                            .cmp(&null_rank(b.0))
+                            .then_with(|| {
+                                if a.0 {
+                                    core::cmp::Ordering::Equal
+                                } else if desc {
+                                    b.1.cmp(&a.1)
+                                } else {
+                                    a.1.cmp(&b.1)
+                                }
+                            })
+                            .then_with(|| a.2.cmp(&b.2))
+                    });
+                    for (_, _, i) in keyed {
+                        indexed.push((Vec::new(), Vec::new(), i));
+                    }
+                } else {
+                    indexed.clear();
+                }
+            }
+            if int_okey_fast && !int_okey_bailed {
+                // Ordered above; nothing else to build.
+            } else if int_pkey_fast {
                 let pos = p_bound[0].expect("gated bound");
                 let mut slot: hashbrown::HashMap<Option<i64>, usize> = hashbrown::HashMap::new();
                 let mut groups: Vec<Vec<usize>> = Vec::new();
@@ -523,7 +615,9 @@ impl Engine {
             // here. Group by encoded key instead, preserving row order
             // inside each group — exactly what the stable sort preserved,
             // so every function (row_number included) answers the same.
-            if int_pkey_fast {
+            if int_okey_fast && !int_okey_bailed {
+                // Already ordered by the i64 key above.
+            } else if int_pkey_fast {
                 // Already grouped above; same-partition rows are adjacent
                 // in original row order.
             } else if order_by.is_empty() && !partition_by.is_empty() {
