@@ -7336,6 +7336,9 @@ impl Engine {
         // 582): each ORDER BY column is bound once, not once per row.
         let order_bound = crate::orderby::order_by_bound_positions(&order_by, &cols, Some(alias));
         let descs: Vec<bool> = order_by.iter().map(|o| o.desc).collect();
+        // Resolved BEFORE the scan, because it now decides what the sort
+        // STORES and not just what it decodes (round 995).
+        let needed = Self::sort_record_columns_needed(&stmt.items, &order_bound, cols.len(), &ctx);
 
         let mut sorter = crate::extsort::ExternalSorter::new(
             self.temp_run_factory,
@@ -7343,7 +7346,8 @@ impl Engine {
             cols.clone(),
             &descs,
         )
-        .with_stats(&self.spill_stats);
+        .with_stats(&self.spill_stats)
+        .with_pruned(&needed);
         let snapshot = self.current_snapshot();
         // One key buffer for the whole scan: `push` drains it and leaves
         // the capacity behind.
@@ -7567,6 +7571,9 @@ impl Engine {
         // 582): each ORDER BY column is bound once, not once per row.
         let order_bound = crate::orderby::order_by_bound_positions(&order_by, &cols, Some(alias));
         let descs: Vec<bool> = order_by.iter().map(|o| o.desc).collect();
+        // Resolved BEFORE the scan, because it now decides what the sort
+        // STORES and not just what it decodes (round 995).
+        let needed = Self::sort_record_columns_needed(&stmt.items, &order_bound, cols.len(), &ctx);
 
         let mut sorter = crate::extsort::ExternalSorter::new(
             self.temp_run_factory,
@@ -7574,7 +7581,8 @@ impl Engine {
             cols.clone(),
             &descs,
         )
-        .with_stats(&self.spill_stats);
+        .with_stats(&self.spill_stats)
+        .with_pruned(&needed);
         let snapshot = self.current_snapshot();
         // One key buffer for the whole scan: `push` drains it and leaves
         // the capacity behind.
@@ -7606,7 +7614,6 @@ impl Engine {
         emit(crate::StreamItem::Header(&columns))?;
 
         let key_ctx = &ctx;
-        let needed = Self::sort_record_columns_needed(&stmt.items, &order_bound, cols.len(), &ctx);
         let mut emitted_since_check = 0usize;
         let n = sorter.finish_each(
             |src| {
@@ -7640,7 +7647,6 @@ impl Engine {
                 }
                 emit(crate::StreamItem::Row(crate::RowCells::Values(cells)))
             },
-            &needed,
         )?;
         Ok(Some(n))
     }
