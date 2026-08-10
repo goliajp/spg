@@ -162,7 +162,27 @@ impl Engine {
         // qualifier-aware column resolver same as the aggregate /
         // projection paths on JOIN.
         let (schema_cols_owned, alias_opt): (Vec<ColumnSchema>, Option<&str>);
-        let filtered: Vec<Row<'static>>;
+        // v7.39 (round 976) — rows this walk OWNS. A derived FROM item and
+        // a JOIN both produce rows that exist nowhere else, so they land
+        // here; a plain stored table does not, and borrows instead.
+        //
+        // It used to clone every row out of the table, on the reasoning
+        // that "the clone is cheap relative to the window computation that
+        // follows". Measured on 400k rows, `row_number() OVER ()` cost
+        // 31.881 ms against 46.520 with a 200-byte column added — so the
+        // clone tracks row width at about 36 ns per row per 200 bytes, and
+        // the window computation it was being compared against is a
+        // counter increment per row. Nothing downstream needs the rows
+        // owned: the very next statement used to be
+        // `filtered.iter().collect()` into the `&Row` slice the window
+        // pipeline actually reads.
+        let mut owned_rows: Vec<Row<'static>> = Vec::new();
+        // What the pipeline reads. Borrows `owned_rows` or the table.
+        let mut filtered: Vec<&Row<'static>> = Vec::new();
+        // Set by the branches that fill `owned_rows`, because "empty" is
+        // an answer a query can legitimately have and so cannot be the
+        // signal for which of the two holds the rows.
+        let mut rows_are_owned = false;
         if from.joins.is_empty() {
             let primary = &from.primary;
             // v7.37 D.13 — window functions over a derived table (subquery /
@@ -194,7 +214,8 @@ impl Engine {
                     }
                     owned.push(row);
                 }
-                filtered = owned;
+                owned_rows = owned;
+                rows_are_owned = true;
             } else {
                 let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
                     StorageError::TableNotFound {
@@ -204,23 +225,21 @@ impl Engine {
                 let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
                 schema_cols_owned = table.schema().columns.clone();
                 alias_opt = Some(alias);
-                // Materialise WHERE-filtered rows owned so the JOIN
-                // and single-table paths share a single downstream
-                // shape.
                 let ctx = self.ev_ctx(&schema_cols_owned, alias_opt);
-                let mut owned: Vec<Row<'static>> = Vec::new();
-                let mut emit = |row: &Row<'static>, i: usize| -> Result<(), EngineError> {
-                    if i.is_multiple_of(256) {
-                        cancel.check()?;
-                    }
+                // The WHERE test, in ONE place, for all four ways a row can
+                // reach this walk. It deliberately does not touch the row
+                // collections: a closure that pushed into them would tie
+                // its argument to the closure body and no borrowed row
+                // could escape it, which is what forced the clone-shaped
+                // version of this loop in the first place.
+                let passes = |row: &Row<'static>| -> Result<bool, EngineError> {
                     if let Some(w) = &stmt.where_ {
                         let cond = eval::eval_expr(w, row, &ctx)?;
                         if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
-                            return Ok(());
+                            return Ok(false);
                         }
                     }
-                    owned.push(row.clone());
-                    Ok(())
+                    Ok(true)
                 };
                 // v7.37.15 Phase B — scan_visible filters rows by the
                 // engine's current snapshot. Phase B's `current_snapshot()`
@@ -229,35 +248,54 @@ impl Engine {
                 // real per-tx snapshots through this same callsite — no
                 // code change needed here when that lands.
                 let snap = self.current_snapshot();
-                // v7.39 (round 975) — ask the indices first, the way the
-                // streaming walk has since round 970. This walk had the
-                // same hole and it is reached by any statement carrying a
-                // window function, so a WHERE that names an indexed column
-                // read the whole table: measured on 400k rows,
-                // `row_number() OVER () … WHERE id = 500` — a ONE-row
-                // answer on a primary key — took 13.762 ms against
-                // PG18.4's 0.151, while the same predicate without the
-                // window took 0.091. The cost was independent of how many
-                // rows survived (999 survivors cost 13.312 ms) and of row
-                // width (13.312 narrow vs 13.327 wide), which is what a
-                // full table walk looks like and what a result-shaped cost
-                // does not.
-                //
-                // The seek only NARROWS — `emit` still applies the whole
-                // WHERE — so no answer can change. Positions arrive
-                // visibility-filtered by the same predicate the scan
-                // applies and capped at a quarter of the table, and `None`
-                // walks the table exactly as before.
-                //
-                // Gated on the table having no cold rows, as the streaming
-                // walk gates itself: the seek reports positions in
-                // `rows()`, and the cold loop below is the other half of
-                // this walk's coverage. With cold rows present the whole
-                // question is handed back to the scan.
-                let seek_positions: Option<Vec<usize>> = if table.has_cold_rows_fast() {
-                    None
+                if table.has_cold_rows_fast() {
+                    // v7.36 (cold-tier coverage) — a cold segment's rows
+                    // are produced on demand and live in a temporary this
+                    // walk cannot borrow from, so a table carrying any owns
+                    // its rows. Hot iter then cold iter, both through the
+                    // same WHERE, as before.
+                    let mut owned: Vec<Row<'static>> = Vec::new();
+                    for (i, row) in table.scan_visible(&snap) {
+                        if i.is_multiple_of(256) {
+                            cancel.check()?;
+                        }
+                        if passes(row)? {
+                            owned.push(row.clone());
+                        }
+                    }
+                    let hot_len = table.row_count();
+                    for (offset, row) in self.iter_cold_rows_of_table(table).iter().enumerate() {
+                        let i = hot_len + offset;
+                        if i.is_multiple_of(256) {
+                            cancel.check()?;
+                        }
+                        if passes(row)? {
+                            owned.push(row.clone());
+                        }
+                    }
+                    owned_rows = owned;
+                    rows_are_owned = true;
                 } else {
-                    stmt.where_.as_ref().and_then(|w| {
+                    // v7.39 (round 975) — ask the indices first, the way
+                    // the streaming walk has since round 970. This walk had
+                    // the same hole and it is reached by any statement
+                    // carrying a window function, so a WHERE that names an
+                    // indexed column read the whole table: measured on 400k
+                    // rows, `row_number() OVER () … WHERE id = 500` — a
+                    // ONE-row answer on a primary key — took 13.762 ms
+                    // against PG18.4's 0.151, while the same predicate
+                    // without the window took 0.091. The cost was
+                    // independent of how many rows survived (999 survivors
+                    // cost 13.312 ms) and of row width (13.312 narrow vs
+                    // 13.327 wide), which is what a full table walk looks
+                    // like and what a result-shaped cost does not.
+                    //
+                    // The seek only NARROWS — `passes` still applies the
+                    // whole WHERE — so no answer can change. Positions
+                    // arrive visibility-filtered by the same predicate the
+                    // scan applies and capped at a quarter of the table,
+                    // and `None` walks the table exactly as before.
+                    let seek_positions: Option<Vec<usize>> = stmt.where_.as_ref().and_then(|w| {
                         crate::index_access::try_index_seek_positions(
                             w,
                             &schema_cols_owned,
@@ -265,37 +303,36 @@ impl Engine {
                             alias,
                             &snap,
                         )
-                    })
-                };
-                match seek_positions {
-                    Some(mut positions) => {
-                        // Table order, which is the order the scan below
-                        // would have produced.
-                        positions.sort_unstable();
-                        for (n, pos) in positions.into_iter().enumerate() {
-                            let Some(row) = table.rows().get(pos) else {
-                                continue;
-                            };
-                            emit(row, n)?;
+                    });
+                    match seek_positions {
+                        Some(mut positions) => {
+                            // Table order, which is the order the scan
+                            // would have produced.
+                            positions.sort_unstable();
+                            for (n, pos) in positions.into_iter().enumerate() {
+                                if n.is_multiple_of(256) {
+                                    cancel.check()?;
+                                }
+                                let Some(row) = table.rows().get(pos) else {
+                                    continue;
+                                };
+                                if passes(row)? {
+                                    filtered.push(row);
+                                }
+                            }
                         }
-                    }
-                    None => {
-                        for (i, row) in table.scan_visible(&snap) {
-                            emit(row, i)?;
-                        }
-                        // v7.36 (cold-tier coverage) — window single-table
-                        // path mirrors `run_single_table_scan`: hot iter
-                        // then cold iter, both routed through the same
-                        // `emit` so WHERE / clone / cancel-poll semantics
-                        // stay byte-identical.
-                        let hot_len = table.row_count();
-                        for (offset, row) in self.iter_cold_rows_of_table(table).iter().enumerate()
-                        {
-                            emit(row, hot_len + offset)?;
+                        None => {
+                            for (i, row) in table.scan_visible(&snap) {
+                                if i.is_multiple_of(256) {
+                                    cancel.check()?;
+                                }
+                                if passes(row)? {
+                                    filtered.push(row);
+                                }
+                            }
                         }
                     }
                 }
-                filtered = owned;
             }
         } else {
             let deferred = self.build_joined_filtered_rows(
@@ -305,20 +342,24 @@ impl Engine {
                 None,
                 &mut ByteBudget::new(self.max_query_bytes),
             )?;
-            // Window path needs owned Rows; materialise the survivors
-            // before moving out the schema.
-            filtered = deferred.materialise();
+            // A join's survivors are row-index tuples over its sources, so
+            // there is no single row to borrow — this branch owns them.
+            owned_rows = deferred.materialise();
+            rows_are_owned = true;
             schema_cols_owned = deferred.combined_schema;
             alias_opt = None;
+        }
+        if rows_are_owned {
+            filtered = owned_rows.iter().collect();
         }
         let schema_cols = &schema_cols_owned;
         let ctx = self.ev_ctx(schema_cols, alias_opt);
         let alias = alias_opt.unwrap_or("");
         let n_rows = filtered.len();
-        // Borrow refs into the owned row vec once so the downstream
-        // `compute_window_partition` call (which takes `&[&Row<'static>]`) and
-        // the per-row eval loops share a single backing buffer.
-        let filtered_refs: Vec<&Row<'static>> = filtered.iter().collect();
+        // The window pipeline reads `&[&Row<'static>]`, and `filtered`
+        // already is one whichever branch produced it — the separate
+        // `filtered_refs` this used to build was the collect that made
+        // owning the rows look necessary.
 
         // 2) Collect unique window function nodes from projection.
         let mut window_nodes: Vec<Expr> = Vec::new();
@@ -537,7 +578,7 @@ impl Engine {
                     *null_treatment,
                     filter.as_deref(),
                     &indexed[p_start..p_end],
-                    &filtered_refs,
+                    &filtered,
                     &ctx,
                     &mut out_vals,
                 )?;
