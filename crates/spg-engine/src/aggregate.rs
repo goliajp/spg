@@ -1070,6 +1070,27 @@ pub(crate) fn run(
     // allocations before discarding 99.75 % at the sort truncation
     // step. HAVING still runs inline on every group because it
     // filters BEFORE the LIMIT; we only skip the SELECT-list eval.
+    //
+    // v7.37 (round 998) — and so a HAVING no longer stands the deferral
+    // down. It used to, which cost the mailrs Track A query 11.9 ms of
+    // 83. Neither clause is expensive alone: HAVING costs 5.0 ms without
+    // an ORDER BY and 16.9 with one, and an ORDER BY costs MINUS 8.6 ms
+    // without a HAVING, because ORDER BY + LIMIT is what switches this
+    // deferral on. The residue of 11.9 ms belonged to neither and
+    // appeared only together.
+    //
+    // What named it: the interaction tracks what the aggregates COST
+    // rather than how many there are — one expensive aggregate
+    // reproduces it as fully as twelve cheap ones — and it does not move
+    // when the LIMIT changes. Both follow from projecting all 20 000
+    // groups instead of the 50 that survive truncation.
+    //
+    // Safe because the clause above runs first: HAVING filters into
+    // `kept_synth` BEFORE this branch, the sort truncates that survivor
+    // list, and the completion projects from it. HAVING is rewritten
+    // against the synthetic group schema, so it never reads a projected
+    // item.
+    //
     // v7.37 (round 997) — a set-returning item must NOT defer. The
     // deferred completion at the end of this function evaluates each item
     // scalarly; the expansion that turns one group into one row per
@@ -1077,9 +1098,11 @@ pub(crate) fn run(
     // `unnest(...)` in the select list came back as
     // `function unnest(integer[]) does not exist` — the exact error round
     // 621 had fixed, reintroduced for the shapes that qualify to defer.
-    // Differential against PG18.4: the same query answers correctly
-    // without LIMIT, with LIMIT >= the group count, or with a HAVING —
-    // all three being cases where the deferral is off.
+    // Differential against PG18.4: the same query answered correctly
+    // without LIMIT, with LIMIT >= the group count, and — at the time —
+    // with a HAVING, those being the cases where the deferral was off.
+    // Round 998 removed the HAVING one from that list, which is why this
+    // guard carries the SRF rule on its own now.
     let any_srf_item = stmt.items.iter().any(|i| match i {
         SelectItem::Expr { expr, .. } => crate::select::top_level_srf_kind(expr).is_some(),
         _ => false,
@@ -1087,7 +1110,6 @@ pub(crate) fn run(
     let defer_projection = !stmt.order_by.is_empty()
         && !stmt.distinct
         && !stmt.limit_with_ties
-        && stmt.having.is_none()
         && !any_srf_item
         && stmt.limit_literal().is_some_and(|l| {
             let off = stmt.offset_literal().unwrap_or(0) as usize;
